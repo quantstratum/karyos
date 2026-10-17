@@ -866,15 +866,16 @@ fn unconfirmed_bindings_never_hold_the_table() {
 /// The heartbeat rule of the trusted profile (coordinator decision): above
 /// the lane's highest seen position is fresh, at it stationary, below it
 /// stale, outside the image's window rejected.
-#[test]
-fn heartbeats_are_classified_against_the_window_and_the_mark() {
+/// An installed one-lane image (session 5, stream 6, initial term 9,
+/// 64 KiB terms) for the liveness tests.
+fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
     use std::sync::Arc;
 
-    use karyos_protocol::frame::{Flags, FrameType, Lane, Word0};
+    use karyos_protocol::frame::Lane;
     use karyos_sys::log_buffer::{
         DEFAULT_CLAIM_DEADLINE, LogBuffer, LogBufferConfig, PublicationMode, ReceiveOwner,
     };
-    use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
+    use karyos_sys::receive::ImageParams;
     use karyos_sys::sizing::TermLength;
     use karyos_sys::term::TermId;
 
@@ -901,7 +902,7 @@ fn heartbeats_are_classified_against_the_window_and_the_mark() {
     );
     let params = ImageParams::new(5, 6, 1, term_length, 1408).unwrap();
     let owner = ReceiveOwner::new(params, vec![Arc::clone(&lane)]).unwrap();
-    let mut image = super::Installed {
+    let image = super::Installed {
         slot: super::SlotRef {
             slot: 0,
             generation: 1,
@@ -927,6 +928,15 @@ fn heartbeats_are_classified_against_the_window_and_the_mark() {
         sm: Arc::new(super::SmSlot::default()),
         evidence: 0,
     };
+    (image, params)
+}
+
+#[test]
+fn heartbeats_are_classified_against_the_window_and_the_mark() {
+    use karyos_protocol::frame::{Flags, FrameType, Lane, Word0};
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
     let heartbeat = |term_id: u32, term_offset: i32| {
         let mut bytes = [0u8; 32];
         let word0 = Word0::new(
@@ -955,4 +965,121 @@ fn heartbeats_are_classified_against_the_window_and_the_mark() {
     assert_eq!(classify(heartbeat(9, 128)), Fresh);
     // Three terms ahead: outside the window.
     assert_eq!(classify(heartbeat(12, 0)), Rejected);
+}
+
+#[test]
+fn stationary_heartbeats_stop_refreshing_after_the_idle_timeout() {
+    let (mut image, _) = installed_image();
+    let idle = 60_000_000_000;
+    super::apply_evidence(&mut image, true, false, 1_000, idle);
+    assert_eq!((image.evidence, image.last_fresh), (1_000, 1_000));
+    // Stationary within the idle timeout: alive, the idle clock kept.
+    super::apply_evidence(&mut image, false, true, 1_000 + idle - 1, idle);
+    assert_eq!(
+        (image.evidence, image.last_fresh),
+        (1_000 + idle - 1, 1_000)
+    );
+    // At the idle timeout: no longer evidence, so the image ages out.
+    super::apply_evidence(&mut image, false, true, 1_000 + idle, idle);
+    assert_eq!(
+        (image.evidence, image.last_fresh),
+        (1_000 + idle - 1, 1_000)
+    );
+    super::apply_evidence(&mut image, false, true, 1_000 + 2 * idle, idle);
+    assert_eq!(image.evidence, 1_000 + idle - 1);
+    // Fresh evidence restarts both.
+    super::apply_evidence(&mut image, true, false, 1_000 + 2 * idle, idle);
+    assert_eq!(
+        (image.evidence, image.last_fresh),
+        (1_000 + 2 * idle, 1_000 + 2 * idle)
+    );
+}
+
+#[test]
+fn a_stale_heartbeat_leaves_the_evidence_unchanged() {
+    let (mut image, _) = installed_image();
+    super::apply_evidence(&mut image, true, false, 5_000, 60_000_000_000);
+    super::apply_evidence(&mut image, false, false, 9_000, 60_000_000_000);
+    assert_eq!((image.evidence, image.last_fresh), (5_000, 5_000));
+}
+
+/// A sender with one publication on `EndpointId(1)`, the answer binding a
+/// receiver with `boot_id` at `join`, and an SM from it at `consumption`.
+fn sm_harness() -> (
+    super::SenderRole,
+    impl Fn([u64; 2], u64) -> karyos_protocol::network::SetupAnswer,
+    impl Fn([u64; 2], u64) -> karyos_protocol::network::StatusMessage,
+) {
+    use karyos_protocol::network::{LaneStatus, Receiver, SetupAnswer, StatusMessage};
+
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let endpoint = EndpointId(1);
+    sender.sessions.add(publication(endpoint)).unwrap();
+    let (path, _log) = outbound(endpoint, "10.0.0.2:4000".parse().unwrap());
+    sender.publications.push(*path);
+    let answer = move |boot_id, join| SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(endpoint).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: boot_id,
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[join]).unwrap(),
+    };
+    let status = |boot_id, consumption| StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: boot_id,
+            receiver_id: 1,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[LaneStatus {
+            consumption,
+            window: 32_768,
+        }])
+        .unwrap(),
+    };
+    (sender, answer, status)
+}
+
+#[test]
+fn a_rebind_never_moves_a_reliable_position_back() {
+    let (mut sender, answer, status) = sm_harness();
+    let endpoint = EndpointId(1);
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(endpoint, receiver, &answer([7, 8], 0), 0);
+    sender.status(endpoint, receiver, &status([7, 8], 8192), 1);
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    // A new answer to the same receiver, at an older join: held.
+    sender.bind(endpoint, receiver, &answer([7, 8], 0), 2);
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    // Its next SM, older still: held, counted stale.
+    sender.status(endpoint, receiver, &status([7, 8], 4096), 3);
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    assert_eq!(sender.counters().sm_stale, 1);
+}
+
+#[test]
+fn an_unconfirmed_receiver_bounds_at_its_joins() {
+    let (mut sender, answer, status) = sm_harness();
+    let endpoint = EndpointId(1);
+    let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    assert_eq!(sender.consumption(endpoint, alias()), None);
+    sender.bind(endpoint, first, &answer([7, 8], 0), 0);
+    sender.status(endpoint, first, &status([7, 8], 8192), 1);
+    sender.bind(endpoint, second, &answer([3, 4], 1024), 2);
+    // The second is answered but silent: it bounds at its join.
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 1024);
+    // Once heard from, at its consumption.
+    sender.status(endpoint, second, &status([3, 4], 16_384), 3);
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    // Another alias has no bound receiver.
+    let other = Alias {
+        session_id: 99,
+        ..alias()
+    };
+    assert_eq!(sender.consumption(endpoint, other), None);
 }

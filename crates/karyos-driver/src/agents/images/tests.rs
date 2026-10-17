@@ -872,3 +872,33 @@ fn a_reliable_lane_resends_after_a_reset() {
     assert_eq!(delivered, messages);
     assert_eq!(rig.endpoints.local_address(publisher), before);
 }
+
+/// RP-2: a DATA heartbeat is image evidence, never path evidence. With
+/// fresh heartbeats every second and no data, the path is lost when
+/// `path_liveness_timeout` (10 s) passes since establishment, and the image
+/// is kept; afterwards the unbound heartbeats are refused.
+#[test]
+fn a_data_heartbeat_does_not_refresh_its_path() {
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1);
+    let before = rig.agents.receiver.counters();
+    let mut lost_at = None;
+    for second in 1..=12u64 {
+        rig.now += 1_000_000_000;
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_heartbeat(&receiver.sessions, b, source, slot, 32 * second, rig.now);
+        rig.round(true);
+        if lost_at.is_none() && rig.agents.receiver.role.live_paths(slot) == 0 {
+            lost_at = Some(second);
+        }
+    }
+    assert_eq!(lost_at, Some(10));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.heartbeats, before.heartbeats + 10);
+    assert_eq!(after.data_unbound, before.data_unbound + 2);
+    assert!(rig.agents.receiver.role.has_image(slot));
+}

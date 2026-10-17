@@ -101,6 +101,22 @@ fn scripted(
     Box<super::Outbound>,
     super::testing::TestLog,
 ) {
+    let (tx, _rx, observer, path, log) = scripted_halves(max_queues, lanes);
+    (tx, observer, path, log)
+}
+
+/// [`scripted`], keeping the RX half, so a test can join and retire an
+/// endpoint left with pending items.
+fn scripted_halves(
+    max_queues: u16,
+    lanes: u8,
+) -> (
+    karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>,
+    karyos_io::sockets::endpoint::SocketsRx<ScriptedSocket>,
+    ScriptedSocket,
+    Box<super::Outbound>,
+    super::testing::TestLog,
+) {
     use std::num::NonZeroU16;
 
     let socket = ScriptedSocket::new();
@@ -109,7 +125,7 @@ fn scripted(
     local.max_queues = NonZeroU16::new(max_queues).unwrap();
     local.max_routes = NonZeroU16::new(2).unwrap();
     let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
-    let (tx, _rx) = endpoint.split().unwrap();
+    let (tx, rx) = endpoint.split().unwrap();
     let alias = Alias {
         session_id: 5,
         stream_id: 6,
@@ -126,7 +142,7 @@ fn scripted(
             .append(&[i; 300], AppendOptions::default())
             .unwrap();
     }
-    (tx, observer, path, log)
+    (tx, rx, observer, path, log)
 }
 
 /// P2-4: a send fault is retried on its queue, which keeps its items; the
@@ -156,6 +172,46 @@ fn a_send_fault_is_retried() {
     assert!(!path.needs_reset());
     let reader = &path.readers()[0];
     assert_eq!(reader.sent_position(), reader.position());
+}
+
+/// A backend failure (EBADF stops the half) is no send fault: the
+/// publication needs an endpoint reset, the failure is counted once, and
+/// later serves do not retry it.
+#[test]
+fn a_backend_failure_needs_a_reset() {
+    use karyos_io::backend::TxReport;
+    use karyos_io::sockets::endpoint::Retired;
+    use karyos_io::sockets::ops::Errno;
+
+    let (mut tx, rx, observer, mut path, _log) = scripted_halves(4, 1);
+    observer.push_send(SendResult::Error(Errno::BADF));
+    for _ in 0..16 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    let _ = path.serve(&mut tx, budget, None).unwrap();
+    let first = path.counters();
+    assert!(path.needs_reset());
+    assert_eq!((first.send_failures, first.send_faults), (1, 0));
+    for _ in 0..5 {
+        let _ = path.serve(&mut tx, budget, None).unwrap();
+    }
+    let counters = path.counters();
+    assert!(path.needs_reset());
+    assert_eq!(counters.send_faults, 0);
+    assert_eq!(counters.submitted, first.submitted, "{counters:?}");
+    // The endpoint table's part: retire the endpoint, returning its items.
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = TxReport::new();
+    while !matches!(endpoint.retire(&mut report), Retired::Complete { .. }) {
+        while report.pop_front().is_some() {}
+    }
 }
 
 /// P2-5: an open that fails part way closes what it opened, so retrying

@@ -180,6 +180,10 @@ pub struct SenderCounters {
     /// Answered receivers not recorded: the binding table was full of
     /// confirmed bindings.
     pub bindings_full: u64,
+    /// Publications whose endpoint needs a reset before they can send again
+    /// (a gauge, recomputed each cycle; the endpoint table acts on it in
+    /// its own PR, ACS 15721).
+    pub needs_reset: u64,
     /// Unconfirmed bindings evicted to make room for a new answer.
     pub bindings_evicted: u64,
     /// Bindings expired: unconfirmed past `setup_challenge_timeout`, or
@@ -268,6 +272,25 @@ fn path_joins(joins: &Lanes<u64>, term_length: u32) -> [(u64, u64); 4] {
         *slot = (*join, term);
     }
     out
+}
+
+/// Applies a datagram's evidence to `image`'s liveness at `now` (trusted
+/// profile): fresh evidence keeps it alive and restarts the idle clock;
+/// stationary heartbeats keep it alive only until `idle_timeout` after the
+/// last fresh evidence; anything else changes nothing.
+fn apply_evidence(
+    image: &mut Installed,
+    fresh: bool,
+    stationary: bool,
+    now: u64,
+    idle_timeout: u64,
+) {
+    if fresh {
+        image.evidence = now;
+        image.last_fresh = now;
+    } else if stationary && age_ns(now, image.last_fresh) < idle_timeout {
+        image.evidence = now;
+    }
 }
 
 /// What a heartbeat is to its image's liveness.
@@ -611,6 +634,58 @@ impl ReceiverRole {
         self.sessions.counters()
     }
 
+    /// Live paths of the image at `slot` (tests).
+    #[cfg(test)]
+    pub(super) fn live_paths(&self, slot: SlotRef) -> usize {
+        self.sessions.paths().live(slot)
+    }
+
+    /// Hands the receiver a DATA heartbeat on lane 0 of the image at
+    /// `slot`, `ahead` bytes above its contiguous prefix, as if it came
+    /// from `source` on `endpoint` at `now` (tests).
+    #[cfg(test)]
+    pub(super) fn inject_heartbeat(
+        &mut self,
+        sessions: &SessionEnd,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        slot: SlotRef,
+        ahead: u64,
+        now: u64,
+    ) {
+        use karyos_protocol::frame::{Flags, FrameType, Word0};
+
+        let image = self.images.iter().find(|image| image.slot == slot).unwrap();
+        let position = image.owner.rebuild_position(Lane::ZERO).unwrap() + ahead;
+        let term_length = u64::from(image.term_length);
+        let term_id = image
+            .initial_term_id
+            .get()
+            .checked_add(u32::try_from(position / term_length).unwrap())
+            .unwrap();
+        let term_offset = u32::try_from(position % term_length).unwrap();
+        let alias = image.key.alias;
+        let mut bytes = [0u8; 32];
+        let word0 = Word0::new(
+            32,
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Data,
+        );
+        bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+        bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+        bytes[12..16].copy_from_slice(&alias.session_id.to_le_bytes());
+        bytes[16..20].copy_from_slice(&alias.stream_id.to_le_bytes());
+        bytes[20..24].copy_from_slice(&term_id.to_le_bytes());
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        intake.data(source, alias, &bytes);
+    }
+
     /// Whether the image installed at `slot` is held.
     #[must_use]
     pub fn has_image(&self, slot: SlotRef) -> bool {
@@ -930,7 +1005,9 @@ impl ReceiverRole {
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
         // A lost path stops being charged in its image's statistics from
-        // the terms it was lost in (RP-6).
+        // the terms it was lost in (RP-6). The term is the contiguous
+        // prefix's, deliberately: frames above a hole put the cut at the
+        // hole, which charges the lost path less, never more.
         let images = &mut self.images;
         let mut work = self.sessions.timers_with(now, |slot, path, _| {
             if let Some(image) = images.iter_mut().find(|image| image.slot == slot) {
@@ -1039,7 +1116,19 @@ impl Intake<'_> {
                 Item::Frame(frame) => {
                     let delivered = delivered(image, &frame, path, self.now);
                     match image.owner.receive(&frame) {
-                        Ok(Received::Committed { .. }) => (0, Some((delivered, Arrival::First))),
+                        Ok(Received::Committed { position, extent }) => {
+                            // The heartbeat mark rises with committed data
+                            // too: a replayed older heartbeat after a data
+                            // period is never fresh.
+                            let end = position.checked_add(u64::from(extent));
+                            let lane = usize::from(frame.lane().get());
+                            if let (Some(end), Some(mark)) =
+                                (end, image.heartbeat_marks.get_mut(lane))
+                            {
+                                *mark = Some(mark.map_or(end, |seen| seen.max(end)));
+                            }
+                            (0, Some((delivered, Arrival::First)))
+                        }
                         Ok(Received::Duplicate) => (1, Some((delivered, Arrival::Duplicate))),
                         Ok(Received::Late) => (1, Some((delivered, Arrival::Late))),
                         Ok(_) => (1, None),
@@ -1090,12 +1179,7 @@ impl Intake<'_> {
         // `idle_image_timeout` after the last fresh evidence; a replay keeps
         // nothing alive.
         let stationary = outcomes.get(5).is_some_and(|count| *count > 0);
-        if fresh {
-            image.evidence = self.now;
-            image.last_fresh = self.now;
-        } else if stationary && age_ns(self.now, image.last_fresh) < role.idle_timeout {
-            image.evidence = self.now;
-        }
+        apply_evidence(image, fresh, stationary, self.now, role.idle_timeout);
         if path_fresh && let Some((slot, path)) = path {
             // Fresh evidence on the path refreshes its liveness (RP-2),
             // never the image's.
@@ -1507,6 +1591,7 @@ impl SenderRole {
         // Its capacity stays for the next cycle.
         self.due = due;
         // First sends (§3.1 step 8), only after establishment (§4.3).
+        let mut needing_reset = 0u64;
         for index in 0..self.publications.len() {
             let Some(outbound) = self.publications.get(index) else {
                 break;
@@ -1532,7 +1617,11 @@ impl SenderRole {
                     .and_then(|positions| positions.get(..lanes)),
             )?;
             work = work.checked_add(served).ok_or(overflow.clone())?;
+            if outbound.needs_reset() {
+                needing_reset = needing_reset.checked_add(1).ok_or(overflow.clone())?;
+            }
         }
+        self.counters.needs_reset = needing_reset;
         Ok(work)
     }
 

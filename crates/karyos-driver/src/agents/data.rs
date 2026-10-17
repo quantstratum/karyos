@@ -397,10 +397,12 @@ impl Outbound {
     }
 
     /// The control path of a send failure (lane-sender.md, outcome
-    /// table): a send fault is retried on its queue, which keeps its items;
-    /// a queue that needs a reset, an invariant, a sender bug or an item of
-    /// unknown exposure marks the publication as needing an endpoint reset,
-    /// which the conductor reads ([`Outbound::needs_reset`]).
+    /// table): a faulted queue (the lane waits for the control path) is
+    /// retried, keeping its items; a backend failure, an invariant, a
+    /// sender bug, a queue that refuses the retry or an item of unknown
+    /// exposure marks the publication as needing an endpoint reset
+    /// ([`Outbound::needs_reset`]), which the sender agent counts and the
+    /// endpoint table acts on (its own PR, ACS 15721).
     fn handle_failure<O: SocketOps>(
         &mut self,
         tx: &mut SocketsTx<O>,
@@ -408,20 +410,11 @@ impl Outbound {
     ) {
         match failure {
             None => {}
-            Some(SenderFailure::Backend { lane, .. }) => {
-                self.counters.bump(|c| &mut c.send_faults, 1);
-                let retried = self
-                    .queues
-                    .get(lane)
-                    .is_some_and(|queue| tx.retry_queue(*queue).is_ok());
-                if retried {
-                    self.sender.retry(lane);
-                } else {
-                    self.needs_reset = true;
-                }
-            }
+            // A backend failure (`Failed(Os)`: the half stopped, EBADF and
+            // the like) is no send fault: retrying it would loop forever.
             Some(
-                SenderFailure::Invariant { .. }
+                SenderFailure::Backend { .. }
+                | SenderFailure::Invariant { .. }
                 | SenderFailure::Sender { .. }
                 | SenderFailure::Drr(_),
             ) => {
@@ -436,9 +429,9 @@ impl Outbound {
                 self.needs_reset = true;
                 continue;
             }
-            // A faulted queue the report did not name (the fault left the
-            // head pending): retried the same way.
-            if self.sender.needs_control(lane) == Some(true) {
+            // A faulted queue (the fault left the head pending) is retried,
+            // unless the endpoint already needs a reset.
+            if !self.needs_reset && self.sender.needs_control(lane) == Some(true) {
                 self.counters.bump(|c| &mut c.send_faults, 1);
                 let retried = self
                     .queues
