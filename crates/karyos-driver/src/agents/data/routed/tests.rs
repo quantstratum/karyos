@@ -777,13 +777,15 @@ fn a_leaving_paths_lone_copies_are_counted() {
     // B stays blocked: the lane waits on B alone, A cannot send. Under
     // `path_lag_limit` (1 ms here) B stays; past it, B leaves (ACS 16856).
     commit(&mut log, 1, 20);
-    for now in 20..30 {
+    // Many cycles inside `path_lag_limit`: time decides, not cycles.
+    for now in (20..990_000).step_by(20_000) {
         let _ = outbound
             .serve_routes(&mut halves, BUDGET, None, now)
             .unwrap();
     }
     assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
     assert_eq!(observer_a.send_calls(), 0, "the lane waits on B");
+    // The next cycle spans the limit from the stall's start.
     let _ = outbound
         .serve_routes(&mut halves, BUDGET, None, 1_000_100)
         .unwrap();
@@ -844,4 +846,138 @@ fn a_close_after_a_leave_does_not_wait_on_the_left_path() {
     let applied = cell.try_read().unwrap();
     assert_eq!(applied.epoch, 3);
     assert_eq!(applied.in_flight, 0, "nothing waits on the left path");
+}
+
+/// #346 review P2-3: several paths can leave in one pass, and the last live
+/// one never does. Three paths each take one datagram of three (the others'
+/// halves are away): each skipped two thirds, so A and B leave and C stays.
+#[test]
+fn several_paths_leave_in_one_pass_but_not_the_last() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    let (c, observer_c, _seen_c) = path(3, 0);
+    for observer in [&observer_a, &observer_b, &observer_c] {
+        sent(observer, 16);
+    }
+    let routes = [
+        (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
+        (EndpointId(2), SocketAddr::from(([127, 0, 0, 2], 41_000))),
+        (EndpointId(3), SocketAddr::from(([127, 0, 0, 3], 41_000))),
+    ];
+    let (mut outbound, mut log) = outbound_routed(&routes, ALIAS, TERM, 1, false);
+    outbound.set_path_policy(super::super::PathPolicy {
+        skip_min_bytes: 3 * FRAME,
+        ..policy()
+    });
+    let mut halves = [Some(a), Some(b), Some(c)];
+    for (i, now) in [(0usize, 10u64), (1, 11), (2, 12)] {
+        let mut present = vec![halves[i].take().unwrap()];
+        commit(&mut log, u8::try_from(i).unwrap(), 1);
+        let _ = outbound
+            .serve_routes(&mut present, BUDGET, None, now)
+            .unwrap();
+        halves[i] = present.pop();
+    }
+    let live: Vec<bool> = (0..3)
+        .map(|route| outbound.path_state(route).unwrap().0)
+        .collect();
+    assert_eq!(live, [false, false, true], "A and B leave, C stays");
+    let mut halves: Vec<_> = halves.into_iter().flatten().collect();
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 13)
+        .unwrap();
+}
+
+/// #346 review P2-4: a submit resets the stall clock. B holds the lane's
+/// two first datagrams alone and is blocked for 60% of `path_lag_limit`.
+/// It submits the first and, in the same cycle, still holds the next head
+/// alone; blocked for 60% again, it never leaves.
+#[test]
+fn a_submit_resets_the_stall_clock() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    let mut halves = vec![b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    // B alone takes p0 and p1, and its socket would block (nothing
+    // scripted).
+    commit(&mut log, 0, 2);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1_000)
+        .unwrap();
+    halves.insert(0, a);
+    commit(&mut log, 2, 2);
+    for now in [2_000, 300_000, 601_000] {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    // B submits p0: the clock resets, though B still holds p1 alone.
+    observer_b.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 602_000)
+        .unwrap();
+    for now in [604_000, 900_000, 1_204_000] {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(
+        outbound.path_state(1).map(|state| state.0),
+        Some(true),
+        "each stall stayed under the limit"
+    );
+    sent(&observer_b, 64);
+    for now in 1_205_000..1_205_010 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+}
+
+/// #346 review P2-2: a shared bottleneck evicts no path. B submits p0 and
+/// A blocks on it; B alone takes p1 and blocks too. B holds the lane's head
+/// alone, but A, which holds later copies, is blocked as well: neither
+/// leaves, however long both sockets would block.
+#[test]
+fn a_shared_bottleneck_evicts_no_path() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    observer_b.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 500)
+        .unwrap();
+    let a_half = halves.remove(0);
+    commit(&mut log, 1, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 700)
+        .unwrap();
+    halves.insert(0, a_half);
+    commit(&mut log, 2, 2);
+    for now in (1_000..3_000_000).step_by(100_000) {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(0).map(|state| state.0), Some(true));
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    for now in 3_000_000..3_000_010 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
 }
