@@ -22,6 +22,10 @@ release may break APIs, wire formats and shared-memory layouts.
   for an image on a subscription's later path.
 - `ViewClosed` maps reason 4 to `ImageRetired { since: None }` and reason 5
   to the new `FeederLost { since }`.
+- A conflation reader that sees its table closed reads the terminal cell
+  again, so a terminal published before the close is in that poll's
+  report. `ConflationWriter::seed_version` is available to dependent
+  crates' tests under `test-hooks`.
 - `AgentConfig::control_capacity` defaults to 512 (was 256). Configuration
   now refuses a receiver control ring below `max_pending_challenges +
   max_images × max_paths + 32`, since an image's SM goes on each of its

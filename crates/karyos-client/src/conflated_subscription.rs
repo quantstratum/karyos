@@ -68,7 +68,9 @@ impl<'a> ConflatedValue<'a> {
 /// Why a view closed for good: its table published a terminal
 /// invalidation, so every value below the end of its interval is stale and
 /// the view delivers nothing more (`quantstratum-docs:
-/// karyos/design/conflated-network-images.md`).
+/// karyos/design/conflated-network-images.md`). An image's retirement
+/// publishes an empty interval: it marks no value stale, and only ends the
+/// view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ViewClosed {
     /// The receive owner's seal waited past its bound for the feeder's

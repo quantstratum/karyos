@@ -14,7 +14,14 @@ use super::{FreshFed, FreshFeed, serve_fresh, serve_gap};
 fn view() -> (karyos_sys::conflation::ConflationWriter, FreshFeed) {
     let link = FreshnessLink::new();
     let writer = conflation_fresh(4, 8, 1024, link.clone()).unwrap();
-    (writer, FreshFeed { link, gap: None })
+    (
+        writer,
+        FreshFeed {
+            link,
+            gap: None,
+            fail_polls: false,
+        },
+    )
 }
 
 /// A posted interval is acknowledged only after the barrier recorded it;

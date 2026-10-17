@@ -722,6 +722,9 @@ pub(crate) struct ConflationFeeder<T: StreamTerms> {
 pub(crate) struct FreshFeed {
     pub(crate) link: karyos_sys::freshness::FreshnessLink,
     pub(crate) gap: Option<(u64, u64)>,
+    /// Every poll of the feeder fails (tests).
+    #[cfg(test)]
+    pub(crate) fail_polls: bool,
 }
 
 /// What a network image view's feeder did in one duty, beyond its writes.
@@ -2918,6 +2921,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 None => false,
             };
             let with_positions = fresh.is_some();
+            #[cfg(test)]
+            let fail_poll = fresh.as_ref().is_some_and(|fresh| fresh.fail_polls);
             let mut terminal = None;
             let mut fed = Fed::default();
             let polled = if blocked {
@@ -2952,6 +2957,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     MessageLimit::new(budget),
                 )
             };
+            // A poll failure injected by a test (a feeder that cannot read
+            // on).
+            #[cfg(test)]
+            let polled = if fail_poll {
+                Err(karyos_client::subscription::PollError {
+                    summary: karyos_client::subscription::PollSummary::default(),
+                    cause: karyos_client::ClientError::ClosedByOverrun,
+                })
+            } else {
+                polled
+            };
             // A failed poll still reports what it handled before the failure.
             if let Some(counters) = &stream.feeder_counters {
                 counters.add(&self.counters, fed);
@@ -2971,6 +2987,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     let _ = writer.publish_terminal(0, u64::MAX, reason);
                     if let Some(net) = &mut self.net {
                         net.count_views(|views| {
+                            // What the mailbox did this duty still counts.
+                            views.add(|c| &mut c.acked, fresh_fed.acked);
+                            views.add(|c| &mut c.withheld, fresh_fed.withheld);
+                            views.add(|c| &mut c.caught_up, fresh_fed.caught_up);
                             if reason == karyos_sys::freshness::TERMINAL_FEEDER_LOST {
                                 views.add(|c| &mut c.feeders_lost, 1);
                             }
@@ -3345,6 +3365,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 fresh: Some(FreshFeed {
                     link: link.clone(),
                     gap: None,
+                    #[cfg(test)]
+                    fail_polls: false,
                 }),
             });
             let registration = stream.aggregate.registration;
@@ -3428,6 +3450,46 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Some(stream.feeder.as_ref()?.fresh.as_ref()?.link.clone())
     }
 
+    /// Seeds `key`'s version in the conflated view of `handle`'s `lane`,
+    /// so that its next write exhausts it (tests).
+    #[cfg(test)]
+    pub(crate) fn seed_network_view_version(
+        &self,
+        handle: &AggregateHandle,
+        lane: karyos_sys::frame::Lane,
+        key: u32,
+        version: u64,
+    ) {
+        let id = handle.lanes.get(usize::from(lane.get())).copied().flatten();
+        if let Some(feeder) = self
+            .streams
+            .iter()
+            .find(|stream| Some(stream.id) == id)
+            .and_then(|stream| stream.feeder.as_ref())
+        {
+            feeder.writer.seed_version(key, version);
+        }
+    }
+
+    /// Makes every poll of the feeder of `handle`'s `lane` fail (tests).
+    #[cfg(test)]
+    pub(crate) fn fail_network_view_polls(
+        &mut self,
+        handle: &AggregateHandle,
+        lane: karyos_sys::frame::Lane,
+    ) {
+        let id = handle.lanes.get(usize::from(lane.get())).copied().flatten();
+        if let Some(fresh) = self
+            .streams
+            .iter_mut()
+            .find(|stream| Some(stream.id) == id)
+            .and_then(|stream| stream.feeder.as_mut())
+            .and_then(|feeder| feeder.fresh.as_mut())
+        {
+            fresh.fail_polls = true;
+        }
+    }
+
     /// What the conflated views of network images did.
     #[must_use]
     pub fn network_view_counters(&self) -> crate::net::NetworkViewCounters {
@@ -3483,14 +3545,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                                 .and_then(|lane| lane.feeder.as_ref())
                                 .filter(|feeder| feeder.fresh.is_some())
                             {
-                                let _ = feeder.writer.publish_terminal(
+                                // The cell is one-shot: an earlier reason
+                                // (exhausted versions) keeps it, and the
+                                // close is counted as that terminal.
+                                let won = feeder.writer.publish_terminal(
                                     0,
                                     0,
                                     karyos_sys::freshness::TERMINAL_IMAGE_RETIRED,
                                 );
                                 if let Some(net) = &mut self.net {
                                     net.count_views(|views| {
-                                        views.add(|c| &mut c.closed_retired, 1);
+                                        if won {
+                                            views.add(|c| &mut c.closed_retired, 1);
+                                        } else {
+                                            views.add(|c| &mut c.closed_terminal, 1);
+                                        }
                                     });
                                 }
                             }

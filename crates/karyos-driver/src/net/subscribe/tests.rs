@@ -795,6 +795,11 @@ fn every_path_of_a_conflated_subscription_finds_its_view() {
     };
     let net = driver.net.as_ref().unwrap();
     let endpoints = net.subscription_endpoints(6);
+    // Linux joins the later path; elsewhere it may fail (std sockets bind
+    // no two sockets to one port), and only the first path is checked.
+    #[cfg(target_os = "linux")]
+    assert_eq!(endpoints.len(), 2, "both paths joined");
+    #[cfg(not(target_os = "linux"))]
     if driver.network_path_counters().1 == 0 {
         assert_eq!(endpoints.len(), 2, "both paths joined");
     }
