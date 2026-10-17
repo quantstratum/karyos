@@ -1402,6 +1402,32 @@ impl Recorder {
     fn closed(&self) -> Vec<u64> {
         self.0.lock().unwrap().closed.clone()
     }
+
+    /// Takes `journal`, as its agent hands it to the hook; its number.
+    fn hand(&self, journal: Option<NetJournal>) -> Option<u64> {
+        let journal = journal?;
+        let number = journal.number;
+        self.clone().open_journal(journal);
+        Some(number)
+    }
+
+    /// Closes the journal in `driver`'s table, then through the hook, as
+    /// its agent's close does; `false` for no such open journal.
+    fn close_in(
+        &self,
+        driver: &mut EmbeddedDriver,
+        side: NetSide,
+        publication: &PublicationIdentity,
+        lane: Lane,
+        boundary: Option<u64>,
+        first_gap: Option<u64>,
+    ) -> bool {
+        let closed = driver.close_network_journal(side, publication, lane, boundary, first_gap);
+        if closed {
+            self.clone().close_journal(side, publication, lane);
+        }
+        closed
+    }
 }
 
 impl NetworkTraceHook for Recorder {
@@ -1479,18 +1505,19 @@ fn a_network_journal_is_handed_to_its_hook_and_drained() {
     let mut driver = net_driver(4, 64, u64::MAX);
     let id = identity(driver.driver_id(), 3);
     let side = NetSide::Sender;
-    assert_eq!(
-        driver.open_network_journal(side, id, lane(1), 3, Some(64)),
-        None
+    assert!(
+        driver
+            .open_network_journal(side, id, lane(1), 3, Some(64))
+            .is_none()
     );
     assert!(entries(&driver).is_empty());
     let hook = hooked(&mut driver, side);
-    let number = driver
-        .open_network_journal(side, id, lane(1), 3, Some(64))
+    let number = hook
+        .hand(driver.open_network_journal(side, id, lane(1), 3, Some(64)))
         .unwrap();
     // One journal per side, publication and lane.
     assert_eq!(
-        driver.open_network_journal(side, id, lane(1), 3, Some(64)),
+        hook.hand(driver.open_network_journal(side, id, lane(1), 3, Some(64))),
         None
     );
     assert_eq!(hook.open(), [number]);
@@ -1526,8 +1553,8 @@ fn a_network_journal_is_handed_to_its_hook_and_drained() {
         seen.push((record.journal, record.payload.len(), record.payload[0]));
     });
     assert_eq!(seen, [(number, TRACE_RECORD_WORDS, 9)]);
-    assert!(driver.close_network_journal(side, &id, lane(1), Some(128), None));
-    assert!(!driver.close_network_journal(side, &id, lane(1), Some(128), None));
+    assert!(hook.close_in(&mut driver, side, &id, lane(1), Some(128), None));
+    assert!(!hook.close_in(&mut driver, side, &id, lane(1), Some(128), None));
     assert_eq!(hook.closed(), [number]);
     let _ = driver.do_work().unwrap();
     let closed = entry(&driver, number);
@@ -1537,16 +1564,17 @@ fn a_network_journal_is_handed_to_its_hook_and_drained() {
 }
 
 /// A receiver journal records the image join, its first sealed gap (a
-/// later one changes nothing), and keeps them when its hook is removed,
-/// which closes it.
+/// later one changes nothing), and keeps them when its hook is removed:
+/// the table forgets it at once, counted as unhooked (`Lost`, never
+/// refused), and its agent closes it through the hook.
 #[test]
 fn a_receiver_journal_keeps_its_first_gap_and_closes_with_its_hook() {
     let mut driver = net_driver(4, 64, u64::MAX);
     let remote = identity([7, 7], 3);
     let side = NetSide::Receiver;
     let hook = hooked(&mut driver, side);
-    let number = driver
-        .open_network_journal(side, remote, lane(0), 40, Some(32))
+    let number = hook
+        .hand(driver.open_network_journal(side, remote, lane(0), 40, Some(32)))
         .unwrap();
     assert_eq!(entry(&driver, number).kind, JournalKind::NetworkReceiver);
     assert!(driver.seal_network_gap(&remote, lane(0), 100));
@@ -1559,6 +1587,10 @@ fn a_receiver_journal_keeps_its_first_gap_and_closes_with_its_hook() {
         ([7, 7], Some(32), Some(100))
     );
     driver.set_network_trace_hook(side, None);
+    assert_eq!(counter(&driver, "network trace journals unhooked"), 1);
+    assert_eq!(counter(&driver, "network trace journals refused"), 0);
+    // Its agent closes it through the previous hook.
+    hook.clone().close_journal(side, &remote, lane(0));
     assert_eq!(hook.closed(), [number]);
     let _ = driver.do_work().unwrap();
     let closed = entry(&driver, number);
@@ -1572,7 +1604,7 @@ fn a_receiver_journal_keeps_its_first_gap_and_closes_with_its_hook() {
     );
     // Without the hook, no new journal.
     assert_eq!(
-        driver.open_network_journal(side, remote, lane(0), 40, Some(32)),
+        hook.hand(driver.open_network_journal(side, remote, lane(0), 40, Some(32))),
         None
     );
 }
@@ -1588,11 +1620,11 @@ fn a_refused_network_journal_is_counted_everywhere() {
     let id = identity(driver.driver_id(), 3);
     let side = NetSide::Sender;
     let hook = hooked(&mut driver, side);
-    let first = driver
-        .open_network_journal(side, id, lane(0), 3, Some(0))
+    let first = hook
+        .hand(driver.open_network_journal(side, id, lane(0), 3, Some(0)))
         .unwrap();
     assert_eq!(
-        driver.open_network_journal(side, id, lane(1), 3, Some(0)),
+        hook.hand(driver.open_network_journal(side, id, lane(1), 3, Some(0))),
         None
     );
     assert_eq!(hook.open(), [first]);
@@ -1605,7 +1637,7 @@ fn a_refused_network_journal_is_counted_everywhere() {
     let client = journal(&mut driver, &mut conductor, publication);
     // The table is full now (two entries): refused again, as exhausted.
     assert_eq!(
-        driver.open_network_journal(side, id, lane(2), 3, Some(0)),
+        hook.hand(driver.open_network_journal(side, id, lane(2), 3, Some(0))),
         None
     );
     assert_eq!(driver.trace_mirror().network_journals_refused(), 2);
@@ -1626,19 +1658,19 @@ fn an_ended_sender_journal_waits_for_coverage() {
     let stream = entry(&driver, published.journal()).stream;
     let id = identity(driver.driver_id(), stream);
     let side = NetSide::Sender;
-    let _hook = hooked(&mut driver, side);
-    let sender = driver
-        .open_network_journal(side, id, lane(0), stream, Some(0))
+    let hook = hooked(&mut driver, side);
+    let sender = hook
+        .hand(driver.open_network_journal(side, id, lane(0), stream, Some(0)))
         .unwrap();
     append(&mut published, [1]);
     let _ = driver.do_work().unwrap();
-    assert!(driver.close_network_journal(side, &id, lane(0), Some(64), None));
+    assert!(hook.close_in(&mut driver, side, &id, lane(0), Some(64), None));
     let _ = driver.do_work().unwrap();
     assert_eq!(entry(&driver, sender).state, JournalState::Closed);
     // The ring still holds the noted publisher record: the entry waits,
     // with no recycle log entry.
     assert_eq!(
-        driver.open_network_journal(side, id, lane(1), stream, Some(0)),
+        hook.hand(driver.open_network_journal(side, id, lane(1), stream, Some(0))),
         None
     );
     assert_eq!(driver.trace_mirror().network_journals_refused(), 1);
@@ -1647,8 +1679,8 @@ fn an_ended_sender_journal_waits_for_coverage() {
     // Four more records push it out of the ring: covered, reused.
     append(&mut published, 2..6);
     let _ = driver.do_work().unwrap();
-    let next = driver
-        .open_network_journal(side, id, lane(1), stream, Some(0))
+    let next = hook
+        .hand(driver.open_network_journal(side, id, lane(1), stream, Some(0)))
         .unwrap();
     assert!(entries(&driver).iter().all(|entry| entry.journal != sender));
     assert_eq!(entry(&driver, next).kind, JournalKind::NetworkSender);
@@ -1659,15 +1691,15 @@ fn an_ended_sender_journal_waits_for_coverage() {
     let mut driver = net_driver(1, 4, u64::MAX);
     let remote = identity([7, 7], 3);
     let side = NetSide::Receiver;
-    let _hook = hooked(&mut driver, side);
-    let receiver = driver
-        .open_network_journal(side, remote, lane(0), 40, Some(0))
+    let hook = hooked(&mut driver, side);
+    let receiver = hook
+        .hand(driver.open_network_journal(side, remote, lane(0), 40, Some(0)))
         .unwrap();
-    assert!(driver.close_network_journal(side, &remote, lane(0), None, None));
+    assert!(hook.close_in(&mut driver, side, &remote, lane(0), None, None));
     let _ = driver.do_work().unwrap();
     assert_eq!(entry(&driver, receiver).state, JournalState::Closed);
-    let next = driver
-        .open_network_journal(side, remote, lane(1), 40, Some(0))
+    let next = hook
+        .hand(driver.open_network_journal(side, remote, lane(1), 40, Some(0)))
         .unwrap();
     assert_eq!(
         entries(&driver)
@@ -1675,6 +1707,36 @@ fn an_ended_sender_journal_waits_for_coverage() {
             .map(|entry| entry.journal)
             .collect::<Vec<_>>(),
         [next]
+    );
+}
+
+/// PR 3a: a journal its agent refuses (no hook there, or its publication
+/// or image is gone) comes back: it closes without a start (`Lost`) and
+/// counts as refused, not as unhooked, so no trace of its publication is
+/// reported `Complete`.
+#[test]
+fn a_journal_its_agent_refuses_counts_as_refused() {
+    let mut driver = net_driver(4, 64, u64::MAX);
+    let remote = identity([7, 7], 3);
+    let side = NetSide::Receiver;
+    let _hook = hooked(&mut driver, side);
+    let journal = driver
+        .open_network_journal(side, remote, lane(0), 40, None)
+        .unwrap();
+    let number = journal.number;
+    driver.apply_trace_event(crate::net::trace::TraceEvent::Refused { journal });
+    assert_eq!(counter(&driver, "network trace journals refused"), 1);
+    assert_eq!(counter(&driver, "network trace journals unhooked"), 0);
+    assert_eq!(driver.network_journals_refused(&remote), 1);
+    let _ = driver.do_work().unwrap();
+    let closed = entry(&driver, number);
+    assert_eq!(closed.state, JournalState::Closed);
+    assert_eq!(closed.network.unwrap().start, None);
+    // Its lane can be traced again.
+    assert!(
+        driver
+            .open_network_journal(side, remote, lane(0), 40, None)
+            .is_some()
     );
 }
 
@@ -1703,25 +1765,23 @@ fn a_closed_network_journal_releases_its_network_bytes() {
     assert!(client_bytes > 0);
     let id = identity(driver.driver_id(), 3);
     let side = NetSide::Sender;
-    let _hook = hooked(&mut driver, side);
+    let hook = hooked(&mut driver, side);
     assert!(
-        driver
-            .open_network_journal(side, id, lane(0), 3, Some(0))
+        hook.hand(driver.open_network_journal(side, id, lane(0), 3, Some(0)))
             .is_some()
     );
     assert_eq!(driver.trace_journals.net_bytes, one);
     // The budget holds one: a second is refused while the first lives.
     assert_eq!(
-        driver.open_network_journal(side, id, lane(1), 3, Some(0)),
+        hook.hand(driver.open_network_journal(side, id, lane(1), 3, Some(0))),
         None
     );
-    assert!(driver.close_network_journal(side, &id, lane(0), Some(0), None));
+    assert!(hook.close_in(&mut driver, side, &id, lane(0), Some(0), None));
     let _ = driver.do_work().unwrap();
     assert_eq!(driver.trace_journals.net_bytes, 0);
     assert_eq!(driver.trace_journals.bytes, client_bytes);
     assert!(
-        driver
-            .open_network_journal(side, id, lane(1), 3, Some(0))
+        hook.hand(driver.open_network_journal(side, id, lane(1), 3, Some(0)))
             .is_some()
     );
     assert_eq!(driver.trace_journals.net_bytes, one);

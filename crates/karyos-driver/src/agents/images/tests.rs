@@ -551,12 +551,13 @@ fn an_accepted_answer_installs_an_image() {
             slot,
             endpoint,
             identity: installed,
+            alias: arrived,
         },
     ] = rig.events.as_slice()
     else {
         panic!("{:?}", rig.events);
     };
-    assert_eq!((*endpoint, *installed), (b, identity()));
+    assert_eq!((*endpoint, *installed, *arrived), (b, identity(), alias()));
     let lanes = rig.images.installed(*slot).unwrap();
     assert_eq!(lanes.len(), 2);
     // The joins are the sender's read cursors: nothing was published yet.
@@ -3586,9 +3587,12 @@ impl Rig {
         self.round(true);
     }
 
-    /// Asks the receiver to close the journal of lane 0 and returns the
-    /// facts it answered.
-    fn close_receiver_journal(&mut self) -> Option<crate::agents::net_trace::JournalFacts> {
+    /// Asks the receiver to close journal `number`, of lane 0, and returns
+    /// the facts it answered.
+    fn close_receiver_journal(
+        &mut self,
+        number: u64,
+    ) -> Option<crate::agents::net_trace::JournalFacts> {
         self.trace_events.clear();
         self.links
             .receiver
@@ -3596,6 +3600,7 @@ impl Rig {
                 reply,
                 publication: traced_publication(),
                 lane: Lane::ZERO,
+                number,
             })
             .unwrap();
         self.round(true);
@@ -3668,14 +3673,14 @@ fn a_receiver_journal_records_each_traced_commit_once() {
         (traced_publication(), Lane::ZERO, position, 0)
     );
     let boundary = rig.agents.receiver.role.rebuild_position(slot, Lane::ZERO);
-    let facts = rig.close_receiver_journal().expect("facts");
+    let facts = rig.close_receiver_journal(9).expect("facts");
     assert_eq!(
         (Some(facts.start), Some(facts.boundary), facts.first_gap),
         (next, boundary, None)
     );
     assert_eq!(recorder.0.lock().unwrap().2, 1, "closed through the hook");
     // A second close finds nothing.
-    assert_eq!(rig.close_receiver_journal(), None);
+    assert_eq!(rig.close_receiver_journal(9), None);
 }
 
 /// P2.12 step 3 PR 2 (NT-2, #327 review): a traced frame lost and
@@ -3786,9 +3791,11 @@ fn a_retired_image_closes_its_journals_with_their_facts() {
         "the facts at the retirement"
     );
     assert_eq!(recorder.0.lock().unwrap().2, 1, "closed through the hook");
-    // A later close: the same facts, then nothing.
-    assert_eq!(rig.close_receiver_journal(), Some(posted));
-    assert_eq!(rig.close_receiver_journal(), None);
+    // A close naming another number (a reinstalled identity's journal)
+    // finds nothing; the right one has the same facts, then nothing.
+    assert_eq!(rig.close_receiver_journal(12), None);
+    assert_eq!(rig.close_receiver_journal(11), Some(posted));
+    assert_eq!(rig.close_receiver_journal(11), None);
 }
 
 /// P2.12 step 3 PR 2: without a hook, or for a publication no image

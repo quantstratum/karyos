@@ -1470,8 +1470,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         let registration = target.aggregate.registration;
         self.retire_lane(stream)?;
+        let closes = self.publication_journal_closes(registration);
         if let Some(net) = &mut self.net {
-            let _ = net.remove_publication(registration);
+            let _ = net.remove_publication(registration, closes);
         }
         self.update_stream_gauges();
         Ok(())
@@ -1525,8 +1526,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         // A network publication's data path comes back to drop its lane
         // readers (wiring note W-d).
+        let closes = self.publication_journal_closes(aggregate.registration());
         if let Some(net) = &mut self.net {
-            let _ = net.remove_publication(aggregate.registration());
+            let _ = net.remove_publication(aggregate.registration(), closes);
         }
         self.update_stream_gauges();
         Ok(())
@@ -3289,6 +3291,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // announced subscription, so none is told twice.
         self.announce_existing_images();
         self.serve_images();
+        // The network journals' answers, after the images they name.
+        self.serve_network_trace();
         // The guarded publications the sender refused or returned: their
         // gates are gone, so their senders leave the close acknowledgement.
         self.deregister_released_guards();
@@ -3513,21 +3517,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         for event in &events {
             match *event {
-                crate::agents::images::ImageEvent::Installed { slot, endpoint, .. } => {
+                crate::agents::images::ImageEvent::Installed {
+                    slot,
+                    endpoint,
+                    identity,
+                    alias,
+                } => {
                     let Some(lanes) = self.net.as_ref().and_then(|net| net.image_lanes(slot))
                     else {
                         continue;
                     };
                     let exposed = <T as sealed::Create>::expose_image(self, &lanes);
                     if let Some(net) = &mut self.net {
-                        net.record_image(slot, endpoint, exposed, &lanes);
+                        let traced = crate::net::trace::identity(&identity, alias);
+                        net.record_image(slot, endpoint, traced, exposed, &lanes);
                     }
                     self.build_network_view(slot, endpoint, exposed.as_ref());
+                    // Its receiver journals, while the receiver has a hook.
+                    self.open_image_journals(slot);
                     if let Some(handle) = exposed {
                         self.announce_image(endpoint, &handle, true);
                     }
                 }
                 crate::agents::images::ImageEvent::Retiring { slot } => {
+                    self.close_image_journals(slot);
                     let handle = self.net.as_ref().and_then(|net| net.image_aggregate(slot));
                     let endpoint = self.net.as_ref().and_then(|net| net.image_endpoint(slot));
                     if let (Some(handle), Some(endpoint)) = (handle, endpoint) {
@@ -3598,6 +3611,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // them stays in a close acknowledgement.
         shutdown.guard_senders_released = self.deregister_released_guards();
         self.net = None;
+        // The agents stopped with their hooks: no network journal stays open.
+        self.close_network_tracing();
         Some(shutdown)
     }
 

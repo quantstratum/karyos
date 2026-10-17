@@ -259,9 +259,9 @@ mod sender {
         let (mut tx, mut path, mut log) = sending();
         let recorder = Recorder::new();
         let mut hook: Box<dyn NetworkTraceHook> = Box::new(recorder.clone());
-        assert_eq!(path.trace(0, identity()), Some(0));
-        assert_eq!(path.trace(0, identity()), None, "already traced");
-        assert_eq!(path.trace(1, identity()), None, "no such lane");
+        assert_eq!(path.trace(0, identity(), 1), Some(0));
+        assert_eq!(path.trace(0, identity(), 1), None, "already traced");
+        assert_eq!(path.trace(1, identity(), 1), None, "no such lane");
         let block = append(&mut log, 3000, traced(1));
         let _ = append(&mut log, 200, AppendOptions::default());
         serve(&mut tx, &mut path, Some(&mut hook));
@@ -278,7 +278,9 @@ mod sender {
                 (identity(), Lane::ZERO, 0, 0)
             );
         }
-        let facts = path.untrace(0, &identity()).unwrap();
+        // Another journal's number untraces nothing (#332 review).
+        assert_eq!(path.untrace(0, 2), None);
+        let facts = path.untrace(0, 1).unwrap();
         assert_eq!(facts.start, 0);
         assert_eq!(facts.boundary, path.readers()[0].position());
         assert!(facts.boundary > pickups[2].1.position);
@@ -296,7 +298,7 @@ mod sender {
         let _ = append(&mut log, 300, traced(1));
         serve(&mut tx, &mut path, Some(&mut hook));
         assert!(recorder.pickups().is_empty(), "the lane was not traced");
-        let start = path.trace(0, identity()).unwrap();
+        let start = path.trace(0, identity(), 1).unwrap();
         assert_eq!(start, path.readers()[0].position());
         assert!(start > 0);
         let block = append(&mut log, 300, traced(2));
@@ -305,7 +307,7 @@ mod sender {
         assert_eq!(pickups.len(), 1);
         assert_eq!((pickups[0].0, pickups[0].1.position), (ext(2), block));
         assert!(block >= start);
-        let facts = path.untrace(0, &identity()).unwrap();
+        let facts = path.untrace(0, 1).unwrap();
         assert_eq!(facts.start, start);
         assert_eq!(facts.boundary, path.readers()[0].position());
     }
@@ -327,6 +329,7 @@ mod sender {
     fn traced_lane() -> TracedLane {
         TracedLane {
             publication: identity(),
+            number: 1,
             start: 0,
             boundary: 0,
             unpicked: None,
@@ -399,11 +402,11 @@ mod sender {
     #[test]
     fn without_a_hook_the_boundary_holds() {
         let (mut tx, mut path, mut log) = sending();
-        let start = path.trace(0, identity()).unwrap();
+        let start = path.trace(0, identity(), 1).unwrap();
         let _ = append(&mut log, 300, traced(1));
         serve(&mut tx, &mut path, None);
         assert!(path.readers()[0].position() > start);
-        let facts = path.untrace(0, &identity()).unwrap();
+        let facts = path.untrace(0, 1).unwrap();
         assert_eq!((facts.start, facts.boundary), (start, start));
     }
 
@@ -421,6 +424,7 @@ mod sender {
         let mut hook: Box<dyn NetworkTraceHook> = Box::new(recorder.clone());
         let traced_lane = TracedLane {
             publication: identity(),
+            number: 1,
             start: 0,
             boundary: 0,
             unpicked: None,
@@ -535,6 +539,7 @@ mod sender {
             reply: replies.reserve().unwrap(),
             publication: identity(),
             lane: Lane::ZERO,
+            number: 4,
         };
         let AgentEvent::NetworkJournalClosed {
             facts: Some(facts), ..
@@ -546,6 +551,7 @@ mod sender {
             facts,
             JournalFacts {
                 publication: identity(),
+                number: 4,
                 start: 0,
                 boundary: 0,
                 first_gap: None,

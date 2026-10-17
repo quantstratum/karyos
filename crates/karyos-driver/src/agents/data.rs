@@ -751,18 +751,20 @@ impl Outbound {
         Lanes::new(joins.get(..self.readers.len())?).ok()
     }
 
-    /// Starts tracing `lane` for `publication`'s journal from the lane's
-    /// next position, which it returns (the start fact, §5). `None` for a
-    /// lane it does not have or one already traced.
+    /// Starts tracing `lane` for `publication`'s journal `number` from the
+    /// lane's next position, which it returns (the start fact, §5). `None`
+    /// for a lane it does not have or one already traced.
     pub(crate) fn trace(
         &mut self,
         lane: usize,
         publication: karyos_protocol::trace_hook::PublicationIdentity,
+        number: u64,
     ) -> Option<u64> {
         let start = self.readers.get(lane)?.position();
         let slot = self.traced.get_mut(lane).filter(|slot| slot.is_none())?;
         *slot = Some(TracedLane {
             publication,
+            number,
             start,
             boundary: start,
             unpicked: None,
@@ -770,15 +772,11 @@ impl Outbound {
         Some(start)
     }
 
-    /// Stops tracing `lane` if `publication`'s journal observes it, and
-    /// returns its facts.
-    pub(crate) fn untrace(
-        &mut self,
-        lane: usize,
-        publication: &karyos_protocol::trace_hook::PublicationIdentity,
-    ) -> Option<TracedLane> {
+    /// Stops tracing `lane` if journal `number` observes it, and returns
+    /// its facts.
+    pub(crate) fn untrace(&mut self, lane: usize, number: u64) -> Option<TracedLane> {
         let slot = self.traced.get_mut(lane)?;
-        if slot.is_some_and(|traced| traced.publication == *publication) {
+        if slot.is_some_and(|traced| traced.number == number) {
             slot.take()
         } else {
             None

@@ -41,6 +41,8 @@ impl core::fmt::Debug for TraceHook {
 pub(crate) struct TracedLane {
     /// The publication the journal observes.
     pub(crate) publication: PublicationIdentity,
+    /// The journal number.
+    pub(crate) number: u64,
     /// The journal's start: the lane's next position when it arrived.
     pub(crate) start: u64,
     /// The end of the highest datagram picked up for a first send since
@@ -67,6 +69,8 @@ impl TracedLane {
 pub struct JournalFacts {
     /// The publication.
     pub publication: PublicationIdentity,
+    /// The journal number.
+    pub number: u64,
     /// The start the agent recorded when the journal arrived.
     pub start: u64,
     /// The sender's pickup boundary or the receiver's commit boundary.
@@ -133,7 +137,9 @@ impl SenderTrace {
                         .find(|outbound| {
                             outbound.endpoint() == endpoint && outbound.alias() == alias
                         })
-                        .and_then(|outbound| outbound.trace(usize::from(lane.get()), publication)),
+                        .and_then(|outbound| {
+                            outbound.trace(usize::from(lane.get()), publication, journal.number)
+                        }),
                     _ => None,
                 };
                 let event = match (start, self.hook.as_mut()) {
@@ -156,10 +162,11 @@ impl SenderTrace {
                 reply,
                 publication,
                 lane,
+                number,
             } => {
                 let traced = publications
                     .iter_mut()
-                    .find_map(|outbound| outbound.untrace(usize::from(lane.get()), &publication));
+                    .find_map(|outbound| outbound.untrace(usize::from(lane.get()), number));
                 if traced.is_some()
                     && let Some(hook) = self.hook.as_mut()
                 {
@@ -167,6 +174,7 @@ impl SenderTrace {
                 }
                 let facts = traced.map(|traced| JournalFacts {
                     publication,
+                    number,
                     start: traced.start,
                     boundary: traced.boundary,
                     first_gap: None,
@@ -177,6 +185,7 @@ impl SenderTrace {
                         agent,
                         publication,
                         lane,
+                        number,
                         facts,
                     },
                 ))
@@ -195,6 +204,8 @@ pub(crate) struct TracedImageLane {
     pub(crate) lane: Lane,
     /// The publication the image receives.
     pub(crate) publication: PublicationIdentity,
+    /// The journal number.
+    pub(crate) number: u64,
     /// The journal's start: the lane's next commit position when it
     /// arrived (the image join fact of §5).
     pub(crate) start: u64,
@@ -291,32 +302,28 @@ impl ReceiverTrace {
         Ok(())
     }
 
-    /// Closes the journal of `lane` of `publication` with the facts
-    /// `facts` gives for the open lane. A journal its image's retirement
-    /// closed answers its facts again (idempotent); `None` when there is
-    /// no such journal.
+    /// Closes journal `number` with the facts `facts` gives for its open
+    /// lane. A journal its image's retirement closed answers its facts
+    /// again (idempotent); `None` when there is no such journal.
     pub(crate) fn close(
         &mut self,
-        publication: &PublicationIdentity,
-        lane: Lane,
+        number: u64,
         facts: impl FnOnce(&TracedImageLane) -> JournalFacts,
     ) -> Option<JournalFacts> {
-        if let Some(index) = self
-            .lanes
-            .iter()
-            .position(|traced| (traced.publication, traced.lane) == (*publication, lane))
-        {
+        if let Some(index) = self.lanes.iter().position(|traced| traced.number == number) {
             let traced = self.lanes.swap_remove(index);
             if let Some(hook) = self.hook.as_mut() {
-                hook.0.close_journal(NetSide::Receiver, publication, lane);
+                hook.0
+                    .close_journal(NetSide::Receiver, &traced.publication, traced.lane);
             }
             return Some(facts(&traced));
         }
         // Closed by its image's retirement: the same facts again, and the
         // unsolicited event is no longer needed.
-        let index = self.retired.iter().position(|retired| {
-            (retired.facts.publication, retired.lane) == (*publication, lane)
-        })?;
+        let index = self
+            .retired
+            .iter()
+            .position(|retired| retired.facts.number == number)?;
         Some(self.retired.swap_remove(index).facts)
     }
 
