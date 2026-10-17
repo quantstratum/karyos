@@ -92,6 +92,7 @@ fn refusal(error: DriverError) -> ErrorCode {
             ErrorCode::IdentitiesExhausted
         }
         DriverError::ReliabilityMismatch => ErrorCode::ReliabilityMismatch,
+        DriverError::ReceiverIdentityMismatch => ErrorCode::ReceiverIdentityMismatch,
         _ => ErrorCode::ResourcesUnavailable,
     }
 }

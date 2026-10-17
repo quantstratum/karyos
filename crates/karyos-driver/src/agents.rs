@@ -433,6 +433,9 @@ pub enum AgentCommand<O: SocketOps> {
         /// each NAK there and read their peers' NAKs from it. `None`
         /// without one: no peer suppression input.
         control_group: Option<(EndpointId, std::net::SocketAddr)>,
+        /// The receiver identity its images name (MC-1, MC-2); `None` for
+        /// an id derived from each image's slot and tag 0.
+        identity: Option<crate::membership::ReceiverIdentity>,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer
@@ -460,6 +463,9 @@ pub enum AgentCommand<O: SocketOps> {
         /// A guarded publication's guard ([`data::Outbound::guard`]);
         /// `None` for an unguarded one.
         guard: Option<data::GuardSpec>,
+        /// Its receivers' configured roles and strategy (MC-1); `None` for
+        /// the `min` strategy with no required or tagged receiver.
+        roles: Option<Box<crate::membership::PublicationRoles>>,
     },
     /// Set the agent's network trace hook, or remove it with `None`
     /// (P2.12 step 3). Journals still open close through the previous hook
@@ -889,6 +895,19 @@ pub struct ReceiverAgent<O: SocketOps> {
     core: AgentCore<O>,
     role: roles::ReceiverRole,
     sessions: chain::SessionEnd,
+}
+
+impl<O: SocketOps> ReceiverAgent<O> {
+    /// The configured identity of the key `(endpoint, stream_id)`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn configured_identity(
+        &self,
+        endpoint: EndpointId,
+        stream_id: i32,
+    ) -> Option<crate::membership::ReceiverIdentity> {
+        self.role.configured_identity(endpoint, stream_id)
+    }
 }
 
 impl<O: SocketOps> SenderAgent<O> {

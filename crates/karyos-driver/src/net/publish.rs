@@ -28,6 +28,7 @@ use crate::agents::data::{GuardSpec, Outbound};
 use crate::embedded::{AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION};
 use crate::error::DriverError;
 use crate::guards::{GuardHandle, GuardRate};
+use crate::membership::PublicationRoles;
 use crate::sessions::send::Publication;
 
 /// Where a channel sends, and the local address its endpoint binds.
@@ -84,7 +85,29 @@ impl EmbeddedDriver<HeapTerms> {
         config: AggregateConfig,
         channel: &UdpConfig,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None)
+        self.add_network(config, channel, None, None)
+    }
+
+    /// [`EmbeddedDriver::add_network_publication`] whose receivers have the
+    /// configured `roles` and strategy (MC-1). Driver-internal: the public
+    /// way in is owner item 7.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_network_publication`]; the sender refuses
+    /// roles its membership cannot hold, which leaves the publication
+    /// refused.
+    #[allow(
+        dead_code,
+        reason = "driver-internal until owner item 7 gives roles a public way in"
+    )]
+    pub(crate) fn add_network_publication_with_roles(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        roles: PublicationRoles,
+    ) -> Result<AggregateHandle, DriverError> {
+        self.add_network(config, channel, None, Some(Box::new(roles)))
     }
 
     /// [`EmbeddedDriver::add_network_publication`], guarded by `guard`:
@@ -104,7 +127,7 @@ impl EmbeddedDriver<HeapTerms> {
         channel: &UdpConfig,
         guard: NetworkGuard,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, Some(guard))
+        self.add_network(config, channel, Some(guard), None)
     }
 
     fn add_network(
@@ -112,6 +135,7 @@ impl EmbeddedDriver<HeapTerms> {
         config: AggregateConfig,
         channel: &UdpConfig,
         guard: Option<NetworkGuard>,
+        roles: Option<Box<PublicationRoles>>,
     ) -> Result<AggregateHandle, DriverError> {
         if self.net.is_none() {
             return Err(DriverError::NetworkUnavailable);
@@ -119,7 +143,14 @@ impl EmbeddedDriver<HeapTerms> {
         let (destination, bind) = route(channel)?;
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
         let handle = self.add_aggregate(config)?;
-        let added = self.attach_sender(&handle, destination, bind, channel.reliable, quanta, guard);
+        let added = self.attach_sender(
+            &handle,
+            destination,
+            bind,
+            channel.reliable,
+            quanta,
+            (guard, roles),
+        );
         if let Err(error) = added {
             let _ = self.remove_aggregate(&handle);
             return Err(error);
@@ -178,7 +209,8 @@ impl EmbeddedDriver<HeapTerms> {
     }
 
     /// Builds the sender's data path over the lanes of `handle`, guards its
-    /// lanes with `guard`, and posts it with the guard's spec.
+    /// lanes with `guard`, and posts it with the guard's spec and the
+    /// receivers' `roles`.
     fn attach_sender(
         &mut self,
         handle: &AggregateHandle,
@@ -186,7 +218,7 @@ impl EmbeddedDriver<HeapTerms> {
         bind: SocketAddr,
         reliable: bool,
         quanta: Lanes<u64>,
-        guard: Option<NetworkGuard>,
+        (guard, roles): (Option<NetworkGuard>, Option<Box<PublicationRoles>>),
     ) -> Result<(), DriverError> {
         let mut guard_sender = None;
         let posted = self.post_sender(
@@ -194,7 +226,7 @@ impl EmbeddedDriver<HeapTerms> {
             (destination, bind),
             reliable,
             quanta,
-            guard,
+            (guard, roles),
             &mut guard_sender,
         );
         // A sender never posted leaves the close acknowledgement at once.
@@ -212,7 +244,7 @@ impl EmbeddedDriver<HeapTerms> {
         (destination, bind): (SocketAddr, SocketAddr),
         reliable: bool,
         quanta: Lanes<u64>,
-        guard: Option<NetworkGuard>,
+        (guard, roles): (Option<NetworkGuard>, Option<Box<PublicationRoles>>),
         guard_sender: &mut Option<crate::guard_ack::GuardSenderId>,
     ) -> Result<(), DriverError> {
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
@@ -282,6 +314,7 @@ impl EmbeddedDriver<HeapTerms> {
                 publication(endpoint),
                 Box::new(outbound),
                 guard,
+                roles,
             )
         });
         if posted.is_err() {

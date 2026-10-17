@@ -323,6 +323,48 @@ fn a_subscription_with_another_reliability_is_refused() {
     );
 }
 
+/// MC-1: subscriptions sharing a receiver entry must agree on its
+/// identity: another receiver id, another group tag, none where the first
+/// has one, and one where the first has none are each refused, with the
+/// endpoint released; the same identity shares the entry.
+#[test]
+fn a_subscription_with_another_identity_is_refused() {
+    use crate::membership::ReceiverIdentity;
+
+    let identity = |id: u64, group_tag: u64| ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(id).unwrap(),
+        group_tag,
+    };
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let first = b
+        .add_network_subscription_as(10, &channel(address), identity(77, 5))
+        .unwrap();
+    for other in [identity(78, 5), identity(77, 6)] {
+        assert_eq!(
+            b.add_network_subscription_as(10, &channel(address), other),
+            Err(crate::DriverError::ReceiverIdentityMismatch)
+        );
+    }
+    assert_eq!(
+        b.add_network_subscription(10, &channel(address)),
+        Err(crate::DriverError::ReceiverIdentityMismatch),
+        "none where the first has one"
+    );
+    let second = b
+        .add_network_subscription_as(10, &channel(address), identity(77, 5))
+        .unwrap();
+    // Another stream, derived identity: one where it has none is refused.
+    let derived = b.add_network_subscription(11, &channel(address)).unwrap();
+    assert_eq!(
+        b.add_network_subscription_as(11, &channel(address), identity(77, 5)),
+        Err(crate::DriverError::ReceiverIdentityMismatch)
+    );
+    for subscription in [first, second, derived] {
+        assert!(b.remove_network_subscription(subscription).unwrap());
+    }
+}
+
 /// W5b B5: the conductor mirrors the receiver's subscription table, so a
 /// new key beyond it is refused at once; a key already held still shares
 /// its entry, and the receiver never refuses one the mirror admitted.
@@ -541,6 +583,44 @@ fn a_subscription_holds_an_endpoint_per_path() {
     assert_eq!(driver.network_held_endpoints(), 0);
 }
 
+/// #304 with rp-w1: every path of a subscription with a configured
+/// identity carries it, so the receiver entry of each later path names the
+/// same identity as the first path's.
+#[test]
+fn every_path_of_a_subscription_carries_its_identity() {
+    let identity = |id: u64, group_tag: u64| crate::membership::ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(id).unwrap(),
+        group_tag,
+    };
+    let mut driver = driver(ThreadingMode::Shared);
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    let group = SocketAddr::from(([239, 7, 9, 3], free_port()));
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(LOOPBACK),
+        ],
+        ..channel(group)
+    };
+    // As above: a host without multicast has nothing to check.
+    let Ok(subscription) = driver.add_network_subscription_as(6, &channel, identity(77, 5)) else {
+        return;
+    };
+    for _ in 0..4 {
+        let _ = driver.do_work().unwrap();
+    }
+    let identities = driver.net.as_ref().unwrap().path_identities(6);
+    assert_eq!(identities.len(), driver.network_held_endpoints());
+    assert!(!identities.is_empty());
+    assert!(
+        identities.iter().all(|held| *held == Some(identity(77, 5))),
+        "{identities:?}"
+    );
+    assert!(driver.remove_network_subscription(subscription).unwrap());
+}
+
 /// Unicast `paths` need a destination per path (owner item 11): refused.
 #[test]
 fn unicast_paths_are_refused() {
@@ -663,6 +743,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         control: None,
         later: paths,
         later_routes: [None; crate::net::LATER_PATHS],
+        identity: None,
         users: 1,
     }
 }

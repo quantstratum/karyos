@@ -43,6 +43,12 @@ pub enum DriverError {
     /// and a reliable subscriber must not get gap-tolerant delivery.
     #[error("the stream is already subscribed with another reliability")]
     ReliabilityMismatch,
+    /// A second subscription of one endpoint and stream names another
+    /// receiver identity than the first, or one where the first has none,
+    /// or none where the first has one: they would share one receiver
+    /// entry, whose images name one identity (MC-1).
+    #[error("the stream is already subscribed with another receiver identity")]
+    ReceiverIdentityMismatch,
     /// A network endpoint could not be opened or its table is full.
     #[error("network endpoint unavailable")]
     NetworkEndpoint,
