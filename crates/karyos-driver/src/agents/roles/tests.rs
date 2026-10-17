@@ -2226,6 +2226,33 @@ fn naks_per_cycle_are_bounded() {
     assert_eq!(rig.sender.counters().naks, 3);
 }
 
+/// RP-11's admission order (rp-w6): the binding check comes before the
+/// cycle's NAK budget, so a NAK from no bound receiver is counted unbound
+/// even once the budget is spent, and spends none of it.
+#[test]
+fn an_unbound_nak_is_counted_before_the_budget() {
+    let mut config = AgentConfig::default();
+    config.repair.naks_per_cycle = 1;
+    let mut rig = RepairRig::new(config, &[alias()], 4);
+    let source = SocketAddr::from(RECEIVER_SOURCE);
+    let stranger = SocketAddr::from(([127, 0, 0, 9], 4_999));
+    rig.nak(alias(), source, 0, 1056);
+    rig.nak(alias(), stranger, FRAME, 1056);
+    rig.nak(alias(), source, FRAME, 1056);
+    rig.script(2);
+    rig.cycle(3);
+    let counters = rig.sender.counters();
+    assert_eq!(
+        (
+            counters.naks,
+            counters.nak_unbound,
+            counters.nak_cycle_budget
+        ),
+        (1, 1, 1),
+        "{counters:?}"
+    );
+}
+
 /// Repair runs the publications in turn from a cursor that moves every
 /// cycle, within one budget per cycle: with room for one frame a cycle,
 /// two publications with two-frame jobs alternate.
