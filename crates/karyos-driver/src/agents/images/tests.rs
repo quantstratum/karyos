@@ -94,6 +94,9 @@ struct Setup {
     roles: Option<fn() -> crate::membership::PublicationRoles>,
     /// The subscription's conflated lane (conflated-network-images.md).
     conflated: Option<Lane>,
+    /// Concurrent handles on each lane of the publication's log, in place
+    /// of the exclusive publication.
+    concurrent: Option<u8>,
 }
 
 impl Setup {
@@ -125,6 +128,7 @@ impl Default for Setup {
             identity: None,
             roles: None,
             conflated: None,
+            concurrent: None,
         }
     }
 }
@@ -252,15 +256,26 @@ impl Rig {
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
-        let (outbound, log) = super::super::data::testing::outbound_joined(
-            a,
-            alias(),
-            destination,
-            term(65_536),
-            2,
-            setup.reliable,
-            setup.before,
-        );
+        let (outbound, log) = match setup.concurrent {
+            Some(publishers) => super::super::data::testing::outbound_concurrent(
+                a,
+                alias(),
+                destination,
+                term(65_536),
+                2,
+                setup.reliable,
+                publishers,
+            ),
+            None => super::super::data::testing::outbound_joined(
+                a,
+                alias(),
+                destination,
+                term(65_536),
+                2,
+                setup.reliable,
+                setup.before,
+            ),
+        };
         rig.log = Some(log);
         rig.links
             .sender
@@ -1905,6 +1920,109 @@ fn an_injected_begin_aborted_end_is_discarded_and_the_next_frame_delivered() {
     assert_eq!(&out[..32], &[4; 32]);
     // The stray END is dropped, not counted as a partial.
     assert_eq!(subscriber.loss_counters().discarded_partial_bytes, 64);
+}
+
+/// T3, the writers' half (contract-traceability-phase-2.md, "Fragmented
+/// commit and abort (network)"; SPEC §13): two concurrent writers of
+/// fragmented messages on a reliable channel, the first stopped in the
+/// middle of its copy, after its first fragment. The second commits behind
+/// it, and nothing reaches the remote subscriber while the first block is
+/// open. The commit deadline aborts the first block: the subscriber of the
+/// image gets one aborted extent, then the second writer's message whole,
+/// and the stopped writer learns that its offer was aborted.
+#[test]
+fn a_fragmented_writer_aborted_mid_copy_reaches_a_remote_reader_as_one_extent() {
+    use karyos_sys::log_buffer::{
+        AppendOptions, ConcurrentOfferOutcome, DEFAULT_CLAIM_DEADLINE, PollOutcome, Role,
+    };
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        concurrent: Some(2),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let log = rig.log.as_mut().unwrap();
+    let mut handles = std::mem::take(&mut log.concurrent[0]);
+    let mut second = handles.pop().unwrap();
+    let mut first = handles.pop().unwrap();
+    // Both fragmented: more than one 1376-byte fragment each.
+    let tagged =
+        |tag: u8, length: usize| -> Vec<u8> { (0..length).map(|i| tag ^ (i as u8)).collect() };
+    let first_data = tagged(1, 4000);
+    let second_data = tagged(2, 3000);
+    /// Lets the stopped writer go on when dropped, so a failed assertion
+    /// fails the test instead of leaving the writer waiting.
+    struct Release(std::sync::mpsc::SyncSender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            first
+                .offer_pausing_after_fragment(&first_data, AppendOptions::default(), 0, &mut || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+                .unwrap()
+        });
+        // The first writer has copied one fragment of its block.
+        paused_rx.recv().unwrap();
+        let release = Release(resume_tx);
+        let ConcurrentOfferOutcome::Appended { position: behind } = second
+            .offer(&second_data, AppendOptions::default())
+            .unwrap()
+        else {
+            panic!("the second writer did not commit");
+        };
+        let mut out = vec![0u8; 8192];
+        for _ in 0..50 {
+            rig.round(true);
+            assert_eq!(
+                subscriber.poll(&mut out).unwrap(),
+                PollOutcome::Pending,
+                "a message got past the open block"
+            );
+        }
+        // The deadline aborts the first block.
+        let now = rig.now;
+        let conductor = &mut rig.log.as_mut().unwrap().conductors[0];
+        assert!(conductor.service_deadlines(&mut || now).unwrap().waiting);
+        let report = conductor
+            .service_deadlines(&mut || now + DEFAULT_CLAIM_DEADLINE + 1)
+            .unwrap();
+        assert_eq!(
+            (report.aborted, report.aborted_bytes),
+            (1, behind),
+            "{report:?}"
+        );
+        assert_eq!(
+            next_outcome(&mut rig, &mut subscriber),
+            PollOutcome::Aborted {
+                position: 0,
+                extent: u32::try_from(behind).unwrap(),
+            }
+        );
+        let PollOutcome::Message {
+            position, length, ..
+        } = subscriber.poll(&mut out).unwrap()
+        else {
+            panic!("the second message is not delivered");
+        };
+        assert_eq!((position, length), (behind, 3000));
+        assert_eq!(&out[..3000], &second_data[..]);
+        drop(release);
+        assert_eq!(
+            writer.join().unwrap(),
+            ConcurrentOfferOutcome::Aborted { position: 0 }
+        );
+    });
 }
 
 /// Phase 6 wiring: a RANGE_UNAVAILABLE that echoes the outstanding NAK

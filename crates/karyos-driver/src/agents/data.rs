@@ -1402,8 +1402,9 @@ pub(crate) mod testing {
     use karyos_protocol::frame::Lane;
     use karyos_protocol::network::{Alias, Lanes, TermParams};
     use karyos_sys::log_buffer::{
-        AppendOptions, Conductor, DEFAULT_CLAIM_DEADLINE, DEFAULT_CORRUPT_RETRIES, LogBuffer,
-        LogBufferConfig, Publication, PublicationMode, Role, SenderRead,
+        AppendOptions, ConcurrentPublication, Conductor, DEFAULT_CLAIM_DEADLINE,
+        DEFAULT_CORRUPT_RETRIES, LogBuffer, LogBufferConfig, Publication, PublicationMode, Role,
+        SenderRead,
     };
     use karyos_sys::sizing::TermLength;
     use karyos_sys::term::TermId;
@@ -1415,6 +1416,9 @@ pub(crate) mod testing {
         pub(crate) lanes: Vec<Arc<LogBuffer>>,
         pub(crate) publications: Vec<Publication<Arc<LogBuffer>>>,
         pub(crate) conductors: Vec<Conductor<Arc<LogBuffer>>>,
+        /// A concurrent log's handles, per lane ([`outbound_concurrent`]);
+        /// `publications` is then empty.
+        pub(crate) concurrent: Vec<Vec<ConcurrentPublication<Arc<LogBuffer>>>>,
     }
 
     /// A publication of `lanes` lanes with `term`, read for `alias` on
@@ -1450,6 +1454,31 @@ pub(crate) mod testing {
             reliable,
             before,
             None,
+            None,
+        )
+    }
+
+    /// [`outbound`] over concurrent logs: `publishers` concurrent handles
+    /// on each lane, in [`TestLog::concurrent`].
+    pub(crate) fn outbound_concurrent(
+        endpoint: EndpointId,
+        alias: Alias,
+        destination: SocketAddr,
+        term: TermParams,
+        lanes: u8,
+        reliable: bool,
+        publishers: u8,
+    ) -> (Box<Outbound>, TestLog) {
+        build(
+            endpoint,
+            alias,
+            destination,
+            term,
+            lanes,
+            reliable,
+            0,
+            None,
+            Some(publishers),
         )
     }
 
@@ -1463,11 +1492,13 @@ pub(crate) mod testing {
         reliable: bool,
         before: u8,
         routes: Option<&[(EndpointId, SocketAddr)]>,
+        concurrent: Option<u8>,
     ) -> (Box<Outbound>, TestLog) {
         let mut log = TestLog {
             lanes: Vec::new(),
             publications: Vec::new(),
             conductors: Vec::new(),
+            concurrent: Vec::new(),
         };
         let mut readers = Vec::new();
         for lane in 0..lanes {
@@ -1475,7 +1506,8 @@ pub(crate) mod testing {
             let buffer = Arc::new(
                 LogBuffer::new(LogBufferConfig {
                     term_length,
-                    spare_slots: 3,
+                    // A concurrent log holds a credit per publisher.
+                    spare_slots: 2 + concurrent.unwrap_or(1),
                     max_subscribers: 2,
                     mtu: term.mtu,
                     max_reserved: term_length.get() / 8,
@@ -1483,18 +1515,34 @@ pub(crate) mod testing {
                     lane: Lane::try_new(lane).unwrap(),
                     session_id: alias.session_id,
                     stream_id: alias.stream_id,
-                    publication: PublicationMode::Exclusive,
+                    publication: match concurrent {
+                        Some(publishers) => PublicationMode::Concurrent {
+                            publishers,
+                            allow_non_lse: false,
+                        },
+                        None => PublicationMode::Exclusive,
+                    },
                     claim_deadline: DEFAULT_CLAIM_DEADLINE,
                     schedule_capacity: 0,
                 })
                 .unwrap(),
             );
             let mut conductor = buffer.conductor_owned().unwrap();
-            let mut publication = buffer.publication_owned().unwrap().unwrap();
-            for i in 0..before {
-                let _ = publication
-                    .append(&[i; 1000], AppendOptions::default())
-                    .unwrap();
+            if let Some(publishers) = concurrent {
+                assert_eq!(before, 0, "a concurrent test log starts empty");
+                log.concurrent.push(
+                    (0..publishers)
+                        .map(|_| conductor.concurrent_publication().unwrap().unwrap())
+                        .collect(),
+                );
+            } else {
+                let mut publication = buffer.publication_owned().unwrap().unwrap();
+                for i in 0..before {
+                    let _ = publication
+                        .append(&[i; 1000], AppendOptions::default())
+                        .unwrap();
+                }
+                log.publications.push(publication);
             }
             // A required participant on every channel, with its L_send
             // reservation (S2 2.1).
@@ -1505,7 +1553,6 @@ pub(crate) mod testing {
                 )
                 .unwrap(),
             );
-            log.publications.push(publication);
             log.conductors.push(conductor);
             log.lanes.push(buffer);
         }
@@ -1552,6 +1599,7 @@ pub(crate) mod testing {
             reliable,
             0,
             Some(routes),
+            None,
         )
     }
 }
