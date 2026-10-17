@@ -186,50 +186,212 @@ impl SenderTrace {
     }
 }
 
-/// The receiver agent's hook until its trace points land (P2.12 step 3,
-/// PR 2): it holds the hook and refuses every journal.
-#[derive(Debug, Default)]
+/// One lane of an installed image with an open network journal (§4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TracedImageLane {
+    /// The image's installed slot.
+    pub(crate) slot: crate::sessions::receive::SlotRef,
+    /// The lane.
+    pub(crate) lane: Lane,
+    /// The publication the image receives.
+    pub(crate) publication: PublicationIdentity,
+    /// The journal's start: the lane's next commit position when it
+    /// arrived (the image join fact of §5).
+    pub(crate) start: u64,
+}
+
+/// A journal its image's retirement closed: posted to the conductor
+/// unsolicited, and answered again to a later `CloseNetworkJournal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetiredJournal {
+    pub(crate) lane: Lane,
+    pub(crate) facts: JournalFacts,
+    /// Whether the unsolicited `NetworkJournalClosed` was posted.
+    pub(crate) posted: bool,
+}
+
+/// The receiver agent's hook, its traced image lanes and the journals
+/// retirement closed (P2.12 step 3, PR 2). Both tables are allocated at
+/// start, so the data path allocates nothing.
+#[derive(Debug)]
 pub(crate) struct ReceiverTrace {
     hook: Option<TraceHook>,
+    lanes: Vec<TracedImageLane>,
+    retired: Vec<RetiredJournal>,
+    capacity: usize,
 }
 
 impl ReceiverTrace {
-    /// Serves a network trace command; `None` for any other command.
-    pub(crate) fn command<O: SocketOps>(
-        &mut self,
-        command: AgentCommand<O>,
-    ) -> Option<(Reservation, AgentEvent<O>)> {
-        let agent = AgentKind::Receiver;
-        let event = match command {
-            AgentCommand::SetNetworkTrace { reply, hook } => (
-                reply,
-                AgentEvent::NetworkTraceSet {
-                    agent,
-                    previous: core::mem::replace(&mut self.hook, hook),
-                    closed: Some(0),
-                },
-            ),
-            AgentCommand::OpenNetworkJournal { reply, journal, .. } => {
-                (reply, AgentEvent::NetworkJournalRefused { agent, journal })
+    /// Room for `capacity` traced image lanes.
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            hook: None,
+            lanes: Vec::with_capacity(capacity),
+            retired: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// The hook, for the data path.
+    pub(crate) fn hook(&mut self) -> Option<&mut (dyn NetworkTraceHook + 'static)> {
+        self.hook.as_mut().map(|hook| &mut *hook.0)
+    }
+
+    /// The traced lane `lane` of the image at `slot`, if it has a journal.
+    pub(crate) fn traced(
+        &self,
+        slot: crate::sessions::receive::SlotRef,
+        lane: Lane,
+    ) -> Option<&TracedImageLane> {
+        self.lanes
+            .iter()
+            .find(|traced| traced.slot == slot && traced.lane == lane)
+    }
+
+    /// Whether any lane has a journal: the data path's one branch.
+    pub(crate) fn any(&self) -> bool {
+        !self.lanes.is_empty()
+    }
+
+    /// Replaces the hook; every journal still open closes through the
+    /// previous one, without facts. Returns the previous hook and how many
+    /// closed (`None` if the count overflowed).
+    pub(crate) fn set_hook(&mut self, hook: Option<TraceHook>) -> (Option<TraceHook>, Option<u64>) {
+        let mut closed = Some(0u64);
+        for traced in self.lanes.drain(..) {
+            if let Some(previous) = self.hook.as_mut() {
+                previous
+                    .0
+                    .close_journal(NetSide::Receiver, &traced.publication, traced.lane);
             }
-            AgentCommand::CloseNetworkJournal {
-                reply,
-                publication,
-                lane,
-            } => (
-                reply,
-                AgentEvent::NetworkJournalClosed {
-                    agent,
-                    publication,
-                    lane,
-                    facts: None,
-                },
-            ),
-            _ => return None,
+            closed = closed.and_then(|count| count.checked_add(1));
+        }
+        (core::mem::replace(&mut self.hook, hook), closed)
+    }
+
+    /// Opens `journal` on `traced`: refused (`Err` with the journal) with
+    /// no hook, the wrong side, a lane already traced or no room.
+    pub(crate) fn open(
+        &mut self,
+        traced: TracedImageLane,
+        journal: karyos_protocol::trace_hook::NetJournal,
+    ) -> Result<(), karyos_protocol::trace_hook::NetJournal> {
+        let lane_taken = self.lanes.iter().any(|open| {
+            (open.publication, open.lane) == (traced.publication, traced.lane)
+                || (open.slot, open.lane) == (traced.slot, traced.lane)
+        });
+        let Some(hook) = self.hook.as_mut() else {
+            return Err(journal);
         };
-        Some(event)
+        if journal.side != NetSide::Receiver || lane_taken || self.lanes.len() >= self.capacity {
+            return Err(journal);
+        }
+        hook.0.open_journal(journal);
+        self.lanes.push(traced);
+        Ok(())
+    }
+
+    /// Closes the journal of `lane` of `publication` with the facts
+    /// `facts` gives for the open lane. A journal its image's retirement
+    /// closed answers its facts again (idempotent); `None` when there is
+    /// no such journal.
+    pub(crate) fn close(
+        &mut self,
+        publication: &PublicationIdentity,
+        lane: Lane,
+        facts: impl FnOnce(&TracedImageLane) -> JournalFacts,
+    ) -> Option<JournalFacts> {
+        if let Some(index) = self
+            .lanes
+            .iter()
+            .position(|traced| (traced.publication, traced.lane) == (*publication, lane))
+        {
+            let traced = self.lanes.swap_remove(index);
+            if let Some(hook) = self.hook.as_mut() {
+                hook.0.close_journal(NetSide::Receiver, publication, lane);
+            }
+            return Some(facts(&traced));
+        }
+        // Closed by its image's retirement: the same facts again, and the
+        // unsolicited event is no longer needed.
+        let index = self.retired.iter().position(|retired| {
+            (retired.facts.publication, retired.lane) == (*publication, lane)
+        })?;
+        Some(self.retired.swap_remove(index).facts)
+    }
+
+    /// The image at `slot` retires: every journal of its lanes closes now,
+    /// with the facts `facts` gives, and is queued for the conductor. A
+    /// full queue drops its oldest posted entry first; with none posted,
+    /// the newest close keeps no entry and `dropped` is called for it, so
+    /// the caller counts each one.
+    pub(crate) fn retire(
+        &mut self,
+        slot: crate::sessions::receive::SlotRef,
+        mut facts: impl FnMut(&TracedImageLane) -> JournalFacts,
+        mut dropped: impl FnMut(),
+    ) {
+        while let Some(index) = self.lanes.iter().position(|traced| traced.slot == slot) {
+            let traced = self.lanes.swap_remove(index);
+            if let Some(hook) = self.hook.as_mut() {
+                hook.0
+                    .close_journal(NetSide::Receiver, &traced.publication, traced.lane);
+            }
+            if self.retired.len() >= self.capacity
+                && let Some(oldest) = self.retired.iter().position(|retired| retired.posted)
+            {
+                self.retired.remove(oldest);
+            }
+            if self.retired.len() < self.capacity {
+                self.retired.push(RetiredJournal {
+                    lane: traced.lane,
+                    facts: facts(&traced),
+                    posted: false,
+                });
+            } else {
+                dropped();
+            }
+        }
+    }
+
+    /// Posts each retired journal not posted yet through `post`, which
+    /// answers whether its event was taken; a full ring leaves the rest
+    /// for the next cycle.
+    pub(crate) fn post_retired(&mut self, mut post: impl FnMut(Lane, JournalFacts) -> bool) {
+        for retired in self.retired.iter_mut().filter(|retired| !retired.posted) {
+            if !post(retired.lane, retired.facts) {
+                return;
+            }
+            retired.posted = true;
+        }
     }
 }
+
+/// The trace extension of a committed DATA frame: `None` without EXT,
+/// `Some(None)` for an EXT that does not decode (counted, not traced).
+pub(crate) fn frame_extension(
+    frame: &karyos_sys::receive::ValidatedFrame<'_>,
+) -> Option<Option<TraceExtension>> {
+    let word0 = frame.image_word0();
+    if word0.frame_type_code() != FrameType::Data.code() || !word0.flags().ext() {
+        return None;
+    }
+    // The extension follows the header, within the body.
+    let start = usize::try_from(HEADER_LENGTH)
+        .ok()?
+        .checked_sub(BODY_OFFSET)?;
+    let end = start.checked_add(usize::try_from(EXTENSION_LENGTH).ok()?)?;
+    Some(
+        frame
+            .body()
+            .get(start..end)
+            .and_then(|ext| TraceExtension::decode(ext).ok()),
+    )
+}
+
+/// The header byte where a validated frame's body starts, after word 0
+/// (`ValidatedFrame::body`).
+const BODY_OFFSET: usize = 8;
 
 fn lane_of(lane: usize) -> Option<Lane> {
     u8::try_from(lane)
