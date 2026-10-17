@@ -4127,39 +4127,55 @@ impl<O: BufferOwner> Conductor<O> {
         if !registration::names(found.registration.load(Ordering::Acquire), occupant) {
             return Ok(Revocation::Stale);
         }
-        let state = found.state.load(Ordering::Acquire);
-        let target = match (state, policy) {
-            (reader, _) if is_observer_like(reader) => CELL_LOST_RESERVED,
-            // A sender reader, silent or not, is a reserved required
-            // reader; a toggle that wins the race leaves this call stale,
-            // and the next scan revokes it from the state it found.
-            (reserved, LossPolicy::Continue) if is_required_reserved(reserved) => {
-                CELL_LOST_RESERVED
+        // A sender reader, silent or not, is a reserved required reader. Its
+        // owner's toggle between the two states can win the race against
+        // this revocation: the attempt then retries once from the state
+        // the toggle left, so a toggle never makes a loss go unrevoked.
+        let mut retried = false;
+        let (quiescent, target) = loop {
+            let state = found.state.load(Ordering::Acquire);
+            let target = match (state, policy) {
+                (reader, _) if is_observer_like(reader) => CELL_LOST_RESERVED,
+                (reserved, LossPolicy::Continue) if is_required_reserved(reserved) => {
+                    CELL_LOST_RESERVED
+                }
+                (CELL_REQUIRED, LossPolicy::Hold) => CELL_LOST_HOLDING,
+                (reserved, LossPolicy::Abort)
+                    if reserved == CELL_REQUIRED || is_required_reserved(reserved) =>
+                {
+                    CELL_LOST
+                }
+                (CELL_REQUIRED, LossPolicy::Continue) => {
+                    return Err(SysError::Protocol {
+                        reason: "the loss policy does not match the reader's admission",
+                    });
+                }
+                (reserved, LossPolicy::Hold) if is_required_reserved(reserved) => {
+                    return Err(SysError::Protocol {
+                        reason: "the loss policy does not match the reader's admission",
+                    });
+                }
+                _ => return Ok(Revocation::Stale),
+            };
+            // From the expected state only: a detach that stored FREE first
+            // means the participant left and nothing was lost.
+            match participant::revoke_cell(
+                &found.state,
+                &found.revoked,
+                &found.loan,
+                state,
+                target,
+            )? {
+                Some(quiescent) => break (quiescent, target),
+                None => {
+                    let now = found.state.load(Ordering::Acquire);
+                    if !retried && is_required_reserved(state) && is_required_reserved(now) {
+                        retried = true;
+                        continue;
+                    }
+                    return Ok(Revocation::Stale);
+                }
             }
-            (CELL_REQUIRED, LossPolicy::Hold) => CELL_LOST_HOLDING,
-            (reserved, LossPolicy::Abort)
-                if reserved == CELL_REQUIRED || is_required_reserved(reserved) =>
-            {
-                CELL_LOST
-            }
-            (CELL_REQUIRED, LossPolicy::Continue) => {
-                return Err(SysError::Protocol {
-                    reason: "the loss policy does not match the reader's admission",
-                });
-            }
-            (reserved, LossPolicy::Hold) if is_required_reserved(reserved) => {
-                return Err(SysError::Protocol {
-                    reason: "the loss policy does not match the reader's admission",
-                });
-            }
-            _ => return Ok(Revocation::Stale),
-        };
-        // From the expected state only: a detach that stored FREE first
-        // means the participant left and nothing was lost.
-        let Some(quiescent) =
-            participant::revoke_cell(&found.state, &found.revoked, &found.loan, state, target)?
-        else {
-            return Ok(Revocation::Stale);
         };
         match target {
             CELL_LOST_HOLDING if quiescent => {
@@ -4197,12 +4213,21 @@ impl<O: BufferOwner> Conductor<O> {
         }
         // Never adopted, so it holds no loan: it leaves flow control at once.
         found.revoked.store(crate::loan::REVOKED, Ordering::SeqCst);
-        let state = found.state.load(Ordering::Acquire);
-        if is_reader(state) {
-            let _ =
-                found
+        // A sender reader's toggle (silent or counting) can change the
+        // state between the load and the exchange, as in
+        // `revoke_participant`: one retry from the state it left. A sender
+        // reader is the driver's own and never a fenced grant, so this
+        // window is not reached in practice.
+        for _ in 0..2 {
+            let state = found.state.load(Ordering::Acquire);
+            if !is_reader(state)
+                || found
                     .state
-                    .compare_exchange(state, CELL_LOST, Ordering::AcqRel, Ordering::Acquire);
+                    .compare_exchange(state, CELL_LOST, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                break;
+            }
         }
         true
     }
