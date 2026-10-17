@@ -1367,3 +1367,6 @@ fn eos_on_every_lane_ends_the_image_cleanly_after_the_last_message() {
     drop(lanes);
     let _ = (a.close_network(), b.close_network());
 }
+
+#[cfg(target_os = "linux")]
+mod ipc;

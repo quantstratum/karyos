@@ -213,9 +213,17 @@ pub(crate) struct Admission<T: StreamTerms> {
 /// (`max_images` images of at most four lanes, each a region that keeps
 /// its `memfd` to pass it), one per stream mapping (`max_streams` lane
 /// streams, each with up to `max_retained_generations` predecessors) and
-/// a socket and a pidfd per client (`max_clients`). The fixed regions,
-/// the admission socket, the network sockets and the standard streams
-/// are not counted, so this is a lower bound. `None` on overflow.
+/// a socket, a pidfd and its command ring's `memfd` per client
+/// (`max_clients`). The fixed regions, the admission socket, the network
+/// sockets and the standard streams are not counted, so this is a lower
+/// bound. `None` on overflow.
+///
+/// An exposed image lane also takes a `max_streams` slot, but it is the
+/// image lane's own region, never cut over (N-4a): it adds no descriptor
+/// and leaves its slot's `1 + max_retained_generations` unused. The sum is
+/// still reached, so it is not lowered: when every stream slot holds a
+/// local stream with all its retained mappings, every installed image
+/// stays unexposed (no slot is free) and still holds its lane regions.
 pub(crate) fn descriptors_needed(
     config: &crate::embedded::DriverConfig,
     network: &crate::net::NetworkConfig,
@@ -230,21 +238,21 @@ pub(crate) fn descriptors_needed(
     let streams = u64::try_from(config.max_streams)
         .ok()?
         .checked_mul(mappings)?;
-    let clients = u64::try_from(config.max_clients).ok()?.checked_mul(2)?;
+    let clients = u64::try_from(config.max_clients).ok()?.checked_mul(3)?;
     images.checked_add(streams)?.checked_add(clients)
 }
 
 /// Refuses `needed` descriptors (`None`: more than `u64` counts) above
-/// `limit` (`None`: unlimited).
+/// the soft limit of `(soft, hard)` (`None`: unlimited).
 ///
 /// # Errors
 ///
-/// [`DriverError::DescriptorLimit`] with both numbers.
+/// [`DriverError::DescriptorLimit`] with the numbers and the hard limit.
 pub(crate) fn check_descriptors(
     needed: Option<u64>,
-    limit: Option<u64>,
+    (soft, hard): (Option<u64>, Option<u64>),
 ) -> Result<(), DriverError> {
-    let Some(limit) = limit else {
+    let Some(limit) = soft else {
         return Ok(());
     };
     match needed {
@@ -252,6 +260,7 @@ pub(crate) fn check_descriptors(
         needed => Err(DriverError::DescriptorLimit {
             needed: needed.unwrap_or(u64::MAX),
             limit,
+            hard,
         }),
     }
 }
@@ -1284,11 +1293,29 @@ mod descriptor_tests {
     use crate::net::NetworkConfig;
 
     /// The defaults: 64 images of four lanes, 64 streams of three mappings
-    /// and 16 clients of two descriptors.
+    /// and 16 clients of three descriptors (socket, pidfd, ring `memfd`).
     #[test]
     fn the_default_bounds_need_their_image_lanes_streams_and_clients() {
         let needed = descriptors_needed(&DriverConfig::default(), &NetworkConfig::default());
-        assert_eq!(needed, Some(64 * 4 + 64 * 3 + 16 * 2));
+        assert_eq!(needed, Some(64 * 4 + 64 * 3 + 16 * 3));
+    }
+
+    /// The bound is reached, so it is not lowered for exposed image lanes:
+    /// a table of one stream slot and one retained mapping, and one image
+    /// of four lanes. The local stream takes the slot (two mappings), so
+    /// the image cannot be exposed and keeps its four lane regions: six
+    /// regions, as the sum counts, plus a client's three descriptors.
+    #[test]
+    fn the_bound_is_reached_when_images_stay_unexposed() {
+        let config = DriverConfig {
+            max_streams: 1,
+            max_retained_generations: 1,
+            max_clients: 1,
+            ..DriverConfig::default()
+        };
+        let mut network = NetworkConfig::default();
+        network.agents.sessions.max_images = 1;
+        assert_eq!(descriptors_needed(&config, &network), Some(4 + 2 + 3));
     }
 
     /// A limit below the bounds refuses with both numbers; one at or above
@@ -1297,19 +1324,21 @@ mod descriptor_tests {
     #[test]
     fn a_limit_below_the_bounds_is_refused_with_both_numbers() {
         assert_eq!(
-            check_descriptors(Some(480), Some(479)),
+            check_descriptors(Some(480), (Some(479), Some(4096))),
             Err(DriverError::DescriptorLimit {
                 needed: 480,
-                limit: 479
+                limit: 479,
+                hard: Some(4096)
             })
         );
-        assert_eq!(check_descriptors(Some(480), Some(480)), Ok(()));
-        assert_eq!(check_descriptors(Some(480), None), Ok(()));
+        assert_eq!(check_descriptors(Some(480), (Some(480), None)), Ok(()));
+        assert_eq!(check_descriptors(Some(480), (None, None)), Ok(()));
         assert_eq!(
-            check_descriptors(None, Some(1024)),
+            check_descriptors(None, (Some(1024), None)),
             Err(DriverError::DescriptorLimit {
                 needed: u64::MAX,
-                limit: 1024
+                limit: 1024,
+                hard: None
             })
         );
         let config = DriverConfig {
