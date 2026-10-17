@@ -919,3 +919,89 @@ fn one_inactive_route_does_not_stop_the_others() {
     assert_eq!(report.drr.lanes[0].served_bytes, 64);
     assert_eq!(routed.debited(0), Some(0));
 }
+
+/// #317 merge review P3: a failed route takes no more flushes in the call,
+/// in `serve` and in `catch_up`, and the first failure of a route is the
+/// one kept until the control path takes it.
+#[test]
+fn a_failed_route_is_flushed_once_per_call_and_keeps_its_first_failure() {
+    use crate::backend::Release;
+    use crate::lanes::tests::fake::{self, Fake};
+
+    let config = DrrConfig::new(&[100, 100], 100).unwrap();
+    let queues = [fake::queue(0), fake::queue(1)];
+    let mut routed = RoutedLaneSender::new(config, &[&queues, &queues], 4).unwrap();
+    // Route 0: tickets 0 and 1; route 1: tickets 2 and 3; lanes 0 and 1.
+    for (route, lane, slot) in [(0, 0, 0), (0, 1, 1), (1, 0, 2), (1, 1, 3)] {
+        let staged = Staged {
+            ticket: fake::ticket(slot),
+            charge: 64,
+            len: 50,
+        };
+        routed
+            .staged(
+                lane,
+                route,
+                RoutedStaged {
+                    staged,
+                    position: 0,
+                },
+            )
+            .unwrap();
+    }
+    let os = |errno| {
+        (
+            None,
+            FlushStop::Failed(BackendFailure::Os {
+                operation: "sendmmsg",
+                errno,
+            }),
+        )
+    };
+    let submitted = |slot| {
+        (
+            Some((
+                TxItemOutcome::Submitted {
+                    release: Release::AtSubmission,
+                },
+                fake::ticket(slot),
+            )),
+            FlushStop::Exposed,
+        )
+    };
+    let mut routes = Faked(vec![
+        Fake {
+            replies: vec![os(9), os(5)].into(),
+            flushes: 0,
+        },
+        Fake {
+            replies: vec![submitted(2), submitted(3)].into(),
+            flushes: 0,
+        },
+    ]);
+    let budget = Budget {
+        work: 16,
+        bytes: 1000,
+    };
+    let report = routed.serve(&mut routes, &mut Gate::default(), budget);
+    assert_eq!(report.failure, None);
+    assert_eq!(served(&report, 2), [64, 64]);
+    assert_eq!(routes.0[0].flushes, 1, "out after its failure in serve");
+    // Route 0 lags at the debited position on both lanes; it fails again on
+    // lane 0 and takes no flush for lane 1.
+    let done = routed.catch_up(&mut routes, &mut Gate::default());
+    assert_eq!(done, CatchUp::default());
+    assert_eq!(routes.0[0].flushes, 2, "out after its failure in catch_up");
+    let failures = routed.take_failures();
+    assert!(
+        matches!(
+            failures[0],
+            Some(SenderFailure::Backend {
+                lane: 0,
+                stop: FlushStop::Failed(BackendFailure::Os { errno: 9, .. })
+            })
+        ),
+        "the first failure is kept: {failures:?}"
+    );
+    assert_eq!(failures[1], None);
+}

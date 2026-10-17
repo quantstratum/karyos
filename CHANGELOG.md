@@ -52,6 +52,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Receiver network trace points (P2.12 step 3, trace-network.md section 4,
+  section 5, NT-2 to NT-4). The receiver agent writes one journal per lane
+  of an installed image: `OpenNetworkJournal` starts it at the lane's next
+  commit position (the image join fact); a traced DATA frame records one
+  `ReceiverCommit` when it commits, naming its path (a repair that fills a
+  hole records too), and copies of an already committed frame record
+  nothing; `CloseNetworkJournal` answers the
+  start, the lane's resolved prefix as the commit boundary and its first
+  sealed gap. An image that retires closes its lanes' journals at once and
+  posts their facts as `NetworkJournalClosed`, retried while the event ring
+  is full; a later close answers the same facts once. New receiver counters:
+  `net_trace_ext_invalid` and `net_journals_retired_dropped`.
 - Conflated views of network images (conflated-network-images.md, C4).
   `EmbeddedDriver::add_network_subscription_conflated` names the lane and
   the view's `ConflationConfig`. When the image of such a key is exposed,
@@ -113,7 +125,10 @@ release may break APIs, wire formats and shared-memory layouts.
   `Outbound::new_routed` takes one endpoint and destination per path, and
   `Outbound::serve_routes` sends each committed datagram once on every
   path, debited once (`karyos_io::lanes::routes::RoutedLaneSender`). Repair
-  stays on the founding path. `Outbound::guard` refuses a routed
+  stays on the founding path, on its queues. A route's failure resets only
+  its endpoint (`Outbound::post_reset_requests`) and a faulted queue is
+  retried on its route; a reliable lane reads again after a reset only when
+  no route still holds its copies. `Outbound::guard` refuses a routed
   publication with `GateError::Routed` until the guard gate covers every
   path.
 - A seal gate on the skip policy (conflated-network-images.md (b)):

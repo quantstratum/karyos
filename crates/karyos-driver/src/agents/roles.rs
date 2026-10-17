@@ -161,6 +161,13 @@ pub struct ReceiverCounters {
     pub sm_copies_skipped: u64,
     /// Images retired at their liveness timeout.
     pub images_retired: u64,
+    /// Traced frames whose EXT did not decode: committed, not traced
+    /// (trace-network.md NT-2).
+    pub net_trace_ext_invalid: u64,
+    /// Network journals a retirement closed while the retired queue was
+    /// full of unposted closes: their facts are lost (the conductor's
+    /// close then finds none, and the journal is `Lost`).
+    pub net_journals_retired_dropped: u64,
     /// Installed images not kept (no SM slot, or no binding): retired at
     /// once so their storage is reclaimed.
     pub images_refused: u64,
@@ -431,6 +438,10 @@ pub struct ReceiverRole {
     /// Test only: DATA datagrams seen since the hook was set.
     #[cfg(test)]
     data_seen: u64,
+    /// Test only: DATA datagrams from this count on arrive twice (a path
+    /// that duplicates).
+    #[cfg(test)]
+    repeat_data_from: Option<u64>,
     /// Test only: every NAK handed to the sender.
     #[cfg(test)]
     posted_naks: Vec<Nak>,
@@ -1106,6 +1117,37 @@ fn receiver_id(slot: SlotRef) -> u64 {
     (u64::from(slot.slot) << 32) | u64::from(slot.generation)
 }
 
+/// The publication identity an image receives (trace-network.md §5).
+fn publication_of(image: &Installed) -> karyos_protocol::trace_hook::PublicationIdentity {
+    karyos_protocol::trace_hook::PublicationIdentity {
+        driver: image.identity.driver_id,
+        registration: image.identity.registration_id,
+        stream_id: image.key.alias.stream_id,
+        session_id: image.key.alias.session_id,
+        incarnation: image.identity.incarnation,
+    }
+}
+
+/// The facts of a receiver journal at its close (§5): its start, the
+/// lane's resolved prefix as the commit boundary, and the lane's first
+/// sealed gap. Without the image's owner (it is gone), the boundary is
+/// the start and no gap is known.
+fn journal_facts(
+    traced: &super::net_trace::TracedImageLane,
+    owner: Option<&ReceiveOwner>,
+) -> super::net_trace::JournalFacts {
+    super::net_trace::JournalFacts {
+        publication: traced.publication,
+        start: traced.start,
+        boundary: owner
+            .and_then(|owner| owner.rebuild_position(traced.lane))
+            .unwrap_or(traced.start),
+        first_gap: owner
+            .and_then(|owner| owner.first_loss(traced.lane))
+            .flatten(),
+    }
+}
+
 /// Adds one to a receiver counter; sticky on overflow.
 fn tally(counters: &mut ReceiverCounters, field: fn(&mut ReceiverCounters) -> &mut u64) {
     let mut overflowed = counters.overflowed;
@@ -1352,6 +1394,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             #[cfg(test)]
             data_seen: 0,
             #[cfg(test)]
+            repeat_data_from: None,
+            #[cfg(test)]
             posted_naks: Vec::new(),
             #[cfg(test)]
             posted_challenges: Vec::new(),
@@ -1395,7 +1439,11 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             delays,
             clock: karyos_sys::host_clock::host_monotonic_ns,
             counters: ReceiverCounters::default(),
-            trace: super::net_trace::ReceiverTrace::default(),
+            // A journal per lane of each image, at most four lanes each;
+            // a table too large for the address space traces nothing.
+            trace: super::net_trace::ReceiverTrace::new(
+                config.sessions.max_images.checked_mul(4).unwrap_or(0),
+            ),
         },
     ))
 }
@@ -1587,8 +1635,114 @@ impl ReceiverRole {
                     registration: publication.identity.registration_id,
                 },
             )),
-            command => self.trace.command(command),
+            command => self.trace_command(command),
         }
+    }
+
+    /// The network trace commands (P2.12 step 3, PR 2; trace-network.md
+    /// §4, §5): the hook, and one journal per lane of an installed image,
+    /// whose start is the lane's next commit position when it arrives.
+    fn trace_command<O: SocketOps>(
+        &mut self,
+        command: AgentCommand<O>,
+    ) -> Option<(Reservation, AgentEvent<O>)> {
+        let agent = AgentKind::Receiver;
+        match command {
+            AgentCommand::SetNetworkTrace { reply, hook } => {
+                let (previous, closed) = self.trace.set_hook(hook);
+                Some((
+                    reply,
+                    AgentEvent::NetworkTraceSet {
+                        agent,
+                        previous,
+                        closed,
+                    },
+                ))
+            }
+            AgentCommand::OpenNetworkJournal { reply, journal, .. } => {
+                let traced = self.images.iter().find_map(|image| {
+                    let publication = publication_of(image);
+                    (publication == journal.publication && journal.lane.get() < image.lane_count)
+                        .then(|| {
+                            image.owner.rebuild_position(journal.lane).map(|start| {
+                                super::net_trace::TracedImageLane {
+                                    slot: image.slot,
+                                    lane: journal.lane,
+                                    publication,
+                                    start,
+                                }
+                            })
+                        })
+                        .flatten()
+                });
+                let (publication, lane, number) =
+                    (journal.publication, journal.lane, journal.number);
+                let event = match traced {
+                    Some(traced) => match self.trace.open(traced, journal) {
+                        Ok(()) => AgentEvent::NetworkJournalOpened {
+                            agent,
+                            publication,
+                            lane,
+                            number,
+                            start: traced.start,
+                        },
+                        Err(journal) => AgentEvent::NetworkJournalRefused { agent, journal },
+                    },
+                    None => AgentEvent::NetworkJournalRefused { agent, journal },
+                };
+                Some((reply, event))
+            }
+            AgentCommand::CloseNetworkJournal {
+                reply,
+                publication,
+                lane,
+            } => {
+                let images = &self.images;
+                let facts = self.trace.close(&publication, lane, |traced| {
+                    let owner = images
+                        .iter()
+                        .find(|image| image.slot == traced.slot)
+                        .map(|image| &*image.owner);
+                    journal_facts(traced, owner)
+                });
+                Some((
+                    reply,
+                    AgentEvent::NetworkJournalClosed {
+                        agent,
+                        publication,
+                        lane,
+                        facts,
+                    },
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The resolved prefix of `lane` of the image at `slot` (tests).
+    #[cfg(test)]
+    pub(super) fn rebuild_position(&self, slot: SlotRef, lane: Lane) -> Option<u64> {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)?
+            .owner
+            .rebuild_position(lane)
+    }
+
+    /// Posts, through `post`, the closes of journals their image's
+    /// retirement closed; a full ring keeps the rest for the next cycle.
+    pub(super) fn post_retired_journals<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O>) -> bool,
+    ) {
+        self.trace.post_retired(|lane, facts| {
+            post(AgentEvent::NetworkJournalClosed {
+                agent: AgentKind::Receiver,
+                publication: facts.publication,
+                lane,
+                facts: Some(facts),
+            })
+        });
     }
 
     /// The session table's counters.
@@ -1740,6 +1894,13 @@ impl ReceiverRole {
     pub(super) fn drop_data(&mut self, nth: &[u64]) {
         self.drop_data = nth.to_vec();
         self.data_seen = 0;
+    }
+
+    /// Delivers every DATA datagram twice from the `from`th since
+    /// [`Self::drop_data`] was set (tests).
+    #[cfg(test)]
+    pub(super) fn repeat_data_from(&mut self, from: u64) {
+        self.repeat_data_from = Some(from);
     }
 
     /// Makes the image at `slot` hold a route fault: two uncertain NAKs,
@@ -2764,6 +2925,14 @@ impl ReceiverRole {
             retire,
             ..
         } = image;
+        // Its lanes' journals close now, with their facts, for the
+        // conductor (trace-network.md §4: they close with the image).
+        let counters = &mut self.counters;
+        self.trace.retire(
+            slot,
+            |traced| journal_facts(traced, Some(&*owner)),
+            || tally(counters, |c| &mut c.net_journals_retired_dropped),
+        );
         let _ = self.sessions.retire(slot, now);
         drop(owner);
         self.count(|c| &mut c.images_retired);
@@ -3222,7 +3391,15 @@ impl Intake<'_> {
             if self.role.drop_data.contains(&seen) {
                 return;
             }
+            if self.role.repeat_data_from.is_some_and(|from| seen >= from) {
+                self.data_once(source, alias, bytes);
+            }
         }
+        self.data_once(source, alias, bytes);
+    }
+
+    /// One DATA datagram's intake ([`Self::data`]).
+    fn data_once(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
         let key = BindingKey {
             endpoint: self.endpoint,
             source,
@@ -3264,6 +3441,34 @@ impl Intake<'_> {
                         image
                             .skip
                             .arrived(frame.lane(), &received, position, self.now);
+                    }
+                    // The commit point of a traced frame (NT-2): once per
+                    // committed frame, naming the path of the copy.
+                    if let Ok(Received::Committed { position, .. }) = received
+                        && role.trace.any()
+                        && let Some(traced) = role.trace.traced(image.slot, frame.lane()).copied()
+                    {
+                        match super::net_trace::frame_extension(&frame) {
+                            Some(Some(ext)) => {
+                                let at = karyos_protocol::trace_hook::NetCommit {
+                                    publication: traced.publication,
+                                    lane: traced.lane,
+                                    position,
+                                    path: path
+                                        .and_then(|(_, path)| u32::try_from(path).ok())
+                                        .unwrap_or(0),
+                                };
+                                if let Some(hook) = role.trace.hook() {
+                                    hook.on_receiver_commit(&ext, &at);
+                                }
+                            }
+                            // Validation refuses an EXT that does not check, so this
+                            // is defensive: counted, never traced.
+                            Some(None) => {
+                                tally(&mut role.counters, |c| &mut c.net_trace_ext_invalid)
+                            }
+                            None => {}
+                        }
                     }
                     match received {
                         Ok(Received::Committed { position, extent }) => {
@@ -4154,13 +4359,12 @@ impl SenderRole {
             let Some(outbound) = self.publications.get_mut(index) else {
                 break;
             };
-            if !outbound.reset_request_due(cycle) {
-                continue;
-            }
-            if post(outbound.endpoint()) {
-                outbound.reset_request_posted(cycle);
+            // Over redundant paths, each route's endpoint on its own.
+            let (posted, refused) = outbound.post_reset_requests(cycle, &mut post);
+            for _ in 0..posted {
                 self.count(|c| &mut c.reset_requests);
-            } else {
+            }
+            for _ in 0..refused {
                 self.count(|c| &mut c.reset_requests_full);
             }
         }
