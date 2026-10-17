@@ -522,10 +522,21 @@ fn a_subscription_holds_an_endpoint_per_path() {
     };
     let (refused, failed) = driver.network_path_counters();
     assert_eq!(refused, 0);
-    assert_eq!(
-        driver.network_held_endpoints(),
-        2 - usize::try_from(failed).unwrap()
-    );
+    if failed > 0 {
+        // The later path cannot join here (macOS std sockets bind no two
+        // sockets to one port, and loopback may refuse the membership):
+        // only its failure was exercised.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED the second path of a_subscription_holds_an_endpoint_per_path: its join failed on this host"
+        );
+        assert_eq!(driver.network_held_endpoints(), 1);
+        assert!(driver.remove_network_subscription(subscription).unwrap());
+        assert_eq!(driver.network_held_endpoints(), 0);
+        return;
+    }
+    assert_eq!(driver.network_held_endpoints(), 2);
     assert!(driver.remove_network_subscription(subscription).unwrap());
     assert_eq!(driver.network_held_endpoints(), 0);
 }
@@ -580,4 +591,140 @@ fn an_unsubscription_waits_for_room_in_the_ring() {
         "the buffer is kept"
     );
     assert_eq!(net.subscription_count(), 0);
+}
+
+/// #307 review P3: unicast with a single path is refused too.
+#[test]
+fn a_unicast_channel_with_one_path_is_refused() {
+    let mut driver = driver(ThreadingMode::Shared);
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    let channel = UdpConfig {
+        interface: None,
+        paths: vec![Interface::Address(LOOPBACK)],
+        ..channel(free_address())
+    };
+    assert_eq!(
+        driver.add_network_subscription(6, &channel),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+}
+
+/// The multicast channel of `group` with `paths` (isolation assumed).
+fn path_channel(group: SocketAddr, paths: Vec<Interface>) -> UdpConfig {
+    UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths,
+        ..channel(group)
+    }
+}
+
+/// #307 review P2-4: a second handle of a key must ask for the same
+/// paths; other paths would be dropped unseen, so they are refused and
+/// counted.
+#[test]
+fn a_shared_key_with_other_paths_is_refused() {
+    let mut driver = driver(ThreadingMode::Shared);
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    let group = SocketAddr::from(([239, 7, 9, 3], free_port()));
+    let any = Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let Ok(_first) = driver.add_network_subscription(6, &path_channel(group, vec![any.clone()]))
+    else {
+        return;
+    };
+    let refused = driver.network_path_counters().0;
+    assert_eq!(
+        driver.add_network_subscription(
+            6,
+            &path_channel(group, vec![any.clone(), Interface::Address(LOOPBACK)])
+        ),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert_eq!(driver.network_path_counters().0, refused + 1);
+    // The same paths share the key.
+    assert!(
+        driver
+            .add_network_subscription(6, &path_channel(group, vec![any]))
+            .is_ok()
+    );
+}
+
+/// A subscription table entry of `stream_id` on endpoint `first`, with
+/// later paths on `later` (tests of the table's rules).
+fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscription {
+    let mut paths = [None; crate::net::LATER_PATHS];
+    for (slot, path) in paths.iter_mut().zip(later) {
+        *slot = Some(crate::agents::EndpointId(*path));
+    }
+    crate::net::NetSubscription {
+        endpoint: crate::agents::EndpointId(first),
+        stream_id,
+        reliable: true,
+        control: None,
+        later: paths,
+        later_routes: [None; crate::net::LATER_PATHS],
+        users: 1,
+    }
+}
+
+/// #307 review P2-2: an entry serves its stream on its first path and on
+/// each later one, and nothing else.
+#[test]
+fn an_entry_serves_its_stream_on_every_path() {
+    use crate::agents::EndpointId;
+
+    let held = entry(1, 6, &[2, 3]);
+    for endpoint in [1, 2, 3] {
+        assert!(held.serves(EndpointId(endpoint), 6), "{endpoint}");
+    }
+    assert!(!held.serves(EndpointId(4), 6));
+    assert!(!held.serves(EndpointId(2), 7));
+    assert_eq!(held.entries(), Some(3));
+}
+
+/// #307 review P2-1: the mirror of the receiver's table counts each
+/// path's entry: with room for 4, two subscriptions of 2 paths fill it,
+/// and a third key is refused.
+#[test]
+fn the_mirror_counts_every_paths_entry() {
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.agents.subscriptions = 4;
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let net = driver.net.as_mut().unwrap();
+    net.subscriptions.push(entry(100, 6, &[101]));
+    net.subscriptions.push(entry(102, 7, &[103]));
+    assert_eq!(
+        driver.add_network_subscription(8, &channel(free_address())),
+        Err(crate::error::DriverError::NetworkSubscriptionsFull)
+    );
+}
+
+/// #307 review P2-2: a first path on an endpoint another subscription of
+/// the stream holds as a later path would share its receiver entry:
+/// refused, and nothing is left held.
+#[test]
+fn a_first_path_never_shares_a_later_paths_entry() {
+    let mut driver = driver(ThreadingMode::Shared);
+    let address = free_address();
+    // Open the endpoint as an ordinary subscription of another stream, then
+    // make it a later path of stream 6 in the table.
+    let other = driver
+        .add_network_subscription(9, &channel(address))
+        .unwrap();
+    let endpoint = other.endpoint();
+    let net = driver.net.as_mut().unwrap();
+    net.subscriptions.push(entry(200, 6, &[endpoint.0]));
+    let held = driver.network_held_endpoints();
+    assert_eq!(
+        driver.add_network_subscription(6, &channel(address)),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert_eq!(driver.network_held_endpoints(), held);
 }

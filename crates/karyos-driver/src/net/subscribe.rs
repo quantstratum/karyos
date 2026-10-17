@@ -41,6 +41,7 @@ fn later_routes(channel: &UdpConfig) -> Result<Vec<(SocketAddr, MulticastConfig)
     let Some((_, later)) = channel.paths.split_first() else {
         return Ok(Vec::new());
     };
+    // Unicast `paths`, even a single one, need a destination per path.
     let Destination::Multicast { group, .. } = &channel.destination else {
         return Err(DriverError::UnsupportedChannel);
     };

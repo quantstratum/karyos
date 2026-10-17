@@ -219,8 +219,25 @@ struct NetSubscription {
     /// own receiver entry (redundant-paths.md; the first path is
     /// `endpoint`).
     later: [Option<EndpointId>; LATER_PATHS],
+    /// The routes the channel asked for its later paths: a second handle
+    /// of the key must ask for the same ones.
+    later_routes: [Option<(SocketAddr, MulticastConfig)>; LATER_PATHS],
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
+}
+
+impl NetSubscription {
+    /// Whether this subscription's receiver entry for `stream_id` is on
+    /// `endpoint`, as its first path or a later one.
+    fn serves(&self, endpoint: EndpointId, stream_id: i32) -> bool {
+        self.stream_id == stream_id
+            && (self.endpoint == endpoint || self.later.contains(&Some(endpoint)))
+    }
+
+    /// The receiver entries it holds: its first path's and each later one's.
+    fn entries(&self) -> Option<usize> {
+        self.later.iter().flatten().count().checked_add(1)
+    }
 }
 
 /// The later paths a network subscription holds beside its first: the
@@ -491,6 +508,19 @@ impl Network {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::ReliabilityMismatch);
             }
+            // A second handle shares the key's paths, so it must ask for the
+            // same ones; other paths would be dropped unseen.
+            let mut asked = [None; LATER_PATHS];
+            for (slot, route) in asked.iter_mut().zip(later) {
+                *slot = Some(*route);
+            }
+            if later.len() > LATER_PATHS || asked != entry.later_routes {
+                release(&mut self.send_endpoints, endpoint);
+                if let Some(count) = self.paths_refused.checked_add(1) {
+                    self.paths_refused = count;
+                }
+                return Err(DriverError::UnsupportedChannel);
+            }
             let Some(users) = entry.users.checked_add(1) else {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::NetworkBusy);
@@ -498,8 +528,26 @@ impl Network {
             entry.users = users;
             return Ok(handle);
         }
-        // A new key: the receiver's table must have room for it.
-        if self.subscriptions.len() >= self.subscription_capacity {
+        // A first path on an endpoint that is already another
+        // subscription's later path of the stream would share its receiver
+        // entry: refused (#307 review P2-2).
+        if self
+            .subscriptions
+            .iter()
+            .any(|entry| entry.serves(endpoint, stream_id))
+        {
+            release(&mut self.send_endpoints, endpoint);
+            return Err(DriverError::UnsupportedChannel);
+        }
+        // A new key: the receiver's table must have room for it and each of
+        // its later paths, one entry each (#307 review P2-1).
+        let total = self
+            .subscriptions
+            .iter()
+            .try_fold(0usize, |held, entry| held.checked_add(entry.entries()?))
+            .and_then(|held| held.checked_add(later.len()))
+            .and_then(|held| held.checked_add(1));
+        if total.is_none_or(|total| total > self.subscription_capacity) {
             release(&mut self.send_endpoints, endpoint);
             return Err(DriverError::NetworkSubscriptionsFull);
         }
@@ -534,11 +582,29 @@ impl Network {
         // publication (RP-1). A path that cannot open or be posted leaves
         // the subscription with the paths it has, counted.
         let mut held = [None; LATER_PATHS];
-        for (slot, (bind, config)) in held.iter_mut().zip(later) {
+        let mut later_routes = [None; LATER_PATHS];
+        for ((slot, route), (bind, config)) in
+            held.iter_mut().zip(later_routes.iter_mut()).zip(later)
+        {
+            *route = Some((*bind, *config));
             let Ok(path) = self.hold_endpoint(*bind, Some(*config)) else {
                 self.count_path_failure();
                 continue;
             };
+            // A later path on an endpoint another subscription of the
+            // stream already uses would merge their receiver entries, and
+            // removing one would remove the other's: skipped, counted
+            // (#307 review P2-2).
+            if path == endpoint
+                || self
+                    .subscriptions
+                    .iter()
+                    .any(|entry| entry.serves(path, stream_id))
+            {
+                release(&mut self.send_endpoints, path);
+                self.count_path_failure();
+                continue;
+            }
             let posted = self
                 .links
                 .receiver
@@ -564,6 +630,7 @@ impl Network {
             reliable,
             control: control.map(|(control, _)| control),
             later: held,
+            later_routes,
             users: 1,
         });
         Ok(handle)
