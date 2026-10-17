@@ -542,3 +542,43 @@ fn a_recording_out_of_gaps_ends_lapped() {
     );
     assert_eq!(recorder.store().gaps().len(), crate::segment::MAX_GAPS);
 }
+
+/// Each duty stamps its writes with its time: a replay at the recorded
+/// pace waits the duties' difference between them.
+#[test]
+fn a_duty_stamps_its_writes_with_its_time() {
+    let disk = FaultDisk::default();
+    // A frame of 64 bytes, then one of 32: replay checks frame lengths.
+    let frame = |length: usize| {
+        let mut frame = data(0, length);
+        frame[..4].copy_from_slice(&i32::try_from(length).unwrap().to_le_bytes());
+        frame
+    };
+    let script = vec![
+        Script::Data(frame(64)),
+        Script::Pending,
+        Script::Data(frame(32)),
+    ];
+    let mut recorder = recorder(disk.clone(), Mode::Required, script);
+    recorder.duty(500).unwrap();
+    recorder.duty(1700).unwrap();
+    let mut replay = crate::replay::ReplaySource::open(
+        disk,
+        Path::new(DIR),
+        1,
+        geometry(),
+        0,
+        96,
+        crate::replay::Rate::AsRecorded,
+        256,
+    )
+    .unwrap();
+    assert!(matches!(
+        replay.poll(0),
+        Ok(crate::replay::Step::Frames { position: 0, .. })
+    ));
+    assert_eq!(
+        replay.poll(1).unwrap(),
+        crate::replay::Step::Wait { until_ns: 1200 }
+    );
+}

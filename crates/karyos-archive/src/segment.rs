@@ -49,9 +49,18 @@
 //!   a range an async recording lost: nothing is stored, and a read inside
 //!   it is refused. Positions stay contiguous across all three. An entry of
 //!   a kind this version does not know is refused at recovery, never cut.
+//! - **Record time.** Index version 2 stamps each entry with the time the
+//!   Archive wrote it (bytes 20 to 27: nanoseconds of the recorder's
+//!   monotonic clock, set by [`SegmentStore::stamp`]; 0 when unknown). It
+//!   is the arrival cadence the recorder saw, not the publish time, and it
+//!   serves only relative pacing of a replay: its origin is the Archive
+//!   process, so only differences within one recording mean anything. The
+//!   wall-clock start stays in the catalog.
 
 #[cfg(test)]
 mod tests;
+
+pub mod replay;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -65,8 +74,8 @@ pub const DEFAULT_SEGMENT_LENGTH: u64 = 128 << 20;
 
 /// "KYSX", the index magic.
 const MAGIC: u32 = u32::from_le_bytes(*b"KYSX");
-/// The index format version.
-const VERSION: u32 = 1;
+/// The index format version: 2 adds the record time of each entry.
+const VERSION: u32 = 2;
 /// The index header's length.
 const HEADER: u64 = 48;
 /// An index entry's length.
@@ -381,19 +390,22 @@ pub struct SegmentStore<D: Disk> {
     /// A sync ran since the last tick (explicit, or a roll's).
     synced_since_tick: bool,
     failed: bool,
+    /// The record time stamped on the next entries ([`SegmentStore::stamp`]).
+    time_ns: u64,
     /// Test only: the index is not synced (a negative control).
     #[cfg(test)]
     skip_index_sync: bool,
 }
 
-/// An index entry: its range, its kind (byte 16, zero in the first
-/// version's entries, which were all data) and the CRC of what it stored.
+/// An index entry: its range, its kind (byte 16), the CRC of what it
+/// stored and its record time (bytes 20 to 27; 0 when unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     start: u64,
     length: u32,
     data_crc: u32,
     kind: EntryKind,
+    time_ns: u64,
 }
 
 /// A decoded entry, or the code of a kind this version does not know.
@@ -406,6 +418,7 @@ impl Entry {
         put(&mut bytes, 8, &self.length.to_le_bytes());
         put(&mut bytes, 12, &self.data_crc.to_le_bytes());
         put(&mut bytes, 16, &[self.kind.code()]);
+        put(&mut bytes, 20, &self.time_ns.to_le_bytes());
         let crc = crc32c(bytes.get(..28).unwrap_or_default());
         put(&mut bytes, 28, &crc.to_le_bytes());
         bytes
@@ -426,6 +439,7 @@ impl Entry {
             length: u32_at(bytes, 8)?,
             data_crc: u32_at(bytes, 12)?,
             kind,
+            time_ns: u64_at(bytes, 20)?,
         }))
     }
 
@@ -585,6 +599,7 @@ impl<D: Disk> SegmentStore<D> {
             last_sync_ns: 0,
             synced_since_tick: false,
             failed: false,
+            time_ns: 0,
             #[cfg(test)]
             skip_index_sync: false,
         };
@@ -712,6 +727,7 @@ impl<D: Disk> SegmentStore<D> {
             length,
             data_crc: crc32c(chunk),
             kind: EntryKind::Data,
+            time_ns: self.time_ns,
         };
         self.write_entry(entry, chunk, None)
     }
@@ -802,6 +818,7 @@ impl<D: Disk> SegmentStore<D> {
             length: extent,
             data_crc: crc32c(record),
             kind: EntryKind::Fill,
+            time_ns: self.time_ns,
         };
         let end = entry.end().ok_or(SegmentError::PositionOverflow)?;
         let extent_end = end
@@ -855,6 +872,7 @@ impl<D: Disk> SegmentStore<D> {
                 length,
                 data_crc: 0,
                 kind: EntryKind::Gap,
+                time_ns: self.time_ns,
             };
             self.write_entry(entry, &[], None)?;
         }
@@ -1027,6 +1045,13 @@ impl<D: Disk> SegmentStore<D> {
         self.gaps.len() < MAX_GAPS || self.gaps.last().is_some_and(|last| last.1 == self.written)
     }
 
+    /// Sets the record time stamped on the entries written next: the
+    /// recorder's monotonic clock in nanoseconds. 0 means unknown, so a
+    /// time of 0 is stamped as 1.
+    pub fn stamp(&mut self, now_ns: u64) {
+        self.time_ns = now_ns.max(1);
+    }
+
     /// Reads `buf.len()` bytes at `position`, within `[start, written)`.
     ///
     /// # Errors
@@ -1164,6 +1189,7 @@ impl<D: Disk> SegmentStore<D> {
             last_sync_ns: 0,
             synced_since_tick: false,
             failed: false,
+            time_ns: 0,
             #[cfg(test)]
             skip_index_sync: false,
         };
