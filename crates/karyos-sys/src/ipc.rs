@@ -33,10 +33,12 @@ use rustix::mm::{Advice, MapFlags, ProtFlags};
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
     SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
+    sockopt::Timeout,
 };
 
 use crate::atomic_view::{AtomicWords, ReadOnlyWords, WORD_BYTES};
 use crate::error::SysError;
+use crate::mmap::retry_interrupted;
 
 /// Bytes before a region's structure: the 64-byte header, padded to the
 /// 128-byte stride (`quantstratum-docs: karyos/design/cnc-primitives.md`).
@@ -205,7 +207,7 @@ impl Region {
         let file_len =
             u64::try_from(len).map_err(|_| SysError::InvalidRegion { address: 0, len })?;
         let fd = create_memfd()?;
-        rustix::fs::ftruncate(&fd, file_len).map_err(os("ftruncate"))?;
+        retry_interrupted(|| rustix::fs::ftruncate(&fd, file_len)).map_err(os("ftruncate"))?;
         let region = Self::map(fd, len, record)?;
         let words = region.words_checked()?;
         for (index, value) in record.header_words().into_iter().enumerate() {
@@ -236,7 +238,7 @@ impl Region {
         let file_len =
             u64::try_from(len).map_err(|_| SysError::InvalidRegion { address: 0, len })?;
         let fd = create_memfd()?;
-        rustix::fs::ftruncate(&fd, file_len).map_err(os("ftruncate"))?;
+        retry_interrupted(|| rustix::fs::ftruncate(&fd, file_len)).map_err(os("ftruncate"))?;
         rustix::fs::fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW)
             .map_err(os("fcntl_add_seals"))?;
         let region = Self::map(fd, len, record)?;
@@ -542,11 +544,13 @@ pub fn reopen_read_only(fd: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
     use rustix::fd::AsRawFd;
     use rustix::fs::{Mode, OFlags};
     let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-    let reopened = rustix::fs::open(
-        path.as_str(),
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY,
-        Mode::empty(),
-    )
+    let reopened = retry_interrupted(|| {
+        rustix::fs::open(
+            path.as_str(),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+    })
     .map_err(os("open(/proc/self/fd)"))?;
     let flags = rustix::fs::fcntl_getfl(&reopened).map_err(os("fcntl(F_GETFL)"))?;
     if flags.intersection(OFlags::RWMODE) != OFlags::RDONLY {
@@ -609,6 +613,14 @@ pub enum Sent {
 
 /// Sends one message with at most one descriptor.
 ///
+/// A send that a signal interrupts (`EINTR`, which a socket with
+/// `SO_SNDTIMEO` gets even under `SA_RESTART`) is sent again while the
+/// socket's send timeout has not passed since the first attempt; past it,
+/// it is [`Sent::WouldBlock`], as when the kernel's own timeout expires.
+/// The timeout is not shortened for a retry, so one call may last up to
+/// about twice it. Without a timeout it is sent again until it is not
+/// interrupted, as a blocking send would wait anyway.
+///
 /// # Errors
 ///
 /// Returns [`SysError::Os`] when `sendmsg` fails, and
@@ -632,12 +644,30 @@ pub fn send(
             reason: "control buffer too small for one descriptor",
         });
     }
-    match rustix::net::sendmsg(
-        socket,
-        &[IoSlice::new(bytes)],
-        &mut control,
-        SendFlags::NOSIGNAL,
-    ) {
+    // An interrupted `sendmsg` sent nothing (a seqpacket record goes whole
+    // or not at all) and left the control data as it was: it is sent
+    // again, within the socket's timeout.
+    let start = std::time::Instant::now();
+    let mut limit = None;
+    let sent = loop {
+        match rustix::net::sendmsg(
+            socket,
+            &[IoSlice::new(bytes)],
+            &mut control,
+            SendFlags::NOSIGNAL,
+        ) {
+            Err(rustix::io::Errno::INTR) => {
+                match interrupted_within(socket, Timeout::Send, start, &mut limit) {
+                    Ok(true) => {}
+                    // Past the timeout: what its expiry reports.
+                    Ok(false) => break Err(rustix::io::Errno::AGAIN),
+                    Err(errno) => return Err(os("getsockopt(SO_SNDTIMEO)")(errno)),
+                }
+            }
+            done => break done,
+        }
+    };
+    match sent {
         Ok(sent) if sent == bytes.len() => Ok(Sent::Sent),
         Ok(_) => Err(SysError::Protocol {
             reason: "partial seqpacket send",
@@ -645,6 +675,26 @@ pub fn send(
         Err(rustix::io::Errno::AGAIN) => Ok(Sent::WouldBlock),
         Err(errno) => Err(os("sendmsg")(errno)),
     }
+}
+
+/// Whether a call on `socket` that a signal interrupted, first tried at
+/// `start`, may be tried again within the socket's `kind` timeout. The
+/// timeout is read once, at the first interruption, into `limit`; the
+/// fast path never reads it.
+fn interrupted_within(
+    socket: BorrowedFd<'_>,
+    kind: Timeout,
+    start: std::time::Instant,
+    limit: &mut Option<Option<core::time::Duration>>,
+) -> rustix::io::Result<bool> {
+    let timeout = match *limit {
+        Some(timeout) => timeout,
+        None => *limit.insert(rustix::net::sockopt::socket_timeout(socket, kind)?),
+    };
+    Ok(crate::retry::retry_interrupted_within(
+        start.elapsed(),
+        timeout,
+    ))
 }
 
 /// One received message: its length in the caller's buffer and its
@@ -673,6 +723,14 @@ pub enum Recv {
 
 /// Receives one message into `buffer`, with at most one descriptor.
 ///
+/// A receive that a signal interrupts (`EINTR`, which a socket with
+/// `SO_RCVTIMEO` gets even under `SA_RESTART`) is tried again while the
+/// socket's receive timeout has not passed since the first attempt; past
+/// it, it is [`Recv::WouldBlock`], as when the kernel's own timeout
+/// expires. The timeout is not shortened for a retry, so one call may
+/// last up to about twice it. Without a timeout it is tried again until
+/// it is not interrupted, as a blocking receive would wait anyway.
+///
 /// # Errors
 ///
 /// Returns [`SysError::Protocol`] for a truncated message or control data,
@@ -681,27 +739,44 @@ pub enum Recv {
 /// when `recvmsg` fails.
 pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<Recv, SysError> {
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut control = RecvAncillaryBuffer::new(&mut space);
-    let message = match rustix::net::recvmsg(
-        socket,
-        &mut [IoSliceMut::new(buffer)],
-        &mut control,
-        RecvFlags::CMSG_CLOEXEC,
-    ) {
-        Ok(message) => message,
-        Err(rustix::io::Errno::AGAIN) => return Ok(Recv::WouldBlock),
-        Err(errno) => return Err(os("recvmsg")(errno)),
-    };
     // Every descriptor the kernel installed is owned here first, so every
     // return below closes those not handed out.
     let mut fds: Vec<OwnedFd> = Vec::new();
     let mut other = false;
-    for item in control.drain() {
-        match item {
-            RecvAncillaryMessage::ScmRights(received) => fds.extend(received),
-            _ => other = true,
+    let start = std::time::Instant::now();
+    let mut limit = None;
+    let message = loop {
+        // A fresh control buffer for each attempt. An interrupted
+        // `recvmsg` took no record and installed no descriptor, so
+        // nothing is lost or left open.
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        match rustix::net::recvmsg(
+            socket,
+            &mut [IoSliceMut::new(buffer)],
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC,
+        ) {
+            Ok(message) => {
+                for item in control.drain() {
+                    match item {
+                        RecvAncillaryMessage::ScmRights(received) => fds.extend(received),
+                        _ => other = true,
+                    }
+                }
+                break message;
+            }
+            Err(rustix::io::Errno::INTR) => {
+                match interrupted_within(socket, Timeout::Recv, start, &mut limit) {
+                    Ok(true) => {}
+                    // Past the timeout: what its expiry reports.
+                    Ok(false) => return Ok(Recv::WouldBlock),
+                    Err(errno) => return Err(os("getsockopt(SO_RCVTIMEO)")(errno)),
+                }
+            }
+            Err(rustix::io::Errno::AGAIN) => return Ok(Recv::WouldBlock),
+            Err(errno) => return Err(os("recvmsg")(errno)),
         }
-    }
+    };
     if message.flags.contains(ReturnFlags::CTRUNC) {
         return Err(SysError::Protocol {
             reason: "truncated control data",
@@ -1698,5 +1773,66 @@ mod tests {
         assert!(matches!(listen(&dir, 8), Err(SysError::Protocol { .. })));
         assert!(probe.elapsed() < core::time::Duration::from_secs(1));
         drop(listener);
+    }
+
+    /// REVIEWER-02: a blocking `recv` that a signal interrupts is called
+    /// again and returns the message sent after the signals. The socket has
+    /// `SO_RCVTIMEO`, as a client's does, so `recvmsg` fails with `EINTR`
+    /// even though `signal` installs the handler with `SA_RESTART`.
+    #[test]
+    fn a_signal_does_not_fail_a_blocking_recv() {
+        use core::ffi::c_int;
+        use core::sync::atomic::AtomicUsize;
+        use std::os::unix::thread::{JoinHandleExt, RawPthread};
+
+        static DELIVERED: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn count(_signal: c_int) {
+            DELIVERED.fetch_add(1, Ordering::Relaxed);
+        }
+        // The C library std links; no crate is needed for two calls.
+        unsafe extern "C" {
+            fn signal(signal: c_int, handler: extern "C" fn(c_int)) -> usize;
+            fn pthread_kill(thread: RawPthread, signal: c_int) -> c_int;
+        }
+        let usr1 = rustix::process::Signal::USR1.as_raw();
+        // SAFETY: the handler only adds to an atomic, which is
+        // async-signal-safe; no other test uses SIGUSR1.
+        let previous = unsafe { signal(usr1, count) };
+        assert_ne!(previous, usize::MAX, "SIG_ERR");
+
+        let (a, b) = seqpacket_pair().unwrap();
+        let timeout = core::time::Duration::from_secs(10);
+        rustix::net::sockopt::set_socket_timeout(
+            &b,
+            rustix::net::sockopt::Timeout::Recv,
+            Some(timeout),
+        )
+        .unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let mut buffer = [0u8; 16];
+            let received = recv(b.as_fd(), &mut buffer).map(|received| match received {
+                Recv::Message(message) => buffer[..message.len].to_vec(),
+                other => panic!("{other:?}"),
+            });
+            done.send(received).unwrap();
+        });
+        let thread = receiver.as_pthread_t();
+        // Signals while the receiver blocks; any one of them interrupts it.
+        for _ in 0..50 {
+            // SAFETY: `thread` is the receiver, not joined until below, so
+            // its id stays valid.
+            let _ = unsafe { pthread_kill(thread, usr1) };
+            std::thread::sleep(core::time::Duration::from_millis(2));
+        }
+        assert!(DELIVERED.load(Ordering::Relaxed) > 0, "no signal arrived");
+        // Still blocked: an interrupted receive must not have returned.
+        if let Ok(early) = result.try_recv() {
+            panic!("recv returned before the message: {early:?}");
+        }
+        assert_eq!(send(a.as_fd(), b"after", None).unwrap(), Sent::Sent);
+        let received = result.recv_timeout(timeout).unwrap();
+        assert_eq!(received.unwrap(), b"after");
+        receiver.join().unwrap();
     }
 }
