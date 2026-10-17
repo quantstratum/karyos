@@ -22,6 +22,13 @@ pub enum WalkerUnavailable {
 /// Errors returned by the embedded driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DriverError {
+    /// A network agent failed or panicked, or its thread could not start;
+    /// fatal for the driver (DN-9).
+    #[error("the {agent:?} network agent failed")]
+    NetworkAgent {
+        /// The agent.
+        agent: crate::agents::AgentKind,
+    },
     /// The stream handle does not name a live stream of this driver.
     #[error("unknown stream {stream}")]
     UnknownStream {

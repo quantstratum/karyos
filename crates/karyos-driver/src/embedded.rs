@@ -247,6 +247,12 @@ pub struct DriverConfig {
     /// close before the effective-close acknowledgement reports it overdue;
     /// it is still pending, never closed (guards-and-abort.md). Nonzero.
     pub guard_ack_timeout: u64,
+    /// The network agents (`quantstratum-docs:
+    /// karyos/design/driver-network-agents.md`); `None`, the default, for
+    /// a driver without network channels. In
+    /// [`crate::agents::ThreadingMode::Shared`] the duty cycle drives them
+    /// with the driver clock, which must then count nanoseconds.
+    pub network: Option<crate::net::NetworkConfig>,
 }
 
 impl Default for DriverConfig {
@@ -294,6 +300,7 @@ impl Default for DriverConfig {
             guard_audit_records: 1024,
             max_guard_senders: 64,
             guard_ack_timeout: 1_000_000_000,
+            network: None,
         }
     }
 }
@@ -779,6 +786,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) guards: crate::guards::Guards,
     /// The sender gates registered with their guards (G-e4).
     pub(crate) guard_senders: crate::guard_ack::GuardSenders,
+    /// The network agents and their tables, when configured.
+    pub(crate) net: Option<crate::net::Network>,
 }
 
 /// The incarnation of a stream's publication in the embedded driver: one per
@@ -1006,6 +1015,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             network: crate::network_journals::NetworkTracing::new(config.max_trace_journals),
             guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
+            // Last: a driver that fails to build starts no agent.
+            net: config
+                .network
+                .as_ref()
+                .map(crate::net::Network::start)
+                .transpose()?,
         })
     }
 
@@ -2364,6 +2379,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut work = self.serve_commands();
         let mut first_error = None;
         add_step(&self.counters, &mut work, &mut first_error, admitted);
+        let network = self.serve_network();
+        add_step(&self.counters, &mut work, &mut first_error, network);
         add_work(&self.counters, &mut work, &mut first_error, alive);
         let charged = self.charged_generations();
         let mut opened = Vec::new();
@@ -2881,6 +2898,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .iter()
             .find(|s| s.id == stream.stream)
             .ok_or(unknown)
+    }
+
+    /// One cycle of the network agents and their events (wiring note
+    /// W-c): their work, and the error of a failed agent.
+    fn serve_network(&mut self) -> (u32, Option<DriverError>) {
+        let Some(net) = &mut self.net else {
+            return (0, None);
+        };
+        match net.duty(self.clock.now()) {
+            Ok(work) => (work, None),
+            Err(error) => (0, Some(error)),
+        }
+    }
+
+    /// Stops the network agents and reclaims their endpoints and images
+    /// (wiring note W-g); `None` without a network or once closed. Dropping
+    /// the driver does the same and discards the report.
+    pub fn close_network(&mut self) -> Option<crate::net::NetworkShutdown> {
+        let mut net = self.net.take()?;
+        Some(net.close())
     }
 
     pub(crate) fn clock_now(&mut self) -> u64 {

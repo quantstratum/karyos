@@ -1865,6 +1865,8 @@ fn issue_refusal(error: &karyos_sys::error::SysError) -> ErrorCode {
 
 impl<T: StreamTerms> Drop for EmbeddedDriver<T> {
     fn drop(&mut self) {
+        // The agents stop first: nothing may still send from the logs.
+        let _ = self.close_network();
         // Position cells are released in a final pass, not left to their
         // owners' drops outside any pass.
         self.positions.close(&mut self.counters);
