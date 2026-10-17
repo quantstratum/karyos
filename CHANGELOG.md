@@ -26,7 +26,7 @@ release may break APIs, wire formats and shared-memory layouts.
   its recording's segment store: data, a padding or aborted block as a
   fill, a lost range as a gap. `Mode::Required` throttles the publisher
   when the disk stalls (SPEC section 8.1); `Mode::Async` records a lap as a gap
-  and stops there or resumes at the lowest retained position. The
+  and stops there or resumes where its source rejoins. The
   `ArchiveHandle` agent thread owns the catalog and the recorders, settles
   the catalog at start, and stops each recording in the catalog once its
   store is closed.
