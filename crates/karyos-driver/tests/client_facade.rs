@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use karyos_client::{
-    Client, ClientConductor, ClientError, Context, IdleStrategy, MessageLimit, OfferOutcome,
+    Client, ClientConductor, ClientError, Context, IdleStrategy, MessageLimit, OfferError,
 };
 use karyos_driver::agents::ThreadingMode;
 use karyos_driver::net::NetworkConfig;
@@ -145,9 +145,12 @@ fn a_udp_publication_reaches_a_udp_subscription() {
         let _ = publisher.poll();
         let _ = subscriber.poll();
         while sent < 64 {
-            match publication.offer(&sent.to_le_bytes()).unwrap() {
-                OfferOutcome::Accepted { .. } => sent += 1,
-                _ => break,
+            match publication.offer(&sent.to_le_bytes()) {
+                Ok(_) => sent += 1,
+                Err(
+                    OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected,
+                ) => break,
+                Err(error) => panic!("{error}"),
             }
         }
         let _ = reading
@@ -207,12 +210,7 @@ fn a_network_subscription_polls_its_images_in_turn() {
         for (index, (publication, tag)) in
             [(&mut one, b"1"), (&mut two, b"2")].into_iter().enumerate()
         {
-            if offered[index] < 8
-                && matches!(
-                    publication.offer(tag).unwrap(),
-                    OfferOutcome::Accepted { .. }
-                )
-            {
+            if offered[index] < 8 && publication.offer(tag).is_ok() {
                 offered[index] += 1;
             }
         }
@@ -560,9 +558,14 @@ mod remote {
             assert!(start.elapsed() < Duration::from_secs(20), "seen {seen}");
             let _ = client.poll();
             while sent < 32 {
-                match publication.offer(&sent.to_le_bytes()).unwrap() {
-                    OfferOutcome::Accepted { .. } => sent += 1,
-                    _ => break,
+                match publication.offer(&sent.to_le_bytes()) {
+                    Ok(_) => sent += 1,
+                    Err(
+                        OfferError::BackPressured
+                        | OfferError::AdminAction
+                        | OfferError::NotConnected,
+                    ) => break,
+                    Err(error) => panic!("{error}"),
                 }
             }
             let _ = reading
@@ -657,5 +660,185 @@ mod remote {
                 Err(error) => panic!("{error}"),
             }
         }
+    }
+}
+
+/// Runs `work` on another thread while `driver` is served here, and
+/// returns what it returns.
+fn serve<R: Send>(driver: &mut EmbeddedDriver, work: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(work);
+        while !handle.is_finished() {
+            let _ = driver.do_work().unwrap();
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        handle.join().unwrap()
+    })
+}
+
+/// A heap aggregate of `stream_id` with `lanes` lanes.
+fn heap_aggregate(stream_id: i32, lanes: usize) -> karyos_driver::AggregateConfig {
+    karyos_driver::AggregateConfig {
+        stream: heap_stream(stream_id),
+        quanta: vec![u64::from(karyos_sys::sizing::DEFAULT_MTU) * 4; lanes],
+    }
+}
+
+/// SPEC §10 (W8): offers and claims return `Result<Accepted, OfferError>`;
+/// a claim dropped uncommitted aborts its frame, which is never delivered;
+/// the errors map to their `OfferError` variants.
+#[test]
+fn offers_and_claims_have_the_spec_shape() {
+    use karyos_client::MessageLength;
+    use karyos_sys::frame::Lane;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let _ = driver.add_stream(heap_stream(1)).unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let mut reading = client
+            .add_subscription("karyos:ipc", StreamId::new(1))
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(1))
+            .unwrap();
+        assert_eq!(publication.lane_count(), 1);
+        let length = MessageLength::try_new(8).unwrap();
+        // Dropped uncommitted: aborted.
+        {
+            let mut claim = publication.try_claim(length).unwrap();
+            claim.payload().fill(1);
+        }
+        let mut claim = publication.try_claim(length).unwrap();
+        claim.payload().fill(2);
+        let committed = claim.commit().unwrap();
+        assert_eq!(committed.lane(), Lane::ZERO);
+        // An explicit abort, then an offer.
+        publication.try_claim(length).unwrap().abort();
+        let offered = publication.offer(&[3; 8]).unwrap();
+        assert!(offered.position() > committed.position());
+        // Errors.
+        assert_eq!(
+            publication.offer_on(Lane::try_new(1).unwrap(), b"x"),
+            Err(OfferError::InvalidLane {
+                lane: Lane::try_new(1).unwrap()
+            })
+        );
+        assert_eq!(
+            publication.offer(&[]),
+            Err(OfferError::Client(ClientError::EmptyMessage))
+        );
+        let max = publication.max_message_length(Lane::ZERO).unwrap();
+        assert!(matches!(
+            publication.offer(&vec![0; max as usize + 1]),
+            Err(OfferError::MessageTooLarge { .. })
+        ));
+        assert_eq!(MessageLength::try_new(0), Err(ClientError::EmptyMessage));
+        // Only the committed frame and the offer are delivered; the poll
+        // reports the aborted blocks it stepped over.
+        let mut seen = Vec::new();
+        let mut aborted = 0;
+        let start = Instant::now();
+        while seen.len() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(10), "{seen:?}");
+            let _ = client.poll();
+            let poll = reading
+                .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+                .unwrap();
+            if poll
+                .stopped
+                .is_some_and(|stop| stop.summary.aborted.is_some())
+            {
+                aborted += 1;
+            }
+        }
+        assert_eq!(seen, [vec![2; 8], vec![3; 8]]);
+        assert!(aborted > 0, "the aborted frames were stepped over");
+    });
+}
+
+/// A publication holds every lane its aggregate configures: `offer_on`
+/// reaches the lane's own handle, and a lane beyond them is refused.
+#[test]
+fn a_publication_holds_every_lane_of_its_aggregate() {
+    use karyos_sys::frame::Lane;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let _ = driver.add_aggregate(heap_aggregate(2, 2)).unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        // A subscriber on lane 0 only.
+        let _reading = client
+            .add_subscription("karyos:ipc", StreamId::new(2))
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(2))
+            .unwrap();
+        assert_eq!(publication.lane_count(), 2);
+        assert_eq!(publication.offer(b"zero").unwrap().lane(), Lane::ZERO);
+        // Lane 1 has its own handle, with no subscriber.
+        assert_eq!(
+            publication.offer_on(Lane::try_new(1).unwrap(), b"one"),
+            Err(OfferError::NotConnected)
+        );
+        assert!(matches!(
+            publication.offer_on(Lane::try_new(2).unwrap(), b"two"),
+            Err(OfferError::InvalidLane { .. })
+        ));
+        client.remove_publication(publication);
+    });
+}
+
+/// The lanes are taken all or nothing: a lane already taken refuses the
+/// publication, and the lanes granted before it are released.
+#[test]
+fn a_refused_lane_releases_the_lanes_already_granted() {
+    use karyos_sys::frame::Lane;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = driver.add_aggregate(heap_aggregate(3, 2)).unwrap();
+    let first = aggregate.lane(Lane::ZERO).unwrap();
+    // Another client holds lane 1's exclusive publication.
+    let mut other = driver.connect().unwrap();
+    let key = karyos_protocol::cnc::StreamKey {
+        stream_id: 3,
+        session_id: 1,
+    };
+    let sequence = other
+        .add_publication_on_lane(key, Lane::try_new(1).unwrap(), true)
+        .unwrap();
+    let mut held = None;
+    let start = Instant::now();
+    while held.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let _ = driver.do_work().unwrap();
+        let _ = other.poll(usize::MAX, |completion| {
+            assert_eq!(completion.sequence, sequence);
+            held = Some(completion.outcome);
+        });
+    }
+    assert!(matches!(held, Some(karyos_client::Outcome::Publication(_))));
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    let refused = serve(&mut driver, || {
+        client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(3))
+            .err()
+    });
+    assert!(matches!(
+        refused,
+        Some(ClientError::Refused {
+            code: karyos_protocol::cnc::ErrorCode::PublicationTaken,
+            ..
+        })
+    ));
+    // Lane 0's grant was released.
+    let start = Instant::now();
+    while driver.live_leases(first).unwrap() > 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "lane 0 is still held"
+        );
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll();
     }
 }

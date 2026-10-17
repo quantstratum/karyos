@@ -522,6 +522,16 @@ impl<T: TermBytes> ClientPublication<T> {
         self.inner.buffer().max_message_length()
     }
 
+    /// The stream and session the handle publishes to.
+    #[must_use]
+    pub fn stream(&self) -> karyos_protocol::cnc::StreamKey {
+        let config = self.inner.buffer().config();
+        karyos_protocol::cnc::StreamKey {
+            stream_id: config.stream_id,
+            session_id: config.session_id,
+        }
+    }
+
     /// Offers one message.
     ///
     /// # Errors
