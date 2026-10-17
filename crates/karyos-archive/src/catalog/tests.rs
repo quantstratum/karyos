@@ -215,13 +215,178 @@ fn a_torn_record_is_cut() {
     })
     .encode()
     .unwrap();
-    let disk = FaultDisk::with_budget(free.used() - 1 - (record.len() as u64 - 3));
+    let disk = FaultDisk::with_budget(free.used() - 1 - (u64::try_from(record.len()).unwrap() - 3));
     let done = run(disk.clone(), &ops);
     assert_eq!(done.ok, 1);
     let opened = Catalog::open(disk.after_crash(Survives::Everything), Path::new(DIR)).unwrap();
     assert!(opened.cut.is_some());
     assert_eq!(opened.catalog.recordings().len(), 1);
     assert_eq!(opened.catalog.next_id(), 2);
+}
+
+/// The catalog file's bytes.
+fn catalog_bytes(disk: &FaultDisk) -> Vec<u8> {
+    let mut raw = disk.clone();
+    let file = raw.open(&Path::new(DIR).join(CATALOG)).unwrap();
+    let mut bytes = vec![0u8; usize::try_from(raw.len(&file).unwrap()).unwrap()];
+    raw.read_at(&file, 0, &mut bytes).unwrap();
+    bytes
+}
+
+/// Writes `bytes` at `offset` of the catalog file.
+fn poke(disk: &FaultDisk, offset: u64, bytes: &[u8]) {
+    let mut raw = disk.clone();
+    let file = raw.open(&Path::new(DIR).join(CATALOG)).unwrap();
+    raw.write_at(&file, offset, bytes).unwrap();
+}
+
+/// The offsets at which a catalog of three started recordings holds its
+/// records.
+fn three_started() -> (FaultDisk, [u64; 3]) {
+    let disk = FaultDisk::default();
+    let done = run(disk.clone(), &[Op::Start(1), Op::Start(2), Op::Start(3)]);
+    assert_eq!(done.ok, 3);
+    let mut offsets = [HEADER_LEN; 3];
+    let mut at = HEADER_LEN;
+    for (index, stream_id) in [1, 2, 3].into_iter().enumerate() {
+        offsets[index] = at;
+        let record = Record::Started(Recording {
+            id: u64::try_from(index + 1).unwrap(),
+            stream_id,
+            session_id: 7,
+            channel: channel_of(stream_id),
+            start: 0,
+            start_time_ns: 5,
+            geometry: geometry(),
+            policy: SyncPolicy::PerSegment,
+            stop: None,
+        })
+        .encode()
+        .unwrap();
+        at += u64::try_from(record.len()).unwrap();
+    }
+    (disk, offsets)
+}
+
+/// #340 review P1: a damaged record with more of the log behind it is
+/// corruption, never a torn tail: the open refuses, names the offset and
+/// changes nothing, so no id is reused.
+#[test]
+fn a_damaged_record_mid_log_is_refused() {
+    let (disk, offsets) = three_started();
+    let before = catalog_bytes(&disk);
+    // One flipped payload byte in record 2: its CRC fails.
+    let at = offsets[1] + 6;
+    poke(&disk, at, &[before[usize::try_from(at).unwrap()] ^ 0x01]);
+    let damaged = catalog_bytes(&disk);
+    assert!(matches!(
+        Catalog::open(disk.clone(), Path::new(DIR)),
+        Err(CatalogError::Corrupt { offset }) if offset == offsets[1]
+    ));
+    assert_eq!(catalog_bytes(&disk), damaged, "nothing is changed");
+    // The same flip in the last record, which reaches the end: torn.
+    poke(&disk, at, &[before[usize::try_from(at).unwrap()]]);
+    let last = offsets[2] + 6;
+    poke(
+        &disk,
+        last,
+        &[before[usize::try_from(last).unwrap()] ^ 0x01],
+    );
+    let opened = Catalog::open(disk, Path::new(DIR)).unwrap();
+    assert_eq!(opened.cut, Some(offsets[2]));
+    assert_eq!(opened.catalog.next_id(), 3);
+}
+
+/// #340 review P1: a whole record that does not decode, or that the state
+/// before it rejects, is corruption wherever it is, the last record
+/// included.
+#[test]
+fn a_checked_record_that_does_not_hold_is_refused() {
+    let (disk, _) = three_started();
+    let end = u64::try_from(catalog_bytes(&disk).len()).unwrap();
+    // A Stopped of a recording that never started, with a valid CRC.
+    let stray = Record::Stopped {
+        id: 9,
+        stop: Stop {
+            position: 0,
+            time_ns: 1,
+            reason: StopReason::Normal,
+            incomplete: false,
+        },
+    }
+    .encode()
+    .unwrap();
+    poke(&disk, end, &stray);
+    assert!(matches!(
+        Catalog::open(disk.clone(), Path::new(DIR)),
+        Err(CatalogError::Corrupt { offset }) if offset == end
+    ));
+    // An unknown kind under a valid CRC.
+    let mut unknown = vec![9, 0, 0, 0];
+    let crc = crc32c(&unknown);
+    unknown.extend_from_slice(&crc.to_le_bytes());
+    poke(&disk, end, &unknown);
+    assert!(matches!(
+        Catalog::open(disk, Path::new(DIR)),
+        Err(CatalogError::Corrupt { offset }) if offset == end
+    ));
+}
+
+/// A log extended over zeros (a crash after the length, before the data)
+/// is a torn tail.
+#[test]
+fn zeros_after_the_last_record_are_a_torn_tail() {
+    let (disk, _) = three_started();
+    let end = u64::try_from(catalog_bytes(&disk).len()).unwrap();
+    poke(&disk, end, &[0u8; 300]);
+    let opened = Catalog::open(disk.clone(), Path::new(DIR)).unwrap();
+    assert_eq!(opened.cut, Some(end));
+    assert_eq!(opened.catalog.recordings().len(), 3);
+    assert_eq!(u64::try_from(catalog_bytes(&disk).len()).unwrap(), end);
+}
+
+/// What an open must refuse with.
+type Expected = fn(&CatalogError) -> bool;
+
+/// #340 review P1: only a header shorter than its length is a catalog
+/// being created; another magic or a failing CRC is corruption and
+/// another version is unsupported, and the file is kept.
+#[test]
+fn a_whole_header_that_does_not_match_is_refused() {
+    let cases: [(usize, u8, Expected); 3] = [
+        (0, b'X', |error| {
+            matches!(error, CatalogError::Corrupt { offset: 0 })
+        }),
+        (13, 0xFF, |error| {
+            matches!(error, CatalogError::Corrupt { offset: 0 })
+        }),
+        (4, 2, |error| {
+            matches!(error, CatalogError::UnsupportedVersion { version: 2 })
+        }),
+    ];
+    for (at, byte, expected) in cases {
+        let (disk, _) = three_started();
+        let mut found = catalog_bytes(&disk)[..HEADER].to_vec();
+        found[at] = byte;
+        if at == 4 {
+            // Another version under a valid CRC.
+            let crc = crc32c(&found[..12]);
+            found[12..16].copy_from_slice(&crc.to_le_bytes());
+        }
+        poke(&disk, 0, &found);
+        let damaged = catalog_bytes(&disk);
+        let error = Catalog::open(disk.clone(), Path::new(DIR)).unwrap_err();
+        assert!(expected(&error), "byte {at}: {error:?}");
+        assert_eq!(catalog_bytes(&disk), damaged, "byte {at}: kept");
+    }
+    // A short header: the creation did not complete; recreated.
+    let disk = FaultDisk::default();
+    let mut raw = disk.clone();
+    let file = raw.create(&Path::new(DIR).join(CATALOG)).unwrap();
+    raw.write_at(&file, 0, &header()[..7]).unwrap();
+    let opened = Catalog::open(disk, Path::new(DIR)).unwrap();
+    assert_eq!(opened.cut, Some(0));
+    assert!(opened.catalog.recordings().is_empty());
 }
 
 /// A compaction's leftover file is removed at the open.
