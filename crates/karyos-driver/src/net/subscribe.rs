@@ -142,8 +142,9 @@ impl EmbeddedDriver<HeapTerms> {
     }
 
     /// [`EmbeddedDriver::add_network_subscription`] with a conflated view
-    /// of `lane` of its images (conflated-network-images.md (a)): the
-    /// receiver gates that lane's seals through the view's barrier mailbox.
+    /// of `lane` of its images, a table of `config` (conflated-network-images.md
+    /// (a)): the receiver gates that lane's seals through the view's barrier
+    /// mailbox, and the conductor feeds the view of each exposed image.
     /// Driver-internal: a URI or public form is the owner's (item 7).
     ///
     /// # Errors
@@ -153,22 +154,29 @@ impl EmbeddedDriver<HeapTerms> {
     /// on the endpoint with another conflated lane, or with none.
     #[allow(
         dead_code,
-        reason = "driver-internal until the conductor builds the view (C4)"
+        reason = "driver-internal until owner item 7 gives conflated network views a way in"
     )]
     pub(crate) fn add_network_subscription_conflated(
         &mut self,
         stream_id: i32,
         channel: &UdpConfig,
         lane: karyos_sys::frame::Lane,
+        config: karyos_sys::conflation::ConflationConfig,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, (None, Some(lane)))
+        self.subscribe_network(stream_id, channel, (None, Some((lane, config))))
     }
 
     fn subscribe_network(
         &mut self,
         stream_id: i32,
         channel: &UdpConfig,
-        options: (Option<ReceiverIdentity>, Option<karyos_sys::frame::Lane>),
+        options: (
+            Option<ReceiverIdentity>,
+            Option<(
+                karyos_sys::frame::Lane,
+                karyos_sys::conflation::ConflationConfig,
+            )>,
+        ),
     ) -> Result<NetworkSubscription, DriverError> {
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
         // Redundant paths need sockets isolated per interface; without

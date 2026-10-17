@@ -679,3 +679,81 @@ fn a_halted_source_keeps_the_visit() {
     assert_eq!((drr.cursor(), drr.deficit(0)), (0, Some(300)));
     assert!(drr.in_visit());
 }
+
+/// T8 (contract-traceability-phase-2.md, "Lane fairness"), per round: four
+/// saturated lanes, lane 3 with maximum frames under a quantum that covers
+/// one. Every round credits each eligible lane once, and lane 0 is always
+/// eligible, so lane 3 is visited every round lane 0 is, except the rounds
+/// it is gated (a closed guard, or out of window), which are excluded; and
+/// every visit sends a frame, so each frame at lane 3's head is sent within
+/// one round. Returns whether the property held, and lane 3's visits.
+fn lane_three_is_served_every_round(faults: Faults, exclude_gated: bool) -> (bool, u64) {
+    const F_MAX: u64 = 1_500;
+    let quanta = [4_000, 1_500, 1_500, 2_000];
+    let mut drr = drr(&quanta, F_MAX);
+    drr.faults = faults;
+    let mut model = Model {
+        saturate: [Some(64), Some(700), Some(1_500), Some(F_MAX)],
+        ..Model::default()
+    };
+    let budgets = [
+        Budget {
+            work: 3,
+            bytes: 5_000,
+        },
+        Budget {
+            work: 50,
+            bytes: 1_600,
+        },
+        Budget {
+            work: 1,
+            bytes: u64::MAX,
+        },
+        Budget {
+            work: 9,
+            bytes: 3_100,
+        },
+    ];
+    let mut totals = Totals::default();
+    // Lane 0's visits in the calls where lane 3 was gated.
+    let mut gated_visits = 0u64;
+    for (call, budget) in budgets.iter().cycle().take(4_000).enumerate() {
+        // Lane 3 is gated in one call of every seven.
+        let gated = call % 7 == 3;
+        model.closed[3] = gated;
+        let report = drr.run(*budget, &mut model);
+        totals.add(&report);
+        if gated && exclude_gated {
+            gated_visits += report.lanes[0].credits;
+        }
+        if drr.cursor() != 3 || !drr.in_visit() {
+            // One visit in progress either way, at most.
+            let behind = totals.credits[0] > totals.credits[3] + gated_visits + 1;
+            let ahead = totals.credits[3] > totals.credits[0] + 1;
+            if behind || ahead || totals.frames[3] < totals.credits[3] {
+                return (false, totals.credits[3]);
+            }
+        }
+    }
+    (true, totals.credits[3])
+}
+
+#[test]
+fn a_saturated_lane_three_is_served_every_open_round() {
+    let (held, visits) = lane_three_is_served_every_round(Faults::default(), true);
+    assert!(held);
+    assert!(visits > 100, "{visits}");
+    // Negative controls: counting the gated rounds as owed, and a scheduler
+    // that restarts every call at lane 0, each break the property.
+    assert!(!lane_three_is_served_every_round(Faults::default(), false).0);
+    assert!(
+        !lane_three_is_served_every_round(
+            Faults {
+                restart_cursor: true,
+                ..Faults::default()
+            },
+            true
+        )
+        .0
+    );
+}
