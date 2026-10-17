@@ -26,12 +26,15 @@ mod guard_streams;
 pub mod guards;
 mod ledger;
 pub mod membership;
+mod network_journals;
 pub mod paths;
 mod positions;
 mod remote_generations;
+pub mod repair;
 pub mod rtt;
 pub mod schedule;
 pub mod sessions;
+pub mod sm_schedule;
 pub mod timed_gate;
 mod trace_journals;
 

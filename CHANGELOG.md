@@ -188,8 +188,11 @@ release may break APIs, wire formats and shared-memory layouts.
 - RTT observations (P2.7 B, reliable-transport.md, RC-1, ACS 15597):
   `karyos_driver::rtt::RttProbes` probes each path of an image with at most
   one outstanding RTTM REQUEST (random nonzero 64-bit ids from
-  `ProbeIds`, the operating system's in the driver, so an off-path
-  spoofer cannot forge a reply; a failed draw is counted),
+  `ProbeIds`, so an off-path spoofer cannot forge a reply; in the driver
+  a pool, `OsProbeIds`, drawn from the operating system on the control
+  path and restocked by `refill_ids` once at or below half full, so the
+  duty path makes no system call and a refill each control cycle is free
+  in steady state; an empty pool or failed draw is counted),
   samples only submitted probes from the time read before the submitting
   call to the validated reply, never subtracts `service_delay_ns`, raises a
   sample below `rtt_floor` to it, refuses a zero sample, keeps the largest
@@ -231,6 +234,61 @@ release may break APIs, wire formats and shared-memory layouts.
   within a bound with a fair
   cursor, and membership events are queued in a bounded queue. Not wired
   yet: the sender agent's SM handoff and gate.
+- Receiver SM schedule (P2.7, multicast-flow-control.md M3 and MC-6, ACS
+  15689): `karyos_driver::sm_schedule::SmSchedule`, one per image. It
+  makes the first SM due at once, then one every `sm_interval` (by
+  `age_ns`), and one as soon as a lane's consumption advances by a quarter
+  of its window. The SM reports, per lane, the larger of the given and the
+  last reported consumption, so it is never stale at the sender; a lower
+  value is counted as a regression. An SM is recorded only once sent, so
+  an unsent one stays due. Not wired yet: the receiver agent's SM path.
+- NAK admission at the sender (phase 6 R4, reliable-transport.md, ACS
+  15597, 15701 and 15711): `karyos_driver::repair::admission::Admission`
+  runs steps 1 to 5 of the eight-step order, the first failure deciding.
+  Context and the requester window drop with no reply, each counted: an
+  unreliable publication, an unknown requester or lane, a range below the
+  join point (counted apart before any accepted SM), below the
+  consumption (stale) or beyond `consumption + window`. A range leaving
+  its term, or beyond the NAK bound, answers `RANGE_INVALID`; one below
+  the floor answers `RANGE_UNAVAILABLE` with the floor, before the
+  frontier check. At most one ERR goes per receiver, lane and range
+  within `nak_reply_linger`, from a bounded table. A passing NAK is a
+  `Request` for the job table (R5). `Membership::requester` gives what a
+  NAK is checked against: a live member's join point, consumption and
+  window, or an expected entry's answered join point before its first SM
+  (`expect` now takes the answer's joins).
+- Repair jobs and coalescing (phase 6 R5, reliable-transport.md, RC-11,
+  ACS 15597 and 15701): `karyos_driver::repair::jobs::Jobs`, steps 6 and
+  7 of NAK admission. The key is the lane, the exact range and the
+  response domain (`Group`, or `Requester` with the receiver and its
+  membership generation); an exact duplicate joins the pending job and
+  adds its requester, and nothing wider merges. The linger
+  (`repair_linger`, 1 ms) starts at the last frame's submission and drops
+  duplicates without extending; a known failure or an uncertain
+  submission starts none. `repair_jobs` (64) and `repair_linger_entries`
+  (256) are bounded: a full table drops and counts. Jobs keep their
+  unsent cursor and a checked slot generation; requester lists are
+  allocated at construction.
+- Repair scheduling (phase 6 R7, reliable-transport.md, RC-12 and RC-13,
+  owner decision P3, ACS 15597 and 15701):
+  `karyos_driver::repair::scheduler::Scheduler` serves the pending jobs
+  with its own protocol `Drr` over the lanes, with the data path's quanta,
+  within the repair budget (64 KiB, 4096 word 0 loads), so a budget too
+  small for a head keeps the lane's deficit. Each lane serves its oldest
+  job from its cursor, one whole frame at a time, read through
+  `RepairRead` (a DATA frame charged its aligned length, PAD and ABORTED
+  32 bytes) and submitted through `RepairSubmit`. At each head, step 8 and
+  the end proof: `BadRequest` or an extent crossing the end answers
+  `RANGE_INVALID`, `Unavailable` or `Revoked` answers `RANGE_UNAVAILABLE`
+  with the floor read after, both to every requester; `CorruptTerm`,
+  `Retry` and `TooSmall` drop the job with no ERR. A submitted last frame
+  ends the job and starts its linger; an uncertain one ends it
+  unresolved; no room stops the call as backpressure. A probe reads at
+  most one head, so reads and ERRs stay within the loads budget; a known
+  failed submission holds its lane for the rest of the call; a head the
+  DRR would refuse is dropped and counted (ACS 15773). The round robin
+  across incarnations is the wiring's. Not wired yet, and the NAK read
+  origin in karyos-sys comes separately.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly

@@ -1330,6 +1330,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             join,
             time_namespace: TimeNamespace::Unknown,
             provenance,
+            network: None,
+            covers: false,
         };
         let (Ok(capacity), Ok(payload_words), Ok(drop_ranges)) = (
             usize::try_from(capacity),

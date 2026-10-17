@@ -93,17 +93,64 @@ fn the_configuration_is_validated() {
     }
 }
 
-/// The operating system's ids are nonzero and do not repeat in practice.
+/// The operating system's ids come from a pool drawn on the control path:
+/// nonzero, not repeating in practice; taking one makes no draw, an empty
+/// pool gives none, and a refill restocks it.
 #[test]
-fn os_probe_ids_are_random() {
-    let mut ids = OsProbeIds;
-    let drawn: Vec<u64> = (0..8).map(|_| ids.probe_id().unwrap()).collect();
+fn os_probe_ids_come_from_a_pool() {
+    let mut ids = OsProbeIds::new();
+    assert_eq!(ids.len(), ID_POOL);
+    let drawn: Vec<u64> = (0..ID_POOL).map(|_| ids.probe_id().unwrap()).collect();
+    assert!(ids.is_empty());
+    assert_eq!(ids.probe_id(), None);
     assert!(drawn.iter().all(|id| *id != 0));
     for (at, id) in drawn.iter().enumerate() {
         assert!(!drawn[at + 1..].contains(id));
     }
-    let mut probes = RttProbes::new(RttConfig::default(), 1).unwrap();
-    assert_ne!(probes.due(0, 0).unwrap().probe_id, 0);
+    ids.refill();
+    assert_eq!(ids.len(), ID_POOL);
+    // Above the low-water mark a refill draws nothing.
+    let held = ids.pool;
+    for _ in 0..ID_POOL - ID_LOW_WATER - 1 {
+        ids.probe_id();
+    }
+    assert_eq!(ids.len(), ID_LOW_WATER + 1);
+    ids.refill();
+    assert_eq!(ids.len(), ID_LOW_WATER + 1, "no draw above the mark");
+    assert_eq!(ids.pool, held);
+    // At the mark it restocks, keeping the ids at hand.
+    ids.probe_id();
+    ids.refill();
+    assert_eq!(ids.len(), ID_POOL);
+    assert_eq!(ids.pool[..ID_LOW_WATER], held[..ID_LOW_WATER]);
+}
+
+/// An image's probes drain the pool and fail, counted, until the control
+/// path refills it.
+#[test]
+fn probes_wait_for_a_refill() {
+    let mut probes = RttProbes::new(
+        RttConfig {
+            rtt_probe_timeout: 1,
+            rtt_initial: 1,
+            rtt_floor: 1,
+            rtt_probe_interval: 1,
+            ..RttConfig::default()
+        },
+        1,
+    )
+    .unwrap();
+    let mut now = 0;
+    for _ in 0..ID_POOL {
+        let probe = probes.due(0, now).unwrap();
+        assert_ne!(probe.probe_id, 0);
+        probes.not_submitted(probe);
+        now += 1;
+    }
+    assert_eq!(probes.due(0, now), None);
+    assert_eq!(probes.counts().id_failures, 1);
+    probes.refill_ids();
+    assert!(probes.due(0, now + 1).is_some());
 }
 
 /// One outstanding probe per path, one per interval, with ids from the

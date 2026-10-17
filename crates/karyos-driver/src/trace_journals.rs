@@ -56,6 +56,16 @@
 //!   `TraceJournalsExhausted`. Free entries are preferred, then ended
 //!   entries that need no log entry. Coverage advances once per duty
 //!   cycle, after the drain.
+//! - **Network journals (`trace-network.md` §4 and §5, NT-3).** The
+//!   driver's own journals of its sender and receiver agents (kinds 3 and
+//!   4) share the table and the mirror sequence, but are charged to their
+//!   own budget, `max_network_journal_bytes`, and live on the heap. A
+//!   refused one creates nothing and raises header word 7 of the mirror.
+//!   Their facts (the sender's `driver_id`, start, boundary and first gap)
+//!   are written at creation and when they change, on the control path.
+//!   A kind 3 entry, and a kind 4 entry of a publication this driver
+//!   sends, is reused only once covered as a subscriber journal is, with
+//!   no recycle log entry: it waits instead.
 //! - **A writer that is gone (J4).** When a remote client's journal grant
 //!   ends (its `Detach`, its exit proof, or a grant never sent), the driver
 //!   drains what is committed and marks the entry closed if the writer had
@@ -66,7 +76,7 @@ use karyos_sys::frame::Lane;
 use karyos_sys::record_journal::{Drained, JournalDrain, JournalLayout};
 use karyos_sys::trace_mirror::{
     JournalEntry, JournalKind, JournalState, MAX_MIRROR_PAYLOAD, MAX_RECYCLE_PAIRS, MIRROR_RANGES,
-    NotedPublisher, RecycledJournal, TimeNamespace, TraceMirror, TraceMirrorReader,
+    NetworkFacts, NotedPublisher, RecycledJournal, TimeNamespace, TraceMirror, TraceMirrorReader,
 };
 
 use crate::counters::{DriverCounters, Event};
@@ -103,6 +113,12 @@ pub(crate) struct Observed {
     pub(crate) time_namespace: TimeNamespace,
     /// The client's clock provenance word.
     pub(crate) provenance: u64,
+    /// A network journal's facts; `None` for a client journal.
+    pub(crate) network: Option<NetworkFacts>,
+    /// Whether a network journal waits for T5 coverage before its entry is
+    /// reused: a sender journal, or a receiver journal of a publication
+    /// this driver sends.
+    pub(crate) covers: bool,
 }
 
 /// A publisher journal noted when a subscriber journal ended.
@@ -139,11 +155,15 @@ struct Held {
     /// `None` once the journal ended: drained to its close, faulted, or
     /// its writer gone.
     drain: Option<JournalDrain>,
-    /// Bytes charged to `max_trace_journal_bytes` while `drain` lives.
+    /// Bytes charged to its kind's budget while `drain` lives:
+    /// `max_trace_journal_bytes` for a client journal,
+    /// `max_network_journal_bytes` for a network journal.
     bytes: u64,
-    /// For a subscriber journal that ended: the publisher journals noted at
-    /// its end.
+    /// For a subscriber journal, or a network journal that `covers`, that
+    /// ended: the publisher journals noted at its end.
     notes: Option<Vec<Note>>,
+    /// See [`Observed::covers`].
+    covers: bool,
 }
 
 impl Held {
@@ -167,6 +187,20 @@ fn release(held: u64, bytes: u64, counters: &DriverCounters) -> u64 {
     })
 }
 
+/// Counts a refused network journal in the driver counters, and an
+/// overflow when the mirror's header count could not rise (`header_rose`
+/// false): the refusal is never silent (ACS 15639).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the agents in P2.12 step 3")
+)]
+fn count_refusal(header_rose: bool, counters: &DriverCounters) {
+    if !header_rose {
+        counters.add(Event::CounterOverflows, 1);
+    }
+    counters.add(Event::NetworkTraceJournalsRefused, 1);
+}
+
 /// A table entry [`TraceJournals::preflight`] found for a new journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Reserved {
@@ -180,6 +214,8 @@ pub(crate) struct Reserved {
     total: u64,
     /// The journal's sequence and the next one (checked here).
     sequence: (u64, u64),
+    /// Charged to the network budget.
+    network: bool,
 }
 
 impl Reserved {
@@ -200,6 +236,9 @@ pub(crate) struct TraceJournals {
     cursor: usize,
     bytes: u64,
     max_bytes: u64,
+    /// Bytes of the network journals held, within `max_net_bytes`.
+    net_bytes: u64,
+    max_net_bytes: u64,
     budget: usize,
     /// The mirror sequence of the next journal created (T7): its own
     /// counter, advanced only by [`TraceJournals::insert`], so the
@@ -221,7 +260,12 @@ pub(crate) fn journal_bytes(layout: &JournalLayout) -> Option<u64> {
 
 impl TraceJournals {
     /// The table over `mirror`, with the driver's limits.
-    pub(crate) fn new(mirror: TraceMirror, max_bytes: u64, budget: usize) -> Self {
+    pub(crate) fn new(
+        mirror: TraceMirror,
+        max_bytes: u64,
+        max_net_bytes: u64,
+        budget: usize,
+    ) -> Self {
         let mut slots = Vec::with_capacity(mirror.entries());
         slots.resize_with(mirror.entries(), || None);
         let mut log = Vec::with_capacity(mirror.log_entries());
@@ -233,6 +277,8 @@ impl TraceJournals {
             cursor: 0,
             bytes: 0,
             max_bytes,
+            net_bytes: 0,
+            max_net_bytes,
             budget,
             next_sequence: 1,
         }
@@ -260,12 +306,23 @@ impl TraceJournals {
             .and_then(JournalDrain::region)
     }
 
-    /// Journals still open.
+    /// Client journals still open.
     pub(crate) fn open(&self) -> usize {
+        self.open_where(false)
+    }
+
+    /// Network journals still open.
+    pub(crate) fn network_open(&self) -> usize {
+        self.open_where(true)
+    }
+
+    fn open_where(&self, network: bool) -> usize {
         self.slots
             .iter()
             .flatten()
-            .filter(|held| held.entry.state == JournalState::Open)
+            .filter(|held| {
+                held.entry.state == JournalState::Open && held.entry.kind.is_network() == network
+            })
             .count()
     }
 
@@ -274,11 +331,27 @@ impl TraceJournals {
     /// the module documentation, "Recycling"). Returns the entry, the
     /// bytes it would charge and the recycle log entry its reuse fills.
     pub(crate) fn preflight(&self, layout: &JournalLayout) -> Result<Reserved, Refusal> {
+        self.preflight_for(layout, false)
+    }
+
+    /// [`TraceJournals::preflight`] for a network journal, against
+    /// `max_network_journal_bytes`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "called by the agents in P2.12 step 3")
+    )]
+    pub(crate) fn preflight_network(&self, layout: &JournalLayout) -> Result<Reserved, Refusal> {
+        self.preflight_for(layout, true)
+    }
+
+    fn preflight_for(&self, layout: &JournalLayout, network: bool) -> Result<Reserved, Refusal> {
         let bytes = journal_bytes(layout).ok_or(Refusal::Resources)?;
-        let total = self
-            .bytes
-            .checked_add(bytes)
-            .filter(|total| *total <= self.max_bytes);
+        let (held, max) = if network {
+            (self.net_bytes, self.max_net_bytes)
+        } else {
+            (self.bytes, self.max_bytes)
+        };
+        let total = held.checked_add(bytes).filter(|total| *total <= max);
         let sizes = layout.validate().is_ok()
             && layout.payload_words <= MAX_MIRROR_PAYLOAD
             && layout.drop_ranges <= MIRROR_RANGES;
@@ -308,6 +381,8 @@ impl TraceJournals {
                         && held.entry.last_record.is_none_or(|last| last < oldest) =>
                 {
                     match &held.notes {
+                        // A network entry is never logged: it waits.
+                        Some(notes) if held.covers && !covered(notes, oldest) => None,
                         Some(notes) if !covered(notes, oldest) => free_log
                             .filter(|_| notes.len() <= MAX_RECYCLE_PAIRS)
                             .map(|log| (2, Some(log))),
@@ -327,6 +402,7 @@ impl TraceJournals {
                         log,
                         total,
                         sequence,
+                        network,
                     },
                 ));
             }
@@ -354,6 +430,7 @@ impl TraceJournals {
             log,
             total,
             sequence: (sequence, next_sequence),
+            network,
         } = reserved;
         let layout = drain.layout();
         let mut entry = JournalEntry::open(
@@ -370,6 +447,7 @@ impl TraceJournals {
         entry.join = observed.join;
         entry.time_namespace = observed.time_namespace;
         entry.provenance = observed.provenance;
+        entry.network = observed.network;
         // Both checked by `preflight`, which nothing changed since.
         entry.sequence = sequence;
         self.next_sequence = next_sequence;
@@ -408,13 +486,62 @@ impl TraceJournals {
             *free = Some(notes);
         }
         self.mirror.write_entry(index, Some(&entry));
-        self.bytes = total;
+        if network {
+            self.net_bytes = total;
+        } else {
+            self.bytes = total;
+        }
         *slot = Some(Held {
             entry,
             drain: Some(drain),
             bytes,
             notes: None,
+            covers: observed.covers,
         });
+    }
+
+    /// Counts a refused network journal in the mirror's header word 7 and
+    /// in the driver counters; a header count that cannot rise is counted
+    /// as an overflow, never silently (ACS 15639).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "called by the agents in P2.12 step 3")
+    )]
+    pub(crate) fn refuse_network(&mut self, counters: &DriverCounters) {
+        count_refusal(self.mirror.refuse_network_journal(), counters);
+    }
+
+    /// Updates the facts of network journal `journal` with `update` and
+    /// rewrites its entry; `false` (nothing changed) for a journal that is
+    /// not a network journal in the table.
+    pub(crate) fn update_network(
+        &mut self,
+        journal: u64,
+        update: impl FnOnce(&mut NetworkFacts),
+    ) -> bool {
+        let found = self.slots.iter_mut().enumerate().find_map(|(index, slot)| {
+            slot.as_mut()
+                .filter(|held| held.entry.journal == journal)
+                .map(|held| (index, held))
+        });
+        let Some((index, held)) = found else {
+            return false;
+        };
+        let Some(facts) = held.entry.network.as_mut() else {
+            return false;
+        };
+        update(facts);
+        self.mirror.write_entry(index, Some(&held.entry))
+    }
+
+    /// The bytes held once `held`, which ended, releases its charge from
+    /// its budget.
+    fn release_held(&mut self, network: bool, bytes: u64, counters: &DriverCounters) {
+        if network {
+            self.net_bytes = release(self.net_bytes, bytes, counters);
+        } else {
+            self.bytes = release(self.bytes, bytes, counters);
+        }
     }
 
     /// Subscriber journal `index` ended: notes every publisher journal of
@@ -425,7 +552,8 @@ impl TraceJournals {
         let Some(Some(subscriber)) = self.slots.get(index) else {
             return;
         };
-        if subscriber.entry.kind != JournalKind::Subscriber || subscriber.notes.is_some() {
+        let noted = subscriber.entry.kind == JournalKind::Subscriber || subscriber.covers;
+        if !noted || subscriber.notes.is_some() {
             return;
         }
         let (stream, incarnation, lane) = (
@@ -587,8 +715,9 @@ impl TraceJournals {
         {
             drop(drain);
             held.entry.state = JournalState::WriterLost;
-            self.bytes = release(self.bytes, held.bytes, counters);
+            let (network, bytes) = (held.entry.kind.is_network(), held.bytes);
             self.mirror.write_entry(index, Some(&held.entry));
+            self.release_held(network, bytes, counters);
             self.note_end(index);
         }
     }
@@ -730,12 +859,13 @@ impl TraceJournals {
             }
             held.drain = None;
             held.entry.state = state;
-            self.bytes = release(self.bytes, held.bytes, counters);
         }
+        let (network, bytes) = (held.entry.kind.is_network(), held.bytes);
         if held.entry != before {
             self.mirror.write_entry(index, Some(&held.entry));
         }
         if ended_now {
+            self.release_held(network, bytes, counters);
             self.note_end(index);
         }
         taken
