@@ -3296,3 +3296,95 @@ fn a_faulted_founding_route_that_goes_leaves_the_later_path_naking() {
     }
     assert_eq!(rig.agents.receiver.counters().reset_requests, resets);
 }
+
+/// T10 (contract-traceability-phase-2.md, "Challenge lifecycle"): a SETUP
+/// replayed through the liveness timeout neither keeps the image alive nor
+/// blocks a rebind. With the publication silent (its guard closed), the
+/// old ANNOUNCE delivered again every second is dropped and counted while
+/// the image is bound, the image still retires at `image_liveness_timeout`,
+/// the replays after that meet the quarantine (counted, no challenge), and
+/// a new incarnation binds a new image through its own challenge.
+#[test]
+fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let (mut rig, b) = Rig::new(Setup {
+        guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::new(AppliedEpoch::new()),
+            epoch: 2,
+            rate: None,
+        }),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    // The publication goes silent: no DATA, no heartbeat.
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let challenges = rig.agents.receiver.role.session_counters().challenges;
+    let dropped = rig.agents.receiver.role.session_counters().dropped;
+    let replay = |rig: &mut Rig| {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            b,
+            source,
+            karyos_protocol::network::Control::SetupAnnounce(announce(65_536)),
+            rig.now,
+        );
+    };
+    // One replay a second, through the liveness timeout and past it.
+    let mut replays = 0u64;
+    let mut retired_after = None;
+    for second in 1..=12u64 {
+        rig.now += 1_000 * MS;
+        replay(&mut rig);
+        replays += 1;
+        rig.round(true);
+        if retired_after.is_none() && !rig.agents.receiver.role.has_image(slot) {
+            retired_after = Some(second);
+        }
+    }
+    let retired_after = retired_after.expect("the replays kept the image alive");
+    assert!(retired_after <= 11, "retired after {retired_after} s");
+    assert_eq!(rig.agents.receiver.counters().images_retired, 1);
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert_eq!(sessions.dropped, dropped + replays, "every replay counted");
+    assert_eq!(sessions.challenges, challenges, "no replay challenged");
+    // A new incarnation binds a new image.
+    let installed = rig
+        .events
+        .iter()
+        .filter(|event| matches!(event, ImageEvent::Installed { .. }))
+        .count();
+    rig.reannounce(
+        b,
+        SetupAnnounce {
+            identity: Identity {
+                incarnation: 2,
+                ..identity()
+            },
+            ..announce(65_536)
+        },
+    );
+    rig.until(true, |rig| {
+        rig.events
+            .iter()
+            .filter(|event| matches!(event, ImageEvent::Installed { .. }))
+            .count()
+            == installed + 1
+    });
+    assert_eq!(
+        rig.agents.receiver.role.session_counters().challenges,
+        challenges + 1
+    );
+}
