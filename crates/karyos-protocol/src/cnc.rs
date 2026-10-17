@@ -2158,6 +2158,34 @@ mod tests {
         assert_eq!(CloseReason::from_seal(SealReason::GuardClosed), None);
     }
 
+    /// A `PublicationClosed` whose reason code this build does not know is
+    /// a typed decode error (`CncError::Reserved`), never a panic: what a
+    /// build from before `EndOfStream` (code 8) decodes for an image's
+    /// clean end. The client skips such an event.
+    #[test]
+    fn a_close_reason_this_build_does_not_know_is_a_typed_decode_error() {
+        let event = Event::PublicationClosed {
+            stream: stream(),
+            lane: Lane::ZERO,
+            reason: CloseReason::StreamRemoved,
+        };
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let length = event.encode(&mut out).unwrap();
+        for code in [9u64, 200, u64::MAX] {
+            let mut bytes = out;
+            bytes[8..16].copy_from_slice(&code.to_le_bytes());
+            assert_eq!(
+                Event::decode(event.type_id(), &bytes[..length]),
+                Err(CncError::Reserved {
+                    type_id: event.type_id()
+                })
+            );
+        }
+        assert_eq!(CloseReason::from_code(9), None);
+        // Code 8 is known to this build.
+        assert_eq!(CloseReason::from_code(8), Some(CloseReason::EndOfStream));
+    }
+
     fn stream() -> StreamKey {
         StreamKey {
             stream_id: -2,

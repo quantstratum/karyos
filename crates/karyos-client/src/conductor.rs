@@ -1752,4 +1752,48 @@ mod tests {
         // Taken and dropped: its lease ended.
         assert_eq!(leases.live(), 0);
     }
+
+    /// A driver event the client cannot decode, here a `PublicationClosed`
+    /// whose close reason this build does not know, is skipped: the poll
+    /// goes on, later events are queued, and the conductor stays open.
+    /// This is what a build from before `EndOfStream` (code 8) does with an
+    /// image's clean end; its handles still close on the final seal,
+    /// which needs no event (ADR-0061).
+    #[test]
+    fn an_event_with_an_unknown_close_reason_is_skipped() {
+        let mut transmitter = broadcast(4096).unwrap();
+        let (producer, _consumer) = command_ring(1024).unwrap();
+        let link = Arc::new(ClientLink::<karyos_sys::term_bytes::HeapTerms>::new());
+        let owner = Owner {
+            driver: 1,
+            client: 1,
+        };
+        let mut client = ClientConductor::new(owner, producer, transmitter.receiver(), link, 4);
+        let closed = |reason| Event::PublicationClosed {
+            stream: StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            lane: Lane::ZERO,
+            reason,
+        };
+        let known = closed(karyos_protocol::cnc::CloseReason::StreamRemoved);
+        let mut payload = [0u8; karyos_protocol::cnc::MAX_EVENT_LENGTH];
+        let length = known.encode(&mut payload).unwrap();
+        let mut unknown = payload;
+        unknown[8..16].copy_from_slice(&200u64.to_le_bytes());
+        let _ = transmitter
+            .transmit(known.type_id(), &unknown[..length])
+            .unwrap();
+        let _ = transmitter
+            .transmit(known.type_id(), &payload[..length])
+            .unwrap();
+        let poll = client.poll(usize::MAX, |_| {});
+        assert_eq!(poll.records, 2, "{poll:?}");
+        let events: Vec<Event> = client.take_events().collect();
+        assert_eq!(events, [known]);
+        assert!(!client.closed());
+        let _ = client.poll(usize::MAX, |_| {});
+        assert_eq!(client.take_events().count(), 0);
+    }
 }

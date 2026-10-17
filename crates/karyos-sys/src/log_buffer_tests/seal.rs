@@ -823,3 +823,33 @@ fn a_claim_admitted_after_the_close_is_aborted_by_the_repeat() {
     claim.payload().fill(7);
     assert_eq!(claim.commit(), CommitOutcome::Aborted { position });
 }
+
+/// A seal reason code this build does not know reads as `Unspecified`, both
+/// from the code and from a sealed buffer's reason word, so a reader closes
+/// with a typed reason and never fails. This is what a build from before
+/// `EndOfStream` (code 8) sees for an image's clean end: a closed lane,
+/// with no claim of a clean end.
+#[test]
+fn an_unknown_seal_reason_reads_as_unspecified() {
+    for code in [9, 200, u64::MAX] {
+        assert_eq!(SealReason::from_code(code), SealReason::Unspecified);
+    }
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    // A newer conductor's code: stored, then a seal that writes no reason
+    // of its own.
+    buffer.seal_reason_word().store(200, Ordering::Relaxed);
+    conductor.seal().unwrap();
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.seal_reason(), Some(SealReason::Unspecified));
+    for _ in 0..2 {
+        assert_eq!(
+            poll(&mut subscription),
+            PollOutcome::Closed {
+                position: 0,
+                reason: SealReason::Unspecified
+            }
+        );
+    }
+}
