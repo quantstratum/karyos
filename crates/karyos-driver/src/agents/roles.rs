@@ -100,7 +100,10 @@ use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
 use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
 use crate::repair::admission::Requester;
-use crate::repair::loss::{Hole, ImageLoss, LossConfig, Observation, ReplyOutcome as NakOutcome};
+use crate::repair::draw::OsDelayDraw;
+use crate::repair::loss::{
+    Hole, ImageLoss, LossConfig, MulticastConfig, Observation, ReplyOutcome as NakOutcome,
+};
 use crate::rtt::{Probe, ReplyOutcome, RttConfig, RttProbes, RttReplies};
 use crate::sessions::OsNonces;
 use crate::sessions::rate::{EndpointRates, RateRefused, TotalRate, normalized};
@@ -208,6 +211,15 @@ pub struct ReceiverCounters {
     /// on the receiver agent's timer step, a known deviation until the
     /// agents have a control thread (ACS 15868).
     pub rttm_id_draws: u64,
+    /// NAK delay pool refills that drew from the operating system, on the
+    /// timer step like `rttm_id_draws` (RC-2).
+    pub nak_delay_draws: u64,
+    /// Multicast NAK delays drawn from an empty pool: the cycle's bound was
+    /// used, so the NAK went at its latest deadline (RC-2).
+    pub nak_delay_empty: u64,
+    /// Multicast NAK cycles started (RC-2): a hole's first, and each one
+    /// after a window ended with the hole still there.
+    pub nak_cycles: u64,
     /// NAKs handed to the sender (phase 6, reliable images).
     pub naks: u64,
     /// NAKs not handed over: the control ring was full (each stays due).
@@ -366,11 +378,10 @@ pub struct ReceiverRole {
     nonces: OsNonces,
     to_sender: RingSender<ControlItem>,
     budget: Budget,
-    /// Subscribed streams per endpoint, with their largest accepted image
-    /// term length.
     /// Subscribed streams: endpoint, stream, largest image term length,
-    /// and whether the channel is reliable (its `reliable` parameter).
-    subscriptions: Vec<(EndpointId, i32, u32, bool)>,
+    /// whether the channel is reliable (its `reliable` parameter), and
+    /// whether the endpoint receives a multicast group.
+    subscriptions: Vec<(EndpointId, i32, u32, bool, bool)>,
     /// Whether a subscription was ever removed: from then on each cycle
     /// retires the images of streams no longer subscribed (bounded by the
     /// subscription table).
@@ -397,6 +408,11 @@ pub struct ReceiverRole {
     path_config: PathConfig,
     /// Each image's RTT probes' settings.
     rtt: RttConfig,
+    /// A multicast image's NAK timing.
+    multicast: MulticastConfig,
+    /// The multicast NAK delays, drawn from a pool restocked on the timer
+    /// step (RC-2).
+    delays: OsDelayDraw,
     /// The clock read when a REPLY is validated.
     clock: fn() -> u64,
     counters: ReceiverCounters,
@@ -952,6 +968,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
                 ..PathConfig::default()
             },
             rtt: config.rtt,
+            multicast: config.multicast,
+            delays: OsDelayDraw::new(),
             clock: karyos_sys::host_clock::host_monotonic_ns,
             counters: ReceiverCounters::default(),
             trace: super::net_trace::ReceiverTrace::default(),
@@ -1011,6 +1029,7 @@ impl ReceiverRole {
                 stream_id,
                 max_term_length,
                 reliable,
+                multicast,
             } => {
                 let held = self
                     .subscriptions
@@ -1027,8 +1046,13 @@ impl ReceiverRole {
                         true
                     }
                     None if !full => {
-                        self.subscriptions
-                            .push((endpoint, stream_id, max_term_length, reliable));
+                        self.subscriptions.push((
+                            endpoint,
+                            stream_id,
+                            max_term_length,
+                            reliable,
+                            multicast,
+                        ));
                         true
                     }
                     None => false,
@@ -1248,6 +1272,19 @@ impl ReceiverRole {
     #[cfg(test)]
     pub(super) fn set_clock(&mut self, clock: fn() -> u64) {
         self.clock = clock;
+    }
+
+    /// Fixes the multicast NAK delay draw (tests): `delay`, or the
+    /// cycle's bound if smaller.
+    #[cfg(test)]
+    pub(super) fn fix_nak_delay(&mut self, delay: u64) {
+        self.delays.fix(delay);
+    }
+
+    /// The bound of the last multicast NAK delay drawn (tests).
+    #[cfg(test)]
+    pub(super) fn last_nak_delay_bound(&self) -> Option<u64> {
+        self.delays.last_bound()
     }
 
     /// The repair counters of the image at `slot` (tests).
@@ -1470,23 +1507,33 @@ impl ReceiverRole {
             .collect();
         // Its repair state, allocated here: reliability is the
         // subscription channel's (ACS 15984).
-        let reliable = self
+        let subscription = self
             .subscriptions
             .iter()
-            .find(|(held, stream, ..)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
-            .is_none_or(|(.., reliable)| *reliable);
+            .find(|(held, stream, ..)| (*held, *stream) == (key.endpoint, key.alias.stream_id));
+        let reliable = subscription.is_none_or(|(_, _, _, reliable, _)| *reliable);
+        let multicast = subscription.is_some_and(|(.., multicast)| *multicast);
         let receiver = Receiver {
             receiver_boot_id: self.sessions.boot_id(),
             receiver_id: receiver_id(installed),
         };
-        let Ok(loss) = ImageLoss::new(
+        // A multicast image times its NAKs by cycle (RC-2).
+        let loss = ImageLoss::new(
             LossConfig::default(),
             key.alias,
             identity,
             receiver,
             chain.lane_count,
             0,
-        ) else {
+        )
+        .and_then(|loss| {
+            if multicast {
+                loss.multicast(self.multicast)
+            } else {
+                Ok(loss)
+            }
+        });
+        let Ok(loss) = loss else {
             return Err(Some(chain.retire));
         };
         let skip_config = if reliable {
@@ -1545,6 +1592,15 @@ impl ReceiverRole {
     fn image_timers(&mut self, sessions: &SessionEnd, now: u64) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
         let mut work = 0u32;
+        // The multicast NAK delays: restocked here, never per datagram.
+        if self.delays.refill() {
+            self.count(|c| &mut c.nak_delay_draws);
+        }
+        let (empty, overflowed) = self.delays.take_empty();
+        match self.counters.nak_delay_empty.checked_add(empty) {
+            Some(total) if !overflowed => self.counters.nak_delay_empty = total,
+            _ => self.counters.overflowed = true,
+        }
         let mut index = 0usize;
         while let Some(image) = self.images.get(index) {
             let unsubscribed = self.unsubscribed
@@ -1679,7 +1735,11 @@ impl ReceiverRole {
     /// The repair step of the image at `index` at `now` (phase 6). On a
     /// reliable image each lane's last NAK report is settled, its first
     /// hole observed, and a due NAK handed to the sender, at most one per
-    /// lane in the ring, to the binding's source. Then the skip policy runs
+    /// lane in the ring, to the binding's source. On a multicast image a
+    /// hole's NAK is due only once its cycle's drawn delay has passed
+    /// (RC-2), and the next cycle starts when the window ends with the hole
+    /// still there; the delays come from a pool restocked on the timer
+    /// step. Then the skip policy runs
     /// on every image: timer seals on an unreliable one, the far-window
     /// close. A close is carried out by the next timer step. Returns the
     /// NAKs handed over.
@@ -1692,6 +1752,7 @@ impl ReceiverRole {
             images,
             to_sender,
             counters,
+            delays,
             #[cfg(test)]
             posted_naks,
             ..
@@ -1749,6 +1810,13 @@ impl ReceiverRole {
             } = image.loss.observe(lane, hole, now)
             {
                 unrecoverable(image, counters, lane, hole, lowest_retained, now);
+            }
+            // A multicast hole's NAK waits for its cycle's drawn delay; a
+            // no-op on a unicast image.
+            let cycles = image.loss.counters().cycles;
+            image.loss.cycle(lane, now, &image.rtt, delays);
+            if image.loss.counters().cycles > cycles {
+                tally(counters, |c| &mut c.nak_cycles);
             }
             let Some(report) = image.naks.get_mut(at) else {
                 continue;
@@ -2398,7 +2466,7 @@ impl Intake<'_> {
                     .find(|(held, stream, ..)| {
                         (*held, *stream) == (endpoint, announce.alias.stream_id)
                     })
-                    .map(|(_, _, max, _)| *max)
+                    .map(|(_, _, max, ..)| *max)
                 else {
                     self.role.count(|c| &mut c.unsubscribed);
                     return;
@@ -2433,7 +2501,7 @@ impl Intake<'_> {
                     .find(|(held, stream, ..)| {
                         (*held, *stream) == (endpoint, answer.alias.stream_id)
                     })
-                    .map(|(_, _, max, _)| *max)
+                    .map(|(_, _, max, ..)| *max)
                 else {
                     self.role.count(|c| &mut c.unsubscribed);
                     return;
