@@ -11,6 +11,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-bench` measures the Archive's write and sync cost on a real disk
+  (phase 3 follow-up): `archive-append` appends to a segment store that
+  never syncs, `archive-sync` syncs after every append. They run only
+  when named with `--workload`, in a removed temporary directory or under
+  `KARYOS_BENCH_DIR`. Their records name the directory, its filesystem,
+  the policy and whether syncs are `F_FULLFSYNC`, and compare only under
+  the same host and filesystem; no gate reads them.
 - `karyos-archive` gains its recorder and agent (phase 3, A4b). A
   `Recorder` copies a lane's committed frames from a `FrameSource` into
   its recording's segment store: data, a padding or aborted block as a
