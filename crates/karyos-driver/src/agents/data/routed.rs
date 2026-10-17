@@ -52,6 +52,15 @@ pub struct PathPolicy {
     /// `path_skip_min_bytes`: the bytes selected in the window before a
     /// path can leave (default 64 KiB, at least 1).
     pub skip_min_bytes: u64,
+    /// `path_backoff_initial` in ns: a left path's first wait before it
+    /// returns (RP-9; default 10 ms, at least 1).
+    pub backoff_initial: u64,
+    /// `path_backoff_max` in ns: the wait doubles up to it (default 1 s, at
+    /// least `backoff_initial`).
+    pub backoff_max: u64,
+    /// `path_backoff_reset` in ns: live this long, a path's wait starts
+    /// over at `backoff_initial` (default 10 s, at least 1).
+    pub backoff_reset: u64,
 }
 
 impl Default for PathPolicy {
@@ -60,6 +69,9 @@ impl Default for PathPolicy {
             lag_limit: 100_000_000,
             skip_percent: 50,
             skip_min_bytes: 64 * 1024,
+            backoff_initial: 10_000_000,
+            backoff_max: 1_000_000_000,
+            backoff_reset: 10_000_000_000,
         }
     }
 }
@@ -69,6 +81,8 @@ impl Default for PathPolicy {
 pub struct PathCounters {
     /// Times it left the live set.
     pub exits: u64,
+    /// Times it returned to the live set (RP-9).
+    pub entries: u64,
     /// Times it became `Degraded`: it skipped something in the window.
     pub degraded: u64,
     /// Copies it held alone when it left: no live path sends them, so the
@@ -132,11 +146,13 @@ impl PathWindow {
 /// its never-exposed copies of `lanes` lanes back through `gate` (the guard's
 /// ring settles), and those it held alone counted abandoned. Returns whether
 /// the cancel failed.
+#[allow(clippy::too_many_arguments, reason = "one step over the routed state")]
 fn leave<R: Routes, G: LaneGate>(
     sender: &mut RoutedLaneSender,
     routes: &mut [RouteSlot],
     index: usize,
     lanes: usize,
+    (policy, now): (PathPolicy, u64),
     lent: &mut R,
     gate: &mut G,
 ) -> bool {
@@ -144,6 +160,19 @@ fn leave<R: Routes, G: LaneGate>(
         return false;
     };
     slot.left = true;
+    slot.left_at = now;
+    slot.returning = false;
+    slot.live_since = None;
+    // RP-9: the wait doubles at each exit, up to its maximum.
+    slot.backoff = if slot.backoff == 0 {
+        policy.backoff_initial
+    } else {
+        match slot.backoff.checked_mul(2) {
+            Some(doubled) => doubled.min(policy.backoff_max),
+            // Past u64: past the maximum too.
+            None => policy.backoff_max,
+        }
+    };
     slot.stall_since = None;
     slot.degraded = false;
     slot.window = PathWindow::default();
@@ -195,6 +224,15 @@ pub(super) struct RouteSlot {
     /// and has not sent it while another path holds later copies (ACS
     /// 16856). Any submit on it ends the stall.
     stall_since: Option<u64>,
+    /// Its current backoff in ns: 0 before its first exit (RP-9).
+    backoff: u64,
+    /// When it left.
+    left_at: u64,
+    /// It returned and has submitted nothing yet: it does not bound
+    /// `sent_low` until then (RP-9).
+    returning: bool,
+    /// Since when it is live again, from its first submit after a return.
+    live_since: Option<u64>,
     counters: PathCounters,
 }
 
@@ -212,6 +250,9 @@ pub(super) struct RoutedTrack {
     unknown: [bool; MAX_ROUTES],
     /// Per route: a copy was submitted this call.
     sent: [bool; MAX_ROUTES],
+    /// Per route: its frontier `sent_p`, the position past the last frame
+    /// it submitted or skipped (a skipped frame counts as passed, RP-8).
+    sent_p: [u64; MAX_ROUTES],
 }
 
 /// One to [`MAX_ROUTES`] routes, each on its own endpoint: each route's TX
@@ -284,6 +325,10 @@ impl Routed {
                     degraded: false,
                     left: false,
                     stall_since: None,
+                    backoff: 0,
+                    left_at: 0,
+                    returning: false,
+                    live_since: None,
                     counters: PathCounters::default(),
                 })
                 .collect(),
@@ -294,6 +339,7 @@ impl Routed {
                     mismatched: false,
                     unknown: [false; MAX_ROUTES],
                     sent: [false; MAX_ROUTES],
+                    sent_p: [0; MAX_ROUTES],
                 })
                 .collect(),
             scratch: vec![0; mtu],
@@ -460,6 +506,9 @@ impl LaneGate for RoutedGate<'_> {
                 if let Some(sent) = track.sent.get_mut(route) {
                     *sent = true;
                 }
+                if let Some(frontier) = track.sent_p.get_mut(route) {
+                    *frontier = (*frontier).max(next);
+                }
             }
             (Some((route, _)), Left::Unknown) => {
                 if let Some(unknown) = track.unknown.get_mut(route) {
@@ -594,6 +643,22 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             .as_deref()
             .and_then(|routed| routed.routes.get(route))
             .map(|route| (!route.left, route.degraded))
+    }
+
+    /// Lane `lane`'s `sent_low`: the least frontier over its live paths, a
+    /// returning path not counted until it submits (RP-9); `None` on one
+    /// path or with no live path.
+    #[must_use]
+    pub fn sent_low(&self, lane: usize) -> Option<u64> {
+        let routed = self.routed.as_deref()?;
+        let track = routed.tracks.get(lane)?;
+        routed
+            .routes
+            .iter()
+            .zip(&track.sent_p)
+            .filter(|(route, _)| !route.left && !route.returning)
+            .map(|(_, frontier)| *frontier)
+            .min()
     }
 
     /// Path `route` takes no copy of the next `count` datagrams, as if its
@@ -947,11 +1012,17 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     if slot.left {
                         continue;
                     }
-                    let skipped = if took.get(route).is_some_and(|took| *took) {
-                        0
-                    } else {
-                        charge
-                    };
+                    let took_it = took.get(route).is_some_and(|took| *took);
+                    // A skipped frame counts as passed for its frontier.
+                    if !took_it
+                        && let Some(frontier) = routed
+                            .tracks
+                            .get_mut(lane)
+                            .and_then(|track| track.sent_p.get_mut(route))
+                    {
+                        *frontier = (*frontier).max(next);
+                    }
+                    let skipped = if took_it { 0 } else { charge };
                     if !slot
                         .window
                         .record(now, routed.policy.lag_limit, charge, skipped)
@@ -1033,6 +1104,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 &mut routed.routes,
                 index,
                 self.readers.len(),
+                (routed.policy, now),
                 &mut lent,
                 &mut gate,
             );
@@ -1067,7 +1139,33 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 continue;
             };
             if slot.left {
+                // RP-9: back after its backoff, on its open queue, from the
+                // current selection point; live once it submits again.
+                let due = slot
+                    .left_at
+                    .checked_add(slot.backoff)
+                    .is_some_and(|due| now >= due);
+                if due {
+                    slot.left = false;
+                    slot.returning = true;
+                    slot.window = PathWindow::default();
+                    bump_path(&mut slot.counters.entries, &mut slot.counters.overflowed);
+                    routed.sender.set_live(index, true);
+                }
                 continue;
+            }
+            if submitted.get(index).is_some_and(|sent| *sent) {
+                if std::mem::take(&mut slot.returning) {
+                    slot.live_since = Some(now);
+                }
+                // Live long enough, its wait starts over (RP-9).
+                if slot.live_since.is_some_and(|since| {
+                    now.checked_sub(since)
+                        .is_some_and(|live| live >= policy.backoff_reset)
+                }) {
+                    slot.backoff = 0;
+                    slot.live_since = None;
+                }
             }
             let Some((selected, skipped)) = slot.window.sums(now, policy.lag_limit) else {
                 slot.counters.overflowed = true;
@@ -1105,6 +1203,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 &mut routed.routes,
                 index,
                 self.readers.len(),
+                (policy, now),
                 &mut lent,
                 &mut gate,
             ) {

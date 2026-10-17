@@ -623,6 +623,7 @@ fn policy() -> super::super::PathPolicy {
         lag_limit: 1_000_000,
         skip_percent: 50,
         skip_min_bytes: 8 * FRAME,
+        ..super::super::PathPolicy::default()
     }
 }
 
@@ -844,4 +845,117 @@ fn a_close_after_a_leave_does_not_wait_on_the_left_path() {
     let applied = cell.try_read().unwrap();
     assert_eq!(applied.epoch, 3);
     assert_eq!(applied.in_flight, 0, "nothing waits on the left path");
+}
+
+/// RP-9 test policy: backoffs of 10 ns doubling to 40 ns, reset after
+/// 100 ns live; leaving by the hook only.
+fn return_policy() -> super::super::PathPolicy {
+    super::super::PathPolicy {
+        backoff_initial: 10,
+        backoff_max: 40,
+        backoff_reset: 100,
+        ..policy()
+    }
+}
+
+/// RP-9: a flapping path backs off 10, 20, 40 and then 40 again (the
+/// maximum), counting every exit and entry.
+#[test]
+fn a_flapping_path_backs_off_doubling_to_the_maximum() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, _log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    let mut now = 1000;
+    for wait in [10u64, 20, 40, 40] {
+        outbound.leave_before_serve(1);
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+        assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now + wait - 1)
+            .unwrap();
+        assert_eq!(
+            outbound.path_state(1).map(|state| state.0),
+            Some(false),
+            "still waiting at {wait} - 1"
+        );
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now + wait)
+            .unwrap();
+        assert_eq!(
+            outbound.path_state(1).map(|state| state.0),
+            Some(true),
+            "back after {wait}"
+        );
+        now += wait + 1;
+    }
+    let counters = outbound.path_counters(1).unwrap();
+    assert_eq!((counters.exits, counters.entries), (4, 4));
+}
+
+/// RP-9: a returning path bounds `sent_low` only from its first submit;
+/// live for `path_backoff_reset`, its wait starts over.
+#[test]
+fn a_returning_path_counts_from_its_first_submit() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    // B leaves before serve and holds out while A sends two datagrams.
+    outbound.leave_before_serve(1);
+    commit(&mut log, 0, 2);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1000)
+        .unwrap();
+    let a_front = outbound.sent_low(0).unwrap();
+    assert_eq!(a_front, 2 * FRAME, "A alone bounds it");
+    // Back after 10 ns, but nothing submitted yet: still A's frontier.
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1010)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    assert_eq!(outbound.sent_low(0), Some(a_front));
+    assert!(outbound.routed.as_deref().unwrap().routes[1].returning);
+    // B submits from the selection point on: it is live, and bounds it.
+    commit(&mut log, 2, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1020)
+        .unwrap();
+    assert!(!outbound.routed.as_deref().unwrap().routes[1].returning);
+    assert_eq!(outbound.sent_low(0), Some(3 * FRAME));
+    // Live past the reset, after a submit: its wait starts over.
+    assert_eq!(outbound.routed.as_deref().unwrap().routes[1].backoff, 10);
+    commit(&mut log, 3, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1200)
+        .unwrap();
+    assert_eq!(outbound.routed.as_deref().unwrap().routes[1].backoff, 0);
+}
+
+/// RP-8: a frame a path skipped counts as passed for its frontier, so
+/// `sent_low` is not held at a skipped position.
+#[test]
+fn a_skipped_frame_passes_the_paths_frontier() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 16);
+    sent(&observer_b, 16);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    outbound.withhold_route(1, 1);
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1000)
+        .unwrap();
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    assert_eq!(outbound.sent_low(0), Some(FRAME));
 }
