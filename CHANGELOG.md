@@ -110,7 +110,10 @@ release may break APIs, wire formats and shared-memory layouts.
   `Outbound::new_routed` takes one endpoint and destination per path, and
   `Outbound::serve_routes` sends each committed datagram once on every
   path, debited once (`karyos_io::lanes::routes::RoutedLaneSender`). Repair
-  stays on the founding path. `Outbound::guard` refuses a routed
+  stays on the founding path, on its queues. A route's failure resets only
+  its endpoint (`Outbound::post_reset_requests`) and a faulted queue is
+  retried on its route; a reliable lane reads again after a reset only when
+  no route still holds its copies. `Outbound::guard` refuses a routed
   publication with `GateError::Routed` until the guard gate covers every
   path.
 - A seal gate on the skip policy (conflated-network-images.md (b)):
