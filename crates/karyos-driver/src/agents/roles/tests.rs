@@ -139,7 +139,13 @@ fn created(
 
 /// The publication on A announced to B: the sender's publication, A's
 /// published alias and B's subscription.
-fn add_publication(links: &Links, a: EndpointId, b: EndpointId, destination: SocketAddr) {
+#[must_use = "the publication's log lives as long as its handles"]
+fn add_publication(
+    links: &Links,
+    a: EndpointId,
+    b: EndpointId,
+    destination: SocketAddr,
+) -> super::super::data::testing::TestLog {
     links
         .receiver
         .post(|reply| AgentCommand::AddPublishedAlias {
@@ -157,15 +163,34 @@ fn add_publication(links: &Links, a: EndpointId, b: EndpointId, destination: Soc
             max_term_length: super::super::images::DEFAULT_MAX_IMAGE_TERM_LENGTH,
         })
         .unwrap();
+    let (outbound, log) = outbound(a, destination);
     links
         .sender
         .post(|reply| AgentCommand::AddPublication {
             reply,
             publication: publication(a),
-            destination,
-            joins: Lanes::new(&[0]).unwrap(),
+            outbound,
         })
         .unwrap();
+    log
+}
+
+/// The one-lane test publication's data path on `endpoint`.
+fn outbound(
+    endpoint: EndpointId,
+    destination: SocketAddr,
+) -> (
+    Box<super::super::data::Outbound>,
+    super::super::data::testing::TestLog,
+) {
+    super::super::data::testing::outbound(
+        endpoint,
+        alias(),
+        destination,
+        publication(endpoint).term,
+        1,
+        false,
+    )
 }
 
 fn publication(endpoint: EndpointId) -> Publication {
@@ -189,7 +214,7 @@ fn publication(endpoint: EndpointId) -> Publication {
 fn a_loopback_setup_reaches_create_image() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, b, destination);
+    let _log = add_publication(&links, a, b, destination);
     let created = created(&mut agents, &links, &mut endpoints);
     assert_eq!(created, (b, identity(), Lanes::new(&[0]).unwrap()));
     assert_eq!(agents.receiver.counters().create_image, 1);
@@ -206,7 +231,7 @@ fn a_loopback_setup_reaches_create_image() {
 fn a_solicit_flood_is_capped() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, b, destination);
+    let _log = add_publication(&links, a, b, destination);
     drive(&mut agents, &links, &mut endpoints, |event| match event {
         AgentEvent::PublicationAdded { .. } => Some(()),
         _ => None,
@@ -256,9 +281,8 @@ fn a_multicast_answer_goes_to_the_group() {
         lane_count: 1,
     };
     sender.sessions.add(publication).unwrap();
-    sender
-        .publications
-        .push((EndpointId(1), alias(), group, Lanes::new(&[0]).unwrap()));
+    let (path, _log) = outbound(EndpointId(1), group);
+    sender.publications.push(*path);
     let challenge = Control::Challenge(karyos_protocol::network::RspChallenge {
         alias: alias(),
         identity: identity(),
@@ -365,7 +389,7 @@ fn the_control_path_emits_only_controls() {
 fn an_answer_waits_for_its_chain_credit() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, b, destination);
+    let _log = add_publication(&links, a, b, destination);
     let held: Vec<_> = std::iter::from_fn(|| agents.receiver.sessions.events.reserve()).collect();
     assert_eq!(held.len(), AgentConfig::default().session_command_capacity);
     let mut now = 0u64;
@@ -558,7 +582,16 @@ fn the_receiver_filters_before_the_ring() {
     intake.control(source, announce);
     intake.control(source, challenge_control());
     intake.control(source, solicit);
+    // A PATH_HB from no bound path creates nothing.
+    intake.control(
+        source,
+        Control::PathHeartbeat(karyos_protocol::network::PathHeartbeat {
+            alias: alias(),
+            identity: identity(),
+        }),
+    );
     let counters = role.counters();
+    assert_eq!(counters.path_heartbeats_unbound, 1);
     assert_eq!(counters.unsubscribed, 1);
     assert_eq!(counters.not_published, 3);
     assert_eq!(counters.forwarded, 0);
@@ -599,7 +632,7 @@ fn control_routes_evict_the_least_recently_used() {
 fn control_routes_survive_a_reset() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, b, destination);
+    let _log = add_publication(&links, a, b, destination);
     created(&mut agents, &links, &mut endpoints);
     endpoints.reset(&links, a).unwrap();
     let mut now = 10_000_000_000u64;
@@ -667,9 +700,8 @@ fn the_sender_validates_sms_against_its_bindings() {
     let endpoint = EndpointId(1);
     sender.sessions.add(publication(endpoint)).unwrap();
     let group: SocketAddr = "10.0.0.2:4000".parse().unwrap();
-    sender
-        .publications
-        .push((endpoint, alias(), group, Lanes::new(&[0]).unwrap()));
+    let (path, _log) = outbound(endpoint, group);
+    sender.publications.push(*path);
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // The answer to the receiver's challenge binds it.
     let answer = |boot_id| SetupAnswer {
@@ -815,9 +847,8 @@ fn unconfirmed_bindings_never_hold_the_table() {
         }])
         .unwrap(),
     };
-    sender
-        .publications
-        .push((endpoint, alias(), receiver, Lanes::new(&[0]).unwrap()));
+    let (path, _log) = outbound(endpoint, receiver);
+    sender.publications.push(*path);
     sender.status(endpoint, receiver, &status, 2);
     assert_eq!(sender.sessions.counters().established, 1);
     assert_eq!(sender.counters().bindings_evicted, 1);

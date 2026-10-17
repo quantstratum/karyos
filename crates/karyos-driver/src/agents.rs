@@ -37,6 +37,7 @@
 
 pub mod chain;
 pub mod control;
+pub mod data;
 pub mod endpoints;
 pub mod images;
 pub mod ring;
@@ -378,10 +379,9 @@ pub enum AgentCommand<O: SocketOps> {
         reply: Reservation,
         /// The publication incarnation.
         publication: crate::sessions::send::Publication,
-        /// Its channel destination.
-        destination: std::net::SocketAddr,
-        /// Each lane's join point.
-        joins: karyos_protocol::network::Lanes<u64>,
+        /// Its data path: one reader per lane, the channel destination and
+        /// the lane quanta, built by the conductor ([`data::Outbound::new`]).
+        outbound: Box<data::Outbound>,
     },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]

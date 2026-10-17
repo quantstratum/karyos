@@ -62,6 +62,9 @@ struct Setup {
     /// The subscription's `max_image_term_length`.
     max_term_length: u32,
     template: ImageTemplate,
+    /// Whether the channel is reliable: the sender is then a required
+    /// participant of its log.
+    reliable: bool,
 }
 
 impl Default for Setup {
@@ -70,6 +73,7 @@ impl Default for Setup {
             term_length: 65_536,
             max_term_length: DEFAULT_MAX_IMAGE_TERM_LENGTH,
             template: ImageTemplate::default(),
+            reliable: false,
         }
     }
 }
@@ -77,6 +81,8 @@ impl Default for Setup {
 struct Rig {
     /// The publishing endpoint A.
     publisher: EndpointId,
+    /// The publication's log on A (64 KiB terms, whatever is announced).
+    log: Option<super::super::data::testing::TestLog>,
     agents: Agents,
     links: Links,
     endpoints: Endpoints<OsSocket>,
@@ -93,6 +99,7 @@ impl Rig {
         let (agents, links) = network_agents::<OsSocket>(config).unwrap();
         let mut rig = Self {
             publisher: EndpointId(u32::MAX),
+            log: None,
             agents,
             links,
             endpoints: Endpoints::new(&config),
@@ -141,6 +148,16 @@ impl Rig {
                 max_term_length: setup.max_term_length,
             })
             .unwrap();
+        // The log's terms stay small: a refused size is only announced.
+        let (outbound, log) = super::super::data::testing::outbound(
+            a,
+            alias(),
+            destination,
+            term(65_536),
+            2,
+            setup.reliable,
+        );
+        rig.log = Some(log);
         rig.links
             .sender
             .post(|reply| AgentCommand::AddPublication {
@@ -152,8 +169,7 @@ impl Rig {
                     term: term(setup.term_length),
                     lane_count: 2,
                 },
-                destination,
-                joins: Lanes::new(&[64, 128]).unwrap(),
+                outbound,
             })
             .unwrap();
         (rig, b)
@@ -163,6 +179,12 @@ impl Rig {
     /// image table serve the session ring.
     fn round(&mut self, serve: bool) {
         self.now += MS;
+        // The publication's conductor: rotation, floor and limit.
+        if let Some(log) = &mut self.log {
+            for conductor in &mut log.conductors {
+                let _ = conductor.duty_cycle().unwrap();
+            }
+        }
         self.agents.do_work(self.now).unwrap();
         self.endpoints.poll(&self.links, |_| {}, |_| {});
         if serve {
@@ -215,7 +237,8 @@ fn an_accepted_answer_installs_an_image() {
     assert_eq!((*endpoint, *installed), (b, identity()));
     let lanes = rig.images.installed(*slot).unwrap();
     assert_eq!(lanes.len(), 2);
-    for (lane, join) in lanes.iter().zip([64, 128]) {
+    // The joins are the sender's read cursors: nothing was published yet.
+    for (lane, join) in lanes.iter().zip([0, 0]) {
         assert!(matches!(
             lane.config().publication,
             PublicationMode::Image { join: at, .. } if at == join
@@ -554,4 +577,197 @@ fn a_busy_sm_slot_skips_the_period() {
     rig.agents.receiver.do_work(rig.now).unwrap();
     rig.agents.sender.do_work(rig.now).unwrap();
     assert_eq!(rig.agents.sender.role.counters().sm_accepted, accepted + 1);
+}
+
+/// A subscriber of the installed image's lane `lane`.
+fn image_subscriber(
+    rig: &Rig,
+    slot: SlotRef,
+    lane: usize,
+    role: karyos_sys::log_buffer::Role,
+) -> (
+    karyos_sys::log_buffer::Conductor<std::sync::Arc<LogBuffer>>,
+    karyos_sys::log_buffer::Subscription<std::sync::Arc<LogBuffer>>,
+) {
+    let buffer = rig.images.installed(slot).unwrap()[lane].clone();
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let subscription = conductor.subscribe(role).unwrap();
+    (conductor, subscription)
+}
+
+/// Polls `subscription` for one message.
+fn poll_message(
+    subscription: &mut karyos_sys::log_buffer::Subscription<std::sync::Arc<LogBuffer>>,
+) -> Option<Vec<u8>> {
+    use karyos_sys::log_buffer::PollOutcome;
+
+    let mut out = vec![0u8; 65_536];
+    match subscription.poll(&mut out).unwrap() {
+        PollOutcome::Message { length, .. } => {
+            subscription.acknowledge();
+            out.truncate(length as usize);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Runs the rig until establishment and returns the installed slot.
+fn established(rig: &mut Rig) -> SlotRef {
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established == 1
+    });
+    let Some(ImageEvent::Installed { slot, .. }) = rig.events.first().copied() else {
+        panic!("{:?}", rig.events);
+    };
+    slot
+}
+
+/// Test 1 (driver-network-agents.md §9): after establishment, messages
+/// published on A reach a local subscriber of B's image, in order, through
+/// the sender's read capability, the lane queue and the receive owner.
+fn round_trip(reliable: bool) {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let messages: Vec<Vec<u8>> = (0..20u8)
+        .map(|i| vec![i; 100 + usize::from(i) * 150])
+        .collect();
+    for message in &messages {
+        let log = rig.log.as_mut().unwrap();
+        let outcome = log.publications[0]
+            .append(message, AppendOptions::default())
+            .unwrap();
+        assert!(
+            matches!(outcome, AppendOutcome::Appended { .. }),
+            "{outcome:?}"
+        );
+    }
+    let mut delivered = Vec::new();
+    for _ in 0..2000 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            delivered.push(message);
+        }
+        if delivered.len() == messages.len() {
+            break;
+        }
+    }
+    assert_eq!(delivered, messages);
+    let receiver = rig.agents.receiver.counters();
+    assert!(receiver.data_committed >= 20, "{receiver:?}");
+    assert_eq!(
+        (
+            receiver.data_unbound,
+            receiver.data_invalid,
+            receiver.data_refused
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn a_message_reaches_a_subscriber_of_the_image() {
+    round_trip(false);
+}
+
+#[test]
+fn a_reliable_message_reaches_a_subscriber_of_the_image() {
+    round_trip(true);
+}
+
+/// Test 3, receiver side (§5): on a reliable channel the sender's position
+/// is the least consumption its receivers report; with the receiver
+/// stopped it does not move, and the publisher meets back pressure. Once
+/// the receiver runs again, the publisher resumes.
+#[test]
+fn a_stopped_receiver_back_pressures_a_reliable_publisher() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    established(&mut rig);
+    let data = vec![7u8; 992];
+    // Only the sender runs: the receiver reads nothing and reports nothing.
+    let mut pressed = false;
+    for _ in 0..2000 {
+        let log = rig.log.as_mut().unwrap();
+        match log.publications[0]
+            .append(&data, AppendOptions::default())
+            .unwrap()
+        {
+            AppendOutcome::Appended { .. } => {}
+            AppendOutcome::BackPressured => {
+                pressed = true;
+                break;
+            }
+            AppendOutcome::AdminAction => {}
+            other => panic!("{other:?}"),
+        }
+        for conductor in &mut rig.log.as_mut().unwrap().conductors {
+            let _ = conductor.duty_cycle().unwrap();
+        }
+        rig.now += MS;
+        rig.agents.sender.do_work(rig.now).unwrap();
+    }
+    assert!(pressed, "never back pressured");
+    // The receiver runs again: its SMs move the sender's position.
+    let mut resumed = false;
+    for _ in 0..2000 {
+        rig.round(true);
+        let log = rig.log.as_mut().unwrap();
+        if matches!(
+            log.publications[0]
+                .append(&data, AppendOptions::default())
+                .unwrap(),
+            AppendOutcome::Appended { .. }
+        ) {
+            resumed = true;
+            break;
+        }
+    }
+    assert!(resumed, "never resumed");
+}
+
+/// Test 5, two lanes: each lane's messages reach its own image lane under
+/// the data DRR, and neither waits for the other.
+#[test]
+fn two_lanes_are_both_served() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_c0, mut lane0) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let (_c1, mut lane1) = image_subscriber(&rig, slot, 1, Role::Optional);
+    for i in 0..10u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 500], AppendOptions::default())
+            .unwrap();
+        let _ = log.publications[1]
+            .append(&[i + 100; 700], AppendOptions::default())
+            .unwrap();
+    }
+    let (mut got0, mut got1) = (Vec::new(), Vec::new());
+    for _ in 0..2000 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut lane0) {
+            got0.push(message[0]);
+        }
+        while let Some(message) = poll_message(&mut lane1) {
+            got1.push(message[0]);
+        }
+        if got0.len() == 10 && got1.len() == 10 {
+            break;
+        }
+    }
+    assert_eq!(got0, (0..10).collect::<Vec<u8>>());
+    assert_eq!(got1, (100..110).collect::<Vec<u8>>());
 }
