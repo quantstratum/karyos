@@ -5,7 +5,7 @@
 
 use karyos_bench::env::{Environment, Labels};
 use karyos_bench::inventory;
-use karyos_bench::{Config, Workload, defaults, report, run};
+use karyos_bench::{Backing, BackingRefused, Config, Workload, defaults, report, run};
 
 /// The counting allocator, so the wire children of these tests count the
 /// allocations of both stages (the allocation build, M-9).
@@ -15,9 +15,18 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
     karyos_sys::alloc_count::CountingAllocator;
 
 fn smoke(config: Config) -> Config {
+    // A heap image install zeroes every term: four 64 MiB lanes take about
+    // a quarter of a second each, so the smoke run installs 1 MiB terms
+    // at most; the bench binary measures the large terms.
+    let term_length = if config.workload == Workload::ImageInstall {
+        config.term_length.min(1 << 20)
+    } else {
+        config.term_length
+    };
     Config {
         iterations: 200,
         warmup: 20,
+        term_length,
         ..config
     }
 }
@@ -189,22 +198,231 @@ fn history_fields_read_back() {
     assert_eq!(report::field(line, "p99_ns"), None);
 }
 
+/// The configuration key keeps its original shape with the backing last,
+/// and a record written before the backing existed still compares with
+/// the same configuration on its workload's default backing.
 #[test]
 fn existing_workload_configuration_key_keeps_its_original_shape() {
     let config = defaults(200)[0];
     assert_eq!(
         config.to_string(),
-        "offer-poll message=32 publishers=1 iterations=200 warmup=20 term=65536"
+        "offer-poll message=32 publishers=1 iterations=200 warmup=20 term=65536 backing=heap"
     );
 
     let labels = Labels::detect();
     let measurement = run(config).unwrap_or_else(|cause| panic!("{config}: {cause}"));
     let line = report::history_line(&measurement, &labels);
+    assert_eq!(report::field(&line, "backing"), Some("heap"));
     let previous = format!(
         "{{\"key\":\"{}\",\"commit\":\"prior\",\"rate\":100,\"p50_ns\":100}}",
         report::key(&measurement, &labels)
     );
     assert!(report::compare(&previous, &line).is_some());
+    let legacy = format!(
+        "{{\"key\":\"offer-poll message=32 publishers=1 iterations=200 warmup=20 \
+         term=65536|host={}|cpu={}|profile={}\",\"commit\":\"prior\",\"p50_ns\":100}}",
+        labels.host, labels.cpu, labels.profile
+    );
+    assert!(report::compare(&legacy, &line).is_some(), "{legacy}");
+}
+
+/// A key without a backing reads as its workload's default backing and as
+/// no other: heap for most, a region for the IPC workloads.
+#[test]
+fn a_key_without_a_backing_reads_as_the_default_backing() {
+    assert_eq!(
+        report::normalized_key("receive message=32 term=65536|host=h"),
+        "receive message=32 term=65536 backing=heap|host=h"
+    );
+    assert_eq!(
+        report::normalized_key("ipc-ping-pong message=32 term=65536|host=h"),
+        "ipc-ping-pong message=32 term=65536 backing=region|host=h"
+    );
+    let shared = "receive message=32 term=65536 backing=shared|host=h";
+    assert_eq!(report::normalized_key(shared), shared);
+    let line = |key: &str| format!("{{\"key\":\"{key}\",\"commit\":\"c\",\"p50_ns\":1}}");
+    let legacy = line("receive message=32 term=65536|host=h");
+    assert!(report::compare(&legacy, &line(shared)).is_none());
+    assert!(
+        report::compare(
+            &legacy,
+            &line("receive message=32 term=65536 backing=heap|host=h")
+        )
+        .is_some()
+    );
+}
+
+/// A tiny configuration of `workload` on `backing`.
+fn tiny(workload: Workload, backing: Backing) -> Config {
+    Config {
+        workload,
+        message: 256,
+        publishers: 1,
+        iterations: 30,
+        warmup: 3,
+        term_length: 64 * 1024,
+        target_rate: None,
+        nak_frames: None,
+        lanes: None,
+        backing,
+    }
+}
+
+/// The backings of `workload` that exist here.
+fn backings_here(workload: Workload) -> Vec<Backing> {
+    workload
+        .backings()
+        .iter()
+        .copied()
+        .filter(|backing| *backing != Backing::Region || cfg!(target_os = "linux"))
+        .collect()
+}
+
+/// Runs `config` to completion and checks its report names the backing.
+#[cfg(test)]
+fn runs_with_latency(config: Config) {
+    let measurement = run(config).unwrap_or_else(|cause| panic!("{config}: {cause}"));
+    assert!(measurement.rate > 0.0, "{config}");
+    let labels = Labels::detect();
+    let line = report::history_line(&measurement, &labels);
+    assert!(report::field(&line, "p50_ns").is_some(), "{line}");
+    assert_eq!(
+        report::field(&line, "backing"),
+        Some(config.backing.name()),
+        "{line}"
+    );
+    assert!(
+        config
+            .to_string()
+            .ends_with(&format!(" backing={}", config.backing.name())),
+        "{config}"
+    );
+}
+
+/// The network-term workloads run to completion on every backing they
+/// take here (network-shared-terms.md, N-5): staging single and
+/// fragmented messages, NAK ranges that cross terms, the receive owner's
+/// write, and image installs of one and four lanes.
+#[test]
+fn network_term_workloads_run_on_every_backing() {
+    for backing in backings_here(Workload::SenderRead) {
+        for (message, term_length) in [(32, 64 * 1024), (1376, 64 * 1024), (65_536, 1 << 20)] {
+            runs_with_latency(Config {
+                message,
+                term_length,
+                ..tiny(Workload::SenderRead, backing)
+            });
+        }
+    }
+    for backing in backings_here(Workload::SenderNak) {
+        // 30 ranges of 16 frames of 1408 bytes cross ten 64 KiB terms; 256
+        // frames of 1408 bytes cross 1 MiB terms.
+        for (frames, message, term_length) in [
+            (1, 32, 64 * 1024),
+            (16, 1376, 64 * 1024),
+            (256, 1376, 1 << 20),
+        ] {
+            runs_with_latency(Config {
+                message,
+                term_length,
+                nak_frames: Some(frames),
+                ..tiny(Workload::SenderNak, backing)
+            });
+        }
+    }
+    for backing in backings_here(Workload::Receive) {
+        runs_with_latency(tiny(Workload::Receive, backing));
+        runs_with_latency(tiny(Workload::ReceiveDuplicate, backing));
+    }
+    for backing in backings_here(Workload::ImageInstall) {
+        for lanes in [1, 4] {
+            runs_with_latency(Config {
+                message: 0,
+                lanes: Some(lanes),
+                ..tiny(Workload::ImageInstall, backing)
+            });
+        }
+    }
+}
+
+/// The defaults hold heap and shared variants of each network-term
+/// workload as different configurations.
+#[test]
+fn heap_and_shared_defaults_are_different_configurations() {
+    let configs = defaults(200);
+    for workload in [Workload::SenderRead, Workload::SenderNak, Workload::Receive] {
+        let key = |backing| {
+            configs
+                .iter()
+                .find(|config| {
+                    config.workload == workload
+                        && config.backing == backing
+                        && config.message == 256
+                })
+                .map(ToString::to_string)
+                .unwrap_or_else(|| panic!("no {} on {}", workload.name(), backing.name()))
+        };
+        let (heap, shared) = (key(Backing::Heap), key(Backing::Shared));
+        assert_ne!(heap, shared);
+        assert!(shared.contains(" backing=shared"), "{shared}");
+    }
+    assert!(
+        configs
+            .iter()
+            .filter(|config| config.workload == Workload::SenderNak)
+            .all(|config| config.nak_frames.is_some())
+    );
+    assert!(
+        configs
+            .iter()
+            .filter(|config| config.workload == Workload::ImageInstall)
+            .all(|config| config.lanes.is_some() && config.backing != Backing::Shared)
+    );
+}
+
+/// A workload refuses a backing it does not run on, typed, and never runs
+/// on the heap instead; a region is refused where it does not exist.
+#[test]
+fn unsupported_backings_are_refused() {
+    for (workload, backing) in [
+        (Workload::OfferPoll, Backing::Shared),
+        (Workload::PingPong, Backing::Region),
+        (Workload::ImageInstall, Backing::Shared),
+        (Workload::IpcPingPong, Backing::Heap),
+    ] {
+        let config = tiny(workload, backing);
+        assert_eq!(
+            config.check_backing(),
+            Err(BackingRefused::Unsupported { workload, backing })
+        );
+        let refused = run(config).err().unwrap_or_else(|| panic!("{config} ran"));
+        assert!(refused.0.contains("does not run on backing"), "{refused}");
+    }
+    if !cfg!(target_os = "linux") {
+        for workload in [
+            Workload::SenderRead,
+            Workload::SenderNak,
+            Workload::Receive,
+            Workload::ImageInstall,
+        ] {
+            let config = tiny(workload, Backing::Region);
+            assert_eq!(
+                config.check_backing(),
+                Err(BackingRefused::NeedsLinux { workload })
+            );
+            assert!(run(config).is_err(), "{config}");
+        }
+    }
+    // A fragmented message is not one NAK frame.
+    let fragmented = Config {
+        message: 2048,
+        nak_frames: Some(1),
+        ..tiny(Workload::SenderNak, Backing::Heap)
+    };
+    assert!(run(fragmented).is_err());
+    // Each knob is required where it applies.
+    assert!(run(tiny(Workload::SenderNak, Backing::Heap)).is_err());
+    assert!(run(tiny(Workload::ImageInstall, Backing::Heap)).is_err());
 }
 
 #[test]
@@ -217,6 +435,9 @@ fn cleaner_workload_observes_term_rotation_and_reclamation() {
         warmup: 1_000,
         term_length: 64 * 1024,
         target_rate: None,
+        nak_frames: None,
+        lanes: None,
+        backing: Backing::Heap,
     };
     let measurement = run(config).unwrap_or_else(|cause| panic!("{config}: {cause}"));
     assert!(measurement.term_rotations_per_second.unwrap_or_default() > 0.0);
@@ -883,6 +1104,9 @@ fn a_failing_ipc_child_fails_the_workload_promptly() {
         warmup: 20,
         term_length: 64 * 1024,
         target_rate: None,
+        nak_frames: None,
+        lanes: None,
+        backing: Backing::Region,
     };
     for (name, run) in [
         (
