@@ -1005,3 +1005,89 @@ fn a_failed_route_is_flushed_once_per_call_and_keeps_its_first_failure() {
     );
     assert_eq!(failures[1], None);
 }
+
+/// rp-w5a, RP-8: a route out of the live set takes no flush and holds no
+/// head back. Route 0 alone holds position 0; once it leaves, 128 on route 1
+/// is the head and is served. That closes the #317 interim.
+#[test]
+fn a_left_route_holds_no_head_back() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    f.routes[0].accept(2);
+    f.routes[1].accept(1);
+    assert_eq!(f.sender.exclusive(0, 0), 1, "position 0 is route 0's alone");
+    f.sender.set_live(0, false);
+    assert_eq!(f.sender.is_live(0), Some(false));
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [100]);
+    assert_eq!(
+        f.routes[0].socket.send_calls(),
+        0,
+        "a left route takes no flush"
+    );
+    assert_eq!(f.routes[1].socket.send_calls(), 1);
+    assert_eq!(f.sender.debited(0), Some(128));
+    // Its copies leave with cancel_route, on every lane, that route only.
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    assert_eq!(gate.left, [0, 2, 0]);
+    assert_eq!(f.sender.pending(0, 0), Some(0));
+    // Back in the live set, it flushes again.
+    f.sender.set_live(0, true);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    f.routes[1].accept(1);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [100]);
+    assert_eq!(f.routes[0].socket.send_calls(), 1);
+}
+
+/// `cancel_route` cancels one route's copies of every lane, leaving the
+/// other route's.
+#[test]
+fn cancel_route_leaves_the_other_routes() {
+    let mut f = Fixture::new(&[100, 100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(1, 0, 100, 100, &[0, 1]);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+    assert_eq!(gate.left, [0, 2, 0]);
+    assert_eq!(
+        (f.sender.pending(0, 1), f.sender.pending(1, 1)),
+        (Some(0), Some(0))
+    );
+    assert_eq!(
+        (f.sender.pending(0, 0), f.sender.pending(1, 0)),
+        (Some(1), Some(1))
+    );
+    assert_eq!(f.sender.exclusive(0, 0), 1, "route 1 no longer holds it");
+}
+
+/// A left route takes no flush even when it holds the head at its front;
+/// and a position it shares with a live route is that route's alone once
+/// the sharer leaves.
+#[test]
+fn a_left_route_takes_no_flush_of_a_shared_head() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    f.routes[1].accept(1);
+    assert_eq!(f.sender.exclusive(0, 0), 0, "route 1 holds it too");
+    f.sender.set_live(1, false);
+    assert_eq!(f.sender.exclusive(0, 0), 1, "a left route holds nothing");
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [100]);
+    assert_eq!(f.routes[1].socket.send_calls(), 0);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}

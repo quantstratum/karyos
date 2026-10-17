@@ -152,13 +152,16 @@ struct Lane {
 
 impl Lane {
     /// The head (module docs): the lowest position not yet debited on any
-    /// route, with its charge, when a route not in `out` holds it at its
-    /// front and may send it now.
-    fn head(&self, out: &[bool; MAX_ROUTES]) -> Option<(u64, u64)> {
+    /// live route, with its charge, when a route not in `out` holds it at
+    /// its front and may send it now. A route out of the live set holds no
+    /// position back (RP-8).
+    fn head(&self, out: &[bool; MAX_ROUTES], live: &[bool; MAX_ROUTES]) -> Option<(u64, u64)> {
         let lowest = self
             .routes
             .iter()
-            .filter_map(|route| route.undebited(self.debited))
+            .zip(live)
+            .filter(|(_, live)| **live)
+            .filter_map(|(route, _)| route.undebited(self.debited))
             .map(|copy| copy.position)
             .min()?;
         self.routes
@@ -181,6 +184,9 @@ pub struct RoutedLaneSender {
     report: TxReport,
     counters: [RouteCounters; MAX_ROUTES],
     failures: RouteFailures,
+    /// The routes in the live set (redundant-paths.md RP-8): a route out of
+    /// it takes no flush and holds no head back.
+    live: [bool; MAX_ROUTES],
 }
 
 /// The routes not lent this call: out from its start.
@@ -190,6 +196,35 @@ fn detached<R: Routes>(routes: &mut R, count: usize) -> [bool; MAX_ROUTES] {
         *out = routes.route(route).is_none();
     }
     out
+}
+
+/// Returns `queue`'s pending copies that were never exposed, through
+/// `gate` as [`Left::Returned`], in staging order.
+fn cancel_queue<B: TxBackend, G: LaneGate>(
+    backend: &mut B,
+    queue: &mut RouteLane,
+    lane: usize,
+    report: &mut TxReport,
+    gate: &mut G,
+) -> Result<(), QueueError> {
+    loop {
+        let outcome = backend.cancel_pending(queue.queue, report)?;
+        while let Some(item) = report.pop_front() {
+            match queue.staged.front().copied() {
+                Some(head) if head.staged.ticket == item.ticket => {
+                    queue.staged.pop_front();
+                    gate.left(lane, head.staged, Left::Returned);
+                }
+                _ => {
+                    while report.pop_front().is_some() {}
+                    return Ok(());
+                }
+            }
+        }
+        if !outcome.more {
+            return Ok(());
+        }
+    }
 }
 
 /// Keeps `failure` for `route`, unless one is kept already.
@@ -241,7 +276,61 @@ impl RoutedLaneSender {
             report: TxReport::new(),
             counters: [RouteCounters::default(); MAX_ROUTES],
             failures: [None; MAX_ROUTES],
+            live: std::array::from_fn(|route| route < queues.len()),
         })
+    }
+
+    /// Puts `route` in the live set, or takes it out (RP-8, RP-9). Out of
+    /// it, a route takes no flush and holds no head back; its copies stay
+    /// recorded until [`RoutedLaneSender::cancel_route`] or a reopen.
+    pub fn set_live(&mut self, route: usize, live: bool) {
+        if route < self.routes
+            && let Some(slot) = self.live.get_mut(route)
+        {
+            *slot = live;
+        }
+    }
+
+    /// Whether `route` is in the live set.
+    #[must_use]
+    pub fn is_live(&self, route: usize) -> Option<bool> {
+        (route < self.routes)
+            .then(|| self.live.get(route).copied())
+            .flatten()
+    }
+
+    /// The copies of `lane` that only `route` holds above the debited
+    /// position, no live route holding their position: a leaving route's
+    /// copies no path will send (RP-8; receivers get them by NAK or close
+    /// the gap by their gap policy).
+    #[must_use]
+    pub fn exclusive(&self, lane: usize, route: usize) -> usize {
+        let Some(entry) = self.lanes.get(lane) else {
+            return 0;
+        };
+        let Some(queue) = entry.routes.get(route) else {
+            return 0;
+        };
+        queue
+            .staged
+            .iter()
+            .filter(|copy| entry.debited.is_none_or(|debited| copy.position > debited))
+            .filter(|copy| {
+                !entry
+                    .routes
+                    .iter()
+                    .zip(&self.live)
+                    .enumerate()
+                    .any(|(index, (other, live))| {
+                        index != route
+                            && *live
+                            && other
+                                .staged
+                                .iter()
+                                .any(|held| held.position == copy.position)
+                    })
+            })
+            .count()
     }
 
     /// The failures that stopped one route of several since the last call,
@@ -412,29 +501,50 @@ impl RoutedLaneSender {
                 }
                 continue;
             };
-            'route: loop {
-                let outcome = match backend.cancel_pending(queue.queue, report) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        first = first.or(Some(error));
-                        break;
-                    }
-                };
-                while let Some(item) = report.pop_front() {
-                    match queue.staged.front().copied() {
-                        Some(head) if head.staged.ticket == item.ticket => {
-                            queue.staged.pop_front();
-                            gate.left(lane, head.staged, Left::Returned);
-                        }
-                        _ => {
-                            while report.pop_front().is_some() {}
-                            break 'route;
-                        }
-                    }
+            if let Err(error) = cancel_queue(backend, queue, lane, report, gate) {
+                first = first.or(Some(error));
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Returns `route`'s pending copies of every lane that were never
+    /// exposed, for a route leaving the live set (RP-8): only that route's
+    /// queues, as [`RoutedLaneSender::cancel`] does per lane; each leaves
+    /// through `gate` as [`Left::Returned`]. A detached route keeps its
+    /// copies, counted ([`RouteCounters::uncancelled`]).
+    ///
+    /// # Errors
+    ///
+    /// The first lane's [`QueueError`]; every other lane is still
+    /// cancelled.
+    pub fn cancel_route<R: Routes, G: LaneGate>(
+        &mut self,
+        routes: &mut R,
+        route: usize,
+        gate: &mut G,
+    ) -> Result<(), QueueError> {
+        let Self {
+            lanes,
+            report,
+            counters,
+            ..
+        } = self;
+        let mut first = None;
+        for (lane, entry) in lanes.iter_mut().enumerate() {
+            let Some(queue) = entry.routes.get_mut(route) else {
+                continue;
+            };
+            let Some(backend) = routes.route(route) else {
+                if !queue.staged.is_empty()
+                    && let Some(counters) = counters.get_mut(route)
+                {
+                    bump(&mut counters.uncancelled, &mut counters.overflowed);
                 }
-                if !outcome.more {
-                    break;
-                }
+                continue;
+            };
+            if let Err(error) = cancel_queue(backend, queue, lane, report, gate) {
+                first = first.or(Some(error));
             }
         }
         first.map_or(Ok(()), Err)
@@ -452,11 +562,15 @@ impl RoutedLaneSender {
             counters,
             failures,
             routes: count,
+            live,
             ..
         } = self;
         let several = *count > 1;
         let mut done = CatchUp::default();
         let mut out = detached(routes, *count);
+        for (out, live) in out.iter_mut().zip(&*live) {
+            *out |= !*live;
+        }
         for (lane, entry) in lanes.iter_mut().enumerate() {
             let Some(debited) = entry.debited else {
                 continue;
@@ -527,7 +641,10 @@ impl RoutedLaneSender {
                 route.paused = false;
             }
         }
-        let out = detached(routes, self.routes);
+        let mut out = detached(routes, self.routes);
+        for (out, live) in out.iter_mut().zip(&self.live) {
+            *out |= !*live;
+        }
         let mut source = Source {
             routes,
             gate,
@@ -537,6 +654,7 @@ impl RoutedLaneSender {
             failures: &mut self.failures,
             count: self.routes,
             out,
+            live: self.live,
             inactive: [false; MAX_ROUTES],
             failure: None,
         };
@@ -667,6 +785,8 @@ struct Source<'a, R, G> {
     count: usize,
     /// Routes that take no more flushes in the call: blocked or inactive.
     out: [bool; MAX_ROUTES],
+    /// The live set (RP-8).
+    live: [bool; MAX_ROUTES],
     /// Routes whose endpoint was resetting or retired in the call.
     inactive: [bool; MAX_ROUTES],
     failure: Option<SenderFailure>,
@@ -687,7 +807,11 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
         if self.failure.is_some() || self.all_inactive() {
             return Probe::Ineligible;
         }
-        let Some((_, charge)) = self.lanes.get(lane).and_then(|entry| entry.head(&self.out)) else {
+        let Some((_, charge)) = self
+            .lanes
+            .get(lane)
+            .and_then(|entry| entry.head(&self.out, &self.live))
+        else {
             return Probe::Ineligible;
         };
         if self.gate.admits(lane) {
@@ -701,7 +825,7 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
         let Some(entry) = self.lanes.get_mut(lane) else {
             return Service::NotServed;
         };
-        let Some((position, _)) = entry.head(&self.out) else {
+        let Some((position, _)) = entry.head(&self.out, &self.live) else {
             return Service::NotServed;
         };
         let (mut served, mut uncertain, mut blocked) = (false, false, false);
