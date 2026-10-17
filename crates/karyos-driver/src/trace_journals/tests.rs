@@ -1350,3 +1350,342 @@ fn journals_pair_within_their_lane() {
         .collect();
     assert_eq!(notes, [publishing_one.journal()]);
 }
+
+// Network journals (`trace-network.md` §4 and §5): the driver's own
+// journals of its agents, handed to a hook.
+
+use std::sync::{Arc, Mutex};
+
+use karyos_protocol::trace_hook::{
+    NetCommit, NetJournal, NetPickup, NetSide, NetworkTraceHook, PublicationIdentity,
+};
+use karyos_sys::frame::Lane;
+use karyos_sys::trace_mirror::{MIRROR_RANGES, NetworkFacts};
+
+use karyos_protocol::trace_hook::{HOST_MONOTONIC_PROVENANCE, TRACE_RECORD_WORDS};
+
+/// What a test hook holds: its open journals and the numbers it closed.
+#[derive(Default)]
+struct HookState {
+    journals: Vec<NetJournal>,
+    closed: Vec<u64>,
+}
+
+/// A hook that keeps the journals the driver hands it and closes them by
+/// dropping their writers.
+#[derive(Clone, Default)]
+struct Recorder(Arc<Mutex<HookState>>);
+
+impl Recorder {
+    /// Appends one record to the hook's journal `number`.
+    fn append(&self, number: u64, value: u64) {
+        let mut state = self.0.lock().unwrap();
+        let journal = state
+            .journals
+            .iter_mut()
+            .find(|journal| journal.number == number)
+            .unwrap();
+        let mut payload = [0; TRACE_RECORD_WORDS];
+        payload[0] = value;
+        journal.writer.append(&payload, stamp(value)).unwrap();
+    }
+
+    fn open(&self) -> Vec<u64> {
+        let state = self.0.lock().unwrap();
+        state
+            .journals
+            .iter()
+            .map(|journal| journal.number)
+            .collect()
+    }
+
+    fn closed(&self) -> Vec<u64> {
+        self.0.lock().unwrap().closed.clone()
+    }
+}
+
+impl NetworkTraceHook for Recorder {
+    fn open_journal(&mut self, journal: NetJournal) {
+        self.0.lock().unwrap().journals.push(journal);
+    }
+
+    fn close_journal(&mut self, side: NetSide, publication: &PublicationIdentity, lane: Lane) {
+        let mut state = self.0.lock().unwrap();
+        if let Some(index) = state.journals.iter().position(|journal| {
+            (journal.side, journal.publication, journal.lane) == (side, *publication, lane)
+        }) {
+            let journal = state.journals.swap_remove(index);
+            state.closed.push(journal.number);
+        }
+    }
+
+    fn on_sender_pickup(&mut self, _ext: &karyos_protocol::frame::TraceExtension, _at: &NetPickup) {
+    }
+
+    fn on_receiver_commit(
+        &mut self,
+        _ext: &karyos_protocol::frame::TraceExtension,
+        _at: &NetCommit,
+    ) {
+    }
+}
+
+/// The layout of the test network journals.
+const NET_LAYOUT: JournalLayout = JournalLayout {
+    capacity: 4,
+    payload_words: TRACE_RECORD_WORDS,
+    drop_ranges: MIRROR_RANGES,
+};
+
+fn net_driver(entries: usize, records: usize, net_bytes: u64) -> EmbeddedDriver {
+    EmbeddedDriver::with_config(DriverConfig {
+        max_trace_journals: entries,
+        trace_mirror_records: records,
+        trace_drain_budget: 64,
+        max_network_journal_bytes: net_bytes,
+        network_journal_records: NET_LAYOUT.capacity,
+        ..DriverConfig::default()
+    })
+    .unwrap()
+}
+
+/// Publication `registration` of driver `driver`.
+fn identity(driver: [u64; 2], registration: u64) -> PublicationIdentity {
+    PublicationIdentity {
+        driver,
+        registration,
+        stream_id: 5,
+        session_id: 1,
+        incarnation: FIRST_INCARNATION,
+    }
+}
+
+fn lane(lane: u8) -> Lane {
+    Lane::try_new(lane).unwrap()
+}
+
+fn hooked(driver: &mut EmbeddedDriver, side: NetSide) -> Recorder {
+    let hook = Recorder::default();
+    driver.set_network_trace_hook(side, Some(Box::new(hook.clone())));
+    hook
+}
+
+/// Without a hook no network journal exists; with one, the driver creates
+/// it in the table (kind 3, no client, its facts, the driver's clock),
+/// hands its writer to the hook, mirrors what the hook writes, and on close
+/// records the boundary and drains it to its end.
+#[test]
+fn a_network_journal_is_handed_to_its_hook_and_drained() {
+    let mut driver = net_driver(4, 64, u64::MAX);
+    let id = identity(driver.driver_id(), 3);
+    let side = NetSide::Sender;
+    assert_eq!(
+        driver.open_network_journal(side, id, lane(1), 3, Some(64)),
+        None
+    );
+    assert!(entries(&driver).is_empty());
+    let hook = hooked(&mut driver, side);
+    let number = driver
+        .open_network_journal(side, id, lane(1), 3, Some(64))
+        .unwrap();
+    // One journal per side, publication and lane.
+    assert_eq!(
+        driver.open_network_journal(side, id, lane(1), 3, Some(64)),
+        None
+    );
+    assert_eq!(hook.open(), [number]);
+    let opened = entry(&driver, number);
+    assert_eq!(
+        (opened.kind, opened.client, opened.state, opened.lane.get()),
+        (JournalKind::NetworkSender, 0, JournalState::Open, 1)
+    );
+    assert_eq!(
+        (opened.registration, opened.stream, opened.incarnation),
+        (3, 3, FIRST_INCARNATION)
+    );
+    assert_eq!(
+        (opened.time_namespace, opened.provenance),
+        (TimeNamespace::Same, HOST_MONOTONIC_PROVENANCE)
+    );
+    assert_eq!(
+        opened.network,
+        Some(NetworkFacts {
+            sender_driver: driver.driver_id(),
+            start: Some(64),
+            boundary: None,
+            first_gap: None,
+        })
+    );
+    assert_eq!(opened.sequence, 1);
+    hook.append(number, 9);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(counter(&driver, "network trace journals open"), 1);
+    assert_eq!(counter(&driver, "trace journals open"), 0);
+    let mut seen = Vec::new();
+    let _ = driver.trace_mirror().scan(&mut 0, |record| {
+        seen.push((record.journal, record.payload.len(), record.payload[0]));
+    });
+    assert_eq!(seen, [(number, TRACE_RECORD_WORDS, 9)]);
+    assert!(driver.close_network_journal(side, &id, lane(1), Some(128), None));
+    assert!(!driver.close_network_journal(side, &id, lane(1), Some(128), None));
+    assert_eq!(hook.closed(), [number]);
+    let _ = driver.do_work().unwrap();
+    let closed = entry(&driver, number);
+    assert_eq!(closed.state, JournalState::Closed);
+    assert_eq!(closed.network.unwrap().boundary, Some(128));
+    assert_eq!(counter(&driver, "network trace journals open"), 0);
+}
+
+/// A receiver journal records the image join, its first sealed gap (a
+/// later one changes nothing), and keeps them when its hook is removed,
+/// which closes it.
+#[test]
+fn a_receiver_journal_keeps_its_first_gap_and_closes_with_its_hook() {
+    let mut driver = net_driver(4, 64, u64::MAX);
+    let remote = identity([7, 7], 3);
+    let side = NetSide::Receiver;
+    let hook = hooked(&mut driver, side);
+    let number = driver
+        .open_network_journal(side, remote, lane(0), 40, Some(32))
+        .unwrap();
+    assert_eq!(entry(&driver, number).kind, JournalKind::NetworkReceiver);
+    assert!(driver.seal_network_gap(&remote, lane(0), 100));
+    assert!(driver.seal_network_gap(&remote, lane(0), 50));
+    // No receiver journal there: nothing to record.
+    assert!(!driver.seal_network_gap(&remote, lane(1), 50));
+    let facts = entry(&driver, number).network.unwrap();
+    assert_eq!(
+        (facts.sender_driver, facts.start, facts.first_gap),
+        ([7, 7], Some(32), Some(100))
+    );
+    driver.set_network_trace_hook(side, None);
+    assert_eq!(hook.closed(), [number]);
+    let _ = driver.do_work().unwrap();
+    let closed = entry(&driver, number);
+    assert_eq!(closed.state, JournalState::Closed);
+    assert_eq!(
+        (
+            closed.network.unwrap().boundary,
+            closed.network.unwrap().first_gap
+        ),
+        (None, Some(100))
+    );
+    // Without the hook, no new journal.
+    assert_eq!(
+        driver.open_network_journal(side, remote, lane(0), 40, Some(32)),
+        None
+    );
+}
+
+/// A network journal beyond `max_network_journal_bytes`, or without a
+/// free table entry, is not created and never reaches the hook: the
+/// mirror's header word 7, the driver counter and the publication's count
+/// rise, and no trace number is spent.
+#[test]
+fn a_refused_network_journal_is_counted_everywhere() {
+    let one = journal_bytes(&NET_LAYOUT).unwrap();
+    let mut driver = net_driver(2, 64, one);
+    let id = identity(driver.driver_id(), 3);
+    let side = NetSide::Sender;
+    let hook = hooked(&mut driver, side);
+    let first = driver
+        .open_network_journal(side, id, lane(0), 3, Some(0))
+        .unwrap();
+    assert_eq!(
+        driver.open_network_journal(side, id, lane(1), 3, Some(0)),
+        None
+    );
+    assert_eq!(hook.open(), [first]);
+    assert_eq!(driver.trace_mirror().network_journals_refused(), 1);
+    assert_eq!(counter(&driver, "network trace journals refused"), 1);
+    assert_eq!(driver.network_journals_refused(&id), 1);
+    assert_eq!(driver.network_journals_refused(&identity([7, 7], 3)), 0);
+    // The client budget is apart: a client journal still fits.
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let client = journal(&mut driver, &mut conductor, publication);
+    // The table is full now (two entries): refused again, as exhausted.
+    assert_eq!(
+        driver.open_network_journal(side, id, lane(2), 3, Some(0)),
+        None
+    );
+    assert_eq!(driver.trace_mirror().network_journals_refused(), 2);
+    assert_eq!(driver.network_journals_refused(&id), 2);
+    // Refusals spent no trace number.
+    assert_eq!(client.journal(), first + 1);
+}
+
+/// A network sender journal that ended is reused only once covered (T5):
+/// the publisher journals of its publication noted at its end were
+/// drained and their records left the ring. A receiver journal of a
+/// remote publication follows J1 alone.
+#[test]
+fn an_ended_sender_journal_waits_for_coverage() {
+    let mut driver = net_driver(2, 4, u64::MAX);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let mut published = journal(&mut driver, &mut conductor, publication);
+    let stream = entry(&driver, published.journal()).stream;
+    let id = identity(driver.driver_id(), stream);
+    let side = NetSide::Sender;
+    let _hook = hooked(&mut driver, side);
+    let sender = driver
+        .open_network_journal(side, id, lane(0), stream, Some(0))
+        .unwrap();
+    append(&mut published, [1]);
+    let _ = driver.do_work().unwrap();
+    assert!(driver.close_network_journal(side, &id, lane(0), Some(64), None));
+    let _ = driver.do_work().unwrap();
+    assert_eq!(entry(&driver, sender).state, JournalState::Closed);
+    // The ring still holds the noted publisher record: the entry waits,
+    // with no recycle log entry.
+    assert_eq!(
+        driver.open_network_journal(side, id, lane(1), stream, Some(0)),
+        None
+    );
+    assert_eq!(driver.trace_mirror().network_journals_refused(), 1);
+    let reader = driver.trace_mirror();
+    assert!((0..reader.log_entries()).all(|index| reader.log_entry(index) == LogRead::Free));
+    // Four more records push it out of the ring: covered, reused.
+    append(&mut published, 2..6);
+    let _ = driver.do_work().unwrap();
+    let next = driver
+        .open_network_journal(side, id, lane(1), stream, Some(0))
+        .unwrap();
+    assert!(entries(&driver).iter().all(|entry| entry.journal != sender));
+    assert_eq!(entry(&driver, next).kind, JournalKind::NetworkSender);
+
+    // A remote publication's receiver journal has no local `Publish` to
+    // cover: reused as soon as it ended and the ring holds none of its
+    // records.
+    let mut driver = net_driver(1, 4, u64::MAX);
+    let remote = identity([7, 7], 3);
+    let side = NetSide::Receiver;
+    let _hook = hooked(&mut driver, side);
+    let receiver = driver
+        .open_network_journal(side, remote, lane(0), 40, Some(0))
+        .unwrap();
+    assert!(driver.close_network_journal(side, &remote, lane(0), None, None));
+    let _ = driver.do_work().unwrap();
+    assert_eq!(entry(&driver, receiver).state, JournalState::Closed);
+    let next = driver
+        .open_network_journal(side, remote, lane(1), 40, Some(0))
+        .unwrap();
+    assert_eq!(
+        entries(&driver)
+            .iter()
+            .map(|entry| entry.journal)
+            .collect::<Vec<_>>(),
+        [next]
+    );
+}
+
+/// A refusal is counted even when the header count cannot rise.
+#[test]
+fn a_refusal_the_header_cannot_count_is_an_overflow() {
+    let driver = net_driver(1, 4, u64::MAX);
+    super::count_refusal(false, &driver.counters);
+    assert_eq!(counter(&driver, "network trace journals refused"), 1);
+    assert_eq!(counter(&driver, "counter overflows"), 1);
+    super::count_refusal(true, &driver.counters);
+    assert_eq!(counter(&driver, "network trace journals refused"), 2);
+    assert_eq!(counter(&driver, "counter overflows"), 1);
+}

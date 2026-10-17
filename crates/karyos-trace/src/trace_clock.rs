@@ -44,7 +44,7 @@ impl ClockProvenance {
         match self {
             Self::Opaque => 0,
             Self::StdMonotonic => 1,
-            Self::HostMonotonic => 2,
+            Self::HostMonotonic => karyos_protocol::trace_hook::HOST_MONOTONIC_PROVENANCE,
         }
     }
 
@@ -54,7 +54,7 @@ impl ClockProvenance {
     pub const fn from_word(word: u64) -> Self {
         match word {
             1 => Self::StdMonotonic,
-            2 => Self::HostMonotonic,
+            karyos_protocol::trace_hook::HOST_MONOTONIC_PROVENANCE => Self::HostMonotonic,
             _ => Self::Opaque,
         }
     }

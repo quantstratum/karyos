@@ -16,6 +16,8 @@ pub const OBSERVATION_WORDS: usize = 22;
 /// Words of a journal record: the observation and the collection stamp
 /// (time, clock, epoch) in words 22 to 24.
 pub const RECORD_WORDS: usize = OBSERVATION_WORDS + 3;
+// The width the driver sizes network journals with.
+const _: () = assert!(RECORD_WORDS == karyos_protocol::trace_hook::TRACE_RECORD_WORDS);
 /// Layout version written in word 0: version 3 carries `path` and
 /// `attempt` in word 21 on `SenderPickup` and `path` on `ReceiverCommit`
 /// (`quantstratum-docs: karyos/design/trace-network.md`, NT-2), in the

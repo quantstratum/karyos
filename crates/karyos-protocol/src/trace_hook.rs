@@ -104,6 +104,16 @@ pub trait TraceHook: Send {
     fn maintain(&mut self) {}
 }
 
+/// Payload words of a trace journal record: the observation and the
+/// writer's collection stamp (`karyos-trace`'s `RECORD_WORDS`). The driver
+/// sizes its network journals with it (`trace-network.md`, NT-3).
+pub const TRACE_RECORD_WORDS: usize = 25;
+
+/// The clock provenance word of the host's `CLOCK_MONOTONIC` in
+/// nanoseconds (`karyos-trace`'s `ClockProvenance::HostMonotonic`): the
+/// clock of the driver's network journals (T2).
+pub const HOST_MONOTONIC_PROVENANCE: u64 = 2;
+
 /// A traced frame copied into backend TX storage, before submission, for
 /// a first send or a retransmission (`SenderPickup`, NT-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
