@@ -174,6 +174,40 @@ fn the_configuration_is_checked() {
             },
             ..AgentConfig::default()
         },
+        // RP-8's path policy: a window of 2 ns or more, a skip ratio of 1
+        // to 100 percent and a minimum of one byte; RP-3's heartbeat.
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                lag_limit: 1,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                skip_percent: 0,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                skip_percent: 101,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                skip_min_bytes: 0,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_heartbeat_interval: 0,
+            ..AgentConfig::default()
+        },
     ] {
         assert!(matches!(
             network_agents::<S>(config),
@@ -402,4 +436,21 @@ fn the_receiver_runs_before_the_sender() {
     for pair in calls.chunks(2) {
         assert_eq!(pair, [AgentKind::Receiver, AgentKind::Sender]);
     }
+}
+
+/// The redundant-path defaults are redundant-paths.md section 7's:
+/// `path_lag_limit` 100 ms, `path_skip_ratio` 50%, `path_skip_min_bytes`
+/// 64 KiB; and RP-3's interim heartbeat, 100 ms.
+#[test]
+fn the_path_defaults_are_section_sevens() {
+    let config = AgentConfig::default();
+    assert_eq!(
+        config.path_policy,
+        crate::agents::data::PathPolicy {
+            lag_limit: 100_000_000,
+            skip_percent: 50,
+            skip_min_bytes: 64 * 1024,
+        }
+    );
+    assert_eq!(config.path_heartbeat_interval, 100_000_000);
 }
