@@ -212,6 +212,15 @@ pub struct ReceiverCounters {
     pub heartbeats_past_terminal: u64,
     /// DATA datagrams from no binding: dropped.
     pub data_unbound: u64,
+    /// DATA datagrams of a multi-path image that a full path queue dropped
+    /// (redundant-paths.md section 5): that path's copy only. It also
+    /// counts one longer than a queue buffer (`MAX_DATAGRAM`), which no
+    /// endpoint delivers; it is dropped rather than delivered past its
+    /// path's queued datagrams.
+    pub path_queue_drops: u64,
+    /// DATA datagrams of a multi-path image delivered at once, past the
+    /// path queues, for lack of a free queue.
+    pub path_queue_bypassed: u64,
     /// DATA datagrams that failed validation for their image: dropped.
     pub data_invalid: u64,
     /// PATH_HB that refreshed a bound path.
@@ -558,6 +567,8 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     idle_timeout: u64,
     /// The path statistics' configuration (redundant-paths.md section 5).
     path_config: PathConfig,
+    /// The path queues, allocated when the first later path is bound.
+    path_intake: Option<Box<path_intake::PathIntake>>,
     /// Each image's RTT probes' settings.
     rtt: RttConfig,
     /// A multicast image's NAK timing.
@@ -1632,8 +1643,10 @@ pub(super) fn roles<T: StreamTerms>(
             idle_timeout: config.idle_image_timeout,
             path_config: PathConfig {
                 max_paths: config.sessions.max_paths,
+                path_queue_datagrams: config.path_queue_datagrams,
                 ..PathConfig::default()
             },
+            path_intake: None,
             rtt: config.rtt,
             multicast: config.multicast,
             delays,
@@ -2128,6 +2141,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
     pub(super) fn drop_data(&mut self, nth: &[u64]) {
         self.drop_data = nth.to_vec();
         self.data_seen = 0;
+    }
+
+    /// Whether the path queues are allocated (tests).
+    #[cfg(test)]
+    pub(super) fn has_path_queues(&self) -> bool {
+        self.path_intake.is_some()
     }
 
     /// Delivers every DATA datagram twice from the `from`th since
@@ -3391,9 +3410,61 @@ impl<T: StreamTerms> ReceiverRole<T> {
             work = work.checked_add(intake.work).ok_or(overflow.clone())?;
         }
         work = work
+            .checked_add(self.drain_path_queues(sessions))
+            .ok_or(overflow.clone())?;
+        work = work
             .checked_add(self.poll_control_groups(halves, now)?)
             .ok_or(overflow)?;
         Ok(work)
+    }
+
+    /// Serves the path queues round robin, after every endpoint's poll: at
+    /// most a poll budget's datagrams per queue, each delivered at its poll
+    /// time. What is left waits for the next cycle. Returns the datagrams
+    /// delivered.
+    fn drain_path_queues(&mut self, sessions: &SessionEnd<T>) -> u32 {
+        if self.path_intake.is_none() {
+            return 0;
+        }
+        // A poll budget per queue; past `u32` (never: at most 16 paths of a
+        // `u32` budget is checked), one poll budget.
+        let per_queue = self.budget.datagrams();
+        let limit = u32::from(self.path_config.max_paths)
+            .checked_mul(per_queue)
+            .unwrap_or(per_queue);
+        let mut served = 0u32;
+        while served < limit {
+            let Some((endpoint, entry, buffer)) = self
+                .path_intake
+                .as_deref_mut()
+                .and_then(path_intake::PathIntake::pop)
+            else {
+                break;
+            };
+            let mut intake = Intake {
+                endpoint,
+                now: entry.now,
+                role: self,
+                sessions,
+                work: 0,
+            };
+            intake.data(
+                entry.source,
+                entry.alias,
+                path_intake::PathIntake::bytes(&entry, &buffer),
+            );
+            if let Some(queues) = self.path_intake.as_deref_mut() {
+                queues.give_back(entry, buffer);
+            }
+            let Some(next) = served.checked_add(1) else {
+                break;
+            };
+            served = next;
+        }
+        if let Some(queues) = self.path_intake.as_deref_mut() {
+            queues.release_idle();
+        }
+        served
     }
 
     /// Whether `endpoint` is joined to a subscription's NAK control group.
@@ -3665,6 +3736,41 @@ impl<T: StreamTerms> Intake<'_, T> {
             }
         }
         self.data_once(source, alias, bytes);
+    }
+
+    /// Queues a DATA datagram of a multi-path image in its path's queue
+    /// (redundant-paths.md section 5), stamped with this poll's time; one
+    /// from an endpoint whose queue holds datagrams is queued too, so its
+    /// path's order holds. Returns whether it was taken (queued, or dropped
+    /// by a full queue); `false` delivers it now.
+    fn enqueue(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) -> bool {
+        let key = BindingKey {
+            endpoint: self.endpoint,
+            source,
+            alias,
+        };
+        let role = &mut *self.role;
+        let paths = role.sessions.paths();
+        let multi = paths
+            .lookup(key)
+            .is_some_and(|(slot, _)| paths.live(slot) > 1);
+        let Some(intake) = role.path_intake.as_deref_mut() else {
+            return false;
+        };
+        if !intake.takes(self.endpoint, multi) {
+            return false;
+        }
+        match intake.push(self.endpoint, (source, alias, self.now), bytes) {
+            path_intake::Queue::Queued => true,
+            path_intake::Queue::Dropped => {
+                role.count(|c| &mut c.path_queue_drops);
+                true
+            }
+            path_intake::Queue::Bypass => {
+                role.count(|c| &mut c.path_queue_bypassed);
+                false
+            }
+        }
     }
 
     /// One DATA datagram's intake ([`Self::data`]).
@@ -4116,6 +4222,12 @@ impl<T: StreamTerms> Intake<'_, T> {
                 }
                 if let AnswerOutcome::PathBound { image, path } = outcome {
                     self.role.count(|c| &mut c.paths_bound);
+                    // The first later path: the path queues are allocated
+                    // now, on the control path, and kept.
+                    if self.role.path_intake.is_none() {
+                        self.role.path_intake =
+                            path_intake::PathIntake::new(&self.role.path_config).map(Box::new);
+                    }
                     // The later path is charged and its freshness tracked
                     // from its own joins (RP-1).
                     let joins = self.role.sessions.paths().joins(image, path);
@@ -4201,7 +4313,9 @@ impl<T: StreamTerms> RxHandler for Intake<'_, T> {
         match classify(datagram.bytes()) {
             Ok(Datagram::Control(control)) => self.control(source, control),
             Ok(Datagram::DataBatch(data) | Datagram::Heartbeat(data)) => {
-                self.data(source, data.alias(), data.bytes());
+                if !self.enqueue(source, data.alias(), data.bytes()) {
+                    self.data(source, data.alias(), data.bytes());
+                }
             }
             Err(_) => self.role.count(|c| &mut c.decode_errors),
         }
@@ -5615,6 +5729,8 @@ fn established<T: StreamTerms>(sessions: &SendSessions, outbound: &Outbound<T>) 
         .route_endpoints()
         .any(|path| sessions.is_established(path, outbound.alias()))
 }
+
+mod path_intake;
 
 #[cfg(test)]
 mod tests;

@@ -5993,6 +5993,98 @@ fn a_different_eos_bound_is_refused_at_the_intake() {
     assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 1));
 }
 
+/// rp-w8: a one-path receiver allocates no path queues and queues nothing.
+#[test]
+fn a_one_path_receiver_has_no_path_queues() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    for _ in 0..200 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() == 4 {
+            break;
+        }
+    }
+    assert_eq!(seen, [0, 1, 2, 3]);
+    assert!(!rig.agents.receiver.role.has_path_queues());
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        (counters.path_queue_drops, counters.path_queue_bypassed),
+        (0, 0)
+    );
+}
+
+/// rp-w8, §8 "Queues and statistics": over two paths, the path queues are
+/// allocated when the later path binds. With one-entry queues, a burst
+/// fills them: each full queue drops only its own path's datagram,
+/// counted, and the other path's copy, or repair once later data shows
+/// the gap, still delivers every message once, in order.
+#[test]
+fn a_full_path_queue_drops_only_its_paths_copy() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        tune: Some(|config: &mut AgentConfig| config.path_queue_datagrams = 1),
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    assert!(rig.agents.receiver.role.has_path_queues());
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    for i in 0..8u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    // Then one message every ten rounds: later data shows the receiver
+    // the gaps the drops left, and repair fills them.
+    let mut seen = Vec::new();
+    let mut next = 8u8;
+    for round in 0..600 {
+        if round % 10 == 0 && next < 16 {
+            let log = rig.log.as_mut().unwrap();
+            let _ = log.publications[0]
+                .append(&[next; 900], AppendOptions::default())
+                .unwrap();
+            next += 1;
+        }
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() >= 16 {
+            break;
+        }
+    }
+    for _ in 0..50 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+    }
+    assert_eq!(seen, (0..16).collect::<Vec<u8>>());
+    let counters = rig.agents.receiver.counters();
+    assert!(counters.path_queue_drops > 0, "{counters:?}");
+}
+
 /// An EOS data frame the receive owner does not commit names no bound: a
 /// frame two terms ahead of the rebuild position reads `Received::Ahead`
 /// (beyond the window `{r, r + 1}`) and is dropped, and the lane's real
