@@ -69,7 +69,15 @@ release may break APIs, wire formats and shared-memory layouts.
   (`RoutedLaneSender::cancel_route`) through the guard gate; those it held
   alone are counted (`PathCounters::copies_abandoned`) and reach receivers
   by NAK or close as gaps. `Outbound::path_state` and
-  `Outbound::path_counters` report it; return is rp-w5b.
+  `Outbound::path_counters` report it. A faulted route leaves too, while
+  another path is live.
+- A left path returns (RP-9; rp-w5b) after its backoff
+  (`PathPolicy::backoff_initial`, 10 ms, doubling to `backoff_max`, 1 s,
+  and starting over after `backoff_reset`, 10 s, live): on its open queue,
+  or by `retry_queue` after a fault, from the current selection point,
+  counted (`PathCounters::entries`). It bounds `Outbound::sent_low`, the
+  least frontier over the live paths, from its first submit; a frame a
+  path skipped counts as passed for its frontier.
 - Receiver trace journals keep their sealed gaps (P2.12 step 3, PR 3b,
   trace-network.md section 5): the first `FACT_GAP_INTERVALS` (16) gaps of
   each traced lane, in order, with an overflow flag, carried in
