@@ -212,10 +212,10 @@ impl Disk for FaultDisk {
         u64::try_from(Self::inode(&mut fs, file)?.data.len()).map_err(io::Error::other)
     }
 
-    fn truncate(&mut self, file: &PathBuf, len: u64) -> io::Result<()> {
+    fn set_len(&mut self, file: &PathBuf, len: u64) -> io::Result<()> {
         let mut fs = self.step()?;
         let len = usize::try_from(len).map_err(io::Error::other)?;
-        Self::inode(&mut fs, file)?.data.truncate(len);
+        Self::inode(&mut fs, file)?.data.resize(len, 0);
         Ok(())
     }
 

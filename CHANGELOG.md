@@ -11,6 +11,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The Archive's segment index entries have a kind (phase 3, A4): data, a
+  fill (a padding or aborted block's canonical record, covering its
+  extent) or a gap (a range an async recording lost, refused to reads).
+  `SegmentStore::append_fill`, `append_gap` and `gaps`; an unknown kind is
+  refused at recovery. The catalog's stop gains the reason `Lapped` and an
+  `incomplete` flag, which `settle` sets for a recording with gaps. The
+  `Disk` trait's `truncate` becomes `set_len`, which also extends.
 - `karyos-archive` gains its catalog (phase 3, A3): `catalog.kyc`, an
   append-only log of CRC-32C checked records (a recording started,
   stopped or forgotten, and the id watermark), each durable before the

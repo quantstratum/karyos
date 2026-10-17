@@ -67,6 +67,8 @@ pub enum StopReason {
     Recovered,
     /// A crash left it open before its segment store existed: it is empty.
     Empty,
+    /// An async recording was lapped and stopped there (`on_lap = Stop`).
+    Lapped,
 }
 
 impl StopReason {
@@ -75,6 +77,7 @@ impl StopReason {
             Self::Normal => 1,
             Self::Recovered => 2,
             Self::Empty => 3,
+            Self::Lapped => 4,
         }
     }
 
@@ -83,6 +86,7 @@ impl StopReason {
             1 => Some(Self::Normal),
             2 => Some(Self::Recovered),
             3 => Some(Self::Empty),
+            4 => Some(Self::Lapped),
             _ => None,
         }
     }
@@ -97,6 +101,9 @@ pub struct Stop {
     pub time_ns: u64,
     /// Why.
     pub reason: StopReason,
+    /// The recording lost ranges (an async recording lapped and resumed):
+    /// its segments hold gap entries there.
+    pub incomplete: bool,
 }
 
 /// A recording the catalog lists.
@@ -310,7 +317,7 @@ impl Record {
                 payload.bytes(&id.to_le_bytes());
                 payload.bytes(&stop.position.to_le_bytes());
                 payload.bytes(&stop.time_ns.to_le_bytes());
-                payload.bytes(&[stop.reason.code()]);
+                payload.bytes(&[stop.reason.code(), u8::from(stop.incomplete)]);
                 STOPPED
             }
             Self::NextId(next) => {
@@ -369,6 +376,11 @@ impl Record {
                     position: input.u64()?,
                     time_ns: input.u64()?,
                     reason: StopReason::of(input.u8()?)?,
+                    incomplete: match input.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    },
                 },
             },
             NEXT_ID => Self::NextId(input.u64()?),
@@ -495,7 +507,7 @@ impl<D: Disk> Catalog<D> {
         if bytes.get(..HEADER) != Some(&header()[..]) {
             // A torn header: the catalog's creation did not complete, so no
             // record of it was ever reported.
-            disk.truncate(&file, 0)?;
+            disk.set_len(&file, 0)?;
             disk.write_at(&file, 0, &header())?;
             cut = Some(0);
         } else {
@@ -513,7 +525,7 @@ impl<D: Disk> Catalog<D> {
             }
         }
         if let Some(at) = cut.filter(|at| *at > 0) {
-            disk.truncate(&file, at)?;
+            disk.set_len(&file, at)?;
         }
         disk.sync(&file)?;
         if removed_temporary || cut.is_some() {
@@ -620,8 +632,9 @@ impl<D: Disk> Catalog<D> {
         Ok(id)
     }
 
-    /// Stops recording `id` at `position`: its `Stopped` record is durable
-    /// on return. The caller closes its segment store first.
+    /// Stops recording `id` at `position`, `incomplete` when it lost
+    /// ranges: its `Stopped` record is durable on return. The caller closes
+    /// its segment store first.
     ///
     /// # Errors
     ///
@@ -634,6 +647,7 @@ impl<D: Disk> Catalog<D> {
         position: u64,
         time_ns: u64,
         reason: StopReason,
+        incomplete: bool,
     ) -> Result<(), CatalogError> {
         let recording = self
             .recordings
@@ -647,6 +661,7 @@ impl<D: Disk> Catalog<D> {
             position,
             time_ns,
             reason,
+            incomplete,
         };
         self.append(&Record::Stopped { id, stop })?;
         if let Some(recording) = self
@@ -764,13 +779,17 @@ impl<D: Disk + Clone> Catalog<D> {
             .collect();
         let mut settled = Vec::with_capacity(open.len());
         for (id, start, geometry, policy) in open {
-            let (position, reason) =
+            let (position, reason, incomplete) =
                 match SegmentStore::recover(self.disk.clone(), &self.dir, id, geometry, policy) {
-                    Ok(recovered) => (recovered.store.written(), StopReason::Recovered),
-                    Err(SegmentError::NotFound { .. }) => (start, StopReason::Empty),
+                    Ok(recovered) => (
+                        recovered.store.written(),
+                        StopReason::Recovered,
+                        !recovered.store.gaps().is_empty(),
+                    ),
+                    Err(SegmentError::NotFound { .. }) => (start, StopReason::Empty, false),
                     Err(error) => return Err(error.into()),
                 };
-            self.stop(id, position, now_ns, reason)?;
+            self.stop(id, position, now_ns, reason, incomplete)?;
             settled.push(Settled {
                 id,
                 position,

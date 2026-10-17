@@ -47,12 +47,13 @@ pub trait Disk {
     /// The operating system's error.
     fn len(&mut self, file: &Self::File) -> io::Result<u64>;
 
-    /// Shortens the file to `len` bytes.
+    /// Sets the file's length to `len` bytes: shortened, or extended with
+    /// zeros.
     ///
     /// # Errors
     ///
     /// The operating system's error.
-    fn truncate(&mut self, file: &Self::File, len: u64) -> io::Result<()>;
+    fn set_len(&mut self, file: &Self::File, len: u64) -> io::Result<()>;
 
     /// Makes the file's data durable. On Apple targets the standard library
     /// issues `F_FULLFSYNC`, since `fsync` there does not reach stable
@@ -132,7 +133,7 @@ impl Disk for StdDisk {
         Ok(file.metadata()?.len())
     }
 
-    fn truncate(&mut self, file: &Self::File, len: u64) -> io::Result<()> {
+    fn set_len(&mut self, file: &Self::File, len: u64) -> io::Result<()> {
         file.set_len(len)
     }
 

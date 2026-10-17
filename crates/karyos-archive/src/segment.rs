@@ -27,8 +27,13 @@
 //!   equals `written` afterwards. A write the index does not cover was
 //!   never `written`, so a torn write is never read back.
 //!
-//! A gap in the stream is not the store's: appends are contiguous, and
-//! the recorder (A4) records a gap as its own record.
+//! - **Kinds.** An index entry covers data, a fill or a gap (byte 16 of
+//!   the entry; zero, data, in every entry of the first version). A fill
+//!   is a padding or aborted block: its canonical 32-byte record is stored
+//!   and checked, and the entry covers the block's logical extent. A gap is
+//!   a range an async recording lost: nothing is stored, and a read inside
+//!   it is refused. Positions stay contiguous across all three. An entry of
+//!   a kind this version does not know is refused at recovery, never cut.
 
 #[cfg(test)]
 mod tests;
@@ -129,6 +134,42 @@ pub enum SyncPolicy {
     },
 }
 
+/// What an index entry covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// Frames, stored at their positions and checked by their CRC.
+    Data,
+    /// A padding or aborted block: its canonical 32-byte record is stored
+    /// at its position and checked, and the entry covers the block's whole
+    /// logical extent, so positions stay contiguous.
+    Fill,
+    /// A range the recording lost (an async recording lapped): nothing is
+    /// stored, and a read inside it is refused.
+    Gap,
+}
+
+impl EntryKind {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Data => 0,
+            Self::Fill => 1,
+            Self::Gap => 2,
+        }
+    }
+
+    const fn of(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Data),
+            1 => Some(Self::Fill),
+            2 => Some(Self::Gap),
+            _ => None,
+        }
+    }
+}
+
+/// The length of a fill's canonical record.
+pub const FILL_RECORD: usize = 32;
+
 /// Why recovery cut a recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CutReason {
@@ -194,6 +235,29 @@ pub enum SegmentError {
     /// A position does not fit 64 bits.
     #[error("position overflow")]
     PositionOverflow,
+    /// A fill shorter than its record, or longer than its segment's room.
+    #[error("a fill of {extent} bytes does not fit")]
+    InvalidFill {
+        /// The fill's extent.
+        extent: u32,
+    },
+    /// A read touches a range the recording lost.
+    #[error("[{from}, {to}) was lost")]
+    Gap {
+        /// The lost range's start.
+        from: u64,
+        /// Its end.
+        to: u64,
+    },
+    /// An index entry of a kind this version does not know (a newer
+    /// format): recovery refuses it rather than cut recorded data.
+    #[error("index entry at {position} has unknown kind {kind}")]
+    UnknownEntryKind {
+        /// The entry's position.
+        position: u64,
+        /// Its kind code.
+        kind: u8,
+    },
     /// An earlier operation failed: the store's state on disk is unknown
     /// until it is recovered.
     #[error("the store failed earlier and must be recovered")]
@@ -237,6 +301,8 @@ pub struct SegmentStore<D: Disk> {
     written: u64,
     durable: u64,
     current: Option<Open<D::File>>,
+    /// The lost ranges, in order: reads inside them are refused.
+    gaps: Vec<(u64, u64)>,
     /// A segment was finished without a sync (no-sync policy): `durable`
     /// can no longer pass it.
     unsynced_behind: bool,
@@ -247,13 +313,18 @@ pub struct SegmentStore<D: Disk> {
     skip_index_sync: bool,
 }
 
-/// An index entry.
+/// An index entry: its range, its kind (byte 16, zero in the first
+/// version's entries, which were all data) and the CRC of what it stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     start: u64,
     length: u32,
     data_crc: u32,
+    kind: EntryKind,
 }
+
+/// A decoded entry, or the code of a kind this version does not know.
+type Decoded = Result<Entry, (u64, u8)>;
 
 impl Entry {
     fn encode(self) -> [u8; 32] {
@@ -261,21 +332,28 @@ impl Entry {
         put(&mut bytes, 0, &self.start.to_le_bytes());
         put(&mut bytes, 8, &self.length.to_le_bytes());
         put(&mut bytes, 12, &self.data_crc.to_le_bytes());
+        put(&mut bytes, 16, &[self.kind.code()]);
         let crc = crc32c(bytes.get(..28).unwrap_or_default());
         put(&mut bytes, 28, &crc.to_le_bytes());
         bytes
     }
 
     /// The entry in `bytes`, if its own CRC holds.
-    fn decode(bytes: &[u8; 32]) -> Option<Self> {
+    fn decode(bytes: &[u8; 32]) -> Option<Decoded> {
         if crc32c(bytes.get(..28)?) != u32_at(bytes, 28)? {
             return None;
         }
-        Some(Self {
-            start: u64_at(bytes, 0)?,
+        let start = u64_at(bytes, 0)?;
+        let code = *bytes.get(16)?;
+        let Some(kind) = EntryKind::of(code) else {
+            return Some(Err((start, code)));
+        };
+        Some(Ok(Self {
+            start,
             length: u32_at(bytes, 8)?,
             data_crc: u32_at(bytes, 12)?,
-        })
+            kind,
+        }))
     }
 
     fn end(self) -> Option<u64> {
@@ -406,6 +484,7 @@ impl<D: Disk> SegmentStore<D> {
             written: start,
             durable: start,
             current: None,
+            gaps: Vec::new(),
             unsynced_behind: false,
             last_sync_ns: 0,
             failed: false,
@@ -440,6 +519,12 @@ impl<D: Disk> SegmentStore<D> {
     #[must_use]
     pub const fn geometry(&self) -> Geometry {
         self.geometry
+    }
+
+    /// The ranges the recording lost, in order.
+    #[must_use]
+    pub fn gaps(&self) -> &[(u64, u64)] {
+        &self.gaps
     }
 
     /// Creates the segment at `base` (its index header naming `start`),
@@ -524,19 +609,39 @@ impl<D: Disk> SegmentStore<D> {
 
     /// Writes `chunk`, which fits the open segment, then its entry.
     fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), SegmentError> {
-        let written = self.written;
-        let open = self.current.as_mut().ok_or(SegmentError::Failed)?;
         let length = u32::try_from(chunk.len()).map_err(|_| SegmentError::PositionOverflow)?;
         let entry = Entry {
-            start: written,
+            start: self.written,
             length,
             data_crc: crc32c(chunk),
+            kind: EntryKind::Data,
         };
-        let offset = written
+        self.write_entry(entry, chunk, None)
+    }
+
+    /// Writes `stored` at the entry's position, extends the data file to
+    /// `extend_to` when given, then appends the entry: the entry is last,
+    /// so what it covers is in place before it counts.
+    fn write_entry(
+        &mut self,
+        entry: Entry,
+        stored: &[u8],
+        extend_to: Option<u64>,
+    ) -> Result<(), SegmentError> {
+        let open = self.current.as_mut().ok_or(SegmentError::Failed)?;
+        let offset = entry
+            .start
             .checked_sub(open.base)
             .ok_or(SegmentError::PositionOverflow)?;
         let entry_at = entry_offset(open.entries).ok_or(SegmentError::PositionOverflow)?;
-        self.disk.write_at(&open.data, offset, chunk)?;
+        if !stored.is_empty() {
+            self.disk.write_at(&open.data, offset, stored)?;
+        }
+        if let Some(length) = extend_to
+            && self.disk.len(&open.data)? < length
+        {
+            self.disk.set_len(&open.data, length)?;
+        }
         self.disk.write_at(&open.index, entry_at, &entry.encode())?;
         open.entries = open
             .entries
@@ -545,6 +650,110 @@ impl<D: Disk> SegmentStore<D> {
         open.dirty = true;
         self.written = entry.end().ok_or(SegmentError::PositionOverflow)?;
         Ok(())
+    }
+
+    /// Opens the segment for the written position, if the open one ends
+    /// there.
+    fn segment_for_written(&mut self) -> Result<u64, SegmentError> {
+        let base = self.geometry.base_of(self.written);
+        if self.current.as_ref().is_none_or(|open| open.base != base) {
+            self.roll(base)?;
+        }
+        Ok(base)
+    }
+
+    /// Appends a padding or aborted block at `position`, the written
+    /// position: its canonical `record` is stored and checked, and the
+    /// entry covers its logical `extent`, which stays inside one segment
+    /// (a block never crosses a term end). Returns the written position.
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentStore::append`], and [`SegmentError::InvalidFill`].
+    pub fn append_fill(
+        &mut self,
+        position: u64,
+        record: &[u8; FILL_RECORD],
+        extent: u32,
+    ) -> Result<u64, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        if position != self.written {
+            return Err(SegmentError::NotContiguous {
+                expected: self.written,
+                got: position,
+            });
+        }
+        // Checked before anything is written: a refusal changes nothing.
+        let base = self.geometry.base_of(self.written);
+        let room = base
+            .checked_add(self.geometry.segment_length)
+            .and_then(|end| end.checked_sub(self.written))
+            .ok_or(SegmentError::PositionOverflow)?;
+        if (extent as usize) < FILL_RECORD || u64::from(extent) > room {
+            return Err(SegmentError::InvalidFill { extent });
+        }
+        let result = self.fill(record, extent);
+        self.guard(result)
+    }
+
+    fn fill(&mut self, record: &[u8; FILL_RECORD], extent: u32) -> Result<u64, SegmentError> {
+        let base = self.segment_for_written()?;
+        let entry = Entry {
+            start: self.written,
+            length: extent,
+            data_crc: crc32c(record),
+            kind: EntryKind::Fill,
+        };
+        let end = entry.end().ok_or(SegmentError::PositionOverflow)?;
+        self.write_entry(entry, record, Some(end - base))?;
+        Ok(self.written)
+    }
+
+    /// Records the range `[position, to)` as lost: nothing is stored, and a
+    /// read inside it is refused. Returns the written position, `to`.
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentStore::append`].
+    pub fn append_gap(&mut self, position: u64, to: u64) -> Result<u64, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        if position != self.written {
+            return Err(SegmentError::NotContiguous {
+                expected: self.written,
+                got: position,
+            });
+        }
+        if to <= position {
+            return Ok(self.written);
+        }
+        let result = self.gap(to);
+        self.guard(result)
+    }
+
+    fn gap(&mut self, to: u64) -> Result<u64, SegmentError> {
+        let from = self.written;
+        while self.written < to {
+            let base = self.segment_for_written()?;
+            let segment_end = base
+                .checked_add(self.geometry.segment_length)
+                .ok_or(SegmentError::PositionOverflow)?;
+            let end = to.min(segment_end);
+            let length =
+                u32::try_from(end - self.written).map_err(|_| SegmentError::PositionOverflow)?;
+            let entry = Entry {
+                start: self.written,
+                length,
+                data_crc: 0,
+                kind: EntryKind::Gap,
+            };
+            self.write_entry(entry, &[], None)?;
+        }
+        push_gap(&mut self.gaps, from, to);
+        Ok(self.written)
     }
 
     /// Finishes the open segment, synced unless the policy is no sync, and
@@ -645,13 +854,20 @@ impl<D: Disk> SegmentStore<D> {
     pub fn read(&mut self, position: u64, buf: &mut [u8]) -> Result<(), SegmentError> {
         let length = u64::try_from(buf.len()).map_err(|_| SegmentError::PositionOverflow)?;
         let end = position.checked_add(length);
-        if position < self.start || end.is_none_or(|end| end > self.written) {
+        let Some(end) = end.filter(|end| position >= self.start && *end <= self.written) else {
             return Err(SegmentError::OutOfRange {
                 position,
                 length,
                 start: self.start,
                 written: self.written,
             });
+        };
+        if let Some(&(from, to)) = self
+            .gaps
+            .iter()
+            .find(|(from, to)| *from < end && position < *to)
+        {
+            return Err(SegmentError::Gap { from, to });
         }
         let mut position = position;
         let mut buf = buf;
@@ -703,6 +919,7 @@ impl<D: Disk> SegmentStore<D> {
             cut: None,
             kept: None,
             dropped: 0,
+            gaps: Vec::new(),
         };
         for base in bases {
             // After a cut nothing continues the recording.
@@ -733,7 +950,7 @@ impl<D: Disk> SegmentStore<D> {
             .checked_sub(kept.base)
             .ok_or(SegmentError::PositionOverflow)?;
         if disk.len(&kept.data)? > length {
-            disk.truncate(&kept.data, length)?;
+            disk.set_len(&kept.data, length)?;
         }
         disk.sync(&kept.data)?;
         disk.sync(&kept.index)?;
@@ -754,6 +971,7 @@ impl<D: Disk> SegmentStore<D> {
                 entries: kept.entries,
                 dirty: false,
             }),
+            gaps: scan.gaps,
             unsynced_behind: false,
             last_sync_ns: 0,
             failed: false,
@@ -785,6 +1003,16 @@ struct Scan<F> {
     cut: Option<Cut>,
     kept: Option<Kept<F>>,
     dropped: u32,
+    gaps: Vec<(u64, u64)>,
+}
+
+/// Adds the lost range `[from, to)` to `gaps`, joining it to the last one
+/// when they touch.
+fn push_gap(gaps: &mut Vec<(u64, u64)>, from: u64, to: u64) {
+    match gaps.last_mut() {
+        Some(last) if last.1 == from => last.1 = to,
+        _ => gaps.push((from, to)),
+    }
 }
 
 /// Removes both files of the segment at `base`, those that exist.
@@ -876,29 +1104,49 @@ fn scan_segment<D: Disk>(
         let at = entry_offset(index_entry).ok_or(SegmentError::PositionOverflow)?;
         let mut bytes = [0u8; 32];
         disk.read_at(&index, at, &mut bytes)?;
-        let Some(entry) = Entry::decode(&bytes) else {
+        let Some(decoded) = Entry::decode(&bytes) else {
             cut = Some(CutReason::EntryChecksum);
             break;
         };
+        let entry = decoded
+            .map_err(|(position, kind)| SegmentError::UnknownEntryKind { position, kind })?;
         let entry_end = entry.end().ok_or(SegmentError::PositionOverflow)?;
         if entry.start != expected_start || entry_end > end || entry.length == 0 {
             cut = Some(CutReason::NotContiguous);
             break;
         }
-        buffer.resize(
-            usize::try_from(entry.length).map_err(|_| SegmentError::PositionOverflow)?,
-            0,
-        );
         let offset = entry.start - base;
-        let read = disk.read_at(&data, offset, &mut buffer);
-        let matches = match read {
-            Ok(()) => crc32c(&buffer) == entry.data_crc,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => false,
-            Err(error) => return Err(error.into()),
+        let stored = match entry.kind {
+            EntryKind::Data => entry.length,
+            EntryKind::Fill if (entry.length as usize) >= FILL_RECORD => FILL_RECORD as u32,
+            EntryKind::Fill => {
+                cut = Some(CutReason::NotContiguous);
+                break;
+            }
+            EntryKind::Gap => 0,
         };
-        if !matches {
-            cut = Some(CutReason::DataChecksum);
-            break;
+        if stored > 0 {
+            buffer.resize(
+                usize::try_from(stored).map_err(|_| SegmentError::PositionOverflow)?,
+                0,
+            );
+            let read = disk.read_at(&data, offset, &mut buffer);
+            let mut matches = match read {
+                Ok(()) => crc32c(&buffer) == entry.data_crc,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => false,
+                Err(error) => return Err(error.into()),
+            };
+            // A fill's extent is in the file before its entry.
+            if entry.kind == EntryKind::Fill && disk.len(&data)? < (entry_end - base) {
+                matches = false;
+            }
+            if !matches {
+                cut = Some(CutReason::DataChecksum);
+                break;
+            }
+        }
+        if entry.kind == EntryKind::Gap {
+            push_gap(&mut scan.gaps, entry.start, entry_end);
         }
         expected_start = entry_end;
         kept = index_entry.saturating_add(1);
@@ -908,7 +1156,7 @@ fn scan_segment<D: Disk>(
     }
     if let Some(reason) = cut {
         let keep = entry_offset(kept).ok_or(SegmentError::PositionOverflow)?;
-        disk.truncate(&index, keep)?;
+        disk.set_len(&index, keep)?;
         scan.cut = Some(Cut {
             position: expected_start,
             reason,

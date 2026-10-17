@@ -78,7 +78,7 @@ fn run(disk: FaultDisk, ops: &[Op]) -> Done {
                     .start(new_recording(stream_id, &channel))
                     .map(|id| done.ids.push(id))
             }
-            Op::Stop(id) => catalog.stop(id, 100, 9, StopReason::Normal),
+            Op::Stop(id) => catalog.stop(id, 100, 9, StopReason::Normal, false),
             Op::Forget(id) => catalog.forget(id),
             Op::Compact => catalog.compact(),
         };
@@ -178,7 +178,7 @@ fn the_watermark_keeps_a_compacted_id_used() {
     let channel = channel_of(1);
     assert_eq!(catalog.start(new_recording(1, &channel)).unwrap(), 1);
     assert_eq!(catalog.start(new_recording(2, &channel)).unwrap(), 2);
-    catalog.stop(2, 64, 9, StopReason::Normal).unwrap();
+    catalog.stop(2, 64, 9, StopReason::Normal, false).unwrap();
     catalog.forget(2).unwrap();
     catalog.compact().unwrap();
     let mut reopened = Catalog::open(disk.clone(), dir).unwrap().catalog;
@@ -291,7 +291,8 @@ fn settling_stops_what_a_crash_left_open() {
         Some(Stop {
             position: 200,
             time_ns: 77,
-            reason: StopReason::Recovered
+            reason: StopReason::Recovered,
+            incomplete: false,
         })
     );
     assert_eq!(
@@ -318,12 +319,12 @@ fn refusals_change_nothing() {
         Err(CatalogError::NotStopped { .. })
     ));
     assert!(matches!(
-        catalog.stop(9, 0, 0, StopReason::Normal),
+        catalog.stop(9, 0, 0, StopReason::Normal, false),
         Err(CatalogError::UnknownRecording { id: 9 })
     ));
-    catalog.stop(id, 0, 0, StopReason::Normal).unwrap();
+    catalog.stop(id, 0, 0, StopReason::Normal, false).unwrap();
     assert!(matches!(
-        catalog.stop(id, 0, 0, StopReason::Normal),
+        catalog.stop(id, 0, 0, StopReason::Normal, false),
         Err(CatalogError::AlreadyStopped { .. })
     ));
     assert_eq!(catalog.next_id(), 2);
@@ -377,4 +378,46 @@ proptest! {
             prop_assert!(result.is_ok(), "{:?}: {:?}", survives, result);
         }
     }
+}
+
+/// A4: a lapped stop and the incomplete flag round-trip, and settling a
+/// recording whose segments hold a gap marks it incomplete.
+#[test]
+fn lapped_and_incomplete_stops_are_kept() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut catalog = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    let channel = channel_of(1);
+    let lapped = catalog.start(new_recording(1, &channel)).unwrap();
+    catalog
+        .stop(lapped, 64, 3, StopReason::Lapped, true)
+        .unwrap();
+    let gapped = catalog.start(new_recording(2, &channel)).unwrap();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        dir,
+        gapped,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    store.append(0, &[1; 10]).unwrap();
+    store.append_gap(10, 50).unwrap();
+    store.append(50, &[2; 10]).unwrap();
+    store.sync().unwrap();
+    drop(store);
+    drop(catalog);
+    let restarted = disk.after_crash(Survives::Synced);
+    let mut catalog = Catalog::open(restarted.clone(), dir).unwrap().catalog;
+    let settled = catalog.settle(8).unwrap();
+    assert_eq!(settled.len(), 1);
+    let reopened = Catalog::open(restarted, dir).unwrap().catalog;
+    let first = reopened.get(lapped).unwrap().stop.unwrap();
+    assert_eq!((first.reason, first.incomplete), (StopReason::Lapped, true));
+    let second = reopened.get(gapped).unwrap().stop.unwrap();
+    assert_eq!(
+        (second.position, second.reason, second.incomplete),
+        (60, StopReason::Recovered, true)
+    );
 }

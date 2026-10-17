@@ -501,3 +501,303 @@ fn measure_the_sync_cost() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A piece of a recording, for the workloads with fills and gaps.
+#[derive(Debug, Clone, Copy)]
+enum Piece {
+    /// `n` stream bytes.
+    Data(usize),
+    /// A fill of this extent.
+    Fill(u32),
+    /// A lost range of this length.
+    Gap(u64),
+    /// A sync.
+    Sync,
+}
+
+/// The canonical record a fill at `position` stores.
+fn fill_record(position: u64) -> [u8; FILL_RECORD] {
+    let mut record = [0u8; FILL_RECORD];
+    record[..8].copy_from_slice(&position.to_le_bytes());
+    record[8] = 0xAB;
+    record
+}
+
+/// Appends `piece` from `position` (the written one), or its rest from
+/// `position` when a crash cut it there; returns the new written position.
+fn apply_piece<D: Disk>(
+    store: &mut SegmentStore<D>,
+    piece_start: u64,
+    piece: Piece,
+    position: u64,
+) -> Result<u64, SegmentError> {
+    match piece {
+        Piece::Data(length) => {
+            let from = usize::try_from(position - piece_start).unwrap();
+            let bytes = piece_bytes(piece_start, length);
+            store.append(position, &bytes[from..])
+        }
+        Piece::Fill(extent) => store.append_fill(position, &fill_record(piece_start), extent),
+        Piece::Gap(length) => store.append_gap(position, piece_start + length),
+        Piece::Sync => store.sync(),
+    }
+}
+
+/// The bytes of a data piece at `start`.
+fn piece_bytes(start: u64, length: usize) -> Vec<u8> {
+    (0..length)
+        .map(|index| u8::try_from((start as usize + index * 13 + 1) % 253).unwrap())
+        .collect()
+}
+
+/// Each piece with its start position.
+fn layout(start: u64, pieces: &[Piece]) -> Vec<(u64, Piece)> {
+    let mut position = start;
+    pieces
+        .iter()
+        .map(|&piece| {
+            let at = position;
+            position += match piece {
+                Piece::Data(length) => length as u64,
+                Piece::Fill(extent) => u64::from(extent),
+                Piece::Gap(length) => length,
+                Piece::Sync => 0,
+            };
+            (at, piece)
+        })
+        .collect()
+}
+
+/// Runs `pieces` on `disk`; returns whether the store was created and the
+/// last durable position reported.
+fn run_pieces(disk: FaultDisk, pieces: &[Piece], start: u64) -> Reported {
+    let dir = Path::new(DIR);
+    let Ok(mut store) = SegmentStore::create(
+        disk,
+        dir,
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        start,
+    ) else {
+        return Reported {
+            created: false,
+            durable: start,
+        };
+    };
+    let mut reported = Reported {
+        created: true,
+        durable: store.durable(),
+    };
+    for (at, piece) in layout(start, pieces) {
+        match apply_piece(&mut store, at, piece, at) {
+            Ok(_) => reported.durable = store.durable(),
+            Err(_) => return reported,
+        }
+    }
+    if let Ok(durable) = store.close() {
+        reported.durable = durable;
+    }
+    reported
+}
+
+/// Checks a recovery of `pieces` against the gate, then continues it.
+fn check_pieces(
+    crashed: &FaultDisk,
+    survives: Survives,
+    reported: Reported,
+    pieces: &[Piece],
+    start: u64,
+) -> Result<(), String> {
+    let recovered = match SegmentStore::recover(
+        crashed.after_crash(survives),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    ) {
+        Ok(recovered) => recovered,
+        Err(SegmentError::NotFound { .. }) if !reported.created => return Ok(()),
+        Err(error) => return Err(format!("recovery failed: {error}")),
+    };
+    let mut store = recovered.store;
+    let written = store.written();
+    if written < reported.durable {
+        return Err(format!(
+            "written {written} below durable {}",
+            reported.durable
+        ));
+    }
+    let pieces = layout(start, pieces);
+    // Every whole or partly kept piece reads back as written.
+    for &(at, piece) in &pieces {
+        let end = at
+            + match piece {
+                Piece::Data(length) => length as u64,
+                Piece::Fill(extent) => u64::from(extent),
+                Piece::Gap(length) => length,
+                Piece::Sync => 0,
+            };
+        let kept = end.min(written);
+        if kept <= at {
+            continue;
+        }
+        let mut read = vec![0u8; usize::try_from(kept - at).unwrap()];
+        match piece {
+            Piece::Data(length) => {
+                store
+                    .read(at, &mut read)
+                    .map_err(|error| error.to_string())?;
+                if read != piece_bytes(at, length)[..read.len()] {
+                    return Err(format!("data at {at} differs"));
+                }
+            }
+            Piece::Fill(_) => {
+                if kept != end {
+                    return Err(format!("fill at {at} kept in part"));
+                }
+                store
+                    .read(at, &mut read)
+                    .map_err(|error| error.to_string())?;
+                if read[..FILL_RECORD] != fill_record(at)
+                    || read[FILL_RECORD..].iter().any(|b| *b != 0)
+                {
+                    return Err(format!("fill at {at} differs"));
+                }
+            }
+            Piece::Gap(_) => {
+                if !matches!(store.read(at, &mut read), Err(SegmentError::Gap { .. })) {
+                    return Err(format!("gap at {at} was readable"));
+                }
+            }
+            Piece::Sync => {}
+        }
+    }
+    // Restart and continue: the rest of the cut piece, then every later one.
+    let mut position = written;
+    for &(at, piece) in &pieces {
+        let end = at
+            + match piece {
+                Piece::Data(length) => length as u64,
+                Piece::Fill(extent) => u64::from(extent),
+                Piece::Gap(length) => length,
+                Piece::Sync => 0,
+            };
+        if end <= position && !matches!(piece, Piece::Sync) {
+            continue;
+        }
+        if matches!(piece, Piece::Sync) {
+            continue;
+        }
+        position =
+            apply_piece(&mut store, at, piece, position).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// A workload of data, fills (padding to a term end) and gaps, crossing
+/// segments; one gap spans a roll.
+fn pieces() -> Vec<Piece> {
+    vec![
+        Piece::Data(40),
+        Piece::Fill(24 + 64),
+        Piece::Sync,
+        Piece::Data(30),
+        Piece::Gap(150),
+        Piece::Data(20),
+        Piece::Sync,
+        Piece::Fill(32),
+        Piece::Data(10),
+    ]
+}
+
+/// A4: fills and gaps keep the gate's properties at every crash point.
+#[test]
+fn every_crash_point_keeps_fills_and_gaps() {
+    let free = FaultDisk::default();
+    let _ = run_pieces(free.clone(), &pieces(), 0);
+    let mut failures = Vec::new();
+    for budget in 0..=free.used() {
+        let disk = FaultDisk::with_budget(budget);
+        let reported = run_pieces(disk.clone(), &pieces(), 0);
+        for survives in [Survives::Everything, Survives::Synced] {
+            if let Err(failure) = check_pieces(&disk, survives, reported, &pieces(), 0) {
+                failures.push(format!("budget {budget}, {survives:?}: {failure}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A fill must hold its record and fit its segment; a gap is refused to
+/// reads and reported by `gaps`.
+#[test]
+fn fills_and_gaps_are_checked() {
+    let mut store = SegmentStore::create(
+        FaultDisk::default(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    assert!(matches!(
+        store.append_fill(0, &fill_record(0), 31),
+        Err(SegmentError::InvalidFill { extent: 31 })
+    ));
+    assert!(matches!(
+        store.append_fill(0, &fill_record(0), 129),
+        Err(SegmentError::InvalidFill { extent: 129 })
+    ));
+    assert_eq!(store.append_fill(0, &fill_record(0), 64).unwrap(), 64);
+    assert_eq!(store.append_gap(64, 100).unwrap(), 100);
+    assert_eq!(store.append_gap(100, 300).unwrap(), 300);
+    assert_eq!(store.gaps(), [(64, 300)]);
+    let mut out = [0u8; 8];
+    assert!(matches!(
+        store.read(90, &mut out),
+        Err(SegmentError::Gap { from: 64, to: 300 })
+    ));
+    let mut fill = [1u8; 64];
+    store.read(0, &mut fill).unwrap();
+    assert_eq!(fill[..FILL_RECORD], fill_record(0));
+}
+
+/// An index entry of an unknown kind is refused at recovery, not cut.
+#[test]
+fn an_unknown_entry_kind_is_refused() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        dir,
+        RECORDING,
+        geometry(),
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    store.append(0, &[1; 10]).unwrap();
+    drop(store);
+    let entry = Entry {
+        start: 10,
+        length: 4,
+        data_crc: 0,
+        kind: EntryKind::Gap,
+    };
+    let mut bytes = entry.encode();
+    bytes[16] = 9;
+    let crc = crc32c(&bytes[..28]);
+    bytes[28..].copy_from_slice(&crc.to_le_bytes());
+    let mut raw = disk.clone();
+    let index = raw.open(&dir.join(index_name(RECORDING, 0))).unwrap();
+    raw.write_at(&index, HEADER + ENTRY, &bytes).unwrap();
+    assert!(matches!(
+        SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::None),
+        Err(SegmentError::UnknownEntryKind {
+            position: 10,
+            kind: 9
+        })
+    ));
+}
