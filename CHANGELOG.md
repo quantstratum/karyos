@@ -11,6 +11,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-archive` gains its catalog (phase 3, A3): `catalog.kyc`, an
+  append-only log of CRC-32C checked records (a recording started,
+  stopped or forgotten, and the id watermark), each durable before the
+  call returns. Ids are never reused: a compaction, written to a temporary
+  file and renamed over the catalog, carries the watermark. Opening cuts a
+  torn log and removes a compaction's leftover; `Catalog::settle` stops the
+  recordings a crash left open at their recovered position, with the
+  reason recorded. The `Disk` trait moves to `karyos_archive::disk` and
+  gains `rename`.
 - `karyos-archive` gains its segment store (phase 3, A2): a recording's
   positions in segment files of a checked multiple of the term length, each
   with an index of CRC-32C checked writes; written and durable positions,
