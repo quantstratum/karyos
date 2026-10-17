@@ -159,6 +159,33 @@ fn a_frame_is_published_and_read() {
     assert_eq!(owner.counters().frames_committed, 1);
 }
 
+/// An image's consumption is its rebuild position, lowered to its least
+/// required subscriber's; optional subscribers bound nothing.
+#[test]
+fn consumption_is_held_by_a_required_subscriber() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let _optional = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(buffer.required_position(), None);
+    assert_eq!(recv(&mut owner, &data(0, 0, 128, 7)), committed(0, 128));
+    assert_eq!(owner.consumption(Lane::ZERO), Some(128));
+    // A required subscriber joins at the head and holds it.
+    let mut required = conductor.subscribe(Role::Required).unwrap();
+    assert_eq!(buffer.required_position(), Some(128));
+    assert_eq!(recv(&mut owner, &data(0, 128, 128, 8)), committed(128, 128));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(256));
+    assert_eq!(owner.consumption(Lane::ZERO), Some(128));
+    let mut out = [0u8; 256];
+    assert!(matches!(
+        required.poll(&mut out).unwrap(),
+        PollOutcome::Message { .. }
+    ));
+    required.acknowledge();
+    assert_eq!(owner.consumption(Lane::ZERO), Some(256));
+    assert_eq!(owner.consumption(Lane::try_new(1).unwrap()), None);
+}
+
 #[test]
 fn an_overlapping_frame_is_refused_and_the_committed_one_kept() {
     let buffer = image(0);
