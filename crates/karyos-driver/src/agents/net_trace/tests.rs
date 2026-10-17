@@ -555,6 +555,7 @@ mod sender {
                 start: 0,
                 boundary: 0,
                 first_gap: None,
+                gaps: None,
             }
         );
         assert_eq!(
@@ -584,4 +585,25 @@ mod sender {
         assert_eq!(recorder.closed().len(), 2);
         assert!(trace.hook().is_none());
     }
+}
+
+/// P2.12 step 3 PR 3b: the gap list keeps the first `FACT_GAP_INTERVALS`
+/// gaps and flags the rest; a gap whose end does not fit is flagged too.
+#[test]
+fn the_gap_list_keeps_the_first_and_flags_the_rest() {
+    let mut gaps = GapIntervals::default();
+    for index in 0..FACT_GAP_INTERVALS {
+        let position = u64::try_from(index).unwrap() * 100;
+        gaps.push(position, 10);
+    }
+    assert_eq!(gaps.intervals().len(), FACT_GAP_INTERVALS);
+    assert_eq!(gaps.intervals()[1], (100, 110));
+    assert!(!gaps.overflowed());
+    gaps.push(10_000, 10);
+    assert_eq!(gaps.intervals().len(), FACT_GAP_INTERVALS);
+    assert!(gaps.overflowed());
+    let mut edge = GapIntervals::default();
+    edge.push(u64::MAX - 1, 10);
+    assert!(edge.intervals().is_empty());
+    assert!(edge.overflowed());
 }

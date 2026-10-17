@@ -162,6 +162,11 @@ pub struct AgentConfig {
     pub publications: usize,
     /// `setup_interval` in ns (default 100 ms).
     pub setup_interval: u64,
+    /// `path_heartbeat_interval` in ns (redundant-paths.md RP-3; default
+    /// 100 ms, at least 1): a routed publication's path that submitted no
+    /// DATA for this long sends a PATH_HB, so it stays live at its
+    /// receivers while another path carries the stream.
+    pub path_heartbeat_interval: u64,
     /// `setup_answer_rate` and its source table.
     pub answer_rate: crate::sessions::send::AnswerRate,
     /// Entries of the receiver-to-sender control ring, at least 1.
@@ -232,6 +237,7 @@ impl Default for AgentConfig {
             sessions: crate::sessions::receive::SessionConfig::default(),
             publications: 64,
             setup_interval: 100_000_000,
+            path_heartbeat_interval: 100_000_000,
             answer_rate: crate::sessions::send::AnswerRate::default(),
             control_capacity: 512,
             control_routes: 8,
@@ -260,6 +266,11 @@ impl AgentConfig {
         let commands = NonZeroUsize::new(self.command_capacity).ok_or(
             AgentError::InvalidConfig("command_capacity must be at least 1"),
         )?;
+        if self.path_heartbeat_interval == 0 {
+            return Err(AgentError::InvalidConfig(
+                "path_heartbeat_interval must be at least 1",
+            ));
+        }
         let events = NonZeroUsize::new(self.event_capacity).ok_or(AgentError::InvalidConfig(
             "event_capacity must be at least 1",
         ))?;
@@ -1056,7 +1067,14 @@ impl<O: SocketOps> ReceiverAgent<O> {
         });
         // Journals a retirement closed reach the conductor with their facts
         // (trace-network.md §4); a full ring keeps them for the next cycle.
-        role.post_retired_journals(|event| events.try_post(event).is_ok());
+        role.post_retired_journals(|event| match events.try_post(event) {
+            Ok(()) => None,
+            Err(
+                ring::PostError::Gone(event)
+                | ring::PostError::Foreign(event)
+                | ring::PostError::Full(event),
+            ) => Some(event),
+        });
         served.checked_add(work).ok_or(overflow)
     }
 
