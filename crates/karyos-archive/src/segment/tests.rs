@@ -687,7 +687,7 @@ fn bad_headers_are_typed_errors() {
     let mut raw = disk.clone();
     for name in [data_name(RECORDING, 128), index_name(RECORDING, 128)] {
         let file = raw.open(&Path::new(DIR).join(name)).unwrap();
-        raw.truncate(&file, 0).unwrap();
+        raw.set_len(&file, 0).unwrap();
     }
     assert!(matches!(
         recover(&disk),
