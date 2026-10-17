@@ -5,11 +5,14 @@
 //! phase 5a).
 //!
 //! [`SenderRead`] owns one subscriber cell of one lane's log buffer: a SPEC
-//! §4 participant with its own loan word and revoked flag. It is a
-//! required participant on every channel (SPEC §4: the sender's position
-//! bounds the publisher; on an unreliable channel it is the sent
-//! position), admitted with its `L_send` slot credit reserved against
-//! `S - C` (S2 2.1, `Conductor::subscribe_as` with `reserve`). Each
+//! §4 participant with its own loan word and revoked flag. For the network
+//! sender it is a required participant on every channel (SPEC §4: the
+//! sender's position bounds the publisher; on an unreliable channel it is
+//! the sent position), admitted with its `L_send` slot credit reserved
+//! against `S - C` (S2 2.1, `Conductor::subscribe_as` with `reserve`). An
+//! Archive recording's reader ([`SenderRead::for_recording`]) is that, or
+//! an optional participant the publisher may lap, which rejoins at the
+//! head ([`SenderRead::rejoin_at_head`]). Each
 //! [`SenderRead::read_committed`] call takes one
 //! loan on the exact `(generation, term)` of its position, copies whole
 //! committed frames into the caller's TX storage and releases the loan
@@ -711,9 +714,11 @@ impl<O: BufferOwner> SenderRead<O> {
     /// read past it and not submitted (an endpoint reset returned it): the
     /// next read starts there again. The registered position is a block
     /// start by construction (the join, or a boundary [`SenderRead::sent`]
-    /// accepted), and never below the floor, so nothing it rereads is
-    /// reclaimed. The C-9 count is kept: a rewind onto a corrupt block does
-    /// not restore its retries.
+    /// accepted). A required reader's is never below the floor, so nothing
+    /// it rereads is reclaimed; an optional recording reader's can fall
+    /// below it, and the read's floor checks then return
+    /// [`ReadError::Unavailable`]. The C-9 count is kept: a rewind onto a
+    /// corrupt block does not restore its retries.
     ///
     /// # Errors
     ///

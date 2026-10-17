@@ -2081,7 +2081,8 @@ fn an_optional_recording_reader_holds_one_loan_at_most() {
                     sr_sent(&mut reader);
                 }
                 Ok(ReadOutcome::Canonical { .. }) => sr_sent(&mut reader),
-                Ok(ReadOutcome::Pending) | Err(_) => break,
+                Ok(ReadOutcome::Pending) => break,
+                Err(error) => panic!("{error:?}"),
             }
         }
     }
