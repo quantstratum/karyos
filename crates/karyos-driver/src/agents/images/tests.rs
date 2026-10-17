@@ -90,6 +90,8 @@ struct Setup {
     identity: Option<crate::membership::ReceiverIdentity>,
     /// The publication's configured roles (MC-1), built at the add.
     roles: Option<fn() -> crate::membership::PublicationRoles>,
+    /// The subscription's conflated lane (conflated-network-images.md).
+    conflated: Option<Lane>,
 }
 
 impl Setup {
@@ -119,6 +121,7 @@ impl Default for Setup {
             before: 0,
             identity: None,
             roles: None,
+            conflated: None,
         }
     }
 }
@@ -236,6 +239,7 @@ impl Rig {
                 multicast: setup.multicast,
                 control_group,
                 identity: setup.identity,
+                conflated: setup.conflated,
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
@@ -382,6 +386,7 @@ impl Rig {
                 multicast: false,
                 control_group: None,
                 identity: setup.identity,
+                conflated: setup.conflated,
             })
             .unwrap();
         self.round(true);
@@ -675,10 +680,12 @@ fn stale_replies_are_counted() {
         SessionEvent::ImageInstalled {
             slot: unknown,
             installed: unknown,
+            freshness: None,
         },
         SessionEvent::ImageInstalled {
             slot: pending,
             installed,
+            freshness: None,
         },
         SessionEvent::ImageReleased { slot: pending },
     ] {
@@ -3105,4 +3112,88 @@ fn losing_the_last_path_retires_the_image() {
         }
     }
     assert!(!rig.agents.receiver.role.has_image(slot));
+}
+
+/// C3 (conflated-network-images.md (b)): a conflated lane whose view's
+/// feeder is not attached seals at once, counted; an unconflated image has
+/// no link and its seals are untouched (control).
+#[test]
+fn an_unattached_conflated_lane_seals_at_once() {
+    for conflated in [Some(Lane::ZERO), None] {
+        let (mut rig, _b) = Rig::new(Setup {
+            conflated,
+            ..Setup::default()
+        });
+        let slot = established(&mut rig);
+        assert_eq!(rig.images.freshness(slot).map(|(lane, _)| lane), conflated);
+        lose_one(&mut rig);
+        rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+        let counters = rig.agents.receiver.counters();
+        assert_eq!(counters.seals_unattached, u64::from(conflated.is_some()));
+        assert_eq!((counters.barrier_posts, counters.seals_gated), (0, 0));
+    }
+}
+
+/// With its feeder attached, the hole is posted and its seal held past the
+/// reorder deadline until the feeder acknowledges; then it is sealed, and
+/// the terminal cell stays empty.
+#[test]
+fn an_attached_conflated_lane_seals_after_the_ack() {
+    let (mut rig, _b) = Rig::new(Setup {
+        conflated: Some(Lane::ZERO),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let link = rig.images.freshness(slot).unwrap().1.clone();
+    let feeder = link.mailbox().unwrap();
+    feeder.attach();
+    lose_one(&mut rig);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().barrier_posts >= 1
+    });
+    let request = feeder.pending().unwrap();
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(counters.gaps_sealed, 0, "held for the ack");
+    assert!(counters.seals_gated >= 1);
+    feeder.acknowledge(request.request).unwrap();
+    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.barrier_acks, counters.barrier_timeouts), (1, 0));
+    assert_eq!(
+        karyos_sys::freshness::TerminalCell::read(&link.terminal_words()),
+        None
+    );
+}
+
+/// A stalled feeder: at `barrier_ack_timeout` the receiver publishes the
+/// view's terminal cell with the posted interval, then seals (design (c)).
+#[test]
+fn a_stalled_feeder_closes_the_conflated_view() {
+    let (mut rig, _b) = Rig::new(Setup {
+        conflated: Some(Lane::ZERO),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let link = rig.images.freshness(slot).unwrap().1.clone();
+    let feeder = link.mailbox().unwrap();
+    feeder.attach();
+    lose_one(&mut rig);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().barrier_posts >= 1
+    });
+    let request = feeder.pending().unwrap();
+    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.barrier_timeouts, counters.barrier_acks), (1, 0));
+    assert_eq!(
+        karyos_sys::freshness::TerminalCell::read(&link.terminal_words()),
+        Some(karyos_sys::freshness::Terminal {
+            start: request.start,
+            end: request.end,
+            reason: karyos_sys::freshness::TERMINAL_BARRIER_TIMEOUT,
+        })
+    );
 }

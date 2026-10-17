@@ -365,6 +365,42 @@ fn a_subscription_with_another_identity_is_refused() {
     }
 }
 
+/// C3: subscriptions sharing a receiver entry agree on its conflated
+/// lane: another lane, none where the first has one, or one where the
+/// first has none, is refused; the same lane shares the entry.
+#[test]
+fn a_subscription_with_another_conflated_lane_is_refused() {
+    use karyos_sys::frame::Lane;
+
+    let lane1 = Lane::try_new(1).unwrap();
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let first = b
+        .add_network_subscription_conflated(10, &channel(address), Lane::ZERO)
+        .unwrap();
+    assert_eq!(
+        b.add_network_subscription_conflated(10, &channel(address), lane1),
+        Err(crate::DriverError::ConflationMismatch)
+    );
+    assert_eq!(
+        b.add_network_subscription(10, &channel(address)),
+        Err(crate::DriverError::ConflationMismatch),
+        "none where the first has one"
+    );
+    let second = b
+        .add_network_subscription_conflated(10, &channel(address), Lane::ZERO)
+        .unwrap();
+    let plain = b.add_network_subscription(11, &channel(address)).unwrap();
+    assert_eq!(
+        b.add_network_subscription_conflated(11, &channel(address), Lane::ZERO),
+        Err(crate::DriverError::ConflationMismatch),
+        "one where the first has none"
+    );
+    for subscription in [first, second, plain] {
+        assert!(b.remove_network_subscription(subscription).unwrap());
+    }
+}
+
 /// W5b B5: the conductor mirrors the receiver's subscription table, so a
 /// new key beyond it is refused at once; a key already held still shares
 /// its entry, and the receiver never refuses one the mirror admitted.
@@ -744,6 +780,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         later: paths,
         later_routes: [None; crate::net::LATER_PATHS],
         identity: None,
+        conflated: None,
         users: 1,
     }
 }

@@ -279,6 +279,21 @@ pub struct ReceiverCounters {
     pub images_closed_protocol_fault: u64,
     /// Gaps sealed by the skip policy (unreliable timers, or `skip`).
     pub gaps_sealed: u64,
+    /// Due holes of a conflated lane held by its seal gate in a duty
+    /// (conflated-network-images.md (b)): posted, not sealed yet.
+    pub seals_gated: u64,
+    /// Intervals posted to a conflated view's feeder.
+    pub barrier_posts: u64,
+    /// Seals permitted after the feeder's acknowledgement.
+    pub barrier_acks: u64,
+    /// Conflated lane seals permitted at once: no feeder attached yet.
+    pub seals_unattached: u64,
+    /// Acknowledgements past `barrier_ack_timeout`: the view's terminal
+    /// cell published (design (c)).
+    pub barrier_timeouts: u64,
+    /// Gate answers Pending while the feeder's claimed terminal cell was
+    /// not yet published (docs#120).
+    pub barrier_claim_waits: u64,
     /// Data and controls this phase does not handle yet.
     pub unhandled: u64,
     /// An increment did not apply.
@@ -440,6 +455,12 @@ pub struct ReceiverRole {
     /// at most one per key, allocated at start): their images name the
     /// configured `receiver_id` and declare its `group_tag`.
     identities: Vec<(EndpointId, i32, crate::membership::ReceiverIdentity)>,
+    /// The conflated lane of subscribed keys (conflated-network-images.md
+    /// (a); at most one per key, allocated at start): their images gate
+    /// that lane's seals.
+    conflated: Vec<(EndpointId, i32, Lane)>,
+    /// `barrier_ack_timeout` of the conflated lanes' seal gates.
+    barrier_ack_timeout: u64,
     /// Whether a subscription was ever removed: from then on each cycle
     /// retires the images of streams no longer subscribed (bounded by the
     /// subscription table).
@@ -821,6 +842,9 @@ struct Installed {
     naks: Vec<PendingNak>,
     /// The close repair decided, carried out by the next timer step.
     closing: Option<CloseReason>,
+    /// The seal gate of its conflated lane, with a conflated view
+    /// (conflated-network-images.md (b)).
+    gate: Option<Box<super::conflated_gate::ConflatedGate>>,
     /// Per lane, when a tail loss was first seen (the heartbeat mark above
     /// a rebuild position with nothing covered above it).
     tail_since: [Option<u64>; 4],
@@ -934,10 +958,20 @@ fn unrecoverable(
         .start
         .checked_add(u64::from(hole.length))
         .map_or(lowest_retained, |end| lowest_retained.max(end));
-    match image
-        .skip
-        .range_unavailable(&mut image.owner, lane, floor, now)
-    {
+    let unavailable = match image.gate.as_deref_mut() {
+        Some(gate) => image
+            .skip
+            .range_unavailable_gated(&mut image.owner, lane, floor, now, gate),
+        None => image
+            .skip
+            .range_unavailable(&mut image.owner, lane, floor, now),
+    };
+    tally_gate(
+        counters,
+        image,
+        unavailable.as_ref().map_or(0, |report| report.gated),
+    );
+    match unavailable {
         Ok(report) => {
             for _ in 0..report.sealed {
                 tally(counters, |c| &mut c.gaps_sealed);
@@ -977,6 +1011,33 @@ fn tally(counters: &mut ReceiverCounters, field: fn(&mut ReceiverCounters) -> &m
     let mut overflowed = counters.overflowed;
     bump(field(counters), &mut overflowed);
     counters.overflowed = overflowed;
+}
+
+/// Adds `delta` to the counter `field` picks, checked as [`tally`].
+fn tally_by(
+    counters: &mut ReceiverCounters,
+    field: fn(&mut ReceiverCounters) -> &mut u64,
+    delta: u64,
+) {
+    let value = field(counters);
+    match value.checked_add(delta) {
+        Some(next) => *value = next,
+        None => counters.overflowed = true,
+    }
+}
+
+/// Settles what an image's seal gate did into the receiver's counters.
+fn tally_gate(counters: &mut ReceiverCounters, image: &mut Installed, gated: u32) {
+    tally_by(counters, |c| &mut c.seals_gated, u64::from(gated));
+    let Some(gate) = image.gate.as_deref_mut() else {
+        return;
+    };
+    let counts = gate.take_counts();
+    tally_by(counters, |c| &mut c.barrier_posts, counts.posted);
+    tally_by(counters, |c| &mut c.barrier_acks, counts.acknowledged);
+    tally_by(counters, |c| &mut c.seals_unattached, counts.unattached);
+    tally_by(counters, |c| &mut c.barrier_timeouts, counts.timeouts);
+    tally_by(counters, |c| &mut c.barrier_claim_waits, counts.claim_waits);
 }
 
 /// Settles `probe`'s report into `rtt`, if the sender made one; `replied`
@@ -1200,6 +1261,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             group_budget: config.group_nak_budget,
             group_start: 0,
             identities: Vec::with_capacity(config.subscriptions),
+            conflated: Vec::with_capacity(config.subscriptions),
+            barrier_ack_timeout: config.barrier_ack_timeout,
             unsubscribed: false,
             published: Vec::with_capacity(config.subscriptions),
             max_entries: config.subscriptions,
@@ -1297,6 +1360,7 @@ impl ReceiverRole {
                 multicast,
                 control_group,
                 identity,
+                conflated,
             } => {
                 let held = self
                     .subscriptions
@@ -1327,6 +1391,10 @@ impl ReceiverRole {
                         // subscription's: the conductor refuses another.
                         if let Some(identity) = identity {
                             self.identities.push((endpoint, stream_id, identity));
+                        }
+                        // Likewise its conflated lane.
+                        if let Some(lane) = conflated {
+                            self.conflated.push((endpoint, stream_id, lane));
                         }
                         true
                     }
@@ -1366,6 +1434,8 @@ impl ReceiverRole {
                 if let Some(index) = found {
                     self.subscriptions.swap_remove(index);
                     self.identities
+                        .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
+                    self.conflated
                         .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
                     self.unsubscribed = true;
                 }
@@ -1740,10 +1810,18 @@ impl ReceiverRole {
                     let chain = self.take_chain(slot);
                     let event = match self.sessions.image_ready(slot, now) {
                         ImageOutcome::Installed(installed) => {
-                            if let Err(retire) = self.install(installed, owner, chain, now) {
-                                refused = Some((installed, retire));
+                            let freshness = match self.install(installed, owner, chain, now) {
+                                Ok(freshness) => freshness,
+                                Err(retire) => {
+                                    refused = Some((installed, retire));
+                                    None
+                                }
+                            };
+                            SessionEvent::ImageInstalled {
+                                slot,
+                                installed,
+                                freshness,
                             }
-                            SessionEvent::ImageInstalled { slot, installed }
                         }
                         // Dropping the owner drops the receiver's hold on
                         // the image, and `retire` frees its unit; the
@@ -1800,7 +1878,7 @@ impl ReceiverRole {
         owner: Box<ReceiveOwner>,
         chain: Option<Chain>,
         now: u64,
-    ) -> Result<(), Option<Reservation>> {
+    ) -> Result<Option<(Lane, karyos_sys::freshness::FreshnessLink)>, Option<Reservation>> {
         let Some(chain) = chain else {
             self.count(|c| &mut c.chain_invariant);
             return Err(None);
@@ -1955,6 +2033,23 @@ impl ReceiverRole {
         }
         // The table holds a slot for every session, so it has room for
         // every installed image.
+        // A conflated lane of its key: that lane's seals go through the
+        // view's barrier mailbox, whose link the conductor gets with the
+        // `ImageInstalled` (conflated-network-images.md (b)).
+        let link = self
+            .conflated
+            .iter()
+            .find(|(held, stream, _)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
+            .map(|(.., lane)| *lane)
+            .filter(|lane| lane.get() < chain.lane_count)
+            .map(|lane| (lane, karyos_sys::freshness::FreshnessLink::new()));
+        let gate = link.as_ref().map(|(lane, link)| {
+            Box::new(super::conflated_gate::ConflatedGate::new(
+                *lane,
+                link.clone(),
+                self.barrier_ack_timeout,
+            ))
+        });
         self.images.push(Installed {
             slot: installed,
             owner,
@@ -1980,6 +2075,7 @@ impl ReceiverRole {
             skip,
             naks,
             closing: None,
+            gate,
             tail_since: [None; 4],
             reset_requested: None,
             next_clean,
@@ -1997,7 +2093,7 @@ impl ReceiverRole {
             receiver_id: named,
             group_tag,
         });
-        Ok(())
+        Ok(link)
     }
 
     /// The installed images' timers at `now`: retirement at the liveness
@@ -2390,7 +2486,16 @@ impl ReceiverRole {
         // an unreliable image; on a reliable one under `skip`, the holes
         // left below an unrecoverable range (at most a few per call).
         if image.closing.is_none() {
-            match image.skip.duty(&mut image.owner, now) {
+            let duty = match image.gate.as_deref_mut() {
+                Some(gate) => image.skip.duty_gated(&mut image.owner, now, gate),
+                None => image.skip.duty(&mut image.owner, now),
+            };
+            tally_gate(
+                counters,
+                image,
+                duty.as_ref().map_or(0, |report| report.gated),
+            );
+            match duty {
                 Ok(report) => {
                     for _ in 0..report.sealed {
                         tally(counters, |c| &mut c.gaps_sealed);
