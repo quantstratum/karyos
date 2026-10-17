@@ -36,8 +36,20 @@
 //!   floor moves is still submitted (RC-13): the floor is not read again
 //!   between the read and the submission.
 //!
+//! - **Bounds per call.** A probe reads at most one head, so reads, and the
+//!   ERRs they cause, stay within the loads budget: a refused job makes the
+//!   probe ineligible and the lane's next job waits for its next probe. A
+//!   known failed submission holds its lane for the rest of the call, the
+//!   job kept, so one failing queue cannot spend the call's budget. A head
+//!   the DRR would refuse (a charge of zero or above the largest, or one
+//!   that does not move forward) is dropped and counted rather than left to
+//!   fail every later call.
+//!
 //! The admitted-NAK count of the repair budget is spent by admission (R4);
 //! this component spends its bytes and its word 0 loads, one probe each.
+//! One [`Scheduler`] serves one incarnation; the round robin across
+//! incarnations with a persistent cursor, sharing one repair budget per
+//! cycle, is the sender agent's (the wiring, ACS 15773).
 
 use karyos_protocol::lanes::drr::{Budget, Drr, DrrConfig, LaneSource, Probe, Report, Service};
 use karyos_protocol::network::{NakReplyReason, Receiver};
@@ -152,6 +164,9 @@ pub struct SchedulerCounts {
     pub range_unavailable: u64,
     /// Jobs dropped with no ERR (`CorruptTerm`, `Retry`, `TooSmall`).
     pub dropped: u64,
+    /// Jobs dropped for a head the DRR would refuse: a charge of zero or
+    /// above the largest, or one that does not move forward.
+    pub invalid_heads: u64,
     /// Jobs ended by an uncertain submission.
     pub unresolved: u64,
     /// An increment did not apply (sticky).
@@ -209,6 +224,11 @@ struct Source<'a, R, S> {
     submit: &'a mut S,
     counts: &'a mut SchedulerCounts,
     selected: [Option<Selected>; karyos_protocol::lanes::drr::MAX_LANES],
+    /// Lanes held for the rest of the call after a known failed
+    /// submission: the job is kept for the next call.
+    held: [bool; karyos_protocol::lanes::drr::MAX_LANES],
+    /// The largest valid charge.
+    max_charge: u64,
     now: u64,
 }
 
@@ -232,52 +252,61 @@ impl<R: RepairRead, S: RepairSubmit> LaneSource for Source<'_, R, S> {
         if let Some(slot) = self.selected.get_mut(lane) {
             *slot = None;
         }
-        // A refused or dropped job leaves the lane's next job to try, at
-        // most every job once.
-        while let Some(pending) = self.jobs.next_for_lane(lane_id) {
-            let key = pending.key;
-            let end = key.start.checked_add(u64::from(key.length));
-            match self.read.head(lane_id, pending.cursor) {
-                Ok(head) if end.is_some_and(|end| head.next() <= end) => {
-                    if let Some(slot) = self.selected.get_mut(lane) {
-                        *slot = Some(Selected {
-                            job: pending.job,
-                            key,
-                            from: pending.cursor,
-                            head,
-                        });
-                    }
-                    return Probe::Eligible {
-                        charge: head.charge(),
-                    };
-                }
-                Ok(_) | Err(RepairReadError::BadRequest) => {
-                    self.refuse(pending.job, &key, NakReplyReason::RangeInvalid);
-                }
-                Err(error @ (RepairReadError::Unavailable { .. } | RepairReadError::Revoked)) => {
-                    // The floor read after the refusal, never below the
-                    // one the read reported.
-                    let floor = self.read.floor(lane_id);
-                    let lowest = match error {
-                        RepairReadError::Unavailable { lowest } => lowest.max(floor),
-                        _ => floor,
-                    };
-                    self.refuse(
-                        pending.job,
-                        &key,
-                        NakReplyReason::RangeUnavailable {
-                            lowest_retained: lowest,
-                        },
-                    );
-                }
-                Err(
-                    RepairReadError::CorruptTerm
-                    | RepairReadError::Retry
-                    | RepairReadError::TooSmall,
-                ) => {
+        if self.held.get(lane).copied().unwrap_or(true) {
+            return Probe::Ineligible;
+        }
+        // At most one head is read per probe: a refused or dropped job
+        // makes this probe ineligible, and the lane's next job waits for
+        // its next probe, so reads and ERRs stay within the loads budget.
+        let Some(pending) = self.jobs.next_for_lane(lane_id) else {
+            return Probe::Ineligible;
+        };
+        let key = pending.key;
+        let end = key.start.checked_add(u64::from(key.length));
+        match self.read.head(lane_id, pending.cursor) {
+            Ok(head) if end.is_some_and(|end| head.next() <= end) => {
+                let charge = head.charge();
+                if charge == 0 || charge > self.max_charge || head.next() <= pending.cursor {
+                    // A head the DRR would refuse: dropped, never left to
+                    // fail every later call.
                     self.jobs.failed(pending.job);
-                    self.counts.bump(|c| &mut c.dropped);
+                    self.counts.bump(|c| &mut c.invalid_heads);
+                    return Probe::Ineligible;
                 }
+                if let Some(slot) = self.selected.get_mut(lane) {
+                    *slot = Some(Selected {
+                        job: pending.job,
+                        key,
+                        from: pending.cursor,
+                        head,
+                    });
+                }
+                return Probe::Eligible { charge };
+            }
+            Ok(_) | Err(RepairReadError::BadRequest) => {
+                self.refuse(pending.job, &key, NakReplyReason::RangeInvalid);
+            }
+            Err(error @ (RepairReadError::Unavailable { .. } | RepairReadError::Revoked)) => {
+                // The floor read after the refusal, never below the one
+                // the read reported.
+                let floor = self.read.floor(lane_id);
+                let lowest = match error {
+                    RepairReadError::Unavailable { lowest } => lowest.max(floor),
+                    _ => floor,
+                };
+                self.refuse(
+                    pending.job,
+                    &key,
+                    NakReplyReason::RangeUnavailable {
+                        lowest_retained: lowest,
+                    },
+                );
+            }
+            Err(
+                RepairReadError::CorruptTerm | RepairReadError::Retry | RepairReadError::TooSmall,
+            ) => {
+                self.jobs.failed(pending.job);
+                self.counts.bump(|c| &mut c.dropped);
             }
         }
         Probe::Ineligible
@@ -309,7 +338,12 @@ impl<R: RepairRead, S: RepairSubmit> LaneSource for Source<'_, R, S> {
                 }
                 Service::Served
             }
-            Submit::NotSubmitted => Service::NotServed,
+            Submit::NotSubmitted => {
+                if let Some(held) = self.held.get_mut(lane) {
+                    *held = true;
+                }
+                Service::NotServed
+            }
             Submit::Uncertain => {
                 self.jobs.unresolved(selected.job);
                 self.counts.bump(|c| &mut c.unresolved);
@@ -359,6 +393,8 @@ impl Scheduler {
             submit,
             counts: &mut self.counts,
             selected: [None; karyos_protocol::lanes::drr::MAX_LANES],
+            held: [false; karyos_protocol::lanes::drr::MAX_LANES],
+            max_charge: self.drr.config().max_charge(),
             now,
         };
         self.drr.run(

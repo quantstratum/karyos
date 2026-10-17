@@ -283,8 +283,12 @@ release may break APIs, wire formats and shared-memory layouts.
   with the floor read after, both to every requester; `CorruptTerm`,
   `Retry` and `TooSmall` drop the job with no ERR. A submitted last frame
   ends the job and starts its linger; an uncertain one ends it
-  unresolved; no room stops the call as backpressure. Not wired yet, and
-  the NAK read origin in karyos-sys comes separately.
+  unresolved; no room stops the call as backpressure. A probe reads at
+  most one head, so reads and ERRs stay within the loads budget; a known
+  failed submission holds its lane for the rest of the call; a head the
+  DRR would refuse is dropped and counted (ACS 15773). The round robin
+  across incarnations is the wiring's. Not wired yet, and the NAK read
+  origin in karyos-sys comes separately.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly

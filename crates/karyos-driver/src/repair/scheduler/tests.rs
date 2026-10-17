@@ -70,11 +70,17 @@ struct Wire {
     submitted: Vec<(u8, u64)>,
     replies: Vec<(JobKey, Vec<Receiver>, NakReplyReason)>,
     script: Vec<Submit>,
+    /// A lane whose every submission fails.
+    failing: Option<u8>,
+    attempts: u64,
 }
 
 impl RepairSubmit for Wire {
     fn submit(&mut self, lane: u8, _job: JobRef, from: u64, _head: Head) -> Submit {
-        let outcome = if self.script.is_empty() {
+        self.attempts += 1;
+        let outcome = if self.failing == Some(lane) {
+            Submit::NotSubmitted
+        } else if self.script.is_empty() {
             Submit::Submitted
         } else {
             self.script.remove(0)
@@ -267,49 +273,6 @@ fn heads_that_fail_end_their_job() {
     assert_eq!(scheduler.counts().dropped, 3);
 }
 
-/// A known failure keeps the job; an uncertain one ends it unresolved
-/// with no linger; no room ends the call as backpressure, the job kept.
-#[test]
-fn submission_outcomes() {
-    let mut log = Log::default().data(0, 0, 256, 2);
-    let mut wire = Wire {
-        script: vec![Submit::NotSubmitted, Submit::NoRoom],
-        ..Wire::default()
-    };
-    let mut jobs = new_jobs();
-    let mut scheduler = new_scheduler(1);
-    let kept = job(&mut jobs, 1, 0, 0, 512);
-    let report = scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
-    assert!(matches!(report.stop, Stop::Backpressure { lane: 0 }));
-    assert_eq!(
-        report.lanes[0].failed, 1,
-        "the known failure is not debited"
-    );
-    assert_eq!(report.lanes[0].served_bytes, 0);
-    assert!(jobs.current(kept));
-    assert_eq!(jobs.next_for_lane(0).unwrap().cursor, 0);
-    let mut wire = Wire {
-        script: vec![Submit::Uncertain],
-        ..Wire::default()
-    };
-    scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
-    assert!(!jobs.current(kept));
-    assert_eq!(scheduler.counts().unresolved, 1);
-    assert!(matches!(
-        jobs.join_or_create(
-            &Request {
-                receiver: receiver(1),
-                lane: 0,
-                start: 0,
-                length: 512,
-            },
-            Domain::Group,
-            0
-        ),
-        Joined::Created(_)
-    ));
-}
-
 /// Lanes share the repair budget by DRR: each is served within a call.
 #[test]
 fn lanes_are_served_round_robin() {
@@ -334,10 +297,57 @@ fn lanes_are_served_round_robin() {
     assert_eq!((lane0, lane1), (4, 4));
 }
 
-/// A job refused at its head leaves the lane's next job to serve in the
-/// same call.
+/// A known failure keeps the job and holds the lane for the call; an
+/// uncertain one ends it unresolved with no linger; no room ends the call
+/// as backpressure, the job kept.
 #[test]
-fn a_refused_job_gives_way_in_the_same_call() {
+fn submission_outcomes() {
+    let mut log = Log::default().data(0, 0, 256, 2);
+    let mut wire = Wire {
+        script: vec![Submit::NotSubmitted, Submit::NoRoom],
+        ..Wire::default()
+    };
+    let mut jobs = new_jobs();
+    let mut scheduler = new_scheduler(1);
+    let kept = job(&mut jobs, 1, 0, 0, 512);
+    let report = scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert_eq!(report.stop, Stop::Idle, "the lane is held for the call");
+    assert_eq!(
+        report.lanes[0].failed, 1,
+        "the known failure is not debited"
+    );
+    assert_eq!(report.lanes[0].served_bytes, 0);
+    assert_eq!(wire.attempts, 1);
+    let report = scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert!(matches!(report.stop, Stop::Backpressure { lane: 0 }));
+    assert!(jobs.current(kept));
+    assert_eq!(jobs.next_for_lane(0).unwrap().cursor, 0);
+    let mut wire = Wire {
+        script: vec![Submit::Uncertain],
+        ..Wire::default()
+    };
+    scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert!(!jobs.current(kept));
+    assert_eq!(scheduler.counts().unresolved, 1);
+    assert!(matches!(
+        jobs.join_or_create(
+            &Request {
+                receiver: receiver(1),
+                lane: 0,
+                start: 0,
+                length: 512,
+            },
+            Domain::Group,
+            0
+        ),
+        Joined::Created(_)
+    ));
+}
+
+/// A probe reads one head: a refused job makes it ineligible, and the
+/// lane's next job goes at the lane's next probe.
+#[test]
+fn a_refused_job_gives_way_at_the_next_probe() {
     let mut log = Log::default().data(0, 1024, 256, 1);
     log.errors.insert((0, 0), RepairReadError::BadRequest);
     let mut wire = Wire::default();
@@ -345,8 +355,128 @@ fn a_refused_job_gives_way_in_the_same_call() {
     let mut scheduler = new_scheduler(1);
     let bad = job(&mut jobs, 1, 0, 0, 256);
     let good = job(&mut jobs, 1, 0, 1024, 256);
-    scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
-    assert!(!jobs.current(bad) && !jobs.current(good));
-    assert_eq!(wire.submitted, [(0, 1024)]);
+    let budget = RepairBudget {
+        bytes: 4096,
+        loads: 1,
+    };
+    scheduler.serve(&mut jobs, budget, &mut log, &mut wire, 0);
+    assert!(!jobs.current(bad) && jobs.current(good));
+    assert_eq!(log.reads, 1, "one load, one read");
     assert_eq!(wire.replies.len(), 1);
+    scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert!(!jobs.current(good));
+    assert_eq!(wire.submitted, [(0, 1024)]);
+}
+
+/// Fifty refusable jobs cost at most one read and one ERR per load.
+#[test]
+fn refusals_stay_within_the_loads() {
+    let mut log = Log::default();
+    let mut wire = Wire::default();
+    let mut jobs = new_jobs();
+    let mut scheduler = new_scheduler(1);
+    for at in 0..50 {
+        job(&mut jobs, 1, 0, at * 64, 64);
+    }
+    scheduler.serve(
+        &mut jobs,
+        RepairBudget {
+            bytes: 4096,
+            loads: 8,
+        },
+        &mut log,
+        &mut wire,
+        0,
+    );
+    assert!(log.reads <= 8, "{} reads", log.reads);
+    assert!(wire.replies.len() <= 8);
+}
+
+/// A lane whose submissions keep failing is held for the call; the other
+/// lane is served and the reads stay bounded.
+#[test]
+fn a_failing_lane_does_not_starve_another() {
+    let mut log = Log::default().data(0, 0, 256, 64).data(1, 0, 256, 64);
+    let mut wire = Wire {
+        failing: Some(0),
+        ..Wire::default()
+    };
+    let mut jobs = new_jobs();
+    let mut scheduler = new_scheduler(2);
+    job(&mut jobs, 1, 0, 0, 64 * 256);
+    job(&mut jobs, 1, 1, 0, 64 * 256);
+    for _ in 0..5 {
+        scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    }
+    let lane1 = wire.submitted.iter().filter(|(lane, _)| *lane == 1).count();
+    assert!(lane1 >= 5 * 4, "lane 1 sent {lane1}");
+    assert!(log.reads < 5 * 64, "{} reads", log.reads);
+}
+
+/// A head the DRR would refuse is dropped and counted; the lane's next
+/// job is served on a later call.
+#[test]
+fn an_invalid_head_is_dropped() {
+    for head in [
+        Head::Data {
+            aligned: 0,
+            next: 64,
+        },
+        Head::Data {
+            aligned: 2048,
+            next: 2048,
+        },
+        Head::Data {
+            aligned: 64,
+            next: 0,
+        },
+    ] {
+        let mut log = Log::default().data(0, 4096, 64, 1);
+        log.heads.insert((0, 0), head);
+        let mut wire = Wire::default();
+        let mut jobs = new_jobs();
+        let mut scheduler = new_scheduler(1);
+        let bad = job(&mut jobs, 1, 0, 0, 4096);
+        let good = job(&mut jobs, 1, 0, 4096, 64);
+        scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+        assert!(!jobs.current(bad), "{head:?}");
+        assert_eq!(scheduler.counts().invalid_heads, 1);
+        scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+        assert!(!jobs.current(good), "{head:?}");
+    }
+}
+
+/// RANGE_UNAVAILABLE names the higher of the read's floor and the floor
+/// read after it.
+#[test]
+fn the_lowest_retained_is_the_higher_floor() {
+    let mut log = Log::default();
+    log.errors
+        .insert((0, 0), RepairReadError::Unavailable { lowest: 300 });
+    log.floor = 128;
+    let mut wire = Wire::default();
+    let mut jobs = new_jobs();
+    let mut scheduler = new_scheduler(1);
+    job(&mut jobs, 1, 0, 0, 256);
+    scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert_eq!(
+        wire.replies[0].2,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: 300
+        }
+    );
+}
+
+/// A head charged exactly the largest charge is valid and served.
+#[test]
+fn a_head_of_the_largest_charge_is_served() {
+    let mut log = Log::default().data(0, 0, 1024, 1);
+    let mut wire = Wire::default();
+    let mut jobs = new_jobs();
+    let mut scheduler = new_scheduler(1);
+    let request = job(&mut jobs, 1, 0, 0, 1024);
+    scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert!(!jobs.current(request));
+    assert_eq!(scheduler.counts().invalid_heads, 0);
+    assert_eq!(wire.submitted, [(0, 0)]);
 }
