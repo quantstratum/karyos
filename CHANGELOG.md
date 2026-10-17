@@ -52,6 +52,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Receiver trace journals keep their sealed gaps (P2.12 step 3, PR 3b,
+  trace-network.md section 5): the first `FACT_GAP_INTERVALS` (16) gaps of
+  each traced lane, in order, with an overflow flag, carried in
+  `JournalFacts::gaps`. `EmbeddedDriver::network_journal_gaps` returns a
+  closed receiver journal's gaps for an in-process report.
+  `SkipPolicy::duty_observed` and `range_unavailable_observed` tell a
+  callback of each committed seal; `duty`, `duty_gated`,
+  `range_unavailable` and `range_unavailable_gated` delegate to them.
 - Network publications over redundant paths (rp-w4b2c): a multicast IPv4
   channel with `paths` sends on one endpoint per path, each bound to its
   path's interface address, as one routed publication; each path holds its

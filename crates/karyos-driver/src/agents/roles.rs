@@ -1063,22 +1063,33 @@ fn tail_hole(image: &mut Installed, lane: Lane, at: usize, now: u64) -> Option<H
 fn unrecoverable(
     image: &mut Installed,
     counters: &mut ReceiverCounters,
+    trace: &mut super::net_trace::ReceiverTrace,
     lane: Lane,
     hole: Hole,
     lowest_retained: u64,
     now: u64,
 ) {
+    let slot = image.slot;
     let floor = hole
         .start
         .checked_add(u64::from(hole.length))
         .map_or(lowest_retained, |end| lowest_retained.max(end));
+    // Each committed seal reaches the lane's trace journal, if any (§5).
+    let sealed = |lane, position, extent| trace.sealed(slot, lane, position, extent);
     let unavailable = match image.gate.as_deref_mut() {
-        Some(gate) => image
-            .skip
-            .range_unavailable_gated(&mut image.owner, lane, floor, now, gate),
-        None => image
-            .skip
-            .range_unavailable(&mut image.owner, lane, floor, now),
+        Some(gate) => {
+            image
+                .skip
+                .range_unavailable_observed(&mut image.owner, lane, floor, now, gate, sealed)
+        }
+        None => image.skip.range_unavailable_observed(
+            &mut image.owner,
+            lane,
+            floor,
+            now,
+            &mut karyos_sys::log_buffer::Ungated,
+            sealed,
+        ),
     };
     tally_gate(
         counters,
@@ -1136,7 +1147,7 @@ fn publication_of(image: &Installed) -> karyos_protocol::trace_hook::Publication
 /// sealed gap. Without the image's owner (it is gone), the boundary is
 /// the start and no gap is known.
 fn journal_facts(
-    traced: &super::net_trace::TracedImageLane,
+    traced: super::net_trace::TracedImageLane,
     owner: Option<&ReceiveOwner>,
 ) -> super::net_trace::JournalFacts {
     super::net_trace::JournalFacts {
@@ -1149,6 +1160,7 @@ fn journal_facts(
         first_gap: owner
             .and_then(|owner| owner.first_loss(traced.lane))
             .flatten(),
+        gaps: Some(traced.gaps),
     }
 }
 
@@ -1678,6 +1690,7 @@ impl ReceiverRole {
                                     publication,
                                     number: journal.number,
                                     start,
+                                    gaps: Box::default(),
                                 }
                             })
                         })
@@ -1686,16 +1699,19 @@ impl ReceiverRole {
                 let (publication, lane, number) =
                     (journal.publication, journal.lane, journal.number);
                 let event = match traced {
-                    Some(traced) => match self.trace.open(traced, journal) {
-                        Ok(()) => AgentEvent::NetworkJournalOpened {
-                            agent,
-                            publication,
-                            lane,
-                            number,
-                            start: traced.start,
-                        },
-                        Err(journal) => AgentEvent::NetworkJournalRefused { agent, journal },
-                    },
+                    Some(traced) => {
+                        let start = traced.start;
+                        match self.trace.open(traced, journal) {
+                            Ok(()) => AgentEvent::NetworkJournalOpened {
+                                agent,
+                                publication,
+                                lane,
+                                number,
+                                start,
+                            },
+                            Err(journal) => AgentEvent::NetworkJournalRefused { agent, journal },
+                        }
+                    }
                     None => AgentEvent::NetworkJournalRefused { agent, journal },
                 };
                 Some((reply, event))
@@ -1743,15 +1759,32 @@ impl ReceiverRole {
     /// retirement closed; a full ring keeps the rest for the next cycle.
     pub(super) fn post_retired_journals<O: SocketOps>(
         &mut self,
-        mut post: impl FnMut(AgentEvent<O>) -> bool,
+        mut post: impl FnMut(AgentEvent<O>) -> Option<AgentEvent<O>>,
     ) {
         self.trace.post_retired(|lane, facts| {
-            post(AgentEvent::NetworkJournalClosed {
+            let (publication, number) = (facts.publication, facts.number);
+            let back = post(AgentEvent::NetworkJournalClosed {
                 agent: AgentKind::Receiver,
-                publication: facts.publication,
+                publication,
                 lane,
-                number: facts.number,
+                number,
                 facts: Some(facts),
+            });
+            back.map_or(Ok(()), |event| {
+                Err(match event {
+                    AgentEvent::NetworkJournalClosed {
+                        facts: Some(facts), ..
+                    } => facts,
+                    // Only the event posted above comes back.
+                    _ => super::net_trace::JournalFacts {
+                        publication,
+                        number,
+                        start: 0,
+                        boundary: 0,
+                        first_gap: None,
+                        gaps: None,
+                    },
+                })
             })
         });
     }
@@ -2653,6 +2686,7 @@ impl ReceiverRole {
             to_sender,
             counters,
             delays,
+            trace,
             #[cfg(test)]
             posted_naks,
             #[cfg(test)]
@@ -2717,7 +2751,7 @@ impl ReceiverRole {
                 ..
             } = image.loss.observe(lane, hole, now)
             {
-                unrecoverable(image, counters, lane, hole, lowest_retained, now);
+                unrecoverable(image, counters, trace, lane, hole, lowest_retained, now);
             }
             // A multicast hole's NAK waits for its cycle's drawn delay; a
             // no-op on a unicast image.
@@ -2836,9 +2870,20 @@ impl ReceiverRole {
         // an unreliable image; on a reliable one under `skip`, the holes
         // left below an unrecoverable range (at most a few per call).
         if image.closing.is_none() {
+            // Each committed seal reaches the lane's trace journal, if any
+            // (§5).
+            let slot = image.slot;
+            let sealed = |lane, position, extent| trace.sealed(slot, lane, position, extent);
             let duty = match image.gate.as_deref_mut() {
-                Some(gate) => image.skip.duty_gated(&mut image.owner, now, gate),
-                None => image.skip.duty(&mut image.owner, now),
+                Some(gate) => image
+                    .skip
+                    .duty_observed(&mut image.owner, now, gate, sealed),
+                None => image.skip.duty_observed(
+                    &mut image.owner,
+                    now,
+                    &mut karyos_sys::log_buffer::Ungated,
+                    sealed,
+                ),
             };
             tally_gate(
                 counters,
@@ -3457,13 +3502,16 @@ impl Intake<'_> {
                     // committed frame, naming the path of the copy.
                     if let Ok(Received::Committed { position, .. }) = received
                         && role.trace.any()
-                        && let Some(traced) = role.trace.traced(image.slot, frame.lane()).copied()
+                        && let Some((traced_publication, traced_lane)) = role
+                            .trace
+                            .traced(image.slot, frame.lane())
+                            .map(|traced| (traced.publication, traced.lane))
                     {
                         match super::net_trace::frame_extension(&frame) {
                             Some(Some(ext)) => {
                                 let at = karyos_protocol::trace_hook::NetCommit {
-                                    publication: traced.publication,
-                                    lane: traced.lane,
+                                    publication: traced_publication,
+                                    lane: traced_lane,
                                     position,
                                     path: path
                                         .and_then(|(_, path)| u32::try_from(path).ok())
@@ -3660,7 +3708,10 @@ impl Intake<'_> {
             return;
         };
         let ReceiverRole {
-            images, counters, ..
+            images,
+            counters,
+            trace,
+            ..
         } = role;
         let Some(image) = images.iter_mut().find(|image| image.slot == slot) else {
             tally(counters, |c| &mut c.nak_replies_unbound);
@@ -3676,7 +3727,7 @@ impl Intake<'_> {
                 lane,
                 hole,
                 lowest_retained,
-            } => unrecoverable(image, counters, lane, hole, lowest_retained, now),
+            } => unrecoverable(image, counters, trace, lane, hole, lowest_retained, now),
             // A floor beyond the window closes the image whatever the skip
             // policy (RC-9): its repair state is terminal already.
             NakOutcome::GapCannotResume { .. } => {

@@ -2526,6 +2526,7 @@ fn a_split_hole_past_the_floor_is_sealed_whole() {
     super::unrecoverable(
         image,
         &mut receiver.counters,
+        &mut receiver.trace,
         Lane::ZERO,
         hole,
         lowest_retained,
@@ -2659,6 +2660,7 @@ fn the_skip_duty_seals_what_one_reply_could_not() {
     super::unrecoverable(
         &mut receiver.images[0],
         &mut receiver.counters,
+        &mut receiver.trace,
         Lane::ZERO,
         hole,
         2048,
