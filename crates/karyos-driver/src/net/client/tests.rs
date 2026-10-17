@@ -258,16 +258,20 @@ fn a_lost_client_takes_its_network_resources_with_it() {
     );
     let net = driver.net.as_ref().unwrap();
     assert_eq!((net.publication_count(), net.subscription_count()), (1, 1));
-    // The client goes, with its handles.
+    // The client goes, with its handles. The sender's answer to the
+    // removal takes a few cycles of the agents: bounded by time, not by a
+    // cycle count, which a loaded machine runs through first.
     drop(outcomes);
     drop(client);
-    for _ in 0..200 {
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
         let _ = driver.do_work().unwrap();
         let net = driver.net.as_ref().unwrap();
         if (net.publication_count(), net.subscription_count()) == (0, 0) {
             assert!(driver.net_owned.is_empty());
             return;
         }
+        std::thread::sleep(Duration::from_micros(100));
     }
     panic!("the client's network resources outlived it");
 }
@@ -385,6 +389,17 @@ fn driver_with(change: impl FnOnce(&mut DriverConfig)) -> EmbeddedDriver {
     };
     change(&mut config);
     EmbeddedDriver::with_config(config).unwrap()
+}
+
+/// Runs `driver` until `done`, for at most 5 s: bounded by time, never
+/// by a cycle count, which a loaded machine runs through first.
+fn eventually(driver: &mut EmbeddedDriver, mut done: impl FnMut(&EmbeddedDriver) -> bool) {
+    let start = std::time::Instant::now();
+    while !done(driver) {
+        assert!(start.elapsed() < Duration::from_secs(5), "not reached");
+        let _ = driver.do_work().unwrap();
+        std::thread::sleep(Duration::from_micros(100));
+    }
 }
 
 /// Runs one driver and its client until request `sequence` completes.
@@ -678,10 +693,9 @@ fn only_its_client_removes_a_network_subscription() {
         Outcome::Succeeded
     ));
     assert!(driver.net_owned.is_empty());
-    for _ in 0..50 {
-        let _ = driver.do_work().unwrap();
-    }
-    assert_eq!(driver.net.as_ref().unwrap().subscription_count(), 0);
+    eventually(&mut driver, |driver| {
+        driver.net.as_ref().unwrap().subscription_count() == 0
+    });
 }
 
 /// #294 tests: a client that stops heartbeating is no longer served, and
@@ -737,11 +751,15 @@ fn a_refused_grant_removes_its_network_publication() {
             true,
         )
         .unwrap();
-    for _ in 0..4 {
+    // Both commands are served (one per cycle), then the refused grant's
+    // publication is removed, once the sender answers.
+    for _ in 0..2 {
         let _ = driver.do_work().unwrap();
     }
-    assert_eq!(driver.net.as_ref().unwrap().publication_count(), 0);
     assert!(driver.net_owned.is_empty());
+    eventually(&mut driver, |driver| {
+        driver.net.as_ref().unwrap().publication_count() == 0
+    });
     let mut outcomes = Vec::new();
     run(
         &mut [&mut driver],
@@ -813,6 +831,10 @@ fn invalid_stream_defaults_are_refused_at_start() {
         |network| network.stream_defaults.lanes = 5,
         |network| network.stream_defaults.spare_slots = 0,
         |network| network.max_owned_per_client = 0,
+        // Beyond the bound, and a product with max_clients that would
+        // overflow: refused, never a capacity panic (#300 P2).
+        |network| network.max_owned_per_client = 4097,
+        |network| network.max_owned_per_client = usize::MAX / 2,
     ] {
         let mut network = NetworkConfig::default();
         change(&mut network);

@@ -26,9 +26,11 @@
 //!   `NetworkConfig::max_owned_per_client`; another is refused with
 //!   `ResourcesUnavailable` and counted.
 //! - **Images.** A subscription learns of the images already there once,
-//!   at the cycle after it is created, and of every later image and
-//!   retirement as it happens; never of one twice, nor of the retirement
-//!   of one it was not told about.
+//!   in the cycle it is created, and of every later image and retirement
+//!   as it happens; never of one twice, nor of the retirement of one it
+//!   was not told about. Both rest on `announced`: set only once every
+//!   event of `announce_existing_images` went out, and the only gate of
+//!   `announce_image`, which runs after it in each cycle.
 //! - **Shared terms.** A driver admitting other processes refuses `udp`
 //!   with `UnsupportedChannel` (D3, SPEC §18).
 
@@ -138,12 +140,27 @@ fn aggregate(
     })
 }
 
+/// The most network resources a client may own by URI
+/// (`NetworkConfig::max_owned_per_client`).
+pub(crate) const MAX_OWNED_PER_CLIENT: usize = 4096;
+
+/// The owned table's capacity for `network` and `max_clients`: one bound
+/// per client. `None` when it overflows.
+pub(crate) fn owned_capacity(
+    network: &crate::net::NetworkConfig,
+    max_clients: usize,
+) -> Option<usize> {
+    network.max_owned_per_client.checked_mul(max_clients)
+}
+
 /// Whether a network configuration's client parameters hold, at start:
 /// its stream defaults make a valid log on every lane count they allow,
-/// and a client may own something.
-pub(crate) fn valid_network(network: &crate::net::NetworkConfig) -> bool {
+/// and a client may own something, within [`MAX_OWNED_PER_CLIENT`] and a
+/// table that fits for `max_clients`.
+pub(crate) fn valid_network(network: &crate::net::NetworkConfig, max_clients: usize) -> bool {
     let defaults = network.stream_defaults;
-    network.max_owned_per_client > 0
+    (1..=MAX_OWNED_PER_CLIENT).contains(&network.max_owned_per_client)
+        && owned_capacity(network, max_clients).is_some()
         && (1..=Lane::COUNT).contains(&defaults.lanes)
         && aggregate(&defaults, &CommonConfig::default(), 0, 1, false).is_ok_and(|config| {
             karyos_sys::log_buffer::LogBuffer::<karyos_sys::term_bytes::HeapTerms>::validate(
@@ -286,7 +303,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .count();
         let room = owned < cap;
         if !room {
-            self.owned_refusals = self.owned_refusals.saturating_add(1);
+            match self.owned_refusals.checked_add(1) {
+                Some(count) => self.owned_refusals = count,
+                None => self.owned_refusals_overflowed = true,
+            }
         }
         room
     }
@@ -305,7 +325,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ) -> Result<i32, ErrorCode> {
         for _ in 0..16 {
             let word = random().ok_or(ErrorCode::ResourcesUnavailable)?;
-            let session_id = (word as u32).cast_signed();
+            let session_id = u32::try_from(word & u64::from(u32::MAX))
+                .map_err(|_| ErrorCode::ResourcesUnavailable)?
+                .cast_signed();
             if session_id != 0
                 && !self
                     .streams

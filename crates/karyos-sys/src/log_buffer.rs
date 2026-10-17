@@ -521,8 +521,9 @@ impl<T: TermBytes> LogBuffer<T> {
         Ok(buffer)
     }
 
-    /// Checks `config` as [`LogBuffer::new`] would, without allocating:
-    /// for a configuration validated ahead of its buffers.
+    /// Checks `config` as [`LogBuffer::new`] would, except for allocation
+    /// failure, without allocating: for a configuration validated ahead of
+    /// its buffers.
     ///
     /// # Errors
     ///

@@ -879,6 +879,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) net_owned: Vec<crate::net::client::OwnedNetwork>,
     /// Network resources refused because their client owned its most.
     pub(crate) owned_refusals: u64,
+    /// `owned_refusals` reached its end and kept its value (SPEC §14).
+    pub(crate) owned_refusals_overflowed: bool,
 }
 
 /// The incarnation of a stream's publication in the embedded driver: one per
@@ -1093,9 +1095,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .is_some_and(|record| config.ring_capacity / 8 >= record)
             && config.broadcast_capacity >= needed
             && config.guard_ack_timeout > 0
-            && config
-                .network
-                .is_none_or(|network| crate::net::client::valid_network(&network));
+            && config.network.is_none_or(|network| {
+                crate::net::client::valid_network(&network, config.max_clients)
+            });
         if !valid {
             return Err(DriverError::InvalidConfig);
         }
@@ -1213,12 +1215,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             network: crate::network_journals::NetworkTracing::new(config.max_trace_journals),
             guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
+            // Validated above: the product fits.
             net_owned: Vec::with_capacity(config.network.map_or(0, |network| {
-                network
-                    .max_owned_per_client
-                    .saturating_mul(config.max_clients)
+                crate::net::client::owned_capacity(&network, config.max_clients).unwrap_or(0)
             })),
             owned_refusals: 0,
+            owned_refusals_overflowed: false,
             // Last: a driver that fails to build starts no agent.
             net: config
                 .network

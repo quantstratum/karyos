@@ -84,8 +84,9 @@ pub struct NetworkConfig {
     /// default: multicast images then have no peer suppression input.
     pub nak_control_groups: ControlGroups,
     /// Network publications and subscriptions one client may create by
-    /// channel URI at once; another is refused with `ResourcesUnavailable`
-    /// and counted (`EmbeddedDriver::network_owned_refusals`).
+    /// channel URI at once, 1 to 4096;
+    /// another is refused with `ResourcesUnavailable` and counted
+    /// (`EmbeddedDriver::network_owned_refusals`).
     pub max_owned_per_client: usize,
 }
 
@@ -900,7 +901,11 @@ impl Network {
             if self.remove_subscription(subscription).is_ok() {
                 self.pending_unsubscribe.swap_remove(index);
             } else {
-                index += 1;
+                // Below the buffer's length, which fits in usize.
+                let Some(next) = index.checked_add(1) else {
+                    break;
+                };
+                index = next;
             }
         }
         // Removals the full ring refused earlier.
