@@ -83,6 +83,7 @@ use karyos_sys::host_clock::age_ns;
 
 use crate::agents::EndpointId;
 use crate::paths::MAX_PATHS;
+use crate::repair::admission::Requester;
 
 /// The session binding an SM arrived through (ACS 15595, 15636): the
 /// sender's key for an accepted SM.
@@ -493,6 +494,8 @@ struct Entry {
     tag: u64,
     /// When a pending entry was expected.
     since: u64,
+    /// The consumption of the joining SM, per lane.
+    joins: [u64; MAX_LANES],
     consumption: [u64; MAX_LANES],
     windows: [u32; MAX_LANES],
     /// `consumption + window`, checked at acceptance.
@@ -514,6 +517,7 @@ impl Entry {
         required: false,
         tag: 0,
         since: 0,
+        joins: [0; MAX_LANES],
         consumption: [0; MAX_LANES],
         windows: [0; MAX_LANES],
         edges: [0; MAX_LANES],
@@ -613,16 +617,22 @@ impl Membership {
     }
 
     /// Expects the join of `key`'s receiver, from its session
-    /// establishment: a pending entry holding that binding, removed at
-    /// `join_timeout` unless an SM joins it first. An existing entry is
-    /// returned unchanged; a repeated SETUP extends nothing.
+    /// establishment: a pending entry holding that binding and the `joins`
+    /// the SETUP answer gave it (lane 0 first), removed at `join_timeout`
+    /// unless an SM joins it first. An existing entry is returned
+    /// unchanged; a repeated SETUP extends nothing.
     ///
     /// # Errors
     ///
     /// [`StatusRejected::Identity`], [`StatusRejected::BootChanged`],
     /// [`StatusRejected::Lost`], [`StatusRejected::PendingFull`] or
     /// [`StatusRejected::TableFull`].
-    pub fn expect(&mut self, key: &SmKey, now: u64) -> Result<MemberRef, StatusRejected> {
+    pub fn expect(
+        &mut self,
+        key: &SmKey,
+        joins: &[u64],
+        now: u64,
+    ) -> Result<MemberRef, StatusRejected> {
         if key.identity != self.identity || key.alias != self.alias {
             return Err(self.reject(StatusRejected::Identity));
         }
@@ -662,6 +672,9 @@ impl Membership {
             entry.required = required;
             entry.tag = tag;
             entry.since = now;
+            for (join, given) in entry.joins.iter_mut().zip(joins) {
+                *join = *given;
+            }
         }
         self.bind(slot, key);
         Ok(self.member_ref(slot))
@@ -840,6 +853,11 @@ impl Membership {
             entry.required = required;
             entry.tag = tag;
             entry.windows = windows;
+            // An expected entry keeps the joins its answer gave; a direct
+            // join starts at its first SM.
+            if current.is_none() {
+                entry.joins = consumption;
+            }
         }
         entry.consumption = consumption;
         entry.edges = edges;
@@ -888,6 +906,38 @@ impl Membership {
                 State::Pending | State::Active | State::LostRequired
             ) && e.generation == member.generation
         })
+    }
+
+    /// What a NAK from `receiver` on `lane` is checked against at `now`
+    /// (R4 step 2): a live member's join point, last accepted consumption
+    /// and window; an expected entry's answered join point before its
+    /// first SM; otherwise [`Requester::Unknown`].
+    #[must_use]
+    pub fn requester(&self, receiver: Receiver, lane: Lane, now: u64) -> Requester {
+        let at = usize::from(lane.get());
+        if at >= usize::from(self.config.lane_count) {
+            return Requester::Unknown;
+        }
+        let Some(entry) = self.find(receiver).and_then(|slot| self.entry(slot)) else {
+            return Requester::Unknown;
+        };
+        let join = entry.joins.get(at).copied();
+        match entry.state {
+            State::Active if self.live(entry, now) => match (
+                join,
+                entry.consumption.get(at).copied(),
+                entry.windows.get(at).copied(),
+            ) {
+                (Some(join), Some(consumption), Some(window)) => Requester::Member {
+                    join,
+                    consumption,
+                    window,
+                },
+                _ => Requester::Unknown,
+            },
+            State::Pending => join.map_or(Requester::Unknown, |join| Requester::Joined { join }),
+            _ => Requester::Unknown,
+        }
     }
 
     /// `lane`'s submission edge at `now`.

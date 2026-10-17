@@ -30,6 +30,7 @@ mod network_journals;
 pub mod paths;
 mod positions;
 mod remote_generations;
+pub mod repair;
 pub mod rtt;
 pub mod schedule;
 pub mod sessions;
