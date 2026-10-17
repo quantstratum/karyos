@@ -96,6 +96,11 @@ pub enum GateError {
         /// The gate's lane count.
         gate: usize,
     },
+    /// The publication sends over redundant paths, whose exposures the
+    /// gate does not pass yet (redundant-paths.md; rp-w4b2): a close could
+    /// not stop a later path, so the guard is refused.
+    #[error("a guard on a publication over redundant paths is not supported yet")]
+    Routed,
 }
 
 /// Why [`GuardGate::stage`] refused a head; nothing is recorded on error.
