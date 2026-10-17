@@ -34,8 +34,14 @@
 //!   lanes between the table and the unread command; both are freed when
 //!   dropped, and nothing outlives them.
 //!
-//! Images are heap-backed in this phase (one process); shared-memory
-//! images for subscribers of other processes follow the IPC mapping work.
+//! - **Lanes (network-shared-terms N-2).** The table builds each lane
+//!   from its [`LaneSource`], on the driver thread inside the existing
+//!   round trip: on the heap for an embedded driver, and in a new shared
+//!   region of the driver's admission, at generation 0, for an IPC
+//!   driver. Region ids are never reused, so a remote mapping of an old
+//!   image never names a new one. A lane that cannot be created refuses
+//!   the image (`refused_storage`) after the lanes already created for it
+//!   are dropped; no partial image is ever offered.
 
 use std::sync::Arc;
 
@@ -52,7 +58,7 @@ use karyos_sys::term_bytes::HeapTerms;
 use super::EndpointId;
 use super::chain::{ImageChain, SessionCommand, SessionEvent, SessionLink};
 use super::ring::Reservation;
-use crate::embedded::StreamTerms;
+use crate::embedded::{StreamTerms, sealed};
 use crate::sessions::receive::SlotRef;
 
 /// The driver default of a subscription's `max_image_term_length`: 64 MiB.
@@ -153,6 +159,9 @@ pub struct ImageCounters {
     pub refused_full: u64,
     /// Refused: the log buffer refused the geometry.
     pub refused_geometry: u64,
+    /// Refused: a lane's storage could not be created (a shared region:
+    /// `ENOMEM`, `EMFILE` or region ids exhausted).
+    pub refused_storage: u64,
     /// Replies for no image, or for an image in another state; ignored.
     pub stale_replies: u64,
     /// An increment did not apply.
@@ -212,6 +221,53 @@ pub struct ImageTable<T: StreamTerms = HeapTerms> {
     /// Calls of `allocate` (tests: no refusal allocates).
     #[cfg(test)]
     allocations: usize,
+    /// Tests: the lane index whose creation fails, as a region that cannot
+    /// be created would.
+    #[cfg(test)]
+    pub(crate) fail_lane: Option<usize>,
+    /// Tests: the lanes the last allocation created, to show that a
+    /// refusal drops them.
+    #[cfg(test)]
+    pub(crate) last_lanes: Vec<std::sync::Weak<LogBuffer<T>>>,
+}
+
+/// Where an image's lanes are created: on the heap, or in new regions of
+/// the driver's admission (`network-shared-terms` N-2). The driver lends
+/// it to the table for one duty cycle, on its own thread.
+#[derive(Debug)]
+pub struct LaneSource<'a> {
+    /// The instance and region ids of an IPC driver; `None` on the heap.
+    #[cfg(target_os = "linux")]
+    regions: Option<crate::admission::RegionIds<'a>>,
+    _lent: core::marker::PhantomData<&'a mut ()>,
+}
+
+impl<'a> LaneSource<'a> {
+    /// Heap lanes: no region.
+    #[must_use]
+    pub(crate) fn heap() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            regions: None,
+            _lent: core::marker::PhantomData,
+        }
+    }
+
+    /// Lanes in new regions with ids from `regions`.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub(crate) fn regions(regions: crate::admission::RegionIds<'a>) -> Self {
+        Self {
+            regions: Some(regions),
+            _lent: core::marker::PhantomData,
+        }
+    }
+
+    /// The instance and a fresh region id; `None` without regions.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn next_region(&mut self) -> Option<Result<(u128, u64), crate::error::DriverError>> {
+        self.regions.as_mut().map(crate::admission::RegionIds::next)
+    }
 }
 
 impl<T: StreamTerms> std::fmt::Debug for ImageTable<T> {
@@ -224,12 +280,16 @@ impl<T: StreamTerms> std::fmt::Debug for ImageTable<T> {
     }
 }
 
+/// An image's lanes and the receive owner over them.
+type Built<T> = (Vec<Arc<LogBuffer<T>>>, ReceiveOwner<T>);
+
 /// Why an image was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
     Budget,
     Full,
     Geometry,
+    Storage,
 }
 
 impl<T: StreamTerms> ImageTable<T> {
@@ -244,6 +304,10 @@ impl<T: StreamTerms> ImageTable<T> {
             counters: ImageCounters::default(),
             #[cfg(test)]
             allocations: 0,
+            #[cfg(test)]
+            fail_lane: None,
+            #[cfg(test)]
+            last_lanes: Vec::new(),
         }
     }
 
@@ -299,18 +363,20 @@ impl<T: StreamTerms> ImageTable<T> {
                 _ => None,
             })
     }
-}
 
-/// The image table's session chain, which builds lanes on the heap until
-/// the shared lane source of step n2 (network streams over shared terms).
-impl ImageTable<HeapTerms> {
-    /// Serves every session event the receiver posted, then reclaims the
-    /// retired images no loan holds any more, reporting image events to
-    /// `on_event`; returns how many events it served.
-    pub fn poll(&mut self, link: &SessionLink, mut on_event: impl FnMut(ImageEvent)) -> u32 {
+    /// Serves every session event the receiver posted, building lanes from
+    /// `lanes`, then reclaims the retired images no loan holds any more,
+    /// reporting image events to `on_event`; returns how many events it
+    /// served.
+    pub fn poll(
+        &mut self,
+        link: &SessionLink<T>,
+        lanes: &mut LaneSource<'_>,
+        mut on_event: impl FnMut(ImageEvent),
+    ) -> u32 {
         let mut served = 0u32;
         while let Some(event) = link.take_event() {
-            self.handle(link, event, &mut on_event);
+            self.handle(link, lanes, event, &mut on_event);
             match served.checked_add(1) {
                 Some(next) => served = next,
                 None => break,
@@ -322,7 +388,7 @@ impl ImageTable<HeapTerms> {
 
     /// Frees every retiring image whose lanes only the table holds, and
     /// posts its `StorageReclaimed`.
-    fn reclaim(&mut self, link: &SessionLink, on_event: &mut impl FnMut(ImageEvent)) {
+    fn reclaim(&mut self, link: &SessionLink<T>, on_event: &mut impl FnMut(ImageEvent)) {
         let mut index = 0usize;
         while let Some(image) = self.images.get(index) {
             let State::Retiring(slot) = image.state else {
@@ -352,10 +418,11 @@ impl ImageTable<HeapTerms> {
         }
     }
 
-    /// Serves one session event.
+    /// Serves one session event, building lanes from `lanes`.
     pub fn handle(
         &mut self,
-        link: &SessionLink,
+        link: &SessionLink<T>,
+        lanes: &mut LaneSource<'_>,
         event: SessionEvent,
         mut on_event: impl FnMut(ImageEvent),
     ) {
@@ -369,9 +436,9 @@ impl ImageTable<HeapTerms> {
                 joins,
                 chain,
             } => {
-                if let Some(event) =
-                    self.create(link, endpoint, alias, slot, identity, term, &joins, chain)
-                {
+                if let Some(event) = self.create(
+                    link, lanes, endpoint, alias, slot, identity, term, &joins, chain,
+                ) {
                     on_event(event);
                 }
             }
@@ -438,7 +505,8 @@ impl ImageTable<HeapTerms> {
     #[allow(clippy::too_many_arguments, reason = "the fields of one CreateImage")]
     fn create(
         &mut self,
-        link: &SessionLink,
+        link: &SessionLink<T>,
+        lanes: &mut LaneSource<'_>,
         endpoint: EndpointId,
         alias: Alias,
         slot: SlotRef,
@@ -457,6 +525,7 @@ impl ImageTable<HeapTerms> {
                 Refusal::Budget => |c| &mut c.refused_budget,
                 Refusal::Full => |c| &mut c.refused_full,
                 Refusal::Geometry => |c| &mut c.refused_geometry,
+                Refusal::Storage => |c| &mut c.refused_storage,
             });
             // The receiver gone: the driver is stopping.
             let _ = link.post(command, SessionCommand::RefuseImage { reply, slot });
@@ -494,11 +563,16 @@ impl ImageTable<HeapTerms> {
         if let Some(allocations) = self.allocations.checked_add(1) {
             self.allocations = allocations;
         }
-        let Ok((lanes, owner)) = self.allocate(alias, term, joins) else {
-            refuse(self, Refusal::Geometry, command, reply);
-            self.images
-                .push(image(State::Refused, Vec::new(), 0, reclaimed));
-            return None;
+        // A refusal drops every lane already built, its regions included,
+        // before the answer.
+        let (lanes, owner) = match self.allocate(lanes, alias, term, joins) {
+            Ok(built) => built,
+            Err(refusal) => {
+                refuse(self, refusal, command, reply);
+                self.images
+                    .push(image(State::Refused, Vec::new(), 0, reclaimed));
+                return None;
+            }
         };
         self.charged = total;
         self.counters.bump(|c| &mut c.offered);
@@ -525,15 +599,27 @@ impl ImageTable<HeapTerms> {
             .checked_mul(lanes)
     }
 
-    /// Builds the lanes and the receive owner of an accepted answer.
+    /// Builds the lanes, from `source`, and the receive owner of an
+    /// accepted answer. Every lane's geometry is checked before any lane is
+    /// created; a lane that cannot be created is `Storage`, and the lanes
+    /// already created drop with the refusal.
     fn allocate(
-        &self,
+        &mut self,
+        source: &mut LaneSource<'_>,
         alias: Alias,
         term: TermParams,
         joins: &Lanes<u64>,
-    ) -> Result<(Vec<Arc<LogBuffer>>, ReceiveOwner), Refusal> {
+    ) -> Result<Built<T>, Refusal> {
         let term_length = TermLength::try_new(term.term_length).map_err(|_| Refusal::Geometry)?;
-        let mut lanes = Vec::with_capacity(joins.as_slice().len());
+        let params = ImageParams::new(
+            alias.session_id,
+            alias.stream_id,
+            joins.count(),
+            term_length,
+            term.mtu,
+        )
+        .map_err(|_| Refusal::Geometry)?;
+        let mut configs = Vec::with_capacity(joins.as_slice().len());
         for (index, &join) in joins.as_slice().iter().enumerate() {
             let lane = u8::try_from(index)
                 .ok()
@@ -556,19 +642,24 @@ impl ImageTable<HeapTerms> {
                 claim_deadline: DEFAULT_CLAIM_DEADLINE,
                 schedule_capacity: 0,
             };
-            lanes.push(Arc::new(
-                LogBuffer::new(config).map_err(|_| Refusal::Geometry)?,
-            ));
+            LogBuffer::<T>::validate(&config).map_err(|_| Refusal::Geometry)?;
+            configs.push(config);
         }
-        let params = ImageParams::new(
-            alias.session_id,
-            alias.stream_id,
-            joins.count(),
-            term_length,
-            term.mtu,
-        )
-        .map_err(|_| Refusal::Geometry)?;
-        let owner = ReceiveOwner::new(params, lanes.clone()).map_err(|_| Refusal::Geometry)?;
+        let mut lanes = Vec::with_capacity(configs.len());
+        for config in configs {
+            #[cfg(test)]
+            if self.fail_lane == Some(lanes.len()) {
+                return Err(Refusal::Storage);
+            }
+            let lane =
+                <T as sealed::Create>::image_lane(source, config).map_err(|_| Refusal::Storage)?;
+            lanes.push(Arc::new(lane));
+            #[cfg(test)]
+            {
+                self.last_lanes = lanes.iter().map(Arc::downgrade).collect();
+            }
+        }
+        let owner = ReceiveOwner::<T>::new(params, lanes.clone()).map_err(|_| Refusal::Geometry)?;
         Ok((lanes, owner))
     }
 }

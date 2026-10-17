@@ -189,6 +189,12 @@ impl EntryKind {
 
 /// The length of a fill's canonical record.
 pub const FILL_RECORD: usize = 32;
+/// [`FILL_RECORD`] as an entry length.
+const FILL_RECORD_LEN: u32 = 32;
+
+/// The lost ranges a store records at most; a gap past them is refused
+/// ([`SegmentError::TooManyGaps`]), so the list a read checks is bounded.
+pub const MAX_GAPS: usize = 1024;
 
 /// Why recovery cut a recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +288,9 @@ pub enum SegmentError {
     /// until it is recovered.
     #[error("the store failed earlier and must be recovered")]
     Failed,
+    /// The store records [`MAX_GAPS`] lost ranges already.
+    #[error("more than {MAX_GAPS} lost ranges")]
+    TooManyGaps,
     /// A segment's index header is bad where recovery cannot treat it as a
     /// segment being created; nothing was removed.
     #[error("the index header of the segment at {base} is bad: {problem:?}")]
@@ -364,9 +373,10 @@ pub struct SegmentStore<D: Disk> {
     gaps: Vec<(u64, u64)>,
     /// Finished segments the interval policy syncs at its next tick.
     finished: Vec<Open<D::File>>,
-    /// A segment was finished without a sync (no-sync policy): `durable`
-    /// can no longer pass it.
-    unsynced_behind: bool,
+    /// The first segment finished without a sync (no-sync policy):
+    /// `durable` cannot pass it until [`SegmentStore::close_synced`] syncs
+    /// it and those after it.
+    unsynced_behind: Option<u64>,
     last_sync_ns: u64,
     /// A sync ran since the last tick (explicit, or a roll's).
     synced_since_tick: bool,
@@ -571,7 +581,7 @@ impl<D: Disk> SegmentStore<D> {
             current: None,
             gaps: Vec::new(),
             finished: Vec::new(),
-            unsynced_behind: false,
+            unsynced_behind: None,
             last_sync_ns: 0,
             synced_since_tick: false,
             failed: false,
@@ -778,7 +788,7 @@ impl<D: Disk> SegmentStore<D> {
             .checked_add(self.geometry.segment_length)
             .and_then(|end| end.checked_sub(self.written))
             .ok_or(SegmentError::PositionOverflow)?;
-        if (extent as usize) < FILL_RECORD || u64::from(extent) > room {
+        if extent < FILL_RECORD_LEN || u64::from(extent) > room {
             return Err(SegmentError::InvalidFill { extent });
         }
         let result = self.fill(record, extent);
@@ -794,7 +804,10 @@ impl<D: Disk> SegmentStore<D> {
             kind: EntryKind::Fill,
         };
         let end = entry.end().ok_or(SegmentError::PositionOverflow)?;
-        self.write_entry(entry, record, Some(end - base))?;
+        let extent_end = end
+            .checked_sub(base)
+            .ok_or(SegmentError::PositionOverflow)?;
+        self.write_entry(entry, record, Some(extent_end))?;
         Ok(self.written)
     }
 
@@ -817,6 +830,10 @@ impl<D: Disk> SegmentStore<D> {
         if to <= position {
             return Ok(self.written);
         }
+        // Checked before anything is written: a refusal changes nothing.
+        if !self.gap_fits() {
+            return Err(SegmentError::TooManyGaps);
+        }
         let result = self.gap(to);
         self.guard(result)
     }
@@ -829,8 +846,10 @@ impl<D: Disk> SegmentStore<D> {
                 .checked_add(self.geometry.segment_length)
                 .ok_or(SegmentError::PositionOverflow)?;
             let end = to.min(segment_end);
-            let length =
-                u32::try_from(end - self.written).map_err(|_| SegmentError::PositionOverflow)?;
+            let length = end
+                .checked_sub(self.written)
+                .and_then(|length| u32::try_from(length).ok())
+                .ok_or(SegmentError::PositionOverflow)?;
             let entry = Entry {
                 start: self.written,
                 length,
@@ -839,7 +858,8 @@ impl<D: Disk> SegmentStore<D> {
             };
             self.write_entry(entry, &[], None)?;
         }
-        push_gap(&mut self.gaps, from, to);
+        // `append_gap` checked that it fits.
+        let _ = push_gap(&mut self.gaps, from, to);
         Ok(self.written)
     }
 
@@ -848,7 +868,11 @@ impl<D: Disk> SegmentStore<D> {
     fn roll(&mut self, base: u64) -> Result<(), SegmentError> {
         let dirty = self.current.as_ref().is_some_and(|open| open.dirty);
         match self.policy {
-            SyncPolicy::None if dirty => self.unsynced_behind = true,
+            SyncPolicy::None if dirty => {
+                if self.unsynced_behind.is_none() {
+                    self.unsynced_behind = self.current.as_ref().map(|open| open.base);
+                }
+            }
             SyncPolicy::PerSegment if dirty => self.sync_open()?,
             // The next tick syncs it: no sync on the write path, unless
             // more than `MAX_FINISHED` wait (no tick for many rolls).
@@ -890,7 +914,7 @@ impl<D: Disk> SegmentStore<D> {
             }
             open.dirty = false;
         }
-        if !self.unsynced_behind {
+        if self.unsynced_behind.is_none() {
             self.durable = target;
         }
         self.synced_since_tick = true;
@@ -955,6 +979,54 @@ impl<D: Disk> SegmentStore<D> {
         Ok(self.durable)
     }
 
+    /// Closes the store with everything written durable, whatever its
+    /// policy: a recording's end, whose catalog entry names the returned
+    /// durable position. Segments a no-sync policy finished unsynced are
+    /// opened again and synced, data then index, before the open one.
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentStore::sync`].
+    pub fn close_synced(mut self) -> Result<u64, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        let result = self.sync_behind();
+        self.guard(result)?;
+        self.sync()?;
+        Ok(self.durable)
+    }
+
+    /// Syncs the segments finished without a sync, from the first of them
+    /// up to the open one.
+    fn sync_behind(&mut self) -> Result<(), SegmentError> {
+        let Some(mut base) = self.unsynced_behind else {
+            return Ok(());
+        };
+        let open = self.current.as_ref().map(|open| open.base);
+        while Some(base) != open && base < self.written {
+            for name in [
+                data_name(self.recording, base),
+                index_name(self.recording, base),
+            ] {
+                let file = self.disk.open(&self.dir.join(name))?;
+                self.disk.sync(&file)?;
+            }
+            base = base
+                .checked_add(self.geometry.segment_length)
+                .ok_or(SegmentError::PositionOverflow)?;
+        }
+        self.unsynced_behind = None;
+        Ok(())
+    }
+
+    /// Whether the store records a gap at the written position: it merges
+    /// with the last one, or fewer than [`MAX_GAPS`] are recorded.
+    #[must_use]
+    pub fn gap_fits(&self) -> bool {
+        self.gaps.len() < MAX_GAPS || self.gaps.last().is_some_and(|last| last.1 == self.written)
+    }
+
     /// Reads `buf.len()` bytes at `position`, within `[start, written)`.
     ///
     /// # Errors
@@ -988,7 +1060,9 @@ impl<D: Disk> SegmentStore<D> {
                 .ok_or(SegmentError::PositionOverflow)?;
             let take = usize::try_from(room).map_or(buf.len(), |room| room.min(buf.len()));
             let (chunk, rest) = buf.split_at_mut(take);
-            let offset = position - base;
+            let offset = position
+                .checked_sub(base)
+                .ok_or(SegmentError::PositionOverflow)?;
             match self.current.as_ref().filter(|open| open.base == base) {
                 Some(open) => self.disk.read_at(&open.data, offset, chunk)?,
                 None => {
@@ -1086,7 +1160,7 @@ impl<D: Disk> SegmentStore<D> {
             }),
             gaps: scan.gaps,
             finished: Vec::new(),
-            unsynced_behind: false,
+            unsynced_behind: None,
             last_sync_ns: 0,
             synced_since_tick: false,
             failed: false,
@@ -1122,12 +1196,15 @@ struct Scan<F> {
 }
 
 /// Adds the lost range `[from, to)` to `gaps`, joining it to the last one
-/// when they touch.
-fn push_gap(gaps: &mut Vec<(u64, u64)>, from: u64, to: u64) {
+/// when they touch; `false`, with nothing added, past [`MAX_GAPS`].
+fn push_gap(gaps: &mut Vec<(u64, u64)>, from: u64, to: u64) -> bool {
+    let full = gaps.len() >= MAX_GAPS;
     match gaps.last_mut() {
         Some(last) if last.1 == from => last.1 = to,
+        _ if full => return false,
         _ => gaps.push((from, to)),
     }
+    true
 }
 
 /// Removes both files of the segment at `base`, those that exist.
@@ -1273,10 +1350,13 @@ fn scan_segment<D: Disk>(
             cut = Some(CutReason::NotContiguous);
             break;
         }
-        let offset = entry.start - base;
+        let offset = entry
+            .start
+            .checked_sub(base)
+            .ok_or(SegmentError::PositionOverflow)?;
         let stored = match entry.kind {
             EntryKind::Data => entry.length,
-            EntryKind::Fill if (entry.length as usize) >= FILL_RECORD => FILL_RECORD as u32,
+            EntryKind::Fill if entry.length >= FILL_RECORD_LEN => FILL_RECORD_LEN,
             EntryKind::Fill => {
                 cut = Some(CutReason::NotContiguous);
                 break;
@@ -1295,7 +1375,10 @@ fn scan_segment<D: Disk>(
                 Err(error) => return Err(error.into()),
             };
             // A fill's extent is in the file before its entry.
-            if entry.kind == EntryKind::Fill && disk.len(&data)? < (entry_end - base) {
+            let extent_end = entry_end
+                .checked_sub(base)
+                .ok_or(SegmentError::PositionOverflow)?;
+            if entry.kind == EntryKind::Fill && disk.len(&data)? < extent_end {
                 matches = false;
             }
             if !matches {
@@ -1303,8 +1386,9 @@ fn scan_segment<D: Disk>(
                 break;
             }
         }
-        if entry.kind == EntryKind::Gap {
-            push_gap(&mut scan.gaps, entry.start, entry_end);
+        // Only a crafted index holds more gaps than a store records.
+        if entry.kind == EntryKind::Gap && !push_gap(&mut scan.gaps, entry.start, entry_end) {
+            return Err(SegmentError::TooManyGaps);
         }
         expected_start = entry_end;
         kept = index_entry.saturating_add(1);

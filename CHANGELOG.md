@@ -37,7 +37,15 @@ release may break APIs, wire formats and shared-memory layouts.
   and stops there or resumes where its source rejoins. The
   `ArchiveHandle` agent thread owns the catalog and the recorders, settles
   the catalog at start, and stops each recording in the catalog once its
-  store is closed.
+  store is closed with everything durable (`SegmentStore::close_synced`,
+  whatever the policy), at the durable position. A source that fails or
+  returns what a source never may ends its recording with
+  `StopReason::Failed(FailKind)`; a store that fails leaves it open for
+  the next start to settle (`Event::Failed { failure }`). A command stop,
+  the shutdown and the seal record `Stopped`, `Shutdown` and `Normal`.
+  Dropped events are counted (`ArchiveHandle::dropped_events`). A store
+  records at most `MAX_GAPS` lost ranges; an async recording lapped past
+  them ends `Lapped`. The catalog format becomes version 2.
 - The Archive's segment index entries have a kind (phase 3, A4): data, a
   fill (a padding or aborted block's canonical record, covering its
   extent) or a gap (a range an async recording lost, refused to reads).

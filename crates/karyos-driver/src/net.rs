@@ -57,7 +57,7 @@ use crate::agents::{AgentCommand, AgentEvent, EndpointId};
 use crate::sessions::send::Publication;
 
 use crate::agents::endpoints::Endpoints;
-use crate::agents::images::{ImageEvent, ImageTable, ImageTemplate};
+use crate::agents::images::{ImageEvent, ImageTable, ImageTemplate, LaneSource};
 use crate::agents::{
     AgentConfig, AgentError, AgentKind, AgentLinks, AgentRunner, LateAgent, NetworkAgents,
     ThreadingMode, YieldThenSleep, guarded, network_agents_over,
@@ -153,20 +153,32 @@ enum Agents<T: StreamTerms> {
 }
 
 /// What closing the network left behind.
-#[derive(Debug, Default)]
-pub struct NetworkShutdown {
+#[derive(Debug)]
+pub struct NetworkShutdown<T: StreamTerms = HeapTerms> {
     /// Endpoints retired cleanly.
     pub endpoints_retired: usize,
     /// The agents' failures, as their threads reported them.
     pub failures: Vec<AgentError>,
     /// Threads that did not stop within `stop_timeout`; they still own
     /// their agents and can be joined.
-    pub late: Vec<LateAgent<OsSocket>>,
+    pub late: Vec<LateAgent<OsSocket, T>>,
     /// Whether every agent that was handed back saw its stop flag.
     pub agents_stopped: bool,
     /// Guard senders of network publications deregistered with the close,
     /// so no guard close waits on them.
     pub guard_senders_released: usize,
+}
+
+impl<T: StreamTerms> Default for NetworkShutdown<T> {
+    fn default() -> Self {
+        Self {
+            endpoints_retired: 0,
+            failures: Vec::new(),
+            late: Vec::new(),
+            agents_stopped: false,
+            guard_senders_released: 0,
+        }
+    }
 }
 
 /// Where a network publication stands with the sender agent.
@@ -1381,11 +1393,7 @@ impl<T: StreamTerms> Network<T> {
             .find(|entry| entry.registration == registration)
             .map(|entry| entry.state)
     }
-}
 
-/// The cycles that serve the image table, whose lanes are built on the
-/// heap until step n2 (network streams over shared terms).
-impl Network<HeapTerms> {
     /// One conductor cycle of network work at the network clock's reading:
     /// the agents when they share this thread, then their events. Returns
     /// the work done.
@@ -1394,7 +1402,7 @@ impl Network<HeapTerms> {
     ///
     /// [`DriverError::NetworkAgent`] once an agent failed (DN-9), and on
     /// every later cycle; [`DriverError::WorkCountOverflow`].
-    pub(crate) fn duty(&mut self) -> Result<u32, DriverError> {
+    pub(crate) fn duty(&mut self, lanes: &mut LaneSource<'_>) -> Result<u32, DriverError> {
         let now = (self.clock)();
         if let Some(agent) = self.failed {
             return Err(DriverError::NetworkAgent { agent });
@@ -1544,9 +1552,9 @@ impl Network<HeapTerms> {
         // Image events go to the conductor, which exposes and retires the
         // images' streams (W3).
         let image_events = &mut self.image_events;
-        let images = self
-            .images
-            .poll(&self.links.sessions, |event| image_events.push(event));
+        let images = self.images.poll(&self.links.sessions, lanes, |event| {
+            image_events.push(event)
+        });
         let overflow = DriverError::WorkCountOverflow {
             count: received,
             delta: sent,
@@ -1560,7 +1568,7 @@ impl Network<HeapTerms> {
     /// Stops the agents, reclaims every endpoint and drains the image
     /// table at the network clock's reading (control path; at most once,
     /// later calls report nothing).
-    pub(crate) fn close(&mut self) -> NetworkShutdown {
+    pub(crate) fn close(&mut self, lanes: &mut LaneSource<'_>) -> NetworkShutdown<T> {
         let now = (self.clock)();
         let mut shutdown = NetworkShutdown::default();
         let agents = match core::mem::replace(&mut self.agents, Agents::Closed) {
@@ -1593,15 +1601,13 @@ impl Network<HeapTerms> {
             shutdown.agents_stopped = agents.is_stopped();
             shutdown.endpoints_retired = self.endpoints.reclaim(&self.links, &mut agents, |_| {});
         }
-        let _ = self.images.poll(&self.links.sessions, |_| {});
+        let _ = self.images.poll(&self.links.sessions, lanes, |_| {});
         // The agents are gone: every tracked guard sender is released for
         // the conductor to deregister.
         self.release_guard_senders();
         shutdown
     }
-}
 
-impl<T: StreamTerms> Network<T> {
     /// Moves the guard sender of every tracked publication to the released
     /// list (agents stopped or failed): the conductor deregisters them.
     fn release_guard_senders(&mut self) {
@@ -1700,6 +1706,13 @@ impl<T: StreamTerms> Network<T> {
     #[cfg(test)]
     pub(crate) fn image_count(&self) -> usize {
         self.images.len()
+    }
+
+    /// Term bytes the image table charges to its storage budget, for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn image_charge(&self) -> u64 {
+        self.images.charged()
     }
 
     /// Stale aliases that found the queue full, for tests.

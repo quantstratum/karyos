@@ -33,6 +33,8 @@ enum Script {
     Fill(u32),
     Pending,
     Sealed,
+    /// A seal at this position, wherever the source is.
+    SealedAt(u64),
     /// The source is lapped: this many bytes are lost.
     Lost(u64),
 }
@@ -102,6 +104,7 @@ impl FrameSource for Scripted {
                 Ok(Frames::Pending)
             }
             Script::Sealed => Ok(Frames::Sealed { at: position }),
+            Script::SealedAt(at) => Ok(Frames::Sealed { at }),
             Script::Lost(length) => {
                 let _ = self.script.pop_front();
                 Ok(Frames::Lost {
@@ -182,7 +185,7 @@ fn data_and_fills_are_recorded_until_the_seal() {
     let mut fill = vec![0u8; 88];
     recorder.store.read(40, &mut fill).unwrap();
     assert_eq!(fill[..FILL_RECORD], fill_record(40));
-    let ended = recorder.close().unwrap();
+    let ended = recorder.close(StopReason::Stopped).unwrap();
     assert_eq!(ended.position, 198);
 }
 
@@ -288,6 +291,17 @@ fn a_misaligned_source_is_refused() {
 /// fills and gaps intact and the lost range marked.
 #[test]
 fn every_crash_point_settles_the_recording() {
+    settles_at_every_crash_point(SyncPolicy::PerSegment);
+}
+
+/// #341 review P2: under no sync, a stop still syncs the store, so a
+/// stopped recording's segments hold its stop position after any crash.
+#[test]
+fn a_stop_without_a_sync_policy_is_durable() {
+    settles_at_every_crash_point(SyncPolicy::None);
+}
+
+fn settles_at_every_crash_point(policy: SyncPolicy) {
     let script = || {
         vec![
             Script::Data(data(0, 40)),
@@ -311,12 +325,11 @@ fn every_crash_point_settles_the_recording() {
             start: 0,
             start_time_ns: 0,
             geometry: geometry(),
-            policy: SyncPolicy::PerSegment,
+            policy,
         }) else {
             return 0;
         };
-        let Ok(store) = SegmentStore::create(disk, dir, id, geometry(), SyncPolicy::PerSegment, 0)
-        else {
+        let Ok(store) = SegmentStore::create(disk, dir, id, geometry(), policy, 0) else {
             return 0;
         };
         let mut durable = store.durable();
@@ -342,7 +355,7 @@ fn every_crash_point_settles_the_recording() {
                 Err(_) => return durable,
             }
         }
-        let Ok(ended) = recorder.close() else {
+        let Ok(ended) = recorder.close(StopReason::Stopped) else {
             return durable;
         };
         if catalog
@@ -362,24 +375,40 @@ fn every_crash_point_settles_the_recording() {
         for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
             let restarted = disk.after_crash(survives);
             let Ok(opened) = Catalog::open(restarted.clone(), Path::new(DIR)) else {
-                failures.push(format!("{budget} {survives:?}: catalog"));
+                failures.push(format!("{policy:?} {budget} {survives:?}: catalog"));
                 continue;
             };
             let mut catalog = opened.catalog;
             if catalog.settle(99).is_err() {
-                failures.push(format!("{budget} {survives:?}: settle"));
+                failures.push(format!("{policy:?} {budget} {survives:?}: settle"));
                 continue;
             }
             let Some(recording) = catalog.recordings().first() else {
                 continue;
             };
             let stop = recording.stop.unwrap();
+            // #341 review P2: the segments hold what the catalog's stop
+            // says, whatever the policy.
+            let recovered = SegmentStore::recover(
+                restarted.clone(),
+                Path::new(DIR),
+                recording.id,
+                geometry(),
+                policy,
+            )
+            .map_or(0, |recovered| recovered.store.written());
+            if recovered < stop.position {
+                failures.push(format!(
+                    "{budget} {survives:?}: stopped at {} but the segments hold {recovered}",
+                    stop.position
+                ));
+            }
             if durable == u64::MAX {
                 // Stopped durably: the catalog says so, normal and complete
                 // but for the gap.
                 if (stop.position, stop.reason, stop.incomplete) != (268, StopReason::Normal, true)
                 {
-                    failures.push(format!("{budget} {survives:?}: stop {stop:?}"));
+                    failures.push(format!("{policy:?} {budget} {survives:?}: stop {stop:?}"));
                 }
                 continue;
             }
@@ -390,7 +419,9 @@ fn every_crash_point_settles_the_recording() {
                 ));
             }
             if stop.position >= 238 && !stop.incomplete {
-                failures.push(format!("{budget} {survives:?}: the gap is not marked"));
+                failures.push(format!(
+                    "{policy:?} {budget} {survives:?}: the gap is not marked"
+                ));
             }
         }
     }
@@ -421,4 +452,93 @@ fn a_busy_resume_is_retried() {
     assert_eq!(recorder.source.resumed, [130]);
     assert_eq!(recorder.store.written(), 150);
     assert_eq!(recorder.store.gaps(), [(30, 130)]);
+}
+
+/// #341 review P3: a seal away from the written position, an empty copy
+/// and an empty loss are refused as an invalid source, which ends the
+/// recording with its store whole.
+#[test]
+fn an_invalid_source_is_refused() {
+    let cases = [
+        (
+            vec![Script::Data(data(0, 40)), Script::SealedAt(30)],
+            Invalid::SealNotAtWritten {
+                at: 30,
+                written: 40,
+            },
+        ),
+        (
+            vec![Script::Data(Vec::new())],
+            Invalid::EmptyCopy { position: 0 },
+        ),
+        (vec![Script::Lost(0)], Invalid::EmptyLoss { from: 0, to: 0 }),
+    ];
+    for (script, invalid) in cases {
+        let store = SegmentStore::create(
+            FaultDisk::default(),
+            Path::new(DIR),
+            1,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        let mut recorder = Recorder::new(
+            store,
+            Scripted::new(0, script),
+            Mode::Async {
+                on_lap: OnLap::Resume,
+            },
+            256,
+            1024,
+        )
+        .unwrap();
+        let error = recorder.duty(0).unwrap_err();
+        assert!(
+            matches!(error, RecorderError::Invalid(found) if found == invalid),
+            "{error:?}"
+        );
+        assert_eq!(error.fail_kind(), Some(FailKind::Invalid));
+    }
+}
+
+/// #341 review P3: an async recording lapped once more than its store
+/// records gaps ends there, lapped and incomplete.
+#[test]
+fn a_recording_out_of_gaps_ends_lapped() {
+    let mut script = Vec::new();
+    for _ in 0..=crate::segment::MAX_GAPS {
+        script.push(Script::Data(vec![7]));
+        script.push(Script::Lost(1));
+    }
+    let store = SegmentStore::create(
+        FaultDisk::default(),
+        Path::new(DIR),
+        1,
+        Geometry::new(64, 64 * 1024).unwrap(),
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    let mut recorder = Recorder::new(
+        store,
+        Scripted::new(0, script),
+        Mode::Async {
+            on_lap: OnLap::Resume,
+        },
+        256,
+        u64::MAX,
+    )
+    .unwrap();
+    let duty = recorder.duty(0).unwrap();
+    let last = 2 * u64::try_from(crate::segment::MAX_GAPS).unwrap() + 1;
+    assert_eq!(
+        duty.ended,
+        Some(Ended {
+            position: last,
+            reason: StopReason::Lapped,
+            incomplete: true,
+        })
+    );
+    assert_eq!(recorder.store().gaps().len(), crate::segment::MAX_GAPS);
 }
