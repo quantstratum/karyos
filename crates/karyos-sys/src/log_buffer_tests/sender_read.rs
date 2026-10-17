@@ -314,12 +314,16 @@ fn sender_read_respects_the_retention_floor() {
         .append(&sized_message(1, 100), AppendOptions::default())
         .unwrap();
     let mut out = sr_out();
+    assert_eq!((reader.floor(), conductor.floor()), (0, 0));
     buffer.floor().store(32, Ordering::Release);
+    // The reader reports the floor its reads enforce.
+    assert_eq!((reader.floor(), conductor.floor()), (32, 32));
     assert_eq!(
         sr_read(&mut reader, &mut out),
         Err(ReadError::Unavailable { lowest: 32 })
     );
     buffer.floor().store(0, Ordering::Release);
+    assert_eq!(reader.floor(), 0);
     assert!(matches!(
         sr_read(&mut reader, &mut out),
         Ok(ReadOutcome::Copied { .. })

@@ -328,6 +328,17 @@ impl<O: BufferOwner> SenderRead<O> {
         self.subscription.cursor.acknowledged
     }
 
+    /// The retention floor (Acquire): the lowest position still retained,
+    /// as the conductor last published it. A read below it is refused as
+    /// unavailable; it only rises, so a later read may refuse a position
+    /// this one admitted. NAK admission checks requests against it before
+    /// the read checks it again.
+    #[must_use]
+    pub fn floor(&self) -> u64 {
+        let buffer: &LogBuffer<O::Terms> = self.subscription.buffer();
+        buffer.floor().load(Ordering::Acquire)
+    }
+
     /// Whether the cursor stands at a block boundary: the last read left
     /// no block open.
     #[must_use]
