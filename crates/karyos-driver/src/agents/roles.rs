@@ -4988,7 +4988,7 @@ impl<T: StreamTerms> SenderRole<T> {
             submitted = total;
             let capacity = replies.capacity();
             let mut dropped: Option<u64> = Some(0);
-            outbound.drain_repair_replies(|reply| {
+            outbound.drain_repair_replies_on(|reply, endpoint| {
                 // Bounded by the list each path keeps, the same capacity.
                 if replies.len() < capacity {
                     replies.push((endpoint, *reply));

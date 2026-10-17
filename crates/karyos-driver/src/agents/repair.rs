@@ -190,7 +190,7 @@ pub struct RepairPath {
     /// The absorption of NAK copies across routes; empty on one path.
     absorb: Absorb,
     /// Step 8 ERRs waiting for the sender agent (allocated here).
-    replies: Vec<NakReply>,
+    replies: Vec<(NakReply, usize)>,
     max_replies: usize,
     /// The incarnation's term length.
     term_length: u32,
@@ -334,27 +334,31 @@ impl RepairPath {
         match self.admission.admit(nak, &ctx, now) {
             Admitted::Dropped(_) => NakOutcome::Dropped,
             Admitted::Reply(reply) => NakOutcome::Reply(reply),
-            Admitted::Pass(request) => match self.jobs.join_or_create(&request, Domain::Group, now)
-            {
-                Joined::Created(_) => {
-                    self.counts.bump(|c| &mut c.jobs_created);
-                    self.absorb.record(&copy_key(nak), route, now);
-                    NakOutcome::Queued
+            Admitted::Pass(request) => {
+                match self
+                    .jobs
+                    .join_or_create_on(&request, Domain::Group, route, now)
+                {
+                    Joined::Created(_) => {
+                        self.counts.bump(|c| &mut c.jobs_created);
+                        self.absorb.record(&copy_key(nak), route, now);
+                        NakOutcome::Queued
+                    }
+                    Joined::Joined(_) => {
+                        self.counts.bump(|c| &mut c.jobs_joined);
+                        self.absorb.record(&copy_key(nak), route, now);
+                        NakOutcome::Queued
+                    }
+                    Joined::Lingering => {
+                        self.counts.bump(|c| &mut c.lingering);
+                        NakOutcome::Dropped
+                    }
+                    Joined::Full => {
+                        self.counts.bump(|c| &mut c.jobs_full);
+                        NakOutcome::Dropped
+                    }
                 }
-                Joined::Joined(_) => {
-                    self.counts.bump(|c| &mut c.jobs_joined);
-                    self.absorb.record(&copy_key(nak), route, now);
-                    NakOutcome::Queued
-                }
-                Joined::Lingering => {
-                    self.counts.bump(|c| &mut c.lingering);
-                    NakOutcome::Dropped
-                }
-                Joined::Full => {
-                    self.counts.bump(|c| &mut c.jobs_full);
-                    NakOutcome::Dropped
-                }
-            },
+            }
         }
     }
 
@@ -449,8 +453,14 @@ impl RepairPath {
 
     /// The step 8 ERRs waiting to be sent, in order; `send` gets each.
     pub fn drain_replies(&mut self, mut send: impl FnMut(&NakReply)) {
-        for reply in self.replies.drain(..) {
-            send(&reply);
+        self.drain_replies_on(|reply, _| send(reply));
+    }
+
+    /// [`RepairPath::drain_replies`] with each ERR's route: the one its
+    /// requester asked on (0 on one path).
+    pub fn drain_replies_on(&mut self, mut send: impl FnMut(&NakReply, usize)) {
+        for (reply, route) in self.replies.drain(..) {
+            send(&reply, route);
         }
     }
 }
@@ -548,7 +558,7 @@ struct SubmitView<'a, 'b, O: SocketOps> {
     scratch: &'a RefCell<Scratch>,
     report: &'a mut TxReport,
     admission: &'a mut Admission,
-    replies: &'a mut Vec<NakReply>,
+    replies: &'a mut Vec<(NakReply, usize)>,
     max_replies: usize,
     alias: Alias,
     identity: Identity,
@@ -735,11 +745,19 @@ impl<O: SocketOps> RepairSubmit for SubmitView<'_, '_, O> {
         outcome
     }
 
-    fn reply(&mut self, key: &JobKey, requesters: &[Receiver], reason: NakReplyReason) {
+    fn reply(
+        &mut self,
+        key: &JobKey,
+        requesters: &[Receiver],
+        routes: &[usize],
+        reason: NakReplyReason,
+    ) {
         let Ok(lane) = Lane::try_new(key.lane) else {
             return;
         };
-        for receiver in requesters {
+        for (at, receiver) in requesters.iter().enumerate() {
+            // One ERR, on the route the requester asked on (RP-11).
+            let route = routes.get(at).copied().unwrap_or(0);
             let nak = Nak {
                 alias: self.alias,
                 identity: self.identity,
@@ -752,7 +770,7 @@ impl<O: SocketOps> RepairSubmit for SubmitView<'_, '_, O> {
             };
             if let Admitted::Reply(reply) = self.admission.reply_to(&nak, reason, self.now) {
                 if self.replies.len() < self.max_replies {
-                    self.replies.push(reply);
+                    self.replies.push((reply, route));
                 } else {
                     self.counts.bump(|c| &mut c.replies_full);
                 }

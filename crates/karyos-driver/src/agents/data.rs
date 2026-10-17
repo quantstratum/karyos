@@ -63,6 +63,7 @@ use karyos_io::backend::{
     Authority, BackendEpoch, Commit, Exposure, GateDecision, SenderGate, SenderToken, TxBackend,
     TxFrame, TxOptions, TxQueueConfig, TxQueueId, TxReport, TxTicket,
 };
+use karyos_io::lanes::routes::MAX_ROUTES;
 use karyos_io::lanes::{LaneGate, LaneSender, Left, SenderFailure, Staged};
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
@@ -749,9 +750,25 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Hands each step 8 ERR waiting to `send`.
-    pub fn drain_repair_replies(&mut self, send: impl FnMut(&NakReply)) {
+    pub fn drain_repair_replies(&mut self, mut send: impl FnMut(&NakReply)) {
+        self.drain_repair_replies_on(|reply, _| send(reply));
+    }
+
+    /// [`Outbound::drain_repair_replies`] with the endpoint each ERR goes
+    /// on: the route its requester asked on (RP-11), the publication's own
+    /// endpoint on one path.
+    pub fn drain_repair_replies_on(&mut self, mut send: impl FnMut(&NakReply, EndpointId)) {
+        let founding = self.endpoint;
+        let mut endpoints = [founding; MAX_ROUTES];
+        if let Some(routed) = self.routed.as_deref() {
+            for (slot, endpoint) in endpoints.iter_mut().zip(routed.endpoints()) {
+                *slot = endpoint;
+            }
+        }
         if let Some(repair) = self.repair.as_deref_mut() {
-            repair.drain_replies(send);
+            repair.drain_replies_on(|reply, route| {
+                send(reply, endpoints.get(route).copied().unwrap_or(founding));
+            });
         }
     }
 

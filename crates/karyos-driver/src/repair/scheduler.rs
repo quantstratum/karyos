@@ -150,8 +150,15 @@ pub trait RepairSubmit {
     /// it, for `job`.
     fn submit(&mut self, lane: u8, job: JobRef, from: u64, head: Head) -> Submit;
 
-    /// An ERR NAK_REPLY for `key`'s range to each of `requesters`.
-    fn reply(&mut self, key: &JobKey, requesters: &[Receiver], reason: NakReplyReason);
+    /// An ERR NAK_REPLY for `key`'s range to each of `requesters`, on the
+    /// route in `routes` that requester asked on (same order).
+    fn reply(
+        &mut self,
+        key: &JobKey,
+        requesters: &[Receiver],
+        routes: &[usize],
+        reason: NakReplyReason,
+    );
 }
 
 /// What the scheduler counted.
@@ -244,7 +251,12 @@ struct Source<'a, R, S> {
 impl<R: RepairRead, S: RepairSubmit> Source<'_, R, S> {
     /// Ends `job` with an ERR to its requesters.
     fn refuse(&mut self, job: JobRef, key: &JobKey, reason: NakReplyReason) {
-        self.submit.reply(key, self.jobs.requesters(job), reason);
+        self.submit.reply(
+            key,
+            self.jobs.requesters(job),
+            self.jobs.requester_routes(job),
+            reason,
+        );
         self.jobs.failed(job);
         self.counts.bump(|c| match reason {
             NakReplyReason::RangeInvalid => &mut c.range_invalid,
