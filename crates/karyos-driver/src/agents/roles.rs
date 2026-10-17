@@ -289,6 +289,10 @@ pub struct SenderCounters {
     pub nak_replies: u64,
     /// Step 8 ERRs whose requester has no bound source: not sent.
     pub nak_replies_unbound: u64,
+    /// Step 8 ERRs past the cycle's reply list: not sent. The list holds
+    /// what one publication's path keeps, so this stays 0 unless that
+    /// bound breaks.
+    pub nak_replies_dropped: u64,
     /// Repair datagrams submitted.
     pub repairs: u64,
     /// RTTM REPLYs sent (counted in `sent` too).
@@ -3219,6 +3223,12 @@ impl SenderRole {
     /// incarnation and receiver id), for a reliable publication; then
     /// admission and the job table. An admission ERR goes back to the
     /// NAK's source.
+    ///
+    /// A binding answered but not yet confirmed by its first SM has no
+    /// receiver id: until then it admits a NAK naming any receiver id from
+    /// its source, boot id and incarnation. A step 8 ERR needs the id
+    /// ([`Self::reply_nak`]), so one for such a binding is not sent and
+    /// counts `nak_replies_unbound`.
     fn nak<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
@@ -3322,16 +3332,26 @@ impl SenderRole {
                 continue;
             };
             let served = outbound.serve_repair(tx, &mut budget, now);
-            submitted = submitted
-                .checked_add(served)
-                .ok_or(AgentError::CountOverflow(AgentKind::Sender))?;
+            let Some(total) = submitted.checked_add(served) else {
+                // The list goes back before the error: it is never
+                // allocated again.
+                self.nak_replies = replies;
+                return Err(AgentError::CountOverflow(AgentKind::Sender));
+            };
+            submitted = total;
             let capacity = replies.capacity();
+            let mut dropped = 0u32;
             outbound.drain_repair_replies(|reply| {
                 // Bounded by the list each path keeps, the same capacity.
                 if replies.len() < capacity {
                     replies.push((endpoint, *reply));
+                } else {
+                    dropped = dropped.saturating_add(1);
                 }
             });
+            for _ in 0..dropped {
+                self.count(|c| &mut c.nak_replies_dropped);
+            }
             for (endpoint, reply) in replies.drain(..) {
                 self.reply_nak(halves, endpoint, &reply);
             }
@@ -3344,7 +3364,10 @@ impl SenderRole {
         Ok(submitted)
     }
 
-    /// Sends a step 8 ERR to its requester's bound source on `endpoint`.
+    /// Sends a step 8 ERR to its requester's bound source on `endpoint`:
+    /// the binding of its alias, incarnation, boot id and receiver id as
+    /// they are now, which may have expired or moved to another receiver
+    /// id since the NAK's admission (then `nak_replies_unbound`).
     fn reply_nak<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],

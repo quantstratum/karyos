@@ -2098,6 +2098,47 @@ fn naks_are_repaired_and_answered() {
     assert_eq!(rig.sender.counters().nak_replies, 2);
 }
 
+/// Step 8 ERRs go to the requester's binding as it is when they are sent:
+/// a binding that moved to another receiver id, or expired, since the
+/// NAK's admission gets none, and the ERR counts `nak_replies_unbound`.
+#[test]
+fn a_step_8_err_needs_its_binding_at_the_send() {
+    use karyos_protocol::network::{Datagram, classify};
+
+    let replies = |rig: &RepairRig| {
+        rig.datagrams()
+            .iter()
+            .filter(|bytes| matches!(classify(bytes), Ok(Datagram::Control(Control::NakReply(_)))))
+            .count()
+    };
+    for change in ["receiver id", "expiry"] {
+        let mut rig = RepairRig::new(AgentConfig::default(), &[alias()], 4);
+        let source = SocketAddr::from(RECEIVER_SOURCE);
+        // Admitted with no repair budget: the job waits for step 8.
+        let budget = rig.sender.repair.budget;
+        rig.sender.repair.budget.loads = 0;
+        rig.nak(alias(), source, 2 * FRAME + 32, 1024);
+        rig.cycle(3);
+        assert_eq!(rig.sender.counters().naks, 1, "{change}");
+        match change {
+            "receiver id" => rig.sender.bindings[0].receiver_id = Some(2),
+            _ => {
+                let _ = rig.sender.bindings.swap_remove(0);
+            }
+        }
+        rig.sender.repair.budget = budget;
+        rig.script(1);
+        rig.cycle(4);
+        let counters = rig.sender.counters();
+        assert_eq!(
+            (counters.nak_replies, counters.nak_replies_unbound),
+            (0, 1),
+            "{change}"
+        );
+        assert_eq!(replies(&rig), 0, "{change}");
+    }
+}
+
 /// At most `naks_per_cycle` NAKs reach admission in a cycle; the rest are
 /// dropped and counted.
 #[test]
