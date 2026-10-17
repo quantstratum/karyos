@@ -30,6 +30,8 @@
 //! | `0x0C` | `AddConflatedSubscription` | sequence | stream and session as above | | |
 //! | `0x0D` | `GuardClose` | sequence | guard | operation id | |
 //! | `0x0E` | `GuardReopen` | sequence | guard | expected closed epoch | operation id |
+//! | `0x0F` | `AddNetworkPublication` | sequence | stream id (low 32; high 32 zero) | flags as `AddPublication` | channel URI length |
+//! | `0x10` | `AddNetworkSubscription` | sequence | stream id (low 32; high 32 zero) | role as `AddSubscription` | channel URI length |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
@@ -39,6 +41,7 @@
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
 //! | `0x88` | `ConflatedReady` | client | sequence | registration | hand-over key |
 //! | `0x89` | `GuardState` | client | sequence | guard | guard word (`karyos_sys::guard`) |
+//! | `0x8A` | `NetworkSubscriptionReady` | client | sequence | registration | |
 //!
 //! `GuardClose` and `GuardReopen` (`quantstratum-docs:
 //! karyos/design/guards-and-abort.md`, local guards): a local operator
@@ -74,6 +77,21 @@
 //! answer itself needs only the state and fits the response limit. A
 //! registration that is not one of the sender's is refused with `Error`
 //! and `UnknownRegistration`.
+//!
+//! `AddNetworkPublication` and `AddNetworkSubscription` (wiring note W5,
+//! coordinator ACS 16021 and 16027) continue after their four words with
+//! the channel URI's UTF-8 bytes, padded with zero bytes to a whole word:
+//! the only variable-length commands. Word 3 is the URI's length in bytes,
+//! 1 to [`MAX_COMMAND_URI`]; a longer URI is refused on the client side,
+//! and the driver configuration keeps the longer URIs a channel allows
+//! (SPEC §18). The driver parses the URI: a `karyos:ipc` channel resolves
+//! the stream as `AddPublication` does, a `karyos:udp` one creates a
+//! network publication or subscription. The command names no session id
+//! and no lane: the driver draws the publication's session id, its wire
+//! alias, and returns it with the grant; the lanes are the URI's `lanes`.
+//! A URI that does not parse is refused with `Error` and `InvalidChannel`
+//! (the detail names the parse error), one the driver cannot serve with
+//! `UnsupportedChannel`.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -130,6 +148,14 @@
 //! | `0xC3` | `PublicationClosed` | stream and session | reason: 1 required participant lost | lane: below 4 | | |
 //! | `0xC4` | `SuccessorReady` | stream and session | registration | hand-over key of the successor grant | base position | generation |
 //! | `0xC5` | `Fenced` | stream and session | registration | | | |
+//! | `0xC6` | `ImageAvailable` | stream and session | network subscription registration | | | |
+//! | `0xC7` | `ImageUnavailable` | stream and session | network subscription registration | | | |
+//!
+//! `ImageAvailable` and `ImageUnavailable` (W5, the minimal image
+//! notification of D2): a remote publication's image became a stream of
+//! the driver under the publication's alias, or retired. A client of the
+//! network subscription attaches with `AddSubscription` naming that
+//! stream and session.
 
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::SealReason;
@@ -144,8 +170,19 @@ const LABEL_WORDS: usize = MAX_LABEL_LENGTH / 8;
 const ALLOCATE_COUNTER_WORDS: usize = 5 + LABEL_WORDS;
 /// Words of an encoded `ReportLoss`.
 const REPORT_LOSS_WORDS: usize = 9;
-/// Largest encoded command, in bytes: `AllocateCounter`.
-pub const MAX_COMMAND_LENGTH: usize = ALLOCATE_COUNTER_WORDS * 8;
+/// Longest channel URI a client command carries, in bytes (SPEC §18): an
+/// encoded command then fits the default command ring.
+pub const MAX_COMMAND_URI: usize = 512;
+/// Words of the fixed part of a command carrying a channel URI.
+const URI_COMMAND_WORDS: usize = 4;
+/// Largest encoded command, in bytes: a command with the longest channel
+/// URI.
+pub const MAX_COMMAND_LENGTH: usize =
+    if URI_COMMAND_WORDS * 8 + MAX_COMMAND_URI > ALLOCATE_COUNTER_WORDS * 8 {
+        URI_COMMAND_WORDS * 8 + MAX_COMMAND_URI
+    } else {
+        ALLOCATE_COUNTER_WORDS * 8
+    };
 /// Words of an encoded `ConflatedReady`: four, and the configuration.
 const CONFLATED_READY_WORDS: usize = 7;
 /// Largest encoded response, in bytes: `ConflatedReady`.
@@ -167,6 +204,8 @@ const QUERY_CUTOVER: u32 = 0x0B;
 const ADD_CONFLATED_SUBSCRIPTION: u32 = 0x0C;
 const GUARD_CLOSE: u32 = 0x0D;
 const GUARD_REOPEN: u32 = 0x0E;
+const ADD_NETWORK_PUBLICATION: u32 = 0x0F;
+const ADD_NETWORK_SUBSCRIPTION: u32 = 0x10;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -176,6 +215,7 @@ const JOURNAL_READY: u32 = 0x86;
 const CUTOVER_STATE: u32 = 0x87;
 const CONFLATED_READY: u32 = 0x88;
 const GUARD_STATE: u32 = 0x89;
+const NETWORK_SUBSCRIPTION_READY: u32 = 0x8A;
 
 /// Whether `epoch` is one a guard can be closed at (`karyos_sys::guard`).
 const fn closed_epoch(epoch: u64) -> bool {
@@ -186,6 +226,8 @@ const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
 const PUBLICATION_CLOSED: u32 = 0xC3;
 const SUCCESSOR_READY: u32 = 0xC4;
 const FENCED: u32 = 0xC5;
+const IMAGE_AVAILABLE: u32 = 0xC6;
+const IMAGE_UNAVAILABLE: u32 = 0xC7;
 
 const ALLOW_UNCONNECTED: u64 = 1;
 
@@ -308,6 +350,62 @@ impl CounterLabel {
             .get(..usize::from(self.length))
             .and_then(|bytes| core::str::from_utf8(bytes).ok())
             .unwrap_or("")
+    }
+}
+
+/// A channel URI a client command carries: UTF-8 of 1 to
+/// [`MAX_COMMAND_URI`] bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChannelUri {
+    bytes: [u8; MAX_COMMAND_URI],
+    length: u16,
+}
+
+impl core::fmt::Debug for ChannelUri {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("ChannelUri").field(&self.as_str()).finish()
+    }
+}
+
+impl ChannelUri {
+    /// The URI `uri`; `None` when it is empty or longer than
+    /// [`MAX_COMMAND_URI`] bytes.
+    #[must_use]
+    pub fn new(uri: &str) -> Option<Self> {
+        Self::from_bytes(uri.as_bytes())
+    }
+
+    /// The URI of `bytes`; `None` unless they are UTF-8 of 1 to
+    /// [`MAX_COMMAND_URI`] bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        core::str::from_utf8(bytes).ok()?;
+        if bytes.is_empty() || bytes.len() > MAX_COMMAND_URI {
+            return None;
+        }
+        let length = u16::try_from(bytes.len()).ok()?;
+        let mut stored = [0u8; MAX_COMMAND_URI];
+        stored.get_mut(..bytes.len())?.copy_from_slice(bytes);
+        Some(Self {
+            bytes: stored,
+            length,
+        })
+    }
+
+    /// The URI.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Only UTF-8 is ever stored (checked by every constructor).
+        self.bytes
+            .get(..usize::from(self.length))
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .unwrap_or("")
+    }
+
+    /// Its bytes padded with zeros to a whole word.
+    fn padded(&self) -> &[u8] {
+        let length = usize::from(self.length).next_multiple_of(8);
+        self.bytes.get(..length).unwrap_or(&self.bytes)
     }
 }
 
@@ -510,6 +608,30 @@ pub enum Command {
         /// The subscriber's role.
         role: SubscriberRole,
     },
+    /// Create an exclusive publication of `stream_id` on the channel `uri`
+    /// (W5): the driver draws its session id.
+    AddNetworkPublication {
+        /// Request sequence.
+        sequence: u64,
+        /// The stream.
+        stream_id: i32,
+        /// Accept offers with no subscriber attached.
+        allow_unconnected: bool,
+        /// The channel.
+        uri: ChannelUri,
+    },
+    /// Subscribe `stream_id` on the channel `uri` (W5): its images are
+    /// announced with `ImageAvailable`.
+    AddNetworkSubscription {
+        /// Request sequence.
+        sequence: u64,
+        /// The stream.
+        stream_id: i32,
+        /// The role of the subscribers that attach to its images.
+        role: SubscriberRole,
+        /// The channel.
+        uri: ChannelUri,
+    },
     /// Issue a concurrent publication handle on one of the stream's
     /// publisher slots.
     AddConcurrentPublication {
@@ -667,6 +789,12 @@ pub enum ErrorCode {
     GuardExhausted,
     /// The calling process is not authorized for this guard (G1).
     NotAuthorized,
+    /// The channel URI does not parse; the detail is the parse error's
+    /// code (W5).
+    InvalidChannel,
+    /// The driver does not serve this channel: no network, a feature not
+    /// wired yet, or shared terms (W5).
+    UnsupportedChannel,
 }
 
 impl ErrorCode {
@@ -683,6 +811,8 @@ impl ErrorCode {
             Self::GuardNotClosedAt => 9,
             Self::GuardExhausted => 10,
             Self::NotAuthorized => 11,
+            Self::InvalidChannel => 12,
+            Self::UnsupportedChannel => 13,
         }
     }
 
@@ -699,6 +829,8 @@ impl ErrorCode {
             9 => Self::GuardNotClosedAt,
             10 => Self::GuardExhausted,
             11 => Self::NotAuthorized,
+            12 => Self::InvalidChannel,
+            13 => Self::UnsupportedChannel,
             _ => return None,
         })
     }
@@ -724,6 +856,14 @@ pub enum Response {
         registration: u64,
         /// The hand-over key.
         key: u64,
+    },
+    /// The network subscription is created (W5); its images are
+    /// announced with `ImageAvailable`, naming `registration`.
+    NetworkSubscriptionReady {
+        /// The request.
+        request: RequestId,
+        /// The new registration.
+        registration: u64,
     },
     /// The command succeeded and returns nothing.
     OperationSucceeded {
@@ -898,6 +1038,8 @@ impl Command {
             Self::AddConflatedSubscription { .. } => ADD_CONFLATED_SUBSCRIPTION,
             Self::GuardClose { .. } => GUARD_CLOSE,
             Self::GuardReopen { .. } => GUARD_REOPEN,
+            Self::AddNetworkPublication { .. } => ADD_NETWORK_PUBLICATION,
+            Self::AddNetworkSubscription { .. } => ADD_NETWORK_SUBSCRIPTION,
         }
     }
 
@@ -918,7 +1060,9 @@ impl Command {
             | Self::QueryCutover { sequence, .. }
             | Self::AddConflatedSubscription { sequence, .. }
             | Self::GuardClose { sequence, .. }
-            | Self::GuardReopen { sequence, .. } => sequence,
+            | Self::GuardReopen { sequence, .. }
+            | Self::AddNetworkPublication { sequence, .. }
+            | Self::AddNetworkSubscription { sequence, .. } => sequence,
         }
     }
 
@@ -1061,6 +1205,36 @@ impl Command {
                 }
                 write_words(&[sequence, guard, expected, operation], out)
             }
+            Self::AddNetworkPublication {
+                sequence,
+                stream_id,
+                allow_unconnected,
+                uri,
+            } => write_uri_command(
+                [
+                    sequence,
+                    u64::from(stream_id.cast_unsigned()),
+                    u64::from(allow_unconnected),
+                    u64::from(uri.length),
+                ],
+                &uri,
+                out,
+            ),
+            Self::AddNetworkSubscription {
+                sequence,
+                stream_id,
+                role,
+                uri,
+            } => write_uri_command(
+                [
+                    sequence,
+                    u64::from(stream_id.cast_unsigned()),
+                    role_code(role),
+                    u64::from(uri.length),
+                ],
+                &uri,
+                out,
+            ),
         }
     }
 
@@ -1249,9 +1423,114 @@ impl Command {
                     operation,
                 })
             }
+            ADD_NETWORK_PUBLICATION | ADD_NETWORK_SUBSCRIPTION => {
+                let ([sequence, stream, flags, _], uri) = read_uri_command(type_id, bytes)?;
+                // The command names the stream only: no session id.
+                let stream_id = u32::try_from(stream)
+                    .map_err(|_| CncError::Reserved { type_id })?
+                    .cast_signed();
+                if type_id == ADD_NETWORK_PUBLICATION {
+                    if flags & !ALLOW_UNCONNECTED != 0 {
+                        return Err(CncError::Reserved { type_id });
+                    }
+                    Ok(Self::AddNetworkPublication {
+                        sequence,
+                        stream_id,
+                        allow_unconnected: flags == ALLOW_UNCONNECTED,
+                        uri,
+                    })
+                } else {
+                    Ok(Self::AddNetworkSubscription {
+                        sequence,
+                        stream_id,
+                        role: role_from(flags).ok_or(CncError::Reserved { type_id })?,
+                        uri,
+                    })
+                }
+            }
             _ => Err(CncError::UnknownType { type_id }),
         }
     }
+}
+
+/// The wire code of a subscriber role.
+const fn role_code(role: SubscriberRole) -> u64 {
+    match role {
+        SubscriberRole::Required => 0,
+        SubscriberRole::Optional => 1,
+        SubscriberRole::Observer => 2,
+    }
+}
+
+/// The subscriber role of a wire code.
+const fn role_from(code: u64) -> Option<SubscriberRole> {
+    match code {
+        0 => Some(SubscriberRole::Required),
+        1 => Some(SubscriberRole::Optional),
+        2 => Some(SubscriberRole::Observer),
+        _ => None,
+    }
+}
+
+/// Writes a command's four words and its channel URI, padded to a word.
+fn write_uri_command(
+    words: [u64; URI_COMMAND_WORDS],
+    uri: &ChannelUri,
+    out: &mut [u8],
+) -> Result<usize, CncError> {
+    let head = write_words(&words, out)?;
+    let tail = uri.padded();
+    let required = head
+        .checked_add(tail.len())
+        .ok_or(CncError::BufferTooShort {
+            required: usize::MAX,
+            available: out.len(),
+        })?;
+    let available = out.len();
+    out.get_mut(head..required)
+        .ok_or(CncError::BufferTooShort {
+            required,
+            available,
+        })?
+        .copy_from_slice(tail);
+    Ok(required)
+}
+
+/// Reads a command's four words and its channel URI, strictly: the length
+/// word names 1 to [`MAX_COMMAND_URI`] bytes of UTF-8, the record is the
+/// words and those bytes padded to a word, and the padding is zero.
+fn read_uri_command(
+    type_id: u32,
+    bytes: &[u8],
+) -> Result<([u64; URI_COMMAND_WORDS], ChannelUri), CncError> {
+    let head = URI_COMMAND_WORDS * 8;
+    let words = read_words::<URI_COMMAND_WORDS>(type_id, bytes.get(..head).unwrap_or(bytes))?;
+    let [_, _, _, length] = words;
+    let length = usize::try_from(length)
+        .ok()
+        .filter(|length| (1..=MAX_COMMAND_URI).contains(length))
+        .ok_or(CncError::Reserved { type_id })?;
+    let expected = length
+        .checked_next_multiple_of(8)
+        .and_then(|padded| head.checked_add(padded))
+        .ok_or(CncError::Reserved { type_id })?;
+    if bytes.len() != expected {
+        return Err(CncError::WrongLength {
+            type_id,
+            length: bytes.len(),
+            expected,
+        });
+    }
+    let (uri, padding) = bytes
+        .get(head..)
+        .unwrap_or_default()
+        .split_at_checked(length)
+        .ok_or(CncError::Reserved { type_id })?;
+    if padding.iter().any(|&byte| byte != 0) {
+        return Err(CncError::Reserved { type_id });
+    }
+    let uri = ChannelUri::from_bytes(uri).ok_or(CncError::Reserved { type_id })?;
+    Ok((words, uri))
 }
 
 impl Response {
@@ -1268,6 +1547,7 @@ impl Response {
             Self::CutoverState { .. } => CUTOVER_STATE,
             Self::ConflatedReady { .. } => CONFLATED_READY,
             Self::GuardState { .. } => GUARD_STATE,
+            Self::NetworkSubscriptionReady { .. } => NETWORK_SUBSCRIPTION_READY,
         }
     }
 
@@ -1283,7 +1563,8 @@ impl Response {
             | Self::JournalReady { request, .. }
             | Self::CutoverState { request, .. }
             | Self::ConflatedReady { request, .. }
-            | Self::GuardState { request, .. } => request,
+            | Self::GuardState { request, .. }
+            | Self::NetworkSubscriptionReady { request, .. } => request,
         }
     }
 
@@ -1307,6 +1588,10 @@ impl Response {
             Self::OperationSucceeded { request } => {
                 write_words(&[request.client, request.sequence], out)
             }
+            Self::NetworkSubscriptionReady {
+                request,
+                registration,
+            } => write_words(&[request.client, request.sequence, registration], out),
             Self::Error {
                 request,
                 code,
@@ -1399,6 +1684,13 @@ impl Response {
                 let [client, sequence] = read_words::<2>(type_id, bytes)?;
                 Ok(Self::OperationSucceeded {
                     request: RequestId { client, sequence },
+                })
+            }
+            NETWORK_SUBSCRIPTION_READY => {
+                let [client, sequence, registration] = read_words::<3>(type_id, bytes)?;
+                Ok(Self::NetworkSubscriptionReady {
+                    request: RequestId { client, sequence },
+                    registration,
                 })
             }
             ERROR => {
@@ -1623,6 +1915,21 @@ pub enum Event {
         /// The registration fenced.
         registration: u64,
     },
+    /// A remote publication's image is a stream of the driver under its
+    /// alias `stream`, for the network subscription `registration` (W5).
+    ImageAvailable {
+        /// The image's stream and session.
+        stream: StreamKey,
+        /// The network subscription.
+        registration: u64,
+    },
+    /// The image of `stream` retired.
+    ImageUnavailable {
+        /// The image's stream and session.
+        stream: StreamKey,
+        /// The network subscription.
+        registration: u64,
+    },
 }
 
 impl Event {
@@ -1635,6 +1942,8 @@ impl Event {
             Self::PublicationClosed { .. } => PUBLICATION_CLOSED,
             Self::SuccessorReady { .. } => SUCCESSOR_READY,
             Self::Fenced { .. } => FENCED,
+            Self::ImageAvailable { .. } => IMAGE_AVAILABLE,
+            Self::ImageUnavailable { .. } => IMAGE_UNAVAILABLE,
         }
     }
 
@@ -1694,6 +2003,14 @@ impl Event {
             Self::Fenced {
                 stream,
                 registration,
+            }
+            | Self::ImageAvailable {
+                stream,
+                registration,
+            }
+            | Self::ImageUnavailable {
+                stream,
+                registration,
             } => write_words(&[stream_word(stream), registration], out),
         }
     }
@@ -1750,6 +2067,21 @@ impl Event {
                 Ok(Self::Fenced {
                     stream: stream_from(stream),
                     registration,
+                })
+            }
+            IMAGE_AVAILABLE | IMAGE_UNAVAILABLE => {
+                let [stream, registration] = read_words::<2>(type_id, bytes)?;
+                let stream = stream_from(stream);
+                Ok(if type_id == IMAGE_AVAILABLE {
+                    Self::ImageAvailable {
+                        stream,
+                        registration,
+                    }
+                } else {
+                    Self::ImageUnavailable {
+                        stream,
+                        registration,
+                    }
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -1894,6 +2226,162 @@ mod tests {
                 Command::decode(command.type_id(), &out[..length]),
                 Ok(command)
             );
+        }
+    }
+
+    fn uri(length: usize) -> ChannelUri {
+        // Multi-byte UTF-8 included: "é" is two bytes.
+        let mut text = String::from("karyos:udp?endpoint=127.0.0.1:40123|é");
+        while text.len() < length {
+            text.push('a');
+        }
+        text.truncate(length);
+        ChannelUri::new(&text).unwrap()
+    }
+
+    /// W5: the URI commands round-trip at every padding remainder and at
+    /// the cap, and their record is the four words and the padded URI.
+    #[test]
+    fn uri_commands_round_trip() {
+        for length in [1, 7, 8, 9, 37, MAX_COMMAND_URI] {
+            let text = "k".repeat(length);
+            let uri = ChannelUri::new(&text).unwrap();
+            for command in [
+                Command::AddNetworkPublication {
+                    sequence: 3,
+                    stream_id: -9,
+                    allow_unconnected: true,
+                    uri,
+                },
+                Command::AddNetworkSubscription {
+                    sequence: u64::MAX,
+                    stream_id: i32::MAX,
+                    role: SubscriberRole::Observer,
+                    uri,
+                },
+            ] {
+                let mut out = [0u8; MAX_COMMAND_LENGTH];
+                let encoded = command.encode(&mut out).unwrap();
+                assert_eq!(encoded, 32 + length.next_multiple_of(8));
+                assert_eq!(
+                    Command::decode(command.type_id(), &out[..encoded]),
+                    Ok(command)
+                );
+            }
+        }
+        let utf8 = uri(40);
+        assert!(utf8.as_str().contains('é'));
+        assert_eq!(ChannelUri::new(""), None);
+        assert_eq!(ChannelUri::new(&"k".repeat(MAX_COMMAND_URI + 1)), None);
+    }
+
+    /// W5: decoding a URI command is strict.
+    #[test]
+    fn uri_commands_are_decoded_strictly() {
+        let command = Command::AddNetworkPublication {
+            sequence: 1,
+            stream_id: 10,
+            allow_unconnected: false,
+            uri: ChannelUri::new("karyos:udp?endpoint=127.0.0.1:1").unwrap(),
+        };
+        let type_id = command.type_id();
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = command.encode(&mut out).unwrap();
+        let good = out[..length].to_vec();
+        let decode = |bytes: &[u8]| Command::decode(type_id, bytes);
+        let reserved = Err(CncError::Reserved { type_id });
+        // A session id in the stream word.
+        let mut session = good.clone();
+        session[12] = 1;
+        assert_eq!(decode(&session), reserved);
+        // A reserved flag.
+        let mut flags = good.clone();
+        flags[16] = 2;
+        assert_eq!(decode(&flags), reserved);
+        // A length of 0, or above the cap.
+        for bad in [0u64, MAX_COMMAND_URI as u64 + 1] {
+            let mut length = good.clone();
+            length[24..32].copy_from_slice(&bad.to_le_bytes());
+            assert_eq!(decode(&length), reserved);
+        }
+        // A record of another length than the URI's padded length.
+        assert!(matches!(
+            decode(&good[..good.len() - 8]),
+            Err(CncError::WrongLength { .. })
+        ));
+        let mut longer = good.clone();
+        longer.extend_from_slice(&[0; 8]);
+        assert!(matches!(decode(&longer), Err(CncError::WrongLength { .. })));
+        // Nonzero padding, and bytes that are not UTF-8.
+        let mut padding = good.clone();
+        *padding.last_mut().unwrap() = 1;
+        assert_eq!(decode(&padding), reserved);
+        let mut utf8 = good.clone();
+        utf8[32] = 0xFF;
+        assert_eq!(decode(&utf8), reserved);
+        // A role that does not exist.
+        let subscription = Command::AddNetworkSubscription {
+            sequence: 1,
+            stream_id: 10,
+            role: SubscriberRole::Required,
+            uri: ChannelUri::new("karyos:ipc").unwrap(),
+        };
+        let length = subscription.encode(&mut out).unwrap();
+        let mut role = out[..length].to_vec();
+        role[16] = 3;
+        assert_eq!(
+            Command::decode(subscription.type_id(), &role),
+            Err(CncError::Reserved {
+                type_id: subscription.type_id()
+            })
+        );
+        assert_eq!(decode(&good), Ok(command));
+    }
+
+    /// W5: the network subscription grant, the image events and the two
+    /// error codes round-trip.
+    #[test]
+    fn network_responses_and_events_round_trip() {
+        let request = RequestId {
+            client: 4,
+            sequence: 9,
+        };
+        for response in [
+            Response::NetworkSubscriptionReady {
+                request,
+                registration: 77,
+            },
+            Response::Error {
+                request,
+                code: ErrorCode::InvalidChannel,
+                detail: 3,
+            },
+            Response::Error {
+                request,
+                code: ErrorCode::UnsupportedChannel,
+                detail: 10,
+            },
+        ] {
+            let mut out = [0u8; MAX_RESPONSE_LENGTH];
+            let length = response.encode(&mut out).unwrap();
+            assert_eq!(
+                Response::decode(response.type_id(), &out[..length]),
+                Ok(response)
+            );
+        }
+        for event in [
+            Event::ImageAvailable {
+                stream: stream(),
+                registration: 77,
+            },
+            Event::ImageUnavailable {
+                stream: stream(),
+                registration: 77,
+            },
+        ] {
+            let mut out = [0u8; MAX_EVENT_LENGTH];
+            let length = event.encode(&mut out).unwrap();
+            assert_eq!(Event::decode(event.type_id(), &out[..length]), Ok(event));
         }
     }
 
@@ -2162,7 +2650,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x0F, &out[..length]),
+            Command::decode(0x11, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         // A lane word of 4 or more, or with any bit above the lane, is
@@ -2211,7 +2699,8 @@ mod tests {
         assert!(CounterLabel::new(&"x".repeat(65)).is_none());
         assert!(CounterLabel::from_bytes(&[0xFF, 0xFE]).is_none());
         assert!(CounterLabel::from_bytes(b"ok").is_some());
-        // The largest command fits the bound exactly.
+        // The longest label fits its fixed layout; the bound is the URI
+        // command's, the largest (W5).
         let mut out = [0u8; MAX_COMMAND_LENGTH];
         let length = Command::AllocateCounter {
             sequence: 1,
@@ -2222,8 +2711,8 @@ mod tests {
         }
         .encode(&mut out)
         .unwrap();
-        assert_eq!(length, MAX_COMMAND_LENGTH);
-        assert_eq!(MAX_COMMAND_LENGTH, 104);
+        assert_eq!(length, 104);
+        assert_eq!(MAX_COMMAND_LENGTH, 32 + MAX_COMMAND_URI);
     }
 
     /// Literal bytes of the counter messages.
@@ -2247,7 +2736,7 @@ mod tests {
             2, 0, 0, 0, 0, 0, 0, 0, // label length
             b'a', b'b', 0, 0, 0, 0, 0, 0, // label
         ];
-        expected.resize(MAX_COMMAND_LENGTH, 0);
+        expected.resize(ALLOCATE_COUNTER_WORDS * 8, 0);
         assert_eq!(&out[..length], &expected[..]);
         let mut out = [0u8; MAX_COMMAND_LENGTH];
         let length = Command::ReleaseCounter {
@@ -2714,7 +3203,7 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(12), None);
+        assert_eq!(ErrorCode::from_code(14), None);
     }
 
     #[test]
@@ -2827,9 +3316,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 12 is not defined.
+        // Error code 14 is not defined.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 12, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 14, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }
@@ -2875,6 +3364,8 @@ mod properties {
             ADD_CONFLATED_SUBSCRIPTION,
             GUARD_CLOSE,
             GUARD_REOPEN,
+            ADD_NETWORK_PUBLICATION,
+            ADD_NETWORK_SUBSCRIPTION,
         ],
     };
 
@@ -2893,6 +3384,7 @@ mod properties {
             CUTOVER_STATE,
             CONFLATED_READY,
             GUARD_STATE,
+            NETWORK_SUBSCRIPTION_READY,
         ],
     };
 
@@ -2907,6 +3399,8 @@ mod properties {
             PUBLICATION_CLOSED,
             SUCCESSOR_READY,
             FENCED,
+            IMAGE_AVAILABLE,
+            IMAGE_UNAVAILABLE,
         ],
     };
 
@@ -3142,14 +3636,16 @@ mod properties {
                     }
                 }
             ),
-            (any::<u64>(), stream(), lane(), role).prop_map(|(sequence, stream, lane, role)| {
-                Command::AddSubscription {
-                    sequence,
-                    stream,
-                    lane,
-                    role,
+            (any::<u64>(), stream(), lane(), role.clone()).prop_map(
+                |(sequence, stream, lane, role)| {
+                    Command::AddSubscription {
+                        sequence,
+                        stream,
+                        lane,
+                        role,
+                    }
                 }
-            }),
+            ),
             any::<(u64, u64)>().prop_map(|(sequence, registration)| {
                 Command::RemovePublication {
                     sequence,
@@ -3162,6 +3658,22 @@ mod properties {
                     registration,
                 }
             }),
+            (any::<u64>(), any::<i32>(), any::<bool>(), "[ -~]{1,512}").prop_map(
+                |(sequence, stream_id, allow_unconnected, uri)| Command::AddNetworkPublication {
+                    sequence,
+                    stream_id,
+                    allow_unconnected,
+                    uri: ChannelUri::new(&uri).unwrap(),
+                }
+            ),
+            (any::<u64>(), any::<i32>(), role, "\\PC{1,100}").prop_map(
+                |(sequence, stream_id, role, uri)| Command::AddNetworkSubscription {
+                    sequence,
+                    stream_id,
+                    role,
+                    uri: ChannelUri::new(&uri).unwrap(),
+                }
+            ),
             (any::<[u64; 4]>(), label()).prop_map(
                 |([sequence, type_id, stream, participant], label)| Command::AllocateCounter {
                     sequence,
@@ -3250,6 +3762,8 @@ mod properties {
                 ErrorCode::GuardNotClosedAt,
                 ErrorCode::GuardExhausted,
                 ErrorCode::NotAuthorized,
+                ErrorCode::InvalidChannel,
+                ErrorCode::UnsupportedChannel,
             ][..],
         );
         prop_oneof![
@@ -3318,6 +3832,12 @@ mod properties {
                     },
                 }
             ),
+            (request(), any::<u64>()).prop_map(|(request, registration)| {
+                Response::NetworkSubscriptionReady {
+                    request,
+                    registration,
+                }
+            }),
         ]
     }
 
@@ -3374,6 +3894,18 @@ mod properties {
             (stream(), any::<u64>()).prop_map(|(stream, registration)| Event::Fenced {
                 stream,
                 registration,
+            }),
+            (stream(), any::<u64>()).prop_map(|(stream, registration)| {
+                Event::ImageAvailable {
+                    stream,
+                    registration,
+                }
+            }),
+            (stream(), any::<u64>()).prop_map(|(stream, registration)| {
+                Event::ImageUnavailable {
+                    stream,
+                    registration,
+                }
             }),
         ]
     }

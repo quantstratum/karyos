@@ -1104,6 +1104,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 operation,
                 ..
             } => self.guard_command(client, request, guard, operation, Some(expected)),
+            // Network channels by URI are served from W5b; until then the
+            // driver refuses them without effect.
+            Command::AddNetworkPublication { stream_id, .. }
+            | Command::AddNetworkSubscription { stream_id, .. } => refuse(
+                ErrorCode::UnsupportedChannel,
+                u64::from(stream_id.cast_unsigned()),
+            ),
         }
     }
 
@@ -2704,6 +2711,93 @@ mod tests {
         link.mark_closed();
         let _ = driver.do_work().unwrap();
         assert_eq!(driver.clients(), 0);
+    }
+
+    /// #289 P1: a command ring whose largest record cannot carry a command
+    /// with the longest URI is refused at start; 8192 bytes is the smallest
+    /// power of two that can, and the default.
+    #[test]
+    fn a_ring_too_small_for_the_largest_command_is_refused() {
+        use crate::embedded::DriverConfig;
+        assert_eq!(DriverConfig::default().ring_capacity, 8192);
+        for ring_capacity in [1024, 4096] {
+            assert!(matches!(
+                EmbeddedDriver::with_config(DriverConfig {
+                    ring_capacity,
+                    ..DriverConfig::default()
+                }),
+                Err(DriverError::InvalidConfig)
+            ));
+        }
+        assert!(EmbeddedDriver::with_config(DriverConfig::default()).is_ok());
+    }
+
+    /// W5a: a client's URI commands reach the driver, which refuses them
+    /// until W5b serves them; a URI over the command cap is refused by the
+    /// client, with nothing submitted.
+    #[test]
+    fn network_commands_are_refused_until_served() {
+        let mut driver = driver();
+        let mut client = driver.connect().unwrap();
+        assert!(matches!(
+            client.add_network_publication(&"k".repeat(513), 10, false),
+            Err(karyos_client::ConductorError::UriTooLong)
+        ));
+        assert!(matches!(
+            client.add_network_subscription("", 10, SubscriberRole::Optional),
+            Err(karyos_client::ConductorError::EmptyUri)
+        ));
+        assert!(matches!(
+            client.add_network_subscription("karyos:tcp", 10, SubscriberRole::Optional),
+            Err(karyos_client::ConductorError::InvalidChannel { .. })
+        ));
+        // The longest URI a command carries reaches the driver on the
+        // default ring (#289 P1): a valid one of exactly 512 bytes.
+        let mut long = String::from("karyos:udp?destinations=");
+        let mut port = 40_000u32;
+        // Destinations until a guard name of 1 to 64 bytes completes 512.
+        while long.len() < 512 - "|guard=".len() - 64 {
+            if !long.ends_with('=') {
+                long.push(';');
+            }
+            long.push_str(&format!("127.0.0.1:{port}"));
+            port += 1;
+        }
+        long.push_str("|guard=");
+        let guard = 512 - long.len();
+        long.push_str(&"g".repeat(guard));
+        assert_eq!(long.len(), 512);
+        let publication = client.add_network_publication(&long, 10, false).unwrap();
+        let subscription = client
+            .add_network_subscription(
+                "karyos:udp?endpoint=127.0.0.1:40124",
+                11,
+                SubscriberRole::Required,
+            )
+            .unwrap();
+        // One command per client ring and cycle.
+        for _ in 0..2 {
+            let _ = driver.do_work().unwrap();
+        }
+        let mut done = Vec::new();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        assert_eq!(done.len(), 2, "only the two submitted commands: {done:?}");
+        for (completion, (sequence, stream)) in
+            done.iter().zip([(publication, 10), (subscription, 11)])
+        {
+            assert_eq!(completion.sequence, sequence);
+            assert!(
+                matches!(
+                    completion.outcome,
+                    Outcome::Refused {
+                        code: ErrorCode::UnsupportedChannel,
+                        detail,
+                    } if detail == stream
+                ),
+                "{:?}",
+                completion.outcome
+            );
+        }
     }
 
     #[test]

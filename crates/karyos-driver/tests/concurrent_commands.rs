@@ -215,8 +215,11 @@ fn an_untaken_entry_holds_its_slot_until_the_client_closes() {
 
 #[test]
 fn remove_frees_the_slot_and_a_full_ring_returns_the_handle() {
+    // More pending requests than the default 8192-byte ring holds, so the
+    // ring fills first.
     let config = DriverConfig {
-        max_pending_per_client: 64,
+        max_pending_per_client: 512,
+        max_hand_over: 512,
         ..DriverConfig::default()
     };
     let (mut driver, stream, _) = driver_with(config);
@@ -235,7 +238,8 @@ fn remove_frees_the_slot_and_a_full_ring_returns_the_handle() {
     let (first, error) = client.remove_concurrent_publication(first).unwrap_err();
     assert_eq!(error, ConductorError::Full);
     assert_eq!(driver.live_leases(stream).unwrap(), u64::from(PUBLISHERS));
-    for _ in 0..64 {
+    // Drain (one command per ring and cycle), then retry.
+    for _ in 0..512 {
         let _ = cycle(&mut driver, &mut client);
     }
     let removed = client.remove_concurrent_publication(first).unwrap();

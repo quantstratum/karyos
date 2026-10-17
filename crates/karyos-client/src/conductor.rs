@@ -42,7 +42,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use karyos_protocol::cnc::{
-    Command, CounterLabel, Event, MAX_COMMAND_LENGTH, Response, StreamKey, SubscriberRole,
+    ChannelUri, Command, CounterLabel, Event, MAX_COMMAND_LENGTH, Response, StreamKey,
+    SubscriberRole,
 };
 use karyos_protocol::cnc::{CutoverState, ErrorCode};
 use karyos_sys::broadcast::{BroadcastReceiver, Received};
@@ -88,6 +89,37 @@ pub enum ConductorError {
     /// journal number 0.
     #[error("invalid trace journal request")]
     InvalidJournal,
+    /// A channel URI is longer than the 512 bytes a command carries
+    /// (`karyos_protocol::cnc::MAX_COMMAND_URI`, SPEC §18).
+    #[error("channel URI longer than 512 bytes")]
+    UriTooLong,
+    /// A channel URI is empty.
+    #[error("empty channel URI")]
+    EmptyUri,
+    /// A channel URI does not parse; `code` is the parse error's code
+    /// (`karyos_protocol::channel::ChannelError::code`).
+    #[error("invalid channel URI (code {code})")]
+    InvalidChannel {
+        /// The parse error's code.
+        code: u64,
+    },
+    /// The command ring cannot carry the command: it is smaller than the
+    /// driver's minimum (`DriverConfig::ring_capacity`).
+    #[error("command larger than the command ring carries")]
+    CommandTooLarge,
+}
+
+/// The channel URI `uri` for a command: it parses (SPEC §5) and fits.
+fn channel_uri(uri: &str) -> Result<ChannelUri, ConductorError> {
+    if uri.is_empty() {
+        return Err(ConductorError::EmptyUri);
+    }
+    if uri.len() > karyos_protocol::cnc::MAX_COMMAND_URI {
+        return Err(ConductorError::UriTooLong);
+    }
+    karyos_protocol::channel::ChannelConfig::parse(uri)
+        .map_err(|error| ConductorError::InvalidChannel { code: error.code() })?;
+    ChannelUri::new(uri).ok_or(ConductorError::UriTooLong)
 }
 
 /// How a request ended.
@@ -116,6 +148,13 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     /// (`quantstratum-docs: karyos/design/conflation-end-to-end.md`,
     /// Cross-process views).
     FetchableConflated(FetchableConflated),
+    /// A network subscription (W5): the driver announces each of its
+    /// images with `ImageAvailable` naming `registration`; a subscriber
+    /// attaches to one with [`ClientConductor::add_subscription`].
+    NetworkSubscription {
+        /// The network subscription's registration.
+        registration: u64,
+    },
     /// The command succeeded.
     Succeeded,
     /// The driver refused the command; it had no effect.
@@ -265,6 +304,7 @@ enum Kind {
     AddPublication,
     AddConcurrentPublication,
     AddSubscription,
+    AddNetworkSubscription,
     /// A remote client's view of a conflated stream's table.
     #[cfg_attr(
         not(target_os = "linux"),
@@ -598,6 +638,79 @@ impl<T: TermBytes> ClientConductor<T> {
                 lane,
                 allow_unconnected,
             }
+        })
+    }
+
+    /// Requests an exclusive publication of `stream_id` on the channel
+    /// `uri` (W5; SPEC §5 channel URIs); returns the request sequence. The
+    /// driver parses the URI: `karyos:ipc` resolves the stream as
+    /// [`add_publication`](Self::add_publication) does, `karyos:udp`
+    /// creates a network publication whose session id the driver draws. It
+    /// completes as [`Outcome::Publication`], on lane 0 of the URI's lanes.
+    /// A URI that does not parse is refused with `InvalidChannel`, one the
+    /// driver cannot serve with `UnsupportedChannel`.
+    ///
+    /// # Errors
+    ///
+    /// [`ConductorError::EmptyUri`], [`ConductorError::UriTooLong`] over 512
+    /// bytes, [`ConductorError::InvalidChannel`] for a URI that does not
+    /// parse, and see [`ConductorError`]; nothing is submitted on error.
+    pub fn add_network_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        let uri = channel_uri(uri)?;
+        self.submit(Kind::AddPublication, None, |sequence| {
+            Command::AddNetworkPublication {
+                sequence,
+                stream_id,
+                allow_unconnected,
+                uri,
+            }
+        })
+    }
+
+    /// Subscribes `stream_id` on the channel `uri` (W5); returns the
+    /// request sequence. It completes as [`Outcome::NetworkSubscription`];
+    /// its images are then announced with `ImageAvailable`, and each is
+    /// attached as a stream with [`add_subscription`](Self::add_subscription)
+    /// and `role`.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_network_publication`](Self::add_network_publication).
+    pub fn add_network_subscription(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        let uri = channel_uri(uri)?;
+        self.submit(Kind::AddNetworkSubscription, None, |sequence| {
+            Command::AddNetworkSubscription {
+                sequence,
+                stream_id,
+                role,
+                uri,
+            }
+        })
+    }
+
+    /// Removes the network subscription `registration`; its images retire.
+    /// Returns the request sequence; it completes as [`Outcome::Succeeded`].
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    pub fn remove_network_subscription(
+        &mut self,
+        registration: u64,
+    ) -> Result<u64, ConductorError> {
+        self.submit(Kind::Remove, None, |sequence| Command::RemoveSubscription {
+            sequence,
+            registration,
         })
     }
 
@@ -1111,6 +1224,9 @@ impl<T: TermBytes> ClientConductor<T> {
                 Ok(sequence)
             }
             Err(RingError::Full) => Err(ConductorError::Full),
+            // Only a ring smaller than the driver's validated minimum
+            // refuses a command for its size.
+            Err(RingError::MessageTooLarge { .. }) => Err(ConductorError::CommandTooLarge),
             Err(_) => Err(ConductorError::Closed),
         }
     }
@@ -1380,6 +1496,10 @@ impl<T: TermBytes> ClientConductor<T> {
             (Kind::Remove | Kind::CloseJournal, Response::OperationSucceeded { .. }) => {
                 Outcome::Succeeded
             }
+            (
+                Kind::AddNetworkSubscription,
+                Response::NetworkSubscriptionReady { registration, .. },
+            ) => Outcome::NetworkSubscription { registration },
             // The writer waits in the hand-over table under its key.
             (Kind::TraceJournal, Response::JournalReady { journal, key, .. }) => {
                 match self.link.take_journal(key) {
