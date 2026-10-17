@@ -90,6 +90,7 @@ const WINDOW_END: u64 = 1 << 20;
 fn the_configuration_is_checked() {
     let zero = LossConfig {
         range_invalid_limit: 0,
+        ..LossConfig::default()
     };
     assert_eq!(
         ImageLoss::new(zero, alias(), identity(), receiver(), 1, 0).err(),
@@ -1139,4 +1140,67 @@ fn a_zero_delay_bound_is_refused() {
         ))
     );
     assert!(config.validate_for(16, 1_000_000).is_ok());
+}
+
+/// rp-w2, RP-4: with two live paths at detection, a gap's NAK waits the
+/// skew window from detection; with one, it is due at once (RP-5).
+#[test]
+fn a_gap_waits_the_skew_window_only_with_two_live_paths() {
+    let skew = 1_000_000;
+    let mut loss = image();
+    loss.set_live_paths(2);
+    let _ = loss.observe(lane(0), hole(0, 64), 100);
+    assert_eq!(loss.due(lane(0), 100 + skew - 1), None);
+    assert!(loss.due(lane(0), 100 + skew).is_some());
+    let mut single = image();
+    single.set_live_paths(1);
+    let _ = single.observe(lane(0), hole(0, 64), 100);
+    assert!(single.due(lane(0), 100).is_some());
+}
+
+/// rp-w2, RP-4: the deadline is fixed at detection: a path lost or a path
+/// bound afterwards, and the hole seen again (a duplicate changes
+/// nothing), never move it.
+#[test]
+fn the_skew_deadline_is_fixed_at_detection() {
+    let skew = 1_000_000;
+    let mut loss = image();
+    loss.set_live_paths(2);
+    let _ = loss.observe(lane(0), hole(0, 64), 100);
+    loss.set_live_paths(1);
+    let _ = loss.observe(lane(0), hole(0, 64), 500);
+    assert_eq!(loss.due(lane(0), 100 + skew - 1), None);
+    loss.set_live_paths(3);
+    let _ = loss.observe(lane(0), hole(0, 64), 900);
+    assert!(loss.due(lane(0), 100 + skew).is_some());
+}
+
+/// rp-w2, RP-4 with multicast: a hole's first cycle, and so its drawn
+/// delay, starts only once the skew deadline passed.
+#[test]
+fn a_multicast_cycle_starts_after_the_skew_window() {
+    let skew = 1_000_000;
+    let mut loss = multicast_image(MulticastConfig::default());
+    loss.set_live_paths(2);
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), skew - 1, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 0);
+    assert_eq!(loss.due(lane(0), skew - 1), None);
+    loss.cycle(lane(0), skew, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 1);
+    assert!(loss.due(lane(0), skew).is_some());
+}
+
+/// RP-4: `path_skew_window` above one second is refused.
+#[test]
+fn a_skew_window_above_one_second_is_refused() {
+    let config = LossConfig {
+        skew_window_ns: MAX_SKEW_WINDOW_NS + 1,
+        ..LossConfig::default()
+    };
+    assert_eq!(
+        ImageLoss::new(config, alias(), identity(), receiver(), 1, 0).err(),
+        Some(LossConfigError::SkewWindow)
+    );
 }
