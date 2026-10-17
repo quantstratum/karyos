@@ -534,5 +534,7 @@ impl<B: TxBackend, G: LaneGate> LaneSource for Source<'_, B, G> {
     }
 }
 
+pub mod routes;
+
 #[cfg(test)]
 mod tests;
