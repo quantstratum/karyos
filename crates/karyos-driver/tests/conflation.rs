@@ -98,13 +98,15 @@ fn feeder_keeps_latest_value_and_regular_subscriber_gets_every_message() {
     assert_eq!(ordinary_values, [b"first".to_vec(), b"latest".to_vec()]);
 
     let mut values = Vec::new();
-    let report = conflated.poll_changed_with(
-        Budget {
-            keys: 8,
-            retries: 3,
-        },
-        |key, version, value| values.push((key, version, value.to_vec())),
-    );
+    let report = conflated
+        .poll_changed_with(
+            Budget {
+                keys: 8,
+                retries: 3,
+            },
+            |key, value| values.push((key, value.version(), value.payload().to_vec())),
+        )
+        .unwrap();
     assert_eq!(report.delivered, 1);
     assert_eq!(values, [(1, 4, b"latest".to_vec())]);
 }
@@ -159,19 +161,21 @@ fn publication_validation_precedes_reservation_and_close_closes_the_table() {
     let _ = driver.do_work().unwrap();
 
     let mut values = Vec::new();
-    let report = conflated.poll_changed_with(
-        Budget {
-            keys: 8,
-            retries: 3,
-        },
-        |key, version, value| values.push((key, version, value.to_vec())),
-    );
+    let report = conflated
+        .poll_changed_with(
+            Budget {
+                keys: 8,
+                retries: 3,
+            },
+            |key, value| values.push((key, value.version(), value.payload().to_vec())),
+        )
+        .unwrap();
     assert_eq!(report.delivered, 1);
     assert_eq!(values, [(1, 2, b"ok".to_vec())]);
 
     driver.remove_stream(stream).unwrap();
     let _ = driver.do_work().unwrap();
-    let report = conflated.poll_changed(|_, _| {});
+    let report = conflated.poll_changed(|_, _| {}).unwrap();
     assert!(report.closed);
 }
 
@@ -213,13 +217,15 @@ fn feeder_and_table_survive_a_mapping_cutover() {
     let _ = driver.do_work().unwrap();
 
     let mut values = Vec::new();
-    let report = conflated.poll_changed_with(
-        Budget {
-            keys: 8,
-            retries: 3,
-        },
-        |key, version, value| values.push((key, version, value.to_vec())),
-    );
+    let report = conflated
+        .poll_changed_with(
+            Budget {
+                keys: 8,
+                retries: 3,
+            },
+            |key, value| values.push((key, value.version(), value.payload().to_vec())),
+        )
+        .unwrap();
     assert_eq!(report.delivered, 2);
     assert_eq!(
         values,
@@ -308,18 +314,21 @@ fn read_all(
     seen: &mut std::collections::BTreeMap<u32, (u64, Vec<u8>)>,
 ) {
     for _ in 0..64 {
-        let report = conflated.poll_changed_with(
-            Budget {
-                keys: 64,
-                retries: 3,
-            },
-            |key, version, value| {
-                if let Some((before, _)) = seen.get(&key) {
-                    assert!(version > *before, "key {key}: {version} after {before}");
-                }
-                let _ = seen.insert(key, (version, value.to_vec()));
-            },
-        );
+        let report = conflated
+            .poll_changed_with(
+                Budget {
+                    keys: 64,
+                    retries: 3,
+                },
+                |key, value| {
+                    let version = value.version();
+                    if let Some((before, _)) = seen.get(&key) {
+                        assert!(version > *before, "key {key}: {version} after {before}");
+                    }
+                    let _ = seen.insert(key, (version, value.payload().to_vec()));
+                },
+            )
+            .unwrap();
         assert!(!report.closed, "the table closed");
         if report.pending == 0 && !report.scanning && report.journal_drained {
             return;
@@ -468,7 +477,8 @@ fn test_conflation_view_survives_cutover_with_a_slow_feeder_and_a_paused_driver(
                 keys: 64,
                 retries: 3,
             },
-            |_, version, _| {
+            |_, value| {
+                let version = value.version();
                 assert!(version < 2 * u64::from(updates) / 2, "the feeder caught up");
                 behind += 1;
             },
@@ -550,7 +560,7 @@ fn a_conflated_view_feeds_its_reader_counts_into_client_counters() {
                 keys: 1,
                 retries: 1,
             },
-            |_, _, _| {},
+            |_, _| {},
         );
     }
     let counts = conflated.counts();

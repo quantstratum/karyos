@@ -3946,12 +3946,12 @@ mod tests {
             "{records:?}"
         );
         // The views end.
-        let mut report = conflated.poll_changed(|_, _| {});
+        let mut report = conflated.poll_changed(|_, _| {}).unwrap();
         for _ in 0..8 {
             if report.closed {
                 break;
             }
-            report = conflated.poll_changed(|_, _| {});
+            report = conflated.poll_changed(|_, _| {}).unwrap();
         }
         assert!(report.closed, "{report:?}");
     }
