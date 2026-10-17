@@ -11,6 +11,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A recording reads a lane's log through the network sender's read
+  capability (phase 3, A4c-1). `SenderRead::for_recording` admits a
+  reserved required cell (a `required` recording) or an optional one (an
+  `async` recording), and `SenderRead::rejoin_at_head` moves a lapped
+  optional reader to the reserved head, a block boundary, as a lapped
+  optional subscription rejoins. `karyos-archive` implements its
+  `FrameSource` for `SenderRead`: a copy is padded to its frames' 32-byte
+  stride, so the segment holds the frames where the log does; a lap is
+  recorded as a gap up to where the reader rejoins, and a source busy at
+  the rejoin is retried on a later duty.
 - `karyos-archive` gains its recorder and agent (phase 3, A4b). A
   `Recorder` copies a lane's committed frames from a `FrameSource` into
   its recording's segment store: data, a padding or aborted block as a
@@ -115,7 +125,22 @@ release may break APIs, wire formats and shared-memory layouts.
   (`RoutedLaneSender::cancel_route`) through the guard gate; those it held
   alone are counted (`PathCounters::copies_abandoned`) and reach receivers
   by NAK or close as gaps. `Outbound::path_state` and
-  `Outbound::path_counters` report it; return is rp-w5b.
+  `Outbound::path_counters` report it. A faulted route leaves too, while
+  another path is live.
+- A left path returns (RP-9; rp-w5b) after its backoff
+  (`PathPolicy::backoff_initial`, 10 ms, doubling to `backoff_max`, 1 s
+  and at most `MAX_PATH_BACKOFF`, 60 s, and starting over after
+  `backoff_reset`, 10 s, live): on its open queue,
+  or by `retry_queue` after a fault, from the current selection point,
+  counted (`PathCounters::entries`). It bounds `Outbound::sent_low`, the
+  least frontier over the live paths, from its first submit; a frame a
+  path skipped counts as passed for its frontier.
+- A close no longer waits on a detached path (rp-w5b; ACS 17049). On a
+  guarded lane's abort, the copies of a route whose TX half is detached
+  are forgotten through the guard gate (`RoutedLaneSender::forget`), so
+  the close can become effective if the path never comes back, and counted
+  (`RouteCounters::forgotten`). The route then returns only through an
+  endpoint reset.
 - Receiver trace journals keep their sealed gaps (P2.12 step 3, PR 3b,
   trace-network.md section 5): the first `FACT_GAP_INTERVALS` (16) gaps of
   each traced lane, in order, with an overflow flag, carried in

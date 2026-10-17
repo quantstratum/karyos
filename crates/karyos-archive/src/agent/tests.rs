@@ -84,9 +84,9 @@ impl FrameSource for Chunks {
         Ok(())
     }
 
-    fn resume(&mut self, to: u64) -> Result<(), SourceError> {
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
         self.position = to;
-        Ok(())
+        Ok(to)
     }
 }
 
@@ -303,9 +303,9 @@ impl FrameSource for Gated {
         Ok(())
     }
 
-    fn resume(&mut self, to: u64) -> Result<(), SourceError> {
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
         self.position = to;
-        Ok(())
+        Ok(to)
     }
 }
 
@@ -374,8 +374,8 @@ impl FrameSource for Panics {
         Ok(())
     }
 
-    fn resume(&mut self, _to: u64) -> Result<(), SourceError> {
-        Ok(())
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        Ok(to)
     }
 }
 
@@ -401,5 +401,38 @@ fn a_command_to_a_dead_agent_is_gone() {
     }
     assert!(matches!(agent.stop(1), Err(AgentError::Gone)));
     assert!(matches!(agent.shutdown(), Err(AgentError::Gone)));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A command stop whose close fails (a no-sync segment it cannot reopen)
+/// returns the error, leaves the recording to settle, and a second stop
+/// is refused as failed.
+#[test]
+fn a_failed_stop_is_remembered() {
+    let dir = temp_dir("failed-stop");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    let drained = Arc::new(AtomicBool::new(false));
+    let id = agent
+        .start(StartRecording {
+            policy: SyncPolicy::None,
+            ..start(Chunks {
+                // A whole first segment finished unsynced, then a roll.
+                chunks: vec![vec![1u8; 8192], vec![2u8; 100]].into(),
+                drained: Arc::clone(&drained),
+                ..Chunks::default()
+            })
+        })
+        .unwrap();
+    wait(&drained);
+    let moved = dir.with_extension("moved");
+    std::fs::rename(&dir, &moved).unwrap();
+    let first = agent.stop(id);
+    std::fs::rename(&moved, &dir).unwrap();
+    assert!(first.is_err(), "{first:?}");
+    assert!(matches!(
+        agent.stop(id),
+        Err(AgentError::RecordingFailed { id: failed }) if failed == id
+    ));
+    agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }

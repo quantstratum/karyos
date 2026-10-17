@@ -4194,6 +4194,14 @@ impl<T: StreamTerms> RxHandler for Intake<'_, T> {
 }
 
 impl<T: StreamTerms> SenderRole<T> {
+    /// The sender's publication at `index` (tests).
+    #[cfg(test)]
+    pub(super) fn publication_mut(&mut self, index: usize) -> Option<&mut Outbound<T>> {
+        self.publications
+            .get_mut(index)
+            .map(|outbound| &mut **outbound)
+    }
+
     /// The counters.
     #[must_use]
     pub fn counters(&self) -> SenderCounters {
