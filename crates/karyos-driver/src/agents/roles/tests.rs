@@ -3011,6 +3011,75 @@ fn the_earliest_uncertain_copy_anchors_when_none_is_submitted() {
     super::anchor_uncertain(&mut image, 0);
     assert_eq!(image.loss.counters().submitted, 1);
     assert_eq!(counters.nak_copies_uncertain, 2);
+    // Anchored at 10, the earliest start (#315 review): its retry is due
+    // before an anchor at 30 would allow.
+    let rtt = crate::repair::loss::RttSource::rtt_snapshot(&image.rtt, 0);
+    assert!(
+        image
+            .loss
+            .due(karyos_protocol::frame::Lane::ZERO, 25 + rtt)
+            .is_some()
+    );
+}
+
+/// Reports `outcome` for lane 0's NAK on the founding path.
+fn report_founding(
+    image: &mut super::Installed,
+    nak: karyos_protocol::network::Nak,
+    start: u64,
+    submitted: bool,
+) {
+    let report = &mut image.naks[0];
+    let mut guard = super::ReportGuard::take(&report.slot);
+    guard.sending(start);
+    if submitted {
+        guard.submitted();
+    } else {
+        guard.uncertain();
+    }
+    report.pending = Some(nak);
+}
+
+/// #315 review P3: an uncertain founding copy is only a candidate, through
+/// the founding report path: a later path's submitted copy anchors the
+/// NAK at its own start. The founding route still counts its uncertainty.
+#[test]
+fn a_founding_uncertain_copy_yields_to_a_later_submitted_one() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    // The later copy is still in flight when the founding one reports.
+    let mut copy = super::ReportGuard::take(&image.copies[1].slot);
+    image.copies[1].pending = Some(nak);
+    report_founding(&mut image, nak, 10, false);
+    super::settle_founding(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert_eq!(image.loss.counters().submitted, 0);
+    assert_eq!(image.loss.counters().uncertain, 1);
+    copy.sending(20);
+    copy.submitted();
+    super::settle_copies(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert_eq!(image.loss.counters().submitted, 1);
+    let rtt = crate::repair::loss::RttSource::rtt_snapshot(&image.rtt, 0);
+    assert_eq!(image.loss.due(Lane::ZERO, 15 + rtt), None);
+    assert!(image.uncertain_at[0].is_none());
+}
+
+/// #315 review P3: an uncertain copy that faults its route is no anchor
+/// candidate; with no other copy the NAK stays unanchored.
+#[test]
+fn an_uncertain_copy_that_faults_its_route_is_no_candidate() {
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    image.routes[1].uncertain = true;
+    report_copy(&mut image, 1, nak, 10, false);
+    super::settle_copies(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert!(image.routes[1].faulted);
+    assert!(image.uncertain_at[0].is_none());
+    assert_eq!(image.loss.counters().submitted, 0);
 }
 
 /// #310 review (M2): a NAK copy the control ring cannot take is skipped
@@ -3046,4 +3115,78 @@ fn a_skipped_copy_leaves_its_slot_free() {
     assert_eq!(counters.nak_copies, 0);
     assert!(image.copies[1].pending.is_none());
     assert!(!super::copies_busy(&image, 0));
+}
+
+/// #321 review P3: the sender role serves a routed publication over every
+/// path's TX half, once it is established: each committed message goes out
+/// on both paths.
+#[test]
+fn the_sender_serves_a_routed_publication_on_every_path() {
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+    use karyos_protocol::network::{Datagram, classify};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    use super::super::Half;
+
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    sender.sessions.add(publication(EndpointId(1))).unwrap();
+    let routes = [
+        (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
+        (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
+    ];
+    let (path, mut log) = super::super::data::testing::outbound_routed(
+        &routes,
+        alias(),
+        publication(EndpointId(1)).term,
+        1,
+        false,
+    );
+    sender.publications.push(path);
+    let mut halves = Vec::new();
+    let mut counts = Vec::new();
+    for id in 1..=2u32 {
+        let socket = ScriptedSocket::new();
+        let observer = socket.observer();
+        let data = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&data);
+        observer.set_send_hook(Box::new(move |_, datagrams| {
+            for datagram in datagrams {
+                if matches!(classify(datagram), Ok(Datagram::DataBatch(_))) {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+        for _ in 0..16 {
+            observer.push_send(SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+        }
+        let instance = InstanceId::new(NonZeroU32::new(id).unwrap());
+        let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
+        let (tx, _rx) = endpoint.split().unwrap();
+        halves.push((EndpointId(id), Half::Tx(Box::new(tx))));
+        counts.push(data);
+    }
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 1 << 20), 1);
+    assert!(sender.sessions.is_established(EndpointId(1), alias()));
+    for i in 0..2u8 {
+        let _ = log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    for now in 2..6 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert_eq!(counts[0].load(Ordering::Relaxed), 2);
+    assert_eq!(counts[1].load(Ordering::Relaxed), 2);
 }
