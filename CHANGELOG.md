@@ -41,8 +41,9 @@ release may break APIs, wire formats and shared-memory layouts.
   `AgentConfig::barrier_ack_timeout` (default 100 ms, at least 10 ms) after
   publishing the view's terminal cell, waiting while a feeder's claimed cell
   is unpublished. New receiver counters: `seals_gated`, `barrier_posts`,
-  `barrier_acks`, `seals_unattached`, `barrier_timeouts` and
-  `barrier_claim_waits`.
+  `barrier_acks`, `seals_unattached`, `barrier_timeouts`,
+  `barrier_claim_waits`, `barrier_post_failures` and
+  `conflated_lane_out_of_range`.
 - Conflation freshness for network images' views (conflated-network-images.md,
   C2): `conflation_fresh` builds a heap table with a loss barrier over the
   terminal cell of a `FreshnessLink` (a seal mailbox and a terminal cell in

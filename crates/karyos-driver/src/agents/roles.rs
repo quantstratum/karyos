@@ -294,6 +294,11 @@ pub struct ReceiverCounters {
     /// Gate answers Pending while the feeder's claimed terminal cell was
     /// not yet published (docs#120).
     pub barrier_claim_waits: u64,
+    /// Posts a view's mailbox refused: the view closed as at a timeout.
+    pub barrier_post_failures: u64,
+    /// Installed images whose key's conflated lane is not one of their
+    /// lanes: no gate, no view.
+    pub conflated_lane_out_of_range: u64,
     /// Data and controls this phase does not handle yet.
     pub unhandled: u64,
     /// An increment did not apply.
@@ -1038,6 +1043,14 @@ fn tally_gate(counters: &mut ReceiverCounters, image: &mut Installed, gated: u32
     tally_by(counters, |c| &mut c.seals_unattached, counts.unattached);
     tally_by(counters, |c| &mut c.barrier_timeouts, counts.timeouts);
     tally_by(counters, |c| &mut c.barrier_claim_waits, counts.claim_waits);
+    tally_by(
+        counters,
+        |c| &mut c.barrier_post_failures,
+        counts.post_failures,
+    );
+    if counts.overflowed {
+        counters.overflowed = true;
+    }
 }
 
 /// Settles `probe`'s report into `rtt`, if the sender made one; `replied`
@@ -2040,9 +2053,12 @@ impl ReceiverRole {
             .conflated
             .iter()
             .find(|(held, stream, _)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
-            .map(|(.., lane)| *lane)
-            .filter(|lane| lane.get() < chain.lane_count)
-            .map(|lane| (lane, karyos_sys::freshness::FreshnessLink::new()));
+            .map(|(.., lane)| *lane);
+        let in_range = link.filter(|lane| lane.get() < chain.lane_count);
+        if link.is_some() && in_range.is_none() {
+            self.count(|c| &mut c.conflated_lane_out_of_range);
+        }
+        let link = in_range.map(|lane| (lane, karyos_sys::freshness::FreshnessLink::new()));
         let gate = link.as_ref().map(|(lane, link)| {
             Box::new(super::conflated_gate::ConflatedGate::new(
                 *lane,
