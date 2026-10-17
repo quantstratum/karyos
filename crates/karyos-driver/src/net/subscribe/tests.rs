@@ -975,3 +975,51 @@ fn a_new_keys_later_paths_need_room() {
         );
     }
 }
+
+/// N-4a (network streams over shared terms, resolution 2): an exposed
+/// image's lanes follow the remote sender's geometry and the receive
+/// owner writes the mapping it was given, so neither the aggregate nor
+/// one of its lanes may be reconfigured, and the image stays at its first
+/// generation.
+/// Before this refusal `reconfigure_aggregate` returned
+/// `Ok(Generation(1))`: the lane was sealed for a cutover while the
+/// receiver kept writing the old mapping.
+#[test]
+fn reconfiguring_an_exposed_image_is_refused() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let mut image = None;
+    pump(&mut a, &mut b, |_, b| {
+        image = b.network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    let lane = image.lane(Lane::ZERO).unwrap();
+    // A reconfiguration any local stream of this geometry accepts.
+    let reconfiguration = crate::generations::Reconfiguration {
+        term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+        spare_slots: 5,
+    };
+    let refused = b.reconfigure_aggregate(&image, reconfiguration);
+    assert!(
+        matches!(refused, Err(crate::error::DriverError::ImageCutover { .. })),
+        "{refused:?}"
+    );
+    let refused = b.reconfigure_stream(lane, reconfiguration);
+    assert!(
+        matches!(refused, Err(crate::error::DriverError::ImageCutover { .. })),
+        "{refused:?}"
+    );
+    let generations = b.generations(lane).unwrap();
+    assert_eq!(generations.len(), 1, "{generations:?}");
+    assert_eq!(
+        generations[0].generation,
+        karyos_sys::term::Generation::default()
+    );
+    let _ = (a.close_network(), b.close_network());
+}
