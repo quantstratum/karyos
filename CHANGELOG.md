@@ -86,6 +86,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Receiver trace journals keep their sealed gaps (P2.12 step 3, PR 3b,
+  trace-network.md section 5): the first `FACT_GAP_INTERVALS` (16) gaps of
+  each traced lane, in order, with an overflow flag, carried in
+  `JournalFacts::gaps`. `EmbeddedDriver::network_journal_gaps` returns a
+  closed receiver journal's gaps for an in-process report.
+  `SkipPolicy::duty_observed` and `range_unavailable_observed` tell a
+  callback of each committed seal; `duty`, `duty_gated`,
+  `range_unavailable` and `range_unavailable_gated` delegate to them.
+- The sender over a routed publication's paths (redundant-paths.md, rp-w4b2b):
+  a SETUP side on each path's endpoint, established on any path; SMs, NAKs
+  and bindings found on any path (`Outbound::serves`,
+  `Outbound::destination_on`); and a PATH_HB on each path idle for
+  `AgentConfig::path_heartbeat_interval` (default 100 ms, an interim for the
+  channel heartbeat interval RP-3 names), counted by
+  `SenderCounters::path_heartbeats_sent`. `SendSessions::identity` gives a
+  session's incarnation. A routed publication takes one entry of
+  `AgentConfig::publications` per path.
 - The conductor hands network trace hooks and journals to the agents
   (P2.12 step 3, PR 3a). `set_network_trace_hook` gives the hook to its
   side's agent; a journal opens per lane of a publication once the sender
@@ -167,15 +184,18 @@ release may break APIs, wire formats and shared-memory layouts.
   uncancelled copies per route. `StageError::OutOfOrder` refuses a copy
   not above its route's last one.
 - A publication over redundant paths (redundant-paths.md section 7, RP-10):
-  `Outbound::new_routed` takes one endpoint and destination per path, and
+  `Outbound::new_routed` (crate-internal: test-only until the publication
+  wiring) takes one endpoint and destination per path, and
   `Outbound::serve_routes` sends each committed datagram once on every
   path, debited once (`karyos_io::lanes::routes::RoutedLaneSender`). Repair
   stays on the founding path, on its queues. A route's failure resets only
   its endpoint (`Outbound::post_reset_requests`) and a faulted queue is
   retried on its route; a reliable lane reads again after a reset only when
-  no route still holds its copies. `Outbound::guard` refuses a routed
-  publication with `GateError::Routed` until the guard gate covers every
-  path.
+  no route still holds its copies. A guard covers every path
+  (`GuardGate::new_routed`, `GuardGate::stage_copy`,
+  `GuardGate::reopen_route`): each copy's exposure loads the guard, a
+  position is rate charged once, the applied positions are the highest
+  submitted on any path, and the work in flight counts every path.
 - A seal gate on the skip policy (conflated-network-images.md (b)):
   `SkipPolicy::duty_gated` and `SkipPolicy::range_unavailable_gated` ask a
   `SealGate` before each seal. While it answers `GateAnswer::Pending`, the

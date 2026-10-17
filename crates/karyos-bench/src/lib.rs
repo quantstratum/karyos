@@ -221,8 +221,9 @@ fn available(backing: Backing) -> bool {
 /// frame at the default MTU, and for `sender-read` also 8 KiB and 64 KiB
 /// messages, fragmented, over 1 MiB terms. `sender-nak` reads ranges of 1,
 /// 16 and 256 frames over 1 MiB terms, so a whole range fits the
-/// publication's window before it is registered. `image-install` runs a
-/// hundredth of the iterations, at least ten.
+/// publication's window before it is registered. `image-install` and
+/// `image-first-fill` (1376 byte messages over 64 KiB, 1 MiB and 16 MiB
+/// terms) run a hundredth of the iterations, at least ten.
 fn network_terms(iterations: u64, warmup: u64) -> Vec<Config> {
     let config = |workload, message, term_length, backing| Config {
         workload,
@@ -274,6 +275,20 @@ fn network_terms(iterations: u64, warmup: u64) -> Vec<Config> {
                     ..config(Workload::ImageInstall, 0, term_length, backing)
                 });
             }
+        }
+    }
+    for backing in Workload::ImageFirstFill
+        .backings()
+        .iter()
+        .copied()
+        .filter(|backing| available(*backing))
+    {
+        for term_length in [64 * 1024, 1024 * 1024, 16 * 1024 * 1024] {
+            configs.push(Config {
+                iterations: installs,
+                warmup: (installs / 10).max(1),
+                ..config(Workload::ImageFirstFill, 1376, term_length, backing)
+            });
         }
     }
     configs
