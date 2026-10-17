@@ -4189,6 +4189,174 @@ fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
     );
 }
 
+/// A whole DATA frame of `payload` bytes on lane 0 of the rig's alias,
+/// for `term_id` at `term_offset`, as a datagram of any incarnation
+/// carries it: DATA names no incarnation, only the alias and the term.
+fn stale_frame(term_id: u32, term_offset: u32, payload: usize) -> Vec<u8> {
+    use karyos_protocol::frame::{Flags, FrameType, Word0};
+
+    let length = 32 + payload;
+    let word0 = Word0::new(
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, false, false, Lane::ZERO),
+        FrameType::Data,
+    );
+    let mut bytes = vec![7u8; length];
+    bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+    bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+    bytes[12..16].copy_from_slice(&alias().session_id.to_le_bytes());
+    bytes[16..20].copy_from_slice(&alias().stream_id.to_le_bytes());
+    bytes[20..24].copy_from_slice(&term_id.to_le_bytes());
+    bytes[24..32].fill(0);
+    bytes
+}
+
+/// T5 (contract-traceability-phase-2.md, "Stale datagrams after sender
+/// restart", the trusted half; SPEC §6): a sender driver restart reuses
+/// the alias, and DATA of the old incarnation is still in flight. The
+/// old image retires; the new incarnation binds a new image through its
+/// own challenge, with another initial term id. Stale DATA of the old
+/// terms then commits nothing and reaches no subscriber. Of nine probes
+/// around and far from the new window, none commits; only the window's own
+/// terms (`r` and `r + 1`) do: a stale datagram is accepted only if its
+/// term id falls there. This proves the receiver's window. The rate SPEC
+/// asks for, about 3 in 2^32, also needs the restarted sender to draw its
+/// initial term id at random, which main does not do yet (a constant
+/// today; coordinator gap G2), so this test sets one by hand. The
+/// authenticated half (always rejected) needs the authenticated profile
+/// (owner decision 5, ADR-0035).
+#[test]
+fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::log_buffer::{PollOutcome, Role};
+    use karyos_sys::sync::Ordering;
+
+    // The new incarnation's initial term id, set by hand (main does not
+    // draw one yet): half the term id space away from the old one, 9.
+    const NEW: u32 = 9 + (1 << 31);
+
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let (mut rig, b) = Rig::new(Setup {
+        guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::new(AppliedEpoch::new()),
+            epoch: 2,
+            rate: None,
+        }),
+        ..Setup::default()
+    });
+    let old = established(&mut rig);
+    // The old incarnation goes silent, as its driver stops; its image
+    // retires at the liveness timeout.
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    for _ in 0..15 {
+        rig.now += 1_000 * MS;
+        rig.round(true);
+        if !rig.agents.receiver.role.has_image(old) {
+            break;
+        }
+    }
+    assert!(!rig.agents.receiver.role.has_image(old));
+    // The restarted driver announces the alias again: a new incarnation
+    // and a fresh initial term id.
+    let installed = |rig: &Rig| {
+        rig.events
+            .iter()
+            .filter(|event| matches!(event, ImageEvent::Installed { .. }))
+            .count()
+    };
+    let before = installed(&rig);
+    rig.reannounce(
+        b,
+        SetupAnnounce {
+            identity: Identity {
+                incarnation: 2,
+                ..identity()
+            },
+            term: TermParams {
+                initial_term_id: NEW.cast_signed(),
+                ..term(65_536)
+            },
+            ..announce(65_536)
+        },
+    );
+    rig.until(true, |rig| installed(rig) == before + 1);
+    let Some(ImageEvent::Installed { slot, .. }) = rig.events.last().copied() else {
+        panic!("{:?}", rig.events);
+    };
+    assert_ne!(slot, old);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let inject = |rig: &mut Rig, term_id: u32| {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_data(
+            &receiver.sessions,
+            b,
+            source,
+            alias(),
+            &stale_frame(term_id, 0, 32),
+            rig.now,
+        );
+        rig.round(true);
+    };
+    let committed = |rig: &Rig| rig.agents.receiver.counters().data_committed;
+    // Nine probes outside the new window {r, r + 1} (r = NEW at the join):
+    // the old incarnation's terms, both sides of the window, and two
+    // quarters of the term id space away.
+    let outside = [
+        9,
+        10,
+        11,
+        NEW.wrapping_sub(2),
+        NEW.wrapping_sub(1),
+        NEW.wrapping_add(2),
+        NEW.wrapping_add(3),
+        NEW.wrapping_add(1 << 30),
+        NEW.wrapping_sub(1 << 30),
+    ];
+    assert_eq!(
+        outside
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        outside.len(),
+        "the probes are distinct"
+    );
+    let start = committed(&rig);
+    for term_id in outside {
+        inject(&mut rig, term_id);
+        assert_eq!(
+            committed(&rig),
+            start,
+            "term id {term_id:#x} outside the window committed"
+        );
+    }
+    let mut out = vec![0u8; 256];
+    assert_eq!(subscriber.poll(&mut out).unwrap(), PollOutcome::Pending);
+    // Inside the window, a frame commits whatever incarnation sent it: the
+    // residual risk the initial term id makes small.
+    for (i, term_id) in [NEW, NEW.wrapping_add(1)].into_iter().enumerate() {
+        inject(&mut rig, term_id);
+        assert_eq!(
+            committed(&rig),
+            start + 1 + u64::try_from(i).unwrap(),
+            "term id {term_id:#x} inside the window"
+        );
+    }
+    assert!(matches!(
+        subscriber.poll(&mut out).unwrap(),
+        PollOutcome::Message {
+            position: 0,
+            length: 32,
+            ..
+        }
+    ));
+}
+
 /// P2.12 step 3 PR 2: a hook that records the receiver's commits and its
 /// journals' opens and closes.
 /// What a [`CommitRecorder`] saw: the commits, the journals opened and
