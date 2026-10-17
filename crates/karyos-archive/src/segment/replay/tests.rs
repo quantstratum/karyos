@@ -122,10 +122,15 @@ fn seen(step: Step<'_>) -> Seen {
     }
 }
 
+/// More steps than any replay here takes: a replay that never ends fails
+/// fast instead of hanging the suite.
+const MAX_STEPS: usize = 1000;
+
 /// Every step at a fixed clock until the end.
 fn drain(source: &mut ReplaySource<FaultDisk>, now: u64) -> Vec<Seen> {
     let mut steps = Vec::new();
     loop {
+        assert!(steps.len() < MAX_STEPS, "no end after {MAX_STEPS} steps");
         let step = seen(source.poll(now).unwrap());
         let done = matches!(step, Seen::End(_));
         steps.push(step);
@@ -268,7 +273,10 @@ fn damaged_data_is_reported_whole_or_in_pieces() {
             .unwrap();
         raw.write_at(&data, last_at + 300, &[0xEE]).unwrap();
         let mut source = open_source(&disk, last_at, end, Rate::Full, buffer);
+        let mut steps = 0;
         let error = loop {
+            steps += 1;
+            assert!(steps < MAX_STEPS, "no end after {MAX_STEPS} steps");
             match source.poll(0) {
                 Ok(Step::End { .. }) => panic!("buffer {buffer}: no error"),
                 Ok(_) => {}
@@ -416,6 +424,7 @@ fn damage(disk: &FaultDisk, base: u64, position: u64, byte: u8) {
 fn until_error(source: &mut ReplaySource<FaultDisk>) -> (Vec<Seen>, Option<ReplayError>) {
     let mut steps = Vec::new();
     loop {
+        assert!(steps.len() < MAX_STEPS, "no end after {MAX_STEPS} steps");
         match source.poll(0) {
             Ok(step) => {
                 let step = seen(step);
