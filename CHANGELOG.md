@@ -37,6 +37,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A publication over redundant paths (redundant-paths.md section 7, RP-10):
+  `Outbound::new_routed` takes one endpoint and destination per path, and
+  `Outbound::serve_routes` sends each committed datagram once on every
+  path, debited once (`karyos_io::lanes::routes::RoutedLaneSender`). Repair
+  stays on the founding path. `Outbound::guard` refuses a routed
+  publication with `GateError::Routed` until the guard gate covers every
+  path.
 - A seal gate on the skip policy (conflated-network-images.md (b)):
   `SkipPolicy::duty_gated` and `SkipPolicy::range_unavailable_gated` ask a
   `SealGate` before each seal. While it answers `GateAnswer::Pending`, the

@@ -172,7 +172,7 @@ fn a_blocked_path_catches_up_without_a_second_debit() {
     let mut frontier = 0;
     for _ in 0..4 {
         let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
-        let now = outbound.readers()[0].sent_position();
+        let now = outbound.sent_high(0).unwrap();
         assert!(now >= frontier);
         frontier = now;
     }
@@ -185,7 +185,7 @@ fn a_blocked_path_catches_up_without_a_second_debit() {
     // blocked calls left in its script.
     for _ in 0..16 {
         let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
-        let now = outbound.readers()[0].sent_position();
+        let now = outbound.sent_high(0).unwrap();
         assert!(now >= frontier);
         frontier = now;
     }
@@ -195,6 +195,7 @@ fn a_blocked_path_catches_up_without_a_second_debit() {
     assert_eq!(sender.counters(1).unwrap().late, 3);
     assert_eq!(sender.counters(0).unwrap().late, 0);
     assert_eq!(frontier, 3 * FRAME);
+    assert_eq!(outbound.readers()[0].sent_position(), 3 * FRAME);
 }
 
 /// A path without a TX half this cycle (its endpoint is resetting) does

@@ -232,6 +232,12 @@ impl Outbound {
             .chain(routed.into_iter().flat_map(Routed::endpoints))
     }
 
+    /// Lane `lane`'s sent frontier (tests).
+    #[cfg(test)]
+    pub(crate) fn sent_high(&self, lane: usize) -> Option<u64> {
+        self.tracks.get(lane).map(|track| track.high)
+    }
+
     /// The routed sender (tests).
     #[cfg(test)]
     pub(crate) fn routed_sender(&self) -> Option<&RoutedLaneSender> {

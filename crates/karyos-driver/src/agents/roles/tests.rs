@@ -3008,6 +3008,75 @@ fn the_earliest_uncertain_copy_anchors_when_none_is_submitted() {
     super::anchor_uncertain(&mut image, 0);
     assert_eq!(image.loss.counters().submitted, 1);
     assert_eq!(counters.nak_copies_uncertain, 2);
+    // Anchored at 10, the earliest start (#315 review): its retry is due
+    // before an anchor at 30 would allow.
+    let rtt = crate::repair::loss::RttSource::rtt_snapshot(&image.rtt, 0);
+    assert!(
+        image
+            .loss
+            .due(karyos_protocol::frame::Lane::ZERO, 25 + rtt)
+            .is_some()
+    );
+}
+
+/// Reports `outcome` for lane 0's NAK on the founding path.
+fn report_founding(
+    image: &mut super::Installed,
+    nak: karyos_protocol::network::Nak,
+    start: u64,
+    submitted: bool,
+) {
+    let report = &mut image.naks[0];
+    let mut guard = super::ReportGuard::take(&report.slot);
+    guard.sending(start);
+    if submitted {
+        guard.submitted();
+    } else {
+        guard.uncertain();
+    }
+    report.pending = Some(nak);
+}
+
+/// #315 review P3: an uncertain founding copy is only a candidate, through
+/// the founding report path: a later path's submitted copy anchors the
+/// NAK at its own start. The founding route still counts its uncertainty.
+#[test]
+fn a_founding_uncertain_copy_yields_to_a_later_submitted_one() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    // The later copy is still in flight when the founding one reports.
+    let mut copy = super::ReportGuard::take(&image.copies[1].slot);
+    image.copies[1].pending = Some(nak);
+    report_founding(&mut image, nak, 10, false);
+    super::settle_founding(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert_eq!(image.loss.counters().submitted, 0);
+    assert_eq!(image.loss.counters().uncertain, 1);
+    copy.sending(20);
+    copy.submitted();
+    super::settle_copies(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert_eq!(image.loss.counters().submitted, 1);
+    let rtt = crate::repair::loss::RttSource::rtt_snapshot(&image.rtt, 0);
+    assert_eq!(image.loss.due(Lane::ZERO, 15 + rtt), None);
+    assert!(image.uncertain_at[0].is_none());
+}
+
+/// #315 review P3: an uncertain copy that faults its route is no anchor
+/// candidate; with no other copy the NAK stays unanchored.
+#[test]
+fn an_uncertain_copy_that_faults_its_route_is_no_candidate() {
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    image.routes[1].uncertain = true;
+    report_copy(&mut image, 1, nak, 10, false);
+    super::settle_copies(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert!(image.routes[1].faulted);
+    assert!(image.uncertain_at[0].is_none());
+    assert_eq!(image.loss.counters().submitted, 0);
 }
 
 /// #310 review (M2): a NAK copy the control ring cannot take is skipped
