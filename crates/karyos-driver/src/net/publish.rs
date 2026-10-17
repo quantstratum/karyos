@@ -8,10 +8,17 @@
 //!   client API, a channel URI in the client's `AddPublication`, calls the
 //!   same function later.
 //! - **Scope.** Unicast and multicast destinations on the trusted
-//!   profile, one path, a local bind by address or the default route.
-//!   Multi-destination channels, redundant paths and interface names are
-//!   refused ([`DriverError::UnsupportedChannel`]). Heap terms only (D3,
-//!   SPEC §18).
+//!   profile, a local bind by address or the default route. Multi-
+//!   destination channels and interface names are refused
+//!   ([`DriverError::UnsupportedChannel`]). Heap terms only (D3, SPEC §18).
+//! - **Redundant paths** (redundant-paths.md, rp-w4b2c). A multicast IPv4
+//!   channel with `paths` sends on one endpoint per path, bound to that
+//!   path's interface address, every path toward the channel's group: one
+//!   routed publication. Refused while the sockets cannot be isolated per
+//!   path ([`SocketOps::isolates_paths`], owner item 12), as subscriptions
+//!   are, and unicast `paths` need a destination per path (owner item 11).
+//!
+//! [`SocketOps::isolates_paths`]: karyos_io::sockets::ops::SocketOps::isolates_paths
 //! - **Readers.** Each lane's sender reader is a required participant of
 //!   its log with an L_send reservation (S2 2.1), so a publisher never
 //!   overruns what the sender has not sent.
@@ -24,6 +31,9 @@ use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
 use karyos_sys::term_bytes::HeapTerms;
 
 use super::NetworkPublicationState;
+use karyos_io::lanes::routes::MAX_ROUTES;
+
+use crate::agents::EndpointId;
 use crate::agents::data::{GuardSpec, Outbound};
 use crate::embedded::{AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION};
 use crate::error::DriverError;
@@ -31,15 +41,31 @@ use crate::guards::{GuardHandle, GuardRate};
 use crate::membership::PublicationRoles;
 use crate::sessions::send::Publication;
 
-/// Where a channel sends, and the local address its endpoint binds.
-fn route(channel: &UdpConfig) -> Result<(SocketAddr, SocketAddr), DriverError> {
+/// Where a channel sends, and the local address its endpoint binds: one
+/// per path for a channel with `paths`, the founding path first (control
+/// path, may allocate).
+fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverError> {
     let destination = match &channel.destination {
         Destination::Unicast(address) => *address,
         Destination::Multicast { group, .. } => *group,
         Destination::MultiDestination { .. } => return Err(DriverError::UnsupportedChannel),
     };
     if !channel.paths.is_empty() {
-        return Err(DriverError::UnsupportedChannel);
+        // Multicast IPv4 only: unicast paths need a destination each.
+        let (Destination::Multicast { .. }, true) = (
+            &channel.destination,
+            destination.is_ipv4() && channel.paths.len() <= MAX_ROUTES,
+        ) else {
+            return Err(DriverError::UnsupportedChannel);
+        };
+        let mut binds = Vec::with_capacity(channel.paths.len());
+        for path in &channel.paths {
+            let Interface::Address(ip @ IpAddr::V4(_)) = path else {
+                return Err(DriverError::UnsupportedChannel);
+            };
+            binds.push(SocketAddr::new(*ip, 0));
+        }
+        return Ok((destination, binds));
     }
     let ip = match &channel.interface {
         Some(Interface::Address(ip)) => *ip,
@@ -47,7 +73,7 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, SocketAddr), DriverError> {
         None if destination.is_ipv4() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         None => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
-    Ok((destination, SocketAddr::new(ip, 0)))
+    Ok((destination, vec![SocketAddr::new(ip, 0)]))
 }
 
 /// The guard of a guarded network publication: every lane stream is
@@ -137,16 +163,22 @@ impl EmbeddedDriver<HeapTerms> {
         guard: Option<NetworkGuard>,
         roles: Option<Box<PublicationRoles>>,
     ) -> Result<AggregateHandle, DriverError> {
-        if self.net.is_none() {
+        let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
+        };
+        // Redundant paths need sockets isolated per interface; without it
+        // they are refused and counted, as for subscriptions.
+        if !channel.paths.is_empty() && !net.paths_isolated() {
+            net.count_paths_refused();
+            return Err(DriverError::UnsupportedChannel);
         }
-        let (destination, bind) = route(channel)?;
+        let (destination, binds) = route(channel)?;
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
         let handle = self.add_aggregate(config)?;
         let added = self.attach_sender(
             &handle,
             destination,
-            bind,
+            &binds,
             channel.reliable,
             quanta,
             (guard, roles),
@@ -215,7 +247,7 @@ impl EmbeddedDriver<HeapTerms> {
         &mut self,
         handle: &AggregateHandle,
         destination: SocketAddr,
-        bind: SocketAddr,
+        binds: &[SocketAddr],
         reliable: bool,
         quanta: Lanes<u64>,
         (guard, roles): (Option<NetworkGuard>, Option<Box<PublicationRoles>>),
@@ -223,7 +255,7 @@ impl EmbeddedDriver<HeapTerms> {
         let mut guard_sender = None;
         let posted = self.post_sender(
             handle,
-            (destination, bind),
+            (destination, binds),
             reliable,
             quanta,
             (guard, roles),
@@ -241,7 +273,7 @@ impl EmbeddedDriver<HeapTerms> {
     fn post_sender(
         &mut self,
         handle: &AggregateHandle,
-        (destination, bind): (SocketAddr, SocketAddr),
+        (destination, binds): (SocketAddr, &[SocketAddr]),
         reliable: bool,
         quanta: Lanes<u64>,
         (guard, roles): (Option<NetworkGuard>, Option<Box<PublicationRoles>>),
@@ -299,28 +331,48 @@ impl EmbeddedDriver<HeapTerms> {
             lane_count,
         };
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
-        let endpoint = net.hold_send_endpoint(bind)?;
-        let posted = Outbound::new(
-            endpoint,
-            alias,
-            destination,
-            readers,
-            &quanta,
-            config.mtu,
-            reliable,
-        )
-        .map_err(|_| DriverError::InvalidConfig)
-        .and_then(|outbound| {
-            net.add_publication(
-                handle.registration(),
-                publication(endpoint),
-                Box::new(outbound),
-                guard,
-                roles,
+        // One send endpoint per path, all or nothing.
+        let mut held: Vec<(EndpointId, SocketAddr)> = Vec::with_capacity(binds.len());
+        for bind in binds {
+            match net.hold_send_endpoint(*bind) {
+                Ok(endpoint) => held.push((endpoint, destination)),
+                Err(error) => {
+                    for (endpoint, _) in held {
+                        net.release_send_endpoint(endpoint);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let &(endpoint, _) = held.first().ok_or(DriverError::InvalidConfig)?;
+        let outbound = if held.len() > 1 {
+            Outbound::new_routed(&held, alias, readers, &quanta, config.mtu, reliable)
+        } else {
+            Outbound::new(
+                endpoint,
+                alias,
+                destination,
+                readers,
+                &quanta,
+                config.mtu,
+                reliable,
             )
-        });
+        };
+        let posted = outbound
+            .map_err(|_| DriverError::InvalidConfig)
+            .and_then(|outbound| {
+                net.add_publication(
+                    handle.registration(),
+                    publication(endpoint),
+                    Box::new(outbound),
+                    guard,
+                    roles,
+                )
+            });
         if posted.is_err() {
-            net.release_send_endpoint(endpoint);
+            for (endpoint, _) in &held {
+                net.release_send_endpoint(*endpoint);
+            }
         }
         posted
     }

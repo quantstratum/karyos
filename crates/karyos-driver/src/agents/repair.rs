@@ -54,6 +54,7 @@ use karyos_sys::log_buffer::{NakRead, ReadError, ReadOutcome};
 use karyos_sys::sizing::align_frame;
 
 use super::data::LaneReader;
+use crate::embedded::StreamTerms;
 use crate::repair::admission::{Admission, AdmissionError, Admitted, NakContext, Requester};
 use crate::repair::jobs::{Domain, JobKey, JobRef, Jobs, JobsConfig, JobsError, Joined};
 use crate::repair::scheduler::{
@@ -245,11 +246,11 @@ impl RepairPath {
     /// Admits `nak` from a bound receiver, whose state on the lane is
     /// `requester`, against `reader`'s retention floor and the lane's NAK
     /// bound `sent_high`, at `now` (R4 steps 1 to 5, then R5).
-    pub fn nak(
+    pub fn nak<T: StreamTerms>(
         &mut self,
         nak: &Nak,
         requester: Requester,
-        reader: Option<&LaneReader>,
+        reader: Option<&LaneReader<T>>,
         sent_high: u64,
         lane_count: u8,
         now: u64,
@@ -258,7 +259,7 @@ impl RepairPath {
             reliable: true,
             lane_count,
             requester,
-            floor: reader.map_or(0, LaneReader::floor),
+            floor: reader.map_or(0, LaneReader::<T>::floor),
             nak_bound: sent_high,
             term_length: self.term_length,
         };
@@ -292,10 +293,10 @@ impl RepairPath {
     /// bound in `sent_high`, at `now`. A lane in `closed` (its guard closed:
     /// nothing more leaves the sender, GC-6) reads nothing: its jobs are
     /// dropped, with no ERR. Returns the DRR report.
-    pub fn serve<O: SocketOps>(
+    pub fn serve<O: SocketOps, T: StreamTerms>(
         &mut self,
         tx: &mut SocketsTx<O>,
-        readers: &mut [LaneReader],
+        readers: &mut [LaneReader<T>],
         (sent_high, closed): (&[u64], &[bool]),
         budget: &mut RepairBudget,
         now: u64,
@@ -344,8 +345,8 @@ impl RepairPath {
 }
 
 /// The lane reads of one call.
-struct ReadView<'a> {
-    readers: &'a mut [LaneReader],
+struct ReadView<'a, T: StreamTerms> {
+    readers: &'a mut [LaneReader<T>],
     sent_high: &'a [u64],
     /// Lanes whose guard closed.
     closed: &'a [bool],
@@ -354,7 +355,7 @@ struct ReadView<'a> {
     loads: u32,
 }
 
-impl RepairRead for ReadView<'_> {
+impl<T: StreamTerms> RepairRead for ReadView<'_, T> {
     fn head(&mut self, lane: u8, from: u64) -> Result<Head, RepairReadError> {
         let index = usize::from(lane);
         if self.closed.get(index).copied().unwrap_or(false) {
@@ -423,7 +424,7 @@ impl RepairRead for ReadView<'_> {
     fn floor(&self, lane: u8) -> u64 {
         self.readers
             .get(usize::from(lane))
-            .map_or(0, LaneReader::floor)
+            .map_or(0, LaneReader::<T>::floor)
     }
 }
 

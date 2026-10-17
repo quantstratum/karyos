@@ -30,14 +30,16 @@
 
 use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
 use karyos_sys::log_buffer::ReceiveOwner;
+use karyos_sys::term_bytes::HeapTerms;
 
 use super::EndpointId;
 use super::ring::{PostError, Reservation, RingReceiver, RingSender};
+use crate::embedded::StreamTerms;
 use crate::sessions::receive::SlotRef;
 
 /// Conductor to receiver, on the session ring.
 #[derive(Debug)]
-pub enum SessionCommand {
+pub enum SessionCommand<T: StreamTerms = HeapTerms> {
     /// `ImageReady`: install the image of the pending `slot`, receive
     /// owner included. Answered [`SessionEvent::ImageInstalled`] or
     /// [`SessionEvent::ImageReleased`] into `reply`.
@@ -47,7 +49,7 @@ pub enum SessionCommand {
         /// The pending session slot, at its challenge generation.
         slot: SlotRef,
         /// The image's receive owner over its lanes.
-        owner: Box<ReceiveOwner>,
+        owner: Box<ReceiveOwner<T>>,
     },
     /// `ImageRefused`: the challenge of `slot` goes. Answered
     /// [`SessionEvent::ImageReleased`] into `reply`.
@@ -133,25 +135,27 @@ pub struct ImageChain {
 
 /// The receiver's end of the session rings.
 #[derive(Debug)]
-pub(super) struct SessionEnd {
+pub(super) struct SessionEnd<T: StreamTerms = HeapTerms> {
     /// Commands from the conductor.
-    pub(super) commands: RingReceiver<SessionCommand>,
+    pub(super) commands: RingReceiver<SessionCommand<T>>,
     /// Events to the conductor.
     pub(super) events: RingSender<SessionEvent>,
     /// A producer handle of the command ring, to reserve the conductor's
     /// units at the answer.
-    pub(super) credit: RingSender<SessionCommand>,
+    pub(super) credit: RingSender<SessionCommand<T>>,
 }
 
 /// The conductor's end of the session rings.
 #[derive(Debug)]
-pub struct SessionLink {
-    commands: RingSender<SessionCommand>,
+pub struct SessionLink<T: StreamTerms = HeapTerms> {
+    commands: RingSender<SessionCommand<T>>,
     events: RingReceiver<SessionEvent>,
 }
 
 /// Both ends of the session rings, `capacity` entries each.
-pub(super) fn session_rings(capacity: std::num::NonZeroUsize) -> (SessionEnd, SessionLink) {
+pub(super) fn session_rings<T: StreamTerms>(
+    capacity: std::num::NonZeroUsize,
+) -> (SessionEnd<T>, SessionLink<T>) {
     let (commands, command_receiver) = super::ring::ring(capacity);
     let (events, event_receiver) = super::ring::ring(capacity);
     (
@@ -167,7 +171,7 @@ pub(super) fn session_rings(capacity: std::num::NonZeroUsize) -> (SessionEnd, Se
     )
 }
 
-impl SessionLink {
+impl<T: StreamTerms> SessionLink<T> {
     /// Takes the receiver's oldest session event.
     #[must_use]
     pub fn take_event(&self) -> Option<SessionEvent> {
@@ -177,7 +181,7 @@ impl SessionLink {
     /// Posts `command` into the unit `reservation` holds. `false` when the
     /// receiver is gone (the driver is stopping) or the reservation belongs
     /// to another ring.
-    pub fn post(&self, reservation: Reservation, command: SessionCommand) -> bool {
+    pub fn post(&self, reservation: Reservation, command: SessionCommand<T>) -> bool {
         match self.commands.post(reservation, command) {
             Ok(()) => true,
             Err(PostError::Gone(_) | PostError::Foreign(_) | PostError::Full(_)) => false,
