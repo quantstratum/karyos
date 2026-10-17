@@ -14,11 +14,13 @@ release may break APIs, wire formats and shared-memory layouts.
 - A guarded network publication's outcome records come from its sender
   gate's submissions, not from the commit (guards-and-abort.md, "Trusted
   sockets in Phase 2"). A message is `Submitted` once a backend took
-  every frame of it, `Unknown` when one may have left unproven (an
-  `Unknown` report, an exposure a reset or a removal cut short, or a
-  position no first send took, which a reliable lane may still repair),
-  and `Aborted` when it never leaves: committed and not sent when a
-  close, a removal or a network close ends the lane. A message's
+  every frame of it, `Unknown` when it may have left whole unproven (an
+  `Unknown` report, an exposure a reset or a removal cut short, a
+  position no first send took, which a reliable lane may still repair,
+  or a later route's submission above a position that never left), and
+  `Aborted` when it never leaves whole: its last frame was not sent when
+  a close, a removal or a network close ended the lane (a partial
+  fragmented message is `Aborted`, as the design's kind table says). A message's
   reservation is therefore released at its network submission, so the
   publisher holds at most `C_m` messages committed and not yet sent: the
   effective window is the smaller of the receivers' and `C_m` messages.
@@ -197,8 +199,8 @@ release may break APIs, wire formats and shared-memory layouts.
 - `karyos_sys::submission_frontier::SubmissionFrontier`: a guarded
   network lane's submission frontier, which its sender gate publishes
   for the driver's outcome walker. Per lane, `resolved` (Release),
-  `unknown_hi` and `staged_hi` (Relaxed, stored before it), all
-  monotone and written by the gate alone, and a final word that the gate
+  `unknown_hi`, `sent_hi` and `staged_hi` (Relaxed, stored before it),
+  all monotone and written by the gate alone, and a final word that the gate
   (`finish`) or, once the gate stopped for good, the conductor
   (`supersede`) sets once, by compare-exchange. A Loom model
   (`loom_submission_frontier`) checks the orders and the race of the two

@@ -1483,9 +1483,17 @@ impl<T: StreamTerms> Network<T> {
             Ok(work) => work,
             Err(agent) => {
                 // A failed agent never answers again (DN-9): every tracked
-                // guard sender is released, so no close waits on it.
+                // guard sender is released, so no close waits on it. The
+                // gates stopped only with the sender: a shared thread runs
+                // neither agent again, while a dedicated sender thread runs
+                // on after a receiver failure (#381 review P1). A thread
+                // reads FAILED with Acquire, after its gate's last store.
+                let gates_stopped = match &self.agents {
+                    Agents::Threads(runner) => runner.failed().contains(&AgentKind::Sender),
+                    Agents::Shared(_) | Agents::Closed => true,
+                };
                 self.failed = Some(agent);
-                self.release_guard_senders();
+                self.release_guard_senders(gates_stopped);
                 return Err(DriverError::NetworkAgent { agent });
             }
         };
@@ -1665,16 +1673,24 @@ impl<T: StreamTerms> Network<T> {
         }
         let _ = self.images.poll(&self.links.sessions, lanes, |_| {});
         // The agents are gone: every tracked guard sender is released for
-        // the conductor to deregister.
-        self.release_guard_senders();
+        // the conductor to deregister. A sender thread still running past
+        // the stop timeout may still run its gates, so they are left as
+        // they are.
+        let sender_late = shutdown
+            .late
+            .iter()
+            .any(|late| late.kinds().contains(&AgentKind::Sender));
+        self.release_guard_senders(!sender_late);
         shutdown
     }
 
     /// Moves the guard sender of every tracked publication to the released
     /// list (agents stopped or failed): the conductor deregisters them.
-    fn release_guard_senders(&mut self) {
+    /// With `gates_stopped`, no sender gate runs again, so each lane a gate
+    /// did not finish is superseded.
+    fn release_guard_senders(&mut self, gates_stopped: bool) {
         for entry in &mut self.publications {
-            if let Some(id) = entry.release_guard() {
+            if let Some(id) = entry.release_guard(gates_stopped) {
                 self.released_guards.push(id);
             }
         }
@@ -1987,14 +2003,15 @@ impl NetPublication {
     }
 
     /// Releases its guard sender, once: the sender refused or returned it,
-    /// or the agents stopped or failed. No gate decides its lanes again, so
-    /// each lane its gate did not finish is superseded.
-    fn release_guard(&mut self) -> Option<crate::guard_ack::GuardSenderId> {
-        let id = self.guard_sender.take()?;
-        if let Some(SharedFrontier(frontier)) = self.frontier.take() {
+    /// or the agents stopped or failed. With `gate_stopped` its gate never
+    /// runs again, so each lane it did not finish is superseded, once; a
+    /// gate still running (a receiver failure on a dedicated runner) keeps
+    /// its frontier until the agents stop.
+    fn release_guard(&mut self, gate_stopped: bool) -> Option<crate::guard_ack::GuardSenderId> {
+        if gate_stopped && let Some(SharedFrontier(frontier)) = self.frontier.take() {
             supersede(&frontier, self.lanes);
         }
-        Some(id)
+        self.guard_sender.take()
     }
 }
 
@@ -2032,8 +2049,10 @@ fn publication_answer<T: StreamTerms>(
 ) {
     // Each tracked publication releases its guard sender once, and the
     // list holds one per tracked publication: it never grows past it.
+    // The sender refused it (its gate never ran) or returned it (its gate
+    // came back with the data path, through the event ring).
     let mut release_guard = |entry: &mut NetPublication| {
-        if let Some(id) = entry.release_guard() {
+        if let Some(id) = entry.release_guard(true) {
             released.push(id);
         }
     };

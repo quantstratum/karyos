@@ -40,11 +40,13 @@ const PUBLISHED: [Frontier; 2] = [
     Frontier {
         resolved: 64,
         unknown_hi: 0,
+        sent_hi: 64,
         staged_hi: 96,
     },
     Frontier {
         resolved: 160,
         unknown_hi: 128,
+        sent_hi: 176,
         staged_hi: 192,
     },
 ];
@@ -55,7 +57,8 @@ fn checked(read: (Final, Frontier), earlier: Frontier) -> Frontier {
     let (state, frontier) = read;
     if frontier.resolved >= PUBLISHED[1].resolved {
         assert!(
-            frontier.unknown_hi >= PUBLISHED[1].unknown_hi,
+            frontier.unknown_hi >= PUBLISHED[1].unknown_hi
+                && frontier.sent_hi >= PUBLISHED[1].sent_hi,
             "a hole below resolved unseen: {frontier:?}"
         );
     }
@@ -72,6 +75,7 @@ fn checked(read: (Final, Frontier), earlier: Frontier) -> Frontier {
     assert!(
         frontier.resolved >= earlier.resolved
             && frontier.unknown_hi >= earlier.unknown_hi
+            && frontier.sent_hi >= earlier.sent_hi
             && frontier.staged_hi >= earlier.staged_hi,
         "a field went down: {frontier:?} after {earlier:?}"
     );

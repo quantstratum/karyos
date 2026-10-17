@@ -796,10 +796,11 @@ impl Fixture {
 
 use karyos_sys::submission_frontier::{Final, Frontier, SubmissionFrontier};
 
-fn at(resolved: u64, unknown_hi: u64, staged_hi: u64) -> Frontier {
+fn at(resolved: u64, unknown_hi: u64, sent_hi: u64, staged_hi: u64) -> Frontier {
     Frontier {
         resolved,
         unknown_hi,
+        sent_hi,
         staged_hi,
     }
 }
@@ -815,13 +816,19 @@ fn an_unknown_head_below_a_later_submission_stays_unknown() {
     let (second, second_end, second_staged) = f.stage(0);
     assert_eq!(check(&mut f.gate, 0, &[first, second]), permit(2));
     f.gate.between_gates();
-    assert_eq!(frontier.read(lane(0)), (Final::Open, at(0, 0, second_end)));
+    assert_eq!(
+        frontier.read(lane(0)),
+        (Final::Open, at(0, 0, 0, second_end))
+    );
     f.gate.left(0, first_staged, Left::Unknown);
     f.gate.left(0, second_staged, Left::Submitted);
     f.gate.between_gates();
     assert_eq!(
         frontier.read(lane(0)),
-        (Final::Open, at(second_end, first_end, second_end))
+        (
+            Final::Open,
+            at(second_end, first_end, second_end, second_end)
+        )
     );
     // `submitted` is the max the acknowledgement used to carry.
     assert_eq!(f.gate.last_submitted(lane(0)), second_end);
@@ -865,11 +872,14 @@ fn a_rewound_reset_holds_its_returned_heads_until_they_go_again() {
         if !rewound {
             assert_eq!(
                 frontier.read(lane(0)).1,
-                at(third_end, third_end, third_end)
+                at(third_end, third_end, third_end, third_end)
             );
             continue;
         }
-        assert_eq!(frontier.read(lane(0)).1, at(first_end, 0, third_end));
+        assert_eq!(
+            frontier.read(lane(0)).1,
+            at(first_end, 0, first_end, third_end)
+        );
         // Read again from the first returned head, and sent.
         f.next_position[0] = first_end;
         let (second, _, second_staged) = f.stage(0);
@@ -880,7 +890,10 @@ fn a_rewound_reset_holds_its_returned_heads_until_they_go_again() {
         f.gate.left(0, second_staged, Left::Submitted);
         f.gate.left(0, third_staged, Left::Submitted);
         f.gate.between_gates();
-        assert_eq!(frontier.read(lane(0)).1, at(third_end, 0, third_end));
+        assert_eq!(
+            frontier.read(lane(0)).1,
+            at(third_end, 0, third_end, third_end)
+        );
     }
 }
 
@@ -908,7 +921,7 @@ fn a_close_finishes_the_lane_once_its_exposures_are_reported() {
             Final::Finished {
                 reason: REASON_GUARD_CLOSED
             },
-            at(second_end, 0, third_end)
+            at(second_end, 0, second_end, third_end)
         )
     );
     assert_eq!(f.cell.try_read().unwrap().positions[0], second_end);
@@ -933,7 +946,7 @@ fn a_removal_makes_an_unreported_exposure_unknown() {
             Final::Finished {
                 reason: REASON_DRIVER_SHUTDOWN
             },
-            at(first_end, second_end, third_end)
+            at(first_end, second_end, second_end, third_end)
         )
     );
 }
@@ -953,7 +966,12 @@ fn a_gap_in_the_staged_positions_is_unknown() {
     f.gate.between_gates();
     assert_eq!(
         frontier.read(lane(0)).1,
-        at(second_end, second_end - u64::from(FRAME), second_end)
+        at(
+            second_end,
+            second_end - u64::from(FRAME),
+            second_end,
+            second_end
+        )
     );
     assert!(first_end < second_end - u64::from(FRAME));
 }
@@ -975,7 +993,7 @@ fn a_contradiction_makes_the_lane_unknown_and_finishes_it() {
         Final::Finished {
             reason: REASON_PUBLICATION_FAULT,
         },
-        at(end - u64::from(FRAME), end, end),
+        at(end - u64::from(FRAME), end, end, end),
     );
     assert_eq!(frontier.read(lane(0)), faulted);
     f.reset(0, false);

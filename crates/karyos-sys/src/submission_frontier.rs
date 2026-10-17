@@ -6,8 +6,10 @@
 //! The sender gate of a guarded network publication tells the driver's
 //! outcome walker, per lane, how far the fate of its first sends is
 //! decided, so that the walker records a message `Submitted` only once a
-//! backend took every frame of it, `Unknown` when one may have left, and
-//! `Aborted` when none ever will:
+//! backend took every frame of it, `Unknown` when it may have left whole,
+//! and `Aborted` when it never will (its last frame never leaves; a
+//! partial fragmented message is `Aborted`, as guards-and-abort.md's kind
+//! table defines it):
 //!
 //! - **`resolved`**: prefix-closed. Below it every datagram has a copy
 //!   submitted on some route or is a hole counted in `unknown_hi`.
@@ -16,6 +18,9 @@
 //!   short, a divergence) or that left no copy at all outside a close (a
 //!   reliable lane may still repair it). A message starting below it may
 //!   have been sent.
+//! - **`sent_hi`**: the highest end of a datagram that may have left:
+//!   submitted, or counted in `unknown_hi`. A message ending above it
+//!   never left whole.
 //! - **`staged_hi`**: the highest end the gate staged: nothing above it
 //!   was ever exposed.
 //! - **The final word**: 0 while the gate may still decide positions;
@@ -25,17 +30,17 @@
 //!
 //! Each field is monotone. There is no sequence lock:
 //!
-//! - **Gate (`publish`).** The only writer of the three positions. It
-//!   stores `unknown_hi` and `staged_hi` (Relaxed), then `resolved` with
-//!   Release, so a walker that sees a `resolved` also sees every hole
-//!   below it. It sets the final word with [`SubmissionFrontier::finish`]
+//! - **Gate (`publish`).** The only writer of the four positions. It
+//!   stores `unknown_hi`, `sent_hi` and `staged_hi` (Relaxed), then
+//!   `resolved` with Release, so a walker that sees a `resolved` also sees
+//!   every hole below it. It sets the final word with [`SubmissionFrontier::finish`]
 //!   after its last publication for the lane, and never publishes the lane
 //!   again.
 //! - **Conductor (`supersede`).** The final word's only other writer, once
 //!   the gate has stopped for good: a compare-exchange from 0, so the
 //!   first of the two writers wins and the word never changes again.
 //! - **Walker (`read`).** Loads the final word with Acquire, then
-//!   `resolved` with Acquire, then the two others (Relaxed). A final word
+//!   `resolved` with Acquire, then the three others (Relaxed). A final word
 //!   the gate wrote brings the gate's last publication with it; a
 //!   `resolved` brings the holes published with or before it. A value read
 //!   later is never lower, so every decision the walker takes errs towards
@@ -58,6 +63,9 @@ pub struct Frontier {
     /// The highest end of a datagram that may have left unproven, or that
     /// left no copy outside a close.
     pub unknown_hi: u64,
+    /// The highest end of a datagram that may have left: submitted, or
+    /// counted in `unknown_hi`.
+    pub sent_hi: u64,
     /// The highest end staged.
     pub staged_hi: u64,
 }
@@ -118,6 +126,7 @@ pub enum WriterControl {
 struct LaneCell {
     resolved: AtomicU64,
     unknown_hi: AtomicU64,
+    sent_hi: AtomicU64,
     staged_hi: AtomicU64,
     last: AtomicU64,
 }
@@ -127,6 +136,7 @@ impl LaneCell {
         Self {
             resolved: AtomicU64::new(0),
             unknown_hi: AtomicU64::new(0),
+            sent_hi: AtomicU64::new(0),
             staged_hi: AtomicU64::new(0),
             last: AtomicU64::new(0),
         }
@@ -178,6 +188,7 @@ impl SubmissionFrontier {
         };
         cell.unknown_hi
             .store(frontier.unknown_hi, Ordering::Relaxed);
+        cell.sent_hi.store(frontier.sent_hi, Ordering::Relaxed);
         cell.staged_hi.store(frontier.staged_hi, Ordering::Relaxed);
         #[cfg(not(loom))]
         let order = Ordering::Release;
@@ -260,6 +271,7 @@ impl SubmissionFrontier {
         let frontier = Frontier {
             resolved,
             unknown_hi: cell.unknown_hi.load(Ordering::Relaxed),
+            sent_hi: cell.sent_hi.load(Ordering::Relaxed),
             staged_hi: cell.staged_hi.load(Ordering::Relaxed),
         };
         (state, frontier)
@@ -284,6 +296,7 @@ mod tests {
         let frontier = Frontier {
             resolved: 128,
             unknown_hi: 64,
+            sent_hi: 160,
             staged_hi: 192,
         };
         cell.publish(ZERO, frontier);

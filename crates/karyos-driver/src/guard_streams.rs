@@ -27,8 +27,9 @@
 //!   gate publishes its submission frontier
 //!   (`karyos_sys::submission_frontier`), and the walker decides each
 //!   message by it: `Submitted` once a backend took every frame of it,
-//!   `Unknown` when one may have left unproven, and, once the gate will
-//!   decide nothing more, `Aborted` for what never left. A message not
+//!   `Unknown` when it may have left whole unproven, and, once the gate
+//!   will decide nothing more, `Aborted` for what never left whole (its
+//!   last frame never left: a partial fragmented message is `Aborted`). A message not
 //!   decided yet waits, with everything after it, so records stay in
 //!   position order; `Ended` waits for the gate's final word too. A
 //!   message's reservation is therefore released at its network
@@ -174,26 +175,31 @@ impl<T: TermBytes> GuardedStream<T> {
             }
             (Block::Message { position, end }, Some((frontier, lane))) => {
                 let (state, at) = frontier.read(*lane);
-                let unknown = position < at.unknown_hi;
                 if end <= at.resolved {
-                    let kind = if unknown {
+                    // Every frame was submitted, or is a hole that may
+                    // have left.
+                    let kind = if position < at.unknown_hi {
                         Kind::Unknown
                     } else {
                         Kind::Submitted
                     };
                     (position, end, kind, 0)
                 } else {
-                    match state {
+                    // Above `resolved` once final: whole only if its last
+                    // frame may have left (a later route may have
+                    // submitted it, or it may have left unproven), never
+                    // whole otherwise, so `Aborted` (a partial fragmented
+                    // message is `Aborted`). A superseded gate may have
+                    // exposed whatever it staged.
+                    let (left, reason) = match state {
                         Final::Open => return None,
-                        Final::Finished { reason } if !unknown => {
-                            (position, end, Kind::Aborted, reason)
-                        }
-                        Final::Superseded { reason } if !unknown && end > at.staged_hi => {
-                            (position, end, Kind::Aborted, reason)
-                        }
-                        Final::Finished { .. } | Final::Superseded { .. } => {
-                            (position, end, Kind::Unknown, 0)
-                        }
+                        Final::Finished { reason } => (at.sent_hi, reason),
+                        Final::Superseded { reason } => (at.staged_hi, reason),
+                    };
+                    if end <= left {
+                        (position, end, Kind::Unknown, 0)
+                    } else {
+                        (position, end, Kind::Aborted, reason)
                     }
                 }
             }
@@ -531,6 +537,7 @@ mod tests {
             Frontier {
                 resolved: 128,
                 unknown_hi: 64,
+                sent_hi: 160,
                 staged_hi: 192,
             },
         );
@@ -554,6 +561,13 @@ mod tests {
             Some((128, 192, Kind::Aborted, REASON_WRITER_ABORTED))
         );
         assert_eq!(frontier.finish(Lane::ZERO, REASON_GUARD_CLOSED), Ok(true));
+        // Its last frame may have left (a later route, or unproven): it
+        // may be whole.
+        assert_eq!(
+            network.decide(message(128, 160)),
+            Some((128, 160, Kind::Unknown, 0))
+        );
+        // Its last frame never left: never whole, whatever went before.
         assert_eq!(
             network.decide(message(128, 192)),
             Some((128, 192, Kind::Aborted, REASON_GUARD_CLOSED))
@@ -570,6 +584,7 @@ mod tests {
             Frontier {
                 resolved: 128,
                 unknown_hi: 0,
+                sent_hi: 128,
                 staged_hi: 192,
             },
         );
@@ -580,6 +595,11 @@ mod tests {
         assert_eq!(
             network.decide(message(128, 192)),
             Some((128, 192, Kind::Unknown, 0))
+        );
+        // Straddling `staged_hi`: its last frame was never staged.
+        assert_eq!(
+            network.decide(message(160, 224)),
+            Some((160, 224, Kind::Aborted, REASON_DRIVER_SHUTDOWN))
         );
         assert_eq!(
             network.decide(message(192, 256)),

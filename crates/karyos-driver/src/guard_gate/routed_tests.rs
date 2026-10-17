@@ -494,15 +494,57 @@ fn a_position_no_route_sent_is_a_hole_unless_rewound() {
             Frontier {
                 resolved: 0,
                 unknown_hi: 0,
+                sent_hi: second,
                 staged_hi: second,
             }
         } else {
             Frontier {
                 resolved: second,
                 unknown_hi: first,
+                sent_hi: second,
                 staged_hi: second,
             }
         };
         assert_eq!(frontier.read(Lane::ZERO).1, expected, "rewound {rewound}");
     }
+}
+
+/// #381 review: a position route 0 submits above a hole that never leaves
+/// (held on route 1, out of the live set, then cancelled by the close) is
+/// above `resolved`, yet it may have left whole: `sent_hi` covers it, so
+/// the walker records it `Unknown`, never `Aborted`.
+#[test]
+fn a_later_routes_submission_above_a_hole_is_covered_by_sent_hi() {
+    use karyos_sys::submission_frontier::{Final, Frontier, SubmissionFrontier};
+
+    let mut f = Fixture::new(None);
+    let frontier = Arc::new(SubmissionFrontier::new());
+    f.gate.set_frontier(Arc::clone(&frontier));
+    let _ = f.stage(&[1]);
+    f.sender.skipped(0);
+    let second = f.stage(&[0, 1]);
+    // Route 1 leaves the live set: it holds no head back, and route 0
+    // submits the second position alone.
+    f.sender.set_live(1, false);
+    f.routes[0].accept(1);
+    let _ = f.serve();
+    assert_eq!(f.gate.last_submitted(Lane::ZERO), second);
+    f.close();
+    f.gate.between_gates();
+    f.cancel();
+    f.gate.between_gates();
+    assert_eq!(
+        frontier.read(Lane::ZERO),
+        (
+            Final::Finished {
+                reason: crate::guard_streams::REASON_GUARD_CLOSED
+            },
+            Frontier {
+                resolved: 0,
+                unknown_hi: 0,
+                sent_hi: second,
+                staged_hi: second,
+            }
+        )
+    );
 }

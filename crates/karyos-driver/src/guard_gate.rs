@@ -24,8 +24,10 @@
 //!   (`karyos_sys::submission_frontier`): `resolved`, prefix-closed (the
 //!   start of the lowest position no copy of which was submitted yet, or
 //!   that a rewind or an abort holds back); `unknown_hi`, the highest end
-//!   that may have left unproven or that no first send will take; and
-//!   `staged_hi`. A position whose last copy left with none submitted is a
+//!   that may have left unproven or that no first send will take;
+//!   `sent_hi`, the highest end that may have left at all (submitted, or
+//!   in `unknown_hi`), which a later route's submission can put above
+//!   `resolved`; and `staged_hi`. A position whose last copy left with none submitted is a
 //!   hole: `Unknown` if a copy may have left, held back if a rewind stages
 //!   it again or an abort means it never leaves, `Unknown` otherwise (a
 //!   reliable lane may repair it). A reset never lowers `unknown_hi`. A
@@ -561,10 +563,16 @@ impl GuardGate {
     fn publish_frontiers(&mut self, forced: Option<u64>) {
         for state in &mut self.lanes {
             let resolved = resolve(state);
+            let submitted = self
+                .submitted
+                .get(usize::from(state.lane.get()))
+                .copied()
+                .unwrap_or(0);
             let frontier = &mut state.frontier;
             let current = Frontier {
                 resolved,
                 unknown_hi: frontier.unknown_hi,
+                sent_hi: submitted.max(frontier.unknown_hi),
                 staged_hi: frontier.staged_hi,
             };
             let Some(cell) = self.frontier.as_deref() else {
