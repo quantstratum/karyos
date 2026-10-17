@@ -14,8 +14,8 @@
 
 use karyos_sys::conflation::{Budget, ConflationReader, PollReport};
 use karyos_sys::freshness::{
-    Freshness, TERMINAL_BARRIER_TIMEOUT, TERMINAL_BELOW_FRONTIER, TERMINAL_FRESHNESS_EXHAUSTED,
-    Terminal,
+    Freshness, TERMINAL_BARRIER_TIMEOUT, TERMINAL_BELOW_FRONTIER, TERMINAL_FEEDER_LOST,
+    TERMINAL_FRESHNESS_EXHAUSTED, TERMINAL_IMAGE_RETIRED, Terminal,
 };
 
 use crate::counter::ClientCounterHandle;
@@ -92,12 +92,21 @@ pub enum ViewClosed {
         since: u64,
     },
     /// The network image the view reads retired (`quantstratum-docs:
-    /// karyos/design/conflated-network-images.md`). Reserved: the view of
-    /// a network image reports it once that close is wired.
+    /// karyos/design/conflated-network-images.md`). Its interval is empty,
+    /// so it marks no value stale: `since` is `None`.
     #[error("the conflated view closed: its image retired")]
     ImageRetired {
         /// The image's last position, when known.
         since: Option<u64>,
+    },
+    /// The view's feeder subscription failed; the image goes on for its
+    /// other subscribers.
+    #[error(
+        "the conflated view closed: the view's feeder subscription failed (stale since {since})"
+    )]
+    FeederLost {
+        /// The start of the unresolved interval.
+        since: u64,
     },
     /// A reason code this client does not know.
     #[error("the conflated view closed (reason {reason}, stale since {since})")]
@@ -118,6 +127,8 @@ impl ViewClosed {
             TERMINAL_BARRIER_TIMEOUT => Self::BarrierTimeout { since },
             TERMINAL_FRESHNESS_EXHAUSTED => Self::FreshnessExhausted { since },
             TERMINAL_BELOW_FRONTIER => Self::BelowFrontier { since },
+            TERMINAL_IMAGE_RETIRED => Self::ImageRetired { since: None },
+            TERMINAL_FEEDER_LOST => Self::FeederLost { since },
             reason => Self::Other { reason, since },
         }
     }
@@ -413,6 +424,11 @@ mod tests {
                 TERMINAL_BELOW_FRONTIER,
                 ViewClosed::BelowFrontier { since: 16 },
             ),
+            (
+                TERMINAL_IMAGE_RETIRED,
+                ViewClosed::ImageRetired { since: None },
+            ),
+            (TERMINAL_FEEDER_LOST, ViewClosed::FeederLost { since: 16 }),
             (
                 99,
                 ViewClosed::Other {
