@@ -29,6 +29,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The driver's sender and receiver agents run multicast flow control. Each
+  publication's `Outbound` holds a `Membership` (interim defaults: no
+  roles, `Strategy::Min`, a minimum window of one maximum frame, a maximum
+  window of half a term); a lane stages a frame only when the whole frame
+  fits below the receivers' edge (`window_waits`, once per wait), an
+  unresolved required loss holds every lane, staged heads included
+  (`held`), and a configured required receiver not yet joined holds new
+  staging (`not_joined`). Once a required receiver joins, a lane's
+  registered position follows the least position the required receivers
+  consumed. The membership follows the driver's `sm_interval`,
+  `image_liveness_timeout` and `idle_image_timeout`, checked at
+  configuration, and starts each lane's sent frontier at the reader's
+  join. Accepted SMs reach the membership, and a binding that expires, is
+  evicted or moves to another receiver id is reported gone in the same
+  call, a reset binding's former receiver included. The receiver sends each
+  image's SMs on its `SmSchedule` (join, interval and quarter window
+  progress), and records an SM as sent only once it is posted.
 - `karyos_driver::guard_gate::GuardGate`, the sender gate of a guarded
   publication's lanes (G-e2): one Acquire load of the guard word per
   check, `Aborting` and the applied epoch published once per incarnation,
