@@ -618,6 +618,53 @@ fn bad_headers_are_typed_errors() {
         })
     ));
     assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), before);
+    // The same with entries but no data behind the torn header: the
+    // entries alone make it corruption.
+    let disk = FaultDisk::default();
+    written(&disk);
+    let mut raw = disk.clone();
+    let data = raw
+        .open(&Path::new(DIR).join(data_name(RECORDING, 256)))
+        .unwrap();
+    raw.truncate(&data, 0).unwrap();
+    overwrite_header(&disk, 256, &[0xFF; 8]);
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 256,
+            problem: HeaderProblem::Corrupt
+        })
+    ));
+    assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), before);
+    // A missing (zeroed) header before the last segment is never a
+    // segment being created.
+    let disk = FaultDisk::default();
+    written(&disk);
+    overwrite_header(&disk, 128, &[0u8; 48]);
+    let mut raw = disk.clone();
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 128,
+            problem: HeaderProblem::Incomplete
+        })
+    ));
+    assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), before);
+    // An index whose data file is gone.
+    let disk = FaultDisk::default();
+    written(&disk);
+    let mut raw = disk.clone();
+    raw.remove(&Path::new(DIR).join(data_name(RECORDING, 128)))
+        .unwrap();
+    let before = raw.list(Path::new(DIR)).unwrap().len();
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 128,
+            problem: HeaderProblem::Incomplete
+        })
+    ));
+    assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), before);
     // Another version under a valid CRC.
     let disk = FaultDisk::default();
     written(&disk);
