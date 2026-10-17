@@ -469,7 +469,16 @@ impl SkipPolicy {
                 return Ok(());
             };
             if gate.before_seal(lane, position, extent, now) == GateAnswer::Pending {
-                // Posted: nothing lands in it until the gate permits.
+                // Posted: nothing lands in it until the gate permits. A lane
+                // holds one posted interval, so the lane's sealing stops at
+                // its first Pending: no later hole is posted while this one
+                // waits.
+                debug_assert!(
+                    owner
+                        .posted(lane)
+                        .is_none_or(|posted| posted.0 == position),
+                    "a second posted interval on one lane"
+                );
                 owner.post_seal(lane, position, extent)?;
                 if let Some(gated) = report.gated.checked_add(1) {
                     report.gated = gated;
