@@ -29,6 +29,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `make netem` (`scripts/netem-test.sh`, W6): the network fault tests in
+  Linux Docker with `NET_ADMIN`, under tc netem on the container's own
+  loopback (default profile: 2% loss, 10% reorder, 1 ms delay, 1%
+  duplicate; `KARYOS_NETEM` sets another). The log names the kernel and
+  the profile. Without the capability the run prints SKIPPED and fails,
+  and it fails if no netem test ran; the tests refuse to run outside the
+  job. A first test checks that the shaping takes effect.
 - The receiver's controls report a third send outcome. `ReportSlot` and
   `ReportGuard` (formerly `ProbeSlot` and `ProbeGuard`) carry an RTTM
   REQUEST's or a NAK's submission back to the receiver: submitted at the

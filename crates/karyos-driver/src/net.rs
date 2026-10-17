@@ -654,4 +654,7 @@ impl Stop for crate::agents::ReceiverAgent<OsSocket> {
 mod publish;
 
 #[cfg(test)]
+mod netem;
+
+#[cfg(test)]
 mod tests;
