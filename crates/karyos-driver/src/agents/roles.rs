@@ -427,6 +427,8 @@ pub struct ReceiverRole {
     groups: Vec<(EndpointId, i32, EndpointId, SocketAddr)>,
     /// `group_nak_budget`.
     group_budget: u32,
+    /// Where the next cycle's control group poll starts (rotating).
+    group_start: usize,
     max_entries: usize,
     rsp_destinations: EndpointRates,
     rsp_total: TotalRate,
@@ -1000,6 +1002,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             subscriptions: Vec::with_capacity(config.subscriptions),
             groups: Vec::with_capacity(config.subscriptions),
             group_budget: config.group_nak_budget,
+            group_start: 0,
             unsubscribed: false,
             published: Vec::with_capacity(config.subscriptions),
             max_entries: config.subscriptions,
@@ -2218,41 +2221,11 @@ impl ReceiverRole {
                 self.rx_epoch(*endpoint, rx.capabilities().epoch);
             }
         }
-        // Control group datagrams share one `group_nak_budget` per cycle.
-        let mut group_left = self.group_budget;
         for (endpoint, half) in halves.iter_mut() {
             let Half::Rx(rx) = half else {
                 continue;
             };
-            if self
-                .groups
-                .iter()
-                .any(|(.., control, _)| *control == *endpoint)
-            {
-                if group_left == 0 {
-                    continue;
-                }
-                let budget = Budget::new(
-                    group_left,
-                    u64::from(group_left)
-                        .checked_mul(u64::from(karyos_io::sockets::endpoint::MAX_DATAGRAM))
-                        .ok_or(overflow.clone())?,
-                    group_left.checked_add(1).ok_or(overflow.clone())?,
-                );
-                let mut intake = GroupIntake {
-                    endpoint: *endpoint,
-                    now,
-                    role: self,
-                    work: 0,
-                };
-                let _ = rx.poll_rx(budget, &mut intake);
-                let read = intake.work;
-                // A poll reads at most its budget's datagrams.
-                group_left = group_left.checked_sub(read).ok_or(overflow.clone())?;
-                if group_left == 0 {
-                    self.count(|c| &mut c.group_nak_budget_full);
-                }
-                work = work.checked_add(read).ok_or(overflow.clone())?;
+            if self.is_control_endpoint(*endpoint) {
                 continue;
             }
             let budget = self.budget;
@@ -2265,6 +2238,77 @@ impl ReceiverRole {
             };
             let _ = rx.poll_rx(budget, &mut intake);
             work = work.checked_add(intake.work).ok_or(overflow.clone())?;
+        }
+        work = work
+            .checked_add(self.poll_control_groups(halves, now)?)
+            .ok_or(overflow)?;
+        Ok(work)
+    }
+
+    /// Whether `endpoint` is joined to a subscription's NAK control group.
+    fn is_control_endpoint(&self, endpoint: EndpointId) -> bool {
+        self.groups
+            .iter()
+            .any(|(.., control, _)| *control == endpoint)
+    }
+
+    /// The control group endpoints' datagrams (RC-15): one
+    /// `group_nak_budget` per cycle, spent by every datagram the backend
+    /// consumed (dropped ones too). The first endpoint polled rotates each
+    /// cycle, so one busy group cannot starve the others. Returns the
+    /// datagrams consumed.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
+    fn poll_control_groups<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+    ) -> Result<u32, AgentError> {
+        let overflow = AgentError::CountOverflow(AgentKind::Receiver);
+        let count = halves.len();
+        if count == 0 || self.groups.is_empty() {
+            return Ok(0);
+        }
+        let start = self
+            .group_start
+            .checked_rem(count)
+            .ok_or(overflow.clone())?;
+        self.group_start = start.checked_add(1).ok_or(overflow.clone())?;
+        let mut left = self.group_budget;
+        let mut work = 0u32;
+        for step in 0..count {
+            let at = start
+                .checked_add(step)
+                .and_then(|at| at.checked_rem(count))
+                .ok_or(overflow.clone())?;
+            let Some((endpoint, Half::Rx(rx))) = halves.get_mut(at) else {
+                continue;
+            };
+            if left == 0 || !self.is_control_endpoint(*endpoint) {
+                continue;
+            }
+            let budget = Budget::new(
+                left,
+                u64::from(left)
+                    .checked_mul(u64::from(karyos_io::sockets::endpoint::MAX_DATAGRAM))
+                    .ok_or(overflow.clone())?,
+                left.checked_add(1).ok_or(overflow.clone())?,
+            );
+            let mut intake = GroupIntake {
+                endpoint: *endpoint,
+                now,
+                role: self,
+                work: 0,
+            };
+            let spent = rx.poll_rx(budget, &mut intake).spent.datagrams;
+            // A poll consumes at most its budget's datagrams.
+            left = left.checked_sub(spent).ok_or(overflow.clone())?;
+            if left == 0 {
+                self.count(|c| &mut c.group_nak_budget_full);
+            }
+            work = work.checked_add(spent).ok_or(overflow.clone())?;
         }
         Ok(work)
     }
@@ -2344,8 +2388,10 @@ impl GroupIntake<'_> {
 
 impl RxHandler for GroupIntake<'_> {
     fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
-        // At most the poll budget's datagrams: no overflow.
-        self.work += 1;
+        let Some(work) = self.work.checked_add(1) else {
+            return ControlFlow::Break(());
+        };
+        self.work = work;
         self.role.count(|c| &mut c.datagrams);
         self.bytes(datagram.bytes());
         ControlFlow::Continue(())
