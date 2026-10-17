@@ -80,11 +80,8 @@ impl LaneGate for DataGate<'_> {
         };
         // Heads leave in staging order.
         match track.staged.pop_front() {
-            Some((ticket, next, boundary)) if ticket == staged.ticket => match how {
-                // Only a block boundary is registered: it is a valid restart
-                // after a reset (`SenderRead::rewind`).
-                Left::Submitted if boundary => track.submitted = Some(next),
-                Left::Submitted => {}
+            Some((ticket, next)) if ticket == staged.ticket => match how {
+                Left::Submitted => track.submitted = Some(next),
                 Left::Returned | Left::Unknown => track.unsent = true,
             },
             _ => track.mismatched = true,
@@ -95,9 +92,8 @@ impl LaneGate for DataGate<'_> {
 /// One lane's staged heads, in order, and what left.
 #[derive(Debug)]
 struct LaneTrack {
-    /// Ticket, the stream position after it, and whether that position is
-    /// a block boundary, per staged datagram.
-    staged: VecDeque<(TxTicket, u64, bool)>,
+    /// Ticket and the stream position after it, per staged datagram.
+    staged: VecDeque<(TxTicket, u64)>,
     /// The position the last submitted head reached, this call.
     submitted: Option<u64>,
     /// The highest position any submitted head reached: a reliable lane's
@@ -326,7 +322,9 @@ impl Outbound {
         // gap to the receiver's gap policy (LaneSender::reopen).
         if self.opened.is_some() && self.reliable {
             for reader in &mut self.readers {
-                reader.rewind();
+                // A faulted reader cannot rewind: its lane is already ended
+                // (C-9) and its reads keep failing.
+                let _ = reader.rewind();
             }
         }
         self.opened = Some(epoch);
@@ -389,8 +387,10 @@ impl Outbound {
             } else {
                 submitted
             };
-            if target > reader.sent_position() {
-                let _ = reader.sent(target);
+            // Only a block boundary the reader returned is registered: the
+            // registered position is always a valid restart after a reset.
+            if let Some(boundary) = reader.boundary_at_or_below(target) {
+                let _ = reader.sent(boundary);
             }
         }
         Ok(work)
@@ -535,7 +535,7 @@ impl Outbound {
                 break;
             }
             if let Some(track) = self.tracks.get_mut(lane) {
-                track.staged.push_back((ticket, next, reader.at_boundary()));
+                track.staged.push_back((ticket, next));
             }
             self.counters.bump(
                 if record {
