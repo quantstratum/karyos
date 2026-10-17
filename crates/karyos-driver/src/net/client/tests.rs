@@ -1099,3 +1099,140 @@ fn a_lap_closes_the_network_subscriptions() {
         ))
     );
 }
+
+/// Offers `payload` on `publication` while serving both drivers until
+/// `done` holds for its outcome, for at most 10 s.
+fn offer_until(
+    drivers: &mut [&mut EmbeddedDriver],
+    publication: &mut karyos_client::ClientPublication,
+    mut done: impl FnMut(&OfferOutcome) -> bool,
+) {
+    let start = std::time::Instant::now();
+    loop {
+        let outcome = publication.offer(b"m").unwrap();
+        if done(&outcome) {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "last {outcome:?}"
+        );
+        for driver in drivers.iter_mut() {
+            let _ = driver.do_work().unwrap();
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
+/// SPEC §4: a network publication is connected while at least one
+/// receiver's status messages are live. With no receiver its offers are
+/// `NotConnected`; once a receiver subscribes and its SMs arrive they are
+/// accepted; once the receiver goes and its SMs lapse past the sender's
+/// receiver timeout, `NotConnected` again.
+#[test]
+fn a_network_publication_is_connected_while_a_receivers_sms_are_live() {
+    // The sender's receiver timeout is its image liveness timeout.
+    let mut a = driver_with(|config| {
+        if let Some(network) = &mut config.network {
+            network.agents.image_liveness_timeout = 300_000_000;
+        }
+    });
+    let mut publisher = a.connect().unwrap();
+    let port = port();
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}");
+    let published = publisher
+        .add_network_publication(&format!("{uri}|interface=127.0.0.1"), 10, false)
+        .unwrap();
+    let Outcome::Publication(mut publication) = complete(&mut a, &mut publisher, published) else {
+        panic!("not a publication");
+    };
+    // No receiver: nothing is appended, for a while.
+    for _ in 0..50 {
+        assert_eq!(publication.offer(b"m").unwrap(), OfferOutcome::NotConnected);
+        let _ = a.do_work().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // A receiver subscribes: its first SMs connect the publication.
+    let mut b = driver();
+    let mut subscriber = b.connect().unwrap();
+    let subscribed = subscriber
+        .add_network_subscription(&uri, 10, SubscriberRole::Required)
+        .unwrap();
+    assert!(matches!(
+        complete(&mut b, &mut subscriber, subscribed),
+        Outcome::NetworkSubscription { .. }
+    ));
+    offer_until(&mut [&mut a, &mut b], &mut publication, |outcome| {
+        matches!(outcome, OfferOutcome::Accepted { .. })
+    });
+    // The receiver goes: its SMs lapse, and the publication is unconnected
+    // again.
+    drop(subscriber);
+    drop(b);
+    offer_until(&mut [&mut a], &mut publication, |outcome| {
+        *outcome == OfferOutcome::NotConnected
+    });
+}
+
+/// `allow_unconnected` skips only the connection check: a network
+/// publication with no receiver accepts offers.
+#[test]
+fn allow_unconnected_skips_the_network_connection_check() {
+    let mut a = driver();
+    let mut publisher = a.connect().unwrap();
+    let port = port();
+    let published = publisher
+        .add_network_publication(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            10,
+            true,
+        )
+        .unwrap();
+    let Outcome::Publication(mut publication) = complete(&mut a, &mut publisher, published) else {
+        panic!("not a publication");
+    };
+    offer_until(&mut [&mut a], &mut publication, |outcome| {
+        matches!(outcome, OfferOutcome::Accepted { .. })
+    });
+}
+
+/// A network publication with a local reader of its stream reads as
+/// connected without a receiver: the IPC rule still applies to local
+/// readers (client-claims.md); only the sender's own cell waits for SMs.
+#[test]
+fn a_local_reader_keeps_a_network_publication_connected() {
+    let mut a = driver();
+    let port = port();
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(udp),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse(&format!(
+        "karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"
+    ))
+    else {
+        panic!("not a udp channel");
+    };
+    let defaults = crate::net::NetworkStreamDefaults {
+        term_length: 64 * 1024,
+        ..crate::net::NetworkStreamDefaults::default()
+    };
+    let config = super::aggregate(
+        &defaults,
+        &karyos_protocol::channel::CommonConfig::default(),
+        10,
+        5,
+        false,
+    )
+    .unwrap();
+    let handle = a.add_network_publication(config, &udp).unwrap();
+    let lane = handle.lane(karyos_sys::frame::Lane::ZERO).unwrap();
+    let mut publication = a.publication(lane).unwrap();
+    assert_eq!(publication.offer(b"m").unwrap(), OfferOutcome::NotConnected);
+    let _reader = a
+        .subscribe(lane, karyos_sys::log_buffer::Role::Required)
+        .unwrap();
+    assert!(matches!(
+        publication.offer(b"m").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+}
