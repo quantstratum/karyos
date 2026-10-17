@@ -11,6 +11,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-archive` gains its segment store (phase 3, A2): a recording's
+  positions in segment files of a checked multiple of the term length, each
+  with an index of CRC-32C checked writes; written and durable positions,
+  with data then index synced before `durable` advances; no-sync,
+  per-segment and interval policies; and recovery that keeps every whole,
+  checked write in order and reports where it cut. Syncs are `fdatasync` on
+  Linux and `F_FULLFSYNC` on Apple targets (through the standard library),
+  and a new segment's directory entry is synced on Linux. A table-driven
+  CRC-32C (`karyos_archive::crc32c`) needs no dependency. Recovery removes
+  only a last segment whose header is missing or torn (being created);
+  any other bad header is `SegmentError::BadHeader` and removes nothing.
+  The interval policy syncs a finished segment at its next tick, never on
+  the write path.
 - A conflated network view closes on its own. Its image retiring publishes
   the terminal reason `TERMINAL_IMAGE_RETIRED` (4) with an empty interval;
   exhausted versions or a feeder that cannot read on publish
