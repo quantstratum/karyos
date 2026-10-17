@@ -6183,3 +6183,102 @@ fn a_single_path_image_bypasses_the_path_queues() {
     assert_eq!(counters.path_queue_bypassed, 0, "{counters:?}");
     assert!(rig.agents.receiver.role.has_path_queues(), "kept");
 }
+
+/// rp-w7c, §8 Liveness: an idle path kept by PATH_HB stays live. Data
+/// flows every second on path A only (path A2 takes no copy: its
+/// selections are skipped, too few bytes for it to leave), for 15 s, past
+/// the path liveness timeout: A2 stays bound on the sender's PATH_HB
+/// alone, which never counts as image evidence (RP-2).
+#[test]
+fn an_idle_path_kept_by_path_heartbeats_stays_live() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents
+        .sender
+        .role
+        .publication_mut(0)
+        .unwrap()
+        .withhold_route(1, 1_000);
+    let heartbeats = rig.agents.receiver.counters().path_heartbeats;
+    for second in 0..15u8 {
+        rig.now += 1_000_000_000;
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[second; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..5 {
+            rig.round(true);
+        }
+        assert_eq!(
+            rig.agents.receiver.role.live_paths(slot),
+            2,
+            "both paths live after {} s",
+            second + 1
+        );
+    }
+    assert!(rig.agents.receiver.counters().path_heartbeats > heartbeats);
+    let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
+    assert_eq!(
+        outbound.path_state(1).map(|state| state.0),
+        Some(true),
+        "A2 never left"
+    );
+}
+
+/// rp-w7c, §8 Join reconciliation: a later path lost (silent past its
+/// liveness timeout) and bound again reconciles as a new later path: the
+/// image's position does not move, and its subscriber reads every message
+/// once, in order, across the loss and the rebind.
+#[test]
+fn a_path_lost_and_bound_again_moves_no_cursor() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let mut seen = Vec::new();
+    let mut next = 0u8;
+    let mut send = |rig: &mut Rig, seen: &mut Vec<u8>| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[next; 100], AppendOptions::default())
+            .unwrap();
+        next += 1;
+        for _ in 0..5 {
+            rig.round(true);
+            while let Some(message) = poll_message(&mut subscriber) {
+                seen.push(message[0]);
+            }
+        }
+    };
+    // The later path is silent: it times out while data flows.
+    for _ in 0..15 {
+        rig.now += 1_000_000_000;
+        send(&mut rig, &mut seen);
+        if rig.agents.receiver.role.live_paths(slot) == 1 {
+            break;
+        }
+    }
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1, "B2 lost");
+    // Bound again, at the sender's position now.
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    for _ in 0..4 {
+        send(&mut rig, &mut seen);
+    }
+    assert_eq!(seen, (0..next).collect::<Vec<u8>>());
+    assert!(rig.agents.receiver.role.has_image(slot));
+}

@@ -1078,6 +1078,17 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.ignore_naks();
     }
 
+    /// Lane `lane`'s sent frontier in its `index`-th publication: the
+    /// highest position a submitted datagram reached, `sent_high` (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast test (MC-1)")
+    )]
+    pub(crate) fn sent_high(&self, index: usize, lane: usize) -> Option<u64> {
+        self.role.outbound(index)?.sent_high(lane)
+    }
+
     /// Reads NAKs again after [`SenderAgent::ignore_naks`] (tests).
     #[cfg(test)]
     #[cfg_attr(
