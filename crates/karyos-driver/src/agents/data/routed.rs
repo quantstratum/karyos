@@ -342,6 +342,27 @@ impl Outbound {
             .chain(routed.into_iter().flat_map(Routed::endpoints))
     }
 
+    /// Whether one of its paths sends on `endpoint`: controls from a
+    /// receiver on any path (SM, NAK, RTTM) name the publication there.
+    #[must_use]
+    pub fn serves(&self, endpoint: EndpointId) -> bool {
+        self.route_endpoints().any(|held| held == endpoint)
+    }
+
+    /// The destination of its path on `endpoint`, where answers on that
+    /// path go; `None` when no path sends there.
+    #[must_use]
+    pub fn destination_on(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        match self.routed.as_deref() {
+            Some(routed) => routed
+                .routes
+                .iter()
+                .find(|route| route.endpoint == endpoint)
+                .map(|route| route.destination),
+            None => (self.endpoint == endpoint).then_some(self.destination),
+        }
+    }
+
     /// Lane `lane`'s sent frontier (tests).
     #[cfg(test)]
     pub(crate) fn sent_high(&self, lane: usize) -> Option<u64> {

@@ -3919,8 +3919,8 @@ impl SenderRole {
         let outbound = self
             .publications
             .iter()
-            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)?;
-        Some((outbound.destination(), outbound.joins()?))
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)?;
+        Some((outbound.destination_on(endpoint)?, outbound.joins()?))
     }
 
     /// One cycle: the controls the receiver handed over, then the
@@ -4350,7 +4350,7 @@ impl SenderRole {
         if let Some(membership) = self
             .publications
             .iter_mut()
-            .find(|outbound| outbound.endpoint() == key.endpoint && outbound.alias() == key.alias)
+            .find(|outbound| outbound.serves(key.endpoint) && outbound.alias() == key.alias)
             .and_then(|outbound| outbound.membership_mut())
         {
             let _ = membership.binding_gone(&key, now);
@@ -4442,7 +4442,7 @@ impl SenderRole {
                     .is_none_or(|id| id == nak.receiver.receiver_id)
         });
         let index = self.publications.iter().position(|outbound| {
-            outbound.endpoint() == endpoint
+            outbound.serves(endpoint)
                 && outbound.alias() == nak.alias
                 && outbound.repair().is_some()
         });
@@ -4607,7 +4607,7 @@ impl SenderRole {
         let publication = self
             .publications
             .iter()
-            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias);
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias);
         let lane_count =
             publication.and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
         // MC-2: an SM whose declared tag is not the one configured for its
@@ -4698,7 +4698,7 @@ impl SenderRole {
         if let Some(membership) = self
             .publications
             .iter_mut()
-            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias)
             .and_then(|outbound| outbound.membership_mut())
         {
             let _ = membership.status(&key, status, now);
