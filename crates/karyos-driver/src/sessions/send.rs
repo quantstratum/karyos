@@ -5,7 +5,11 @@
 //! `network-control-schemas.md` §6.2 and §6.3).
 //!
 //! - **Announce.** Each publication incarnation announces SETUP every
-//!   `setup_interval` until its first SM, then stops (SPEC §5).
+//!   `setup_interval` until its first SM, then stops (SPEC §5). When the
+//!   publication later has no live receiver (no live member and no
+//!   confirmed binding), the caller reports it disconnected and it
+//!   announces again until the next accepted SM: SPEC §5's rule applied
+//!   per connection episode (coordinator decision, ACS 15933).
 //! - **Challenge.** The sender answers an RSP_SETUP CHALLENGE only if its
 //!   identity block names a publication it currently sends, with that
 //!   stream and alias, on the endpoint where it arrived; otherwise the
@@ -86,8 +90,12 @@ pub struct SendCounters {
     pub rate_limited: u64,
     /// Challenges and solicits dropped with the rate table full.
     pub rate_sources_full: u64,
-    /// Incarnations established by their first SM.
+    /// Incarnations established by an SM: the first, and the first after
+    /// each disconnection.
     pub established: u64,
+    /// Established incarnations that lost every receiver and announce
+    /// again.
+    pub reannounced: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -241,6 +249,24 @@ impl SendSessions {
         self.sessions.iter_mut().find(|session| {
             session.publication.endpoint == endpoint && session.publication.alias == alias
         })
+    }
+
+    /// The publication on `endpoint` and `alias` has no live receiver: an
+    /// established one announces again from the next call of
+    /// [`SendSessions::announce_due`], every `setup_interval`, until an
+    /// accepted SM establishes it again. Returns whether it was
+    /// established.
+    pub fn disconnected(&mut self, endpoint: EndpointId, alias: Alias) -> bool {
+        let Some(session) = self.find_mut(endpoint, alias) else {
+            return false;
+        };
+        if !session.established {
+            return false;
+        }
+        session.established = false;
+        session.last_announce = None;
+        self.counters.bump(|c| &mut c.reannounced);
+        true
     }
 
     /// The announcements due at `now`, each to send on its endpoint;

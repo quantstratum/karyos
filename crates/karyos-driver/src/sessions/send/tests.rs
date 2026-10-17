@@ -111,6 +111,40 @@ fn announcements_repeat_until_the_first_sm() {
     assert_eq!(sessions.counters().established, 1);
 }
 
+/// ACS 15933: an established publication reported disconnected announces
+/// again at once, then every interval, and stops at the next SM; one not
+/// established, or unknown, is unchanged.
+#[test]
+fn a_disconnected_publication_announces_again() {
+    let mut sessions = SendSessions::new(4, INTERVAL, AnswerRate::default()).unwrap();
+    sessions.add(publication(5)).unwrap();
+    assert!(
+        !sessions.disconnected(EndpointId(1), alias(5)),
+        "not established"
+    );
+    assert!(!sessions.disconnected(EndpointId(1), alias(6)), "unknown");
+    let _ = due(&mut sessions, 0);
+    assert!(sessions.status(EndpointId(1), &sm(5, 1)));
+    // Disconnected within an interval of the last announcement: the next
+    // one is due at once, not an interval after the old one.
+    assert!(sessions.disconnected(EndpointId(1), alias(5)));
+    assert!(!sessions.is_established(EndpointId(1), alias(5)));
+    assert_eq!(due(&mut sessions, 2).len(), 1);
+    assert!(due(&mut sessions, INTERVAL + 1).is_empty());
+    assert_eq!(due(&mut sessions, INTERVAL + 2).len(), 1);
+    assert!(sessions.status(EndpointId(1), &sm(5, 1)));
+    assert!(due(&mut sessions, 20 * INTERVAL).is_empty());
+    let counters = sessions.counters();
+    assert_eq!(
+        (
+            counters.reannounced,
+            counters.established,
+            counters.announces
+        ),
+        (1, 2, 3)
+    );
+}
+
 /// A challenge naming our identity is answered with the echoed challenge
 /// and the current joins; another identity, alias or endpoint is dropped.
 #[test]

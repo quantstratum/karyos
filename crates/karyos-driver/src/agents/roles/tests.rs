@@ -1461,3 +1461,29 @@ fn solicits_need_a_subscription_an_answerable_source_and_a_term_bound() {
     assert_eq!(receiver.counters().term_too_large, 1);
     assert_eq!(receiver.counters().create_image, 0);
 }
+
+/// ACS 15933: a confirmed binding keeps a publication established even
+/// with no membership attached; once the binding expires, the publication
+/// is disconnected and announces again.
+#[test]
+fn a_confirmed_binding_keeps_the_publication_established() {
+    let mut sender = sm_sender();
+    let endpoint = EndpointId(1);
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(endpoint, receiver, &sm_status([7, 8], 0), 1);
+    assert!(sender.sessions.is_established(endpoint, alias()));
+    let mut halves: [(EndpointId, super::Half<karyos_io::sockets::OsSocket>); 0] = [];
+    sender.duty(&mut halves, 2).unwrap();
+    assert!(sender.sessions.is_established(endpoint, alias()));
+    assert_eq!(sender.session_counters().reannounced, 0);
+    // Past `image_liveness_timeout` with no SM: the binding expires.
+    sender
+        .duty(
+            &mut halves,
+            1 + AgentConfig::default().image_liveness_timeout,
+        )
+        .unwrap();
+    assert!(!sender.sessions.is_established(endpoint, alias()));
+    assert_eq!(sender.session_counters().reannounced, 1);
+}
