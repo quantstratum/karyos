@@ -3791,6 +3791,26 @@ impl SenderRole {
                 continue;
             }
             let consumption = self.consumption(endpoint, alias);
+            // A routed publication is served over every path's half
+            // (redundant paths, RP-10).
+            if let Some(outbound) = self.publications.get_mut(index)
+                && outbound.is_routed()
+            {
+                let lanes = outbound.readers().len();
+                let served = outbound.serve_routes(
+                    halves,
+                    DATA_BUDGET,
+                    consumption
+                        .as_ref()
+                        .and_then(|positions| positions.get(..lanes)),
+                    now,
+                )?;
+                work = work.checked_add(served).ok_or(overflow.clone())?;
+                if outbound.needs_reset() {
+                    needing_reset = needing_reset.checked_add(1).ok_or(overflow.clone())?;
+                }
+                continue;
+            }
             let tx = halves.iter_mut().find_map(|(held, half)| match half {
                 Half::Tx(tx) if *held == endpoint => Some(tx),
                 _ => None,
