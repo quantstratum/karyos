@@ -313,7 +313,9 @@ impl Rig {
         if serve {
             let events = &mut self.events;
             self.images
-                .poll(&self.links.sessions, |image| events.push(image));
+                .poll(&self.links.sessions, &mut LaneSource::heap(), |image| {
+                    events.push(image);
+                });
         }
         std::thread::sleep(Duration::from_micros(200));
     }
@@ -715,8 +717,14 @@ fn stale_replies_are_counted() {
         },
         SessionEvent::ImageReleased { slot: pending },
     ] {
-        rig.images
-            .handle(&rig.links.sessions, event, |image| events.push(image));
+        rig.images.handle(
+            &rig.links.sessions,
+            &mut LaneSource::heap(),
+            event,
+            |image| {
+                events.push(image);
+            },
+        );
     }
     assert!(events.is_empty());
     assert_eq!(rig.images.counters().stale_replies, 3);
@@ -3999,4 +4007,262 @@ fn an_overloaded_cycle_keeps_every_per_cycle_bound() {
     let sender = rig.agents.sender.counters();
     assert!(sender.nak_cycle_budget >= 1, "{sender:?}");
     assert!(sender.repairs >= 12, "{sender:?}");
+}
+
+/// The receiver's end of the session rings, driven by hand, and the table
+/// that serves them: the chain without agents or sockets.
+struct Chain<T: StreamTerms> {
+    end: super::super::chain::SessionEnd<T>,
+    link: SessionLink<T>,
+    images: ImageTable<T>,
+    events: Vec<ImageEvent>,
+}
+
+impl<T: StreamTerms> Chain<T> {
+    fn new(template: ImageTemplate) -> Self {
+        let (end, link) =
+            super::super::chain::session_rings(std::num::NonZeroUsize::new(FULL).unwrap());
+        Self {
+            end,
+            link,
+            images: ImageTable::new(8, template),
+            events: Vec::new(),
+        }
+    }
+
+    /// Posts the `CreateImage` of pending slot `slot` for `lanes` lanes of
+    /// 64 KiB terms, with its whole chain reserved.
+    fn create(&self, slot: u32, lanes: usize) {
+        let create = self.end.events.reserve().unwrap();
+        let chain = ImageChain {
+            command: self.end.credit.reserve().unwrap(),
+            reply: self.end.events.reserve().unwrap(),
+            reclaimed: self.end.credit.reserve().unwrap(),
+        };
+        let event = SessionEvent::CreateImage {
+            endpoint: EndpointId(1),
+            alias: alias(),
+            slot: SlotRef {
+                slot,
+                generation: 1,
+            },
+            identity: identity(),
+            term: term(65_536),
+            joins: Lanes::new(&vec![0u64; lanes]).unwrap(),
+            chain,
+        };
+        assert!(self.end.events.post(create, event).is_ok());
+    }
+
+    /// Posts `event` into a fresh unit.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux shared tests")
+    )]
+    fn post(&self, event: SessionEvent) {
+        let unit = self.end.events.reserve().unwrap();
+        assert!(self.end.events.post(unit, event).is_ok());
+    }
+
+    /// One poll of the table over `lanes`.
+    fn poll(&mut self, lanes: &mut LaneSource<'_>) {
+        let events = &mut self.events;
+        let _ = self
+            .images
+            .poll(&self.link, lanes, |event| events.push(event));
+    }
+
+    /// The receive owner and reply unit of the next `InstallImage`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux shared tests")
+    )]
+    fn install(&self) -> (Reservation, SlotRef, Box<ReceiveOwner<T>>) {
+        match self.end.commands.try_take().unwrap() {
+            Some(SessionCommand::InstallImage { reply, slot, owner }) => (reply, slot, owner),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// A lane that cannot be created at the second lane of a four-lane image
+/// refuses the image: `RefuseImage` is answered, `refused_storage` counted,
+/// nothing charged, and the first lane is already dropped when the answer
+/// is posted. Heap lanes here; the shared variant below uses regions.
+#[test]
+fn a_lane_that_cannot_be_created_refuses_the_whole_image() {
+    let mut chain = Chain::<karyos_sys::term_bytes::HeapTerms>::new(ImageTemplate::default());
+    chain.images.fail_lane = Some(1);
+    chain.create(1, 4);
+    chain.poll(&mut LaneSource::heap());
+    assert!(matches!(
+        chain.end.commands.try_take().unwrap(),
+        Some(SessionCommand::RefuseImage { .. })
+    ));
+    let counters = chain.images.counters();
+    assert_eq!((counters.refused_storage, counters.offered), (1, 0));
+    assert_eq!(chain.images.charged(), 0);
+    assert_eq!(chain.images.last_lanes.len(), 1, "the first lane was built");
+    assert!(
+        chain
+            .images
+            .last_lanes
+            .iter()
+            .all(|lane| lane.upgrade().is_none())
+    );
+}
+
+#[cfg(target_os = "linux")]
+mod shared {
+    //! The image table over the shared lane source (network-shared-terms
+    //! N-2): lanes in new regions with fresh, increasing ids.
+
+    use karyos_sys::term_bytes::SharedTerms;
+
+    use super::*;
+    use crate::admission::RegionIds;
+
+    const INSTANCE: u128 = 0x5eed;
+
+    fn region_ids(lanes: &[Arc<LogBuffer<SharedTerms>>]) -> Vec<u64> {
+        lanes
+            .iter()
+            .map(|lane| lane.region().unwrap().record().region)
+            .collect()
+    }
+
+    /// Install, retire and reclaim over regions: each lane is a region of
+    /// the driver's instance at generation 0, ids are fresh and increase
+    /// across images, and the charge returns to zero once both images are
+    /// reclaimed.
+    #[test]
+    fn image_lanes_are_regions_installed_retired_and_reclaimed() {
+        let mut next = 40u64;
+        let mut chain = Chain::<SharedTerms>::new(ImageTemplate::default());
+        let mut ids = Vec::new();
+        for slot in [1, 2] {
+            chain.create(slot, 2);
+            chain.poll(&mut LaneSource::regions(RegionIds::new(
+                INSTANCE, &mut next,
+            )));
+            let (reply, pending, owner) = chain.install();
+            let installed = SlotRef {
+                slot,
+                generation: 2,
+            };
+            assert!(
+                chain
+                    .end
+                    .events
+                    .post(
+                        reply,
+                        SessionEvent::ImageInstalled {
+                            slot: pending,
+                            installed,
+                            freshness: None,
+                        },
+                    )
+                    .is_ok()
+            );
+            chain.poll(&mut LaneSource::regions(RegionIds::new(
+                INSTANCE, &mut next,
+            )));
+            let lanes = chain.images.installed(installed).unwrap();
+            for lane in lanes {
+                let record = lane.region().unwrap().record();
+                assert_eq!((record.instance, record.generation), (INSTANCE, 0));
+            }
+            ids.extend(region_ids(lanes));
+            drop(owner);
+        }
+        assert_eq!(ids, vec![40, 41, 42, 43], "fresh and increasing");
+        assert_eq!(next, 44);
+        assert!(chain.images.charged() > 0);
+        for slot in [1, 2] {
+            chain.post(SessionEvent::RetireImage {
+                slot: SlotRef {
+                    slot,
+                    generation: 2,
+                },
+            });
+        }
+        chain.poll(&mut LaneSource::regions(RegionIds::new(
+            INSTANCE, &mut next,
+        )));
+        let counters = chain.images.counters();
+        assert_eq!((counters.retired, counters.reclaimed), (2, 2));
+        assert_eq!(chain.images.charged(), 0);
+        assert!(chain.images.is_empty());
+        let reclaimed = std::iter::from_fn(|| chain.end.commands.try_take().unwrap())
+            .filter(|command| matches!(command, SessionCommand::StorageReclaimed { .. }))
+            .count();
+        assert_eq!(reclaimed, 2);
+    }
+
+    /// A region failure at the second lane of a four-lane image refuses
+    /// the image, counts `refused_storage` and drops the first lane's
+    /// region before the answer; the next image takes fresh ids.
+    #[test]
+    fn a_region_failure_refuses_the_image_and_drops_its_regions() {
+        let mut next = 7u64;
+        let mut chain = Chain::<SharedTerms>::new(ImageTemplate::default());
+        chain.images.fail_lane = Some(1);
+        chain.create(1, 4);
+        chain.poll(&mut LaneSource::regions(RegionIds::new(
+            INSTANCE, &mut next,
+        )));
+        assert!(matches!(
+            chain.end.commands.try_take().unwrap(),
+            Some(SessionCommand::RefuseImage { .. })
+        ));
+        assert_eq!(chain.images.counters().refused_storage, 1);
+        assert_eq!(chain.images.charged(), 0);
+        assert_eq!(chain.images.last_lanes.len(), 1, "one region was created");
+        assert!(
+            chain
+                .images
+                .last_lanes
+                .iter()
+                .all(|lane| lane.upgrade().is_none())
+        );
+        assert_eq!(next, 8, "its id is spent, never reused");
+        chain.images.fail_lane = None;
+        chain.create(2, 1);
+        chain.poll(&mut LaneSource::regions(RegionIds::new(
+            INSTANCE, &mut next,
+        )));
+        let (_reply, _slot, owner) = chain.install();
+        drop(owner);
+        assert_eq!(chain.images.counters().offered, 1);
+        assert_eq!(next, 9);
+    }
+
+    /// Exhausted region ids refuse the image as storage, with nothing
+    /// charged or offered.
+    #[test]
+    fn exhausted_region_ids_refuse_the_image() {
+        let mut next = u64::MAX;
+        let mut chain = Chain::<SharedTerms>::new(ImageTemplate::default());
+        chain.create(1, 1);
+        chain.poll(&mut LaneSource::regions(RegionIds::new(
+            INSTANCE, &mut next,
+        )));
+        assert!(matches!(
+            chain.end.commands.try_take().unwrap(),
+            Some(SessionCommand::RefuseImage { .. })
+        ));
+        let counters = chain.images.counters();
+        assert_eq!((counters.refused_storage, counters.offered), (1, 0));
+        assert_eq!(chain.images.charged(), 0);
+    }
+
+    /// A shared table lent no regions (never, in an IPC driver) refuses as
+    /// storage rather than building heap lanes.
+    #[test]
+    fn a_shared_table_without_regions_refuses_the_image() {
+        let mut chain = Chain::<SharedTerms>::new(ImageTemplate::default());
+        chain.create(1, 1);
+        chain.poll(&mut LaneSource::heap());
+        assert_eq!(chain.images.counters().refused_storage, 1);
+    }
 }

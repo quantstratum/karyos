@@ -1806,3 +1806,48 @@ fn a_held_grant_fetched_on_a_retiring_stream_reports_closed_at_the_seal() {
         karyos_driver::StreamState::Retiring
     );
 }
+
+/// Resolution 4 (network streams over shared terms): an IPC driver with a
+/// network checks its descriptor limit at start. Bounds no `RLIMIT_NOFILE`
+/// can cover fail with the typed error naming both numbers; the default
+/// bounds start (480 descriptors, under any usual soft limit).
+#[test]
+fn an_ipc_driver_with_a_network_checks_its_descriptor_limit_at_start() {
+    let network = karyos_driver::net::NetworkConfig {
+        threading: karyos_driver::agents::ThreadingMode::Shared,
+        ..karyos_driver::net::NetworkConfig::default()
+    };
+    let limit = karyos_sys::ipc::descriptor_limit();
+    let over_dir = dir("descriptors-over");
+    let over = EmbeddedDriver::<SharedTerms>::with_ipc(
+        DriverConfig {
+            network: Some(network),
+            max_streams: 1 << 40,
+            ..DriverConfig::default()
+        },
+        ipc_config(&over_dir, 100),
+        Box::new(ManualClock::default()),
+    );
+    match limit {
+        Some(limit) => assert!(
+            matches!(
+                over,
+                Err(karyos_driver::DriverError::DescriptorLimit { needed, limit: l })
+                    if l == limit && needed == 64 * 4 + (1u64 << 40) * 3 + 16 * 2
+            ),
+            "{over:?}"
+        ),
+        None => assert!(over.is_ok(), "an unlimited process starts"),
+    }
+    let fits_dir = dir("descriptors-default");
+    let mut fits = EmbeddedDriver::<SharedTerms>::with_ipc(
+        DriverConfig {
+            network: Some(network),
+            ..DriverConfig::default()
+        },
+        ipc_config(&fits_dir, 100),
+        Box::new(ManualClock::default()),
+    )
+    .unwrap();
+    let _ = fits.close_network();
+}
