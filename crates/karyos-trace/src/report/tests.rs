@@ -864,3 +864,531 @@ fn a_declared_message_is_out_of_scope() {
     let held = report.messages();
     assert_eq!(held.len(), 2);
 }
+
+// Network journals (`quantstratum-docs: karyos/design/trace-network.md`
+// §5 and §8, "Membership"): fragments joined to their messages by
+// `message_id`, membership per message, parking, refusals.
+
+use karyos_protocol::trace_hook::NetSide;
+
+use crate::record::NetworkPath;
+
+/// The fragment of message `message` (its BEGIN position and id) at frame
+/// `frame`, observed at `point` on `path` at host time `time`.
+fn fragment(
+    point: Point,
+    message: u64,
+    frame: u64,
+    trace: u64,
+    time: u64,
+    path: u32,
+) -> crate::record::TraceRecord {
+    crate::record::TraceRecord {
+        position: frame,
+        ids: crate::record::TraceIds {
+            message_id: message,
+            ..observation(point, message, trace, time).ids
+        },
+        subscriber: None,
+        network: Some(NetworkPath { path, attempt: 0 }),
+        root: false,
+        ..observation(point, message, trace, time)
+    }
+}
+
+fn key() -> PublicationKey {
+    PublicationKey::from(PublicationId::from(IDENTITY))
+}
+
+/// A report over the publisher journal (Publish of `messages` in trace 1),
+/// a subscriber journal that polled them, and the given network journals:
+/// `(side, start, records, state)`, registered before the client journals
+/// when `network_first`, so their fragments drain before any Publish.
+fn network_report(
+    attribution: AttributionConfig,
+    messages: &[u64],
+    network: Vec<(
+        NetSide,
+        Option<u64>,
+        Vec<crate::record::TraceRecord>,
+        crate::source::SourceState,
+    )>,
+    network_first: bool,
+) -> TraceReport {
+    let mut report = TraceReport::new(attribution, HISTOGRAM);
+    let publishes: Vec<_> = messages
+        .iter()
+        .map(|position| observation(Point::Publish, *position, 1, 10))
+        .collect();
+    let polls: Vec<_> = messages
+        .iter()
+        .map(|position| observation(Point::SubscriberPoll, *position, 1, 90))
+        .collect();
+    let add_network = |report: &mut TraceReport| {
+        for (index, (side, start, records, state)) in network.iter().enumerate() {
+            report
+                .add_network_source(
+                    recorded(10 + index as u64, 0, records, *state),
+                    host(true),
+                    key(),
+                    *side,
+                    0,
+                    *start,
+                )
+                .unwrap();
+        }
+    };
+    if network_first {
+        add_network(&mut report);
+    }
+    report
+        .add_publisher_source(recorded(1, 0, &publishes, CLOSED), host(true), key())
+        .unwrap();
+    report
+        .add_subscriber_source(
+            recorded(2, 0, &polls, closed_at(1 << 20)),
+            host(true),
+            key(),
+            0,
+        )
+        .unwrap();
+    if !network_first {
+        add_network(&mut report);
+    }
+    report.drain().unwrap();
+    report
+}
+
+/// Every fragment joins its message by `message_id`, whichever journal
+/// drains first: a message of two fragments observed by the sender and the
+/// receiver completes its trace, and no fragment becomes a message.
+#[test]
+fn network_fragments_join_their_message() {
+    for network_first in [false, true] {
+        let sender = vec![
+            fragment(Point::SenderPickup, 64, 64, 1, 20, 0),
+            fragment(Point::SenderPickup, 64, 1472, 1, 21, 0),
+        ];
+        let receiver = vec![
+            fragment(Point::ReceiverCommit, 64, 64, 1, 40, 1),
+            fragment(Point::ReceiverCommit, 64, 1472, 1, 41, 1),
+        ];
+        let report = network_report(
+            ATTRIBUTION,
+            &[64],
+            vec![
+                (NetSide::Sender, Some(0), sender, closed_at(2880)),
+                (NetSide::Receiver, Some(0), receiver, closed_at(2880)),
+            ],
+            network_first,
+        );
+        assert_eq!(
+            report.trace([1, 1]),
+            TraceAnswer::Final(Verdict::Complete),
+            "network first: {network_first}"
+        );
+        assert_eq!(report.messages().len(), 1);
+        assert_eq!(report.parked(), ParkedCounts::default());
+    }
+}
+
+/// An expected network journal closed without any record of the message
+/// makes its trace Incomplete; one that is still open keeps it
+/// provisional.
+#[test]
+fn an_expected_network_journal_without_the_message_is_incomplete() {
+    let report = network_report(
+        ATTRIBUTION,
+        &[64],
+        vec![(NetSide::Receiver, Some(0), Vec::new(), closed_at(2880))],
+        false,
+    );
+    assert_eq!(
+        report.trace([1, 1]),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+    let report = network_report(
+        ATTRIBUTION,
+        &[64],
+        vec![(
+            NetSide::Sender,
+            Some(0),
+            Vec::new(),
+            crate::source::SourceState::Open,
+        )],
+        false,
+    );
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Provisional);
+}
+
+/// A network journal is not expected for a message below its start, at or
+/// beyond its boundary, or in a recorded gap; it is expected whenever it
+/// holds part of the message, even below its start.
+#[test]
+fn network_membership_follows_start_boundary_and_gaps() {
+    for (start, boundary) in [(Some(128), 2880), (Some(0), 64)] {
+        let report = network_report(
+            ATTRIBUTION,
+            &[64],
+            vec![(NetSide::Receiver, start, Vec::new(), closed_at(boundary))],
+            false,
+        );
+        assert_eq!(
+            report.trace([1, 1]),
+            TraceAnswer::Final(Verdict::Complete),
+            "{start:?} {boundary}"
+        );
+    }
+    // A recorded gap: the message's frame never committed.
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    report
+        .add_publisher_source(
+            recorded(1, 0, &[observation(Point::Publish, 64, 1, 10)], CLOSED),
+            host(true),
+            key(),
+        )
+        .unwrap();
+    let receiver = report
+        .add_network_source(
+            recorded(3, 0, &[], closed_at(2880)),
+            host(true),
+            key(),
+            NetSide::Receiver,
+            0,
+            Some(0),
+        )
+        .unwrap();
+    report.drain().unwrap();
+    assert_eq!(
+        report.trace([1, 1]),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+    report.network_gaps(receiver, &[(0, 1408)]);
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    // Holding a fragment of the message: expected, and observed.
+    let report = network_report(
+        ATTRIBUTION,
+        &[64],
+        vec![(
+            NetSide::Sender,
+            Some(1000),
+            vec![fragment(Point::SenderPickup, 64, 1472, 1, 20, 0)],
+            closed_at(2880),
+        )],
+        false,
+    );
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+}
+
+/// A publication with refused network journals never has a final
+/// `Complete`: its observations were never recorded.
+#[test]
+fn a_refused_network_journal_keeps_its_publication_from_complete() {
+    let mut report = network_report(ATTRIBUTION, &[64], Vec::new(), false);
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    let mut report_refused = network_report(ATTRIBUTION, &[64], Vec::new(), false);
+    report_refused.network_refused(key(), 1);
+    assert_eq!(report_refused.trace([1, 1]), TraceAnswer::OutOfScope);
+    // No refusal, or another publication's: unchanged.
+    report.network_refused(key(), 0);
+    report.network_refused(PublicationKey::from(PublicationId::from(IDENTITY_B)), 1);
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+}
+
+/// The parking area is bounded: an overflow is counted, keeps the final
+/// answers of its publication's traces and puts the others out of scope.
+#[test]
+fn a_parking_overflow_puts_the_publication_out_of_scope() {
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    // Trace 1 at 0 and trace 3 at 1 << 20.
+    report
+        .add_publisher_source(
+            recorded(
+                1,
+                0,
+                &[
+                    observation(Point::Publish, 0, 1, 10),
+                    observation(Point::Publish, 1 << 20, 3, 10),
+                ],
+                CLOSED,
+            ),
+            host(true),
+            key(),
+        )
+        .unwrap();
+    // The subscriber was expected for trace 1 and never polled it: final
+    // Incomplete. Trace 3 lies past its boundary.
+    report
+        .add_subscriber_source(recorded(2, 0, &[], closed_at(65)), host(true), key(), 0)
+        .unwrap();
+    // An open sender journal with one fragment more than the area holds,
+    // of a message whose Publish never comes.
+    let overflowing: Vec<_> = (0..=MAX_PARKED as u64)
+        .map(|frame| fragment(Point::SenderPickup, 1 << 30, frame, 2, 20, 0))
+        .collect();
+    report
+        .add_network_source(
+            recorded(3, 0, &overflowing, crate::source::SourceState::Open),
+            host(true),
+            key(),
+            NetSide::Sender,
+            0,
+            Some(1 << 21),
+        )
+        .unwrap();
+    report.drain().unwrap();
+    assert_eq!(report.parked().overflowed, 1);
+    assert_eq!(
+        report.trace([1, 1]),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+    assert_eq!(report.trace([3, 1]), TraceAnswer::OutOfScope);
+}
+
+/// A source like `recorded` whose journal also lost one record after
+/// them: every trace it holds is then Incomplete (`D` unbounded).
+fn lossy(
+    journal: u64,
+    records: &[crate::record::TraceRecord],
+    state: crate::source::SourceState,
+) -> Recorded {
+    let mut source = recorded(journal, 0, records, state);
+    source.attempted += 1;
+    source
+}
+
+/// A network journal registered with `report` from `source`.
+fn add_network_source(
+    report: &mut TraceReport,
+    source: Recorded,
+    side: NetSide,
+    lane: u8,
+    start: Option<u64>,
+) -> JournalId {
+    report
+        .add_network_source(source, host(true), key(), side, lane, start)
+        .unwrap()
+}
+
+/// The coordinator's #262 scenario: a parked fragment's message is
+/// published in another journal. The verdict is the same whichever journal
+/// drains first, and a fragment ages out only once its message can no
+/// longer appear.
+#[test]
+fn the_drain_order_never_changes_a_verdict() {
+    let attribution = AttributionConfig {
+        span: 100,
+        ..ATTRIBUTION
+    };
+    let network = || {
+        recorded(
+            3,
+            0,
+            &[
+                fragment(Point::SenderPickup, 64, 64, 1, 20, 0),
+                fragment(Point::SenderPickup, 4096, 4096, 2, 500, 0),
+            ],
+            closed_at(1 << 20),
+        )
+    };
+    let publisher = || recorded(1, 0, &[observation(Point::Publish, 64, 1, 10)], CLOSED);
+    let mut answers = Vec::new();
+    for network_first in [false, true] {
+        let mut report = TraceReport::new(attribution, HISTOGRAM);
+        if network_first {
+            add_network_source(&mut report, network(), NetSide::Sender, 0, Some(0));
+        }
+        report
+            .add_publisher_source(publisher(), host(true), key())
+            .unwrap();
+        if !network_first {
+            add_network_source(&mut report, network(), NetSide::Sender, 0, Some(0));
+        }
+        report.drain().unwrap();
+        // The fragment of message 4096 can never be named: aged out.
+        assert_eq!(
+            report.parked(),
+            ParkedCounts {
+                overflowed: 0,
+                aged: 1
+            }
+        );
+        answers.push(report.trace([1, 1]));
+    }
+    assert_eq!(answers, [TraceAnswer::Final(Verdict::Complete); 2]);
+}
+
+/// A parked fragment waits while a client journal of its publication is
+/// open, and ages out once all of them are terminal; with none
+/// registered it waits.
+#[test]
+fn a_parked_fragment_ages_out_only_when_its_message_cannot_appear() {
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    add_network_source(
+        &mut report,
+        recorded(
+            3,
+            0,
+            &[fragment(Point::SenderPickup, 64, 64, 2, 10, 0)],
+            crate::source::SourceState::Open,
+        ),
+        NetSide::Sender,
+        0,
+        Some(0),
+    );
+    report.drain().unwrap();
+    // No client journal of the publication: it waits.
+    assert_eq!(report.parked(), ParkedCounts::default());
+    let publisher = report
+        .add_publisher(
+            trace_journal(
+                4,
+                4,
+                ObserverId {
+                    driver: IDENTITY.driver,
+                    journal: 9,
+                },
+                1,
+            )
+            .unwrap()
+            .1,
+            ClockProvenance::HostMonotonic,
+            PublicationId::from(IDENTITY),
+        )
+        .unwrap();
+    report.drain().unwrap();
+    // An open publisher journal could still publish it.
+    assert_eq!(report.parked().aged, 0);
+    report.closed(publisher, None);
+    report.drain().unwrap();
+    assert_eq!(report.parked().aged, 1);
+}
+
+/// A network journal that holds part of a message is expected for it even
+/// below its start: its loss makes the trace Incomplete.
+#[test]
+fn a_journal_holding_the_message_is_expected_below_its_start() {
+    let report = network_report(ATTRIBUTION, &[64], Vec::new(), false);
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    let mut report = network_report(ATTRIBUTION, &[64], Vec::new(), false);
+    // Not expected by its start (1000), but it holds a fragment of the
+    // message and lost a record: expected, so Incomplete.
+    let _ = report.add_network_source(
+        lossy(
+            3,
+            &[fragment(Point::SenderPickup, 64, 1472, 1, 20, 0)],
+            closed_at(2880),
+        ),
+        host(true),
+        key(),
+        NetSide::Sender,
+        0,
+        Some(1000),
+    );
+    report.drain().unwrap();
+    assert_eq!(
+        report.trace([1, 1]),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+}
+
+/// Gap and lane edges: a message at a gap's start or in a second gap is
+/// not expected, one at a gap's end is; a journal of another lane is
+/// never expected.
+#[test]
+fn gap_and_lane_edges_decide_membership() {
+    let receiver = |report: &mut TraceReport, lane: u8| {
+        add_network_source(
+            report,
+            recorded(3, 0, &[], closed_at(1 << 20)),
+            NetSide::Receiver,
+            lane,
+            Some(0),
+        )
+    };
+    let gaps = [(64, 128), (512, 1024)];
+    for (position, expected) in [
+        (64, TraceAnswer::Final(Verdict::Complete)),
+        (128, TraceAnswer::Final(Verdict::Incomplete)),
+        (640, TraceAnswer::Final(Verdict::Complete)),
+    ] {
+        let mut report = network_report(ATTRIBUTION, &[position], Vec::new(), false);
+        let journal = receiver(&mut report, 0);
+        report.network_gaps(journal, &gaps);
+        report.drain().unwrap();
+        assert_eq!(report.trace([1, 1]), expected, "position {position}");
+    }
+    let mut report = network_report(ATTRIBUTION, &[64], Vec::new(), false);
+    let _ = receiver(&mut report, 2);
+    report.drain().unwrap();
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+}
+
+/// A poll can name the message first: network, then subscriber, then
+/// publisher journals complete the trace with one message and nothing
+/// parked.
+#[test]
+fn a_poll_first_names_the_message() {
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    add_network_source(
+        &mut report,
+        recorded(
+            3,
+            0,
+            &[
+                fragment(Point::SenderPickup, 64, 64, 1, 20, 0),
+                fragment(Point::SenderPickup, 64, 1472, 1, 21, 0),
+            ],
+            closed_at(2880),
+        ),
+        NetSide::Sender,
+        0,
+        Some(0),
+    );
+    report
+        .add_subscriber_source(
+            recorded(
+                2,
+                0,
+                &[observation(Point::SubscriberPoll, 64, 1, 90)],
+                closed_at(1 << 20),
+            ),
+            host(true),
+            key(),
+            0,
+        )
+        .unwrap();
+    report
+        .add_publisher_source(
+            recorded(1, 0, &[observation(Point::Publish, 64, 1, 10)], CLOSED),
+            host(true),
+            key(),
+        )
+        .unwrap();
+    report.drain().unwrap();
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(report.messages().len(), 1);
+    assert_eq!(report.parked(), ParkedCounts::default());
+}
+
+/// A network journal closed without a boundary is lost, as a subscriber
+/// journal without one is: its traces are Incomplete, never provisional
+/// for ever.
+#[test]
+fn a_network_journal_closed_without_a_boundary_is_lost() {
+    let report = network_report(
+        ATTRIBUTION,
+        &[64],
+        vec![(
+            NetSide::Sender,
+            Some(0),
+            vec![fragment(Point::SenderPickup, 64, 64, 1, 20, 0)],
+            CLOSED,
+        )],
+        false,
+    );
+    assert_eq!(
+        report.trace([1, 1]),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+}
