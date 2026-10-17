@@ -338,3 +338,21 @@ fn an_overrun_at_the_probes_zero_charge_serve_is_applied() {
     assert_eq!(lane.first_loss, Some(0));
     assert!(lane.end.is_none(), "rejoined at the head");
 }
+
+/// A lane ends cleanly at the stream's removal or at an image's remote EOS
+/// bound; a retired image, an unknown reason or any other end is not
+/// clean.
+#[test]
+fn a_lane_ends_cleanly_at_a_removal_or_an_images_eos() {
+    use karyos_sys::log_buffer::SealReason;
+
+    let closed = |reason| LaneEnd::Closed {
+        position: 0,
+        reason,
+    };
+    assert!(closed(SealReason::StreamRemoved).clean());
+    assert!(closed(SealReason::EndOfStream).clean());
+    assert!(!closed(SealReason::ImageRetired).clean());
+    assert!(!closed(SealReason::Unspecified).clean());
+    assert!(!LaneEnd::Revoked { position: 0 }.clean());
+}

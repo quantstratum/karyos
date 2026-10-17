@@ -132,6 +132,9 @@ pub enum ImageEvent {
     Retiring {
         /// The installed slot.
         slot: SlotRef,
+        /// Whether it ended cleanly at its lanes' EOS bounds
+        /// ([`SessionEvent::RetireImage`]).
+        complete: bool,
     },
     /// A retired image's storage was freed and `StorageReclaimed` posted.
     Reclaimed {
@@ -460,7 +463,7 @@ impl<T: StreamTerms> ImageTable<T> {
                 }
                 _ => self.counters.bump(|c| &mut c.stale_replies),
             },
-            SessionEvent::RetireImage { slot } => {
+            SessionEvent::RetireImage { slot, complete } => {
                 let found = self
                     .images
                     .iter_mut()
@@ -469,7 +472,7 @@ impl<T: StreamTerms> ImageTable<T> {
                     Some(image) => {
                         image.state = State::Retiring(slot);
                         self.counters.bump(|c| &mut c.retired);
-                        on_event(ImageEvent::Retiring { slot });
+                        on_event(ImageEvent::Retiring { slot, complete });
                     }
                     None => self.counters.bump(|c| &mut c.stale_replies),
                 }

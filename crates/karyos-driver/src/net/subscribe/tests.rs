@@ -1281,3 +1281,89 @@ fn a_liveness_retirement_ends_unsent_image_grants_and_the_exit_proof_the_rest() 
     assert!(b.streams.iter().all(|stream| stream.id != image_stream));
     let _ = (a.close_network(), b.close_network());
 }
+
+/// Network streams' terminal bound (network-sessions.md, Liveness and
+/// terminal transitions): EOS on each lane's last message names its bound,
+/// the image closes cleanly once both lanes' complete prefixes reach it,
+/// and the subscriber reads every message, the EOS one marked, then a clean
+/// terminal: every lane closed at `EndOfStream`.
+#[test]
+fn eos_on_every_lane_ends_the_image_cleanly_after_the_last_message() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 2), &channel(address))
+        .unwrap();
+    let mut image = None;
+    pump(&mut a, &mut b, |_, b| {
+        image = b.network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    let mut lanes = [
+        a.publication(publication.lane(Lane::ZERO).unwrap())
+            .unwrap(),
+        a.publication(publication.lane(Lane::try_new(1).unwrap()).unwrap())
+            .unwrap(),
+    ];
+    let eos = karyos_sys::log_buffer::AppendOptions {
+        end_of_stream: true,
+        ..karyos_sys::log_buffer::AppendOptions::default()
+    };
+    // Two messages on lane 0, the second the end; one on lane 1.
+    let mut offered = [0u8; 2];
+    let plan: [&[(u8, bool)]; 2] = [&[(1, false), (2, true)], &[(3, true)]];
+    let mut seen = Vec::new();
+    let mut terminal = None;
+    pump(&mut a, &mut b, |_, _| {
+        for (lane, publication) in lanes.iter_mut().enumerate() {
+            while let Some(&(fill, end)) = plan[lane].get(usize::from(offered[lane])) {
+                let options = if end {
+                    eos
+                } else {
+                    karyos_sys::log_buffer::AppendOptions::default()
+                };
+                match publication.offer_with(&[fill; 300], options).unwrap() {
+                    OfferOutcome::Accepted { .. } => offered[lane] += 1,
+                    _ => break,
+                }
+            }
+        }
+        let poll = reader.poll(
+            |bytes, lane, info| seen.push((lane.get(), bytes[0], info.end_of_stream)),
+            BUDGET,
+        );
+        if poll.terminal.is_some() {
+            terminal = Some(poll);
+        }
+        terminal.is_some()
+    });
+    let poll = terminal.unwrap();
+    seen.sort_unstable();
+    assert_eq!(seen, [(0, 1, false), (0, 2, true), (1, 3, true)]);
+    assert!(poll.terminal.unwrap().clean, "{poll:?}");
+    for lane in &poll.lanes {
+        assert!(
+            matches!(
+                lane.end,
+                Some(karyos_client::aggregate::LaneEnd::Closed {
+                    reason: karyos_sys::log_buffer::SealReason::EndOfStream,
+                    ..
+                })
+            ),
+            "{lane:?}"
+        );
+    }
+    let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert_eq!(
+        (receiver.eos_bounds, receiver.images_closed_eos),
+        (2, 1),
+        "{receiver:?}"
+    );
+    drop(lanes);
+    let _ = (a.close_network(), b.close_network());
+}

@@ -728,12 +728,14 @@ fn seal_reason_codes_round_trip() {
         (SealReason::GuardClosed, 5),
         (SealReason::DeadlineMissed, 6),
         (SealReason::ImageRetired, 7),
+        (SealReason::EndOfStream, 8),
     ] {
         assert_eq!(reason.code(), code);
         assert_eq!(SealReason::from_code(code), reason);
     }
     assert!(!SealReason::ImageRetired.is_gate());
-    assert_eq!(SealReason::from_code(8), SealReason::Unspecified);
+    assert!(!SealReason::EndOfStream.is_gate());
+    assert_eq!(SealReason::from_code(9), SealReason::Unspecified);
 }
 
 /// A guard close aborts the admitted claim at once, whatever its deadline

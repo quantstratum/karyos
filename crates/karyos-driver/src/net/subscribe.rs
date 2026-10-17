@@ -14,7 +14,9 @@
 //! - **Retirement.** A retiring image's streams are sealed with
 //!   [`SealReason::ImageRetired`](karyos_sys::log_buffer::SealReason) and
 //!   retired; they free once no lease holds them, and only then does the
-//!   image table reclaim the image.
+//!   image table reclaim the image. An image whose every lane reached the
+//!   terminal bound its EOS named, through a complete prefix, is sealed
+//!   with `SealReason::EndOfStream` instead: its clean end.
 //! - **Scope.** Unicast (the channel's `endpoint` is the local receive
 //!   address) and IPv4 multicast (the group's port, joined on `interface`
 //!   or any); interface names and IPv6 groups are refused. Heap terms only

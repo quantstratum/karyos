@@ -1847,6 +1847,9 @@ pub enum CloseReason {
     /// The stream is an image whose remote publication the receiver
     /// retired.
     ImageRetired,
+    /// The stream is an image whose remote publication ended: every lane
+    /// reached its EOS bound through a complete prefix.
+    EndOfStream,
 }
 
 impl CloseReason {
@@ -1859,6 +1862,7 @@ impl CloseReason {
             Self::StreamRemoved => 3,
             Self::ConflationFeederLost => 4,
             Self::ImageRetired => 7,
+            Self::EndOfStream => 8,
         }
     }
 
@@ -1869,6 +1873,7 @@ impl CloseReason {
             3 => Some(Self::StreamRemoved),
             4 => Some(Self::ConflationFeederLost),
             7 => Some(Self::ImageRetired),
+            8 => Some(Self::EndOfStream),
             _ => None,
         }
     }
@@ -1883,6 +1888,7 @@ impl CloseReason {
             SealReason::StreamRemoved => Some(Self::StreamRemoved),
             SealReason::ConflationFeederLost => Some(Self::ConflationFeederLost),
             SealReason::ImageRetired => Some(Self::ImageRetired),
+            SealReason::EndOfStream => Some(Self::EndOfStream),
             _ => None,
         }
     }
@@ -2143,6 +2149,7 @@ mod tests {
             SealReason::StreamRemoved,
             SealReason::ConflationFeederLost,
             SealReason::ImageRetired,
+            SealReason::EndOfStream,
         ] {
             let close = CloseReason::from_seal(reason).unwrap();
             assert_eq!(close.code(), reason.code());
