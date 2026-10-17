@@ -318,6 +318,19 @@ release may break APIs, wire formats and shared-memory layouts.
   `RANGE_UNAVAILABLE` names the floor of that moment. `repair-fair` checks
   that two backlogged lanes stay within `Q + 2 F` of each other. Each
   oracle fails under a mutant of the components.
+- NAK reads in the sender read capability (phase 6, network-sessions-sender.md
+  S2 2.3, ACS 15762 and 15763): `SenderRead::read_nak(from, NakRead {
+  bound, loads }, out)` copies whole frames from an untrusted NAK position
+  below the NAK bound, never moving the cursor, the open block, the
+  registered position or the boundary ring, and never feeding C-9. The
+  position is proved a frame boundary by a word 0 walk from a checkpoint
+  (`nak_checkpoint_stride`, default 64 KiB, `SenderRead::with_nak_stride`):
+  every frame the cursor path copies records, per stride it passes, the
+  first frame start at or after the stride and its block's end when
+  interior, in arrays tagged with their term count and read only for it.
+  A scan spends at most `stride / 32 + 1` loads from a recorded entry and
+  returns the loads spent; it never reads a payload word. New
+  `ReadError::BadRequest` and `ReadError::Budget`, and NAK counters.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly

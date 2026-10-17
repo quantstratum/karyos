@@ -80,9 +80,13 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         let mut frame = first;
         let mut reserved: u32 = 0;
         let mut length: u32 = 0;
+        let mut frames: u32 = 0;
         // Every iteration moves `offset` forward by a positive extent
         // inside the term, so the walk ends.
         loop {
+            frames = frames
+                .checked_add(1)
+                .ok_or_else(|| corrupt(offset, "fragment count overflow"))?;
             let header_length = frame.word0.flags().header_length();
             let frame_length = frame.word0.frame_length().cast_unsigned();
             reserved = reserved.saturating_add(frame.reserved);
@@ -100,6 +104,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                     length,
                     end_of_stream: frame.word0.flags().eos(),
                     ext: flags.ext(),
+                    frames,
                 }));
             }
             if offset == term_length {

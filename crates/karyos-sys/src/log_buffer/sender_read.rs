@@ -35,12 +35,25 @@
 //!   every later call returns [`ReadError::Faulted`]. The block is never
 //!   skipped.
 //!
-//! Limits of this phase: the only origin is the sender's own cursor
-//! ([`ReadOrigin::Cursor`]); NAK reads (S2 2.3, `BadRequest` and the
-//! checkpoint arrays) and reads of a draining generation (2.4) come with
-//! repair in phase 6, and so does the retention floor at `sent -
-//! retransmit_window`: until then the registered position bounds it. A
-//! reader covers one lane; the incarnation's lanes are the sender agent's.
+//! - **NAK reads** (S2 2.3; ACS 15762, 15763). [`SenderRead::read_nak`]
+//!   copies from an untrusted position below the NAK bound, never moving
+//!   the cursor, the open block, the registered position or the boundary
+//!   ring, and never feeding C-9. It proves the position a frame boundary
+//!   by walking word 0 values forward from a checkpoint: as the cursor
+//!   path copies, every frame it copies records, for each multiple of
+//!   `nak_checkpoint_stride` it passes in that term, the first frame start
+//!   at or after it, with its block's end when it is an interior
+//!   fragment. Each term slot's array is tagged with
+//!   its term count and is read only for that count; a missing or other
+//!   tag falls back to an earlier entry or the term start, itself a
+//!   boundary. A scan costs at most `stride / 32 + 1` word 0 loads from a
+//!   recorded entry, charged against the caller's budget; it never reads a
+//!   payload word, so a forged header inside a payload is never landed on.
+//!
+//! Limits of this phase: reads of a draining generation (2.4) and the
+//! retention floor at `sent - retransmit_window` come later; until then
+//! the registered position bounds the floor. A reader covers one lane; the
+//! incarnation's lanes are the sender agent's.
 //!
 //! Safety (ADR-0034): every term byte is read under a loan taken with the
 //! SPEC §4 acquisition (`take_loan`: loan word `SeqCst`, then the slot
@@ -78,6 +91,33 @@ pub const DEFAULT_CORRUPT_RETRIES: u32 = 3;
 
 /// Bytes of a canonical PAD or ABORTED record.
 const CANONICAL_LENGTH: usize = HEADER_LENGTH as usize;
+
+/// The default `nak_checkpoint_stride` (C-8): at most the term length.
+pub const DEFAULT_NAK_CHECKPOINT_STRIDE: u32 = 64 * 1024;
+
+/// The least `nak_checkpoint_stride` (C-8).
+pub const MIN_NAK_CHECKPOINT_STRIDE: u32 = 4 * 1024;
+
+/// A checkpoint entry: a frame's term offset and its block's end when it
+/// is an interior fragment (0 for a block start).
+type Checkpoint = (u32, u32);
+
+/// One term slot's checkpoints and the term count they belong to.
+type CheckpointArray = (Option<TermCount>, Vec<Checkpoint>);
+
+/// A checkpoint entry with nothing recorded.
+const NO_CHECKPOINT: Checkpoint = (u32::MAX, 0);
+
+/// A NAK read's bounds (S2 2.3): the lane's NAK bound, read once by the
+/// caller (`sent_position`, or `sent_high` with redundant paths), and the
+/// word 0 loads the scan may spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NakRead {
+    /// Positions at or above it are `BadRequest`.
+    pub bound: u64,
+    /// Word 0 loads the scan may spend.
+    pub loads: u32,
+}
 
 /// Where a read's position came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +195,13 @@ pub enum ReadError {
         /// Bytes needed.
         needed: usize,
     },
+    /// A NAK position that is not a frame boundary, is at or above the NAK
+    /// bound, lies past the head, or overflows: a peer error, counted,
+    /// never an `Invariant`.
+    BadRequest,
+    /// A NAK scan did not fit its load budget: dropped and counted, never
+    /// answered; the receiver repeats it.
+    Budget,
 }
 
 /// The reader's counters (S2 2.6): checked, sticky on overflow. The NAK
@@ -176,6 +223,16 @@ pub struct SenderReadCounters {
     pub corrupt: u64,
     /// `Invariant` results.
     pub invariant: u64,
+    /// NAK reads that copied frames or a canonical record.
+    pub nak_reads: u64,
+    /// NAK reads refused as `BadRequest`.
+    pub nak_bad_request: u64,
+    /// NAK reads dropped for their load budget.
+    pub nak_budget: u64,
+    /// NAK reads that met a corrupt word 0 (never C-9).
+    pub nak_corrupt: u64,
+    /// Word 0 loads spent by NAK scans.
+    pub nak_loads: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -220,6 +277,97 @@ enum CopyError {
     Invariant,
 }
 
+/// The NAK checkpoints of one lane (S2 2.3, C-8): per term slot, an array
+/// tagged with its term count whose entry `i` is the first frame start at
+/// or after `i * stride` in that term, paired with the end of its block
+/// when it is an interior fragment (0 for a block start), recorded only by
+/// the cursor path from frames it copied.
+#[derive(Debug)]
+struct Checkpoints {
+    stride: u32,
+    arrays: Vec<CheckpointArray>,
+    /// The last frame start the cursor path recorded.
+    last: u64,
+}
+
+impl Checkpoints {
+    fn new(term_length: u32, slots: u8, stride: u32, last: u64) -> Self {
+        let per_term = term_length
+            .checked_div(stride)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0);
+        let arrays = (0..slots)
+            .map(|_| (None, vec![NO_CHECKPOINT; per_term]))
+            .collect();
+        Self {
+            stride,
+            arrays,
+            last,
+        }
+    }
+
+    fn index(&self, count: TermCount) -> Option<usize> {
+        let slots = u32::try_from(self.arrays.len()).ok()?;
+        usize::try_from(count.get().checked_rem(slots)?).ok()
+    }
+
+    /// The array of `count`, if its tag is `count`.
+    fn array(&self, count: TermCount) -> Option<&[Checkpoint]> {
+        let (tag, entries) = self.arrays.get(self.index(count)?)?;
+        (*tag == Some(count)).then_some(entries.as_slice())
+    }
+
+    /// Records `frame`, the start of a frame the cursor path copied after
+    /// `self.last` (`block_end` its block's end for an interior fragment, 0
+    /// for a block start): every stride multiple `m` of its term with
+    /// `last < m <= frame` gets it. Arithmetic that cannot be done records
+    /// nothing (a missing entry only costs loads).
+    fn record(&mut self, term_length: u32, frame: u64, block_end: u32) {
+        let last = core::mem::replace(&mut self.last, frame);
+        let term = u64::from(term_length);
+        let (Some(index), Some(offset)) = (frame.checked_div(term), frame.checked_rem(term)) else {
+            return;
+        };
+        let Some(count) = u32::try_from(index)
+            .ok()
+            .and_then(|count| TermCount::try_new(count).ok())
+        else {
+            return;
+        };
+        let Some(base) = index.checked_mul(term) else {
+            return;
+        };
+        let stride = u64::from(self.stride);
+        // The first stride past the previous frame: in this term, the one
+        // after it; from an earlier term, this term's first.
+        let first = match last.checked_sub(base) {
+            Some(within) => within.checked_div(stride).and_then(|i| i.checked_add(1)),
+            None => Some(0),
+        };
+        let (Some(first), Some(end)) = (first, offset.checked_div(stride)) else {
+            return;
+        };
+        let Ok(value) = u32::try_from(offset) else {
+            return;
+        };
+        let Some(slot) = self.index(count) else {
+            return;
+        };
+        let Some((tag, entries)) = self.arrays.get_mut(slot) else {
+            return;
+        };
+        if *tag != Some(count) {
+            *tag = Some(count);
+            entries.fill(NO_CHECKPOINT);
+        }
+        for i in first..=end {
+            if let Some(entry) = usize::try_from(i).ok().and_then(|i| entries.get_mut(i)) {
+                *entry = (value, block_end);
+            }
+        }
+    }
+}
+
 /// The sender read capability of one lane (see the module documentation).
 #[derive(Debug)]
 pub struct SenderRead<O: BufferOwner> {
@@ -238,6 +386,8 @@ pub struct SenderRead<O: BufferOwner> {
     /// registered position is always a block start that
     /// [`SenderRead::rewind`] can restart at.
     boundaries: VecDeque<u64>,
+    /// The NAK checkpoints (S2 2.3).
+    checkpoints: Checkpoints,
 }
 
 /// Block-boundary read ends a reader remembers until they are registered.
@@ -274,7 +424,33 @@ impl<O: BufferOwner> SenderRead<O> {
     ///
     /// [`SysError::InvalidPublicationMode`] for an image, or for any other
     /// cell (another role, or a required cell without its reservation).
-    pub fn new(mut subscription: Subscription<O>, corrupt_retries: u32) -> Result<Self, SysError> {
+    pub fn new(subscription: Subscription<O>, corrupt_retries: u32) -> Result<Self, SysError> {
+        let stride = DEFAULT_NAK_CHECKPOINT_STRIDE.min(subscription.buffer.term_length);
+        Self::with_nak_stride(subscription, corrupt_retries, stride)
+    }
+
+    /// [`SenderRead::new`] with NAK checkpoints every `nak_checkpoint_stride`
+    /// bytes of a term (C-8), allocated here.
+    ///
+    /// # Errors
+    ///
+    /// As [`SenderRead::new`], and [`SysError::InvalidPublicationMode`] for a
+    /// stride that is not a power of two from
+    /// [`MIN_NAK_CHECKPOINT_STRIDE`] to the term length.
+    pub fn with_nak_stride(
+        mut subscription: Subscription<O>,
+        corrupt_retries: u32,
+        nak_checkpoint_stride: u32,
+    ) -> Result<Self, SysError> {
+        let term_length = subscription.buffer.term_length;
+        if !nak_checkpoint_stride.is_power_of_two()
+            || nak_checkpoint_stride < MIN_NAK_CHECKPOINT_STRIDE
+            || nak_checkpoint_stride > term_length
+        {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "nak_checkpoint_stride is a power of two from 4 KiB to the term length",
+            });
+        }
         if subscription.buffer.image() {
             return Err(SysError::InvalidPublicationMode {
                 reason: "a sender read of an image",
@@ -292,6 +468,12 @@ impl<O: BufferOwner> SenderRead<O> {
         if subscription.cursor.pending.take().is_some() {
             subscription.cursor.position = subscription.cursor.acknowledged;
         }
+        let checkpoints = Checkpoints::new(
+            term_length,
+            subscription.buffer.slots,
+            nak_checkpoint_stride,
+            subscription.cursor.position,
+        );
         Ok(Self {
             subscription,
             open: None,
@@ -301,6 +483,7 @@ impl<O: BufferOwner> SenderRead<O> {
             counters: SenderReadCounters::default(),
             hook: HookSlot::default(),
             boundaries: VecDeque::with_capacity(BOUNDARIES),
+            checkpoints,
         })
     }
 
@@ -308,6 +491,26 @@ impl<O: BufferOwner> SenderRead<O> {
     #[cfg(test)]
     pub(crate) fn inject(&mut self, hook: TestHook) {
         self.hook = Some(hook);
+    }
+
+    /// Plants checkpoint `index` of the array of `count`'s slot, tagged
+    /// `tag` (tests: a stale or foreign entry).
+    #[cfg(test)]
+    pub(crate) fn plant_checkpoint(
+        &mut self,
+        count: TermCount,
+        tag: TermCount,
+        index: usize,
+        entry: (u32, u32),
+    ) {
+        if let Some(slot) = self.checkpoints.index(count)
+            && let Some((held, entries)) = self.checkpoints.arrays.get_mut(slot)
+        {
+            *held = Some(tag);
+            if let Some(planted) = entries.get_mut(index) {
+                *planted = entry;
+            }
+        }
     }
 
     /// The buffer it reads.
@@ -368,6 +571,8 @@ impl<O: BufferOwner> SenderRead<O> {
         cursor.position = cursor.acknowledged;
         self.open = None;
         self.boundaries.clear();
+        // The rereads record the same boundaries again, from here.
+        self.checkpoints.last = cursor.acknowledged;
         Ok(())
     }
 
@@ -497,8 +702,319 @@ impl<O: BufferOwner> SenderRead<O> {
                 return Err(ReadError::CorruptTerm { failures });
             }
             Err(ReadError::Faulted { .. }) => self.counters.bump(|c| &mut c.corrupt, 1),
+            // NAK reads only.
+            Err(ReadError::BadRequest | ReadError::Budget) => {}
         }
         result
+    }
+
+    /// Copies committed frames of this lane starting at `from`, a NAK's
+    /// untrusted position, into `out` (S2 2.3), without crossing a term
+    /// end or the seal. Nothing of the cursor path moves: not the cursor,
+    /// the open block, the registered position, the boundary ring or the
+    /// C-9 count. `from` must be a frame boundary below `nak.bound`, proved
+    /// by a word 0 walk from a checkpoint within `nak.loads`. Returns the
+    /// result and the loads spent.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::BadRequest`], [`ReadError::Budget`], `Unavailable`,
+    /// `Retry`, `Revoked`, `CorruptTerm` (counted as a NAK corruption,
+    /// never C-9), `TooSmall` or `Faulted`; the loan word is empty on every
+    /// return.
+    pub fn read_nak(
+        &mut self,
+        from: u64,
+        nak: NakRead,
+        out: &mut [u8],
+    ) -> (Result<ReadOutcome, ReadError>, u32) {
+        let (result, loads) = match self.faulted {
+            Some(position) => (Err(ReadError::Faulted { position }), 0),
+            None => self.nak(from, nak, out),
+        };
+        self.counters.bump(|c| &mut c.nak_loads, u64::from(loads));
+        match result {
+            Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. }) => {
+                self.counters.bump(|c| &mut c.nak_reads, 1);
+            }
+            Err(ReadError::BadRequest) => self.counters.bump(|c| &mut c.nak_bad_request, 1),
+            Err(ReadError::Budget) => self.counters.bump(|c| &mut c.nak_budget, 1),
+            Err(ReadError::CorruptTerm { .. }) => self.counters.bump(|c| &mut c.nak_corrupt, 1),
+            Err(ReadError::Unavailable { .. }) => self.counters.bump(|c| &mut c.unavailable, 1),
+            Err(ReadError::Retry) => self.counters.bump(|c| &mut c.retry, 1),
+            Err(ReadError::Invariant) => self.counters.bump(|c| &mut c.invariant, 1),
+            Ok(ReadOutcome::Pending)
+            | Err(ReadError::TooSmall { .. } | ReadError::Revoked | ReadError::Faulted { .. }) => {}
+        }
+        (result, loads)
+    }
+
+    fn nak(
+        &mut self,
+        from: u64,
+        nak: NakRead,
+        out: &mut [u8],
+    ) -> (Result<ReadOutcome, ReadError>, u32) {
+        let Self {
+            subscription,
+            hook,
+            checkpoints,
+            ..
+        } = self;
+        let buffer = &*subscription.buffer;
+        if from >= nak.bound || !from.is_multiple_of(u64::from(crate::frame::FRAME_ALIGNMENT)) {
+            return (Err(ReadError::BadRequest), 0);
+        }
+        // The retention floor, before any loan.
+        let floor = buffer.floor().load(Ordering::Acquire);
+        if from < floor {
+            return (Err(ReadError::Unavailable { lowest: floor }), 0);
+        }
+        let Ok((count, offset)) = buffer.split(from) else {
+            return (Err(ReadError::BadRequest), 0);
+        };
+        match buffer.head() {
+            Ok(Some(head)) if from < head => {}
+            Ok(Some(_)) => return (Err(ReadError::BadRequest), 0),
+            Ok(None) => return (Err(ReadError::Retry), 0),
+            Err(_) => return (Err(ReadError::Invariant), 0),
+        }
+        let slot = match buffer.lookup(count) {
+            Ok(Lookup::Slot(slot)) => slot,
+            Ok(Lookup::Missing) => return (Err(ReadError::Retry), 0),
+            Ok(Lookup::Gone) => {
+                let lowest = buffer.floor().load(Ordering::Acquire);
+                return (Err(ReadError::Unavailable { lowest }), 0);
+            }
+            Err(_) => return (Err(ReadError::Invariant), 0),
+        };
+        // The scan's start: the last recorded checkpoint at or below
+        // `offset` of this exact term count, or the term start.
+        let (start, start_end) = match Self::scan_start(checkpoints, count, offset) {
+            Ok(start) => start,
+            Err(error) => return (Err(error), 0),
+        };
+        // The SPEC §4 acquisition on the exact term, as for the cursor.
+        let (cell, descriptor, target) = match (
+            buffer.cell(subscription.cursor.cell),
+            buffer.descriptor(slot),
+            buffer.target(slot, count),
+        ) {
+            (Ok(cell), Ok(descriptor), Ok(target)) => (cell, descriptor, target),
+            _ => return (Err(ReadError::Invariant), 0),
+        };
+        match take_loan(&cell.loan, &cell.revoked, descriptor, target) {
+            Ok(LoanOutcome::Granted) => {}
+            Ok(LoanOutcome::Retry) => return (Err(ReadError::Retry), 0),
+            Ok(LoanOutcome::Overrun) => {
+                let lowest = buffer.floor().load(Ordering::Acquire);
+                return (Err(ReadError::Unavailable { lowest }), 0);
+            }
+            Ok(LoanOutcome::Revoked) => return (Err(ReadError::Revoked), 0),
+            Err(_) => return (Err(ReadError::Invariant), 0),
+        }
+        let floor = buffer.floor().load(Ordering::Acquire);
+        if from < floor {
+            release_loan(&cell.loan);
+            return (Err(ReadError::Unavailable { lowest: floor }), 0);
+        }
+        let scanned = Self::scan(
+            buffer,
+            &mut subscription.cursor,
+            slot,
+            start,
+            start_end,
+            offset,
+            nak.loads,
+        );
+        let (open, loads) = match scanned {
+            Ok(found) => found,
+            Err((error, loads)) => {
+                release_loan(&cell.loan);
+                return (Err(error), loads);
+            }
+        };
+        let open = open.map(|end| OpenBlock { count, end });
+        let copied = Self::copy(
+            buffer,
+            &mut subscription.cursor,
+            open,
+            hook,
+            None,
+            slot,
+            count,
+            offset,
+            out,
+        );
+        release_loan(&cell.loan);
+        let next = |end: u32| buffer.position(count, end);
+        let result = match copied {
+            Ok(Copy::Frames { len, end, .. }) => Ok(ReadOutcome::Copied {
+                len,
+                next: next(end),
+            }),
+            Ok(Copy::Pending) => Ok(ReadOutcome::Pending),
+            Ok(Copy::Canonical { record, end }) => Ok(ReadOutcome::Canonical {
+                record,
+                next: next(end),
+            }),
+            Err(CopyError::Corrupt) => Err(ReadError::CorruptTerm { failures: 0 }),
+            Err(CopyError::TooSmall(needed)) => Err(ReadError::TooSmall { needed }),
+            Err(CopyError::Invariant) => Err(ReadError::Invariant),
+        };
+        (result, loads)
+    }
+
+    /// Where a NAK scan of `offset` in term `count` starts: the greatest
+    /// recorded checkpoint at or below it (only from an array tagged
+    /// `count`), with its block's end for an interior fragment, or the term
+    /// start. An entry above `offset` in its own stride means no frame
+    /// starts between the stride and the entry: `offset` is not a frame
+    /// boundary, so `BadRequest`.
+    fn scan_start(
+        checkpoints: &Checkpoints,
+        count: TermCount,
+        offset: u32,
+    ) -> Result<Checkpoint, ReadError> {
+        let Some(entries) = checkpoints.array(count) else {
+            return Ok((0, 0));
+        };
+        let Some(own) = offset
+            .checked_div(checkpoints.stride)
+            .and_then(|i| usize::try_from(i).ok())
+        else {
+            return Ok((0, 0));
+        };
+        // `own` lies inside the array: `offset` is below the term length.
+        let upto = entries.get(..=own).unwrap_or(entries);
+        for entry in upto.iter().rev() {
+            match *entry {
+                NO_CHECKPOINT => {}
+                (frame, block_end) if frame <= offset => return Ok((frame, block_end)),
+                _ => return Err(ReadError::BadRequest),
+            }
+        }
+        Ok((0, 0))
+    }
+
+    /// Walks word 0 values from the frame start `start` to `offset`, under
+    /// the caller's loan of the exact term in `slot`, within `loads`;
+    /// `start_end` is the end of `start`'s block when `start` is an interior
+    /// fragment, 0 for a block start. Returns, for a frame boundary, the end
+    /// of its block when it lies inside one (an interior fragment) and the
+    /// loads spent.
+    #[allow(clippy::too_many_arguments, reason = "the split borrows of one scan")]
+    fn scan(
+        buffer: &LogBuffer<O::Terms>,
+        cursor: &mut Cursor,
+        slot: u8,
+        start: u32,
+        start_end: u32,
+        offset: u32,
+        loads: u32,
+    ) -> Result<(Option<u32>, u32), (ReadError, u32)> {
+        let lane = buffer.config.lane;
+        let mut spent: u32 = 0;
+        let charge = |spent: &mut u32, cost: u32| -> Result<(), (ReadError, u32)> {
+            match spent.checked_add(cost).filter(|total| *total <= loads) {
+                Some(total) => {
+                    *spent = total;
+                    Ok(())
+                }
+                None => Err((ReadError::Budget, *spent)),
+            }
+        };
+        let mut at = start;
+        if start_end > start {
+            // An interior checkpoint: walk the rest of its block by its
+            // fragments' word 0s.
+            while at < offset && at < start_end {
+                charge(&mut spent, 1)?;
+                // SAFETY: loan held on this slot's term; the entry was
+                // recorded by the cursor path from a fragment it copied, in
+                // an array tagged with this term count, after it observed
+                // the block's first word 0 with Acquire in an earlier call
+                // under a loan of this term incarnation (as for a resumed
+                // block); each next start comes from a validated length.
+                let raw = load_interior(unsafe { buffer.regions.word0(slot, at) });
+                let Some(checked) = check_frame(raw, at, start_end, false, lane) else {
+                    return Err((ReadError::CorruptTerm { failures: 0 }, spent));
+                };
+                at = checked.next;
+            }
+            if at == offset && at < start_end {
+                return Ok((Some(start_end), spent));
+            }
+            if at > offset {
+                return Err((ReadError::BadRequest, spent));
+            }
+        }
+        while at < offset {
+            let context = SubscriptionContext {
+                buffer,
+                cursor: &mut *cursor,
+            };
+            // SAFETY of the walk: `at` is a block boundary of this term
+            // count. It is the term start, an entry recorded only by the
+            // cursor path from a block boundary of an array tagged with
+            // this count (`scan_start`), or the end of a block this walk
+            // validated; a validated geometry is the only source of the
+            // next `at`, so no payload word is ever read as a header.
+            match context.validate_block(slot, at) {
+                Ok(Validated::Block(block)) => {
+                    // The first pass loaded each fragment's word 0 once.
+                    charge(&mut spent, block.frames)?;
+                    if offset >= block.end {
+                        at = block.end;
+                        continue;
+                    }
+                    // `offset` lies inside this block: walk its fragments.
+                    let mut fragment = at;
+                    let mut begin = true;
+                    while fragment < offset {
+                        charge(&mut spent, 1)?;
+                        // SAFETY: loan held on this slot's term; `fragment`
+                        // is a frame start inside the block whose first word
+                        // 0 was observed with Acquire by `validate_block`
+                        // above, under this loan.
+                        let raw = load_interior(unsafe { buffer.regions.word0(slot, fragment) });
+                        let Some(checked) = check_frame(raw, fragment, block.end, begin, lane)
+                        else {
+                            return Err((ReadError::CorruptTerm { failures: 0 }, spent));
+                        };
+                        fragment = checked.next;
+                        begin = false;
+                    }
+                    if fragment != offset {
+                        return Err((ReadError::BadRequest, spent));
+                    }
+                    return Ok((Some(block.end), spent));
+                }
+                Ok(Validated::Aborted { extent }) => {
+                    charge(&mut spent, 1)?;
+                    match at.checked_add(extent) {
+                        Some(end) if end <= offset => at = end,
+                        _ => return Err((ReadError::BadRequest, spent)),
+                    }
+                }
+                // A PAD runs to the term end, past `offset`.
+                Ok(Validated::Pad | Validated::Pending) => {
+                    charge(&mut spent, 1)?;
+                    return Err((ReadError::BadRequest, spent));
+                }
+                Ok(Validated::Skip { .. }) => return Err((ReadError::Invariant, spent)),
+                Err(SysError::CorruptTerm { .. }) => {
+                    charge(&mut spent, 1)?;
+                    return Err((ReadError::CorruptTerm { failures: 0 }, spent));
+                }
+                Err(_) => return Err((ReadError::Invariant, spent)),
+            }
+        }
+        if at == offset {
+            Ok((None, spent))
+        } else {
+            Err((ReadError::BadRequest, spent))
+        }
     }
 
     fn read(&mut self, from: u64, out: &mut [u8]) -> Result<ReadOutcome, ReadError> {
@@ -511,6 +1027,7 @@ impl<O: BufferOwner> SenderRead<O> {
             open: open_block,
             hook,
             boundaries,
+            checkpoints,
             ..
         } = self;
         if from != subscription.cursor.position {
@@ -585,6 +1102,7 @@ impl<O: BufferOwner> SenderRead<O> {
             &mut subscription.cursor,
             *open_block,
             hook,
+            Some(&mut *checkpoints),
             slot,
             count,
             offset,
@@ -608,6 +1126,7 @@ impl<O: BufferOwner> SenderRead<O> {
                 subscription.cursor.position = next;
                 *open_block = None;
                 Self::remember(boundaries, next);
+                checkpoints.record(buffer.term_length, from, 0);
                 Ok(ReadOutcome::Canonical { record, next })
             }
             Err(CopyError::Corrupt) => Err(ReadError::CorruptTerm { failures: 0 }),
@@ -624,6 +1143,7 @@ impl<O: BufferOwner> SenderRead<O> {
         cursor: &mut Cursor,
         open: Option<OpenBlock>,
         hook: &mut HookSlot,
+        mut checkpoints: Option<&mut Checkpoints>,
         slot: u8,
         count: TermCount,
         start: u32,
@@ -737,6 +1257,11 @@ impl<O: BufferOwner> SenderRead<O> {
                 }
                 if let Some(padding) = out.get_mut(frame_end..padded.min(out.len())) {
                     padding.fill(0);
+                }
+                // A frame the cursor path copied: a NAK checkpoint (S2 2.3).
+                if let Some(checkpoints) = checkpoints.as_deref_mut() {
+                    let interior = if begin { 0 } else { block_end };
+                    checkpoints.record(term_length, buffer.position(count, at), interior);
                 }
                 len = frame_end;
                 stride = padded;
