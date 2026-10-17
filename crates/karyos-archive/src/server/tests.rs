@@ -144,6 +144,7 @@ impl ArchiveHost for Host {
         _request: &control::Replay<'_>,
         _recording: &Recording,
         from: u64,
+        _to: u64,
     ) -> Result<Box<dyn ReplaySink + Send>, HostRefusal> {
         if let Some(why) = &self.refuse {
             return Err(HostRefusal(why.clone()));

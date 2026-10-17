@@ -56,8 +56,10 @@ pub trait ArchiveHost {
         request: &control::StartRecording<'_>,
     ) -> Result<HostRecording, HostRefusal>;
 
-    /// Opens the target stream of a replay of `recording` from `from`: an
-    /// image that keeps the recorded positions.
+    /// Opens the target stream of a replay of `recording` over
+    /// `[from, to)`: an image that keeps the recorded positions. The sink's
+    /// `finish` names where the replay ended; it reached its end only at
+    /// `to`.
     ///
     /// # Errors
     ///
@@ -67,6 +69,7 @@ pub trait ArchiveHost {
         request: &control::Replay<'_>,
         recording: &Recording,
         from: u64,
+        to: u64,
     ) -> Result<Box<dyn ReplaySink + Send>, HostRefusal>;
 }
 
@@ -456,7 +459,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 }
             },
         };
-        let sink = match self.host.open_replay(request, &described.recording, from) {
+        let sink = match self.host.open_replay(request, &described.recording, from, to) {
             Ok(sink) => sink,
             Err(HostRefusal(why)) => {
                 self.respond(correlation_id, 0, ResponseCode::Error, &why);
