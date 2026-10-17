@@ -168,6 +168,10 @@ pub struct AgentConfig {
     /// DATA for this long sends a PATH_HB, so it stays live at its
     /// receivers while another path carries the stream.
     pub path_heartbeat_interval: u64,
+    /// When a routed publication's path leaves the live set
+    /// (redundant-paths.md section 7, RP-8): `path_lag_limit` (100 ms),
+    /// `path_skip_ratio` in percent (50) and `path_skip_min_bytes` (64 KiB).
+    pub path_policy: crate::agents::data::PathPolicy,
     /// `setup_answer_rate` and its source table.
     pub answer_rate: crate::sessions::send::AnswerRate,
     /// Entries of the receiver-to-sender control ring, at least 1.
@@ -239,6 +243,7 @@ impl Default for AgentConfig {
             publications: 64,
             setup_interval: 100_000_000,
             path_heartbeat_interval: 100_000_000,
+            path_policy: crate::agents::data::PathPolicy::default(),
             answer_rate: crate::sessions::send::AnswerRate::default(),
             control_capacity: 512,
             control_routes: 8,
@@ -267,6 +272,15 @@ impl AgentConfig {
         let commands = NonZeroUsize::new(self.command_capacity).ok_or(
             AgentError::InvalidConfig("command_capacity must be at least 1"),
         )?;
+        let policy = self.path_policy;
+        if policy.lag_limit < 2
+            || !(1..=100).contains(&policy.skip_percent)
+            || policy.skip_min_bytes == 0
+        {
+            return Err(AgentError::InvalidConfig(
+                "path_policy needs a lag limit of 2 ns or more, a skip ratio of 1 to 100 percent and a minimum of 1 byte",
+            ));
+        }
         if self.path_heartbeat_interval == 0 {
             return Err(AgentError::InvalidConfig(
                 "path_heartbeat_interval must be at least 1",

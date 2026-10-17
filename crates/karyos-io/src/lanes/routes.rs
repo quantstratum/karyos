@@ -333,6 +333,47 @@ impl RoutedLaneSender {
             .count()
     }
 
+    /// The route that alone holds `lane`'s head, at its front, while
+    /// another live route holds a later copy: the lane waits on that route
+    /// (redundant-paths.md RP-8; ACS 16856). `None` when the head is shared,
+    /// absent, or no other route waits.
+    #[must_use]
+    pub fn sole_holder(&self, lane: usize) -> Option<usize> {
+        let entry = self.lanes.get(lane)?;
+        let live = |index: &usize| self.live.get(*index).is_some_and(|live| *live);
+        let lowest = entry
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| live(index))
+            .filter_map(|(_, route)| route.undebited(entry.debited))
+            .map(|copy| copy.position)
+            .min()?;
+        let mut holders = entry
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(index, route)| {
+                live(index) && route.staged.iter().any(|copy| copy.position == lowest)
+            })
+            .map(|(index, _)| index);
+        let holder = holders.next()?;
+        if holders.next().is_some() {
+            return None;
+        }
+        let at_front = entry
+            .routes
+            .get(holder)
+            .and_then(|route| route.staged.front())
+            .is_some_and(|copy| copy.position == lowest);
+        let others_wait = entry.routes.iter().enumerate().any(|(index, route)| {
+            index != holder
+                && live(&index)
+                && route.staged.iter().any(|copy| copy.position > lowest)
+        });
+        (at_front && others_wait).then_some(holder)
+    }
+
     /// The failures that stopped one route of several since the last call,
     /// the first per route: each route's half waits for its control path
     /// (retry or reset). Taking them clears them.

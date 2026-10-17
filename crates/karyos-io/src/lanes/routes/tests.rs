@@ -1091,3 +1091,44 @@ fn a_left_route_takes_no_flush_of_a_shared_head() {
         .cancel_route(&mut Lent(routes), 1, &mut gate)
         .unwrap();
 }
+
+/// ACS 16856: `sole_holder` names the route that alone holds a lane's head
+/// at its front while another live route waits with a later copy.
+#[test]
+fn the_sole_holder_of_a_waiting_lane_is_named() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    assert_eq!(f.sender.sole_holder(0), Some(0));
+    // Shared, or nobody waiting: none.
+    let mut g = Fixture::new(&[100], 100, 2);
+    g.stage(0, 0, 100, 100, &[0, 1]);
+    assert_eq!(g.sender.sole_holder(0), None);
+    let mut h = Fixture::new(&[100], 100, 2);
+    h.stage(0, 0, 100, 100, &[0]);
+    assert_eq!(h.sender.sole_holder(0), None, "no other route waits");
+    // Out of the live set, route 0 holds nothing.
+    f.sender.set_live(0, false);
+    assert_eq!(f.sender.sole_holder(0), None);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+    let Fixture { routes, sender, .. } = &mut g;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+    let Fixture { routes, sender, .. } = &mut h;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+}

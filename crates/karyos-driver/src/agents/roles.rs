@@ -1254,6 +1254,8 @@ pub struct SenderRole {
     due: Vec<(EndpointId, SetupAnnounce)>,
     /// `path_heartbeat_interval` in ns (RP-3).
     path_heartbeat_interval: u64,
+    /// When a routed publication's path leaves the live set (RP-8).
+    path_policy: super::data::PathPolicy,
     /// The receivers answered, at most `receiver_bindings` (allocated at
     /// creation).
     bindings: Vec<ReceiverBinding>,
@@ -1390,6 +1392,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
             path_heartbeat_interval: config.path_heartbeat_interval,
+            path_policy: config.path_policy,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
             unconfirmed_timeout: config.sessions.setup_challenge_timeout,
@@ -4065,6 +4068,8 @@ impl SenderRole {
                         .is_ok();
                 // A guarded publication's gate decides every exposure.
                 let guarded = guard.is_none_or(|spec| outbound.guard(spec, (self.clock)()).is_ok());
+                // Its paths leave the live set by the agent's policy (RP-8).
+                outbound.set_path_policy(self.path_policy);
                 if repairs && guarded {
                     add_sessions(&mut self.sessions, &publication, &outbound)
                 } else {
