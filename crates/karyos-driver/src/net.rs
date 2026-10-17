@@ -74,7 +74,11 @@ pub struct NetworkConfig {
     pub agents: AgentConfig,
     /// Where the agents run (SPEC.md §3).
     pub threading: ThreadingMode,
-    /// The image log buffers.
+    /// The image log buffers. Its `spare_slots` (default 5) bound the
+    /// optional and observer readers of each image lane: the receive
+    /// owner holds three of the lane's credits, so the default admits one
+    /// such reader, and another is refused with `ResourcesUnavailable`
+    /// ([`ImageTemplate::spare_slots`]).
     pub images: ImageTemplate,
     /// The log of a network publication a client creates by channel URI
     /// (W5b): the URI's `term-length`, `mtu` and `lanes` override these.
