@@ -316,7 +316,12 @@ struct Outbox {
 impl Outbox {
     fn send(&self, event: Event) {
         if self.sender.try_send(event).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            // Sticky at u64::MAX rather than wrapping.
+            let _ = self
+                .dropped
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |dropped| {
+                    dropped.checked_add(1)
+                });
         }
     }
 }
@@ -343,7 +348,7 @@ impl FrameSource for Box<dyn FrameSource + Send> {
         (**self).consumed(position)
     }
 
-    fn resume(&mut self, to: u64) -> Result<(), crate::recorder::SourceError> {
+    fn resume(&mut self, to: u64) -> Result<u64, crate::recorder::SourceError> {
         (**self).resume(to)
     }
 }
@@ -395,32 +400,27 @@ fn run<D>(
                 &config,
                 &mut catalog,
                 &mut active,
-                &failed,
+                &mut failed,
                 now(),
             ) {
                 return;
             }
         }
-        let mut index = 0;
-        while let Some(recording) = active.get_mut(index) {
-            match recording.recorder.duty(now()) {
+        // Each recording's duty; those that end or fail leave the set.
+        for mut recording in std::mem::take(&mut active) {
+            let event = match recording.recorder.duty(now()) {
                 Ok(duty) => {
                     worked |= duty.recorded > 0;
-                    if duty.ended.is_some() {
-                        let recording = active.swap_remove(index);
-                        // The reason it ended for (the seal, a lap).
-                        let event = finish(recording, &mut catalog, StopReason::Normal, now());
-                        if let Event::Failed { id, .. } = event {
-                            failed.push(id);
-                        }
-                        outbox.send(event);
+                    if duty.ended.is_none() {
+                        active.push(recording);
                         continue;
                     }
+                    // The reason it ended for (the seal, a lap).
+                    finish(recording, &mut catalog, StopReason::Normal, now())
                 }
                 Err(error) => {
                     worked = true;
-                    let recording = active.swap_remove(index);
-                    let event = match error.fail_kind() {
+                    match error.fail_kind() {
                         // The store is whole: close it and stop the
                         // recording, typed.
                         Some(kind) => {
@@ -430,15 +430,13 @@ fn run<D>(
                             id: recording.id,
                             failure: Failure::Store,
                         },
-                    };
-                    if let Event::Failed { id, .. } = event {
-                        failed.push(id);
                     }
-                    outbox.send(event);
-                    continue;
                 }
+            };
+            if let Event::Failed { id, .. } = event {
+                failed.push(id);
             }
-            index += 1;
+            outbox.send(event);
         }
         if !worked {
             match inbox.recv_timeout(config.idle) {
@@ -450,7 +448,7 @@ fn run<D>(
                         &config,
                         &mut catalog,
                         &mut active,
-                        &failed,
+                        &mut failed,
                         now(),
                     ) {
                         return;
@@ -507,7 +505,7 @@ fn serve<D: Disk + Clone>(
     config: &AgentConfig,
     catalog: &mut Catalog<D>,
     active: &mut Vec<Active<D>>,
-    failed: &[u64],
+    failed: &mut Vec<u64>,
     now: u64,
 ) -> bool {
     match command {
@@ -518,7 +516,14 @@ fn serve<D: Disk + Clone>(
         }
         Command::Stop(id, reply) => {
             let result = match active.iter().position(|recording| recording.id == id) {
-                Some(index) => stop(active.swap_remove(index), catalog, StopReason::Stopped, now),
+                Some(index) => {
+                    let result = stop(active.swap_remove(index), catalog, StopReason::Stopped, now);
+                    // A stop that failed leaves the recording to settle.
+                    if result.is_err() {
+                        failed.push(id);
+                    }
+                    result
+                }
                 None if failed.contains(&id) => Err(AgentError::RecordingFailed { id }),
                 None => Err(AgentError::NotRecording { id }),
             };
