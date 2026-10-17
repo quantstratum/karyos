@@ -3873,3 +3873,59 @@ fn a_bound_below_the_heartbeat_mark_caps_the_tail_nak() {
     let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
     assert_eq!((hole.start, hole.length), (0, 96));
 }
+
+/// rp-w7c, §8 "Sender join", at the sender role: a later path's ANSWER
+/// with a higher join leaves the membership's join unchanged, and the
+/// receiver's SMs below it on that path are still accepted.
+#[test]
+fn a_later_paths_higher_join_leaves_the_members_join() {
+    use crate::repair::admission::Requester;
+
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (_event, _log) = add_routed(&mut sender);
+    let on_a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let on_b: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), on_a, &sm_status([7, 8], 0), 1);
+    // B's ANSWER names a join two frames on: the path lags.
+    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 2112), 2);
+    sender.status(EndpointId(2), on_b, &sm_status([7, 8], 0), 3);
+    let member = member_on(&mut sender, 3);
+    assert!(
+        matches!(member, Requester::Member { join: 0, .. }),
+        "{member:?}"
+    );
+    let counters = *sender.publications[0].membership_mut().unwrap().counters();
+    assert_eq!(counters.joins, 1, "{counters:?}");
+    assert_eq!(counters.accepted, 2, "B's SM below its join: {counters:?}");
+}
+
+/// rp-w7c, §8 "Sender join", the NAK half: the receiver answers again from
+/// a second source on the publication's endpoint with a join two frames
+/// on, as a lagging later path would. The membership's join stays, and a
+/// NAK from that source below its join is still admitted and repaired.
+#[test]
+fn a_nak_below_a_later_bindings_join_is_admitted() {
+    let mut rig = RepairRig::new(AgentConfig::default(), &[alias()], 4);
+    let later: SocketAddr = "10.0.0.10:5001".parse().unwrap();
+    rig.sender
+        .bind(EndpointId(1), later, &sm_answer([7, 8], 2 * FRAME), 1);
+    rig.sender
+        .status(EndpointId(1), later, &sm_status([7, 8], 0), 1);
+    let joins = rig.sender.publications[0]
+        .membership_mut()
+        .unwrap()
+        .counters()
+        .joins;
+    assert_eq!(joins, 1, "the member's join stays");
+    rig.nak(alias(), later, 0, 1056);
+    rig.script(1);
+    rig.cycle(2);
+    let counters = rig.sender.counters();
+    assert_eq!(
+        (counters.naks, counters.nak_unbound),
+        (1, 0),
+        "{counters:?}"
+    );
+    assert!(counters.repairs >= 1, "{counters:?}");
+}
