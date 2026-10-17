@@ -2850,4 +2850,31 @@ fn a_publication_takes_its_configured_roles() {
         "{event:?}"
     );
     assert_eq!(membership, None);
+    // The table bounds the roles: 64 entries (its default size) fit, 65
+    // do not, for the required set and for the tags alike.
+    for (count, added) in [(64u64, true), (65, false)] {
+        for tagged in [false, true] {
+            let ids: Vec<u64> = (1..=count).collect();
+            let roles = if tagged {
+                PublicationRoles {
+                    strategy: Strategy::Min,
+                    required: Vec::new(),
+                    tags: ids.iter().map(|id| (*id, 1)).collect(),
+                }
+            } else {
+                PublicationRoles {
+                    strategy: Strategy::Min,
+                    required: ids,
+                    tags: Vec::new(),
+                }
+            };
+            let (event, _) = add(Some(roles));
+            assert_eq!(
+                matches!(event, Some(AgentEvent::PublicationAdded { .. })),
+                added,
+                "{count} {}: {event:?}",
+                if tagged { "tags" } else { "required" }
+            );
+        }
+    }
 }

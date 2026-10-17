@@ -2279,9 +2279,10 @@ fn an_image_names_its_configured_receiver_identity() {
 }
 
 /// MC-2: an SM whose `group_tag` is not the tag configured for its
-/// receiver is rejected whole by the publication's membership and counted;
-/// the receiver joins nothing. The negative control, the configured tag,
-/// joins and counts no tag rejection.
+/// receiver is rejected whole before it touches the sender's binding
+/// (#304 ruling): counted, it pins no receiver id and never establishes
+/// the session, so it cannot hold retention either. The negative control,
+/// the configured tag, binds receiver 77, establishes and joins.
 #[test]
 fn an_sm_with_another_tag_is_rejected_whole() {
     use crate::membership::{PublicationRoles, Strategy};
@@ -2300,28 +2301,56 @@ fn an_sm_with_another_tag_is_rejected_whole() {
             roles: Some(tagged_5),
             ..Setup::default()
         });
-        let _ = established(&mut rig);
-        let counters = |rig: &Rig| {
-            *rig.agents
-                .sender
-                .role
-                .membership_of(alias())
-                .unwrap()
-                .counters()
-        };
-        rig.until(true, |rig| {
-            let counters = counters(rig);
-            if declared == 5 {
-                counters.joins >= 1
-            } else {
-                counters.tag >= 1
-            }
-        });
-        let counters = counters(&rig);
         if declared == 5 {
-            assert_eq!(counters.tag, 0);
+            let _ = established(&mut rig);
+            rig.until(true, |rig| {
+                rig.agents
+                    .sender
+                    .role
+                    .membership_of(alias())
+                    .is_some_and(|membership| membership.counters().joins >= 1)
+            });
+            assert_eq!(rig.agents.sender.counters().sm_tag_mismatch, 0);
+            assert_eq!(rig.agents.sender.role.bound_receivers(alias()), [Some(77)]);
         } else {
-            assert_eq!(counters.joins, 0, "a mismatched tag joins nothing");
+            rig.until(true, |rig| {
+                rig.agents.sender.counters().sm_tag_mismatch >= 3
+            });
+            assert_eq!(rig.agents.sender.role.session_counters().established, 0);
+            assert!(
+                rig.agents
+                    .sender
+                    .role
+                    .bound_receivers(alias())
+                    .iter()
+                    .all(Option::is_none),
+                "a mismatched SM pins no receiver id"
+            );
+            assert_eq!(rig.agents.sender.counters().sm_accepted, 0);
         }
     }
+}
+
+/// #304 review: with a configured identity, the receiver still knows its
+/// own NAK copy when the control group loops it back (it names receiver
+/// 77, not the slot's id), so it never suppresses its own NAK.
+#[test]
+fn an_identity_knows_its_own_group_copy() {
+    let (mut rig, _b) = Rig::new(Setup {
+        identity: Some(identity_77(0)),
+        ..control_setup(0)
+    });
+    let _slot = established(&mut rig);
+    lose_one(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().group_nak_own >= 1
+    });
+    assert_eq!(rig.agents.receiver.counters().group_nak_suppressions, 0);
+    assert_eq!(
+        rig.agents.receiver.role.posted_naks()[0]
+            .receiver
+            .receiver_id,
+        77
+    );
 }

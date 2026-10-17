@@ -633,6 +633,15 @@ impl Membership {
         &self.config
     }
 
+    /// The tag configured for `receiver_id` (MC-2): 0 when none is.
+    #[must_use]
+    pub fn configured_tag(&self, receiver_id: u64) -> u64 {
+        self.tags
+            .iter()
+            .find(|(id, _)| *id == receiver_id)
+            .map_or(0, |(_, tag)| *tag)
+    }
+
     /// The counters.
     #[must_use]
     pub const fn counters(&self) -> &MembershipCounters {

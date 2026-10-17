@@ -321,6 +321,9 @@ pub struct SenderCounters {
     /// NAKs from no receiver bound on that endpoint (source, alias, boot
     /// id, incarnation and receiver id), or for no reliable publication.
     pub nak_unbound: u64,
+    /// SMs whose declared tag is not the one configured for their receiver
+    /// (MC-2): dropped whole before the binding.
+    pub sm_tag_mismatch: u64,
     /// ERR NAK_REPLYs sent (admission's and step 8's).
     pub nak_replies: u64,
     /// Step 8 ERRs whose requester has no bound source: not sent.
@@ -1269,9 +1272,14 @@ impl ReceiverRole {
     /// `slot` (tests).
     #[cfg(test)]
     pub(super) fn receiver_of(&self, slot: SlotRef) -> Receiver {
+        let named = self
+            .images
+            .iter()
+            .find(|image| image.slot == slot)
+            .map_or(receiver_id(slot), |image| image.receiver_id);
         Receiver {
             receiver_boot_id: self.sessions.boot_id(),
-            receiver_id: receiver_id(slot),
+            receiver_id: named,
         }
     }
 
@@ -2392,7 +2400,7 @@ impl GroupIntake<'_> {
         }
         // 3. Never this receiver's own copy, looped back.
         let mine = Receiver {
-            receiver_id: receiver_id(image.slot),
+            receiver_id: image.receiver_id,
             ..own
         };
         if nak.receiver == mine {
@@ -3873,11 +3881,25 @@ impl SenderRole {
     ) {
         self.expire_bindings(now);
         let source = normalized(source);
-        let lane_count = self
+        let publication = self
             .publications
             .iter()
-            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
-            .and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
+            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias);
+        let lane_count =
+            publication.and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
+        // MC-2: an SM whose declared tag is not the one configured for its
+        // receiver is rejected whole before it touches the binding, so it
+        // neither refreshes nor pins it, establishes the session, nor holds
+        // retention through its consumption.
+        let tag_ok = publication
+            .and_then(|outbound| outbound.membership())
+            .is_none_or(|membership| {
+                membership.configured_tag(status.receiver.receiver_id) == status.group_tag
+            });
+        if !tag_ok {
+            self.count(|c| &mut c.sm_tag_mismatch);
+            return;
+        }
         // The incarnation is part of the binding: an earlier incarnation's
         // row from the same receiver never shadows the current one.
         let found = self.bindings.iter_mut().find(|binding| {
