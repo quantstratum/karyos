@@ -65,9 +65,17 @@ const ROTATION_SLOTS: u64 = 3;
 /// The image log buffer parameters the answer does not carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageTemplate {
-    /// Spare slots beyond the three rotation slots (default 5).
+    /// Spare slots beyond the three rotation slots (default 5). They are
+    /// also each lane's admission credits (SPEC.md §4: the reservations
+    /// never exceed `spare_slots - CLEANING_HEADROOM`): the receive owner
+    /// holds three, and every optional or observer reader takes one, so
+    /// the default admits one such reader per lane, in process or remote.
+    /// Each further spare admits one more and adds a term per lane to the
+    /// image's storage charge.
     pub spare_slots: u8,
-    /// Local subscribers per image (default 8).
+    /// Local subscribers per image (default 8): subscriber cells, of which
+    /// optional and observer readers are bounded by `spare_slots` as
+    /// well. Required readers take no credit.
     pub max_subscribers: u8,
     /// Whether the receive owner may seal local gaps (default true:
     /// gaps-and-unreliable-delivery.md).
