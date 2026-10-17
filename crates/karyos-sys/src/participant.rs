@@ -43,9 +43,16 @@ pub const CELL_OBSERVER: u64 = 8;
 /// streams"). Everything else is as for [`CELL_OBSERVER`].
 pub const CELL_WALKER: u64 = 9;
 
+/// A network publication's sender reader while no receiver's status
+/// messages are live: it bounds the publisher and holds its spare-slot
+/// credit exactly as [`CELL_REQUIRED_RESERVED`], but does not keep the
+/// publication connected (SPEC.md §4). Its owner moves it between the two
+/// with [`set_sender_counts`].
+pub const CELL_SENDER_SILENT: u64 = 10;
+
 /// Every cell state, in value order: the one list the predicate tests
 /// enumerate, so a new state cannot be left out of them.
-pub const CELL_STATES: [u64; 10] = [
+pub const CELL_STATES: [u64; 11] = [
     CELL_FREE,
     CELL_REQUIRED,
     CELL_OPTIONAL,
@@ -56,6 +63,7 @@ pub const CELL_STATES: [u64; 10] = [
     CELL_LOST_RESERVED,
     CELL_OBSERVER,
     CELL_WALKER,
+    CELL_SENDER_SILENT,
 ];
 
 /// Whether a cell in `state` is a live reader of any role: it has a
@@ -64,11 +72,11 @@ pub const CELL_STATES: [u64; 10] = [
 /// state cannot fall into a default arm unnoticed.
 #[must_use]
 pub const fn is_reader(state: u64) -> bool {
-    counts_for_connection(state) || state == CELL_WALKER
+    counts_for_connection(state) || matches!(state, CELL_WALKER | CELL_SENDER_SILENT)
 }
 
 /// Whether a reader in `state` keeps the publication connected (SPEC.md
-/// §4): every live reader but the driver's walker.
+/// §4): every live reader but the driver's walker and a silent sender.
 #[must_use]
 pub const fn counts_for_connection(state: u64) -> bool {
     matches!(
@@ -153,8 +161,34 @@ pub fn join_after_admit(head: &AtomicU64, start: u64) -> u64 {
 pub const fn bounds(state: u64) -> bool {
     matches!(
         state,
-        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_LOST_HOLDING
+        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_LOST_HOLDING | CELL_SENDER_SILENT
     )
+}
+
+/// Whether a reader in `state` was admitted with a spare-slot
+/// reservation as a required reader: [`CELL_REQUIRED_RESERVED`], or a
+/// sender reader in either of its states.
+#[must_use]
+pub const fn is_required_reserved(state: u64) -> bool {
+    matches!(state, CELL_REQUIRED_RESERVED | CELL_SENDER_SILENT)
+}
+
+/// Owner of a network publication's sender reader: makes it count for
+/// connection (`counts`, while a receiver's status messages are live) or
+/// not. A compare-exchange from the other state only, a read-modify-write
+/// as every write to a cell's state word: a revocation or a leave that
+/// came first is never undone, and both states bound the publisher and
+/// hold the credit identically, so only the connection count changes.
+/// Returns whether the cell moved.
+pub fn set_sender_counts(state: &AtomicU64, counts: bool) -> bool {
+    let (from, to) = if counts {
+        (CELL_SENDER_SILENT, CELL_REQUIRED_RESERVED)
+    } else {
+        (CELL_REQUIRED_RESERVED, CELL_SENDER_SILENT)
+    };
+    state
+        .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 /// Driver: revokes the participant of a cell found in state `from` and
@@ -263,6 +297,7 @@ mod tests {
             (CELL_LOST_RESERVED, false, false, false, false, false, false),
             (CELL_OBSERVER, true, true, true, true, false, false),
             (CELL_WALKER, true, false, false, true, false, true),
+            (CELL_SENDER_SILENT, true, false, false, false, true, true),
         ];
         for (state, reader, connects, listed, observer, bounding, floor) in table {
             assert_eq!(holds_floor(state), floor, "holds_floor({state})");
@@ -273,14 +308,14 @@ mod tests {
             assert_eq!(bounds(state), bounding, "bounds({state})");
         }
         // The table covers every state, in the order of CELL_STATES, and the
-        // states are the values 0 to 9 with no gap: a new constant must be
+        // states are the values 0 to 10 with no gap: a new constant must be
         // added to CELL_STATES and here.
         let states: Vec<u64> = table.iter().map(|row| row.0).collect();
         assert_eq!(states, CELL_STATES);
         let expected: Vec<u64> = (0..).take(CELL_STATES.len()).collect();
         assert_eq!(CELL_STATES.to_vec(), expected);
         // Any other value is no reader at all.
-        let next = CELL_WALKER + 1;
+        let next = CELL_SENDER_SILENT + 1;
         assert!(!is_reader(next) && !bounds(next) && !is_observer_like(next));
         assert!(!holds_floor(next));
     }
@@ -300,5 +335,50 @@ mod tests {
         let alone = [cell(CELL_WALKER, 40), cell(CELL_OPTIONAL, 10)];
         let pairs = alone.iter().map(|(state, position)| (state, position));
         assert_eq!(reader_minima(pairs), (None, Some(40)));
+    }
+
+    /// The sender toggle changes only the connection count: the bound,
+    /// the floor and the credit are the same in both states, and a cell
+    /// in any other state is never moved.
+    #[test]
+    fn the_sender_toggle_changes_only_the_connection_count() {
+        let cell = |state: u64, position: u64| (AtomicU64::new(state), AtomicU64::new(position));
+        let cells = [cell(CELL_REQUIRED_RESERVED, 700), cell(CELL_OBSERVER, 100)];
+        let minima = |cells: &[(AtomicU64, AtomicU64)]| {
+            reader_minima(cells.iter().map(|(state, position)| (state, position)))
+        };
+        let connected = |cells: &[(AtomicU64, AtomicU64)]| {
+            cells
+                .iter()
+                .filter(|(state, _)| counts_for_connection(state.load(Ordering::Acquire)))
+                .count()
+        };
+        let before = minima(&cells);
+        assert_eq!(connected(&cells), 2);
+        assert!(set_sender_counts(&cells[0].0, false));
+        assert_eq!(cells[0].0.load(Ordering::Acquire), CELL_SENDER_SILENT);
+        assert_eq!(minima(&cells), before, "the bound and the floor stay");
+        assert_eq!(connected(&cells), 1);
+        // On change only: a second store in the same direction is refused.
+        assert!(!set_sender_counts(&cells[0].0, false));
+        assert!(set_sender_counts(&cells[0].0, true));
+        assert_eq!(cells[0].0.load(Ordering::Acquire), CELL_REQUIRED_RESERVED);
+        assert_eq!(minima(&cells), before);
+        assert_eq!(connected(&cells), 2);
+        // A revoked, freed or other cell is never moved.
+        for state in CELL_STATES {
+            if matches!(state, CELL_REQUIRED_RESERVED | CELL_SENDER_SILENT) {
+                continue;
+            }
+            let word = AtomicU64::new(state);
+            assert!(!set_sender_counts(&word, true) && !set_sender_counts(&word, false));
+            assert_eq!(word.load(Ordering::Acquire), state);
+        }
+        for state in CELL_STATES {
+            assert_eq!(
+                is_required_reserved(state),
+                matches!(state, CELL_REQUIRED_RESERVED | CELL_SENDER_SILENT)
+            );
+        }
     }
 }

@@ -83,6 +83,9 @@ struct Setup {
     control_group: bool,
     /// The receiver's `group_nak_budget`, when not the default.
     group_nak_budget: Option<u32>,
+    /// Messages on each lane before the sender's reader subscribes: the
+    /// image then joins above 0.
+    before: u8,
     /// The subscription's configured receiver identity (MC-1).
     identity: Option<crate::membership::ReceiverIdentity>,
     /// The publication's configured roles (MC-1), built at the add.
@@ -113,6 +116,7 @@ impl Default for Setup {
             guard: None,
             control_group: false,
             group_nak_budget: None,
+            before: 0,
             identity: None,
             roles: None,
         }
@@ -235,13 +239,14 @@ impl Rig {
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
-        let (outbound, log) = super::super::data::testing::outbound(
+        let (outbound, log) = super::super::data::testing::outbound_joined(
             a,
             alias(),
             destination,
             term(65_536),
             2,
             setup.reliable,
+            setup.before,
         );
         rig.log = Some(log);
         rig.links
@@ -423,6 +428,51 @@ impl Rig {
             );
         }
         b2
+    }
+
+    /// Delivers the publication's ANNOUNCE again on `endpoint` and answers
+    /// its challenge, as a path coming back would (see
+    /// [`Rig::second_path`]).
+    fn reannounce(&mut self, endpoint: EndpointId, announce: SetupAnnounce) {
+        let source = self.endpoints.local_address(self.publisher).unwrap();
+        let receiver = &mut self.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            endpoint,
+            source,
+            karyos_protocol::network::Control::SetupAnnounce(announce),
+            self.now,
+        );
+        let challenge = self
+            .agents
+            .receiver
+            .role
+            .posted_challenges()
+            .iter()
+            .rev()
+            .find_map(|(held, control)| match control {
+                karyos_protocol::network::Control::Challenge(challenge) if *held == endpoint => {
+                    Some(*challenge)
+                }
+                _ => None,
+            });
+        if let Some(challenge) = challenge {
+            let answer = karyos_protocol::network::SetupAnswer {
+                alias: announce.alias,
+                identity: announce.identity,
+                term: announce.term,
+                challenge: challenge.challenge,
+                joins: Lanes::new(&[0, 0]).unwrap(),
+            };
+            let receiver = &mut self.agents.receiver;
+            receiver.role.inject_control(
+                &receiver.sessions,
+                endpoint,
+                source,
+                karyos_protocol::network::Control::SetupAnswer(answer),
+                self.now,
+            );
+        }
     }
 
     /// Removes the subscription of the stream on `endpoint`.
@@ -2899,4 +2949,160 @@ fn a_nak_goes_on_every_bound_path() {
     assert_eq!(counters.nak_copies_skipped, 0, "{counters:?}");
     assert!(loss.submitted <= counters.naks, "{loss:?} {counters:?}");
     assert_eq!(loss.retries, loss.submitted - 1, "{loss:?}");
+}
+
+/// #307 review P2-3: once the founding path's subscription is removed and
+/// a later path keeps the image, its control still flows, on the later
+/// path only: NAK copies anchor the NAK (the loss state records the
+/// submission), and SM copies keep going.
+#[test]
+fn control_flows_on_the_later_path_after_the_founding_one_goes() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    };
+    let (mut rig, b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.unsubscribe(b);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    assert!(rig.agents.receiver.role.has_image(slot));
+    let before = rig.agents.receiver.counters();
+    let founding = rig.agents.receiver.role.founding_naks();
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|loss| loss.submitted >= 1)
+    });
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().sm_copies > before.sm_copies + 2
+    });
+    let after = rig.agents.receiver.counters();
+    assert!(after.nak_copies > before.nak_copies, "{after:?}");
+    // Nothing went on the founding path.
+    assert_eq!(rig.agents.receiver.role.founding_naks(), founding);
+}
+
+/// #307 review, §8 join reconciliation: a later path whose join is below
+/// the image's is accepted, and its frames below the image's join are
+/// `Late` on that path.
+#[test]
+fn a_later_path_below_the_join_delivers_late() {
+    let setup = Setup {
+        reliable: true,
+        before: 4,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let b2 = rig.second_path(
+        &setup,
+        announce(setup.term_length),
+        Some(Lanes::new(&[0, 0]).unwrap()),
+    );
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_frame(&receiver.sessions, b2, source, slot, 0, 1000, rig.now);
+    let later = rig.agents.receiver.role.path_counts(slot, 1).unwrap();
+    assert_eq!(later.late, 1, "{later:?}");
+}
+
+/// #307 review, §8: a path lost at its liveness timeout and established
+/// again binds once more and reconciles the same way.
+#[test]
+fn a_lost_path_is_established_again() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    for i in 0..15u8 {
+        rig.now += 1_000_000_000;
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..5 {
+            rig.round(true);
+        }
+        if rig.agents.receiver.role.live_paths(slot) == 1 {
+            break;
+        }
+    }
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1);
+    // The path announces again on B2 and completes a fresh challenge.
+    rig.reannounce(b2, announce(setup.term_length));
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    assert!(rig.agents.receiver.role.has_image(slot));
+}
+
+/// #307 review, §8: an announcement of another identity on a later
+/// endpoint binds no path of the image.
+#[test]
+fn a_later_path_of_another_identity_binds_nothing() {
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let other = SetupAnnounce {
+        identity: Identity {
+            incarnation: 2,
+            ..identity()
+        },
+        ..announce(setup.term_length)
+    };
+    let _b2 = rig.second_path(&setup, other, None);
+    for _ in 0..100 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1);
+}
+
+/// #307 review, §8 liveness: with every path silent the last one is lost
+/// and the image follows image liveness: it retires.
+#[test]
+fn losing_the_last_path_retires_the_image() {
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    for _ in 0..30 {
+        rig.now += 1_000_000_000;
+        for _ in 0..3 {
+            rig.round(true);
+        }
+        if !rig.agents.receiver.role.has_image(slot) {
+            break;
+        }
+    }
+    assert!(!rig.agents.receiver.role.has_image(slot));
 }
