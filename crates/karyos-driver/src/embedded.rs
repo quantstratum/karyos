@@ -722,6 +722,9 @@ pub(crate) struct ConflationFeeder<T: StreamTerms> {
 pub(crate) struct FreshFeed {
     pub(crate) link: karyos_sys::freshness::FreshnessLink,
     pub(crate) gap: Option<(u64, u64)>,
+    /// Every poll of the feeder fails (tests).
+    #[cfg(test)]
+    pub(crate) fail_polls: bool,
 }
 
 /// What a network image view's feeder did in one duty, beyond its writes.
@@ -2884,15 +2887,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // A network image's view whose terminal cell is published is
             // done: its readers deliver nothing more, and the feeder stops
             // (conflated-network-images.md (c)).
-            if stream
+            let published = stream
                 .feeder
                 .as_ref()
                 .and_then(|feeder| feeder.fresh.as_ref())
                 .is_some_and(|fresh| {
                     karyos_sys::freshness::TerminalCell::read(&fresh.link.terminal_words())
                         .is_some()
-                })
-            {
+                });
+            if published {
                 if let Some(mut feeder) = stream.feeder.take() {
                     feeder.writer.close();
                 }
@@ -2920,6 +2923,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 None => false,
             };
             let with_positions = fresh.is_some();
+            #[cfg(test)]
+            let fail_poll = fresh.as_ref().is_some_and(|fresh| fresh.fail_polls);
             let mut terminal = None;
             let mut fed = Fed::default();
             let polled = if blocked {
@@ -2954,9 +2959,47 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     MessageLimit::new(budget),
                 )
             };
+            // A poll failure injected by a test (a feeder that cannot read
+            // on).
+            #[cfg(test)]
+            let polled = if fail_poll {
+                Err(karyos_client::subscription::PollError {
+                    summary: karyos_client::subscription::PollSummary::default(),
+                    cause: karyos_client::ClientError::ClosedByOverrun,
+                })
+            } else {
+                polled
+            };
             // A failed poll still reports what it handled before the failure.
             if let Some(counters) = &stream.feeder_counters {
                 counters.add(&self.counters, fed);
+            }
+            // A network image's view closes on its own, never sealing the
+            // image lane its other subscribers read (#324 review): exhausted
+            // versions or a feeder that cannot read on publish the view's
+            // terminal cell, every value stale, and the next duty closes
+            // the feeder.
+            if with_positions {
+                let reason = match (&terminal, &polled) {
+                    (Some(_), _) => Some(karyos_sys::freshness::TERMINAL_FRESHNESS_EXHAUSTED),
+                    (None, Err(_)) => Some(karyos_sys::freshness::TERMINAL_FEEDER_LOST),
+                    (None, Ok(_)) => None,
+                };
+                if let Some(reason) = reason {
+                    let _ = writer.publish_terminal(0, u64::MAX, reason);
+                    if let Some(net) = &mut self.net {
+                        net.count_views(|views| {
+                            // What the mailbox did this duty still counts.
+                            views.add(|c| &mut c.acked, fresh_fed.acked);
+                            views.add(|c| &mut c.withheld, fresh_fed.withheld);
+                            views.add(|c| &mut c.caught_up, fresh_fed.caught_up);
+                            if reason == karyos_sys::freshness::TERMINAL_FEEDER_LOST {
+                                views.add(|c| &mut c.feeders_lost, 1);
+                            }
+                        });
+                    }
+                    continue;
+                }
             }
             // A gap the poll stopped at: recorded now, or held (nothing
             // past it is polled) until the barrier takes it.
@@ -3256,10 +3299,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         served
     }
 
-    /// Applies the image table's events (W3): an installed image becomes
-    /// the lane streams of one aggregate, or is driven unexposed; a
-    /// retiring one has its streams sealed and retired, so they free once
-    /// no lease holds them and the image table can reclaim the image.
     /// Builds the conflated view of the installed image `slot`, when its
     /// key asked for one (conflated-network-images.md (a)): a heap table
     /// over the link the receiver's seal gate shares, fed from a required
@@ -3275,28 +3314,50 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some((lane, link)) = self.net.as_ref().and_then(|net| net.image_freshness(slot)) else {
             return;
         };
-        let built = exposed.and_then(|handle| {
+        use crate::net::ViewBuildFailure;
+        // `Err(None)`: the image is not exposed.
+        let built: Result<(), Option<ViewBuildFailure>> = (|| {
+            let handle = exposed.ok_or(None)?;
             let id = handle
                 .lanes
                 .get(usize::from(lane.get()))
                 .copied()
-                .flatten()?;
-            let index = self.streams.iter().position(|stream| stream.id == id)?;
-            let stream_id = self.streams.get(index)?.stream_id;
-            let (_, config) = self.net.as_ref()?.conflation_of(endpoint, stream_id)?;
+                .flatten()
+                .ok_or(Some(ViewBuildFailure::NoLane))?;
+            let index = self
+                .streams
+                .iter()
+                .position(|stream| stream.id == id)
+                .ok_or(Some(ViewBuildFailure::NoLane))?;
+            let stream_id = self
+                .streams
+                .get(index)
+                .ok_or(Some(ViewBuildFailure::NoLane))?
+                .stream_id;
+            let (_, config) = self
+                .net
+                .as_ref()
+                .and_then(|net| net.conflation_of(endpoint, stream_id))
+                .ok_or(Some(ViewBuildFailure::NoConfiguration))?;
             let writer = karyos_sys::conflation::conflation_fresh(
                 config.keys,
                 config.value_capacity,
                 config.journal_capacity,
                 link.clone(),
             )
-            .ok()?;
-            let stream = self.streams.get_mut(index)?;
-            let inner = stream.conductor.subscribe(Role::Required).ok()?;
+            .map_err(|error| Some(ViewBuildFailure::Table(error)))?;
+            let stream = self
+                .streams
+                .get_mut(index)
+                .ok_or(Some(ViewBuildFailure::NoLane))?;
+            let inner = stream
+                .conductor
+                .subscribe(Role::Required)
+                .map_err(|_| Some(ViewBuildFailure::Subscription))?;
             let generation = GenerationLink::new();
             let subscription = ClientSubscription::new(inner)
                 .with_generation(Arc::clone(&generation), 0)
-                .ok()?;
+                .map_err(|_| Some(ViewBuildFailure::Subscription))?;
             stream.members.push(Member {
                 link: Arc::downgrade(&generation),
                 kind: MemberKind::Feeder,
@@ -3308,6 +3369,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 fresh: Some(FreshFeed {
                     link: link.clone(),
                     gap: None,
+                    #[cfg(test)]
+                    fail_polls: false,
                 }),
             });
             let registration = stream.aggregate.registration;
@@ -3315,9 +3378,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if let Some(stream) = self.streams.get_mut(index) {
                 stream.feeder_counters = Some(counters);
             }
-            Some(())
-        });
-        if built.is_some()
+            Ok(())
+        })();
+        let deferred = self
+            .net
+            .as_ref()
+            .is_some_and(crate::net::Network::defers_view_attach);
+        if built.is_ok()
+            && !deferred
             && let Ok(mailbox) = link.mailbox()
         {
             // Attached once its feeder exists: the receiver's gate posts
@@ -3325,13 +3393,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             mailbox.attach();
         }
         if let Some(net) = &mut self.net {
-            net.count_views(|views| {
-                if built.is_some() {
-                    views.add(|c| &mut c.built, 1);
-                } else {
-                    views.add(|c| &mut c.unbuilt, 1);
+            net.count_views(|views| match built {
+                Ok(()) => views.add(|c| &mut c.built, 1),
+                Err(None) => views.add(|c| &mut c.unbuilt_unexposed, 1),
+                Err(Some(failure)) => {
+                    views.add(|c| &mut c.unbuilt_failed, 1);
+                    views.last_build_failure = Some(failure);
                 }
             });
+        }
+    }
+
+    /// Attaches every built conflated view of a network image that
+    /// `Network::defer_view_attach` held back (tests).
+    #[cfg(test)]
+    pub(crate) fn attach_network_views(&self) {
+        for stream in &self.streams {
+            if let Some(fresh) = stream
+                .feeder
+                .as_ref()
+                .and_then(|feeder| feeder.fresh.as_ref())
+                && let Ok(mailbox) = fresh.link.mailbox()
+            {
+                mailbox.attach();
+            }
         }
     }
 
@@ -3369,6 +3454,46 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Some(stream.feeder.as_ref()?.fresh.as_ref()?.link.clone())
     }
 
+    /// Seeds `key`'s version in the conflated view of `handle`'s `lane`,
+    /// so that its next write exhausts it (tests).
+    #[cfg(test)]
+    pub(crate) fn seed_network_view_version(
+        &self,
+        handle: &AggregateHandle,
+        lane: karyos_sys::frame::Lane,
+        key: u32,
+        version: u64,
+    ) {
+        let id = handle.lanes.get(usize::from(lane.get())).copied().flatten();
+        if let Some(feeder) = self
+            .streams
+            .iter()
+            .find(|stream| Some(stream.id) == id)
+            .and_then(|stream| stream.feeder.as_ref())
+        {
+            feeder.writer.seed_version(key, version);
+        }
+    }
+
+    /// Makes every poll of the feeder of `handle`'s `lane` fail (tests).
+    #[cfg(test)]
+    pub(crate) fn fail_network_view_polls(
+        &mut self,
+        handle: &AggregateHandle,
+        lane: karyos_sys::frame::Lane,
+    ) {
+        let id = handle.lanes.get(usize::from(lane.get())).copied().flatten();
+        if let Some(fresh) = self
+            .streams
+            .iter_mut()
+            .find(|stream| Some(stream.id) == id)
+            .and_then(|stream| stream.feeder.as_mut())
+            .and_then(|feeder| feeder.fresh.as_mut())
+        {
+            fresh.fail_polls = true;
+        }
+    }
+
     /// What the conflated views of network images did.
     #[must_use]
     pub fn network_view_counters(&self) -> crate::net::NetworkViewCounters {
@@ -3378,6 +3503,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .unwrap_or_default()
     }
 
+    /// Applies the image table's events (W3): an installed image becomes
+    /// the lane streams of one aggregate, or is driven unexposed; a
+    /// retiring one has its streams sealed and retired, so they free once
+    /// no lease holds them and the image table can reclaim the image.
     fn serve_images(&mut self) {
         let Some(events) = self
             .net
@@ -3420,6 +3549,33 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }
                     if let Some(handle) = handle {
                         for stream in handle.streams() {
+                            // A conflated view of the image closes with a
+                            // typed reason, marking no value stale (design
+                            // (a)); the retire below closes the feeder.
+                            if let Some(feeder) = self
+                                .stream(stream)
+                                .ok()
+                                .and_then(|lane| lane.feeder.as_ref())
+                                .filter(|feeder| feeder.fresh.is_some())
+                            {
+                                // The cell is one-shot: an earlier reason
+                                // (exhausted versions) keeps it, and the
+                                // close is counted as that terminal.
+                                let won = feeder.writer.publish_terminal(
+                                    0,
+                                    0,
+                                    karyos_sys::freshness::TERMINAL_IMAGE_RETIRED,
+                                );
+                                if let Some(net) = &mut self.net {
+                                    net.count_views(|views| {
+                                        if won {
+                                            views.add(|c| &mut c.closed_retired, 1);
+                                        } else {
+                                            views.add(|c| &mut c.closed_terminal, 1);
+                                        }
+                                    });
+                                }
+                            }
                             let _ = self.retire_lane_with(
                                 stream,
                                 SealReason::ImageRetired,

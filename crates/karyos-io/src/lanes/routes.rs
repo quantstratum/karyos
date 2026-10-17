@@ -247,6 +247,12 @@ impl RoutedLaneSender {
     /// The failures that stopped one route of several since the last call,
     /// the first per route: each route's half waits for its control path
     /// (retry or reset). Taking them clears them.
+    ///
+    /// With several routes they are the only report of a failure: a call in
+    /// which every route fails reports [`SenderReport::failure`] `None` (the
+    /// DRR stops idle, every route out), so the control path reads them
+    /// after every [`RoutedLaneSender::serve`] and
+    /// [`RoutedLaneSender::catch_up`].
     pub fn take_failures(&mut self) -> RouteFailures {
         std::mem::take(&mut self.failures)
     }

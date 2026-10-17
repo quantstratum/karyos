@@ -357,6 +357,9 @@ pub enum OutboundError {
     Quanta,
     /// The MTU is zero or does not fit a datagram.
     Mtu,
+    /// No path, more than four, or two paths on one endpoint: a routed
+    /// publication finds each route's TX half by its endpoint.
+    Routes,
 }
 
 /// A sender that goes leaves its readers' cells not counting for the
@@ -646,7 +649,13 @@ impl Outbound {
         budget: &mut RepairBudget,
         now: u64,
     ) -> u32 {
-        if self.repair.is_none() || !self.open(tx) {
+        // Over redundant paths repair stays on the founding route, whose
+        // queues `open_routes` opened: never a second route (#321 review).
+        let open = match self.routed.as_deref() {
+            Some(routed) => routed.founding_open(tx.capabilities().epoch),
+            None => self.open(tx),
+        };
+        if self.repair.is_none() || !open {
             return 0;
         }
         let mut sent_high = [0u64; MAX_LANES];
@@ -1063,9 +1072,51 @@ impl Outbound {
     /// Whether the endpoint needs a reset before this publication can send
     /// again (a send fault that cannot be retried, an invariant, or an item
     /// of unknown exposure). A new endpoint epoch clears it.
+    /// Over redundant paths, whether any route's endpoint needs one.
     #[must_use]
     pub fn needs_reset(&self) -> bool {
         self.needs_reset
+            || self
+                .routed
+                .as_deref()
+                .is_some_and(|routed| routed.routes_needing_reset().next().is_some())
+    }
+
+    /// Posts, through `post` (which says whether the request was posted),
+    /// the reset request of each endpoint that needs one and is due in
+    /// sender cycle `cycle` ([`Outbound::reset_request_due`]): the
+    /// publication's own, or each route's over redundant paths. Returns the
+    /// requests posted and those `post` refused.
+    pub fn post_reset_requests(
+        &mut self,
+        cycle: u64,
+        mut post: impl FnMut(EndpointId) -> bool,
+    ) -> (u64, u64) {
+        let mut done = (0u64, 0u64);
+        let mut tally = |posted: bool| {
+            let count = if posted { &mut done.0 } else { &mut done.1 };
+            if let Some(next) = count.checked_add(1) {
+                *count = next;
+            }
+        };
+        if let Some(routed) = self.routed.as_deref_mut() {
+            for (endpoint, requested) in routed.reset_requests_due(cycle) {
+                let posted = post(endpoint);
+                if posted {
+                    *requested = Some(cycle);
+                }
+                tally(posted);
+            }
+            return done;
+        }
+        if self.reset_request_due(cycle) {
+            let posted = post(self.endpoint);
+            if posted {
+                self.reset_request_posted(cycle);
+            }
+            tally(posted);
+        }
+        done
     }
 
     /// Whether a reset request is due in sender cycle `cycle`: it needs a
