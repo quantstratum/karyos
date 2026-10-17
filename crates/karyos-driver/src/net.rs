@@ -705,12 +705,17 @@ impl Network {
         }
     }
 
-    /// Stops `subscription`: its images retire and its endpoint is
-    /// released (control path). `false` when it is unknown.
+    /// Stops `subscription`: its images retire and its endpoints, every
+    /// path's, are released (control path). `false` when it is unknown.
     ///
     /// # Errors
     ///
-    /// [`DriverError::NetworkBusy`]; nothing changes then.
+    /// [`DriverError::NetworkBusy`] when the receiver's ring is full. The
+    /// table and the endpoints are then unchanged, but when the ring filled
+    /// part way through a subscription with later paths, the removals of
+    /// some later paths' receiver entries may already be posted. A retry
+    /// posts them again, which the receiver answers as not found, and
+    /// completes the removal.
     pub(crate) fn remove_subscription(
         &mut self,
         subscription: NetworkSubscription,

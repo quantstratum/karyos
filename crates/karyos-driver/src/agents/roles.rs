@@ -571,6 +571,12 @@ fn frame_position(image: &Installed, frame: &ValidatedFrame<'_>) -> Option<u64> 
 /// told to its path statistics as cleaned with their whole length (RP-6):
 /// what a path did not deliver fresh in them is its missing bytes. At most
 /// two terms per lane and call, so a step stays bounded.
+///
+/// Known limit: the whole term length counts as committed, since the
+/// receive owner does not report a term's committed bytes. On an
+/// unreliable image the bytes of a sealed gap, which no path delivered,
+/// are then charged to every path as missing (redundant-paths.md section
+/// 5 charges only committed bytes).
 fn terms_complete(image: &mut Installed) {
     let term_length = u64::from(image.term_length);
     for at in 0..usize::from(image.lane_count) {
