@@ -173,6 +173,10 @@ impl Disk for FaultDisk {
         Ok(path.to_path_buf())
     }
 
+    fn open_read(&mut self, path: &Path) -> io::Result<PathBuf> {
+        self.open(path)
+    }
+
     fn write_at(&mut self, file: &PathBuf, offset: u64, bytes: &[u8]) -> io::Result<()> {
         let mut fs = self.view()?;
         let cost = u64::try_from(bytes.len()).map_err(io::Error::other)?;

@@ -34,6 +34,23 @@ release may break APIs, wire formats and shared-memory layouts.
   of schema 1, validated whole on decode and encoded into the caller's
   buffer without allocating; an encoding that fails leaves no message
   in the buffer, not even an earlier one.
+- An Archive recording is read back for replay (phase 3, A5a).
+  `karyos_archive::replay::ReplaySource` reads a recording's range
+  without changing it, through read-only files (`Disk::open_read`):
+  whole frames, fills and gaps in order, from a frame boundary to the
+  last whole frame below the range's end, the end clamped to what the
+  recording held at open. No byte goes out before its entry's CRC holds:
+  an entry not delivered whole in one read is first read whole through
+  the buffer, its CRC and frame lengths checked. A segment missing inside
+  the range is an error, never the recording's end. It paces at full
+  speed, as recorded or scaled (`NonZeroU32` parts per million). The
+  segment index becomes version 2: each entry carries its record time
+  (the Archive's write time on its monotonic clock, 0 when unknown),
+  stamped by `SegmentStore::stamp` each recorder duty; a paced replay of
+  entries without one is refused, and a version 1 index is foreign: an
+  archive directory where an earlier build left a recording open fails
+  every agent start, since each start's settle recovers that recording.
+  A replay's error is final.
 - The driver hands an Archive recording a lane's reader (phase 3,
   A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
   reserved required or an optional cell and returns a `RecordingReader`:

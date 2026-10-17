@@ -723,7 +723,7 @@ fn bad_headers_are_typed_errors() {
         term_length: 64,
     }
     .encode();
-    header[4..8].copy_from_slice(&2u32.to_le_bytes());
+    header[4..8].copy_from_slice(&3u32.to_le_bytes());
     let crc = crc32c(&header[..44]);
     header[44..].copy_from_slice(&crc.to_le_bytes());
     overwrite_header(&disk, 128, &header);
@@ -1171,6 +1171,7 @@ fn an_unknown_entry_kind_is_refused() {
         length: 4,
         data_crc: 0,
         kind: EntryKind::Gap,
+        time_ns: 0,
     };
     let mut bytes = entry.encode();
     bytes[16] = 9;
@@ -1277,6 +1278,7 @@ fn an_index_with_too_many_gaps_is_refused() {
         length: 1,
         data_crc: 0,
         kind: EntryKind::Gap,
+        time_ns: 0,
     };
     let mut raw = disk.clone();
     let index = raw.open(&dir.join(index_name(RECORDING, 0))).unwrap();
