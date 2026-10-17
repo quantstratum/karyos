@@ -75,8 +75,10 @@ impl EmbeddedDriver<HeapTerms> {
     /// # Errors
     ///
     /// [`DriverError::NetworkUnavailable`] without a network,
-    /// [`DriverError::UnsupportedChannel`], [`DriverError::NetworkEndpoint`]
-    /// and [`DriverError::NetworkBusy`].
+    /// [`DriverError::UnsupportedChannel`], [`DriverError::NetworkEndpoint`],
+    /// [`DriverError::NetworkBusy`], and
+    /// [`DriverError::ReliabilityMismatch`] for a stream already subscribed
+    /// on the endpoint with another reliability.
     pub fn add_network_subscription(
         &mut self,
         stream_id: i32,
@@ -84,7 +86,13 @@ impl EmbeddedDriver<HeapTerms> {
     ) -> Result<NetworkSubscription, DriverError> {
         let (bind, multicast) = receive_route(channel)?;
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
-        net.add_subscription(stream_id, bind, multicast, DEFAULT_MAX_IMAGE_TERM_LENGTH)
+        net.add_subscription(
+            stream_id,
+            bind,
+            multicast,
+            DEFAULT_MAX_IMAGE_TERM_LENGTH,
+            channel.reliable,
+        )
     }
 
     /// Stops `subscription`: its images retire, which seals their streams

@@ -62,8 +62,8 @@ use karyos_io::backend::{Budget, RxBackend, RxDatagram, RxDrop, RxHandler};
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::frame::{FRAME_ALIGNMENT, Lane};
 use karyos_protocol::network::{
-    Alias, Control, Datagram, Identity, LaneStatus, Lanes, MAX_WINDOW, Receiver, Rttm, RttmKind,
-    SetupAnnounce, SetupAnswer, StatusMessage, classify,
+    Alias, Control, Datagram, Identity, LaneStatus, Lanes, MAX_WINDOW, Nak, NakReply, Receiver,
+    Rttm, RttmKind, SetupAnnounce, SetupAnswer, StatusMessage, classify,
 };
 use karyos_sys::host_clock::age_ns;
 use karyos_sys::log_buffer::ReceiveError;
@@ -90,6 +90,7 @@ const DATA_BUDGET: karyos_protocol::lanes::drr::Budget = karyos_protocol::lanes:
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
 use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
+use crate::repair::loss::{Hole, ImageLoss, LossConfig, Observation, ReplyOutcome as NakOutcome};
 use crate::rtt::{Probe, ReplyOutcome, RttConfig, RttProbes, RttReplies};
 use crate::sessions::OsNonces;
 use crate::sessions::rate::{EndpointRates, RateRefused, TotalRate, normalized};
@@ -100,6 +101,7 @@ use crate::sessions::receive::{
 use crate::sessions::send::{SendSessionError, SendSessions};
 use crate::sm_schedule::{SmDue, SmSchedule};
 use karyos_sys::log_buffer::ReceiveOwner;
+use karyos_sys::log_buffer::{CloseCause, SkipConfig, SkipPolicy};
 
 /// The receiver's counters; checked, sticky on overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -194,6 +196,32 @@ pub struct ReceiverCounters {
     /// on the receiver agent's timer step, a known deviation until the
     /// agents have a control thread (ACS 15868).
     pub rttm_id_draws: u64,
+    /// NAKs handed to the sender (phase 6, reliable images).
+    pub naks: u64,
+    /// NAKs not handed over: the control ring was full (each stays due).
+    pub ring_full_nak: u64,
+    /// NAK retries: a hole NAKed again (a reliable image whose sender
+    /// never repairs, such as a `reliable=false` publication, shows here).
+    pub nak_retries: u64,
+    /// Endpoint resets requested for a route fault (RC-6).
+    pub reset_requests: u64,
+    /// Reset requests not posted: the event ring was full.
+    pub reset_requests_full: u64,
+    /// A second uncertain NAK of an image while one is unresolved (RC-6):
+    /// its NAKs stop until the endpoint reset resolves them.
+    pub nak_route_faults: u64,
+    /// ERR NAK_REPLY controls for no installed image.
+    pub nak_replies_unbound: u64,
+    /// Images closed by repair: a range proven unrecoverable under
+    /// `on_unrecoverable = close`, or `GapCannotResume`.
+    pub images_closed_unrecoverable: u64,
+    /// Images closed by `GapCannotResume` (a floor beyond the window).
+    pub images_closed_cannot_resume: u64,
+    /// Images closed by a protocol fault (`range_invalid_limit`
+    /// consecutive RANGE_INVALID).
+    pub images_closed_protocol_fault: u64,
+    /// Gaps sealed by the skip policy (unreliable timers, or `skip`).
+    pub gaps_sealed: u64,
     /// Data and controls this phase does not handle yet.
     pub unhandled: u64,
     /// An increment did not apply.
@@ -289,6 +317,24 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
 /// The receiver agent's network state.
 #[derive(Debug)]
 pub struct ReceiverRole {
+    /// Test only: the DATA datagrams to drop at the intake, by their
+    /// count since the hook was set (a lossy path).
+    #[cfg(test)]
+    drop_data: Vec<u64>,
+    /// Test only: DATA datagrams seen since the hook was set.
+    #[cfg(test)]
+    data_seen: u64,
+    /// Test only: every NAK handed to the sender.
+    #[cfg(test)]
+    posted_naks: Vec<Nak>,
+    /// The epoch of each endpoint's RX half last seen, at most
+    /// `max_endpoints` (allocated at creation): a new one is the endpoint's
+    /// reset, which resolves its images' uncertain NAKs (RC-6).
+    rx_epochs: Vec<(EndpointId, karyos_io::backend::BackendEpoch)>,
+    /// The most endpoints the agent holds (`max_endpoints`).
+    max_endpoints: usize,
+    /// Duty cycles run, for the reset request cadence.
+    cycle: u64,
     /// The network trace hook (P2.12 step 3).
     trace: super::net_trace::ReceiverTrace,
     sessions: ReceiveSessions,
@@ -297,7 +343,9 @@ pub struct ReceiverRole {
     budget: Budget,
     /// Subscribed streams per endpoint, with their largest accepted image
     /// term length.
-    subscriptions: Vec<(EndpointId, i32, u32)>,
+    /// Subscribed streams: endpoint, stream, largest image term length,
+    /// and whether the channel is reliable (its `reliable` parameter).
+    subscriptions: Vec<(EndpointId, i32, u32, bool)>,
     /// Whether a subscription was ever removed: from then on each cycle
     /// retires the images of streams no longer subscribed (bounded by the
     /// subscription table).
@@ -408,6 +456,20 @@ fn classify_heartbeat(image: &mut Installed, heartbeat: &Heartbeat) -> Heartbeat
 /// What the path statistics record of `frame` from `path`: its lane, term
 /// count, stream position and extent. `None` off any bound path or for a
 /// term outside the incarnation.
+/// The stream position of `frame` in `image`, or `None` for a term outside
+/// the incarnation.
+fn frame_position(image: &Installed, frame: &ValidatedFrame<'_>) -> Option<u64> {
+    let term = u64::from(
+        frame
+            .term_id()
+            .count_from(image.initial_term_id)
+            .ok()?
+            .get(),
+    );
+    term.checked_mul(u64::from(image.term_length))?
+        .checked_add(u64::from(frame.term_offset()))
+}
+
 fn delivered(
     image: &Installed,
     frame: &ValidatedFrame<'_>,
@@ -492,6 +554,131 @@ struct Installed {
     rtt: RttProbes,
     /// Each path's REQUEST report slot and the probe it reports on.
     probes: Vec<PathProbe>,
+    /// Whether its channel is reliable: losses are NAKed, otherwise the
+    /// skip policy seals them.
+    reliable: bool,
+    /// Its repair state (phase 6): each lane's earliest-gap decision.
+    loss: ImageLoss,
+    /// Its skip policy (GU-4 to GU-6): timer seals, unrecoverable ranges,
+    /// far-window closes.
+    skip: SkipPolicy,
+    /// Each lane's NAK report slot and the NAK it reports on: at most one
+    /// NAK per lane in the ring.
+    naks: Vec<PendingNak>,
+    /// The close repair decided, carried out by the next timer step.
+    closing: Option<CloseReason>,
+    /// Per lane, when a tail loss was first seen (the heartbeat mark above
+    /// a rebuild position with nothing covered above it).
+    tail_since: [Option<u64>; 4],
+    /// The receiver cycle its last endpoint reset request was posted in,
+    /// while a route fault holds its NAKs (RC-6).
+    reset_requested: Option<u64>,
+}
+
+/// One lane's NAK in flight: its report slot (the RTTM probe's contract:
+/// the sender reads the clock before the submitting call and reports
+/// whether it submitted) and the NAK the report belongs to.
+#[derive(Debug)]
+struct PendingNak {
+    slot: Arc<ReportSlot>,
+    pending: Option<Nak>,
+}
+
+/// Why repair closes an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReason {
+    /// A range proven unrecoverable, under `on_unrecoverable = close`.
+    Unrecoverable,
+    /// A floor beyond the receive window (RC-9, GU-6).
+    CannotResume,
+    /// `range_invalid_limit` consecutive RANGE_INVALID (RC-8).
+    ProtocolFault,
+}
+
+impl From<CloseCause> for CloseReason {
+    fn from(cause: CloseCause) -> Self {
+        match cause {
+            CloseCause::Unrecoverable => Self::Unrecoverable,
+            CloseCause::GapCannotResume => Self::CannotResume,
+        }
+    }
+}
+
+/// A tail loss on `image`'s `lane` (ACS 15957 note 1, 15984): nothing above
+/// the rebuild position is covered, yet the lane's heartbeat mark (the
+/// sender's submitted position) is above it, and has been for one RTT.
+/// The hole runs from the rebuild position to the mark, never past the
+/// rebuild position's term: a NAK beyond the sender's position would be
+/// answered RANGE_INVALID. The wait starts when the condition is first
+/// seen and ends when it clears.
+fn tail_hole(image: &mut Installed, lane: Lane, at: usize, now: u64) -> Option<Hole> {
+    use crate::repair::loss::RttSource;
+
+    let rebuild = image.owner.rebuild_position(lane)?;
+    let mark = image.heartbeat_marks.get(at).copied().flatten();
+    let Some(mark) = mark.filter(|mark| *mark > rebuild) else {
+        if let Some(since) = image.tail_since.get_mut(at) {
+            *since = None;
+        }
+        return None;
+    };
+    let since = image.tail_since.get_mut(at)?;
+    let first = *since.get_or_insert(now);
+    if age_ns(now, first) < image.rtt.rtt_snapshot(0) {
+        return None;
+    }
+    let term = u64::from(image.term_length);
+    let term_end = rebuild
+        .checked_div(term)?
+        .checked_add(1)?
+        .checked_mul(term)?;
+    let length = u32::try_from(mark.min(term_end).checked_sub(rebuild)?).ok()?;
+    Some(Hole {
+        start: rebuild,
+        length,
+    })
+}
+
+/// `hole` of `image`'s `lane` proven unrecoverable, with the sender's
+/// lowest retained position: the skip policy seals it (`skip`) or decides
+/// the image's close (`close`, or a floor beyond the window). The whole
+/// hole is unrecoverable even when the floor lies inside it (RC-9), so the
+/// policy is given the later of the floor and the hole's end: it seals
+/// every hole starting below that.
+fn unrecoverable(
+    image: &mut Installed,
+    counters: &mut ReceiverCounters,
+    lane: Lane,
+    hole: Hole,
+    lowest_retained: u64,
+    now: u64,
+) {
+    let floor = hole
+        .start
+        .checked_add(u64::from(hole.length))
+        .map_or(lowest_retained, |end| lowest_retained.max(end));
+    match image
+        .skip
+        .range_unavailable(&mut image.owner, lane, floor, now)
+    {
+        Ok(report) => {
+            for _ in 0..report.sealed {
+                tally(counters, |c| &mut c.gaps_sealed);
+            }
+            if let Some(close) = report.close {
+                image.closing = Some(CloseReason::from(close.cause));
+            }
+        }
+        Err(_) => tally(counters, |c| &mut c.chain_invariant),
+    }
+}
+
+/// The end of `lane`'s receive window `{r, r + 1}` of `owner`: two terms
+/// past the start of the rebuild position's term. `None` past `u64`.
+fn window_end(owner: &ReceiveOwner, lane: Lane, term_length: u32) -> Option<u64> {
+    let term = u64::from(term_length);
+    let rebuild = owner.rebuild_position(lane)?;
+    rebuild.checked_div(term)?.checked_add(2)?.checked_mul(term)
 }
 
 /// One path's RTTM REQUEST in flight: its report slot (at most one
@@ -689,6 +876,15 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             trace: super::net_trace::SenderTrace::default(),
         },
         ReceiverRole {
+            #[cfg(test)]
+            drop_data: Vec::new(),
+            #[cfg(test)]
+            data_seen: 0,
+            #[cfg(test)]
+            posted_naks: Vec::new(),
+            rx_epochs: Vec::with_capacity(config.max_endpoints),
+            max_endpoints: config.max_endpoints,
+            cycle: 0,
             sessions,
             nonces: OsNonces,
             to_sender,
@@ -770,22 +966,25 @@ impl ReceiverRole {
                 endpoint,
                 stream_id,
                 max_term_length,
+                reliable,
             } => {
                 let held = self
                     .subscriptions
                     .iter()
-                    .position(|(held, stream, _)| (*held, *stream) == (endpoint, stream_id));
+                    .position(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id));
                 let full = self.subscriptions.len() >= max;
                 let accepted = match held.and_then(|index| self.subscriptions.get_mut(index)) {
                     // Two subscribers of one stream on one endpoint: the
-                    // stricter limit holds for both.
+                    // stricter limit and the stricter reliability (repair)
+                    // hold for both.
                     Some(entry) => {
                         entry.2 = entry.2.min(max_term_length);
+                        entry.3 |= reliable;
                         true
                     }
                     None if !full => {
                         self.subscriptions
-                            .push((endpoint, stream_id, max_term_length));
+                            .push((endpoint, stream_id, max_term_length, reliable));
                         true
                     }
                     None => false,
@@ -813,7 +1012,7 @@ impl ReceiverRole {
                 let found = self
                     .subscriptions
                     .iter()
-                    .position(|(held, stream, _)| (*held, *stream) == (endpoint, stream_id));
+                    .position(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id));
                 if let Some(index) = found {
                     self.subscriptions.swap_remove(index);
                     self.unsubscribed = true;
@@ -915,6 +1114,105 @@ impl ReceiverRole {
             work: 0,
         };
         intake.data(source, alias, bytes);
+    }
+
+    /// Hands the receiver a DATA frame of `payload` bytes on lane 0 of the
+    /// image at `slot`, at stream position `position`, from `source` on
+    /// `endpoint` at `now` (tests).
+    #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a test helper naming the frame's whole context"
+    )]
+    pub(super) fn inject_frame(
+        &mut self,
+        sessions: &SessionEnd,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        slot: SlotRef,
+        position: u64,
+        payload: usize,
+        now: u64,
+    ) {
+        use karyos_protocol::frame::{Flags, FrameType, Word0};
+
+        let image = self.images.iter().find(|image| image.slot == slot).unwrap();
+        let term_length = u64::from(image.term_length);
+        let term_id = image
+            .initial_term_id
+            .get()
+            .checked_add(u32::try_from(position / term_length).unwrap())
+            .unwrap();
+        let term_offset = u32::try_from(position % term_length).unwrap();
+        let alias = image.key.alias;
+        let length = 32 + payload;
+        let mut bytes = vec![0u8; length];
+        let word0 = Word0::new(
+            i32::try_from(length).unwrap(),
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Data,
+        );
+        bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+        bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+        bytes[12..16].copy_from_slice(&alias.session_id.to_le_bytes());
+        bytes[16..20].copy_from_slice(&alias.stream_id.to_le_bytes());
+        bytes[20..24].copy_from_slice(&term_id.to_le_bytes());
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        intake.data(source, alias, &bytes);
+    }
+
+    /// Drops the DATA datagrams numbered `nth` (from 0) from now on at the
+    /// intake, as a lossy path would (tests).
+    #[cfg(test)]
+    pub(super) fn drop_data(&mut self, nth: &[u64]) {
+        self.drop_data = nth.to_vec();
+        self.data_seen = 0;
+    }
+
+    /// Makes the image at `slot` hold a route fault: two uncertain NAKs,
+    /// the second while the first is unresolved (tests).
+    #[cfg(test)]
+    pub(super) fn fault_naks(&mut self, slot: SlotRef, nak: &Nak) {
+        struct Fixed;
+        impl crate::repair::loss::RttSource for Fixed {
+            fn rtt_snapshot(&self, _: usize) -> u64 {
+                0
+            }
+        }
+        let image = self
+            .images
+            .iter_mut()
+            .find(|image| image.slot == slot)
+            .unwrap();
+        let _ = image.loss.uncertain(nak, 0, &Fixed);
+        let _ = image.loss.uncertain(nak, 0, &Fixed);
+    }
+
+    /// Every NAK handed to the sender (tests).
+    #[cfg(test)]
+    pub(super) fn posted_naks(&self) -> &[Nak] {
+        &self.posted_naks
+    }
+
+    /// Replaces the receiver's clock (tests: a rig's virtual time).
+    #[cfg(test)]
+    pub(super) fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = clock;
+    }
+
+    /// The repair counters of the image at `slot` (tests).
+    #[cfg(test)]
+    pub(super) fn loss_counters(&self, slot: SlotRef) -> Option<crate::repair::loss::LossCounters> {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .map(|image| image.loss.counters())
     }
 
     /// Hands the receiver a DATA heartbeat on lane 0 of the image at
@@ -1126,6 +1424,41 @@ impl ReceiverRole {
                 pending: None,
             })
             .collect();
+        // Its repair state, allocated here: reliability is the
+        // subscription channel's (ACS 15984).
+        let reliable = self
+            .subscriptions
+            .iter()
+            .find(|(held, stream, ..)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
+            .is_none_or(|(.., reliable)| *reliable);
+        let receiver = Receiver {
+            receiver_boot_id: self.sessions.boot_id(),
+            receiver_id: receiver_id(installed),
+        };
+        let Ok(loss) = ImageLoss::new(
+            LossConfig::default(),
+            key.alias,
+            identity,
+            receiver,
+            chain.lane_count,
+            0,
+        ) else {
+            return Err(Some(chain.retire));
+        };
+        let skip_config = if reliable {
+            SkipConfig::reliable()
+        } else {
+            SkipConfig::unreliable()
+        };
+        let Ok(skip) = SkipPolicy::new(skip_config, usize::from(chain.lane_count)) else {
+            return Err(Some(chain.retire));
+        };
+        let naks = (0..chain.lane_count)
+            .map(|_| PendingNak {
+                slot: Arc::new(ReportSlot::default()),
+                pending: None,
+            })
+            .collect();
         // The table holds a slot for every session, so it has room for
         // every installed image.
         self.images.push(Installed {
@@ -1148,6 +1481,13 @@ impl ReceiverRole {
             evidence: now,
             rtt,
             probes,
+            reliable,
+            loss,
+            skip,
+            naks,
+            closing: None,
+            tail_since: [None; 4],
+            reset_requested: None,
         });
         Ok(())
     }
@@ -1164,10 +1504,24 @@ impl ReceiverRole {
         let mut index = 0usize;
         while let Some(image) = self.images.get(index) {
             let unsubscribed = self.unsubscribed
-                && !self.subscriptions.iter().any(|(endpoint, stream, _)| {
+                && !self.subscriptions.iter().any(|(endpoint, stream, ..)| {
                     (*endpoint, *stream) == (image.key.endpoint, image.key.alias.stream_id)
                 });
             if unsubscribed || age_ns(now, image.evidence) >= self.liveness_timeout {
+                let image = self.images.swap_remove(index);
+                self.retire(sessions, image, now);
+                work = work.checked_add(1).ok_or(overflow.clone())?;
+                continue;
+            }
+            // A close repair decided (an ERR reply in the intake, or the
+            // skip policy below on an earlier step).
+            if let Some(reason) = image.closing {
+                let field: fn(&mut ReceiverCounters) -> &mut u64 = match reason {
+                    CloseReason::Unrecoverable => |c| &mut c.images_closed_unrecoverable,
+                    CloseReason::CannotResume => |c| &mut c.images_closed_cannot_resume,
+                    CloseReason::ProtocolFault => |c| &mut c.images_closed_protocol_fault,
+                };
+                self.count(field);
                 let image = self.images.swap_remove(index);
                 self.retire(sessions, image, now);
                 work = work.checked_add(1).ok_or(overflow.clone())?;
@@ -1210,9 +1564,198 @@ impl ReceiverRole {
             work = work
                 .checked_add(self.probe_paths(index, now)?)
                 .ok_or(overflow.clone())?;
+            // Then its repair: NAKs due, the skip policy's seals and
+            // closes (phase 6).
+            work = work
+                .checked_add(self.repair(index, now)?)
+                .ok_or(overflow.clone())?;
             index = index.checked_add(1).ok_or(overflow.clone())?;
         }
         Ok(work)
+    }
+
+    /// Asks for the reset of each endpoint whose image a route fault holds
+    /// (RC-6), through `post` (which returns whether the request was
+    /// posted): at most once per `RESET_REQUEST_CYCLES` per image while the
+    /// fault holds; the reset's new epoch resolves it. Nothing allocates.
+    pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
+        let cycle = self.cycle;
+        let Self {
+            images, counters, ..
+        } = self;
+        for image in images.iter_mut() {
+            if !image.loss.is_faulted() {
+                continue;
+            }
+            let due = image.reset_requested.is_none_or(|at| {
+                cycle
+                    .checked_sub(at)
+                    .is_none_or(|age| age >= super::data::RESET_REQUEST_CYCLES)
+            });
+            if !due {
+                continue;
+            }
+            if post(image.key.endpoint) {
+                image.reset_requested = Some(cycle);
+                tally(counters, |c| &mut c.reset_requests);
+            } else {
+                tally(counters, |c| &mut c.reset_requests_full);
+            }
+        }
+    }
+
+    /// Records the epoch of `endpoint`'s RX half: a new one (the endpoint
+    /// was reset and both halves reopened) resolves the uncertain NAKs of
+    /// its images (RC-6), and their NAKs resume.
+    fn rx_epoch(&mut self, endpoint: EndpointId, epoch: karyos_io::backend::BackendEpoch) {
+        let room = self.rx_epochs.len() < self.max_endpoints;
+        match self
+            .rx_epochs
+            .iter_mut()
+            .find(|(held, _)| *held == endpoint)
+        {
+            Some((_, seen)) if *seen == epoch => {}
+            Some((_, seen)) => {
+                *seen = epoch;
+                for image in &mut self.images {
+                    if image.key.endpoint == endpoint {
+                        image.loss.uncertain_resolved();
+                        image.reset_requested = None;
+                    }
+                }
+            }
+            // At most `max_endpoints` halves: a full table is not reached.
+            None if room => {
+                self.rx_epochs.push((endpoint, epoch));
+            }
+            None => {}
+        }
+    }
+
+    /// The repair step of the image at `index` at `now` (phase 6). On a
+    /// reliable image each lane's last NAK report is settled, its first
+    /// hole observed, and a due NAK handed to the sender, at most one per
+    /// lane in the ring, to the binding's source. Then the skip policy runs
+    /// on every image: timer seals on an unreliable one, the far-window
+    /// close. A close is carried out by the next timer step. Returns the
+    /// NAKs handed over.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
+    fn repair(&mut self, index: usize, now: u64) -> Result<u32, AgentError> {
+        let Self {
+            images,
+            to_sender,
+            counters,
+            #[cfg(test)]
+            posted_naks,
+            ..
+        } = self;
+        let Some(image) = images.get_mut(index) else {
+            return Ok(0);
+        };
+        let mut sent = 0u32;
+        let lanes = usize::from(image.lane_count);
+        for at in 0..lanes {
+            let Some(lane) = u8::try_from(at).ok().and_then(|at| Lane::try_new(at).ok()) else {
+                continue;
+            };
+            if let Some(report) = image.naks.get_mut(at)
+                && let Some(settled) = report.slot.collect(false)
+                && let Some(nak) = report.pending.take()
+            {
+                let retries = image.loss.counters().retries;
+                match settled {
+                    SendReport::Submitted(start) => image.loss.submitted(&nak, start, &image.rtt),
+                    SendReport::NotSubmitted => image.loss.not_submitted(&nak),
+                    // RC-6: counts as submitted at its start; a second
+                    // while one is unresolved is a route fault.
+                    SendReport::Uncertain(start) => {
+                        if image.loss.uncertain(&nak, start, &image.rtt).is_err() {
+                            tally(counters, |c| &mut c.nak_route_faults);
+                        }
+                    }
+                }
+                if image.loss.counters().retries > retries {
+                    tally(counters, |c| &mut c.nak_retries);
+                }
+            }
+            if !image.reliable {
+                continue;
+            }
+            let first = image
+                .owner
+                .first_hole(lane)
+                .ok()
+                .flatten()
+                .map(|(start, length)| Hole { start, length });
+            // A covered hole ends any tail wait: a later tail waits its RTT
+            // afresh.
+            if first.is_some()
+                && let Some(since) = image.tail_since.get_mut(at)
+            {
+                *since = None;
+            }
+            let hole = first.or_else(|| tail_hole(image, lane, at, now));
+            if let Observation::Unrecoverable {
+                hole,
+                lowest_retained,
+                ..
+            } = image.loss.observe(lane, hole, now)
+            {
+                unrecoverable(image, counters, lane, hole, lowest_retained, now);
+            }
+            let Some(report) = image.naks.get_mut(at) else {
+                continue;
+            };
+            if report.slot.busy() {
+                continue;
+            }
+            let Some(nak) = image.loss.due(lane, now) else {
+                continue;
+            };
+            let item = ControlItem::Outgoing {
+                endpoint: image.key.endpoint,
+                destination: image.key.source,
+                control: Control::Nak(nak),
+                guard: Some(ItemGuard::Report(ReportGuard::take(&report.slot))),
+            };
+            // A dropped item drops its guard: reported not submitted, and
+            // the NAK stays due.
+            match to_sender.try_post(item) {
+                Ok(()) => {
+                    report.pending = Some(nak);
+                    #[cfg(test)]
+                    posted_naks.push(nak);
+                    tally(counters, |c| &mut c.naks);
+                    sent = sent
+                        .checked_add(1)
+                        .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
+                }
+                Err(_) => {
+                    tally(counters, |c| &mut c.ring_full_nak);
+                    image.loss.not_submitted(&nak);
+                }
+            }
+        }
+        // The skip policy's duty: timer seals and the far-window close on
+        // an unreliable image; on a reliable one under `skip`, the holes
+        // left below an unrecoverable range (at most a few per call).
+        if image.closing.is_none() {
+            match image.skip.duty(&mut image.owner, now) {
+                Ok(report) => {
+                    for _ in 0..report.sealed {
+                        tally(counters, |c| &mut c.gaps_sealed);
+                    }
+                    if let Some(close) = report.close {
+                        image.closing = Some(CloseReason::from(close.cause));
+                    }
+                }
+                Err(_) => tally(counters, |c| &mut c.chain_invariant),
+            }
+        }
+        Ok(sent)
     }
 
     /// The RTTM REQUESTs due on the bound paths of the image at `index` at
@@ -1414,9 +1957,15 @@ impl ReceiverRole {
                 image.rtt.rebind(path);
             }
         });
+        self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         work = work
             .checked_add(self.image_timers(sessions, now)?)
             .ok_or(overflow.clone())?;
+        for (endpoint, half) in halves.iter() {
+            if let Half::Rx(rx) = half {
+                self.rx_epoch(*endpoint, rx.capabilities().epoch);
+            }
+        }
         for (endpoint, half) in halves.iter_mut() {
             let Half::Rx(rx) = half else {
                 continue;
@@ -1530,6 +2079,16 @@ impl Intake<'_> {
     /// committed by the receive owner. Fresh evidence (a committed frame or
     /// a heartbeat) keeps the image and the path alive. Nothing allocates.
     fn data(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
+        #[cfg(test)]
+        {
+            let seen = self.role.data_seen;
+            if let Some(next) = seen.checked_add(1) {
+                self.role.data_seen = next;
+            }
+            if self.role.drop_data.contains(&seen) {
+                return;
+            }
+        }
         let key = BindingKey {
             endpoint: self.endpoint,
             source,
@@ -1564,7 +2123,15 @@ impl Intake<'_> {
             let (outcome, arrival) = match item {
                 Item::Frame(frame) => {
                     let delivered = delivered(image, &frame, path, self.now);
-                    match image.owner.receive(&frame) {
+                    let received = image.owner.receive(&frame);
+                    // The skip policy's far-window clock (GU-6): a run of
+                    // `Ahead` arrivals starts it, a committed one stops it.
+                    if let Some(position) = frame_position(image, &frame) {
+                        image
+                            .skip
+                            .arrived(frame.lane(), &received, position, self.now);
+                    }
+                    match received {
                         Ok(Received::Committed { position, extent }) => {
                             // The heartbeat mark rises with committed data
                             // too: a replayed older heartbeat after a data
@@ -1683,7 +2250,7 @@ impl Intake<'_> {
             .role
             .subscriptions
             .iter()
-            .any(|(held, stream, _)| (*held, *stream) == (key.endpoint, key.alias.stream_id));
+            .any(|(held, stream, ..)| (*held, *stream) == (key.endpoint, key.alias.stream_id));
         if !subscribed {
             return;
         }
@@ -1724,6 +2291,52 @@ impl Intake<'_> {
         }
     }
 
+    /// An ERR NAK_REPLY from `source` (phase 6): it reaches the image bound
+    /// to its key, whose repair state accepts only an exact echo of an
+    /// outstanding NAK. RANGE_UNAVAILABLE goes to the skip policy (seal or
+    /// close, RC-9); a protocol fault (RC-8) closes the image.
+    fn nak_reply(&mut self, source: SocketAddr, reply: &NakReply) {
+        let key = BindingKey {
+            endpoint: self.endpoint,
+            source,
+            alias: reply.alias,
+        };
+        let now = self.now;
+        let role = &mut *self.role;
+        let Some(slot) = role.sessions.lookup(&key) else {
+            role.count(|c| &mut c.nak_replies_unbound);
+            return;
+        };
+        let ReceiverRole {
+            images, counters, ..
+        } = role;
+        let Some(image) = images.iter_mut().find(|image| image.slot == slot) else {
+            tally(counters, |c| &mut c.nak_replies_unbound);
+            return;
+        };
+        let lane = reply.range.lane;
+        let Some(end) = window_end(&image.owner, lane, image.term_length) else {
+            tally(counters, |c| &mut c.nak_replies_unbound);
+            return;
+        };
+        match image.loss.reply(reply, end) {
+            NakOutcome::Unrecoverable {
+                lane,
+                hole,
+                lowest_retained,
+            } => unrecoverable(image, counters, lane, hole, lowest_retained, now),
+            // A floor beyond the window closes the image whatever the skip
+            // policy (RC-9): its repair state is terminal already.
+            NakOutcome::GapCannotResume { .. } => {
+                image.closing = Some(CloseReason::CannotResume);
+            }
+            NakOutcome::ProtocolFault { .. } => {
+                image.closing = Some(CloseReason::ProtocolFault);
+            }
+            NakOutcome::Unmatched | NakOutcome::StillDue => {}
+        }
+    }
+
     fn control(&mut self, source: SocketAddr, control: Control) {
         let endpoint = self.endpoint;
         let now = self.now;
@@ -1734,10 +2347,10 @@ impl Intake<'_> {
                     .role
                     .subscriptions
                     .iter()
-                    .find(|(held, stream, _)| {
+                    .find(|(held, stream, ..)| {
                         (*held, *stream) == (endpoint, announce.alias.stream_id)
                     })
-                    .map(|(.., max)| *max)
+                    .map(|(_, _, max, _)| *max)
                 else {
                     self.role.count(|c| &mut c.unsubscribed);
                     return;
@@ -1769,10 +2382,10 @@ impl Intake<'_> {
                     .role
                     .subscriptions
                     .iter()
-                    .find(|(held, stream, _)| {
+                    .find(|(held, stream, ..)| {
                         (*held, *stream) == (endpoint, answer.alias.stream_id)
                     })
-                    .map(|(.., max)| *max)
+                    .map(|(_, _, max, _)| *max)
                 else {
                     self.role.count(|c| &mut c.unsubscribed);
                     return;
@@ -1894,6 +2507,7 @@ impl Intake<'_> {
                 }
                 RttmKind::Reply { .. } => self.rttm_reply(source, &rttm),
             },
+            Control::NakReply(reply) => self.nak_reply(source, &reply),
             _ => self.role.count(|c| &mut c.unhandled),
         }
     }
@@ -2307,6 +2921,12 @@ impl SenderRole {
                 self.count(|c| &mut c.reset_requests_full);
             }
         }
+    }
+
+    /// Replaces the sender's clock (tests: a rig's virtual time).
+    #[cfg(test)]
+    pub(super) fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = clock;
     }
 
     /// The least position every receiver bound to `alias` on `endpoint`

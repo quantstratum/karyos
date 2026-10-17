@@ -163,6 +163,7 @@ fn add_publication(
             endpoint: b,
             stream_id: alias().stream_id,
             max_term_length: super::super::images::DEFAULT_MAX_IMAGE_TERM_LENGTH,
+            reliable: true,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -717,13 +718,15 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             endpoint: EndpointId(1),
             stream_id: 6,
             max_term_length,
+            // Reliable if any subscription of the stream is.
+            reliable: max_term_length == 2 << 20,
         };
         assert!(matches!(
             role.command(command),
             Some((_, AgentEvent::Configured { accepted: true, .. }))
         ));
     }
-    assert_eq!(role.subscriptions, [(EndpointId(1), 6, 512 << 10)]);
+    assert_eq!(role.subscriptions, [(EndpointId(1), 6, 512 << 10, true)]);
 }
 
 /// The sender accepts an SM only from a receiver it answered on that
@@ -1097,6 +1100,13 @@ fn unconfirmed_bindings_never_hold_the_table() {
 /// An installed one-lane image (session 5, stream 6, initial term 9,
 /// 64 KiB terms) for the liveness tests.
 fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
+    installed_image_with(karyos_sys::log_buffer::SkipConfig::reliable())
+}
+
+/// [`installed_image`] with `skip` as its skip policy's configuration.
+fn installed_image_with(
+    skip: karyos_sys::log_buffer::SkipConfig,
+) -> (super::Installed, karyos_sys::receive::ImageParams) {
     use std::sync::Arc;
 
     use karyos_protocol::frame::Lane;
@@ -1162,6 +1172,27 @@ fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
                 pending: None,
             })
             .collect(),
+        reliable: true,
+        loss: crate::repair::loss::ImageLoss::new(
+            crate::repair::loss::LossConfig::default(),
+            alias(),
+            identity(),
+            karyos_protocol::network::Receiver {
+                receiver_boot_id: [7, 8],
+                receiver_id: 1,
+            },
+            1,
+            0,
+        )
+        .unwrap(),
+        skip: karyos_sys::log_buffer::SkipPolicy::new(skip, 1).unwrap(),
+        naks: vec![super::PendingNak {
+            slot: Arc::new(super::ReportSlot::default()),
+            pending: None,
+        }],
+        closing: None,
+        tail_since: [None; 4],
+        reset_requested: None,
     };
     (image, params)
 }
@@ -1838,7 +1869,9 @@ fn a_rate_limited_solicit_leaves_no_entry() {
     };
     let (sender, mut receiver) = super::roles(&config).unwrap();
     let (sessions, _link) = event_ring();
-    receiver.subscriptions.push((EndpointId(1), 6, 1 << 20));
+    receiver
+        .subscriptions
+        .push((EndpointId(1), 6, 1 << 20, true));
     let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let other = Alias {
         session_id: 50,
@@ -1893,7 +1926,9 @@ fn solicits_need_a_subscription_an_answerable_source_and_a_term_bound() {
     // Not subscribed: nothing.
     receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 1);
     assert!(sender.from_receiver.try_take().unwrap().is_none());
-    receiver.subscriptions.push((EndpointId(1), 6, 65_536));
+    receiver
+        .subscriptions
+        .push((EndpointId(1), 6, 65_536, true));
     // A group source cannot be answered: no entry is created.
     let group: SocketAddr = "239.1.1.1:5000".parse().unwrap();
     receiver.inject_data(&sessions, EndpointId(1), group, alias(), &bytes, 2);
@@ -1944,7 +1979,9 @@ fn the_total_rsp_rate_is_checked_before_any_entry() {
     };
     let (sender, mut receiver) = super::roles(&config).unwrap();
     let (sessions, _link) = event_ring();
-    receiver.subscriptions.push((EndpointId(1), 6, 1 << 20));
+    receiver
+        .subscriptions
+        .push((EndpointId(1), 6, 1 << 20, true));
     let bytes = [0u8; 32];
     let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
@@ -1984,4 +2021,351 @@ fn a_confirmed_binding_keeps_the_publication_established() {
         .unwrap();
     assert!(!sender.sessions.is_established(endpoint, alias()));
     assert_eq!(sender.session_counters().reannounced, 1);
+}
+
+/// Commits a DATA frame of `payload` bytes at `offset` of the first term
+/// into `image`'s lane 0.
+fn commit_frame(
+    image: &mut super::Installed,
+    params: &karyos_sys::receive::ImageParams,
+    offset: u32,
+    payload: usize,
+) {
+    use karyos_protocol::frame::{Flags, FrameType, Lane, Word0};
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let length = 32 + payload;
+    let mut bytes = vec![0u8; length];
+    let word0 = Word0::new(
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, false, false, Lane::ZERO),
+        FrameType::Data,
+    );
+    bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+    bytes[8..12].copy_from_slice(&offset.to_le_bytes());
+    bytes[12..16].copy_from_slice(&5i32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&6i32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&9u32.to_le_bytes());
+    let datagram = ValidatedDatagram::parse(&bytes, params).unwrap();
+    for item in datagram.items() {
+        let Item::Frame(frame) = item else {
+            panic!("not a frame");
+        };
+        assert!(matches!(
+            image.owner.receive(&frame),
+            Ok(karyos_sys::log_buffer::Received::Committed { .. })
+        ));
+    }
+}
+
+/// The receiver with `image` installed alone, and the sender whose ring
+/// its NAKs reach.
+fn repairing(image: super::Installed) -> (super::SenderRole, super::ReceiverRole) {
+    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
+    receiver.images.push(image);
+    (sender, receiver)
+}
+
+/// Takes the sender's next NAK and reports it submitted at `start`, as
+/// the sender's control path does.
+fn submit_nak(sender: &super::SenderRole, start: u64) -> karyos_protocol::network::Nak {
+    let Ok(Some(super::ControlItem::Outgoing {
+        control: Control::Nak(nak),
+        guard: Some(super::ItemGuard::Report(mut guard)),
+        ..
+    })) = sender.from_receiver.try_take()
+    else {
+        panic!("no NAK");
+    };
+    guard.sending(start);
+    guard.submitted();
+    nak
+}
+
+/// Phase 6 wiring, RC-9 with `on_unrecoverable = skip`: RANGE_UNAVAILABLE
+/// with a floor inside a NAKed hole that late data split makes the whole
+/// NAKed range unrecoverable. The first part is sealed at the reply; the
+/// part past the floor, found by the next observation inside the span, is
+/// sealed then. No hole remains.
+#[test]
+fn a_split_hole_past_the_floor_is_sealed_whole() {
+    use karyos_protocol::frame::Lane;
+    use karyos_protocol::network::{NakReply, NakReplyReason};
+    use karyos_sys::log_buffer::{SkipConfig, Unrecoverable};
+
+    let (mut image, params) = installed_image_with(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    let nak = submit_nak(&sender, 1);
+    assert_eq!((nak.range.start, nak.range.length), (64, 1024));
+    receiver.repair(0, 2).unwrap();
+    // Late original data splits the hole: [64, 320) and [576, 1088).
+    commit_frame(&mut receiver.images[0], &params, 320, 224);
+    receiver.repair(0, 3).unwrap();
+    let reply = NakReply::answering(
+        &nak,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: 400,
+        },
+    );
+    let image = &mut receiver.images[0];
+    let crate::repair::loss::ReplyOutcome::Unrecoverable {
+        hole,
+        lowest_retained,
+        ..
+    } = image.loss.reply(&reply, 1 << 20)
+    else {
+        panic!("not unrecoverable");
+    };
+    super::unrecoverable(
+        image,
+        &mut receiver.counters,
+        Lane::ZERO,
+        hole,
+        lowest_retained,
+        4,
+    );
+    receiver.repair(0, 5).unwrap();
+    assert_eq!(
+        receiver.images[0].owner.first_hole(Lane::ZERO).unwrap(),
+        None
+    );
+    assert_eq!(receiver.counters().gaps_sealed, 2);
+    assert!(receiver.images[0].closing.is_none());
+}
+
+/// Phase 6 wiring: a lane's NAK stays one in the ring: while its report
+/// is not settled (the sender has not taken it), no other is posted.
+#[test]
+fn one_nak_per_lane_waits_in_the_ring() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (_sender, mut receiver) = repairing(image);
+    for now in [1, 10_000_000, 20_000_000, 2_000_000_000] {
+        receiver.repair(0, now).unwrap();
+    }
+    assert_eq!(receiver.counters().naks, 1);
+}
+
+/// Phase 6 wiring: with the control ring full, a due NAK is counted and
+/// reported not submitted; it stays due.
+#[test]
+fn a_full_ring_reports_the_nak_not_submitted() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (_sender, mut receiver) = repairing(image);
+    let filler = || super::ControlItem::Outgoing {
+        endpoint: EndpointId(1),
+        destination: "10.0.0.9:5000".parse().unwrap(),
+        control: Control::SetupAnnounce(karyos_protocol::network::SetupAnnounce {
+            alias: alias(),
+            identity: identity(),
+            term: publication(EndpointId(1)).term,
+            lane_count: 1,
+        }),
+        guard: None,
+    };
+    while receiver.to_sender.try_post(filler()).is_ok() {}
+    receiver.repair(0, 1).unwrap();
+    let counters = receiver.counters();
+    assert_eq!((counters.naks, counters.ring_full_nak), (0, 1));
+    let loss = receiver.images[0].loss.counters();
+    assert_eq!(loss.not_submitted, 1);
+    assert!(receiver.images[0].loss.due(Lane::ZERO, 2).is_some());
+}
+
+/// Phase 6 wiring, RC-6: an uncertain NAK counts as submitted at its
+/// start (its retry waits one RTT); a second while it is unresolved is a
+/// route fault, and the image's NAKs stop.
+#[test]
+fn uncertain_naks_are_bounded_per_image() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (sender, mut receiver) = repairing(image);
+    let take = |sender: &super::SenderRole| {
+        let Ok(Some(super::ControlItem::Outgoing {
+            guard: Some(super::ItemGuard::Report(mut guard)),
+            ..
+        })) = sender.from_receiver.try_take()
+        else {
+            panic!("no NAK");
+        };
+        guard.sending(1);
+        guard.uncertain();
+    };
+    receiver.repair(0, 1).unwrap();
+    take(&sender);
+    receiver.repair(0, 2).unwrap();
+    let loss = receiver.images[0].loss.counters();
+    assert_eq!((loss.uncertain, loss.submitted), (1, 1));
+    // Its retry, one RTT later, is uncertain too: a route fault.
+    let rtt = crate::rtt::RttConfig::default().rtt_initial;
+    receiver.repair(0, 2 + rtt).unwrap();
+    take(&sender);
+    receiver.repair(0, 3 + rtt).unwrap();
+    assert_eq!(receiver.counters().nak_route_faults, 1);
+    let naks = receiver.counters().naks;
+    receiver.repair(0, 10 * rtt).unwrap();
+    assert_eq!(receiver.counters().naks, naks);
+}
+
+/// #284 review P3: a NAK the sender did not submit is due again at once.
+#[test]
+fn a_nak_not_submitted_is_due_again() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    // The sender drops it unsubmitted: its guard reports NotSubmitted.
+    drop(sender.from_receiver.try_take().unwrap());
+    receiver.repair(0, 2).unwrap();
+    assert_eq!(receiver.counters().naks, 2);
+    assert_eq!(receiver.images[0].loss.counters().not_submitted, 1);
+}
+
+/// #284 review P3: on a reliable image under `skip`, the skip policy's
+/// duty seals the holes left below an unrecoverable range that its reply
+/// could not seal in one call (at most a few per call).
+#[test]
+fn the_skip_duty_seals_what_one_reply_could_not() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::log_buffer::{SkipConfig, Unrecoverable};
+
+    let (mut image, params) = installed_image_with(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    // Ten 64-byte holes, each after a 64-byte frame.
+    for k in 0..11u32 {
+        commit_frame(&mut image, &params, 128 * k, 32);
+    }
+    let (_sender, mut receiver) = repairing(image);
+    let hole = crate::repair::loss::Hole {
+        start: 64,
+        length: 64,
+    };
+    super::unrecoverable(
+        &mut receiver.images[0],
+        &mut receiver.counters,
+        Lane::ZERO,
+        hole,
+        2048,
+        1,
+    );
+    let sealed = receiver.counters().gaps_sealed;
+    assert!(sealed < 10, "one call sealed {sealed}");
+    receiver.repair(0, 2).unwrap();
+    assert_eq!(receiver.counters().gaps_sealed, 10);
+    assert_eq!(
+        receiver.images[0].owner.first_hole(Lane::ZERO).unwrap(),
+        None
+    );
+}
+
+/// #284 review P3: a covered hole ends a tail wait, so a later tail waits
+/// its RTT afresh instead of NAKing at once.
+#[test]
+fn a_covered_hole_restarts_the_tail_wait() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    image.heartbeat_marks[0] = Some(4096);
+    let (sender, mut receiver) = repairing(image);
+    let rtt = crate::rtt::RttConfig::default().rtt_initial;
+    // The tail is seen at 1: it waits one RTT.
+    receiver.repair(0, 1).unwrap();
+    assert_eq!(receiver.counters().naks, 0);
+    // A frame further on leaves a covered hole [64, 1024): it is NAKed.
+    commit_frame(&mut receiver.images[0], &params, 1024, 32);
+    receiver.repair(0, 2).unwrap();
+    assert_eq!(receiver.counters().naks, 1);
+    drop(sender.from_receiver.try_take().unwrap());
+    // The hole fills; the tail is back, and waits one RTT from now.
+    commit_frame(&mut receiver.images[0], &params, 64, 928);
+    receiver.repair(0, 1 + rtt).unwrap();
+    assert_eq!(receiver.counters().naks, 1);
+    receiver.repair(0, 1 + 2 * rtt).unwrap();
+    assert_eq!(receiver.counters().naks, 2);
+}
+
+/// #284 review P3: NAK retries reach the receiver's counters, where a
+/// reliable image whose sender never repairs is visible.
+#[test]
+fn nak_retries_are_counted_by_the_receiver() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (sender, mut receiver) = repairing(image);
+    let rtt = crate::rtt::RttConfig::default().rtt_initial;
+    receiver.repair(0, 1).unwrap();
+    submit_nak(&sender, 1);
+    receiver.repair(0, 2).unwrap();
+    assert_eq!(receiver.counters().nak_retries, 0);
+    receiver.repair(0, 1 + rtt).unwrap();
+    submit_nak(&sender, 1 + rtt);
+    receiver.repair(0, 2 + rtt).unwrap();
+    assert_eq!(receiver.counters().nak_retries, 1);
+}
+
+/// #284 review P2-2: a route fault asks for the endpoint's reset at once,
+/// then once per `RESET_REQUEST_CYCLES` while it holds; the reset's new
+/// epoch resolves it, and a later fault asks again at once.
+#[test]
+fn a_route_fault_asks_for_a_reset_at_its_cadence() {
+    use super::super::data::RESET_REQUEST_CYCLES;
+    use karyos_io::backend::BackendEpoch;
+
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (_sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    let nak = receiver.posted_naks()[0];
+    let slot = receiver.images[0].slot;
+    receiver.fault_naks(slot, &nak);
+    let mut asked = Vec::new();
+    let mut ask = |receiver: &mut super::ReceiverRole, cycle| {
+        receiver.cycle = cycle;
+        receiver.request_resets(|endpoint| {
+            asked.push((cycle, endpoint));
+            true
+        });
+    };
+    ask(&mut receiver, 10);
+    ask(&mut receiver, 10 + RESET_REQUEST_CYCLES - 1);
+    ask(&mut receiver, 10 + RESET_REQUEST_CYCLES);
+    assert_eq!(
+        asked,
+        [
+            (10, EndpointId(1)),
+            (10 + RESET_REQUEST_CYCLES, EndpointId(1))
+        ]
+    );
+    // The reset: a new epoch of the endpoint's RX half resolves the fault.
+    receiver.rx_epoch(EndpointId(1), BackendEpoch::FIRST);
+    receiver.rx_epoch(
+        EndpointId(1),
+        BackendEpoch::new(std::num::NonZeroU32::new(2).unwrap()),
+    );
+    assert!(!receiver.images[0].loss.is_faulted());
+    // A later fault asks again at once.
+    receiver.fault_naks(slot, &nak);
+    let mut later = Vec::new();
+    receiver.cycle = 11 + RESET_REQUEST_CYCLES;
+    receiver.request_resets(|endpoint| {
+        later.push(endpoint);
+        true
+    });
+    assert_eq!(later, [EndpointId(1)]);
+    assert_eq!(receiver.counters().reset_requests, 3);
 }

@@ -387,6 +387,16 @@ pub enum AgentCommand<O: SocketOps> {
         /// subscription of the same stream on the same endpoint keeps the
         /// smaller of the two limits.
         max_term_length: u32,
+        /// Whether the channel is reliable (its `reliable` URI parameter,
+        /// SPEC §5, default true): its images repair losses with NAKs;
+        /// otherwise the skip policy seals them. Two subscriptions of one
+        /// stream on one endpoint are reliable if either is. A reliable
+        /// subscription to a `reliable=false` publication is a
+        /// configuration error: the sender drops its NAKs, and a loss
+        /// stalls the image with counted NAK retries (`nak_retries`) until
+        /// its liveness timeout. (The far-window close applies to
+        /// unreliable images only, GU-6.)
+        reliable: bool,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer
@@ -620,10 +630,11 @@ pub enum AgentEvent<O: SocketOps> {
         /// The agent.
         agent: AgentKind,
     },
-    /// The sender asks for an endpoint reset: a publication on `endpoint`
-    /// needs one before it can send again (`Outbound::needs_reset`). Posted
-    /// unsolicited into a free slot, and again every
-    /// `RESET_REQUEST_CYCLES` sender cycles while the need holds; the
+    /// An agent asks for an endpoint reset: on the sender, a publication on
+    /// `endpoint` needs one before it can send again
+    /// (`Outbound::needs_reset`); on the receiver, a route fault holds an
+    /// image's NAKs (RC-6). Posted unsolicited into a free slot, and again
+    /// every `RESET_REQUEST_CYCLES` cycles while the need holds; the
     /// endpoint table ignores it unless the endpoint is active.
     ResetRequested {
         /// The endpoint.
@@ -914,6 +925,14 @@ impl<O: SocketOps> ReceiverAgent<O> {
             return Ok(served);
         }
         let work = role.duty(&mut core.halves, sessions, now)?;
+        // A route fault asks for the endpoint's reset (RC-6); a full ring
+        // drops the request and a later cycle asks again.
+        let events = &core.events;
+        role.request_resets(|endpoint| {
+            events
+                .try_post(AgentEvent::ResetRequested { endpoint })
+                .is_ok()
+        });
         served.checked_add(work).ok_or(overflow)
     }
 

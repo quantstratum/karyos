@@ -152,6 +152,8 @@ struct SendEndpoint {
 struct NetSubscription {
     endpoint: EndpointId,
     stream_id: i32,
+    /// The channel's reliability, which every handle of this key shares.
+    reliable: bool,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
@@ -298,15 +300,23 @@ impl Network {
     /// `Configured { accepted: false }` and never challenges the stream,
     /// so no image appears for it.
     ///
+    /// `reliable` is the channel's `reliable` parameter: the receiver
+    /// repairs its images' losses with NAKs, otherwise its skip policy
+    /// seals them. A second subscription of the same endpoint and stream
+    /// shares the first's receiver entry, so it must ask for the same
+    /// reliability ([`DriverError::ReliabilityMismatch`] otherwise).
+    ///
     /// # Errors
     ///
-    /// [`DriverError::NetworkEndpoint`], [`DriverError::NetworkBusy`].
+    /// [`DriverError::NetworkEndpoint`], [`DriverError::NetworkBusy`],
+    /// [`DriverError::ReliabilityMismatch`].
     pub(crate) fn add_subscription(
         &mut self,
         stream_id: i32,
         bind: SocketAddr,
         multicast: Option<MulticastConfig>,
         max_term_length: u32,
+        reliable: bool,
     ) -> Result<NetworkSubscription, DriverError> {
         let endpoint = self.hold_endpoint(bind, multicast)?;
         let handle = NetworkSubscription {
@@ -318,6 +328,12 @@ impl Network {
             .iter_mut()
             .find(|entry| (entry.endpoint, entry.stream_id) == (endpoint, stream_id))
         {
+            // One receiver entry per key: a reliable subscriber must not
+            // share an unreliable one's delivery, nor the reverse.
+            if entry.reliable != reliable {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::ReliabilityMismatch);
+            }
             let Some(users) = entry.users.checked_add(1) else {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::NetworkBusy);
@@ -333,6 +349,7 @@ impl Network {
                 endpoint,
                 stream_id,
                 max_term_length,
+                reliable,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
@@ -341,6 +358,7 @@ impl Network {
         self.subscriptions.push(NetSubscription {
             endpoint,
             stream_id,
+            reliable,
             users: 1,
         });
         Ok(handle)

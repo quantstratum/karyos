@@ -360,6 +360,13 @@ impl ImageLoss {
         self.counters
     }
 
+    /// Whether a route fault holds the image (RC-6): its NAKs wait for the
+    /// endpoint's reset.
+    #[must_use]
+    pub fn is_faulted(&self) -> bool {
+        self.faulted
+    }
+
     /// Whether the image closed (a protocol fault or `GapCannotResume`).
     #[must_use]
     pub fn is_closed(&self) -> bool {
