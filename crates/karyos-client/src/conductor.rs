@@ -862,6 +862,33 @@ impl<T: TermBytes> ClientConductor<T> {
         })
     }
 
+    /// Requests a subscription to lane `lane` of the network image whose
+    /// aggregate registration is `image`, of the alias `stream`
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-5):
+    /// `AddImageSubscription`, recorded as a [`Request::Subscription`] of
+    /// the alias, so the grant is checked against it as any other.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    pub(crate) fn add_image_subscription(
+        &mut self,
+        stream: StreamKey,
+        image: u64,
+        lane: Lane,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        let request = Request::Subscription { stream, lane, role };
+        self.submit(Kind::AddSubscription, Some(request), |sequence| {
+            Command::AddImageSubscription {
+                sequence,
+                image,
+                lane,
+                role,
+            }
+        })
+    }
+
     /// Requests a view of a conflated stream's table (a remote client;
     /// `quantstratum-docs: karyos/design/conflation-end-to-end.md`,
     /// Cross-process views); returns the request sequence. It completes as

@@ -319,6 +319,15 @@ pub trait Connection: sealed::Sealed {
     #[doc(hidden)]
     fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError>;
 
+    /// Attaches to lane 0 of the image `image` of the alias `stream`
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-5).
+    #[doc(hidden)]
+    fn add_image_subscription(
+        &mut self,
+        stream: StreamKey,
+        image: u64,
+    ) -> Result<u64, ConductorError>;
+
     #[doc(hidden)]
     fn add_publication_on_lane(
         &mut self,
@@ -382,6 +391,20 @@ impl Connection for ClientConductor {
 
     fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
         ClientConductor::add_subscription(self, stream, ROLE)
+    }
+
+    fn add_image_subscription(
+        &mut self,
+        stream: StreamKey,
+        image: u64,
+    ) -> Result<u64, ConductorError> {
+        ClientConductor::add_image_subscription(
+            self,
+            stream,
+            image,
+            karyos_sys::frame::Lane::ZERO,
+            ROLE,
+        )
     }
 
     fn add_publication_on_lane(
@@ -473,6 +496,14 @@ impl Connection for crate::ipc::RemoteClient {
 
     fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
         crate::ipc::RemoteClient::add_subscription(self, stream, ROLE)
+    }
+
+    fn add_image_subscription(
+        &mut self,
+        stream: StreamKey,
+        image: u64,
+    ) -> Result<u64, ConductorError> {
+        crate::ipc::RemoteClient::add_image_subscription(self, stream, image, ROLE)
     }
 
     fn add_publication_on_lane(
@@ -651,6 +682,9 @@ struct Network<T: TermBytes> {
 struct Slot {
     /// The attach request's sequence: the image's id.
     id: u64,
+    /// The image's aggregate registration, which names it in the driver's
+    /// events (per-source-images.md, D2-5).
+    image: u64,
     session_id: i32,
     /// Its grant arrived and was handed to the subscription.
     attached: bool,
@@ -1025,18 +1059,19 @@ impl<C: Connection> Client<C> {
             Event::ImageAvailable {
                 stream,
                 registration,
+                image,
                 ..
-            } => self.image_available(stream, registration),
+            } => self.image_available(stream, registration, image),
             Event::ImageUnavailable {
-                stream,
                 registration,
+                image,
                 ..
-            } => self.image_unavailable(stream, registration),
+            } => self.image_unavailable(registration, image),
             _ => {}
         }
     }
 
-    fn image_available(&mut self, stream: StreamKey, registration: u64) {
+    fn image_available(&mut self, stream: StreamKey, registration: u64, image: u64) {
         let Some(network) = self
             .networks
             .iter_mut()
@@ -1047,22 +1082,20 @@ impl<C: Connection> Client<C> {
         let Some(inbox) = network.inbox.upgrade() else {
             return;
         };
-        // An image already holding a slot is not attached twice.
-        if network
-            .slots
-            .iter()
-            .any(|slot| slot.session_id == stream.session_id)
-        {
+        // An image already holding a slot is not attached twice. Images
+        // are told apart by registration: two sources may share an alias.
+        if network.slots.iter().any(|slot| slot.image == image) {
             return;
         }
         if network.slots.len() >= self.context.max_images {
             inbox.update(|state| bump(&mut state.refused));
             return;
         }
-        match self.connection.add_subscription(stream) {
+        match self.connection.add_image_subscription(stream, image) {
             Ok(sequence) => {
                 network.slots.push(Slot {
                     id: sequence,
+                    image,
                     session_id: stream.session_id,
                     attached: false,
                 });
@@ -1076,7 +1109,7 @@ impl<C: Connection> Client<C> {
         }
     }
 
-    fn image_unavailable(&mut self, stream: StreamKey, registration: u64) {
+    fn image_unavailable(&mut self, registration: u64, image: u64) {
         let Some(network) = self
             .networks
             .iter_mut()
@@ -1085,11 +1118,7 @@ impl<C: Connection> Client<C> {
             return;
         };
         // Only an image holding a slot frees one; a refused one held none.
-        let Some(index) = network
-            .slots
-            .iter()
-            .position(|slot| slot.session_id == stream.session_id)
-        else {
+        let Some(index) = network.slots.iter().position(|slot| slot.image == image) else {
             return;
         };
         let slot = network.slots.swap_remove(index);

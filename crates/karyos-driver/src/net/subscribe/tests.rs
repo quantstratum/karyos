@@ -1688,3 +1688,88 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         ]
     );
 }
+
+/// A client conductor of the subscribing driver (per-source-images.md,
+/// D2-3 and D2-5): a network subscription by URI hears two
+/// `ImageAvailable` events for two images of one alias, each naming its
+/// image registration and its source, and a plain `add_subscription` by
+/// the alias still attaches the oldest image.
+#[test]
+fn a_conductor_hears_each_image_and_attaches_by_alias_to_the_oldest() {
+    use karyos_client::Outcome;
+    use karyos_protocol::cnc::{Event, StreamKey, SubscriberRole};
+
+    let mut a = driver(ThreadingMode::Shared);
+    let mut c = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let mut client = b.connect().unwrap();
+    let uri = format!("karyos:udp?endpoint={address}");
+    let subscribed = client
+        .add_network_subscription(&uri, 10, SubscriberRole::Required)
+        .unwrap();
+    let _first = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let _second = c
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let mut heard = Vec::new();
+    let mut outcomes = Vec::new();
+    pump(&mut a, &mut b, |_, _| {
+        let _ = c.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| outcomes.push(completion));
+        for event in client.take_events() {
+            if let Event::ImageAvailable {
+                stream,
+                image,
+                source,
+                ..
+            } = event
+            {
+                heard.push((stream, image, source));
+            }
+        }
+        heard.len() == 2
+    });
+    assert!(
+        outcomes
+            .iter()
+            .any(|completion| completion.sequence == subscribed
+                && matches!(completion.outcome, Outcome::NetworkSubscription { .. }))
+    );
+    let alias = StreamKey {
+        stream_id: 10,
+        session_id: 3,
+    };
+    heard.sort_unstable_by_key(|(_, image, _)| *image);
+    let images: Vec<_> = b
+        .network_images(10)
+        .into_iter()
+        .map(|(handle, source)| (alias, handle.registration(), source))
+        .collect();
+    assert_eq!(heard, images, "each image with its registration and source");
+    let attach = client
+        .add_subscription(alias, SubscriberRole::Required)
+        .unwrap();
+    pump(&mut a, &mut b, |_, _| {
+        let _ = c.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| outcomes.push(completion));
+        outcomes
+            .iter()
+            .any(|completion| completion.sequence == attach)
+    });
+    let completion = outcomes
+        .iter()
+        .find(|completion| completion.sequence == attach)
+        .unwrap();
+    assert!(matches!(completion.outcome, Outcome::Subscription(_)));
+    let oldest = images[0].1;
+    assert_eq!(
+        b.registrations
+            .last()
+            .map(crate::commands::Registration::stream),
+        Some(oldest),
+        "the alias attaches the oldest image"
+    );
+}
