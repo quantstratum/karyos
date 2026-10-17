@@ -23,7 +23,7 @@ use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
 use crate::fault::FaultDisk;
-use crate::recorder::{Mode, OnLap, Recorder};
+use crate::recorder::{FrameSource, Frames, Mode, OnLap, Recorder};
 use crate::segment::{Geometry, SegmentStore, SyncPolicy};
 
 fn config() -> LogBufferConfig {
@@ -221,4 +221,85 @@ fn a_guarded_source_drops_the_source_first() {
         Noisy("guard", std::rc::Rc::clone(&order)),
     ));
     assert_eq!(*order.borrow(), ["source", "guard"]);
+}
+
+/// #351 review P1: a term longer than the copy buffer, so a copy can end
+/// inside a fragmented message. The publisher is released to the last
+/// whole message, the recording goes on, and every byte is recorded.
+#[test]
+fn a_copy_ending_inside_a_message_releases_the_last_whole_one() {
+    for prefix in (100..3100).step_by(100) {
+        let mut config = config();
+        config.term_length = TermLength::try_new(MIN_TERM_LENGTH * 4).unwrap();
+        let buffer = LogBuffer::new(config).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let source =
+            SenderRead::for_recording(conductor.subscribe_as(Role::Required, true, 1).unwrap(), 3)
+                .unwrap();
+        // The agent's default copy buffer, shorter than the term.
+        let mut recorder =
+            Recorder::new(store(0), source, Mode::Required, 64 * 1024, 1 << 20).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let mut end = 0;
+        for (sequence, length) in (0..30u32).map(|i| (i, if i == 0 { prefix } else { 3000 })) {
+            match publication
+                .append(&message(sequence, length), AppendOptions::default())
+                .unwrap()
+            {
+                AppendOutcome::Appended { position, .. } => end = position,
+                other => panic!("{other:?}"),
+            }
+        }
+        let _ = conductor.duty_cycle().unwrap();
+        while recorder
+            .duty(0)
+            .unwrap_or_else(|error| panic!("prefix {prefix}: {error:?}"))
+            .recorded
+            > 0
+        {}
+        assert!(recorder.store().written() >= end, "prefix {prefix}");
+    }
+}
+
+/// #351 review P2: a copy buffer off the 32-byte stride still records: it
+/// is rounded up, and a source given one copies whole strides only.
+#[test]
+fn a_copy_buffer_off_the_stride_still_records() {
+    let buffer = LogBuffer::new(config()).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let source =
+        SenderRead::for_recording(conductor.subscribe_as(Role::Required, true, 1).unwrap(), 3)
+            .unwrap();
+    let mut recorder = Recorder::new(store(0), source, Mode::Required, 940, 1 << 20).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for sequence in 0..2u32 {
+        let _ = publication
+            .append(&message(sequence, 900), AppendOptions::default())
+            .unwrap();
+    }
+    while recorder.duty(0).unwrap().recorded > 0 {}
+    assert_eq!(recorder.store().written(), 2 * 960);
+    // The source alone: two 932-byte frames at 960-byte strides, and a
+    // buffer that holds the second frame but not its stride. The copy
+    // stops at the first, whole with its padding.
+    let buffer = LogBuffer::new(config()).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut source =
+        SenderRead::for_recording(conductor.subscribe_as(Role::Required, true, 1).unwrap(), 3)
+            .unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for sequence in 0..2u32 {
+        let _ = publication
+            .append(&message(sequence, 900), AppendOptions::default())
+            .unwrap();
+    }
+    let mut out = vec![0u8; 1900];
+    assert_eq!(
+        FrameSource::read(&mut source, &mut out).unwrap(),
+        Frames::Copied {
+            position: 0,
+            len: 960,
+            next: 960
+        }
+    );
 }

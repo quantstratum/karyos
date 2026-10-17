@@ -10,6 +10,7 @@
 //! after the copy, and the segment holds the frames exactly where the log
 //! does.
 
+use karyos_sys::frame::FRAME_ALIGNMENT;
 use karyos_sys::log_buffer::{BufferOwner, ReadError, ReadOrigin, ReadOutcome, SenderRead};
 
 use crate::recorder::{FrameSource, Frames, SourceError};
@@ -66,6 +67,10 @@ impl<O: BufferOwner> FrameSource for SenderRead<O> {
 
     fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
         let position = Self::position(self);
+        // Whole strides only: a frame copied then fits with its padding.
+        let stride = usize::try_from(FRAME_ALIGNMENT).map_err(|_| SourceError::Invariant)?;
+        let whole = out.len() - out.len() % stride;
+        let out = out.get_mut(..whole).ok_or(SourceError::Invariant)?;
         match self.read_committed(position, ReadOrigin::Cursor, out) {
             Ok(ReadOutcome::Copied { len, next }) => {
                 let extent = next
@@ -106,7 +111,13 @@ impl<O: BufferOwner> FrameSource for SenderRead<O> {
     }
 
     fn consumed(&mut self, position: u64) -> Result<(), SourceError> {
-        self.sent(position).map_err(|_| SourceError::Invariant)
+        // A copy that fills the buffer can end inside a fragmented message:
+        // the publisher may move past the last whole message only, as the
+        // network sender releases a submission.
+        match self.boundary_at_or_below(position) {
+            Some(boundary) => self.sent(boundary).map_err(|_| SourceError::Invariant),
+            None => Ok(()),
+        }
     }
 
     fn resume(&mut self, to: u64) -> Result<u64, SourceError> {

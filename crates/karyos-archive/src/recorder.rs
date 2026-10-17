@@ -247,7 +247,9 @@ pub struct Recorder<D: Disk, S> {
 impl<D: Disk, S: FrameSource> Recorder<D, S> {
     /// A recorder of `source` into `store`, whose written position must be
     /// the source's; each duty copies through a buffer of `buffer` bytes
-    /// (at least the largest frame) and records at most `budget` bytes.
+    /// (at least the largest frame; rounded up to the 32-byte frame stride,
+    /// so a frame that fits fits with its padding) and records at most
+    /// `budget` bytes.
     ///
     /// # Errors
     ///
@@ -265,11 +267,17 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                 store: store.written(),
             });
         }
+        let stride = usize::try_from(karyos_sys::frame::FRAME_ALIGNMENT)
+            .map_err(|_| SegmentError::PositionOverflow)?;
+        let buffer = buffer
+            .max(FILL_RECORD)
+            .checked_next_multiple_of(stride)
+            .ok_or(SegmentError::PositionOverflow)?;
         Ok(Self {
             store,
             source,
             mode,
-            buffer: vec![0; buffer.max(FILL_RECORD)],
+            buffer: vec![0; buffer],
             budget,
             incomplete: false,
             ended: None,
