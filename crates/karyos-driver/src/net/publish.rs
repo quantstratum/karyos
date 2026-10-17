@@ -27,6 +27,7 @@ use super::NetworkPublicationState;
 use crate::agents::data::Outbound;
 use crate::embedded::{AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION};
 use crate::error::DriverError;
+use crate::membership::PublicationRoles;
 use crate::sessions::send::Publication;
 
 /// Where a channel sends, and the local address its endpoint binds.
@@ -67,13 +68,44 @@ impl EmbeddedDriver<HeapTerms> {
         config: AggregateConfig,
         channel: &UdpConfig,
     ) -> Result<AggregateHandle, DriverError> {
+        self.add_network(config, channel, None)
+    }
+
+    /// [`EmbeddedDriver::add_network_publication`] whose receivers have the
+    /// configured `roles` and strategy (MC-1). Driver-internal: the public
+    /// way in is owner item 7.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_network_publication`]; the sender refuses
+    /// roles its membership cannot hold, which leaves the publication
+    /// refused.
+    #[allow(
+        dead_code,
+        reason = "driver-internal until owner item 7 gives roles a public way in"
+    )]
+    pub(crate) fn add_network_publication_with_roles(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        roles: PublicationRoles,
+    ) -> Result<AggregateHandle, DriverError> {
+        self.add_network(config, channel, Some(Box::new(roles)))
+    }
+
+    fn add_network(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        roles: Option<Box<PublicationRoles>>,
+    ) -> Result<AggregateHandle, DriverError> {
         if self.net.is_none() {
             return Err(DriverError::NetworkUnavailable);
         }
         let (destination, bind) = route(channel)?;
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
         let handle = self.add_aggregate(config)?;
-        let added = self.attach_sender(&handle, destination, bind, channel.reliable, quanta);
+        let added = self.attach_sender(&handle, destination, bind, channel.reliable, quanta, roles);
         if let Err(error) = added {
             let _ = self.remove_aggregate(&handle);
             return Err(error);
@@ -102,6 +134,7 @@ impl EmbeddedDriver<HeapTerms> {
         bind: SocketAddr,
         reliable: bool,
         quanta: Lanes<u64>,
+        roles: Option<Box<PublicationRoles>>,
     ) -> Result<(), DriverError> {
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
         let mut term = None;
@@ -164,6 +197,7 @@ impl EmbeddedDriver<HeapTerms> {
                 handle.registration(),
                 publication(endpoint),
                 Box::new(outbound),
+                roles,
             )
         });
         if posted.is_err() {

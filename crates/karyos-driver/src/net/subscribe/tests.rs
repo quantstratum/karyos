@@ -323,6 +323,48 @@ fn a_subscription_with_another_reliability_is_refused() {
     );
 }
 
+/// MC-1: subscriptions sharing a receiver entry must agree on its
+/// identity: another receiver id, another group tag, none where the first
+/// has one, and one where the first has none are each refused, with the
+/// endpoint released; the same identity shares the entry.
+#[test]
+fn a_subscription_with_another_identity_is_refused() {
+    use crate::membership::ReceiverIdentity;
+
+    let identity = |id: u64, group_tag: u64| ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(id).unwrap(),
+        group_tag,
+    };
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let first = b
+        .add_network_subscription_as(10, &channel(address), identity(77, 5))
+        .unwrap();
+    for other in [identity(78, 5), identity(77, 6)] {
+        assert_eq!(
+            b.add_network_subscription_as(10, &channel(address), other),
+            Err(crate::DriverError::ReceiverIdentityMismatch)
+        );
+    }
+    assert_eq!(
+        b.add_network_subscription(10, &channel(address)),
+        Err(crate::DriverError::ReceiverIdentityMismatch),
+        "none where the first has one"
+    );
+    let second = b
+        .add_network_subscription_as(10, &channel(address), identity(77, 5))
+        .unwrap();
+    // Another stream, derived identity: one where it has none is refused.
+    let derived = b.add_network_subscription(11, &channel(address)).unwrap();
+    assert_eq!(
+        b.add_network_subscription_as(11, &channel(address), identity(77, 5)),
+        Err(crate::DriverError::ReceiverIdentityMismatch)
+    );
+    for subscription in [first, second, derived] {
+        assert!(b.remove_network_subscription(subscription).unwrap());
+    }
+}
+
 /// W5b B5: the conductor mirrors the receiver's subscription table, so a
 /// new key beyond it is refused at once; a key already held still shares
 /// its entry, and the receiver never refuses one the mirror admitted.

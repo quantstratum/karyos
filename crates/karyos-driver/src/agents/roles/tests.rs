@@ -166,6 +166,7 @@ fn add_publication(
             reliable: true,
             multicast: false,
             control_group: None,
+            identity: None,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -176,6 +177,7 @@ fn add_publication(
             publication: publication(a),
             outbound,
             guard: None,
+            roles: None,
         })
         .unwrap();
     log
@@ -725,6 +727,7 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             reliable: max_term_length == 2 << 20,
             multicast: false,
             control_group: None,
+            identity: None,
         };
         assert!(matches!(
             role.command(command),
@@ -997,6 +1000,7 @@ fn a_publication_membership_follows_the_driver_timing() {
         publication: publication(endpoint),
         outbound: path,
         guard: None,
+        roles: None,
     };
     assert!(matches!(
         sender.command(command),
@@ -1203,6 +1207,11 @@ fn installed_image_with(
         tail_since: [None; 4],
         reset_requested: None,
         control_group: None,
+        receiver_id: super::receiver_id(super::SlotRef {
+            slot: 0,
+            generation: 1,
+        }),
+        group_tag: 0,
     };
     (image, params)
 }
@@ -1951,6 +1960,7 @@ impl RepairRig {
                 publication,
                 outbound: path,
                 guard: None,
+                roles: None,
             };
             assert!(matches!(
                 sender.command(command),
@@ -2780,6 +2790,7 @@ fn an_unestablished_guarded_publication_applies_a_close() {
             epoch: 2,
             rate: None,
         }),
+        roles: None,
     };
     assert!(matches!(
         sender.command(command),
@@ -2788,4 +2799,55 @@ fn an_unestablished_guarded_publication_applies_a_close() {
     let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
     let _ = sender.duty::<OsSocket>(&mut [], 1).unwrap();
     assert_eq!(cell.try_read().unwrap().epoch, 3);
+}
+
+/// MC-1: a publication's configured roles reach its membership: its
+/// strategy, and a required receiver that has not joined holds admission
+/// (NotJoined) where the same publication without roles is open; roles the
+/// membership cannot hold (a zero id) refuse the publication.
+#[test]
+fn a_publication_takes_its_configured_roles() {
+    use crate::membership::{Admission, PublicationRoles, Strategy};
+
+    let add = |roles: Option<PublicationRoles>| {
+        let (mut sender, _role) = receiver_with(AgentConfig::default());
+        let (replies, _keep) =
+            super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+        let (path, _log) = outbound(EndpointId(1), "10.0.0.9:5000".parse().unwrap());
+        let event = sender
+            .command(AgentCommand::<OsSocket>::AddPublication {
+                reply: replies.reserve().unwrap(),
+                publication: publication(EndpointId(1)),
+                outbound: path,
+                guard: None,
+                roles: roles.map(Box::new),
+            })
+            .map(|(_, event)| event);
+        let membership = sender
+            .membership_of(alias())
+            .map(|membership| (membership.config().strategy, membership.admission(1)));
+        (event, membership)
+    };
+    let (event, membership) = add(Some(PublicationRoles {
+        strategy: Strategy::Max,
+        required: vec![7],
+        tags: vec![(9, 3)],
+    }));
+    assert!(
+        matches!(event, Some(AgentEvent::PublicationAdded { .. })),
+        "{event:?}"
+    );
+    assert_eq!(membership, Some((Strategy::Max, Admission::NotJoined)));
+    let (_, membership) = add(None);
+    assert_eq!(membership, Some((Strategy::Min, Admission::Open)));
+    let (event, membership) = add(Some(PublicationRoles {
+        strategy: Strategy::Min,
+        required: vec![0],
+        tags: Vec::new(),
+    }));
+    assert!(
+        matches!(event, Some(AgentEvent::PublicationRefused { .. })),
+        "{event:?}"
+    );
+    assert_eq!(membership, None);
 }

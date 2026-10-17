@@ -667,6 +667,12 @@ impl Outbound {
         self.membership.as_deref_mut()
     }
 
+    /// Its receivers' membership, if attached.
+    #[must_use]
+    pub fn membership(&self) -> Option<&Membership> {
+        self.membership.as_deref()
+    }
+
     /// Whether its membership has a live member at `now` (`false` with no
     /// membership attached).
     #[must_use]

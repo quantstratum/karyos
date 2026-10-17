@@ -83,6 +83,10 @@ struct Setup {
     control_group: bool,
     /// The receiver's `group_nak_budget`, when not the default.
     group_nak_budget: Option<u32>,
+    /// The subscription's configured receiver identity (MC-1).
+    identity: Option<crate::membership::ReceiverIdentity>,
+    /// The publication's configured roles (MC-1), built at the add.
+    roles: Option<fn() -> crate::membership::PublicationRoles>,
 }
 
 impl Default for Setup {
@@ -99,6 +103,8 @@ impl Default for Setup {
             guard: None,
             control_group: false,
             group_nak_budget: None,
+            identity: None,
+            roles: None,
         }
     }
 }
@@ -212,6 +218,7 @@ impl Rig {
                 reliable: setup.reliable,
                 multicast: setup.multicast,
                 control_group,
+                identity: setup.identity,
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
@@ -237,6 +244,7 @@ impl Rig {
                 },
                 outbound,
                 guard: setup.guard,
+                roles: setup.roles.map(|roles| Box::new(roles())),
             })
             .unwrap();
         (rig, b)
@@ -2217,4 +2225,103 @@ fn group_nak_validation_is_ordered_and_bound_to_its_control_group() {
     assert_eq!(counters.group_nak_own, 1, "{counters:?}");
     assert_eq!(counters.group_nak_range, 0, "{counters:?}");
     assert_eq!(counters.group_naks, 0, "{counters:?}");
+}
+
+/// The configured identity of the rig's subscription: receiver 77 with
+/// `group_tag`.
+fn identity_77(group_tag: u64) -> crate::membership::ReceiverIdentity {
+    crate::membership::ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+        group_tag,
+    }
+}
+
+/// MC-1: a subscription's configured identity is what its image names in
+/// every RB block. The sender binds receiver 77 from its SMs, the image's
+/// NAK names it, and its RTTM round trip still matches (a sample is
+/// taken). The negative control, an image with no identity, names the id
+/// derived from its slot, unchanged.
+#[test]
+fn an_image_names_its_configured_receiver_identity() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    for configured in [true, false] {
+        let (mut rig, _b) = Rig::new(Setup {
+            reliable: true,
+            repairs: false,
+            identity: configured.then(|| identity_77(0)),
+            ..Setup::default()
+        });
+        let slot = established(&mut rig);
+        let expected = if configured {
+            77
+        } else {
+            (u64::from(slot.slot) << 32) | u64::from(slot.generation)
+        };
+        rig.until(true, |rig| {
+            rig.agents.sender.role.bound_receivers(alias()) == [Some(expected)]
+        });
+        rig.agents.receiver.role.drop_data(&[1]);
+        for i in 0..4u8 {
+            let log = rig.log.as_mut().unwrap();
+            let _ = log.publications[0]
+                .append(&[i; 900], AppendOptions::default())
+                .unwrap();
+        }
+        rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+        let nak = rig.agents.receiver.role.posted_naks()[0];
+        assert_eq!(
+            nak.receiver.receiver_id, expected,
+            "configured {configured}"
+        );
+        rig.until(true, |rig| rig.agents.receiver.counters().rttm_samples >= 1);
+    }
+}
+
+/// MC-2: an SM whose `group_tag` is not the tag configured for its
+/// receiver is rejected whole by the publication's membership and counted;
+/// the receiver joins nothing. The negative control, the configured tag,
+/// joins and counts no tag rejection.
+#[test]
+fn an_sm_with_another_tag_is_rejected_whole() {
+    use crate::membership::{PublicationRoles, Strategy};
+
+    fn tagged_5() -> PublicationRoles {
+        PublicationRoles {
+            strategy: Strategy::Min,
+            required: Vec::new(),
+            tags: vec![(77, 5)],
+        }
+    }
+    for declared in [6, 5] {
+        let (mut rig, _b) = Rig::new(Setup {
+            reliable: true,
+            identity: Some(identity_77(declared)),
+            roles: Some(tagged_5),
+            ..Setup::default()
+        });
+        let _ = established(&mut rig);
+        let counters = |rig: &Rig| {
+            *rig.agents
+                .sender
+                .role
+                .membership_of(alias())
+                .unwrap()
+                .counters()
+        };
+        rig.until(true, |rig| {
+            let counters = counters(rig);
+            if declared == 5 {
+                counters.joins >= 1
+            } else {
+                counters.tag >= 1
+            }
+        });
+        let counters = counters(&rig);
+        if declared == 5 {
+            assert_eq!(counters.tag, 0);
+        } else {
+            assert_eq!(counters.joins, 0, "a mismatched tag joins nothing");
+        }
+    }
 }

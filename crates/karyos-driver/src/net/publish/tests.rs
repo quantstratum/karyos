@@ -377,6 +377,7 @@ fn a_refused_publication_releases_its_endpoint_and_alias() {
             },
             outbound,
             guard: None,
+            roles: None,
         })
         .unwrap();
     let first = driver

@@ -30,6 +30,7 @@ use super::NetworkSubscription;
 use crate::agents::images::DEFAULT_MAX_IMAGE_TERM_LENGTH;
 use crate::embedded::{AggregateHandle, EmbeddedDriver};
 use crate::error::DriverError;
+use crate::membership::ReceiverIdentity;
 
 /// The local address a subscription binds, and its multicast group.
 fn receive_route(
@@ -84,6 +85,38 @@ impl EmbeddedDriver<HeapTerms> {
         stream_id: i32,
         channel: &UdpConfig,
     ) -> Result<NetworkSubscription, DriverError> {
+        self.subscribe_network(stream_id, channel, None)
+    }
+
+    /// [`EmbeddedDriver::add_network_subscription`] whose images name the
+    /// configured receiver `identity` (MC-1, MC-2): its `receiver_id` in
+    /// every RB block and its `group_tag` in their SMs. Driver-internal:
+    /// the public way in is owner item 7.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_network_subscription`], and
+    /// [`DriverError::ReceiverIdentityMismatch`] for a stream already
+    /// subscribed on the endpoint with another identity, or with none.
+    #[allow(
+        dead_code,
+        reason = "driver-internal until owner item 7 gives identities a public way in"
+    )]
+    pub(crate) fn add_network_subscription_as(
+        &mut self,
+        stream_id: i32,
+        channel: &UdpConfig,
+        identity: ReceiverIdentity,
+    ) -> Result<NetworkSubscription, DriverError> {
+        self.subscribe_network(stream_id, channel, Some(identity))
+    }
+
+    fn subscribe_network(
+        &mut self,
+        stream_id: i32,
+        channel: &UdpConfig,
+        identity: Option<ReceiverIdentity>,
+    ) -> Result<NetworkSubscription, DriverError> {
         let (bind, multicast) = receive_route(channel)?;
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
         net.add_subscription(
@@ -92,6 +125,7 @@ impl EmbeddedDriver<HeapTerms> {
             multicast,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
             channel.reliable,
+            identity,
         )
     }
 
