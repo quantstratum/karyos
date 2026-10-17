@@ -7,27 +7,44 @@
 //! sampling discards the few words that would bias the result, so a draw
 //! takes one word except with probability below `bound / 2^64`.
 //!
-//! An empty pool, or a failed refill, draws the bound itself: the NAK goes
-//! at the latest deadline of the cycle, which delays it but suppresses
-//! nothing. Each such draw is counted.
+//! **Sizing** (#296 review): one timer step starts at most one cycle per
+//! lane of each image, so the pool keeps at least `per_step = images ×
+//! lanes` words plus a margin for rejections at the start of every step.
+//! A burst of losses on every image then never empties it: an empty pool
+//! would put every receiver's NAK at the bound in lockstep, which defeats
+//! the random delay.
+//!
+//! An empty pool, after a failed refill, draws the bound itself: the NAK
+//! goes at the latest deadline of the cycle, which delays it but
+//! suppresses nothing. Each such draw is counted, and so is each failed
+//! refill.
 
 use super::loss::DelayDraw;
 
-/// Words the pool holds: a cycle per lane per image for a burst of losses
-/// before the next timer step, with room to spare.
-const POOL: usize = 32;
+/// Words kept beyond one step's draws, for rejected words.
+const MARGIN: usize = 8;
 
-/// The pool is restocked only at or below this many words, so a refill on
-/// every timer step makes no system call in steady state.
-const LOW_WATER: usize = POOL / 2;
+/// What a refill did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refill {
+    /// The pool held a step's words: no system call.
+    Full,
+    /// The pool was restocked from the operating system.
+    Drew,
+    /// The system call failed: the pool is as it was.
+    Failed,
+}
 
 /// Random words for [`DelayDraw`], drawn into a pool on the timer step;
 /// a draw only takes from it. Neither `Copy` nor `Clone`: a copied pool
 /// would repeat its draws.
 #[derive(Debug)]
 pub struct OsDelayDraw {
-    pool: [u64; POOL],
+    /// Twice a step's words, allocated at construction.
+    pool: Box<[u64]>,
     len: usize,
+    /// The words one timer step may take: a refill restocks below it.
+    per_step: usize,
     /// Draws made from an empty pool (the bound was drawn) since the last
     /// [`OsDelayDraw::take_empty`].
     empty: u64,
@@ -39,40 +56,53 @@ pub struct OsDelayDraw {
     /// Tests: the bound of the last draw.
     #[cfg(test)]
     last_bound: Option<u64>,
+    /// Tests: refills fail.
+    #[cfg(test)]
+    fail_refills: bool,
 }
 
 impl OsDelayDraw {
-    /// A full pool, drawn now: call it on the control path.
+    /// A full pool for `images` images of up to `lanes` lanes, drawn now:
+    /// call it on the control path. `None` when the size overflows.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(images: usize, lanes: usize) -> Option<Self> {
+        let per_step = images.checked_mul(lanes)?.checked_add(MARGIN)?;
+        let capacity = per_step.checked_mul(2)?;
         let mut draw = Self {
-            pool: [0; POOL],
+            pool: vec![0; capacity].into_boxed_slice(),
             len: 0,
+            per_step,
             empty: 0,
             overflowed: false,
             #[cfg(test)]
             fixed: None,
             #[cfg(test)]
             last_bound: None,
+            #[cfg(test)]
+            fail_refills: false,
         };
         let _ = draw.refill();
-        draw
+        Some(draw)
     }
 
-    /// Restocks the pool when it is at or below half full; returns whether
-    /// it called the operating system. A failed call leaves the pool as it
-    /// was.
-    pub fn refill(&mut self) -> bool {
-        if self.len > LOW_WATER {
-            return false;
+    /// Restocks the pool when it holds fewer than a step's words, on the
+    /// timer step before any draw. A failed call leaves the pool as it was.
+    pub fn refill(&mut self) -> Refill {
+        if self.len >= self.per_step {
+            return Refill::Full;
+        }
+        #[cfg(test)]
+        if self.fail_refills {
+            return Refill::Failed;
         }
         let Some(missing) = self.pool.get_mut(self.len..) else {
-            return false;
+            return Refill::Failed;
         };
-        if karyos_sys::random::fill_u64s(missing).is_ok() {
-            self.len = POOL;
+        if karyos_sys::random::fill_u64s(missing).is_err() {
+            return Refill::Failed;
         }
-        true
+        self.len = self.pool.len();
+        Refill::Drew
     }
 
     /// The words at hand.
@@ -109,17 +139,18 @@ impl OsDelayDraw {
         self.last_bound
     }
 
+    /// Tests: empties the pool, and makes later refills fail or not.
+    #[cfg(test)]
+    pub(crate) fn drain(&mut self, fail_refills: bool) {
+        self.len = 0;
+        self.fail_refills = fail_refills;
+    }
+
     fn word(&mut self) -> Option<u64> {
         let last = self.len.checked_sub(1)?;
         let word = self.pool.get(last).copied()?;
         self.len = last;
         Some(word)
-    }
-}
-
-impl Default for OsDelayDraw {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -164,9 +195,13 @@ fn uniform(bound: u64, mut next: impl FnMut() -> Option<u64>) -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn pool() -> OsDelayDraw {
+        OsDelayDraw::new(2, 4).unwrap()
+    }
+
     #[test]
     fn a_draw_stays_within_its_bound() {
-        let mut draw = OsDelayDraw::new();
+        let mut draw = pool();
         for bound in [0, 1, 7, 1_000_000, u64::MAX] {
             let _ = draw.refill();
             assert!(draw.draw(bound) <= bound);
@@ -198,29 +233,38 @@ mod tests {
 
     #[test]
     fn an_empty_pool_draws_the_bound_and_counts() {
-        let mut draw = OsDelayDraw {
-            pool: [0; POOL],
-            len: 0,
-            empty: 0,
-            overflowed: false,
-            fixed: None,
-            last_bound: None,
-        };
+        let mut draw = pool();
+        draw.drain(true);
+        assert_eq!(draw.refill(), Refill::Failed);
         assert_eq!(draw.draw(500), 500);
         assert_eq!(draw.take_empty(), (1, false));
         assert_eq!(draw.take_empty(), (0, false));
     }
 
+    /// The pool holds twice a step's words (2 images of 4 lanes plus 8)
+    /// and is restocked once fewer than a step's remain: a step of draws on
+    /// every lane of every image never empties it.
     #[test]
-    fn a_refill_happens_only_at_low_water() {
-        let mut draw = OsDelayDraw::new();
-        assert_eq!(draw.len(), POOL);
-        assert!(!draw.refill());
-        for _ in 0..(POOL - LOW_WATER) {
+    fn a_refill_keeps_a_steps_words() {
+        let mut draw = pool();
+        let per_step = 2 * 4 + MARGIN;
+        assert_eq!(draw.len(), 2 * per_step);
+        assert_eq!(draw.refill(), Refill::Full);
+        for _ in 0..per_step {
             let _ = draw.draw(10);
         }
-        assert_eq!(draw.len(), LOW_WATER);
-        assert!(draw.refill());
-        assert_eq!(draw.len(), POOL);
+        assert_eq!(draw.refill(), Refill::Full);
+        let _ = draw.draw(10);
+        assert_eq!(draw.refill(), Refill::Drew);
+        assert_eq!(draw.len(), 2 * per_step);
+        for _ in 0..per_step {
+            let _ = draw.draw(10);
+        }
+        assert_eq!(draw.take_empty(), (0, false));
+    }
+
+    #[test]
+    fn an_oversized_pool_is_refused() {
+        assert!(OsDelayDraw::new(usize::MAX, 4).is_none());
     }
 }

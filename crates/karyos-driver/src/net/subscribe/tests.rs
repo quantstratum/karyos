@@ -358,3 +358,116 @@ fn the_receivers_subscription_table_is_mirrored() {
     }
     assert_eq!(b.network_subscription_refusals(), 0);
 }
+
+/// A free port, for a multicast group endpoint.
+fn free_port() -> u16 {
+    free_address().port()
+}
+
+/// RC-15 interim table (ACS 16103): an invalid control group table is
+/// refused when the network starts.
+#[test]
+fn an_invalid_control_group_table_is_refused() {
+    use crate::error::DriverError;
+    use crate::net::{ControlGroup, MAX_CONTROL_GROUPS};
+
+    let mut table = [None; MAX_CONTROL_GROUPS];
+    table[0] = Some(ControlGroup {
+        data_group: SocketAddr::from(([239, 7, 7, 1], 4000)),
+        interface: None,
+        control_group: SocketAddr::from(([10, 0, 0, 1], 4001)),
+    });
+    let refused = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(NetworkConfig {
+            nak_control_groups: table,
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    });
+    assert!(matches!(refused, Err(DriverError::InvalidConfig)));
+}
+
+/// RC-15: a reliable multicast subscription whose data group has a table
+/// entry also holds an endpoint joined to the control group, or counts a
+/// failed join and runs without peer input; it is accepted either way. An
+/// unreliable one joins nothing, and removing the last handle releases
+/// the control group endpoint.
+#[test]
+fn a_multicast_subscription_joins_its_control_group() {
+    use crate::net::{ControlGroup, MAX_CONTROL_GROUPS};
+
+    let data_group = SocketAddr::from(([239, 7, 7, 1], free_port()));
+    let other_group = SocketAddr::from(([239, 7, 8, 1], free_port()));
+    let mut table = [None; MAX_CONTROL_GROUPS];
+    table[0] = Some(ControlGroup {
+        data_group,
+        interface: None,
+        control_group: SocketAddr::from(([239, 7, 7, 2], free_port())),
+    });
+    table[1] = Some(ControlGroup {
+        data_group: other_group,
+        interface: None,
+        control_group: SocketAddr::from(([239, 7, 8, 2], free_port())),
+    });
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            nak_control_groups: table,
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let multicast = |group, reliable| UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        reliable,
+        ..channel(group)
+    };
+    let before = driver.network_held_endpoints();
+    // A host without multicast on its default interface cannot join the
+    // data group either: nothing to check there.
+    let Ok(reliable) = driver.add_network_subscription(6, &multicast(data_group, true)) else {
+        return;
+    };
+    let failed = driver.network_control_join_failures();
+    let held = driver.network_held_endpoints();
+    // The receiver's entry is multicast: its images time NAKs by cycle.
+    for _ in 0..20 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        driver.net.as_ref().unwrap().receiver_multicast(reliable),
+        Some(true)
+    );
+    assert_eq!(held, before + 2 - usize::try_from(failed).unwrap());
+    // Its own data group, whose table entry it does not join.
+    let unreliable = driver
+        .add_network_subscription(7, &multicast(other_group, false))
+        .unwrap();
+    assert_eq!(driver.network_held_endpoints(), held + 1);
+    assert_eq!(driver.network_control_join_failures(), failed);
+    assert!(driver.remove_network_subscription(unreliable).unwrap());
+    assert!(driver.remove_network_subscription(reliable).unwrap());
+    assert_eq!(driver.network_held_endpoints(), before);
+}
+
+/// A unicast subscription's receiver entry is not multicast.
+#[test]
+fn a_unicast_subscription_is_not_multicast() {
+    let mut driver = driver(ThreadingMode::Shared);
+    let subscription = driver
+        .add_network_subscription(9, &channel(free_address()))
+        .unwrap();
+    for _ in 0..20 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_multicast(subscription),
+        Some(false)
+    );
+}

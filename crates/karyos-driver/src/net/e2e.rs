@@ -691,4 +691,102 @@ fn the_network_keeps_its_own_clock() {
     });
 }
 
+/// mc-w2 in the shared mode with a frozen driver clock (ACS 16142): a
+/// multicast image's cycles run on the network's own time base, so a hole
+/// the sender never repairs is asked again cycle after cycle; each NAK's
+/// copy reaches the other subscriber's control group, where it passes
+/// validation. Linux only, after the loopback multicast probe, like
+/// `a_multicast_publication_reaches_every_subscriber`.
+#[cfg(target_os = "linux")]
+#[test]
+fn multicast_cycles_run_on_the_network_clock() {
+    use std::io::Write as _;
+
+    use crate::net::{ControlGroup, MAX_CONTROL_GROUPS};
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED multicast_cycles_run_on_the_network_clock: {why}"
+        );
+        return;
+    }
+    let group = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)),
+        free_address().port(),
+    );
+    let control = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)),
+        free_address().port(),
+    );
+    let mut table = [None; MAX_CONTROL_GROUPS];
+    table[0] = Some(ControlGroup {
+        data_group: group,
+        interface: None,
+        control_group: control,
+    });
+    let frozen = || {
+        EmbeddedDriver::with_clock(
+            DriverConfig {
+                network: Some(NetworkConfig {
+                    threading: ThreadingMode::Shared,
+                    nak_control_groups: table,
+                    ..NetworkConfig::default()
+                }),
+                ..DriverConfig::default()
+            },
+            Box::new(Frozen),
+        )
+        .unwrap()
+    };
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b, mut c) = (frozen(), frozen(), frozen());
+    for subscriber in [&mut b, &mut c] {
+        let _ = subscriber.add_network_subscription(10, &channel).unwrap();
+    }
+    assert_eq!(b.network_control_join_failures(), 0);
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel)
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some() && drivers[2].network_image(10, 3).is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // B loses the second DATA datagram; the sender never repairs.
+    shared(&mut b).receiver.drop_data(&[1]);
+    shared(&mut a).sender.ignore_naks();
+    let mut sent = 0u32;
+    let counters =
+        |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().receiver_counters().unwrap();
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        while sent < 8
+            && matches!(
+                lane.offer(&[7u8; 1000]).unwrap(),
+                OfferOutcome::Accepted { .. }
+            )
+        {
+            sent += 1;
+        }
+        let _ = reader.poll(|_, _, _| {}, BUDGET);
+        let (b, c) = (counters(&*drivers[1]), counters(&*drivers[2]));
+        b.nak_cycles >= 2 && b.naks >= 2 && c.group_naks >= 1
+    });
+    let b = counters(&b);
+    assert!(b.group_nak_copies >= 2, "{b:?}");
+}
+
 mod netem;
