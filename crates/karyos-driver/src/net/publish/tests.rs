@@ -376,6 +376,7 @@ fn a_refused_publication_releases_its_endpoint_and_alias() {
                 lane_count: 1,
             },
             outbound,
+            guard: None,
         })
         .unwrap();
     let first = driver

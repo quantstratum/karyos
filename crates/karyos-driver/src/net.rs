@@ -768,6 +768,7 @@ impl Network {
                 reply,
                 publication,
                 outbound,
+                guard: None,
             });
         if posted.is_err() {
             // The receiver learned the alias: it is stale now. The capacity
