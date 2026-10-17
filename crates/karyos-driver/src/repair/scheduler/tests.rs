@@ -91,7 +91,13 @@ impl RepairSubmit for Wire {
         outcome
     }
 
-    fn reply(&mut self, key: &JobKey, requesters: &[Receiver], reason: NakReplyReason) {
+    fn reply(
+        &mut self,
+        key: &JobKey,
+        requesters: &[Receiver],
+        _routes: &[usize],
+        reason: NakReplyReason,
+    ) {
         self.replies.push((*key, requesters.to_vec(), reason));
     }
 }

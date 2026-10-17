@@ -13,6 +13,7 @@
 //! - [`scheduler`] (R7): the repair DRR over the lanes within the repair
 //!   budget, with step 8 and the end proof at each head.
 
+pub mod absorb;
 pub mod admission;
 pub mod draw;
 pub mod jobs;

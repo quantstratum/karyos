@@ -36,9 +36,11 @@ use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::lanes::drr::{Budget, DrrConfig};
 use karyos_sys::log_buffer::{ReadError, ReadOrigin, ReadOutcome};
 
+use super::super::repair::RouteRepairCounts;
 use super::super::{AgentError, AgentKind, EndpointId, Half};
 use super::{Limit, Outbound, OutboundError, STAGED_PER_LANE, align_frame, messages_started};
 use crate::guard_gate::{GateHead, GuardGate};
+use crate::repair::scheduler::RepairBudget;
 
 /// When a path leaves the live set (redundant-paths.md section 7, RP-8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,11 +64,20 @@ pub struct PathPolicy {
     /// `path_backoff_reset` in ns: live this long, a path's wait starts
     /// over at `backoff_initial` (default 10 s, at least 1).
     pub backoff_reset: u64,
+    /// `path_skew_window` in ns: a NAK copy on another path within it is
+    /// absorbed (RP-11; default 1 ms, at most 1 s, the receivers' window).
+    pub skew_window: u64,
+    /// `path_copy_entries`: the absorption table's entries per publication
+    /// (RP-11; default 256, 1 to [`MAX_PATH_COPY_ENTRIES`]).
+    pub copy_entries: usize,
 }
 
 /// The longest `path_backoff_max`, in ns (60 s): past it a left path
 /// could wait so long it never comes back.
 pub const MAX_PATH_BACKOFF: u64 = 60_000_000_000;
+
+/// The largest `path_copy_entries`.
+pub const MAX_PATH_COPY_ENTRIES: usize = 4_096;
 
 impl Default for PathPolicy {
     fn default() -> Self {
@@ -77,6 +88,8 @@ impl Default for PathPolicy {
             backoff_initial: 10_000_000,
             backoff_max: 1_000_000_000,
             backoff_reset: 10_000_000_000,
+            skew_window: crate::paths::PathConfig::default().path_skew_window,
+            copy_entries: 256,
         }
     }
 }
@@ -409,11 +422,12 @@ impl Routed {
         posted
     }
 
-    /// Whether the founding route's queues are open in `epoch`.
-    pub(super) fn founding_open(&self, epoch: BackendEpoch) -> bool {
+    /// Whether route `index`, at its endpoint's `epoch`, takes repairs: open
+    /// at that epoch, not waiting for a reset, and in the live set (RP-11).
+    pub(super) fn repair_live(&self, index: usize, epoch: BackendEpoch) -> bool {
         self.routes
-            .first()
-            .is_some_and(|route| route.opened == Some(epoch) && !route.needs_reset)
+            .get(index)
+            .is_some_and(|route| route.opened == Some(epoch) && !route.needs_reset && !route.left)
     }
 
     /// The routes' endpoints, in route order.
@@ -633,6 +647,11 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     pub(crate) fn set_path_policy(&mut self, policy: PathPolicy) {
         if let Some(routed) = self.routed.as_deref_mut() {
             routed.policy = policy;
+            // Its NAK copies arrive on every path: sized here, when the
+            // publication is added (RP-11).
+            if let Some(repair) = self.repair.as_deref_mut() {
+                repair.set_absorb(policy.copy_entries, policy.skew_window);
+            }
         }
     }
 
@@ -704,6 +723,65 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     #[cfg(test)]
     pub(crate) fn sent_high(&self, lane: usize) -> Option<u64> {
         self.tracks.get(lane).map(|track| track.high)
+    }
+
+    /// Serves its repairs on every live route (RP-11): each route's TX
+    /// half in `halves` that is open at its epoch, not resetting and in the
+    /// live set, within `budget`, which it spends, at `now`. Returns the
+    /// heads submitted; 0 on one path (see [`Outbound::serve_repair`]).
+    pub fn serve_repair_routes<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        budget: &mut RepairBudget,
+        now: u64,
+    ) -> u32 {
+        let Some(routed) = self.routed.as_deref() else {
+            return 0;
+        };
+        let mut routes: [Option<&mut SocketsTx<O>>; MAX_ROUTES] = std::array::from_fn(|_| None);
+        for (held, half) in halves.iter_mut() {
+            let Half::Tx(tx) = half else {
+                continue;
+            };
+            let Some(index) = routed
+                .routes
+                .iter()
+                .position(|route| route.endpoint == *held)
+            else {
+                continue;
+            };
+            if routed.repair_live(index, tx.capabilities().epoch)
+                && let Some(slot) = routes.get_mut(index)
+            {
+                *slot = Some(&mut **tx);
+            }
+        }
+        // A route in the live set that cannot take repairs now (not open
+        // at its epoch, resetting, or detached) skips them, counted.
+        let mut passed = [false; MAX_ROUTES];
+        for ((passed, route), lent) in passed.iter_mut().zip(&routed.routes).zip(&routes) {
+            *passed = !route.left && lent.is_none();
+        }
+        if routes.iter().all(Option::is_none) {
+            return 0;
+        }
+        let served = self.serve_repair_with(&mut routes, budget, now);
+        if let Some(repair) = self.repair.as_deref_mut() {
+            for (route, passed) in passed.iter().enumerate() {
+                if *passed {
+                    repair.count_skipped(route, served);
+                }
+            }
+        }
+        served
+    }
+
+    /// What its repair path counted on `route` (RP-11); `None` on one path,
+    /// without repair, or past its routes.
+    #[must_use]
+    pub fn repair_route_counts(&self, route: usize) -> Option<RouteRepairCounts> {
+        self.routed.as_deref()?;
+        self.repair.as_deref()?.route_counts(route)
     }
 
     /// The routed sender (tests).
@@ -788,11 +866,9 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     let _ = reader.rewind();
                 }
             }
-            // The repair queue, on the founding route and outside the lane
-            // sender (repair stays on the founding path until rp-w6).
-            if index == 0
-                && let Some(repair) = self.repair.as_deref_mut()
-            {
+            // The route's repair queue, outside the lane sender: every
+            // route carries every repair (RP-11).
+            if let Some(repair) = self.repair.as_deref_mut() {
                 let queue = tx
                     .open_queue(TxQueueConfig {
                         authority: Authority::FIRST,
@@ -803,7 +879,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 if queue.is_none() {
                     self.counters.bump(|c| &mut c.queue_failures, 1);
                 }
-                repair.reopened(queue);
+                repair.reopened_route(index, queue);
             }
             for (lane, queue) in slot.queues.iter().enumerate() {
                 // A guarded lane reopens through its gate, which refunds what

@@ -222,7 +222,13 @@ impl RepairSubmit for Wire<'_> {
         outcome
     }
 
-    fn reply(&mut self, key: &JobKey, requesters: &[Receiver], reason: NakReplyReason) {
+    fn reply(
+        &mut self,
+        key: &JobKey,
+        requesters: &[Receiver],
+        _routes: &[usize],
+        reason: NakReplyReason,
+    ) {
         if let NakReplyReason::RangeUnavailable { lowest_retained } = reason {
             let floor = self.floors[usize::from(key.lane)];
             if lowest_retained != floor || key.start >= lowest_retained {

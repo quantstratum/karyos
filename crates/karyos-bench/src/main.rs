@@ -59,7 +59,9 @@ use karyos_bench::inventory::{self, Eligibility, Inventory, Scope};
 use karyos_bench::manifest::{ILLUSTRATIVE_E_MAX, MtuRule, primary};
 use karyos_bench::plan::{self, PlanOptions};
 use karyos_bench::wire::process::Cores;
-use karyos_bench::{Backing, Config, Workload, analyze, defaults, measure, report, run};
+use karyos_bench::{
+    Backing, Config, Workload, analyze, archive_configs, defaults, measure, report, run,
+};
 
 /// The allocation build counts allocations with this allocator; it never
 /// measures timing (`alloc-count`, M-9).
@@ -122,7 +124,12 @@ fn parse() -> Result<Options, String> {
 
 /// The default configurations `options` select.
 fn selected(options: &Options) -> Vec<Config> {
-    let configs = defaults(options.iterations)
+    let mut all = defaults(options.iterations);
+    // The archive workloads write to a disk: only when named.
+    if options.workload.is_some() {
+        all.extend(archive_configs(options.iterations));
+    }
+    let configs = all
         .into_iter()
         .filter(|config| options.workload.is_none_or(|w| w == config.workload));
     match (options.backing, options.workload) {
