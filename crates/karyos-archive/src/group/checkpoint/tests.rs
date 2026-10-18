@@ -22,7 +22,7 @@ use super::*;
 use crate::fault::{FaultDisk, Survives};
 use crate::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
 use crate::group::order::OrderRule;
-use crate::group::prefix::{Coverage, PrefixTracker, RangeStart};
+use crate::group::prefix::{CheckpointHeld, Coverage, DurableFor, PrefixTracker, RangeStart};
 use crate::group::record::{
     Capture, Clock, EndOutcome, EventEnd, GapMarker, GapReason, JournalHeader, MAX_RECORD,
     TimerEvent,
@@ -352,6 +352,8 @@ fn a_failed_write_leaves_no_record_and_may_be_retried() {
 struct Store {
     written: Cell<u64>,
     durable: Cell<u64>,
+    /// Ranges starting here are lost.
+    lost: Cell<Option<u64>>,
 }
 
 impl Coverage for Store {
@@ -363,8 +365,16 @@ impl Coverage for Store {
         None
     }
 
-    fn checkpoint(&self, _position: u64, end: u64) -> Option<bool> {
-        (end <= self.written.get()).then(|| end <= self.durable.get())
+    fn checkpoint(&self, position: u64, end: u64) -> CheckpointHeld {
+        if self.lost.get() == Some(position) {
+            CheckpointHeld::Lost
+        } else if end > self.written.get() {
+            CheckpointHeld::Missing
+        } else if end <= self.durable.get() {
+            CheckpointHeld::Durable
+        } else {
+            CheckpointHeld::Written
+        }
     }
 }
 
@@ -488,14 +498,21 @@ fn ranges_follow_each_other_and_a_lost_checkpoint_opens_nothing() {
     store.durable.set(100);
     assert_eq!(tracker.advance(at, at, &store), (2, 2));
     assert!(tracker.stopped());
-    // Checkpoint 2 at event 3, whose bytes are lost: its range has event
-    // 4, but nothing counts.
+    // Checkpoint 2 at event 3: until the store answers for its bytes it
+    // opens nothing; lost, it never does.
     at = feed(&mut tracker, &checkpoint_record(3, 2, 100), at);
     assert_eq!(tracker.advance(at, at, &store), (2, 2));
-    assert_eq!(tracker.range().start.unwrap().checkpoint_id, 2);
-    store.written.set(200);
-    store.durable.set(200);
+    assert_eq!(tracker.range().start.unwrap().checkpoint_id, 1);
+    store.lost.set(Some(100));
+    assert_eq!(tracker.advance(at, at, &store), (2, 2));
+    assert_eq!(tracker.range().start.unwrap().checkpoint_id, 1);
+    assert!(tracker.stopped());
+    // Checkpoint 3 at event 4 opens the range.
+    at = feed(&mut tracker, &checkpoint_record(4, 3, 200), at);
+    store.written.set(300);
+    store.durable.set(300);
     assert_eq!(tracker.advance(at, at, &store), (4, 4));
+    assert_eq!(tracker.range().start.unwrap().checkpoint_id, 3);
 }
 
 /// The workload of the crash gate: events, a checkpoint across segments,
@@ -596,7 +613,7 @@ fn check(crashed: &FaultDisk, survives: Survives, snapshots: &[Vec<u8>]) -> Resu
         };
         let expected = &snapshots[usize::try_from(record.checkpoint_id - 1).unwrap()];
         match group.writer.store().holds(record.position, end) {
-            Some(_) => {
+            CheckpointHeld::Written | CheckpointHeld::Durable => {
                 let mut bytes = vec![0u8; expected.len()];
                 group
                     .writer
@@ -607,24 +624,13 @@ fn check(crashed: &FaultDisk, survives: Survives, snapshots: &[Vec<u8>]) -> Resu
                     return Err(format!("checkpoint {} differs", record.checkpoint_id));
                 }
             }
-            // With every write kept, a record never names bytes the store
-            // lacks: they were written before it.
-            None if survives == Survives::Everything => {
+            // The bytes are synced before the record: under every crash
+            // model, a kept record names bytes the store kept.
+            held => {
                 return Err(format!(
-                    "checkpoint {} recorded with its bytes missing",
+                    "checkpoint {} recorded, its bytes {held:?}",
                     record.checkpoint_id
                 ));
-            }
-            None => {
-                let mut bytes = vec![0u8; expected.len()];
-                if group
-                    .writer
-                    .store_mut()
-                    .read(record.position, &mut bytes)
-                    .is_ok()
-                {
-                    return Err(format!("lost checkpoint {} reads", record.checkpoint_id));
-                }
             }
         }
     }
@@ -687,7 +693,7 @@ impl Coverage for Held<'_> {
         None
     }
 
-    fn checkpoint(&self, position: u64, end: u64) -> Option<bool> {
+    fn checkpoint(&self, position: u64, end: u64) -> CheckpointHeld {
         self.0.holds(position, end)
     }
 }
@@ -796,17 +802,17 @@ fn a_range_past_more_events_than_the_tracker_holds_stays_at_its_checkpoint() {
     assert_eq!(tracker.advance(at, at, &store), (6, 6));
 }
 
-/// A record durable before its bytes: the journal synced, the store did
-/// not, then a crash. Recovery marks the range lost: it reads as lost,
-/// the prefixes' coverage does not hold it, and the next checkpoint goes
-/// past it, never reusing it.
+/// #414 review P1: the bytes are synced before the record. With the
+/// journal synced and the store's policy never syncing on its own, a
+/// crash keeps the record and its bytes both: the checkpoint is durable,
+/// read back, and opens its range.
 #[test]
-fn a_record_whose_bytes_were_lost_reads_as_lost() {
+fn a_recorded_checkpoint_is_durable_by_construction() {
     let disk = FaultDisk::default();
     let journal = GroupJournal::create(
         disk.clone(),
         Path::new(JOURNALS),
-        &header(Capture::Strict),
+        &header(Capture::BestEffort),
         config(SyncPolicy::None),
     )
     .unwrap();
@@ -822,11 +828,19 @@ fn a_record_whose_bytes_were_lost_reads_as_lost() {
         journal,
         slot: CheckpointSlot::new(64),
     };
+    let _ = group.journal.append(&gap(1, 1)).unwrap();
+    let record = group.checkpoint(1, b"kept state").unwrap();
+    assert_eq!(
+        group
+            .writer
+            .store()
+            .holds(record.position, record.end().unwrap()),
+        CheckpointHeld::Durable
+    );
     let _ = group
         .journal
-        .append(&event(1, EndOutcome::Complete))
+        .append(&event(2, EndOutcome::Complete))
         .unwrap();
-    let record = group.checkpoint(1, b"lost state").unwrap();
     let _ = group.journal.sync().unwrap();
     let disk = disk.after_crash(Survives::Synced);
     let mut journal = GroupJournal::recover(
@@ -838,7 +852,6 @@ fn a_record_whose_bytes_were_lost_reads_as_lost() {
     .unwrap()
     .journal;
     let end = recorded_end(&mut journal).unwrap();
-    assert_eq!(end, record.end().unwrap());
     let mut store = CheckpointStore::recover(
         disk,
         Path::new(CHECKPOINTS),
@@ -847,24 +860,322 @@ fn a_record_whose_bytes_were_lost_reads_as_lost() {
         end,
     )
     .unwrap();
-    assert_eq!(store.written(), end);
-    assert_eq!(store.holds(record.position, end), None);
-    let mut bytes = [0u8; 10];
-    assert!(matches!(
-        store.read(record.position, &mut bytes),
-        Err(SegmentError::Gap { .. })
-    ));
-    let mut writer = CheckpointWriter::new(store, &journal).unwrap();
-    let _ = journal.append(&event(2, EndOutcome::Complete)).unwrap();
-    let request = CheckpointSlot::new(16).take(2, 7, |b| {
-        b[..5].copy_from_slice(b"after");
-        5
-    });
-    let next = writer.write(&mut journal, &request.unwrap()).unwrap();
-    assert_eq!((next.checkpoint_id, next.position), (2, end));
-    // Written; durable only at a sync (policy None).
+    assert_eq!(store.holds(record.position, end), CheckpointHeld::Durable);
+    assert_eq!(read(&mut store, &record), b"kept state");
+    let recovered = crate::group::prefix::recover(&mut journal, &Held(&store), 8).unwrap();
+    let range = recovered.tracker.range();
+    assert_eq!((range.complete, range.durable), (2, 2));
+    assert_eq!(range.start.unwrap().checkpoint_id, 1);
+}
+
+/// #414 review P1, a real loss: a record kept whose bytes the store does
+/// not hold (its files damaged). Recovery marks the range lost: it reads
+/// as lost and never opens its range, the next valid checkpoint does, and
+/// the next write goes past the lost range, never reusing it.
+#[test]
+fn a_lost_checkpoint_opens_nothing_and_the_next_one_does() {
+    let disk = FaultDisk::default();
+    let mut group = Group::create(&disk, Capture::BestEffort, 64);
+    let _ = group.journal.append(&gap(1, 2)).unwrap();
+    // A record naming 10 bytes the store never got.
+    let _ = group
+        .journal
+        .append(&encode(&GroupRecord::Checkpoint(CheckpointRecord {
+            group_seq: 2,
+            checkpoint_id: 1,
+            position: 0,
+            length: 10,
+            crc32c: crc32c(b"lost state"),
+            format: 7,
+        })))
+        .unwrap();
+    let _ = group
+        .journal
+        .append(&event(3, EndOutcome::Complete))
+        .unwrap();
+    let Group {
+        journal, writer, ..
+    } = group;
+    let _ = journal.close().unwrap();
+    let _ = writer.store.close().unwrap();
+    let disk = disk.after_crash(Survives::Synced);
+    let mut journal = GroupJournal::recover(
+        disk.clone(),
+        Path::new(JOURNALS),
+        GROUP,
+        config(SyncPolicy::PerSegment),
+    )
+    .unwrap()
+    .journal;
+    let end = recorded_end(&mut journal).unwrap();
+    let store = CheckpointStore::recover(
+        disk,
+        Path::new(CHECKPOINTS),
+        GROUP,
+        config(SyncPolicy::PerSegment),
+        end,
+    )
+    .unwrap();
+    assert_eq!(store.holds(0, 10), CheckpointHeld::Lost);
+    let recovered = crate::group::prefix::recover(&mut journal, &Held(&store), 8).unwrap();
+    assert!(!recovered.full);
     assert_eq!(
-        writer.store().holds(next.position, next.end().unwrap()),
-        Some(false)
+        recovered.tracker.range().start,
+        None,
+        "the lost one opens nothing"
     );
+    assert!(recovered.tracker.stopped());
+    // The next one, after event 3, opens the range; its bytes go past the
+    // lost range.
+    let mut group = Group {
+        writer: CheckpointWriter::new(store, &journal).unwrap(),
+        journal,
+        slot: CheckpointSlot::new(64),
+    };
+    let record = group.checkpoint(3, b"state at 3").unwrap();
+    assert_eq!((record.checkpoint_id, record.position), (2, 10));
+    let mut tracker = recovered.tracker;
+    tracker
+        .record(&GroupRecord::Checkpoint(record), group.journal.written())
+        .unwrap();
+    let written = group.journal.written();
+    let _ = group.journal.sync().unwrap();
+    let (complete, durable) = tracker.advance(written, written, &Held(group.writer.store()));
+    assert_eq!((complete, durable), (3, 3));
+    assert_eq!(tracker.range().start.unwrap().checkpoint_id, 2);
+}
+
+/// #414 review P1: a reopened range never claims the old range's events.
+/// In best effort, event 1's payload is by reference to recording 7,
+/// whose frames are never written; a gap at 2; a checkpoint at 2, held.
+/// The new range starts at 2, but event 1 is not durable: the view
+/// answers it from the first range's final values, never durable.
+#[test]
+fn a_reopened_range_does_not_claim_old_events_durable() {
+    use karyos_sys::frame::Lane;
+
+    use crate::group::record::{MessageEvent, Payload};
+
+    let mut tracker = PrefixTracker::new(8);
+    let view = tracker.view();
+    let store = Store::default();
+    let mut at = feed(
+        &mut tracker,
+        &encode(&GroupRecord::Header(header(Capture::BestEffort))),
+        0,
+    );
+    let mut first = encode(&GroupRecord::Message(MessageEvent {
+        group_seq: 1,
+        logical_time: 1,
+        incarnation: 1,
+        position: 0,
+        extent: 64,
+        stream_id: 1,
+        session_id: 1,
+        lane: Lane::ZERO,
+        reserved_value: 0,
+        end_of_stream: false,
+        extension: None,
+        payload: Payload::Reference {
+            recording_id: 7,
+            length: 10,
+        },
+    }));
+    first.extend(encode(&GroupRecord::End(EventEnd {
+        group_seq: 1,
+        observations: 0,
+        outcome: EndOutcome::Complete,
+    })));
+    at = feed(&mut tracker, &first, at);
+    at = feed(&mut tracker, &gap(2, 2), at);
+    at = feed(&mut tracker, &checkpoint_record(2, 1, 0), at);
+    store.written.set(100);
+    store.durable.set(100);
+    assert_eq!(tracker.advance(at, at, &store), (2, 2));
+    let first_range = tracker.first_range().unwrap();
+    assert_eq!((first_range.complete, first_range.durable), (0, 0));
+    assert_eq!(view.durable_for(1), DurableFor::Never(0));
+    assert_eq!(view.durable_for(2), DurableFor::Never(0));
+    at = feed(&mut tracker, &event(3, EndOutcome::Complete), at);
+    let _ = tracker.advance(at, at, &store);
+    assert_eq!(view.durable_for(3), DurableFor::Reached(3));
+    assert_eq!(view.durable_for(4), DurableFor::Pending(3));
+}
+
+/// #414 review mutant d1: a range waits for its opening record's own
+/// journal position, not only for the store: with the journal written
+/// short of the record, nothing of the range counts.
+#[test]
+fn a_range_waits_for_its_record_in_the_journal() {
+    let mut tracker = PrefixTracker::new(8);
+    let store = Store::default();
+    store.written.set(100);
+    store.durable.set(100);
+    let mut at = feed(
+        &mut tracker,
+        &encode(&GroupRecord::Header(header(Capture::BestEffort))),
+        0,
+    );
+    at = feed(&mut tracker, &gap(1, 1), at);
+    let before = at;
+    at = feed(&mut tracker, &checkpoint_record(1, 1, 0), at);
+    assert_eq!(tracker.advance(before, before, &store), (0, 0));
+    assert_eq!(tracker.advance(at, before, &store), (1, 0));
+    assert_eq!(tracker.advance(at, at, &store), (1, 1));
+}
+
+/// #414 review mutant e: a real store I/O failure, on a disk of its own,
+/// fails the write with no record, and the slot reports it.
+#[test]
+fn a_store_failure_leaves_no_record() {
+    let journals = FaultDisk::default();
+    let mut journal = GroupJournal::create(
+        journals,
+        Path::new(JOURNALS),
+        &header(Capture::Strict),
+        config(SyncPolicy::PerSegment),
+    )
+    .unwrap();
+    let _ = journal.append(&event(1, EndOutcome::Complete)).unwrap();
+    let records = journal.order().records();
+    // The store's disk crashes inside the write: its budget covers the
+    // creation and 1000 units more.
+    let probe = FaultDisk::default();
+    let _ = CheckpointStore::create(
+        probe.clone(),
+        Path::new(CHECKPOINTS),
+        GROUP,
+        config(SyncPolicy::PerSegment),
+    )
+    .unwrap();
+    let checkpoints = FaultDisk::with_budget(probe.used() + 1000);
+    let store = CheckpointStore::create(
+        checkpoints.clone(),
+        Path::new(CHECKPOINTS),
+        GROUP,
+        config(SyncPolicy::PerSegment),
+    )
+    .unwrap();
+    let mut group = Group {
+        writer: CheckpointWriter::new(store, &journal).unwrap(),
+        journal,
+        slot: CheckpointSlot::new(300_000),
+    };
+    assert!(matches!(
+        group.checkpoint(1, &snapshot(1, 200_000)),
+        Err(CheckpointError::Store(_))
+    ));
+    assert_eq!(group.journal.order().records(), records, "no record");
+    assert!(group.records().is_empty());
+    assert_eq!(
+        group.slot.last_checkpoint(),
+        Some(LastCheckpoint::Failed { group_seq: 1 })
+    );
+}
+
+/// Replays `journal` from its start; returns the events' `group_seq`s and
+/// the stop.
+fn replay_from_start(
+    journal: GroupJournal<FaultDisk>,
+    store: &CheckpointStore<FaultDisk>,
+    mut recovered_journal: GroupJournal<FaultDisk>,
+) -> (Vec<u64>, crate::group::replay::Stop) {
+    use crate::group::replay::{CursorConfig, ReplayConfig, ReplayCursor, Step};
+
+    let recovery = crate::group::prefix::recover(&mut recovered_journal, &Held(store), 8).unwrap();
+    drop(recovered_journal);
+    let mut cursor = ReplayCursor::open(
+        journal,
+        &recovery,
+        &ReplayConfig {
+            manifest: b"m",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 4 * MAX_RECORD,
+            records: 4,
+        },
+    )
+    .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        match cursor.step().unwrap() {
+            Step::Event(event) => seen.push(event.group_seq()),
+            Step::Stop(stop) => return (seen, stop),
+        }
+    }
+}
+
+/// #414 review P2: the replay cursor reads journals that hold template
+/// 30. A strict journal with a checkpoint between its events replays them
+/// all; a best-effort one whose later range a checkpoint opened replays
+/// from its start up to the gap, the first range's end.
+#[test]
+fn replay_from_the_start_skips_checkpoints_and_stops_at_the_first_range() {
+    use crate::group::replay::Stop;
+
+    for capture in [Capture::Strict, Capture::BestEffort] {
+        let disk = FaultDisk::default();
+        let mut group = Group::create(&disk, capture, 64);
+        let _ = group
+            .journal
+            .append(&event(1, EndOutcome::Complete))
+            .unwrap();
+        let _ = group.checkpoint(1, b"state at 1").unwrap();
+        if capture == Capture::BestEffort {
+            let _ = group.journal.append(&gap(2, 2)).unwrap();
+            let _ = group.checkpoint(2, b"state at 2").unwrap();
+            let _ = group
+                .journal
+                .append(&event(3, EndOutcome::Complete))
+                .unwrap();
+        } else {
+            let _ = group
+                .journal
+                .append(&event(2, EndOutcome::Complete))
+                .unwrap();
+        }
+        let Group {
+            journal, writer, ..
+        } = group;
+        let _ = journal.close().unwrap();
+        let _ = writer.store.close().unwrap();
+        let disk = disk.after_crash(Survives::Synced);
+        let recover = || {
+            GroupJournal::recover(
+                disk.clone(),
+                Path::new(JOURNALS),
+                GROUP,
+                config(SyncPolicy::PerSegment),
+            )
+            .unwrap()
+            .journal
+        };
+        let mut journal = recover();
+        let end = recorded_end(&mut journal).unwrap();
+        let store = CheckpointStore::recover(
+            disk.clone(),
+            Path::new(CHECKPOINTS),
+            GROUP,
+            config(SyncPolicy::PerSegment),
+            end,
+        )
+        .unwrap();
+        let (seen, stop) = replay_from_start(journal, &store, recover());
+        if capture == Capture::Strict {
+            assert_eq!(seen, [1, 2]);
+            assert_eq!(
+                stop,
+                Stop::EndOfPrefix {
+                    complete_recording_seq: 2
+                }
+            );
+        } else {
+            assert_eq!(seen, [1]);
+            assert!(
+                matches!(stop, Stop::Gap(GapMarker { from_seq: 2, .. })),
+                "{stop:?}"
+            );
+        }
+    }
 }

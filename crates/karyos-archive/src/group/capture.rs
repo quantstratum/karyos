@@ -42,7 +42,7 @@ use karyos_codec::{CodecError, Envelope};
 use karyos_sys::command_ring::{RingConsumer, RingError, RingProducer, command_ring};
 
 use super::journal::{GroupJournal, JournalError};
-use super::prefix::{self, Coverage, PrefixError, PrefixTracker, PrefixView};
+use super::prefix::{self, Coverage, DurableFor, PrefixError, PrefixTracker, PrefixView};
 use super::record::{Capture, GroupRecord, ReferenceUnavailable, Role};
 use crate::disk::Disk;
 use crate::segment::SyncPolicy;
@@ -241,6 +241,10 @@ pub fn capture<D: Disk>(
         dispatched,
         in_flight,
     };
+    let uncovered = config
+        .in_flight
+        .checked_mul(2)
+        .ok_or(CaptureSetup::Config(CaptureError::InFlight))?;
     let job = CaptureJob {
         consumer,
         journal,
@@ -249,7 +253,7 @@ pub fn capture<D: Disk>(
         capture,
         sync_at_bound: policy == SyncPolicy::PerSegment,
         in_flight,
-        uncovered: Vec::with_capacity(config.in_flight),
+        uncovered: Vec::with_capacity(uncovered),
         capacity: config.ring_capacity,
         emptied: 0,
         signalled: 0,
@@ -288,6 +292,11 @@ fn check(config: CaptureConfig, policy: SyncPolicy) -> Result<(u64, u64, u64), C
         Ok(0) | Err(_) => return Err(CaptureError::InFlight),
         Ok(in_flight) => in_flight,
     };
+    // The events a recording that ended may leave uncovered: the tracker's
+    // queue and, past a stop, the events a checkpoint may yet take.
+    if config.in_flight.checked_mul(2).is_none() {
+        return Err(CaptureError::InFlight);
+    }
     if policy == SyncPolicy::None {
         return Err(CaptureError::NoSync);
     }
@@ -494,10 +503,18 @@ impl GroupWaiter {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         loop {
-            let durable = self.shared.view.durable_group_seq();
-            if durable >= seq {
-                return Ok(durable);
-            }
+            let durable = match self.shared.view.durable_for(seq) {
+                DurableFor::Reached(durable) => return Ok(durable),
+                // Before the current range, and not in the first range's
+                // final durable prefix (A9).
+                DurableFor::Never(durable) => {
+                    return Err(WaitError::Stopped {
+                        durable,
+                        state: self.shared.state(),
+                    });
+                }
+                DurableFor::Pending(durable) => durable,
+            };
             let state = self.shared.state();
             if state != GroupState::Running {
                 return Err(WaitError::Stopped { durable, state });

@@ -6,17 +6,24 @@
 //!
 //! - **The store.** Each group has a [`CheckpointStore`]: a segment store
 //!   (A2) named by the group, in a checkpoint directory beside the
-//!   group's journal, with the journal's sync policy. Each checkpoint is
-//!   one contiguous range of it, checked by the store's CRC-32C on every
-//!   write; its `position` is where the range starts. Retention follows
+//!   group's journal, with the journal's sync policy for its segments.
+//!   Each checkpoint is one contiguous range of it, checked by the store's
+//!   CRC-32C on every write; its `position` is where the range starts. A
+//!   checkpoint's bytes are synced before its record is appended, so a
+//!   recorded checkpoint is durable by construction (one sync per
+//!   checkpoint, which is rare). Retention follows
 //!   the journal's: a checkpoint is kept while its record is (the journal
 //!   deletes nothing yet, so neither does the store).
 //! - **The writer.** [`CheckpointWriter::write`] runs on the Archive's
 //!   thread, between the group's events. It checks the record against the
 //!   journal's order rules first, so a refusal writes nothing; then it
-//!   appends the bytes to the store, and only then template 30 to the
-//!   journal. A record never names bytes that are not written, and a
-//!   failed write leaves no record.
+//!   appends the bytes to the store and syncs them, and only then appends
+//!   template 30 to the journal. A record never names bytes that are not
+//!   durable, and a failed write leaves no record. After an I/O error the
+//!   store fails until it is recovered, as every segment store does: a
+//!   retry then fails too ([`SegmentError::Failed`]), and the retry that
+//!   may name the same `group_seq` is one after recovery, or after a
+//!   refusal.
 //! - **The handoff.** The Gateway owns one buffer of `max_checkpoint`
 //!   bytes ([`CheckpointSlot`]), allocated at configuration. A checkpoint
 //!   fills it and hands it, by ownership, to the writer, which gives it
@@ -26,11 +33,12 @@
 //!   is recorded for it. `Gateway::checkpoint` builds on it once the
 //!   Gateway lands (A7d-2).
 //! - **Recovery.** A crash can leave bytes no record names (the write
-//!   ended, the record was never appended), or a record whose bytes the
-//!   store lost (the record became durable first).
-//!   [`CheckpointStore::recover`] cuts the first back to the last record's
-//!   end, and marks the second lost, so the next checkpoint never reuses a
-//!   range a record names and a lost one never reads as written.
+//!   ended, the record was never appended): [`CheckpointStore::recover`]
+//!   cuts them back to the last record's end. Since the bytes are synced
+//!   before the record, a kept record names durable bytes; should the
+//!   store still hold less (its files damaged), the range is marked lost,
+//!   so the next checkpoint never reuses a range a record names and a lost
+//!   one never reads as written, and never opens its range.
 //!
 //! Nothing allocates per checkpoint after configuration.
 
@@ -38,6 +46,7 @@ use std::path::Path;
 
 use super::journal::{GroupJournal, JournalConfig, JournalError};
 use super::order::OrderError;
+use super::prefix::CheckpointHeld;
 use super::record::{CHECKPOINT, CheckpointRecord, GroupRecord};
 use crate::crc32c::crc32c;
 use crate::disk::Disk;
@@ -48,8 +57,10 @@ mod tests;
 
 /// The encoded length of a checkpoint record.
 const RECORD_LENGTH: usize = 12 + 40;
+/// The same, as the template declares it.
+const RECORD_LENGTH_U32: u32 = 12 + 40;
 
-const _: () = assert!(CHECKPOINT.max_length as usize == RECORD_LENGTH);
+const _: () = assert!(CHECKPOINT.max_length == RECORD_LENGTH_U32);
 
 /// Why a checkpoint was not taken or not written.
 #[derive(Debug, thiserror::Error)]
@@ -76,7 +87,7 @@ pub enum CheckpointError {
     #[error(transparent)]
     Order(#[from] OrderError),
     /// The store failed: the bytes may be partly written, and no record
-    /// names them.
+    /// names them. The store then fails until recovered.
     #[error(transparent)]
     Store(#[from] SegmentError),
     /// The journal failed to take the record after the bytes were
@@ -138,21 +149,26 @@ impl<D: Disk> CheckpointStore<D> {
         Ok(Self { store })
     }
 
-    /// Whether it holds `[position, end)`: `Some(true)` once durable,
-    /// `Some(false)` while only written, `None` when it does not (past
-    /// its written position, or lost); the prefix tracker's
-    /// [`super::prefix::Coverage::checkpoint`].
+    /// What it holds of `[position, end)`, the prefix tracker's
+    /// [`super::prefix::Coverage::checkpoint`]: lost when recovery marked
+    /// it so, or below the store's start; missing past its written
+    /// position; else written, or durable.
     #[must_use]
-    pub fn holds(&self, position: u64, end: u64) -> Option<bool> {
+    pub fn holds(&self, position: u64, end: u64) -> CheckpointHeld {
         let lost = self
             .store
             .gaps()
             .iter()
             .any(|(from, to)| *from < end && position < *to);
-        if position < self.store.start() || end > self.store.written() || lost {
-            return None;
+        if lost || position < self.store.start() {
+            CheckpointHeld::Lost
+        } else if end > self.store.written() {
+            CheckpointHeld::Missing
+        } else if end <= self.store.durable() {
+            CheckpointHeld::Durable
+        } else {
+            CheckpointHeld::Written
         }
-        Some(end <= self.store.durable())
     }
 
     /// Reads `buf.len()` bytes at `position`.
@@ -264,6 +280,19 @@ pub struct CheckpointStats {
     pub ended: u64,
     /// Written and failed: no record.
     pub failed: u64,
+    /// A count reached `u64::MAX` and holds there.
+    pub overflowed: bool,
+}
+
+impl CheckpointStats {
+    /// Adds one to `count`, which holds at `u64::MAX` and sets
+    /// `overflowed` there.
+    fn bump(count: &mut u64, overflowed: &mut bool) {
+        match count.checked_add(1) {
+            Some(next) => *count = next,
+            None => *overflowed = true,
+        }
+    }
 }
 
 /// How the last checkpoint the writer took ended.
@@ -321,17 +350,17 @@ impl CheckpointSlot {
         write: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<CheckpointRequest, CheckpointError> {
         if self.ended {
-            self.stats.ended = self.stats.ended.wrapping_add(1);
+            CheckpointStats::bump(&mut self.stats.ended, &mut self.stats.overflowed);
             return Err(CheckpointError::Ended);
         }
         let Some(mut buffer) = self.buffer.take() else {
-            self.stats.in_flight = self.stats.in_flight.wrapping_add(1);
+            CheckpointStats::bump(&mut self.stats.in_flight, &mut self.stats.overflowed);
             return Err(CheckpointError::InFlight);
         };
         let length = write(&mut buffer);
         if length == 0 || length > self.max {
             self.buffer = Some(buffer);
-            self.stats.too_large = self.stats.too_large.wrapping_add(1);
+            CheckpointStats::bump(&mut self.stats.too_large, &mut self.stats.overflowed);
             return Err(if length == 0 {
                 CheckpointError::Empty
             } else {
@@ -341,7 +370,7 @@ impl CheckpointSlot {
                 }
             });
         }
-        self.stats.taken = self.stats.taken.wrapping_add(1);
+        CheckpointStats::bump(&mut self.stats.taken, &mut self.stats.overflowed);
         Ok(CheckpointRequest {
             buffer,
             length,
@@ -358,11 +387,11 @@ impl CheckpointSlot {
     ) {
         self.last = Some(match result {
             Ok(record) => {
-                self.stats.recorded = self.stats.recorded.wrapping_add(1);
+                CheckpointStats::bump(&mut self.stats.recorded, &mut self.stats.overflowed);
                 LastCheckpoint::Recorded(*record)
             }
             Err(_) => {
-                self.stats.failed = self.stats.failed.wrapping_add(1);
+                CheckpointStats::bump(&mut self.stats.failed, &mut self.stats.overflowed);
                 LastCheckpoint::Failed {
                     group_seq: request.group_seq,
                 }
@@ -428,8 +457,9 @@ impl<D: Disk> CheckpointWriter<D> {
     ///
     /// [`CheckpointError::Order`] for a record the journal would refuse
     /// (inside an event, naming an event not ended, or not above the last
-    /// recorded checkpoint), with nothing written; the store's errors,
-    /// with no record; the journal's, after the bytes were written.
+    /// recorded checkpoint) or exhausted ids, with nothing written; the
+    /// store's errors, with no record; the journal's, after the bytes were
+    /// written and synced.
     pub fn write(
         &mut self,
         journal: &mut GroupJournal<D>,
@@ -451,12 +481,15 @@ impl<D: Disk> CheckpointWriter<D> {
         let encoded = record
             .encode(&mut self.record)
             .map_err(JournalError::Record)?;
-        let _ = self.store.store.append(record.position, bytes)?;
-        let _ = journal.append(self.record.get(..encoded).unwrap_or_default())?;
-        self.next_id = self.next_id.checked_add(1).ok_or(OrderError {
+        let next_id = self.next_id.checked_add(1).ok_or(OrderError {
             ordinal: journal.order().records(),
             rule: super::order::OrderRule::Exhausted,
         })?;
+        let _ = self.store.store.append(record.position, bytes)?;
+        // Durable before its record: a kept record never names lost bytes.
+        let _ = self.store.store.sync()?;
+        let _ = journal.append(self.record.get(..encoded).unwrap_or_default())?;
+        self.next_id = next_id;
         Ok(record)
     }
 
