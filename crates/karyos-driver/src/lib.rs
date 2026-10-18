@@ -55,7 +55,7 @@ pub use embedded::{
     AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, FIRST_INCARNATION,
     StreamConfig, StreamHandle, StreamState,
 };
-pub use error::{DriverError, WalkerUnavailable};
+pub use error::{DriverError, TimedNetworkUnsupported, WalkerUnavailable};
 pub use generations::{GenerationInfo, Reconfiguration};
 pub use guards::{Audit, AuditOutcome, AuditRecord, GuardHandle, GuardRate, RateScope, Requester};
 pub use karyos_client::ConflatedSubscription;
