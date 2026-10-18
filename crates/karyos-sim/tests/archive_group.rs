@@ -573,6 +573,25 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
             "no {label} cell moved while recording: {moved:?}"
         );
     }
+    // Exactly: one offer and one claim of 8 bytes per message, each a
+    // 64-byte frame (its 32-byte header and payload, aligned), on the
+    // output stream from 0; its subscriber read them all.
+    let answers = 2 * MESSAGES * 64;
+    let from_zero = |label: &str| {
+        moved.iter().any(|(index, name, value)| {
+            name.starts_with(label)
+                && *value == answers
+                && at_start
+                    .iter()
+                    .any(|start| start.0 == *index && start.2 == 0)
+        })
+    };
+    assert!(from_zero("stream head"), "output head: {moved:?}");
+    assert!(from_zero("subscriber position"), "output reader: {moved:?}");
+    // `commands served` counts CnC commands; every call here is the
+    // embedded driver's own, so it reads 0 throughout, and the full
+    // comparison below holds it there.
+    assert_eq!(driver_counter(&before, "commands served"), [0]);
     let mut journal = GroupJournal::recover(StdDisk, &groups, 1, JOURNAL)
         .unwrap()
         .journal;
