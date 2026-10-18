@@ -244,7 +244,7 @@ fn entries_stop_at_max_bytes_but_always_return_one() {
     let written: Vec<Entry> = (1..5).map(|index| entry(index, 1, &[0; 100])).collect();
     log.append(&written).unwrap();
     // Each entry is 136 bytes encoded: 36 of header, 100 of payload.
-    assert_eq!(written[0].encoded_len(), 136);
+    assert_eq!(written[0].encoded_len(), Some(136));
     assert_eq!(log.entries(1..5, 272).unwrap(), written[..2].to_vec());
     assert_eq!(log.entries(1..5, 271).unwrap(), written[..1].to_vec());
     assert_eq!(log.entries(1..5, 0).unwrap(), written[..1].to_vec());
@@ -768,7 +768,9 @@ fn a_flip_mid_segment_is_corruption() {
     let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
     log.append(&entries(1..6, 1)).unwrap();
     log.sync().unwrap();
-    let second = log.entries(1..2, u64::MAX).unwrap()[0].encoded_len();
+    let second = log.entries(1..2, u64::MAX).unwrap()[0]
+        .encoded_len()
+        .unwrap();
     drop(log);
     let segment = data_file(&dir.0, 0);
     let mut bytes = std::fs::read(&segment).unwrap();
@@ -1018,7 +1020,7 @@ fn a_failed_truncation_poisons() {
     assert!(matches!(log.truncate_suffix(2), Err(LogError::Poisoned)));
     let held = log.entries(1..4, u64::MAX).unwrap();
     assert_eq!(held.len() as u64, log.last_index().unwrap());
-    let end: u64 = held.iter().map(Entry::encoded_len).sum();
+    let end: u64 = held.iter().filter_map(Entry::encoded_len).sum();
     assert!(end <= log.written(), "{end} {}", log.written());
 }
 
@@ -1416,4 +1418,159 @@ fn create_over_a_lost_store_is_refused() {
             .first_index(),
         7
     );
+}
+
+/// A log that voted (term 5, vote 2) and holds nothing reported durable.
+fn voted(name: &str) -> TempDir {
+    let dir = TempDir::new(name);
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    log.save_hard_state(HardState {
+        current_term: 5,
+        voted_for: Some(2),
+        commit: None,
+    })
+    .unwrap();
+    drop(log);
+    dir
+}
+
+/// `create` refuses on each kind of leftover alone, beside an unset mark so
+/// that nothing else tells, changing nothing: the hard state alone, the
+/// store alone, the first index alone.
+#[test]
+fn create_refuses_on_each_leftover_alone() {
+    // The hard state (and the mark) alone.
+    let dir = voted("hard-state-alone");
+    for (name, _) in listing(&dir.0) {
+        if name != MARK_FILE && name != HARD_STATE_FILE {
+            std::fs::remove_file(dir.0.join(name)).unwrap();
+        }
+    }
+    let before = listing(&dir.0);
+    assert!(matches!(
+        RaftLog::create(StdDisk, &dir.0, geometry(), 1),
+        Err(LogError::Exists)
+    ));
+    assert_eq!(listing(&dir.0), before);
+    // The store alone: its first index lost, no hard state, the mark
+    // unset (nothing synced), so only the store tells.
+    let dir = TempDir::new("store-alone");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..2, 5)).unwrap();
+    drop(log);
+    std::fs::remove_file(dir.0.join(FIRST_INDEX_FILE)).unwrap();
+    let mark = std::fs::read(dir.0.join(MARK_FILE)).unwrap();
+    assert!(matches!(
+        RaftLog::create(StdDisk, &dir.0, geometry(), 1),
+        Err(LogError::Exists)
+    ));
+    assert_eq!(std::fs::read(dir.0.join(MARK_FILE)).unwrap(), mark);
+    // The first index alone (with an unset mark): the store lost, no
+    // hard state.
+    let dir = TempDir::new("first-alone");
+    drop(RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap());
+    std::fs::remove_file(index_file(&dir.0, 0)).unwrap();
+    std::fs::remove_file(data_file(&dir.0, 0)).unwrap();
+    let mark = std::fs::read(dir.0.join(MARK_FILE)).unwrap();
+    assert!(matches!(
+        RaftLog::create(StdDisk, &dir.0, geometry(), 1),
+        Err(LogError::Exists)
+    ));
+    assert_eq!(std::fs::read(dir.0.join(MARK_FILE)).unwrap(), mark);
+}
+
+/// A lone watermark that says entries were durable is a log's evidence:
+/// `create` refuses it and leaves it as it was. Only the unset mark a
+/// creation cut short leaves (sequence 1) may be created over.
+#[test]
+fn create_refuses_over_a_lone_set_watermark() {
+    let dir = TempDir::new("lone-mark");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..3, 5)).unwrap();
+    log.sync().unwrap();
+    drop(log);
+    for (name, _) in listing(&dir.0) {
+        if name != MARK_FILE {
+            std::fs::remove_file(dir.0.join(name)).unwrap();
+        }
+    }
+    let mark = std::fs::read(dir.0.join(MARK_FILE)).unwrap();
+    assert_eq!(
+        newest(&mark).unwrap().1,
+        Slot {
+            sequence: 2,
+            durable: Some(2)
+        }
+    );
+    assert!(matches!(
+        RaftLog::create(StdDisk, &dir.0, geometry(), 1),
+        Err(LogError::Exists)
+    ));
+    assert_eq!(std::fs::read(dir.0.join(MARK_FILE)).unwrap(), mark);
+    // An unset mark at a later sequence is no creation cut short either.
+    let unset_later = [
+        Slot {
+            sequence: 3,
+            durable: None,
+        }
+        .encode(),
+        [0u8; SLOT_LEN],
+    ]
+    .concat();
+    std::fs::write(dir.0.join(MARK_FILE), &unset_later).unwrap();
+    assert!(matches!(
+        RaftLog::create(StdDisk, &dir.0, geometry(), 1),
+        Err(LogError::Exists)
+    ));
+}
+
+/// A watermark sequence at `u64::MAX`: the next mark cannot be numbered,
+/// and that poisons the log.
+#[test]
+fn a_watermark_sequence_overflow_poisons() {
+    let dir = TempDir::new("mark-sequence-max");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..2, 5)).unwrap();
+    log.sync().unwrap();
+    drop(log);
+    let at_max = [
+        Slot {
+            sequence: u64::MAX,
+            durable: Some(1),
+        }
+        .encode(),
+        [0u8; SLOT_LEN],
+    ]
+    .concat();
+    std::fs::write(dir.0.join(MARK_FILE), at_max).unwrap();
+    let mut log = open(StdDisk, &dir.0, geometry());
+    log.append(&entries(2..3, 5)).unwrap();
+    assert!(matches!(log.sync(), Err(LogError::Poisoned)));
+    assert!(matches!(
+        log.append(&entries(3..4, 5)),
+        Err(LogError::Poisoned)
+    ));
+}
+
+/// `Store` and `Io` are transparent: their message is the cause's, once,
+/// and the chain does not repeat it.
+#[test]
+fn store_and_io_errors_are_transparent() {
+    use std::error::Error;
+
+    let io = LogError::from(io::Error::other("boom"));
+    assert_eq!(io.to_string(), "boom");
+    let mut chain = vec![io.to_string()];
+    let mut source = io.source();
+    while let Some(error) = source {
+        chain.push(error.to_string());
+        source = error.source();
+    }
+    assert_eq!(chain.iter().filter(|line| line.contains("boom")).count(), 1);
+    let store = LogError::from(karyos_archive::segment::SegmentError::Failed);
+    assert_eq!(
+        store.to_string(),
+        karyos_archive::segment::SegmentError::Failed.to_string()
+    );
+    assert!(LogError::Exists.source().is_none());
 }
