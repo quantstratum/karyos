@@ -263,17 +263,19 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 11,
-                &Fields::new(41)
+                &Fields::new(51)
                     .u64(0, 6)
                     .u64(8, 1024)
                     .u64(16, 0)
-                    .u32(24, 0)
-                    .i32(28, 30)
-                    .i32(32, 1)
-                    .u16(36, 0)
-                    .u8(38, 1)
-                    .u8(39, 1)
-                    .u8(40, 2)
+                    .u64(24, 0)
+                    .u32(32, 0)
+                    .i32(36, 30)
+                    .i32(40, 1)
+                    .u16(44, 0)
+                    .u16(46, 0)
+                    .u8(48, 1)
+                    .u8(49, 1)
+                    .u8(50, 2)
                     .0,
                 &[],
             ),
@@ -290,19 +292,23 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
             }),
         ),
         (
+            // MessageTooLarge { length: 70000, max: 65536 }: code 1, no
+            // inner error, both fields.
             vector(
                 11,
-                &Fields::new(41)
+                &Fields::new(51)
                     .u64(0, 6)
                     .u64(8, 0)
                     .u64(16, 70_000)
-                    .u32(24, 1)
-                    .i32(28, 30)
-                    .i32(32, 1)
-                    .u16(36, 1)
-                    .u8(38, 1)
-                    .u8(39, 9)
-                    .u8(40, 0)
+                    .u64(24, 65_536)
+                    .u32(32, 1)
+                    .i32(36, 30)
+                    .i32(40, 1)
+                    .u16(44, 1)
+                    .u16(46, 0)
+                    .u8(48, 1)
+                    .u8(49, 9)
+                    .u8(50, 0)
                     .0,
                 &[],
             ),
@@ -314,7 +320,9 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 operation: Operation::Offer,
                 outcome: Outcome::Failed {
                     error: 1,
+                    sub: 0,
                     detail: 70_000,
+                    detail2: 65_536,
                 },
             }),
         ),
@@ -401,6 +409,41 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 from_seq: 7,
                 to_seq: 9,
                 reason: GapReason::RingFull,
+            }),
+        ),
+        // Conflation(ValueTooLarge { length: 300, max: 256 }): code 5, its
+        // third variant, both fields of it.
+        (
+            vector(
+                11,
+                &Fields::new(51)
+                    .u64(0, 8)
+                    .u64(8, 0)
+                    .u64(16, 300)
+                    .u64(24, 256)
+                    .u32(32, 0)
+                    .i32(36, 40)
+                    .i32(40, 2)
+                    .u16(44, 5)
+                    .u16(46, 3)
+                    .u8(48, 1)
+                    .u8(49, 9)
+                    .u8(50, 0)
+                    .0,
+                &[],
+            ),
+            GroupRecord::Outcome(OutcomeObservation {
+                group_seq: 8,
+                index: 0,
+                stream_id: 40,
+                session_id: 2,
+                operation: Operation::Offer,
+                outcome: Outcome::Failed {
+                    error: 5,
+                    sub: 3,
+                    detail: 300,
+                    detail2: 256,
+                },
             }),
         ),
     ]
@@ -513,7 +556,9 @@ fn samples() -> Vec<GroupRecord<'static>> {
             Operation::Offer,
             Outcome::Failed {
                 error: MAX_ERROR_CODE,
+                sub: 0,
                 detail: 0,
+                detail2: 0,
             },
         ),
         (Operation::Claim, positioned),
@@ -522,8 +567,10 @@ fn samples() -> Vec<GroupRecord<'static>> {
         (
             Operation::Claim,
             Outcome::Failed {
-                error: 6,
+                error: 11,
+                sub: 26,
                 detail: u64::MAX,
+                detail2: 1,
             },
         ),
         (Operation::Commit, positioned),
@@ -653,6 +700,7 @@ const TIMER_OP: usize = 9;
 const DELIVERY: usize = 11;
 const END: usize = 12;
 const GAP: usize = 13;
+const NESTED: usize = 14;
 
 #[test]
 #[allow(clippy::too_many_lines, reason = "one case per rule")]
@@ -773,41 +821,51 @@ fn every_invalid_field_is_refused() {
     assert_eq!(refused(&available), out_of_range("lane"));
     // Outcomes.
     assert_eq!(
-        refused(&mutated(ACCEPTED, 38, 4, 1)),
+        refused(&mutated(ACCEPTED, 48, 4, 1)),
         invalid("operation", 4)
     );
     assert_eq!(
-        refused(&mutated(ACCEPTED, 39, 10, 1)),
+        refused(&mutated(ACCEPTED, 49, 10, 1)),
         invalid("outcome", 10)
     );
     // An aborted offer; a commit that is neither accepted nor aborted.
     assert_eq!(
-        refused(&mutated(ACCEPTED, 39, 8, 1)),
+        refused(&mutated(ACCEPTED, 49, 8, 1)),
         out_of_range("outcome")
     );
-    let mut commit = mutated(ACCEPTED, 38, 3, 1);
-    commit[12 + 39] = 2;
+    let mut commit = mutated(ACCEPTED, 48, 3, 1);
+    commit[12 + 49] = 2;
     commit[12 + 8..12 + 16].fill(0);
-    commit[12 + 40] = 0;
+    commit[12 + 50] = 0;
     assert_eq!(refused(&commit), out_of_range("outcome"));
     // A position or a lane on an outcome that has none.
     assert_eq!(
-        refused(&mutated(ACCEPTED, 39, 2, 1)),
+        refused(&mutated(ACCEPTED, 49, 2, 1)),
         out_of_range("position")
     );
     let mut lane_only = mutated(ACCEPTED, 8, 0, 8);
-    lane_only[12 + 39] = 6;
+    lane_only[12 + 49] = 6;
     assert_eq!(refused(&lane_only), out_of_range("lane"));
-    assert_eq!(refused(&mutated(ACCEPTED, 40, 4, 1)), out_of_range("lane"));
-    // An error on an outcome that is no failure; a failure with no error
-    // or an unknown one.
-    assert_eq!(refused(&mutated(ACCEPTED, 36, 1, 2)), out_of_range("error"));
-    assert_eq!(refused(&mutated(ACCEPTED, 16, 1, 8)), out_of_range("error"));
-    assert_eq!(refused(&mutated(FAILED, 36, 0, 2)), out_of_range("error"));
+    assert_eq!(refused(&mutated(ACCEPTED, 50, 4, 1)), out_of_range("lane"));
+    // An error, a sub-variant or a detail on an outcome that is no
+    // failure; a failure with no error, an unknown one, or a sub-variant
+    // its error does not have.
+    for (at, width) in [(44, 2), (46, 2), (16, 8), (24, 8)] {
+        assert_eq!(
+            refused(&mutated(ACCEPTED, at, 1, width)),
+            out_of_range("error"),
+            "{at}"
+        );
+    }
+    assert_eq!(refused(&mutated(FAILED, 44, 0, 2)), out_of_range("error"));
     assert_eq!(
-        refused(&mutated(FAILED, 36, u64::from(MAX_ERROR_CODE) + 1, 2)),
+        refused(&mutated(FAILED, 44, u64::from(MAX_ERROR_CODE) + 1, 2)),
         out_of_range("error")
     );
+    // MessageTooLarge has no inner error; Conflation has seven.
+    assert_eq!(refused(&mutated(FAILED, 46, 1, 2)), out_of_range("sub"));
+    assert_eq!(refused(&mutated(NESTED, 46, 0, 2)), out_of_range("sub"));
+    assert_eq!(refused(&mutated(NESTED, 46, 8, 2)), out_of_range("sub"));
     // Timer operation, delivery, end and gap.
     assert_eq!(
         refused(&mutated(TIMER_OP, 8, 0, 8)),
@@ -887,14 +945,27 @@ fn invalid_values_are_not_encoded() {
             Operation::Commit,
             Outcome::Failed {
                 error: 1,
+                sub: 0,
                 detail: 0,
+                detail2: 0,
             },
         ),
         outcome(
             Operation::Offer,
             Outcome::Failed {
                 error: 0,
+                sub: 0,
                 detail: 0,
+                detail2: 0,
+            },
+        ),
+        outcome(
+            Operation::Offer,
+            Outcome::Failed {
+                error: 5,
+                sub: 8,
+                detail: 0,
+                detail2: 0,
             },
         ),
         GroupRecord::Delivery(DeliveryObservation {
@@ -961,6 +1032,7 @@ fn every_record_knows_its_role() {
                 to_seq: 9,
                 reason: GapReason::RingFull
             }),
+            Role::Observation(8, 0),
         ]
     );
 }
