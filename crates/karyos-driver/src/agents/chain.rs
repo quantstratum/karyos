@@ -76,6 +76,9 @@ pub enum SessionEvent {
     CreateImage {
         /// The endpoint it arrived on.
         endpoint: EndpointId,
+        /// The datagram source its binding names (`quantstratum-docs:
+        /// karyos/design/per-source-images.md`, D2-1).
+        source: std::net::SocketAddr,
         /// Stream and session alias of the binding.
         alias: Alias,
         /// The pending session slot, at its challenge generation.

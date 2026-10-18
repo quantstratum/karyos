@@ -66,6 +66,24 @@ pub struct ScheduleConsumer {
     /// Read entries not yet released, oldest first: whether each message is
     /// done (its last fragment left, or it was aborted).
     outstanding: VecDeque<bool>,
+    /// Entries read before the last rewind ([`Self::rewind`]): read again,
+    /// their messages are resent, not scheduled.
+    replay_to: u64,
+    /// Whether the message being read is one read again.
+    current_replayed: bool,
+    /// After a rewind, until the first frame: the rewind may land inside a
+    /// message, whose continuation then takes the entry at `head`.
+    resuming: bool,
+}
+
+/// A frame's message: its requested time, and whether it was read before
+/// a rewind (resent at once, outside the timed policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scheduled {
+    /// The message's requested time.
+    pub time: u64,
+    /// The message was read before the last rewind.
+    pub replayed: bool,
 }
 
 impl ScheduleConsumer {
@@ -82,7 +100,101 @@ impl ScheduleConsumer {
             reader,
             current: None,
             outstanding: VecDeque::with_capacity(capacity),
+            replay_to: 0,
+            current_replayed: false,
+            resuming: false,
         })
+    }
+
+    /// A reliable lane's log was rewound to a position no message of an
+    /// entry not yet released lies below (the registered position, up to
+    /// which entries are released): every entry not released is read
+    /// again, in order. The oldest `sent` of them, whose messages were
+    /// sent (or may have been) in whole or in part, are marked replayed;
+    /// the later ones were only read, and keep their time. A position
+    /// inside a message resumes it at its next fragment.
+    ///
+    /// # Errors
+    ///
+    /// [`ScheduleConsumerError::CorruptTerm`] when `sent` is above the
+    /// entries outstanding, or they above the entries read; nothing
+    /// changes.
+    pub fn rewind(&mut self, sent: usize) -> Result<(), ScheduleConsumerError> {
+        let corrupt = ScheduleConsumerError::CorruptTerm {
+            position: 0,
+            reason: "a rewind past the entries outstanding",
+        };
+        if sent > self.outstanding.len() {
+            return Err(corrupt);
+        }
+        let outstanding = u64::try_from(self.outstanding.len()).map_err(|_| corrupt)?;
+        let sent = u64::try_from(sent).map_err(|_| corrupt)?;
+        let replay_to = self
+            .reader
+            .read()
+            .checked_sub(outstanding)
+            .and_then(|released| released.checked_add(sent))
+            .ok_or(corrupt)?;
+        self.replay_to = self.replay_to.max(replay_to);
+        self.reader.rewind_to_released();
+        self.outstanding.clear();
+        self.current = None;
+        self.current_replayed = false;
+        self.resuming = true;
+        Ok(())
+    }
+
+    /// [`Self::frame`], with whether the message was read before the last
+    /// rewind.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::frame`].
+    pub fn frame_scheduled(
+        &mut self,
+        ring: &[AtomicU64],
+        frame: LaneFrame,
+    ) -> Result<Option<Scheduled>, ScheduleConsumerError> {
+        let resuming = std::mem::take(&mut self.resuming);
+        // A rewind inside a message: its continuation takes the entry at
+        // `head`, the message's own, which starts below the frame.
+        if resuming
+            && let LaneFrame::Data {
+                position,
+                begin: false,
+                end,
+            } = frame
+        {
+            let index = self.reader.read();
+            let entry = self
+                .reader
+                .peek(ring)?
+                .filter(|entry| entry.position < position)
+                .ok_or(ScheduleConsumerError::CorruptTerm {
+                    position,
+                    reason: "a resumed continuation with no entry below it",
+                })?;
+            self.reader.advance(ring)?;
+            self.outstanding.push_back(false);
+            self.current_replayed = index < self.replay_to;
+            if !end {
+                self.current = Some(entry.time);
+            }
+            return Ok(Some(Scheduled {
+                time: entry.time,
+                replayed: self.current_replayed,
+            }));
+        }
+        let index = self.reader.read();
+        let first = matches!(frame, LaneFrame::Data { begin: true, .. });
+        let time = self.frame(ring, frame)?;
+        if first {
+            self.current_replayed = index < self.replay_to;
+        }
+        Ok(time.map(|time| Scheduled {
+            time,
+            replayed: self.current_replayed,
+        }))
     }
 
     /// The requested time of `frame`'s message, read in lane order; `None`
@@ -181,6 +293,29 @@ impl ScheduleConsumer {
             },
         )?;
         *oldest = true;
+        self.release_done(ring)
+    }
+
+    /// The message read last never left (its last fragment was read but
+    /// not staged): its entry, the newest outstanding, is done, and the
+    /// done entries at the front are released. An older message still
+    /// waiting to leave keeps its entry.
+    ///
+    /// # Errors
+    ///
+    /// [`ScheduleConsumerError::CorruptTerm`] with no message outstanding,
+    /// and ring errors.
+    pub fn message_lost(&mut self, ring: &[AtomicU64]) -> Result<(), ScheduleConsumerError> {
+        let newest = self
+            .outstanding
+            .iter_mut()
+            .rev()
+            .find(|done| !**done)
+            .ok_or(ScheduleConsumerError::CorruptTerm {
+                position: 0,
+                reason: "a message lost with none outstanding",
+            })?;
+        *newest = true;
         self.release_done(ring)
     }
 

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use karyos_client::ipc::{AttachError, RemoteClient, attach};
 use karyos_client::{MessageLimit, OfferOutcome, Outcome};
-use karyos_protocol::cnc::{StreamKey, SubscriberRole};
+use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SealReason};
 use karyos_sys::sizing::{MIN_TERM_LENGTH, TermLength};
@@ -421,3 +421,218 @@ fn a_remote_client_fetches_an_image_and_closes_at_its_retirement() {
 }
 
 mod processes;
+
+/// Whether descriptor `fd` still names the file of inode `ino`: other tests
+/// of this process open regions too, and may take a closed number again.
+fn still_open((fd, ino): (i32, u64)) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    std::fs::metadata(format!("/proc/self/fd/{fd}")).is_ok_and(|meta| meta.ino() == ino)
+}
+
+/// The descriptor and inode of the region behind each lane of the image
+/// `handle` on `driver`.
+fn image_descriptors(driver: &IpcDriver, handle: &AggregateHandle) -> Vec<(i32, u64)> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    driver
+        .streams
+        .iter()
+        .filter(|stream| stream.aggregate.registration == handle.registration())
+        .map(|stream| {
+            let fd = stream
+                .buffer
+                .region()
+                .unwrap()
+                .descriptor()
+                .unwrap()
+                .as_raw_fd();
+            let ino = std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .unwrap()
+                .ino();
+            (fd, ino)
+        })
+        .collect()
+}
+
+/// How the remote reader lets go of each image's handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LetGo {
+    /// Dropped: its export is detached, its registration stays.
+    Drop,
+    /// Removed with `RemoveSubscription`, then dropped.
+    Remove,
+}
+
+/// A long-lived remote subscriber of an IPC driver, still connected, takes
+/// one image per round: install, fetch and adopt, read, the remote
+/// publication removed, the image retired, the handle let go. Each round's
+/// streams free, the image table empties, and every region descriptor the
+/// images opened is closed, with the client attached throughout: a
+/// registration no longer pins a retiring stream.
+fn images_free_while_a_remote_subscriber_stays(let_go: LetGo) {
+    let dir = dir(match let_go {
+        LetGo::Drop => "rounds-drop",
+        LetGo::Remove => "rounds-remove",
+    });
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = ipc_driver(&dir);
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = b.network_subscription_address(10).unwrap();
+    let mut client = attach_running(&mut a, &mut b, &dir).unwrap();
+    for _ in 0..50 {
+        let _ = b.do_work().unwrap();
+    }
+    let mut opened = Vec::new();
+    let rounds = 4i32;
+    let (to_client, rounds_in) = std::sync::mpsc::channel::<Option<i32>>();
+    let (done_out, from_client) = std::sync::mpsc::channel::<u32>();
+    let (taken_out, taken_in) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        // Owned here, so a failed assertion drops it and ends the reader.
+        let to_client = to_client;
+        let reader = scope.spawn(move || {
+            while let Ok(Some(session_id)) = rounds_in.recv() {
+                let key = StreamKey {
+                    stream_id: 10,
+                    session_id,
+                };
+                let _ = client
+                    .add_subscription(key, SubscriberRole::Required)
+                    .unwrap();
+                let mut fetchable = None;
+                let start = Instant::now();
+                while fetchable.is_none() {
+                    assert!(start.elapsed() < Duration::from_secs(10), "no completion");
+                    let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                        Outcome::Fetchable(grant) => fetchable = Some(grant),
+                        Outcome::Succeeded => {}
+                        other => panic!("expected a fetchable grant, got {other:?}"),
+                    });
+                }
+                let mut subscription = client.take_subscription(&fetchable.unwrap()).unwrap();
+                // Attached: the round's messages are offered only now.
+                taken_out.send(()).unwrap();
+                let mut seen = 0u32;
+                let start = Instant::now();
+                loop {
+                    assert!(start.elapsed() < Duration::from_secs(20), "never closed");
+                    let summary = subscription
+                        .poll(|_, _| seen += 1, MessageLimit::new(64))
+                        .unwrap();
+                    let _ = client.poll(usize::MAX, |_| {});
+                    if summary.closed.is_some() {
+                        break;
+                    }
+                }
+                match let_go {
+                    LetGo::Drop => drop(subscription),
+                    LetGo::Remove => {
+                        assert!(client.remove_subscription(subscription).is_ok());
+                        // The retirement ended the last grant, so the driver
+                        // may have reclaimed the registration first: the
+                        // Remove then answers UnknownRegistration.
+                        let mut removed = false;
+                        let start = Instant::now();
+                        while !removed {
+                            assert!(start.elapsed() < Duration::from_secs(10), "no removal");
+                            let _ =
+                                client.poll(usize::MAX, |completion| match completion.outcome {
+                                    Outcome::Succeeded
+                                    | Outcome::Refused {
+                                        code: ErrorCode::UnknownRegistration,
+                                        ..
+                                    } => removed = true,
+                                    other => panic!("unexpected removal {other:?}"),
+                                });
+                        }
+                    }
+                }
+                done_out.send(seen).unwrap();
+            }
+            // Still connected at the end of every round.
+            client
+        });
+        for round in 0..rounds {
+            let session_id = 3 + round;
+            let publication = a
+                .add_network_publication(aggregate(10, session_id, 1), &channel(address))
+                .unwrap();
+            let mut image = None;
+            pump(&mut a, &mut b, |b| {
+                image = b.exposed_network_image(10, session_id);
+                image.is_some()
+            });
+            opened.extend(image_descriptors(&b, &image.unwrap()));
+            to_client.send(Some(session_id)).unwrap();
+            let start = Instant::now();
+            while taken_in.try_recv().is_err() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "round {round}: never attached"
+                );
+                let _ = a.do_work().unwrap();
+                let _ = b.do_work().unwrap();
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            offer(&mut a, &mut b, &publication, 0, 8);
+            a.remove_aggregate(&publication).unwrap();
+            let start = Instant::now();
+            let seen = loop {
+                assert!(start.elapsed() < Duration::from_secs(30), "round {round}");
+                if let Ok(seen) = from_client.try_recv() {
+                    break seen;
+                }
+                let _ = a.do_work().unwrap();
+                let _ = b.do_work().unwrap();
+                std::thread::sleep(Duration::from_micros(200));
+            };
+            assert_eq!(seen, 8, "round {round}");
+            // The round's image frees with the client still attached.
+            pump(&mut a, &mut b, |b| {
+                b.net.as_ref().unwrap().image_count() == 0
+                    && b.exposed_network_image(10, session_id).is_none()
+            });
+        }
+        to_client.send(None).unwrap();
+        let client = reader.join().unwrap();
+        for _ in 0..50 {
+            let _ = b.do_work().unwrap();
+        }
+        assert_eq!(b.net.as_ref().unwrap().image_count(), 0);
+        assert!(
+            b.streams.iter().all(|stream| stream.source.is_none()),
+            "no image stream left"
+        );
+        // Removed (Remove) or reclaimed once detached (Drop): no
+        // registration is left either way.
+        assert!(b.registrations.is_empty(), "registrations left");
+        assert_eq!(opened.len(), usize::try_from(rounds).unwrap());
+        let left: Vec<_> = opened
+            .iter()
+            .copied()
+            .filter(|&fd| still_open(fd))
+            .collect();
+        assert!(left.is_empty(), "image regions still open: {left:?}");
+
+        drop(client);
+    });
+    assert!(b.unsubscribe_network(subscription).unwrap());
+    let _ = (a.close_network(), b.close_network());
+}
+
+/// The leak of case 7: each image a connected remote subscriber took
+/// stayed Retiring, with its regions, until the client left. With the
+/// handle only dropped (its export detached), every round frees.
+#[test]
+fn a_connected_remote_subscriber_leaves_no_retired_image_behind() {
+    images_free_while_a_remote_subscriber_stays(LetGo::Drop);
+}
+
+/// The same with the handle removed (`RemoteClient::remove_subscription`),
+/// which also lets the driver forget the registration.
+#[test]
+fn a_removed_remote_subscription_leaves_no_retired_image_behind() {
+    images_free_while_a_remote_subscriber_stays(LetGo::Remove);
+}

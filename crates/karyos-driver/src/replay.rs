@@ -397,12 +397,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let scratch = vec![0; usize::try_from(config.mtu).map_err(|_| DriverError::InvalidConfig)?];
         let lane = Arc::new(self.replay_lane(buffer)?);
         let owner = ReceiveOwner::new(params, vec![Arc::clone(&lane)])?;
-        let handle = self
-            .add_image_aggregate(&[lane])
-            .ok_or(DriverError::DuplicateStream {
-                stream_id: config.stream_id,
-                session_id: config.session_id,
-            })?;
+        let handle =
+            self.add_image_aggregate(&[lane], None)
+                .ok_or(DriverError::DuplicateStream {
+                    stream_id: config.stream_id,
+                    session_id: config.session_id,
+                })?;
         let dropped = Arc::new(AtomicBool::new(false));
         self.replays.targets.push((handle, Arc::clone(&dropped)));
         let feed = ReplayFeed {

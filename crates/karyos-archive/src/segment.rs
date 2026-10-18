@@ -551,6 +551,41 @@ fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
 }
 
+/// The geometry recording `recording`'s first segment in `dir` names in
+/// its header, read only: `None` when it has no segment, or its first
+/// header is missing, torn or foreign. A tool that reads a store it did
+/// not create learns its geometry here, before [`SegmentStore::recover`].
+///
+/// # Errors
+///
+/// The operating system's errors.
+pub fn recorded_geometry<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    recording: u64,
+) -> Result<Option<Geometry>, SegmentError> {
+    let Some(&base) = bases(recording, &disk.list(dir)?).first() else {
+        return Ok(None);
+    };
+    let index = match disk.open_read(&dir.join(index_name(recording, base))) {
+        Ok(index) => index,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = [0u8; HEADER_BYTES];
+    let header = match disk.read_at(&index, 0, &mut bytes) {
+        Ok(()) => Header::read(Some(&bytes)),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(match header {
+        HeaderRead::Valid(header) if header.recording == recording => {
+            Geometry::new(header.term_length, header.segment_length).ok()
+        }
+        _ => None,
+    })
+}
+
 fn data_name(recording: u64, base: u64) -> String {
     format!("{recording:016x}-{base:016x}.seg")
 }
@@ -639,6 +674,12 @@ impl<D: Disk> SegmentStore<D> {
     #[must_use]
     pub const fn written(&self) -> u64 {
         self.written
+    }
+
+    /// Its sync policy.
+    #[must_use]
+    pub const fn policy(&self) -> SyncPolicy {
+        self.policy
     }
 
     /// The end of what a sync made durable, data and index both.

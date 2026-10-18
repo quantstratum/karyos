@@ -39,6 +39,10 @@ path = "src/bin/karyos-stat.rs"
 name = "karyos-errors"
 path = "src/bin/karyos-errors.rs"
 
+[[bin]]
+name = "karyos-tools"
+path = "src/bin/karyos-tools.rs"
+
 # Not documented: its rustdoc output would collide with the karyos-trace
 # library's (target/doc/karyos_trace); its logic is documented in the
 # library's `trace` module.

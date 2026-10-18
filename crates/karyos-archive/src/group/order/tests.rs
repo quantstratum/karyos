@@ -219,6 +219,8 @@ fn an_observation_index_does_not_wrap() {
     checker.state = State::InEvent {
         seq: 1,
         index: u32::MAX,
+        owed: 0,
+        publication: (0, 0),
     };
     assert_eq!(
         checker.push(Role::Observation(1, u32::MAX)),
@@ -332,4 +334,185 @@ fn a_best_effort_journal_holds_an_uncaptured_payload() {
     ])
     .unwrap();
     assert_eq!(checker.next_seq(), 3);
+}
+
+fn checkpoint(group_seq: u64, checkpoint_id: u64) -> Role {
+    Role::Checkpoint {
+        group_seq,
+        checkpoint_id,
+    }
+}
+
+/// A9-1: a checkpoint sits between events and names one already ended,
+/// at or after the first; recorded checkpoints rise in `group_seq` and in
+/// id. Events after its `group_seq` may come before it (its record lags
+/// the write). A strict journal holds them too, but nothing after its
+/// incomplete end.
+#[test]
+fn checkpoints_name_ended_events_in_rising_order() {
+    let checker = check(&[
+        header(Capture::Strict, 5),
+        Role::Event(5),
+        complete(5, 0),
+        Role::Event(6),
+        complete(6, 0),
+        checkpoint(5, 1),
+        checkpoint(6, 4),
+    ])
+    .unwrap();
+    assert_eq!(checker.last_checkpoint(), Some((6, 4)));
+    let cases = [
+        (
+            vec![header(Capture::Strict, 5)],
+            checkpoint(0, 1),
+            OrderRule::Invalid,
+        ),
+        (
+            vec![header(Capture::Strict, 5)],
+            checkpoint(1, 0),
+            OrderRule::Invalid,
+        ),
+        (
+            vec![header(Capture::Strict, 5)],
+            checkpoint(5, 1),
+            OrderRule::Checkpoint,
+        ),
+        (
+            vec![header(Capture::Strict, 5), Role::Event(5), complete(5, 0)],
+            checkpoint(4, 1),
+            OrderRule::Checkpoint,
+        ),
+        (
+            vec![
+                header(Capture::Strict, 5),
+                Role::Event(5),
+                complete(5, 0),
+                checkpoint(5, 2),
+            ],
+            checkpoint(5, 3),
+            OrderRule::Checkpoint,
+        ),
+        (
+            vec![
+                header(Capture::Strict, 5),
+                Role::Event(5),
+                complete(5, 0),
+                Role::Event(6),
+                complete(6, 0),
+                checkpoint(5, 2),
+            ],
+            checkpoint(6, 2),
+            OrderRule::Checkpoint,
+        ),
+        (
+            vec![header(Capture::Strict, 5), Role::Event(5)],
+            checkpoint(5, 1),
+            OrderRule::Nested,
+        ),
+        (
+            vec![
+                header(Capture::Strict, 5),
+                Role::Event(5),
+                end(5, 0, EndOutcome::Incomplete),
+            ],
+            checkpoint(5, 1),
+            OrderRule::AfterIncomplete,
+        ),
+    ];
+    for (before, role, rule) in cases {
+        let mut checker = check(&before).unwrap();
+        let kept = checker;
+        assert_eq!(
+            checker.push(role),
+            Err(OrderError {
+                ordinal: u64::try_from(before.len()).unwrap(),
+                rule
+            }),
+            "{before:?} then {role:?}"
+        );
+        assert_eq!(checker, kept, "the checker stays as it was");
+    }
+    // In best effort, after a gap: the gap's events count as ended.
+    let checker = check(&[header(Capture::BestEffort, 1), gap(1, 3), checkpoint(3, 1)]).unwrap();
+    assert_eq!(checker.next_seq(), 4);
+}
+
+fn poll(seq: u64, index: u32, count: u32, stream_id: i32) -> Role {
+    Role::Poll {
+        group_seq: seq,
+        index,
+        count,
+        stream_id,
+        session_id: 1,
+    }
+}
+
+fn delivery(seq: u64, index: u32, stream_id: i32) -> Role {
+    Role::Delivery {
+        group_seq: seq,
+        index,
+        stream_id,
+        session_id: 1,
+    }
+}
+
+/// A delivery poll is followed by exactly its `count` delivery
+/// observations, on its publication.
+#[test]
+fn a_delivery_poll_announces_its_deliveries() {
+    let valid = check(&[
+        header(Capture::Strict, 1),
+        Role::Event(1),
+        poll(1, 0, 0, 7),
+        poll(1, 1, 2, 7),
+        delivery(1, 2, 7),
+        delivery(1, 3, 7),
+        Role::Observation(1, 4),
+        poll(1, 5, 1, 8),
+        delivery(1, 6, 8),
+        complete(1, 7),
+    ])
+    .unwrap();
+    assert!(valid.at_boundary());
+    let open = [header(Capture::Strict, 1), Role::Event(1)];
+    let cases: [(&[Role], OrderRule); 9] = [
+        // A delivery with no poll, after an empty one, or past its count.
+        (&[delivery(1, 0, 7)], OrderRule::Poll),
+        (&[poll(1, 0, 0, 7), delivery(1, 1, 7)], OrderRule::Poll),
+        (
+            &[poll(1, 0, 1, 7), delivery(1, 1, 7), delivery(1, 2, 7)],
+            OrderRule::Poll,
+        ),
+        // On another publication.
+        (&[poll(1, 0, 1, 7), delivery(1, 1, 8)], OrderRule::Poll),
+        // Cut short by another observation, a poll, or the end.
+        (
+            &[poll(1, 0, 1, 7), Role::Observation(1, 1)],
+            OrderRule::Poll,
+        ),
+        (&[poll(1, 0, 1, 7), poll(1, 1, 0, 7)], OrderRule::Poll),
+        (&[poll(1, 0, 1, 7), complete(1, 1)], OrderRule::Poll),
+        // The index rules hold for both.
+        (&[poll(1, 1, 0, 7)], OrderRule::Index),
+        (&[poll(1, 0, 1, 7), delivery(1, 2, 7)], OrderRule::Index),
+    ];
+    for (tail, rule) in cases {
+        let roles: Vec<Role> = open.iter().chain(tail).copied().collect();
+        let ordinal = u64::try_from(roles.len() - 1).unwrap();
+        let mut checker = check(&roles[..roles.len() - 1]).unwrap();
+        let before = checker;
+        assert_eq!(
+            checker.push(roles[roles.len() - 1]),
+            Err(OrderError { ordinal, rule }),
+            "{tail:?}"
+        );
+        assert_eq!(checker, before);
+    }
+    // Neither outside an event.
+    for role in [poll(1, 0, 0, 7), delivery(1, 0, 7)] {
+        assert_eq!(
+            check(&[header(Capture::Strict, 1), role]).unwrap_err().rule,
+            OrderRule::OutsideEvent
+        );
+    }
 }

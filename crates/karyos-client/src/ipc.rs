@@ -269,10 +269,21 @@ impl Session {
                     self.close_where(|entry| entry.registration == registration);
                 }
                 // Only the closed lane's links. A conflated view has no
-                // link: it ends with its table's `closed`.
-                Event::PublicationClosed { stream, lane, .. } => {
+                // link: it ends with its table's `closed`. A close naming
+                // an image closes only that image's links, by the
+                // aggregate registration each grant carried: images of one
+                // alias share their stream key (per-source-images.md,
+                // D2-3).
+                Event::PublicationClosed {
+                    stream,
+                    lane,
+                    image,
+                    ..
+                } => {
                     self.close_where(|entry| {
-                        entry.request.stream() == stream && entry.request.lane() == Some(lane)
+                        entry.request.stream() == stream
+                            && entry.request.lane() == Some(lane)
+                            && (image == 0 || entry.publication.0 == image)
                     });
                 }
                 _ => {}
@@ -743,6 +754,22 @@ impl RemoteClient {
         self.conductor_mut()?.add_subscription(stream, role)
     }
 
+    /// Requests a subscription to lane 0 of the network image `image` of
+    /// the alias `stream`, as `ClientConductor::add_image_subscription`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_subscription`].
+    pub(crate) fn add_image_subscription(
+        &mut self,
+        stream: StreamKey,
+        image: u64,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_image_subscription(stream, image, Lane::ZERO, role)
+    }
+
     /// Requests an exclusive publication of `stream_id` on the channel
     /// `uri`, as [`ClientConductor::add_network_publication`]; its grant
     /// completes as [`Outcome::Fetchable`](crate::Outcome::Fetchable) with
@@ -826,6 +853,41 @@ impl RemoteClient {
                 Ok(sequence)
             }
             Err(error) => Err((publication, error)),
+        }
+    }
+
+    /// Removes a subscription handle taken from a grant: `RemoveSubscription`
+    /// of its registration, as [`ClientConductor::remove_subscription`]. The
+    /// handle is dropped, detaching its export, only after the command is
+    /// written, and the driver then forgets the registration: without it,
+    /// the registration would stay until the client ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handle intact with the error, so the caller can retry:
+    /// [`ConductorError::ForeignHandle`] for a handle this client did not
+    /// take, and the errors of [`ClientConductor::remove_subscription`].
+    #[allow(
+        clippy::result_large_err,
+        reason = "the handle is returned intact so the caller can retry; boxing it would allocate on every Full"
+    )]
+    pub fn remove_subscription(
+        &mut self,
+        subscription: ClientSubscription<SharedTerms>,
+    ) -> Result<u64, (ClientSubscription<SharedTerms>, ConductorError)> {
+        let Some(registration) = self.taken_registration(subscription.generation_link()) else {
+            return Err((subscription, ConductorError::ForeignHandle));
+        };
+        let submitted = match self.conductor_mut() {
+            Ok(conductor) => conductor.remove_subscription_registration(registration),
+            Err(error) => Err(error),
+        };
+        match submitted {
+            Ok(sequence) => {
+                drop(subscription);
+                Ok(sequence)
+            }
+            Err(error) => Err((subscription, error)),
         }
     }
 
@@ -1793,6 +1855,7 @@ mod tests {
                 stream: STREAM,
                 lane: Lane::ZERO,
                 reason: karyos_protocol::cnc::CloseReason::RequiredParticipantLost,
+                image: 0,
             }],
             false,
         );
@@ -1810,6 +1873,46 @@ mod tests {
         );
         assert_eq!(fenced.status(), LinkStatus::Closed);
         assert_eq!(other.status(), LinkStatus::Current);
+    }
+
+    /// Two images of one alias share their stream key (`quantstratum-docs:
+    /// karyos/design/per-source-images.md`, D2-3): a `PublicationClosed`
+    /// naming one image closes only that image's link on the lane, by the
+    /// aggregate registration its grant carried; a close naming no image
+    /// closes by stream and lane, both.
+    #[test]
+    fn an_image_close_leaves_the_other_images_link_open() {
+        let (session, _peer) = session();
+        let request = Request::Subscription {
+            stream: STREAM,
+            lane: Lane::ZERO,
+            role: SubscriberRole::Required,
+        };
+        let image = |registration: u64, image: u64| {
+            let link = GenerationLink::new_remote();
+            session.links().push(RemoteLink {
+                registration,
+                publication: (image, 1),
+                request,
+                generation: 0,
+                link: Arc::downgrade(&link),
+            });
+            link
+        };
+        let (first, second) = (image(1, 40), image(2, 41));
+        let close = |image| Event::PublicationClosed {
+            stream: STREAM,
+            lane: Lane::ZERO,
+            reason: karyos_protocol::cnc::CloseReason::ImageRetired,
+            image,
+        };
+        session.serve_cutovers(vec![close(40)], false);
+        assert_eq!(first.status(), LinkStatus::Closed);
+        assert_eq!(second.status(), LinkStatus::Current, "the other image");
+        let third = image(3, 42);
+        session.serve_cutovers(vec![close(0)], false);
+        assert_eq!(second.status(), LinkStatus::Closed);
+        assert_eq!(third.status(), LinkStatus::Closed);
     }
 
     /// A link whose handle is gone is forgotten at the next service.

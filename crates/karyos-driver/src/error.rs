@@ -19,6 +19,32 @@ pub enum WalkerUnavailable {
     NoReaderCell,
 }
 
+/// What a network publication's timed lanes do not support yet (P2.11
+/// PR1, the software route; `quantstratum-docs:
+/// karyos/design/timed-tx.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TimedNetworkUnsupported {
+    /// A channel with redundant paths: each path submits its own copy, and
+    /// when a timed head is selected once is not designed yet.
+    #[error("redundant paths")]
+    Routed,
+    /// The `Tai` clock domain: the sender runs on the monotonic clock.
+    #[error("the Tai clock domain")]
+    TaiDomain,
+    /// Cancel-on-deadline: the sealing it needs is the conductor's, which
+    /// the sender agent does not hold.
+    #[error("cancel-on-deadline")]
+    CancelOnDeadline,
+    /// A horizon that, with one heartbeat interval, reaches the image
+    /// liveness timeout: a lane holding only a head that far ahead sends
+    /// nothing (no DATA, and no idle heartbeat while a head is staged),
+    /// and its last heartbeat can come one interval before, so its
+    /// receivers' images would retire before it leaves. Receivers are
+    /// assumed to use this driver's `image_liveness_timeout`.
+    #[error("a horizon that, with a heartbeat interval, reaches the image liveness timeout")]
+    HorizonPastLiveness,
+}
+
 /// Errors returned by the embedded driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DriverError {
@@ -232,6 +258,12 @@ pub enum DriverError {
     NotTimed {
         /// The stream id.
         stream: u64,
+    },
+    /// A network publication's timed lanes cannot take this yet.
+    #[error("a timed network publication does not support {reason}")]
+    TimedNetworkUnsupported {
+        /// What it does not support.
+        reason: TimedNetworkUnsupported,
     },
     /// A cutover of a timed lane: its schedule ring belongs to one
     /// incarnation's buffer and is never carried to a successor

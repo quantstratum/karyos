@@ -69,7 +69,9 @@ use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::lanes::drr::{Budget, DrrConfig};
 use karyos_protocol::network::{Alias, Identity, Lanes, MAX_LANES, Nak, NakReply};
-use karyos_sys::log_buffer::{LogBuffer, ReadError, ReadOrigin, ReadOutcome, SenderRead};
+use karyos_sys::log_buffer::{
+    CanonicalKind, LogBuffer, ReadError, ReadOrigin, ReadOutcome, SenderRead,
+};
 use karyos_sys::sizing::align_frame;
 use karyos_sys::term_bytes::HeapTerms;
 
@@ -81,6 +83,8 @@ use crate::guard_gate::{GateError, GateHead, GateLane, GuardGate};
 use crate::membership::{Admission, Limit, Membership};
 use crate::repair::admission::Requester;
 use crate::repair::scheduler::RepairBudget;
+use crate::schedule::{LaneFrame, ScheduleConsumer};
+use crate::timed_gate::{LatePolicy, TimedLaneCounters, TimedState};
 use karyos_protocol::frame::{Lane, TraceExtension};
 use karyos_protocol::trace_hook::{NetPickup, NetworkTraceHook};
 
@@ -150,12 +154,37 @@ impl LaneGate for DataGate<'_> {
             return;
         };
         // Heads leave in staging order.
+        let ends = track.ends.pop_front().unwrap_or(false);
+        let mut left_at = None;
         match track.staged.pop_front() {
-            Some((ticket, next)) if ticket == staged.ticket => match how {
-                Left::Submitted => track.submitted = Some(next),
-                Left::Returned | Left::Unknown => track.unsent = true,
-            },
+            Some((ticket, next)) if ticket == staged.ticket => {
+                match how {
+                    Left::Submitted => track.submitted = Some(next),
+                    Left::Returned | Left::Unknown => track.unsent = true,
+                }
+                left_at = Some(next);
+            }
             _ => track.mismatched = true,
+        }
+        // A timed message's last fragment left (ScheduleConsumer::
+        // message_left): sent or maybe sent, at the position its message
+        // ends, which a reliable lane releases once acknowledged; returned
+        // unsent, which an unreliable lane never sends again.
+        let sent = matches!(how, Left::Submitted | Left::Unknown);
+        track.started = !ends && (sent || track.started);
+        if ends {
+            match (how, left_at) {
+                (Left::Submitted | Left::Unknown, Some(end))
+                    if track.left_ends.len() < track.left_ends.capacity() =>
+                {
+                    track.left_ends.push_back(end);
+                }
+                _ => {
+                    if let Some(returned) = track.returned_ends.checked_add(1) {
+                        track.returned_ends = returned;
+                    }
+                }
+            }
         }
     }
 }
@@ -183,6 +212,35 @@ struct LaneTrack {
     /// Staging stopped at the receivers' edge and has not staged since: a
     /// wait is counted once, not once per idle cycle.
     waiting: bool,
+    /// A timed lane's staged datagrams, in step with `staged`: whether each
+    /// carries its message's last fragment.
+    ends: VecDeque<bool>,
+    /// Where each timed message whose last fragment was sent (or may have
+    /// been) this call ends, in order.
+    left_ends: VecDeque<u64>,
+    /// Timed messages whose last fragment was returned unsent this call.
+    returned_ends: u32,
+    /// A fragment of the timed message being sent left (submitted, or of
+    /// unknown exposure) and its last fragment has not: a reliable reset
+    /// counts that message as sent.
+    started: bool,
+}
+
+/// A timed publication's schedule (`quantstratum-docs:
+/// karyos/design/timed-tx.md`; P2.11 PR1, the software route): its timed
+/// gate's record and each lane's reader of its schedule ring. A timed lane
+/// stages one message per datagram, so each head waits for exactly its own
+/// time, and only for it.
+#[derive(Debug)]
+struct Timed {
+    state: TimedState,
+    /// Per lane, the consumer of its ring; `None` for a lane with none.
+    consumers: Vec<Option<ScheduleConsumer>>,
+    /// A reliable publication's lanes, per lane: where each sent timed
+    /// message ends, oldest first, until the registered position passes it
+    /// and its entry is released (a reset rewinds to that position and
+    /// reads the messages above it again). Sized by the lane's ring.
+    unacknowledged: Vec<VecDeque<u64>>,
 }
 
 /// The counters of one outbound publication; checked, sticky on overflow.
@@ -225,6 +283,10 @@ pub struct OutboundCounters {
     /// Traced datagrams whose failed commit the lane could not remember
     /// (it holds one range): their frames are never recorded.
     pub trace_unpicked: u64,
+    /// A timed lane's frames and its schedule entries disagreed, or its
+    /// ring refused a release: a broken invariant, counted; the lane
+    /// stages nothing more.
+    pub schedule_faults: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -291,6 +353,8 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     idle_since: [Option<u64>; 4],
     /// Its removal linger, once removing (driver-network-agents.md §7).
     removal: Option<Box<removal::Removal>>,
+    /// A timed publication's schedule ([`Outbound::set_timed`]).
+    timed: Option<Box<Timed>>,
 }
 
 /// The guard of a guarded publication, as the conductor hands it to the
@@ -318,6 +382,26 @@ impl std::fmt::Debug for GuardSpec {
             .field("epoch", &self.epoch)
             .field("rate", &self.rate)
             .finish_non_exhaustive()
+    }
+}
+
+/// The timed lane frame of a datagram holding one DATA frame read at
+/// `position`, from its header's flags. A header that does not decode is
+/// a continuation outside a message, which the consumer refuses.
+fn data_frame(bytes: &[u8], position: u64) -> LaneFrame {
+    use karyos_sys::frame::Word0;
+
+    let word = bytes
+        .get(..8)
+        .and_then(|word| <[u8; 8]>::try_from(word).ok())
+        .and_then(|raw| Word0::unpack(u64::from_le_bytes(raw)).ok());
+    let (begin, end) = word.map_or((false, false), |word| {
+        (word.flags().begin(), word.flags().end())
+    });
+    LaneFrame::Data {
+        position,
+        begin,
+        end,
     }
 }
 
@@ -425,6 +509,10 @@ impl<T: StreamTerms> Outbound<T> {
                 unsent: false,
                 mismatched: false,
                 waiting: false,
+                ends: VecDeque::with_capacity(bound),
+                left_ends: VecDeque::with_capacity(bound),
+                returned_ends: 0,
+                started: false,
             })
             .collect();
         Ok(Self {
@@ -460,6 +548,7 @@ impl<T: StreamTerms> Outbound<T> {
             route: None,
             idle_since: [None; 4],
             removal: None,
+            timed: None,
         })
     }
 
@@ -606,6 +695,7 @@ impl<T: StreamTerms> Outbound<T> {
             tracks,
             readers,
             counters,
+            timed,
             ..
         } = self
         else {
@@ -621,7 +711,12 @@ impl<T: StreamTerms> Outbound<T> {
                 held: false,
                 guard: Some(&mut **guard),
             };
-            match sender.cancel(tx, lane, &mut gate) {
+            // A timed lane's heads leave its timed record too, as dropped.
+            let cancelled_now = match timed.as_deref_mut() {
+                Some(timed) => sender.cancel(tx, lane, &mut timed.state.view(&mut gate)),
+                None => sender.cancel(tx, lane, &mut gate),
+            };
+            match cancelled_now {
                 Ok(_) => cancelled = true,
                 Err(_) => counters.bump(|c| &mut c.queue_failures, 1),
             }
@@ -955,6 +1050,58 @@ impl<T: StreamTerms> Outbound<T> {
             }
             repair.reopened(queue);
         }
+        // A timed lane's heads the reset returned. An unreliable lane sends
+        // none of them again, so a message whose last fragment was among
+        // them is done, and each is counted dropped. A reliable one reads
+        // again from its registered position, below which every entry is
+        // released, so its consumer rewinds to its oldest entry not
+        // released, and nothing is done or dropped. Only the messages that
+        // left (in whole, or in part) are resent at once; the ones only
+        // read keep their time.
+        let rewinding = self.opened.is_some() && self.reliable;
+        if let Some(timed) = self.timed.as_deref_mut() {
+            for (lane, track) in self.tracks.iter_mut().enumerate() {
+                let _ = timed.state.forget(lane, !rewinding);
+                if rewinding {
+                    track.ends.clear();
+                    let unacknowledged =
+                        timed
+                            .unacknowledged
+                            .get_mut(lane)
+                            .map_or(0, |unacknowledged| {
+                                let sent = unacknowledged.len();
+                                unacknowledged.clear();
+                                sent
+                            });
+                    let sent = unacknowledged
+                        .checked_add(track.left_ends.len())
+                        .and_then(|sent| sent.checked_add(usize::from(track.started)));
+                    track.left_ends.clear();
+                    track.returned_ends = 0;
+                    track.started = false;
+                    if let Some(Some(consumer)) = timed.consumers.get_mut(lane) {
+                        let rewound = sent.map(|sent| consumer.rewind(sent));
+                        if !matches!(rewound, Some(Ok(()))) {
+                            self.counters.bump(|c| &mut c.schedule_faults, 1);
+                        }
+                    }
+                    continue;
+                }
+                let ended = track.ends.iter().filter(|ends| **ends).count();
+                track.ends.clear();
+                let ring = self
+                    .readers
+                    .get(lane)
+                    .and_then(|reader| reader.subscription().buffer().schedule_ring());
+                if let (Some(Some(consumer)), Some(ring)) = (timed.consumers.get_mut(lane), ring) {
+                    for _ in 0..ended {
+                        if consumer.message_left(ring).is_err() {
+                            self.counters.bump(|c| &mut c.schedule_faults, 1);
+                        }
+                    }
+                }
+            }
+        }
         for track in &mut self.tracks {
             track.staged.clear();
         }
@@ -1002,6 +1149,61 @@ impl<T: StreamTerms> Outbound<T> {
             route,
             queues,
         });
+    }
+
+    /// Makes its lanes timed (control path, before it is posted): each lane
+    /// whose buffer has a schedule ring holds every head until its
+    /// message's requested time, under `policies[lane]` (its tolerance),
+    /// counting into `counters[lane]`; the gate's clock starts at `now`,
+    /// the network clock.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboundError::Lanes`] for a lane's ring that is not one.
+    pub(crate) fn set_timed(
+        &mut self,
+        policies: &[LatePolicy],
+        counters: Vec<Option<Arc<TimedLaneCounters>>>,
+        now: u64,
+    ) -> Result<(), OutboundError> {
+        let mut consumers = Vec::with_capacity(self.readers.len());
+        for reader in &self.readers {
+            let consumer = match reader.subscription().buffer().schedule_ring() {
+                Some(ring) => Some(ScheduleConsumer::new(ring).map_err(|_| OutboundError::Lanes)?),
+                None => None,
+            };
+            consumers.push(consumer);
+        }
+        let mut state = TimedState::new(policies, usize::from(STAGED_PER_LANE), now);
+        state.set_resends_returned(self.reliable);
+        for (lane, cells) in counters.into_iter().enumerate() {
+            if let Some(cells) = cells {
+                state.attach_counters(lane, cells);
+            }
+        }
+        let mut unacknowledged = Vec::with_capacity(self.readers.len());
+        for reader in &self.readers {
+            let buffer = reader.subscription().buffer();
+            let capacity = match (self.reliable, buffer.schedule_ring()) {
+                (true, Some(_)) => usize::try_from(buffer.config().schedule_capacity)
+                    .map_err(|_| OutboundError::Lanes)?,
+                _ => 0,
+            };
+            unacknowledged.push(VecDeque::with_capacity(capacity));
+        }
+        self.timed = Some(Box::new(Timed {
+            state,
+            consumers,
+            unacknowledged,
+        }));
+        Ok(())
+    }
+
+    /// What its timed gate counted, if it is timed (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn timed_counts(&self) -> Option<crate::timed_gate::TimedCounts> {
+        self.timed.as_deref().map(|timed| timed.state.counts())
     }
 
     /// One cycle: stage what each lane has committed, serve the lanes
@@ -1054,21 +1256,29 @@ impl<T: StreamTerms> Outbound<T> {
         if let Some(guard) = self.guard.as_deref_mut() {
             guard.set_now(now);
         }
-        let report = self.sender.serve(
-            tx,
-            &mut DataGate {
-                lanes: &mut self.tracks,
-                held,
-                guard: self.guard.as_deref_mut(),
-            },
-            budget,
-        );
+        let mut gate = DataGate {
+            lanes: &mut self.tracks,
+            held,
+            guard: self.guard.as_deref_mut(),
+        };
+        // A timed publication's heads wait for their time over the data
+        // gate, which decides them once due (timed-tx.md section 4).
+        let report = match self.timed.as_deref_mut() {
+            Some(timed) => {
+                timed.state.set_now(now);
+                self.sender
+                    .serve(tx, &mut timed.state.view(&mut gate), budget)
+            }
+            None => self.sender.serve(tx, &mut gate, budget),
+        };
         // Once a cycle, even with nothing flushed, so a close becomes
         // effective with no pending traffic (DN 3.1 step 10).
         if let Some(guard) = self.guard.as_deref_mut() {
             guard.between_gates();
         }
         self.cancel_aborted(tx);
+        // After the cancel, whose returned heads end their messages too.
+        self.release_ended();
         self.handle_failure(tx, report.failure);
         for (track, idle) in self.tracks.iter_mut().zip(&mut self.idle_since) {
             if std::mem::take(&mut track.unsent) {
@@ -1085,7 +1295,101 @@ impl<T: StreamTerms> Outbound<T> {
             }
         }
         self.advance_registered(consumption);
+        self.release_acknowledged();
         Ok(work)
+    }
+
+    /// A timed message of `lane` whose last fragment never reached the
+    /// queue: its own schedule entry, the newest read, is done; older
+    /// messages still queued keep theirs.
+    fn timed_message_lost(&mut self, lane: usize) {
+        let ring = self
+            .readers
+            .get(lane)
+            .and_then(|reader| reader.subscription().buffer().schedule_ring());
+        let consumer = self
+            .timed
+            .as_deref_mut()
+            .and_then(|timed| timed.consumers.get_mut(lane))
+            .and_then(Option::as_mut);
+        if let (Some(ring), Some(consumer)) = (ring, consumer)
+            && consumer.message_lost(ring).is_err()
+        {
+            self.counters.bump(|c| &mut c.schedule_faults, 1);
+        }
+    }
+
+    /// Frees the schedule entry of every timed message whose last fragment
+    /// left this cycle, in order.
+    fn release_ended(&mut self) {
+        let Some(timed) = self.timed.as_deref_mut() else {
+            return;
+        };
+        for (lane, track) in self.tracks.iter_mut().enumerate() {
+            let returned = std::mem::take(&mut track.returned_ends);
+            let ring = self
+                .readers
+                .get(lane)
+                .and_then(|reader| reader.subscription().buffer().schedule_ring());
+            let (Some(Some(consumer)), Some(ring)) = (timed.consumers.get_mut(lane), ring) else {
+                track.left_ends.clear();
+                continue;
+            };
+            // A reliable lane holds a sent message's entry until it is
+            // acknowledged ([`Outbound::release_acknowledged`]); a message
+            // returned unsent is read again after the reset.
+            if self.reliable {
+                if let Some(unacknowledged) = timed.unacknowledged.get_mut(lane) {
+                    while let Some(end) = track.left_ends.pop_front() {
+                        if unacknowledged.len() < unacknowledged.capacity() {
+                            unacknowledged.push_back(end);
+                        } else {
+                            self.counters.bump(|c| &mut c.schedule_faults, 1);
+                        }
+                    }
+                }
+                continue;
+            }
+            let ended = track.left_ends.len();
+            track.left_ends.clear();
+            for _ in (0..ended).map(drop).chain((0..returned).map(drop)) {
+                if consumer.message_left(ring).is_err() {
+                    self.counters.bump(|c| &mut c.schedule_faults, 1);
+                }
+            }
+        }
+    }
+
+    /// Frees, in order, the entry of every timed message of a reliable lane
+    /// whose end its registered position passed: the receivers consumed
+    /// it, so no reset reads it again.
+    fn release_acknowledged(&mut self) {
+        let Some(timed) = self.timed.as_deref_mut() else {
+            return;
+        };
+        if !self.reliable {
+            return;
+        }
+        for (lane, reader) in self.readers.iter().enumerate() {
+            let acknowledged = reader.sent_position();
+            let ring = reader.subscription().buffer().schedule_ring();
+            let (Some(unacknowledged), Some(Some(consumer)), Some(ring)) = (
+                timed.unacknowledged.get_mut(lane),
+                timed.consumers.get_mut(lane),
+                ring,
+            ) else {
+                continue;
+            };
+            while unacknowledged
+                .front()
+                .is_some_and(|end| *end <= acknowledged)
+            {
+                let _ = unacknowledged.pop_front();
+                if consumer.message_left(ring).is_err() {
+                    self.counters.bump(|c| &mut c.schedule_faults, 1);
+                }
+            }
+        }
     }
 
     /// The receivers' limits this cycle, and whether a required loss holds
@@ -1326,21 +1630,80 @@ impl<T: StreamTerms> Outbound<T> {
                 }
                 break;
             }
-            let Ok(mut frame) = tx.claim_tx(queue, self.mtu) else {
-                break;
-            };
-            let (len, next, record) =
-                match reader.read_committed(from, ReadOrigin::Cursor, frame.bytes_mut()) {
-                    Ok(ReadOutcome::Copied { len, next }) => (len, next, false),
-                    Ok(ReadOutcome::Canonical { next, .. }) => (32, next, true),
-                    // Dropping the unused frame frees its slot.
-                    Ok(ReadOutcome::Pending) => break,
-                    Err(ReadError::Retry) => break,
-                    Err(_) => {
+            // A timed lane sends one frame per datagram: the first frame's
+            // length, from a read that copies nothing and moves nothing,
+            // bounds the copy, so each head waits for its own time only.
+            let timed = self
+                .timed
+                .as_deref()
+                .is_some_and(|timed| matches!(timed.consumers.get(lane), Some(Some(_))));
+            let cap = if timed {
+                match reader.read_committed(from, ReadOrigin::Cursor, &mut []) {
+                    Err(ReadError::TooSmall { needed }) => needed.min(self.mtu),
+                    Ok(ReadOutcome::Pending) | Err(ReadError::Retry) => break,
+                    Ok(_) | Err(_) => {
                         self.counters.bump(|c| &mut c.read_errors, 1);
                         break;
                     }
+                }
+            } else {
+                self.mtu
+            };
+            let Ok(mut frame) = tx.claim_tx(queue, self.mtu) else {
+                break;
+            };
+            let Some(out) = frame.bytes_mut().get_mut(..cap) else {
+                break;
+            };
+            let (len, next, record) = match reader.read_committed(from, ReadOrigin::Cursor, out) {
+                Ok(ReadOutcome::Copied { len, next }) => (len, next, None),
+                Ok(ReadOutcome::Canonical { next, record }) => (32, next, Some(record)),
+                // Dropping the unused frame frees its slot.
+                Ok(ReadOutcome::Pending) => break,
+                Err(ReadError::Retry) => break,
+                Err(_) => {
+                    self.counters.bump(|c| &mut c.read_errors, 1);
+                    break;
+                }
+            };
+            // A timed lane's frame takes its message's time from the ring:
+            // a first fragment takes its entry, later fragments its time;
+            // padding and aborted blocks carry none.
+            let mut schedule = None;
+            if timed {
+                let lane_frame = match record {
+                    Some(CanonicalKind::Pad) => LaneFrame::Pad,
+                    Some(CanonicalKind::Aborted) => LaneFrame::Aborted { position: from },
+                    None => data_frame(frame.bytes_mut().get(..len).unwrap_or_default(), from),
                 };
+                let ring = reader.subscription().buffer().schedule_ring();
+                let consumer = self
+                    .timed
+                    .as_deref_mut()
+                    .and_then(|timed| timed.consumers.get_mut(lane))
+                    .and_then(Option::as_mut);
+                let (Some(ring), Some(consumer)) = (ring, consumer) else {
+                    break;
+                };
+                let Ok(scheduled) = consumer.frame_scheduled(ring, lane_frame) else {
+                    self.counters.bump(|c| &mut c.schedule_faults, 1);
+                    break;
+                };
+                let ends = matches!(lane_frame, LaneFrame::Data { end: true, .. });
+                // A message a reliable reset read again was sent once: it
+                // goes at once, outside the late policy, counted apart.
+                let time = match scheduled {
+                    Some(scheduled) if scheduled.replayed => {
+                        if let (Some(timed), true) = (self.timed.as_deref_mut(), ends) {
+                            timed.state.count_rewound();
+                        }
+                        None
+                    }
+                    scheduled => scheduled.map(|scheduled| scheduled.time),
+                };
+                schedule = Some((time, ends));
+            }
+            let record = record.is_some();
             // One branch per datagram without a hook.
             let traced = if hook.is_some() {
                 self.traced.get(lane).copied().flatten()
@@ -1380,6 +1743,9 @@ impl<T: StreamTerms> Outbound<T> {
                 if traced.is_some() && !remember_unpicked(&mut self.traced, lane, from, next) {
                     self.counters.bump(|c| &mut c.trace_unpicked, 1);
                 }
+                if let Some((_, true)) = schedule {
+                    self.timed_message_lost(lane);
+                }
                 break;
             };
             let charge = u32::try_from(len)
@@ -1399,11 +1765,13 @@ impl<T: StreamTerms> Outbound<T> {
                 len: len16,
             };
             // A guarded lane stages through its gate, which records the head
-            // in step with the sender.
-            let refused = match self.guard.as_deref_mut() {
+            // in step with the sender; a timed one records it, with its
+            // time, in the same step.
+            let (guard, sender) = (self.guard.as_deref_mut(), &mut self.sender);
+            let inner = || match guard {
                 Some(guard) => guard
                     .stage(
-                        &mut self.sender,
+                        sender,
                         lane,
                         staged_head,
                         GateHead {
@@ -1414,15 +1782,30 @@ impl<T: StreamTerms> Outbound<T> {
                             end: next,
                         },
                     )
+                    .map_err(drop),
+                None => sender.staged(lane, staged_head).map_err(drop),
+            };
+            let refused = match (schedule, self.timed.as_deref_mut()) {
+                (Some((time, ends)), Some(timed)) => timed
+                    .state
+                    .stage_with(lane, (token, ticket), (time, ends), inner)
                     .is_err(),
-                None => self.sender.staged(lane, staged_head).is_err(),
+                _ => inner().is_err(),
             };
             if refused {
+                // A message whose last fragment is not staged never leaves:
+                // its entry is done (the receiver closes the gap).
+                if let Some((_, true)) = schedule {
+                    self.timed_message_lost(lane);
+                }
                 self.counters.bump(|c| &mut c.staged_refused, 1);
                 break;
             }
             if let Some(track) = self.tracks.get_mut(lane) {
                 track.staged.push_back((ticket, next));
+                if let Some((_, ends)) = schedule {
+                    track.ends.push_back(ends);
+                }
                 track.waiting = false;
             }
             // The bytes are in TX storage (NT-2). Only a first pickup is
@@ -1563,6 +1946,50 @@ pub(crate) mod testing {
         outbound_joined(endpoint, alias, destination, term, lanes, reliable, 0)
     }
 
+    /// [`outbound`] of one lane with a schedule ring of `capacity`.
+    pub(crate) fn outbound_timed(
+        endpoint: EndpointId,
+        alias: Alias,
+        destination: SocketAddr,
+        term: TermParams,
+        capacity: u32,
+    ) -> (Box<Outbound>, TestLog) {
+        build(
+            endpoint,
+            alias,
+            destination,
+            term,
+            1,
+            false,
+            0,
+            None,
+            None,
+            capacity,
+        )
+    }
+
+    /// [`outbound_timed`] over a reliable channel.
+    pub(crate) fn outbound_timed_reliable(
+        endpoint: EndpointId,
+        alias: Alias,
+        destination: SocketAddr,
+        term: TermParams,
+        capacity: u32,
+    ) -> (Box<Outbound>, TestLog) {
+        build(
+            endpoint,
+            alias,
+            destination,
+            term,
+            1,
+            true,
+            0,
+            None,
+            None,
+            capacity,
+        )
+    }
+
     /// [`outbound`], with `before` 1000-byte messages appended on each lane
     /// before its reader subscribes: the reader joins above 0.
     pub(crate) fn outbound_joined(
@@ -1584,6 +2011,7 @@ pub(crate) mod testing {
             before,
             None,
             None,
+            0,
         )
     }
 
@@ -1608,6 +2036,7 @@ pub(crate) mod testing {
             0,
             None,
             Some(publishers),
+            0,
         )
     }
 
@@ -1622,6 +2051,7 @@ pub(crate) mod testing {
         before: u8,
         routes: Option<&[(EndpointId, SocketAddr)]>,
         concurrent: Option<u8>,
+        schedule: u32,
     ) -> (Box<Outbound>, TestLog) {
         let mut log = TestLog {
             lanes: Vec::new(),
@@ -1652,7 +2082,7 @@ pub(crate) mod testing {
                         None => PublicationMode::Exclusive,
                     },
                     claim_deadline: DEFAULT_CLAIM_DEADLINE,
-                    schedule_capacity: 0,
+                    schedule_capacity: schedule,
                 })
                 .unwrap(),
             );
@@ -1729,6 +2159,7 @@ pub(crate) mod testing {
             0,
             Some(routes),
             None,
+            0,
         )
     }
 }

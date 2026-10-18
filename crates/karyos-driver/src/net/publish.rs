@@ -123,7 +123,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         config: AggregateConfig,
         channel: &UdpConfig,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, None)
+        self.add_network(config, channel, None, None, None)
     }
 
     /// [`EmbeddedDriver::add_network_publication`] whose receivers have the
@@ -145,7 +145,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         roles: PublicationRoles,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, Some(Box::new(roles)))
+        self.add_network(config, channel, None, Some(Box::new(roles)), None)
     }
 
     /// [`EmbeddedDriver::add_network_publication`], guarded by `guard`:
@@ -172,7 +172,52 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         guard: NetworkGuard,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, Some(guard), None)
+        self.add_network(config, channel, Some(guard), None, None)
+    }
+
+    /// [`EmbeddedDriver::add_network_publication`] whose lanes are timed
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`; P2.11, the software
+    /// route): every lane of `config` has a schedule ring
+    /// (`schedule_capacity`), takes `schedule` as its settings
+    /// ([`EmbeddedDriver::schedule_stream`], fixed from the add on), and
+    /// its sender holds each message until its requested time, one message
+    /// per datagram, then sends it. A plain network publication whose lanes
+    /// have a ring is timed with the default settings. Guarded by `guard`,
+    /// if any, as [`EmbeddedDriver::add_guarded_network_publication`].
+    ///
+    /// The sender times heads on the network clock, the host monotonic
+    /// clock, as `ClockDomain::Monotonic` offers are timed; no time
+    /// namespace is checked, as on the local route.
+    ///
+    /// On a reliable channel a message's schedule entry is held until the
+    /// receivers acknowledge it (the lane's registered position passes
+    /// it), so a reset can read it again: `schedule_capacity` must cover
+    /// the unacknowledged window, or offers are back-pressured until the
+    /// receivers consume. A message read again after a reset is resent at
+    /// once, outside the late policy, and counted as rewound, not late.
+    /// NAK repairs go through the repair path, never the timed gate.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::TimedNetworkUnsupported`] for a channel with paths,
+    /// the `Tai` domain, cancel-on-deadline or a `max_horizon` that, with
+    /// one `sender_heartbeat_interval`, reaches
+    /// `image_liveness_timeout`;
+    /// [`DriverError::InvalidConfig`] for lanes with no schedule ring; the
+    /// errors of [`EmbeddedDriver::add_network_publication`] and of
+    /// [`EmbeddedDriver::schedule_stream`]. Nothing is left configured on
+    /// error.
+    pub fn add_timed_network_publication(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        guard: Option<NetworkGuard>,
+        schedule: karyos_client::schedule::ScheduleOptions,
+    ) -> Result<AggregateHandle, DriverError> {
+        if config.stream.buffer.schedule_capacity == 0 {
+            return Err(DriverError::InvalidConfig);
+        }
+        self.add_network(config, channel, guard, None, Some(schedule))
     }
 
     fn add_network(
@@ -181,10 +226,24 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         guard: Option<NetworkGuard>,
         roles: Option<Box<PublicationRoles>>,
+        schedule: Option<karyos_client::schedule::ScheduleOptions>,
     ) -> Result<AggregateHandle, DriverError> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
         };
+        // Timed lanes (a schedule ring on every lane): what the software
+        // route does not support yet is refused before anything exists.
+        let timed =
+            (config.stream.buffer.schedule_capacity > 0).then(|| schedule.unwrap_or_default());
+        if let Some(options) = timed {
+            let liveness = self.config.network.map(|network| {
+                (
+                    network.agents.image_liveness_timeout,
+                    network.agents.sender_heartbeat_interval,
+                )
+            });
+            timed_supported(channel, options, liveness)?;
+        }
         // Redundant paths need sockets isolated per interface; without it
         // they are refused and counted, as for subscriptions.
         if !channel.paths.is_empty() && !net.paths_isolated() {
@@ -203,6 +262,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut config = config;
         config.stream.buffer.initial_term_id = self.draw_initial_term_id(forced)?;
         let handle = self.add_aggregate_drawn(config)?;
+        if let Some(options) = timed
+            && let Err(error) = self.time_lanes(&handle, options)
+        {
+            let _ = self.remove_aggregate(&handle);
+            return Err(error);
+        }
         let channel = SenderChannel {
             destination,
             binds,
@@ -217,6 +282,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(error);
         }
         Ok(handle)
+    }
+
+    /// Applies `options` to every lane of `handle` and allocates its timed
+    /// counters, before the sender exists; the settings are fixed from
+    /// then on, as once a handle is issued.
+    fn time_lanes(
+        &mut self,
+        handle: &AggregateHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+    ) -> Result<(), DriverError> {
+        for stream in handle.streams() {
+            self.schedule_stream(stream, options)?;
+            self.ensure_timed_counters(stream)?;
+            self.stream(stream)?.schedule_issued = true;
+        }
+        Ok(())
     }
 
     /// The state of the network publication `aggregate`; `None` when it
@@ -379,6 +460,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             },
             lane_count,
         };
+        // Timed lanes: each one's tolerance and counter cells, for its
+        // sender's timed gate.
+        let mut timed = None;
+        for stream in handle.streams() {
+            let cells = self.timed_counters(stream)?;
+            let found = self.stream_ref(stream)?;
+            if found.buffer.schedule_ring().is_none() {
+                continue;
+            }
+            let (policies, counters) = timed.get_or_insert_with(|| {
+                (
+                    Vec::with_capacity(usize::from(handle.lanes())),
+                    Vec::with_capacity(usize::from(handle.lanes())),
+                )
+            });
+            policies.push(crate::timed_gate::LatePolicy {
+                tolerance: found.schedule.unwrap_or_default().lateness_tolerance,
+                cancel_on_deadline: false,
+            });
+            counters.push(cells);
+        }
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
         // One send endpoint per path, all or nothing.
         let mut held: Vec<(EndpointId, SocketAddr)> = Vec::with_capacity(binds.len());
@@ -408,6 +510,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             )
         };
         let posted = outbound
+            .and_then(|mut outbound| {
+                if let Some((policies, counters)) = timed {
+                    let now = karyos_sys::host_clock::host_monotonic_ns();
+                    outbound.set_timed(&policies, counters, now)?;
+                }
+                Ok(outbound)
+            })
             .map_err(|_| DriverError::InvalidConfig)
             .and_then(|outbound| {
                 net.add_publication(
@@ -431,6 +540,38 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         Ok(())
     }
+}
+
+/// Refuses what a timed network publication does not support yet (P2.11
+/// PR1).
+fn timed_supported(
+    channel: &UdpConfig,
+    options: karyos_client::schedule::ScheduleOptions,
+    liveness: Option<(u64, u64)>,
+) -> Result<(), DriverError> {
+    use crate::error::TimedNetworkUnsupported as Unsupported;
+
+    let reason = if !channel.paths.is_empty() {
+        Some(Unsupported::Routed)
+    } else if options.domain == karyos_client::schedule::ClockDomain::Tai {
+        Some(Unsupported::TaiDomain)
+    } else if options.cancel_on_deadline {
+        Some(Unsupported::CancelOnDeadline)
+    } else if liveness.is_some_and(|(liveness, heartbeat)| {
+        // A lane's last heartbeat can come one interval before its held
+        // head: the silence is up to the horizon plus that interval.
+        options
+            .max_horizon
+            .checked_add(heartbeat)
+            .is_none_or(|silence| silence >= liveness)
+    }) {
+        Some(Unsupported::HorizonPastLiveness)
+    } else {
+        None
+    };
+    reason.map_or(Ok(()), |reason| {
+        Err(DriverError::TimedNetworkUnsupported { reason })
+    })
 }
 
 #[cfg(test)]

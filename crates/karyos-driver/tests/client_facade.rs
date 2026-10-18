@@ -238,6 +238,139 @@ fn a_network_subscription_polls_its_images_in_turn() {
     assert!(pairs >= 3, "the images are read in turn: {seen:?}");
 }
 
+/// A network driver driven by the caller.
+fn network_driver() -> EmbeddedDriver {
+    EmbeddedDriver::with_config(DriverConfig {
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap()
+}
+
+/// Two images of one alias (`quantstratum-docs:
+/// karyos/design/per-source-images.md`, D2-5): two publishers on two
+/// drivers use the same stream and session to one subscription. Both
+/// images are attached, two slots, each delivering its own publisher's
+/// messages in order; when one publisher goes, its `ImageUnavailable`
+/// drops only its image, and the other keeps delivering.
+#[test]
+fn a_network_subscription_reads_two_images_of_one_alias() {
+    use karyos_protocol::channel::{Destination, Interface, Security, UdpConfig};
+    use karyos_sys::frame::Lane;
+
+    // The receiver retires an image half a second after its sender goes.
+    let (_b, mut b) = driven(1, Some(500_000_000));
+    let mut subscriber = Client::with_conductor(b.remove(0), context());
+    let port = port();
+    let mut reading = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(8),
+        )
+        .unwrap();
+    let channel = UdpConfig {
+        destination: Destination::Unicast(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+        interface: Some(Interface::Address(Ipv4Addr::LOCALHOST.into())),
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    // One alias, (8, 1), from two sources.
+    let mut publishers = [network_driver(), network_driver()];
+    let handles = publishers.each_mut().map(|driver| {
+        driver
+            .add_network_publication(heap_aggregate(8, 1), &channel)
+            .unwrap()
+    });
+    let serve = |publishers: &mut [EmbeddedDriver; 2], subscriber: &mut Client<ClientConductor>| {
+        for driver in publishers.iter_mut() {
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = subscriber.poll();
+        std::thread::sleep(Duration::from_micros(100));
+    };
+    let start = Instant::now();
+    while reading.image_count() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(20), "two images");
+        serve(&mut publishers, &mut subscriber);
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+    }
+    let [first, second] = &mut publishers;
+    let mut lanes = [
+        first
+            .publication(handles[0].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+        second
+            .publication(handles[1].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+    ];
+    let mut offered = [0u8; 2];
+    let mut seen: Vec<[u8; 2]> = Vec::new();
+    let start = Instant::now();
+    while seen.len() < 16 {
+        assert!(start.elapsed() < Duration::from_secs(20), "{seen:?}");
+        for (publisher, lane) in lanes.iter_mut().enumerate() {
+            if offered[publisher] < 8
+                && matches!(
+                    lane.offer(&[u8::try_from(publisher).unwrap(), offered[publisher]]),
+                    Ok(karyos_client::OfferOutcome::Accepted { .. })
+                )
+            {
+                offered[publisher] += 1;
+            }
+        }
+        serve(&mut publishers, &mut subscriber);
+        let _ = reading
+            .poll(
+                |bytes, _| seen.push([bytes[0], bytes[1]]),
+                MessageLimit::new(64),
+            )
+            .unwrap();
+    }
+    for publisher in 0..2u8 {
+        let own: Vec<u8> = seen
+            .iter()
+            .filter(|[from, _]| *from == publisher)
+            .map(|[_, index]| *index)
+            .collect();
+        assert_eq!(own, (0..8).collect::<Vec<u8>>(), "publisher {publisher}");
+    }
+    // The second publisher goes: only its image is dropped.
+    let [mut lane, second] = lanes;
+    drop(second);
+    publishers[1].remove_aggregate(&handles[1]).unwrap();
+    let start = Instant::now();
+    while reading.image_count() > 1 {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "one image retires"
+        );
+        serve(&mut publishers, &mut subscriber);
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(64));
+    }
+    assert_eq!(reading.image_count(), 1);
+    assert_eq!(reading.images_refused(), 0);
+    // The image left is the first publisher's: it still delivers.
+    let mut later = Vec::new();
+    let start = Instant::now();
+    while later.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(20), "the first image");
+        let _ = lane.offer(&[0, 99]);
+        serve(&mut publishers, &mut subscriber);
+        let _ = reading
+            .poll(
+                |bytes, _| later.push([bytes[0], bytes[1]]),
+                MessageLimit::new(64),
+            )
+            .unwrap();
+    }
+    assert_eq!(later[0], [0, 99]);
+}
+
 /// An image beyond the context's `max_images` is refused and counted,
 /// never attached; a refused image holds no slot, so its retirement frees
 /// none (#306 review P1: A attached, B refused, B retired, C refused).
@@ -558,6 +691,36 @@ mod remote {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    /// #420 review P1: a remote facade client that subscribes by
+    /// `karyos:ipc` and drops each subscription is never refused at the
+    /// export bound (16): each dropped handle detaches its grant, and the
+    /// driver reclaims the registration. Twenty cycles are all admitted,
+    /// and the client can still publish; a removed one is admitted too.
+    #[test]
+    fn subscribe_and_drop_cycles_are_never_refused_at_the_export_bound() {
+        let (_driver, dir) = ipc_driver("cycles");
+        let mut client = connect(&dir);
+        for cycle in 0..20 {
+            let subscription = client
+                .add_subscription("karyos:ipc", StreamId::new(3))
+                .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
+            drop(subscription);
+            // The Detach and the reclaim run on the driver's thread.
+            for _ in 0..20 {
+                let _ = client.poll();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let removed = client
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
+        client.remove_subscription(removed);
+        assert_eq!(client.subscription_releases_failed(), 0);
+        let _publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(3))
+            .unwrap();
     }
 
     /// SPEC §10 remote: a client attaches by directory, publishes and

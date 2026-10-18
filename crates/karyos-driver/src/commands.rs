@@ -30,7 +30,11 @@
 //! named stream, is a protocol violation: nothing is recorded and the
 //! client is retired as faulty. A live subscription of the sender gives a
 //! verified record; one that has already ended gives a record flagged
-//! unverified, counted in `loss reports unverified`. Every record counts
+//! unverified, counted in `loss reports unverified`. Once the named
+//! stream is freed, an incarnation above 0 can no longer be checked
+//! unless the sender's subscription still bounds it, so such a report is
+//! unverified too, whether its registration was removed or reclaimed at
+//! its last `Detach` in the same cycle. Every record counts
 //! once under the policy actually applied (`overruns rejoin at head`,
 //! `overruns snapshot` whether the source rebuilt or failed, `overruns
 //! close`), and a `replay` fallback also in `replay fallbacks`.
@@ -191,6 +195,11 @@ impl Registration {
     pub(crate) fn incarnation(&self) -> u64 {
         self.incarnation
     }
+
+    /// The client it belongs to.
+    pub(crate) fn client(&self) -> u64 {
+        self.client
+    }
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
@@ -350,6 +359,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let publication = target.aggregate.registration;
             let lane = target.config.lane.get();
             let closed_lane = target.config.lane;
+            let closed_image = target.image_registration();
             let key = StreamKey {
                 stream_id: target.stream_id,
                 session_id: target.session_id,
@@ -439,6 +449,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     stream: key,
                     lane: closed_lane,
                     reason: CloseReason::RequiredParticipantLost,
+                    image: closed_image,
                 }),
                 _ => {}
             }
@@ -570,14 +581,40 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
-    /// Forgets registrations whose capability was dropped without
-    /// `remove`, so dropping handles cannot accumulate registration
-    /// records. A registration whose handle was dropped by `remove` stays
-    /// until its queued `Remove` is served (or its client is retired).
+    /// Forgets registrations that ended without a `Remove`, so dropping
+    /// handles cannot accumulate registration records:
+    ///
+    /// - an in-process one whose capability was dropped without `remove`;
+    ///   one whose handle was dropped by `remove` stays until its queued
+    ///   `Remove` is served (or its client is retired);
+    /// - a remote one with no stream grant left in its client's ledger:
+    ///   its last grant was detached, or ended unsent. A journal grant
+    ///   never keeps one, since its registration word is a journal number.
+    ///   It can never get another, since a successor grant is reserved
+    ///   only from a grant still in the ledger
+    ///   (`open_remote_successors`), and registration ids are never reused.
+    ///   A later `RemoveSubscription` or `RemovePublication` of it answers
+    ///   `UnknownRegistration`, which the client facade ignores.
     pub(crate) fn sweep_ended_registrations(&mut self) {
         let before = self.registrations.len();
-        self.registrations
-            .retain(|registration| registration.end.state() != LeaseState::Dropped);
+        let clients = &self.clients;
+        self.registrations.retain(|registration| {
+            if registration.end.state() == LeaseState::Dropped {
+                return false;
+            }
+            clients
+                .iter()
+                .find(|slot| slot.id == registration.client)
+                .and_then(|slot| slot.ledger.as_ref())
+                .is_none_or(|ledger| {
+                    ledger.grants().iter().any(|grant| {
+                        // A journal grant's registration word is its
+                        // journal number, another id space.
+                        !matches!(grant.participant, Participant::Journal { .. })
+                            && grant.registration == registration.id
+                    })
+                })
+        });
         let swept = before - self.registrations.len();
         if swept > 0 {
             self.counters.add(
@@ -681,16 +718,38 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// The lane stream of `stream`'s aggregate on `lane`, or, for `None`,
     /// the lane that carries the aggregate's registration (lane 0, or the
     /// only lane of a stream added with `add_stream`).
+    ///
+    /// A live key names a local stream or images, never both
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-2):
+    /// images of one alias resolve to the oldest, the lowest registration.
     fn find_stream(&self, stream: StreamKey, lane: Option<Lane>) -> Option<usize> {
         // Commands bind by wire key at execution; retiring streams accept
         // nothing new.
+        self.streams
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.retiring
+                    && s.stream_id == stream.stream_id
+                    && s.session_id == stream.session_id
+                    && lane.map_or(s.id == s.aggregate.registration, |lane| {
+                        s.config.lane == lane
+                    })
+            })
+            .min_by_key(|(_, s)| s.aggregate.registration)
+            .map(|(index, _)| index)
+    }
+
+    /// The lane stream `lane` of the live network image whose aggregate
+    /// registration is `image` (`quantstratum-docs:
+    /// karyos/design/per-source-images.md`, D2-3). Only an image: a local
+    /// stream or a network publication of that registration is not one.
+    fn find_image(&self, image: u64, lane: Lane) -> Option<usize> {
         self.streams.iter().position(|s| {
             !s.retiring
-                && s.stream_id == stream.stream_id
-                && s.session_id == stream.session_id
-                && lane.map_or(s.id == s.aggregate.registration, |lane| {
-                    s.config.lane == lane
-                })
+                && s.source.is_some()
+                && s.aggregate.registration == image
+                && s.config.lane == lane
         })
     }
 
@@ -745,9 +804,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err("loss report of another driver instance; the client is retired");
         }
         let issued = |id: u64, next: u64| id != 0 && id < next;
-        // An incarnation the driver cannot verify: 0, above the lane's
-        // current one, or, once the lane's stream is freed, any but the
-        // first (the only one a freed stream is known to have had).
+        // An incarnation the driver cannot verify: 0, or above the lane's
+        // current one. Once the lane's stream is freed, the bound is the
+        // incarnation of the client's own subscription on it, if it still
+        // has one (a `ReportLoss` queued ahead of its `Remove`); with none
+        // (removed, or reclaimed at its last `Detach`) there is no bound
+        // left to check, and the report is recorded unverified.
         let lane_incarnation = self
             .streams
             .iter()
@@ -755,7 +817,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 s.aggregate.registration == loss.stream_registration
                     && s.config.lane.get() == loss.lane
             })
-            .map_or(crate::embedded::FIRST_INCARNATION, |s| s.incarnation);
+            .map_or_else(
+                || {
+                    self.registrations
+                        .iter()
+                        .find(|r| {
+                            r.id == loss.subscription
+                                && r.client == client
+                                && r.kind == Kind::Subscription
+                                && !self.streams.iter().any(|s| s.id == r.stream)
+                        })
+                        .map_or(u64::MAX, |r| r.incarnation)
+                },
+                |s| s.incarnation,
+            );
         let never = loss.incarnation == 0 || loss.incarnation > lane_incarnation;
         if !issued(loss.stream_registration, self.next_stream)
             || never
@@ -783,6 +858,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }) =>
             {
                 true
+            }
+            // The client's own subscription whose stream was freed: ended,
+            // as a registration that is gone (a `ReportLoss` queued ahead of
+            // its `Remove` is served after the stream frees).
+            Some(live)
+                if live.client == client
+                    && live.kind == Kind::Subscription
+                    && !self.streams.iter().any(|s| s.id == live.stream) =>
+            {
+                false
             }
             Some(_) => {
                 return Err(
@@ -861,13 +946,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             detail,
         };
         match command {
-            Command::AddPublication { stream, lane, .. }
-            | Command::AddConcurrentPublication { stream, lane, .. }
-            | Command::AddSubscription { stream, lane, .. } => {
-                let detail = u64::from(stream.stream_id.cast_unsigned());
+            Command::AddPublication { .. }
+            | Command::AddConcurrentPublication { .. }
+            | Command::AddSubscription { .. }
+            | Command::AddImageSubscription { .. } => {
                 // A lane the aggregate does not configure is an unknown
                 // stream (quantstratum-docs: karyos/design/aggregate-ownership.md).
-                let Some(index) = self.find_stream(stream, Some(lane)) else {
+                // An image is named by its registration (per-source-images.md,
+                // D2-3), its detail.
+                let (found, detail) = match command {
+                    Command::AddImageSubscription { image, lane, .. } => {
+                        (self.find_image(image, lane), image)
+                    }
+                    Command::AddPublication { stream, lane, .. }
+                    | Command::AddConcurrentPublication { stream, lane, .. }
+                    | Command::AddSubscription { stream, lane, .. } => (
+                        self.find_stream(stream, Some(lane)),
+                        u64::from(stream.stream_id.cast_unsigned()),
+                    ),
+                    _ => (None, 0),
+                };
+                let Some(index) = found else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
                 // A guarded stream's publications are bound to the guard's
@@ -883,7 +982,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 {
                     return refuse(ErrorCode::InvalidPublicationMode, detail);
                 }
-                let remote = self.ledger(client).map(Ledger::full);
+                let remote = self.remote_full(client);
                 match remote {
                     // The export bound refuses before anything is reserved.
                     Some(true) => return refuse(ErrorCode::ResourcesUnavailable, detail),
@@ -1261,8 +1360,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let bytes = conflation_bytes(&feeder.writer);
         let admitted = self
-            .ledger(client)
-            .map(|ledger| !ledger.full() && bytes.is_some_and(|bytes| ledger.fetchable(1, bytes)));
+            .remote_full(client)
+            .zip(self.ledger(client))
+            .map(|(full, ledger)| !full && bytes.is_some_and(|bytes| ledger.fetchable(1, bytes)));
         if admitted != Some(true) {
             return refuse(ErrorCode::ResourcesUnavailable, detail);
         }
@@ -1791,6 +1891,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .and_then(|slot| slot.ledger.as_mut())
     }
 
+    /// Whether remote client `client` can take no more: its ledger is full,
+    /// or it holds as many registrations as its ledger holds grants
+    /// (`max_exports_per_client`). This caps every add that makes a
+    /// registration: `AddPublication`, `AddConcurrentPublication`,
+    /// `AddSubscription`, `AddImageSubscription` and a conflated view, each
+    /// refused, typed, with `ResourcesUnavailable`. A remote registration
+    /// whose last grant left the ledger is reclaimed
+    /// (`sweep_ended_registrations`), so this counts only what the client
+    /// still holds. `None` for an in-process client, whose registrations
+    /// end with their handles.
+    fn remote_full(&self, client: u64) -> Option<bool> {
+        let ledger = self.ledger(client)?;
+        let registrations = self
+            .registrations
+            .iter()
+            .filter(|registration| registration.client == client)
+            .count();
+        Some(ledger.full() || registrations >= ledger.limit())
+    }
+
     /// A remote client's `Remove*` of `registration`: a grant never sent is
     /// ended at once, its participant released in the buffer; a sent one
     /// stays charged until its `Detach` or the client's exit proof.
@@ -1906,7 +2026,9 @@ fn conflation_bytes(writer: &karyos_sys::conflation::ConflationWriter) -> Option
 /// other command (the callers only reach it for subscriptions).
 fn subscription_role(command: Command) -> Role {
     match command {
-        Command::AddSubscription { role, .. } => Role::from(role),
+        Command::AddSubscription { role, .. } | Command::AddImageSubscription { role, .. } => {
+            Role::from(role)
+        }
         _ => Role::Required,
     }
 }
@@ -2722,6 +2844,260 @@ mod tests {
         assert_eq!(ledger(&driver, client).len(), 1);
         assert_eq!(driver.streams[0].buffer.attached_subscribers(), 1);
         assert_eq!(driver.streams.len(), 1);
+    }
+
+    /// A remote subscription of `KEY` by `client`, granted, fetched and
+    /// detached: what is left is its registration.
+    fn detached_subscription(
+        driver: &mut EmbeddedDriver,
+        producer: &mut RingProducer,
+        client: u64,
+        sequence: u64,
+    ) -> u64 {
+        write(
+            producer,
+            Command::AddSubscription {
+                sequence,
+                stream: KEY,
+                lane: Lane::ZERO,
+                // Required: a guarded stream's walker holds the slot credit
+                // an optional reader would need.
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let grant = *ledger(driver, client).last().unwrap();
+        let ledger = remote_ledger(driver, client);
+        ledger.set_state(grant.export, crate::ledger::GrantState::Exported);
+        let detached = ledger.detach(grant.export).unwrap();
+        driver.end_grant(&detached);
+        assert!(!ledger_names(driver, client, grant.stream));
+        grant.registration
+    }
+
+    fn ledger_names(driver: &EmbeddedDriver, client: u64, stream: u64) -> bool {
+        ledger(driver, client)
+            .iter()
+            .any(|grant| grant.stream == stream)
+    }
+
+    /// The errors `observer` has not read yet, as (sequence, code, detail).
+    fn errors(
+        observer: &mut karyos_sys::broadcast::BroadcastReceiver,
+    ) -> Vec<(u64, ErrorCode, u64)> {
+        responses(observer)
+            .into_iter()
+            .filter_map(|response| match response {
+                Response::Error {
+                    request,
+                    code,
+                    detail,
+                } => Some((request.sequence, code, detail)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A remote registration whose last grant left the ledger is reclaimed
+    /// at the next cycle: it does not keep its retiring stream, which
+    /// frees; a later `RemoveSubscription` of it answers
+    /// `UnknownRegistration`, and the client is still served.
+    #[test]
+    fn a_remote_registration_with_no_grant_left_is_reclaimed() {
+        let (mut driver, stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let registration = detached_subscription(&mut driver, &mut producer, client, 1);
+        let _ = driver.do_work().unwrap();
+        assert!(driver.registrations.is_empty(), "reclaimed");
+        driver.remove_stream(stream).unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            driver.stream_state(stream).unwrap(),
+            crate::embedded::StreamState::Freed
+        );
+        let _ = responses(&mut observer);
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 2,
+                registration,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            errors(&mut observer),
+            [(2, ErrorCode::UnknownRegistration, registration)]
+        );
+        assert!(
+            driver
+                .clients
+                .iter()
+                .any(|slot| slot.id == client && slot.serving())
+        );
+    }
+
+    /// A registration that still has a grant is kept: an undetached remote
+    /// subscription stays registered across cycles.
+    #[test]
+    fn a_remote_registration_with_a_grant_is_kept() {
+        let (mut driver, _stream) = driver_with_stream();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                lane: Lane::ZERO,
+                role: SubscriberRole::Optional,
+            },
+        );
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(ledger(&driver, client).len(), 1);
+        assert_eq!(driver.registrations.len(), 1, "its grant keeps it");
+    }
+
+    /// A journal grant whose journal number equals a registration's id does
+    /// not keep that registration: the two are different id spaces.
+    #[test]
+    fn a_journal_grant_with_a_colliding_number_keeps_no_registration() {
+        let (mut driver, _stream) = driver_with_stream();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let registration = detached_subscription(&mut driver, &mut producer, client, 1);
+        let export = driver.next_export;
+        remote_ledger(&mut driver, client).push(Grant {
+            export,
+            registration,
+            key: 0,
+            stream: 0,
+            participant: Participant::Journal {
+                journal: registration,
+            },
+            state: GrantState::Held,
+            sent: false,
+            generation: 0,
+            incarnation: 0,
+            fence_at: None,
+            fenced: false,
+        });
+        let _ = driver.do_work().unwrap();
+        assert!(
+            driver.registrations.is_empty(),
+            "the journal grant does not keep it"
+        );
+        assert_eq!(ledger(&driver, client).len(), 1, "the journal grant stays");
+    }
+
+    /// A reclaimed registration's id is never reused, nor its stream's: a
+    /// new stream of the same key in the freed slot gets a new id, and a
+    /// `RemoveSubscription` of the old registration answers
+    /// `UnknownRegistration`, leaving the new stream, its registration and
+    /// its grant untouched.
+    #[test]
+    fn a_reclaimed_registration_never_names_a_later_stream() {
+        let (mut driver, stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let old = detached_subscription(&mut driver, &mut producer, client, 1);
+        let freed_id = driver.streams[0].id;
+        driver.remove_stream(stream).unwrap();
+        let _ = driver.do_work().unwrap();
+        assert!(driver.streams.is_empty(), "freed");
+        let config = StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: KEY.session_id,
+                stream_id: KEY.stream_id,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            },
+            allow_unconnected: false,
+            on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+            conflation: None,
+        };
+        let later = driver.add_stream(config).unwrap();
+        let later_id = driver.streams[0].id;
+        assert_ne!(later_id, freed_id, "a freed id is never reused");
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 2,
+                stream: KEY,
+                lane: Lane::ZERO,
+                role: SubscriberRole::Optional,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let new = ledger(&driver, client)[0].registration;
+        assert_ne!(new, old, "a registration id is never reused");
+        let _ = responses(&mut observer);
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 3,
+                registration: old,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            errors(&mut observer),
+            [(3, ErrorCode::UnknownRegistration, old)]
+        );
+        let left: Vec<u64> = driver
+            .registrations
+            .iter()
+            .map(Registration::stream)
+            .collect();
+        assert_eq!(left, [later_id], "the later stream's registration stays");
+        assert!(ledger_names(&driver, client, later_id), "its grant stays");
+        assert_eq!(
+            driver.stream_state(later).unwrap(),
+            crate::embedded::StreamState::Active
+        );
+    }
+
+    /// The cap: a remote client holds at most `max_exports_per_client`
+    /// registrations (its ledger's limit), and the next add is refused,
+    /// typed, with `ResourcesUnavailable`; the client is still served.
+    #[test]
+    fn a_remote_client_is_refused_at_its_ledger_limit() {
+        let (mut driver, _stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 2);
+        for sequence in 1..=3 {
+            write(
+                &mut producer,
+                Command::AddSubscription {
+                    sequence,
+                    stream: KEY,
+                    lane: Lane::ZERO,
+                    role: SubscriberRole::Required,
+                },
+            );
+        }
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(driver.registrations.len(), 2);
+        assert!(matches!(
+            errors(&mut observer)[..],
+            [(3, ErrorCode::ResourcesUnavailable, _)]
+        ));
+        assert!(
+            driver
+                .clients
+                .iter()
+                .any(|slot| slot.id == client && slot.serving())
+        );
     }
 
     fn write(producer: &mut RingProducer, command: Command) {
@@ -4306,11 +4682,161 @@ mod tests {
         assert_eq!(counter(&driver, "clients faulty"), 0);
     }
 
+    /// Reincarnates the guarded `stream` once (a close, a reopen and a
+    /// fresh handle, dropped), so its current incarnation is 2.
+    fn reincarnated(driver: &mut EmbeddedDriver, stream: StreamHandle) {
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        // The stream needs a reader to accept the offer the seal is placed
+        // after; it goes with the old incarnation.
+        let reader = driver
+            .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+            .unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        assert!(matches!(
+            publication.offer(b"x").unwrap(),
+            karyos_client::OfferOutcome::Accepted { .. }
+        ));
+        let _ = driver.close_guard(guard, 2).unwrap();
+        drop(publication);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+        drop(driver.publication(stream).unwrap());
+        drop(reader);
+        assert_eq!(driver.streams[0].incarnation, 2);
+    }
+
+    /// A report on incarnation 2 of `stream_registration`'s lane 0.
+    fn reported_on(
+        driver: &EmbeddedDriver,
+        stream_registration: u64,
+        subscription: u64,
+    ) -> ReportedLoss {
+        ReportedLoss {
+            stream_registration,
+            incarnation: 2,
+            ..reported(driver, subscription)
+        }
+    }
+
+    /// Serves `loss` from `client` in the cycle that frees the stream, and
+    /// returns whether the client is still served.
+    fn served_after_free(
+        driver: &mut EmbeddedDriver,
+        stream: StreamHandle,
+        producer: &mut RingProducer,
+        client: u64,
+        loss: ReportedLoss,
+    ) -> bool {
+        driver.remove_stream(stream).unwrap();
+        write(producer, Command::ReportLoss { sequence: 9, loss });
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            driver.stream_state(stream).unwrap(),
+            crate::embedded::StreamState::Freed
+        );
+        driver
+            .clients
+            .iter()
+            .any(|slot| slot.id == client && slot.serving())
+    }
+
+    /// #420 re-check: the remote order. A remote subscriber of incarnation
+    /// 2 detaches its last grant; in one cycle the driver reclaims its
+    /// registration, frees the stream and then serves its `ReportLoss`,
+    /// with no registration left to bound it: recorded unverified, the
+    /// client kept.
+    #[test]
+    fn a_remote_loss_report_after_reclaim_and_free_is_unverified() {
+        let (mut driver, stream) = driver_with_stream();
+        reincarnated(&mut driver, stream);
+        let stream_registration = driver.streams[0].id;
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let subscription = detached_subscription(&mut driver, &mut producer, client, 1);
+        let loss = reported_on(&driver, stream_registration, subscription);
+        assert!(served_after_free(
+            &mut driver,
+            stream,
+            &mut producer,
+            client,
+            loss
+        ));
+        assert!(driver.registrations.is_empty(), "reclaimed");
+        assert_eq!(counter(&driver, "clients faulty"), 0);
+        assert_eq!(counter(&driver, "loss reports unverified"), 1);
+        assert_eq!(losses(&driver).len(), 1);
+    }
+
+    /// #420 re-check: the in-process order. The subscription is removed,
+    /// the stream frees, then the report on incarnation 2 is served:
+    /// recorded unverified, the client kept.
+    #[test]
+    fn an_in_process_loss_report_after_remove_and_free_is_unverified() {
+        let (mut driver, stream) = driver_with_stream();
+        reincarnated(&mut driver, stream);
+        let stream_registration = driver.streams[0].id;
+        let (client, mut producer, subscription) = reporting_client(&mut driver);
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 2,
+                registration: subscription,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert!(driver.registrations.is_empty(), "removed");
+        let loss = reported_on(&driver, stream_registration, subscription);
+        assert!(served_after_free(
+            &mut driver,
+            stream,
+            &mut producer,
+            client,
+            loss
+        ));
+        assert_eq!(counter(&driver, "clients faulty"), 0);
+        assert_eq!(counter(&driver, "loss reports unverified"), 1);
+        assert_eq!(losses(&driver).len(), 1);
+    }
+
+    /// The refusals stand on a freed stream too: incarnation 0 and a stream
+    /// registration never issued retire the client, recording nothing.
+    #[test]
+    fn a_loss_report_after_free_still_refuses_what_was_never_issued() {
+        type Case = fn(&mut ReportedLoss, u64);
+        let cases: [(&str, Case); 3] = [
+            ("incarnation 0", |loss, _| loss.incarnation = 0),
+            ("stream never issued", |loss, next| {
+                loss.stream_registration = next;
+            }),
+            ("subscription never issued", |loss, _| {
+                loss.subscription = u64::MAX;
+            }),
+        ];
+        for (name, case) in cases {
+            let (mut driver, stream) = driver_with_stream();
+            reincarnated(&mut driver, stream);
+            let stream_registration = driver.streams[0].id;
+            let (client, mut producer) = remote_client(&mut driver, 4);
+            let subscription = detached_subscription(&mut driver, &mut producer, client, 1);
+            let mut loss = reported_on(&driver, stream_registration, subscription);
+            case(&mut loss, driver.next_stream);
+            assert!(
+                !served_after_free(&mut driver, stream, &mut producer, client, loss),
+                "{name}"
+            );
+            assert_eq!(counter(&driver, "clients faulty"), 1, "{name}");
+            assert_eq!(counter(&driver, "loss reports unverified"), 0, "{name}");
+            assert_eq!(losses(&driver), Vec::new(), "{name}");
+        }
+    }
+
     #[test]
     fn a_loss_report_of_a_foreign_or_never_issued_identity_is_a_violation() {
         type Case = fn(&mut ReportedLoss, u64);
-        let cases: [(&str, Case); 9] = [
+        let cases: [(&str, Case); 10] = [
             ("another driver instance", |loss, _| loss.driver[1] ^= 1),
+            ("incarnation 0", |loss, _| loss.incarnation = 0),
             ("subscription 0", |loss, _| loss.subscription = 0),
             ("subscription never issued", |loss, next| {
                 loss.subscription = next;

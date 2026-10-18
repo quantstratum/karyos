@@ -21,8 +21,23 @@
 //!   cycle, each in turn, so recording keeps priority. A replay is first
 //!   prepared, its range checked against the recording's index, and only
 //!   then given its target's sink.
-//! - **Caps.** Recordings and replays at once are capped; a start beyond
-//!   is refused and counted.
+//! - **Groups.** Each group's job runs after the recorders, whose
+//!   positions cover its payloads. A recording that stops or fails
+//!   settles the groups' references to it: by its stop, or by its frames
+//!   durable at the failure, which the agent keeps beside the failed
+//!   recording for references drained later. A failed recording holds its
+//!   slot under the recording cap until every running group has read its
+//!   ring empty after the failure; a start that needs the slot then drops
+//!   the entry. A reference that raced the failure and arrives after that
+//!   covers nothing. A strict group that ended
+//!   because its recording failed short comes back running after a
+//!   restart when the recording recovers frames that cover the reference.
+//!   Its journal holds every event up to the end; the events the Gateway
+//!   sent before it learned of the end are not journaled. Stopping a group
+//!   refuses its sender, then drains its ring into the journal, bounded by
+//!   the ring, before it closes.
+//! - **Caps.** Recordings, replays and groups at once are capped; a start
+//!   beyond is refused and counted.
 //! - **Idle.** A cycle with nothing to do waits for a command up to the
 //!   idle interval, so an idle agent does not spin.
 //!
@@ -39,6 +54,12 @@ use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
+use crate::group::capture::{
+    self, CaptureConfig, CaptureError, CaptureJob, CaptureSender, CaptureSetup, GroupState,
+};
+use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
+use crate::group::prefix::Coverage;
+use crate::group::record::{CONTRACT_VERSION, Capture, Clock, JournalHeader};
 use crate::recorder::{Ended, FrameSource, Mode, Recorder, RecorderError};
 use crate::replay::{Rate, ReplayError, ReplaySource, Step};
 use crate::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
@@ -74,6 +95,10 @@ pub struct AgentConfig {
     pub prepared_timeout: Duration,
     /// How long an idle cycle waits for a command.
     pub idle: Duration,
+    /// Recording groups captured at once at most (A7d).
+    pub max_groups: usize,
+    /// Events one group's journal takes at most per cycle.
+    pub group_budget: usize,
 }
 
 impl Default for AgentConfig {
@@ -88,8 +113,45 @@ impl Default for AgentConfig {
             max_replays: 16,
             prepared_timeout: Duration::from_secs(5),
             idle: Duration::from_millis(1),
+            max_groups: 16,
+            group_budget: 64,
         }
     }
+}
+
+/// A recording group to capture (A7d; `quantstratum-docs:
+/// karyos/design/recording-group-gateway.md` section 9): its journal, made
+/// new or recovered, and its capture path. The agent serves the group's
+/// job in its cycle, after the recorders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartGroup {
+    /// The group, never 0.
+    pub group_id: u64,
+    /// The directory of group journals, which the host made: it holds
+    /// group journals only.
+    pub dir: PathBuf,
+    /// A new group's journal header; `None` recovers the group's journal
+    /// from `dir`, its prefixes recomputed over the recordings this Archive
+    /// keeps.
+    pub new: Option<NewGroup>,
+    /// The journal's segments and sync policy.
+    pub journal: JournalConfig,
+    /// The capture path's ring and bounds.
+    pub capture: CaptureConfig,
+}
+
+/// A new group's journal header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewGroup {
+    /// The first event's `group_seq`, never 0.
+    pub first_group_seq: u64,
+    /// The payload size above which a `required` source's payload is
+    /// stored by reference.
+    pub inline_threshold: u32,
+    /// Strict or best effort.
+    pub capture: Capture,
+    /// The caller's identity of what ran, 1 to 4096 bytes.
+    pub manifest: Vec<u8>,
 }
 
 /// A recording to start, with its source.
@@ -283,6 +345,10 @@ pub enum Failure {
 /// The agent's errors.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
+    /// The agent's count of failed recordings, or of recordings it holds,
+    /// would pass its range: the start is refused.
+    #[error("the agent's recording counts are exhausted")]
+    Exhausted,
     /// The catalog failed.
     #[error(transparent)]
     Catalog(#[from] CatalogError),
@@ -331,6 +397,18 @@ pub enum AgentError {
     /// The agent's thread is gone.
     #[error("the agent stopped")]
     Gone,
+    /// A recording group's journal could not be made, recovered or closed.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    /// A recording group's capture settings cannot work.
+    #[error(transparent)]
+    Capture(#[from] CaptureError),
+    /// A recording group of that id is already captured.
+    #[error("group {id} is already captured")]
+    GroupCaptured {
+        /// The group.
+        id: u64,
+    },
     /// The thread could not be spawned.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -357,6 +435,8 @@ enum Command {
     },
     Replay(Box<StartReplay>, Reply<u64>),
     StopReplay(u64, Reply<u64>),
+    StartGroup(Box<StartGroup>, Reply<CaptureSender>),
+    StopGroup(u64, Reply<u64>),
     Shutdown(Reply<()>),
 }
 
@@ -417,6 +497,8 @@ impl core::fmt::Debug for Command {
                 .finish_non_exhaustive(),
             Self::Replay(start, _) => f.debug_tuple("Replay").field(start).finish(),
             Self::StopReplay(id, _) => f.debug_tuple("StopReplay").field(id).finish(),
+            Self::StartGroup(start, _) => f.debug_tuple("StartGroup").field(start).finish(),
+            Self::StopGroup(id, _) => f.debug_tuple("StopGroup").field(id).finish(),
             Self::Shutdown(_) => f.write_str("Shutdown"),
         }
     }
@@ -550,6 +632,30 @@ impl ArchiveHandle {
     /// As [`ArchiveHandle::post_start`].
     pub fn post_stop(&self, id: u64) -> Result<Posted<Ended>, AgentError> {
         self.post(|reply| Command::Stop(id, reply))
+    }
+
+    /// Starts capturing a recording group: its journal is made, or
+    /// recovered, and its job served in the agent's cycle; returns the
+    /// sender the event loop's Gateway writes through.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Full`], [`AgentError::GroupCaptured`],
+    /// [`AgentError::Capture`], [`AgentError::Journal`] and
+    /// [`AgentError::Gone`].
+    pub fn start_group(&self, start: StartGroup) -> Result<CaptureSender, AgentError> {
+        self.call(|reply| Command::StartGroup(Box::new(start), reply))
+    }
+
+    /// Stops capturing group `id`: its journal is closed, synced; returns
+    /// the journal's durable position. The group's sender then refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Unknown`], [`AgentError::Journal`] and
+    /// [`AgentError::Gone`].
+    pub fn stop_group(&self, id: u64) -> Result<u64, AgentError> {
+        self.call(|reply| Command::StopGroup(id, reply))
     }
 
     /// The catalog's recordings, in id order.
@@ -951,12 +1057,14 @@ fn run<D>(
         catalog,
         active: Vec::new(),
         failed: Vec::new(),
+        failures: 0,
         replays: Replays {
             active: Vec::new(),
             prepared: Vec::new(),
             next_id: 1,
             turn: 0,
         },
+        groups: Vec::new(),
     };
     loop {
         let mut worked = false;
@@ -975,6 +1083,8 @@ fn run<D>(
         // its replay.
         state.replays.expire(now(), config.prepared_timeout);
         worked |= state.duty(outbox, now());
+        // After the recorders, whose positions cover the groups' payloads.
+        worked |= state.group_duty(now());
         // After the recorders: they keep priority.
         worked |= state
             .replays
@@ -1002,8 +1112,145 @@ struct State<D: Disk> {
     active: Vec<Active<D>>,
     /// Recordings whose store failed: open in the catalog until the next
     /// start settles them.
-    failed: Vec<u64>,
+    failed: Vec<Failed>,
+    /// How many recordings failed: each failed entry's number.
+    failures: u64,
     replays: Replays<D>,
+    groups: Vec<ActiveGroup<D>>,
+}
+
+/// A recording that failed: no stop in the catalog, so the groups settle
+/// their references to it by `durable`, its frames durable at the failure.
+///
+/// The event loop stops naming a recording once it learns that it failed,
+/// so only references already in the groups' rings can name it. An entry
+/// is kept until every running group has read its ring empty in a duty
+/// that began after the failure (`seq`), and is dropped then when a start
+/// needs its slot. A failed recording
+/// holds its slot under the recording cap until then, so the list is
+/// bounded by the cap, and a start past it is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Failed {
+    id: u64,
+    durable: u64,
+    /// The failure's number: the agent's count of failures with it.
+    seq: u64,
+}
+
+/// The failure count after one more failure. The start checked that it
+/// stays in range; were it not to, the count stays, so entries are kept
+/// longer, never dropped early.
+fn next_failure(failures: u64) -> u64 {
+    failures.checked_add(1).unwrap_or(failures)
+}
+
+/// A recording group the agent captures.
+#[derive(Debug)]
+struct ActiveGroup<D: Disk> {
+    id: u64,
+    job: CaptureJob<D>,
+    /// The failures whose references this group has all read: its last
+    /// duty that read the ring empty began after them.
+    cleared: u64,
+}
+
+/// The recordings' frames as recording groups see them (A7d): an active
+/// `required` recorder's written and durable positions, a stopped
+/// `required` recording's end, which its close made durable, and a failed
+/// `required` recording's frames durable at the failure. An `async`
+/// recording, or one the catalog does not know as `required` (an entry
+/// from before the mode was recorded), answers nothing.
+struct Recorded<'a, D: Disk> {
+    active: &'a [Active<D>],
+    failed: &'a [Failed],
+    catalog: &'a Catalog<D>,
+}
+
+impl<D: Disk> Recorded<'_, D> {
+    /// A failed recording's durable end: it will never cover more.
+    fn failed(&self, recording_id: u64) -> Option<u64> {
+        self.failed
+            .iter()
+            .find(|failed| failed.id == recording_id)
+            .map(|failed| failed.durable)
+    }
+}
+
+impl<D: Disk> Coverage for Recorded<'_, D> {
+    fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
+        let recording = self.catalog.get(recording_id)?;
+        if !recording.required {
+            return None;
+        }
+        if let Some(active) = self.active.iter().find(|active| active.id == recording_id) {
+            let store = active.recorder.store();
+            return Some((store.written(), store.durable()));
+        }
+        let end = recording
+            .stop
+            .map(|stop| stop.position)
+            .or_else(|| self.failed(recording_id))?;
+        Some((end, end))
+    }
+
+    fn ended(&self, recording_id: u64) -> Option<u64> {
+        // A recording the catalog does not know vouches for nothing.
+        let Some(recording) = self.catalog.get(recording_id) else {
+            return Some(0);
+        };
+        if let Some(end) = recording
+            .stop
+            .map(|stop| stop.position)
+            .or_else(|| self.failed(recording_id))
+        {
+            return Some(if recording.required { end } else { 0 });
+        }
+        // Open in the catalog and not recording: it failed, and its entry
+        // was dropped once the groups read past the failure. A reference
+        // sent later raced the failure; it covers nothing, so it is never
+        // over-vouched and never waits for good.
+        if self.active.iter().any(|active| active.id == recording_id) {
+            None
+        } else {
+            Some(0)
+        }
+    }
+}
+
+/// Records that recording `id` failed with its frames durable to
+/// `durable` and no stop in the catalog, and settles every group's
+/// references to it. A reference drained later is settled by the groups'
+/// duty, through [`Coverage::ended`], as for a recording that stopped.
+/// Only a `required` recording vouches for its frames: a reference to any
+/// other covers nothing.
+fn fail_recording<D: Disk>(
+    groups: &mut [ActiveGroup<D>],
+    active: &[Active<D>],
+    (failed, failures): (&mut Vec<Failed>, &mut u64),
+    catalog: &Catalog<D>,
+    id: u64,
+    durable: u64,
+) {
+    // A start is refused unless every recording it holds can fail with
+    // the count in range ([`next_failure`]), so this always advances.
+    *failures = next_failure(*failures);
+    failed.push(Failed {
+        id,
+        durable,
+        seq: *failures,
+    });
+    let required = catalog.get(id).is_some_and(|recording| recording.required);
+    let durable = if required { durable } else { 0 };
+    let recorded = Recorded {
+        active,
+        failed,
+        catalog,
+    };
+    for group in groups {
+        // A mark that cannot be written fails the group, which its sender
+        // then reports; nothing else is to be done here.
+        let _ = group.job.recording_ended(id, durable, &recorded);
+    }
 }
 
 impl<D: Disk + Clone> State<D> {
@@ -1013,6 +1260,8 @@ impl<D: Disk + Clone> State<D> {
         let mut worked = false;
         let mut index = 0;
         while let Some(recording) = self.active.get_mut(index) {
+            // What was durable before a close that may fail.
+            let durable = recording.recorder.store().durable();
             let event = match recording.recorder.duty(now) {
                 Ok(duty) => {
                     worked |= duty.recorded > 0;
@@ -1045,8 +1294,17 @@ impl<D: Disk + Clone> State<D> {
                     }
                 }
             };
+            // A recording that ended is settled by the groups' duty, from
+            // its stop in the catalog; one that failed has none there.
             if let Event::Failed { id, .. } = event {
-                self.failed.push(id);
+                fail_recording(
+                    &mut self.groups,
+                    &self.active,
+                    (&mut self.failed, &mut self.failures),
+                    &self.catalog,
+                    id,
+                    durable,
+                );
             }
             outbox.send(event);
         }
@@ -1063,14 +1321,26 @@ impl<D: Disk + Clone> State<D> {
                 let result = match self.active.iter().position(|recording| recording.id == id) {
                     Some(index) => {
                         let recording = self.active.swap_remove(index);
+                        let durable = recording.recorder.store().durable();
                         let result = stop(recording, &mut self.catalog, StopReason::Stopped, now);
-                        // A stop that failed leaves the recording to settle.
+                        // A stop that failed leaves the recording to settle,
+                        // with none in the catalog to settle the groups'
+                        // references by.
                         if result.is_err() {
-                            self.failed.push(id);
+                            fail_recording(
+                                &mut self.groups,
+                                &self.active,
+                                (&mut self.failed, &mut self.failures),
+                                &self.catalog,
+                                id,
+                                durable,
+                            );
                         }
                         result
                     }
-                    None if self.failed.contains(&id) => Err(AgentError::RecordingFailed { id }),
+                    None if self.failed.iter().any(|failed| failed.id == id) => {
+                        Err(AgentError::RecordingFailed { id })
+                    }
                     None => Err(AgentError::NotRecording { id }),
                 };
                 let _ = reply.send(result);
@@ -1145,7 +1415,24 @@ impl<D: Disk + Clone> State<D> {
                 };
                 let _ = reply.send(result);
             }
+            Command::StartGroup(start, reply) => {
+                let _ = reply.send(self.start_group(*start, outbox));
+            }
+            Command::StopGroup(id, reply) => {
+                let result = match self.groups.iter().position(|group| group.id == id) {
+                    Some(index) => {
+                        let group = self.groups.swap_remove(index);
+                        self.close_group(group, now)
+                    }
+                    None => Err(AgentError::Unknown { id }),
+                };
+                let _ = reply.send(result);
+            }
             Command::Shutdown(reply) => {
+                let groups = std::mem::take(&mut self.groups);
+                for group in groups {
+                    let _ = self.close_group(group, now);
+                }
                 for mut replay in self.replays.active.drain(..) {
                     let position = replay.source.position();
                     replay.sink.finish(position, false);
@@ -1167,15 +1454,143 @@ impl<D: Disk + Clone> State<D> {
         false
     }
 
+    /// Drains what the group's ring still holds into its journal, then
+    /// closes it, synced: an event the sender wrote before the stop is
+    /// recorded. The sender is refused first, and the drain is bounded by
+    /// the ring, so a live sender cannot hold the agent here.
+    fn close_group(&self, mut group: ActiveGroup<D>, now: u64) -> Result<u64, AgentError> {
+        let recorded = Recorded {
+            active: &self.active,
+            failed: &self.failed,
+            catalog: &self.catalog,
+        };
+        // A job that fails reports it through its sender's state, and
+        // closes all the same.
+        let _ = group.job.drain_to_close(now, &recorded);
+        group.job.close().map_err(AgentError::from)
+    }
+
+    /// Makes or recovers a group's journal and its capture path.
+    fn start_group(
+        &mut self,
+        start: StartGroup,
+        outbox: &Outbox,
+    ) -> Result<CaptureSender, AgentError> {
+        if self.groups.len() >= self.config.max_groups {
+            return Err(outbox.refused("groups", self.config.max_groups));
+        }
+        let id = start.group_id;
+        if self.groups.iter().any(|group| group.id == id) {
+            return Err(AgentError::GroupCaptured { id });
+        }
+        // Checked before the journal exists, so a refused start leaves
+        // none behind.
+        capture::validate(start.capture, start.journal.policy).map_err(AgentError::Capture)?;
+        let journal = match &start.new {
+            Some(new) => GroupJournal::create(
+                self.disk.clone(),
+                &start.dir,
+                &JournalHeader {
+                    group_id: id,
+                    first_group_seq: new.first_group_seq,
+                    inline_threshold: new.inline_threshold,
+                    contract_version: CONTRACT_VERSION,
+                    clock: Clock::HostMonotonic,
+                    capture: new.capture,
+                    manifest: &new.manifest,
+                },
+                start.journal,
+            )?,
+            None => {
+                GroupJournal::recover(self.disk.clone(), &start.dir, id, start.journal)?.journal
+            }
+        };
+        let recorded = Recorded {
+            active: &self.active,
+            failed: &self.failed,
+            catalog: &self.catalog,
+        };
+        let (sender, job) =
+            capture::capture(start.capture, journal, &recorded).map_err(|error| match error {
+                CaptureSetup::Config(error) => AgentError::Capture(error),
+                CaptureSetup::Journal(error) => AgentError::Journal(error),
+            })?;
+        // A new ring holds no reference to a recording that failed.
+        self.groups.push(ActiveGroup {
+            id,
+            job,
+            cleared: self.failures,
+        });
+        Ok(sender)
+    }
+
+    /// Each group's job: drains its ring into its journal and advances its
+    /// prefixes over the recordings. Returns whether any read.
+    fn group_duty(&mut self, now: u64) -> bool {
+        let recorded = Recorded {
+            active: &self.active,
+            failed: &self.failed,
+            catalog: &self.catalog,
+        };
+        let failures = self.failures;
+        let mut worked = false;
+        for group in &mut self.groups {
+            let emptied = group.job.emptied();
+            // A job that fails reports it through its sender's state.
+            worked |= group
+                .job
+                .duty(now, self.config.group_budget, &recorded)
+                .unwrap_or(false);
+            // A group that read its ring empty, or that reads nothing
+            // more, holds no reference to an earlier failure.
+            if group.job.emptied() != emptied || group.job.state() != GroupState::Running {
+                group.cleared = failures;
+            }
+        }
+        worked
+    }
+
+    /// Drops the failed entries no group's ring can still name: every
+    /// running group read its ring empty after the failure.
+    fn reclaim_failed(&mut self) {
+        let cleared = self
+            .groups
+            .iter()
+            .map(|group| group.cleared)
+            .min()
+            .unwrap_or(self.failures);
+        self.failed.retain(|failed| failed.seq > cleared);
+    }
+
     fn start_recording(
         &mut self,
         start: StartRecording,
         outbox: &Outbox,
         now: u64,
     ) -> Result<u64, AgentError> {
-        if self.active.len() >= self.config.max_recordings {
+        // A failed recording holds its slot until no group's ring can
+        // still name it, which bounds the failed list by the cap. Its entry
+        // is kept until a start needs the slot, so a late reference still
+        // finds its durable end when nothing pressed for room.
+        let held = |state: &Self| {
+            state
+                .active
+                .len()
+                .checked_add(state.failed.len())
+                .ok_or(AgentError::Exhausted)
+        };
+        if held(self)? >= self.config.max_recordings {
+            self.reclaim_failed();
+        }
+        if held(self)? >= self.config.max_recordings {
             return Err(outbox.refused("recordings", self.config.max_recordings));
         }
+        // Every recording held, this one among them, can still fail with
+        // the failure count in range.
+        u64::try_from(self.config.max_recordings)
+            .ok()
+            .and_then(|max| self.failures.checked_add(max))
+            .ok_or(AgentError::Exhausted)?;
         let position = start.source.position();
         let id = self.catalog.start(NewRecording {
             stream_id: start.stream_id,
@@ -1186,6 +1601,7 @@ impl<D: Disk + Clone> State<D> {
             geometry: start.geometry,
             policy: start.policy,
             format: start.format,
+            required: matches!(start.mode, Mode::Required),
         })?;
         let recorder = SegmentStore::create(
             self.disk.clone(),
@@ -1220,7 +1636,13 @@ impl<D: Disk + Clone> State<D> {
                     .stop(id, position, now, StopReason::Empty, false)
                     .is_err()
                 {
-                    self.failed.push(id);
+                    // Nothing was recorded, and no group refers to it yet.
+                    self.failures = next_failure(self.failures);
+                    self.failed.push(Failed {
+                        id,
+                        durable: position,
+                        seq: self.failures,
+                    });
                 }
                 Err(error)
             }

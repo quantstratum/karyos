@@ -16,8 +16,11 @@
 //!   grants lane 0 as `AddPublication` does.
 //! - **Subscription.** `karyos:udp` subscribes the stream (W3) and answers
 //!   `NetworkSubscriptionReady`; each image is then announced with
-//!   `ImageAvailable`, and the client attaches with `AddSubscription`
-//!   naming its alias. `karyos:ipc` is `AddSubscription`'s, refused here.
+//!   `ImageAvailable`, naming its registration and its source, and the
+//!   client attaches with `AddImageSubscription` naming the image, or with
+//!   `AddSubscription` naming its alias, which reaches the oldest image of
+//!   it (`quantstratum-docs: karyos/design/per-source-images.md`).
+//!   `karyos:ipc` is `AddSubscription`'s, refused here.
 //! - **Ownership.** What a client creates is owned by its registration:
 //!   one reconcile pass, run every cycle, removes a network publication
 //!   whose registration ended (removed, dropped or its client gone) and a
@@ -498,14 +501,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         handle: &AggregateHandle,
         available: bool,
     ) {
-        let Some(stream) = self
+        // The image is named by its registration, with its source
+        // (`quantstratum-docs: karyos/design/per-source-images.md`, D2-3).
+        let image = handle.registration();
+        let Some((stream, source)) = self
             .streams
             .iter()
-            .find(|stream| stream.id == handle.registration())
-            .map(|stream| StreamKey {
-                stream_id: stream.stream_id,
-                session_id: stream.session_id,
-            })
+            .find(|stream| stream.id == image)
+            .and_then(|stream| Some((stream.key(), stream.source?.source)))
         else {
             return;
         };
@@ -532,11 +535,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 DriverEvent::ImageAvailable {
                     stream,
                     registration,
+                    image,
+                    source,
                 }
             } else {
                 DriverEvent::ImageUnavailable {
                     stream,
                     registration,
+                    image,
                 }
             });
         }
@@ -575,21 +581,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 else {
                     continue;
                 };
-                let stream = self
+                let image = handle.registration();
+                let found = self
                     .streams
                     .iter()
-                    .find(|stream| stream.id == handle.registration() && !stream.retiring)
-                    .map(|stream| StreamKey {
-                        stream_id: stream.stream_id,
-                        session_id: stream.session_id,
-                    });
-                if let Some(stream) = stream
+                    .find(|stream| stream.id == image && !stream.retiring)
+                    .and_then(|stream| Some((stream.key(), stream.source?.source)));
+                if let Some((stream, source)) = found
                     && endpoint == subscription.endpoint()
                     && stream.stream_id == subscription.stream_id()
                 {
                     sent &= self.try_emit(&DriverEvent::ImageAvailable {
                         stream,
                         registration,
+                        image,
+                        source,
                     });
                 }
             }

@@ -11,6 +11,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A remote client's registrations are capped at `max_exports_per_client`,
+  as its ledger's grants were before. Every add that makes a
+  registration counts: `AddPublication`, `AddConcurrentPublication`,
+  `AddSubscription`, `AddImageSubscription` and a conflated view; past
+  the cap each is refused with `ResourcesUnavailable`, and the client
+  stays served. A remote registration whose last grant ended (detached,
+  or ended unsent) is reclaimed, so a client that only drops its handles
+  never reaches the cap that way; a later `RemoveSubscription` or
+  `RemovePublication` of a reclaimed registration answers
+  `UnknownRegistration`, which the client facade ignores.
+- `Client::remove_subscription` removes a subscription as
+  `Client::remove_publication` removes a publication: a `karyos:ipc` one
+  at the driver, a `karyos:udp` one with every image it reads. A removal
+  that cannot be sent drops the handle and is counted:
+  `Client::subscription_releases_failed`, as the facade counts every
+  image handle it lets go of whose removal could not be sent.
 - A publication released through the client facade whose removal cannot
   be sent (the command ring full, a handle another connection issued, a
   closed link) is counted: `Client::publication_releases_failed`. The
@@ -290,6 +306,56 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Checkpoints of a recording group, the store and the record (phase 3,
+  A9-1; recording-group-checkpoints.md sections 2 to 5). Each group has
+  a `CheckpointStore` beside its journal, with the journal's sync policy.
+  `CheckpointWriter::write` checks the record against the order rules,
+  appends the snapshot's bytes and syncs them, then appends template 30
+  (`CheckpointRecord`, block 40): a failed write leaves no record, and
+  a recorded checkpoint is durable by construction. The Gateway's
+  one-slot handoff (`CheckpointSlot`) refuses a checkpoint in flight,
+  one above `max_checkpoint`, an empty one and any after a strict
+  journal's end, each typed and counted. A new order rule
+  (`OrderRule::Checkpoint`): recorded checkpoints name an ended event
+  and rise in `group_seq` and id. The prefix tracker follows ranges: a
+  checkpoint after a gap or an incomplete event opens a new one at its
+  record once the store holds its bytes (`Coverage::checkpoint`,
+  `CheckpointHeld`; a lost one opens nothing), reported by
+  `PrefixTracker::range`. The first range's final values are frozen
+  (`PrefixTracker::first_range`): replay from the start stops there,
+  and `PrefixView::durable_for` answers a wait for an event before the
+  current range from them. The replay cursor skips template 30.
+  Recovery cuts bytes no record names and marks as lost a range a
+  record names that the store lacks. Nothing allocates per checkpoint.
+
+- Timed lanes over the network (P2.11 PR1, the software route;
+  timed-tx.md). `EmbeddedDriver::add_timed_network_publication` adds a
+  network publication whose lanes have a schedule ring: its sender holds
+  each message until its requested time, then sends it, one message per
+  datagram, and frees its schedule entry once it left, so the ring bounds
+  only messages outstanding. A plain network publication whose lanes have
+  a ring is timed with the default settings; before, its offers were
+  back-pressured for good after the ring's capacity, as nothing freed it.
+  Lateness, late sends and heads dropped by an unreliable reset are
+  counted; a guard close ends a head still waiting for its time. Refused
+  for now, typed (`DriverError::TimedNetworkUnsupported`): redundant
+  paths, the `Tai` domain, cancel-on-deadline and a `max_horizon` that,
+  with one `sender_heartbeat_interval`, reaches `image_liveness_timeout`
+  (a lane holding only a head that far ahead sends nothing, so its
+  images would retire). A lane's settings and counter cells are fixed
+  from the add, also across a guard reopen's fresh incarnation. Counts
+  are per message, not per fragment. On a reliable channel (PR1b) a
+  message's schedule entry is held until the receivers acknowledge it,
+  so `schedule_capacity` must cover the unacknowledged window (a smaller
+  ring back-pressures offers until they consume); a reset reads the held
+  entries again with `ScheduleReader::rewind_to_released`, and the
+  messages it resends go at once, outside the late policy, counted as
+  rewound. A NAK repair reads only the frames its request covers, as a
+  timed lane sends one frame per datagram. The sender times heads on the
+  host monotonic clock,
+  as `Monotonic` offers are timed; no time namespace is checked, as on the
+  local route. `TimedGate` keeps its API over a `TimedState`, which a
+  sender holds across cycles and gates through a `TimedView`.
 - The `replay` rejoin through the Archive end to end (phase 3, A6d):
   karyos-sim's `tests/archive_control.rs` wraps a lapped optional reader
   in a `ReplayRejoin` whose provider is the Archive's client, over the
@@ -307,6 +373,57 @@ release may break APIs, wire formats and shared-memory layouts.
   the linger gets the repeats. The EOS counts as sent once one path
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
+- The recording group Gateway (phase 3, A7d-2a; `recording-group-gateway.md`
+  sections 3, 6 and 8). `karyos_archive::group::gateway` holds the
+  `GroupGateway` trait that capture and replay share: `Event`, `Effects` (clock,
+  offer, a scoped claim, `poll_outcomes`, timers, external reads), `Handler`,
+  `Dispatched` and `GatewayError`. `gateway::live::Gateway` captures: it reads
+  the clock once per event, numbers it, delivers it, and records the event and
+  each call into an event buffer allocated at configuration, sent as one ring
+  message; the publications are reached through a `Port`. Strict capture never
+  delivers or performs what it cannot record, refusing it typed
+  (`GatewayError::Refused`, `Outcome::Gated`); best effort delivers it
+  unrecorded and coalesces the events refused in a row into one gap marker with
+  the first refusal's reason. `deliver_external` dispatches an input from
+  outside Karyos. Template 11 gains the output intent's `length` and `crc32c`
+  (block 59), and template 15, the delivery poll, precedes its delivery
+  outcomes, under a new order rule.
+- The Archive's agent captures recording groups (phase 3, A7d-1c;
+  `recording-group-gateway.md` sections 7 and 9). `ArchiveHandle::start_group`
+  makes a group's journal (or recovers it) in the host's group directory and
+  returns its `CaptureSender`; the agent serves the group's job after the
+  recorders, and `stop_group` refuses the group's sender, drains its ring into
+  the journal, bounded by the ring, and closes it. Settings that cannot work are
+  refused before the journal is made, and a start past `max_groups` is counted
+  in `refused()`. A group's references are covered by the agent's recordings: an
+  active `required` recorder's written and durable positions, and a stopped
+  `required` recording's end, also after a restart. A recording that fails, with
+  no stop in the catalog, has its references settled by its frames durable at
+  the failure, also those drained after it; it holds its slot under the
+  recording cap until every running group has read past the failure. The catalog
+  records each recording's mode in its `Started` record (an optional last byte
+  under version 3, covered by the CRC; an entry without it reads back as
+  `async`), and `Recording::required` reports it. `AgentConfig` gains
+  `max_groups` and `group_budget`.
+- A recording group's capture path (phase 3, A7d-1b;
+  `recording-group-gateway.md` section 9). `karyos_archive::group::capture`
+  makes a group's `CaptureSender`, for the event loop, and `CaptureJob`,
+  for the Archive's thread, over one command ring: each message is an
+  event's records. `admit` takes an event only when the ring has room for
+  the largest one, with a wrap's padding, both ends counting in the ring's
+  own framed positions, and fewer events are in flight than the prefix
+  tracker holds (until the prefixes stop); a gap needs only room. Its
+  refusals are typed. The job appends each message to the journal, feeds
+  the tracker and advances the prefixes; `recording_ended` counts the
+  references a stopped recording covers as covered, and marks the others
+  unavailable (best effort) or ends a strict group; a reference that
+  reaches the job after its recording ended is settled when read
+  (`Coverage::ended`). A strict incomplete event ends the group. A
+  `GroupWaiter` waits for durability off the event loop; the job only
+  notifies it. A journal failure fails the group. `capture` refuses a
+  journal that never syncs (`SyncPolicy::None`), a recovery with more
+  events waiting than the tracker holds, and settings whose arithmetic
+  would overflow; under `PerSegment` the job syncs at the in-flight bound.
 - A recording group's records for the Gateway (phase 3, A7d-1a;
   `recording-group-gateway.md` section 10), in place under schema 3
   version 1. A message's payload can be unavailable (value 3): above
@@ -977,6 +1094,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- An IPC driver no longer keeps the images a connected remote subscriber
+  read. A registration kept its stream from freeing, and a remote client
+  had no way to remove one, so every image it took stayed Retiring, with
+  its regions, descriptors and storage charge, until the client left. A
+  retiring stream now frees once no lease, remote grant or lingering
+  network publication holds it. An in-process registration whose
+  `Remove` is still queued stays until it is served, and the `Remove`
+  succeeds; a `ReportLoss` queued ahead of it is not a protocol
+  violation once the stream is freed (it is counted unverified). A remote
+  registration is reclaimed once its last grant ends. Stream ids and
+  registration ids are never reused, so neither names a later one. A
+  remote registration no longer keeps a replaced guarded incarnation by
+  itself: its grants do.
+  `RemoteClient::remove_subscription` removes a taken subscription, and
+  the client facade releases retired, dropped and late-granted image
+  handles with it (the doc-hidden `Connection::release_subscription`).
 - A removed network publication's sender closes its lane queues, its
   repair queue and its route at its next duty (#354 review P3-6;
   driver-network-agents.md §7: the sender drops its queues), on every

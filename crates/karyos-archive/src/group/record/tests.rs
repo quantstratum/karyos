@@ -263,7 +263,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 11,
-                &Fields::new(51)
+                &Fields::new(59)
                     .u64(0, 6)
                     .u64(8, 1024)
                     .u64(16, 0)
@@ -276,6 +276,8 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                     .u8(48, 1)
                     .u8(49, 1)
                     .u8(50, 2)
+                    .u32(51, 112)
+                    .u32(55, 0x5f1c_09a2)
                     .0,
                 &[],
             ),
@@ -285,6 +287,8 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 stream_id: 30,
                 session_id: 1,
                 operation: Operation::Offer,
+                length: 112,
+                crc32c: 0x5f1c_09a2,
                 outcome: Outcome::Accepted {
                     lane: lane(2),
                     position: 1024,
@@ -296,7 +300,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
             // inner error, both fields.
             vector(
                 11,
-                &Fields::new(51)
+                &Fields::new(59)
                     .u64(0, 6)
                     .u64(8, 0)
                     .u64(16, 70_000)
@@ -318,6 +322,8 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 stream_id: 30,
                 session_id: 1,
                 operation: Operation::Offer,
+                length: 0,
+                crc32c: 0,
                 outcome: Outcome::Failed {
                     error: 1,
                     sub: 0,
@@ -416,7 +422,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 11,
-                &Fields::new(51)
+                &Fields::new(59)
                     .u64(0, 8)
                     .u64(8, 0)
                     .u64(16, 300)
@@ -438,6 +444,8 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 stream_id: 40,
                 session_id: 2,
                 operation: Operation::Offer,
+                length: 0,
+                crc32c: 0,
                 outcome: Outcome::Failed {
                     error: 5,
                     sub: 3,
@@ -558,6 +566,50 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 recording_id: 9,
             }),
         ),
+        (
+            vector(
+                15,
+                &Fields::new(28)
+                    .u64(0, 6)
+                    .u32(8, 3)
+                    .u32(12, 8)
+                    .u32(16, 1)
+                    .i32(20, 30)
+                    .i32(24, 1)
+                    .0,
+                &[],
+            ),
+            GroupRecord::Poll(DeliveryPoll {
+                group_seq: 6,
+                index: 3,
+                max: 8,
+                count: 1,
+                stream_id: 30,
+                session_id: 1,
+            }),
+        ),
+        (
+            vector(
+                30,
+                &Fields::new(40)
+                    .u64(0, 12)
+                    .u64(8, 3)
+                    .u64(16, 4096)
+                    .u64(24, 700)
+                    .u32(32, 0xDEAD_BEEF)
+                    .u32(36, 5)
+                    .0,
+                &[],
+            ),
+            GroupRecord::Checkpoint(CheckpointRecord {
+                group_seq: 12,
+                checkpoint_id: 3,
+                position: 4096,
+                length: 700,
+                crc32c: 0xDEAD_BEEF,
+                format: 5,
+            }),
+        ),
     ]
 }
 
@@ -573,6 +625,8 @@ fn failures_follow_the_table() {
             stream_id: 1,
             session_id: 1,
             operation: Operation::Offer,
+            length: 0,
+            crc32c: 0,
             outcome: Outcome::Failed {
                 error,
                 sub,
@@ -582,7 +636,7 @@ fn failures_follow_the_table() {
         });
         let bytes = vector(
             11,
-            &Fields::new(51)
+            &Fields::new(59)
                 .u64(0, 1)
                 .u64(16, detail)
                 .u64(24, detail2)
@@ -739,6 +793,8 @@ fn samples() -> Vec<GroupRecord<'static>> {
             stream_id: -1,
             session_id: -2,
             operation,
+            length: 0,
+            crc32c: 0,
             outcome,
         }));
     }
@@ -920,6 +976,7 @@ const OVERRUN: usize = 15;
 const SKIPPED: usize = 16;
 const UNCAPTURED: usize = 17;
 const UNAVAILABLE: usize = 18;
+const POLL: usize = 19;
 
 #[test]
 #[allow(clippy::too_many_lines, reason = "one case per rule")]
@@ -1057,6 +1114,18 @@ fn every_invalid_field_is_refused() {
     commit[12 + 8..12 + 16].fill(0);
     commit[12 + 50] = 0;
     assert_eq!(refused(&commit), out_of_range("outcome"));
+    // A claim records no length or digest.
+    let mut claim = mutated(ACCEPTED, 48, 2, 1);
+    claim[12 + 51..12 + 59].fill(0);
+    assert!(GroupRecord::decode(&claim).is_ok());
+    for at in [51, 55] {
+        let mut digested = claim.clone();
+        digested[12 + at] = 1;
+        assert_eq!(refused(&digested), out_of_range("length"), "{at}");
+    }
+    // A delivery poll presenting more than its maximum.
+    assert_eq!(refused(&mutated(POLL, 16, 9, 4)), out_of_range("count"));
+    assert!(GroupRecord::decode(&mutated(POLL, 16, 8, 4)).is_ok());
     // A position or a lane on an outcome that has none.
     assert_eq!(
         refused(&mutated(ACCEPTED, 49, 2, 1)),
@@ -1131,6 +1200,8 @@ fn invalid_values_are_not_encoded() {
             stream_id: 0,
             session_id: 0,
             operation,
+            length: 0,
+            crc32c: 0,
             outcome,
         })
     };
@@ -1240,7 +1311,12 @@ fn every_record_knows_its_role() {
             Role::Observation(6, 1),
             Role::Observation(6, 2),
             Role::Observation(6, 3),
-            Role::Observation(6, 4),
+            Role::Delivery {
+                group_seq: 6,
+                index: 4,
+                stream_id: 30,
+                session_id: 1,
+            },
             Role::End(EventEnd {
                 group_seq: 6,
                 observations: 5,
@@ -1256,6 +1332,17 @@ fn every_record_knows_its_role() {
             Role::Event(11),
             Role::Uncaptured(12),
             Role::Unavailable(2),
+            Role::Poll {
+                group_seq: 6,
+                index: 3,
+                count: 1,
+                stream_id: 30,
+                session_id: 1,
+            },
+            Role::Checkpoint {
+                group_seq: 12,
+                checkpoint_id: 3,
+            },
         ]
     );
 }
@@ -1315,7 +1402,7 @@ proptest! {
 
     #[test]
     fn arbitrary_blocks_of_every_template_never_panic(
-        template in 0usize..14,
+        template in 0usize..15,
         block in proptest::collection::vec(any::<u8>(), 72),
         value in proptest::collection::vec(any::<u8>(), 0..16),
     ) {
@@ -1324,6 +1411,7 @@ proptest! {
             LIFECYCLE_EVENT, EXTERNAL_EVENT, OUTCOME_OBSERVATION,
             TIMER_OBSERVATION, EXTERNAL_OBSERVATION, DELIVERY_OBSERVATION,
             EVENT_END, GAP_MARKER, LOSS_EVENT, REFERENCE_UNAVAILABLE,
+            DELIVERY_POLL,
         ];
         let template = templates[template];
         let block = &block[..usize::from(template.block_length)];
@@ -1366,7 +1454,7 @@ fn a_failure_holds_only_its_variants_fields() {
     let failure = |error: u16, sub: u16, first: u64, second: u64| {
         vector(
             11,
-            &Fields::new(51)
+            &Fields::new(59)
                 .u64(0, 1)
                 .u64(16, first)
                 .u64(24, second)
@@ -1404,6 +1492,8 @@ fn a_failure_holds_only_its_variants_fields() {
         stream_id: 1,
         session_id: 1,
         operation: Operation::Offer,
+        length: 0,
+        crc32c: 0,
         outcome: Outcome::Failed {
             error: 2,
             sub: 0,
@@ -1655,4 +1745,118 @@ fn loss_codes_follow_the_tables() {
         );
     }
     assert_eq!(codes(loss(Loss::Aborted)), (3, 0, 0));
+}
+
+/// A header of another contract or clock is named as such, not taken as
+/// a corrupt record.
+#[test]
+fn an_unsupported_header_is_named() {
+    let header = GroupRecord::Header(JournalHeader {
+        group_id: 1,
+        first_group_seq: 1,
+        inline_threshold: 4096,
+        contract_version: CONTRACT_VERSION,
+        clock: Clock::HostMonotonic,
+        capture: Capture::Strict,
+        manifest: b"m",
+    });
+    let mut bytes = vec![0u8; MAX_RECORD];
+    let length = header.encode(&mut bytes).unwrap();
+    bytes.truncate(length);
+    assert_eq!(unsupported_header(&bytes), None);
+    let mut contract = bytes.clone();
+    contract[12 + 20..12 + 22].copy_from_slice(&2u16.to_le_bytes());
+    assert!(GroupRecord::decode(&contract).is_err());
+    assert_eq!(
+        unsupported_header(&contract),
+        Some(UnsupportedHeader::Contract { found: 2 })
+    );
+    let mut clock = bytes.clone();
+    clock[12 + 22] = 7;
+    assert_eq!(
+        unsupported_header(&clock),
+        Some(UnsupportedHeader::Clock { found: 7 })
+    );
+    // Another record is no header.
+    let end = GroupRecord::End(EventEnd {
+        group_seq: 1,
+        observations: 0,
+        outcome: EndOutcome::Complete,
+    });
+    let mut other = vec![0u8; MAX_RECORD];
+    let length = end.encode(&mut other).unwrap();
+    assert_eq!(unsupported_header(&other[..length]), None);
+}
+
+/// A9-1: a checkpoint record names an event and an id, never 0, a length
+/// of at least 1, and a range that ends within `u64`, unless its position
+/// is a replay capture's `u64::MAX`; a refused one encodes nothing and
+/// does not decode.
+#[test]
+fn a_checkpoint_record_refuses_what_names_nothing() {
+    let valid = CheckpointRecord {
+        group_seq: 1,
+        checkpoint_id: 1,
+        position: 0,
+        length: 1,
+        crc32c: 0,
+        format: 0,
+    };
+    let capture = CheckpointRecord {
+        position: u64::MAX,
+        length: u64::MAX,
+        ..valid
+    };
+    assert_eq!(capture.end(), None);
+    let bytes = encoded(&GroupRecord::Checkpoint(capture));
+    assert_eq!(
+        GroupRecord::decode(&bytes).unwrap(),
+        GroupRecord::Checkpoint(capture)
+    );
+    let refused = [
+        (
+            "group_seq",
+            CheckpointRecord {
+                group_seq: 0,
+                ..valid
+            },
+        ),
+        (
+            "checkpoint_id",
+            CheckpointRecord {
+                checkpoint_id: 0,
+                ..valid
+            },
+        ),
+        ("length", CheckpointRecord { length: 0, ..valid }),
+        (
+            "position",
+            CheckpointRecord {
+                position: u64::MAX - 1,
+                length: 2,
+                ..valid
+            },
+        ),
+    ];
+    for (field, record) in refused {
+        let mut out = vec![0u8; MAX_RECORD];
+        assert_eq!(
+            GroupRecord::Checkpoint(record).encode(&mut out),
+            Err(CodecError::ValueOutOfRange { field })
+        );
+        let bytes = vector(
+            30,
+            &Fields::new(40)
+                .u64(0, record.group_seq)
+                .u64(8, record.checkpoint_id)
+                .u64(16, record.position)
+                .u64(24, record.length)
+                .0,
+            &[],
+        );
+        assert_eq!(
+            GroupRecord::decode(&bytes),
+            Err(CodecError::ValueOutOfRange { field })
+        );
+    }
 }

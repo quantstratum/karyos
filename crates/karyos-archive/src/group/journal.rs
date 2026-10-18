@@ -103,6 +103,10 @@ pub enum JournalError {
         /// The group the header named.
         found: u64,
     },
+    /// A journal whose header names a capture contract or a clock this
+    /// build cannot take: not a corrupt journal, another one.
+    #[error("a journal header this build cannot take: {0:?}")]
+    Unsupported(super::record::UnsupportedHeader),
     /// A recovered journal holds a record that is not valid at
     /// `position`, or a header naming another group.
     #[error("corrupt journal at {position}")]
@@ -209,7 +213,10 @@ impl<D: Disk> GroupJournal<D> {
             };
             if length > 0 {
                 let bytes = journal.scratch.get(..length).ok_or_else(corrupt)?;
-                let record = GroupRecord::decode(bytes).map_err(|_| corrupt())?;
+                let record = GroupRecord::decode(bytes).map_err(|_| {
+                    super::record::unsupported_header(bytes)
+                        .map_or_else(corrupt, JournalError::Unsupported)
+                })?;
                 if let GroupRecord::Header(header) = record
                     && header.group_id != group_id
                 {
@@ -303,8 +310,12 @@ impl<D: Disk> GroupJournal<D> {
                     .scratch
                     .get(..length)
                     .ok_or(JournalError::Corrupt { position })?;
-                let record =
-                    GroupRecord::decode(bytes).map_err(|_| JournalError::Corrupt { position })?;
+                let record = GroupRecord::decode(bytes).map_err(|_| {
+                    super::record::unsupported_header(bytes).map_or(
+                        JournalError::Corrupt { position },
+                        JournalError::Unsupported,
+                    )
+                })?;
                 let end = u64::try_from(length)
                     .ok()
                     .and_then(|length| position.checked_add(length))
@@ -420,6 +431,12 @@ impl<D: Disk> GroupJournal<D> {
     #[must_use]
     pub const fn order(&self) -> &OrderCheck {
         &self.check
+    }
+
+    /// Its sync policy.
+    #[must_use]
+    pub const fn policy(&self) -> SyncPolicy {
+        self.store.policy()
     }
 
     /// The end of the last record written.

@@ -37,6 +37,10 @@ impl Recordings {
 }
 
 impl Coverage for Recordings {
+    fn ended(&self, _recording_id: u64) -> Option<u64> {
+        None
+    }
+
     fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
         self.0.borrow().get(&recording_id).copied()
     }
@@ -423,6 +427,10 @@ fn a_reference_to_an_async_recording_never_completes() {
     /// answered, whatever its written position.
     struct RequiredOnly;
     impl Coverage for RequiredOnly {
+        fn ended(&self, _recording_id: u64) -> Option<u64> {
+            None
+        }
+
         fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
             (recording_id == 7).then_some((4096, 4096))
         }
@@ -513,6 +521,8 @@ fn a_gap_inside_an_event_or_an_observation_outside_one_is_refused() {
         stream_id: 1,
         session_id: 1,
         operation: Operation::Offer,
+        length: 0,
+        crc32c: 0,
         outcome: Outcome::BackPressured,
     });
     let mut tracker = PrefixTracker::new(2);

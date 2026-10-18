@@ -24,7 +24,8 @@
 //! - **Sender.** [`ScheduleReader::peek`] loads `tail` with Acquire and
 //!   reads the entry at `head`; [`ScheduleReader::release`] stores
 //!   `head + 1` with Release once every path submitted the message, which
-//!   frees the slot.
+//!   frees the slot. [`ScheduleReader::rewind_to_released`] reads again
+//!   from `head`: entries not released are never overwritten.
 //!
 //! `tail` and `head` count entries and never wrap: 2^64 messages on one
 //! lane are refused as exhausted, never wrapped (SPEC.md section 14).
@@ -303,6 +304,10 @@ pub struct ScheduleReader {
     /// read cursor, so a slot can be freed before its entry is read.
     #[cfg(loom)]
     unchecked_release: bool,
+    /// Loom only: the negative control whose rewind goes back past `head`,
+    /// to the first entry, reading slots the publisher may have reused.
+    #[cfg(loom)]
+    rewind_past_head: bool,
 }
 
 impl ScheduleReader {
@@ -322,7 +327,19 @@ impl ScheduleReader {
             witness: None,
             #[cfg(loom)]
             unchecked_release: false,
+            #[cfg(loom)]
+            rewind_past_head: false,
         })
+    }
+
+    /// Loom only: the negative control whose `rewind_to_released` goes back
+    /// past `head`, to the first entry.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_rewind_past_head(mut self) -> Self {
+        self.rewind_past_head = true;
+        self
     }
 
     /// Loom only: the negative control whose `release` may pass the read
@@ -413,6 +430,21 @@ impl ScheduleReader {
         word(ring, HEAD)?.store(head, Ordering::Release);
         self.head = head;
         Ok(())
+    }
+
+    /// Moves the read cursor back to the oldest entry not released, so the
+    /// entries read since are read again, in order: a reliable lane's
+    /// sender rewinds its log to a position whose messages' entries it has
+    /// not released yet. It touches no word of the ring: the publisher
+    /// never reuses a slot before `head` passes it, and `head` does not
+    /// move here, so every entry read again is still the one written.
+    pub fn rewind_to_released(&mut self) {
+        #[cfg(loom)]
+        if self.rewind_past_head {
+            self.next = 0;
+            return;
+        }
+        self.next = self.head;
     }
 
     /// The ring's capacity in entries, as it declared it at attach.

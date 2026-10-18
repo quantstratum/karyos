@@ -823,6 +823,7 @@ fn child() {
                     if let Event::ImageAvailable {
                         stream,
                         registration: of,
+                        ..
                     } = event
                     {
                         assert_eq!(of, registration);

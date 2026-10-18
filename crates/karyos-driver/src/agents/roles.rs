@@ -4282,6 +4282,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 {
                     let event = SessionEvent::CreateImage {
                         endpoint,
+                        source,
                         alias: answer.alias,
                         slot,
                         identity,

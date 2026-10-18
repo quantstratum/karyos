@@ -482,6 +482,10 @@ static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 pub(crate) struct Stream<T: StreamTerms> {
     pub(crate) id: u64,
+    /// Where a network image's lane comes from; `None` for a local stream,
+    /// a network publication's lane and a replay target
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-1).
+    pub(crate) source: Option<crate::net::ImageSource>,
     /// The aggregate this lane belongs to.
     pub(crate) aggregate: Aggregate,
     pub(crate) retiring: bool,
@@ -757,6 +761,16 @@ impl<T: StreamTerms> Stream<T> {
         }
     }
 
+    /// The image registration a close of this lane names
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-3):
+    /// its aggregate's for an image's lane, 0 for any other stream.
+    pub(crate) const fn image_registration(&self) -> u64 {
+        match self.source {
+            Some(_) => self.aggregate.registration,
+            None => 0,
+        }
+    }
+
     /// A new generation link for a handle on the current mapping.
     pub(crate) fn join(&mut self, kind: MemberKind) -> (Arc<GenerationLink<T>>, u64) {
         let link = GenerationLink::new();
@@ -933,30 +947,37 @@ pub const FIRST_INCARNATION: u64 = 1;
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Exposes the lanes of an installed image as the lane streams of one
-    /// aggregate, keyed by the image's alias (wiring note W-e, W3; the
-    /// interim D2 step, ACS 15937). Each lane's conductor is issued here,
-    /// so the duty cycle prepares the image's terms as for a local stream.
-    /// Returns `None`, with nothing added, when the key is in use (a local
-    /// stream or an earlier image of the alias), the stream table is full
-    /// or a conductor was already issued. A retiring stream keeps its key
-    /// until it frees, so a new image of that alias installed meanwhile
-    /// stays unexposed for its whole life (interim D2, #283 P3).
+    /// aggregate, named by its registration (`quantstratum-docs:
+    /// karyos/design/per-source-images.md`, D2-1; wiring note W-e, W3).
+    /// Each lane's conductor is issued here, so the duty cycle prepares
+    /// the image's terms as for a local stream.
+    ///
+    /// A network image comes with its `source`: images of one alias from
+    /// different sources are each exposed, and the alias is refused only
+    /// when it is the key of a stream that is not a network image (as a
+    /// local stream over an image's key is refused). A replay target has
+    /// no source and is refused for any stream of its key. Returns `None`,
+    /// with nothing added, for a refused key, a full stream table or an
+    /// aggregate that cannot be built (its quanta, its profile, its
+    /// registrations or a conductor already issued). A retiring stream
+    /// keeps its key until it frees, so an image of that alias installed
+    /// meanwhile stays unexposed for its whole life (#283 P3).
     pub(crate) fn add_image_aggregate(
         &mut self,
         lanes: &[Arc<LogBuffer<T>>],
+        source: Option<crate::net::ImageSource>,
     ) -> Option<AggregateHandle> {
         let first = lanes.first()?.config();
         let key = (first.stream_id, first.session_id);
         let count = u8::try_from(lanes.len()).ok()?;
-        if self
+        if self.streams.iter().any(|stream| {
+            (stream.stream_id, stream.session_id) == key
+                && (source.is_none() || stream.source.is_none())
+        }) || self
             .streams
-            .iter()
-            .any(|stream| (stream.stream_id, stream.session_id) == key)
-            || self
-                .streams
-                .len()
-                .checked_add(lanes.len())
-                .is_none_or(|total| total > self.config.max_streams)
+            .len()
+            .checked_add(lanes.len())
+            .is_none_or(|total| total > self.config.max_streams)
         {
             return None;
         }
@@ -995,6 +1016,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             staged.push(Stream {
                 id,
+                source,
                 aggregate,
                 retiring: false,
                 buffer: Arc::clone(buffer),
@@ -1583,6 +1605,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             target.conductor.seal_with_reason(seal)?;
             let key = target.key();
             let lane = target.config.lane;
+            let image = target.image_registration();
             if let Some(mut feeder) = target.feeder.take() {
                 feeder.writer.close();
             }
@@ -1598,19 +1621,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     stream: key,
                     lane,
                     reason: close,
+                    image,
                 });
             }
         }
         Ok(())
     }
 
-    /// Frees retiring streams with no live lease and no registration.
-    /// A network publication's lanes stay while its removal lingers: its
+    /// Frees retiring streams with no live lease and no remote grant. A
+    /// registration does not keep its stream: once the stream is freed it
+    /// stays, naming a stream id that is never reused, until its client
+    /// removes it, a remote one's last grant ends (it is then reclaimed,
+    /// `sweep_ended_registrations`) or the client ends. A remote client's
+    /// grants (its ledger) keep the stream until they end, at their
+    /// `Detach` or the client's exit proof. A network publication's lanes
+    /// stay while its removal lingers: its
     /// sender still reads them to their seals and serves repair from them,
     /// with no lease (driver-network-agents.md §7). A stopped or failed
     /// network holds nothing, so they free with no linger.
     pub(crate) fn free_retired_streams(&mut self) {
-        let registrations = &self.registrations;
         let clients = &self.clients;
         let net = self.net.as_ref();
         // A remote grant keeps its stream until it ends, even after its
@@ -1621,9 +1650,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 stream.retiring
                     && stream.leases.live() == 0
                     && !net.is_some_and(|net| net.holds_publication(stream.aggregate.registration))
-                    && !registrations
-                        .iter()
-                        .any(|registration| registration.stream() == stream.id)
                     && !clients.iter().any(|client| {
                         client
                             .ledger
@@ -2227,6 +2253,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         });
         Ok(Stream {
             id,
+            source: None,
             aggregate,
             retiring: false,
             buffer,
@@ -2374,7 +2401,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Allocates a timed lane's counters once, when its first handle is
     /// prepared; nothing for a lane that is not timed.
-    fn ensure_timed_counters(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+    pub(crate) fn ensure_timed_counters(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<(), DriverError> {
         let found = self.stream_ref(stream)?;
         if found.buffer.schedule_ring().is_none() || found.timed_counters.is_some() {
             return Ok(());
@@ -2639,8 +2669,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // The buffer's configuration, which a network sender announces.
         found.config = plan.config;
         found.incarnation = plan.incarnation;
-        // A fresh incarnation has a fresh ring.
-        found.schedule_issued = false;
+        // A fresh incarnation has a fresh ring. A local lane takes new
+        // settings before its next handle; a network lane's are its
+        // sender's, fixed from the add: kept, with its counters, on every
+        // lane, so a reopen bypasses no refusal of the add.
+        if found.network == NetworkLane::Local {
+            found.schedule_issued = false;
+        }
         found.base = plan.base;
         found.members.clear();
         found.spare = None;
@@ -3055,13 +3090,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut work = 0u32;
         let mut first_error = None;
         let mut lapped = Vec::new();
-        // The (stream, incarnation) pairs a registration, a remote grant or
-        // a held bound still names: a replaced incarnation they name is
-        // kept, so a remote reader can read it to its seal. A dead remote
-        // client releases them through its liveness timeout or exit proof.
+        // The (stream, incarnation) pairs an in-process registration, a
+        // remote grant or a held bound still names: a replaced incarnation
+        // they name is kept, so a reader can read it to its seal. A remote
+        // registration pins through its grants, not by itself: one with no
+        // grant left reads nothing and is reclaimed. A dead remote client
+        // releases them through its liveness timeout or exit proof.
+        let clients = &self.clients;
         let mut pinned: Vec<(u64, u64)> = self
             .registrations
             .iter()
+            .filter(|registration| {
+                clients
+                    .iter()
+                    .find(|slot| slot.id() == registration.client())
+                    .is_none_or(|slot| slot.ledger.is_none())
+            })
             .map(|registration| (registration.stream(), registration.incarnation()))
             .chain(
                 self.holding
@@ -3192,7 +3236,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     first_error.get_or_insert(DriverError::from(error));
                 }
                 if was_active && stream.conductor.seal_state() != SealState::Active {
-                    closed.push((stream.key(), stream.config.lane));
+                    closed.push((
+                        stream.key(),
+                        stream.config.lane,
+                        stream.image_registration(),
+                    ));
                 }
             }
             let Some(config) = stream.conflation else {
@@ -3345,7 +3393,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             stream.aggregate.registration,
                             u64::from(stream.config.lane.get()),
                         ],
-                        (stream.key(), stream.config.lane),
+                        (
+                            stream.key(),
+                            stream.config.lane,
+                            stream.image_registration(),
+                        ),
                         error.cause.to_string(),
                         open,
                     ));
@@ -3381,7 +3433,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             // Only the seal that moved the stream out of `Active` reports it.
             if was_active && stream.conductor.seal_state() != SealState::Active {
-                closed.push((stream.key(), stream.config.lane));
+                closed.push((
+                    stream.key(),
+                    stream.config.lane,
+                    stream.image_registration(),
+                ));
             }
             // An end the stream did not reach (no terminal seal: the feeder
             // could not follow a cutover) is a lost feeder, never a silent
@@ -3392,7 +3448,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         stream.aggregate.registration,
                         u64::from(stream.config.lane.get()),
                     ],
-                    (stream.key(), stream.config.lane),
+                    (
+                        stream.key(),
+                        stream.config.lane,
+                        stream.image_registration(),
+                    ),
                     "the feeder ended before its stream".to_owned(),
                     true,
                 ));
@@ -3411,17 +3471,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
         }
-        for (stream, lane) in closed {
+        for (stream, lane, image) in closed {
             self.emit(&DriverEvent::PublicationClosed {
                 stream,
                 lane,
                 reason: CloseReason::ConflationVersionsExhausted,
+                image,
             });
         }
         // The loss is always logged; only a stream it closes is reported,
         // so a stream closed for good earlier gets no second closing.
         // The record names the aggregate's registration and the lane.
-        for (key, (stream, lane), cause, open) in lost {
+        for (key, (stream, lane, image), cause, open) in lost {
             self.diagnostics.error(
                 &mut self.counters,
                 crate::diagnostics::ErrorCode::ConflationFeederLost,
@@ -3433,6 +3494,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     stream,
                     lane,
                     reason: CloseReason::ConflationFeederLost,
+                    image,
                 });
             }
         }
@@ -3840,6 +3902,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 crate::agents::images::ImageEvent::Installed {
                     slot,
                     endpoint,
+                    source,
                     identity,
                     alias,
                 } => {
@@ -3847,10 +3910,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     else {
                         continue;
                     };
-                    let exposed = self.add_image_aggregate(&lanes);
+                    let source = crate::net::ImageSource {
+                        endpoint,
+                        source,
+                        identity,
+                    };
+                    let exposed = self.add_image_aggregate(&lanes, Some(source));
                     if let Some(net) = &mut self.net {
                         let traced = crate::net::trace::identity(&identity, alias);
-                        net.record_image(slot, endpoint, traced, exposed, &lanes);
+                        net.record_image(slot, source, traced, exposed, &lanes);
                     }
                     self.build_network_view(slot, endpoint, exposed.as_ref());
                     // Its receiver journals, while the receiver has a hook.
@@ -4363,6 +4431,7 @@ mod tests {
                 },
                 lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::ConflationVersionsExhausted,
+                image: 0,
             }]
         );
         assert_eq!(
@@ -4435,6 +4504,7 @@ mod tests {
                 },
                 lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::ConflationFeederLost,
+                image: 0,
             }]
         );
         assert!(driver.streams[0].feeder.is_none());
@@ -4708,6 +4778,7 @@ mod tests {
                 },
                 lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::RequiredParticipantLost,
+                image: 0,
             });
         }
         let _ = observer.poll(usize::MAX, |_| {});

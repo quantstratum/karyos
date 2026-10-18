@@ -28,6 +28,10 @@ pub enum OrderRule {
     Index,
     /// An end whose observation count is not the event's.
     Count,
+    /// A delivery observation its poll did not announce, or on another
+    /// publication than its poll's, or another record before a poll's
+    /// delivery observations are all there.
+    Poll,
     /// A record after a strict journal's incomplete end.
     AfterIncomplete,
     /// A gap marker in a strict journal.
@@ -39,10 +43,16 @@ pub enum OrderRule {
     /// it holds the events waiting on their payloads, and this checker
     /// holds a few words.
     Unavailable,
+    /// A checkpoint naming an event before the first or not ended, or one
+    /// whose `group_seq` or `checkpoint_id` is not above the previous
+    /// recorded checkpoint's (A9). A failed write leaves no record, so
+    /// only recorded checkpoints count.
+    Checkpoint,
     /// A `group_seq` or index past `u64` or `u32`.
     Exhausted,
     /// A role no decoded record has: a header whose first `group_seq` is
-    /// 0, or a gap that ends before it starts. Roles are plain values, so
+    /// 0, a gap that ends before it starts, or a checkpoint whose
+    /// `group_seq` or `checkpoint_id` is 0. Roles are plain values, so
     /// the checker refuses these itself.
     Invalid,
 }
@@ -64,8 +74,14 @@ enum State {
     Start,
     /// Between events: the next is `next_seq`.
     Between,
-    /// Inside event `seq`, expecting observation `index` or its end.
-    InEvent { seq: u64, index: u32 },
+    /// Inside event `seq`, expecting observation `index` or its end;
+    /// `owed` delivery observations on `publication` come first.
+    InEvent {
+        seq: u64,
+        index: u32,
+        owed: u32,
+        publication: (i32, i32),
+    },
     /// A strict journal ended at an incomplete event.
     Ended,
 }
@@ -78,6 +94,8 @@ pub struct OrderCheck {
     first_seq: u64,
     next_seq: u64,
     ordinal: u64,
+    /// The last recorded checkpoint's `(group_seq, checkpoint_id)`.
+    checkpoint: Option<(u64, u64)>,
 }
 
 impl Default for OrderCheck {
@@ -96,6 +114,7 @@ impl OrderCheck {
             first_seq: 0,
             next_seq: 0,
             ordinal: 0,
+            checkpoint: None,
         }
     }
 
@@ -150,7 +169,12 @@ impl OrderCheck {
                 Err(OrderRule::Unavailable)
             }
             (State::Between, Role::Event(seq) | Role::Uncaptured(seq)) if seq == self.next_seq => {
-                Ok(State::InEvent { seq, index: 0 })
+                Ok(State::InEvent {
+                    seq,
+                    index: 0,
+                    owed: 0,
+                    publication: (0, 0),
+                })
             }
             (State::Between, Role::Event(_) | Role::Uncaptured(_)) => Err(OrderRule::Sequence),
             (State::Between, Role::Gap(gap)) if gap.to_seq < gap.from_seq => {
@@ -173,22 +197,107 @@ impl OrderCheck {
                 Err(OrderRule::Unavailable)
             }
             (State::Between, Role::Unavailable(_)) => Ok(State::Between),
-            (State::Between, Role::Observation(..) | Role::End(_)) => Err(OrderRule::OutsideEvent),
+            (
+                State::Between,
+                Role::Checkpoint {
+                    group_seq,
+                    checkpoint_id,
+                },
+            ) => {
+                if group_seq == 0 || checkpoint_id == 0 {
+                    return Err(OrderRule::Invalid);
+                }
+                let ended = group_seq >= self.first_seq && group_seq < self.next_seq;
+                let above = self
+                    .checkpoint
+                    .is_none_or(|(seq, id)| group_seq > seq && checkpoint_id > id);
+                if !ended || !above {
+                    return Err(OrderRule::Checkpoint);
+                }
+                self.checkpoint = Some((group_seq, checkpoint_id));
+                Ok(State::Between)
+            }
+            (
+                State::Between,
+                Role::Observation(..) | Role::Poll { .. } | Role::Delivery { .. } | Role::End(_),
+            ) => Err(OrderRule::OutsideEvent),
             (
                 State::InEvent { .. },
-                Role::Event(_) | Role::Uncaptured(_) | Role::Gap(_) | Role::Unavailable(_),
+                Role::Event(_)
+                | Role::Uncaptured(_)
+                | Role::Gap(_)
+                | Role::Unavailable(_)
+                | Role::Checkpoint { .. },
             ) => Err(OrderRule::Nested),
-            (State::InEvent { seq, index }, Role::Observation(of, at)) => {
+            (
+                State::InEvent {
+                    seq,
+                    index,
+                    owed,
+                    publication,
+                },
+                Role::Delivery {
+                    group_seq,
+                    index: at,
+                    stream_id,
+                    session_id,
+                },
+            ) => {
+                if group_seq != seq {
+                    Err(OrderRule::OutsideEvent)
+                } else if at != index {
+                    Err(OrderRule::Index)
+                } else if owed == 0 || (stream_id, session_id) != publication {
+                    Err(OrderRule::Poll)
+                } else {
+                    Ok(State::InEvent {
+                        seq,
+                        index: index.checked_add(1).ok_or(OrderRule::Exhausted)?,
+                        owed: owed - 1,
+                        publication,
+                    })
+                }
+            }
+            (State::InEvent { owed: 1.., .. }, _) => Err(OrderRule::Poll),
+            (State::InEvent { seq, index, .. }, Role::Observation(of, at)) => {
                 if of != seq {
                     Err(OrderRule::OutsideEvent)
                 } else if at != index {
                     Err(OrderRule::Index)
                 } else {
                     let index = index.checked_add(1).ok_or(OrderRule::Exhausted)?;
-                    Ok(State::InEvent { seq, index })
+                    Ok(State::InEvent {
+                        seq,
+                        index,
+                        owed: 0,
+                        publication: (0, 0),
+                    })
                 }
             }
-            (State::InEvent { seq, index }, Role::End(end)) => {
+            (
+                State::InEvent { seq, index, .. },
+                Role::Poll {
+                    group_seq,
+                    index: at,
+                    count,
+                    stream_id,
+                    session_id,
+                },
+            ) => {
+                if group_seq != seq {
+                    Err(OrderRule::OutsideEvent)
+                } else if at != index {
+                    Err(OrderRule::Index)
+                } else {
+                    Ok(State::InEvent {
+                        seq,
+                        index: index.checked_add(1).ok_or(OrderRule::Exhausted)?,
+                        owed: count,
+                        publication: (stream_id, session_id),
+                    })
+                }
+            }
+            (State::InEvent { seq, index, .. }, Role::End(end)) => {
                 if end.group_seq != seq {
                     Err(OrderRule::OutsideEvent)
                 } else if end.observations != index {
@@ -217,6 +326,12 @@ impl OrderCheck {
     #[must_use]
     pub const fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// The last recorded checkpoint's `(group_seq, checkpoint_id)`.
+    #[must_use]
+    pub const fn last_checkpoint(&self) -> Option<(u64, u64)> {
+        self.checkpoint
     }
 
     /// How many records it took.
