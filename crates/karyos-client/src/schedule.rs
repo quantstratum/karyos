@@ -17,6 +17,7 @@ use crate::error::ClientError;
 
 /// The clock a timed publication's requested times are read in (TT-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ClockDomain {
     /// The host's monotonic clock (`karyos_sys::host_clock::host_monotonic_ns`):
     /// the default, for software scheduling.
@@ -85,6 +86,7 @@ pub fn now(domain: ClockDomain) -> Result<u64, ClientError> {
 /// A timed publication's settings (TT-2, TT-3); the defaults are
 /// provisional and configurable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScheduleOptions {
     /// The clock domain of requested times.
     pub domain: ClockDomain,
@@ -106,6 +108,37 @@ impl Default for ScheduleOptions {
             lateness_tolerance: 1_000_000,
             cancel_on_deadline: false,
         }
+    }
+}
+
+impl ScheduleOptions {
+    /// These options with the clock domain `domain`.
+    #[must_use]
+    pub const fn with_domain(mut self, domain: ClockDomain) -> Self {
+        self.domain = domain;
+        self
+    }
+
+    /// These options with a horizon of `max_horizon` nanoseconds.
+    #[must_use]
+    pub const fn with_max_horizon(mut self, max_horizon: u64) -> Self {
+        self.max_horizon = max_horizon;
+        self
+    }
+
+    /// These options with a lateness tolerance of `lateness_tolerance`
+    /// nanoseconds.
+    #[must_use]
+    pub const fn with_lateness_tolerance(mut self, lateness_tolerance: u64) -> Self {
+        self.lateness_tolerance = lateness_tolerance;
+        self
+    }
+
+    /// These options with `cancel_on_deadline`.
+    #[must_use]
+    pub const fn with_cancel_on_deadline(mut self, cancel_on_deadline: bool) -> Self {
+        self.cancel_on_deadline = cancel_on_deadline;
+        self
     }
 }
 
@@ -309,10 +342,7 @@ mod tests {
     fn an_unavailable_clock_refuses() {
         for max_horizon in [0, 1, 1_000_000_000] {
             let binding = ScheduleBinding::new(
-                ScheduleOptions {
-                    max_horizon,
-                    ..ScheduleOptions::default()
-                },
+                ScheduleOptions::default().with_max_horizon(max_horizon),
                 ScheduleClock::new(unavailable),
             );
             for time in [0, 1_000, u64::MAX - 1_000_000_000] {
@@ -325,10 +355,7 @@ mod tests {
     /// itself (timed-tx.md section 8).
     #[test]
     fn the_horizon_is_exact() {
-        let options = ScheduleOptions {
-            max_horizon: 500,
-            ..ScheduleOptions::default()
-        };
+        let options = ScheduleOptions::default().with_max_horizon(500);
         let (_ring, binding) = binding(options);
         assert_eq!(binding.check(1_500), Ok(()));
         assert_eq!(
@@ -358,10 +385,7 @@ mod tests {
     /// Deadline sums that overflow are refused, never wrapped.
     #[test]
     fn overflowing_deadlines_are_refused() {
-        let (_ring, binding) = binding(ScheduleOptions {
-            max_horizon: u64::MAX,
-            ..ScheduleOptions::default()
-        });
+        let (_ring, binding) = binding(ScheduleOptions::default().with_max_horizon(u64::MAX));
         assert_eq!(binding.check(2_000), Err(ClientError::ScheduleOverflow));
         let (_ring, binding) = self::binding(ScheduleOptions::default());
         assert_eq!(binding.check(u64::MAX), Err(ClientError::ScheduleOverflow));

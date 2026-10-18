@@ -11,6 +11,27 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- karyos-client's public enums and report structs are `#[non_exhaustive]`
+  before alpha.2 (quantstratum-docs:
+  `karyos/testing/public-api-audit-alpha2.md`), so later minor releases can
+  add variants and fields: errors (`ClientError`, `SubscriptionError`,
+  `OfferError`, `ConductorError`, `MergeError`, `MergeFailed`,
+  `HandOverError`, `AttachError`), outcomes and reports (`OfferOutcome`,
+  `ClaimOutcome`, the concurrent ones, `SubscriptionPoll`, `ImageStop`,
+  `MergePoll`, the aggregate's polls, `LinkStatus`, `LeaseState`,
+  `ViewClosed`, `ReplayStatus`, `ReplayUnavailable`, the conductor's
+  `Outcome`, `Completion`, `Fetchable*` and the counter snapshots) and inputs
+  users build from variants or `Default` (`IdleStrategy`, `RejoinPolicy`,
+  `Secondary`, `ClockDomain`, `Request`, `ScheduleOptions`,
+  `ConflatedLimits`). A match outside the crate needs a wildcard arm, and a
+  struct is built from `Default`: `ScheduleOptions` gains `with_domain`,
+  `with_max_horizon`, `with_lateness_tolerance` and `with_cancel_on_deadline`.
+  The types the Archive's Gateway builds or matches (`PollSummary`,
+  `PollError`, the loss reports, `RejoinOutcome`, `SecondaryOutcome`,
+  `ReplayFallbackReason`) follow with karyos-archive's change;
+  `ScheduleCounters`, `link::Capability`, `ReplayRequest`, `link::Owner` and
+  `link::HandOverEntry` stay as they are for now, built or matched by the
+  driver.
 - `karyos-archive` recordings handle a mapping cutover
   (mapping-generations.md, "Recordings"). `Frames` gains `Cutover { at }`
   (the source moved to the successor; the recording goes on at `at`,

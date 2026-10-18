@@ -100,6 +100,7 @@ const ROLE: SubscriberRole = SubscriberRole::Required;
 
 /// How a control call waits between two services of its connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IdleStrategy {
     /// Spin without yielding.
     BusySpin,
@@ -255,6 +256,7 @@ impl ContextBuilder {
 
 /// A failed subscription poll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum SubscriptionError {
     /// An image's poll failed after `delivered` messages of this poll.
     #[error("image poll failed after {delivered} messages: {error}")]
@@ -273,6 +275,7 @@ pub enum SubscriptionError {
 
 /// What a subscription poll did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubscriptionPoll {
     /// Messages delivered, over every image.
     pub delivered: u32,
@@ -297,6 +300,7 @@ pub struct ImageChange {
 
 /// An image's poll that reported more than deliveries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImageStop {
     /// The image's session id, for a network subscription.
     pub session_id: Option<i32>,

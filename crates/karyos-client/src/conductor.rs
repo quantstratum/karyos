@@ -65,6 +65,7 @@ use crate::subscription::ClientSubscription;
 
 /// Errors submitting a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ConductorError {
     /// The command ring has no room; retry after the driver drains it.
     #[error("command ring full")]
@@ -126,6 +127,7 @@ fn channel_uri(uri: &str) -> Result<(ChannelUri, bool), ConductorError> {
 
 /// How a request ended.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Outcome<T: TermBytes = HeapTerms> {
     /// The publication, ready to offer.
     Publication(ClientPublication<T>),
@@ -197,6 +199,7 @@ impl<T: TermBytes> Outcome<T> {
 /// What a request asked for, kept per request sequence: the handle needs
 /// it and neither the response nor the wire record carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Request {
     /// The stream's exclusive publication.
     Publication {
@@ -271,6 +274,7 @@ impl Request {
 
 /// A remote client's grant, ready to fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Fetchable {
     /// The hand-over key of the response, which the fetch names.
     pub key: u64,
@@ -288,6 +292,7 @@ pub struct Fetchable {
 /// The configuration is the driver's answer: a view checks it against its
 /// own limits before it maps anything, then requires it of the region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FetchableConflated {
     /// The hand-over key of the response, which the fetch names.
     pub key: u64,
@@ -305,6 +310,7 @@ pub struct FetchableConflated {
 
 /// A completed request.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Completion<T: TermBytes = HeapTerms> {
     /// The request sequence returned when it was submitted.
     pub sequence: u64,
@@ -314,6 +320,7 @@ pub struct Completion<T: TermBytes = HeapTerms> {
 
 /// What one [`ClientConductor::poll`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ConductorPoll {
     /// Broadcast records read, including other clients' responses and lap
     /// reports.

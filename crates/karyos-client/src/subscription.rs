@@ -73,6 +73,7 @@ impl MessageInfo {
 /// keeps its value and `overflowed` stays set (SPEC.md §14, ADR-0007).
 /// Delivery is never affected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct InvalidExtensions {
     /// Messages counted.
     pub count: u64,
@@ -145,6 +146,7 @@ pub struct SnapshotFailed;
 /// creation (SPEC.md §4 and §10). A required reader is never lapped, so for
 /// it the policy is accepted and never used.
 #[derive(Default)]
+#[non_exhaustive]
 pub enum RejoinPolicy {
     /// Delivery continues at the head (the default).
     #[default]
@@ -162,6 +164,7 @@ pub enum RejoinPolicy {
 }
 
 /// The policy `replay` falls back to.
+#[non_exhaustive]
 pub enum Secondary {
     /// As [`RejoinPolicy::RejoinAtHead`].
     RejoinAtHead,

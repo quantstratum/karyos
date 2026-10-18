@@ -86,6 +86,7 @@ pub struct LeaseEnd {
 
 /// The observed state of a [`LeaseEnd`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LeaseState {
     /// The capability is alive (held for hand-over or in a handle).
     Alive,
@@ -243,6 +244,7 @@ pub struct ClientLink<T: TermBytes = HeapTerms> {
 
 /// Why a hand-over put or take failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HandOverError {
     /// The driver is gone or the entry was dropped.
     Closed,

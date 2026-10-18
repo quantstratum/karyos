@@ -9,6 +9,7 @@ use thiserror::Error;
 
 /// Errors returned by publications and subscriptions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ClientError {
     /// The message exceeds the publication's maximum message length.
     #[error("message of {length} bytes exceeds the maximum of {max}")]

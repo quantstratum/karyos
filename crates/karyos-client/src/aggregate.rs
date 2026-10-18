@@ -53,6 +53,7 @@ const PEEKS_PER_PROBE: u32 = 2;
 
 /// How a lane ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LaneEnd {
     /// Closed at its seal, with no successor.
     Closed {
@@ -93,6 +94,7 @@ impl LaneEnd {
 
 /// What one poll did on one lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct LanePoll {
     /// Messages delivered.
     pub delivered: u64,
@@ -108,6 +110,7 @@ pub struct LanePoll {
 
 /// The aggregate's terminal: every configured lane ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Terminal {
     /// Whether it is a clean EOS: every lane closed at its seal with a
     /// normal reason and no lane reported a loss.
@@ -116,6 +119,7 @@ pub struct Terminal {
 
 /// What one [`AggregateSubscription::poll`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AggregatePoll {
     /// The DRR's report.
     pub drr: Report,

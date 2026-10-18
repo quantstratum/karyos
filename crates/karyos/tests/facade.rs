@@ -24,6 +24,8 @@ fn claim_through_the_facade(publication: &mut ClientPublication) -> Option<Commi
             | ClaimOutcome::RateLimited,
         )
         | Err(_) => None,
+        // Later outcomes: the enum is non-exhaustive.
+        Ok(_) => None,
     }
 }
 

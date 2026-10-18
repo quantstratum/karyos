@@ -1992,14 +1992,8 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         ],
         ..unreliable.clone()
     };
-    let tai = ScheduleOptions {
-        domain: ClockDomain::Tai,
-        ..ScheduleOptions::default()
-    };
-    let cancel = ScheduleOptions {
-        cancel_on_deadline: true,
-        ..ScheduleOptions::default()
-    };
+    let tai = ScheduleOptions::default().with_domain(ClockDomain::Tai);
+    let cancel = ScheduleOptions::default().with_cancel_on_deadline(true);
     let cases = vec![
         (unreliable.clone(), cancel, Unsupported::CancelOnDeadline),
         // Refused before anything platform-specific: on every platform.
@@ -2009,11 +2003,10 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
             unreliable.clone(),
             // The horizon plus one heartbeat interval (the silence before
             // a held head) reaches the liveness timeout.
-            ScheduleOptions {
-                max_horizon: crate::agents::AgentConfig::default().image_liveness_timeout
+            ScheduleOptions::default().with_max_horizon(
+                crate::agents::AgentConfig::default().image_liveness_timeout
                     - crate::agents::AgentConfig::default().sender_heartbeat_interval,
-                ..ScheduleOptions::default()
-            },
+            ),
             Unsupported::HorizonPastLiveness,
         ),
     ];
@@ -2121,10 +2114,7 @@ fn a_reincarnated_timed_lane_keeps_its_settings_and_counters() {
     });
     assert_eq!(taken, Some(Ok(())));
     assert_eq!(driver.trace_identity(lanes[1]).unwrap().incarnation, 2);
-    let cancel = ScheduleOptions {
-        cancel_on_deadline: true,
-        ..ScheduleOptions::default()
-    };
+    let cancel = ScheduleOptions::default().with_cancel_on_deadline(true);
     assert_eq!(
         driver.schedule_stream(lanes[1], cancel),
         Err(DriverError::InvalidConfig)
