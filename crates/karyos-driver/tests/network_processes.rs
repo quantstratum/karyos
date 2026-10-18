@@ -570,8 +570,9 @@ fn an_image_retired_during_a_remote_fetch_never_leaves_the_grant_open() {
         b.clients() == 0
     });
     assert!(child.0.wait().unwrap().success());
-    // Whichever it was, nothing holds the image's stream any more:
-    // `network_image` hides a retiring stream, so the state is read.
+    // Closed at the seal and the subscriber gone, nothing holds the
+    // image's stream any more: `network_image` hides a retiring stream,
+    // so the state is read.
     pump(&mut a, &mut b, "the image freed", |_, b| {
         b.stream_state(lane).unwrap() == karyos_driver::StreamState::Freed
     });
