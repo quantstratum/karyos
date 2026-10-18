@@ -304,6 +304,31 @@ impl PrefixTracker {
         Ok(())
     }
 
+    /// Recording `recording_id` stopped or failed with its frames durable
+    /// to `durable`: each waiting event whose payload it covers counts
+    /// covered for good, and `uncovered` is called with each one it does
+    /// not cover, which will never be covered (A7d,
+    /// `recording-group-gateway.md` section 7).
+    pub fn recording_ended(
+        &mut self,
+        recording_id: u64,
+        durable: u64,
+        mut uncovered: impl FnMut(u64),
+    ) {
+        for waiting in &mut self.waiting {
+            match waiting.reference {
+                Some((recording, end)) if recording == recording_id => {
+                    if end <= durable {
+                        waiting.reference = None;
+                    } else {
+                        uncovered(waiting.seq);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Whether the queue has room for one more complete event: the strict
     /// admission check before a dispatch.
     #[must_use]
