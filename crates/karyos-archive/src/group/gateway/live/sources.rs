@@ -28,6 +28,7 @@ use karyos_client::{
 use karyos_sys::conflation::{Budget, ConflationConfig};
 use karyos_sys::frame::Lane;
 use karyos_sys::freshness::Freshness as ReadFreshness;
+use karyos_sys::log_buffer::SealReason;
 use karyos_sys::term_bytes::TermBytes;
 
 use super::{Gateway, Port};
@@ -292,9 +293,14 @@ fn reported(summary: &PollSummary) -> Option<Held> {
             reason: EndReason::Revoked,
         });
     }
+    // A seal with no cause is the stream's end; one with a cause (the
+    // stream removed, a required participant lost, ...) closed it.
     summary.closed.map(|position| Held::Ended {
         position,
-        reason: EndReason::EndOfStream,
+        reason: match summary.close_reason {
+            None | Some(SealReason::Unspecified) => EndReason::EndOfStream,
+            Some(_) => EndReason::Closed,
+        },
     })
 }
 
@@ -438,6 +444,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             };
             let event = Event::Conflated {
                 source: id,
+                key,
                 version,
                 freshness: freshness.unwrap_or(Freshness::Fresh),
                 value,

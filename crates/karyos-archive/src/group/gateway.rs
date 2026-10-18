@@ -81,6 +81,8 @@ pub enum Event<'a> {
     Conflated {
         /// The view.
         source: ConflatedId,
+        /// The value's key in the view.
+        key: u32,
         /// The value's version.
         version: u64,
         /// Its freshness.

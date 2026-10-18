@@ -567,8 +567,8 @@ fn conflated_values_are_events() {
     writer.write(3, b"three").unwrap();
     let mut values = Vec::new();
     let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
-        if let Event::Conflated { value, .. } = event {
-            values.push(value.to_vec());
+        if let Event::Conflated { key, value, .. } = event {
+            values.push((*key, value.to_vec()));
         }
     };
     let mut dispatched = 0;
@@ -576,8 +576,9 @@ fn conflated_values_are_events() {
         dispatched += 1;
     }
     assert_eq!(dispatched, 2);
+    // Each value with its own key, in whichever order the view gave them.
     values.sort();
-    assert_eq!(values, [b"three".to_vec(), b"two".to_vec()]);
+    assert_eq!(values, [(2, b"two".to_vec()), (3, b"three".to_vec())]);
     let bytes = records(rig.job, &rig.disk);
     let keys: Vec<(u32, i32)> = decoded(&bytes)
         .into_iter()
@@ -744,4 +745,195 @@ fn strict_reads_an_optional_source_only_with_room() {
         assert!(refused > 0, "{role:?}: the ring never filled");
         assert_eq!(*seen.borrow(), (0..12).collect::<Vec<u8>>(), "{role:?}");
     }
+}
+
+/// A message source that reports one scripted poll summary, then nothing.
+struct Scripted(Option<karyos_client::PollSummary>);
+
+impl MessageSource for Scripted {
+    fn poll_taking(
+        &mut self,
+        _: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        _: MessageLimit,
+    ) -> Result<karyos_client::PollSummary, karyos_client::PollError> {
+        Ok(self.0.take().unwrap_or_default())
+    }
+}
+
+/// The loss events a scripted source's summary makes, as recorded.
+fn scripted_losses(summary: karyos_client::PollSummary) -> Vec<(u64, u64, u64, Loss)> {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let identity = SourceIdentity {
+        stream_id: 9,
+        ..IDENTITY
+    };
+    let _ = rig
+        .gateway
+        .add_subscription(
+            Box::new(Scripted(Some(summary))),
+            identity,
+            Arc::new(RecordingWord::new()),
+        )
+        .unwrap();
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(noop) {}
+    let bytes = records(rig.job, &rig.disk);
+    decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Loss(loss) => Some((loss.from, loss.lost_to, loss.resume, loss.loss)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An overrun is a loss event with its three positions, each its own, and
+/// its rejoin outcome.
+#[test]
+fn an_overrun_is_a_loss_event_with_its_positions() {
+    let summary = karyos_client::PollSummary {
+        overrun: Some(karyos_client::Overrun {
+            from: 100,
+            lost_to: 200,
+            resume: 300,
+        }),
+        rejoin: Some(RejoinOutcome::ResumedAtHead),
+        ..Default::default()
+    };
+    assert_eq!(
+        scripted_losses(summary),
+        [(
+            100,
+            200,
+            300,
+            Loss::Overrun {
+                outcome: OverrunOutcome::ResumedAtHead,
+                fallback: None
+            }
+        )]
+    );
+}
+
+/// A skipped range is a loss event from its position to its end, where
+/// delivery resumes, with its reason.
+#[test]
+fn a_skipped_range_is_a_loss_event() {
+    let summary = karyos_client::PollSummary {
+        skipped: Some(karyos_client::Skipped {
+            position: 64,
+            extent: 32,
+            reason: karyos_sys::log_buffer::SkipReason::MissingEnd,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        scripted_losses(summary),
+        [(
+            64,
+            96,
+            96,
+            Loss::Skipped(karyos_sys::log_buffer::SkipReason::MissingEnd)
+        )]
+    );
+}
+
+/// A due timer strict capture refuses stays due, at its deadline, and
+/// fires once there is room.
+#[test]
+fn a_refused_timer_stays_due() {
+    let mut rig = rig(Capture::Strict, 8 * 1024, 1000, 64 * 1024);
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    rig.gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            effects.schedule(TimerId(2), 900);
+        })
+        .unwrap();
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.deliver_external(1, &[0u8; 600], noop) {}
+    let mut fired = Vec::new();
+    let mut handler = |event: &Event<'_>, effects: &mut dyn Effects| {
+        if let Event::Timer { timer } = event {
+            fired.push((*timer, effects.clock()));
+        }
+    };
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Err(GatewayError::Refused(Refusal::RingFull))
+    );
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    assert!(matches!(
+        rig.gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { .. })
+    ));
+    assert_eq!(fired, [(TimerId(2), 900)]);
+}
+
+/// A seal with no cause ends the source as its stream's end; a seal with
+/// a cause closes it.
+#[test]
+fn a_seal_reason_names_the_end() {
+    for (reason, expected) in [
+        (None, EndReason::EndOfStream),
+        (
+            Some(karyos_sys::log_buffer::SealReason::Unspecified),
+            EndReason::EndOfStream,
+        ),
+        (
+            Some(karyos_sys::log_buffer::SealReason::StreamRemoved),
+            EndReason::Closed,
+        ),
+    ] {
+        let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+        let summary = karyos_client::PollSummary {
+            closed: Some(640),
+            close_reason: reason,
+            ..Default::default()
+        };
+        let _ = rig
+            .gateway
+            .add_subscription(
+                Box::new(Scripted(Some(summary))),
+                SourceIdentity {
+                    stream_id: 9,
+                    ..IDENTITY
+                },
+                Arc::new(RecordingWord::new()),
+            )
+            .unwrap();
+        let mut ends = Vec::new();
+        let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+            if let Event::Lifecycle { kind, .. } = event {
+                ends.push(*kind);
+            }
+        };
+        while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+        assert_eq!(
+            ends,
+            [LifecycleKind::SubscriptionEnded(expected)],
+            "{reason:?}"
+        );
+    }
+}
+
+/// A view whose largest value makes an event of exactly the byte budget is
+/// accepted; one byte more is refused.
+#[test]
+fn a_view_at_the_event_budget_is_accepted() {
+    let budget = 512;
+    let rig_budget = || rig(Capture::Strict, 1 << 16, budget, 64 * 1024);
+    let head =
+        usize::from(CONFLATED_EVENT.block_length) + 12 + 2 + crate::group::gateway::live::END;
+    let fits = budget - head;
+    let (_writer, at) = view(fits);
+    assert!(
+        rig_budget()
+            .gateway
+            .add_conflated(Box::new(at), 5, 1)
+            .is_ok()
+    );
+    let (_writer, over) = view(fits + 1);
+    assert_eq!(
+        rig_budget().gateway.add_conflated(Box::new(over), 5, 1),
+        Err(GatewayError::TooLarge(fits + 1))
+    );
 }

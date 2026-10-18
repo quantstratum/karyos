@@ -432,7 +432,7 @@ release may break APIs, wire formats and shared-memory layouts.
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
 - karyos-client's `MessageInfo` gains `extent`, the bytes the message takes in
-  the stream (the next message starts at `position + extent`), and is
+  the stream (its frames end at `position + extent`), and is
   `#[non_exhaustive]`, so later fields add without breaking; it was built only
   by the client. `ClientSubscription::poll_taking` is public: a handler that
   returns false declines the message, which stays pending for a required reader.

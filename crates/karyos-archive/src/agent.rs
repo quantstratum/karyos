@@ -1231,8 +1231,9 @@ struct State<D: Disk> {
 /// A recording that failed: no stop in the catalog, so the groups settle
 /// their references to it by `durable`, its frames durable at the failure.
 ///
-/// The event loop stops naming a recording once it learns that it failed,
-/// so only references already in the groups' rings can name it. An entry
+/// A Gateway stops naming a recording once its word is cleared, which
+/// happens when it leaves the active set, so only references sent before
+/// that can name it. An entry
 /// is kept until every running group has read its ring empty in a duty
 /// that began after the failure (`seq`), and is dropped then when a start
 /// needs its slot. A failed recording
@@ -2118,8 +2119,13 @@ fn stop<D: Disk>(
     reason: StopReason,
     now: u64,
 ) -> Result<Ended, AgentError> {
-    let id = recording.id;
-    let ended = recording.recorder.close(reason)?;
+    let Active {
+        id, recorder, word, ..
+    } = recording;
+    // Cleared first: a Gateway stops naming the recording before the close
+    // and the catalog's stop, which take time.
+    drop(word);
+    let ended = recorder.close(reason)?;
     catalog.stop(id, ended.position, now, ended.reason, ended.incomplete)?;
     Ok(ended)
 }
