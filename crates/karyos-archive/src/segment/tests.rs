@@ -1807,3 +1807,59 @@ fn a_backward_clock_does_not_sync() {
     assert_eq!(store.tick(50).unwrap(), 10, "no sync on a backward step");
     assert_eq!(store.tick(110).unwrap(), 20);
 }
+
+/// #430 re-check: `open_verified` opens only for reading, never writes,
+/// and reads what `recover` then keeps, older segments included.
+#[test]
+fn open_verified_opens_only_for_reading_and_reads_what_recover_keeps() {
+    let disk = FaultDisk::default();
+    {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(300)).unwrap();
+        store.close().unwrap();
+    }
+    // A torn entry on the last segment: recovery cuts its index.
+    let mut raw = disk.clone();
+    let index = raw
+        .open(&Path::new(DIR).join(index_name(RECORDING, 256)))
+        .unwrap();
+    let length = raw.len(&index).unwrap();
+    raw.set_len(&index, length - 1).unwrap();
+    let before = disk.snapshot();
+    let mut verified = SegmentStore::open_verified(
+        NoWritableOpen(crate::disk::ReadOnly(disk.clone())),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    let written = verified.written();
+    let mut seen = vec![0u8; usize::try_from(written).unwrap()];
+    verified.read(0, &mut seen).unwrap();
+    assert!(verified.append(written, b"x").is_err());
+    assert_eq!(disk.snapshot(), before);
+    let mut recovered = SegmentStore::recover(
+        disk,
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap()
+    .store;
+    assert_eq!(recovered.written(), written);
+    // The torn entry was the last segment's only one; the first is read.
+    assert_eq!(written, 256);
+    let mut kept = vec![0u8; seen.len()];
+    recovered.read(0, &mut kept).unwrap();
+    assert_eq!(seen, kept);
+}

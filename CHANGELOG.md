@@ -11,6 +11,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-archive` recordings handle a mapping cutover
+  (mapping-generations.md, "Recordings"). `Frames` gains `Cutover { at }`
+  (the source moved to the successor; the recording goes on at `at`,
+  with no gap) and `Fenced { at }` (the source cannot follow it). A
+  fenced recording follows its lap policy from the seal: `resume` joins
+  the successor's head with a gap and marks the recording incomplete;
+  `stop`, and a required recording, end at the seal, incomplete, with
+  `StopReason::Lapped`. `Duty::fenced` reports it and
+  `ArchiveHandle::fenced_recordings` counts it; the segment format does
+  not change. `SenderRead::sealed_with_successor` lets the recording
+  source tell a seal for a cutover from a final one. The driver still
+  refuses a cutover of a recorded stream (`RecordingCutover`), so a
+  recording source is fenced at a seal for a cutover until recordings
+  get a successor cell.
 - `karyos-archive` recovery gains a dry run: `SegmentStore::verify`
   returns a `RecoveryPlan` (the kept segment as a `KeptSegment`, the
   `Cut`, and each removed segment as a `DroppedSegment` with its
@@ -432,12 +446,37 @@ release may break APIs, wire formats and shared-memory layouts.
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
 - karyos-client's `MessageInfo` gains `extent`, the bytes the message takes in
-  the stream (the next message starts at `position + extent`), and is
+  the stream (its frames end at `position + extent`), and is
   `#[non_exhaustive]`, so later fields add without breaking; it was built only
   by the client. `ClientSubscription::poll_taking` is public: a handler that
   returns false declines the message, which stays pending for a required reader.
   karyos-sys's `FrameReader::ready_end` gives a complete message's end. For the
   recording group Gateway's sources (phase 3, A7d-2b).
+- The recording group Gateway takes its inputs (phase 3, A7d-2b;
+  `recording-group-gateway.md` sections 4 and 5). `Gateway::add_subscription`
+  adds a message source with its `SourceIdentity` and the `RecordingWord` of
+  the recording that holds its stream; `Gateway::add_conflated` adds a
+  conflated view, refused with `GatewayError::TooLarge` when its largest value
+  could not be recorded. A dispatch fires the earliest due timer first, else
+  takes one event from the next source or view in turn. A message whose
+  length exceeds the inline threshold and whose position the recording holds
+  is recorded by reference; otherwise inline up to `MAX_INLINE`; above it
+  strict capture declines the message (`TooLarge`) and best effort records
+  its payload as unavailable. `Event::Message` gains `extent`, `length` and
+  `payload: MessagePayload` (`Bytes` or `Unavailable`); replay presents the
+  same. A loss or an end a source reports stays held while strict capture
+  refuses it, and strict capture polls a view only when it can admit the
+  event, since reading a value consumes it. `set_inline_threshold` and
+  `set_observation_budget` tune placement and observation. The Archive's
+  `ArchiveHandle::recording_word(stream, session, lane)` gives the shared
+  word naming a required recording of that lane and its start; the word
+  clears when the recording stops, ends or fails. A Gateway takes one
+  source per stream and session (`GatewayError::DuplicateSource`). Strict
+  capture reads a source or a view only when it can admit the event; a
+  message it read and cannot record ends the journal at an incomplete
+  skipped range. `Event::Conflated` carries the value's key.
+  karyos-client's `ConflatedSubscription::config` gives a view's
+  table configuration.
 - The recording group Gateway (phase 3, A7d-2a; `recording-group-gateway.md`
   sections 3, 6 and 8). `karyos_archive::group::gateway` holds the
   `GroupGateway` trait that capture and replay share: `Event`, `Effects` (clock,

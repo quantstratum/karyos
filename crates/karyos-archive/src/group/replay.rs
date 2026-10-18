@@ -413,8 +413,8 @@ pub(crate) fn allocate<T>(capacity: usize) -> Result<Vec<T>, ReplayError> {
 ///
 /// It allocates only when opened: the buffer, the events a reference
 /// unavailable names, and the recorded checkpoints of the range it
-/// replays. Each [`ReplayCursor::step`] reads one
-/// event's records into the buffer and lends them until the next call.
+/// replays. Each [`ReplayCursor::step`] reads one event's records into
+/// the buffer and lends them until the next call.
 #[derive(Debug)]
 pub struct ReplayCursor<D: Disk> {
     journal: GroupJournal<D>,
@@ -433,6 +433,8 @@ pub struct ReplayCursor<D: Disk> {
     /// The last event given (the checkpoint's `group_seq` when opened at
     /// one).
     last_seq: u64,
+    /// The `group_seq` of the checkpoint it was opened at.
+    opened_at: Option<u64>,
     buffer: Vec<u8>,
     spans: Vec<(usize, usize)>,
     /// The final stop, once reached.
@@ -653,6 +655,7 @@ impl<D: Disk> ReplayCursor<D> {
             checkpoints,
             next_checkpoint: 0,
             last_seq: from,
+            opened_at: after,
             buffer,
             spans: allocate(room.records)?,
             stopped: None,
@@ -889,6 +892,13 @@ impl<D: Disk> ReplayCursor<D> {
         });
         self.stopped = Some(stop);
         Ok(Some(stop))
+    }
+
+    /// The `group_seq` of the checkpoint the cursor was opened at
+    /// ([`ReplayCursor::open_at_checkpoint`]); `None` from the start.
+    #[must_use]
+    pub const fn opened_at(&self) -> Option<u64> {
+        self.opened_at
     }
 
     /// The recorded checkpoint of the event just given, if one is due,

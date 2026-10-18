@@ -26,7 +26,7 @@ use karyos_sys::term::TermId;
 
 use super::*;
 use crate::fault::FaultDisk;
-use crate::group::capture::{CaptureConfig, CaptureJob, capture};
+use crate::group::capture::{CaptureConfig, CaptureJob, GroupState, capture};
 use crate::group::gateway::live::{Gateway, Port};
 use crate::group::gateway::{ClaimCommit, DeliveryOutcome, Effects, GroupGateway, PublicationId};
 use crate::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
@@ -89,7 +89,8 @@ fn log(term_length: u32) -> Arc<LogBuffer> {
     Arc::new(
         LogBuffer::new(LogBufferConfig {
             term_length: TermLength::try_new(term_length).unwrap(),
-            spare_slots: 2,
+            // Room for an optional or observer reader's credit.
+            spare_slots: 4,
             max_subscribers: 2,
             mtu: DEFAULT_MTU,
             max_reserved: term_length / 8,
@@ -119,6 +120,17 @@ struct Rig {
 /// A Gateway over one required subscription of a fresh log, the clock
 /// reading 1000 at every call.
 fn rig(mode: Capture, ring_capacity: usize, max_event: usize, term_length: u32) -> Rig {
+    rig_as(Role::Required, mode, ring_capacity, max_event, term_length)
+}
+
+/// [`rig`] with a subscription of `role`.
+fn rig_as(
+    role: Role,
+    mode: Capture,
+    ring_capacity: usize,
+    max_event: usize,
+    term_length: u32,
+) -> Rig {
     let disk = FaultDisk::default();
     let header = JournalHeader {
         group_id: 1,
@@ -151,7 +163,7 @@ fn rig(mode: Capture, ring_capacity: usize, max_event: usize, term_length: u32) 
     gateway.set_inline_threshold(64);
     let buffer = log(term_length);
     let mut conductor = buffer.conductor_owned().unwrap();
-    let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+    let subscription = ClientSubscription::new(conductor.subscribe(role).unwrap());
     let publication = buffer.publication_owned().unwrap().unwrap();
     let word = Arc::new(RecordingWord::new());
     let _ = gateway
@@ -345,36 +357,115 @@ fn strict_declines_a_message_it_cannot_record() {
     assert_eq!(taken + delivered, 12);
 }
 
-/// A payload above `MAX_INLINE` with no recording: strict declines it,
-/// best effort records it with payload unavailable.
+/// A payload that cannot be recorded, already read from its source:
+/// above `MAX_INLINE` with no recording, or under it but past the event
+/// budget. Strict ends the journal at it: the handler gets the skipped
+/// range as a loss whose effects are refused from the start, the Gateway
+/// refuses every later dispatch at once, and the job ends the group
+/// (not failed). Best effort delivers the message: its payload recorded
+/// unavailable above `MAX_INLINE`, else the message is a gap.
 #[test]
-fn a_payload_past_max_inline_is_unavailable() {
-    for mode in [Capture::Strict, Capture::BestEffort] {
-        let mut rig = rig(mode, 1 << 20, 4096, 1024 * 1024);
-        append(&mut rig, &vec![5u8; MAX_INLINE + 1]);
-        let mut ran = false;
-        let result = rig
-            .gateway
-            .dispatch(&mut |_: &Event<'_>, _: &mut dyn Effects| ran = true);
-        match mode {
-            Capture::Strict => {
-                assert_eq!(result, Err(GatewayError::Refused(Refusal::TooLarge)));
-                assert!(!ran);
+fn a_payload_that_cannot_be_recorded() {
+    for (length, max_event) in [(MAX_INLINE + 1, 4096), (2000, 1000)] {
+        for mode in [Capture::Strict, Capture::BestEffort] {
+            let mut rig = rig(mode, 1 << 20, max_event, 1024 * 1024);
+            append(&mut rig, &vec![5u8; length]);
+            let mut seen = Vec::new();
+            let result =
+                rig.gateway
+                    .dispatch(&mut |event: &Event<'_>, effects: &mut dyn Effects| {
+                        seen.push((
+                            matches!(
+                                event,
+                                Event::Loss {
+                                    loss: Loss::Skipped(
+                                        karyos_sys::log_buffer::SkipReason::MessageTooLarge
+                                    ),
+                                    ..
+                                }
+                            ),
+                            effects.offer(PublicationId(1), b"p"),
+                        ));
+                    });
+            match (mode, length > MAX_INLINE) {
+                (Capture::BestEffort, false) => assert_eq!(result, Ok(Dispatched::Uncaptured)),
+                _ => assert_eq!(result, Ok(Dispatched::Event { group_seq: 1 }), "{length}"),
             }
-            Capture::BestEffort => {
-                assert_eq!(result, Ok(Dispatched::Event { group_seq: 1 }));
-                assert!(ran);
-                let bytes = records(rig.job, &rig.disk);
-                assert!(decoded(&bytes).iter().any(|record| matches!(
-                    record,
-                    GroupRecord::Message(MessageEvent {
-                        payload: Payload::Unavailable { .. },
-                        ..
-                    })
-                )));
+            match mode {
+                Capture::Strict => {
+                    assert_eq!(seen, [(true, Outcome::Gated)], "{length}");
+                    assert_eq!(rig.gateway.stats().incomplete, 1);
+                    // Latched: refused before the job runs.
+                    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+                    assert_eq!(rig.gateway.dispatch(noop), Err(GatewayError::Ended));
+                    assert_eq!(
+                        rig.gateway.deliver_external(1, b"", noop),
+                        Err(GatewayError::Ended)
+                    );
+                    let mut job = rig.job;
+                    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+                    assert_eq!(job.state(), GroupState::Ended, "{length}");
+                    let bytes = records(job, &rig.disk);
+                    let records = decoded(&bytes);
+                    assert!(records.iter().any(|record| matches!(
+                        record,
+                        GroupRecord::Loss(LossEvent {
+                            group_seq: 1,
+                            loss: Loss::Skipped(
+                                karyos_sys::log_buffer::SkipReason::MessageTooLarge
+                            ),
+                            ..
+                        })
+                    )));
+                }
+                Capture::BestEffort => {
+                    assert_eq!(seen.len(), 1);
+                    assert!(!seen[0].0, "{length}: a message");
+                    let bytes = records(rig.job, &rig.disk);
+                    let records = decoded(&bytes);
+                    if length > MAX_INLINE {
+                        assert!(records.iter().any(|record| matches!(
+                            record,
+                            GroupRecord::Message(MessageEvent {
+                                payload: Payload::Unavailable { .. },
+                                ..
+                            })
+                        )));
+                    } else {
+                        // Under `MAX_INLINE`, an unavailable payload is not
+                        // a record: the message is a gap, delivered.
+                        assert!(
+                            records
+                                .iter()
+                                .any(|record| matches!(record, GroupRecord::Gap(_)))
+                        );
+                    }
+                }
             }
         }
     }
+}
+
+/// An event the observation budget ends incomplete ends the strict
+/// journal: the Gateway refuses every later dispatch at once, before the
+/// job ends the group, which ends (not fails).
+#[test]
+fn a_strict_incomplete_event_is_latched() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    rig.gateway.set_observation_budget(0);
+    append(&mut rig, b"one");
+    append(&mut rig, b"two");
+    let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
+        assert_eq!(effects.offer(PublicationId(1), b"p"), Outcome::Gated);
+    };
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { group_seq: 1 })
+    );
+    assert_eq!(rig.gateway.dispatch(&mut handler), Err(GatewayError::Ended));
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    assert_eq!(job.state(), GroupState::Ended);
 }
 
 /// The kinds of events a handler saw, dispatching until idle.
@@ -538,8 +629,8 @@ fn conflated_values_are_events() {
     writer.write(3, b"three").unwrap();
     let mut values = Vec::new();
     let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
-        if let Event::Conflated { value, .. } = event {
-            values.push(value.to_vec());
+        if let Event::Conflated { key, value, .. } = event {
+            values.push((*key, value.to_vec()));
         }
     };
     let mut dispatched = 0;
@@ -547,8 +638,9 @@ fn conflated_values_are_events() {
         dispatched += 1;
     }
     assert_eq!(dispatched, 2);
+    // Each value with its own key, in whichever order the view gave them.
     values.sort();
-    assert_eq!(values, [b"three".to_vec(), b"two".to_vec()]);
+    assert_eq!(values, [(2, b"two".to_vec()), (3, b"three".to_vec())]);
     let bytes = records(rig.job, &rig.disk);
     let keys: Vec<(u32, i32)> = decoded(&bytes)
         .into_iter()
@@ -580,12 +672,449 @@ fn strict_leaves_a_view_unread_without_room() {
             seen += 1;
         }
     };
-    assert_eq!(rig.gateway.dispatch(&mut handler), Ok(Dispatched::Idle));
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Err(GatewayError::Refused(Refusal::RingFull))
+    );
     let mut job = rig.job;
     while job.duty(0, 1024, &NoRecordings).unwrap() {}
     assert!(matches!(
         rig.gateway.dispatch(&mut handler),
         Ok(Dispatched::Event { .. })
     ));
+    assert_eq!(seen, 1);
+}
+
+/// The placement's bounds, exactly: a payload of the inline threshold's
+/// length stays inline though the word names a recording, and one of
+/// `MAX_INLINE` bytes is recorded inline by strict capture.
+#[test]
+fn placement_bounds_are_exact() {
+    let mut rig = rig(Capture::Strict, 1 << 20, 70_000, 1024 * 1024);
+    append(&mut rig, &[9u8; 64]);
+    append(&mut rig, &vec![5u8; MAX_INLINE]);
+    rig.word.set(7, 0);
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    assert_eq!(
+        rig.gateway.dispatch(noop),
+        Ok(Dispatched::Event { group_seq: 1 })
+    );
+    rig.word.clear();
+    assert_eq!(
+        rig.gateway.dispatch(noop),
+        Ok(Dispatched::Event { group_seq: 2 })
+    );
+    let bytes = records(rig.job, &rig.disk);
+    let lengths: Vec<Option<usize>> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Message(message) => Some(match message.payload {
+                Payload::Inline(bytes) => Some(bytes.len()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lengths, [Some(64), Some(MAX_INLINE)]);
+}
+
+/// A timer due exactly at the dispatch's read fires; of two due timers
+/// the earlier deadline goes first.
+#[test]
+fn due_timers_fire_earliest_first_at_their_deadline() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    rig.gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            effects.schedule(TimerId(1), 1000);
+            effects.schedule(TimerId(2), 800);
+        })
+        .unwrap();
+    let mut fired = Vec::new();
+    let mut handler = |event: &Event<'_>, effects: &mut dyn Effects| {
+        if let Event::Timer { timer } = event {
+            fired.push((*timer, effects.clock()));
+        }
+    };
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+    assert_eq!(fired, [(TimerId(2), 800), (TimerId(1), 1000)]);
+}
+
+/// A view whose largest value is exactly `MAX_INLINE` is accepted.
+#[test]
+fn a_view_of_max_inline_values_is_accepted() {
+    let mut rig = rig(Capture::Strict, 1 << 20, 70_000, 64 * 1024);
+    let (_writer, view) = view(MAX_INLINE);
+    assert!(rig.gateway.add_conflated(Box::new(view), 5, 1).is_ok());
+}
+
+/// A second source of the same stream and session is refused, even on
+/// another lane: replay names a source by stream and session.
+#[test]
+fn a_second_source_of_a_stream_and_session_is_refused() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let subscription = ClientSubscription::new(rig.conductor.subscribe(Role::Required).unwrap());
+    let other_lane = SourceIdentity {
+        lane: Lane::try_new(1).unwrap(),
+        ..IDENTITY
+    };
+    assert_eq!(
+        rig.gateway.add_subscription(
+            Box::new(subscription),
+            other_lane,
+            Arc::new(RecordingWord::new())
+        ),
+        Err(GatewayError::DuplicateSource {
+            stream_id: 2,
+            session_id: 1
+        })
+    );
+}
+
+/// Strict capture reads an optional or observer source only when it can
+/// record what it reads: such a reader acknowledges on copy, so a message
+/// read and then refused would be lost without trace. With the ring full
+/// nothing is read, and every message comes once there is room.
+#[test]
+fn strict_reads_an_optional_source_only_with_room() {
+    for role in [Role::Optional, Role::Observer] {
+        let mut rig = rig_as(role, Capture::Strict, 8 * 1024, 1000, 64 * 1024);
+        for index in 0..12u8 {
+            append(&mut rig, &[index; 600]);
+        }
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+            if let Event::Message {
+                payload: MessagePayload::Bytes(bytes),
+                ..
+            } = event
+            {
+                seen.borrow_mut().push(bytes[0]);
+            }
+        };
+        let mut job = rig.job;
+        let mut refused = 0;
+        while seen.borrow().len() < 12 {
+            match rig.gateway.dispatch(&mut handler) {
+                Ok(Dispatched::Event { .. }) => {}
+                Err(GatewayError::Refused(Refusal::RingFull | Refusal::InFlight)) => {
+                    refused += 1;
+                    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+                }
+                other => panic!("{role:?}: {other:?} after {:?}", seen.borrow()),
+            }
+            assert!(refused < 100, "{role:?}: no progress");
+        }
+        assert!(refused > 0, "{role:?}: the ring never filled");
+        assert_eq!(*seen.borrow(), (0..12).collect::<Vec<u8>>(), "{role:?}");
+    }
+}
+
+/// A message source that reports one scripted poll summary, then nothing.
+struct Scripted(Option<karyos_client::PollSummary>);
+
+impl MessageSource for Scripted {
+    fn poll_taking(
+        &mut self,
+        _: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        _: MessageLimit,
+    ) -> Result<karyos_client::PollSummary, karyos_client::PollError> {
+        Ok(self.0.take().unwrap_or_default())
+    }
+}
+
+/// The loss events a scripted source's summary makes, as recorded.
+fn scripted_losses(summary: karyos_client::PollSummary) -> Vec<(u64, u64, u64, Loss)> {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let identity = SourceIdentity {
+        stream_id: 9,
+        ..IDENTITY
+    };
+    let _ = rig
+        .gateway
+        .add_subscription(
+            Box::new(Scripted(Some(summary))),
+            identity,
+            Arc::new(RecordingWord::new()),
+        )
+        .unwrap();
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(noop) {}
+    let bytes = records(rig.job, &rig.disk);
+    decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Loss(loss) => Some((loss.from, loss.lost_to, loss.resume, loss.loss)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An overrun is a loss event with its three positions, each its own, and
+/// its rejoin outcome.
+#[test]
+fn an_overrun_is_a_loss_event_with_its_positions() {
+    let summary = karyos_client::PollSummary {
+        overrun: Some(karyos_client::Overrun {
+            from: 100,
+            lost_to: 200,
+            resume: 300,
+        }),
+        rejoin: Some(RejoinOutcome::ResumedAtHead),
+        ..Default::default()
+    };
+    assert_eq!(
+        scripted_losses(summary),
+        [(
+            100,
+            200,
+            300,
+            Loss::Overrun {
+                outcome: OverrunOutcome::ResumedAtHead,
+                fallback: None
+            }
+        )]
+    );
+}
+
+/// A skipped range is a loss event from its position to its end, where
+/// delivery resumes, with its reason.
+#[test]
+fn a_skipped_range_is_a_loss_event() {
+    let summary = karyos_client::PollSummary {
+        skipped: Some(karyos_client::Skipped {
+            position: 64,
+            extent: 32,
+            reason: karyos_sys::log_buffer::SkipReason::MissingEnd,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        scripted_losses(summary),
+        [(
+            64,
+            96,
+            96,
+            Loss::Skipped(karyos_sys::log_buffer::SkipReason::MissingEnd)
+        )]
+    );
+}
+
+/// A due timer strict capture refuses stays due, at its deadline, and
+/// fires once there is room.
+#[test]
+fn a_refused_timer_stays_due() {
+    let mut rig = rig(Capture::Strict, 8 * 1024, 1000, 64 * 1024);
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    rig.gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            effects.schedule(TimerId(2), 900);
+        })
+        .unwrap();
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.deliver_external(1, &[0u8; 600], noop) {}
+    let mut fired = Vec::new();
+    let mut handler = |event: &Event<'_>, effects: &mut dyn Effects| {
+        if let Event::Timer { timer } = event {
+            fired.push((*timer, effects.clock()));
+        }
+    };
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Err(GatewayError::Refused(Refusal::RingFull))
+    );
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    assert!(matches!(
+        rig.gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { .. })
+    ));
+    assert_eq!(fired, [(TimerId(2), 900)]);
+}
+
+/// A seal with no cause ends the source as its stream's end; a seal with
+/// a cause closes it.
+#[test]
+fn a_seal_reason_names_the_end() {
+    for (reason, expected) in [
+        (None, EndReason::EndOfStream),
+        (
+            Some(karyos_sys::log_buffer::SealReason::Unspecified),
+            EndReason::EndOfStream,
+        ),
+        (
+            Some(karyos_sys::log_buffer::SealReason::StreamRemoved),
+            EndReason::Closed,
+        ),
+    ] {
+        let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+        let summary = karyos_client::PollSummary {
+            closed: Some(640),
+            close_reason: reason,
+            ..Default::default()
+        };
+        let _ = rig
+            .gateway
+            .add_subscription(
+                Box::new(Scripted(Some(summary))),
+                SourceIdentity {
+                    stream_id: 9,
+                    ..IDENTITY
+                },
+                Arc::new(RecordingWord::new()),
+            )
+            .unwrap();
+        let mut ends = Vec::new();
+        let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+            if let Event::Lifecycle { kind, .. } = event {
+                ends.push(*kind);
+            }
+        };
+        while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+        assert_eq!(
+            ends,
+            [LifecycleKind::SubscriptionEnded(expected)],
+            "{reason:?}"
+        );
+    }
+}
+
+/// A view whose largest value makes an event of exactly the byte budget is
+/// accepted; one byte more is refused.
+#[test]
+fn a_view_at_the_event_budget_is_accepted() {
+    let budget = 512;
+    let rig_budget = || rig(Capture::Strict, 1 << 16, budget, 64 * 1024);
+    let head =
+        usize::from(CONFLATED_EVENT.block_length) + 12 + 2 + crate::group::gateway::live::END;
+    let fits = budget - head;
+    let (_writer, at) = view(fits);
+    assert!(
+        rig_budget()
+            .gateway
+            .add_conflated(Box::new(at), 5, 1)
+            .is_ok()
+    );
+    let (_writer, over) = view(fits + 1);
+    assert_eq!(
+        rig_budget().gateway.add_conflated(Box::new(over), 5, 1),
+        Err(GatewayError::TooLarge(fits + 1))
+    );
+}
+
+/// The strict end at a payload that cannot be recorded: live and replay
+/// present the same loss, with every call refused.
+#[test]
+fn the_strict_end_replays_as_it_was_captured() {
+    use crate::group::prefix::recover;
+    use crate::group::replay::gateway::{GatewayConfig, ReplayGateway};
+    use crate::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
+    let mut rig = rig(Capture::Strict, 1 << 20, 4096, 1024 * 1024);
+    append(&mut rig, &vec![5u8; MAX_INLINE + 1]);
+    struct Seen(Vec<(String, Outcome)>);
+    impl Handler for Seen {
+        fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
+            self.0
+                .push((format!("{event:?}"), effects.offer(PublicationId(1), b"p")));
+        }
+    }
+    let mut live = Seen(Vec::new());
+    let _ = rig.gateway.dispatch(&mut live).unwrap();
+    let live = live.0;
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    job.close().unwrap();
+    let mut journal = GroupJournal::recover(
+        rig.disk.clone(),
+        Path::new("/g"),
+        1,
+        JournalConfig {
+            segment_length: MIN_SEGMENT_LENGTH,
+            policy: SyncPolicy::Every {
+                interval_ns: u64::MAX,
+            },
+        },
+    )
+    .unwrap()
+    .journal;
+    let recovery = recover(&mut journal, &NoRecordings, 8).unwrap();
+    let cursor = ReplayCursor::open(
+        journal,
+        &recovery,
+        &ReplayConfig {
+            manifest: b"m",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 4096,
+            records: 8,
+        },
+    )
+    .unwrap();
+    let mut replay = ReplayGateway::new(
+        cursor,
+        &GatewayConfig {
+            publications: &[(1, 1)],
+            subscriptions: &[(2, 1)],
+            conflated: &[],
+            max_claim: 64,
+            max_payload: 0,
+            present_unavailable: false,
+        },
+        None,
+    )
+    .unwrap();
+    let mut replayed = Seen(Vec::new());
+    while let Ok(Dispatched::Event { .. }) = replay.dispatch(&mut replayed) {}
+    let replayed = replayed.0;
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].1, Outcome::Gated);
+    assert_eq!(replayed, live);
+}
+
+/// A second view of one stream and session is refused: replay names a
+/// view by the pair.
+#[test]
+fn a_second_view_of_a_stream_and_session_is_refused() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let (_first, one) = view(64);
+    let (_second, two) = view(64);
+    rig.gateway.add_conflated(Box::new(one), 5, 1).unwrap();
+    assert_eq!(
+        rig.gateway.add_conflated(Box::new(two), 5, 1),
+        Err(GatewayError::DuplicateSource {
+            stream_id: 5,
+            session_id: 1
+        })
+    );
+}
+
+/// A view alone, with the ring full: strict reads none of its values and
+/// refuses the dispatch; once there is room the value comes, once.
+#[test]
+fn strict_reads_a_view_only_with_room() {
+    let mut rig = rig(Capture::Strict, 8 * 1024, 1000, 64 * 1024);
+    // Only the view: the message source ended, polled no more.
+    rig.gateway.sources[0].ended = true;
+    let (mut writer, view) = view(64);
+    rig.gateway.add_conflated(Box::new(view), 5, 1).unwrap();
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.deliver_external(1, &[0u8; 600], noop) {}
+    writer.write(1, b"kept").unwrap();
+    let mut seen = 0;
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+        if matches!(event, Event::Conflated { .. }) {
+            seen += 1;
+        }
+    };
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Err(GatewayError::Refused(Refusal::RingFull))
+    );
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    assert!(matches!(
+        rig.gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { .. })
+    ));
+    assert_eq!(rig.gateway.dispatch(&mut handler), Ok(Dispatched::Idle));
     assert_eq!(seen, 1);
 }

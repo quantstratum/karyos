@@ -28,6 +28,7 @@ use karyos_client::{
 use karyos_sys::conflation::{Budget, ConflationConfig};
 use karyos_sys::frame::Lane;
 use karyos_sys::freshness::Freshness as ReadFreshness;
+use karyos_sys::log_buffer::SealReason;
 use karyos_sys::term_bytes::TermBytes;
 
 use super::{Gateway, Port};
@@ -292,22 +293,43 @@ fn reported(summary: &PollSummary) -> Option<Held> {
             reason: EndReason::Revoked,
         });
     }
+    // A seal with no cause is the stream's end; one with a cause (the
+    // stream removed, a required participant lost, ...) closed it.
     summary.closed.map(|position| Held::Ended {
         position,
-        reason: EndReason::EndOfStream,
+        reason: match summary.close_reason {
+            None | Some(SealReason::Unspecified) => EndReason::EndOfStream,
+            Some(_) => EndReason::Closed,
+        },
     })
 }
 
 impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     /// Adds a message source with its identity and the word naming its
-    /// `required` recording here, if any. Configuration only: it
+    /// `required` recording here, if any: the word of the source's own
+    /// lane (`ArchiveHandle::recording_word`). Configuration only: it
     /// allocates.
+    ///
+    /// # Errors
+    ///
+    /// [`GatewayError::DuplicateSource`] for a second source of the same
+    /// stream and session, even on another lane: replay could not tell
+    /// them apart.
     pub fn add_subscription(
         &mut self,
         source: Box<dyn MessageSource + Send>,
         identity: SourceIdentity,
         word: Arc<RecordingWord>,
     ) -> Result<SubscriptionId, GatewayError> {
+        if self.sources.iter().any(|slot| {
+            (slot.identity.stream_id, slot.identity.session_id)
+                == (identity.stream_id, identity.session_id)
+        }) {
+            return Err(GatewayError::DuplicateSource {
+                stream_id: identity.stream_id,
+                session_id: identity.session_id,
+            });
+        }
         let id = u16::try_from(self.sources.len()).map_err(|_| GatewayError::Ended)?;
         self.sources.push(Source {
             source: Some(source),
@@ -326,13 +348,24 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     ///
     /// [`GatewayError::TooLarge`] for a view whose largest value exceeds
     /// `MAX_INLINE` or does not fit the event budget: its values could
-    /// not be recorded.
+    /// not be recorded. [`GatewayError::DuplicateSource`] for a second
+    /// view of one stream and session, which replay could not tell apart.
     pub fn add_conflated(
         &mut self,
         source: Box<dyn ConflatedSource + Send>,
         stream_id: i32,
         session_id: i32,
     ) -> Result<ConflatedId, GatewayError> {
+        if self
+            .views
+            .iter()
+            .any(|view| (view.stream_id, view.session_id) == (stream_id, session_id))
+        {
+            return Err(GatewayError::DuplicateSource {
+                stream_id,
+                session_id,
+            });
+        }
         let largest = source.config().value_capacity;
         let event = usize::from(CONFLATED_EVENT.block_length)
             .checked_add(12 + 2)
@@ -349,6 +382,25 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             closed: false,
         });
         Ok(ConflatedId(id))
+    }
+
+    /// Under strict capture, whether an event can be admitted now: a
+    /// source's message or a view's value is consumed when read (an
+    /// optional reader acknowledges on copy), so strict capture reads one
+    /// only when it can record it. The refusal is counted as a dispatch's
+    /// would be.
+    fn strict_admit(&mut self) -> Result<(), GatewayError> {
+        if self.capture != Capture::Strict {
+            return Ok(());
+        }
+        match self.sender.admit() {
+            Ok(()) => Ok(()),
+            Err(Refusal::Ended | Refusal::Failed | Refusal::Closing) => Err(GatewayError::Ended),
+            Err(refusal) => {
+                let _ = self.count(refusal);
+                Err(GatewayError::Refused(refusal))
+            }
+        }
     }
 
     /// Polls view `index` for one value; `None` when it had none or was
@@ -369,11 +421,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             return Ok(None);
         }
         let (stream_id, session_id) = (view.stream_id, view.session_id);
-        if self.capture == Capture::Strict
-            && (self.pending.is_some() || self.sender.admit().is_err())
-        {
-            return Ok(None);
-        }
+        self.strict_admit()?;
         let Some(mut source) = self
             .views
             .get_mut(index)
@@ -407,6 +455,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             };
             let event = Event::Conflated {
                 source: id,
+                key,
                 version,
                 freshness: freshness.unwrap_or(Freshness::Fresh),
                 value,
@@ -501,6 +550,10 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         if slot.ended {
             return Ok(None);
         }
+        self.strict_admit()?;
+        let Some(slot) = self.sources.get_mut(index) else {
+            return Ok(None);
+        };
         let Some(mut source) = slot.source.take() else {
             return Ok(None);
         };
@@ -543,6 +596,13 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
 
     /// Delivers a loss or an end source `index` reported; it stays held
     /// while strict capture refuses it.
+    ///
+    /// Defensive: a source is read only after `strict_admit`, admission
+    /// only loosens until this delivery (the job only frees room, and only
+    /// this Gateway's sends count in flight), and `Gateway::new`'s least
+    /// event budget holds every loss and lifecycle record, so strict
+    /// capture does not refuse here today; best effort never refuses. The hold keeps a report from being lost
+    /// should a later change let admission fail in between.
     fn deliver_held(
         &mut self,
         index: usize,
@@ -634,22 +694,19 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let length32 =
             u32::try_from(length).map_err(|_| GatewayError::Refused(Refusal::TooLarge))?;
         let threshold = usize::try_from(self.inline_threshold).unwrap_or(usize::MAX);
-        let strict = self.capture == Capture::Strict;
-        let placed = |group_seq: u64, out: &mut [u8]| {
-            let payload = match word.read() {
-                // A recording that started after the message does not
-                // hold it.
-                Some((recording_id, start)) if length > threshold && info.position >= start => {
-                    Payload::Reference {
-                        recording_id,
-                        length: length32,
-                    }
+        // The word is read once: the record and the decision agree.
+        let placement = match word.read() {
+            // A recording that started after the message does not hold it.
+            Some((recording_id, start)) if length > threshold && info.position >= start => {
+                Payload::Reference {
+                    recording_id,
+                    length: length32,
                 }
-                _ if length <= MAX_INLINE => Payload::Inline(bytes),
-                // Strict cannot record it: the message is declined.
-                _ if strict => return Err(Refusal::TooLarge),
-                _ => Payload::Unavailable { length: length32 },
-            };
+            }
+            _ if length <= MAX_INLINE => Payload::Inline(bytes),
+            _ => Payload::Unavailable { length: length32 },
+        };
+        let record = |group_seq: u64, payload: Payload<'_>, out: &mut [u8]| {
             let extension: Option<&[u8; EXTENSION]> = info.extension.as_ref();
             GroupRecord::Message(MessageEvent {
                 group_seq,
@@ -668,6 +725,44 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             .encode(out)
             .map_err(|_| Refusal::TooLarge)
         };
+        // Whether the record fits the event buffer with its end: an inline
+        // payload under `MAX_INLINE` can still exceed the event budget.
+        let fits = self
+            .buffer
+            .len()
+            .checked_sub(super::END)
+            .and_then(|limit| self.buffer.get_mut(..limit))
+            .is_some_and(|room| record(self.next_seq, placement, room).is_ok());
+        // Best effort records an unavailable payload above `MAX_INLINE`
+        // (the record's rule); one under it that does not fit is refused
+        // into the pending gap, delivered unrecorded and counted.
+        let payload = placement;
+        let cannot = !fits || matches!(payload, Payload::Unavailable { .. });
+        if self.capture == Capture::Strict && cannot {
+            // Strict cannot record its payload (a strict journal holds no
+            // unavailable payload), and the message is already read: the
+            // journal ends at it, never silently. The handler gets the
+            // skipped range as a loss whose effects are refused from the
+            // start, as replay presents it.
+            let _ = self.count(Refusal::TooLarge);
+            let end = info
+                .position
+                .checked_add(u64::from(info.extent))
+                .ok_or(GatewayError::Ended)?;
+            self.incomplete_next = true;
+            return self.deliver_held(
+                usize::from(source.0),
+                Held::Loss {
+                    loss: Loss::Skipped(karyos_sys::log_buffer::SkipReason::MessageTooLarge),
+                    from: info.position,
+                    lost_to: end,
+                    resume: end,
+                },
+                now,
+                handler,
+            );
+        }
+        let placed = |group_seq: u64, out: &mut [u8]| record(group_seq, payload, out);
         let event = Event::Message {
             source,
             lane: identity.lane,

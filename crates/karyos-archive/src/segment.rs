@@ -1366,7 +1366,7 @@ impl<D: Disk> SegmentStore<D> {
                 Some(open) => self.disk.read_at(&open.data, offset, chunk)?,
                 None => {
                     let path = self.dir.join(data_name(self.recording, base));
-                    let file = self.disk.open(&path)?;
+                    let file = self.disk.open_read(&path)?;
                     self.disk.read_at(&file, offset, chunk)?;
                 }
             }
@@ -1417,7 +1417,64 @@ impl<D: Disk> SegmentStore<D> {
         disk.sync(&data)?;
         disk.sync(&index)?;
         disk.sync_dir(dir)?;
-        let store = Self {
+        let store = Self::recovered(
+            disk,
+            dir,
+            recording,
+            geometry,
+            policy,
+            kept,
+            (data, index),
+            plan.gaps,
+        );
+        Ok(Recovered {
+            store,
+            cut: plan.cut,
+            dropped_segments: u32::try_from(plan.dropped.len())
+                .map_err(|_| SegmentError::PositionOverflow)?,
+        })
+    }
+
+    /// Opens recording `recording` in `dir` for reading, as
+    /// [`SegmentStore::recover`] would leave it, changing nothing: the plan
+    /// of [`SegmentStore::verify`] applied in memory only. What recovery
+    /// would cut is past `written` and never read; a segment it would drop
+    /// lies past the cut. It opens the files for reading, so it runs on a
+    /// read-only directory, and every write fails there.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentStore::recover`]'s refusals, and the operating system's
+    /// errors.
+    pub fn open_verified(
+        mut disk: D,
+        dir: &Path,
+        recording: u64,
+        geometry: Geometry,
+        policy: SyncPolicy,
+    ) -> Result<Self, SegmentError> {
+        let (plan, files) = scan_recording(&mut disk, dir, recording, geometry, Access::Read)?;
+        let (Some(kept), Some(files)) = (plan.kept, files) else {
+            return Err(SegmentError::NotFound { recording });
+        };
+        Ok(Self::recovered(
+            disk, dir, recording, geometry, policy, kept, files, plan.gaps,
+        ))
+    }
+
+    /// The store a recovery plan leaves, its newest segment `kept` open.
+    #[allow(clippy::too_many_arguments, reason = "the store's fields, once")]
+    fn recovered(
+        disk: D,
+        dir: &Path,
+        recording: u64,
+        geometry: Geometry,
+        policy: SyncPolicy,
+        kept: KeptSegment,
+        (data, index): KeptFiles<D>,
+        gaps: Vec<(u64, u64)>,
+    ) -> Self {
+        Self {
             disk,
             dir: dir.to_path_buf(),
             recording,
@@ -1433,7 +1490,7 @@ impl<D: Disk> SegmentStore<D> {
                 entries: kept.entries,
                 dirty: false,
             }),
-            gaps: plan.gaps,
+            gaps,
             finished: Vec::new(),
             unsynced_behind: None,
             last_sync_ns: 0,
@@ -1442,13 +1499,25 @@ impl<D: Disk> SegmentStore<D> {
             time_ns: 0,
             #[cfg(test)]
             skip_index_sync: false,
-        };
-        Ok(Recovered {
-            store,
-            cut: plan.cut,
-            dropped_segments: u32::try_from(plan.dropped.len())
-                .map_err(|_| SegmentError::PositionOverflow)?,
-        })
+        }
+    }
+
+    /// Ends the store's view at `end`, in memory only, for a store opened
+    /// by [`SegmentStore::open_verified`]: what lies past it is not
+    /// written, and a range up to it that the store does not hold is a
+    /// gap. It is more lenient than [`SegmentStore::recover`] with a
+    /// truncation or a gap: an end inside a write, an end below the start
+    /// and any number of gaps are taken as they are, which a read-only
+    /// view may do and a recovery may not.
+    pub(crate) fn view_until(&mut self, end: u64) {
+        if self.written > end {
+            self.written = end.max(self.start);
+            self.durable = self.durable.min(self.written);
+        } else if self.written < end {
+            self.gaps.push((self.written, end));
+            self.written = end;
+            self.durable = end;
+        }
     }
 
     /// Reports what [`SegmentStore::recover`] would do to recording

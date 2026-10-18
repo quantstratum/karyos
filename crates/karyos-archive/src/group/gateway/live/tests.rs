@@ -360,6 +360,12 @@ fn every_observation_is_recorded_as_the_handler_saw_it() {
 /// The ring's capacity for these tests: eight events of 1 KiB, no more.
 const SMALL_RING: usize = 8 * 1024;
 
+/// An external value that brings an external event's head to the
+/// Gateway's least event budget, so a budget of that least plus `room`
+/// leaves exactly `room` for observations.
+const PAD: [u8; 12 + MESSAGE_EVENT.block_length as usize + 2 + 2 + 64 - (12 + 20 + 2)] =
+    [0; 12 + MESSAGE_EVENT.block_length as usize + 2 + 2 + 64 - (12 + 20 + 2)];
+
 /// Fills the ring with events the job does not drain, until one is
 /// refused; returns how many were taken.
 fn fill(gateway: &mut Gateway<Accepting, Clocked>) -> u64 {
@@ -578,7 +584,7 @@ fn an_event_past_its_buffer_ends_incomplete() {
 /// and the port is never called (REVIEWER-01's repro).
 #[test]
 fn strict_performs_no_call_it_cannot_record() {
-    let max_event = 12 + 20 + 2 + END + 10;
+    let max_event = 12 + 20 + 2 + PAD.len() + END + 10;
     let (mut gateway, job, disk, _) = gateway(Capture::Strict, 1 << 16, max_event);
     let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
         assert_eq!(effects.offer(PublicationId(1), b"p"), Outcome::Gated);
@@ -599,7 +605,7 @@ fn strict_performs_no_call_it_cannot_record() {
         effects.cancel(TimerId(1));
     };
     assert_eq!(
-        gateway.deliver_external(1, b"", &mut handler),
+        gateway.deliver_external(1, &PAD, &mut handler),
         Ok(Dispatched::Event { group_seq: 1 })
     );
     assert_eq!(gateway.port().calls, 0);
@@ -708,13 +714,13 @@ fn a_gateway_that_cannot_work_is_refused() {
 /// observations end where the handler's calls stopped being performed.
 #[test]
 fn a_strict_refusal_ends_the_event_for_later_calls() {
-    let max_event = 12 + 20 + 2 + END + OUTCOME;
+    let max_event = 12 + 20 + 2 + PAD.len() + END + OUTCOME;
     let (mut gateway, job, disk, _) = gateway(Capture::Strict, 1 << 16, max_event);
     let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
         assert_eq!(effects.poll_outcomes(PublicationId(1), 4, &mut |_| {}), 0);
         assert_eq!(effects.offer(PublicationId(1), b"p"), Outcome::Gated);
     };
-    gateway.deliver_external(1, b"", &mut handler).unwrap();
+    gateway.deliver_external(1, &PAD, &mut handler).unwrap();
     assert_eq!(gateway.port().calls, 0);
     let bytes = records(job, &disk);
     assert_eq!(
@@ -752,7 +758,11 @@ fn with_room(
     CaptureJob<FaultDisk>,
     FaultDisk,
 ) {
-    let (gateway, job, disk, _) = gateway(Capture::Strict, 1 << 16, 12 + 20 + 2 + END + room);
+    let (gateway, job, disk, _) = gateway(
+        Capture::Strict,
+        1 << 16,
+        12 + 20 + 2 + PAD.len() + END + room,
+    );
     (gateway, job, disk)
 }
 
@@ -767,7 +777,7 @@ fn strict_room_is_checked_at_its_boundaries() {
         let (mut gateway, job, disk) = with_room(room);
         let mut result = None;
         gateway
-            .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            .deliver_external(1, &PAD, &mut |_: &Event<'_>, effects: &mut dyn Effects| {
                 result = Some(effects.claim(PublicationId(1), 4, &mut |_| true));
             })
             .unwrap();
@@ -799,7 +809,7 @@ fn strict_room_is_checked_at_its_boundaries() {
         gateway.port().deliveries = 2;
         let mut presented = 0;
         gateway
-            .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            .deliver_external(1, &PAD, &mut |_: &Event<'_>, effects: &mut dyn Effects| {
                 presented = effects.poll_outcomes(PublicationId(1), 2, &mut |_| {});
             })
             .unwrap();
@@ -811,7 +821,7 @@ fn strict_room_is_checked_at_its_boundaries() {
     // An offer with room for exactly one record runs and is recorded.
     let (mut gateway, job, disk) = with_room(OUTCOME);
     gateway
-        .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+        .deliver_external(1, &PAD, &mut |_: &Event<'_>, effects: &mut dyn Effects| {
             assert_ne!(effects.offer(PublicationId(1), b"p"), Outcome::Gated);
         })
         .unwrap();
