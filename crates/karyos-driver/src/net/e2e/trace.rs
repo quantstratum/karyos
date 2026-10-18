@@ -365,3 +365,69 @@ fn a_repeated_removal_keeps_the_pending_closes() {
     }
     assert_eq!(counter(&a, "network trace journals unhooked"), 0);
 }
+
+/// #396 review P3: a reincarnation closes the old incarnation's sender
+/// journal before its session's removal, as a removal does, rather than
+/// leaving it to end lost.
+#[test]
+fn a_reincarnation_closes_the_old_sender_journal() {
+    use karyos_sys::guard::Closed;
+    use karyos_sys::log_buffer::SealReason;
+
+    use crate::error::DriverError;
+    use crate::net::NetworkGuard;
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let sender = hook(&mut a, NetSide::Sender);
+    let guard = a.add_guard("journal").unwrap();
+    assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
+    let _ = b
+        .add_network_subscription(10, &channel(ANY_PORT, false))
+        .unwrap();
+    let address = bound(&b, 10);
+    let mut config = aggregate(10, 3, 1);
+    config.stream.buffer.spare_slots = 4;
+    let publication = a
+        .add_guarded_network_publication(
+            config,
+            &channel(address, false),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let sent = sender.opened();
+        sent.len() == 1 && start(drivers[0], sent[0]).is_some()
+    });
+    let sent = sender.opened()[0];
+    let lane = publication.lane(Lane::ZERO).unwrap();
+    // A traced message picked up on the first incarnation.
+    let mut handle = lane_zero(&mut a, &publication);
+    offer_traced(&mut a, &mut b, &mut handle, 7);
+    pump(&mut [&mut a, &mut b], |_| !sender.pickups().is_empty());
+    let pickup = sender.pickups()[0];
+    drop(handle);
+    let Closed::Now { epoch } = a.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].seal_reason(lane) == Ok(Some(SealReason::GuardClosed))
+    });
+    let _ = a.reopen_guard(guard, epoch, epoch).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        matches!(
+            drivers[0].publication(lane),
+            Err(DriverError::QuarantinedAlias { .. })
+        )
+    });
+    // Closed with its facts, not lost: its boundary is past the message.
+    pump(&mut [&mut a, &mut b], |drivers| {
+        entry(drivers[0], sent).is_some_and(|entry| entry.state == JournalState::Closed)
+    });
+    assert_eq!(sender.closed(), [sent]);
+    let facts = entry(&a, sent).unwrap().network.unwrap();
+    assert!(facts.boundary > Some(pickup.1.position), "{facts:?}");
+}

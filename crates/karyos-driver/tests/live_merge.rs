@@ -10,12 +10,14 @@
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use karyos_client::{
     ClientPublication, ClientSubscription, LiveMerge, MergeError, MergePoll, MessageLimit,
-    OfferOutcome, Replay, ReplayStop,
+    OfferOutcome, PollSummary, RejoinOutcome, Replay, ReplayFallbackReason, ReplayProvider,
+    ReplayRejoin, ReplayRequest, ReplayStatus, ReplayStop, ReplayUnavailable, Secondary,
+    SecondaryOutcome,
 };
 use karyos_driver::recording::RecordingLease;
 use karyos_driver::replay::{ReplayFeed, ReplayTargetConfig};
@@ -945,4 +947,416 @@ fn a_fragmented_message_across_the_cutover_is_a_mismatch() {
         })
     );
     assert_eq!(merged.messages.len(), 1);
+}
+
+/// What a test's replay provider was asked, and what it answers next.
+#[derive(Default)]
+struct Asked {
+    requests: Vec<ReplayRequest>,
+    ready: Option<Box<Replay>>,
+    unavailable: Option<ReplayUnavailable>,
+    cancels: usize,
+}
+
+/// A replay provider the test drives: pending until the test hands it a
+/// replay, or a reason.
+#[derive(Clone, Default)]
+struct Provider(Arc<Mutex<Asked>>);
+
+impl ReplayProvider for Provider {
+    fn replay(&mut self, request: &ReplayRequest) -> ReplayStatus {
+        let mut asked = self.0.lock().unwrap();
+        asked.requests.push(*request);
+        if let Some(replay) = asked.ready.take() {
+            return ReplayStatus::Ready(replay);
+        }
+        asked
+            .unavailable
+            .map_or(ReplayStatus::Pending, ReplayStatus::Unavailable)
+    }
+
+    fn cancel(&mut self) {
+        self.0.lock().unwrap().cancels += 1;
+    }
+}
+
+/// A recorded stream and an optional reader of it, from its start, with a
+/// replay rejoin on `provider` and `secondary`, lapped by `published`
+/// messages; returns the driver, the recording, the rejoin and the
+/// stream's identity.
+fn lapped_rejoin(
+    published: u32,
+    provider: &Provider,
+    secondary: Secondary,
+) -> (EmbeddedDriver, Recorded, ReplayRejoin, PublicationIdentity) {
+    let (driver, recorded, rejoin, source, _client) =
+        lapped_client_rejoin(published, provider, secondary);
+    (driver, recorded, rejoin, source)
+}
+
+/// [`lapped_rejoin`], the reader a client's, handed over by its conductor
+/// so it reports its losses; returns the client too.
+fn lapped_client_rejoin(
+    published: u32,
+    provider: &Provider,
+    secondary: Secondary,
+) -> (
+    EmbeddedDriver,
+    Recorded,
+    ReplayRejoin,
+    PublicationIdentity,
+    karyos_client::ClientConductor,
+) {
+    let mut driver = pinned();
+    let mut recorded = Recorded::new(&mut driver, SOURCE);
+    let mut client = driver.connect().unwrap();
+    let _ = client
+        .add_subscription(
+            karyos_protocol::cnc::StreamKey {
+                stream_id: SOURCE,
+                session_id: 1,
+            },
+            karyos_protocol::cnc::SubscriberRole::Optional,
+        )
+        .unwrap();
+    driver.do_work().unwrap();
+    let mut live = None;
+    let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+        karyos_client::Outcome::Subscription(subscription) => live = Some(subscription),
+        other => panic!("unexpected {other:?}"),
+    });
+    let source = driver.trace_identity(recorded.handle).unwrap();
+    let rejoin = ReplayRejoin::new(live.unwrap(), source, Box::new(provider.clone()), secondary);
+    recorded.publish(&mut driver, published, 1000);
+    (driver, recorded, rejoin, source, client)
+}
+
+/// Runs the client and the driver until its loss reports were sent.
+fn settle(driver: &mut EmbeddedDriver, client: &mut karyos_client::ClientConductor) {
+    for _ in 0..1000 {
+        let _ = client.poll(usize::MAX, |completion| {
+            panic!("unexpected completion {completion:?}");
+        });
+        if client.loss_reports_queued() == 0 && client.pending() == 0 {
+            return;
+        }
+        driver.do_work().unwrap();
+    }
+    panic!("the reports never settled");
+}
+
+/// Polls `rejoin` once, collecting each message's sequence and position.
+fn poll_rejoin(
+    driver: &mut EmbeddedDriver,
+    rejoin: &mut ReplayRejoin,
+    seen: &mut Vec<(u32, u64)>,
+) -> PollSummary {
+    driver.do_work().unwrap();
+    rejoin
+        .poll(
+            |bytes, info| seen.push((sequence(bytes), info.position)),
+            MessageLimit::new(16),
+        )
+        .unwrap()
+}
+
+/// The overrun's first poll: it reports the overrun as `Replaying`, and
+/// the next asks the provider for exactly the gap.
+fn overrun_asked(
+    driver: &mut EmbeddedDriver,
+    rejoin: &mut ReplayRejoin,
+    provider: &Provider,
+    source: PublicationIdentity,
+) -> karyos_client::Overrun {
+    let mut seen = Vec::new();
+    let first = poll_rejoin(driver, rejoin, &mut seen);
+    let overrun = first.overrun.unwrap();
+    assert_eq!(first.rejoin, Some(RejoinOutcome::Replaying));
+    assert!(seen.is_empty());
+    assert!(rejoin.is_recovering());
+    let waiting = poll_rejoin(driver, rejoin, &mut seen);
+    assert_eq!(waiting, PollSummary::default());
+    assert!(seen.is_empty());
+    assert_eq!(
+        provider.0.lock().unwrap().requests.last(),
+        Some(&ReplayRequest {
+            source,
+            from: overrun.from,
+            to: overrun.resume,
+        })
+    );
+    overrun
+}
+
+/// A lapped optional reader recovers its gap from a recording: the poll
+/// that sees the overrun reports it as replaying, the provider is asked
+/// for exactly the gap, the replay's messages fill it, and the poll that
+/// settles reports it replayed; the live reader goes on alone. Every
+/// message comes once, in order.
+#[test]
+fn a_lapped_reader_recovers_its_gap_from_a_recording() {
+    let provider = Provider::default();
+    let (mut driver, mut recorded, mut rejoin, source, mut client) =
+        lapped_client_rejoin(300, &provider, Secondary::RejoinAtHead);
+    let overrun = overrun_asked(&mut driver, &mut rejoin, &provider, source);
+    assert_eq!(overrun.from, 0);
+    assert_eq!(client.loss_reports_queued(), 0);
+    let stops = Stops::default();
+    let (replay, mut feeding) = replay_from(
+        &mut driver,
+        &recorded,
+        SOURCE,
+        overrun.from..overrun.resume,
+        None,
+        source,
+        &stops,
+    );
+    provider.0.lock().unwrap().ready = Some(replay);
+    let mut seen = Vec::new();
+    let mut outcomes = Vec::new();
+    for _ in 0..2000 {
+        feeding.step(&mut driver);
+        let summary = poll_rejoin(&mut driver, &mut rejoin, &mut seen);
+        outcomes.extend(summary.rejoin);
+        if seen.len() >= 300 {
+            break;
+        }
+    }
+    assert_eq!(
+        outcomes,
+        [RejoinOutcome::Replayed {
+            cutover: overrun.resume
+        }]
+    );
+    let sequences: Vec<u32> = seen.iter().map(|(sequence, _)| *sequence).collect();
+    assert_eq!(sequences, (0..300).collect::<Vec<_>>());
+    assert!(!rejoin.is_recovering());
+    assert_eq!(stops.count(), 1);
+    // The live reader goes on alone.
+    offer_more(&mut driver, &mut recorded, 300..305);
+    for _ in 0..10 {
+        poll_rejoin(&mut driver, &mut rejoin, &mut seen);
+    }
+    assert_eq!(seen.len(), 305);
+    assert_eq!(seen[300].0, 300);
+    // One loss report, once it resolved: replayed, with no reason.
+    settle(&mut driver, &mut client);
+    let mut records = Vec::new();
+    let _ = driver
+        .loss_report()
+        .scan(&mut 0, |_, record| records.push(record));
+    let [record] = records[..] else {
+        panic!("{records:?}");
+    };
+    assert_eq!(
+        (
+            record.configured_policy,
+            record.applied_policy,
+            record.reason,
+            record.from,
+            record.to
+        ),
+        (4, 5, 0, overrun.from, overrun.lost_to)
+    );
+}
+
+/// Offers messages `sequences` without reading them as the recording does,
+/// so the recording's required reader keeps the retention where the live
+/// reader is.
+fn offer_more(
+    driver: &mut EmbeddedDriver,
+    recorded: &mut Recorded,
+    sequences: std::ops::Range<u32>,
+) {
+    for sequence in sequences {
+        for _ in 0..1000 {
+            if let OfferOutcome::Accepted { .. } = recorded
+                .publication
+                .offer(&message(sequence, 1000))
+                .unwrap()
+            {
+                break;
+            }
+            driver.do_work().unwrap();
+        }
+    }
+}
+
+/// No replay for the gap: the secondary policy applies to it, with the
+/// provider's reason. At the head, the live reader goes on from the
+/// resume; closed, it reports the closure on every poll.
+#[test]
+fn an_unavailable_replay_falls_back_to_the_secondary() {
+    let provider = Provider::default();
+    let (mut driver, mut recorded, mut rejoin, source) =
+        lapped_rejoin(300, &provider, Secondary::RejoinAtHead);
+    let overrun = overrun_asked(&mut driver, &mut rejoin, &provider, source);
+    provider.0.lock().unwrap().unavailable = Some(ReplayUnavailable::RecordingBehind);
+    let mut seen = Vec::new();
+    let fell_back = poll_rejoin(&mut driver, &mut rejoin, &mut seen);
+    assert_eq!(
+        fell_back.rejoin,
+        Some(RejoinOutcome::ReplayFallback {
+            reason: ReplayFallbackReason::RecordingBehind,
+            secondary: SecondaryOutcome::ResumedAtHead,
+        })
+    );
+    assert!(!rejoin.is_recovering());
+    offer_more(&mut driver, &mut recorded, 300..303);
+    for _ in 0..10 {
+        poll_rejoin(&mut driver, &mut rejoin, &mut seen);
+    }
+    assert_eq!(
+        seen.iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<Vec<_>>(),
+        [300, 301, 302]
+    );
+    assert!(seen[0].1 >= overrun.resume);
+
+    let provider = Provider::default();
+    let (mut driver, _recorded, mut rejoin, source) =
+        lapped_rejoin(300, &provider, Secondary::Close);
+    let overrun = overrun_asked(&mut driver, &mut rejoin, &provider, source);
+    provider.0.lock().unwrap().unavailable = Some(ReplayUnavailable::NoRecording);
+    let closed = poll_rejoin(&mut driver, &mut rejoin, &mut Vec::new());
+    let outcome = RejoinOutcome::ReplayFallback {
+        reason: ReplayFallbackReason::NoRecording,
+        secondary: SecondaryOutcome::Closed,
+    };
+    assert_eq!(closed.rejoin, Some(outcome));
+    assert_eq!(closed.closed_by_overrun, Some(overrun));
+    let again = poll_rejoin(&mut driver, &mut rejoin, &mut Vec::new());
+    assert_eq!(
+        (again.rejoin, again.closed_by_overrun),
+        (Some(outcome), Some(overrun))
+    );
+}
+
+/// A replay that does not merge, here of another incarnation, falls back
+/// with `MergeFailed`, and the merge's typed error is kept.
+#[test]
+fn a_replay_that_does_not_merge_falls_back() {
+    let provider = Provider::default();
+    let (mut driver, recorded, mut rejoin, source) =
+        lapped_rejoin(300, &provider, Secondary::RejoinAtHead);
+    let overrun = overrun_asked(&mut driver, &mut rejoin, &provider, source);
+    let other = PublicationIdentity {
+        incarnation: source.incarnation + 1,
+        ..source
+    };
+    let stops = Stops::default();
+    let (replay, _feeding) = replay_from(
+        &mut driver,
+        &recorded,
+        SOURCE,
+        overrun.from..overrun.resume,
+        None,
+        other,
+        &stops,
+    );
+    provider.0.lock().unwrap().ready = Some(replay);
+    let fell_back = poll_rejoin(&mut driver, &mut rejoin, &mut Vec::new());
+    assert_eq!(
+        fell_back.rejoin,
+        Some(RejoinOutcome::ReplayFallback {
+            reason: ReplayFallbackReason::MergeFailed,
+            secondary: SecondaryOutcome::ResumedAtHead,
+        })
+    );
+    assert!(matches!(
+        rejoin.merge_failure(),
+        Some(MergeError::EpochChanged { .. })
+    ));
+    assert_eq!(stops.count(), 1);
+}
+
+/// A live reader lapped again while its gap is recovered, with a replay
+/// that runs past the cutover, is checked there before the merge settles:
+/// the rejoin falls back with
+/// `MergeFailed` (`LiveOverrun`), never `Replayed`. The gap the secondary
+/// covers, and the driver records, runs from the overrun's start to where
+/// the live reader rejoined, past the cutover.
+#[test]
+fn a_live_reader_lapped_before_the_cutover_falls_back() {
+    let provider = Provider::default();
+    let (mut driver, mut recorded, mut rejoin, source, mut client) =
+        lapped_client_rejoin(300, &provider, Secondary::RejoinAtHead);
+    let overrun = overrun_asked(&mut driver, &mut rejoin, &provider, source);
+    // The recording reads on past the live reader, held at its resume: the
+    // floor passes it, and it is lapped again.
+    recorded.publish(&mut driver, 100, 1000);
+    // A replay past the cutover: the merge checks the live reader's first
+    // message against the replay's there.
+    let end = recorded.reader.position();
+    assert!(end > overrun.resume);
+    let stops = Stops::default();
+    let (replay, mut feeding) = replay_from(
+        &mut driver,
+        &recorded,
+        SOURCE,
+        overrun.from..end,
+        None,
+        source,
+        &stops,
+    );
+    provider.0.lock().unwrap().ready = Some(replay);
+    let mut seen = Vec::new();
+    let mut outcomes = Vec::new();
+    for _ in 0..2000 {
+        feeding.step(&mut driver);
+        let summary = poll_rejoin(&mut driver, &mut rejoin, &mut seen);
+        outcomes.extend(summary.rejoin);
+        if !rejoin.is_recovering() {
+            break;
+        }
+    }
+    assert_eq!(
+        outcomes,
+        [RejoinOutcome::ReplayFallback {
+            reason: ReplayFallbackReason::MergeFailed,
+            secondary: SecondaryOutcome::ResumedAtHead,
+        }]
+    );
+    assert!(matches!(
+        rejoin.merge_failure(),
+        Some(MergeError::LiveOverrun(_))
+    ));
+    // The replay's messages, the whole gap, and none of the live reader's.
+    let sequences: Vec<u32> = seen.iter().map(|(sequence, _)| *sequence).collect();
+    assert_eq!(sequences, (0..300).collect::<Vec<_>>());
+    assert_eq!(stops.count(), 1);
+    let rejoined = rejoin.into_live().unwrap().position();
+    assert!(rejoined > overrun.resume, "{rejoined} {overrun:?}");
+    settle(&mut driver, &mut client);
+    let mut records = Vec::new();
+    let _ = driver
+        .loss_report()
+        .scan(&mut 0, |_, record| records.push(record));
+    let [record] = records[..] else {
+        panic!("{records:?}");
+    };
+    assert_eq!(
+        (
+            record.configured_policy,
+            record.applied_policy,
+            record.reason,
+            record.from,
+            record.to
+        ),
+        (4, 1, 6, overrun.from, rejoined)
+    );
+}
+
+/// The live reader can be taken back while a gap is asked for: the
+/// request is withdrawn.
+#[test]
+fn a_rejoin_gives_its_live_reader_back() {
+    let provider = Provider::default();
+    let (mut driver, _recorded, mut rejoin, source) =
+        lapped_rejoin(300, &provider, Secondary::RejoinAtHead);
+    let overrun = overrun_asked(&mut driver, &mut rejoin, &provider, source);
+    let live = rejoin.into_live().unwrap();
+    assert_eq!(provider.0.lock().unwrap().cancels, 1);
+    assert_eq!(live.position(), overrun.resume);
 }

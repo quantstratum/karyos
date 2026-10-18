@@ -484,8 +484,9 @@ impl Connection for crate::ipc::RemoteClient {
     }
 
     fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) {
-        // Dropped: the handle detaches its export and ends its registration.
-        drop(publication);
+        // A handle that cannot be removed now is dropped: it detaches its
+        // export, and its registration ends with the client.
+        let _ = crate::ipc::RemoteClient::remove_publication(self, publication);
     }
 
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError> {
@@ -527,11 +528,18 @@ impl Connection for crate::ipc::RemoteClient {
 
     fn release(&mut self, outcome: Outcome) -> bool {
         match outcome {
-            // Taken and dropped: the handle detaches its export and ends
-            // its registration.
+            // Taken, then released: a publication is removed, as a
+            // released one is; a subscription is dropped, which detaches
+            // its export and ends its registration.
             Outcome::Fetchable(fetchable) => match fetchable.request {
                 crate::conductor::Request::Publication { .. } => {
-                    self.take_publication(&fetchable).is_ok()
+                    match self.take_publication(&fetchable) {
+                        Ok(publication) => {
+                            self.release_publication(publication);
+                            true
+                        }
+                        Err(_) => false,
+                    }
                 }
                 crate::conductor::Request::Subscription { .. } => {
                     self.take_subscription(&fetchable).is_ok()
