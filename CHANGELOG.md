@@ -262,6 +262,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A removed routed publication sends each lane's EOS on every live path
+  (redundant paths; rp-w5b follow-up). A lane is drained once its first
+  sends reached its seal on every path that can send now; a path whose
+  TX half is detached, that is resetting or that left the live set
+  neither holds the drain nor gets the EOS, and one that returns during
+  the linger gets the repeats. The EOS counts as sent once one path
+  submitted it; a closed guard sends it on none. Routed removals no
+  longer linger without EOS.
 - A recording group's three prefixes (phase 3, A7c; SPEC §8.3).
   `karyos_archive::group::prefix::PrefixTracker` tracks `delivered_seq`,
   `complete_recording_seq` and `durable_group_seq`: an event is complete
@@ -915,6 +923,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A removed network publication's sender closes its lane queues, its
+  repair queue and its route at its next duty (#354 review P3-6;
+  driver-network-agents.md §7: the sender drops its queues), on every
+  path of a routed one, instead of leaving them open until the endpoint
+  retires. A half the sender does not hold then, or one in another
+  epoch, dropped them already. Counted (`removed_closed`); items still
+  pending in a closing queue are returned and counted
+  (`removed_returned`), and a full close list, never expected, is
+  counted (`removed_unrecorded`).
 - The driver's loopback tests no longer pick a free port by binding a
   socket, dropping it and binding the port again later, which another
   process could take in between. A test's embedded subscription binds on
