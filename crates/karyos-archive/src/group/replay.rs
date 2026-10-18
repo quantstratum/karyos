@@ -484,6 +484,10 @@ impl<D: Disk> ReplayCursor<D> {
     /// Returns the cursor and the checkpoint's record; the snapshot is
     /// `snapshot[..length]`.
     ///
+    /// Recover with the group's reopen hold
+    /// ([`super::prefix::recover_with_hold`]): with another, a range a
+    /// checkpoint reopened may be recovered otherwise than it ran.
+    ///
     /// # Errors
     ///
     /// [`ReplayError::UnknownCheckpoint`], [`ReplayError::NotInPrefix`],

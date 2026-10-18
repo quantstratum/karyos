@@ -286,7 +286,7 @@ fn the_reopen_hold_allocates_nothing_after_configuration() {
     }
 
     let mut tracker = PrefixTracker::new(2);
-    tracker.reserve_reopen_hold(8);
+    tracker.reserve_reopen_hold(8).unwrap();
     let mut records = vec![GroupRecord::Header(JournalHeader {
         group_id: 4,
         first_group_seq: 1,
