@@ -942,7 +942,10 @@ pub fn recover<D: crate::disk::Disk>(
 /// [`recover`], with the reopening window sized to `hold` events
 /// ([`PrefixTracker::reserve_reopen_hold`], at least `capacity`) before
 /// the first record: the running tracker's, so a range a checkpoint
-/// reopened is recovered as it ran.
+/// reopened is recovered as it ran. Recover with the group's reopen
+/// hold (`GroupCheckpoints::reopen_hold`, or its default): a smaller one
+/// may let go of events the run held, a larger one may hold events the
+/// run let go.
 ///
 /// # Errors
 ///
