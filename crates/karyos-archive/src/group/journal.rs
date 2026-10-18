@@ -46,7 +46,8 @@ mod tests;
 
 /// The default segment length: 16 MiB.
 pub const DEFAULT_SEGMENT_LENGTH: u32 = 16 << 20;
-/// The shortest segment: one record of the largest size and an envelope.
+/// The shortest segment: the power of two above the largest record
+/// ([`MAX_RECORD`], about 64 KiB), so a segment always holds one whole.
 pub const MIN_SEGMENT_LENGTH: u32 = 128 << 10;
 
 /// How a journal is stored.
@@ -94,6 +95,13 @@ pub enum JournalError {
     NotWhole {
         /// The bytes after the last whole record.
         length: usize,
+    },
+    /// A header naming another group than the journal's: refused,
+    /// nothing written.
+    #[error("a header of group {found}, not this journal's")]
+    Group {
+        /// The group the header named.
+        found: u64,
     },
     /// A recovered journal holds a record that is not valid at
     /// `position`, or a header naming another group.
@@ -239,7 +247,15 @@ impl<D: Disk> GroupJournal<D> {
             let record = records.get(offset..end).ok_or(JournalError::NotWhole {
                 length: records.len() - offset,
             })?;
-            check.push(GroupRecord::decode(record)?.role())?;
+            let decoded = GroupRecord::decode(record)?;
+            if let GroupRecord::Header(header) = decoded
+                && header.group_id != self.group_id
+            {
+                return Err(JournalError::Group {
+                    found: header.group_id,
+                });
+            }
+            check.push(decoded.role())?;
             offset = end;
         }
         // Then written: runs of whole records, padded at each segment end
@@ -264,12 +280,12 @@ impl<D: Disk> GroupJournal<D> {
         Ok(self.store.written())
     }
 
-    /// Reads the records from `from`, a record boundary, in order, giving
-    /// each with its position and its end to `visit` until it returns
-    /// `false` or the
+    /// Reads the records from `from`, in order, giving each with its
+    /// position and its end to `visit` until it returns `false` or the
     /// written position is reached; padding is skipped. Returns where it
     /// stopped: the position of the record `visit` declined, or the
-    /// written position.
+    /// written position. `from` must be a record boundary: 0, a position
+    /// `visit` was given, or a position `walk` returned.
     ///
     /// # Errors
     ///
@@ -316,8 +332,16 @@ impl<D: Disk> GroupJournal<D> {
             .ok_or(JournalError::Corrupt { position })?;
         let left = segment_end.min(written) - position;
         let envelope = u64::try_from(ENVELOPE_LENGTH).map_err(|_| JournalError::InvalidConfig)?;
+        // Padding always runs to its segment's end: a short tail or a zero
+        // length before the written position's segment end is no padding
+        // the journal wrote.
+        let padded = segment_end <= written;
         if left < envelope {
-            return Ok(Some((0, segment_end.min(written))));
+            return if padded {
+                Ok(Some((0, segment_end)))
+            } else {
+                Err(JournalError::Corrupt { position })
+            };
         }
         let head = self
             .scratch
@@ -326,7 +350,11 @@ impl<D: Disk> GroupJournal<D> {
         self.store.read(position, head)?;
         let declared = Envelope::read(head)?.message_length;
         if declared == 0 {
-            return Ok(Some((0, segment_end.min(written))));
+            return if padded {
+                Ok(Some((0, segment_end)))
+            } else {
+                Err(JournalError::Corrupt { position })
+            };
         }
         let length = usize::try_from(declared)
             .ok()

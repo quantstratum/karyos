@@ -478,3 +478,102 @@ fn a_tail_shorter_than_an_envelope_is_padding() {
     .journal;
     assert_eq!(read_back(&mut journal), expected);
 }
+
+/// #383 review P2: a journal that recovered empty takes only its own
+/// group's header; another group's is refused, nothing written, and the
+/// journal recovers after.
+#[test]
+fn an_empty_journal_takes_only_its_own_header() {
+    let geometry = config(SyncPolicy::None).geometry().unwrap();
+    let disk = FaultDisk::default();
+    let store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        GROUP,
+        geometry,
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    store.close_synced().unwrap();
+    let disk = disk.after_crash(Survives::Synced);
+    let mut journal = GroupJournal::recover(
+        disk.clone(),
+        Path::new(DIR),
+        GROUP,
+        config(SyncPolicy::None),
+    )
+    .unwrap()
+    .journal;
+    assert_eq!(journal.order().records(), 0);
+    let other = encode(&GroupRecord::Header(JournalHeader {
+        group_id: GROUP + 1,
+        ..header()
+    }));
+    assert!(matches!(
+        journal.append(&other),
+        Err(JournalError::Group { found }) if found == GROUP + 1
+    ));
+    assert_eq!(journal.written(), 0);
+    journal
+        .append(&encode(&GroupRecord::Header(header())))
+        .unwrap();
+    journal.close().unwrap();
+    let mut journal = GroupJournal::recover(
+        disk.after_crash(Survives::Synced),
+        Path::new(DIR),
+        GROUP,
+        config(SyncPolicy::None),
+    )
+    .unwrap()
+    .journal;
+    assert_eq!(read_back(&mut journal).len(), 1);
+}
+
+/// #383 review P3: a record whose declared length runs past the written
+/// position, or a short tail before the written position's segment end,
+/// is corruption at recovery, not padding or a store error.
+#[test]
+fn recovery_refuses_a_record_past_the_written_end() {
+    let geometry = config(SyncPolicy::None).geometry().unwrap();
+    let header = encode(&GroupRecord::Header(header()));
+    for tail in [
+        // A whole timer event, its length raised by 8.
+        {
+            let mut long = timer(1);
+            let declared = u32::try_from(long.len() + 8).unwrap();
+            long[8..12].copy_from_slice(&declared.to_le_bytes());
+            long
+        },
+        // Five bytes, fewer than an envelope.
+        vec![1, 2, 3, 4, 5],
+        // An envelope of zeros, which only padding has.
+        vec![0; 12],
+    ] {
+        let disk = FaultDisk::default();
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            GROUP,
+            geometry,
+            SyncPolicy::None,
+            0,
+        )
+        .unwrap();
+        store.append(0, &header).unwrap();
+        store.append(store.written(), &tail).unwrap();
+        store.close_synced().unwrap();
+        assert!(
+            matches!(
+                GroupJournal::recover(
+                    disk.after_crash(Survives::Synced),
+                    Path::new(DIR),
+                    GROUP,
+                    config(SyncPolicy::None),
+                ),
+                Err(JournalError::Corrupt { position }) if position == u64::try_from(header.len()).unwrap()
+            ),
+            "{tail:?}"
+        );
+    }
+}
