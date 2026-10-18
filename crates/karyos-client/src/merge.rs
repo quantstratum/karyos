@@ -377,10 +377,10 @@ impl<T: TermBytes> LiveMerge<T> {
 
     /// Delivers up to `message_limit` messages to `handler`: the replay's
     /// below the cutover, then the live reader's. A limit of 0 does
-    /// nothing, but a failed merge still reports its failure. A poll stops at the replay's first report (a skipped range
-    /// or an aborted block below the cutover) and at the cutover itself;
-    /// after it, the live reader is polled as [`ClientSubscription::poll`]
-    /// polls.
+    /// nothing, but a failed merge still reports its failure. A poll stops
+    /// at the replay's first report (a skipped range or an aborted block
+    /// below the cutover) and at the cutover itself; after it, the live
+    /// reader is polled as [`ClientSubscription::poll`] polls.
     ///
     /// # Errors
     ///

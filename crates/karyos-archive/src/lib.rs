@@ -12,6 +12,7 @@
 
 pub mod agent;
 pub mod catalog;
+pub mod client;
 pub mod control;
 pub mod crc32c;
 pub mod disk;

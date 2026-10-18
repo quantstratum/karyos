@@ -68,7 +68,9 @@ pub struct AgentConfig {
     pub max_replays: usize,
     /// How long a prepared replay waits for its sink. Past it the agent
     /// drops it, so a sink never attached, its post lost or its server
-    /// gone, does not hold a replay's slot.
+    /// gone, does not hold a replay's slot. Keep it above the time a host
+    /// takes to open a target: 0 drops every prepared replay on the
+    /// agent's next cycle, before any attach can find it.
     pub prepared_timeout: Duration,
     /// How long an idle cycle waits for a command.
     pub idle: Duration,
@@ -969,8 +971,10 @@ fn run<D>(
                 return;
             }
         }
-        worked |= state.duty(outbox, now());
+        // Right after the commands: an attach this cycle served still found
+        // its replay.
         state.replays.expire(now(), config.prepared_timeout);
+        worked |= state.duty(outbox, now());
         // After the recorders: they keep priority.
         worked |= state
             .replays
