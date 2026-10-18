@@ -254,8 +254,12 @@ pub struct MessageEvent<'a> {
     pub payload: Payload<'a>,
 }
 
-/// A trace extension's length.
+/// A trace extension's length: `karyos_sys::frame::EXTENSION_LENGTH`.
 pub const EXTENSION: usize = 64;
+const _: () = assert!(
+    karyos_sys::frame::EXTENSION_LENGTH == 64,
+    "EXTENSION is the frame's extension length"
+);
 /// The end-of-stream flag of a message event.
 const FLAG_END_OF_STREAM: u8 = 1;
 /// The trace-extension flag of a message event.
@@ -661,6 +665,58 @@ const MAX_SUB: [u16; 22] = [
     0, 0, 0, 0, 0, 7, 0, 4, 0, 0, 0, 26, 0, 0, 6, 11, 0, 0, 16, 0, 6, 0,
 ];
 
+/// Per `ClientError` code with no inner error, its numeric fields, and
+/// per inner error, its variants' numeric fields from `sub` 1 (section 5.1
+/// of the note); an `Option<u64>` counts as two (its value and its flag).
+const FLAT_FIELDS: [u8; 22] = [
+    0, 2, 0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0,
+];
+const CONFLATION_FIELDS: [u8; 7] = [0, 1, 2, 0, 0, 0, 2];
+const OUTCOMES_FIELDS: [u8; 4] = [0, 1, 1, 0];
+const SYS_FIELDS: [u8; 26] = [
+    1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 1, 0, 2, 0, 0, 0, 1, 0, 0, 1, 0, 2, 1, 2,
+];
+const ATTACH_FIELDS: [u8; 6] = [1, 2, 0, 0, 0, 0];
+const CONDUCTOR_FIELDS: [u8; 11] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+const VIEW_FIELDS: [u8; 6] = [1, 1, 1, 2, 1, 2];
+
+/// The numeric fields a failure of `error` and `sub` (already checked)
+/// carries, and whether the second is an `Option` flag.
+fn fields_of(error: u16, sub: u16) -> (u8, bool) {
+    let inner = |table: &[u8]| {
+        usize::from(sub)
+            .checked_sub(1)
+            .and_then(|at| table.get(at).copied())
+            .unwrap_or_default()
+    };
+    match error {
+        5 => (inner(&CONFLATION_FIELDS), false),
+        7 => (inner(&OUTCOMES_FIELDS), false),
+        11 => (inner(&SYS_FIELDS), false),
+        14 => (inner(&ATTACH_FIELDS), sub == 2),
+        15 => (inner(&CONDUCTOR_FIELDS), false),
+        20 => (inner(&VIEW_FIELDS), sub == 4),
+        _ => (
+            FLAT_FIELDS
+                .get(usize::from(error))
+                .copied()
+                .unwrap_or_default(),
+            false,
+        ),
+    }
+}
+
+/// Whether a failure's details fit its variant: a field it does not have
+/// is 0, and an `Option`'s flag is 0 or 1, with its value 0 when absent.
+fn details_fit(error: u16, sub: u16, detail: u64, detail2: u64) -> bool {
+    match fields_of(error, sub) {
+        (0, _) => detail == 0 && detail2 == 0,
+        (1, _) => detail2 == 0,
+        (_, true) => detail2 == 1 || (detail2 == 0 && detail == 0),
+        _ => true,
+    }
+}
+
 /// Whether `sub` names a variant of `error`'s inner error: 1 to its count
 /// when it has one, else 0.
 fn sub_of(error: u16, sub: u16) -> bool {
@@ -792,6 +848,9 @@ impl OutcomeObservation {
             7 => Outcome::RateLimited,
             _ if error == 0 || error > MAX_ERROR_CODE => return Err(out_of_range("error")),
             _ if !sub_of(error, sub) => return Err(out_of_range("sub")),
+            _ if !details_fit(error, sub, detail, detail2) => {
+                return Err(out_of_range("detail"));
+            }
             _ => Outcome::Failed {
                 error,
                 sub,
@@ -833,6 +892,14 @@ impl OutcomeObservation {
             }
             Outcome::Failed { error, sub, .. } if !sub_of(error, sub) => {
                 return Err(out_of_range("sub"));
+            }
+            Outcome::Failed {
+                error,
+                sub,
+                detail,
+                detail2,
+            } if !details_fit(error, sub, detail, detail2) => {
+                return Err(out_of_range("detail"));
             }
             Outcome::Failed {
                 error,
@@ -902,6 +969,14 @@ pub struct DeliveryObservation {
 
 /// The outcome ring's kind codes.
 const DELIVERY_KINDS: [u8; 9] = [1, 2, 3, 4, 5, 16, 17, 18, 19];
+/// The ring's outcomes-lost kind.
+const OUTCOMES_LOST: u8 = 19;
+
+/// The ring's range-side kinds (`Kind::is_range`): range, interrupted,
+/// ended and outcomes lost.
+const fn range_side(kind: u8) -> bool {
+    matches!(kind, 16..=19)
+}
 
 impl DeliveryObservation {
     fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
@@ -909,6 +984,14 @@ impl DeliveryObservation {
         let kind = block.u8(70)?;
         if !DELIVERY_KINDS.contains(&kind) {
             return Err(invalid_enum("kind", kind));
+        }
+        // As the ring itself refuses (`outcome_ring::Record`): a receiver
+        // only on a range-side kind, a lost count only on outcomes lost.
+        if !range_side(kind) && block.u16(68)? != 0 {
+            return Err(out_of_range("receiver"));
+        }
+        if kind != OUTCOMES_LOST && block.u64(48)? != 0 {
+            return Err(out_of_range("lost"));
         }
         Ok(Self {
             group_seq: id("group_seq", block.u64(0)?)?,
@@ -937,6 +1020,12 @@ impl DeliveryObservation {
         let mut encoder = Encoder::new(out, &DELIVERY_OBSERVATION)?;
         if !DELIVERY_KINDS.contains(&self.kind) {
             return Err(out_of_range("kind"));
+        }
+        if !range_side(self.kind) && self.receiver != 0 {
+            return Err(out_of_range("receiver"));
+        }
+        if self.kind != OUTCOMES_LOST && self.lost != 0 {
+            return Err(out_of_range("lost"));
         }
         encoder.u64(0, id("group_seq", self.group_seq)?)?;
         encoder.u64(8, self.incarnation)?;
