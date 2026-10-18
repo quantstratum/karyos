@@ -163,6 +163,7 @@ fn replaying_from(
         },
         archive,
     )
+    .unwrap()
 }
 
 /// A handler that writes down each event and, on a message, offers its
@@ -605,5 +606,88 @@ fn an_incomplete_event_is_captured_incomplete() {
             encoded(&records[1]),
             encoded(&records[2])
         ]
+    );
+}
+
+/// An event a reference unavailable (template 22) names is not presented
+/// with the payload, even while its recording still holds the frames:
+/// not reproducible, or with the opt-in, presented with no payload.
+#[test]
+fn a_reference_named_unavailable_is_not_read() {
+    use crate::group::record::ReferenceUnavailable;
+
+    let (archive, event) = by_reference(b"by reference!");
+    let records = [
+        event,
+        end(1, 0, EndOutcome::Complete),
+        GroupRecord::Unavailable(ReferenceUnavailable {
+            group_seq: 1,
+            recording_id: 7,
+        }),
+    ];
+    let mut gateway = replaying_from(Capture::BestEffort, &records, false, Some(archive.clone()));
+    assert_eq!(
+        gateway.dispatch(&mut Echo::default()),
+        Err(GatewayError::NotReproducible { group_seq: 1 })
+    );
+    let mut gateway = replaying_from(Capture::BestEffort, &records, true, Some(archive));
+    let mut payloads = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+        if let Event::Message { payload, .. } = event {
+            payloads.push(payload.to_vec());
+        }
+    };
+    assert_eq!(
+        gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { group_seq: 1 })
+    );
+    assert_eq!(payloads, [Vec::<u8>::new()]);
+}
+
+/// A table that names one stream and session twice is refused at
+/// configuration: an event would silently be its first id's.
+#[test]
+fn a_duplicate_source_is_refused_at_configuration() {
+    let gateway = || replaying(Capture::Strict, &offered(), false).into_parts().0;
+    for (publications, subscriptions) in [
+        (&[(20, 5), (20, 5)][..], &SUBSCRIPTIONS[..]),
+        (&PUBLICATIONS[..], &[(10, 3), (10, 3)][..]),
+    ] {
+        let refused = ReplayGateway::new(
+            gateway(),
+            &GatewayConfig {
+                publications,
+                subscriptions,
+                conflated: &[],
+                max_claim: 64,
+                max_payload: 256,
+                present_unavailable: false,
+            },
+            None,
+        );
+        assert!(matches!(refused, Err(ReplayError::InvalidConfig)));
+    }
+}
+
+/// An incomplete event a reference unavailable names is not presented
+/// either: the cursor's scan covers the event it gives after the prefix.
+#[test]
+fn an_incomplete_event_named_unavailable_is_not_presented() {
+    use crate::group::record::ReferenceUnavailable;
+
+    let (archive, event) = by_reference(b"by reference!");
+    let records = [
+        event,
+        end(1, 0, EndOutcome::Incomplete),
+        GroupRecord::Unavailable(ReferenceUnavailable {
+            group_seq: 1,
+            recording_id: 7,
+        }),
+    ];
+    let mut gateway = replaying_from(Capture::BestEffort, &records, false, Some(archive));
+    let mut never = |_: &Event<'_>, _: &mut dyn Effects| panic!("presented");
+    assert_eq!(
+        gateway.dispatch(&mut never),
+        Err(GatewayError::NotReproducible { group_seq: 1 })
     );
 }

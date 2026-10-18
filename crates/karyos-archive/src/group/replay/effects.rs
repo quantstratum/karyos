@@ -348,6 +348,26 @@ impl<'e, 's> ReplayEffects<'e, 's> {
         self.publications.get(usize::from(publication.0)).copied()
     }
 
+    /// Diverges at the next observation, unless replay already did:
+    /// `call` is not the recorded one there.
+    fn diverge(&mut self, call: Call) {
+        if self.diverged.is_some() {
+            return;
+        }
+        let kind = match self.peek() {
+            Some(record) => DivergenceKind::Call {
+                expected: recorded(&record),
+                found: call,
+            },
+            None => DivergenceKind::Extra { found: call },
+        };
+        self.diverged = Some(Divergence {
+            group_seq: self.event.group_seq(),
+            index: self.index(),
+            kind,
+        });
+    }
+
     /// Takes the next observation for `call`, or diverges: `matches` says
     /// whether the record answers the call.
     fn take(
@@ -471,7 +491,15 @@ impl Effects for ReplayEffects<'_, '_> {
     }
 
     fn offer(&mut self, publication: PublicationId, payload: &[u8]) -> Outcome {
-        let intent = digest(payload);
+        let Some(intent) = digest(payload) else {
+            // No record holds a length past `u32`.
+            self.diverge(Call::Offer {
+                publication,
+                length: u32::MAX,
+                crc32c: crc32c(payload),
+            });
+            return NEUTRAL;
+        };
         let call = Call::Offer {
             publication,
             length: intent.0,
@@ -495,33 +523,41 @@ impl Effects for ReplayEffects<'_, '_> {
             publication,
             length,
         };
-        let index = self.index();
         let Some(observation) = self.outcome(call, Operation::Claim, publication, (0, 0)) else {
             return refused(NEUTRAL);
         };
-        if !matches!(observation.outcome, Outcome::Accepted { .. }) {
+        let Outcome::Accepted { lane, position } = observation.outcome else {
             return refused(observation.outcome);
-        }
-        // A claim longer than the largest configured one: the recording
-        // was made under another configuration.
-        let Some(bytes) = self.scratch.get_mut(..length) else {
-            self.diverged = Some(Divergence {
-                group_seq: self.event.group_seq(),
-                index,
-                kind: DivergenceKind::Call {
-                    expected: recorded(&GroupRecord::Outcome(observation)),
-                    found: call,
-                },
-            });
-            return refused(NEUTRAL);
         };
+        // What a commit that cannot be answered from the recording returns:
+        // an abort at the claim, as a commit only accepts or aborts.
+        let unanswered = Outcome::Aborted { lane, position };
+        // A claim longer than the largest configured one: the recording
+        // was made under another configuration. Its claim matched; the
+        // divergence is at its commit, the next observation, where the
+        // capture ends too.
+        let Some(bytes) = self.scratch.get_mut(..length) else {
+            self.diverge(call);
+            return ClaimCommit {
+                claim: observation.outcome,
+                commit: Some(unanswered),
+            };
+        };
+        // Bytes an earlier claim left are not this claim's.
         bytes.fill(0);
         let committed = write(bytes);
-        let intent = digest(bytes);
+        let crc = crc32c(bytes);
+        let Some(intent) = digest(bytes) else {
+            self.diverge(call);
+            return ClaimCommit {
+                claim: observation.outcome,
+                commit: Some(unanswered),
+            };
+        };
         let call = Call::Commit {
             publication,
             length: intent.0,
-            crc32c: intent.1,
+            crc32c: crc,
             aborted: !committed,
         };
         // An abort is recorded as an aborted commit; a commit may have been
@@ -530,7 +566,7 @@ impl Effects for ReplayEffects<'_, '_> {
             .outcome_where(call, Operation::Commit, publication, intent, |outcome| {
                 committed || matches!(outcome, Outcome::Aborted { .. })
             })
-            .map_or(NEUTRAL, |observation| observation.outcome);
+            .map_or(unanswered, |observation| observation.outcome);
         ClaimCommit {
             claim: observation.outcome,
             commit: Some(commit),
@@ -586,13 +622,10 @@ impl Effects for ReplayEffects<'_, '_> {
     }
 }
 
-/// An output intent's `(length, crc32c)`; a length past `u32` reads as
-/// `u32::MAX`, which no record holds.
-fn digest(bytes: &[u8]) -> (u32, u32) {
-    (
-        u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-        crc32c(bytes),
-    )
+/// An output intent's `(length, crc32c)`; `None` for a length past
+/// `u32`, which no record holds.
+fn digest(bytes: &[u8]) -> Option<(u32, u32)> {
+    Some((u32::try_from(bytes.len()).ok()?, crc32c(bytes)))
 }
 
 fn delivery(observation: &DeliveryObservation) -> DeliveryOutcome {

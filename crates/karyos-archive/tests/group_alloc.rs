@@ -187,3 +187,125 @@ fn a_replay_cursor_steps_without_allocating() {
     drop(cursor);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A replayed dispatch allocates nothing per event (recording-group-
+/// replay.md section 11): an inline message, its offer checked and
+/// answered from the recording, with no capture.
+#[test]
+fn a_replay_gateway_dispatches_without_allocating() {
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::group::gateway::{Dispatched, Effects, Event, GroupGateway, PublicationId};
+    use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
+    use karyos_archive::group::prefix::{Coverage, recover};
+    use karyos_archive::group::replay::gateway::{GatewayConfig, ReplayGateway};
+    use karyos_archive::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
+    use karyos_archive::segment::SyncPolicy;
+
+    struct Nothing;
+    impl Coverage for Nothing {
+        fn positions(&self, _recording_id: u64) -> Option<(u64, u64)> {
+            None
+        }
+        fn ended(&self, _recording_id: u64) -> Option<u64> {
+            None
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "karyos-replay-gateway-alloc-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let records = journal();
+    let GroupRecord::Header(header) = records[0] else {
+        panic!("no header");
+    };
+    let mut out = vec![0u8; MAX_RECORD];
+    let mut journal = GroupJournal::create(StdDisk, &dir, &header, config).unwrap();
+    for seq in 1..=3u64 {
+        for record in &records[1..4] {
+            let record = match *record {
+                GroupRecord::Message(message) => GroupRecord::Message(MessageEvent {
+                    group_seq: seq,
+                    ..message
+                }),
+                // The offer of the message's payload, as the handler makes it.
+                GroupRecord::Outcome(outcome) => GroupRecord::Outcome(OutcomeObservation {
+                    group_seq: seq,
+                    length: 7,
+                    crc32c: karyos_archive::crc32c::crc32c(b"payload"),
+                    ..outcome
+                }),
+                GroupRecord::End(end) => GroupRecord::End(EventEnd {
+                    group_seq: seq,
+                    ..end
+                }),
+                other => other,
+            };
+            let length = record.encode(&mut out).unwrap();
+            let _ = journal.append(&out[..length]).unwrap();
+        }
+    }
+    let _ = journal.close().unwrap();
+    let mut journal = GroupJournal::recover(StdDisk, &dir, header.group_id, config)
+        .unwrap()
+        .journal;
+    let recovery = recover(&mut journal, &Nothing, 8).unwrap();
+    let replay = ReplayConfig {
+        manifest: header.manifest,
+        accept_manifest: false,
+    };
+    let room = CursorConfig {
+        bytes: 4096,
+        records: 8,
+    };
+    let cursor = ReplayCursor::open(journal, &recovery, &replay, room).unwrap();
+    // The recorded offer is publication 0's: stream 20, session 1.
+    let GroupRecord::Outcome(offer) = records[2] else {
+        panic!("no offer");
+    };
+    let publications = [(offer.stream_id, offer.session_id)];
+    let GroupRecord::Message(message) = records[1] else {
+        panic!("no message");
+    };
+    let subscriptions = [(message.stream_id, message.session_id)];
+    let mut gateway = ReplayGateway::new(
+        cursor,
+        &GatewayConfig {
+            publications: &publications,
+            subscriptions: &subscriptions,
+            conflated: &[],
+            max_claim: 64,
+            max_payload: 0,
+            present_unavailable: false,
+        },
+        None,
+    )
+    .unwrap();
+    let mut handler = |event: &Event<'_>, effects: &mut dyn Effects| {
+        if let Event::Message { payload, .. } = event {
+            let _ = effects.offer(PublicationId(0), payload);
+        }
+    };
+    let mut seen = 0u64;
+    loop {
+        let (dispatched, allocations) = count(|| gateway.dispatch(&mut handler));
+        assert_eq!(allocations, 0, "a dispatch allocated");
+        match dispatched.unwrap() {
+            Dispatched::Event { group_seq } => {
+                seen += 1;
+                assert_eq!(group_seq, seen);
+            }
+            Dispatched::End => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(seen, 3);
+    drop(gateway);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

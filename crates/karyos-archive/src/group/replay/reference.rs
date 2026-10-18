@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use karyos_sys::frame::{FRAME_ALIGNMENT, Word0};
+use karyos_sys::frame::{EXTENSION_LENGTH, FRAME_ALIGNMENT, HEADER_LENGTH, Word0};
 
 use crate::disk::Disk;
 use crate::segment::Geometry;
@@ -58,9 +58,14 @@ pub fn read_message<D: Disk>(
     out: &mut [u8],
 ) -> Option<usize> {
     let to = frames.position.checked_add(u64::from(frames.extent))?;
-    let buffer = usize::try_from(frames.extent)
-        .ok()?
-        .max(usize::try_from(FRAME_ALIGNMENT).ok()?);
+    let length = usize::try_from(frames.length).ok()?;
+    let out = out.get_mut(..length)?;
+    // The source needs room for the largest frame, at most the whole
+    // payload behind the longest header, never the whole extent.
+    let alignment = usize::try_from(FRAME_ALIGNMENT).ok()?;
+    let buffer = length
+        .checked_add(usize::try_from(HEADER_LENGTH + EXTENSION_LENGTH).ok()?)?
+        .checked_next_multiple_of(alignment)?;
     let mut source = ReplaySource::open(
         disk,
         recording.dir,
@@ -72,8 +77,6 @@ pub fn read_message<D: Disk>(
         buffer,
     )
     .ok()?;
-    let length = usize::try_from(frames.length).ok()?;
-    let out = out.get_mut(..length)?;
     let mut filled = 0usize;
     let mut started = false;
     let mut ended = false;
@@ -101,9 +104,8 @@ pub fn read_message<D: Disk>(
                     out.get_mut(filled..to)?.copy_from_slice(payload);
                     filled = to;
                     ended = flags.end();
-                    offset = offset.checked_add(
-                        frame_length.next_multiple_of(usize::try_from(FRAME_ALIGNMENT).ok()?),
-                    )?;
+                    offset =
+                        offset.checked_add(frame_length.checked_next_multiple_of(alignment)?)?;
                 }
             }
             Step::End { .. } => break,

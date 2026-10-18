@@ -72,7 +72,7 @@ fn outcome(
 ) -> GroupRecord<'static> {
     let (length, crc32c) = match operation {
         Operation::Claim => (0, 0),
-        _ => digest(intent),
+        _ => digest(intent).unwrap(),
     };
     GroupRecord::Outcome(OutcomeObservation {
         group_seq: SEQ,
@@ -287,7 +287,15 @@ fn an_output_byte_changed_diverges_at_its_intent() {
             bytes.copy_from_slice(b"claimed bytez");
             true
         });
-        assert_eq!(committed.commit, Some(Outcome::Gated));
+        // A commit only accepts or aborts: unanswered, it aborts at the
+        // claim.
+        assert_eq!(
+            committed.commit,
+            Some(Outcome::Aborted {
+                lane: LANE,
+                position: 64
+            })
+        );
     })
     .unwrap_err();
     assert_eq!(divergence.index, 2);
@@ -414,23 +422,40 @@ fn a_call_of_another_kind_or_other_arguments_diverges() {
     ));
 }
 
-/// A claim longer than the scratch claim diverges; a refused claim is
-/// returned as recorded and hands out nothing.
+/// A claim longer than the scratch claim diverges at its commit, the
+/// observation after the claim that matched, where the capture ends too;
+/// a refused claim is returned as recorded and hands out nothing.
 #[test]
 fn claims_follow_the_record_and_the_scratch() {
-    let long = [outcome(0, Operation::Claim, accepted(0), &[])];
+    let long = [
+        outcome(0, Operation::Claim, accepted(0), &[]),
+        outcome(1, Operation::Commit, accepted(0), &[0; 65]),
+    ];
     let divergence = replay(&long, |effects| {
         let committed = effects.claim(PublicationId(0), 65, &mut |_| panic!("written"));
         assert_eq!(
             committed,
             ClaimCommit {
-                claim: Outcome::Gated,
-                commit: None
+                claim: accepted(0),
+                commit: Some(Outcome::Aborted {
+                    lane: LANE,
+                    position: 0
+                }),
             }
         );
     })
     .unwrap_err();
-    assert_eq!(divergence.index, 0);
+    assert_eq!(divergence.index, 1);
+    assert!(matches!(
+        divergence.kind,
+        DivergenceKind::Call {
+            expected: Recorded::Outcome {
+                operation: Operation::Commit,
+                ..
+            },
+            found: Call::Claim { length: 65, .. },
+        }
+    ));
     let refused = [outcome(0, Operation::Claim, Outcome::BackPressured, &[])];
     assert_eq!(
         replay(&refused, |effects| {
@@ -488,4 +513,32 @@ fn an_abort_is_checked_as_an_aborted_commit() {
             ..
         }
     ));
+}
+
+/// A claim's scratch is zeroed: bytes an earlier claim left are not
+/// digested as a later one's when its handler writes only part of it.
+#[test]
+fn a_claim_starts_from_zeroed_bytes() {
+    let mut second = [0u8; 8];
+    second[..2].copy_from_slice(b"ab");
+    let records = [
+        outcome(0, Operation::Claim, accepted(0), &[]),
+        outcome(1, Operation::Commit, accepted(0), b"stale!!!"),
+        outcome(2, Operation::Claim, accepted(64), &[]),
+        outcome(3, Operation::Commit, accepted(64), &second),
+    ];
+    assert_eq!(
+        replay(&records, |effects| {
+            let _ = effects.claim(PublicationId(0), 8, &mut |bytes| {
+                bytes.copy_from_slice(b"stale!!!");
+                true
+            });
+            let committed = effects.claim(PublicationId(0), 8, &mut |bytes| {
+                bytes[..2].copy_from_slice(b"ab");
+                true
+            });
+            assert_eq!(committed.commit, Some(accepted(64)));
+        }),
+        Ok(())
+    );
 }

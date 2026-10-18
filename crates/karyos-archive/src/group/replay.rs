@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Replay of a recording group, the first part (`quantstratum-docs:
-//! karyos/SPEC.md` §8.3; ADR-0024; archive-gap-analysis.md, phase 3 batch
-//! A8).
+//! Replay of a recording group (`quantstratum-docs: karyos/SPEC.md` §8.3;
+//! ADR-0024; archive-gap-analysis.md, phase 3 batch A8;
+//! recording-group-replay.md).
 //!
-//! Built here, with no Gateway yet:
+//! The journal side, here:
 //!
 //! - [`check_header`]: a journal replays only under this build's capture
 //!   contract and a clock replay knows, and only for the replaying
@@ -19,8 +19,11 @@
 //! - [`CaptureJournal`]: the journal a replay writes what it observes to,
 //!   under the replaying caller's manifest (section 9).
 //!
-//! The checks of each call against its recorded observation wait for the
-//! Gateway's operation trait (A7d).
+//! The Gateway side: [`gateway::ReplayGateway`], the replay implementation
+//! of [`super::gateway::GroupGateway`], presents the events through
+//! [`effects::ReplayEffects`], which checks each call against its recorded
+//! observation; [`reference`] reads a payload by reference from its
+//! recording.
 
 use std::path::Path;
 
@@ -285,7 +288,7 @@ pub struct CursorConfig {
 }
 
 /// One allocation of `capacity` elements, or [`ReplayError::InvalidConfig`].
-fn allocate<T>(capacity: usize) -> Result<Vec<T>, ReplayError> {
+pub(crate) fn allocate<T>(capacity: usize) -> Result<Vec<T>, ReplayError> {
     let mut vec = Vec::new();
     vec.try_reserve_exact(capacity)
         .map_err(|_| ReplayError::InvalidConfig)?;
@@ -352,10 +355,11 @@ impl<D: Disk> ReplayCursor<D> {
         checked.ok_or(ReplayError::NoHeader)??;
         let complete_seq = recovery.tracker.complete_recording_seq();
         // Counted first, so the list is one allocation that fails typed.
+        // The prefix's events, and the incomplete event the cursor may
+        // give after them.
+        let last = complete_seq.checked_add(1).unwrap_or(complete_seq);
         let names = |record: &GroupRecord<'_>| match record {
-            GroupRecord::Unavailable(record) if record.group_seq <= complete_seq => {
-                Some(record.group_seq)
-            }
+            GroupRecord::Unavailable(record) if record.group_seq <= last => Some(record.group_seq),
             _ => None,
         };
         let mut count = Some(0usize);

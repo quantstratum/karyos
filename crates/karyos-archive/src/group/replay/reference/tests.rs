@@ -140,3 +140,55 @@ fn what_the_recording_cannot_give_is_unavailable() {
         None
     );
 }
+
+/// A padding block inside the range, or a message whose last fragment
+/// is not there, leaves the payload unavailable.
+#[test]
+fn a_fill_or_a_missing_end_is_unavailable() {
+    // A first fragment only: no end.
+    let open = frame(b"head", true, false);
+    let disk = recorded(&[Ok(open.clone())]);
+    let extent = u32::try_from(open.len()).unwrap();
+    assert_eq!(
+        read(
+            &disk,
+            Frames {
+                position: 0,
+                extent,
+                length: 4
+            }
+        ),
+        None
+    );
+    // A padding block after a whole message, inside the range: the
+    // extent names more than the message's frames.
+    let disk = FaultDisk::default();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    store.stamp(1);
+    let whole = frame(b"head", true, true);
+    let at = store.append(0, &whole).unwrap();
+    let mut fill = [0u8; 32];
+    fill[..4].copy_from_slice(&32i32.to_le_bytes());
+    fill[8..16].copy_from_slice(&at.to_le_bytes());
+    let end = store.append_fill(at, &fill, 64).unwrap();
+    store.close().unwrap();
+    assert_eq!(
+        read(
+            &disk,
+            Frames {
+                position: 0,
+                extent: u32::try_from(end).unwrap(),
+                length: 4
+            }
+        ),
+        None
+    );
+}

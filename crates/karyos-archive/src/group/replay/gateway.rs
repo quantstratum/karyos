@@ -33,7 +33,7 @@ use std::path::PathBuf;
 
 use super::effects::ReplayEffects;
 use super::reference::{Frames, Recording, read_message};
-use super::{CaptureJournal, ReplayCursor, ReplayEvent, Step, Stop};
+use super::{CaptureJournal, ReplayCursor, ReplayError, ReplayEvent, Step, Stop, allocate};
 use crate::disk::Disk;
 use crate::group::gateway::{
     ConflatedId, Dispatched, Event, GatewayError, GroupGateway, Handler, SubscriptionId, TimerId,
@@ -52,7 +52,9 @@ mod tests;
 pub struct GatewayConfig<'a> {
     /// By publication id.
     pub publications: &'a [(i32, i32)],
-    /// By subscription id.
+    /// By subscription id. A subscription takes every lane of its stream
+    /// and session, as a client's subscription does, so the lane is not
+    /// part of its key; each pair is named once.
     pub subscriptions: &'a [(i32, i32)],
     /// By conflated view id.
     pub conflated: &'a [(i32, i32)],
@@ -100,24 +102,43 @@ impl<D: Disk> ReplayGateway<D> {
     /// A Gateway over `cursor`, configured by `config`, reading payloads
     /// by reference from `archive`. It allocates here, and nothing per
     /// event but a payload by reference's read.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayError::InvalidConfig`] for a table that names one stream
+    /// and session twice (an event would be its first id's, silently),
+    /// or a buffer that cannot be allocated.
     pub fn new(
         cursor: ReplayCursor<D>,
         config: &GatewayConfig<'_>,
         archive: Option<Archive<D>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ReplayError> {
+        let copied = |table: &[(i32, i32)]| -> Result<Vec<(i32, i32)>, ReplayError> {
+            let mut seen = std::collections::BTreeSet::new();
+            if !table.iter().all(|source| seen.insert(*source)) {
+                return Err(ReplayError::InvalidConfig);
+            }
+            let mut copy = allocate(table.len())?;
+            copy.extend_from_slice(table);
+            Ok(copy)
+        };
+        let zeroed = |length: usize| -> Result<Vec<u8>, ReplayError> {
+            let mut bytes = allocate(length)?;
+            bytes.resize(length, 0);
+            Ok(bytes)
+        };
+        Ok(Self {
             cursor,
-            publications: config.publications.to_vec(),
-            subscriptions: config.subscriptions.to_vec(),
-            conflated: config.conflated.to_vec(),
-            scratch: vec![0u8; config.max_claim],
+            publications: copied(config.publications)?,
+            subscriptions: copied(config.subscriptions)?,
+            conflated: copied(config.conflated)?,
+            scratch: zeroed(config.max_claim)?,
             archive,
-            payload: vec![0u8; config.max_payload],
+            payload: zeroed(config.max_payload)?,
             present_unavailable: config.present_unavailable,
             capture: None,
             stopped: None,
-        }
+        })
     }
 
     /// Writes what the handler does to `capture` (section 9): a journal
@@ -247,7 +268,9 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                     _ => None,
                 };
                 let payload = match (message.payload, read) {
-                    (Payload::Inline(bytes), _) if !event.reference_unavailable() => Some(bytes),
+                    // A reference unavailable names only an event whose payload is by
+                    // reference (the prefix tracker refuses any other).
+                    (Payload::Inline(bytes), _) => Some(bytes),
                     (Payload::Reference { .. }, Some(length)) => self.payload.get(..length),
                     _ if self.present_unavailable => Some(&[][..]),
                     _ => None,
