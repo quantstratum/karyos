@@ -31,9 +31,10 @@ use super::{
 use crate::crc32c::crc32c;
 use crate::group::capture::{CaptureSender, GroupState, Refusal};
 use crate::group::record::{
-    Capture, DeliveryObservation, DeliveryPoll, EVENT_END, EndOutcome, EventEnd, ExternalEvent,
-    ExternalObservation, GapMarker, GapReason, GroupRecord, MAX_INLINE, Operation, Outcome,
-    OutcomeObservation, TimerAction, TimerObservation,
+    Capture, DELIVERY_OBSERVATION, DELIVERY_POLL, DeliveryObservation, DeliveryPoll, EVENT_END,
+    EXTERNAL_OBSERVATION, EndOutcome, EventEnd, ExternalEvent, ExternalObservation, GapMarker,
+    GapReason, GroupRecord, MAX_INLINE, OUTCOME_OBSERVATION, Operation, Outcome,
+    OutcomeObservation, TIMER_OBSERVATION, TimerAction, TimerObservation,
 };
 
 #[cfg(test)]
@@ -88,8 +89,26 @@ pub struct GatewayStats {
     pub uncaptured: u64,
     /// Events that ended incomplete.
     pub incomplete: u64,
+    /// Events refused because an earlier gap marker was still waiting for
+    /// room: the gap must precede the next recorded event.
+    pub gap_pending: u64,
     /// Gap markers written.
     pub gaps: u64,
+    /// A count reached `u64::MAX` and stopped there: the counts are then
+    /// lower bounds.
+    pub overflowed: bool,
+}
+
+impl GatewayStats {
+    /// Adds one to `count(self)`, sticky at its maximum with the overflow
+    /// flag set.
+    fn bump(&mut self, count: fn(&mut Self) -> &mut u64) {
+        let counter = count(self);
+        match counter.checked_add(1) {
+            Some(next) => *counter = next,
+            None => self.overflowed = true,
+        }
+    }
 }
 
 /// Events refused in a row, waiting to be written as one gap marker.
@@ -112,6 +131,8 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
     scratch: Vec<u8>,
     pending: Option<Pending>,
     stats: GatewayStats,
+    /// Each timer's pending deadline, for a cancel to repeat it.
+    deadlines: Vec<Option<u64>>,
 }
 
 /// Why a Gateway could not be configured.
@@ -135,7 +156,8 @@ const END: usize = 12 + EVENT_END.block_length as usize;
 impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     /// A Gateway over `sender`, whose journal's mode is `capture` and
     /// whose next event is `next_seq`. Its event buffer is `max_event`
-    /// bytes, the sender's own bound.
+    /// bytes, the sender's own bound; its timer table holds `timers`
+    /// timers, ids below it.
     ///
     /// # Errors
     ///
@@ -148,6 +170,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         capture: Capture,
         next_seq: u64,
         max_event: usize,
+        timers: u16,
     ) -> Result<Self, ConfigError> {
         if next_seq == 0 {
             return Err(ConfigError::FirstSeq);
@@ -167,6 +190,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             scratch: vec![0; MAX_INLINE],
             pending: None,
             stats: GatewayStats::default(),
+            deadlines: vec![None; usize::from(timers)],
         })
     }
 
@@ -217,18 +241,17 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             return false;
         }
         self.pending = None;
-        self.stats.gaps = self.stats.gaps.checked_add(1).unwrap_or(self.stats.gaps);
+        self.stats.bump(|stats| &mut stats.gaps);
         true
     }
 
     /// Counts `refusal` by its reason; returns the gap reason it maps to.
     fn count(&mut self, refusal: Refusal) -> GapReason {
-        let counter = match refusal {
-            Refusal::InFlight => &mut self.stats.in_flight,
-            Refusal::TooLarge => &mut self.stats.payload_unavailable,
-            _ => &mut self.stats.ring_full,
-        };
-        *counter = counter.checked_add(1).unwrap_or(*counter);
+        self.stats.bump(match refusal {
+            Refusal::InFlight => |stats| &mut stats.in_flight,
+            Refusal::TooLarge => |stats| &mut stats.payload_unavailable,
+            _ => |stats| &mut stats.ring_full,
+        });
         match refusal {
             Refusal::TooLarge => GapReason::PayloadUnavailable,
             _ => GapReason::RingFull,
@@ -275,15 +298,14 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             self.deliver_unrecorded(event, logical_time, handler);
             return Ok(Dispatched::Uncaptured);
         }
-        let flushed = self.flush();
-        let refused = if flushed {
-            self.sender.admit().err()
-        } else {
-            // A gap still pending must precede the next recorded event.
-            Some(Refusal::RingFull)
-        };
-        if let Some(refusal) = refused {
-            return self.refuse(refusal, event, logical_time, handler);
+        if !self.flush() {
+            // A gap still pending must precede the next recorded event: the
+            // event joins it, counted as such.
+            self.stats.bump(|stats| &mut stats.gap_pending);
+            return self.refuse(None, event, logical_time, handler);
+        }
+        if let Err(refusal) = self.sender.admit() {
+            return self.refuse(Some(refusal), event, logical_time, handler);
         }
         let seq = self.next_seq;
         // `new` checked that the buffer holds an end.
@@ -300,7 +322,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let length = match opened {
             Ok(length) => length,
             Err(GatewayError::Refused(refusal)) => {
-                return self.refuse(refusal, event, logical_time, handler);
+                return self.refuse(Some(refusal), event, logical_time, handler);
             }
             Err(error) => return Err(error),
         };
@@ -316,6 +338,8 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             logical_time,
             incomplete: false,
             recording: true,
+            strict: self.capture == Capture::Strict,
+            deadlines: &mut self.deadlines,
         };
         handler.on_event(event, &mut effects);
         let (length, index, incomplete) = (effects.length, effects.index, effects.incomplete);
@@ -336,11 +360,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             .and_then(|total| self.buffer.get(..total))
             .ok_or(GatewayError::Ended)?;
         if incomplete {
-            self.stats.incomplete = self
-                .stats
-                .incomplete
-                .checked_add(1)
-                .unwrap_or(self.stats.incomplete);
+            self.stats.bump(|stats| &mut stats.incomplete);
         }
         // Admitted, so the ring has room: a refusal here is a failed group.
         self.sender
@@ -351,13 +371,24 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
 
     /// An event that cannot be recorded: strict refuses it; best effort
     /// delivers it unrecorded and joins it to the pending gap.
+    /// `None` is an event behind a pending gap, already counted; it joins
+    /// the gap, whose reason it keeps.
     fn refuse(
         &mut self,
-        refusal: Refusal,
+        refusal: Option<Refusal>,
         event: &Event<'_>,
         logical_time: u64,
         handler: &mut dyn Handler,
     ) -> Result<Dispatched, GatewayError> {
+        let Some(refusal) = refusal else {
+            if self.capture == Capture::Strict {
+                return Err(GatewayError::Refused(Refusal::RingFull));
+            }
+            let seq = self.advance()?;
+            self.join_gap(seq, GapReason::RingFull);
+            self.deliver_unrecorded(event, logical_time, handler);
+            return Ok(Dispatched::Uncaptured);
+        };
         if matches!(refusal, Refusal::Ended | Refusal::Failed | Refusal::Closing) {
             if self.capture == Capture::Strict {
                 return Err(GatewayError::Ended);
@@ -385,11 +416,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         logical_time: u64,
         handler: &mut dyn Handler,
     ) {
-        self.stats.uncaptured = self
-            .stats
-            .uncaptured
-            .checked_add(1)
-            .unwrap_or(self.stats.uncaptured);
+        self.stats.bump(|stats| &mut stats.uncaptured);
         let mut effects = Recording {
             port: &mut self.port,
             buffer: &mut self.buffer,
@@ -401,6 +428,8 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             logical_time,
             incomplete: false,
             recording: false,
+            strict: self.capture == Capture::Strict,
+            deadlines: &mut self.deadlines,
         };
         handler.on_event(event, &mut effects);
     }
@@ -447,9 +476,26 @@ impl<P: Port, C: FnMut() -> u64> GroupGateway for Gateway<P, C> {
     }
 }
 
+/// Observation lengths, envelope included: template 11, 12, 15 and 14,
+/// and template 13 before its value.
+const OUTCOME: usize = 12 + OUTCOME_OBSERVATION.block_length as usize;
+const TIMER: usize = 12 + TIMER_OBSERVATION.block_length as usize;
+const POLL: usize = 12 + DELIVERY_POLL.block_length as usize;
+const DELIVERY: usize = 12 + DELIVERY_OBSERVATION.block_length as usize;
+const EXTERNAL: usize = 12 + EXTERNAL_OBSERVATION.block_length as usize + 2;
+
 /// The handler's effects during one event: each call performed through
 /// the port and, while `recording`, its observation appended to the
 /// buffer.
+///
+/// Strict capture never performs a call it cannot record: one whose
+/// observations would not fit is refused, not performed, and ends the
+/// event incomplete; so is every later call. An offer or a claim refused
+/// so returns [`Outcome::Gated`], a poll presents nothing, and a timer
+/// operation does nothing. Best effort performs every call and records
+/// what fits. An external value is read first in both modes, since the
+/// read acts on nothing Karyos records; in strict capture one that does
+/// not fit ends the event incomplete.
 struct Recording<'a, P: Port> {
     port: &'a mut P,
     buffer: &'a mut [u8],
@@ -465,9 +511,34 @@ struct Recording<'a, P: Port> {
     /// An observation did not fit: no more are recorded.
     incomplete: bool,
     recording: bool,
+    strict: bool,
+    deadlines: &'a mut [Option<u64>],
 }
 
 impl<P: Port> Recording<'_, P> {
+    /// Whether a call whose observations take `bytes` (`None` past
+    /// `usize`) may run. Strict refuses one that cannot be recorded and
+    /// ends the event incomplete; best effort runs every call.
+    fn admit(&mut self, bytes: Option<usize>) -> bool {
+        if !self.recording || !self.strict {
+            return true;
+        }
+        let fits = !self.incomplete
+            && bytes
+                .and_then(|bytes| self.length.checked_add(bytes))
+                .is_some_and(|end| end <= self.limit);
+        if !fits {
+            self.incomplete = true;
+        }
+        fits
+    }
+
+    /// The observation index the next record takes, or `None` when no
+    /// more are recorded.
+    fn next_index(&self) -> Option<u32> {
+        (self.recording && !self.incomplete).then_some(self.index)
+    }
+
     /// Appends `record` as the next observation; one that does not fit
     /// ends the event incomplete.
     fn push(&mut self, record: &GroupRecord<'_>) {
@@ -478,9 +549,8 @@ impl<P: Port> Recording<'_, P> {
             .buffer
             .get_mut(self.length..self.limit)
             .and_then(|room| record.encode(room).ok());
-        let next = self.index.checked_add(1);
         let total = encoded.and_then(|length| self.length.checked_add(length));
-        match (total, next) {
+        match (total, self.index.checked_add(1)) {
             (Some(total), Some(next)) => {
                 self.length = total;
                 self.index = next;
@@ -489,17 +559,56 @@ impl<P: Port> Recording<'_, P> {
         }
     }
 
-    /// The observation `index` the next push takes, or `None` when no more
-    /// are recorded.
-    fn next_index(&self) -> Option<u32> {
-        (self.recording && !self.incomplete).then_some(self.index)
+    /// Records an operation's outcome; a length past `u32` cannot be
+    /// recorded, and ends the event incomplete.
+    fn outcome(
+        &mut self,
+        (stream_id, session_id): (i32, i32),
+        operation: Operation,
+        outcome: Outcome,
+        bytes: Option<(usize, u32)>,
+    ) {
+        let Some(index) = self.next_index() else {
+            return;
+        };
+        let (length, crc32c) = match bytes {
+            None => (0, 0),
+            Some((length, digest)) => match u32::try_from(length) {
+                Ok(length) => (length, digest),
+                Err(_) => {
+                    self.incomplete = true;
+                    return;
+                }
+            },
+        };
+        self.push(&GroupRecord::Outcome(OutcomeObservation {
+            group_seq: self.seq,
+            index,
+            stream_id,
+            session_id,
+            operation,
+            outcome,
+            length,
+            crc32c,
+        }));
+    }
+
+    fn timer(&mut self, timer: TimerId, deadline: u64, action: TimerAction) {
+        if let Some(index) = self.next_index() {
+            self.push(&GroupRecord::TimerOperation(TimerObservation {
+                group_seq: self.seq,
+                index,
+                timer_id: u64::from(timer.0),
+                deadline,
+                action,
+            }));
+        }
     }
 }
 
-/// A length as template 11 records it: a payload is at most a frame's,
-/// far below `u32`.
-fn length_u32(length: usize) -> u32 {
-    u32::try_from(length).unwrap_or(u32::MAX)
+/// Whether `length` fits template 11's `length`.
+fn recordable(length: usize) -> Option<usize> {
+    u32::try_from(length).ok().map(|_| OUTCOME)
 }
 
 impl<P: Port> Effects for Recording<'_, P> {
@@ -508,20 +617,17 @@ impl<P: Port> Effects for Recording<'_, P> {
     }
 
     fn offer(&mut self, publication: PublicationId, payload: &[u8]) -> Outcome {
-        let (stream_id, session_id) = self.port.publication(publication);
-        let outcome = self.port.offer(publication, payload);
-        if let Some(index) = self.next_index() {
-            self.push(&GroupRecord::Outcome(OutcomeObservation {
-                group_seq: self.seq,
-                index,
-                stream_id,
-                session_id,
-                operation: Operation::Offer,
-                outcome,
-                length: length_u32(payload.len()),
-                crc32c: crc32c(payload),
-            }));
+        if !self.admit(recordable(payload.len())) {
+            return Outcome::Gated;
         }
+        let ids = self.port.publication(publication);
+        let outcome = self.port.offer(publication, payload);
+        self.outcome(
+            ids,
+            Operation::Offer,
+            outcome,
+            Some((payload.len(), crc32c(payload))),
+        );
         outcome
     }
 
@@ -531,36 +637,23 @@ impl<P: Port> Effects for Recording<'_, P> {
         length: usize,
         write: &mut dyn FnMut(&mut [u8]) -> bool,
     ) -> ClaimCommit {
-        let (stream_id, session_id) = self.port.publication(publication);
+        let both = recordable(length).and_then(|one| one.checked_mul(2));
+        if !self.admit(both) {
+            return ClaimCommit {
+                claim: Outcome::Gated,
+                commit: None,
+            };
+        }
+        let ids = self.port.publication(publication);
         let mut digest = 0;
         let result = self.port.claim(publication, length, &mut |bytes| {
             let commit = write(bytes);
             digest = crc32c(bytes);
             commit
         });
-        if let Some(index) = self.next_index() {
-            self.push(&GroupRecord::Outcome(OutcomeObservation {
-                group_seq: self.seq,
-                index,
-                stream_id,
-                session_id,
-                operation: Operation::Claim,
-                outcome: result.claim,
-                length: 0,
-                crc32c: 0,
-            }));
-        }
-        if let (Some(commit), Some(index)) = (result.commit, self.next_index()) {
-            self.push(&GroupRecord::Outcome(OutcomeObservation {
-                group_seq: self.seq,
-                index,
-                stream_id,
-                session_id,
-                operation: Operation::Commit,
-                outcome: commit,
-                length: length_u32(length),
-                crc32c: digest,
-            }));
+        self.outcome(ids, Operation::Claim, result.claim, None);
+        if let Some(commit) = result.commit {
+            self.outcome(ids, Operation::Commit, commit, Some((length, digest)));
         }
         result
     }
@@ -571,6 +664,13 @@ impl<P: Port> Effects for Recording<'_, P> {
         max: u32,
         each: &mut dyn FnMut(&DeliveryOutcome),
     ) -> u32 {
+        let most = usize::try_from(max)
+            .ok()
+            .and_then(|max| max.checked_mul(DELIVERY))
+            .and_then(|deliveries| deliveries.checked_add(POLL));
+        if !self.admit(most) {
+            return 0;
+        }
         let (stream_id, session_id) = self.port.publication(publication);
         let poll = |index: u32, count: u32, seq: u64| {
             GroupRecord::Poll(DeliveryPoll {
@@ -618,11 +718,11 @@ impl<P: Port> Effects for Recording<'_, P> {
                     .get_mut(this.length..this.limit)
                     .and_then(|room| record.encode(room).ok());
                 let total = encoded.and_then(|length| this.length.checked_add(length));
-                match (total, index.checked_add(1)) {
-                    (Some(total), Some(next)) => {
+                match (total, index.checked_add(1), recorded.checked_add(1)) {
+                    (Some(total), Some(next), Some(count)) => {
                         this.length = total;
                         this.index = next;
-                        recorded = recorded.checked_add(1).unwrap_or(recorded);
+                        recorded = count;
                     }
                     _ => this.incomplete = true,
                 }
@@ -639,34 +739,36 @@ impl<P: Port> Effects for Recording<'_, P> {
     }
 
     fn schedule(&mut self, timer: TimerId, deadline: u64) {
-        self.port.schedule(timer, deadline);
-        if let Some(index) = self.next_index() {
-            self.push(&GroupRecord::TimerOperation(TimerObservation {
-                group_seq: self.seq,
-                index,
-                timer_id: u64::from(timer.0),
-                deadline,
-                action: TimerAction::Create,
-            }));
+        if !self.admit(Some(TIMER)) {
+            return;
         }
+        self.port.schedule(timer, deadline);
+        if let Some(slot) = self.deadlines.get_mut(usize::from(timer.0)) {
+            *slot = Some(deadline);
+        }
+        self.timer(timer, deadline, TimerAction::Create);
     }
 
+    /// A cancel repeats the timer's pending deadline; one not pending
+    /// records 0.
     fn cancel(&mut self, timer: TimerId) {
-        self.port.cancel(timer);
-        if let Some(index) = self.next_index() {
-            self.push(&GroupRecord::TimerOperation(TimerObservation {
-                group_seq: self.seq,
-                index,
-                timer_id: u64::from(timer.0),
-                deadline: 0,
-                action: TimerAction::Cancel,
-            }));
+        if !self.admit(Some(TIMER)) {
+            return;
         }
+        self.port.cancel(timer);
+        let deadline = self
+            .deadlines
+            .get_mut(usize::from(timer.0))
+            .and_then(Option::take)
+            .unwrap_or(0);
+        self.timer(timer, deadline, TimerAction::Cancel);
     }
 
     fn external(&mut self, kind: u32, read: &mut dyn FnMut(&mut [u8]) -> usize) -> &[u8] {
         let length = read(self.scratch).min(self.scratch.len());
-        if let Some(index) = self.next_index() {
+        if self.admit(EXTERNAL.checked_add(length))
+            && let Some(index) = self.next_index()
+        {
             let value = self.scratch.get(..length).unwrap_or_default();
             let record = GroupRecord::ExternalObservation(ExternalObservation {
                 group_seq: self.seq,

@@ -178,7 +178,7 @@ fn gateway(
             1000 * reads.get()
         })
     };
-    let gateway = Gateway::new(Accepting::default(), clock, sender, mode, 1, max_event).unwrap();
+    let gateway = Gateway::new(Accepting::default(), clock, sender, mode, 1, max_event, 8).unwrap();
     (gateway, job, disk, reads)
 }
 
@@ -339,7 +339,7 @@ fn every_observation_is_recorded_as_the_handler_saw_it() {
             group_seq: 1,
             index: 10,
             timer_id: 4,
-            deadline: 0,
+            deadline: 77,
             action: TimerAction::Cancel,
         }),
         GroupRecord::ExternalObservation(ExternalObservation {
@@ -527,27 +527,42 @@ fn a_gap_keeps_its_first_reason() {
         ]
     );
     assert_eq!(gateway.stats().payload_unavailable, 1);
-    assert_eq!(gateway.stats().ring_full, 3);
+    // The large value behind the pending gap counts as gap pending.
+    assert_eq!(gateway.stats().ring_full, 2);
+    assert_eq!(gateway.stats().gap_pending, 1);
 }
 
-/// Observations past the event buffer end the event incomplete; the calls
-/// are still performed. A strict group then refuses every later event.
+/// Observations past the event buffer end the event incomplete. Best
+/// effort still performs every call; strict performs none it cannot
+/// record, refusing it as gated, and then refuses every later event.
 #[test]
 fn an_event_past_its_buffer_ends_incomplete() {
     for mode in [Capture::BestEffort, Capture::Strict] {
         let (mut gateway, mut job, _disk, _) = gateway(mode, 1 << 16, 512);
-        let mut offers = 0;
+        let mut outcomes = Vec::new();
         let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
             for _ in 0..20 {
-                let _ = effects.offer(PublicationId(1), b"p");
-                offers += 1;
+                outcomes.push(effects.offer(PublicationId(1), b"p"));
             }
         };
         assert_eq!(
             gateway.deliver_external(1, b"", &mut handler),
             Ok(Dispatched::Event { group_seq: 1 })
         );
-        assert_eq!(gateway.port().calls, 20);
+        // The offers that fit beside the external event and its end.
+        let fit = (512 - (12 + 20 + 2) - END) / OUTCOME;
+        let performed = match mode {
+            Capture::BestEffort => 20,
+            Capture::Strict => fit,
+        };
+        assert_eq!(gateway.port().calls as usize, performed);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == Outcome::Gated)
+                .count(),
+            20 - performed
+        );
         assert_eq!(gateway.stats().incomplete, 1);
         while job.duty(0, 1024, &NoRecordings).unwrap() {}
         let next = gateway.deliver_external(1, b"", &mut |_: &Event<'_>, _: &mut dyn Effects| {});
@@ -556,6 +571,79 @@ fn an_event_past_its_buffer_ends_incomplete() {
             Capture::BestEffort => assert_eq!(next, Ok(Dispatched::Event { group_seq: 2 })),
         }
     }
+}
+
+/// Strict never performs a call it cannot record: with room for no
+/// observation, an offer, a claim, a poll and timer operations are refused
+/// and the port is never called (REVIEWER-01's repro).
+#[test]
+fn strict_performs_no_call_it_cannot_record() {
+    let max_event = 12 + 20 + 2 + END + 10;
+    let (mut gateway, job, disk, _) = gateway(Capture::Strict, 1 << 16, max_event);
+    let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
+        assert_eq!(effects.offer(PublicationId(1), b"p"), Outcome::Gated);
+        let mut wrote = false;
+        assert_eq!(
+            effects.claim(PublicationId(1), 4, &mut |_| {
+                wrote = true;
+                true
+            }),
+            ClaimCommit {
+                claim: Outcome::Gated,
+                commit: None
+            }
+        );
+        assert!(!wrote);
+        assert_eq!(effects.poll_outcomes(PublicationId(1), 1, &mut |_| {}), 0);
+        effects.schedule(TimerId(1), 5);
+        effects.cancel(TimerId(1));
+    };
+    assert_eq!(
+        gateway.deliver_external(1, b"", &mut handler),
+        Ok(Dispatched::Event { group_seq: 1 })
+    );
+    assert_eq!(gateway.port().calls, 0);
+    let bytes = records(job, &disk);
+    assert_eq!(
+        decoded(&bytes).last(),
+        Some(&GroupRecord::End(EventEnd {
+            group_seq: 1,
+            observations: 0,
+            outcome: EndOutcome::Incomplete,
+        }))
+    );
+}
+
+/// A cancel repeats its timer's pending deadline; a timer not pending
+/// records 0, and a cancel clears it.
+#[test]
+fn a_cancel_repeats_the_pending_deadline() {
+    let (mut gateway, job, disk, _) = gateway(Capture::Strict, 1 << 16, 4096);
+    let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
+        effects.schedule(TimerId(2), 40);
+        effects.schedule(TimerId(2), 50);
+        effects.cancel(TimerId(2));
+        effects.cancel(TimerId(2));
+        effects.cancel(TimerId(3));
+        // Past the table: recorded with no deadline to repeat.
+        effects.schedule(TimerId(100), 9);
+        effects.cancel(TimerId(100));
+    };
+    gateway.deliver_external(1, b"", &mut handler).unwrap();
+    let bytes = records(job, &disk);
+    let cancels: Vec<(u64, u64)> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::TimerOperation(TimerObservation {
+                timer_id,
+                deadline,
+                action: TimerAction::Cancel,
+                ..
+            }) => Some((timer_id, deadline)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cancels, [(2, 50), (2, 0), (3, 0), (100, 0)]);
 }
 
 /// The configuration refuses a buffer too small for an event, and a first
@@ -590,11 +678,51 @@ fn a_gateway_that_cannot_work_is_refused() {
     };
     drop(journal);
     assert!(matches!(
-        Gateway::new(Accepting::default(), || 0, make(), Capture::Strict, 1, 40),
+        Gateway::new(
+            Accepting::default(),
+            || 0,
+            make(),
+            Capture::Strict,
+            1,
+            40,
+            8
+        ),
         Err(ConfigError::Buffer(40))
     ));
     assert!(matches!(
-        Gateway::new(Accepting::default(), || 0, make(), Capture::Strict, 0, 4096),
+        Gateway::new(
+            Accepting::default(),
+            || 0,
+            make(),
+            Capture::Strict,
+            0,
+            4096,
+            8
+        ),
         Err(ConfigError::FirstSeq)
     ));
+}
+
+/// A strict refusal is final for its event: after a call too large to
+/// record, a later one that would fit is refused too, so the recorded
+/// observations end where the handler's calls stopped being performed.
+#[test]
+fn a_strict_refusal_ends_the_event_for_later_calls() {
+    let max_event = 12 + 20 + 2 + END + OUTCOME;
+    let (mut gateway, job, disk, _) = gateway(Capture::Strict, 1 << 16, max_event);
+    let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
+        assert_eq!(effects.poll_outcomes(PublicationId(1), 4, &mut |_| {}), 0);
+        assert_eq!(effects.offer(PublicationId(1), b"p"), Outcome::Gated);
+    };
+    gateway.deliver_external(1, b"", &mut handler).unwrap();
+    assert_eq!(gateway.port().calls, 0);
+    let bytes = records(job, &disk);
+    assert_eq!(
+        decoded(&bytes).last(),
+        Some(&GroupRecord::End(EventEnd {
+            group_seq: 1,
+            observations: 0,
+            outcome: EndOutcome::Incomplete,
+        }))
+    );
 }
