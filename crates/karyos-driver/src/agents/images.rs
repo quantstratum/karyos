@@ -115,6 +115,9 @@ pub enum ImageEvent {
         slot: SlotRef,
         /// The endpoint it arrived on.
         endpoint: EndpointId,
+        /// The datagram source its binding names (per-source-images.md,
+        /// D2-1).
+        source: std::net::SocketAddr,
         /// The publication incarnation.
         identity: Identity,
         /// The alias it arrived under.
@@ -202,6 +205,8 @@ struct Image<T: StreamTerms> {
     /// The pending slot, at its challenge generation.
     slot: SlotRef,
     endpoint: EndpointId,
+    /// The datagram source its binding names.
+    source: std::net::SocketAddr,
     identity: Identity,
     alias: Alias,
     lanes: Vec<Arc<LogBuffer<T>>>,
@@ -450,6 +455,7 @@ impl<T: StreamTerms> ImageTable<T> {
         match event {
             SessionEvent::CreateImage {
                 endpoint,
+                source,
                 alias,
                 slot,
                 identity,
@@ -458,7 +464,15 @@ impl<T: StreamTerms> ImageTable<T> {
                 chain,
             } => {
                 if let Some(event) = self.create(
-                    link, lanes, endpoint, alias, slot, identity, term, &joins, chain,
+                    link,
+                    lanes,
+                    (endpoint, source),
+                    alias,
+                    slot,
+                    identity,
+                    term,
+                    &joins,
+                    chain,
                 ) {
                     on_event(event);
                 }
@@ -475,6 +489,7 @@ impl<T: StreamTerms> ImageTable<T> {
                     on_event(ImageEvent::Installed {
                         slot: installed,
                         endpoint: image.endpoint,
+                        source: image.source,
                         identity: image.identity,
                         alias: image.alias,
                     });
@@ -528,7 +543,7 @@ impl<T: StreamTerms> ImageTable<T> {
         &mut self,
         link: &SessionLink<T>,
         lanes: &mut LaneSource<'_>,
-        endpoint: EndpointId,
+        (endpoint, source): (EndpointId, std::net::SocketAddr),
         alias: Alias,
         slot: SlotRef,
         identity: Identity,
@@ -560,6 +575,7 @@ impl<T: StreamTerms> ImageTable<T> {
         let image = |state, lanes, charge, reclaimed| Image {
             slot,
             endpoint,
+            source,
             identity,
             alias,
             lanes,

@@ -512,6 +512,7 @@ fn test_driver_events_abort_reports_the_loss_and_the_closed_publication() {
             stream: LOST_STREAM,
             lane: Lane::ZERO,
             reason: CloseReason::RequiredParticipantLost,
+            image: 0,
         }
     );
 }
@@ -648,6 +649,7 @@ fn test_seal_reason_removal_reaches_handles_and_is_reported_once() {
             stream: LOST_STREAM,
             lane: Lane::ZERO,
             reason: CloseReason::StreamRemoved,
+            image: 0,
         }]
     );
     assert_eq!(

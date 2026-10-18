@@ -151,8 +151,12 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     /// Cross-process views).
     FetchableConflated(FetchableConflated),
     /// A network subscription (W5): the driver announces each of its
-    /// images with `ImageAvailable` naming `registration`; a subscriber
-    /// attaches to one with [`ClientConductor::add_subscription`].
+    /// images with `ImageAvailable` naming `registration`, the image's
+    /// aggregate registration and its source. A subscriber attaches to an
+    /// image by its registration with `AddImageSubscription`, as the
+    /// client facade does, or with [`ClientConductor::add_subscription`]
+    /// naming the alias, which reaches the oldest live image of it
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-2).
     NetworkSubscription {
         /// The network subscription's registration.
         registration: u64,
@@ -856,6 +860,33 @@ impl<T: TermBytes> ClientConductor<T> {
             Command::AddSubscription {
                 sequence,
                 stream,
+                lane,
+                role,
+            }
+        })
+    }
+
+    /// Requests a subscription to lane `lane` of the network image whose
+    /// aggregate registration is `image`, of the alias `stream`
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-5):
+    /// `AddImageSubscription`, recorded as a [`Request::Subscription`] of
+    /// the alias, so the grant is checked against it as any other.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    pub(crate) fn add_image_subscription(
+        &mut self,
+        stream: StreamKey,
+        image: u64,
+        lane: Lane,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        let request = Request::Subscription { stream, lane, role };
+        self.submit(Kind::AddSubscription, Some(request), |sequence| {
+            Command::AddImageSubscription {
+                sequence,
+                image,
                 lane,
                 role,
             }
@@ -1810,6 +1841,7 @@ mod tests {
             },
             lane: Lane::ZERO,
             reason,
+            image: 0,
         };
         let known = closed(karyos_protocol::cnc::CloseReason::StreamRemoved);
         let mut payload = [0u8; karyos_protocol::cnc::MAX_EVENT_LENGTH];
