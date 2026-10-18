@@ -11,6 +11,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The live merge (phase 3, A6a; SPEC.md §8.2).
+  `karyos_client::LiveMerge` merges a `Replay` of a recording into the
+  live subscription of the same publication at an explicit cutover: the
+  live reader's position when the merge is made. Below it the replay's
+  messages are delivered, from it the live reader's; the replay's
+  duplicates are dropped by position, and the live reader's first message
+  must match the replay's there in position and length. Every
+  disagreement is a typed, final `MergeError`: an epoch change (another
+  publication or incarnation), a reader of another lane than 0, a replay
+  short of the cutover, a message or term padding across it, a replay or
+  live reader lapped. A required live reader keeps a first message that
+  disagrees pending, for `into_live`. A gap in the
+  recording below the cutover is reported as the replay's local gap. A
+  replay stops through its `ReplayStop` at the cutover, on failure and on
+  drop. `ReplayProvider`, which the Archive's client implements, hands out
+  replays without blocking (`ReplayStatus`, `ReplayUnavailable`).
 - The Archive is controlled over streams (phase 3, A5c).
   `karyos_archive::server::ControlServer` reads A1's requests from a
   `RequestSource`, serves them with the agent and answers on a
