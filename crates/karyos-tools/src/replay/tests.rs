@@ -701,3 +701,55 @@ fn a_payload_is_shown_by_length_and_digest() {
     );
     assert!(text.len() < 1000, "{} bytes", text.len());
 }
+
+/// An explicit `--from` at a prefix's first event left out is past it,
+/// for prefixes of equal or different lengths; the default `--from` on
+/// an empty journal is the `end` kind (above).
+#[test]
+fn a_from_one_past_a_prefix_is_not_comparable() {
+    for (left, right) in [(timers(1, 3), timers(1, 3)), (timers(1, 7), timers(1, 3))] {
+        let report = run(&left, &right, |args| args.from = Some(4));
+        assert_eq!(report.exit_code(), 2, "{report:?}");
+    }
+}
+
+/// A difference in any compared field is shown: two messages that
+/// differ only in their logical time print different lines.
+#[test]
+fn every_compared_field_is_shown() {
+    let GroupRecord::Message(event) = message(1, Payload::Inline(b"a")) else {
+        panic!("a message");
+    };
+    let mut later = timers(1, 1);
+    later[0] = GroupRecord::Message(MessageEvent {
+        logical_time: event.logical_time + 1,
+        ..event
+    });
+    let mut original = timers(1, 1);
+    original[0] = GroupRecord::Message(event);
+    let Report::Diverged {
+        expected, found, ..
+    } = run(&original, &later, |_| {})
+    else {
+        panic!("not diverged");
+    };
+    assert_ne!(expected, found);
+    assert!(expected.contains("logical time 10"), "{expected}");
+}
+
+/// An event of more than 16384 records is an error, exit 3.
+#[test]
+fn an_event_past_the_record_bound_is_an_error() {
+    let observations = 16_383u32;
+    let mut records = vec![GroupRecord::Timer(TimerEvent {
+        group_seq: 1,
+        logical_time: 1,
+        timer_id: 1,
+    })];
+    records.extend((0..observations).map(|index| schedule(1, index, 100)));
+    records.push(end(1, observations, EndOutcome::Complete));
+    assert_eq!(records.len(), 16_385);
+    let report = run(&records, &records, |_| {});
+    assert_eq!(report.exit_code(), 3, "{report:?}");
+    assert!(report.text().contains("16384 records"), "{}", report.text());
+}

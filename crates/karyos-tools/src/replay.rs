@@ -517,7 +517,15 @@ pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
             "--from {from} is before a journal's first event, group_seq {first}"
         ));
     }
-    compare(&mut left.cursor, &mut right.cursor, from, args.to)
+    compare(
+        &mut left.cursor,
+        &mut right.cursor,
+        Range {
+            from,
+            to: args.to,
+            explicit_from: args.from.is_some(),
+        },
+    )
 }
 
 /// One side's next item in the range.
@@ -578,10 +586,16 @@ fn describe(record: Option<&GroupRecord<'_>>) -> String {
                 } => format!("by reference to recording {recording_id}, length {length}"),
                 Payload::Unavailable { length } => format!("not captured, length {length}"),
             };
+            let extension = message
+                .extension
+                .map_or_else(|| "none".to_owned(), |extension| bytes(extension));
             format!(
-                "message {}, stream {} session {} lane {}, position {}, extent {}, \
-                 reserved {}, end of stream {}, payload {payload}",
+                "message {}, logical time {}, incarnation {}, stream {} session {} lane {}, \
+                 position {}, extent {}, reserved {}, end of stream {}, extension {extension}, \
+                 payload {payload}",
                 message.group_seq,
+                message.logical_time,
+                message.incarnation,
                 message.stream_id,
                 message.session_id,
                 message.lane.get(),
@@ -592,8 +606,10 @@ fn describe(record: Option<&GroupRecord<'_>>) -> String {
             )
         }
         Some(GroupRecord::Conflated(view)) => format!(
-            "conflated {}, stream {} session {}, key {}, version {}, {:?}, value {}",
+            "conflated {}, logical time {}, stream {} session {}, key {}, version {}, {:?}, \
+             value {}",
             view.group_seq,
+            view.logical_time,
             view.stream_id,
             view.session_id,
             view.key,
@@ -602,8 +618,9 @@ fn describe(record: Option<&GroupRecord<'_>>) -> String {
             bytes(view.value)
         ),
         Some(GroupRecord::External(external)) => format!(
-            "external {}, kind {}, value {}",
+            "external {}, logical time {}, kind {}, value {}",
             external.group_seq,
+            external.logical_time,
             external.kind,
             bytes(external.value)
         ),
@@ -662,6 +679,25 @@ fn first_missing(stop: &Stop) -> Option<u64> {
     }
 }
 
+/// The range compared: `--from` (given or the default) and `--to`.
+#[derive(Debug, Clone, Copy)]
+struct Range {
+    from: u64,
+    to: Option<u64>,
+    /// `--from` was given: a range that starts at a prefix's first event
+    /// left out is past it. The default `--from` is the journals' own
+    /// first event, so an empty journal there is the `end` kind instead.
+    explicit_from: bool,
+}
+
+impl Range {
+    /// Whether a range starting at `from` begins past a prefix whose first
+    /// event left out is `missing`.
+    const fn starts_past(&self, missing: u64) -> bool {
+        missing < self.from || (self.explicit_from && missing == self.from)
+    }
+}
+
 /// One side's state at a step: an event in the range, the range's end
 /// on that side (an event past `to`), or a stop.
 enum Side<'c> {
@@ -689,9 +725,9 @@ fn side<'c>(item: Item<'c>, to: Option<u64>) -> Side<'c> {
 fn compare<L: Disk, R: Disk>(
     left: &mut ReplayCursor<L>,
     right: &mut ReplayCursor<R>,
-    from: u64,
-    to: Option<u64>,
+    range: Range,
 ) -> Report {
+    let Range { from, to, .. } = range;
     if let Some(to) = to
         && to < from
     {
@@ -751,11 +787,11 @@ fn compare<L: Disk, R: Disk>(
                 return one_sided(&event, "left");
             }
             (Side::Event(event), Side::Stop(stop)) => {
-                return past_start(stop, from, to, "right")
+                return past_start(stop, range, "right")
                     .unwrap_or_else(|| ended_one_side(&event, stop, "right"));
             }
             (Side::Stop(stop), Side::Event(event)) => {
-                return past_start(stop, from, to, "left")
+                return past_start(stop, range, "left")
                     .unwrap_or_else(|| ended_one_side(&event, stop, "left"));
             }
             // Both sides ended, or are past the range.
@@ -771,7 +807,7 @@ fn compare<L: Disk, R: Disk>(
                     {
                         return not_comparable(stopped(stop, name));
                     }
-                    if events == 0 && missing.is_some_and(|missing| missing < from) {
+                    if events == 0 && missing.is_some_and(|missing| range.starts_past(missing)) {
                         return not_comparable(format!(
                             "--from {from} is past the {name} journal's complete prefix, \
                              which ends at group_seq {}",
@@ -790,12 +826,13 @@ fn compare<L: Disk, R: Disk>(
 /// A range past the `side` journal's complete prefix, which ended at
 /// `stop`: one that starts past it, or an explicit end that names events
 /// past it. Not comparable.
-fn past_start(stop: Stop, from: u64, to: Option<u64>, side: &str) -> Option<Report> {
+fn past_start(stop: Stop, range: Range, side: &str) -> Option<Report> {
+    let Range { from, to, .. } = range;
     let missing = first_missing(&stop)?;
     if to.is_some_and(|to| missing <= to) {
         return Some(not_comparable(stopped(stop, side)));
     }
-    (missing < from).then(|| {
+    range.starts_past(missing).then(|| {
         not_comparable(format!(
             "--from {from} is past the {side} journal's complete prefix, whose first \
              event left out is group_seq {missing}"
@@ -904,9 +941,7 @@ fn compare_events(left: &ReplayEvent<'_>, right: &ReplayEvent<'_>) -> Option<Rep
         let at = left_count.checked_add(1)?;
         return diverged(Some(left_count), Kind::ExtraObservation, (None, Some(at)));
     }
-    let (left_end, right_end) = (left.len().checked_sub(1)?, right.len().checked_sub(1)?);
-    if left.record_bytes(left_end) != right.record_bytes(right_end) {
-        return diverged(None, Kind::End, (Some(left_end), Some(right_end)));
-    }
+    // The ends agree: their observation counts are the ones compared, and
+    // an end that says incomplete is a stop before this.
     None
 }
