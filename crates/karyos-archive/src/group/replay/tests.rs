@@ -34,12 +34,16 @@ const ROOM: CursorConfig = CursorConfig {
     records: 4,
 };
 
-/// Only recording 7, written and durable to 4096.
+/// Only recording 7, written and durable to 4096; none has ended.
 struct Seven;
 
 impl Coverage for Seven {
     fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
         (recording_id == 7).then_some((4096, 4096))
+    }
+
+    fn ended(&self, _recording_id: u64) -> Option<u64> {
+        None
     }
 }
 
