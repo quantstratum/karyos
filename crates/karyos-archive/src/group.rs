@@ -9,9 +9,11 @@
 //! the journal on disk ([`journal`], A7b); its three prefixes
 //! ([`prefix`], A7c); the records the Gateway needs (A7d-1a) and its
 //! capture path to the Archive's thread ([`capture`], A7d-1b). The
-//! Gateway itself and checkpoints follow.
+//! trait the Gateway implements ([`gateway`], A7d-2). The Gateway
+//! itself and checkpoints follow.
 
 pub mod capture;
+pub mod gateway;
 pub mod journal;
 pub mod order;
 pub mod prefix;
