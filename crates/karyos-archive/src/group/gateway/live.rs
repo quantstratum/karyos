@@ -180,6 +180,14 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     /// bytes, the sender's own bound; its timer table holds `timers`
     /// timers, ids below it.
     ///
+    /// A message whose record does not fit `max_event` cannot be recorded:
+    /// strict capture ends the journal at it, and best effort delivers it
+    /// in a gap (above `MAX_INLINE`, its payload recorded unavailable). To
+    /// record every inline payload of a source with no recording to
+    /// reference, `max_event` needs at least 147 + `MAX_INLINE` + the end
+    /// record (12 + its block): a message head with a trace extension, the
+    /// largest inline payload and its end.
+    ///
     /// # Errors
     ///
     /// [`ConfigError`] for a buffer too small for an event, or a first

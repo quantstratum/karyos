@@ -707,6 +707,33 @@ fn a_gateway_that_cannot_work_is_refused() {
         ),
         Err(ConfigError::FirstSeq)
     ));
+    // The least budget exactly: a message head with an empty payload and
+    // an extension, and its end; one byte less is refused.
+    let least = 12 + 20 + 2 + PAD.len() + END;
+    assert!(
+        Gateway::new(
+            Accepting::default(),
+            || 0,
+            make(),
+            Capture::Strict,
+            1,
+            least,
+            8
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        Gateway::new(
+            Accepting::default(),
+            || 0,
+            make(),
+            Capture::Strict,
+            1,
+            least - 1,
+            8
+        ),
+        Err(ConfigError::Buffer(budget)) if budget == least - 1
+    ));
 }
 
 /// A strict refusal is final for its event: after a call too large to

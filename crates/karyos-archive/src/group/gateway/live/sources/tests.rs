@@ -1118,3 +1118,134 @@ fn strict_reads_a_view_only_with_room() {
     assert_eq!(rig.gateway.dispatch(&mut handler), Ok(Dispatched::Idle));
     assert_eq!(seen, 1);
 }
+
+/// A message source whose every poll fails, counting its polls.
+struct Failing(Arc<std::sync::atomic::AtomicU32>);
+
+impl MessageSource for Failing {
+    fn poll_taking(
+        &mut self,
+        _: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        _: MessageLimit,
+    ) -> Result<karyos_client::PollSummary, karyos_client::PollError> {
+        let _ = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(karyos_client::PollError {
+            summary: karyos_client::PollSummary::default(),
+            cause: karyos_client::ClientError::OutcomesLost,
+        })
+    }
+}
+
+/// A poll that fails ends its source as closed, at the summary's seal or
+/// else 0, and the source is not polled again.
+#[test]
+fn a_failed_poll_ends_its_source() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    rig.gateway.sources[0].ended = true;
+    let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let _ = rig
+        .gateway
+        .add_subscription(
+            Box::new(Failing(Arc::clone(&polls))),
+            SourceIdentity {
+                stream_id: 9,
+                ..IDENTITY
+            },
+            Arc::new(RecordingWord::new()),
+        )
+        .unwrap();
+    let mut kinds = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+        if let Event::Lifecycle { kind, .. } = event {
+            kinds.push(*kind);
+        }
+    };
+    for _ in 0..4 {
+        let _ = rig.gateway.dispatch(&mut handler);
+    }
+    assert_eq!(kinds, [LifecycleKind::SubscriptionEnded(EndReason::Closed)]);
+    assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let bytes = records(rig.job, &rig.disk);
+    assert!(decoded(&bytes).iter().any(|record| matches!(
+        record,
+        GroupRecord::Lifecycle(LifecycleEvent {
+            position: 0,
+            kind: LifecycleKind::SubscriptionEnded(EndReason::Closed),
+            ..
+        })
+    )));
+}
+
+/// A view whose poll fails is closed: it is not polled again.
+struct ClosedView(Arc<std::sync::atomic::AtomicU32>);
+
+impl ConflatedSource for ClosedView {
+    fn config(&self) -> karyos_sys::conflation::ConflationConfig {
+        let (_writer, view) = view(64);
+        ConflatedSource::config(&view)
+    }
+
+    fn poll_one(&mut self, _: &mut ValueHandler<'_>) -> Result<u32, karyos_client::ClientError> {
+        let _ = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(karyos_client::ClientError::OutcomesLost)
+    }
+}
+
+#[test]
+fn a_closed_view_is_not_polled_again() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    rig.gateway.sources[0].ended = true;
+    let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    rig.gateway
+        .add_conflated(Box::new(ClosedView(Arc::clone(&polls))), 5, 1)
+        .unwrap();
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    for _ in 0..4 {
+        assert_eq!(rig.gateway.dispatch(noop), Ok(Dispatched::Idle));
+    }
+    assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// The message size the Gateway computes is the encoded record's, with
+/// and without an extension, for inline payloads and a reference.
+#[test]
+fn the_message_size_is_the_records() {
+    let mut out = vec![0u8; MAX_RECORD];
+    for (payload, extension) in [
+        (Payload::Inline(&[]), None),
+        (Payload::Inline(&[7u8; 300]), Some([1u8; EXTENSION])),
+        (
+            Payload::Reference {
+                recording_id: 3,
+                length: 70_000,
+            },
+            Some([1u8; EXTENSION]),
+        ),
+    ] {
+        let (inline, length) = match payload {
+            Payload::Inline(bytes) => (bytes.len(), bytes.len()),
+            Payload::Reference { length, .. } | Payload::Unavailable { length } => {
+                (0, usize::try_from(length).unwrap())
+            }
+        };
+        // Its frames: the payload behind a 32-byte header, aligned to 32.
+        let extent = u32::try_from((length + 32).div_ceil(32) * 32).unwrap();
+        let encoded = GroupRecord::Message(MessageEvent {
+            group_seq: 1,
+            logical_time: 0,
+            incarnation: 1,
+            position: 0,
+            extent,
+            stream_id: 2,
+            session_id: 1,
+            lane: Lane::ZERO,
+            reserved_value: 0,
+            end_of_stream: false,
+            extension: extension.as_ref(),
+            payload,
+        })
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(message_size(inline, extension.is_some()), Some(encoded));
+    }
+}
