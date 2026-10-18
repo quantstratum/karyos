@@ -589,3 +589,65 @@ fn strict_leaves_a_view_unread_without_room() {
     ));
     assert_eq!(seen, 1);
 }
+
+/// The placement's bounds, exactly: a payload of the inline threshold's
+/// length stays inline though the word names a recording, and one of
+/// `MAX_INLINE` bytes is recorded inline by strict capture.
+#[test]
+fn placement_bounds_are_exact() {
+    let mut rig = rig(Capture::Strict, 1 << 20, 70_000, 1024 * 1024);
+    append(&mut rig, &[9u8; 64]);
+    append(&mut rig, &vec![5u8; MAX_INLINE]);
+    rig.word.set(7, 0);
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    assert_eq!(
+        rig.gateway.dispatch(noop),
+        Ok(Dispatched::Event { group_seq: 1 })
+    );
+    rig.word.clear();
+    assert_eq!(
+        rig.gateway.dispatch(noop),
+        Ok(Dispatched::Event { group_seq: 2 })
+    );
+    let bytes = records(rig.job, &rig.disk);
+    let lengths: Vec<Option<usize>> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Message(message) => Some(match message.payload {
+                Payload::Inline(bytes) => Some(bytes.len()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lengths, [Some(64), Some(MAX_INLINE)]);
+}
+
+/// A timer due exactly at the dispatch's read fires; of two due timers
+/// the earlier deadline goes first.
+#[test]
+fn due_timers_fire_earliest_first_at_their_deadline() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    rig.gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            effects.schedule(TimerId(1), 1000);
+            effects.schedule(TimerId(2), 800);
+        })
+        .unwrap();
+    let mut fired = Vec::new();
+    let mut handler = |event: &Event<'_>, effects: &mut dyn Effects| {
+        if let Event::Timer { timer } = event {
+            fired.push((*timer, effects.clock()));
+        }
+    };
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+    assert_eq!(fired, [(TimerId(2), 800), (TimerId(1), 1000)]);
+}
+
+/// A view whose largest value is exactly `MAX_INLINE` is accepted.
+#[test]
+fn a_view_of_max_inline_values_is_accepted() {
+    let mut rig = rig(Capture::Strict, 1 << 20, 70_000, 64 * 1024);
+    let (_writer, view) = view(MAX_INLINE);
+    assert!(rig.gateway.add_conflated(Box::new(view), 5, 1).is_ok());
+}
