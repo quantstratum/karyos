@@ -514,6 +514,7 @@ struct Counts {
     dropped_events: AtomicU64,
     dropped_replay_ends: AtomicU64,
     refused: AtomicU64,
+    fenced_recordings: AtomicU64,
 }
 
 /// Adds one to `counter`, sticky at `u64::MAX`.
@@ -848,6 +849,14 @@ impl ArchiveHandle {
         self.counts.refused.load(Ordering::Relaxed)
     }
 
+    /// Recordings whose source was fenced at a mapping cutover: each one
+    /// recorded a gap from the seal, or ended there (mapping-generations.md,
+    /// "Recordings"). It tells a cutover gap from a lap.
+    #[must_use]
+    pub fn fenced_recordings(&self) -> u64 {
+        self.counts.fenced_recordings.load(Ordering::Relaxed)
+    }
+
     /// Stops every recording where it is (reason [`StopReason::Shutdown`])
     /// and ends the agent's thread.
     ///
@@ -892,6 +901,11 @@ impl Outbox {
         if self.replay_ends.try_send(ended).is_err() {
             count(&self.counts.dropped_replay_ends);
         }
+    }
+
+    /// A recording's source fenced at a cutover.
+    fn fenced(&self) {
+        count(&self.counts.fenced_recordings);
     }
 
     /// A start or replay refused at a cap.
@@ -1380,6 +1394,9 @@ impl<D: Disk + Clone> State<D> {
             let event = match recording.recorder.duty(now) {
                 Ok(duty) => {
                     worked |= duty.recorded > 0;
+                    if duty.fenced {
+                        outbox.fenced();
+                    }
                     if duty.ended.is_none() {
                         index += 1;
                         continue;

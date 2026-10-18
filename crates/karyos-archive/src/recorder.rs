@@ -55,6 +55,20 @@ pub enum Frames {
         /// The seal position.
         at: u64,
     },
+    /// The publication was sealed at `at` for a cutover, and the source
+    /// moved to its successor: the stream goes on at `at`, the
+    /// successor's base (mapping-generations.md, "Recordings").
+    Cutover {
+        /// The seal position, where the successor's positions start.
+        at: u64,
+    },
+    /// The publication was sealed at `at` for a cutover, and the source
+    /// cannot follow it: it was fenced at the cutover deadline. The
+    /// recording follows its lap policy from `at`.
+    Fenced {
+        /// The seal position.
+        at: u64,
+    },
     /// The source was lapped: `[from, to)` is lost, and `to` is the lowest
     /// position still retained.
     Lost {
@@ -228,6 +242,9 @@ pub struct Duty {
     pub recorded: u64,
     /// The recording ended in this duty.
     pub ended: Option<Ended>,
+    /// The source was fenced at a cutover in this duty: what the Archive
+    /// counts, so a cutover gap is told from a lap.
+    pub fenced: bool,
 }
 
 /// The recorder of one stream lane into one recording.
@@ -368,6 +385,44 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                     }
                     duty.ended = Some(self.end(at, StopReason::Normal));
                     break;
+                }
+                Frames::Cutover { at } => {
+                    // The successor continues the stream where the seal is:
+                    // nothing is lost, and the recording goes on.
+                    let written = self.store.written();
+                    if at != written {
+                        return Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+                            at,
+                            written,
+                        }));
+                    }
+                }
+                Frames::Fenced { at } => {
+                    let written = self.store.written();
+                    if at != written {
+                        return Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+                            at,
+                            written,
+                        }));
+                    }
+                    duty.fenced = true;
+                    self.incomplete = true;
+                    // Resuming joins the successor at its head, a gap from
+                    // the seal; a recording that stops, or a required one,
+                    // ends at the seal, which it recorded whole.
+                    let resume = matches!(
+                        self.mode,
+                        Mode::Async {
+                            on_lap: OnLap::Resume
+                        }
+                    );
+                    if !resume || !self.store.gap_fits() {
+                        duty.ended = Some(self.end(at, StopReason::Lapped));
+                        break;
+                    }
+                    if !self.resume_after_lap(at)? {
+                        break;
+                    }
                 }
                 Frames::Lost { from, to } => {
                     if to <= from {

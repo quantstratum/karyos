@@ -88,10 +88,13 @@ impl<O: BufferOwner> FrameSource for SenderRead<O> {
                 })
             }
             Ok(ReadOutcome::Canonical { next, .. }) => Ok(Frames::Fill { position, next }),
-            Ok(ReadOutcome::Pending) => Ok(if self.seal_position() == Some(position) {
-                Frames::Sealed { at: position }
-            } else {
-                Frames::Pending
+            // A seal with a successor: this reader holds no link to it (the
+            // driver does not offer recordings one yet), so it cannot follow
+            // the cutover and is fenced there.
+            Ok(ReadOutcome::Pending) => Ok(match self.seal_position() {
+                Some(at) if at == position && self.sealed_with_successor() => Frames::Fenced { at },
+                Some(at) if at == position => Frames::Sealed { at },
+                _ => Frames::Pending,
             }),
             Err(ReadError::Unavailable { lowest }) => Ok(Frames::Lost {
                 from: position,
