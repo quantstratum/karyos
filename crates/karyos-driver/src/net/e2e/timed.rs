@@ -486,6 +486,72 @@ fn a_reliable_timed_lane_holds_its_ring_until_acknowledged() {
     assert_clean(&mut a);
 }
 
+/// P2.11 PR1b (REVIEWER-01 on #412): an entry is freed once the
+/// registered position reaches its message's end, not only past it. The
+/// subscriber reads the 4 a ring of 4 holds, so the registered position is
+/// the fourth message's end: every entry is freed and the ring takes 4
+/// more. A reset then resends only those 4, unacknowledged, each read
+/// once, with no schedule fault.
+#[test]
+fn a_reset_after_part_of_the_window_is_acknowledged() {
+    let (mut a, mut b, publication, mut reader) = timed_pair(4, ScheduleOptions::default(), true);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let now = karyos_sys::host_clock::host_monotonic_ns();
+    for index in 0..4u32 {
+        assert!(matches!(
+            lane.offer_at(&index.to_le_bytes(), now).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    let mut seen = 0u32;
+    let read = |reader: &mut karyos_client::aggregate::AggregateSubscription<_>,
+                    seen: &mut u32| {
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, *seen, "in order, exactly once");
+                *seen += 1;
+            },
+            BUDGET,
+        );
+    };
+    pump(&mut [&mut a, &mut b], |_| {
+        read(&mut reader, &mut seen);
+        seen == 4
+    });
+    let mut accepted = 4u32;
+    pump(&mut [&mut a, &mut b], |_| {
+        let now = karyos_sys::host_clock::host_monotonic_ns();
+        if let Ok(OfferOutcome::Accepted { .. }) = lane.offer_at(&accepted.to_le_bytes(), now) {
+            accepted += 1;
+        }
+        accepted == 8
+    });
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].net.as_ref().unwrap().reopened() >= 1
+    });
+    pump(&mut [&mut a, &mut b], |_| {
+        read(&mut reader, &mut seen);
+        seen == 8
+    });
+    assert_clean(&mut a);
+}
+
 /// P2.11 PR1b: a reliable timed lane's endpoint reset rewinds it to its
 /// registered position. The messages above it are read again with their
 /// entries, which were held: resent at once, outside the late policy and

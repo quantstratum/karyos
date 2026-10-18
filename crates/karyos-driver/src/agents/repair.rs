@@ -520,6 +520,7 @@ impl<T: StreamTerms> RepairRead for ReadView<'_, T> {
             .and_then(|end| end.checked_sub(from))
             .and_then(|room| usize::try_from(room).ok())
             .map_or(scratch.bytes.len(), |room| room.min(scratch.bytes.len()));
+        let bounded = room < scratch.bytes.len();
         let Some(out) = scratch.bytes.get_mut(..room) else {
             return Err(RepairReadError::TooSmall);
         };
@@ -565,6 +566,12 @@ impl<T: StreamTerms> RepairRead for ReadView<'_, T> {
             }
             Err(ReadError::Revoked) => return Err(RepairReadError::Revoked),
             Err(ReadError::CorruptTerm { .. }) => return Err(RepairReadError::CorruptTerm),
+            // The request ends inside the frame at `from`: it names no
+            // whole frame there, so it is refused as a range, as before the
+            // read was bounded.
+            Err(ReadError::TooSmall { .. }) if bounded => {
+                return Err(RepairReadError::BadRequest);
+            }
             Err(ReadError::TooSmall { .. }) => return Err(RepairReadError::TooSmall),
             // A faulted lane or a broken invariant: dropped, no ERR.
             Err(_) => return Err(RepairReadError::Retry),
