@@ -412,3 +412,147 @@ fn recovery_recomputes_the_prefixes() {
         .unwrap();
     assert_eq!(recovery.tracker.complete_end(), ends[1]);
 }
+
+/// #384 review P2-1: under version 1, `Coverage` answers only for a
+/// `required` recording. A reference to an async recording, which may
+/// have recorded a lost range as a gap with its written position past it,
+/// gets `None` and keeps the event out of both prefixes.
+#[test]
+fn a_reference_to_an_async_recording_never_completes() {
+    /// A required recording 7 written to 4096; async recording 8 is not
+    /// answered, whatever its written position.
+    struct RequiredOnly;
+    impl Coverage for RequiredOnly {
+        fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
+            (recording_id == 7).then_some((4096, 4096))
+        }
+    }
+    let mut tracker = PrefixTracker::new(8);
+    feed(
+        &mut tracker,
+        &[
+            GroupRecord::Header(header(1, Capture::Strict)),
+            message(1, Some(8)),
+            end(1, EndOutcome::Complete),
+        ],
+    );
+    assert_eq!(tracker.advance(300, 300, &RequiredOnly), (0, 0));
+    let mut tracker = PrefixTracker::new(8);
+    feed(
+        &mut tracker,
+        &[
+            GroupRecord::Header(header(1, Capture::Strict)),
+            message(1, Some(7)),
+            end(1, EndOutcome::Complete),
+        ],
+    );
+    assert_eq!(tracker.advance(300, 300, &RequiredOnly), (1, 1));
+}
+
+/// #384 review P2-2: the complete prefix is a prefix: a later event,
+/// written and inline, does not complete past an earlier one still
+/// waiting on its payload.
+#[test]
+fn the_complete_prefix_waits_for_an_earlier_payload() {
+    let recordings = Recordings::default();
+    let mut tracker = PrefixTracker::new(8);
+    feed(
+        &mut tracker,
+        &[
+            GroupRecord::Header(header(1, Capture::Strict)),
+            message(1, Some(7)),
+            end(1, EndOutcome::Complete),
+            message(2, None),
+            end(2, EndOutcome::Complete),
+        ],
+    );
+    assert_eq!(tracker.advance(500, 0, &recordings), (0, 0));
+    recordings.set(7, 64, 0);
+    assert_eq!(tracker.advance(500, 0, &recordings), (2, 0));
+}
+
+/// #384 review P3: a full queue at an end leaves the tracker in the event;
+/// the same end is taken again once there is room.
+#[test]
+fn a_full_end_is_taken_again_once_there_is_room() {
+    let recordings = Recordings::default();
+    let mut tracker = PrefixTracker::new(1);
+    let at = feed(
+        &mut tracker,
+        &[
+            GroupRecord::Header(header(1, Capture::Strict)),
+            message(1, Some(7)),
+            end(1, EndOutcome::Complete),
+            message(2, None),
+        ],
+    );
+    assert_eq!(
+        tracker.record(&end(2, EndOutcome::Complete), at + 100),
+        Err(PrefixError::Full { capacity: 1 })
+    );
+    assert_eq!(
+        tracker.record(&message(3, None), at + 200),
+        Err(PrefixError::OutOfOrder)
+    );
+    recordings.set(7, 64, 64);
+    assert_eq!(tracker.advance(at, at, &recordings), (1, 1));
+    tracker
+        .record(&end(2, EndOutcome::Complete), at + 100)
+        .unwrap();
+    tracker.record(&message(3, None), at + 200).unwrap();
+}
+
+/// #384 review P3: the tracker refuses a gap inside an event and an
+/// observation outside one by itself.
+#[test]
+fn a_gap_inside_an_event_or_an_observation_outside_one_is_refused() {
+    use crate::group::record::{Operation, Outcome, OutcomeObservation};
+    let observation = GroupRecord::Outcome(OutcomeObservation {
+        group_seq: 1,
+        index: 0,
+        stream_id: 1,
+        session_id: 1,
+        operation: Operation::Offer,
+        outcome: Outcome::BackPressured,
+    });
+    let mut tracker = PrefixTracker::new(2);
+    tracker
+        .record(&GroupRecord::Header(header(1, Capture::BestEffort)), 100)
+        .unwrap();
+    assert_eq!(
+        tracker.record(&observation, 200),
+        Err(PrefixError::OutOfOrder)
+    );
+    tracker.record(&message(1, None), 200).unwrap();
+    assert_eq!(
+        tracker.record(
+            &GroupRecord::Gap(GapMarker {
+                from_seq: 2,
+                to_seq: 2,
+                reason: GapReason::RingFull,
+            }),
+            300,
+        ),
+        Err(PrefixError::OutOfOrder)
+    );
+}
+
+/// #384 review P3: a snapshot never shows durable above complete.
+#[test]
+fn a_snapshot_keeps_durable_at_most_complete() {
+    let none = Recordings::default();
+    let mut tracker = PrefixTracker::new(4);
+    let view = tracker.view();
+    feed(
+        &mut tracker,
+        &[
+            GroupRecord::Header(header(1, Capture::Strict)),
+            message(1, None),
+            end(1, EndOutcome::Complete),
+        ],
+    );
+    let _ = tracker.advance(300, 300, &none);
+    let (_, complete, durable) = view.snapshot();
+    assert!(durable <= complete);
+    assert_eq!((complete, durable), (1, 1));
+}

@@ -35,9 +35,17 @@ use super::record::{EndOutcome, GroupRecord, Payload};
 mod tests;
 
 /// How far a recording's frames are written and durable.
+///
+/// Version 1 answers only for a `required` recording (ADR-0023), which is
+/// never lapped, so every position below its written position holds
+/// frames: an `async` recording may have recorded a lost range as a gap
+/// and moved its written position past it (`recording-group-records.md`
+/// sections 4.1 and 9). For any other recording it answers `None`, and an
+/// event that references one never completes. A range-aware check comes in
+/// a later version.
 pub trait Coverage {
-    /// Recording `recording_id`'s `(written, durable)` positions, or `None`
-    /// for a recording this Archive does not keep.
+    /// Recording `recording_id`'s `(written, durable)` positions when it is
+    /// a `required` recording this Archive keeps, else `None`.
     fn positions(&self, recording_id: u64) -> Option<(u64, u64)>;
 }
 
@@ -96,6 +104,19 @@ impl PrefixView {
     pub fn durable_group_seq(&self) -> u64 {
         self.durable.load(Ordering::Acquire)
     }
+
+    /// `(delivered_seq, complete_recording_seq, durable_group_seq)` read so
+    /// that durable is never above complete: durable first, then complete
+    /// (each published value is at least the one before, and complete is
+    /// published before durable). Three separate reads may see a newer
+    /// durable than complete.
+    #[must_use]
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        let durable = self.durable.load(Ordering::Acquire);
+        let complete = self.complete.load(Ordering::Acquire);
+        let delivered = self.delivered.load(Ordering::Acquire);
+        (delivered, complete, durable)
+    }
 }
 
 /// The prefixes of one group.
@@ -150,8 +171,10 @@ impl PrefixTracker {
     ///
     /// # Errors
     ///
-    /// [`PrefixError::Full`] for a complete event with no room (nothing
-    /// changes), [`PrefixError::OutOfOrder`] and
+    /// [`PrefixError::Full`] for a complete event with no room: nothing
+    /// changes, the tracker stays inside the event, and the caller takes
+    /// the same end again once [`PrefixTracker::has_room`] after
+    /// [`PrefixTracker::advance`]. [`PrefixError::OutOfOrder`] and
     /// [`PrefixError::Exhausted`].
     pub fn record(
         &mut self,
@@ -347,8 +370,10 @@ pub struct Recovery {
 
 /// Recomputes the prefixes of a recovered `journal`, every record of it
 /// taken as written and durable (recovery made it so), the payloads by
-/// `coverage`. Events the tracker had no room for, with `capacity` events
-/// waiting on their payloads, stay outside the prefix.
+/// `coverage`. When the queue is full at an event's end, the prefixes are
+/// advanced and the end taken again; an event that still finds no room,
+/// with `capacity` events waiting on their payloads, stops the feed there,
+/// so `capacity` should be at least the running tracker's.
 ///
 /// # Errors
 ///
@@ -369,7 +394,14 @@ pub fn recover<D: crate::disk::Disk>(
         if full {
             return true;
         }
-        if tracker.record(record, end).is_err() {
+        let mut taken = tracker.record(record, end);
+        if matches!(taken, Err(PrefixError::Full { .. })) {
+            // Room comes back as events become durable: everything kept
+            // is written, and durable up to `durable`.
+            let _ = tracker.advance(end, durable.min(end), coverage);
+            taken = tracker.record(record, end);
+        }
+        if taken.is_err() {
             full = true;
             return true;
         }
