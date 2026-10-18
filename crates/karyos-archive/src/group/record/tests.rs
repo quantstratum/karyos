@@ -449,6 +449,50 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
     ]
 }
 
+/// #382 review: a failure's encoding against the note's §5.1 table: the
+/// `Option<u64>` of `ViewClosed::ImageRetired` (sub 4) present and absent,
+/// and `Sys::Os`'s errno sign-extended (sub 13).
+#[test]
+fn failures_follow_the_table() {
+    let failure = |error, sub, detail, detail2| {
+        let record = GroupRecord::Outcome(OutcomeObservation {
+            group_seq: 1,
+            index: 0,
+            stream_id: 1,
+            session_id: 1,
+            operation: Operation::Offer,
+            outcome: Outcome::Failed {
+                error,
+                sub,
+                detail,
+                detail2,
+            },
+        });
+        let bytes = vector(
+            11,
+            &Fields::new(51)
+                .u64(0, 1)
+                .u64(16, detail)
+                .u64(24, detail2)
+                .i32(36, 1)
+                .i32(40, 1)
+                .u16(44, error)
+                .u16(46, sub)
+                .u8(48, 1)
+                .u8(49, 9)
+                .0,
+            &[],
+        );
+        assert_eq!(GroupRecord::decode(&bytes).unwrap(), record);
+        assert_eq!(encoded(&record), bytes);
+    };
+    // ImageRetired { since: Some(4096) } and { since: None }.
+    failure(20, 4, 4096, 1);
+    failure(20, 4, 0, 0);
+    // Sys(Os { errno: -1 }): the i32, sign-extended.
+    failure(11, 13, (-1i64).cast_unsigned(), 0);
+}
+
 #[test]
 fn every_template_has_its_golden_vector() {
     for (bytes, record) in goldens() {
