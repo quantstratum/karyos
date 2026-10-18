@@ -738,6 +738,7 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
         &GatewayConfig {
             publications: &[(OUT, 1)],
             subscriptions: &[(STREAM, 1)],
+            network: &[],
             conflated: &[],
             max_claim: 8,
             max_payload: 4096,
