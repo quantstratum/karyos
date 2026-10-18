@@ -109,7 +109,7 @@ fn events(sizes: &[Option<usize>]) -> Vec<Vec<u8>> {
 fn read_back(journal: &mut GroupJournal<FaultDisk>) -> Vec<Vec<u8>> {
     let mut records = Vec::new();
     journal
-        .walk(0, |_, record| {
+        .walk(0, |_, _, record| {
             records.push(encode(record));
             true
         })
@@ -158,7 +158,7 @@ fn records_read_back_exactly_across_segments() {
     let first_end = u64::from(MIN_SEGMENT_LENGTH);
     let mut starts = Vec::new();
     journal
-        .walk(0, |position, _| {
+        .walk(0, |position, _, _| {
             starts.push(position);
             true
         })
@@ -457,7 +457,7 @@ fn a_tail_shorter_than_an_envelope_is_padding() {
     }
     let mut starts = Vec::new();
     journal
-        .walk(0, |position, _| {
+        .walk(0, |position, _, _| {
             starts.push(position);
             true
         })
