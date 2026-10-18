@@ -52,6 +52,8 @@ fn journal() -> [GroupRecord<'static>; 5] {
             stream_id: 20,
             session_id: 1,
             operation: Operation::Offer,
+            length: 0,
+            crc32c: 0,
             outcome: Outcome::BackPressured,
         }),
         GroupRecord::End(EventEnd {

@@ -67,9 +67,11 @@ pub const EXTERNAL_EVENT: Template = template(6, 20, 12 + 20 + 2 + 65_535);
 /// `LossEvent`, template 7.
 pub const LOSS_EVENT: Template = template(7, 60, 12 + 60);
 /// `OutcomeObservation`, template 11.
-pub const OUTCOME_OBSERVATION: Template = template(11, 51, 12 + 51);
+pub const OUTCOME_OBSERVATION: Template = template(11, 59, 12 + 59);
 /// `TimerObservation`, template 12.
 pub const TIMER_OBSERVATION: Template = template(12, 29, 12 + 29);
+/// `DeliveryPoll`, template 15.
+pub const DELIVERY_POLL: Template = template(15, 28, 12 + 28);
 /// `DeliveryObservation`, template 14.
 pub const DELIVERY_OBSERVATION: Template = template(14, 72, 12 + 72);
 /// `ExternalObservation`, template 13.
@@ -1086,6 +1088,11 @@ pub struct OutcomeObservation {
     pub operation: Operation,
     /// What it returned.
     pub outcome: Outcome,
+    /// An offer's payload length, or a commit's claimed bytes' length,
+    /// whatever the outcome; 0 for a claim.
+    pub length: u32,
+    /// The CRC-32C of those bytes; 0 for a claim.
+    pub crc32c: u32,
 }
 
 /// Whether `operation` can return `outcome`'s code.
@@ -1153,6 +1160,10 @@ impl OutcomeObservation {
                 detail2,
             },
         };
+        let (length, crc32c) = (block.u32(51)?, block.u32(55)?);
+        if operation == Operation::Claim && (length != 0 || crc32c != 0) {
+            return Err(out_of_range("length"));
+        }
         Ok(Self {
             group_seq: id("group_seq", block.u64(0)?)?,
             index: block.u32(32)?,
@@ -1160,6 +1171,8 @@ impl OutcomeObservation {
             session_id: block.i32(40)?,
             operation,
             outcome,
+            length,
+            crc32c,
         })
     }
 
@@ -1206,6 +1219,9 @@ impl OutcomeObservation {
         if !returns(self.operation, outcome) {
             return Err(out_of_range("outcome"));
         }
+        if self.operation == Operation::Claim && (self.length != 0 || self.crc32c != 0) {
+            return Err(out_of_range("length"));
+        }
         let operation = match self.operation {
             Operation::Offer => 1,
             Operation::Claim => 2,
@@ -1223,6 +1239,65 @@ impl OutcomeObservation {
         encoder.u8(48, operation)?;
         encoder.u8(49, outcome)?;
         encoder.u8(50, lane)?;
+        encoder.u32(51, self.length)?;
+        encoder.u32(55, self.crc32c)?;
+        encoder.finish()
+    }
+}
+
+/// A `poll_outcomes` call on a guarded publication: it precedes the
+/// `count` delivery observations the call presented, so replay can tell
+/// the calls apart, an empty one included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryPoll {
+    /// The event's sequence in its group, never 0.
+    pub group_seq: u64,
+    /// The observation's index within the event, from 0.
+    pub index: u32,
+    /// The call's maximum.
+    pub max: u32,
+    /// The records it presented, at most `max`.
+    pub count: u32,
+    /// The stream.
+    pub stream_id: i32,
+    /// The session.
+    pub session_id: i32,
+}
+
+impl DeliveryPoll {
+    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+        decoder.finish()?;
+        let (max, count) = (block.u32(12)?, block.u32(16)?);
+        if count > max {
+            return Err(out_of_range("count"));
+        }
+        Ok(Self {
+            group_seq: id("group_seq", block.u64(0)?)?,
+            index: block.u32(8)?,
+            max,
+            count,
+            stream_id: block.i32(20)?,
+            session_id: block.i32(24)?,
+        })
+    }
+
+    /// Encodes into `out`; returns the record's length.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
+    /// a `count` over `max`.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &DELIVERY_POLL)?;
+        if self.count > self.max {
+            return Err(out_of_range("count"));
+        }
+        encoder.u64(0, id("group_seq", self.group_seq)?)?;
+        encoder.u32(8, self.index)?;
+        encoder.u32(12, self.max)?;
+        encoder.u32(16, self.count)?;
+        encoder.i32(20, self.stream_id)?;
+        encoder.i32(24, self.session_id)?;
         encoder.finish()
     }
 }
@@ -1619,6 +1694,8 @@ pub enum GroupRecord<'a> {
     ExternalObservation(ExternalObservation<'a>),
     /// Template 14.
     Delivery(DeliveryObservation),
+    /// Template 15.
+    Poll(DeliveryPoll),
     /// Template 20.
     End(EventEnd),
     /// Template 21.
@@ -1644,6 +1721,31 @@ pub enum Role {
     Uncaptured(u64),
     /// An observation, with its `group_seq` and index.
     Observation(u64, u32),
+    /// A delivery poll: an observation that the next `count` records of
+    /// its event are its delivery observations, on its publication.
+    Poll {
+        /// The event's `group_seq`.
+        group_seq: u64,
+        /// The observation's index.
+        index: u32,
+        /// The delivery observations that follow.
+        count: u32,
+        /// The publication's stream.
+        stream_id: i32,
+        /// Its session.
+        session_id: i32,
+    },
+    /// A delivery observation, on its publication.
+    Delivery {
+        /// The event's `group_seq`.
+        group_seq: u64,
+        /// The observation's index.
+        index: u32,
+        /// The publication's stream.
+        stream_id: i32,
+        /// Its session.
+        session_id: i32,
+    },
     /// An event's end.
     End(EventEnd),
     /// A gap marker.
@@ -1682,6 +1784,7 @@ impl<'a> GroupRecord<'a> {
             12 => &TIMER_OBSERVATION,
             13 => &EXTERNAL_OBSERVATION,
             14 => &DELIVERY_OBSERVATION,
+            15 => &DELIVERY_POLL,
             20 => &EVENT_END,
             21 => &GAP_MARKER,
             22 => &REFERENCE_UNAVAILABLE,
@@ -1700,6 +1803,7 @@ impl<'a> GroupRecord<'a> {
             12 => Self::TimerOperation(TimerObservation::decode(block, decoder)?),
             13 => Self::ExternalObservation(ExternalObservation::decode(block, decoder)?),
             14 => Self::Delivery(DeliveryObservation::decode(block, decoder)?),
+            15 => Self::Poll(DeliveryPoll::decode(block, decoder)?),
             20 => Self::End(EventEnd::decode(block, decoder)?),
             21 => Self::Gap(GapMarker::decode(block, decoder)?),
             _ => Self::Unavailable(ReferenceUnavailable::decode(block, decoder)?),
@@ -1724,6 +1828,7 @@ impl<'a> GroupRecord<'a> {
             Self::TimerOperation(record) => record.encode(out),
             Self::ExternalObservation(record) => record.encode(out),
             Self::Delivery(record) => record.encode(out),
+            Self::Poll(record) => record.encode(out),
             Self::End(record) => record.encode(out),
             Self::Gap(record) => record.encode(out),
             Self::Unavailable(record) => record.encode(out),
@@ -1757,10 +1862,26 @@ impl<'a> GroupRecord<'a> {
             })
             | Self::ExternalObservation(ExternalObservation {
                 group_seq, index, ..
-            })
-            | Self::Delivery(DeliveryObservation {
-                group_seq, index, ..
             }) => Role::Observation(*group_seq, *index),
+            Self::Delivery(DeliveryObservation {
+                group_seq,
+                index,
+                stream_id,
+                session_id,
+                ..
+            }) => Role::Delivery {
+                group_seq: *group_seq,
+                index: *index,
+                stream_id: *stream_id,
+                session_id: *session_id,
+            },
+            Self::Poll(poll) => Role::Poll {
+                group_seq: poll.group_seq,
+                index: poll.index,
+                count: poll.count,
+                stream_id: poll.stream_id,
+                session_id: poll.session_id,
+            },
             Self::End(end) => Role::End(*end),
             Self::Gap(gap) => Role::Gap(*gap),
             Self::Unavailable(unavailable) => Role::Unavailable(unavailable.group_seq),

@@ -335,6 +335,21 @@ release may break APIs, wire formats and shared-memory layouts.
   the linger gets the repeats. The EOS counts as sent once one path
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
+- The recording group Gateway (phase 3, A7d-2a; `recording-group-gateway.md`
+  sections 3, 6 and 8). `karyos_archive::group::gateway` holds the
+  `GroupGateway` trait that capture and replay share: `Event`, `Effects` (clock,
+  offer, a scoped claim, `poll_outcomes`, timers, external reads), `Handler`,
+  `Dispatched` and `GatewayError`. `gateway::live::Gateway` captures: it reads
+  the clock once per event, numbers it, delivers it, and records the event and
+  each call into an event buffer allocated at configuration, sent as one ring
+  message; the publications are reached through a `Port`. Strict capture never
+  delivers or performs what it cannot record, refusing it typed
+  (`GatewayError::Refused`, `Outcome::Gated`); best effort delivers it
+  unrecorded and coalesces the events refused in a row into one gap marker with
+  the first refusal's reason. `deliver_external` dispatches an input from
+  outside Karyos. Template 11 gains the output intent's `length` and `crc32c`
+  (block 59), and template 15, the delivery poll, precedes its delivery
+  outcomes, under a new order rule.
 - The Archive's agent captures recording groups (phase 3, A7d-1c;
   `recording-group-gateway.md` sections 7 and 9). `ArchiveHandle::start_group`
   makes a group's journal (or recovers it) in the host's group directory and
