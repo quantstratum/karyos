@@ -39,7 +39,7 @@ use crate::group::record::{
 
 mod sources;
 
-pub use sources::{MessageSource, RecordingWord, SourceIdentity};
+pub use sources::{ConflatedSource, MessageSource, RecordingWord, SourceIdentity};
 
 #[cfg(test)]
 mod tests;
@@ -138,8 +138,10 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
     /// Each timer's pending deadline, for a cancel to repeat it and for
     /// dispatch to fire it.
     deadlines: Vec<Option<u64>>,
-    /// The message sources, polled in turn from `turn`.
+    /// The message sources, then the conflated views, polled in turn from
+    /// `turn`.
     sources: Vec<sources::Source>,
+    views: Vec<sources::View>,
     turn: usize,
     /// Payloads above it are recorded by reference when they can be.
     inline_threshold: u32,
@@ -204,6 +206,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             stats: GatewayStats::default(),
             deadlines: vec![None; usize::from(timers)],
             sources: Vec::new(),
+            views: Vec::new(),
             turn: 0,
             inline_threshold: DEFAULT_INLINE_THRESHOLD,
             observation_budget: u32::MAX,

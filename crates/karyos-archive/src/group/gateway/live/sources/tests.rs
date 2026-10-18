@@ -16,7 +16,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use karyos_client::ClientSubscription;
+use karyos_client::{ClientSubscription, ConflatedSubscription};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     AppendOptions, ClaimOutcome, Conductor, LogBuffer, LogBufferConfig, Publication, Role,
@@ -494,4 +494,98 @@ fn a_message_event_carries_its_length_and_extent() {
     let (position, extent, length, bytes) = seen[0];
     assert_eq!((length, bytes), (5, true));
     assert_eq!(position + u64::from(extent), seen[1].0);
+}
+
+fn view(
+    value_capacity: usize,
+) -> (
+    karyos_sys::conflation::ConflationWriter,
+    ConflatedSubscription,
+) {
+    let writer = karyos_sys::conflation::conflation(4, value_capacity, 4096).unwrap();
+    let view = ConflatedSubscription::new(
+        writer.reader(),
+        karyos_sys::conflation::Budget {
+            keys: 4,
+            retries: 4,
+        },
+    );
+    (writer, view)
+}
+
+/// A view whose largest value cannot fit an event, or exceeds
+/// `MAX_INLINE`, is refused when it is added.
+#[test]
+fn a_view_too_large_is_refused_when_added() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 512, 64 * 1024);
+    let (_writer, large) = view(1024);
+    assert_eq!(
+        rig.gateway.add_conflated(Box::new(large), 5, 1),
+        Err(GatewayError::TooLarge(1024))
+    );
+    let (_writer, small) = view(64);
+    assert!(rig.gateway.add_conflated(Box::new(small), 5, 1).is_ok());
+}
+
+/// A view's values are events, one per dispatch, each recorded with its
+/// key, version and freshness, after the message sources' turn.
+#[test]
+fn conflated_values_are_events() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let (mut writer, view) = view(64);
+    rig.gateway.add_conflated(Box::new(view), 5, 1).unwrap();
+    writer.write(2, b"two").unwrap();
+    writer.write(3, b"three").unwrap();
+    let mut values = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+        if let Event::Conflated { value, .. } = event {
+            values.push(value.to_vec());
+        }
+    };
+    let mut dispatched = 0;
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {
+        dispatched += 1;
+    }
+    assert_eq!(dispatched, 2);
+    values.sort();
+    assert_eq!(values, [b"three".to_vec(), b"two".to_vec()]);
+    let bytes = records(rig.job, &rig.disk);
+    let keys: Vec<(u32, i32)> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Conflated(event) => Some((event.key, event.stream_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert!(
+        keys.iter()
+            .all(|(key, stream)| [2, 3].contains(key) && *stream == 5)
+    );
+}
+
+/// Strict polls a view only when an event can be admitted: with the ring
+/// full its value stays in the table, and comes once there is room.
+#[test]
+fn strict_leaves_a_view_unread_without_room() {
+    let mut rig = rig(Capture::Strict, 8 * 1024, 1000, 64 * 1024);
+    let (mut writer, view) = view(64);
+    rig.gateway.add_conflated(Box::new(view), 5, 1).unwrap();
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.deliver_external(1, &[0u8; 600], noop) {}
+    writer.write(1, b"kept").unwrap();
+    let mut seen = 0;
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+        if matches!(event, Event::Conflated { .. }) {
+            seen += 1;
+        }
+    };
+    assert_eq!(rig.gateway.dispatch(&mut handler), Ok(Dispatched::Idle));
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    assert!(matches!(
+        rig.gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { .. })
+    ));
+    assert_eq!(seen, 1);
 }

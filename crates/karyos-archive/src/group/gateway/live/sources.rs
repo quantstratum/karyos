@@ -22,10 +22,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_client::{
-    ClientSubscription, MessageInfo, MessageLimit, PollError, PollSummary, RejoinOutcome,
-    ReplayFallbackReason, SecondaryOutcome,
+    ClientError, ClientSubscription, ConflatedSubscription, MessageInfo, MessageLimit, PollError,
+    PollSummary, RejoinOutcome, ReplayFallbackReason, SecondaryOutcome,
 };
+use karyos_sys::conflation::{Budget, ConflationConfig};
 use karyos_sys::frame::Lane;
+use karyos_sys::freshness::Freshness as ReadFreshness;
 use karyos_sys::term_bytes::TermBytes;
 
 use super::{Gateway, Port};
@@ -34,12 +36,13 @@ use super::{Gateway, Port};
 mod tests;
 use crate::group::capture::Refusal;
 use crate::group::gateway::{
-    Dispatched, Event, GatewayError, Handler, MessagePayload, SubscriptionId, TimerId,
+    ConflatedId, Dispatched, Event, GatewayError, Handler, MessagePayload, SubscriptionId, TimerId,
 };
 use crate::group::record::Capture;
 use crate::group::record::{
-    EXTENSION, EndReason, FallbackReason, GroupRecord, LifecycleEvent, LifecycleKind, Loss,
-    LossEvent, MAX_INLINE, MessageEvent, OverrunOutcome, Payload, TimerEvent,
+    CONFLATED_EVENT, ConflatedEvent, EXTENSION, EndReason, FallbackReason, Freshness, GroupRecord,
+    LifecycleEvent, LifecycleKind, Loss, LossEvent, MAX_INLINE, MessageEvent, OverrunOutcome,
+    Payload, TimerEvent,
 };
 
 /// A message source's identity, recorded with each of its events.
@@ -120,6 +123,60 @@ impl<T: TermBytes> MessageSource for ClientSubscription<T> {
         limit: MessageLimit,
     ) -> Result<PollSummary, PollError> {
         ClientSubscription::poll_taking(self, handler, limit)
+    }
+}
+
+/// What takes a conflated value: its key, bytes, version and freshness.
+pub type ValueHandler<'a> = dyn FnMut(u32, &[u8], u64, ReadFreshness) + 'a;
+
+/// A conflated view the Gateway polls one value at a time.
+pub trait ConflatedSource {
+    /// The view's table configuration: its largest value bounds what an
+    /// event needs.
+    fn config(&self) -> ConflationConfig;
+
+    /// Delivers at most one changed key's latest value to `handler`
+    /// (key, value, version, freshness); returns how many it delivered.
+    ///
+    /// # Errors
+    ///
+    /// The client's [`ClientError::ViewClosed`] once the view closed.
+    fn poll_one(&mut self, handler: &mut ValueHandler<'_>) -> Result<u32, ClientError>;
+}
+
+impl ConflatedSource for ConflatedSubscription {
+    fn config(&self) -> ConflationConfig {
+        ConflatedSubscription::config(self)
+    }
+
+    fn poll_one(&mut self, handler: &mut ValueHandler<'_>) -> Result<u32, ClientError> {
+        let budget = Budget {
+            keys: 1,
+            retries: 4,
+        };
+        self.poll_changed_with(budget, |key, value| {
+            handler(key, value.payload(), value.version(), value.freshness());
+        })
+        .map(|report| report.delivered)
+    }
+}
+
+/// A conflated view added at configuration.
+pub(super) struct View {
+    source: Option<Box<dyn ConflatedSource + Send>>,
+    stream_id: i32,
+    session_id: i32,
+    /// Closed for good: polled no more.
+    closed: bool,
+}
+
+impl core::fmt::Debug for View {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("View")
+            .field("stream_id", &self.stream_id)
+            .field("session_id", &self.session_id)
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
     }
 }
 
@@ -262,6 +319,107 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         Ok(SubscriptionId(id))
     }
 
+    /// Adds a conflated view of stream `stream_id`, session `session_id`.
+    /// Configuration only: it allocates.
+    ///
+    /// # Errors
+    ///
+    /// [`GatewayError::TooLarge`] for a view whose largest value exceeds
+    /// `MAX_INLINE` or does not fit the event budget: its values could
+    /// not be recorded.
+    pub fn add_conflated(
+        &mut self,
+        source: Box<dyn ConflatedSource + Send>,
+        stream_id: i32,
+        session_id: i32,
+    ) -> Result<ConflatedId, GatewayError> {
+        let largest = source.config().value_capacity;
+        let event = usize::from(CONFLATED_EVENT.block_length)
+            .checked_add(12 + 2)
+            .and_then(|head| head.checked_add(largest))
+            .and_then(|event| event.checked_add(super::END));
+        if largest > MAX_INLINE || event.is_none_or(|event| event > self.buffer.len()) {
+            return Err(GatewayError::TooLarge(largest));
+        }
+        let id = u16::try_from(self.views.len()).map_err(|_| GatewayError::TooLarge(largest))?;
+        self.views.push(View {
+            source: Some(source),
+            stream_id,
+            session_id,
+            closed: false,
+        });
+        Ok(ConflatedId(id))
+    }
+
+    /// Polls view `index` for one value; `None` when it had none or was
+    /// skipped. Its value is consumed when read, so strict capture polls it
+    /// only when an event can be admitted: a skipped view may conflate
+    /// further versions meanwhile, as conflation does, and the recorded
+    /// value is the one the handler saw.
+    fn poll_view(
+        &mut self,
+        index: usize,
+        now: u64,
+        handler: &mut dyn Handler,
+    ) -> Result<Option<Dispatched>, GatewayError> {
+        let Some(view) = self.views.get_mut(index) else {
+            return Ok(None);
+        };
+        if view.closed {
+            return Ok(None);
+        }
+        let (stream_id, session_id) = (view.stream_id, view.session_id);
+        if self.capture == Capture::Strict
+            && (self.pending.is_some() || self.sender.admit().is_err())
+        {
+            return Ok(None);
+        }
+        let Some(mut source) = self
+            .views
+            .get_mut(index)
+            .and_then(|view| view.source.take())
+        else {
+            return Ok(None);
+        };
+        let id = ConflatedId(u16::try_from(index).unwrap_or(u16::MAX));
+        let mut result = None;
+        let polled = source.poll_one(&mut |key, value, version, read| {
+            let freshness = match read {
+                ReadFreshness::Fresh => Some(Freshness::Fresh),
+                ReadFreshness::Stale { since } => Some(Freshness::Stale { since }),
+                // The client delivers coherent values only.
+                ReadFreshness::Retry => None,
+            };
+            let first = |group_seq: u64, out: &mut [u8]| {
+                let freshness = freshness.ok_or(Refusal::TooLarge)?;
+                GroupRecord::Conflated(ConflatedEvent {
+                    group_seq,
+                    logical_time: now,
+                    version,
+                    key,
+                    stream_id,
+                    session_id,
+                    freshness,
+                    value,
+                })
+                .encode(out)
+                .map_err(|_| Refusal::TooLarge)
+            };
+            let event = Event::Conflated {
+                source: id,
+                version,
+                freshness: freshness.unwrap_or(Freshness::Fresh),
+                value,
+            };
+            result = Some(self.dispatch_event(&event, now, &first, handler));
+        });
+        if let Some(view) = self.views.get_mut(index) {
+            view.source = Some(source);
+            view.closed |= polled.is_err();
+        }
+        result.transpose()
+    }
+
     /// The timer due at `now` with the earliest deadline, taken from the
     /// table.
     fn due(&mut self, now: u64) -> Option<(TimerId, u64)> {
@@ -305,14 +463,22 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             return result;
         }
         let _ = self.flush();
-        let count = self.sources.len();
+        // The message sources, then the views, in turn.
+        let sources = self.sources.len();
+        let count = sources
+            .checked_add(self.views.len())
+            .ok_or(GatewayError::Ended)?;
         for _ in 0..count {
             let index = self.turn;
             self.turn = index
                 .checked_add(1)
                 .filter(|next| *next < count)
                 .unwrap_or(0);
-            if let Some(dispatched) = self.poll_source(index, now, handler)? {
+            let dispatched = match index.checked_sub(sources) {
+                None => self.poll_source(index, now, handler)?,
+                Some(view) => self.poll_view(view, now, handler)?,
+            };
+            if let Some(dispatched) = dispatched {
                 return Ok(dispatched);
             }
         }

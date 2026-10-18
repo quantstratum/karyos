@@ -12,7 +12,7 @@
 //! read them; an embedded view without such a client has only the
 //! accessors.
 
-use karyos_sys::conflation::{Budget, ConflationReader, PollReport};
+use karyos_sys::conflation::{Budget, ConflationConfig, ConflationReader, PollReport};
 use karyos_sys::freshness::{
     Freshness, TERMINAL_BARRIER_TIMEOUT, TERMINAL_BELOW_FRONTIER, TERMINAL_FEEDER_LOST,
     TERMINAL_FRESHNESS_EXHAUSTED, TERMINAL_IMAGE_RETIRED, Terminal,
@@ -216,6 +216,13 @@ impl ConflatedSubscription {
         self
     }
 
+    /// The configuration of the view's table: its keys, its largest value
+    /// and its journal. Fixed when the table is mapped.
+    #[must_use]
+    pub fn config(&self) -> ConflationConfig {
+        self.reader.config()
+    }
+
     /// The reader-side counts since the view was created.
     #[must_use]
     pub fn counts(&self) -> ReaderCounts {
@@ -291,6 +298,19 @@ impl ConflatedSubscription {
 mod tests {
     use super::*;
     use karyos_sys::conflation::conflation;
+
+    #[test]
+    fn a_view_reports_its_table_config() {
+        let writer = conflation(2, 8, 1024).unwrap();
+        let subscription = ConflatedSubscription::new(
+            writer.reader(),
+            Budget {
+                keys: 1,
+                retries: 1,
+            },
+        );
+        assert_eq!(subscription.config(), writer.config());
+    }
 
     #[test]
     fn poll_changed_uses_the_subscription_budget() {
