@@ -31,11 +31,15 @@ use super::{
 use crate::crc32c::crc32c;
 use crate::group::capture::{CaptureSender, GroupState, Refusal};
 use crate::group::record::{
-    Capture, DELIVERY_OBSERVATION, DELIVERY_POLL, DeliveryObservation, DeliveryPoll, EVENT_END,
-    EXTERNAL_OBSERVATION, EndOutcome, EventEnd, ExternalEvent, ExternalObservation, GapMarker,
-    GapReason, GroupRecord, MAX_INLINE, OUTCOME_OBSERVATION, Operation, Outcome,
-    OutcomeObservation, TIMER_OBSERVATION, TimerAction, TimerObservation,
+    Capture, DEFAULT_INLINE_THRESHOLD, DELIVERY_OBSERVATION, DELIVERY_POLL, DeliveryObservation,
+    DeliveryPoll, EVENT_END, EXTERNAL_OBSERVATION, EndOutcome, EventEnd, ExternalEvent,
+    ExternalObservation, GapMarker, GapReason, GroupRecord, MAX_INLINE, OUTCOME_OBSERVATION,
+    Operation, Outcome, OutcomeObservation, TIMER_OBSERVATION, TimerAction, TimerObservation,
 };
+
+mod sources;
+
+pub use sources::{MessageSource, RecordingWord, SourceIdentity};
 
 #[cfg(test)]
 mod tests;
@@ -131,8 +135,16 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
     scratch: Vec<u8>,
     pending: Option<Pending>,
     stats: GatewayStats,
-    /// Each timer's pending deadline, for a cancel to repeat it.
+    /// Each timer's pending deadline, for a cancel to repeat it and for
+    /// dispatch to fire it.
     deadlines: Vec<Option<u64>>,
+    /// The message sources, polled in turn from `turn`.
+    sources: Vec<sources::Source>,
+    turn: usize,
+    /// Payloads above it are recorded by reference when they can be.
+    inline_threshold: u32,
+    /// Observations recorded per event at most.
+    observation_budget: u32,
 }
 
 /// Why a Gateway could not be configured.
@@ -191,7 +203,23 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             pending: None,
             stats: GatewayStats::default(),
             deadlines: vec![None; usize::from(timers)],
+            sources: Vec::new(),
+            turn: 0,
+            inline_threshold: DEFAULT_INLINE_THRESHOLD,
+            observation_budget: u32::MAX,
         })
+    }
+
+    /// Sets the inline threshold: the journal header's. Configuration only.
+    pub fn set_inline_threshold(&mut self, threshold: u32) {
+        self.inline_threshold = threshold;
+    }
+
+    /// Sets the observation budget per event. Strict refuses a call past
+    /// it; best effort performs it and ends the event incomplete.
+    /// Configuration only.
+    pub fn set_observation_budget(&mut self, budget: u32) {
+        self.observation_budget = budget;
     }
 
     /// The refusals and uncaptured events so far.
@@ -340,6 +368,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             recording: true,
             strict: self.capture == Capture::Strict,
             deadlines: &mut self.deadlines,
+            budget: self.observation_budget,
         };
         handler.on_event(event, &mut effects);
         let (length, index, incomplete) = (effects.length, effects.index, effects.incomplete);
@@ -430,20 +459,20 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             recording: false,
             strict: self.capture == Capture::Strict,
             deadlines: &mut self.deadlines,
+            budget: self.observation_budget,
         };
         handler.on_event(event, &mut effects);
     }
 }
 
 impl<P: Port, C: FnMut() -> u64> GroupGateway for Gateway<P, C> {
-    /// A2b's sources dispatch here; until then there is no event but an
-    /// external one, so a dispatch only writes a pending gap.
-    fn dispatch(&mut self, _handler: &mut dyn Handler) -> Result<Dispatched, GatewayError> {
+    /// Takes the next event, a timer due now or a source's, and delivers
+    /// it.
+    fn dispatch(&mut self, handler: &mut dyn Handler) -> Result<Dispatched, GatewayError> {
         if self.capture == Capture::Strict && self.sender.state() != GroupState::Running {
             return Err(GatewayError::Ended);
         }
-        let _ = self.flush();
-        Ok(Dispatched::Idle)
+        self.dispatch_next(handler)
     }
 
     fn deliver_external(
@@ -513,6 +542,8 @@ struct Recording<'a, P: Port> {
     recording: bool,
     strict: bool,
     deadlines: &'a mut [Option<u64>],
+    /// Observations recorded per event at most.
+    budget: u32,
 }
 
 impl<P: Port> Recording<'_, P> {
@@ -524,6 +555,7 @@ impl<P: Port> Recording<'_, P> {
             return true;
         }
         let fits = !self.incomplete
+            && self.index < self.budget
             && bytes
                 .and_then(|bytes| self.length.checked_add(bytes))
                 .is_some_and(|end| end <= self.limit);
@@ -543,6 +575,10 @@ impl<P: Port> Recording<'_, P> {
     /// ends the event incomplete.
     fn push(&mut self, record: &GroupRecord<'_>) {
         if !self.recording || self.incomplete {
+            return;
+        }
+        if self.index >= self.budget {
+            self.incomplete = true;
             return;
         }
         let encoded = self
