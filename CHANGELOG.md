@@ -295,8 +295,9 @@ release may break APIs, wire formats and shared-memory layouts.
   counted; a guard close ends a head still waiting for its time. Refused
   for now, typed (`DriverError::TimedNetworkUnsupported`): redundant
   paths, reliable channels (PR1b), the `Tai` domain, cancel-on-deadline
-  and a `max_horizon` at or past `image_liveness_timeout` (a lane holding
-  only a head that far ahead sends nothing, so its images would retire).
+  and a `max_horizon` that, with one `sender_heartbeat_interval`, reaches
+  `image_liveness_timeout` (a lane holding only a head that far ahead
+  sends nothing, so its images would retire).
   A lane's settings and counter cells are fixed from the add, also across
   a guard reopen's fresh incarnation. Counts are per message, not per
   fragment. The sender times heads on the host monotonic clock,

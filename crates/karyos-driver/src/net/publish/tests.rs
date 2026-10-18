@@ -2001,14 +2001,22 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         ..ScheduleOptions::default()
     };
     let cases = vec![
+        (
+            channel(destination),
+            ScheduleOptions::default(),
+            Unsupported::Reliable,
+        ),
         (unreliable.clone(), cancel, Unsupported::CancelOnDeadline),
         // Refused before anything platform-specific: on every platform.
         (unreliable.clone(), tai, Unsupported::TaiDomain),
         (routed, ScheduleOptions::default(), Unsupported::Routed),
         (
             unreliable.clone(),
+            // The horizon plus one heartbeat interval (the silence before
+            // a held head) reaches the liveness timeout.
             ScheduleOptions {
-                max_horizon: crate::agents::AgentConfig::default().image_liveness_timeout,
+                max_horizon: crate::agents::AgentConfig::default().image_liveness_timeout
+                    - crate::agents::AgentConfig::default().sender_heartbeat_interval,
                 ..ScheduleOptions::default()
             },
             Unsupported::HorizonPastLiveness,

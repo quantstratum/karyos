@@ -807,3 +807,67 @@ fn a_tail_dropped_by_a_reset_is_not_drained() {
         while report.pop_front().is_some() {}
     }
 }
+
+/// #404 re-check P3: a timed message whose last fragment never reached its
+/// queue frees its own schedule entry, the newest read: an older message
+/// still staged keeps its slot, so the publisher's ring stays full until
+/// that one leaves.
+#[test]
+fn a_lost_timed_message_frees_its_own_entry() {
+    use karyos_sys::log_buffer::ScheduledOutcome;
+    use karyos_sys::schedule_ring::SchedulePublisher;
+
+    use super::testing::outbound_timed;
+    use crate::timed_gate::LatePolicy;
+
+    // Unscripted sends block: staged heads stay queued.
+    let socket = ScriptedSocket::new();
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (mut path, mut log) = outbound_timed(EndpointId(1), alias, destination, term, 2);
+    path.set_timed(&[LatePolicy::default()], vec![None], 0)
+        .unwrap();
+    for i in 0..2u8 {
+        assert!(matches!(
+            log.publications[0]
+                .append_scheduled(&[i; 100], AppendOptions::default(), 0)
+                .unwrap(),
+            ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+        ));
+    }
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    for now in 1..4 {
+        let _ = path.serve(&mut tx, budget, None, now).unwrap();
+    }
+    assert_eq!(path.counters().staged, 2);
+    let ring = log.lanes[0].schedule_ring().unwrap();
+    let mut publisher = SchedulePublisher::attach(ring).unwrap();
+    assert_eq!(publisher.has_room(ring), Ok(false));
+    // The newest is lost: the older, still staged, keeps its entry.
+    path.timed_message_lost(0);
+    assert_eq!(publisher.has_room(ring), Ok(false), "the older one's slot");
+    assert_eq!(path.counters().schedule_faults, 0);
+    // The endpoint table's part: retire the endpoint, returning its items.
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while !matches!(
+        endpoint.retire(&mut report),
+        karyos_io::sockets::endpoint::Retired::Complete { .. }
+    ) {
+        while report.pop_front().is_some() {}
+    }
+}

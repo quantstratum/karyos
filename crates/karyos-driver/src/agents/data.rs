@@ -1807,6 +1807,28 @@ pub(crate) mod testing {
 
     /// [`outbound`], with `before` 1000-byte messages appended on each lane
     /// before its reader subscribes: the reader joins above 0.
+    /// [`outbound`] of one lane with a schedule ring of `capacity`.
+    pub(crate) fn outbound_timed(
+        endpoint: EndpointId,
+        alias: Alias,
+        destination: SocketAddr,
+        term: TermParams,
+        capacity: u32,
+    ) -> (Box<Outbound>, TestLog) {
+        build(
+            endpoint,
+            alias,
+            destination,
+            term,
+            1,
+            false,
+            0,
+            None,
+            None,
+            capacity,
+        )
+    }
+
     pub(crate) fn outbound_joined(
         endpoint: EndpointId,
         alias: Alias,
@@ -1826,6 +1848,7 @@ pub(crate) mod testing {
             before,
             None,
             None,
+            0,
         )
     }
 
@@ -1850,6 +1873,7 @@ pub(crate) mod testing {
             0,
             None,
             Some(publishers),
+            0,
         )
     }
 
@@ -1864,6 +1888,7 @@ pub(crate) mod testing {
         before: u8,
         routes: Option<&[(EndpointId, SocketAddr)]>,
         concurrent: Option<u8>,
+        schedule: u32,
     ) -> (Box<Outbound>, TestLog) {
         let mut log = TestLog {
             lanes: Vec::new(),
@@ -1894,7 +1919,7 @@ pub(crate) mod testing {
                         None => PublicationMode::Exclusive,
                     },
                     claim_deadline: DEFAULT_CLAIM_DEADLINE,
-                    schedule_capacity: 0,
+                    schedule_capacity: schedule,
                 })
                 .unwrap(),
             );
@@ -1971,6 +1996,7 @@ pub(crate) mod testing {
             0,
             Some(routes),
             None,
+            0,
         )
     }
 }
