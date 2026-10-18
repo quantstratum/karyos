@@ -60,8 +60,8 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
 
 use karyos_io::backend::{
-    Authority, BackendEpoch, Commit, Exposure, GateDecision, SenderGate, SenderToken, TxBackend,
-    TxFrame, TxOptions, TxQueueConfig, TxQueueId, TxReport, TxTicket,
+    Authority, BackendEpoch, Commit, Exposure, GateDecision, RouteId, SenderGate, SenderToken,
+    TxBackend, TxFrame, TxOptions, TxQueueConfig, TxQueueId, TxReport, TxTicket,
 };
 use karyos_io::lanes::routes::MAX_ROUTES;
 use karyos_io::lanes::{LaneGate, LaneSender, Left, SenderFailure, Staged};
@@ -268,6 +268,8 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     tracks: Vec<LaneTrack>,
     /// The endpoint epoch its queues were opened in.
     opened: Option<BackendEpoch>,
+    /// The route its queues were opened on, in that epoch.
+    route: Option<RouteId>,
     /// See [`Outbound::needs_reset`].
     needs_reset: bool,
     /// The sender cycle its last reset request was posted in, while it
@@ -455,6 +457,7 @@ impl<T: StreamTerms> Outbound<T> {
                     .ok_or(OutboundError::Mtu)?,
             ),
             routed: None,
+            route: None,
             idle_since: [None; 4],
             removal: None,
         })
@@ -967,9 +970,38 @@ impl<T: StreamTerms> Outbound<T> {
             }
         }
         self.opened = Some(epoch);
+        self.route = Some(route);
         self.needs_reset = false;
         self.reset_requested = None;
         true
+    }
+
+    /// What it holds open on its endpoints, given to `held` once per
+    /// endpoint: the route, the lane queues and the repair queue it opened
+    /// there, in that endpoint's epoch. A removed publication's sender closes
+    /// them at its next duty (driver-network-agents.md §7: the sender drops
+    /// its queues).
+    pub(crate) fn opened_resources(&self, mut held: impl FnMut(Opened)) {
+        if let Some(routed) = self.routed.as_deref() {
+            routed.opened_resources(self.repair.as_deref(), &mut held);
+            return;
+        }
+        let (Some(epoch), Some(route)) = (self.opened, self.route) else {
+            return;
+        };
+        let mut queues = [None; OPENED_QUEUES];
+        for (slot, queue) in queues.iter_mut().zip(&self.queues) {
+            *slot = Some(*queue);
+        }
+        if let Some(slot) = queues.last_mut() {
+            *slot = self.repair.as_deref().and_then(|repair| repair.queue_on(0));
+        }
+        held(Opened {
+            endpoint: self.endpoint,
+            epoch,
+            route,
+            queues,
+        });
     }
 
     /// One cycle: stage what each lane has committed, serve the lanes
@@ -1699,6 +1731,23 @@ pub(crate) mod testing {
             None,
         )
     }
+}
+
+/// A lane queue per lane, then the repair queue.
+pub(crate) const OPENED_QUEUES: usize = 5;
+
+/// A publication's route and queues on one endpoint, in one epoch
+/// ([`Outbound::opened_resources`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Opened {
+    /// The endpoint.
+    pub(crate) endpoint: EndpointId,
+    /// The epoch they were opened in: a later one dropped them already.
+    pub(crate) epoch: BackendEpoch,
+    /// The route.
+    pub(crate) route: RouteId,
+    /// The lane queues, then the repair queue.
+    pub(crate) queues: [Option<TxQueueId>; OPENED_QUEUES],
 }
 
 mod heartbeat;

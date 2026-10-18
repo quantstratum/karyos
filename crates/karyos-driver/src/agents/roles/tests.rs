@@ -4118,3 +4118,97 @@ fn the_sender_heartbeat_interval_is_bounded() {
         assert_eq!(config.validate().is_ok(), valid, "{interval}");
     }
 }
+
+/// The sender of a removed single-path publication added and established
+/// on endpoint 1, its queues opened by a few cycles; the halves.
+fn removed_after_opening() -> (
+    super::SenderRole,
+    Vec<(
+        EndpointId,
+        super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+    )>,
+    super::super::data::Opened,
+) {
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let (path, _log) = outbound(EndpointId(1), "10.0.0.9:5000".parse().unwrap());
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    let (half, _frames, _data) = header_only_frames();
+    let mut halves = vec![(EndpointId(1), half)];
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    for now in 2..4 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    let mut opened = None;
+    sender.publications[0].opened_resources(|held| opened = Some(held));
+    let opened = opened.expect("its route and queues are open");
+    let removed = sender.command(AgentCommand::<OsSocket>::RemoveSenderSession {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias: alias(),
+        registration: 1,
+    });
+    assert!(matches!(
+        removed,
+        Some((_, AgentEvent::PublicationRemoved { .. }))
+    ));
+    (sender, halves, opened)
+}
+
+/// #354 review P3-6 (driver-network-agents.md §7: the sender drops its
+/// queues): a removed publication's lane queues and route are closed at
+/// the sender's next duty; none stays open.
+#[test]
+fn a_removed_publication_closes_its_queues_and_route() {
+    use karyos_io::backend::TxBackend;
+
+    let (mut sender, mut halves, opened) = removed_after_opening();
+    let queues: Vec<_> = opened.queues.into_iter().flatten().collect();
+    assert!(!queues.is_empty());
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    for queue in &queues {
+        assert!(tx.claim_tx(*queue, 32).is_ok(), "open before the duty");
+    }
+    assert!(tx.route_info(opened.route).is_ok());
+    let _ = sender.duty(&mut halves, 4).unwrap();
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    for queue in &queues {
+        assert!(tx.claim_tx(*queue, 32).is_err(), "{queue:?} still open");
+    }
+    assert!(
+        tx.route_info(opened.route).is_err(),
+        "the route is still open"
+    );
+    let closed = u64::try_from(queues.len() + 1).unwrap();
+    assert_eq!(sender.counters().removed_closed, closed);
+    // Nothing is left to close.
+    let _ = sender.duty(&mut halves, 5).unwrap();
+    assert_eq!(sender.counters().removed_closed, closed);
+}
+
+/// P3-6: with no TX half when the duty comes (its endpoint is being reset
+/// or retired), the removed publication's queues are dropped by that
+/// reset, so nothing is closed and nothing waits.
+#[test]
+fn a_removed_publication_with_no_half_closes_nothing() {
+    let (mut sender, mut halves, _opened) = removed_after_opening();
+    let half = halves.pop().unwrap();
+    let _ = sender.duty(&mut halves, 4).unwrap();
+    assert_eq!(sender.counters().removed_closed, 0);
+    halves.push(half);
+    let _ = sender.duty(&mut halves, 5).unwrap();
+    assert_eq!(sender.counters().removed_closed, 0, "nothing waited");
+}
