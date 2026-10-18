@@ -103,8 +103,6 @@ struct Ended {
 struct Host {
     driver: EmbeddedDriver,
     data: StreamHandle,
-    /// The recorded stream's buffer, which its recording's format is.
-    buffer: LogBufferConfig,
     next_session: i32,
     /// Each replay target's reader, subscribed before the replay starts.
     targets: Vec<karyos_client::aggregate::AggregateSubscription<HeapTerms>>,
@@ -136,19 +134,21 @@ impl ArchiveHost for Host {
             .driver
             .trace_identity(self.data)
             .map_err(|error| HostRefusal(error.to_string()))?;
-        let (reader, lease) = self
+        // The recorded lane's format, from its reader: the driver drew its
+        // initial term id.
+        let recording = self
             .driver
             .recording_reader(self.data, Role::Required)
-            .map_err(|error| HostRefusal(error.to_string()))?
-            .into_parts();
-        let buffer = self.buffer;
+            .map_err(|error| HostRefusal(error.to_string()))?;
+        let format = recording.format();
+        let (reader, lease) = recording.into_parts();
         Ok(HostRecording {
             source: Box::new(Guarded::new(reader, lease)),
-            term_length: buffer.term_length.get(),
+            term_length: format.term_length,
             format: StreamFormat {
-                lane: buffer.lane,
-                initial_term_id: buffer.initial_term_id.get().cast_signed(),
-                mtu: NonZeroU32::new(buffer.mtu)
+                lane: format.lane,
+                initial_term_id: format.initial_term_id,
+                mtu: NonZeroU32::new(format.mtu)
                     .ok_or_else(|| HostRefusal("an mtu of 0".to_owned()))?,
                 source: SourceIncarnation {
                     driver: identity.driver,
@@ -288,10 +288,14 @@ impl Rig {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
-        let mut driver = EmbeddedDriver::new().unwrap();
-        let config = stream(DATA, initial_term_id);
-        let buffer = config.buffer;
-        let data = driver.add_stream(config).unwrap();
+        // The driver draws each stream's initial term id; the override
+        // starts the recorded stream at `initial_term_id` (the wrap test).
+        let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
+            initial_term_id: Some(initial_term_id),
+            ..karyos_driver::DriverConfig::default()
+        })
+        .unwrap();
+        let data = driver.add_stream(stream(DATA, initial_term_id)).unwrap();
         let requests = driver
             .add_stream(stream(REQUESTS, INITIAL_TERM_ID))
             .unwrap();
@@ -308,7 +312,6 @@ impl Rig {
         let host = Host {
             driver,
             data,
-            buffer,
             next_session: 1,
             targets: Vec::new(),
             ended: channel(),
