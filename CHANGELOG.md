@@ -11,6 +11,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A publication released through the client facade whose removal cannot
+  be sent (the command ring full, a handle another connection issued, a
+  closed link) is counted: `Client::publication_releases_failed`. The
+  handle is still dropped; in process that ends its lease, and for a
+  remote client the driver keeps the publication, with no EOS, until the
+  client ends. The doc-hidden `Connection::release_publication` returns
+  whether the removal was sent (#402 review P3).
 - The Archive's client (phase 3, A6b-2).
   `karyos_archive::client::ArchiveClient` is a `ReplayProvider` over the
   Archive's control streams (`ControlRequests`, `ControlResponses`): asked
