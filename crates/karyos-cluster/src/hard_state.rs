@@ -42,7 +42,8 @@ pub struct HardState {
     /// The node it voted for in `current_term`, if any.
     pub voted_for: Option<u64>,
     /// A commit index the node chose to keep; never above the log's
-    /// durable last index.
+    /// durable last index, and never lowered or cleared once stored: a
+    /// vote-only save (openraft's `save_vote`) carries the stored one.
     pub commit: Option<u64>,
 }
 

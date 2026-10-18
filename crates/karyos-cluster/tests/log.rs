@@ -625,8 +625,8 @@ fn data_file(dir: &Path, base: u64) -> PathBuf {
 }
 
 /// Two 3000-byte entries over 4 KiB segments: the second spans the
-/// segment at 4096, with its second chunk indexed there as the first
-/// entry (bytes 48..80 of that index file). Returns the second's start.
+/// segment at 4096, its second chunk the last A2 write. Returns the
+/// second's start.
 fn spanning(name: &str) -> (TempDir, u64) {
     let dir = TempDir::new(name);
     let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
@@ -637,16 +637,24 @@ fn spanning(name: &str) -> (TempDir, u64) {
     (dir, second)
 }
 
-/// The real torn tail: an entry spanning two segments whose second chunk
-/// was lost (its index entry never written). Cut at the entry's start,
-/// the entries before it kept.
+/// Tears the last A2 write, as a crash inside it does: the second chunk
+/// of the spanning entry keeps only its first 500 bytes.
+fn tear_last_write(dir: &Path) {
+    let data = std::fs::OpenOptions::new()
+        .write(true)
+        .open(data_file(dir, 4096))
+        .unwrap();
+    data.set_len(500).unwrap();
+}
+
+/// The real torn tail: a crash inside the last A2 write, the second chunk
+/// of an entry spanning two segments. A2 cuts the torn write, and the log
+/// cuts the entry whose first chunk is left, at its start; the entries
+/// before it are kept.
 #[test]
 fn a_torn_tail_is_cut() {
     let (dir, second) = spanning("tail");
-    let index = index_file(&dir.0, 4096);
-    let mut bytes = std::fs::read(&index).unwrap();
-    bytes[48..80].fill(0);
-    std::fs::write(&index, &bytes).unwrap();
+    tear_last_write(&dir.0);
     let opened = RaftLog::open(StdDisk, &dir.0, small()).unwrap();
     assert_eq!(opened.cut, Some(second));
     let mut log = opened.log;
@@ -659,10 +667,7 @@ fn a_torn_tail_is_cut() {
 #[test]
 fn a_torn_tail_below_the_commit_is_refused() {
     let (dir, second) = spanning("tail-commit");
-    let index = index_file(&dir.0, 4096);
-    let mut bytes = std::fs::read(&index).unwrap();
-    bytes[48..80].fill(0);
-    std::fs::write(&index, &bytes).unwrap();
+    tear_last_write(&dir.0);
     let committed = HardState {
         current_term: 1,
         voted_for: None,

@@ -874,9 +874,11 @@ impl<D: Disk + Clone> RaftLog<D> {
     }
 
     /// Saves `state` durably: returns only after its sync. The stored
-    /// commit only moves forward: a vote saved without a new commit must
-    /// carry the stored one ([`RaftLog::hard_state`]). A failure poisons
-    /// the log, which refuses every write until reopened.
+    /// commit only moves forward. [`HardState`] is one record, so a
+    /// vote-only save (openraft's `save_vote`) must carry the stored
+    /// commit ([`RaftLog::hard_state`]): a save with no commit after one
+    /// was stored is refused. A failure poisons the log, which refuses
+    /// every write until reopened.
     ///
     /// # Errors
     ///
