@@ -4247,8 +4247,9 @@ fn stale_frame(term_id: u32, term_offset: u32, payload: usize) -> Vec<u8> {
 /// terms (`r` and `r + 1`) do: a stale datagram is accepted only if its
 /// term id falls there. This proves the receiver's window. The rate SPEC
 /// asks for, about 3 in 2^32, also needs the restarted sender to draw its
-/// initial term id at random, which main does not do yet (a constant
-/// today; coordinator gap G2), so this test sets one by hand. The
+/// initial term id at random, which a network publication does (G2,
+/// `network_publications_draw_their_initial_term_ids`); this test sets
+/// one by hand so the probes are placed around a known window. The
 /// authenticated half (always rejected) needs the authenticated profile
 /// (owner decision 5, ADR-0035).
 #[test]
@@ -4259,8 +4260,8 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
     use karyos_sys::log_buffer::{PollOutcome, Role};
     use karyos_sys::sync::Ordering;
 
-    // The new incarnation's initial term id, set by hand (main does not
-    // draw one yet): half the term id space away from the old one, 9.
+    // The new incarnation's initial term id, set by hand so the probes
+    // know the window: half the term id space away from the old one, 9.
     const NEW: u32 = 9 + (1 << 31);
 
     let word = Arc::new(karyos_client::HeapWords::zeroed(1));

@@ -114,8 +114,10 @@
 //! [`RejoinPolicyCode`]), the applied outcome (bits 23 to 16, a
 //! [`RejoinOutcomeCode`]) and the replay fallback reason (bits 31 to 24, a
 //! [`FallbackReasonCode`], nonzero exactly when the configured policy is
-//! `replay`); the other bits are zero. The outcome must be one the
-//! configured policy can produce. The driver answers `OperationSucceeded`
+//! `replay` and the outcome is not `Replayed`); the other bits are zero.
+//! The outcome must be one the configured policy can produce. `Replayed`
+//! and the reasons from 4 on were added in place under admission
+//! `VERSION` 2, which no release has used. The driver answers `OperationSucceeded`
 //! when it recorded the report, and nothing for a protocol violation.
 //!
 //! `TraceJournal` continues after its four words with word 4, the
@@ -491,6 +493,9 @@ pub enum RejoinOutcomeCode {
     SnapshotFailed = 3,
     /// The subscription closed.
     Closed = 4,
+    /// `replay` recovered the range from a recording and merged back into
+    /// the live stream.
+    Replayed = 5,
 }
 
 impl RejoinOutcomeCode {
@@ -500,6 +505,7 @@ impl RejoinOutcomeCode {
             2 => Self::SnapshotRebuilt,
             3 => Self::SnapshotFailed,
             4 => Self::Closed,
+            5 => Self::Replayed,
             _ => return None,
         })
     }
@@ -531,6 +537,16 @@ pub enum FallbackReasonCode {
     NoRecording = 2,
     /// The recording's retention does not reach the gap (phase 3).
     RetentionShort = 3,
+    /// The recording had not reached the gap's end in time (phase 3).
+    RecordingBehind = 4,
+    /// The Archive refused the replay (phase 3).
+    Refused = 5,
+    /// The replay and the live stream did not merge (phase 3).
+    MergeFailed = 6,
+    /// The gap was given up before it resolved: the rejoin was dropped,
+    /// or its live reader taken back, while the gap was asked for or
+    /// merging (phase 3).
+    Withdrawn = 7,
 }
 
 impl FallbackReasonCode {
@@ -539,6 +555,10 @@ impl FallbackReasonCode {
             1 => Self::NoArchive,
             2 => Self::NoRecording,
             3 => Self::RetentionShort,
+            4 => Self::RecordingBehind,
+            5 => Self::Refused,
+            6 => Self::MergeFailed,
+            7 => Self::Withdrawn,
             _ => return None,
         })
     }
@@ -569,7 +589,8 @@ pub struct ReportedLoss {
     /// The outcome of the policy applied: for `replay`, the secondary's.
     pub applied: RejoinOutcomeCode,
     /// Why `replay` fell back; `Some` exactly when `configured` is
-    /// [`RejoinPolicyCode::Replay`].
+    /// [`RejoinPolicyCode::Replay`] and `applied` is not
+    /// [`RejoinOutcomeCode::Replayed`].
     pub fallback: Option<FallbackReasonCode>,
 }
 
@@ -604,9 +625,9 @@ impl ReportedLoss {
             0 => None,
             code => Some(FallbackReasonCode::from_code(code)?),
         };
-        if !applied.follows(configured)
-            || fallback.is_some() != (configured == RejoinPolicyCode::Replay)
-        {
+        let fell_back =
+            configured == RejoinPolicyCode::Replay && applied != RejoinOutcomeCode::Replayed;
+        if !applied.follows(configured) || fallback.is_some() != fell_back {
             return None;
         }
         Some(Self {
@@ -3315,7 +3336,8 @@ mod tests {
             (65, 0), // no policy
             (65, 5), // unknown policy
             (66, 0), // no outcome
-            (66, 5), // unknown outcome
+            (66, 6), // unknown outcome
+            (66, 5), // only replay replays
             (66, 1), // snapshot cannot resume at head
             (66, 4), // snapshot cannot close without failing
             (67, 1), // a reason without replay
@@ -3338,12 +3360,25 @@ mod tests {
             Command::decode(0x08, &bad[..length]),
             Err(CncError::Reserved { type_id: 0x08 })
         );
-        bad[67] = 4;
+        bad[67] = 8;
         assert_eq!(
             Command::decode(0x08, &bad[..length]),
             Err(CncError::Reserved { type_id: 0x08 })
         );
-        bad[67] = 1;
+        for reason in 1..=7 {
+            bad[67] = reason;
+            assert!(
+                Command::decode(0x08, &bad[..length]).is_ok(),
+                "reason {reason}"
+            );
+        }
+        // Replayed carries no reason.
+        bad[66] = 5;
+        assert_eq!(
+            Command::decode(0x08, &bad[..length]),
+            Err(CncError::Reserved { type_id: 0x08 })
+        );
+        bad[67] = 0;
         assert!(Command::decode(0x08, &bad[..length]).is_ok());
         // A range whose end is below its start.
         let mut bad = out;
@@ -3361,11 +3396,11 @@ mod tests {
         ];
         for (policy, code) in policies {
             assert_eq!(policy as u8, code);
-            for outcome in 1..=4u8 {
+            for outcome in 1..=5u8 {
                 let mut case = out;
                 case[65] = code;
                 case[66] = outcome;
-                case[67] = u8::from(policy == RejoinPolicyCode::Replay);
+                case[67] = u8::from(policy == RejoinPolicyCode::Replay && outcome != 5);
                 let expected = matches!((code, outcome), (1, 1) | (2, 2 | 3) | (3, 4) | (4, _));
                 assert_eq!(
                     Command::decode(0x08, &case[..length]).is_ok(),
@@ -3988,8 +4023,11 @@ mod properties {
     }
 
     fn loss() -> impl Strategy<Value = ReportedLoss> {
-        use FallbackReasonCode::{NoArchive, NoRecording, RetentionShort};
-        use RejoinOutcomeCode::{Closed, ResumedAtHead, SnapshotFailed, SnapshotRebuilt};
+        use FallbackReasonCode::{
+            MergeFailed, NoArchive, NoRecording, RecordingBehind, Refused, RetentionShort,
+            Withdrawn,
+        };
+        use RejoinOutcomeCode::{Closed, Replayed, ResumedAtHead, SnapshotFailed, SnapshotRebuilt};
         use RejoinPolicyCode::{Close, RejoinAtHead, Replay, Snapshot};
         (
             any::<[u64; 5]>(),
@@ -3997,7 +4035,17 @@ mod properties {
             any::<(u64, u64)>(),
             prop::sample::select(&[RejoinAtHead, Snapshot, Close, Replay][..]),
             any::<prop::sample::Index>(),
-            prop::sample::select(&[NoArchive, NoRecording, RetentionShort][..]),
+            prop::sample::select(
+                &[
+                    NoArchive,
+                    NoRecording,
+                    RetentionShort,
+                    RecordingBehind,
+                    Refused,
+                    MergeFailed,
+                    Withdrawn,
+                ][..],
+            ),
         )
             .prop_map(
                 |(
@@ -4012,8 +4060,15 @@ mod properties {
                         RejoinAtHead => &[ResumedAtHead],
                         Snapshot => &[SnapshotRebuilt, SnapshotFailed],
                         Close => &[Closed],
-                        Replay => &[ResumedAtHead, SnapshotRebuilt, SnapshotFailed, Closed],
+                        Replay => &[
+                            ResumedAtHead,
+                            SnapshotRebuilt,
+                            SnapshotFailed,
+                            Closed,
+                            Replayed,
+                        ],
                     };
+                    let applied = *outcome.get(outcomes);
                     ReportedLoss {
                         driver: [high, low],
                         stream_registration,
@@ -4023,8 +4078,8 @@ mod properties {
                         from: a.min(b),
                         to: a.max(b),
                         configured,
-                        applied: *outcome.get(outcomes),
-                        fallback: (configured == Replay).then_some(reason),
+                        applied,
+                        fallback: (configured == Replay && applied != Replayed).then_some(reason),
                     }
                 },
             )

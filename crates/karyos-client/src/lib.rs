@@ -67,8 +67,8 @@ pub use karyos_sys::frame::Lane;
 pub use karyos_sys::freshness::Freshness;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
 pub use merge::{
-    LiveMerge, MergeError, MergeFailed, MergePoll, Replay, ReplayProvider, ReplayRequest,
-    ReplayStatus, ReplayStop, ReplayUnavailable,
+    LiveMerge, MergeError, MergeFailed, MergePoll, Replay, ReplayProvider, ReplayRejoin,
+    ReplayRequest, ReplayStatus, ReplayStop, ReplayUnavailable,
 };
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{

@@ -34,9 +34,13 @@ use karyos_sys::sizing::align_frame;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::error::ClientError;
+use crate::loss::LossReporter;
 use crate::subscription::{
-    Aborted, ClientSubscription, MessageInfo, MessageLimit, Overrun, PollSummary, Skipped,
+    Aborted, ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,
+    RejoinOutcome, RejoinPolicy, ReplayFallbackReason, Secondary, SecondaryOutcome, Skipped,
+    rebuild,
 };
+use karyos_protocol::cnc::RejoinPolicyCode;
 
 /// Stops a replay the merge no longer needs: run once, at the cutover, when
 /// the merge fails or gives its live reader back, or when it is dropped.
@@ -351,6 +355,15 @@ impl<T: TermBytes> LiveMerge<T> {
     #[must_use]
     pub fn is_live(&self) -> bool {
         matches!(self.state, State::Live { .. })
+    }
+
+    /// Whether the merge is done: live, with the live reader's first
+    /// message checked against the replay's at the cutover, or with
+    /// nothing there to check.
+    #[inline]
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        matches!(self.state, State::Live { expect: None, .. })
     }
 
     /// The final failure, if the merge failed.
@@ -717,6 +730,344 @@ enum Step {
     /// Switch to the live reader, expecting its first message to be this
     /// one, if any.
     Cutover(Option<(u64, usize)>),
+}
+
+/// A subscription whose overruns are recovered from a recording: the
+/// `replay` rejoin policy with an Archive (SPEC.md §4 and §8.2;
+/// `quantstratum-docs: karyos/design/rejoin-policies.md`, A6c).
+///
+/// On an overrun `{ from, lost_to, resume }` the live reader rejoins at
+/// `resume`, and the poll reports the overrun with
+/// [`RejoinOutcome::Replaying`]. The provider is asked for `[from,
+/// resume)`, polled across polls, and nothing is delivered meanwhile; the
+/// provider's own deadline bounds the wait. Its replay is merged into the
+/// live reader at `resume` ([`LiveMerge`]): the poll on which the merge
+/// settles ([`LiveMerge::is_settled`]) reports [`RejoinOutcome::Replayed`],
+/// and the live reader goes on alone. When the provider has no replay,
+/// or the merge fails, the secondary policy applies to the gap and the
+/// poll reports [`RejoinOutcome::ReplayFallback`] with its reason; a
+/// merge's typed error is kept ([`ReplayRejoin::merge_failure`]). Each
+/// overrun is reported to the driver once, when it resolved. A gap given
+/// up before it resolved, when the rejoin is dropped or its live reader
+/// taken back ([`ReplayRejoin::into_live`]), is reported then, as
+/// [`ReplayFallbackReason::Withdrawn`] with the live reader resumed at
+/// its resume.
+///
+/// Only an optional reader is overrun. While its gap is recovered it is
+/// not polled, so it can be lapped again, which fails the merge
+/// ([`MergeError::LiveOverrun`]) and applies the secondary policy. Only
+/// lane 0 of a single subscription is recovered (A6, Q6); another lane
+/// fails its merges.
+pub struct ReplayRejoin<T: TermBytes = HeapTerms> {
+    state: Rejoin<T>,
+    source: PublicationIdentity,
+    provider: Box<dyn ReplayProvider<T>>,
+    secondary: Secondary,
+    /// The subscription's own rejoin policy, given back with it.
+    policy: Option<RejoinPolicy>,
+    loss: Option<Box<LossReporter>>,
+    lane: u8,
+    failure: Option<MergeError>,
+}
+
+/// Where a [`ReplayRejoin`] stands.
+enum Rejoin<T: TermBytes> {
+    /// Delivering the live reader.
+    Live(ClientSubscription<T>),
+    /// Asking for the gap of `overrun`; the live reader holds at its
+    /// resume.
+    Asking {
+        live: ClientSubscription<T>,
+        overrun: Overrun,
+    },
+    /// Merging the replay of `overrun`'s gap, until it settles.
+    Merging {
+        merge: Box<LiveMerge<T>>,
+        overrun: Overrun,
+    },
+    /// Only between two states, within a poll, with no handler running.
+    Moving,
+}
+
+impl<T: TermBytes> core::fmt::Debug for ReplayRejoin<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let state = match &self.state {
+            Rejoin::Live(_) => "Live",
+            Rejoin::Asking { .. } => "Asking",
+            Rejoin::Merging { .. } => "Merging",
+            Rejoin::Moving => "Moving",
+        };
+        f.debug_struct("ReplayRejoin")
+            .field("state", &state)
+            .field("source", &self.source)
+            .field("secondary", &self.secondary)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: TermBytes> ReplayRejoin<T> {
+    /// Recovers `subscription`'s overruns, the subscription of publication
+    /// `source`, from `provider`'s replays, falling back to `secondary`.
+    /// The subscription's own rejoin policy becomes `RejoinAtHead`, and its
+    /// loss reports are made here instead, until
+    /// [`ReplayRejoin::into_live`] gives both back.
+    #[must_use]
+    pub fn new(
+        subscription: ClientSubscription<T>,
+        source: PublicationIdentity,
+        provider: Box<dyn ReplayProvider<T>>,
+        secondary: Secondary,
+    ) -> Self {
+        let mut live = subscription;
+        let policy = live.replace_rejoin(RejoinPolicy::RejoinAtHead);
+        let loss = live.take_loss_reports();
+        let lane = live.lane().map_or(0, Lane::get);
+        Self {
+            state: Rejoin::Live(live),
+            source,
+            provider,
+            secondary,
+            policy: Some(policy),
+            loss,
+            lane,
+            failure: None,
+        }
+    }
+
+    /// Whether a gap is being recovered: asked for, or merging.
+    #[inline]
+    #[must_use]
+    pub fn is_recovering(&self) -> bool {
+        matches!(self.state, Rejoin::Asking { .. } | Rejoin::Merging { .. })
+    }
+
+    /// The last merge's typed failure, if a merge failed.
+    #[inline]
+    #[must_use]
+    pub fn merge_failure(&self) -> Option<MergeError> {
+        self.failure
+    }
+
+    /// Gives the live reader back, with its own rejoin policy and loss
+    /// reports: a gap asked for is withdrawn, a replay merging is stopped,
+    /// and either is reported as withdrawn. `None` only after a panic
+    /// between two states, where no handler runs.
+    #[must_use]
+    pub fn into_live(mut self) -> Option<ClientSubscription<T>> {
+        let mut live = match self.withdraw() {
+            Rejoin::Live(live) => live,
+            Rejoin::Asking { live, .. } => live,
+            Rejoin::Merging { merge, .. } => merge.into_live(),
+            Rejoin::Moving => return None,
+        };
+        if let Some(policy) = self.policy.take() {
+            let _ = live.replace_rejoin(policy);
+        }
+        live.restore_loss_reports(self.loss.take());
+        Some(live)
+    }
+
+    /// Takes the state out, giving up a gap not resolved: the provider's
+    /// request is withdrawn, and the overrun is reported as withdrawn,
+    /// the live reader resumed at its resume. A merging replay stops when
+    /// its merge drops.
+    fn withdraw(&mut self) -> Rejoin<T> {
+        let state = std::mem::replace(&mut self.state, Rejoin::Moving);
+        if let Rejoin::Asking { overrun, .. } | Rejoin::Merging { overrun, .. } = &state {
+            if matches!(state, Rejoin::Asking { .. }) {
+                self.provider.cancel();
+            }
+            let outcome = RejoinOutcome::ReplayFallback {
+                reason: ReplayFallbackReason::Withdrawn,
+                secondary: SecondaryOutcome::ResumedAtHead,
+            };
+            self.report(overrun, outcome);
+        }
+        state
+    }
+
+    /// Delivers up to `message_limit` messages to `handler`, as
+    /// [`ClientSubscription::poll`] does, recovering overruns (see the type
+    /// documentation).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientSubscription::poll`]: the live reader's poll failures.
+    #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
+    pub fn poll<H>(
+        &mut self,
+        mut handler: H,
+        message_limit: MessageLimit,
+    ) -> Result<PollSummary, PollError>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        if let Rejoin::Asking { overrun, .. } = self.state
+            && let Some(resolved) = self.ask(overrun)
+        {
+            return Ok(resolved);
+        }
+        match &mut self.state {
+            Rejoin::Live(live) => {
+                let summary = live.poll(&mut handler, message_limit)?;
+                Ok(self.overran(summary))
+            }
+            Rejoin::Merging { merge, .. } => match merge.poll(&mut handler, message_limit) {
+                Ok(poll) => Ok(self.merged(poll.summary)),
+                Err(failed) => self.merge_failed(failed),
+            },
+            Rejoin::Asking { .. } | Rejoin::Moving => Ok(PollSummary::default()),
+        }
+    }
+
+    /// After a live poll: an overrun starts its recovery, reported as
+    /// `Replaying`.
+    fn overran(&mut self, mut summary: PollSummary) -> PollSummary {
+        let Some(overrun) = summary
+            .overrun
+            .filter(|_| summary.closed_by_overrun.is_none())
+        else {
+            return summary;
+        };
+        match std::mem::replace(&mut self.state, Rejoin::Moving) {
+            Rejoin::Live(live) => {
+                summary.rejoin = Some(RejoinOutcome::Replaying);
+                self.state = Rejoin::Asking { live, overrun };
+            }
+            other => self.state = other,
+        }
+        summary
+    }
+
+    /// Asks the provider for `overrun`'s gap: a replay starts its merge;
+    /// none applies the secondary policy, and returns that poll's report.
+    fn ask(&mut self, overrun: Overrun) -> Option<PollSummary> {
+        let request = ReplayRequest {
+            source: self.source,
+            from: overrun.from,
+            to: overrun.resume,
+        };
+        let status = self.provider.replay(&request);
+        let Rejoin::Asking { live, overrun } = std::mem::replace(&mut self.state, Rejoin::Moving)
+        else {
+            return None;
+        };
+        match status {
+            ReplayStatus::Pending => {
+                self.state = Rejoin::Asking { live, overrun };
+                None
+            }
+            ReplayStatus::Ready(replay) => {
+                self.state = Rejoin::Merging {
+                    merge: Box::new(LiveMerge::new(live, self.source, replay)),
+                    overrun,
+                };
+                None
+            }
+            ReplayStatus::Unavailable(reason) => Some(self.fall_back(live, overrun, reason.into())),
+        }
+    }
+
+    /// After a merge poll: once settled the gap is recovered, reported as
+    /// `Replayed`, and the live reader goes on alone.
+    fn merged(&mut self, mut summary: PollSummary) -> PollSummary {
+        let settled = matches!(&self.state, Rejoin::Merging { merge, .. } if merge.is_settled());
+        if !settled {
+            return summary;
+        }
+        let Rejoin::Merging { merge, overrun } = std::mem::replace(&mut self.state, Rejoin::Moving)
+        else {
+            return summary;
+        };
+        let outcome = RejoinOutcome::Replayed {
+            cutover: merge.cutover(),
+        };
+        self.report(&overrun, outcome);
+        summary.rejoin = Some(outcome);
+        self.state = Rejoin::Live(merge.into_live());
+        summary
+    }
+
+    /// A merge that failed: the secondary policy applies to the gap, from
+    /// the overrun's start to where the live reader is now. The live
+    /// reader's own poll failure is passed on, and the merge goes on.
+    #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
+    fn merge_failed(&mut self, failed: MergeFailed) -> Result<PollSummary, PollError> {
+        if let MergeError::Live(cause) = failed.cause {
+            return Err(PollError {
+                summary: failed.poll.summary,
+                cause,
+            });
+        }
+        self.failure = Some(failed.cause);
+        let Rejoin::Merging { merge, overrun } = std::mem::replace(&mut self.state, Rejoin::Moving)
+        else {
+            return Ok(failed.poll.summary);
+        };
+        let live = merge.into_live();
+        let position = live.position();
+        let gap = Overrun {
+            from: overrun.from,
+            lost_to: position,
+            resume: position,
+        };
+        let summary = self.fall_back(live, gap, ReplayFallbackReason::MergeFailed);
+        Ok(PollSummary {
+            delivered: failed.poll.summary.delivered,
+            ..summary
+        })
+    }
+
+    /// Applies the secondary policy to `overrun`'s gap and reports it.
+    fn fall_back(
+        &mut self,
+        mut live: ClientSubscription<T>,
+        overrun: Overrun,
+        reason: ReplayFallbackReason,
+    ) -> PollSummary {
+        let secondary = match &mut self.secondary {
+            Secondary::RejoinAtHead => SecondaryOutcome::ResumedAtHead,
+            Secondary::Snapshot(source) => rebuild(source.as_mut(), &overrun),
+            Secondary::Close => SecondaryOutcome::Closed,
+        };
+        let outcome = RejoinOutcome::ReplayFallback { reason, secondary };
+        self.report(&overrun, outcome);
+        let closed = outcome.closed();
+        if closed {
+            live.close_by_overrun(overrun, outcome);
+        }
+        self.state = Rejoin::Live(live);
+        PollSummary {
+            rejoin: Some(outcome),
+            closed_by_overrun: closed.then_some(overrun),
+            ..PollSummary::default()
+        }
+    }
+
+    /// Reports how the overrun resolved, once, to the driver.
+    fn report(&self, overrun: &Overrun, outcome: RejoinOutcome) {
+        if let Some(loss) = &self.loss {
+            loss.report_as(self.lane, overrun, RejoinPolicyCode::Replay, outcome);
+        }
+    }
+}
+
+impl<T: TermBytes> Drop for ReplayRejoin<T> {
+    /// A gap not resolved is given up, and reported as withdrawn.
+    fn drop(&mut self) {
+        let _ = self.withdraw();
+    }
+}
+
+impl From<ReplayUnavailable> for ReplayFallbackReason {
+    fn from(reason: ReplayUnavailable) -> Self {
+        match reason {
+            ReplayUnavailable::NoRecording => Self::NoRecording,
+            ReplayUnavailable::RetentionShort => Self::RetentionShort,
+            ReplayUnavailable::RecordingBehind => Self::RecordingBehind,
+            ReplayUnavailable::Refused => Self::Refused,
+        }
+    }
 }
 
 #[cfg(test)]

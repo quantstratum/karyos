@@ -745,12 +745,14 @@ mod remote {
     /// IPC drivers, a remote client publishes by `karyos:udp` and another
     /// subscribes by it; the subscriber reads the exact sequence from the
     /// image, whose lanes it fetched as regions, and drops the image once
-    /// its publication goes.
+    /// the publisher removes its publication: the removal ends the image at
+    /// its EOS while the publisher stays connected.
     #[test]
     fn a_remote_udp_publication_reaches_a_remote_udp_subscription() {
         let (_a, a_dir) = ipc_network_driver("udp-pub", 500_000_000);
-        // The receiver retires an image half a second after its sender goes.
-        let (_b, b_dir) = ipc_network_driver("udp-sub", 500_000_000);
+        // A minute: within the wait below, the image can end only at its
+        // EOS, never at its liveness timeout.
+        let (_b, b_dir) = ipc_network_driver("udp-sub", 60_000_000_000);
         let mut publisher = connect(&a_dir);
         let mut subscriber = connect(&b_dir);
         let port = port();
@@ -801,15 +803,67 @@ mod remote {
         }
         assert_eq!(reading.image_count(), 1);
         assert_eq!(reading.images_refused(), 0);
-        // The publisher goes: a remote client's network publication ends
-        // with its client (its registration ends with its grant), and the
-        // removal ends the image.
-        drop(publication);
-        drop(publisher);
-        until(&mut [&mut subscriber], || {
+        // The publication goes, its client stays: the driver removes the
+        // network publication the client created by URI, which ends the
+        // image at its EOS.
+        publisher.remove_publication(publication);
+        until(&mut [&mut subscriber, &mut publisher], || {
             let _ = reading.poll(|_, _| {}, MessageLimit::new(16));
             reading.image_count() == 0
         });
+        // Still served.
+        let _ = publisher
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
+    }
+
+    /// Releasing a remote client's `karyos:ipc` publication removes only its
+    /// registration: the stream stays, and a subscription of it reads every
+    /// message offered before the release.
+    #[test]
+    fn a_released_remote_ipc_publication_leaves_its_stream() {
+        let (_driver, dir) = ipc_driver("ipc-release");
+        let mut client = connect(&dir);
+        let mut reading = client
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(3))
+            .unwrap();
+        let mut sent = 0u32;
+        let start = Instant::now();
+        while sent < 16 {
+            assert!(start.elapsed() < Duration::from_secs(20), "sent {sent}");
+            let _ = client.poll();
+            match publication.offer(&sent.to_le_bytes()) {
+                Ok(_) => sent += 1,
+                Err(
+                    OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected,
+                ) => std::thread::sleep(Duration::from_micros(100)),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        client.remove_publication(publication);
+        let mut seen = 0u32;
+        let start = Instant::now();
+        while seen < sent {
+            assert!(start.elapsed() < Duration::from_secs(20), "seen {seen}");
+            let _ = client.poll();
+            let _ = reading
+                .poll(
+                    |bytes, _| {
+                        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                        seen += 1;
+                    },
+                    MessageLimit::new(8),
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        // The stream is still there, and the client still served.
+        let _ = client
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
     }
 
     /// `connect` needs the driver's directory.
@@ -819,6 +873,66 @@ mod remote {
             Client::connect(Context::builder().build().unwrap()).err(),
             Some(ClientError::NoDirectory)
         ));
+    }
+
+    /// A remote publication grant that arrives after its request timed out
+    /// is taken and removed at once: a `karyos:udp` publication the client
+    /// created by URI ends, so with room for one owned network resource
+    /// per client, the next one is granted.
+    #[test]
+    fn a_remote_late_publication_grant_is_removed() {
+        let mut network = NetworkConfig {
+            threading: ThreadingMode::Shared,
+            max_owned_per_client: 1,
+            ..NetworkConfig::default()
+        };
+        network.stream_defaults.term_length = 64 * 1024;
+        let config = DriverConfig {
+            network: Some(network),
+            ..DriverConfig::default()
+        };
+        let (_driver, dir, paused) = ipc_driver_with("late-pub", 16, config);
+        let mut client = Client::connect(
+            Context::builder()
+                .dir(&dir)
+                .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        let uri = |port: u16| format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1");
+        paused.hold();
+        assert_eq!(
+            client
+                .add_exclusive_publication(&uri(port()), StreamId::new(7))
+                .err(),
+            Some(ClientError::Timeout)
+        );
+        paused.resume();
+        let start = Instant::now();
+        while client.late_grants_released() == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "not released");
+            let _ = client.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The only owned resource is free again.
+        let mut granted = None;
+        let start = Instant::now();
+        while granted.is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the late publication is still owned"
+            );
+            match client.add_exclusive_publication(&uri(port()), StreamId::new(8)) {
+                Ok(publication) => granted = Some(publication),
+                Err(ClientError::Refused { .. } | ClientError::Timeout) => {
+                    let _ = client.poll();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
     }
 
     /// A remote grant that arrives after its request timed out is taken
@@ -1096,4 +1210,30 @@ fn a_named_lane_count_is_taken_exactly() {
         client.add_exclusive_publication("karyos:ipc?lanes=2", StreamId::new(4))
     });
     assert_eq!(publication.unwrap().lane_count(), 2);
+}
+
+/// A publication released whose removal cannot be sent is dropped and
+/// counted (#402 review P3): client B releasing client A's publication
+/// gets `ForeignHandle` from its own connection, so B counts one failed
+/// release; A's release of its own publication is sent and counts none.
+#[test]
+fn a_release_whose_removal_cannot_be_sent_is_counted() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let _ = driver.add_stream(heap_stream(5)).unwrap();
+    let _ = driver.add_stream(heap_stream(6)).unwrap();
+    let mut a = Client::with_conductor(driver.connect().unwrap(), context());
+    let mut b = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let foreign = a
+            .add_exclusive_publication("karyos:ipc", StreamId::new(5))
+            .unwrap();
+        b.remove_publication(foreign);
+        assert_eq!(b.publication_releases_failed(), 1);
+        assert_eq!(a.publication_releases_failed(), 0);
+        let own = a
+            .add_exclusive_publication("karyos:ipc", StreamId::new(6))
+            .unwrap();
+        a.remove_publication(own);
+        assert_eq!(a.publication_releases_failed(), 0);
+    });
 }

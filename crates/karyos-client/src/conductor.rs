@@ -951,6 +951,26 @@ impl<T: TermBytes> ClientConductor<T> {
         }
     }
 
+    /// Submits the removal of the publication `registration`, whose handle
+    /// a remote client took from its grant and drops once this is written.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn remove_publication_registration(
+        &mut self,
+        registration: u64,
+    ) -> Result<u64, ConductorError> {
+        self.submit(Kind::Remove, None, |sequence| Command::RemovePublication {
+            sequence,
+            registration,
+        })
+    }
+
     /// Removes a concurrent publication handle this conductor handed out,
     /// as [`ClientConductor::remove_publication`]; dropping the handle frees
     /// its publisher slot.

@@ -11,6 +11,30 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A publication released through the client facade whose removal cannot
+  be sent (the command ring full, a handle another connection issued, a
+  closed link) is counted: `Client::publication_releases_failed`. The
+  handle is still dropped; in process that ends its lease, and for a
+  remote client the driver keeps the publication, with no EOS, until the
+  client ends. The doc-hidden `Connection::release_publication` returns
+  whether the removal was sent (#402 review P3).
+- The `replay` rejoin with an Archive (phase 3, A6c; SPEC.md §4).
+  `karyos_client::ReplayRejoin` wraps a subscription: on an overrun the
+  live reader rejoins at the head, the poll reports the overrun as
+  `RejoinOutcome::Replaying`, and a `ReplayProvider` is asked for the gap,
+  across polls; its replay is merged in (`LiveMerge`), and the poll on
+  which the merge settles reports `RejoinOutcome::Replayed { cutover }`.
+  With no replay, or a merge that fails, the secondary policy applies and
+  the poll reports `ReplayFallback` with the reason, which gains
+  `RecordingBehind`, `Refused` and `MergeFailed`. Each overrun is
+  reported to the driver once, when it resolved; a gap given up first,
+  when the rejoin is dropped or its live reader taken back
+  (`into_live`, which gives back the reader's own policy and loss
+  reports), is reported as `Withdrawn`. The loss report gains the outcome
+  code `Replayed` (5, with no reason) and the reasons 4 to 7, in place
+  under admission version 2, and the driver counts `overruns replayed`.
+  A plain `RejoinPolicy::Replay`, with no provider, still falls back with
+  `NoArchive`. `LiveMerge::is_settled` tells when a merge is done.
 - The Archive's client (phase 3, A6b-2).
   `karyos_archive::client::ArchiveClient` is a `ReplayProvider` over the
   Archive's control streams (`ControlRequests`, `ControlResponses`): asked
@@ -266,6 +290,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The `replay` rejoin through the Archive end to end (phase 3, A6d):
+  karyos-sim's `tests/archive_control.rs` wraps a lapped optional reader
+  in a `ReplayRejoin` whose provider is the Archive's client, over the
+  control streams, with the sim host as its `ReplayTargets`. The gap is
+  replayed from the recording and merged back into the live stream at
+  the resume, every message once, in order, byte-exact. A recording
+  lapped before it was read reports its gap as the replay's local gap and
+  merges what follows; a stream with no recording falls back with
+  `NoRecording`.
 - A removed routed publication sends each lane's EOS on every live path
   (redundant paths; rp-w5b follow-up). A lane is drained once its first
   sends reached its seal on every path that can send now; a path whose
@@ -955,13 +988,23 @@ release may break APIs, wire formats and shared-memory layouts.
 - The segment store's arithmetic is checked (SPEC §14): five
   saturating operations in the interval sync and in recovery's counts
   are checked ones. A clock that steps back still syncs nothing.
-- A guarded network publication that a guard close sealed no longer
-  takes a fresh incarnation after the reopen: `publication()` refuses with
-  `DriverError::NetworkReincarnation`. The network sender did not follow
-  the reincarnation (it kept reading the sealed log, and no SETUP
-  announced the new incarnation), so offers were accepted and never sent.
-  The publication is removed and added again until the sender follows a
-  reincarnation.
+- A guarded network publication that a guard close sealed takes its
+  fresh incarnation after the reopen as a new publication identity on
+  the wire, every lane at once. The first `publication()` after the
+  reopen removes the old session with no linger (its closed guard sends
+  no EOS) and refuses with `DriverError::QuarantinedAlias { stream,
+  until_ns }`. Once the alias's `alias_quarantine` (default 10 s) has
+  passed from that removal, the next call swaps in every lane and adds
+  the sender again under the same alias, with incarnation N in its
+  SETUP and its guard gate registered again; the send endpoints stay
+  held between incarnations. Remote receivers are assumed to use the
+  same `alias_quarantine`. `NetworkPublicationState::Reincarnating`
+  reports the wait, and `DriverError::NetworkReincarnation` is gone. A
+  network close or an agent failure before the next incarnation is
+  added refuses its lanes (`NetworkUnavailable`, `NetworkAgent`) and
+  leaves them sealed: they never reincarnate locally. Each incarnation
+  draws its own `initial_term_id` before it is announced (SPEC §4,
+  initial state), shared by its lanes; a test pin still wins.
 - The network keeps one time base in every threading mode. In
   `ThreadingMode::Shared` the agents' cycles took the driver's injectable
   clock while their role clocks read `host_monotonic_ns`. On Linux every
