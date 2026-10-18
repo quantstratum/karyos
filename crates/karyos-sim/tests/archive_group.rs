@@ -484,6 +484,7 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
                 max_event: 4096,
                 in_flight: 64,
             },
+            checkpoints: None,
         })
         .unwrap();
     let waiter = sender.waiter();
