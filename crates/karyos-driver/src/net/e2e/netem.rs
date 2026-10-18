@@ -496,6 +496,21 @@ fn n7_a_reliable_channel_recovers_from_a_blackout() {
         (sent, seen)
     };
     pump(&mut [&mut a, &mut b], |_| step(before).1 == before);
+    // Two more status messages from the receiver after it read the 200:
+    // the later was sent after the reads, so the sender's window covers
+    // the whole tail before the path goes dark.
+    let status = |a: &EmbeddedDriver| {
+        a.net
+            .as_ref()
+            .unwrap()
+            .sender_counters()
+            .unwrap()
+            .sm_accepted
+    };
+    let read = status(&a);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        status(drivers[0]) >= read + 2
+    });
     let (naks_before, repairs_before) = repair_work(&a, &b);
     let blackout = Profile::replace("loss 100%");
     let start = Instant::now();
