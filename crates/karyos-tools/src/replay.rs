@@ -14,6 +14,11 @@
 //! reference is compared as its reference, so the complete prefix is
 //! bounded only by incomplete events and gap markers. A payload not
 //! captured, or a reference unavailable, in the range is not comparable.
+//!
+//! Recorded checkpoints (A9-2, template 30) are not compared yet: the
+//! cursor gives them right after their events, and the diff passes over
+//! them. Their comparison, matched by `group_seq` with the `state
+//! checkpoint` kind, and `--from-checkpoint` follow (A8-2).
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
