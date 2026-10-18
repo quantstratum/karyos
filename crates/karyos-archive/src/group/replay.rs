@@ -205,6 +205,13 @@ pub enum Step<'c> {
     Stop(Stop),
 }
 
+/// What a read gave, before it is lent.
+#[derive(Debug, Clone, Copy)]
+enum Next {
+    Event { group_seq: u64, incomplete: bool },
+    Stop(Stop),
+}
+
 /// One event's records: its first record, its observations in order, and
 /// its end, borrowed from the cursor's buffer.
 #[derive(Debug, Clone, Copy)]
@@ -258,6 +265,13 @@ impl<'c> ReplayEvent<'c> {
     pub fn bytes(&self) -> &'c [u8] {
         let end = self.spans.last().map_or(0, |&(_, end)| end);
         self.bytes.get(..end).unwrap_or_default()
+    }
+
+    /// Record `index`'s encoded bytes.
+    #[must_use]
+    pub fn record_bytes(&self, index: usize) -> Option<&'c [u8]> {
+        let &(start, end) = self.spans.get(index)?;
+        self.bytes.get(start..end)
     }
 
     /// Record `index`, decoded.
@@ -408,13 +422,51 @@ impl<D: Disk> ReplayCursor<D> {
     /// [`ReplayError::Torn`], [`ReplayError::NotAnEvent`],
     /// [`ReplayError::Reencoded`]; and the journal's errors.
     pub fn step(&mut self) -> Result<Step<'_>, ReplayError> {
+        let next = self.read_next()?;
+        Ok(self.view(next))
+    }
+
+    /// [`ReplayCursor::step`], past the events before `from`: the first
+    /// event at or after it, or the stop.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReplayCursor::step`].
+    pub fn step_from(&mut self, from: u64) -> Result<Step<'_>, ReplayError> {
+        loop {
+            let next = self.read_next()?;
+            if !matches!(next, Next::Event { group_seq, .. } if group_seq < from) {
+                return Ok(self.view(next));
+            }
+        }
+    }
+
+    /// What [`Self::read_next`] read, lent from the buffer.
+    fn view(&self, next: Next) -> Step<'_> {
+        match next {
+            Next::Stop(stop) => Step::Stop(stop),
+            Next::Event {
+                group_seq,
+                incomplete,
+            } => Step::Event(ReplayEvent {
+                group_seq,
+                incomplete,
+                reference_unavailable: self.unavailable.binary_search(&group_seq).is_ok(),
+                bytes: &self.buffer,
+                spans: &self.spans,
+            }),
+        }
+    }
+
+    /// Reads the next event's records into the buffer, or the stop.
+    fn read_next(&mut self) -> Result<Next, ReplayError> {
         if let Some(stop) = self.stopped {
-            return Ok(Step::Stop(stop));
+            return Ok(Next::Stop(stop));
         }
         loop {
             if self.position >= self.complete_end {
                 match self.past_prefix()? {
-                    Some(stop) => return Ok(Step::Stop(stop)),
+                    Some(stop) => return Ok(Next::Stop(stop)),
                     // The incomplete event: read it, up to its end.
                     None => continue,
                 }
@@ -497,13 +549,10 @@ impl<D: Disk> ReplayCursor<D> {
                     if incomplete {
                         self.stopped = Some(Stop::Incomplete { group_seq });
                     }
-                    return Ok(Step::Event(ReplayEvent {
+                    return Ok(Next::Event {
                         group_seq,
                         incomplete,
-                        reference_unavailable: self.unavailable.binary_search(&group_seq).is_ok(),
-                        bytes: &self.buffer,
-                        spans: &self.spans,
-                    }));
+                    });
                 }
                 _ => {
                     return Err(ReplayError::Torn {
