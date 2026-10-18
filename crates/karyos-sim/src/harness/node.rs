@@ -14,22 +14,35 @@
 //!   restart** reopens the log and rebuilds the core from it
 //!   ([`ConsensusCore::recover`]); a refused open is recorded as an
 //!   [`Observation::OpenFailed`], and the node stays down.
+//! - **A log error** in [`drive`] stops the node until a restart. One the
+//!   core caused by breaking C4's contract (an append that is not next, a
+//!   term or commit going back, a truncation below the commit) is an
+//!   [`Observation::Contract`], which the checks report as a violation;
+//!   one of the disk is an [`Observation::OpenFailed`].
+//! - **Positions** are indices, not the byte positions of SPEC.md §9:
+//!   received is the core's last index, written or not; written and
+//!   durable are the log's; committed is the core's; applied is the
+//!   service's.
 //!
 //! [`ClusterSim`]: crate::cluster::ClusterSim
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::rc::Rc;
 
 use karyos_archive::segment::Geometry;
-use karyos_cluster::{Entry, RaftLog};
+use karyos_cluster::{Entry, LogError, RaftLog};
 
-use super::core::{ConsensusCore, Recovered, Step, drive};
+use super::core::{ConsensusCore, DriveError, LogView, Release, Step, drive};
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
 use crate::lin::{self, History};
 use crate::net::NodeId;
+
+/// The tag every command's bytes start with, so a core's own entries do
+/// not decode as commands.
+pub const COMMAND_MAGIC: [u8; 4] = *b"KC5\x01";
 
 /// The directory of a server's log on its disk.
 pub const LOG_DIR: &str = "/raft";
@@ -88,10 +101,11 @@ pub struct Command {
 }
 
 impl Command {
-    /// Its bytes in the log: client, sequence, a tag, then the value.
+    /// Its bytes in the log: [`COMMAND_MAGIC`], client, sequence, a tag,
+    /// then the value.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut bytes = COMMAND_MAGIC.to_vec();
         bytes.extend_from_slice(&self.client.to_le_bytes());
         bytes.extend_from_slice(&self.sequence.to_le_bytes());
         match &self.op {
@@ -107,7 +121,8 @@ impl Command {
     /// The command in a log entry's payload, if it is one.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let (client, rest) = bytes.split_first_chunk::<4>()?;
+        let rest = bytes.strip_prefix(&COMMAND_MAGIC)?;
+        let (client, rest) = rest.split_first_chunk::<4>()?;
         let (sequence, rest) = rest.split_first_chunk::<8>()?;
         let (tag, value) = rest.split_first()?;
         let op = match tag {
@@ -214,6 +229,49 @@ pub enum Observation {
         /// The step.
         step: Step,
     },
+    /// A server sent a message that waited for persistence.
+    Released {
+        /// The server.
+        node: NodeId,
+        /// The receiver.
+        to: NodeId,
+        /// What it waited for, and what the log held at the send.
+        release: Release,
+    },
+    /// A server released its reply to the client's command at `index`.
+    Reply {
+        /// The server.
+        node: NodeId,
+        /// The client.
+        client: NodeId,
+        /// The entry's index.
+        index: u64,
+        /// The entry's term.
+        term: u64,
+    },
+    /// A server crashed: its positions are gone until its restart.
+    Crashed {
+        /// The server.
+        node: NodeId,
+    },
+    /// A server's restart reopened its log.
+    Recovered {
+        /// The server.
+        node: NodeId,
+        /// Every entry the log holds: index and term.
+        entries: Vec<(u64, u64)>,
+        /// The log's durable last index.
+        durable: Option<u64>,
+    },
+    /// A server's core broke C4's contract: the log refused its write.
+    Contract {
+        /// The server.
+        node: NodeId,
+        /// What it broke.
+        breach: Breach,
+        /// The log's error.
+        error: String,
+    },
     /// A server's commit index moved.
     Commit {
         /// The server.
@@ -248,8 +306,8 @@ pub enum Observation {
         /// Its positions.
         positions: Positions,
     },
-    /// A server's log refused to open at a restart, or its persistence
-    /// failed.
+    /// A server's log refused to open at a restart, or its disk failed:
+    /// the environment, not the core.
     OpenFailed {
         /// The server.
         node: NodeId,
@@ -258,10 +316,55 @@ pub enum Observation {
     },
 }
 
-/// A server's five positions (SPEC §9), as indices.
+/// What a core broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Breach {
+    /// An append that is not the next index.
+    NotNext,
+    /// An entry's term below the last.
+    TermBack,
+    /// An entry too large for the log.
+    TooLarge,
+    /// A read or truncation outside the log.
+    OutOfRange,
+    /// A prefix purge.
+    PurgeUnsupported,
+    /// A truncation that would remove committed entries.
+    TruncateBelowCommit,
+    /// A hard state the log refuses.
+    HardState,
+    /// A commit above the durable last index.
+    CommitBeyondDurable,
+    /// A commit going back.
+    CommitBack,
+    /// Still ready after [`super::core::MAX_READIES`] Readys.
+    WorkBudget,
+}
+
+impl Breach {
+    /// The breach `error` is, or `None` for the environment's error.
+    #[must_use]
+    pub fn of(error: &LogError) -> Option<Self> {
+        Some(match error {
+            LogError::NotNext { .. } => Self::NotNext,
+            LogError::TermBack { .. } => Self::TermBack,
+            LogError::TooLarge { .. } => Self::TooLarge,
+            LogError::OutOfRange { .. } => Self::OutOfRange,
+            LogError::PurgeUnsupported => Self::PurgeUnsupported,
+            LogError::TruncateBelowCommit { .. } => Self::TruncateBelowCommit,
+            LogError::HardState(_) => Self::HardState,
+            LogError::CommitBeyondDurable { .. } => Self::CommitBeyondDurable,
+            LogError::CommitBack { .. } => Self::CommitBack,
+            _ => return None,
+        })
+    }
+}
+
+/// A server's five positions (after SPEC.md §9), as indices (see the
+/// module).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Positions {
-    /// The highest index the core received.
+    /// The core's last index, written or not.
     pub received: Option<u64>,
     /// The log's last index written.
     pub written: Option<u64>,
@@ -319,8 +422,10 @@ pub struct ServerNode<C: ConsensusCore> {
     running: Option<(C, RaftLog<SimDisk>)>,
     service: TestService,
     /// Requests this server took, by client and sequence: it answers them.
-    pending: BTreeMap<(NodeId, u64), ()>,
+    pending: BTreeSet<(NodeId, u64)>,
     commit: Option<u64>,
+    /// Why the disk cannot come back, when its crash could not be taken.
+    lost: Option<String>,
     recorder: Shared,
 }
 
@@ -338,17 +443,10 @@ impl<C: ConsensusCore> ServerNode<C> {
         survives: Survives,
         geometry: Geometry,
         recorder: Shared,
-    ) -> Result<Self, karyos_cluster::LogError> {
-        let log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
-        let core = C::recover(
-            id,
-            &peers,
-            Recovered {
-                first_index: 1,
-                hard_state: None,
-                entries: Vec::new(),
-            },
-        );
+    ) -> Result<Self, LogError> {
+        let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
+        let core = C::recover(id, &peers, &mut LogView::new(&mut log));
+        let commit = core.committed();
         Ok(Self {
             id,
             peers,
@@ -357,10 +455,39 @@ impl<C: ConsensusCore> ServerNode<C> {
             survives,
             running: Some((core, log)),
             service: TestService::default(),
-            pending: BTreeMap::new(),
-            commit: None,
+            pending: BTreeSet::new(),
+            commit,
+            lost: None,
             recorder,
         })
+    }
+
+    /// Server `id` of `peers` over the log already on `disk`, started as
+    /// a restart would; it is down if the log does not open.
+    #[must_use]
+    pub fn open(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        disk: SimDisk,
+        survives: Survives,
+        geometry: Geometry,
+        recorder: Shared,
+    ) -> Self {
+        let mut server = Self {
+            id,
+            peers,
+            geometry,
+            disk,
+            survives,
+            running: None,
+            service: TestService::default(),
+            pending: BTreeSet::new(),
+            commit: None,
+            lost: None,
+            recorder,
+        };
+        server.start();
+        server
     }
 
     /// Whether it is up: its log open and its core running.
@@ -390,36 +517,62 @@ impl<C: ConsensusCore> ServerNode<C> {
         let Some((mut core, mut log)) = self.running.take() else {
             return;
         };
-        let mut steps = Vec::new();
+        let node = self.id;
+        let recorder = Rc::clone(&self.recorder);
         let mut applied = Vec::new();
         let driven = drive(
             &mut core,
             &mut log,
-            &mut |to, message| out.push((to, Wire::Core(message))),
+            &mut |to, message, release| {
+                if let Some(release) = release {
+                    recorder
+                        .borrow_mut()
+                        .observations
+                        .push(Observation::Released { node, to, release });
+                }
+                out.push((to, Wire::Core(message)));
+            },
             &mut |entry| applied.push(entry.clone()),
-            &mut |step| steps.push(step),
+            &mut |step| {
+                recorder
+                    .borrow_mut()
+                    .observations
+                    .push(Observation::Drive { node, step });
+            },
         );
-        for step in steps {
-            self.observe(Observation::Drive {
-                node: self.id,
-                step,
-            });
-        }
         if let Err(error) = driven {
-            // Poisoned: the node stops until a restart reopens the log.
-            self.observe(Observation::OpenFailed {
-                node: self.id,
-                error: error.to_string(),
-            });
+            // The node stops until a restart reopens the log.
+            let observation = match &error {
+                DriveError::Log(error) => match Breach::of(error) {
+                    Some(breach) => Observation::Contract {
+                        node,
+                        breach,
+                        error: error.to_string(),
+                    },
+                    None => Observation::OpenFailed {
+                        node,
+                        error: error.to_string(),
+                    },
+                },
+                DriveError::WorkBudget { readies } => Observation::Contract {
+                    node,
+                    breach: Breach::WorkBudget,
+                    error: format!("still ready after {readies} Readys"),
+                },
+            };
+            self.observe(observation);
             return;
         }
         for entry in applied {
             if let Some((command, ret)) = self.service.apply(&entry)
-                && self
-                    .pending
-                    .remove(&(command.client, command.sequence))
-                    .is_some()
+                && self.pending.remove(&(command.client, command.sequence))
             {
+                self.observe(Observation::Reply {
+                    node,
+                    client: command.client,
+                    index: entry.index,
+                    term: entry.term,
+                });
                 out.push((
                     command.client,
                     Wire::Response {
@@ -429,46 +582,87 @@ impl<C: ConsensusCore> ServerNode<C> {
                     },
                 ));
             }
-            self.observe(Observation::Applied {
-                node: self.id,
-                entry,
-            });
+            self.observe(Observation::Applied { node, entry });
         }
         let committed = core.committed();
         if committed > self.commit
             && let Some(index) = committed
         {
-            let entry_term = log
-                .term(index)
-                .or_else(|| (index == 0).then_some(0))
-                .unwrap_or(0);
             self.observe(Observation::Commit {
-                node: self.id,
+                node,
                 term: core.term(),
                 leader: core.leads(),
                 index,
-                entry_term,
+                entry_term: log.term(index).unwrap_or(0),
             });
             self.commit = committed;
         }
+        self.positions(&core, &log);
+        self.running = Some((core, log));
+    }
+
+    fn positions(&self, core: &C, log: &RaftLog<SimDisk>) {
         self.observe(Observation::Positions {
             node: self.id,
             positions: Positions {
                 received: core.received(),
                 written: log.last_index(),
                 durable: log.durable_index(),
-                committed,
+                committed: core.committed(),
                 applied: self.service.applied(),
             },
         });
+    }
+
+    /// Opens the log and recovers the core from it.
+    fn start(&mut self) {
+        if let Some(error) = self.lost.clone() {
+            self.observe(Observation::OpenFailed {
+                node: self.id,
+                error,
+            });
+            return;
+        }
+        let opened = RaftLog::open(self.disk.clone(), Path::new(LOG_DIR), self.geometry);
+        let mut log = match opened {
+            Ok(opened) => opened.log,
+            Err(error) => {
+                self.observe(Observation::OpenFailed {
+                    node: self.id,
+                    error: error.to_string(),
+                });
+                return;
+            }
+        };
+        let first = log.first_index();
+        let entries: Vec<(u64, u64)> = log
+            .last_index()
+            .map(|last| {
+                (first..=last)
+                    .filter_map(|index| log.term(index).map(|term| (index, term)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.observe(Observation::Recovered {
+            node: self.id,
+            entries,
+            durable: log.durable_index(),
+        });
+        let core = C::recover(self.id, &self.peers, &mut LogView::new(&mut log));
+        // The service's state is rebuilt from the log as the core hands
+        // out its committed entries again; the recovered commit is a
+        // baseline, not a new commit.
+        self.service = TestService::default();
+        self.commit = core.committed();
+        self.positions(&core, &log);
         self.running = Some((core, log));
     }
 }
 
 impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     fn tick(&mut self, now: u64, out: &mut Outbox<Wire<C::Message>>) {
-        if let Some((core, _)) = self.running.as_mut() {
-            core.tick(now);
+        if let Some((core, log)) = self.running.as_mut() {
+            core.tick(now, &mut LogView::new(log));
         }
         self.duty(out);
     }
@@ -480,16 +674,17 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
         _now: u64,
         out: &mut Outbox<Wire<C::Message>>,
     ) {
-        let Some((core, _)) = self.running.as_mut() else {
+        let Some((core, log)) = self.running.as_mut() else {
             return;
         };
+        let mut view = LogView::new(log);
         match message {
-            Wire::Core(message) => core.step(from, message),
+            Wire::Core(message) => core.step(from, message, &mut view),
             Wire::Request(command) => {
                 let key = (command.client, command.sequence);
-                match core.propose(command.encode()) {
+                match core.propose(command.encode(), &mut view) {
                     Ok(()) => {
-                        let _ = self.pending.insert(key, ());
+                        let _ = self.pending.insert(key);
                     }
                     Err(_) => out.push((
                         command.client,
@@ -507,55 +702,17 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     fn crash(&mut self) {
         self.running = None;
         self.pending.clear();
+        self.observe(Observation::Crashed { node: self.id });
         match self.disk.after_crash(self.survives) {
             Ok(disk) => self.disk = disk,
-            Err(error) => self.observe(Observation::OpenFailed {
-                node: self.id,
-                error: error.to_string(),
-            }),
+            // The pre-crash disk is no state to restart from: the node
+            // stays down, and its restart reports why.
+            Err(error) => self.lost = Some(error.to_string()),
         }
     }
 
     fn restart(&mut self, _now: u64) {
-        let opened = RaftLog::open(self.disk.clone(), Path::new(LOG_DIR), self.geometry);
-        let mut log = match opened {
-            Ok(opened) => opened.log,
-            Err(error) => {
-                self.observe(Observation::OpenFailed {
-                    node: self.id,
-                    error: error.to_string(),
-                });
-                return;
-            }
-        };
-        let first_index = log.first_index();
-        let entries = match log.last_index().and_then(|last| last.checked_add(1)) {
-            Some(end) => match log.entries(first_index..end, u64::MAX) {
-                Ok(entries) => entries,
-                Err(error) => {
-                    self.observe(Observation::OpenFailed {
-                        node: self.id,
-                        error: error.to_string(),
-                    });
-                    return;
-                }
-            },
-            None => Vec::new(),
-        };
-        let core = C::recover(
-            self.id,
-            &self.peers,
-            Recovered {
-                first_index,
-                hard_state: log.hard_state(),
-                entries,
-            },
-        );
-        // The service's state is rebuilt from the log as the core
-        // commits again.
-        self.service = TestService::default();
-        self.commit = None;
-        self.running = Some((core, log));
+        self.start();
     }
 }
 

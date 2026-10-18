@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use karyos_cluster::Entry;
 
-use super::core::Step;
-use super::node::{Observation, Op, Positions, Ret, ServiceModel};
+use super::core::{Release, Step};
+use super::node::{Breach, Observation, Op, Positions, Ret, ServiceModel};
 use crate::lin::{self, History, HistoryError, Limit, Verdict};
 use crate::net::NodeId;
 
@@ -46,13 +46,18 @@ pub enum Violation {
         /// The entry's term.
         entry_term: u64,
     },
-    /// A client got a success for an index fewer than a majority of the
-    /// servers held durably.
-    SuccessBeforeDurableMajority {
+    /// A server released its reply for the entry at `index` while fewer
+    /// than a majority of the servers held that entry (its index and
+    /// term) durably.
+    ReplyBeforeDurableMajority {
+        /// The server.
+        node: NodeId,
         /// The client.
         client: NodeId,
-        /// The index.
+        /// The entry's index.
         index: u64,
+        /// The entry's term.
+        term: u64,
         /// The servers that held it durably.
         durable: usize,
         /// The servers.
@@ -65,13 +70,40 @@ pub enum Violation {
         /// Its positions.
         positions: Positions,
     },
-    /// A server released messages that depend on persistence before that
-    /// persistence was reported.
+    /// A server sent a message that waits for persistence before the
+    /// log held what it waits for.
     ReleasedBeforePersisted {
         /// The server.
         node: NodeId,
-        /// How many messages.
-        count: usize,
+        /// The receiver.
+        to: NodeId,
+        /// What it waited for, and what the log held.
+        release: Release,
+    },
+    /// A server's core broke C4's contract.
+    Contract {
+        /// The server.
+        node: NodeId,
+        /// What it broke.
+        breach: Breach,
+        /// The log's error.
+        error: String,
+    },
+    /// A restarted server's log lacks an entry it held durably before.
+    DurableLost {
+        /// The server.
+        node: NodeId,
+        /// The entry's index.
+        index: u64,
+        /// The entry's term.
+        term: u64,
+    },
+    /// A server truncated an entry the cluster had applied.
+    CommittedTruncated {
+        /// The server.
+        node: NodeId,
+        /// The entry's index.
+        index: u64,
     },
 }
 
@@ -153,37 +185,158 @@ pub fn no_old_term_direct_commit(observations: &[Observation]) -> Result<(), Vio
     Ok(())
 }
 
-/// Every success names an index that a majority of the `servers` held
-/// durably when it arrived, by their last positions recorded before it.
+/// What each server holds durably: index to term, from its persisted
+/// Readys and its reopened log. A crashed server's durable entries still
+/// count: they are on its disk, and its restart shows them
+/// ([`durable_kept`]).
+#[derive(Debug, Default)]
+struct DurableLogs {
+    logs: BTreeMap<NodeId, BTreeMap<u64, u64>>,
+}
+
+impl DurableLogs {
+    /// Takes `observation` in; returns the entries a truncation removed.
+    fn observe(&mut self, observation: &Observation) -> Vec<(NodeId, u64, u64)> {
+        match observation {
+            Observation::Drive {
+                node,
+                step:
+                    Step::Persisted {
+                        truncated_from,
+                        appended,
+                        ..
+                    },
+            } => {
+                let log = self.logs.entry(*node).or_default();
+                let removed = truncated_from
+                    .map(|from| log.split_off(&from))
+                    .unwrap_or_default();
+                log.extend(appended.iter().copied());
+                removed
+                    .into_iter()
+                    .map(|(index, term)| (*node, index, term))
+                    .collect()
+            }
+            Observation::Recovered {
+                node,
+                entries,
+                durable,
+            } => {
+                let log = entries
+                    .iter()
+                    .copied()
+                    .filter(|(index, _)| Some(*index) <= *durable)
+                    .collect();
+                let _ = self.logs.insert(*node, log);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The servers holding entry `index` of `term` durably.
+    fn holding(&self, index: u64, term: u64) -> usize {
+        self.logs
+            .values()
+            .filter(|log| log.get(&index) == Some(&term))
+            .count()
+    }
+}
+
+/// Every reply a server releases is for an entry (its index and term) a
+/// majority of the `servers` held durably at that moment.
 ///
 /// # Errors
 ///
-/// [`Violation::SuccessBeforeDurableMajority`].
-pub fn durable_majority_before_success(
+/// [`Violation::ReplyBeforeDurableMajority`].
+pub fn durable_majority_before_reply(
     observations: &[Observation],
     servers: usize,
 ) -> Result<(), Violation> {
-    let mut durable: BTreeMap<NodeId, Option<u64>> = BTreeMap::new();
+    let mut logs = DurableLogs::default();
+    for observation in observations {
+        let _ = logs.observe(observation);
+        if let Observation::Reply {
+            node,
+            client,
+            index,
+            term,
+        } = observation
+        {
+            let durable = logs.holding(*index, *term);
+            if durable <= servers / 2 {
+                return Err(Violation::ReplyBeforeDurableMajority {
+                    node: *node,
+                    client: *client,
+                    index: *index,
+                    term: *term,
+                    durable,
+                    servers,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A restarted server's reopened log holds every entry it held durably
+/// before the crash, and no server truncates an entry the cluster applied.
+///
+/// # Errors
+///
+/// [`Violation::DurableLost`] and [`Violation::CommittedTruncated`].
+pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
+    let mut logs = DurableLogs::default();
+    let mut applied: BTreeMap<u64, u64> = BTreeMap::new();
     for observation in observations {
         match observation {
-            Observation::Positions { node, positions } => {
-                let _ = durable.insert(*node, positions.durable);
+            Observation::Applied { entry, .. } => {
+                let _ = applied.insert(entry.index, entry.term);
             }
-            Observation::Success { client, index } => {
-                let holding = durable
-                    .values()
-                    .filter(|last| last.is_some_and(|last| last >= *index))
-                    .count();
-                if holding <= servers / 2 {
-                    return Err(Violation::SuccessBeforeDurableMajority {
-                        client: *client,
-                        index: *index,
-                        durable: holding,
-                        servers,
-                    });
+            Observation::Recovered { node, entries, .. } => {
+                if let Some(before) = logs.logs.get(node) {
+                    let reopened: BTreeMap<u64, u64> = entries.iter().copied().collect();
+                    if let Some((index, term)) = before
+                        .iter()
+                        .find(|(index, term)| reopened.get(index) != Some(term))
+                    {
+                        return Err(Violation::DurableLost {
+                            node: *node,
+                            index: *index,
+                            term: *term,
+                        });
+                    }
                 }
             }
             _ => {}
+        }
+        for (node, index, term) in logs.observe(observation) {
+            if applied.get(&index) == Some(&term) {
+                return Err(Violation::CommittedTruncated { node, index });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// No server's core broke C4's contract.
+///
+/// # Errors
+///
+/// [`Violation::Contract`].
+pub fn no_contract_breach(observations: &[Observation]) -> Result<(), Violation> {
+    for observation in observations {
+        if let Observation::Contract {
+            node,
+            breach,
+            error,
+        } = observation
+        {
+            return Err(Violation::Contract {
+                node: *node,
+                breach: *breach,
+                error: error.clone(),
+            });
         }
     }
     Ok(())
@@ -223,29 +376,24 @@ pub fn positions_ordered(observations: &[Observation]) -> Result<(), Violation> 
     Ok(())
 }
 
-/// At every server, each release of messages that depend on persistence
-/// follows that server's report of the persistence they depend on.
+/// Every message that waits for persistence left when the log held what
+/// it waits for: its Ready's last entry durable, its hard state stored.
 ///
 /// # Errors
 ///
 /// [`Violation::ReleasedBeforePersisted`].
 pub fn released_after_persistence(observations: &[Observation]) -> Result<(), Violation> {
-    let mut persisted: BTreeMap<NodeId, bool> = BTreeMap::new();
     for observation in observations {
-        let Observation::Drive { node, step } = observation else {
-            continue;
-        };
-        match step {
-            Step::Persisted(_) => {
-                let _ = persisted.insert(*node, true);
-            }
-            Step::Released { count } => {
-                if !persisted.insert(*node, false).unwrap_or(false) && *count > 0 {
-                    return Err(Violation::ReleasedBeforePersisted {
-                        node: *node,
-                        count: *count,
-                    });
-                }
+        if let Observation::Released { node, to, release } = observation {
+            let durable = release.durable >= release.needs;
+            let stored =
+                release.needs_state.is_none() || release.stored_state == release.needs_state;
+            if !(durable && stored) {
+                return Err(Violation::ReleasedBeforePersisted {
+                    node: *node,
+                    to: *to,
+                    release: *release,
+                });
             }
         }
     }
@@ -262,8 +410,10 @@ pub fn all(
     history: &History<Op, Ret>,
     servers: usize,
 ) -> Result<(), Violation> {
+    no_contract_breach(observations)?;
     released_after_persistence(observations)?;
-    durable_majority_before_success(observations, servers)?;
+    durable_majority_before_reply(observations, servers)?;
+    durable_kept(observations)?;
     committed_prefixes_agree(observations)?;
     no_old_term_direct_commit(observations)?;
     positions_ordered(observations)?;
