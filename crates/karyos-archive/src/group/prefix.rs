@@ -53,10 +53,7 @@ pub trait Coverage {
     /// any other (it vouches for nothing). `None` while it records, or for
     /// a recording this Archive does not know. A7d-1c: a reference that
     /// reaches the journal after its recording ended is settled by it.
-    fn ended(&self, recording_id: u64) -> Option<u64> {
-        let _ = recording_id;
-        None
-    }
+    fn ended(&self, recording_id: u64) -> Option<u64>;
 }
 
 /// Why the tracker refused a record.

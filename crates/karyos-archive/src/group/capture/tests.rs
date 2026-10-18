@@ -34,6 +34,10 @@ use crate::segment::SyncPolicy;
 struct Recordings(RefCell<BTreeMap<u64, (u64, u64)>>);
 
 impl Coverage for Recordings {
+    fn ended(&self, _recording_id: u64) -> Option<u64> {
+        None
+    }
+
     fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
         self.0.borrow().get(&recording_id).copied()
     }
@@ -821,4 +825,71 @@ fn an_event_budget_that_overflows_is_refused() {
         ),
         Err(CaptureSetup::Config(CaptureError::Ring { .. }))
     ));
+}
+
+/// #408 re-check P2: once the prefixes stopped, nothing is in flight, so
+/// the job does not sync the journal at every duty.
+#[test]
+fn no_sync_at_the_bound_after_a_stop() {
+    let none = Recordings::default();
+    let (mut sender, mut job) = new(
+        Capture::BestEffort,
+        SyncPolicy::PerSegment,
+        settings(4096, 400, 1),
+    );
+    sender.send(&gap(1, 1), 1).unwrap();
+    job.duty(0, 16, &none).unwrap();
+    let durable = job.journal().durable();
+    for seq in 2..=6 {
+        sender.send(&event(seq, 10, None), seq).unwrap();
+        job.duty(0, 16, &none).unwrap();
+    }
+    assert_eq!(job.journal().durable(), durable);
+}
+
+/// Positions only while it records, then its end: an ended recording.
+struct GoneQuiet;
+
+impl Coverage for GoneQuiet {
+    fn positions(&self, _recording_id: u64) -> Option<(u64, u64)> {
+        None
+    }
+
+    fn ended(&self, _recording_id: u64) -> Option<u64> {
+        Some(64)
+    }
+}
+
+/// #408 re-check P3: an ended recording whose positions answer nothing
+/// still settles a reference its end covers.
+#[test]
+fn a_covered_reference_settles_with_no_positions() {
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
+    sender.send(&event(1, 10, Some(7)), 1).unwrap();
+    job.duty(0, 16, &GoneQuiet).unwrap();
+    job.sync(&GoneQuiet).unwrap();
+    assert_eq!(sender.view().snapshot(), (1, 1, 1));
+}
+
+/// #408 re-check P3: a recovered strict journal that ended at an
+/// incomplete event takes nothing more.
+#[test]
+fn a_recovered_strict_end_stays_ended() {
+    let none = Recordings::default();
+    let disk = FaultDisk::default();
+    let mut journal = journal(disk.clone(), Capture::Strict, SyncPolicy::PerSegment);
+    journal
+        .append(&event_at(1, 10, None, 0, EndOutcome::Incomplete))
+        .unwrap();
+    journal.close().unwrap();
+    let journal = GroupJournal::recover(
+        disk.after_crash(Survives::Synced),
+        Path::new("/g"),
+        1,
+        config(SyncPolicy::PerSegment),
+    )
+    .unwrap()
+    .journal;
+    let (sender, _job) = capture(settings(4096, 400, 8), journal, &none).unwrap();
+    assert_eq!(sender.admit(), Err(Refusal::Ended));
 }
