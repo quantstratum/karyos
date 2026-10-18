@@ -529,10 +529,10 @@ fn a_remote_udp_publisher_killed_mid_offer_is_resolved_and_sent_past() {
 /// Case 6, resolution 9: the image is retired while a remote `Fetch` of
 /// its `Held` grant is in flight. B runs until the image's stream is
 /// retiring (held by the grant, so not freed) before the child sends its
-/// `Fetch`, so the fetch always meets a retired image. The grant is either
-/// refused (`AttachError::Refused` only: a timeout or any other error
-/// fails), or fetched and then reports closed at the seal; never left
-/// open, and the stream frees once the subscriber leaves.
+/// `Fetch`, so the fetch always meets a retired image. The grant is
+/// fetched and then reports closed at the seal (any other outcome, a
+/// refusal, a timeout or an error, fails); never left open, and the stream
+/// frees once the subscriber leaves.
 #[test]
 fn an_image_retired_during_a_remote_fetch_never_leaves_the_grant_open() {
     let dir = dir("fetch-retire");
@@ -561,10 +561,11 @@ fn an_image_retired_during_a_remote_fetch_never_leaves_the_grant_open() {
     let _ = pump_until_report(&mut a, &mut b, &reports, "fetching");
     let outcome = pump_until_report(&mut a, &mut b, &reports, "");
     println!("case 6 branch: {outcome}");
-    assert!(
-        outcome == "refused" || outcome == "closed EndOfStream",
-        "{outcome}"
-    );
+    // A refusal is unreachable in this ordering: the `Held` grant keeps
+    // the retiring stream (it frees only once no grant names it), so
+    // admission still finds its buffer and serves the `Fetch`. A change
+    // that makes a retiring stream's fetch refused fails here, not passes.
+    assert_eq!(outcome, "closed EndOfStream");
     pump(&mut a, &mut b, "the subscriber left", |_, b| {
         b.clients() == 0
     });
