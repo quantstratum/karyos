@@ -226,6 +226,7 @@ pub fn capture<D: Disk>(
     let mut tracker = recovery.tracker;
     // Every event the journal holds was delivered before it was sent.
     tracker.delivered(recovery.last_seen);
+    let tracker_stopped = tracker.stopped();
     let shared = Arc::new(Shared {
         consumed: AtomicU64::new(0),
         state: AtomicU8::new(RUNNING),
@@ -235,6 +236,11 @@ pub fn capture<D: Disk>(
         signal: Condvar::new(),
     });
     let capture = journal_capture(&mut journal).map_err(CaptureSetup::Journal)?;
+    // A recovered strict journal that ended at an incomplete event takes
+    // nothing more.
+    if capture == Capture::Strict && tracker_stopped {
+        shared.state.store(ENDED, Ordering::Release);
+    }
     let dispatched = recovery.last_seen.max(tracker.durable_group_seq());
     let sender = CaptureSender {
         producer,
@@ -312,11 +318,12 @@ impl CaptureSender {
         self.room()?;
         if !self.shared.stopped.load(Ordering::Acquire) {
             let durable = self.shared.view.durable_group_seq();
-            if self
+            // Nothing is durable before it was sent.
+            let in_flight = self
                 .dispatched
                 .checked_sub(durable)
-                .is_some_and(|in_flight| in_flight >= self.in_flight)
-            {
+                .ok_or(Refusal::Failed)?;
+            if in_flight >= self.in_flight {
                 return Err(Refusal::InFlight);
             }
         }
@@ -601,11 +608,15 @@ impl<D: Disk> CaptureJob<D> {
 
     /// Whether as many events are delivered and not durable as the tracker
     /// holds.
+    /// Once the prefixes stopped no event is in flight: the bound is
+    /// never reached.
     fn at_bound(&self) -> bool {
-        self.tracker
-            .delivered_seq()
-            .checked_sub(self.tracker.durable_group_seq())
-            .is_some_and(|in_flight| in_flight >= self.in_flight)
+        !self.tracker.stopped()
+            && self
+                .tracker
+                .delivered_seq()
+                .checked_sub(self.tracker.durable_group_seq())
+                .is_some_and(|in_flight| in_flight >= self.in_flight)
     }
 
     /// Settles the waiting references to recordings that already ended
@@ -614,10 +625,11 @@ impl<D: Disk> CaptureJob<D> {
     fn settle_ended(&mut self, coverage: &impl Coverage) -> Result<(), JobError> {
         while self.shared.state() == GroupState::Running {
             let Some((recording, durable)) =
-                self.tracker.references().find_map(|(recording, end)| {
+                self.tracker.references().find_map(|(recording, _)| {
+                    // Covered or not, an ended recording's references are
+                    // settled: its positions may answer nothing any more.
                     coverage
                         .ended(recording)
-                        .filter(|&durable| end > durable)
                         .map(|durable| (recording, durable))
                 })
             else {
