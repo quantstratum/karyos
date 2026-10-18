@@ -19,6 +19,28 @@ pub enum WalkerUnavailable {
     NoReaderCell,
 }
 
+/// What a network publication's timed lanes do not support yet (P2.11
+/// PR1, the software route; `quantstratum-docs:
+/// karyos/design/timed-tx.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TimedNetworkUnsupported {
+    /// A channel with redundant paths: each path submits its own copy, and
+    /// when a timed head is selected once is not designed yet.
+    #[error("redundant paths")]
+    Routed,
+    /// A reliable channel: a reset rewinds the lane below schedule entries
+    /// already released (PR1b).
+    #[error("a reliable channel")]
+    Reliable,
+    /// The `Tai` clock domain: the sender runs on the monotonic clock.
+    #[error("the Tai clock domain")]
+    TaiDomain,
+    /// Cancel-on-deadline: the sealing it needs is the conductor's, which
+    /// the sender agent does not hold.
+    #[error("cancel-on-deadline")]
+    CancelOnDeadline,
+}
+
 /// Errors returned by the embedded driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DriverError {
@@ -228,6 +250,12 @@ pub enum DriverError {
     NotTimed {
         /// The stream id.
         stream: u64,
+    },
+    /// A network publication's timed lanes cannot take this yet.
+    #[error("a timed network publication does not support {reason}")]
+    TimedNetworkUnsupported {
+        /// What it does not support.
+        reason: TimedNetworkUnsupported,
     },
     /// A cutover of a timed lane: its schedule ring belongs to one
     /// incarnation's buffer and is never carried to a successor

@@ -2323,7 +2323,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Allocates a timed lane's counters once, when its first handle is
     /// prepared; nothing for a lane that is not timed.
-    fn ensure_timed_counters(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+    pub(crate) fn ensure_timed_counters(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<(), DriverError> {
         let found = self.stream_ref(stream)?;
         if found.buffer.schedule_ring().is_none() || found.timed_counters.is_some() {
             return Ok(());

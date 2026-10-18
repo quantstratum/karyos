@@ -1088,6 +1088,8 @@ mod netem;
 
 mod trace;
 
+mod timed;
+
 /// The table of the conflated views below: four keys of 16 bytes.
 const VIEW: karyos_sys::conflation::ConflationConfig = karyos_sys::conflation::ConflationConfig {
     keys: 4,

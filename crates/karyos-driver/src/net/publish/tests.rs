@@ -1247,3 +1247,86 @@ fn network_publications_draw_their_initial_term_ids() {
     };
     assert_ne!(first, second);
 }
+
+/// P2.11 PR1: what a timed network publication's software route does
+/// not support yet is refused, typed, before anything is configured.
+#[test]
+fn a_timed_network_publication_refuses_what_it_does_not_support() {
+    use karyos_client::schedule::{ClockDomain, ScheduleOptions};
+    use karyos_protocol::channel::Interface;
+
+    use crate::error::TimedNetworkUnsupported as Unsupported;
+
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let unreliable = UdpConfig {
+        reliable: false,
+        ..channel(destination.clone())
+    };
+    let routed = UdpConfig {
+        destination: Destination::Multicast {
+            group: "239.255.0.9:4000".parse().unwrap(),
+            ttl: None,
+        },
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Interface::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ],
+        ..unreliable.clone()
+    };
+    let tai = ScheduleOptions {
+        domain: ClockDomain::Tai,
+        ..ScheduleOptions::default()
+    };
+    let cancel = ScheduleOptions {
+        cancel_on_deadline: true,
+        ..ScheduleOptions::default()
+    };
+    let mut cases = vec![
+        (
+            channel(destination),
+            ScheduleOptions::default(),
+            Unsupported::Reliable,
+        ),
+        (unreliable.clone(), cancel, Unsupported::CancelOnDeadline),
+    ];
+    // The Tai domain is Linux only; elsewhere the schedule refuses it first.
+    if cfg!(target_os = "linux") {
+        cases.push((unreliable.clone(), tai, Unsupported::TaiDomain));
+    }
+    let mut driver = driver();
+    if driver.net.as_ref().unwrap().paths_isolated() {
+        cases.push((routed, ScheduleOptions::default(), Unsupported::Routed));
+    }
+    for (channel, options, reason) in cases {
+        let mut config = aggregate(10, 1);
+        config.stream.buffer.schedule_capacity = 4;
+        let refused = driver.add_timed_network_publication(config, &channel, None, options);
+        assert_eq!(
+            refused.map(drop),
+            Err(DriverError::TimedNetworkUnsupported { reason }),
+            "{reason:?}"
+        );
+        // Nothing was configured: the key is free.
+        driver.free_retired_streams();
+        assert!(driver.streams.is_empty(), "{reason:?}");
+    }
+    // A timed add of lanes with no ring is refused too.
+    let refused = driver.add_timed_network_publication(
+        aggregate(10, 1),
+        &unreliable,
+        None,
+        ScheduleOptions::default(),
+    );
+    assert_eq!(refused.map(drop), Err(DriverError::InvalidConfig));
+    // Once added, a lane's settings are its sender's: they do not change.
+    let mut config = aggregate(10, 1);
+    config.stream.buffer.schedule_capacity = 4;
+    let handle = driver
+        .add_timed_network_publication(config, &unreliable, None, ScheduleOptions::default())
+        .unwrap();
+    assert_eq!(
+        driver.schedule_stream(handle.lane(Lane::ZERO).unwrap(), ScheduleOptions::default()),
+        Err(DriverError::InvalidConfig)
+    );
+}

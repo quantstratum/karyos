@@ -266,6 +266,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Timed lanes over the network (P2.11 PR1, the software route;
+  timed-tx.md). `EmbeddedDriver::add_timed_network_publication` adds a
+  network publication whose lanes have a schedule ring: its sender holds
+  each message until its requested time, then sends it, one message per
+  datagram, and frees its schedule entry once it left, so the ring bounds
+  only messages outstanding. A plain network publication whose lanes have
+  a ring is timed with the default settings; before, its offers were
+  back-pressured for good after the ring's capacity, as nothing freed it.
+  Lateness, late sends and heads dropped by an unreliable reset are
+  counted; a guard close ends a head still waiting for its time. Refused
+  for now, typed (`DriverError::TimedNetworkUnsupported`): redundant
+  paths, reliable channels (PR1b), the `Tai` domain and
+  cancel-on-deadline. The sender times heads on the host monotonic clock,
+  as `Monotonic` offers are timed; no time namespace is checked, as on the
+  local route. `TimedGate` keeps its API over a `TimedState`, which a
+  sender holds across cycles and gates through a `TimedView`.
 - A removed routed publication sends each lane's EOS on every live path
   (redundant paths; rp-w5b follow-up). A lane is drained once its first
   sends reached its seal on every path that can send now; a path whose
