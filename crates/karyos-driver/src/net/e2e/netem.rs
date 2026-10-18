@@ -15,6 +15,8 @@
 //!   duplicate"): N2 in Dedicated mode, on two lanes, on a multicast group
 //!   with two subscribers, and across a blackout of the path, which the
 //!   sender's idle DATA heartbeat (SPEC §6) lets the receiver repair.
+//! - N8 (network-shared-terms n4): N2 between two IPC drivers, whose
+//!   publication and image lanes are shared regions (Linux).
 
 #![allow(
     clippy::print_stdout,
@@ -496,6 +498,21 @@ fn n7_a_reliable_channel_recovers_from_a_blackout() {
         (sent, seen)
     };
     pump(&mut [&mut a, &mut b], |_| step(before).1 == before);
+    // Two more status messages from the receiver after it read the 200:
+    // the later was sent after the reads, so the sender's window covers
+    // the whole tail before the path goes dark.
+    let status = |a: &EmbeddedDriver| {
+        a.net
+            .as_ref()
+            .unwrap()
+            .sender_counters()
+            .unwrap()
+            .sm_accepted
+    };
+    let read = status(&a);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        status(drivers[0]) >= read + 2
+    });
     let (naks_before, repairs_before) = repair_work(&a, &b);
     let blackout = Profile::replace("loss 100%");
     let start = Instant::now();
@@ -527,4 +544,77 @@ fn n7_a_reliable_channel_recovers_from_a_blackout() {
         naks > naks_before && repairs > repairs_before && heartbeats > 0,
         "no repair after the blackout"
     );
+}
+
+/// N8 (network-shared-terms n4): N2 between two IPC drivers. The
+/// publication's lanes and the image's are shared regions, so the
+/// sender's staging and NAK reads and the receive owner's writes and
+/// repairs run on shared terms; every message still arrives exactly once
+/// and in order, and the faults did reach the path.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n8_a_reliable_channel_between_ipc_drivers_delivers_exactly_once_in_order() {
+    super::super::netem::require_netem();
+    let dirs = [ipc_dir("a"), ipc_dir("b")];
+    let (mut a, mut b) = (ipc_driver(&dirs[0]), ipc_driver(&dirs[1]));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let lane = image.lane(Lane::ZERO).unwrap();
+    assert!(b.stream_ref(lane).unwrap().buffer.region().is_some());
+    let lane = publication.lane(Lane::ZERO).unwrap();
+    assert!(a.stream_ref(lane).unwrap().buffer.region().is_some());
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let count = 2000;
+    exchange(&mut a, &mut b, &publication, &mut reader, count);
+    let poll = reader.poll(|_, _, _| {}, ONE);
+    assert_eq!(poll.lanes[0].first_loss, None, "a reliable lane lost data");
+    let sender = a.net.as_ref().unwrap().sender_counters().unwrap();
+    assert!(sender.naks >= 1 && sender.repairs >= 1, "{sender:?}");
+    println!(
+        "N8: {count} delivered in order exactly once between IPC drivers; {} NAKs, {} repairs",
+        sender.naks, sender.repairs
+    );
+    drop(reader);
+    let _ = (a.close_network(), b.close_network());
+    drop((a, b));
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A fresh directory for an IPC driver of this process.
+#[cfg(target_os = "linux")]
+fn ipc_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("karyos-n8-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// An IPC driver with a network, as [`driver`] in Shared mode.
+#[cfg(target_os = "linux")]
+fn ipc_driver(dir: &std::path::Path) -> EmbeddedDriver<karyos_sys::term_bytes::SharedTerms> {
+    let timeout = 5_000_000_000;
+    EmbeddedDriver::with_ipc(
+        crate::embedded::DriverConfig {
+            network: Some(crate::net::NetworkConfig {
+                threading: ThreadingMode::Shared,
+                ..crate::net::NetworkConfig::default()
+            }),
+            ..crate::embedded::DriverConfig::default()
+        },
+        crate::admission::IpcConfig {
+            dir: dir.to_path_buf(),
+            max_pending_hellos: 2,
+            hello_timeout: timeout,
+            max_outbound_per_client: 8,
+            fetch_deadline: timeout,
+            max_exports_per_client: 16,
+            max_fetches_per_client: 4,
+            max_regions_per_fetch: 4,
+            max_fetch_bytes: 1 << 30,
+            max_tools: crate::admission::DEFAULT_MAX_TOOLS,
+        },
+        Box::new(crate::clock::SystemClock::new()),
+    )
+    .unwrap()
 }

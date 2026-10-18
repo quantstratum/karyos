@@ -297,6 +297,12 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         &mut self.store
     }
 
+    /// Whether the recording lost ranges so far (an async lap resumed).
+    #[must_use]
+    pub const fn incomplete(&self) -> bool {
+        self.incomplete
+    }
+
     /// Whether the recording ended.
     #[must_use]
     pub const fn ended(&self) -> Option<Ended> {

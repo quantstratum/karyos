@@ -103,38 +103,6 @@ pub(crate) mod sealed {
         ) -> Result<LogBuffer<Self>, DriverError>
         where
             Self: StreamTerms;
-
-        /// Exposes an installed image's lanes as an aggregate, on either
-        /// backing (network-shared-terms n3): on an IPC driver its lanes
-        /// are regions, so remote clients may subscribe to the image and
-        /// fetch them. `None` when the key is in use or the stream table
-        /// is full ([`EmbeddedDriver::add_image_aggregate`]).
-        fn expose_image(
-            driver: &mut EmbeddedDriver<Self>,
-            lanes: &[std::sync::Arc<LogBuffer<Self>>],
-        ) -> Option<crate::embedded::AggregateHandle>
-        where
-            Self: StreamTerms;
-
-        /// A network publication a client asked for by URI (W5b);
-        /// `UnsupportedChannel` where streams are not heap backed (D3).
-        fn network_publication(
-            driver: &mut EmbeddedDriver<Self>,
-            config: crate::embedded::AggregateConfig,
-            channel: &karyos_protocol::channel::UdpConfig,
-        ) -> Result<crate::embedded::AggregateHandle, DriverError>
-        where
-            Self: StreamTerms;
-
-        /// A network subscription a client asked for by URI (W5b), as
-        /// [`Create::network_publication`].
-        fn network_subscription(
-            driver: &mut EmbeddedDriver<Self>,
-            stream_id: i32,
-            channel: &karyos_protocol::channel::UdpConfig,
-        ) -> Result<crate::net::NetworkSubscription, DriverError>
-        where
-            Self: StreamTerms;
     }
 
     impl Create for karyos_sys::term_bytes::HeapTerms {
@@ -156,29 +124,6 @@ pub(crate) mod sealed {
             config: LogBufferConfig,
         ) -> Result<LogBuffer<Self>, DriverError> {
             Ok(LogBuffer::new(config)?)
-        }
-
-        fn expose_image(
-            driver: &mut EmbeddedDriver<Self>,
-            lanes: &[std::sync::Arc<LogBuffer<Self>>],
-        ) -> Option<crate::embedded::AggregateHandle> {
-            driver.add_image_aggregate(lanes)
-        }
-
-        fn network_publication(
-            driver: &mut EmbeddedDriver<Self>,
-            config: crate::embedded::AggregateConfig,
-            channel: &karyos_protocol::channel::UdpConfig,
-        ) -> Result<crate::embedded::AggregateHandle, DriverError> {
-            driver.client_network_publication(config, channel)
-        }
-
-        fn network_subscription(
-            driver: &mut EmbeddedDriver<Self>,
-            stream_id: i32,
-            channel: &karyos_protocol::channel::UdpConfig,
-        ) -> Result<crate::net::NetworkSubscription, DriverError> {
-            driver.client_network_subscription(stream_id, channel)
         }
     }
 
@@ -213,29 +158,6 @@ pub(crate) mod sealed {
                 config,
                 Generation::default(),
             )?)
-        }
-
-        fn expose_image(
-            driver: &mut EmbeddedDriver<Self>,
-            lanes: &[std::sync::Arc<LogBuffer<Self>>],
-        ) -> Option<crate::embedded::AggregateHandle> {
-            driver.add_image_aggregate(lanes)
-        }
-
-        fn network_publication(
-            _driver: &mut EmbeddedDriver<Self>,
-            _config: crate::embedded::AggregateConfig,
-            _channel: &karyos_protocol::channel::UdpConfig,
-        ) -> Result<crate::embedded::AggregateHandle, DriverError> {
-            Err(DriverError::UnsupportedChannel)
-        }
-
-        fn network_subscription(
-            _driver: &mut EmbeddedDriver<Self>,
-            _stream_id: i32,
-            _channel: &karyos_protocol::channel::UdpConfig,
-        ) -> Result<crate::net::NetworkSubscription, DriverError> {
-            Err(DriverError::UnsupportedChannel)
         }
     }
 }
@@ -3680,7 +3602,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     else {
                         continue;
                     };
-                    let exposed = <T as sealed::Create>::expose_image(self, &lanes);
+                    let exposed = self.add_image_aggregate(&lanes);
                     if let Some(net) = &mut self.net {
                         let traced = crate::net::trace::identity(&identity, alias);
                         net.record_image(slot, endpoint, traced, exposed, &lanes);

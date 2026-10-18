@@ -36,16 +36,13 @@
 //! - **Backings (network-shared-terms n3).** An image is exposed on either
 //!   backing: on an IPC driver its lanes are shared regions, so in-process
 //!   subscribers read it as any stream of the driver and remote clients
-//!   subscribe to its stream key and fetch its regions. The public calls
-//!   here stay on heap drivers until an IPC driver serves network channels
-//!   (n4); meanwhile the driver reaches an IPC driver's subscriptions
-//!   through the generic calls below (`subscribe_network`).
+//!   subscribe to its stream key and fetch its regions. The calls here
+//!   serve either backing (n4).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use karyos_io::sockets::endpoint::{InterfaceSel, MulticastConfig};
 use karyos_protocol::channel::{Destination, Interface, UdpConfig};
-use karyos_sys::term_bytes::HeapTerms;
 
 use super::{LATER_PATHS, NetworkSubscription};
 use crate::agents::images::DEFAULT_MAX_IMAGE_TERM_LENGTH;
@@ -119,7 +116,7 @@ fn receive_route(
     }
 }
 
-impl EmbeddedDriver<HeapTerms> {
+impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Subscribes `stream_id` on `channel` (control path): its images,
     /// once installed, are streams of this driver
     /// ([`EmbeddedDriver::network_image`]).
@@ -261,10 +258,8 @@ impl EmbeddedDriver<HeapTerms> {
     }
 }
 
-/// The network subscriptions of either backing, for the driver itself:
-/// the public calls above stay on heap drivers until an IPC driver serves
-/// network channels (network-shared-terms n4); an IPC driver's images
-/// are reached through these meanwhile (its tests).
+/// The driver's own network subscription calls, which the public ones
+/// above and the client's URI path go through.
 impl<T: StreamTerms> EmbeddedDriver<T> {
     pub(crate) fn subscribe_network(
         &mut self,

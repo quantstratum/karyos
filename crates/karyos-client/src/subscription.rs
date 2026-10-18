@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use karyos_sys::frame::EXTENSION_LENGTH;
+use karyos_sys::frame::{EXTENSION_LENGTH, Lane};
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SealReason, SkipReason, Subscription};
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
@@ -542,6 +542,28 @@ impl<T: TermBytes> ClientSubscription<T> {
     where
         H: FnMut(&[u8], MessageInfo),
     {
+        self.poll_taking(
+            |bytes, info| {
+                handler(bytes, info);
+                true
+            },
+            message_limit,
+        )
+    }
+
+    /// [`ClientSubscription::poll`], with a handler that may decline a
+    /// message: the poll then stops, and a required reader's message is
+    /// not acknowledged, so the next poll delivers it again. An optional
+    /// or observer reader acknowledges on copy: what it declines is gone.
+    #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
+    pub(crate) fn poll_taking<H>(
+        &mut self,
+        mut handler: H,
+        message_limit: MessageLimit,
+    ) -> Result<PollSummary, PollError>
+    where
+        H: FnMut(&[u8], MessageInfo) -> bool,
+    {
         let message_limit = message_limit.get();
         let mut summary = PollSummary::default();
         if let Some((overrun, outcome, _)) = self.closed {
@@ -597,7 +619,10 @@ impl<T: TermBytes> ClientSubscription<T> {
                         self.invalid_extensions.count_one();
                     }
                     let message = self.scratch.get(..length as usize).unwrap_or(&[]);
-                    handler(message, info);
+                    if !handler(message, info) {
+                        // Declined: pending for a required reader.
+                        break;
+                    }
                     // Reached only if the handler returned.
                     inner.acknowledge();
                     summary.delivered += 1;
@@ -675,6 +700,12 @@ impl<T: TermBytes> ClientSubscription<T> {
             (None, Some((_, _, position))) => position,
             (None, None) => self.base,
         }
+    }
+
+    /// The lane read; `None` once the rejoin policy closed the
+    /// subscription.
+    pub(crate) fn lane(&self) -> Option<Lane> {
+        self.inner.as_ref().map(|inner| inner.buffer().lane())
     }
 
     /// Whether the rejoin policy closed the subscription.
