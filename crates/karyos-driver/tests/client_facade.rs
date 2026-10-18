@@ -742,6 +742,66 @@ mod remote {
         ));
     }
 
+    /// A remote publication grant that arrives after its request timed out
+    /// is taken and removed at once: a `karyos:udp` publication the client
+    /// created by URI ends, so with room for one owned network resource
+    /// per client, the next one is granted.
+    #[test]
+    fn a_remote_late_publication_grant_is_removed() {
+        let mut network = NetworkConfig {
+            threading: ThreadingMode::Shared,
+            max_owned_per_client: 1,
+            ..NetworkConfig::default()
+        };
+        network.stream_defaults.term_length = 64 * 1024;
+        let config = DriverConfig {
+            network: Some(network),
+            ..DriverConfig::default()
+        };
+        let (_driver, dir, paused) = ipc_driver_with("late-pub", 16, config);
+        let mut client = Client::connect(
+            Context::builder()
+                .dir(&dir)
+                .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        let uri = |port: u16| format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1");
+        paused.hold();
+        assert_eq!(
+            client
+                .add_exclusive_publication(&uri(port()), StreamId::new(7))
+                .err(),
+            Some(ClientError::Timeout)
+        );
+        paused.resume();
+        let start = Instant::now();
+        while client.late_grants_released() == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "not released");
+            let _ = client.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The only owned resource is free again.
+        let mut granted = None;
+        let start = Instant::now();
+        while granted.is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the late publication is still owned"
+            );
+            match client.add_exclusive_publication(&uri(port()), StreamId::new(8)) {
+                Ok(publication) => granted = Some(publication),
+                Err(ClientError::Refused { .. } | ClientError::Timeout) => {
+                    let _ = client.poll();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
     /// A remote grant that arrives after its request timed out is taken
     /// and dropped at once, so its export is free again: with one export
     /// per client, the next subscription is granted.
