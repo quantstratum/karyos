@@ -2639,6 +2639,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             });
         }
         found.buffer = fresh.buffer;
+        // The buffer's configuration, which a network sender announces.
+        found.config = plan.config;
         found.incarnation = plan.incarnation;
         // A fresh incarnation has a fresh ring. A local lane takes new
         // settings before its next handle; a network lane's are its
@@ -2727,9 +2729,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let until_ns = net.start_reincarnation(registration, stream, closes)?;
                 return Err(DriverError::QuarantinedAlias { stream, until_ns });
             }
+            // The new incarnation is announced anew: its first term id is
+            // drawn before it, as for any publication (SPEC §4, initial
+            // state), shared by every lane; a test pin still wins. A
+            // failed draw refuses with nothing swapped.
+            let forced = self
+                .config
+                .network
+                .and_then(|network| network.stream_defaults.initial_term_id);
+            let drawn = self.draw_initial_term_id(forced)?;
             let mut fresh = Vec::with_capacity(plans.len());
             for (lane, plan) in plans {
-                if let Some(plan) = plan {
+                if let Some(mut plan) = plan {
+                    plan.config.initial_term_id = drawn;
                     let prepared = self.prepare_incarnation(&plan)?;
                     fresh.push((lane, plan, prepared));
                 }
