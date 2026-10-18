@@ -35,6 +35,20 @@ fn new_recording(stream_id: i32, channel: &[u8]) -> NewRecording<'_> {
         start_time_ns: 5,
         geometry: geometry(),
         policy: SyncPolicy::PerSegment,
+        format: format(),
+    }
+}
+
+fn format() -> StreamFormat {
+    StreamFormat {
+        lane: karyos_sys::frame::Lane::ZERO,
+        initial_term_id: -3,
+        mtu: core::num::NonZeroU32::new(1408).unwrap(),
+        source: crate::catalog::SourceIncarnation {
+            driver: [1, 2],
+            registration: 3,
+            incarnation: 1,
+        },
     }
 }
 
@@ -211,6 +225,7 @@ fn a_torn_record_is_cut() {
         start_time_ns: 5,
         geometry: geometry(),
         policy: SyncPolicy::PerSegment,
+        format: format(),
         stop: None,
     })
     .encode()
@@ -259,6 +274,7 @@ fn three_started() -> (FaultDisk, [u64; 3]) {
             start_time_ns: 5,
             geometry: geometry(),
             policy: SyncPolicy::PerSegment,
+            format: format(),
             stop: None,
         })
         .encode()
@@ -360,8 +376,9 @@ fn a_whole_header_that_does_not_match_is_refused() {
         (13, 0xFF, |error| {
             matches!(error, CatalogError::Corrupt { offset: 0 })
         }),
-        (4, 3, |error| {
-            matches!(error, CatalogError::UnsupportedVersion { version: 3 })
+        // Version 2, the last one without a stream format.
+        (4, 2, |error| {
+            matches!(error, CatalogError::UnsupportedVersion { version: 2 })
         }),
     ];
     for (at, byte, expected) in cases {
@@ -633,4 +650,63 @@ fn an_unknown_stop_reason_is_corrupt() {
         Catalog::open(disk, Path::new(DIR)),
         Err(CatalogError::Corrupt { offset }) if offset == end
     ));
+}
+
+/// A recording's stream format survives a reopen, for its replays; a
+/// `Started` naming a lane no stream has, or an mtu of 0, is corrupt.
+#[test]
+fn the_stream_format_is_kept() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut catalog = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    let lane = karyos_sys::frame::Lane::try_new(3).unwrap();
+    let format = StreamFormat {
+        lane,
+        initial_term_id: i32::MIN,
+        mtu: core::num::NonZeroU32::new(9000).unwrap(),
+        source: crate::catalog::SourceIncarnation {
+            driver: [1, 2],
+            registration: 3,
+            incarnation: 1,
+        },
+    };
+    let channel = channel_of(1);
+    let id = catalog
+        .start(NewRecording {
+            format,
+            ..new_recording(1, &channel)
+        })
+        .unwrap();
+    drop(catalog);
+    let reopened = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    assert_eq!(reopened.get(id).unwrap().format, format);
+    drop(reopened);
+    // The lane byte follows the policy (1) and interval (8) in the payload,
+    // after the head (4): lane 4 is no lane.
+    let record = Record::Started(Recording {
+        id: 9,
+        stream_id: 1,
+        session_id: 7,
+        channel,
+        start: 0,
+        start_time_ns: 5,
+        geometry: geometry(),
+        policy: SyncPolicy::PerSegment,
+        format,
+        stop: None,
+    })
+    .encode()
+    .unwrap();
+    let lane_at = HEAD + 8 + 4 + 4 + 8 + 8 + 4 + 8 + 1 + 8;
+    assert_eq!(record[lane_at], 3);
+    let mut payload = record[HEAD..record.len() - TAIL].to_vec();
+    payload[lane_at - HEAD] = 4;
+    assert!(Record::decode(STARTED, &payload).is_none());
+    payload[lane_at - HEAD] = 3;
+    assert!(Record::decode(STARTED, &payload).is_some());
+    // The initial term id (4) follows the lane, then the mtu.
+    let mtu_at = lane_at - HEAD + 1 + 4;
+    assert_eq!(payload[mtu_at..mtu_at + 4], 9000u32.to_le_bytes());
+    payload[mtu_at..mtu_at + 4].fill(0);
+    assert!(Record::decode(STARTED, &payload).is_none());
 }

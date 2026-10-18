@@ -33,6 +33,14 @@ fn geometry() -> Geometry {
     Geometry::new(64 * 1024, 4 * 64 * 1024).unwrap()
 }
 
+fn source() -> SourceIncarnation {
+    SourceIncarnation {
+        driver: [0x0102_0304_0506_0708, 0x1112_1314_1516_1718],
+        registration: 21,
+        incarnation: 2,
+    }
+}
+
 /// One message of every template, every enum variant among them.
 fn samples() -> Vec<ControlMessage<'static>> {
     vec![
@@ -126,8 +134,12 @@ fn samples() -> Vec<ControlMessage<'static>> {
             recording_id: 1,
             start: 0,
             start_time_ns: 5,
-            state: RecordingState::Recording { incomplete: false },
+            state: RecordingState::Recording {
+                written: 4096,
+                incomplete: false,
+            },
             geometry: geometry(),
+            source: source(),
             stream_id: 10,
             session_id: 3,
             channel: "ipc",
@@ -144,6 +156,7 @@ fn samples() -> Vec<ControlMessage<'static>> {
                 incomplete: true,
             }),
             geometry: geometry(),
+            source: source(),
             stream_id: 10,
             session_id: 3,
             channel: "ipc",
@@ -175,8 +188,16 @@ fn samples() -> Vec<ControlMessage<'static>> {
             recording_id: 3,
             start: 0,
             start_time_ns: 5,
-            state: RecordingState::Recording { incomplete: true },
+            state: RecordingState::Recording {
+                written: 0,
+                incomplete: true,
+            },
             geometry: geometry(),
+            source: SourceIncarnation {
+                driver: [u64::MAX, 0],
+                registration: u64::MAX,
+                incarnation: 0,
+            },
             stream_id: 10,
             session_id: 3,
             channel: "ipc",
@@ -256,14 +277,19 @@ fn every_template_has_a_vector() {
         ),
         (
             11,
-            "01 00 66 00 01 00 46 00 57 00 00 00
+            "01 00 66 00 01 00 6e 00 7f 00 00 00
              0b 00 00 00 00 00 00 00
              01 00 00 00 00 00 00 00
              00 00 00 00 00 00 00 00
              ff ff ff ff ff ff ff ff
+             00 10 00 00 00 00 00 00
              05 00 00 00 00 00 00 00
              00 00 00 00 00 00 00 00
              00 00 04 00 00 00 00 00
+             08 07 06 05 04 03 02 01
+             18 17 16 15 14 13 12 11
+             15 00 00 00 00 00 00 00
+             02 00 00 00 00 00 00 00
              00 00 01 00
              0a 00 00 00
              03 00 00 00
@@ -387,15 +413,18 @@ fn every_invalid_field_is_refused_by_name() {
         (&replay_scaled, 35, 0xFF, "scale_ppm"),
         (&ok, 16, 6, "code"),
         (&error, 8, 1, "id"),
-        (&recording, 68, 10, "stop_reason"),
+        (&recording, 108, 10, "stop_reason"),
         (&recording, 24, 0, "stop"),
-        (&recording, 40, 1, "stop"),
-        (&recording, 69, 2, "incomplete"),
+        (&recording, 48, 1, "stop"),
+        (&recording, 109, 2, "incomplete"),
         (&recording, 8, 0, "recording_id"),
-        (&recording, 56, 3, "segment_length"),
-        (&recording, 58, 0, "term_length"),
-        (&recording, 48, 1, "segment_length"),
-        (&stopped, 68, 0, "stop"),
+        (&recording, 96, 3, "segment_length"),
+        (&recording, 98, 0, "term_length"),
+        (&recording, 56, 1, "segment_length"),
+        // Written below the start, and a stop other than the written.
+        (&recording, 17, 0xFF, "written"),
+        (&stopped, 32, 1, "written"),
+        (&stopped, 108, 0, "stop"),
         (&started, 24, 4, "signal"),
         (&started, 25, 4, "stop_reason"),
         (&started, 26, 1, "incomplete"),
@@ -560,6 +589,14 @@ fn encoding_refuses_what_decoding_would() {
                 ..descriptor_sample()
             }),
             "recording_id",
+        ),
+        // Written to 4096, from a start after it.
+        (
+            ControlMessage::RecordingDescriptor(RecordingDescriptor {
+                start: 8192,
+                ..descriptor_sample()
+            }),
+            "written",
         ),
         (signal(0, 0, Signal::Started), "recording_id"),
         (signal(1, 1, stopped), "correlation_id"),

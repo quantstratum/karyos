@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Network images on an IPC driver (network-shared-terms n3): a heap driver
-//! A publishes on loopback; an IPC driver B subscribes through the driver's
-//! own call (its public channel calls refuse until n4), installs each image
-//! in shared regions and exposes it as an aggregate, which an in-process
-//! subscriber reads and a remote client fetches.
+//! Network streams on IPC drivers (network-shared-terms n3 and n4): a
+//! driver A, heap or IPC, publishes on loopback; an IPC driver B
+//! subscribes, installs each image in shared regions and exposes it as an
+//! aggregate, which an in-process subscriber reads and a remote client
+//! fetches. On an IPC A, the publication's lanes are A's regions.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,11 +19,11 @@ use karyos_sys::log_buffer::{Role, SealReason};
 use karyos_sys::sizing::{MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term_bytes::SharedTerms;
 
-use super::{BUDGET, aggregate, channel, driver, free_address};
+use super::{ANY_PORT, BUDGET, aggregate, channel, driver};
 use crate::admission::IpcConfig;
 use crate::agents::ThreadingMode;
 use crate::clock::SystemClock;
-use crate::embedded::{AggregateHandle, DriverConfig, EmbeddedDriver};
+use crate::embedded::{AggregateHandle, DriverConfig, EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::net::{NetworkConfig, NetworkSubscription};
 
@@ -81,7 +81,11 @@ fn ipc_driver(dir: &Path) -> IpcDriver {
 }
 
 /// Runs both drivers until `done`.
-fn pump(a: &mut EmbeddedDriver, b: &mut IpcDriver, mut done: impl FnMut(&mut IpcDriver) -> bool) {
+fn pump<P: StreamTerms>(
+    a: &mut EmbeddedDriver<P>,
+    b: &mut IpcDriver,
+    mut done: impl FnMut(&mut IpcDriver) -> bool,
+) {
     let start = Instant::now();
     while !done(b) {
         assert!(start.elapsed() < Duration::from_secs(20), "not reached");
@@ -92,15 +96,13 @@ fn pump(a: &mut EmbeddedDriver, b: &mut IpcDriver, mut done: impl FnMut(&mut Ipc
 }
 
 /// A's publication of `lanes` lanes and B's image of it, exposed.
-fn exposed(
-    a: &mut EmbeddedDriver,
+fn exposed<P: StreamTerms>(
+    a: &mut EmbeddedDriver<P>,
     b: &mut IpcDriver,
     lanes: usize,
 ) -> (AggregateHandle, AggregateHandle, NetworkSubscription) {
-    let address = free_address();
-    let subscription = b
-        .subscribe_network(10, &channel(address), (None, None))
-        .unwrap();
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = b.network_subscription_address(10).unwrap();
     let publication = a
         .add_network_publication(aggregate(10, 3, lanes), &channel(address))
         .unwrap();
@@ -114,8 +116,8 @@ fn exposed(
 
 /// Offers `count` numbered messages on lane `lane` of `publication`,
 /// running both drivers while the publisher is held.
-fn offer(
-    a: &mut EmbeddedDriver,
+fn offer<P: StreamTerms>(
+    a: &mut EmbeddedDriver<P>,
     b: &mut IpcDriver,
     publication: &AggregateHandle,
     lane: u8,
@@ -191,9 +193,110 @@ fn an_ipc_drivers_image_lives_in_regions_and_is_read_in_process() {
     let _ = (a.close_network(), b.close_network());
 }
 
+/// Two IPC drivers over the network (network-shared-terms n4): A's
+/// network publication, made by the public call, has its lanes in A's
+/// regions; B subscribes by the public call, and an in-process subscriber
+/// of B's image reads every lane's exact sequence.
+#[test]
+fn an_ipc_drivers_publication_lives_in_regions_and_reaches_an_ipc_image() {
+    let (a_dir, b_dir) = (dir("pair-a"), dir("pair-b"));
+    let (mut a, mut b) = (ipc_driver(&a_dir), ipc_driver(&b_dir));
+    let (publication, image, _subscription) = exposed(&mut a, &mut b, 2);
+    let instance = a.instance().unwrap();
+    for stream in publication.streams() {
+        let lane = a.stream_ref(stream).unwrap();
+        let record = lane.buffer.region().unwrap().record();
+        assert_eq!(record.instance, instance);
+    }
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    offer(&mut a, &mut b, &publication, 0, 40);
+    offer(&mut a, &mut b, &publication, 1, 10);
+    let mut seen = [0u32; 2];
+    pump(&mut a, &mut b, |_| {
+        let _ = reader.poll(
+            |bytes, lane, _| {
+                let lane = usize::from(lane.get());
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen[lane], "lane {lane} in order");
+                seen[lane] += 1;
+            },
+            BUDGET,
+        );
+        seen == [40, 10]
+    });
+    drop(reader);
+    let _ = (a.close_network(), b.close_network());
+}
+
+/// E5 on shared terms (network-shared-terms n4): between two IPC drivers,
+/// a steady network cycle on either side allocates nothing, so the
+/// sender's staging and NAK reads and the receive owner's writes into
+/// regions allocate nothing either.
+#[test]
+fn a_steady_ipc_network_cycle_allocates_nothing() {
+    use karyos_sys::alloc_count::count;
+
+    let ((), made) = count(|| drop(std::hint::black_box(vec![0_u8; 8])));
+    assert!(made > 0, "the counting allocator counts in this binary");
+    let (a_dir, b_dir) = (dir("alloc-a"), dir("alloc-b"));
+    let (mut a, mut b) = (ipc_driver(&a_dir), ipc_driver(&b_dir));
+    let (publication, image, _subscription) = exposed(&mut a, &mut b, 1);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // Warm up: every buffer the path keeps is sized by real traffic.
+    let (mut sent, mut seen) = (0u32, 0u32);
+    pump(&mut a, &mut b, |_| {
+        while sent < 128 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        seen == 128
+    });
+    // Then traffic keeps flowing while only the network cycles are counted.
+    let mut work = [0u64; 2];
+    for _ in 0..2_000 {
+        while sent < 384 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let ((units, error), made) = count(|| a.serve_network());
+        assert!(error.is_none());
+        assert_eq!(made, 0, "publisher: {units} units allocated");
+        work[0] += u64::from(units);
+        let ((units, error), made) = count(|| b.serve_network());
+        assert!(error.is_none());
+        assert_eq!(made, 0, "subscriber: {units} units allocated");
+        work[1] += u64::from(units);
+        let _ = (a.do_work().unwrap(), b.do_work().unwrap());
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        if seen == 384 {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    assert_eq!(seen, 384);
+    assert!(
+        work[0] > 0 && work[1] > 0,
+        "counted cycles did work: {work:?}"
+    );
+    drop(reader);
+    let _ = (a.close_network(), b.close_network());
+}
+
 /// Attaches a remote client to `b` while both drivers run.
-fn attach_running(
-    a: &mut EmbeddedDriver,
+fn attach_running<P: StreamTerms>(
+    a: &mut EmbeddedDriver<P>,
     b: &mut IpcDriver,
     dir: &Path,
 ) -> Result<RemoteClient, AttachError> {

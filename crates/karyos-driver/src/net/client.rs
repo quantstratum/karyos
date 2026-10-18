@@ -31,13 +31,16 @@
 //!   was not told about. Both rest on `announced`: set only once every
 //!   event of `announce_existing_images` went out, and the only gate of
 //!   `announce_image`, which runs after it in each cycle.
-//! - **Shared terms.** A driver admitting other processes refuses `udp`
-//!   with `UnsupportedChannel` (D3, SPEC §18).
+//! - **Backings (network-shared-terms n4).** A `udp` channel is served on
+//!   either backing: on an IPC driver a remote client's network
+//!   publication and its images are shared regions, which the client
+//!   fetches as it does a local stream's. A driver with no network refuses
+//!   `udp` with `UnsupportedChannel`.
 
 use std::sync::Arc;
 
 use karyos_client::link::ClientLink;
-use karyos_protocol::channel::{ChannelConfig, CommonConfig, Media, UdpConfig};
+use karyos_protocol::channel::{ChannelConfig, CommonConfig, Media};
 use karyos_protocol::cnc::{
     Command, ErrorCode, Event as DriverEvent, RequestId, Response, StreamKey, SubscriberRole,
 };
@@ -257,11 +260,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Ok(config) => config,
             Err(error) => return refuse(refusal(error), detail),
         };
-        let handle =
-            match <T as crate::embedded::sealed::Create>::network_publication(self, config, &udp) {
-                Ok(handle) => handle,
-                Err(error) => return refuse(refusal(error), detail),
-            };
+        let handle = match self.add_network_publication(config, &udp) {
+            Ok(handle) => handle,
+            Err(error) => return refuse(refusal(error), detail),
+        };
         let response = grant(
             self,
             StreamKey {
@@ -416,9 +418,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(next) = registration.checked_add(1) else {
             return refuse(ErrorCode::IdentitiesExhausted, 0);
         };
-        let handle = match <T as crate::embedded::sealed::Create>::network_subscription(
-            self, stream_id, &udp,
-        ) {
+        let handle = match self.add_network_subscription(stream_id, &udp) {
             Ok(handle) => handle,
             Err(error) => return refuse(refusal(error), detail),
         };
@@ -602,25 +602,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 *announced = true;
             }
         }
-    }
-}
-
-/// The heap-terms side of the network operations a client's URI asks for.
-impl EmbeddedDriver<karyos_sys::term_bytes::HeapTerms> {
-    pub(crate) fn client_network_publication(
-        &mut self,
-        config: AggregateConfig,
-        channel: &UdpConfig,
-    ) -> Result<AggregateHandle, DriverError> {
-        self.add_network_publication(config, channel)
-    }
-
-    pub(crate) fn client_network_subscription(
-        &mut self,
-        stream_id: i32,
-        channel: &UdpConfig,
-    ) -> Result<NetworkSubscription, DriverError> {
-        self.add_network_subscription(stream_id, channel)
     }
 }
 

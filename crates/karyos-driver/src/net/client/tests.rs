@@ -33,12 +33,17 @@ fn driver() -> EmbeddedDriver {
     .unwrap()
 }
 
+/// A loopback port free a moment ago, for a client's subscription: a
+/// channel URI refuses port 0, so a client cannot bind on any port and
+/// read it back.
 fn port() -> u16 {
-    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    silent().local_addr().unwrap().port()
+}
+
+/// A loopback socket nobody reads, for a publication with no receiver to
+/// send to: held while the test runs, so no other process takes its port.
+fn silent() -> UdpSocket {
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap()
 }
 
 /// Runs the drivers until `done`, polling every client into `outcomes`.
@@ -243,18 +248,19 @@ fn ipc_uris_and_refusals() {
 fn a_lost_client_takes_its_network_resources_with_it() {
     let mut driver = driver();
     let mut client = driver.connect().unwrap();
-    let port = port();
+    let silent = silent();
+    let destination = silent.local_addr().unwrap();
     let mut outcomes = Vec::new();
     let published = client
         .add_network_publication(
-            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            &format!("karyos:udp?endpoint={destination}|interface=127.0.0.1"),
             10,
             true,
         )
         .unwrap();
     let subscribed = client
         .add_network_subscription(
-            &format!("karyos:udp?endpoint=127.0.0.1:{}", port + 1),
+            &format!("karyos:udp?endpoint=127.0.0.1:{}", port()),
             11,
             SubscriberRole::Optional,
         )
@@ -752,14 +758,15 @@ fn a_refused_grant_removes_its_network_publication() {
     let mut driver = driver_with(|config| config.max_hand_over = 1);
     let _ = driver.add_stream(crate::net::e2e_config(20)).unwrap();
     let mut client = driver.connect().unwrap();
-    let port = port();
+    let silent = silent();
+    let destination = silent.local_addr().unwrap();
     // The first grant stays held, untaken, so the second is refused.
     let held = client
         .add_network_publication("karyos:ipc", 20, true)
         .unwrap();
     let refused = client
         .add_network_publication(
-            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            &format!("karyos:udp?endpoint={destination}|interface=127.0.0.1"),
             10,
             true,
         )
@@ -1142,10 +1149,30 @@ fn a_network_publication_is_connected_while_a_receivers_sms_are_live() {
         }
     });
     let mut publisher = a.connect().unwrap();
-    let port = port();
-    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}");
+    // The receiver's endpoint is bound on any port first, so the
+    // publication can name the port the kernel chose; its driver is not
+    // driven until it subscribes, so until then it sends no SMs.
+    let mut b = driver();
+    // A channel URI refuses port 0: the URI's channel, rebound on port 0.
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(mut receive),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse("karyos:udp?endpoint=127.0.0.1:9")
+    else {
+        panic!("not a udp channel");
+    };
+    receive.destination = karyos_protocol::channel::Destination::Unicast(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        0,
+    ));
+    let _subscription = b.add_network_subscription(10, &receive).unwrap();
+    let address = b.network_subscription_address(10).unwrap();
     let published = publisher
-        .add_network_publication(&format!("{uri}|interface=127.0.0.1"), 10, false)
+        .add_network_publication(
+            &format!("karyos:udp?endpoint={address}|interface=127.0.0.1"),
+            10,
+            false,
+        )
         .unwrap();
     let Outcome::Publication(mut publication) = complete(&mut a, &mut publisher, published) else {
         panic!("not a publication");
@@ -1158,22 +1185,12 @@ fn a_network_publication_is_connected_while_a_receivers_sms_are_live() {
         let _ = a.do_work().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
-    // A receiver subscribes: its first SMs connect the publication.
-    let mut b = driver();
-    let mut subscriber = b.connect().unwrap();
-    let subscribed = subscriber
-        .add_network_subscription(&uri, 10, SubscriberRole::Required)
-        .unwrap();
-    assert!(matches!(
-        complete(&mut b, &mut subscriber, subscribed),
-        Outcome::NetworkSubscription { .. }
-    ));
+    // The receiver's driver runs: its first SMs connect the publication.
     offer_until(&mut [&mut a, &mut b], &mut publication, |outcome| {
         matches!(outcome, OfferOutcome::Accepted { .. })
     });
     // The receiver goes: its SMs lapse, and the publication is unconnected
     // again.
-    drop(subscriber);
     drop(b);
     offer_until(&mut [&mut a], &mut publication, |outcome| {
         *outcome == OfferOutcome::NotConnected
@@ -1186,10 +1203,11 @@ fn a_network_publication_is_connected_while_a_receivers_sms_are_live() {
 fn allow_unconnected_skips_the_network_connection_check() {
     let mut a = driver();
     let mut publisher = a.connect().unwrap();
-    let port = port();
+    let silent = silent();
+    let destination = silent.local_addr().unwrap();
     let published = publisher
         .add_network_publication(
-            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            &format!("karyos:udp?endpoint={destination}|interface=127.0.0.1"),
             10,
             true,
         )
@@ -1208,12 +1226,13 @@ fn allow_unconnected_skips_the_network_connection_check() {
 #[test]
 fn a_local_reader_keeps_a_network_publication_connected() {
     let mut a = driver();
-    let port = port();
+    let silent = silent();
+    let destination = silent.local_addr().unwrap();
     let Ok(karyos_protocol::channel::ChannelConfig {
         media: karyos_protocol::channel::Media::Udp(udp),
         ..
     }) = karyos_protocol::channel::ChannelConfig::parse(&format!(
-        "karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"
+        "karyos:udp?endpoint={destination}|interface=127.0.0.1"
     ))
     else {
         panic!("not a udp channel");
@@ -1251,10 +1270,11 @@ fn a_local_reader_keeps_a_network_publication_connected() {
 fn a_silent_sender_still_back_pressures_the_publisher() {
     let mut a = driver();
     let mut publisher = a.connect().unwrap();
-    let port = port();
+    let silent = silent();
+    let destination = silent.local_addr().unwrap();
     let published = publisher
         .add_network_publication(
-            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            &format!("karyos:udp?endpoint={destination}|interface=127.0.0.1"),
             10,
             true,
         )

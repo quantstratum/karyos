@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use karyos_archive::agent::{AgentConfig, ArchiveHandle, Event, StartRecording};
-use karyos_archive::catalog::StopReason;
+use karyos_archive::catalog::{StopReason, StreamFormat};
 use karyos_archive::disk::StdDisk;
 use karyos_archive::recorder::{FrameSource, Frames, Mode, OnLap, SourceError};
 use karyos_archive::segment::{Geometry, SegmentStore, SyncPolicy};
@@ -68,6 +68,20 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The recorded streams' format, as the host knows it from their config.
+fn format() -> StreamFormat {
+    StreamFormat {
+        lane: karyos_sys::frame::Lane::ZERO,
+        initial_term_id: 7,
+        mtu: core::num::NonZeroU32::new(karyos_sys::sizing::DEFAULT_MTU).unwrap(),
+        source: karyos_archive::catalog::SourceIncarnation {
+            driver: [1, 2],
+            registration: 3,
+            incarnation: 1,
+        },
     }
 }
 
@@ -233,7 +247,9 @@ fn seal_and_wait(
                 id: ended_id,
                 ended,
             }) if ended_id == id => return (ended, seal),
-            Some(Event::Failed { id, failure }) => panic!("recording {id} failed: {failure:?}"),
+            Some(Event::Failed { id, failure, .. }) => {
+                panic!("recording {id} failed: {failure:?}")
+            }
             _ => assert!(Instant::now() < deadline, "recording {id} never ended"),
         }
     }
@@ -263,6 +279,7 @@ fn the_archive_records_driver_streams_end_to_end() {
             geometry: geometry(),
             policy: SyncPolicy::PerSegment,
             mode: Mode::Required,
+            format: format(),
             source: Box::new(Guarded::new(reader, lease)),
         })
         .unwrap();
@@ -337,6 +354,7 @@ fn the_archive_records_driver_streams_end_to_end() {
             mode: Mode::Async {
                 on_lap: OnLap::Resume,
             },
+            format: format(),
             source: Box::new(Watched {
                 source: Guarded::new(reader, lease),
                 resumed: Arc::clone(&resumed),
