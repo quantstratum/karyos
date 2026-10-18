@@ -40,7 +40,7 @@ use karyos_archive::recorder::Mode;
 use karyos_archive::segment::SyncPolicy;
 use karyos_archive::server::{
     ArchiveHost, ControlServer, HostRecording, HostRefusal, MAX_REQUEST, RequestSource,
-    ResponseSink,
+    ResponseSink, replay_session_id,
 };
 use karyos_archive::source::Guarded;
 use karyos_client::aggregate::LaneEnd;
@@ -105,7 +105,8 @@ struct Host {
     data: StreamHandle,
     /// The recorded stream's buffer, which its recording's format is.
     buffer: LogBufferConfig,
-    next_session: i32,
+    /// Each replay target's stream and session ids, as opened.
+    opened: Vec<(i32, i32)>,
     /// Each replay target's reader, subscribed before the replay starts.
     targets: Vec<karyos_client::aggregate::AggregateSubscription<HeapTerms>>,
     ended: (Sender<Ended>, Receiver<Ended>),
@@ -163,15 +164,16 @@ impl ArchiveHost for Host {
         &mut self,
         request: &control::Replay<'_>,
         recording: &Recording,
+        replay_id: u64,
         from: u64,
         to: u64,
     ) -> Result<Box<dyn ReplaySink + Send>, HostRefusal> {
-        self.next_session += 1;
         let (handle, feed) = self
             .driver
             .replay_target(ReplayTargetConfig {
                 stream_id: request.target_stream_id,
-                session_id: self.next_session,
+                // Where the requester finds it.
+                session_id: replay_session_id(replay_id),
                 term_length: recording.geometry.term_length(),
                 initial_term_id: recording.format.initial_term_id,
                 mtu: recording.format.mtu.get(),
@@ -181,6 +183,8 @@ impl ArchiveHost for Host {
                 source_session_id: recording.session_id,
             })
             .map_err(|error| HostRefusal(error.to_string()))?;
+        self.opened
+            .push((request.target_stream_id, replay_session_id(replay_id)));
         let reader = match self.driver.subscribe_aggregate(&handle, Role::Required) {
             Ok(reader) => reader,
             Err(error) => {
@@ -309,7 +313,7 @@ impl Rig {
             driver,
             data,
             buffer,
-            next_session: 1,
+            opened: Vec::new(),
             targets: Vec::new(),
             ended: channel(),
         };
@@ -533,10 +537,31 @@ fn made_and_replayed(initial_term_id: u32) {
     // recorded.
     expected.retain(|(position, _)| *position < end);
 
+    // The first replay's id is 1, the recorded stream's session: a target
+    // on the recorded stream's id would collide with it, and is refused.
+    rig.request(&ControlMessage::Replay(control::Replay {
+        target_stream_id: DATA,
+        ..match replay(CLIENT + 6, recording_id, 0, u64::MAX) {
+            ControlMessage::Replay(request) => request,
+            _ => unreachable!(),
+        }
+    }));
+    let answers = rig.answers(CLIENT + 6, 1);
+    let refused = response(&answers[0]);
+    assert_eq!(refused.code, ResponseCode::Error, "{}", refused.message);
+    assert!(rig.server.host().opened.is_empty());
+
     // The whole recording.
     rig.request(&replay(CLIENT + 3, recording_id, 0, u64::MAX));
     let answers = rig.answers(CLIENT + 3, 1);
-    assert_eq!(response(&answers[0]).code, ResponseCode::Ok);
+    let started = response(&answers[0]);
+    assert_eq!(started.code, ResponseCode::Ok);
+    // The target is at the requested stream, its session the replay id's
+    // low 32 bits.
+    assert_eq!(
+        rig.server.host().opened.last(),
+        Some(&(TARGET, i32::try_from(started.id).unwrap()))
+    );
     let (messages, lane_end, clean) = read_target(&mut rig);
     assert_eq!(messages.len(), expected.len());
     assert!(messages == expected, "byte-exact at the recorded positions");

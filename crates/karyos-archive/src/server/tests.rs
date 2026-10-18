@@ -185,6 +185,7 @@ impl ArchiveHost for Host {
         &mut self,
         _request: &control::Replay<'_>,
         _recording: &Recording,
+        _replay_id: u64,
         from: u64,
         _to: u64,
     ) -> Result<Box<dyn ReplaySink + Send>, HostRefusal> {
@@ -396,6 +397,15 @@ fn a_recording_starts_ends_and_is_listed() {
         descriptor.state,
         RecordingState::Stopped(stop) if stop.position == end
     ));
+    // The source the host gave, for a live merge to match.
+    assert_eq!(
+        descriptor.source,
+        crate::catalog::SourceIncarnation {
+            driver: [1, 2],
+            registration: 3,
+            incarnation: 1,
+        }
+    );
     assert_eq!(response(&sent[4]).id, 1);
     // From an id past the last: none, and a count of 0.
     rig.request(&ControlMessage::ListRecordings(control::ListRecordings {
@@ -416,6 +426,13 @@ fn a_recording_stops_by_request() {
     let mut rig = Rig::new("stop", Host::of(frames(2, 2), false));
     rig.request(&start(1));
     rig.sent(2);
+    // Once the agent wrote the lane's two frames.
+    for _ in 0..5000 {
+        if rig.server.agent().describe(1).unwrap().end == 192 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
     rig.request(&ControlMessage::ListRecordings(control::ListRecordings {
         correlation_id: 2,
         from_id: 1,
@@ -427,7 +444,10 @@ fn a_recording_stops_by_request() {
     };
     assert_eq!(
         descriptor.state,
-        RecordingState::Recording { incomplete: false }
+        RecordingState::Recording {
+            written: 192,
+            incomplete: false
+        }
     );
     rig.request(&ControlMessage::StopRecording(control::StopRecording {
         correlation_id: 3,
@@ -805,4 +825,13 @@ fn a_storage_fault_is_an_error() {
     assert_eq!(refused.code, ResponseCode::Error, "{}", refused.message);
     assert!(rig.server.host().replays.is_empty());
     rig.finish();
+}
+
+/// A replay target's session id is the replay id's low 32 bits.
+#[test]
+fn a_replay_session_is_the_ids_low_half() {
+    assert_eq!(replay_session_id(7), 7);
+    assert_eq!(replay_session_id(0x1_0000_0002), 2);
+    assert_eq!(replay_session_id(0xFFFF_FFFF), -1);
+    assert_eq!(replay_session_id(0x8000_0000), i32::MIN);
 }
