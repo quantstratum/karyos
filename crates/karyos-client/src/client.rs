@@ -293,6 +293,19 @@ pub struct ImageChange {
     pub available: bool,
 }
 
+impl ImageChange {
+    /// A change of image `image_id` of session `session_id`: for sources
+    /// other than a client's, and tests.
+    #[must_use]
+    pub const fn new(image_id: u64, session_id: i32, available: bool) -> Self {
+        Self {
+            image_id,
+            session_id,
+            available,
+        }
+    }
+}
+
 /// An image's poll that reported more than deliveries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageStop {
