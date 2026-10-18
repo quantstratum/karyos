@@ -12,6 +12,8 @@
 //! - a crashed server's restart reopens C4's log and recovers its core
 //!   from it, and a follower's stale entry of another term is truncated
 //!   and replaced, its hard state saved along the way;
+//! - `drive` stops a core that is always ready at its work budget, and
+//!   the node records the breach;
 //! - each check catches its violation in a hand-built record.
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
@@ -29,7 +31,8 @@ use karyos_sim::cluster::ClusterSim;
 use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::check::{self, Violation};
 use karyos_sim::harness::core::{
-    ConsensusCore, LogView, NotLeader, Persisted, Ready, Release, Step,
+    ConsensusCore, DriveError, LogView, MAX_READIES, NotLeader, Persisted, Ready, Release, Step,
+    drive,
 };
 use karyos_sim::harness::node::{
     Breach, ClientNode, LOG_DIR, Member, Observation, Op, Positions, Recorder, Ret, ServerNode,
@@ -846,4 +849,104 @@ fn lost_durable_entries_are_caught() {
         check::durable_kept(&truncated),
         Err(Violation::CommittedTruncated { node: 1, index: 2 })
     );
+}
+
+/// A core that is always ready with one message, for at most `limit`
+/// Readys, so a `drive` without its budget ends instead of hanging.
+struct Busy {
+    readies: usize,
+    limit: usize,
+}
+
+impl ConsensusCore for Busy {
+    type Message = ();
+
+    fn recover(_id: NodeId, _peers: &[NodeId], _log: &mut LogView<'_>) -> Self {
+        Self {
+            readies: 0,
+            limit: 10 * MAX_READIES,
+        }
+    }
+
+    fn propose(&mut self, _command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), NotLeader> {
+        Err(NotLeader { leader: None })
+    }
+
+    fn step(&mut self, _from: NodeId, _message: (), _log: &mut LogView<'_>) {}
+
+    fn tick(&mut self, _now: u64, _log: &mut LogView<'_>) {}
+
+    fn ready(&mut self, _log: &mut LogView<'_>) -> Option<Ready<()>> {
+        if self.readies == self.limit {
+            return None;
+        }
+        self.readies += 1;
+        Some(Ready {
+            messages: vec![(1, ())],
+            ..Ready::default()
+        })
+    }
+
+    fn advance(&mut self, _persisted: Persisted, _log: &mut LogView<'_>) {}
+
+    fn term(&self) -> u64 {
+        0
+    }
+
+    fn leads(&self) -> bool {
+        false
+    }
+
+    fn received(&self) -> Option<u64> {
+        None
+    }
+
+    fn committed(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[test]
+fn drive_stops_at_its_work_budget() {
+    let mut log = RaftLog::create(SimDisk::new(), Path::new(LOG_DIR), geometry(), 1).unwrap();
+    let mut core = Busy::recover(0, &[0, 1], &mut LogView::new(&mut log));
+    let mut sent = 0usize;
+    let driven = drive(
+        &mut core,
+        &mut log,
+        &mut |_, (), _| sent += 1,
+        &mut |_| {},
+        &mut |_| {},
+    );
+    assert!(
+        matches!(driven, Err(DriveError::WorkBudget { readies }) if readies == MAX_READIES),
+        "{driven:?}"
+    );
+    assert_eq!(sent, MAX_READIES);
+
+    // A node records the breach, and the check reports it.
+    let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
+    let mut sim: ClusterSim<ServerNode<Busy>, Wire<()>> =
+        ClusterSim::new("budget", 1, LinkConfig::default()).unwrap();
+    for id in 0..2 {
+        let server = ServerNode::<Busy>::new(
+            id,
+            vec![0, 1],
+            SimDisk::new(),
+            Survives::Synced,
+            geometry(),
+            Rc::clone(&recorder),
+        )
+        .unwrap();
+        let _ = sim.add_node(server, 0, 0).unwrap();
+    }
+    sim.run_for(3).unwrap();
+    let recorded = recorder.borrow();
+    assert!(matches!(
+        check::no_contract_breach(&recorded.observations),
+        Err(Violation::Contract {
+            breach: Breach::WorkBudget,
+            ..
+        })
+    ));
 }
