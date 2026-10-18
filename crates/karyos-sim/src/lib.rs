@@ -15,12 +15,16 @@
 //! Suspensions and drops are logical, inside one
 //! process: they are not evidence for real process pause, crash or restart,
 //! which belongs to IPC. A linearizability checker over recorded
-//! histories ([`lin`], cluster-gap-analysis.md C3) is the Cluster's first
-//! piece. The network, the backend ring models, the disk model, the
-//! Archive and the Cluster do not exist yet.
+//! histories ([`lin`], cluster-gap-analysis.md C3) and the multi-node
+//! host (C1), which runs several message level nodes on skewed clocks over
+//! a faulty network (`cluster`, `net`), are the Cluster's first pieces.
+//! The backend ring models, the disk model, the Archive and the Cluster
+//! do not exist yet.
 
 pub mod clock;
+pub mod cluster;
 pub mod lin;
+pub mod net;
 pub mod oracle;
 pub mod payload;
 pub mod publisher;
