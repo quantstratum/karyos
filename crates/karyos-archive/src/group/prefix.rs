@@ -47,6 +47,13 @@ pub trait Coverage {
     /// Recording `recording_id`'s `(written, durable)` positions when it is
     /// a `required` recording this Archive keeps, else `None`.
     fn positions(&self, recording_id: u64) -> Option<(u64, u64)>;
+
+    /// The durable end of recording `recording_id` once it ended, which
+    /// will never cover more: its stop for a `required` recording, 0 for
+    /// any other (it vouches for nothing). `None` while it records, or for
+    /// a recording this Archive does not know. A7d-1c: a reference that
+    /// reaches the journal after its recording ended is settled by it.
+    fn ended(&self, recording_id: u64) -> Option<u64>;
 }
 
 /// Why the tracker refused a record.
@@ -284,8 +291,10 @@ impl PrefixTracker {
     /// recording held its frames after all, as one that recovers more after
     /// a crash than it reported before (`recording-group-gateway.md`
     /// section 7). One at or past the stop: no event is queued there, and
-    /// the prefixes cannot reach it. A `group_seq` inside the gap that
-    /// stopped them names no event, and is refused.
+    /// the prefixes cannot reach it; such a mark is taken unchecked,
+    /// since checking it would need to remember every event past the
+    /// stop, without bound. A `group_seq` inside the gap that stopped them
+    /// names no event, and is refused.
     fn settle(&mut self, seq: u64, recording_id: u64) -> Result<(), PrefixError> {
         let no_reference = PrefixError::NoReference {
             group_seq: seq,
@@ -313,6 +322,37 @@ impl PrefixTracker {
         }
         self.open = Some((seq, reference));
         Ok(())
+    }
+
+    /// Recording `recording_id` stopped or failed with its frames durable
+    /// to `durable`: each waiting event whose payload it covers counts
+    /// covered for good, and `uncovered` is called with each one it does
+    /// not cover, which will never be covered (A7d,
+    /// `recording-group-gateway.md` section 7).
+    pub fn recording_ended(
+        &mut self,
+        recording_id: u64,
+        durable: u64,
+        mut uncovered: impl FnMut(u64),
+    ) {
+        for waiting in &mut self.waiting {
+            match waiting.reference {
+                Some((recording, end)) if recording == recording_id => {
+                    if end <= durable {
+                        waiting.reference = None;
+                    } else {
+                        uncovered(waiting.seq);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The recordings and frame ends the waiting events' payloads name, in
+    /// order: `(recording_id, end)`.
+    pub fn references(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.waiting.iter().filter_map(|waiting| waiting.reference)
     }
 
     /// Whether the queue has room for one more complete event: the strict
@@ -418,6 +458,11 @@ pub struct Recovery {
     /// events after the complete prefix, up to it, are outside the replay
     /// guarantee.
     pub last_seen: u64,
+    /// The feed stopped: an event found no room, with `capacity` events
+    /// waiting on their payloads (or a record was refused). The tracker
+    /// then holds only the journal's start, and cannot take the next
+    /// events.
+    pub full: bool,
 }
 
 /// Recomputes the prefixes of a recovered `journal`, every record of it
@@ -466,5 +511,9 @@ pub fn recover<D: crate::disk::Disk>(
     })?;
     let written = journal.written();
     let _ = tracker.advance(written, durable, coverage);
-    Ok(Recovery { tracker, last_seen })
+    Ok(Recovery {
+        tracker,
+        last_seen,
+        full,
+    })
 }
