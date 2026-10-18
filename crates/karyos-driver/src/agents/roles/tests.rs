@@ -3931,3 +3931,190 @@ fn a_nak_below_a_later_bindings_join_is_admitted() {
     );
     assert!(counters.repairs >= 1, "{counters:?}");
 }
+
+/// Each header-only frame's term id, term offset and flags byte.
+type Headers = std::sync::Arc<std::sync::Mutex<Vec<(u32, i32, u8)>>>;
+
+/// The header-only DATA frames a scripted endpoint sent, in order, and a
+/// count of its DATA datagrams. Every send is accepted.
+fn header_only_frames() -> (
+    super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+    Headers,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let data = Arc::new(AtomicUsize::new(0));
+    let (seen, sent) = (Arc::clone(&frames), Arc::clone(&data));
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            let length = i32::from_le_bytes(datagram[..4].try_into().unwrap());
+            if datagram.len() == 32 && length == 32 {
+                seen.lock().unwrap().push((
+                    u32::from_le_bytes(datagram[20..24].try_into().unwrap()),
+                    i32::from_le_bytes(datagram[8..12].try_into().unwrap()),
+                    datagram[5],
+                ));
+            } else if length > 32 {
+                sent.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }));
+    for _ in 0..256 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let instance = InstanceId::new(NonZeroU32::new(1).unwrap());
+    let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    (super::super::Half::Tx(Box::new(tx)), frames, data)
+}
+
+/// SPEC §6: an established single-path lane that sent no DATA for
+/// `sender_heartbeat_interval` sends a header-only DATA frame at its next
+/// position (BEGIN and END, no EOS), not before; DATA restarts the wait.
+#[test]
+fn an_idle_lane_sends_a_data_heartbeat_at_its_position() {
+    use std::sync::atomic::Ordering;
+
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let (path, mut log) = outbound(EndpointId(1), "10.0.0.9:5000".parse().unwrap());
+    let event = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    assert!(matches!(
+        event,
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    let (half, frames, data) = header_only_frames();
+    let mut halves = vec![(EndpointId(1), half)];
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    let _ = log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    for now in 2..6 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert_eq!(data.load(Ordering::Relaxed), 1);
+    assert!(frames.lock().unwrap().is_empty());
+    // The DATA left at 2. Just before an interval after it: nothing; at
+    // it: one heartbeat at the lane's next position, term 9, offset 1056
+    // (one aligned frame).
+    let _ = sender.duty(&mut halves, 2 + interval - 1).unwrap();
+    assert!(frames.lock().unwrap().is_empty());
+    let _ = sender.duty(&mut halves, 2 + interval).unwrap();
+    let flags = karyos_protocol::frame::Flags::new(
+        true,
+        true,
+        false,
+        false,
+        karyos_protocol::frame::Lane::ZERO,
+    );
+    assert_eq!(*frames.lock().unwrap(), [(9, 1056, flags.get())]);
+    assert_eq!(sender.counters().heartbeats_sent, 1);
+    // DATA restarts the wait: a message half an interval later, then no
+    // heartbeat until a whole interval after it.
+    let t = 2 + interval + interval / 2;
+    let _ = log.publications[0]
+        .append(&[2; 1000], AppendOptions::default())
+        .unwrap();
+    let _ = sender.duty(&mut halves, t).unwrap();
+    assert_eq!(data.load(Ordering::Relaxed), 2);
+    let _ = sender.duty(&mut halves, 2 + 2 * interval).unwrap();
+    assert_eq!(
+        frames.lock().unwrap().len(),
+        1,
+        "the DATA restarted the wait"
+    );
+    let _ = sender.duty(&mut halves, t + interval).unwrap();
+    assert_eq!(frames.lock().unwrap().len(), 2);
+    assert_eq!(frames.lock().unwrap()[1].1, 2112);
+}
+
+/// A guarded lane whose guard closed sends no idle heartbeat (GC-6).
+#[test]
+fn a_guard_closed_lane_sends_no_heartbeat() {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let (path, _log) = outbound(EndpointId(1), "10.0.0.9:5000".parse().unwrap());
+    let event = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::new(AppliedEpoch::new()),
+            epoch: 2,
+            rate: None,
+            frontier: Default::default(),
+        }),
+        roles: None,
+    });
+    assert!(matches!(
+        event,
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    let (half, frames, _data) = header_only_frames();
+    let mut halves = vec![(EndpointId(1), half)];
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    for now in [2, 3, 3 + interval, 3 + 3 * interval] {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert!(frames.lock().unwrap().is_empty());
+    assert_eq!(sender.counters().heartbeats_sent, 0);
+}
+
+/// `sender_heartbeat_interval` is at least 1 and at most half of the
+/// driver's own `image_liveness_timeout`.
+#[test]
+fn the_sender_heartbeat_interval_is_bounded() {
+    let liveness = AgentConfig::default().image_liveness_timeout;
+    for (interval, valid) in [
+        (0, false),
+        (1, true),
+        (liveness / 2, true),
+        (liveness / 2 + 1, false),
+    ] {
+        let config = AgentConfig {
+            sender_heartbeat_interval: interval,
+            ..AgentConfig::default()
+        };
+        assert_eq!(config.validate().is_ok(), valid, "{interval}");
+    }
+}

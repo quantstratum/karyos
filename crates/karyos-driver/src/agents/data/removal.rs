@@ -40,16 +40,9 @@
 //! ends at once, with no linger: it drains nothing and nobody would read
 //! its EOS. It is counted once (`removals_unestablished`).
 
-use std::num::NonZeroU16;
-
-use karyos_io::backend::{
-    Commit, Exposure, FlushRequest, GateDecision, SenderGate, SenderToken, TxBackend, TxFrame,
-    TxItemOutcome, TxOptions,
-};
 use karyos_io::lanes::LaneGate;
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
-use karyos_protocol::frame::{Flags, FrameType, HEADER_LENGTH, Lane, Word0};
 
 use super::Outbound;
 use crate::embedded::StreamTerms;
@@ -113,22 +106,6 @@ enum EosSent {
     /// The lane's guard closed: no EOS leaves it, and its linger runs as
     /// if one did.
     Closed,
-}
-
-/// The gate of an EOS frame: one header-only frame, always permitted (a
-/// closed guard's lane sends none, checked before the frame is claimed).
-struct EosGate;
-
-impl SenderGate for EosGate {
-    fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
-        match u16::try_from(candidate.tokens.len())
-            .ok()
-            .and_then(NonZeroU16::new)
-        {
-            Some(count) => GateDecision::Permit { count },
-            None => GateDecision::Deny,
-        }
-    }
 }
 
 impl<T: StreamTerms> Outbound<T> {
@@ -340,90 +317,10 @@ impl<T: StreamTerms> Outbound<T> {
         {
             return EosSent::Closed;
         }
-        if self.write_eos(tx, lane, seal) {
+        if self.write_heartbeat(tx, lane, seal, true) {
             EosSent::Submitted
         } else {
             EosSent::NotSent
         }
-    }
-
-    /// Claims, writes and flushes `lane`'s EOS frame at `seal`; `true` when
-    /// it was submitted.
-    fn write_eos<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, lane: usize, seal: u64) -> bool {
-        let (Some(reader), Some(queue)) = (self.readers.get(lane), self.queues.get(lane).copied())
-        else {
-            return false;
-        };
-        let config = reader.subscription().buffer().config();
-        let term_length = u64::from(config.term_length.get());
-        let Some((count, offset)) = seal
-            .checked_div(term_length)
-            .and_then(|count| u32::try_from(count).ok())
-            .zip(seal.checked_rem(term_length))
-            .and_then(|(count, offset)| Some((count, i32::try_from(offset).ok()?)))
-        else {
-            return false;
-        };
-        let Ok(lane_id) = u8::try_from(lane)
-            .map_err(drop)
-            .and_then(|lane| Lane::try_new(lane).map_err(drop))
-        else {
-            return false;
-        };
-        let header = HEADER_LENGTH as usize;
-        let mut bytes = [0u8; HEADER_LENGTH as usize];
-        let word0 = Word0::new(
-            HEADER_LENGTH as i32,
-            Flags::new(true, true, true, false, lane_id),
-            FrameType::Data,
-        );
-        let term_id = config.initial_term_id.get().wrapping_add(count);
-        for (at, field) in [
-            (0, word0.pack().to_le_bytes().as_slice()),
-            (8, offset.to_le_bytes().as_slice()),
-            (12, config.session_id.to_le_bytes().as_slice()),
-            (16, config.stream_id.to_le_bytes().as_slice()),
-            (20, term_id.to_le_bytes().as_slice()),
-        ] {
-            if let Some(target) = bytes.get_mut(at..at + field.len()) {
-                target.copy_from_slice(field);
-            }
-        }
-        let Ok(mut frame) = tx.claim_tx(queue, header) else {
-            return false;
-        };
-        let Some(target) = frame.bytes_mut().get_mut(..header) else {
-            return false;
-        };
-        target.copy_from_slice(&bytes);
-        if frame
-            .commit(Commit {
-                len: header,
-                token: SenderToken::new(0),
-                options: TxOptions::none(),
-            })
-            .is_err()
-        {
-            return false;
-        }
-        let _ = tx.flush(
-            FlushRequest {
-                queue,
-                max_datagrams: NonZeroU16::MIN,
-                max_bytes: u32::MAX,
-            },
-            &mut EosGate,
-            &mut self.report,
-        );
-        let mut submitted = false;
-        while let Some(entry) = self.report.pop_front() {
-            submitted |= matches!(entry.outcome, TxItemOutcome::Submitted { .. });
-        }
-        if !submitted {
-            // Not taken now: dropped, and sent again at the next cadence.
-            let _ = tx.cancel_pending(queue, &mut self.report);
-            while self.report.pop_front().is_some() {}
-        }
-        submitted
     }
 }

@@ -5,8 +5,10 @@
 //!
 //! Built so far: the journal's records, schema 3 version 1 ([`record`]),
 //! and the order rules a journal obeys ([`order`]), from
-//! `quantstratum-docs: karyos/design/recording-group-records.md` (A7a).
-//! The journal store, the prefixes, the Gateway and checkpoints follow.
+//! `quantstratum-docs: karyos/design/recording-group-records.md` (A7a);
+//! the journal on disk ([`journal`], A7b). The prefixes, the Gateway and
+//! checkpoints follow.
 
+pub mod journal;
 pub mod order;
 pub mod record;

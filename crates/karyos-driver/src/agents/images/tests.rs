@@ -1452,7 +1452,16 @@ fn a_reliable_lane_resends_after_a_reset() {
 /// is kept; afterwards the unbound heartbeats are refused.
 #[test]
 fn a_data_heartbeat_does_not_refresh_its_path() {
-    let (mut rig, b) = Rig::new(Setup::default());
+    // The sender's own idle heartbeats wait past the test (SPEC §6), so
+    // only the injected ones count.
+    let (mut rig, b) = Rig::new(Setup {
+        tune: Some(|config| {
+            config.image_liveness_timeout = 100_000_000_000;
+            config.idle_image_timeout = 100_000_000_000;
+            config.sender_heartbeat_interval = 50_000_000_000;
+        }),
+        ..Setup::default()
+    });
     let slot = established(&mut rig);
     let source = rig.endpoints.local_address(rig.publisher).unwrap();
     assert_eq!(rig.agents.receiver.role.live_paths(slot), 1);
@@ -1631,13 +1640,16 @@ fn a_stale_heartbeat_through_the_intake_changes_no_evidence() {
 fn unbound_data_solicits_a_new_image() {
     use karyos_sys::log_buffer::AppendOptions;
 
+    // The idle sender's stationary heartbeats keep its image only until
+    // `idle_image_timeout`, here as short as allowed.
     let (mut rig, _b) = Rig::new(Setup {
         alias_quarantine: Some(1),
+        tune: Some(|config| config.idle_image_timeout = config.image_liveness_timeout),
         ..Setup::default()
     });
     let first = established(&mut rig);
     // Idle in steps: the image's SMs keep the binding fresh until the
-    // image retires after `image_liveness_timeout`.
+    // image retires after `idle_image_timeout`.
     let mut retired = false;
     for _ in 0..200 {
         rig.now += 99 * MS;
@@ -1676,7 +1688,10 @@ fn unbound_data_solicits_a_new_image() {
         "{sessions:?} {:?}",
         rig.agents.receiver.counters()
     );
-    assert_eq!((sessions.solicits, sessions.solicits_answered), (1, 1));
+    // The idle sender's heartbeats are unbound DATA too, so they may
+    // solicit before the message does; every solicit is answered.
+    assert!(sessions.solicits >= 1, "{sessions:?}");
+    assert_eq!(sessions.solicits, sessions.solicits_answered);
     // No announcement was needed.
     assert_eq!(
         rig.agents.sender.role.session_counters().announces,
