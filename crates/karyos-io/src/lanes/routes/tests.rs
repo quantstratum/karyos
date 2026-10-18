@@ -1300,3 +1300,92 @@ fn a_route_that_submits_is_ready_again() {
         .cancel_route(&mut Lent(routes), 1, &mut gate)
         .unwrap();
 }
+
+/// rp-w9, RP-10: each route counts the datagrams and bytes it submitted,
+/// catch-up copies included; a route that blocks counts nothing; and the
+/// DRR's served bytes are one frame's charge however many routes took it.
+#[test]
+fn each_route_counts_what_it_submitted_and_the_drr_charges_once() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    f.routes[1].accept(1);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [100], "charged once for two copies");
+    for route in 0..2 {
+        let counters = f.sender.counters(route).unwrap();
+        assert_eq!((counters.datagrams, counters.bytes), (1, 100), "{route}");
+    }
+    // Only route 0 takes the next one: route 1 counts nothing yet.
+    f.stage(0, 128, 60, 60, &[0, 1]);
+    f.routes[0].accept(1);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [60]);
+    assert_eq!(f.sender.counters(1).unwrap().datagrams, 1);
+    // Its catch-up copy counts when it goes.
+    f.routes[1].accept(1);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate).submitted, 1);
+    let counters = f.sender.counters(1).unwrap();
+    // Late twice: its first copy went after route 0's in the same call.
+    assert_eq!(
+        (counters.datagrams, counters.bytes, counters.late),
+        (2, 160, 2)
+    );
+    let counters = f.sender.counters(0).unwrap();
+    assert_eq!((counters.datagrams, counters.bytes), (2, 160));
+}
+
+/// rp-w9, SPEC §13 "Lane fairness" over two routes: with route 1 blocked
+/// for good (its copies skipped once its queues are full), lane 0, kept
+/// eligible on route 0, still gets at least `k × Q₀ − D_max` charged bytes
+/// over its `k` credited rounds, whatever budget ends each call; the
+/// blocked route never makes it ineligible.
+#[test]
+fn a_blocked_route_keeps_lane_fairness() {
+    const D_MAX: u64 = 96;
+    let quanta = [150u64, 100];
+    let mut f = Fixture::new(&quanta, D_MAX, 2);
+    let mut next = [0u64; 2];
+    let (mut served_bytes, mut credits) = (0u64, 0u64);
+    for call in 0..12u64 {
+        for (lane, position) in next.iter_mut().enumerate() {
+            for _ in 0..2 {
+                let charge = if call % 2 == 0 { D_MAX } else { 64 };
+                let len = u16::try_from(charge).unwrap();
+                // Kept eligible on route 0 as far as its queue has room.
+                if f.sender.pending(lane, 0).unwrap() >= usize::from(BOUND) {
+                    break;
+                }
+                // Route 1 never drains: once its queue is full, it skips.
+                let room = f.sender.pending(lane, 1).unwrap() < usize::from(BOUND);
+                let on: &[usize] = if room { &[0, 1] } else { &[0] };
+                if !room {
+                    f.sender.skipped(1);
+                }
+                f.stage(lane, *position, len, charge, on);
+                *position += 128;
+            }
+        }
+        f.routes[0].accept(8);
+        let report = f.serve(&mut Gate::default(), 97 + call * 13);
+        served_bytes += report.drr.lanes[0].served_bytes;
+        credits += report.drr.lanes[0].credits;
+        assert_eq!(report.failure, None, "call {call}");
+    }
+    assert!(credits >= 4, "lane 0 was visited");
+    assert!(
+        served_bytes + D_MAX >= credits * quanta[0],
+        "{served_bytes} served over {credits} credits"
+    );
+    assert!(f.sender.counters(1).unwrap().skipped > 0, "route 1 skipped");
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}

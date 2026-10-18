@@ -26,10 +26,13 @@
 //! [`SocketOps::isolates_paths`]: karyos_io::sockets::ops::SocketOps::isolates_paths
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use karyos_protocol::channel::{Destination, Interface, UdpConfig};
 use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
+use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
+use karyos_sys::submission_frontier::SubmissionFrontier;
 use karyos_sys::term_bytes::HeapTerms;
 
 use super::NetworkPublicationState;
@@ -149,6 +152,13 @@ impl EmbeddedDriver<HeapTerms> {
     /// sender runs the guard's gate from its first send. A close is local
     /// on sockets (O-11, GC-6).
     ///
+    /// Each lane's outcome records follow the gate's submissions
+    /// (`crate::guard_streams`): a message's reservation is released when a
+    /// backend takes it, not at commit, so the publisher holds at most
+    /// `guard.messages` (`C_m`) messages committed and not yet sent, and
+    /// the lane's effective window is the smaller of its receivers' and
+    /// `C_m` messages.
+    ///
     /// # Errors
     ///
     /// Those of [`EmbeddedDriver::add_network_publication`], of
@@ -236,6 +246,18 @@ impl EmbeddedDriver<HeapTerms> {
         }
         let word = self.guards.view(guard.guard)?;
         let epoch = self.guards.state(guard.guard)?.epoch;
+        // The walker records each lane's outcomes by its sender gate's
+        // submissions, not at commit.
+        let frontier = Arc::new(SubmissionFrontier::new());
+        for (index, stream) in handle.streams().enumerate() {
+            let lane = u8::try_from(index)
+                .ok()
+                .and_then(|index| Lane::try_new(index).ok())
+                .ok_or(DriverError::InvalidConfig)?;
+            if let Some(guarded) = self.stream(stream)?.guarded.as_mut() {
+                guarded.submit_through(Arc::clone(&frontier), lane);
+            }
+        }
         let (id, cell) = self.register_guard_sender(guard.guard)?;
         Ok(Some((
             GuardSpec {
@@ -243,6 +265,7 @@ impl EmbeddedDriver<HeapTerms> {
                 cell,
                 epoch,
                 rate: guard.rate.map(|rate| rate.policy),
+                frontier,
             },
             id,
         )))
@@ -269,11 +292,13 @@ impl EmbeddedDriver<HeapTerms> {
             (guard, roles),
             &mut guard_sender,
         );
-        // A sender never posted leaves the close acknowledgement at once.
+        // A sender never posted leaves the close acknowledgement at once,
+        // and no gate will ever decide its lanes.
         if posted.is_err()
-            && let Some(id) = guard_sender
+            && let Some((id, frontier)) = guard_sender
         {
             let _ = self.deregister_guard_sender(id);
+            crate::net::supersede(&frontier, handle.lanes());
         }
         posted
     }
@@ -285,7 +310,7 @@ impl EmbeddedDriver<HeapTerms> {
         reliable: bool,
         quanta: Lanes<u64>,
         (guard, roles): (Option<NetworkGuard>, Option<Box<PublicationRoles>>),
-        guard_sender: &mut Option<crate::guard_ack::GuardSenderId>,
+        guard_sender: &mut Option<(crate::guard_ack::GuardSenderId, Arc<SubmissionFrontier>)>,
     ) -> Result<(), DriverError> {
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
         let mut term = None;
@@ -320,7 +345,9 @@ impl EmbeddedDriver<HeapTerms> {
         // stream short of spare slots for its walker says so
         // (`GuardWalkerUnavailable`).
         let guard = self.guard_lanes(handle, guard)?;
-        *guard_sender = guard.as_ref().map(|(_, id)| *id);
+        *guard_sender = guard
+            .as_ref()
+            .map(|(spec, id)| (*id, Arc::clone(&spec.frontier)));
         let (config, alias) = term.ok_or(DriverError::InvalidConfig)?;
         let lane_count = u8::try_from(readers.len()).map_err(|_| DriverError::InvalidConfig)?;
         let publication = |endpoint| Publication {

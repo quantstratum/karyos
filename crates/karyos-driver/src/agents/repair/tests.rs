@@ -427,6 +427,7 @@ fn a_guard_close_stops_every_submission() {
                 cell: Arc::clone(&cell),
                 epoch: 2,
                 rate: None,
+                frontier: Default::default(),
             },
             0,
         )
@@ -458,6 +459,76 @@ fn a_guard_close_stops_every_submission() {
     rig.finish();
 }
 
+/// SPEC §13 "Guard close gate" (contract-traceability-phase-2.md): the
+/// sender reads the guard open and is permitted a retransmission, then
+/// pauses at the system call, where the guard closes; the backend refuses
+/// that admission (`EAGAIN`), so the retransmission stays pending, beside
+/// a first send not yet staged. Once the sender applies the close, nothing
+/// more is submitted, neither the pending retransmission nor the first
+/// send, and the acknowledgement's cell lists the last position submitted
+/// under the old epoch.
+#[test]
+fn a_close_at_the_system_call_stops_a_pending_repair_and_a_refused_admission() {
+    let mut rig = Rig::new(&RepairConfig::default());
+    let (word, cell) = guarded(&mut rig);
+    rig.publish(2);
+    assert_eq!(rig.datagrams().len(), 2, "open: sent as before");
+    // A NAK for the first frame: a retransmission pending; and one more
+    // message, a first send.
+    assert_eq!(rig.nak(0, 1056, 1), NakOutcome::Queued);
+    let _ = rig.log.publications[0]
+        .append(&[2; 1000], AppendOptions::default())
+        .unwrap();
+    // At the next system call, after the gate's permit, the guard closes
+    // and the backend refuses the admission.
+    let record = Arc::clone(&rig.sent);
+    let closing = Arc::clone(&word);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let once = Arc::clone(&armed);
+    rig.observer.set_send_hook(Box::new(move |_, datagrams| {
+        if once.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            let _ = karyos_sys::guard::close(&closing.words()[0]).unwrap();
+        }
+        for datagram in datagrams {
+            record.lock().unwrap().push(datagram.to_vec());
+        }
+    }));
+    rig.observer
+        .push_send(SendResult::Error(karyos_io::sockets::ops::Errno::AGAIN));
+    let mut budget = RepairBudget::default();
+    let _ = rig.repair(&mut budget, 2);
+    assert!(
+        !armed.load(std::sync::atomic::Ordering::Relaxed),
+        "the call was made"
+    );
+    assert!(rig.path.repair().unwrap().counts().submitted == 0);
+    // The sender resumes: the backend would take everything now, yet the
+    // gate denies both the pending retransmission and the first send.
+    rig.scripted(8);
+    for now in 3..8 {
+        let _ = rig.path.serve(&mut rig.tx, BUDGET, None, now).unwrap();
+        let _ = rig.repair(&mut RepairBudget::default(), now);
+    }
+    // The refused call recorded what it was handed; nothing went out after.
+    let sent = rig.datagrams();
+    assert_eq!(
+        sent.len(),
+        3,
+        "the two first sends, then only the refused call's datagram"
+    );
+    assert_eq!(rig.path.repair().unwrap().counts().submitted, 0);
+    let gate = rig.path.guard_gate().unwrap();
+    assert!(gate.abort_cause(0).is_some());
+    let applied = cell.try_read().unwrap();
+    assert_eq!(applied.epoch, 3, "the close's epoch is applied");
+    assert_eq!(
+        applied.positions[0],
+        2 * FRAME,
+        "the last position submitted under the old epoch"
+    );
+    rig.finish();
+}
+
 /// The rig's publication guarded by a fresh open guard at epoch 2: the
 /// word and the applied-epoch cell.
 fn guarded(
@@ -475,6 +546,7 @@ fn guarded(
                 cell: Arc::clone(&cell),
                 epoch: 2,
                 rate: None,
+                frontier: Default::default(),
             },
             0,
         )
@@ -573,6 +645,7 @@ fn guard_spec(
             cell: Arc::clone(&cell),
             epoch: 2,
             rate,
+            frontier: Default::default(),
         },
         cell,
     )

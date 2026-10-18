@@ -26,6 +26,32 @@ release may break APIs, wire formats and shared-memory layouts.
   replays need, and the source's incarnation (`SourceIncarnation`: the
   driver id, registration and incarnation of the publication recorded),
   which a live merge matches (`StreamFormat`).
+- A guarded network publication's outcome records come from its sender
+  gate's submissions, not from the commit (guards-and-abort.md, "Trusted
+  sockets in Phase 2"). A message is `Submitted` once a backend took
+  every frame of it, `Unknown` when it may have left whole unproven (an
+  `Unknown` report, an exposure a reset or a removal cut short, a
+  position no first send took, which a reliable lane may still repair,
+  or a later route's submission above a position that never left), and
+  `Aborted` when it never leaves whole: its last frame was not sent when
+  a close, a removal or a network close ended the lane (a partial
+  fragmented message is `Aborted`, as the design's kind table says). A message's
+  reservation is therefore released at its network submission, so the
+  publisher holds at most `C_m` messages committed and not yet sent: the
+  effective window is the smaller of the receivers' and `C_m` messages.
+  The close acknowledgement's `positions` are each lane's prefix-closed
+  frontier: below it every message was handed to a backend or is
+  reported `Unknown` (before, the highest position submitted, which an
+  unproven or skipped one could sit below). `GateHead` gains `start`,
+  and `GuardGate::reopen` and `reopen_route` take whether the lane is
+  rewound; `GuardSpec` gains `frontier`. Code that names every field in
+  a struct literal must add them.
+- `RouteCounters` (`karyos-io`) and `PathCounters` (`karyos-driver`)
+  gained the public fields `datagrams` and `bytes` (rp-w9). Neither
+  struct is `#[non_exhaustive]`, so a struct literal that names every
+  field must add them. Both count the lane sender's first sends of DATA
+  only, catch-up copies included: repairs (`repair_route_counts`),
+  PATH_HB and other controls, and `Flushed::Unknown` are not in them.
 - An Archive replay's target stream (phase 3, A5b).
   `EmbeddedDriver::replay_target(ReplayTargetConfig)` makes a one-lane
   image with local gaps, joined at the replay's first position and
@@ -185,6 +211,27 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A segment store is truncated at the end of a write
+  (`SegmentStore::truncate`; phase 3, for a recording group's recovery
+  to its complete prefix, SPEC §8.3). Everything after the cut is
+  removed on disk and what is kept is durable on return; a crash inside
+  recovers either as before or at the cut. A position outside the
+  recording or inside a write is refused, typed, with nothing changed.
+- `karyos_sys::submission_frontier::SubmissionFrontier`: a guarded
+  network lane's submission frontier, which its sender gate publishes
+  for the driver's outcome walker. Per lane, `resolved` (Release),
+  `unknown_hi`, `sent_hi` and `staged_hi` (Relaxed, stored before it),
+  all monotone and written by the gate alone, and a final word that the gate
+  (`finish`) or, once the gate stopped for good, the conductor
+  (`supersede`) sets once, by compare-exchange. A Loom model
+  (`loom_submission_frontier`) checks the orders and the race of the two
+  final writers, with three negative controls.
+- Per-path datagram and byte counts (RP-10; rp-w9). Each route of a
+  routed publication counts the datagrams and bytes it submitted,
+  catch-up copies included (`RouteCounters::datagrams`, `bytes`), and
+  `Outbound::path_counters` reports them (`PathCounters::datagrams`,
+  `bytes`) for capacity planning. The DRR still charges a frame once,
+  however many paths take it.
 - Receive path queues (redundant-paths.md section 5; rp-w8). A multi-path
   image's DATA datagrams and heartbeats wait in their path's queue between
   the endpoint's receive poll and the image, and the receiver serves the
@@ -198,7 +245,10 @@ release may break APIs, wire formats and shared-memory layouts.
   sizes each queue; the queues take `sessions.max_paths ×
   path_queue_datagrams × 8 KiB` (8 MiB by default, at most 64 MiB,
   validated), allocated when the first later path is bound and kept: a
-  single-path receiver allocates none.
+  single-path receiver allocates none. The queues are per local receive
+  endpoint and live in one slab; a control on an endpoint first delivers
+  that path's queued datagrams, so a reply never overtakes them; queued
+  datagrams are counted (`path_queued`) (rp-w8b).
 - The live set of a routed publication's paths (redundant-paths.md section
   7, RP-8; rp-w5a). Each path keeps a `path_lag_limit` window (100 ms) of
   bytes selected and skipped: one that skipped anything is `Degraded`, and
@@ -782,6 +832,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- The segment store's arithmetic is checked (SPEC §14): five
+  saturating operations in the interval sync and in recovery's counts
+  are checked ones. A clock that steps back still syncs nothing.
+- A guarded network publication that a guard close sealed no longer
+  takes a fresh incarnation after the reopen: `publication()` refuses with
+  `DriverError::NetworkReincarnation`. The network sender did not follow
+  the reincarnation (it kept reading the sealed log, and no SETUP
+  announced the new incarnation), so offers were accepted and never sent.
+  The publication is removed and added again until the sender follows a
+  reincarnation.
 - The network keeps one time base in every threading mode. In
   `ThreadingMode::Shared` the agents' cycles took the driver's injectable
   clock while their role clocks read `host_monotonic_ns`. On Linux every
@@ -789,6 +849,13 @@ release may break APIs, wire formats and shared-memory layouts.
   again for a hole whose NAK or repair was lost. The network now reads
   `host_monotonic_ns` for its cycles and its close, as runner threads do;
   the driver's clock times claim deadlines only.
+- A replay target checks what it is fed (#374 review). A frame whose
+  header (term id and offset, from the recorded initial term id) names
+  another position than where it lies in the run is refused, and a fill
+  must be a PAD or ABORTED record whose extent is the one given.
+  `finish_replay` and the reaping of a dropped feed refresh the stream
+  gauges, and a dropped feed's target whose retire fails is counted
+  (`replay targets not retired`) instead of ignored.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

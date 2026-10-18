@@ -66,6 +66,8 @@ fn target(session_id: i32, join: u64) -> ReplayTargetConfig {
         mtu: DEFAULT_MTU,
         join,
         lane: Lane::ZERO,
+        source_stream_id: 42,
+        source_session_id: 1,
     }
 }
 
@@ -567,4 +569,267 @@ fn first_index(run: &Run) -> u32 {
     };
     // The payload follows the 32-byte header.
     u32::from_le_bytes(bytes[32..36].try_into().unwrap())
+}
+
+/// #374 review P2: a feed that wrote past the end it finishes at is
+/// refused, typed, and its target retires; so does a dropped feed's, on
+/// the driver's next duty; a frame of another source is refused.
+#[test]
+fn a_target_is_never_left_behind() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let (runs, _) = record(&mut driver, 40);
+    let frames: Vec<&Run> = runs
+        .iter()
+        .filter(|run| matches!(run, Run::Frames(..)))
+        .collect();
+    let (handle, mut feed) = driver.replay_target(target(2, 0)).unwrap();
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    // The first run, then the third: the second is outstanding.
+    for run in [frames[0], frames[2]] {
+        let Run::Frames(position, bytes) = run else {
+            unreachable!()
+        };
+        while !feed.frames(*position, bytes).unwrap() {
+            driver.do_work().unwrap();
+        }
+    }
+    let end = frames[1].position();
+    assert!(matches!(
+        driver.finish_replay(handle, feed, end),
+        Err(DriverError::ReplayOutstanding { .. })
+    ));
+    let mut seen = Vec::new();
+    let terminal = until_terminal(&mut driver, &mut reader, &mut seen);
+    assert!(matches!(
+        terminal.lanes[0].end,
+        Some(LaneEnd::Closed {
+            reason: SealReason::ImageRetired,
+            ..
+        })
+    ));
+    // Dropped unfinished: retired on the next duty.
+    let (handle, feed) = driver.replay_target(target(3, 0)).unwrap();
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    drop(feed);
+    let terminal = until_terminal(&mut driver, &mut reader, &mut seen);
+    assert!(matches!(
+        terminal.lanes[0].end,
+        Some(LaneEnd::Closed {
+            reason: SealReason::ImageRetired,
+            ..
+        })
+    ));
+    // Frames recorded from another session are refused before any write.
+    let (handle, mut feed) = driver
+        .replay_target(ReplayTargetConfig {
+            source_session_id: 9,
+            ..target(4, 0)
+        })
+        .unwrap();
+    let Run::Frames(position, bytes) = frames[0] else {
+        unreachable!()
+    };
+    assert!(matches!(
+        feed.frames(*position, bytes),
+        Err(ReplayFeedError::Invalid { .. })
+    ));
+    assert_eq!(feed.position(), 0);
+    assert!(driver.finish_replay(handle, feed, 0).unwrap());
+}
+
+/// Joins the runs into runs of several frames: every stretch of frames
+/// runs between two fills becomes one run, its frames at their offsets.
+fn joined(runs: &[Run]) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for run in runs {
+        match (out.last_mut(), run) {
+            (Some(Run::Frames(start, bytes)), Run::Frames(position, frame)) => {
+                let offset = usize::try_from(position - *start).unwrap();
+                bytes.resize(offset, 0);
+                bytes.extend_from_slice(frame);
+            }
+            _ => out.push(run.clone()),
+        }
+    }
+    out
+}
+
+/// #374 review P3 (M7): a run of several frames, as a recording reader may
+/// read it, is written frame by frame at its positions, and its last frame
+/// may omit its alignment padding.
+#[test]
+fn a_run_of_several_frames_is_written_whole() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let count = 120;
+    let (runs, end) = record(&mut driver, count);
+    let runs = joined(&runs);
+    assert!(
+        runs.iter()
+            .any(|run| matches!(run, Run::Frames(_, bytes) if bytes.len() > 2 * 1056)),
+        "no run of several frames"
+    );
+    let (handle, mut feed) = driver.replay_target(target(2, 0)).unwrap();
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    let mut seen = Vec::new();
+    let mut polls = Vec::new();
+    replay(
+        &mut driver,
+        &mut feed,
+        &mut reader,
+        &runs,
+        None,
+        false,
+        &mut seen,
+        &mut polls,
+    );
+    assert_eq!(feed.position(), end);
+    assert!(driver.finish_replay(handle, feed, end).unwrap());
+    let terminal = until_terminal(&mut driver, &mut reader, &mut seen);
+    assert_eq!(seen, (0..count).collect::<Vec<_>>());
+    assert!(terminal.terminal.unwrap().clean);
+}
+
+/// #374 review P3 (M6): a replay over more terms than the image has slots
+/// goes on only because the feed cleans the terms its reader left.
+#[test]
+fn a_replay_longer_than_the_images_terms_cleans_as_it_goes() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let count = 400;
+    let (runs, end) = record(&mut driver, count);
+    assert!(
+        end > 6 * u64::from(MIN_TERM_LENGTH),
+        "over six terms: {end}"
+    );
+    let (handle, mut feed) = driver.replay_target(target(2, 0)).unwrap();
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    let mut seen = Vec::new();
+    let mut polls = Vec::new();
+    replay(
+        &mut driver,
+        &mut feed,
+        &mut reader,
+        &runs,
+        None,
+        false,
+        &mut seen,
+        &mut polls,
+    );
+    assert!(driver.finish_replay(handle, feed, end).unwrap());
+    let terminal = until_terminal(&mut driver, &mut reader, &mut seen);
+    assert_eq!(seen, (0..count).collect::<Vec<_>>());
+    assert!(terminal.terminal.unwrap().clean);
+}
+
+/// #374 review P3: each message reads at the position it was recorded at,
+/// and the target is freed only once its last reader drops.
+#[test]
+fn messages_read_at_their_recorded_positions_and_the_target_outlives_its_reader() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let count = 40;
+    let (runs, end) = record(&mut driver, count);
+    let recorded: Vec<(u32, u64)> = runs
+        .iter()
+        .filter(|run| matches!(run, Run::Frames(..)))
+        .map(|run| (first_index(run), run.position()))
+        .collect();
+    let (handle, mut feed) = driver.replay_target(target(2, 0)).unwrap();
+    let stream = handle.streams().next().unwrap();
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    // A second reader, polled only at the end, for the positions.
+    let mut late = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    let mut seen = Vec::new();
+    let mut polls = Vec::new();
+    replay(
+        &mut driver,
+        &mut feed,
+        &mut reader,
+        &runs,
+        None,
+        false,
+        &mut seen,
+        &mut polls,
+    );
+    assert!(driver.finish_replay(handle, feed, end).unwrap());
+    // The gauges show the retiring target at once, before any duty.
+    assert_eq!(counter(&driver, "streams retiring"), 1);
+    until_terminal(&mut driver, &mut reader, &mut seen);
+    let mut read = Vec::new();
+    for _ in 0..1000 {
+        driver.do_work().unwrap();
+        let poll = late.poll(
+            |bytes, _, info| {
+                read.push((
+                    u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+                    info.position,
+                ));
+            },
+            BUDGET,
+        );
+        if poll.terminal.is_some() {
+            break;
+        }
+    }
+    assert_eq!(read, recorded);
+    // Retired, but read: kept until both readers drop.
+    drop(reader);
+    for _ in 0..4 {
+        driver.do_work().unwrap();
+    }
+    assert!(driver.stream(stream).is_ok());
+    drop(late);
+    for _ in 0..4 {
+        driver.do_work().unwrap();
+    }
+    assert!(matches!(
+        driver.stream(stream),
+        Err(DriverError::UnknownStream { .. })
+    ));
+}
+
+/// #374 review P3: a frame whose header names another position than the
+/// one it is fed at is refused, and so is a fill that is not a record of
+/// its extent; nothing is written.
+#[test]
+fn frames_and_fills_are_checked_against_their_positions_and_extents() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let (runs, _) = record(&mut driver, 80);
+    let (handle, mut feed) = driver.replay_target(target(2, 0)).unwrap();
+    let Run::Frames(_, frame) = &runs[0] else {
+        panic!("frames first");
+    };
+    assert!(matches!(
+        feed.frames(1056, frame),
+        Err(ReplayFeedError::Invalid { position: 1056, .. })
+    ));
+    let (fill, record, extent) = runs
+        .iter()
+        .find_map(|run| match run {
+            Run::Fill(position, record, extent) => Some((*position, record.clone(), *extent)),
+            Run::Frames(..) => None,
+        })
+        .unwrap();
+    assert!(matches!(
+        feed.fill(fill, &record, extent - 32),
+        Err(ReplayFeedError::Invalid { .. })
+    ));
+    assert!(matches!(
+        feed.fill(0, frame, 1056),
+        Err(ReplayFeedError::Invalid { position: 0, .. })
+    ));
+    assert_eq!(feed.position(), 0);
+    assert!(driver.finish_replay(handle, feed, 0).unwrap());
+}
+
+/// A driver counter by its label.
+fn counter(driver: &EmbeddedDriver, label: &str) -> u64 {
+    use karyos_sys::counters::CellRead;
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .find_map(|index| match reader.read(index) {
+            CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == label.as_bytes() => Some(value),
+            _ => None,
+        })
+        .unwrap()
 }

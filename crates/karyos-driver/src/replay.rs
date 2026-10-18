@@ -40,6 +40,7 @@
 //! replay is later work.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use karyos_sys::frame::{FRAME_ALIGNMENT, Lane};
 use karyos_sys::local_gap::GapReason;
@@ -47,7 +48,7 @@ use karyos_sys::log_buffer::{
     DEFAULT_CLAIM_DEADLINE, LogBuffer, LogBufferConfig, PublicationMode, ReceiveError,
     ReceiveOwner, Received,
 };
-use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
+use karyos_sys::receive::{FrameKind, ImageParams, Item, ValidatedDatagram};
 use karyos_sys::sizing::TermLength;
 use karyos_sys::term::TermId;
 
@@ -57,6 +58,7 @@ use crate::error::DriverError;
 use karyos_protocol::cnc::CloseReason;
 
 use crate::SealReason;
+use crate::counters::Event;
 
 #[cfg(test)]
 mod tests;
@@ -81,6 +83,10 @@ pub struct ReplayTargetConfig {
     pub join: u64,
     /// The recorded lane: only lane 0 is replayed in A5.
     pub lane: Lane,
+    /// The recorded stream id, which every frame must carry.
+    pub source_stream_id: i32,
+    /// The recorded session id, which every frame must carry.
+    pub source_session_id: i32,
 }
 
 /// Why a write into a replay target failed.
@@ -110,10 +116,16 @@ pub struct ReplayFeed<T: StreamTerms> {
     owner: ReceiveOwner<T>,
     params: ImageParams,
     term_length: u64,
+    /// The recorded stream's initial term id: a frame's term id and offset
+    /// name its position.
+    initial_term_id: TermId,
     /// One frame, its ids rewritten: allocated once, of the mtu.
     scratch: Vec<u8>,
     registration: u64,
+    source: (i32, i32),
     finished: bool,
+    /// Set when dropped unfinished: the driver retires the target.
+    dropped: Arc<AtomicBool>,
 }
 
 /// The session id's offset in a frame header; the stream id follows it.
@@ -143,8 +155,9 @@ impl<T: StreamTerms> ReplayFeed<T> {
     ///
     /// # Errors
     ///
-    /// [`ReplayFeedError`] for frames that are not whole and valid, or that
-    /// the image refuses.
+    /// [`ReplayFeedError`] for frames that are not whole and valid, whose
+    /// headers name another position than where they lie in the run, or
+    /// that the image refuses.
     pub fn frames(&mut self, position: u64, bytes: &[u8]) -> Result<bool, ReplayFeedError> {
         self.owner.duty();
         let mut offset = 0usize;
@@ -160,7 +173,7 @@ impl<T: StreamTerms> ReplayFeed<T> {
             let frame = bytes
                 .get(offset..end.min(bytes.len()))
                 .ok_or_else(|| invalid(at, "bad frame"))?;
-            if let Taken::NotYet = self.write(at, frame)? {
+            if let Taken::NotYet = self.write(at, frame, None)? {
                 return Ok(false);
             }
             offset = end;
@@ -169,18 +182,24 @@ impl<T: StreamTerms> ReplayFeed<T> {
     }
 
     /// Writes a PAD or ABORTED record at `position`: one frame, whose
-    /// header states the extent it covers. As [`ReplayFeed::frames`].
+    /// header states the extent it covers, which must be `extent`. As
+    /// [`ReplayFeed::frames`].
     ///
     /// # Errors
     ///
-    /// As [`ReplayFeed::frames`].
+    /// As [`ReplayFeed::frames`], and [`ReplayFeedError::Invalid`] for a
+    /// DATA frame or a record whose extent is not `extent`.
     pub fn fill(
         &mut self,
         position: u64,
         record: &[u8],
-        _extent: u32,
+        extent: u32,
     ) -> Result<bool, ReplayFeedError> {
-        self.frames(position, record)
+        self.owner.duty();
+        Ok(matches!(
+            self.write(position, record, Some(extent))?,
+            Taken::Yes
+        ))
     }
 
     /// Seals `[from, to)`, a range the recording lost, as local gap
@@ -199,8 +218,10 @@ impl<T: StreamTerms> ReplayFeed<T> {
                 .and_then(|term| term.checked_mul(self.term_length))
                 .ok_or_else(|| invalid(at, "position overflow"))?;
             let end = term_end.min(to);
-            let extent =
-                u32::try_from(end.saturating_sub(at)).map_err(|_| invalid(at, "gap extent"))?;
+            let extent = end
+                .checked_sub(at)
+                .and_then(|extent| u32::try_from(extent).ok())
+                .ok_or_else(|| invalid(at, "gap extent"))?;
             match self
                 .owner
                 .seal_gap(Lane::ZERO, at, extent, GapReason::RangeUnavailable)?
@@ -215,12 +236,29 @@ impl<T: StreamTerms> ReplayFeed<T> {
         Ok(true)
     }
 
-    fn write(&mut self, position: u64, frame: &[u8]) -> Result<Taken, ReplayFeedError> {
+    /// Writes one frame at `position`; a fill passes the record's `extent`.
+    fn write(
+        &mut self,
+        position: u64,
+        frame: &[u8],
+        fill: Option<u32>,
+    ) -> Result<Taken, ReplayFeedError> {
+        let origin = (self.initial_term_id, self.term_length);
         let copy = self
             .scratch
             .get_mut(..frame.len())
             .ok_or_else(|| invalid(position, "a frame larger than the mtu"))?;
         copy.copy_from_slice(frame);
+        let id = |at: usize| {
+            copy.get(at..at + 4)
+                .and_then(|word| word.try_into().ok())
+                .map(i32::from_le_bytes)
+        };
+        if (id(SESSION_OFFSET), id(SESSION_OFFSET + 4))
+            != (Some(self.source.1), Some(self.source.0))
+        {
+            return Err(invalid(position, "a frame of another stream or session"));
+        }
         let ids = copy
             .get_mut(SESSION_OFFSET..STREAM_END)
             .ok_or_else(|| invalid(position, "a frame shorter than its header"))?;
@@ -235,6 +273,20 @@ impl<T: StreamTerms> ReplayFeed<T> {
                 // A header-only frame carries nothing to write.
                 continue;
             };
+            if position_of(origin, frame.term_id(), frame.term_offset()) != Some(position) {
+                return Err(invalid(
+                    position,
+                    "a frame whose header names another position",
+                ));
+            }
+            if let Some(extent) = fill
+                && (frame.kind() == FrameKind::Data || frame.extent() != extent)
+            {
+                return Err(invalid(
+                    position,
+                    "a fill that is not a record of its extent",
+                ));
+            }
             match self.owner.receive(&frame)? {
                 Received::Committed { .. } | Received::Duplicate => {}
                 Received::NotReady | Received::Ahead => return Ok(Taken::NotYet),
@@ -247,12 +299,24 @@ impl<T: StreamTerms> ReplayFeed<T> {
     }
 }
 
+/// The position a frame header names: its term's start, counted from the
+/// recorded initial term id with terms of `term_length`, plus its offset.
+fn position_of(
+    (initial_term_id, term_length): (TermId, u64),
+    term_id: TermId,
+    term_offset: u32,
+) -> Option<u64> {
+    let term = term_id.count_from(initial_term_id).ok()?;
+    u64::from(term.get())
+        .checked_mul(term_length)?
+        .checked_add(u64::from(term_offset))
+}
+
 impl<T: StreamTerms> Drop for ReplayFeed<T> {
     fn drop(&mut self) {
-        debug_assert!(
-            self.finished || std::thread::panicking(),
-            "a replay feed must end with EmbeddedDriver::finish_replay"
-        );
+        if !self.finished {
+            self.dropped.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -277,7 +341,7 @@ fn frame_extent(bytes: &[u8], offset: usize) -> Option<usize> {
 /// aggregate.
 #[derive(Debug, Default)]
 pub(crate) struct ReplayTargets {
-    registrations: Vec<u64>,
+    targets: Vec<(AggregateHandle, Arc<AtomicBool>)>,
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
@@ -330,6 +394,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             schedule_capacity: 0,
         };
         LogBuffer::<T>::validate(&buffer).map_err(|_| DriverError::InvalidConfig)?;
+        let scratch = vec![0; usize::try_from(config.mtu).map_err(|_| DriverError::InvalidConfig)?];
         let lane = Arc::new(self.replay_lane(buffer)?);
         let owner = ReceiveOwner::new(params, vec![Arc::clone(&lane)])?;
         let handle = <T as sealed::Create>::expose_image(self, &[lane]).ok_or(
@@ -338,26 +403,32 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 session_id: config.session_id,
             },
         )?;
-        self.replays.registrations.push(handle.registration());
+        let dropped = Arc::new(AtomicBool::new(false));
+        self.replays.targets.push((handle, Arc::clone(&dropped)));
         let feed = ReplayFeed {
             owner,
             params,
             term_length: u64::from(term_length.get()),
-            scratch: vec![0; usize::try_from(config.mtu).map_err(|_| DriverError::InvalidConfig)?],
+            initial_term_id: TermId::new(config.initial_term_id.cast_unsigned()),
+            scratch,
             registration: handle.registration(),
+            source: (config.source_stream_id, config.source_session_id),
             finished: false,
+            dropped,
         };
         Ok((handle, feed))
     }
 
-    /// Ends a replay at `end`: its target is sealed and retired, with
-    /// [`SealReason::EndOfStream`] when the feed wrote it up to `end`, else
-    /// [`SealReason::ImageRetired`]. Returns whether it was complete.
+    /// Ends a replay at `end`: its target seals with
+    /// [`SealReason::EndOfStream`] when the feed wrote exactly up to
+    /// `end`, else [`SealReason::ImageRetired`]. Returns whether it was
+    /// complete. The feed's own target retires whatever the outcome.
     ///
     /// # Errors
     ///
-    /// [`DriverError::UnknownStream`] for a target this driver did not
-    /// make, and the retire's errors.
+    /// [`DriverError::UnknownStream`] for a feed this driver did not make
+    /// or a handle not its target's, [`DriverError::ReplayOutstanding`]
+    /// for a feed that wrote past `end`, and the retire's errors.
     pub fn finish_replay(
         &mut self,
         handle: AggregateHandle,
@@ -368,27 +439,70 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let registration = feed.registration;
         let index = self
             .replays
-            .registrations
+            .targets
             .iter()
-            .position(|known| *known == registration)
-            .filter(|_| handle.registration() == registration)
+            .position(|(target, _)| target.registration() == registration)
             .ok_or(DriverError::UnknownStream {
                 stream: registration,
             })?;
-        self.replays.registrations.swap_remove(index);
-        let complete = feed.position() == end;
-        let (seal, close) = if complete {
+        let (target, _) = self.replays.targets.swap_remove(index);
+        let written = feed.owner.high_water(Lane::ZERO).unwrap_or(0);
+        let outcome = if handle != target {
+            Err(DriverError::UnknownStream {
+                stream: handle.registration(),
+            })
+        } else if written > end {
+            Err(DriverError::ReplayOutstanding { end, written })
+        } else {
+            Ok(feed.position() == end)
+        };
+        let (seal, close) = if outcome == Ok(true) {
             (SealReason::EndOfStream, CloseReason::EndOfStream)
         } else {
             (SealReason::ImageRetired, CloseReason::ImageRetired)
         };
         // The owner goes first: nothing is written after the seal.
         drop(feed);
-        let streams: Vec<_> = handle.streams().collect();
+        let retired = self.retire_target(target, seal, close);
+        self.update_stream_gauges();
+        retired?;
+        outcome
+    }
+
+    /// Retires the targets whose feed was dropped unfinished. A retire that
+    /// fails is counted (`replay targets not retired`); the target is no
+    /// longer tracked.
+    pub(crate) fn reap_replays(&mut self) {
+        let dropped: Vec<AggregateHandle> = self
+            .replays
+            .targets
+            .extract_if(.., |(_, dropped)| dropped.load(Ordering::Acquire))
+            .map(|(target, _)| target)
+            .collect();
+        for target in &dropped {
+            if self
+                .retire_target(*target, SealReason::ImageRetired, CloseReason::ImageRetired)
+                .is_err()
+            {
+                self.counters.add(Event::ReplayTargetsNotRetired, 1);
+            }
+        }
+        if !dropped.is_empty() {
+            self.update_stream_gauges();
+        }
+    }
+
+    fn retire_target(
+        &mut self,
+        target: AggregateHandle,
+        seal: SealReason,
+        close: CloseReason,
+    ) -> Result<(), DriverError> {
+        let streams: Vec<_> = target.streams().collect();
         for stream in streams {
             self.retire_lane_with(stream, seal, close)?;
         }
-        Ok(complete)
+        Ok(())
     }
 
     /// An image lane for a replay target, on the driver's backing.

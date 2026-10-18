@@ -201,9 +201,14 @@ pub struct AgentConfig {
     /// each path queue of the receiver holds (default 256, the design's, at
     /// least 1). A multi-path image's datagrams wait in their path's queue
     /// between the endpoint's receive poll and the image, served round
-    /// robin across paths. The receiver allocates `sessions.max_paths ×
-    /// path_queue_datagrams × MAX_DATAGRAM` (8 KiB) bytes for them at start
-    /// (8 MiB by default), at most [`MAX_PATH_QUEUE_BYTES`].
+    /// robin across paths. The queues are per local receive endpoint. The
+    /// receiver allocates `sessions.max_paths × path_queue_datagrams ×
+    /// MAX_DATAGRAM` (8 KiB) bytes for them, in one slab, when it first
+    /// binds a later path of an image (8 MiB by default), at most
+    /// [`MAX_PATH_QUEUE_BYTES`]; a single-path receiver allocates none.
+    /// At least `rx_datagrams` (the defaults: 256 and 64), one poll never
+    /// fills a queue, since every queue is drained after each cycle's
+    /// polls; a smaller queue drops a poll's excess.
     pub path_queue_datagrams: u16,
     /// Subscribed streams and published aliases the receiver tracks, each
     /// at least 1.
@@ -1082,6 +1087,12 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     )]
     pub(crate) fn sent_high(&self, index: usize, lane: usize) -> Option<u64> {
         self.role.outbound(index)?.sent_high(lane)
+    }
+
+    /// The counters of its `index`-th publication's data path (tests).
+    #[cfg(test)]
+    pub(crate) fn outbound_counters(&self, index: usize) -> Option<data::OutboundCounters> {
+        self.role.outbound(index).map(data::Outbound::counters)
     }
 
     /// Reads NAKs again after [`SenderAgent::ignore_naks`] (tests).

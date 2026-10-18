@@ -302,6 +302,9 @@ pub struct GuardSpec {
     pub epoch: u64,
     /// The publication's rate policy.
     pub rate: Option<karyos_sys::rate_limit::RatePolicy>,
+    /// The submission frontier its gate publishes for the walker, which
+    /// records each lane's outcomes by it.
+    pub frontier: Arc<karyos_sys::submission_frontier::SubmissionFrontier>,
 }
 
 impl std::fmt::Debug for GuardSpec {
@@ -541,6 +544,7 @@ impl<T: StreamTerms> Outbound<T> {
     ///
     /// [`GateError`].
     pub fn guard(&mut self, spec: GuardSpec, now: u64) -> Result<(), GateError> {
+        let frontier = spec.frontier;
         let lanes: Vec<GateLane> = (0..self.readers.len())
             .filter_map(|lane| u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()))
             .map(|lane| GateLane {
@@ -569,8 +573,18 @@ impl<T: StreamTerms> Outbound<T> {
                 now,
             )?,
         };
+        let mut gate = gate;
+        gate.set_frontier(frontier);
         self.guard = Some(Box::new(gate));
         Ok(())
+    }
+
+    /// Its removal is final for its guard's gate (drained or given up):
+    /// the walker records what never left (control path).
+    pub(crate) fn finish_removed(&mut self) {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.finish_removed();
+        }
     }
 
     /// Returns, through the gate, the staged items of every lane its guard
@@ -908,11 +922,13 @@ impl<T: StreamTerms> Outbound<T> {
                 *queue = opened;
             }
         }
+        // A reliable lane reads again what the reset returned (below).
+        let rewound = self.opened.is_some() && self.reliable;
         for (lane, queue) in self.queues.iter().enumerate() {
             // A guarded lane reopens through its gate, which refunds what
             // the old queue held.
             match self.guard.as_deref_mut() {
-                Some(guard) => guard.reopen(&mut self.sender, lane, *queue),
+                Some(guard) => guard.reopen(&mut self.sender, lane, *queue, rewound),
                 None => self.sender.reopen(lane, *queue),
             }
         }
@@ -1356,6 +1372,7 @@ impl<T: StreamTerms> Outbound<T> {
                             token,
                             length: u64::from(len16),
                             messages,
+                            start: from,
                             end: next,
                         },
                     )

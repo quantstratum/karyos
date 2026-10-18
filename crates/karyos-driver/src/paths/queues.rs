@@ -85,6 +85,12 @@ impl<T> PathQueues<T> {
         None
     }
 
+    /// The next datagram of `path` alone, out of turn: the round robin's
+    /// place does not move.
+    pub fn pop_from(&mut self, path: usize) -> Option<T> {
+        self.queues.get_mut(path).and_then(VecDeque::pop_front)
+    }
+
     /// Datagrams waiting on `path`.
     #[must_use]
     pub fn len(&self, path: usize) -> usize {

@@ -2232,8 +2232,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::StreamRetiring`] for a removed stream, and
     /// [`DriverError::UnknownStream`] for a foreign handle or a freed stream.
     /// On a guarded stream also [`DriverError::GuardNotOpen`],
-    /// [`DriverError::GuardSealed`], [`DriverError::IncarnationsExhausted`]
-    /// and [`DriverError::PositionsExhausted`] (see
+    /// [`DriverError::GuardSealed`], [`DriverError::IncarnationsExhausted`],
+    /// [`DriverError::PositionsExhausted`] and, for a lane of a network
+    /// publication, [`DriverError::NetworkReincarnation`] (see
     /// `reincarnate_if_reopened`), with nothing created or taken.
     pub fn publication(
         &mut self,
@@ -2472,7 +2473,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// conflated stream or one with a cutover or retained mappings (remote
     /// holders stay on the replaced incarnation, which they pin);
     /// [`DriverError::IncarnationsExhausted`]; [`DriverError::PositionsExhausted`];
-    /// and the buffer's allocation errors.
+    /// [`DriverError::NetworkReincarnation`] for a lane of a network
+    /// publication, which takes no fresh incarnation yet; and the buffer's
+    /// allocation errors.
     fn reincarnate_if_reopened(&mut self, handle: StreamHandle) -> Result<(), DriverError> {
         let found = self.stream_ref(handle)?;
         let Some(guarded) = &found.guarded else {
@@ -2485,6 +2488,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             || !self.guards.state(guarded.guard)?.open
         {
             return Ok(());
+        }
+        // The network sender does not follow a reincarnation yet: refused,
+        // rather than accepting offers no SETUP announces and no sender
+        // reads. Every check comes first, so nothing changes.
+        if self
+            .net
+            .as_ref()
+            .is_some_and(|net| net.is_network_aggregate(found.aggregate.registration))
+        {
+            return Err(DriverError::NetworkReincarnation { stream: found.id });
         }
         let sealed = DriverError::GuardSealed { stream: found.id };
         let position = match found.conductor.seal_state() {
@@ -2695,6 +2708,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::WorkCountOverflow`] when the work count does not fit
     /// `u32`.
     pub fn do_work(&mut self) -> Result<u32, DriverError> {
+        // Replay targets whose feed was dropped unfinished retire.
+        self.reap_replays();
         #[cfg(target_os = "linux")]
         let admitted = self.serve_admission();
         #[cfg(not(target_os = "linux"))]

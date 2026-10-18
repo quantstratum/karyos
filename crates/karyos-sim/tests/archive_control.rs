@@ -11,7 +11,9 @@
 //!   signals.
 //! - A replay of the whole recording delivers every message at its
 //!   recorded position, byte-exact, and ends at the recording's end with a
-//!   clean EOS; a replay of a range delivers that range.
+//!   clean EOS; a replay of a range delivers that range. The same holds
+//!   for a recording whose terms cross the term id wrap: the target takes
+//!   the recording's first term id, not one of its own.
 //! - Pacing (as recorded and scaled) is covered where its clock can be
 //!   set: `ReplaySource`'s tests in karyos-archive. The agent paces on its
 //!   own monotonic clock.
@@ -55,13 +57,16 @@ const DATA: i32 = 42;
 const REQUESTS: i32 = 100;
 const RESPONSES: i32 = 101;
 const TARGET: i32 = 200;
-const INITIAL_TERM_ID: i32 = 7;
+const INITIAL_TERM_ID: u32 = 7;
+/// Two terms below the term id wrap: a recording of three terms crosses
+/// it.
+const WRAPPING_TERM_ID: u32 = u32::MAX - 1;
 const BUDGET: Budget = Budget {
     work: 256,
     bytes: 1 << 22,
 };
 
-fn stream(stream_id: i32) -> StreamConfig {
+fn stream(stream_id: i32, initial_term_id: u32) -> StreamConfig {
     StreamConfig {
         buffer: LogBufferConfig {
             term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
@@ -69,7 +74,7 @@ fn stream(stream_id: i32) -> StreamConfig {
             max_subscribers: 8,
             mtu: DEFAULT_MTU,
             max_reserved: MIN_TERM_LENGTH / 8,
-            initial_term_id: TermId::new(INITIAL_TERM_ID.cast_unsigned()),
+            initial_term_id: TermId::new(initial_term_id),
             lane: Lane::ZERO,
             session_id: 1,
             stream_id,
@@ -94,6 +99,8 @@ struct Ended {
 struct Host {
     driver: EmbeddedDriver,
     data: StreamHandle,
+    /// The recorded stream's buffer, which its recording's format is.
+    buffer: LogBufferConfig,
     next_session: i32,
     /// Each replay target's reader, subscribed before the replay starts.
     targets: Vec<karyos_client::aggregate::AggregateSubscription<HeapTerms>>,
@@ -130,13 +137,14 @@ impl ArchiveHost for Host {
             .recording_reader(self.data, Role::Required)
             .map_err(|error| HostRefusal(error.to_string()))?
             .into_parts();
+        let buffer = self.buffer;
         Ok(HostRecording {
             source: Box::new(Guarded::new(reader, lease)),
-            term_length: MIN_TERM_LENGTH,
+            term_length: buffer.term_length.get(),
             format: StreamFormat {
-                lane: Lane::ZERO,
-                initial_term_id: INITIAL_TERM_ID,
-                mtu: DEFAULT_MTU,
+                lane: buffer.lane,
+                initial_term_id: buffer.initial_term_id.get().cast_signed(),
+                mtu: buffer.mtu,
                 source: SourceIncarnation {
                     driver: identity.driver,
                     registration: identity.registration,
@@ -164,6 +172,8 @@ impl ArchiveHost for Host {
                 mtu: recording.format.mtu,
                 join: from,
                 lane: recording.format.lane,
+                source_stream_id: recording.stream_id,
+                source_session_id: recording.session_id,
             })
             .map_err(|error| HostRefusal(error.to_string()))?;
         let reader = self
@@ -260,15 +270,24 @@ struct Rig {
 }
 
 impl Rig {
-    fn new() -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("karyos-sim-archive-control-{}", std::process::id()));
+    /// A rig whose recorded stream starts at `initial_term_id`.
+    fn new(initial_term_id: u32) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "karyos-sim-archive-control-{}-{initial_term_id}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let mut driver = EmbeddedDriver::new().unwrap();
-        let data = driver.add_stream(stream(DATA)).unwrap();
-        let requests = driver.add_stream(stream(REQUESTS)).unwrap();
-        let responses = driver.add_stream(stream(RESPONSES)).unwrap();
+        let config = stream(DATA, initial_term_id);
+        let buffer = config.buffer;
+        let data = driver.add_stream(config).unwrap();
+        let requests = driver
+            .add_stream(stream(REQUESTS, INITIAL_TERM_ID))
+            .unwrap();
+        let responses = driver
+            .add_stream(stream(RESPONSES, INITIAL_TERM_ID))
+            .unwrap();
         let client = Client {
             requests: driver.publication(requests).unwrap(),
             responses: driver.subscribe(responses, Role::Required).unwrap(),
@@ -279,6 +298,7 @@ impl Rig {
         let host = Host {
             driver,
             data,
+            buffer,
             next_session: 1,
             targets: Vec::new(),
             ended: channel(),
@@ -389,7 +409,21 @@ fn read_target(rig: &mut Rig) -> (Vec<(u64, Vec<u8>)>, LaneEnd, bool) {
 /// comes back at its recorded position, byte-exact, whole or by range.
 #[test]
 fn a_recording_is_made_and_replayed_by_request() {
-    let mut rig = Rig::new();
+    made_and_replayed(INITIAL_TERM_ID);
+}
+
+/// A recording whose terms cross the term id wrap replays as one that
+/// does not: the target takes its first term id from the recording, so
+/// every frame lands at its recorded position.
+#[test]
+fn a_recording_across_the_term_id_wrap_is_replayed_by_request() {
+    made_and_replayed(WRAPPING_TERM_ID);
+}
+
+/// Records about three terms of a stream starting at `initial_term_id`
+/// and replays them by request, whole and by range.
+fn made_and_replayed(initial_term_id: u32) {
+    let mut rig = Rig::new(initial_term_id);
     // Reads the data stream as the recording does, for the expected
     // messages and positions.
     let data = rig.server.host().data;
@@ -452,6 +486,10 @@ fn a_recording_is_made_and_replayed_by_request() {
     ));
     let end = stopped.position;
     let recorded = rig.server.agent().describe(recording_id).unwrap().recording;
+    assert_eq!(
+        recorded.format.initial_term_id,
+        initial_term_id.cast_signed()
+    );
     let identity = rig.driver().trace_identity(data).unwrap();
     assert_eq!(
         recorded.format.source,
@@ -461,7 +499,9 @@ fn a_recording_is_made_and_replayed_by_request() {
             incarnation: identity.incarnation,
         }
     );
-    expected.retain(|(position, _)| *position <= end);
+    // Positions are where messages start: one starting at the end is not
+    // recorded.
+    expected.retain(|(position, _)| *position < end);
 
     // The whole recording.
     rig.request(&replay(3, recording_id, 0, u64::MAX));
@@ -494,7 +534,7 @@ fn a_recording_is_made_and_replayed_by_request() {
     assert!(
         messages
             .iter()
-            .all(|(position, _)| (term..=2 * term).contains(position))
+            .all(|(position, _)| (term..2 * term).contains(position))
     );
     assert_eq!(
         lane_end,

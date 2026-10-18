@@ -29,11 +29,13 @@ fn from(port: u16) -> SocketAddr {
 /// Pops every datagram: its endpoint, first byte and poll time.
 fn drain(intake: &mut PathIntake) -> Vec<(EndpointId, u8, u64)> {
     let mut out = Vec::new();
-    while let Some((endpoint, entry, buffer)) = intake.pop() {
-        let first = PathIntake::bytes(&entry, &buffer)[0];
+    let slab = intake.take_slab();
+    while let Some((endpoint, entry)) = intake.pop() {
+        let first = PathIntake::bytes(&entry, &slab)[0];
         out.push((endpoint, first, entry.now));
-        intake.give_back(entry, buffer);
+        intake.release(entry);
     }
+    intake.put_slab(slab);
     out
 }
 
@@ -114,9 +116,17 @@ fn the_largest_datagram_is_queued_whole() {
         intake.push(EndpointId(1), (from(1), ALIAS, 0), &bytes),
         Queue::Queued
     );
-    let (_, entry, buffer) = intake.pop().unwrap();
-    assert_eq!(PathIntake::bytes(&entry, &buffer), bytes.as_slice());
-    intake.give_back(entry, buffer);
+    let slab = intake.take_slab();
+    let (_, entry) = intake.pop().unwrap();
+    assert_eq!(PathIntake::bytes(&entry, &slab), bytes.as_slice());
+    intake.release(entry);
+    intake.put_slab(slab);
+    // One byte more is dropped, never queued nor bypassed.
+    let longer = vec![7u8; usize::from(MAX_DATAGRAM) + 1];
+    assert_eq!(
+        intake.push(EndpointId(1), (from(1), ALIAS, 0), &longer),
+        Queue::Dropped
+    );
 }
 
 /// A path whose queue holds datagrams is never bypassed: with every queue
@@ -149,4 +159,66 @@ fn a_path_keeps_its_queue_until_it_drains() {
     assert!(intake.takes(a, false), "waiting: queued behind");
     let _ = drain(&mut intake);
     assert!(!intake.takes(a, false));
+}
+
+/// A control on an endpoint first takes that path's queued datagrams, out
+/// of turn and in order; the other paths keep theirs.
+#[test]
+fn one_paths_datagrams_are_taken_out_of_turn() {
+    let mut intake = intake(2, 4);
+    let (a, b) = (EndpointId(1), EndpointId(2));
+    let _ = intake.push(b, (from(2), ALIAS, 0), &[9; 8]);
+    let _ = intake.push(a, (from(1), ALIAS, 0), &[1; 8]);
+    let _ = intake.push(a, (from(1), ALIAS, 0), &[2; 8]);
+    let slab = intake.take_slab();
+    let mut firsts = Vec::new();
+    while let Some(entry) = intake.pop_from(a) {
+        firsts.push(PathIntake::bytes(&entry, &slab)[0]);
+        intake.release(entry);
+    }
+    intake.put_slab(slab);
+    assert_eq!(firsts, [1, 2]);
+    assert!(!intake.holds(a));
+    assert!(intake.holds(b), "B keeps its datagram");
+    let _ = drain(&mut intake);
+}
+
+/// #372 review: slots are `MAX_DATAGRAM` apart. Two full-size datagrams
+/// live at once keep their own bytes; and a push one byte too long, given
+/// the free slot just before a live full-size one, is dropped and leaves
+/// that slot intact.
+#[test]
+fn slots_keep_their_own_bytes_at_full_size() {
+    use karyos_io::sockets::endpoint::MAX_DATAGRAM;
+
+    let full = usize::from(MAX_DATAGRAM);
+    let mut intake = intake(1, 2);
+    let a = EndpointId(1);
+    // Slots are taken lowest first: slot 0, then slot 1.
+    assert_eq!(
+        intake.push(a, (from(1), ALIAS, 0), &vec![1u8; full]),
+        Queue::Queued
+    );
+    assert_eq!(
+        intake.push(a, (from(1), ALIAS, 0), &vec![2u8; full]),
+        Queue::Queued
+    );
+    let slab = intake.take_slab();
+    let (_, first) = intake.pop().unwrap();
+    assert_eq!(PathIntake::bytes(&first, &slab), vec![1u8; full].as_slice());
+    intake.release(first);
+    intake.put_slab(slab);
+    // Slot 0 is free again, just before the live slot 1.
+    assert_eq!(
+        intake.push(a, (from(1), ALIAS, 0), &vec![3u8; full + 1]),
+        Queue::Dropped
+    );
+    let slab = intake.take_slab();
+    let (_, second) = intake.pop().unwrap();
+    assert_eq!(
+        PathIntake::bytes(&second, &slab),
+        vec![2u8; full].as_slice()
+    );
+    intake.release(second);
+    intake.put_slab(slab);
 }
