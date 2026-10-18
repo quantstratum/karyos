@@ -26,8 +26,8 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32};
 
 use karyos_io::backend::{
-    Authority, BackendEpoch, Commit, Exposure, GateDecision, SenderGate, SenderToken, TxBackend,
-    TxFrame, TxOptions, TxQueueConfig, TxQueueId, TxTicket,
+    Authority, BackendEpoch, Commit, Exposure, GateDecision, RouteId, SenderGate, SenderToken,
+    TxBackend, TxFrame, TxOptions, TxQueueConfig, TxQueueId, TxTicket,
 };
 use karyos_io::lanes::routes::{MAX_ROUTES, RoutedLaneSender, RoutedStaged, Routes};
 use karyos_io::lanes::{LaneGate, Left, Staged};
@@ -238,6 +238,8 @@ pub(super) struct RouteSlot {
     queues: Vec<TxQueueId>,
     /// The endpoint epoch its queues were opened in.
     opened: Option<BackendEpoch>,
+    /// The route its queues were opened on, in that epoch.
+    route: Option<RouteId>,
     /// This route's endpoint needs a reset before the route sends again: a
     /// failure of its half, an item of unknown exposure, or a fault its
     /// queue refused to retry. Its new epoch clears it.
@@ -351,6 +353,7 @@ impl Routed {
                     destination,
                     queues: queues.clone(),
                     opened: None,
+                    route: None,
                     needs_reset: false,
                     reset_requested: None,
                     last_sent: None,
@@ -439,6 +442,33 @@ impl Routed {
         self.routes
             .get(index)
             .is_some_and(|route| route.opened == Some(epoch) && !route.needs_reset && !route.left)
+    }
+
+    /// [`Outbound::opened_resources`] for each route: its route and its
+    /// lane queues on its endpoint, and its repair queue.
+    pub(super) fn opened_resources(
+        &self,
+        repair: Option<&super::super::repair::RepairPath>,
+        held: &mut impl FnMut(super::Opened),
+    ) {
+        for (index, slot) in self.routes.iter().enumerate() {
+            let (Some(epoch), Some(route)) = (slot.opened, slot.route) else {
+                continue;
+            };
+            let mut queues = [None; super::OPENED_QUEUES];
+            for (held, queue) in queues.iter_mut().zip(&slot.queues) {
+                *held = Some(*queue);
+            }
+            if let Some(last) = queues.last_mut() {
+                *last = repair.and_then(|repair| repair.queue_on(index));
+            }
+            held(super::Opened {
+                endpoint: slot.endpoint,
+                epoch,
+                route,
+                queues,
+            });
+        }
     }
 
     /// The routes' endpoints, in route order.
@@ -1020,6 +1050,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 }
             }
             slot.opened = Some(epoch);
+            slot.route = Some(route);
             slot.needs_reset = false;
             slot.reset_requested = None;
             open = true;

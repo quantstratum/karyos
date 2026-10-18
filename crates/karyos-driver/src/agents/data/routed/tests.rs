@@ -1860,3 +1860,35 @@ fn a_closed_guard_sends_no_eos_on_any_path() {
     );
     assert!(outbound.serve_removal_routes(&mut halves, 1_010).drained);
 }
+
+/// #354 review P3-6: a routed publication reports, per path, the route
+/// and lane queues it opened on that path's endpoint, for its removal to
+/// close; a route never opened reports none.
+#[test]
+fn a_routed_publication_reports_what_it_opened_per_path() {
+    use karyos_io::backend::TxBackend;
+
+    let (outbound, mut halves, _observers) = sealed_routed(true);
+    let mut opened = Vec::new();
+    outbound.opened_resources(|held| opened.push(held));
+    let endpoints: Vec<_> = opened.iter().map(|held| held.endpoint).collect();
+    assert_eq!(endpoints, [halves[0].0, halves[1].0]);
+    for held in &opened {
+        let (_, Half::Tx(tx)) = halves
+            .iter_mut()
+            .find(|(endpoint, _)| *endpoint == held.endpoint)
+            .unwrap()
+        else {
+            panic!("a TX half");
+        };
+        assert!(tx.route_info(held.route).is_ok());
+        let lanes: Vec<_> = held.queues[..4].iter().flatten().collect();
+        assert_eq!(lanes.len(), 1, "one lane queue");
+        assert!(tx.claim_tx(*lanes[0], 32).is_ok());
+    }
+    // A routed publication never opened reports nothing.
+    let (fresh, _log) = routed(0);
+    let mut none = Vec::new();
+    fresh.opened_resources(|held| none.push(held));
+    assert!(none.is_empty());
+}

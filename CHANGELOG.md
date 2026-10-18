@@ -910,6 +910,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A removed network publication's sender closes its lane queues, its
+  repair queue and its route at its next duty (#354 review P3-6;
+  driver-network-agents.md §7: the sender drops its queues), on every
+  path of a routed one, instead of leaving them open until the endpoint
+  retires. A half the sender does not hold then, or one in another
+  epoch, dropped them already. Counted (`removed_closed`); items still
+  pending in a closing queue are returned and counted
+  (`removed_returned`), and a full close list, never expected, is
+  counted (`removed_unrecorded`).
 - The driver's loopback tests no longer pick a free port by binding a
   socket, dropping it and binding the port again later, which another
   process could take in between. A test's embedded subscription binds on
