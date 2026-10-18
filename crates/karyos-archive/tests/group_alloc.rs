@@ -96,3 +96,92 @@ fn a_journal_is_encoded_decoded_and_checked_without_allocating() {
     assert!(refused);
     assert_eq!(allocations, 0);
 }
+
+/// A replay cursor allocates when it opens, then nothing per event
+/// (recording-group-replay.md section 11), over a journal on disk.
+#[test]
+fn a_replay_cursor_steps_without_allocating() {
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
+    use karyos_archive::group::prefix::{Coverage, recover};
+    use karyos_archive::group::replay::{CursorConfig, ReplayConfig, ReplayCursor, Step};
+    use karyos_archive::segment::SyncPolicy;
+
+    struct Nothing;
+    impl Coverage for Nothing {
+        fn positions(&self, _recording_id: u64) -> Option<(u64, u64)> {
+            None
+        }
+        fn ended(&self, _recording_id: u64) -> Option<u64> {
+            None
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("karyos-replay-alloc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let records = journal();
+    let GroupRecord::Header(header) = records[0] else {
+        panic!("no header");
+    };
+    let mut out = vec![0u8; MAX_RECORD];
+    let mut journal = GroupJournal::create(StdDisk, &dir, &header, config).unwrap();
+    // Three copies of the event, as group_seq 1 to 3.
+    for seq in 1..=3u64 {
+        for record in &records[1..4] {
+            let record = match *record {
+                GroupRecord::Message(message) => GroupRecord::Message(MessageEvent {
+                    group_seq: seq,
+                    ..message
+                }),
+                GroupRecord::Outcome(outcome) => GroupRecord::Outcome(OutcomeObservation {
+                    group_seq: seq,
+                    ..outcome
+                }),
+                GroupRecord::End(end) => GroupRecord::End(EventEnd {
+                    group_seq: seq,
+                    ..end
+                }),
+                other => other,
+            };
+            let length = record.encode(&mut out).unwrap();
+            let _ = journal.append(&out[..length]).unwrap();
+        }
+    }
+    let _ = journal.close().unwrap();
+    let mut journal = GroupJournal::recover(StdDisk, &dir, header.group_id, config)
+        .unwrap()
+        .journal;
+    let recovery = recover(&mut journal, &Nothing, 8).unwrap();
+    let replay = ReplayConfig {
+        manifest: header.manifest,
+        accept_manifest: false,
+    };
+    let room = CursorConfig {
+        bytes: 4096,
+        records: 8,
+    };
+    let mut cursor = ReplayCursor::open(journal, &recovery, &replay, room).unwrap();
+    let mut seen = 0u64;
+    loop {
+        let (step, allocations) = count(|| match cursor.step().unwrap() {
+            Step::Event(event) => Some(event.group_seq()),
+            Step::Stop(_) => None,
+        });
+        assert_eq!(allocations, 0, "a step allocated");
+        match step {
+            Some(seq) => {
+                seen += 1;
+                assert_eq!(seq, seen);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen, 3);
+    drop(cursor);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

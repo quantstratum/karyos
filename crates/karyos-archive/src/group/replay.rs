@@ -6,15 +6,18 @@
 //!
 //! Built here, with no Gateway yet:
 //!
-//! - [`check_header`]: a journal replays only under the capture contract
-//!   and the clock it was captured with, and only for the manifest it
-//!   names, compared byte for byte.
+//! - [`check_header`]: a journal replays only under this build's capture
+//!   contract and a clock replay knows, and only for the replaying
+//!   caller's manifest, compared byte for byte unless it accepts another
+//!   (`recording-group-replay.md` section 8).
 //! - [`ReplayCursor`]: the events of a recovered journal's complete
 //!   prefix, in order, each with its observations and its end, from a
-//!   buffer sized when the cursor is opened. Where the prefix ends, the
-//!   cursor says why with a typed [`Stop`].
+//!   buffer sized when the cursor is opened. Each event says whether a
+//!   reference unavailable (template 22) names it, before it is presented
+//!   (section 7). Where the prefix ends, the cursor says why with a typed
+//!   [`Stop`].
 //! - [`CaptureJournal`]: the journal a replay writes what it observes to,
-//!   for the comparison with the recorded one.
+//!   under the replaying caller's manifest (section 9).
 //!
 //! The checks of each call against its recorded observation wait for the
 //! Gateway's operation trait (A7d).
@@ -26,24 +29,27 @@ use super::prefix::Recovery;
 use karyos_codec::CodecError;
 
 use super::record::{
-    Clock, EndOutcome, GapMarker, GroupRecord, JournalHeader, MAX_RECORD, ReferenceUnavailable,
-    Role,
+    CONTRACT_VERSION, Clock, EndOutcome, GapMarker, GroupRecord, JournalHeader, MAX_RECORD, Role,
 };
 use crate::disk::Disk;
 
 #[cfg(test)]
 mod tests;
 
-/// What a replay expects of the journal it replays.
+/// The clock replay presents the readings of.
+const CLOCK: Clock = Clock::HostMonotonic;
+
+/// The replaying caller's side of the header check. The contract and the
+/// clock are this build's, never the caller's: another contract is not
+/// comparable, with no override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Expected<'a> {
-    /// The capture contract the replay implements.
-    pub contract_version: u16,
-    /// The clock whose readings the replay presents.
-    pub clock: Clock,
+pub struct ReplayConfig<'a> {
     /// The caller's identity of what replays: the recorded manifest must
-    /// be the same bytes.
+    /// be the same bytes, unless `accept_manifest`.
     pub manifest: &'a [u8],
+    /// Accept a recorded manifest that differs, as a strategy or version
+    /// comparison does on purpose.
+    pub accept_manifest: bool,
 }
 
 /// How a journal's header differs from what the replay expects.
@@ -70,29 +76,30 @@ pub enum HeaderMismatch {
     Manifest,
 }
 
-/// Checks a journal's `header` against what the replay `expected`: the
-/// contract, the clock, then the manifest, byte for byte.
+/// Checks a journal's `header`: this build's contract, a clock replay
+/// knows, then `config`'s manifest, byte for byte unless it accepts
+/// another.
 ///
 /// # Errors
 ///
 /// The first [`HeaderMismatch`] found.
 pub fn check_header(
     header: &JournalHeader<'_>,
-    expected: &Expected<'_>,
+    config: &ReplayConfig<'_>,
 ) -> Result<(), HeaderMismatch> {
-    if header.contract_version != expected.contract_version {
+    if header.contract_version != CONTRACT_VERSION {
         return Err(HeaderMismatch::Contract {
             found: header.contract_version,
-            expected: expected.contract_version,
+            expected: CONTRACT_VERSION,
         });
     }
-    if header.clock != expected.clock {
+    if header.clock != CLOCK {
         return Err(HeaderMismatch::Clock {
             found: header.clock,
-            expected: expected.clock,
+            expected: CLOCK,
         });
     }
-    if header.manifest != expected.manifest {
+    if !config.accept_manifest && header.manifest != config.manifest {
         return Err(HeaderMismatch::Manifest);
     }
     Ok(())
@@ -119,12 +126,39 @@ pub enum ReplayError {
         /// The buffer's records.
         capacity: usize,
     },
+    /// A cursor configuration with fewer than two records per event, or
+    /// a buffer that cannot be allocated.
+    #[error("invalid cursor configuration")]
+    InvalidConfig,
+    /// The recovery stopped feeding the journal (`Recovery::full`): its
+    /// prefixes cover only the journal's start, so replay would claim
+    /// less than the journal holds.
+    #[error("the recovery's feed stopped")]
+    Truncated,
     /// The complete prefix ends inside an event, at `position`: the
     /// recovery and the journal disagree.
     #[error("the complete prefix ends inside an event at {position}")]
     Torn {
         /// Where the event's records stop.
         position: u64,
+    },
+    /// An event that starts at `position` with a record that is no
+    /// event's first.
+    #[error("no event starts at {position}")]
+    NotAnEvent {
+        /// Where.
+        position: u64,
+    },
+    /// The record at `position` encodes again to another length than it
+    /// has in the journal.
+    #[error("the record at {position} encodes to {found} bytes, not {expected}")]
+    Reencoded {
+        /// Where.
+        position: u64,
+        /// Its length in the journal.
+        expected: usize,
+        /// Its length encoded again.
+        found: usize,
     },
     /// A record that does not encode again.
     #[error(transparent)]
@@ -145,10 +179,6 @@ pub enum Stop {
         /// Its `group_seq`.
         group_seq: u64,
     },
-    /// An event already given, by `group_seq`, has a payload by reference
-    /// that its recording will never hold. Not an end: the next call goes
-    /// on after it.
-    ReferenceUnavailable(ReferenceUnavailable),
     /// The complete prefix ends with nothing recorded against it: what
     /// follows, if anything, is not complete yet.
     EndOfPrefix {
@@ -157,15 +187,8 @@ pub enum Stop {
     },
 }
 
-impl Stop {
-    /// Whether the cursor gives nothing more.
-    #[must_use]
-    pub const fn is_final(&self) -> bool {
-        !matches!(self, Self::ReferenceUnavailable(_))
-    }
-}
-
-/// What [`ReplayCursor::step`] gives.
+/// What [`ReplayCursor::step`] gives: once it gives a stop, it gives the
+/// same stop on every later call.
 #[derive(Debug)]
 pub enum Step<'c> {
     /// The next event of the complete prefix.
@@ -179,6 +202,7 @@ pub enum Step<'c> {
 #[derive(Debug, Clone, Copy)]
 pub struct ReplayEvent<'c> {
     group_seq: u64,
+    reference_unavailable: bool,
     bytes: &'c [u8],
     spans: &'c [(usize, usize)],
 }
@@ -188,6 +212,15 @@ impl<'c> ReplayEvent<'c> {
     #[must_use]
     pub const fn group_seq(&self) -> u64 {
         self.group_seq
+    }
+
+    /// Whether a reference unavailable (template 22) names the event: its
+    /// payload by reference will never be there, so replay cannot present
+    /// it whole (`recording-group-replay.md` section 7). The record may
+    /// lie anywhere after the event; the cursor found it when it opened.
+    #[must_use]
+    pub const fn reference_unavailable(&self) -> bool {
+        self.reference_unavailable
     }
 
     /// The number of records, its first and its end included.
@@ -236,9 +269,18 @@ pub struct CursorConfig {
     pub records: usize,
 }
 
+/// One allocation of `capacity` elements, or [`ReplayError::InvalidConfig`].
+fn allocate<T>(capacity: usize) -> Result<Vec<T>, ReplayError> {
+    let mut vec = Vec::new();
+    vec.try_reserve_exact(capacity)
+        .map_err(|_| ReplayError::InvalidConfig)?;
+    Ok(vec)
+}
+
 /// The events of a recovered journal's complete prefix, in order.
 ///
-/// It allocates only when opened. Each [`ReplayCursor::step`] reads one
+/// It allocates only when opened: the buffer, and the events a reference
+/// unavailable names. Each [`ReplayCursor::step`] reads one
 /// event's records into the buffer and lends them until the next call.
 #[derive(Debug)]
 pub struct ReplayCursor<D: Disk> {
@@ -248,6 +290,9 @@ pub struct ReplayCursor<D: Disk> {
     /// The journal position after the complete prefix's last record.
     complete_end: u64,
     complete_seq: u64,
+    /// The `group_seq`s of the prefix that a reference unavailable names,
+    /// sorted.
+    unavailable: Vec<u64>,
     buffer: Vec<u8>,
     spans: Vec<(usize, usize)>,
     /// The final stop, once reached.
@@ -257,134 +302,178 @@ pub struct ReplayCursor<D: Disk> {
 impl<D: Disk> ReplayCursor<D> {
     /// Opens a cursor over `journal`, whose prefixes `recovery` computed
     /// (by [`super::prefix::recover`] on the same journal), after checking
-    /// its header against `expected`.
+    /// its header against `config`. It reads the journal once to find the
+    /// events of the prefix a reference unavailable names.
     ///
     /// # Errors
     ///
-    /// [`ReplayError::NoHeader`], [`ReplayError::Header`], and the
+    /// [`ReplayError::NoHeader`], [`ReplayError::Header`],
+    /// [`ReplayError::InvalidConfig`], [`ReplayError::Truncated`], and the
     /// journal's errors.
     pub fn open(
         mut journal: GroupJournal<D>,
         recovery: &Recovery,
-        expected: &Expected<'_>,
-        config: CursorConfig,
+        config: &ReplayConfig<'_>,
+        room: CursorConfig,
     ) -> Result<Self, ReplayError> {
+        if recovery.full {
+            return Err(ReplayError::Truncated);
+        }
+        if room.records < 2 {
+            return Err(ReplayError::InvalidConfig);
+        }
         let mut checked = None;
         let mut header_end = 0;
         let _ = journal.walk(0, |_, end, record| {
             if let GroupRecord::Header(header) = record {
-                checked = Some(check_header(header, expected));
+                checked = Some(check_header(header, config));
                 header_end = end;
             }
             false
         })?;
         checked.ok_or(ReplayError::NoHeader)??;
+        let complete_seq = recovery.tracker.complete_recording_seq();
+        let mut unavailable = Vec::new();
+        let _ = journal.walk(header_end, |_, _, record| {
+            if let GroupRecord::Unavailable(record) = record
+                && record.group_seq <= complete_seq
+            {
+                unavailable.push(record.group_seq);
+            }
+            true
+        })?;
+        unavailable.sort_unstable();
+        unavailable.dedup();
+        let mut buffer = allocate(room.bytes)?;
+        buffer.resize(room.bytes, 0u8);
         Ok(Self {
             journal,
             position: header_end,
             complete_end: recovery.tracker.complete_end().max(header_end),
-            complete_seq: recovery.tracker.complete_recording_seq(),
-            buffer: vec![0u8; config.bytes],
-            spans: Vec::with_capacity(config.records.max(2)),
+            complete_seq,
+            unavailable,
+            buffer,
+            spans: allocate(room.records)?,
             stopped: None,
         })
     }
 
-    /// The next event of the complete prefix, or why there is none.
+    /// The next event of the complete prefix, or why there is none. A
+    /// reference unavailable record is not an event, and is skipped: its
+    /// event says it was named.
     ///
     /// # Errors
     ///
     /// [`ReplayError::Bytes`] and [`ReplayError::Records`] for an event
     /// larger than the buffer, which is not consumed;
-    /// [`ReplayError::Torn`]; and the journal's errors.
+    /// [`ReplayError::Torn`], [`ReplayError::NotAnEvent`],
+    /// [`ReplayError::Reencoded`]; and the journal's errors.
     pub fn step(&mut self) -> Result<Step<'_>, ReplayError> {
         if let Some(stop) = self.stopped {
             return Ok(Step::Stop(stop));
         }
-        if self.position >= self.complete_end {
-            return self.past_prefix().map(Step::Stop);
-        }
-        self.spans.clear();
-        let (buffer, spans) = (&mut self.buffer, &mut self.spans);
-        let mut fill = 0usize;
-        let mut first = None;
-        let mut done = None;
-        let mut failed = None;
-        let _ = self.journal.walk(self.position, |position, end, record| {
-            if spans.is_empty()
-                && let GroupRecord::Unavailable(unavailable) = record
-            {
-                done = Some((end, Some(*unavailable)));
-                return false;
+        loop {
+            if self.position >= self.complete_end {
+                return self.past_prefix().map(Step::Stop);
             }
-            let length = usize::try_from(end - position).unwrap_or(usize::MAX);
-            let Some(slot) = fill
-                .checked_add(length)
-                .and_then(|to| buffer.get_mut(fill..to))
-            else {
-                failed = Some(ReplayError::Bytes {
-                    capacity: buffer.len(),
-                });
-                return false;
-            };
-            if spans.len() == spans.capacity() {
-                failed = Some(ReplayError::Records {
-                    capacity: spans.capacity(),
-                });
-                return false;
-            }
-            if let Err(error) = record.encode(slot) {
-                failed = Some(ReplayError::Record(error));
-                return false;
-            }
-            spans.push((fill, fill + length));
-            fill += length;
-            if let Role::Event(seq) | Role::Uncaptured(seq) = record.role() {
-                first = Some(seq);
-            }
-            if matches!(record, GroupRecord::End(_)) {
-                done = Some((end, None));
-                return false;
-            }
-            true
-        })?;
-        if let Some(error) = failed {
             self.spans.clear();
-            return Err(error);
-        }
-        match done {
-            Some((end, Some(unavailable))) => {
-                self.position = end;
-                Ok(Step::Stop(Stop::ReferenceUnavailable(unavailable)))
+            let (buffer, spans) = (&mut self.buffer, &mut self.spans);
+            let mut fill = 0usize;
+            let mut first = None;
+            let mut done = None;
+            let mut failed = None;
+            let _ = self.journal.walk(self.position, |position, end, record| {
+                if spans.is_empty() {
+                    match record.role() {
+                        Role::Unavailable(_) => {
+                            done = Some((end, false));
+                            return false;
+                        }
+                        Role::Event(seq) | Role::Uncaptured(seq) => first = Some(seq),
+                        _ => {
+                            failed = Some(ReplayError::NotAnEvent { position });
+                            return false;
+                        }
+                    }
+                }
+                let Some(length) = end
+                    .checked_sub(position)
+                    .and_then(|length| usize::try_from(length).ok())
+                else {
+                    failed = Some(ReplayError::Torn { position });
+                    return false;
+                };
+                let Some((to, slot)) = fill
+                    .checked_add(length)
+                    .and_then(|to| buffer.get_mut(fill..to).map(|slot| (to, slot)))
+                else {
+                    failed = Some(ReplayError::Bytes {
+                        capacity: buffer.len(),
+                    });
+                    return false;
+                };
+                if spans.len() == spans.capacity() {
+                    failed = Some(ReplayError::Records {
+                        capacity: spans.capacity(),
+                    });
+                    return false;
+                }
+                match record.encode(slot) {
+                    Ok(found) if found == length => {}
+                    Ok(found) => {
+                        failed = Some(ReplayError::Reencoded {
+                            position,
+                            expected: length,
+                            found,
+                        });
+                        return false;
+                    }
+                    Err(error) => {
+                        failed = Some(ReplayError::Record(error));
+                        return false;
+                    }
+                }
+                spans.push((fill, to));
+                fill = to;
+                if matches!(record, GroupRecord::End(_)) {
+                    done = Some((end, true));
+                    return false;
+                }
+                true
+            })?;
+            if let Some(error) = failed {
+                self.spans.clear();
+                return Err(error);
             }
-            Some((end, None)) if end <= self.complete_end => {
-                self.position = end;
-                Ok(Step::Event(ReplayEvent {
-                    group_seq: first.unwrap_or_default(),
-                    bytes: &self.buffer,
-                    spans: &self.spans,
-                }))
+            match (done, first) {
+                // A reference unavailable record: skipped.
+                (Some((end, false)), _) => self.position = end,
+                (Some((end, true)), Some(group_seq)) if end <= self.complete_end => {
+                    self.position = end;
+                    return Ok(Step::Event(ReplayEvent {
+                        group_seq,
+                        reference_unavailable: self.unavailable.binary_search(&group_seq).is_ok(),
+                        bytes: &self.buffer,
+                        spans: &self.spans,
+                    }));
+                }
+                _ => {
+                    return Err(ReplayError::Torn {
+                        position: self.position,
+                    });
+                }
             }
-            _ => Err(ReplayError::Torn {
-                position: self.position,
-            }),
         }
     }
 
     /// The stop at the end of the complete prefix, from the records after
-    /// it: a reference unavailable for an event in the prefix comes first,
-    /// then the gap or the incomplete event the prefix stopped at.
+    /// it: the gap or the incomplete event the prefix stopped at, if one
+    /// comes before the next complete event. Reference unavailable records
+    /// are skipped: the cursor found those of the prefix when it opened.
     fn past_prefix(&mut self) -> Result<Stop, ReplayError> {
-        let complete_seq = self.complete_seq;
-        let mut unavailable = None;
         let mut stop = None;
-        let _ = self.journal.walk(self.position, |_, end, record| {
+        let _ = self.journal.walk(self.position, |_, _, record| {
             match record {
-                GroupRecord::Unavailable(record) if record.group_seq <= complete_seq => {
-                    unavailable = Some((end, *record));
-                    return false;
-                }
-                GroupRecord::Unavailable(_) => {}
                 GroupRecord::Gap(gap) => {
                     stop = Some(Stop::Gap(*gap));
                     return false;
@@ -396,19 +485,14 @@ impl<D: Disk> ReplayCursor<D> {
                     return false;
                 }
                 // The first event past the prefix is complete and waits on
-                // its payload, or on durability: nothing is recorded
-                // against the prefix.
+                // its payload, or on durability.
                 GroupRecord::End(_) => return false,
                 _ => {}
             }
             true
         })?;
-        if let Some((end, record)) = unavailable {
-            self.position = end;
-            return Ok(Stop::ReferenceUnavailable(record));
-        }
         let stop = stop.unwrap_or(Stop::EndOfPrefix {
-            complete_recording_seq: complete_seq,
+            complete_recording_seq: self.complete_seq,
         });
         self.stopped = Some(stop);
         Ok(stop)
@@ -431,8 +515,11 @@ pub struct CaptureJournal<D: Disk> {
 }
 
 impl<D: Disk> CaptureJournal<D> {
-    /// Creates the capture journal of `header`'s group in `dir`. A replay
-    /// passes the recorded header, so that the two journals compare.
+    /// Creates the capture journal of the recorded `header`'s group in
+    /// `dir`, with the replaying caller's `manifest` in its header
+    /// (`recording-group-replay.md` section 9). `dir` is the capture's own
+    /// directory: the original's holds the group's journal already, and
+    /// is refused ([`crate::segment::SegmentError::Exists`]).
     ///
     /// # Errors
     ///
@@ -441,10 +528,15 @@ impl<D: Disk> CaptureJournal<D> {
         disk: D,
         dir: &Path,
         header: &JournalHeader<'_>,
+        manifest: &[u8],
         config: JournalConfig,
     ) -> Result<Self, JournalError> {
+        let header = JournalHeader {
+            manifest,
+            ..*header
+        };
         Ok(Self {
-            journal: GroupJournal::create(disk, dir, header, config)?,
+            journal: GroupJournal::create(disk, dir, &header, config)?,
             scratch: vec![0u8; MAX_RECORD],
         })
     }
