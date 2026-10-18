@@ -1251,3 +1251,66 @@ fn an_empty_checkpoint_directory_is_not_comparable() {
         "{report:?}"
     );
 }
+
+/// #430 follow-up: a record that names intact store bytes with another
+/// crc32c is held by the store, so its digest is what refuses it: the
+/// checkpoint is corrupt, not comparable (exit 2), never an error.
+#[test]
+fn a_record_whose_digest_differs_from_intact_bytes_is_corrupt() {
+    let events = timers(1, 4);
+    let at_two: &[(u64, &[u8])] = &[(2, b"state at 2")];
+    let scratch = Scratch::new();
+    let (left, right, source) = (
+        scratch.side("left"),
+        scratch.side("right"),
+        scratch.side("source"),
+    );
+    let header = header(Capture::Strict, b"m");
+    write_with_checkpoints(&left, &header, &events, at_two);
+    // The store's bytes, written for a journal whose record is right.
+    write_with_checkpoints(&source, &header, &events, at_two);
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let mut journal = GroupJournal::recover(StdDisk, &source, 1, config)
+        .unwrap()
+        .journal;
+    let mut recorded = None;
+    let _ = journal
+        .walk(0, |_, _, record| {
+            if let GroupRecord::Checkpoint(checkpoint) = record {
+                recorded = Some(*checkpoint);
+            }
+            true
+        })
+        .unwrap();
+    drop(journal);
+    let recorded = recorded.unwrap();
+    // The right journal names the same bytes with another digest.
+    let mut records = events.clone();
+    let after_two = records
+        .iter()
+        .position(|record| matches!(record, GroupRecord::End(end) if end.group_seq == 2))
+        .unwrap();
+    records.insert(
+        after_two + 1,
+        GroupRecord::Checkpoint(CheckpointRecord {
+            crc32c: recorded.crc32c ^ 1,
+            ..recorded
+        }),
+    );
+    write(&right, &header, &records);
+    std::fs::create_dir_all(right.join(CHECKPOINTS)).unwrap();
+    for entry in std::fs::read_dir(source.join(CHECKPOINTS)).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::copy(
+            &path,
+            right.join(CHECKPOINTS).join(path.file_name().unwrap()),
+        )
+        .unwrap();
+    }
+    let report = diff_from_checkpoint(&left, &right, 1);
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    assert!(report.text().contains("corrupt"), "{}", report.text());
+}
