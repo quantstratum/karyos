@@ -165,7 +165,7 @@ fn cursor(records: &[GroupRecord<'_>], capture: Capture) -> ReplayCursor<FaultDi
 }
 
 /// The next step's event, as `(group_seq, records)`.
-fn event(cursor: &mut ReplayCursor<FaultDisk>) -> (u64, Vec<Vec<u8>>) {
+fn event<D: crate::disk::Disk>(cursor: &mut ReplayCursor<D>) -> (u64, Vec<Vec<u8>>) {
     match cursor.step().unwrap() {
         Step::Event(event) => (
             event.group_seq(),
@@ -692,4 +692,46 @@ fn a_record_that_starts_no_event_is_refused() {
     let mut cursor = ReplayCursor::open(journal, &recovery, &expected(), ROOM).unwrap();
     assert_eq!(event(&mut cursor).0, 1);
     assert!(matches!(cursor.step(), Err(ReplayError::NotAnEvent { .. })));
+}
+
+/// A closed journal recovers through a read-only disk, and a cursor reads
+/// it: what a tool that writes nothing does. A journal whose recovery
+/// would repair it fails instead.
+#[test]
+fn a_closed_journal_recovers_read_only() {
+    use crate::disk::ReadOnly;
+
+    let records = [message(1, None), end(1, 0, EndOutcome::Complete)];
+    let disk = FaultDisk::default();
+    let header = header(Capture::Strict);
+    let mut journal = GroupJournal::create(disk.clone(), Path::new("/g"), &header, CONFIG).unwrap();
+    for record in &records {
+        journal.append(&encode(record)).unwrap();
+    }
+    journal.close().unwrap();
+    let mut journal = GroupJournal::recover(ReadOnly(disk.clone()), Path::new("/g"), 1, CONFIG)
+        .unwrap()
+        .journal;
+    let recovery = recover(&mut journal, &Seven, 8).unwrap();
+    let mut cursor = ReplayCursor::open(journal, &recovery, &expected(), ROOM).unwrap();
+    assert_eq!(event(&mut cursor).0, 1);
+    assert_eq!(
+        crate::segment::recorded_geometry(&mut ReadOnly(disk), Path::new("/g"), 1).unwrap(),
+        Some(
+            crate::segment::Geometry::new(MIN_SEGMENT_LENGTH, u64::from(MIN_SEGMENT_LENGTH))
+                .unwrap()
+        )
+    );
+    // A torn tail (the data of an unsynced append lost, its index entry
+    // kept): recovery would cut it; read only, it fails.
+    let disk = FaultDisk::default();
+    let mut journal = GroupJournal::create(disk.clone(), Path::new("/g"), &header, CONFIG).unwrap();
+    journal.append(&encode(&records[0])).unwrap();
+    let crashed = disk.after_crash(Survives::TornData);
+    let read_only = GroupJournal::recover(ReadOnly(crashed), Path::new("/g"), 1, CONFIG);
+    assert!(matches!(
+        read_only,
+        Err(JournalError::Segment(crate::segment::SegmentError::Io(error)))
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+    ));
 }

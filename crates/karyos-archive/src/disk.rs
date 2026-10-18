@@ -185,3 +185,67 @@ impl Disk for StdDisk {
         std::fs::rename(from, to)
     }
 }
+
+/// Another disk, read only: every file opens for reading, and every call
+/// that would change a file or a directory fails with
+/// [`io::ErrorKind::PermissionDenied`], so a store opened through it is
+/// read and never repaired. A sync has nothing to write and succeeds.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReadOnly<D>(pub D);
+
+/// The error of a write through [`ReadOnly`].
+fn read_only() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "a read-only disk")
+}
+
+impl<D: Disk> Disk for ReadOnly<D> {
+    type File = D::File;
+
+    fn create(&mut self, _path: &Path) -> io::Result<Self::File> {
+        Err(read_only())
+    }
+
+    fn open(&mut self, path: &Path) -> io::Result<Self::File> {
+        self.0.open_read(path)
+    }
+
+    fn open_read(&mut self, path: &Path) -> io::Result<Self::File> {
+        self.0.open_read(path)
+    }
+
+    fn write_at(&mut self, _file: &Self::File, _offset: u64, _bytes: &[u8]) -> io::Result<()> {
+        Err(read_only())
+    }
+
+    fn read_at(&mut self, file: &Self::File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.0.read_at(file, offset, buf)
+    }
+
+    fn len(&mut self, file: &Self::File) -> io::Result<u64> {
+        self.0.len(file)
+    }
+
+    fn set_len(&mut self, _file: &Self::File, _len: u64) -> io::Result<()> {
+        Err(read_only())
+    }
+
+    fn sync(&mut self, _file: &Self::File) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn sync_dir(&mut self, _dir: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn list(&mut self, dir: &Path) -> io::Result<Vec<String>> {
+        self.0.list(dir)
+    }
+
+    fn remove(&mut self, _path: &Path) -> io::Result<()> {
+        Err(read_only())
+    }
+
+    fn rename(&mut self, _from: &Path, _to: &Path) -> io::Result<()> {
+        Err(read_only())
+    }
+}
