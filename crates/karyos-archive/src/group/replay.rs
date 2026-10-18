@@ -333,12 +333,24 @@ impl<D: Disk> ReplayCursor<D> {
         })?;
         checked.ok_or(ReplayError::NoHeader)??;
         let complete_seq = recovery.tracker.complete_recording_seq();
-        let mut unavailable = Vec::new();
+        // Counted first, so the list is one allocation that fails typed.
+        let names = |record: &GroupRecord<'_>| match record {
+            GroupRecord::Unavailable(record) if record.group_seq <= complete_seq => {
+                Some(record.group_seq)
+            }
+            _ => None,
+        };
+        let mut count = 0usize;
         let _ = journal.walk(header_end, |_, _, record| {
-            if let GroupRecord::Unavailable(record) = record
-                && record.group_seq <= complete_seq
+            count = count.saturating_add(usize::from(names(record).is_some()));
+            true
+        })?;
+        let mut unavailable = allocate::<u64>(count)?;
+        let _ = journal.walk(header_end, |_, _, record| {
+            if let Some(seq) = names(record)
+                && unavailable.len() < unavailable.capacity()
             {
-                unavailable.push(record.group_seq);
+                unavailable.push(seq);
             }
             true
         })?;

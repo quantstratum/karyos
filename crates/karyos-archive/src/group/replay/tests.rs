@@ -617,3 +617,67 @@ fn a_capture_in_the_originals_directory_is_refused() {
         Err(JournalError::Segment(SegmentError::Exists { .. }))
     ));
 }
+
+/// Marks out of order: each named event is flagged, the others not (the
+/// #413 re-check's probe; a sort that is skipped fails it).
+#[test]
+fn marks_out_of_order_flag_their_events() {
+    let mark = |group_seq| {
+        GroupRecord::Unavailable(ReferenceUnavailable {
+            group_seq,
+            recording_id: 8,
+        })
+    };
+    let records = [
+        message(1, Some(8)),
+        end(1, 0, EndOutcome::Complete),
+        message(2, None),
+        end(2, 0, EndOutcome::Complete),
+        message(3, Some(8)),
+        end(3, 0, EndOutcome::Complete),
+        mark(3),
+        mark(1),
+        message(4, None),
+        end(4, 0, EndOutcome::Complete),
+    ];
+    let mut c = cursor(&records, Capture::BestEffort);
+    assert_eq!(
+        steps(&mut c),
+        (
+            vec![(1, true), (2, false), (3, true), (4, false)],
+            Stop::EndOfPrefix {
+                complete_recording_seq: 4
+            }
+        )
+    );
+}
+
+/// A recovery of another journal, whose prefix has an event where this
+/// journal has a gap: the cursor refuses it typed.
+#[test]
+fn a_record_that_starts_no_event_is_refused() {
+    let other = [
+        message(1, None),
+        end(1, 0, EndOutcome::Complete),
+        message(2, None),
+        end(2, 0, EndOutcome::Complete),
+        message(3, None),
+        end(3, 0, EndOutcome::Complete),
+    ];
+    let (_, recovery) = recorded(&header(Capture::BestEffort), &other);
+    let records = [
+        message(1, None),
+        end(1, 0, EndOutcome::Complete),
+        GroupRecord::Gap(GapMarker {
+            from_seq: 2,
+            to_seq: 2,
+            reason: GapReason::RingFull,
+        }),
+        message(3, None),
+        end(3, 0, EndOutcome::Complete),
+    ];
+    let (journal, _) = recorded(&header(Capture::BestEffort), &records);
+    let mut cursor = ReplayCursor::open(journal, &recovery, &expected(), ROOM).unwrap();
+    assert_eq!(event(&mut cursor).0, 1);
+    assert!(matches!(cursor.step(), Err(ReplayError::NotAnEvent { .. })));
+}
