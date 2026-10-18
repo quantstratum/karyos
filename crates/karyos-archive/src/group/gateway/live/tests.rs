@@ -742,3 +742,86 @@ fn timer_zero_is_not_recorded() {
         assert_eq!(gateway.stats().incomplete, 1, "{mode:?}");
     }
 }
+
+/// A strict Gateway whose event buffer leaves exactly `room` bytes for
+/// observations after an empty external event.
+fn with_room(
+    room: usize,
+) -> (
+    Gateway<Accepting, Clocked>,
+    CaptureJob<FaultDisk>,
+    FaultDisk,
+) {
+    let (gateway, job, disk, _) = gateway(Capture::Strict, 1 << 16, 12 + 20 + 2 + END + room);
+    (gateway, job, disk)
+}
+
+/// The strict room check at its boundaries: a claim needs two template 11
+/// records, a poll its template 15 and `max` deliveries, an offer one
+/// template 11, each exactly.
+#[test]
+fn strict_room_is_checked_at_its_boundaries() {
+    // A claim with room for one record is refused, unperformed; with room
+    // for two it runs and both are recorded.
+    for (room, performed) in [(OUTCOME, false), (2 * OUTCOME, true)] {
+        let (mut gateway, job, disk) = with_room(room);
+        let mut result = None;
+        gateway
+            .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+                result = Some(effects.claim(PublicationId(1), 4, &mut |_| true));
+            })
+            .unwrap();
+        assert_eq!(gateway.port().calls, u32::from(performed), "{room}");
+        let records = decoded(&records(job, &disk)).len();
+        if performed {
+            assert!(result.unwrap().commit.is_some());
+            // The event, op 2, op 3 and the end.
+            assert_eq!(records, 4);
+        } else {
+            assert_eq!(
+                result,
+                Some(ClaimCommit {
+                    claim: Outcome::Gated,
+                    commit: None
+                })
+            );
+            assert_eq!(records, 2);
+        }
+    }
+    // A poll of max 2 one byte short of its poll and two deliveries is
+    // refused (room enough for the deliveries alone); with that room it
+    // runs.
+    for (room, performed) in [
+        (POLL + 2 * DELIVERY - 1, false),
+        (POLL + 2 * DELIVERY, true),
+    ] {
+        let (mut gateway, job, disk) = with_room(room);
+        gateway.port().deliveries = 2;
+        let mut presented = 0;
+        gateway
+            .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+                presented = effects.poll_outcomes(PublicationId(1), 2, &mut |_| {});
+            })
+            .unwrap();
+        assert_eq!(gateway.port().calls, u32::from(performed), "{room}");
+        assert_eq!(presented, if performed { 2 } else { 0 });
+        let records = decoded(&records(job, &disk)).len();
+        assert_eq!(records, if performed { 5 } else { 2 });
+    }
+    // An offer with room for exactly one record runs and is recorded.
+    let (mut gateway, job, disk) = with_room(OUTCOME);
+    gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            assert_ne!(effects.offer(PublicationId(1), b"p"), Outcome::Gated);
+        })
+        .unwrap();
+    assert_eq!(gateway.port().calls, 1);
+    assert_eq!(
+        decoded(&records(job, &disk)).last(),
+        Some(&GroupRecord::End(EventEnd {
+            group_seq: 1,
+            observations: 1,
+            outcome: EndOutcome::Complete,
+        }))
+    );
+}
