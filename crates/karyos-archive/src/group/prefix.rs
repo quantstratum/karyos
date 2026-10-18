@@ -239,7 +239,8 @@ impl PrefixTracker {
             GroupRecord::Outcome(_)
             | GroupRecord::TimerOperation(_)
             | GroupRecord::ExternalObservation(_)
-            | GroupRecord::Delivery(_) => {
+            | GroupRecord::Delivery(_)
+            | GroupRecord::Poll(_) => {
                 if self.open.is_none() {
                     return Err(PrefixError::OutOfOrder);
                 }

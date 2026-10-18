@@ -263,7 +263,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 11,
-                &Fields::new(51)
+                &Fields::new(59)
                     .u64(0, 6)
                     .u64(8, 1024)
                     .u64(16, 0)
@@ -276,6 +276,8 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                     .u8(48, 1)
                     .u8(49, 1)
                     .u8(50, 2)
+                    .u32(51, 112)
+                    .u32(55, 0x5f1c_09a2)
                     .0,
                 &[],
             ),
@@ -285,6 +287,8 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 stream_id: 30,
                 session_id: 1,
                 operation: Operation::Offer,
+                length: 112,
+                crc32c: 0x5f1c_09a2,
                 outcome: Outcome::Accepted {
                     lane: lane(2),
                     position: 1024,
@@ -296,7 +300,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
             // inner error, both fields.
             vector(
                 11,
-                &Fields::new(51)
+                &Fields::new(59)
                     .u64(0, 6)
                     .u64(8, 0)
                     .u64(16, 70_000)
@@ -318,6 +322,8 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 stream_id: 30,
                 session_id: 1,
                 operation: Operation::Offer,
+                length: 0,
+                crc32c: 0,
                 outcome: Outcome::Failed {
                     error: 1,
                     sub: 0,
@@ -416,7 +422,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 11,
-                &Fields::new(51)
+                &Fields::new(59)
                     .u64(0, 8)
                     .u64(8, 0)
                     .u64(16, 300)
@@ -438,6 +444,8 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 stream_id: 40,
                 session_id: 2,
                 operation: Operation::Offer,
+                length: 0,
+                crc32c: 0,
                 outcome: Outcome::Failed {
                     error: 5,
                     sub: 3,
@@ -558,6 +566,28 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 recording_id: 9,
             }),
         ),
+        (
+            vector(
+                15,
+                &Fields::new(28)
+                    .u64(0, 6)
+                    .u32(8, 3)
+                    .u32(12, 8)
+                    .u32(16, 1)
+                    .i32(20, 30)
+                    .i32(24, 1)
+                    .0,
+                &[],
+            ),
+            GroupRecord::Poll(DeliveryPoll {
+                group_seq: 6,
+                index: 3,
+                max: 8,
+                count: 1,
+                stream_id: 30,
+                session_id: 1,
+            }),
+        ),
     ]
 }
 
@@ -573,6 +603,8 @@ fn failures_follow_the_table() {
             stream_id: 1,
             session_id: 1,
             operation: Operation::Offer,
+            length: 0,
+            crc32c: 0,
             outcome: Outcome::Failed {
                 error,
                 sub,
@@ -582,7 +614,7 @@ fn failures_follow_the_table() {
         });
         let bytes = vector(
             11,
-            &Fields::new(51)
+            &Fields::new(59)
                 .u64(0, 1)
                 .u64(16, detail)
                 .u64(24, detail2)
@@ -739,6 +771,8 @@ fn samples() -> Vec<GroupRecord<'static>> {
             stream_id: -1,
             session_id: -2,
             operation,
+            length: 0,
+            crc32c: 0,
             outcome,
         }));
     }
@@ -920,6 +954,7 @@ const OVERRUN: usize = 15;
 const SKIPPED: usize = 16;
 const UNCAPTURED: usize = 17;
 const UNAVAILABLE: usize = 18;
+const POLL: usize = 19;
 
 #[test]
 #[allow(clippy::too_many_lines, reason = "one case per rule")]
@@ -1057,6 +1092,18 @@ fn every_invalid_field_is_refused() {
     commit[12 + 8..12 + 16].fill(0);
     commit[12 + 50] = 0;
     assert_eq!(refused(&commit), out_of_range("outcome"));
+    // A claim records no length or digest.
+    let mut claim = mutated(ACCEPTED, 48, 2, 1);
+    claim[12 + 51..12 + 59].fill(0);
+    assert!(GroupRecord::decode(&claim).is_ok());
+    for at in [51, 55] {
+        let mut digested = claim.clone();
+        digested[12 + at] = 1;
+        assert_eq!(refused(&digested), out_of_range("length"), "{at}");
+    }
+    // A delivery poll presenting more than its maximum.
+    assert_eq!(refused(&mutated(POLL, 16, 9, 4)), out_of_range("count"));
+    assert!(GroupRecord::decode(&mutated(POLL, 16, 8, 4)).is_ok());
     // A position or a lane on an outcome that has none.
     assert_eq!(
         refused(&mutated(ACCEPTED, 49, 2, 1)),
@@ -1131,6 +1178,8 @@ fn invalid_values_are_not_encoded() {
             stream_id: 0,
             session_id: 0,
             operation,
+            length: 0,
+            crc32c: 0,
             outcome,
         })
     };
@@ -1240,7 +1289,12 @@ fn every_record_knows_its_role() {
             Role::Observation(6, 1),
             Role::Observation(6, 2),
             Role::Observation(6, 3),
-            Role::Observation(6, 4),
+            Role::Delivery {
+                group_seq: 6,
+                index: 4,
+                stream_id: 30,
+                session_id: 1,
+            },
             Role::End(EventEnd {
                 group_seq: 6,
                 observations: 5,
@@ -1256,6 +1310,13 @@ fn every_record_knows_its_role() {
             Role::Event(11),
             Role::Uncaptured(12),
             Role::Unavailable(2),
+            Role::Poll {
+                group_seq: 6,
+                index: 3,
+                count: 1,
+                stream_id: 30,
+                session_id: 1,
+            },
         ]
     );
 }
@@ -1315,7 +1376,7 @@ proptest! {
 
     #[test]
     fn arbitrary_blocks_of_every_template_never_panic(
-        template in 0usize..14,
+        template in 0usize..15,
         block in proptest::collection::vec(any::<u8>(), 72),
         value in proptest::collection::vec(any::<u8>(), 0..16),
     ) {
@@ -1324,6 +1385,7 @@ proptest! {
             LIFECYCLE_EVENT, EXTERNAL_EVENT, OUTCOME_OBSERVATION,
             TIMER_OBSERVATION, EXTERNAL_OBSERVATION, DELIVERY_OBSERVATION,
             EVENT_END, GAP_MARKER, LOSS_EVENT, REFERENCE_UNAVAILABLE,
+            DELIVERY_POLL,
         ];
         let template = templates[template];
         let block = &block[..usize::from(template.block_length)];
@@ -1366,7 +1428,7 @@ fn a_failure_holds_only_its_variants_fields() {
     let failure = |error: u16, sub: u16, first: u64, second: u64| {
         vector(
             11,
-            &Fields::new(51)
+            &Fields::new(59)
                 .u64(0, 1)
                 .u64(16, first)
                 .u64(24, second)
@@ -1404,6 +1466,8 @@ fn a_failure_holds_only_its_variants_fields() {
         stream_id: 1,
         session_id: 1,
         operation: Operation::Offer,
+        length: 0,
+        crc32c: 0,
         outcome: Outcome::Failed {
             error: 2,
             sub: 0,
