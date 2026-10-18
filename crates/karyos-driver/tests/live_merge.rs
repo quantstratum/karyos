@@ -1271,6 +1271,83 @@ fn a_replay_that_does_not_merge_falls_back() {
     assert_eq!(stops.count(), 1);
 }
 
+/// A live reader lapped again while its gap is recovered, with a replay
+/// that runs past the cutover, is checked there before the merge settles:
+/// the rejoin falls back with
+/// `MergeFailed` (`LiveOverrun`), never `Replayed`. The gap the secondary
+/// covers, and the driver records, runs from the overrun's start to where
+/// the live reader rejoined, past the cutover.
+#[test]
+fn a_live_reader_lapped_before_the_cutover_falls_back() {
+    let provider = Provider::default();
+    let (mut driver, mut recorded, mut rejoin, source, mut client) =
+        lapped_client_rejoin(300, &provider, Secondary::RejoinAtHead);
+    let overrun = overrun_asked(&mut driver, &mut rejoin, &provider, source);
+    // The recording reads on past the live reader, held at its resume: the
+    // floor passes it, and it is lapped again.
+    recorded.publish(&mut driver, 100, 1000);
+    // A replay past the cutover: the merge checks the live reader's first
+    // message against the replay's there.
+    let end = recorded.reader.position();
+    assert!(end > overrun.resume);
+    let stops = Stops::default();
+    let (replay, mut feeding) = replay_from(
+        &mut driver,
+        &recorded,
+        SOURCE,
+        overrun.from..end,
+        None,
+        source,
+        &stops,
+    );
+    provider.0.lock().unwrap().ready = Some(replay);
+    let mut seen = Vec::new();
+    let mut outcomes = Vec::new();
+    for _ in 0..2000 {
+        feeding.step(&mut driver);
+        let summary = poll_rejoin(&mut driver, &mut rejoin, &mut seen);
+        outcomes.extend(summary.rejoin);
+        if !rejoin.is_recovering() {
+            break;
+        }
+    }
+    assert_eq!(
+        outcomes,
+        [RejoinOutcome::ReplayFallback {
+            reason: ReplayFallbackReason::MergeFailed,
+            secondary: SecondaryOutcome::ResumedAtHead,
+        }]
+    );
+    assert!(matches!(
+        rejoin.merge_failure(),
+        Some(MergeError::LiveOverrun(_))
+    ));
+    // The replay's messages, the whole gap, and none of the live reader's.
+    let sequences: Vec<u32> = seen.iter().map(|(sequence, _)| *sequence).collect();
+    assert_eq!(sequences, (0..300).collect::<Vec<_>>());
+    assert_eq!(stops.count(), 1);
+    let rejoined = rejoin.into_live().unwrap().position();
+    assert!(rejoined > overrun.resume, "{rejoined} {overrun:?}");
+    settle(&mut driver, &mut client);
+    let mut records = Vec::new();
+    let _ = driver
+        .loss_report()
+        .scan(&mut 0, |_, record| records.push(record));
+    let [record] = records[..] else {
+        panic!("{records:?}");
+    };
+    assert_eq!(
+        (
+            record.configured_policy,
+            record.applied_policy,
+            record.reason,
+            record.from,
+            record.to
+        ),
+        (4, 1, 6, overrun.from, rejoined)
+    );
+}
+
 /// The live reader can be taken back while a gap is asked for: the
 /// request is withdrawn.
 #[test]

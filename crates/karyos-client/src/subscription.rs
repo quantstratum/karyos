@@ -218,6 +218,11 @@ pub enum ReplayFallbackReason {
     /// The replay and the live stream did not merge (phase 3): the
     /// merge's typed error is on the poll that failed.
     MergeFailed,
+    /// The gap was given up before it resolved (phase 3): the
+    /// [`crate::merge::ReplayRejoin`] was dropped, or its live reader taken
+    /// back, while the gap was asked for or merging. Only a loss report
+    /// carries it, with the live reader resumed at its resume.
+    Withdrawn,
 }
 
 /// What the rejoin policy did after an overrun, reported with it.
@@ -529,6 +534,16 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// itself.
     pub(crate) fn take_loss_reports(&mut self) -> Option<Box<LossReporter>> {
         self.loss.take()
+    }
+
+    /// Gives back the loss reporter [`Self::take_loss_reports`] took.
+    pub(crate) fn restore_loss_reports(&mut self, loss: Option<Box<LossReporter>>) {
+        self.loss = loss;
+    }
+
+    /// Replaces the rejoin policy; returns the one it had.
+    pub(crate) fn replace_rejoin(&mut self, policy: RejoinPolicy) -> RejoinPolicy {
+        std::mem::replace(&mut self.rejoin, policy)
     }
 
     /// The owner and registration, for a handle from a client conductor.
