@@ -597,13 +597,35 @@ fn check(crashed: &FaultDisk, survives: Survives, snapshots: &[Vec<u8>]) -> Resu
         Err(error) => return Err(format!("journal recovery: {error}")),
     };
     let end = recorded_end(&mut journal).map_err(|e| format!("walk: {e}"))?;
-    let store = match CheckpointStore::recover(
-        disk.clone(),
+    // Opened for reading first, over a disk that refuses writes: it sees
+    // what recovery then leaves, and changes nothing.
+    let verified = match CheckpointStore::open_verified(
+        crate::disk::ReadOnly(disk.clone()),
         Path::new(CHECKPOINTS),
         GROUP,
         config(SyncPolicy::PerSegment),
         end,
     ) {
+        Ok(verified) => Some(verified),
+        Err(SegmentError::NotFound { .. }) => None,
+        Err(error) => return Err(format!("store open_verified: {error}")),
+    };
+    let recovered = CheckpointStore::recover(
+        disk.clone(),
+        Path::new(CHECKPOINTS),
+        GROUP,
+        config(SyncPolicy::PerSegment),
+        end,
+    );
+    // Both find the store, or neither does.
+    if verified.is_none() != matches!(recovered, Err(SegmentError::NotFound { .. })) {
+        return Err(format!(
+            "open_verified found a store: {}, recovery: {}",
+            verified.is_some(),
+            recovered.is_ok()
+        ));
+    }
+    let store = match recovered {
         Ok(store) => store,
         Err(SegmentError::NotFound { .. }) => {
             if end > 0 {
@@ -630,11 +652,29 @@ fn check(crashed: &FaultDisk, survives: Survives, snapshots: &[Vec<u8>]) -> Resu
             group.writer.store().written()
         ));
     }
+    if let Some(verified) = &verified
+        && verified.written() != end
+    {
+        return Err(format!(
+            "open_verified at {}, records end at {end}",
+            verified.written()
+        ));
+    }
     let records = group.records();
     for record in &records {
         let Some(end) = record.end() else {
             return Err("a recorded checkpoint with no range".into());
         };
+        let held = group.writer.store().holds(record.position, end);
+        if let Some(verified) = &verified
+            && verified.holds(record.position, end) != held
+        {
+            return Err(format!(
+                "checkpoint {}: open_verified holds {:?}, recovery {held:?}",
+                record.checkpoint_id,
+                verified.holds(record.position, end)
+            ));
+        }
         let expected = &snapshots[usize::try_from(record.checkpoint_id - 1).unwrap()];
         match group.writer.store().holds(record.position, end) {
             CheckpointHeld::Written | CheckpointHeld::Durable => {

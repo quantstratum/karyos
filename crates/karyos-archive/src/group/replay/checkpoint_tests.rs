@@ -19,9 +19,11 @@ use std::path::Path;
 use super::*;
 use crate::fault::{FaultDisk, Survives};
 use crate::group::checkpoint::{CheckpointSlot, CheckpointWriter, recorded_end};
+use crate::group::gateway::{Dispatched, Effects, Event, GatewayError, GroupGateway, Handler};
 use crate::group::journal::MIN_SEGMENT_LENGTH;
 use crate::group::prefix::{Coverage, recover};
 use crate::group::record::{Capture, EventEnd, GapReason, TimerEvent};
+use crate::group::replay::gateway::{GatewayConfig, ReplayGateway};
 use crate::segment::SyncPolicy;
 
 const JOURNALS: &str = "/groups";
@@ -743,4 +745,197 @@ fn step_from_skips_checkpoints_below_its_start() {
         }
     }
     assert_eq!(seen, ["e3", "c3"]);
+}
+
+/// A handler that records its restores and counts its events, and accepts a
+/// snapshot equal to `accepted`.
+struct Restoring {
+    accepted: &'static [u8],
+    restored: Vec<Vec<u8>>,
+    events: u32,
+}
+
+impl Handler for Restoring {
+    fn on_event(&mut self, _event: &Event<'_>, _effects: &mut dyn Effects) {
+        self.events += 1;
+    }
+
+    fn restore(&mut self, state: &[u8]) -> bool {
+        self.restored.push(state.to_vec());
+        state == self.accepted
+    }
+}
+
+impl Recorded {
+    /// A gateway over a cursor opened at checkpoint `id`, its record and
+    /// snapshot.
+    fn gateway_at(&self, id: u64) -> (ReplayGateway<FaultDisk>, CheckpointRecord, Vec<u8>) {
+        let mut store = self.store();
+        let recovery = self.recovery(&store);
+        let mut snapshot = vec![0u8; 4096];
+        let (cursor, record) = ReplayCursor::open_at_checkpoint(
+            self.journal(),
+            &recovery,
+            &mut store,
+            id,
+            &replay_config(),
+            ROOM,
+            &mut snapshot,
+        )
+        .unwrap();
+        snapshot.truncate(usize::try_from(record.length).unwrap());
+        let gateway = ReplayGateway::new(
+            cursor,
+            &GatewayConfig {
+                publications: &[],
+                subscriptions: &[],
+                conflated: &[],
+                max_claim: 64,
+                max_payload: 256,
+                present_unavailable: false,
+            },
+            None,
+        )
+        .unwrap();
+        (gateway, record, snapshot)
+    }
+}
+
+fn handler() -> Restoring {
+    Restoring {
+        accepted: b"state at 2",
+        restored: Vec::new(),
+        events: 0,
+    }
+}
+
+/// #431: `from_checkpoint` is `open_at_checkpoint` then `restore`: the
+/// handler gets the snapshot once, and the first event it sees is the
+/// one after the checkpoint. A snapshot it refuses stops replay, not
+/// reproducible at the checkpoint.
+#[test]
+fn replay_from_a_checkpoint_restores_then_dispatches_the_next_event() {
+    let recorded = Recorded::new(
+        Capture::Strict,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Records(event(2, EndOutcome::Complete)),
+            Write::Checkpoint(2, b"state at 2"),
+            Write::Records(event(3, EndOutcome::Complete)),
+        ],
+    );
+    let (mut gateway, record, snapshot) = recorded.gateway_at(1);
+    let mut accepting = handler();
+    assert_eq!(gateway.restore(&record, &snapshot, &mut accepting), Ok(()));
+    assert_eq!(accepting.restored, [b"state at 2".to_vec()]);
+    assert_eq!(
+        gateway.dispatch(&mut accepting),
+        Ok(Dispatched::Event { group_seq: 3 })
+    );
+    assert_eq!(accepting.events, 1);
+    let (mut gateway, record, snapshot) = recorded.gateway_at(1);
+    let mut refusing = Restoring {
+        accepted: b"another state",
+        ..handler()
+    };
+    let refused = GatewayError::NotReproducible { group_seq: 2 };
+    assert_eq!(
+        gateway.restore(&record, &snapshot, &mut refusing),
+        Err(refused)
+    );
+    assert_eq!(gateway.dispatch(&mut refusing), Err(refused));
+    assert_eq!(refusing.events, 0);
+}
+
+/// #431: a restore out of order, or of a snapshot that is not its
+/// record's, is refused typed without calling the handler, and stops
+/// replay; on a stopped gateway it returns that stop.
+#[test]
+fn a_restore_out_of_order_or_corrupt_is_refused() {
+    let recorded = Recorded::new(
+        Capture::Strict,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Checkpoint(1, b"state at 1"),
+            Write::Records(event(2, EndOutcome::Complete)),
+            Write::Checkpoint(2, b"state at 2"),
+            Write::Records(event(3, EndOutcome::Complete)),
+        ],
+    );
+    let order = |group_seq| Err(GatewayError::RestoreOrder { group_seq });
+    // After the first dispatch.
+    let (mut gateway, record, snapshot) = recorded.gateway_at(2);
+    let mut seen = handler();
+    assert_eq!(gateway.restore(&record, &snapshot, &mut seen), Ok(()));
+    assert!(gateway.dispatch(&mut seen).is_ok());
+    assert_eq!(gateway.restore(&record, &snapshot, &mut seen), order(2));
+    // A second restore.
+    let (mut gateway, record, snapshot) = recorded.gateway_at(2);
+    assert_eq!(gateway.restore(&record, &snapshot, &mut seen), Ok(()));
+    assert_eq!(gateway.restore(&record, &snapshot, &mut seen), order(2));
+    assert_eq!(
+        gateway.dispatch(&mut seen),
+        Err(GatewayError::RestoreOrder { group_seq: 2 })
+    );
+    // Another checkpoint than the one the cursor was opened at.
+    let (mut gateway, _, _) = recorded.gateway_at(2);
+    let (_, first, first_snapshot) = recorded.gateway_at(1);
+    assert_eq!(
+        gateway.restore(&first, &first_snapshot, &mut seen),
+        order(1)
+    );
+    // A snapshot that is not its record's: another crc32c, then the
+    // same bytes under a record of another length.
+    let corrupt = Err(GatewayError::CheckpointCorrupt { group_seq: 2 });
+    let (mut gateway, record, _) = recorded.gateway_at(2);
+    assert_eq!(gateway.restore(&record, b"state at 3", &mut seen), corrupt);
+    let (mut gateway, record, _) = recorded.gateway_at(2);
+    let longer = CheckpointRecord {
+        length: record.length + 1,
+        ..record
+    };
+    assert_eq!(gateway.restore(&longer, &snapshot, &mut seen), corrupt);
+    // On a stopped gateway, its stop.
+    assert_eq!(gateway.restore(&record, &snapshot, &mut seen), corrupt);
+    // Only the two restores in order reached the handler.
+    assert_eq!(
+        seen.restored,
+        [b"state at 2".to_vec(), b"state at 2".to_vec()]
+    );
+}
+
+/// #431 re-check: a replay opened at a checkpoint never dispatches from
+/// the handler's empty state; without a restore its first dispatch is
+/// refused and stops replay. A restore after replay ended is refused,
+/// that end kept.
+#[test]
+fn a_replay_opened_at_a_checkpoint_dispatches_only_after_its_restore() {
+    let recorded = Recorded::new(
+        Capture::Strict,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Checkpoint(1, b"state at 2"),
+            Write::Records(event(2, EndOutcome::Complete)),
+        ],
+    );
+    let order = Err(GatewayError::RestoreOrder { group_seq: 1 });
+    let (mut gateway, record, snapshot) = recorded.gateway_at(1);
+    let mut seen = handler();
+    assert_eq!(gateway.dispatch(&mut seen), order);
+    assert_eq!(gateway.dispatch(&mut seen), order);
+    assert_eq!(seen.events, 0);
+    let (mut gateway, record_again, _) = recorded.gateway_at(1);
+    assert_eq!(record_again, record);
+    assert_eq!(gateway.restore(&record, &snapshot, &mut seen), Ok(()));
+    assert_eq!(
+        gateway.dispatch(&mut seen),
+        Ok(Dispatched::Event { group_seq: 2 })
+    );
+    let end = gateway.dispatch(&mut seen);
+    assert!(matches!(end, Ok(Dispatched::End)), "{end:?}");
+    assert_eq!(
+        gateway.restore(&record, &snapshot, &mut seen),
+        Err(GatewayError::RestoreOrder { group_seq: 1 })
+    );
+    assert_eq!(gateway.dispatch(&mut seen), end);
 }

@@ -36,6 +36,7 @@ use super::reference::{Frames, Recording, read_message};
 use super::{
     CaptureJournal, ReplayCursor, ReplayError, ReplayEvent, Step, Stop, allocate, compare_state,
 };
+use crate::crc32c::crc32c;
 use crate::disk::Disk;
 use crate::group::gateway::{
     ConflatedId, Dispatched, Event, GatewayError, GroupGateway, Handler, SubscriptionId, TimerId,
@@ -103,6 +104,8 @@ pub struct ReplayGateway<D: Disk> {
     observations: u32,
     /// Where replay stopped, returned again by every later dispatch.
     stopped: Option<Result<Dispatched, GatewayError>>,
+    /// A restore may still come: no dispatch and no restore yet.
+    restorable: bool,
 }
 
 impl<D: Disk> ReplayGateway<D> {
@@ -147,12 +150,14 @@ impl<D: Disk> ReplayGateway<D> {
             state: Vec::new(),
             observations: 0,
             stopped: None,
+            restorable: true,
         })
     }
 
     /// Compares the handler's state at each recorded checkpoint (A9-2):
     /// it writes it into a buffer of `max_state` bytes, allocated here.
-    /// Without one, a recorded checkpoint finds no state and diverges.
+    /// A recorded snapshot larger than the buffer (empty without this
+    /// call) stops the replay with [`GatewayError::StateBuffer`].
     ///
     /// # Errors
     ///
@@ -208,6 +213,56 @@ impl<D: Disk> ReplayGateway<D> {
             return Err(GatewayError::Ended);
         }
         Ok(())
+    }
+
+    /// Hands checkpoint `record`'s snapshot to the handler's `restore`,
+    /// once, before the first dispatch of a replay from it (A9-2,
+    /// `recording-group-checkpoints.md` section 6, whose
+    /// `from_checkpoint` is [`ReplayCursor::open_at_checkpoint`] then
+    /// this): `record` is the checkpoint the cursor was opened at, and
+    /// `snapshot` its bytes.
+    ///
+    /// # Errors
+    ///
+    /// Without calling the handler: the stop of a gateway already
+    /// stopped by an error; [`GatewayError::RestoreOrder`] after a
+    /// dispatch (the stop of one stopped at its end is kept), for a
+    /// second restore, or for a checkpoint the cursor was not opened at;
+    /// [`GatewayError::CheckpointCorrupt`] for a snapshot whose length or
+    /// crc32c differs from `record`. [`GatewayError::NotReproducible`] at
+    /// the checkpoint's `group_seq` when the handler refuses the bytes.
+    /// Replay stops at each, and each later dispatch returns the same.
+    /// A replay opened at a checkpoint restores before its first
+    /// dispatch: one without it returns [`GatewayError::RestoreOrder`]
+    /// and stops.
+    pub fn restore(
+        &mut self,
+        record: &CheckpointRecord,
+        snapshot: &[u8],
+        handler: &mut dyn Handler,
+    ) -> Result<(), GatewayError> {
+        let group_seq = record.group_seq;
+        match self.stopped {
+            Some(Err(stopped)) => return Err(stopped),
+            // Stopped at its end: refused, the stop kept.
+            Some(Ok(_)) => return Err(GatewayError::RestoreOrder { group_seq }),
+            None => {}
+        }
+        let refused = if !std::mem::replace(&mut self.restorable, false)
+            || self.cursor.opened_at() != Some(group_seq)
+        {
+            GatewayError::RestoreOrder { group_seq }
+        } else if u64::try_from(snapshot.len()).ok() != Some(record.length)
+            || crc32c(snapshot) != record.crc32c
+        {
+            GatewayError::CheckpointCorrupt { group_seq }
+        } else if handler.restore(snapshot) {
+            return Ok(());
+        } else {
+            GatewayError::NotReproducible { group_seq }
+        };
+        self.stopped = Some(Err(refused));
+        Err(refused)
     }
 
     /// Writes what the handler does to `capture` (section 9): a journal
@@ -296,6 +351,13 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
     fn dispatch(&mut self, handler: &mut dyn Handler) -> Result<Dispatched, GatewayError> {
         if let Some(stopped) = self.stopped {
             return stopped;
+        }
+        // Opened at a checkpoint, replay starts from its restored state:
+        // never from the handler's empty one.
+        if std::mem::replace(&mut self.restorable, false)
+            && let Some(group_seq) = self.cursor.opened_at()
+        {
+            return self.stop(Err(GatewayError::RestoreOrder { group_seq }));
         }
         let event = match self.cursor.step() {
             Ok(Step::Event(event)) => event,

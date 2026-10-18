@@ -31,7 +31,9 @@
 //!   A2 for its recovery plan ([`SegmentStore::verify`], read-only) and
 //!   walks the frames the plan keeps, before anything is cut. A log that
 //!   would end below the watermark is [`LogError::Corruption`]; anything
-//!   lost above it is a crash's loss, reported in [`Opened::cut`]. The
+//!   lost above it is a crash's loss, accepted. [`Opened::cut`] reports
+//!   the cuts recovery makes, not writes whose index entries never
+//!   reached the disk. The
 //!   last write may hold the first chunks of a frame whose later chunks
 //!   were lost with the next segment: that torn tail is cut, unless it is
 //!   committed or below the watermark. Any other frame that is not the
@@ -143,13 +145,12 @@ impl Entry {
         Ok(frame)
     }
 
-    /// Its encoded size: header and payload.
+    /// Its encoded size: header and payload; `None` past `u64::MAX`.
     #[must_use]
-    pub fn encoded_len(&self) -> u64 {
+    pub fn encoded_len(&self) -> Option<u64> {
         u64::try_from(self.payload.len())
-            .ok()
-            .and_then(|length| length.checked_add(FRAME_HEADER_LEN))
-            .unwrap_or(u64::MAX)
+            .ok()?
+            .checked_add(FRAME_HEADER_LEN)
     }
 }
 
@@ -288,10 +289,10 @@ pub enum LogError {
     #[error("a write or a sync failed: reopen the log")]
     Poisoned,
     /// The segment store's error.
-    #[error("segment store: {0}")]
+    #[error(transparent)]
     Store(#[from] SegmentError),
     /// The disk's error.
-    #[error("disk: {0}")]
+    #[error(transparent)]
     Io(#[from] io::Error),
 }
 
@@ -393,7 +394,8 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// # Errors
     ///
     /// [`LogError::Exists`] when a log, or what is left of one, is in
-    /// `dir` (its store, first-index or hard-state file), changing
+    /// `dir` (its store, first-index or hard-state file, or a watermark
+    /// other than the unset one a creation cut short leaves), changing
     /// nothing: a lost store is [`RaftLog::open`]'s to refuse, never to be
     /// created over. The disk's errors.
     pub fn create(
@@ -408,6 +410,18 @@ impl<D: Disk + Clone> RaftLog<D> {
             name.starts_with(&prefix) || name == FIRST_INDEX_FILE || name == HARD_STATE_FILE
         }) {
             return Err(LogError::Exists);
+        }
+        // A creation cut short leaves its mark unset, at sequence 1; any
+        // other valid mark is a log's evidence, never reset.
+        if names.iter().any(|name| name == MARK_FILE) {
+            let left = match file::read(&mut disk, dir, MARK_FILE, MARK_LEN)? {
+                Read::Bytes(bytes) => mark::newest(&bytes).map(|(_, slot)| slot),
+                Read::Missing => None,
+                Read::TooLong(_) => return Err(LogError::Exists),
+            };
+            if left.is_some_and(|slot| slot != CREATED.1) {
+                return Err(LogError::Exists);
+            }
         }
         let mark_file = mark::create(&mut disk, dir)?;
         file::replace(&mut disk, dir, FIRST_INDEX_FILE, &encode_first(first_index))?;

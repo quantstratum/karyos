@@ -259,3 +259,45 @@ fn the_budget_crashes_the_disk() {
     let mut restarted = disk.after_crash(Survives::Everything).unwrap();
     assert_eq!(contents(&mut restarted, "a").unwrap(), b"x");
 }
+
+/// Torn's seed decides too: two seeds tear the same writes differently.
+#[test]
+fn different_seeds_tear_differently() {
+    let mut disk = SimDisk::new().with_sector(16);
+    let file = disk.create(&path("a")).unwrap();
+    disk.sync_dir(Path::new(DIR)).unwrap();
+    for block in 0..8u64 {
+        disk.write_at(&file, block * 128, &[1; 128]).unwrap();
+    }
+    let first = disk
+        .after_crash(Survives::Torn { seed: 0 })
+        .unwrap()
+        .trace();
+    let differs =
+        (1..8).any(|seed| disk.after_crash(Survives::Torn { seed }).unwrap().trace() != first);
+    assert!(differs, "every seed tore alike");
+}
+
+/// A write within one sector is atomic under Torn: whole or dropped,
+/// never in part, whatever the seed.
+#[test]
+fn a_write_within_one_sector_is_never_torn_in_part() {
+    let mut disk = SimDisk::new();
+    let file = disk.create(&path("a")).unwrap();
+    disk.sync_dir(Path::new(DIR)).unwrap();
+    disk.write_at(&file, 100, &[9u8; 300]).unwrap();
+    let (mut whole, mut dropped) = (0, 0);
+    for seed in 0..64 {
+        let mut torn = disk.after_crash(Survives::Torn { seed }).unwrap();
+        let bytes = contents(&mut torn, "a").unwrap_or_default();
+        let kept = bytes
+            .get(100..)
+            .map_or(0, |tail| tail.iter().take_while(|byte| **byte == 9).count());
+        match kept {
+            300 => whole += 1,
+            0 => dropped += 1,
+            kept => panic!("seed {seed}: {kept} of 300 bytes kept"),
+        }
+    }
+    assert!(whole > 0 && dropped > 0, "{whole} whole, {dropped} dropped");
+}
