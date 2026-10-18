@@ -462,3 +462,36 @@ fn the_observation_budget_holds_per_event() {
         assert_eq!(gated, usize::from(mode == Capture::Strict), "{mode:?}");
     }
 }
+
+/// The handler's message event carries the payload's bytes, its length
+/// and its extent, as the client delivered them.
+#[test]
+fn a_message_event_carries_its_length_and_extent() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    append(&mut rig, b"hello");
+    append(&mut rig, b"next");
+    let mut seen = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+        if let Event::Message {
+            position,
+            extent,
+            length,
+            payload,
+            ..
+        } = *event
+        {
+            seen.push((
+                position,
+                extent,
+                length,
+                payload == MessagePayload::Bytes(b"hello"),
+            ));
+        }
+    };
+    rig.gateway.dispatch(&mut handler).unwrap();
+    rig.gateway.dispatch(&mut handler).unwrap();
+    assert_eq!(seen.len(), 2);
+    let (position, extent, length, bytes) = seen[0];
+    assert_eq!((length, bytes), (5, true));
+    assert_eq!(position + u64::from(extent), seen[1].0);
+}

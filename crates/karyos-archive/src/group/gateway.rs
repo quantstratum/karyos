@@ -49,6 +49,11 @@ pub enum Event<'a> {
         lane: Lane,
         /// Its position.
         position: u64,
+        /// The bytes it takes in the stream: the next message starts at
+        /// `position + extent`.
+        extent: u32,
+        /// Its payload's length, also when the payload is unavailable.
+        length: u32,
         /// The frame's reserved value.
         reserved_value: i64,
         /// Whether it ended its stream.
@@ -56,7 +61,7 @@ pub enum Event<'a> {
         /// Its trace extension, if it had one.
         extension: Option<&'a [u8; EXTENSION]>,
         /// Its payload.
-        payload: &'a [u8],
+        payload: MessagePayload<'a>,
     },
     /// What a subscription's poll reported instead of a message: an
     /// overrun, a skipped range or an aborted block (section 5).
@@ -103,6 +108,18 @@ pub enum Event<'a> {
         /// The value.
         value: &'a [u8],
     },
+}
+
+/// A message's payload as the handler gets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessagePayload<'a> {
+    /// The payload's bytes.
+    Bytes(&'a [u8]),
+    /// The payload cannot be given: under replay, one not captured
+    /// (payload 3), a reference unavailable, or a recording it cannot
+    /// read. The event's `length`, `position` and `extent` describe it.
+    /// Capture always gives the bytes.
+    Unavailable,
 }
 
 /// What a scoped [`Effects::claim`] did: the claim's outcome, and the

@@ -33,7 +33,9 @@ use super::{Gateway, Port};
 #[cfg(test)]
 mod tests;
 use crate::group::capture::Refusal;
-use crate::group::gateway::{Dispatched, Event, GatewayError, Handler, SubscriptionId, TimerId};
+use crate::group::gateway::{
+    Dispatched, Event, GatewayError, Handler, MessagePayload, SubscriptionId, TimerId,
+};
 use crate::group::record::Capture;
 use crate::group::record::{
     EXTENSION, EndReason, FallbackReason, GroupRecord, LifecycleEvent, LifecycleKind, Loss,
@@ -461,10 +463,13 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         handler: &mut dyn Handler,
     ) -> Result<Dispatched, GatewayError> {
         let length = bytes.len();
+        // A client message's length is a u32; one past it cannot be
+        // recorded, and is declined.
+        let length32 =
+            u32::try_from(length).map_err(|_| GatewayError::Refused(Refusal::TooLarge))?;
         let threshold = usize::try_from(self.inline_threshold).unwrap_or(usize::MAX);
         let strict = self.capture == Capture::Strict;
         let placed = |group_seq: u64, out: &mut [u8]| {
-            let length32 = u32::try_from(length).map_err(|_| Refusal::TooLarge)?;
             let payload = match word.read() {
                 // A recording that started after the message does not
                 // hold it.
@@ -501,10 +506,12 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             source,
             lane: identity.lane,
             position: info.position,
+            extent: info.extent,
+            length: length32,
             reserved_value: info.reserved_value,
             end_of_stream: info.end_of_stream,
             extension: info.extension.as_ref(),
-            payload: bytes,
+            payload: MessagePayload::Bytes(bytes),
         };
         self.dispatch_event(&event, now, &placed, handler)
     }
