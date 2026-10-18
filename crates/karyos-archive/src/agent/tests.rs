@@ -1759,8 +1759,9 @@ mod groups {
         let begun = std::time::Instant::now();
         let result = agent.stop_group(GROUP);
         let took = begun.elapsed();
-        halt.store(true, Ordering::Release);
+        // The closed group refuses the sender, which then stops on its own.
         let state = producer.join().unwrap();
+        halt.store(true, Ordering::Release);
         watchdog.join().unwrap();
         result.unwrap();
         assert!(!fired.load(Ordering::Acquire), "took {took:?}");

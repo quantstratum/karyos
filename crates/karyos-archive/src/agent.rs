@@ -345,6 +345,10 @@ pub enum Failure {
 /// The agent's errors.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
+    /// The agent's count of failed recordings, or of recordings it holds,
+    /// would pass its range: the start is refused.
+    #[error("the agent's recording counts are exhausted")]
+    Exhausted,
     /// The catalog failed.
     #[error(transparent)]
     Catalog(#[from] CatalogError),
@@ -1133,6 +1137,13 @@ struct Failed {
     seq: u64,
 }
 
+/// The failure count after one more failure. The start checked that it
+/// stays in range; were it not to, the count stays, so entries are kept
+/// longer, never dropped early.
+fn next_failure(failures: u64) -> u64 {
+    failures.checked_add(1).unwrap_or(failures)
+}
+
 /// A recording group the agent captures.
 #[derive(Debug)]
 struct ActiveGroup<D: Disk> {
@@ -1183,7 +1194,10 @@ impl<D: Disk> Coverage for Recorded<'_, D> {
     }
 
     fn ended(&self, recording_id: u64) -> Option<u64> {
-        let recording = self.catalog.get(recording_id)?;
+        // A recording the catalog does not know vouches for nothing.
+        let Some(recording) = self.catalog.get(recording_id) else {
+            return Some(0);
+        };
         if let Some(end) = recording
             .stop
             .map(|stop| stop.position)
@@ -1217,7 +1231,9 @@ fn fail_recording<D: Disk>(
     id: u64,
     durable: u64,
 ) {
-    *failures = failures.wrapping_add(1);
+    // A start is refused unless every recording it holds can fail with
+    // the count in range ([`next_failure`]), so this always advances.
+    *failures = next_failure(*failures);
     failed.push(Failed {
         id,
         durable,
@@ -1556,12 +1572,25 @@ impl<D: Disk + Clone> State<D> {
         // still name it, which bounds the failed list by the cap. Its entry
         // is kept until a start needs the slot, so a late reference still
         // finds its durable end when nothing pressed for room.
-        if self.active.len().saturating_add(self.failed.len()) >= self.config.max_recordings {
+        let held = |state: &Self| {
+            state
+                .active
+                .len()
+                .checked_add(state.failed.len())
+                .ok_or(AgentError::Exhausted)
+        };
+        if held(self)? >= self.config.max_recordings {
             self.reclaim_failed();
         }
-        if self.active.len().saturating_add(self.failed.len()) >= self.config.max_recordings {
+        if held(self)? >= self.config.max_recordings {
             return Err(outbox.refused("recordings", self.config.max_recordings));
         }
+        // Every recording held, this one among them, can still fail with
+        // the failure count in range.
+        u64::try_from(self.config.max_recordings)
+            .ok()
+            .and_then(|max| self.failures.checked_add(max))
+            .ok_or(AgentError::Exhausted)?;
         let position = start.source.position();
         let id = self.catalog.start(NewRecording {
             stream_id: start.stream_id,
@@ -1608,7 +1637,7 @@ impl<D: Disk + Clone> State<D> {
                     .is_err()
                 {
                     // Nothing was recorded, and no group refers to it yet.
-                    self.failures = self.failures.wrapping_add(1);
+                    self.failures = next_failure(self.failures);
                     self.failed.push(Failed {
                         id,
                         durable: position,

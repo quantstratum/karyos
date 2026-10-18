@@ -602,7 +602,9 @@ impl<D: Disk> CaptureJob<D> {
         let mut read = false;
         for _ in 0..budget {
             let Some(message) = self.consumer.read().map_err(|_| JobError::Ring)? else {
-                self.emptied = self.emptied.wrapping_add(1);
+                // Past `u64` the count stays: a failed entry is then kept
+                // longer, never dropped early.
+                self.emptied = self.emptied.checked_add(1).unwrap_or(self.emptied);
                 break;
             };
             read = true;
