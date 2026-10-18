@@ -2377,6 +2377,22 @@ mod checkpoints {
         }
     }
 
+    /// Every path under `dir`, files and directories, relative to it.
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(at) = stack.pop() {
+            for entry in std::fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                out.push(path.strip_prefix(dir).unwrap().to_path_buf());
+                if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        out
+    }
+
     /// #426 re-check P2: a reopen hold too large to allocate is refused,
     /// typed, before the journal exists; the agent keeps running and
     /// starts the group with a hold it can take.
@@ -2385,6 +2401,14 @@ mod checkpoints {
         let dir = dirs("checkpoint-hold-oversized");
         let policy = SyncPolicy::Every { interval_ns: 0 };
         let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        // The host made `groups/` and its stores' directory (`dirs`); a
+        // refused start leaves the tree as it was.
+        let tree = |dir: &Path| {
+            let mut names: Vec<_> = walk(dir);
+            names.sort();
+            names
+        };
+        let before = tree(&dir);
         for hold in [usize::MAX, MAX_REOPEN_HOLD + 1] {
             let start = StartGroup {
                 checkpoints: Some(GroupCheckpoints {
@@ -2398,12 +2422,7 @@ mod checkpoints {
                 "{hold}"
             );
         }
-        // No journal was made: the directory holds the stores' only.
-        let made: Vec<_> = std::fs::read_dir(dir.join("groups"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(made.len(), 1, "{made:?}");
+        assert_eq!(tree(&dir), before, "a refused start made something");
         let start = StartGroup {
             checkpoints: Some(GroupCheckpoints {
                 max_checkpoint: 64,
