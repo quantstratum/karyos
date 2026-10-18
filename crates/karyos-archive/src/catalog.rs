@@ -65,7 +65,9 @@ const MAGIC: u32 = u32::from_le_bytes(*b"KYCT");
 /// The catalog format version.
 /// Version 2: `Stopped` carries the `incomplete` flag and the reasons of
 /// A4. Version 3: `Started` carries the recorded stream's format (A5),
-/// which a replay needs (nothing of versions 1 or 2 was released).
+/// which a replay needs, then an optional mode byte (A7d-1c: 1
+/// `required`, 2 `async`; absent reads as `async`), under the record's
+/// CRC (nothing of versions 1 or 2 was released).
 const VERSION: u32 = 3;
 /// The header's length: magic, version, reserved, CRC.
 const HEADER: usize = 16;

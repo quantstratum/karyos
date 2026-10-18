@@ -191,26 +191,8 @@ pub fn capture<D: Disk>(
     mut journal: GroupJournal<D>,
     coverage: &impl Coverage,
 ) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
-    let ring_error = CaptureSetup::Config(CaptureError::Ring {
-        max_event: config.max_event,
-    });
-    let (Ok(ring), Some(max_extent)) = (
-        u64::try_from(config.ring_capacity),
-        extent(config.max_event),
-    ) else {
-        return Err(ring_error);
-    };
-    if !config.ring_capacity.is_power_of_two() || max_extent > ring / 8 {
-        return Err(ring_error);
-    }
-    let in_flight = match u64::try_from(config.in_flight) {
-        Ok(0) | Err(_) => return Err(CaptureSetup::Config(CaptureError::InFlight)),
-        Ok(in_flight) => in_flight,
-    };
     let policy = journal.policy();
-    if policy == SyncPolicy::None {
-        return Err(CaptureSetup::Config(CaptureError::NoSync));
-    }
+    let (ring, max_extent, in_flight) = check(config, policy).map_err(CaptureSetup::Config)?;
     let (producer, consumer) = command_ring(config.ring_capacity).map_err(|_| {
         CaptureSetup::Config(CaptureError::Ring {
             max_event: config.max_event,
@@ -265,6 +247,42 @@ pub fn capture<D: Disk>(
         stop_notified: false,
     };
     Ok((sender, job))
+}
+
+/// Checks `config` and the journal's sync `policy` as [`capture`] does,
+/// before a journal exists: a caller that creates the journal checks
+/// first, so a refused start leaves nothing behind.
+///
+/// # Errors
+///
+/// [`CaptureError`] for settings that cannot work.
+pub fn validate(config: CaptureConfig, policy: SyncPolicy) -> Result<(), CaptureError> {
+    check(config, policy).map(|_| ())
+}
+
+/// The ring's capacity, the largest event's extent and the in-flight
+/// bound, once `config` and `policy` can work.
+fn check(config: CaptureConfig, policy: SyncPolicy) -> Result<(u64, u64, u64), CaptureError> {
+    let ring_error = CaptureError::Ring {
+        max_event: config.max_event,
+    };
+    let (Ok(ring), Some(max_extent)) = (
+        u64::try_from(config.ring_capacity),
+        extent(config.max_event),
+    ) else {
+        return Err(ring_error);
+    };
+    if !config.ring_capacity.is_power_of_two() || max_extent > ring / 8 {
+        return Err(ring_error);
+    }
+    let in_flight = match u64::try_from(config.in_flight) {
+        Ok(0) | Err(_) => return Err(CaptureError::InFlight),
+        Ok(in_flight) => in_flight,
+    };
+    if policy == SyncPolicy::None {
+        return Err(CaptureError::NoSync);
+    }
+    Ok((ring, max_extent, in_flight))
 }
 
 /// Why [`capture`] could not make a group's capture path.

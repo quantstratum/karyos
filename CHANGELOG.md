@@ -333,11 +333,13 @@ release may break APIs, wire formats and shared-memory layouts.
   `ArchiveHandle::start_group` makes a group's journal (or recovers it)
   in the host's group directory and returns its `CaptureSender`; the
   agent serves the group's job after the recorders, and `stop_group`
-  closes it. A group's references are covered by the agent's recordings:
+  drains its ring into the journal and closes it. Settings that cannot
+  work are refused before the journal is made, and a start past
+  `max_groups` is counted in `refused()`. A group's references are covered by the agent's recordings:
   an active `required` recorder's written and durable positions, and a
   stopped `required` recording's end, also after a restart. A recording
   that fails, with no stop in the catalog, has its references settled by
-  what was durable before. The catalog records each recording's mode in
+  its frames durable at the failure, also those drained after it. The catalog records each recording's mode in
   its `Started` record (an optional last byte under version 3, covered by
   the CRC; an entry without it reads back as `async`), and
   `Recording::required` reports it. `AgentConfig` gains `max_groups` and
