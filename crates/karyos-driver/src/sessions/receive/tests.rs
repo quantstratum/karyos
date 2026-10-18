@@ -1462,3 +1462,53 @@ fn two_live_challenges_answered_out_of_order_both_install() {
     assert_eq!(sessions.counters().installed, 2);
     assert_eq!(sessions.counters().challenges, 2, "no new challenge");
 }
+
+/// Guarded reopen step (2), decision B: a publication's next incarnation
+/// keeps its alias, so its SETUP arrives on the key the old incarnation's
+/// image is bound to. While that image is bound, it is refused; once the
+/// image retires, it is accepted on the same key and installs; the retired
+/// old identity stays rejected for `alias_quarantine`, on that key too.
+#[test]
+fn a_next_incarnation_binds_its_key_once_the_old_image_retired() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let nonce = challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces))
+        .challenge
+        .nonce;
+    let pending = accepted(sessions.answer(key(1), &answer(1, nonce), MS, || true));
+    let ReadyOutcome::Installed(old) = sessions.image_ready(pending, 2 * MS) else {
+        panic!("not installed");
+    };
+    // Incarnation 2 while incarnation 1's image is bound: refused.
+    assert_eq!(
+        sessions.announce(key(1), &announce(2), 3 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::BoundOtherIdentity)
+    );
+    // The old image retires (its liveness ran out).
+    assert!(sessions.retire(old, SECOND));
+    assert_eq!(sessions.lookup(&key(1)), None);
+    // Incarnation 1 stays rejected for the quarantine, on its own key.
+    assert_eq!(
+        sessions.announce(key(1), &announce(1), 2 * SECOND, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::Quarantined)
+    );
+    // Incarnation 2 is accepted on the same key and installs.
+    let nonce = challenged(sessions.announce(key(1), &announce(2), 2 * SECOND, &mut nonces))
+        .challenge
+        .nonce;
+    let pending = accepted(sessions.answer(key(1), &answer(2, nonce), 2 * SECOND + MS, || true));
+    let ReadyOutcome::Installed(new) = sessions.image_ready(pending, 2 * SECOND + 2 * MS) else {
+        panic!("not installed");
+    };
+    assert_eq!(sessions.lookup(&key(1)), Some(new));
+    // And its own repeats are ignored as the bound identity.
+    assert_eq!(
+        sessions.announce(key(1), &announce(2), 3 * SECOND, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::BoundSameIdentity)
+    );
+    // Before the quarantine passes, incarnation 1 is still refused.
+    assert_eq!(
+        sessions.announce(key(2), &announce(1), 10 * SECOND, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::Quarantined)
+    );
+}

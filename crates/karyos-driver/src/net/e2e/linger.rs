@@ -635,3 +635,232 @@ fn a_removed_publication_sends_only_eos_through_its_linger() {
     let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
     assert_eq!(receiver.create_image, 1, "{receiver:?}");
 }
+
+/// A guarded network publication reopened after a guard close takes its
+/// fresh incarnation end to end (guards-and-abort.md, On the network): the
+/// old image ends (no EOS: its guard closed), the next incarnation is
+/// added under the same alias once the quarantine has passed, and its
+/// offers reach a new image on the receiver, exactly once and in order.
+#[test]
+fn a_reopened_guarded_publication_reaches_a_new_image() {
+    use karyos_sys::guard::Closed;
+    use karyos_sys::outcome_ring::Kind;
+
+    use crate::error::DriverError;
+    use crate::net::NetworkGuard;
+    use crate::sessions::receive::SessionConfig;
+
+    const QUARANTINE: u64 = 200 * MS;
+    let reincarnating = || {
+        EmbeddedDriver::with_config(DriverConfig {
+            network: Some(NetworkConfig {
+                threading: ThreadingMode::Shared,
+                agents: AgentConfig {
+                    sessions: SessionConfig {
+                        alias_quarantine: QUARANTINE,
+                        ..SessionConfig::default()
+                    },
+                    // A silent image retires at liveness; an idle one
+                    // waiting for its first offer stays.
+                    idle_image_timeout: 1_000 * MS,
+                    ..super::fast_agents()
+                },
+                ..NetworkConfig::default()
+            }),
+            ..DriverConfig::default()
+        })
+        .unwrap()
+    };
+    let (mut a, mut b) = (reincarnating(), reincarnating());
+    let guard = a.add_guard("reincarnate").unwrap();
+    assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
+    let address = free_address();
+    let _ = b
+        .add_network_subscription(10, &channel(address, true))
+        .unwrap();
+    let mut config = aggregate(10, 3, 1);
+    config.stream.buffer.spare_slots = 4;
+    let publication = a
+        .add_guarded_network_publication(
+            config,
+            &channel(address, true),
+            NetworkGuard {
+                guard,
+                messages: 4,
+                rate: None,
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let old = image.unwrap();
+    let mut reader = b.subscribe_aggregate(&old, Role::Required).unwrap();
+    offer_all(&mut a, &publication, 1, 2);
+    let mut seen = 0;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        seen == 2
+    });
+    let Closed::Now { epoch } = a.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    let lane = publication.lane(Lane::ZERO).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].seal_reason(lane) == Ok(Some(SealReason::GuardClosed))
+    });
+    let _ = a.reopen_guard(guard, epoch, epoch).unwrap();
+    // Refused while the old session is removed and its alias quarantined.
+    let started = Instant::now();
+    let mut refusals = 0u32;
+    let mut handle = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        match drivers[0].publication(lane) {
+            Err(DriverError::GuardSealed { .. }) => false,
+            Err(DriverError::QuarantinedAlias { .. }) => {
+                refusals += 1;
+                false
+            }
+            other => {
+                handle = Some(other.unwrap());
+                true
+            }
+        }
+    });
+    let mut handle = handle.unwrap();
+    assert!(refusals > 0);
+    assert!(started.elapsed() >= Duration::from_nanos(QUARANTINE));
+    assert_eq!(a.trace_identity(lane).unwrap().incarnation, 2);
+    // The old image ends, with no EOS.
+    let (_, ends, counts) = read_to_end(&mut a, &mut b, &mut reader);
+    assert_eq!(counts[0], 0, "nothing more on the old image");
+    assert!(!closed_at_eos(ends[0]), "{ends:?}");
+    assert_eq!(eos_sent(&a), 0);
+    // The old image's streams retire with its last reader, freeing its
+    // key for the new image (interim keying).
+    drop(reader);
+    // A new image of the same key, for the new incarnation.
+    let mut fresh = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        fresh = drivers[1]
+            .network_image(10, 3)
+            .filter(|image| image.registration() != old.registration());
+        fresh.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&fresh.unwrap(), Role::Required)
+        .unwrap();
+    // Sixteen offers on the new incarnation: each is read once and in
+    // order on the new image, and its outcome is Submitted, named by
+    // incarnation 2.
+    let (mut sent, mut seen, mut submitted) = (0u32, 0u32, 0u32);
+    pump(&mut [&mut a, &mut b], |_| {
+        while sent < 16 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match handle.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        let _ = handle
+            .poll_outcomes(16, |_, record| {
+                assert_eq!(record.kind, Kind::Submitted, "{record:?}");
+                assert_eq!(record.incarnation, 2, "{record:?}");
+                submitted += 1;
+            })
+            .unwrap();
+        seen == 16 && submitted == 16
+    });
+}
+
+/// The old incarnation's removal does not linger: its closed guard sends
+/// no EOS, so a receiver still established (its image not retired yet)
+/// does not hold the reincarnation for `publication_linger`.
+#[test]
+fn a_reincarnation_does_not_wait_for_the_linger() {
+    use karyos_sys::guard::Closed;
+
+    use crate::error::DriverError;
+    use crate::net::NetworkGuard;
+    use crate::sessions::receive::SessionConfig;
+
+    let mut a = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            agents: AgentConfig {
+                sessions: SessionConfig {
+                    alias_quarantine: 50 * MS,
+                    ..SessionConfig::default()
+                },
+                ..AgentConfig::default()
+            },
+            stream_defaults: NetworkStreamDefaults {
+                publication_linger: 60_000 * MS,
+                ..NetworkStreamDefaults::default()
+            },
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let mut b = lingering(60_000 * MS);
+    let guard = a.add_guard("no-linger").unwrap();
+    assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
+    let address = free_address();
+    let _ = b
+        .add_network_subscription(10, &channel(address, true))
+        .unwrap();
+    let mut config = aggregate(10, 3, 1);
+    config.stream.buffer.spare_slots = 4;
+    let publication = a
+        .add_guarded_network_publication(
+            config,
+            &channel(address, true),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let _reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    offer_all(&mut a, &publication, 1, 2);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0]
+            .net
+            .as_ref()
+            .and_then(|net| net.sender_counters())
+            .is_some_and(|counters| counters.sm_accepted > 4)
+    });
+    let Closed::Now { epoch } = a.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    let lane = publication.lane(Lane::ZERO).unwrap();
+    let _ = a.reopen_guard(guard, epoch, epoch).unwrap();
+    // Within the pump's few seconds, far below the 60 s linger.
+    pump(&mut [&mut a, &mut b], |drivers| {
+        !matches!(
+            drivers[0].publication(lane),
+            Err(DriverError::GuardSealed { .. } | DriverError::QuarantinedAlias { .. })
+        )
+    });
+    assert_eq!(a.trace_identity(lane).unwrap().incarnation, 2);
+}

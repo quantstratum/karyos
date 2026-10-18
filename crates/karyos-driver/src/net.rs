@@ -229,10 +229,15 @@ pub enum NetworkPublicationState {
     Refused,
     /// Being removed: its data path has not come back yet.
     Removing,
+    /// Between incarnations after a guard reopen
+    /// ([`EmbeddedDriver::publication`](crate::EmbeddedDriver::publication)):
+    /// the old incarnation's session is being removed, or its alias waits
+    /// out the quarantine before the next one is added.
+    Reincarnating,
 }
 
 /// A network publication of this driver.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct NetPublication {
     /// The aggregate's registration.
     registration: u64,
@@ -264,6 +269,61 @@ struct NetPublication {
     /// Its open sender journals to close before `RemovePublication`, in the
     /// same ring (P2.12 step 3): `(lane, journal number)`.
     trace_closes: Vec<(Lane, u64)>,
+    /// What its sender was added with, for the next incarnation; taken
+    /// when a reincarnation starts.
+    channel: Option<SenderChannel>,
+    /// Removed for its next incarnation: no linger, and its removal ends
+    /// in a [`Reincarnation`].
+    reincarnating: bool,
+}
+
+/// What a network publication's sender is added with, kept for the next
+/// incarnation (control path).
+#[derive(Debug, Clone)]
+pub(crate) struct SenderChannel {
+    /// Where it sends.
+    pub(crate) destination: SocketAddr,
+    /// The local address of each path's endpoint, the founding path first.
+    pub(crate) binds: Vec<SocketAddr>,
+    /// Whether it is reliable.
+    pub(crate) reliable: bool,
+    /// Its lanes' quanta.
+    pub(crate) quanta: karyos_protocol::network::Lanes<u64>,
+    /// Its guard.
+    pub(crate) guard: Option<publish::NetworkGuard>,
+    /// Its receivers' roles.
+    pub(crate) roles: Option<Box<crate::membership::PublicationRoles>>,
+}
+
+/// A network publication between incarnations (guards-and-abort.md, On
+/// the network): its old session is removed, then its alias waits out
+/// `alias_quarantine` from that removal before the next incarnation is
+/// added under the same alias. Remote receivers are assumed to quarantine
+/// a retired identity for the same `alias_quarantine` as this driver's.
+#[derive(Debug)]
+struct Reincarnation {
+    registration: u64,
+    /// One extra hold on each path's send endpoint, taken when the
+    /// reincarnation starts, so the endpoints stay open for the next
+    /// incarnation; released once its sender is posted.
+    held: Vec<EndpointId>,
+    /// When the old session's removal ended (`PublicationRemoved`), on the
+    /// network clock.
+    removed: Option<u64>,
+    /// Whether the conductor already swapped in the next incarnation's
+    /// lanes, so a later call only posts its sender.
+    swapped: bool,
+    channel: SenderChannel,
+}
+
+/// Where a reincarnating network publication stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReincarnationPhase {
+    /// Its old alias is quarantined until `until_ns` on the network clock:
+    /// an estimate while the old session is still being removed.
+    Waiting { until_ns: u64 },
+    /// The next incarnation can be added; `swapped` once its lanes are.
+    Ready { swapped: bool },
 }
 
 /// An endpoint shared by the publications and subscriptions bound to one
@@ -484,6 +544,12 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     capacity: usize,
     /// `publication_linger` (ns), handed to the sender at each removal.
     publication_linger: u64,
+    /// The receiver's `alias_quarantine` (ns): how long a reincarnating
+    /// publication's alias waits after its old session's removal.
+    alias_quarantine: u64,
+    /// Publications between incarnations, at most one per tracked
+    /// publication (allocated at start).
+    reincarnations: Vec<Reincarnation>,
     /// Stale aliases that found the queue full: never, by construction;
     /// counted if it happens.
     stale_overflows: u64,
@@ -571,6 +637,8 @@ impl<T: StreamTerms> Network<T> {
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
             publication_linger: config.stream_defaults.publication_linger,
+            alias_quarantine: config.agents.sessions.alias_quarantine,
+            reincarnations: Vec::with_capacity(config.agents.publications),
             stale_overflows: 0,
             clock: karyos_sys::host_clock::host_monotonic_ns,
             released_guards: ReleasedGuards {
@@ -1288,6 +1356,7 @@ impl<T: StreamTerms> Network<T> {
             crate::guard_ack::GuardSenderId,
         )>,
         roles: Option<Box<crate::membership::PublicationRoles>>,
+        channel: SenderChannel,
     ) -> Result<(), DriverError> {
         let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
         let frontier = spec
@@ -1403,6 +1472,8 @@ impl<T: StreamTerms> Network<T> {
             traced,
             lanes,
             trace_closes: Vec::new(),
+            channel: Some(channel),
+            reincarnating: false,
         });
         Ok(())
     }
@@ -1419,13 +1490,16 @@ impl<T: StreamTerms> Network<T> {
         registration: u64,
         trace_closes: Vec<(Lane, u64)>,
     ) -> bool {
+        // A reincarnation ends with its publication: nothing is added.
+        let reincarnating = self.end_reincarnation(registration);
         let Some(entry) = self
             .publications
             .iter_mut()
             .find(|entry| entry.registration == registration)
         else {
-            return false;
+            return reincarnating;
         };
+        entry.reincarnating = false;
         // Its sender journals close first, in the same ring; a repeated
         // removal adds to the closes still pending, never replaces them.
         entry.trace_closes.extend(trace_closes);
@@ -1449,8 +1523,167 @@ impl<T: StreamTerms> Network<T> {
         true
     }
 
+    /// The network clock's reading.
+    pub(crate) fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    /// Starts the reincarnation of the network publication `registration`
+    /// after a guard reopen (control path): one extra hold on each of its
+    /// send endpoints, then its old session's removal, with no linger.
+    /// Returns the estimated end of its alias's quarantine.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NetworkAgent`] once an agent failed,
+    /// [`DriverError::NetworkUnavailable`] once the network closed, and
+    /// [`DriverError::UnknownStream`] for a publication not tracked or not
+    /// added (refused or being removed). Nothing changes on error.
+    pub(crate) fn start_reincarnation(&mut self, registration: u64) -> Result<u64, DriverError> {
+        if let Some(agent) = self.failed {
+            return Err(DriverError::NetworkAgent { agent });
+        }
+        if matches!(self.agents, Agents::Closed) {
+            return Err(DriverError::NetworkUnavailable);
+        }
+        let unknown = DriverError::UnknownStream {
+            stream: registration,
+        };
+        let entry = self
+            .publications
+            .iter_mut()
+            .find(|entry| entry.registration == registration)
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    NetworkPublicationState::Adding | NetworkPublicationState::Active
+                ) && entry.channel.is_some()
+            })
+            .ok_or(unknown)?;
+        let mut held = Vec::with_capacity(entry.paths().count());
+        for path in entry.paths() {
+            let Some(endpoint) = self
+                .send_endpoints
+                .iter_mut()
+                .find(|endpoint| endpoint.endpoint == path)
+            else {
+                continue;
+            };
+            let Some(users) = endpoint.users.checked_add(1) else {
+                for path in held {
+                    release(&mut self.send_endpoints, path);
+                }
+                return Err(DriverError::NetworkEndpoint);
+            };
+            endpoint.users = users;
+            held.push(path);
+        }
+        let channel = entry.channel.take().ok_or(unknown)?;
+        entry.state = NetworkPublicationState::Removing;
+        entry.reincarnating = true;
+        self.reincarnations.push(Reincarnation {
+            registration,
+            held,
+            removed: None,
+            swapped: false,
+            channel,
+        });
+        let mut stale = Stale {
+            queue: &mut self.stale_aliases,
+            overflows: &mut self.stale_overflows,
+        };
+        post_removals(
+            &self.links,
+            &mut self.publications,
+            &mut stale,
+            self.publication_linger,
+        );
+        self.now()
+            .checked_add(self.alias_quarantine)
+            .ok_or(DriverError::InvalidConfig)
+    }
+
+    /// Where the reincarnation of `registration` stands; `None` when it is
+    /// not reincarnating.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidConfig`] when the quarantine's end is past
+    /// the clock's range.
+    pub(crate) fn reincarnation(
+        &self,
+        registration: u64,
+    ) -> Result<Option<ReincarnationPhase>, DriverError> {
+        let Some(entry) = self
+            .reincarnations
+            .iter()
+            .find(|entry| entry.registration == registration)
+        else {
+            return Ok(None);
+        };
+        let now = self.now();
+        let until_ns = entry
+            .removed
+            .unwrap_or(now)
+            .checked_add(self.alias_quarantine)
+            .ok_or(DriverError::InvalidConfig)?;
+        Ok(Some(if entry.removed.is_some() && now >= until_ns {
+            ReincarnationPhase::Ready {
+                swapped: entry.swapped,
+            }
+        } else {
+            ReincarnationPhase::Waiting { until_ns }
+        }))
+    }
+
+    /// Records that the conductor swapped in the next incarnation's lanes
+    /// of `registration`, and returns what its sender is added with.
+    pub(crate) fn reincarnation_swapped(&mut self, registration: u64) -> Option<SenderChannel> {
+        let entry = self
+            .reincarnations
+            .iter_mut()
+            .find(|entry| entry.registration == registration)?;
+        entry.swapped = true;
+        Some(entry.channel.clone())
+    }
+
+    /// Ends the reincarnation of `registration`: its sender was posted, or
+    /// its publication is removed. Releases the extra endpoint holds;
+    /// `false` when it was not reincarnating.
+    pub(crate) fn end_reincarnation(&mut self, registration: u64) -> bool {
+        let Some(index) = self
+            .reincarnations
+            .iter()
+            .position(|entry| entry.registration == registration)
+        else {
+            return false;
+        };
+        let entry = self.reincarnations.swap_remove(index);
+        for path in entry.held {
+            release(&mut self.send_endpoints, path);
+        }
+        true
+    }
+
+    /// Ends every reincarnation: the agents failed or stopped, so no next
+    /// incarnation is added.
+    fn end_reincarnations(&mut self) {
+        for entry in self.reincarnations.drain(..) {
+            for path in entry.held {
+                release(&mut self.send_endpoints, path);
+            }
+        }
+    }
+
     /// The state of the network publication `registration`.
     pub(crate) fn publication_state(&self, registration: u64) -> Option<NetworkPublicationState> {
+        if self
+            .reincarnations
+            .iter()
+            .any(|entry| entry.registration == registration)
+        {
+            return Some(NetworkPublicationState::Reincarnating);
+        }
         self.publications
             .iter()
             .find(|entry| entry.registration == registration)
@@ -1500,6 +1733,7 @@ impl<T: StreamTerms> Network<T> {
                 };
                 self.failed = Some(agent);
                 self.release_guard_senders(gates_stopped);
+                self.end_reincarnations();
                 return Err(DriverError::NetworkAgent { agent });
             }
         };
@@ -1536,11 +1770,12 @@ impl<T: StreamTerms> Network<T> {
         #[cfg(test)]
         let mut reopened = Some(self.reopened);
         let mut refusals = self.subscription_refusals;
-        let (publications, send_endpoints, released, trace_events) = (
+        let (publications, send_endpoints, released, trace_events, reincarnations) = (
             &mut self.publications,
             &mut self.send_endpoints,
             &mut self.released_guards,
             &mut self.trace_events,
+            &mut self.reincarnations,
         );
         let mut stale = Stale {
             queue: &mut self.stale_aliases,
@@ -1597,7 +1832,14 @@ impl<T: StreamTerms> Network<T> {
                         traced: entry.traced,
                     });
                 }
-                publication_answer(publications, send_endpoints, &mut stale, released, event);
+                publication_answer(
+                    publications,
+                    send_endpoints,
+                    &mut stale,
+                    released,
+                    (reincarnations, now),
+                    event,
+                );
                 if let Some(registration) = added
                     && publications.iter().any(|entry| {
                         entry.registration == registration
@@ -1687,6 +1929,7 @@ impl<T: StreamTerms> Network<T> {
             .iter()
             .any(|late| late.kinds().contains(&AgentKind::Sender));
         self.release_guard_senders(!sender_late);
+        self.end_reincarnations();
         shutdown
     }
 
@@ -1934,6 +2177,9 @@ fn post_removals<T: StreamTerms>(
             let _ = entry.trace_closes.pop();
         }
         let (endpoint, alias, registration) = (entry.endpoint, entry.alias, entry.registration);
+        // A reincarnating publication's guard closed its log: no EOS is
+        // due, so it does not linger.
+        let linger = if entry.reincarnating { 0 } else { linger };
         let posted = links.sender.post(|reply| AgentCommand::RemovePublication {
             reply,
             endpoint,
@@ -2051,6 +2297,7 @@ fn publication_answer<T: StreamTerms>(
     send_endpoints: &mut [SendEndpoint],
     stale: &mut Stale<'_>,
     released: &mut ReleasedGuards,
+    (reincarnations, now): (&mut [Reincarnation], u64),
     event: AgentEvent<OsSocket, T>,
 ) {
     // Each tracked publication releases its guard sender once, and the
@@ -2150,6 +2397,15 @@ fn publication_answer<T: StreamTerms>(
                 release_guard(&mut entry);
                 for path in entry.paths() {
                     release(send_endpoints, path);
+                }
+                // The old session's terminal transition: its alias's
+                // quarantine runs from here (network-sessions.md).
+                if entry.reincarnating
+                    && let Some(next) = reincarnations
+                        .iter_mut()
+                        .find(|next| next.registration == registration)
+                {
+                    next.removed = Some(now);
                 }
             }
         }
