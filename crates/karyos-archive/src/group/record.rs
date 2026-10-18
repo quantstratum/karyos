@@ -50,19 +50,21 @@ const fn template(template_id: u16, block_length: u16, max_length: u32) -> Templ
 /// `JournalHeader`, template 1.
 pub const JOURNAL_HEADER: Template = template(1, 24, 12 + 24 + 2 + 4096);
 /// `MessageEvent`, template 2.
-pub const MESSAGE_EVENT: Template = template(2, 58, 12 + 58 + 2 + 65_535);
+pub const MESSAGE_EVENT: Template = template(2, 67, 12 + 67 + 2 + 65_535 + 2 + 64);
 /// `ConflatedEvent`, template 3.
 pub const CONFLATED_EVENT: Template = template(3, 45, 12 + 45 + 2 + 65_535);
 /// `TimerEvent`, template 4.
 pub const TIMER_EVENT: Template = template(4, 24, 12 + 24);
 /// `LifecycleEvent`, template 5.
-pub const LIFECYCLE_EVENT: Template = template(5, 41, 12 + 41);
+pub const LIFECYCLE_EVENT: Template = template(5, 43, 12 + 43);
 /// `ExternalEvent`, template 6.
 pub const EXTERNAL_EVENT: Template = template(6, 20, 12 + 20 + 2 + 65_535);
 /// `OutcomeObservation`, template 11.
-pub const OUTCOME_OBSERVATION: Template = template(11, 31, 12 + 31);
+pub const OUTCOME_OBSERVATION: Template = template(11, 41, 12 + 41);
 /// `TimerObservation`, template 12.
 pub const TIMER_OBSERVATION: Template = template(12, 29, 12 + 29);
+/// `DeliveryObservation`, template 14.
+pub const DELIVERY_OBSERVATION: Template = template(14, 72, 12 + 72);
 /// `ExternalObservation`, template 13.
 pub const EXTERNAL_OBSERVATION: Template = template(13, 16, 12 + 16 + 2 + 65_535);
 /// `EventEnd`, template 20.
@@ -71,7 +73,7 @@ pub const EVENT_END: Template = template(20, 13, 12 + 13);
 pub const GAP_MARKER: Template = template(21, 17, 12 + 17);
 
 /// The longest record of any template.
-pub const MAX_RECORD: usize = 12 + 58 + 2 + 65_535;
+pub const MAX_RECORD: usize = 12 + 67 + 2 + 65_535 + 2 + 64;
 
 fn invalid_enum(field: &'static str, value: impl Into<u64>) -> CodecError {
     CodecError::InvalidEnum {
@@ -231,8 +233,8 @@ pub struct MessageEvent<'a> {
     pub incarnation: u64,
     /// The stream position of the message's first frame.
     pub position: u64,
-    /// The frames' extent from `position`: a nonzero multiple of 32, at
-    /// least the payload's length.
+    /// The frames' extent from `position`: a multiple of 32 that covers
+    /// the payload and at least one frame header.
     pub extent: u32,
     /// The stream.
     pub stream_id: i32,
@@ -240,14 +242,32 @@ pub struct MessageEvent<'a> {
     pub session_id: i32,
     /// The lane.
     pub lane: Lane,
+    /// The reserved value of the message's first fragment, which the
+    /// publisher set.
+    pub reserved_value: i64,
+    /// The message ended its stream.
+    pub end_of_stream: bool,
+    /// The opaque trace extension the message carried, if any: an input,
+    /// which A8's comparison schema may name as excludable.
+    pub extension: Option<&'a [u8; EXTENSION]>,
     /// The payload.
     pub payload: Payload<'a>,
 }
 
-/// The frames' extent: a nonzero multiple of the frame alignment, covering
-/// at least the payload.
+/// A trace extension's length.
+pub const EXTENSION: usize = 64;
+/// The end-of-stream flag of a message event.
+const FLAG_END_OF_STREAM: u8 = 1;
+/// The trace-extension flag of a message event.
+const FLAG_EXTENSION: u8 = 2;
+
+/// The frames' extent: a multiple of the frame alignment that holds the
+/// payload after one frame header, at least.
 fn extent(extent: u32, length: u32) -> Result<u32, CodecError> {
-    if extent == 0 || !extent.is_multiple_of(FRAME_ALIGNMENT) || extent < length {
+    let least = length
+        .checked_add(FRAME_ALIGNMENT)
+        .and_then(|least| least.checked_next_multiple_of(FRAME_ALIGNMENT));
+    if !extent.is_multiple_of(FRAME_ALIGNMENT) || least.is_none_or(|least| extent < least) {
         Err(out_of_range("extent"))
     } else {
         Ok(extent)
@@ -257,10 +277,21 @@ fn extent(extent: u32, length: u32) -> Result<u32, CodecError> {
 impl<'a> MessageEvent<'a> {
     fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
         let recording_id = block.u64(32)?;
-        let length = block.u32(40)?;
+        let length = block.u32(48)?;
+        let flags = block.u8(66)?;
+        if flags & !(FLAG_END_OF_STREAM | FLAG_EXTENSION) != 0 {
+            return Err(out_of_range("flags"));
+        }
         let value = decoder.bytes("value", 0, MAX_INLINE)?;
+        let extension = if flags & FLAG_EXTENSION == 0 {
+            decoder.bytes("extension", 0, 0)?;
+            None
+        } else {
+            let bytes = decoder.bytes("extension", EXTENSION, EXTENSION)?;
+            Some(bytes.try_into().map_err(|_| out_of_range("extension"))?)
+        };
         decoder.finish()?;
-        let payload = match block.u8(57)? {
+        let payload = match block.u8(65)? {
             1 if recording_id != 0 => return Err(out_of_range("recording_id")),
             1 if usize::try_from(length).ok() != Some(value.len()) => {
                 return Err(out_of_range("length"));
@@ -285,10 +316,13 @@ impl<'a> MessageEvent<'a> {
             logical_time: block.u64(8)?,
             incarnation: block.u64(16)?,
             position: block.u64(24)?,
-            extent: extent(block.u32(44)?, length)?,
-            stream_id: block.i32(48)?,
-            session_id: block.i32(52)?,
-            lane: lane(block.u8(56)?)?,
+            extent: extent(block.u32(52)?, length)?,
+            stream_id: block.i32(56)?,
+            session_id: block.i32(60)?,
+            lane: lane(block.u8(64)?)?,
+            reserved_value: block.u64(40)?.cast_signed(),
+            end_of_stream: flags & FLAG_END_OF_STREAM != 0,
+            extension,
             payload,
         })
     }
@@ -319,18 +353,29 @@ impl<'a> MessageEvent<'a> {
                 length,
             } => (id("recording_id", recording_id)?, length, 2, &[][..]),
         };
+        let mut flags = 0;
+        if self.end_of_stream {
+            flags |= FLAG_END_OF_STREAM;
+        }
+        if self.extension.is_some() {
+            flags |= FLAG_EXTENSION;
+        }
         encoder.u64(0, id("group_seq", self.group_seq)?)?;
         encoder.u64(8, self.logical_time)?;
         encoder.u64(16, self.incarnation)?;
         encoder.u64(24, self.position)?;
         encoder.u64(32, recording_id)?;
-        encoder.u32(40, length)?;
-        encoder.u32(44, extent(self.extent, length)?)?;
-        encoder.i32(48, self.stream_id)?;
-        encoder.i32(52, self.session_id)?;
-        encoder.u8(56, self.lane.get())?;
-        encoder.u8(57, kind)?;
+        encoder.u64(40, self.reserved_value.cast_unsigned())?;
+        encoder.u32(48, length)?;
+        encoder.u32(52, extent(self.extent, length)?)?;
+        encoder.i32(56, self.stream_id)?;
+        encoder.i32(60, self.session_id)?;
+        encoder.u8(64, self.lane.get())?;
+        encoder.u8(65, kind)?;
+        encoder.u8(66, flags)?;
         encoder.bytes("value", 0, MAX_INLINE, value)?;
+        let extension = self.extension.map_or(&[][..], |extension| &extension[..]);
+        encoder.bytes("extension", 0, EXTENSION, extension)?;
         encoder.finish()
     }
 }
@@ -451,6 +496,19 @@ impl TimerEvent {
     }
 }
 
+/// Why a subscription ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// Its stream ended (end of stream).
+    EndOfStream,
+    /// It was closed because it was overrun.
+    Overrun,
+    /// It was revoked.
+    Revoked,
+    /// Any other close.
+    Closed,
+}
+
 /// What a lifecycle event announced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleKind {
@@ -459,7 +517,7 @@ pub enum LifecycleKind {
     /// An image went away.
     ImageUnavailable,
     /// A subscription ended.
-    SubscriptionEnded,
+    SubscriptionEnded(EndReason),
 }
 
 /// An image's availability or a subscription's end, delivered to the
@@ -472,12 +530,15 @@ pub struct LifecycleEvent {
     pub logical_time: u64,
     /// The publication incarnation.
     pub incarnation: u64,
-    /// Where the image joined or ended.
+    /// The position on `lane` the event names (where the image joined or
+    /// ended), or 0 when it names none.
     pub position: u64,
     /// The stream.
     pub stream_id: i32,
     /// The session.
     pub session_id: i32,
+    /// The lane `position` is on.
+    pub lane: Lane,
     /// What happened.
     pub kind: LifecycleKind,
 }
@@ -485,11 +546,17 @@ pub struct LifecycleEvent {
 impl LifecycleEvent {
     fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
         decoder.finish()?;
-        let kind = match block.u8(40)? {
-            1 => LifecycleKind::ImageAvailable,
-            2 => LifecycleKind::ImageUnavailable,
-            3 => LifecycleKind::SubscriptionEnded,
-            value => return Err(invalid_enum("kind", value)),
+        let reason = block.u8(42)?;
+        let kind = match (block.u8(40)?, reason) {
+            (1, 0) => LifecycleKind::ImageAvailable,
+            (2, 0) => LifecycleKind::ImageUnavailable,
+            (1 | 2, _) => return Err(out_of_range("reason")),
+            (3, 1) => LifecycleKind::SubscriptionEnded(EndReason::EndOfStream),
+            (3, 2) => LifecycleKind::SubscriptionEnded(EndReason::Overrun),
+            (3, 3) => LifecycleKind::SubscriptionEnded(EndReason::Revoked),
+            (3, 4) => LifecycleKind::SubscriptionEnded(EndReason::Closed),
+            (3, value) => return Err(invalid_enum("reason", value)),
+            (value, _) => return Err(invalid_enum("kind", value)),
         };
         Ok(Self {
             group_seq: id("group_seq", block.u64(0)?)?,
@@ -498,6 +565,7 @@ impl LifecycleEvent {
             position: block.u64(24)?,
             stream_id: block.i32(32)?,
             session_id: block.i32(36)?,
+            lane: lane(block.u8(41)?)?,
             kind,
         })
     }
@@ -509,10 +577,13 @@ impl LifecycleEvent {
     /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let mut encoder = Encoder::new(out, &LIFECYCLE_EVENT)?;
-        let kind = match self.kind {
-            LifecycleKind::ImageAvailable => 1,
-            LifecycleKind::ImageUnavailable => 2,
-            LifecycleKind::SubscriptionEnded => 3,
+        let (kind, reason) = match self.kind {
+            LifecycleKind::ImageAvailable => (1, 0),
+            LifecycleKind::ImageUnavailable => (2, 0),
+            LifecycleKind::SubscriptionEnded(EndReason::EndOfStream) => (3, 1),
+            LifecycleKind::SubscriptionEnded(EndReason::Overrun) => (3, 2),
+            LifecycleKind::SubscriptionEnded(EndReason::Revoked) => (3, 3),
+            LifecycleKind::SubscriptionEnded(EndReason::Closed) => (3, 4),
         };
         encoder.u64(0, id("group_seq", self.group_seq)?)?;
         encoder.u64(8, self.logical_time)?;
@@ -521,6 +592,8 @@ impl LifecycleEvent {
         encoder.i32(32, self.stream_id)?;
         encoder.i32(36, self.session_id)?;
         encoder.u8(40, kind)?;
+        encoder.u8(41, self.lane.get())?;
+        encoder.u8(42, reason)?;
         encoder.finish()
     }
 }
@@ -573,12 +646,19 @@ pub enum Operation {
     Offer,
     /// A claim.
     Claim,
+    /// A claim's commit: accepted, or lost to an abort.
+    Commit,
 }
 
-/// An offer's or a claim's outcome.
+/// The highest `ClientError` code (section 5.1 of the note): codes 1 to
+/// it name the client's errors in a stable order.
+pub const MAX_ERROR_CODE: u16 = 21;
+
+/// An operation's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// An offer accepted, or a claim reserved, at `position` in `lane`.
+    /// An offer accepted, a claim reserved, or a commit accepted, at
+    /// `position` in `lane`.
     Accepted {
         /// The lane.
         lane: Lane,
@@ -597,15 +677,23 @@ pub enum Outcome {
     Gated,
     /// The rate limit held no token.
     RateLimited,
-    /// A claim consumed and aborted at `position` in `lane`.
+    /// A claim consumed and aborted, or a commit that lost to an abort, at
+    /// `position` in `lane`.
     Aborted {
         /// The lane.
         lane: Lane,
         /// The position.
         position: u64,
     },
-    /// The call returned an error.
-    Failed,
+    /// The call returned an error: its `ClientError` code, 1 to
+    /// [`MAX_ERROR_CODE`], and the one field the handler can see in it (a
+    /// message's length for a message too large), else 0.
+    Failed {
+        /// The error's code.
+        error: u16,
+        /// Its detail.
+        detail: u64,
+    },
 }
 
 /// An operation's outcome, as the handler observed it.
@@ -619,48 +707,72 @@ pub struct OutcomeObservation {
     pub stream_id: i32,
     /// The session.
     pub session_id: i32,
-    /// Offer or claim.
+    /// Offer, claim or commit.
     pub operation: Operation,
     /// What it returned.
     pub outcome: Outcome,
 }
 
+/// Whether `operation` can return `outcome`'s code.
+const fn returns(operation: Operation, outcome: u8) -> bool {
+    match operation {
+        Operation::Offer => matches!(outcome, 1..=7 | 9),
+        Operation::Claim => matches!(outcome, 1..=9),
+        Operation::Commit => matches!(outcome, 1 | 8),
+    }
+}
+
 impl OutcomeObservation {
     fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
         decoder.finish()?;
-        let operation = match block.u8(28)? {
+        let operation = match block.u8(38)? {
             1 => Operation::Offer,
             2 => Operation::Claim,
+            3 => Operation::Commit,
             value => return Err(invalid_enum("operation", value)),
         };
-        let (position, lane_byte) = (block.u64(8)?, block.u8(30)?);
-        let positioned = || -> Result<(Lane, u64), CodecError> { Ok((lane(lane_byte)?, position)) };
-        let outcome = match block.u8(29)? {
-            1 => {
-                let (lane, position) = positioned()?;
-                Outcome::Accepted { lane, position }
-            }
-            8 if operation == Operation::Offer => return Err(out_of_range("outcome")),
-            8 => {
-                let (lane, position) = positioned()?;
-                Outcome::Aborted { lane, position }
-            }
-            2..=7 | 9 if position != 0 => return Err(out_of_range("position")),
-            2..=7 | 9 if lane_byte != 0 => return Err(out_of_range("lane")),
+        let (position, detail, error) = (block.u64(8)?, block.u64(16)?, block.u16(36)?);
+        let lane_byte = block.u8(40)?;
+        let code = block.u8(39)?;
+        if !(1..=9).contains(&code) {
+            return Err(invalid_enum("outcome", code));
+        }
+        if !returns(operation, code) {
+            return Err(out_of_range("outcome"));
+        }
+        let positioned = matches!(code, 1 | 8);
+        if !positioned && position != 0 {
+            return Err(out_of_range("position"));
+        }
+        if !positioned && lane_byte != 0 {
+            return Err(out_of_range("lane"));
+        }
+        if code != 9 && (error != 0 || detail != 0) {
+            return Err(out_of_range("error"));
+        }
+        let outcome = match code {
+            1 => Outcome::Accepted {
+                lane: lane(lane_byte)?,
+                position,
+            },
+            8 => Outcome::Aborted {
+                lane: lane(lane_byte)?,
+                position,
+            },
             2 => Outcome::BackPressured,
             3 => Outcome::AdminAction,
             4 => Outcome::NotConnected,
             5 => Outcome::Closed,
             6 => Outcome::Gated,
             7 => Outcome::RateLimited,
-            9 => Outcome::Failed,
-            value => return Err(invalid_enum("outcome", value)),
+            _ if error == 0 || error > MAX_ERROR_CODE => return Err(out_of_range("error")),
+            _ => Outcome::Failed { error, detail },
         };
         Ok(Self {
             group_seq: id("group_seq", block.u64(0)?)?,
-            index: block.u32(16)?,
-            stream_id: block.i32(20)?,
-            session_id: block.i32(24)?,
+            index: block.u32(24)?,
+            stream_id: block.i32(28)?,
+            session_id: block.i32(32)?,
             operation,
             outcome,
         })
@@ -671,35 +783,132 @@ impl OutcomeObservation {
     /// # Errors
     ///
     /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// an aborted offer.
+    /// an outcome its operation cannot return or an error code outside 1
+    /// to [`MAX_ERROR_CODE`].
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let mut encoder = Encoder::new(out, &OUTCOME_OBSERVATION)?;
-        let (outcome, lane, position) = match self.outcome {
-            Outcome::Accepted { lane, position } => (1, lane.get(), position),
-            Outcome::BackPressured => (2, 0, 0),
-            Outcome::AdminAction => (3, 0, 0),
-            Outcome::NotConnected => (4, 0, 0),
-            Outcome::Closed => (5, 0, 0),
-            Outcome::Gated => (6, 0, 0),
-            Outcome::RateLimited => (7, 0, 0),
-            Outcome::Aborted { .. } if self.operation == Operation::Offer => {
-                return Err(out_of_range("outcome"));
+        let (outcome, lane, position, error, detail) = match self.outcome {
+            Outcome::Accepted { lane, position } => (1, lane.get(), position, 0, 0),
+            Outcome::BackPressured => (2, 0, 0, 0, 0),
+            Outcome::AdminAction => (3, 0, 0, 0, 0),
+            Outcome::NotConnected => (4, 0, 0, 0, 0),
+            Outcome::Closed => (5, 0, 0, 0, 0),
+            Outcome::Gated => (6, 0, 0, 0, 0),
+            Outcome::RateLimited => (7, 0, 0, 0, 0),
+            Outcome::Aborted { lane, position } => (8, lane.get(), position, 0, 0),
+            Outcome::Failed { error, .. } if error == 0 || error > MAX_ERROR_CODE => {
+                return Err(out_of_range("error"));
             }
-            Outcome::Aborted { lane, position } => (8, lane.get(), position),
-            Outcome::Failed => (9, 0, 0),
+            Outcome::Failed { error, detail } => (9, 0, 0, error, detail),
         };
+        if !returns(self.operation, outcome) {
+            return Err(out_of_range("outcome"));
+        }
         let operation = match self.operation {
             Operation::Offer => 1,
             Operation::Claim => 2,
+            Operation::Commit => 3,
         };
         encoder.u64(0, id("group_seq", self.group_seq)?)?;
         encoder.u64(8, position)?;
-        encoder.u32(16, self.index)?;
-        encoder.i32(20, self.stream_id)?;
-        encoder.i32(24, self.session_id)?;
-        encoder.u8(28, operation)?;
-        encoder.u8(29, outcome)?;
-        encoder.u8(30, lane)?;
+        encoder.u64(16, detail)?;
+        encoder.u32(24, self.index)?;
+        encoder.i32(28, self.stream_id)?;
+        encoder.i32(32, self.session_id)?;
+        encoder.u16(36, error)?;
+        encoder.u8(38, operation)?;
+        encoder.u8(39, outcome)?;
+        encoder.u8(40, lane)?;
+        encoder.finish()
+    }
+}
+
+/// A guarded publication's delivery outcome, as the outcome ring
+/// presented it to the handler (SPEC §8.3, asynchronous delivery
+/// outcomes): its kind is the ring's code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryObservation {
+    /// The event's sequence in its group, never 0.
+    pub group_seq: u64,
+    /// The observation's index within the event, from 0.
+    pub index: u32,
+    /// The stream.
+    pub stream_id: i32,
+    /// The session.
+    pub session_id: i32,
+    /// The ring's kind code: 1 submitted, 2 confirmed cancelled, 3
+    /// unknown, 4 rejected, 5 aborted, 16 range, 17 interrupted, 18 ended,
+    /// 19 outcomes lost.
+    pub kind: u8,
+    /// The lane.
+    pub lane: Lane,
+    /// The receiver index, for range kinds; else 0.
+    pub receiver: u16,
+    /// The incarnation.
+    pub incarnation: u64,
+    /// The message's start, or a receiver's delivered prefix.
+    pub start: u64,
+    /// The message's end, or the unresolved range's end.
+    pub end: u64,
+    /// The guard epoch at the decision.
+    pub epoch: u64,
+    /// The reason, for the kinds that carry one.
+    pub reason: u64,
+    /// The lost count, for outcomes lost.
+    pub lost: u64,
+}
+
+/// The outcome ring's kind codes.
+const DELIVERY_KINDS: [u8; 9] = [1, 2, 3, 4, 5, 16, 17, 18, 19];
+
+impl DeliveryObservation {
+    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+        decoder.finish()?;
+        let kind = block.u8(70)?;
+        if !DELIVERY_KINDS.contains(&kind) {
+            return Err(invalid_enum("kind", kind));
+        }
+        Ok(Self {
+            group_seq: id("group_seq", block.u64(0)?)?,
+            incarnation: block.u64(8)?,
+            start: block.u64(16)?,
+            end: block.u64(24)?,
+            epoch: block.u64(32)?,
+            reason: block.u64(40)?,
+            lost: block.u64(48)?,
+            index: block.u32(56)?,
+            stream_id: block.i32(60)?,
+            session_id: block.i32(64)?,
+            receiver: block.u16(68)?,
+            kind,
+            lane: lane(block.u8(71)?)?,
+        })
+    }
+
+    /// Encodes into `out`; returns the record's length.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
+    /// a kind the ring does not have.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &DELIVERY_OBSERVATION)?;
+        if !DELIVERY_KINDS.contains(&self.kind) {
+            return Err(out_of_range("kind"));
+        }
+        encoder.u64(0, id("group_seq", self.group_seq)?)?;
+        encoder.u64(8, self.incarnation)?;
+        encoder.u64(16, self.start)?;
+        encoder.u64(24, self.end)?;
+        encoder.u64(32, self.epoch)?;
+        encoder.u64(40, self.reason)?;
+        encoder.u64(48, self.lost)?;
+        encoder.u32(56, self.index)?;
+        encoder.i32(60, self.stream_id)?;
+        encoder.i32(64, self.session_id)?;
+        encoder.u16(68, self.receiver)?;
+        encoder.u8(70, self.kind)?;
+        encoder.u8(71, self.lane.get())?;
         encoder.finish()
     }
 }
@@ -946,6 +1155,8 @@ pub enum GroupRecord<'a> {
     TimerOperation(TimerObservation),
     /// Template 13.
     ExternalObservation(ExternalObservation<'a>),
+    /// Template 14.
+    Delivery(DeliveryObservation),
     /// Template 20.
     End(EventEnd),
     /// Template 21.
@@ -1000,6 +1211,7 @@ impl<'a> GroupRecord<'a> {
             11 => &OUTCOME_OBSERVATION,
             12 => &TIMER_OBSERVATION,
             13 => &EXTERNAL_OBSERVATION,
+            14 => &DELIVERY_OBSERVATION,
             20 => &EVENT_END,
             21 => &GAP_MARKER,
             _ => return Err(unsupported),
@@ -1015,6 +1227,7 @@ impl<'a> GroupRecord<'a> {
             11 => Self::Outcome(OutcomeObservation::decode(block, decoder)?),
             12 => Self::TimerOperation(TimerObservation::decode(block, decoder)?),
             13 => Self::ExternalObservation(ExternalObservation::decode(block, decoder)?),
+            14 => Self::Delivery(DeliveryObservation::decode(block, decoder)?),
             20 => Self::End(EventEnd::decode(block, decoder)?),
             _ => Self::Gap(GapMarker::decode(block, decoder)?),
         })
@@ -1036,6 +1249,7 @@ impl<'a> GroupRecord<'a> {
             Self::Outcome(record) => record.encode(out),
             Self::TimerOperation(record) => record.encode(out),
             Self::ExternalObservation(record) => record.encode(out),
+            Self::Delivery(record) => record.encode(out),
             Self::End(record) => record.encode(out),
             Self::Gap(record) => record.encode(out),
         }
@@ -1061,6 +1275,9 @@ impl<'a> GroupRecord<'a> {
                 group_seq, index, ..
             })
             | Self::ExternalObservation(ExternalObservation {
+                group_seq, index, ..
+            })
+            | Self::Delivery(DeliveryObservation {
                 group_seq, index, ..
             }) => Role::Observation(*group_seq, *index),
             Self::End(end) => Role::End(*end),

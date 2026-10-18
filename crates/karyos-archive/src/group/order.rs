@@ -34,6 +34,10 @@ pub enum OrderRule {
     StrictGap,
     /// A `group_seq` or index past `u64` or `u32`.
     Exhausted,
+    /// A role no decoded record has: a header whose first `group_seq` is
+    /// 0, or a gap that ends before it starts. Roles are plain values, so
+    /// the checker refuses these itself.
+    Invalid,
 }
 
 /// A record that broke an order rule.
@@ -116,6 +120,12 @@ impl OrderCheck {
             (
                 State::Start,
                 Role::Header {
+                    first_group_seq: 0, ..
+                },
+            ) => Err(OrderRule::Invalid),
+            (
+                State::Start,
+                Role::Header {
                     capture,
                     first_group_seq,
                 },
@@ -130,6 +140,9 @@ impl OrderCheck {
                 Ok(State::InEvent { seq, index: 0 })
             }
             (State::Between, Role::Event(_)) => Err(OrderRule::Sequence),
+            (State::Between, Role::Gap(gap)) if gap.to_seq < gap.from_seq => {
+                Err(OrderRule::Invalid)
+            }
             (State::Between, Role::Gap(_)) if self.capture == Capture::Strict => {
                 Err(OrderRule::StrictGap)
             }

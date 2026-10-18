@@ -248,6 +248,9 @@ struct NetPublication {
     /// A guarded publication's sender gate, registered with the guard's
     /// owner; released once the sender refused or returned it.
     guard_sender: Option<crate::guard_ack::GuardSenderId>,
+    /// Its gate's submission frontier: superseded when the guard sender is
+    /// released, so the walker ends lanes no gate will decide again.
+    frontier: Option<SharedFrontier>,
     /// The identity its trace journals name (trace-network.md §5).
     traced: karyos_protocol::trace_hook::PublicationIdentity,
     /// Its lane count.
@@ -1281,6 +1284,9 @@ impl<T: StreamTerms> Network<T> {
         roles: Option<Box<crate::membership::PublicationRoles>>,
     ) -> Result<(), DriverError> {
         let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
+        let frontier = spec
+            .as_ref()
+            .map(|spec| SharedFrontier(std::sync::Arc::clone(&spec.frontier)));
         let (endpoint, alias) = (publication.endpoint, publication.alias);
         // Its later paths: each endpoint publishes the alias, so the
         // receiver hands that path's SMs and NAKs to the sender.
@@ -1387,6 +1393,7 @@ impl<T: StreamTerms> Network<T> {
             drained: false,
             session_posted: false,
             guard_sender,
+            frontier,
             traced,
             lanes,
             trace_closes: Vec::new(),
@@ -1476,9 +1483,17 @@ impl<T: StreamTerms> Network<T> {
             Ok(work) => work,
             Err(agent) => {
                 // A failed agent never answers again (DN-9): every tracked
-                // guard sender is released, so no close waits on it.
+                // guard sender is released, so no close waits on it. The
+                // gates stopped only with the sender: a shared thread runs
+                // neither agent again, while a dedicated sender thread runs
+                // on after a receiver failure (#381 review P1). A thread
+                // reads FAILED with Acquire, after its gate's last store.
+                let gates_stopped = match &self.agents {
+                    Agents::Threads(runner) => runner.failed().contains(&AgentKind::Sender),
+                    Agents::Shared(_) | Agents::Closed => true,
+                };
                 self.failed = Some(agent);
-                self.release_guard_senders();
+                self.release_guard_senders(gates_stopped);
                 return Err(DriverError::NetworkAgent { agent });
             }
         };
@@ -1658,16 +1673,24 @@ impl<T: StreamTerms> Network<T> {
         }
         let _ = self.images.poll(&self.links.sessions, lanes, |_| {});
         // The agents are gone: every tracked guard sender is released for
-        // the conductor to deregister.
-        self.release_guard_senders();
+        // the conductor to deregister. A sender thread still running past
+        // the stop timeout may still run its gates, so they are left as
+        // they are.
+        let sender_late = shutdown
+            .late
+            .iter()
+            .any(|late| late.kinds().contains(&AgentKind::Sender));
+        self.release_guard_senders(!sender_late);
         shutdown
     }
 
     /// Moves the guard sender of every tracked publication to the released
     /// list (agents stopped or failed): the conductor deregisters them.
-    fn release_guard_senders(&mut self) {
+    /// With `gates_stopped`, no sender gate runs again, so each lane a gate
+    /// did not finish is superseded.
+    fn release_guard_senders(&mut self, gates_stopped: bool) {
         for entry in &mut self.publications {
-            if let Some(id) = entry.guard_sender.take() {
+            if let Some(id) = entry.release_guard(gates_stopped) {
                 self.released_guards.push(id);
             }
         }
@@ -1978,6 +2001,42 @@ impl NetPublication {
     fn paths(&self) -> impl Iterator<Item = EndpointId> + '_ {
         core::iter::once(self.endpoint).chain(self.later.into_iter().flatten())
     }
+
+    /// Releases its guard sender, once: the sender refused or returned it,
+    /// or the agents stopped or failed. With `gate_stopped` its gate never
+    /// runs again, so each lane it did not finish is superseded, once; a
+    /// gate still running (a receiver failure on a dedicated runner) keeps
+    /// its frontier until the agents stop.
+    fn release_guard(&mut self, gate_stopped: bool) -> Option<crate::guard_ack::GuardSenderId> {
+        if gate_stopped && let Some(SharedFrontier(frontier)) = self.frontier.take() {
+            supersede(&frontier, self.lanes);
+        }
+        self.guard_sender.take()
+    }
+}
+
+/// A publication's submission frontier, the same cell its gate writes:
+/// equal only to itself.
+#[derive(Debug, Clone)]
+struct SharedFrontier(std::sync::Arc<karyos_sys::submission_frontier::SubmissionFrontier>);
+
+impl PartialEq for SharedFrontier {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedFrontier {}
+
+/// Supersedes the first `lanes` lanes of `frontier` with
+/// `DRIVER_SHUTDOWN`: their gate never runs again. A lane its gate
+/// finished keeps its word (the first writer wins).
+pub(crate) fn supersede(frontier: &karyos_sys::submission_frontier::SubmissionFrontier, lanes: u8) {
+    for lane in (0..lanes).filter_map(|lane| karyos_sys::frame::Lane::try_new(lane).ok()) {
+        // A nonzero reason below the superseded bit, on a lane in range:
+        // never refused.
+        let _ = frontier.supersede(lane, crate::guard_streams::REASON_DRIVER_SHUTDOWN);
+    }
 }
 
 /// Applies the sender's answer about a publication.
@@ -1990,8 +2049,10 @@ fn publication_answer<T: StreamTerms>(
 ) {
     // Each tracked publication releases its guard sender once, and the
     // list holds one per tracked publication: it never grows past it.
+    // The sender refused it (its gate never ran) or returned it (its gate
+    // came back with the data path, through the event ring).
     let mut release_guard = |entry: &mut NetPublication| {
-        if let Some(id) = entry.guard_sender.take() {
+        if let Some(id) = entry.release_guard(true) {
             released.push(id);
         }
     };

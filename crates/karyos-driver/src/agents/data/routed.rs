@@ -868,6 +868,8 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             // from its registered position, as on one path; the copies at
             // or below its debited position go as catch-up, debiting nothing.
             let reopened = slot.opened.is_some();
+            // Per lane, whether it reads again what the reset returned.
+            let mut rewound = [false; karyos_sys::frame::Lane::COUNT as usize];
             for (lane, reader) in self.readers.iter_mut().enumerate() {
                 // Only a route that can still send them holds copies: one
                 // resetting or never opened will drop its own (#331 review).
@@ -879,6 +881,9 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 if reopened && self.reliable && !others {
                     // A faulted reader cannot rewind: its lane already ended.
                     let _ = reader.rewind();
+                    if let Some(flag) = rewound.get_mut(lane) {
+                        *flag = true;
+                    }
                 }
             }
             // The route's repair queue, outside the lane sender: every
@@ -900,7 +905,13 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 // A guarded lane reopens through its gate, which refunds what
                 // only this route held.
                 match self.guard.as_deref_mut() {
-                    Some(guard) => guard.reopen_route(&mut routed.sender, lane, index, *queue),
+                    Some(guard) => guard.reopen_route(
+                        &mut routed.sender,
+                        lane,
+                        index,
+                        *queue,
+                        rewound.get(lane).copied().unwrap_or(false),
+                    ),
                     None => routed.sender.reopen(lane, index, *queue),
                 }
                 if let Some(track) = routed.tracks.get_mut(lane) {
@@ -1078,6 +1089,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                                 token,
                                 length: u64::from(len16),
                                 messages,
+                                start: from,
                                 end: next,
                             },
                         )

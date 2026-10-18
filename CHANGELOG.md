@@ -11,6 +11,26 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A guarded network publication's outcome records come from its sender
+  gate's submissions, not from the commit (guards-and-abort.md, "Trusted
+  sockets in Phase 2"). A message is `Submitted` once a backend took
+  every frame of it, `Unknown` when it may have left whole unproven (an
+  `Unknown` report, an exposure a reset or a removal cut short, a
+  position no first send took, which a reliable lane may still repair,
+  or a later route's submission above a position that never left), and
+  `Aborted` when it never leaves whole: its last frame was not sent when
+  a close, a removal or a network close ended the lane (a partial
+  fragmented message is `Aborted`, as the design's kind table says). A message's
+  reservation is therefore released at its network submission, so the
+  publisher holds at most `C_m` messages committed and not yet sent: the
+  effective window is the smaller of the receivers' and `C_m` messages.
+  The close acknowledgement's `positions` are each lane's prefix-closed
+  frontier: below it every message was handed to a backend or is
+  reported `Unknown` (before, the highest position submitted, which an
+  unproven or skipped one could sit below). `GateHead` gains `start`,
+  and `GuardGate::reopen` and `reopen_route` take whether the lane is
+  rewound; `GuardSpec` gains `frontier`. Code that names every field in
+  a struct literal must add them.
 - `RouteCounters` (`karyos-io`) and `PathCounters` (`karyos-driver`)
   gained the public fields `datagrams` and `bytes` (rp-w9). Neither
   struct is `#[non_exhaustive]`, so a struct literal that names every
@@ -200,12 +220,29 @@ release may break APIs, wire formats and shared-memory layouts.
   A7a; SPEC §8.3, ADR-0024). `karyos_archive::group::record` holds the
   journal header (group, first `group_seq`, inline threshold, capture
   contract, clock provenance, strict or best-effort capture, the
-  caller's manifest), five event records (message inline or by recording
-  reference, conflated value, timer, lifecycle, external), three
-  observations (offer and claim outcomes, timer create and cancel,
-  external), the event end and the gap marker, hand written on the
+  caller's manifest), five event records (a message with its reserved
+  value, end of stream and trace extension, inline or by reference to a
+  required recording; conflated value; timer; lifecycle; external), four
+  observations (offer, claim and commit outcomes with the client error
+  code; timer create and cancel; external; delivery outcomes), the event
+  end and the gap marker, hand written on the
   `karyos-codec` runtime as A1. `karyos_archive::group::order` checks a
   journal's order rules with fixed state. Nothing allocates.
+- A segment store is truncated at the end of a write
+  (`SegmentStore::truncate`; phase 3, for a recording group's recovery
+  to its complete prefix, SPEC §8.3). Everything after the cut is
+  removed on disk and what is kept is durable on return; a crash inside
+  recovers either as before or at the cut. A position outside the
+  recording or inside a write is refused, typed, with nothing changed.
+- `karyos_sys::submission_frontier::SubmissionFrontier`: a guarded
+  network lane's submission frontier, which its sender gate publishes
+  for the driver's outcome walker. Per lane, `resolved` (Release),
+  `unknown_hi`, `sent_hi` and `staged_hi` (Relaxed, stored before it),
+  all monotone and written by the gate alone, and a final word that the gate
+  (`finish`) or, once the gate stopped for good, the conductor
+  (`supersede`) sets once, by compare-exchange. A Loom model
+  (`loom_submission_frontier`) checks the orders and the race of the two
+  final writers, with three negative controls.
 - Per-path datagram and byte counts (RP-10; rp-w9). Each route of a
   routed publication counts the datagrams and bytes it submitted,
   catch-up copies included (`RouteCounters::datagrams`, `bytes`), and
@@ -812,6 +849,9 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- The segment store's arithmetic is checked (SPEC §14): five
+  saturating operations in the interval sync and in recovery's counts
+  are checked ones. A clock that steps back still syncs nothing.
 - A guarded network publication that a guard close sealed no longer
   takes a fresh incarnation after the reopen: `publication()` refuses with
   `DriverError::NetworkReincarnation`. The network sender did not follow

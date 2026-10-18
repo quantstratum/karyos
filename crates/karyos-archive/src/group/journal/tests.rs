@@ -63,6 +63,9 @@ fn message(seq: u64, payload: &[u8]) -> Vec<u8> {
         stream_id: 10,
         session_id: 3,
         lane: Lane::ZERO,
+        reserved_value: 0,
+        end_of_stream: false,
+        extension: None,
         payload: Payload::Inline(payload),
     }))
 }
@@ -120,7 +123,7 @@ fn read_back(journal: &mut GroupJournal<FaultDisk>) -> Vec<Vec<u8>> {
 fn spanning() -> Vec<Vec<u8>> {
     events(&[
         Some(65_535),
-        Some(65_275),
+        Some(65_253),
         None,
         Some(60_000),
         Some(65_000),
@@ -416,7 +419,7 @@ fn check(
 /// unit, so most fall inside a write), and each of the first 64 units.
 #[test]
 fn crash_points_recover_a_prefix_of_whole_records() {
-    let records = events(&[Some(65_535), Some(65_275), None, Some(60_000), Some(200)]);
+    let records = events(&[Some(65_535), Some(65_253), None, Some(60_000), Some(200)]);
     for policy in [SyncPolicy::PerSegment, SyncPolicy::None] {
         let free = FaultDisk::default();
         let _ = run(free.clone(), &records, policy);
@@ -448,7 +451,7 @@ fn a_tail_shorter_than_an_envelope_is_padding() {
         config(SyncPolicy::None),
     )
     .unwrap();
-    let records = events(&[Some(65_535), Some(65_287), None]);
+    let records = events(&[Some(65_535), Some(65_265), None]);
     for record in &records {
         journal.append(record).unwrap();
     }
