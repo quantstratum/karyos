@@ -893,3 +893,23 @@ fn a_recovered_strict_end_stays_ended() {
     let (sender, _job) = capture(settings(4096, 400, 8), journal, &none).unwrap();
     assert_eq!(sender.admit(), Err(Refusal::Ended));
 }
+
+/// #411 review P2: a close drains what the ring holds and refuses the
+/// sender first, so a live sender cannot keep the drain going.
+#[test]
+fn a_close_drains_the_ring_and_refuses_the_sender() {
+    let none = Recordings::default();
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 8));
+    for seq in 1..=3 {
+        sender.admit().unwrap();
+        sender.send(&event(seq, 10, None), seq).unwrap();
+    }
+    job.drain_to_close(0, &none).unwrap();
+    assert_eq!(sender.view().delivered_seq(), 3);
+    assert_eq!(sender.admit(), Err(Refusal::Closing));
+    assert_eq!(sender.room(), Err(Refusal::Closing));
+    assert_eq!(sender.send(&event(4, 10, None), 4), Err(Refusal::Closing));
+    assert_eq!(sender.state(), GroupState::Running);
+    job.close().unwrap();
+    assert_eq!(sender.admit(), Err(Refusal::Ended));
+}

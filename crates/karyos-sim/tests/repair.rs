@@ -140,7 +140,7 @@ struct Log {
 }
 
 impl RepairRead for Log {
-    fn head(&mut self, lane: u8, from: u64) -> Result<Head, RepairReadError> {
+    fn head(&mut self, lane: u8, from: u64, _end: Option<u64>) -> Result<Head, RepairReadError> {
         let log = &self.lanes[usize::from(lane)];
         if from < log.floor {
             return Err(RepairReadError::Unavailable { lowest: log.floor });

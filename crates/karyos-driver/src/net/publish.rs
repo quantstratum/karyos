@@ -189,11 +189,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// clock, as `ClockDomain::Monotonic` offers are timed; no time
     /// namespace is checked, as on the local route.
     ///
+    /// On a reliable channel a message's schedule entry is held until the
+    /// receivers acknowledge it (the lane's registered position passes
+    /// it), so a reset can read it again: `schedule_capacity` must cover
+    /// the unacknowledged window, or offers are back-pressured until the
+    /// receivers consume. A message read again after a reset is resent at
+    /// once, outside the late policy, and counted as rewound, not late.
+    /// NAK repairs go through the repair path, never the timed gate.
+    ///
     /// # Errors
     ///
-    /// [`DriverError::TimedNetworkUnsupported`] for a channel with paths, a
-    /// reliable channel, the `Tai` domain, cancel-on-deadline or a
-    /// `max_horizon` that, with one `sender_heartbeat_interval`, reaches
+    /// [`DriverError::TimedNetworkUnsupported`] for a channel with paths,
+    /// the `Tai` domain, cancel-on-deadline or a `max_horizon` that, with
+    /// one `sender_heartbeat_interval`, reaches
     /// `image_liveness_timeout`;
     /// [`DriverError::InvalidConfig`] for lanes with no schedule ring; the
     /// errors of [`EmbeddedDriver::add_network_publication`] and of
@@ -545,8 +553,6 @@ fn timed_supported(
 
     let reason = if !channel.paths.is_empty() {
         Some(Unsupported::Routed)
-    } else if channel.reliable {
-        Some(Unsupported::Reliable)
     } else if options.domain == karyos_client::schedule::ClockDomain::Tai {
         Some(Unsupported::TaiDomain)
     } else if options.cancel_on_deadline {

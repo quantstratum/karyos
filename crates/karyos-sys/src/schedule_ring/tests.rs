@@ -152,3 +152,36 @@ fn the_reader_reads_ahead_and_releases_in_order() {
     assert_eq!(reader.release(&ring), Err(ScheduleError::Invariant));
     assert_eq!(reader.peek(&ring), Ok(Some(entry(2))));
 }
+
+/// A rewind reads again, in order, every entry read and not released;
+/// the released ones stay released, and the publisher still has no room
+/// for a slot not freed.
+#[test]
+fn a_rewind_reads_the_unreleased_entries_again() {
+    let ring = ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut reader = ScheduleReader::attach(&ring).unwrap();
+    for n in 0..4 {
+        assert_eq!(publisher.has_room(&ring), Ok(true));
+        publisher.push(&ring, entry(n)).unwrap();
+    }
+    for _ in 0..4 {
+        reader.advance(&ring).unwrap();
+    }
+    reader.release(&ring).unwrap();
+    reader.rewind_to_released();
+    assert_eq!((reader.read(), reader.released()), (1, 1));
+    for n in 1..4 {
+        assert_eq!(reader.peek(&ring), Ok(Some(entry(n))));
+        reader.advance(&ring).unwrap();
+    }
+    assert_eq!(reader.peek(&ring), Ok(None));
+    // One slot freed, one pushed: full again until the next release.
+    assert_eq!(publisher.has_room(&ring), Ok(true));
+    publisher.push(&ring, entry(4)).unwrap();
+    assert_eq!(publisher.has_room(&ring), Ok(false));
+    // A rewind with nothing read past `head` changes nothing.
+    let mut fresh = ScheduleReader::attach(&ring).unwrap();
+    fresh.rewind_to_released();
+    assert_eq!(fresh.read(), fresh.released());
+}

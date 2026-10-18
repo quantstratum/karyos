@@ -234,6 +234,22 @@ fn a_misaligned_nak_is_invalid_at_its_head() {
     rig.finish();
 }
 
+/// A NAK that ends inside the frame at its start names no whole frame:
+/// the read bounded to its range is refused with RANGE_INVALID, through
+/// the ERR list, never dropped without a reply (REVIEWER-01 on #412).
+#[test]
+fn a_nak_ending_inside_a_frame_is_invalid() {
+    let mut rig = Rig::new(&RepairConfig::default());
+    rig.publish(3);
+    assert_eq!(rig.nak(FRAME, 512, 1), NakOutcome::Queued);
+    assert_eq!(rig.repair(&mut RepairBudget::default(), 2), 0);
+    let mut replies = Vec::new();
+    rig.path.drain_repair_replies(|reply| replies.push(*reply));
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].reason, NakReplyReason::RangeInvalid);
+    rig.finish();
+}
+
 /// Step 8 ERRs wait in a bounded list: past it they are dropped and
 /// counted, never grown.
 #[test]

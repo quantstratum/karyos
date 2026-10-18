@@ -115,6 +115,10 @@ pub enum Refusal {
     /// never be covered.
     #[error("the group ended")]
     Ended,
+    /// The group is closing: what the ring holds is drained into the
+    /// journal, and nothing more is taken.
+    #[error("the group is closing")]
+    Closing,
 }
 
 /// Where a group stands.
@@ -142,6 +146,8 @@ struct Shared {
     /// The prefixes stopped at an incomplete event or a gap: no event is
     /// queued any more, so none is in flight.
     stopped: std::sync::atomic::AtomicBool,
+    /// The group is closing: the sender takes nothing more.
+    closing: std::sync::atomic::AtomicBool,
     view: Arc<PrefixView>,
     /// Held for no work: the job takes it before it notifies, so a waiter
     /// that checked under it is already waiting.
@@ -191,26 +197,8 @@ pub fn capture<D: Disk>(
     mut journal: GroupJournal<D>,
     coverage: &impl Coverage,
 ) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
-    let ring_error = CaptureSetup::Config(CaptureError::Ring {
-        max_event: config.max_event,
-    });
-    let (Ok(ring), Some(max_extent)) = (
-        u64::try_from(config.ring_capacity),
-        extent(config.max_event),
-    ) else {
-        return Err(ring_error);
-    };
-    if !config.ring_capacity.is_power_of_two() || max_extent > ring / 8 {
-        return Err(ring_error);
-    }
-    let in_flight = match u64::try_from(config.in_flight) {
-        Ok(0) | Err(_) => return Err(CaptureSetup::Config(CaptureError::InFlight)),
-        Ok(in_flight) => in_flight,
-    };
     let policy = journal.policy();
-    if policy == SyncPolicy::None {
-        return Err(CaptureSetup::Config(CaptureError::NoSync));
-    }
+    let (ring, max_extent, in_flight) = check(config, policy).map_err(CaptureSetup::Config)?;
     let (producer, consumer) = command_ring(config.ring_capacity).map_err(|_| {
         CaptureSetup::Config(CaptureError::Ring {
             max_event: config.max_event,
@@ -231,6 +219,7 @@ pub fn capture<D: Disk>(
         consumed: AtomicU64::new(0),
         state: AtomicU8::new(RUNNING),
         stopped: std::sync::atomic::AtomicBool::new(tracker.stopped()),
+        closing: std::sync::atomic::AtomicBool::new(false),
         view: tracker.view(),
         lock: Mutex::new(()),
         signal: Condvar::new(),
@@ -261,10 +250,48 @@ pub fn capture<D: Disk>(
         sync_at_bound: policy == SyncPolicy::PerSegment,
         in_flight,
         uncovered: Vec::with_capacity(config.in_flight),
+        capacity: config.ring_capacity,
+        emptied: 0,
         signalled: 0,
         stop_notified: false,
     };
     Ok((sender, job))
+}
+
+/// Checks `config` and the journal's sync `policy` as [`capture`] does,
+/// before a journal exists: a caller that creates the journal checks
+/// first, so a refused start leaves nothing behind.
+///
+/// # Errors
+///
+/// [`CaptureError`] for settings that cannot work.
+pub fn validate(config: CaptureConfig, policy: SyncPolicy) -> Result<(), CaptureError> {
+    check(config, policy).map(|_| ())
+}
+
+/// The ring's capacity, the largest event's extent and the in-flight
+/// bound, once `config` and `policy` can work.
+fn check(config: CaptureConfig, policy: SyncPolicy) -> Result<(u64, u64, u64), CaptureError> {
+    let ring_error = CaptureError::Ring {
+        max_event: config.max_event,
+    };
+    let (Ok(ring), Some(max_extent)) = (
+        u64::try_from(config.ring_capacity),
+        extent(config.max_event),
+    ) else {
+        return Err(ring_error);
+    };
+    if !config.ring_capacity.is_power_of_two() || max_extent > ring / 8 {
+        return Err(ring_error);
+    }
+    let in_flight = match u64::try_from(config.in_flight) {
+        Ok(0) | Err(_) => return Err(CaptureError::InFlight),
+        Ok(in_flight) => in_flight,
+    };
+    if policy == SyncPolicy::None {
+        return Err(CaptureError::NoSync);
+    }
+    Ok((ring, max_extent, in_flight))
 }
 
 /// Why [`capture`] could not make a group's capture path.
@@ -343,6 +370,9 @@ impl CaptureSender {
             GroupState::Failed => return Err(Refusal::Failed),
             GroupState::Ended => return Err(Refusal::Ended),
         }
+        if self.shared.closing.load(Ordering::Acquire) {
+            return Err(Refusal::Closing);
+        }
         let consumed = self.shared.consumed.load(Ordering::Acquire);
         // The job reads only what was written, so `consumed` is never past
         // the tail, nor a capacity behind it.
@@ -380,6 +410,9 @@ impl CaptureSender {
             return Err(Refusal::TooLarge);
         }
         let framed = extent(records.len()).ok_or(Refusal::TooLarge)?;
+        if self.shared.closing.load(Ordering::Acquire) {
+            return Err(Refusal::Closing);
+        }
         // A failure stores the state only: the event loop never takes the
         // waiters' lock, and the job notifies them.
         let fail = |shared: &Shared| {
@@ -507,6 +540,10 @@ pub struct CaptureJob<D: Disk> {
     signalled: u64,
     /// The waiters were told the group stopped.
     stop_notified: bool,
+    /// The ring's capacity in bytes.
+    capacity: usize,
+    /// How many duties found the ring empty.
+    emptied: u64,
 }
 
 /// Why the job stopped recording.
@@ -565,6 +602,9 @@ impl<D: Disk> CaptureJob<D> {
         let mut read = false;
         for _ in 0..budget {
             let Some(message) = self.consumer.read().map_err(|_| JobError::Ring)? else {
+                // Past `u64` the count stays: a failed entry is then kept
+                // longer, never dropped early.
+                self.emptied = self.emptied.checked_add(1).unwrap_or(self.emptied);
                 break;
             };
             read = true;
@@ -739,6 +779,13 @@ impl<D: Disk> CaptureJob<D> {
         Ok(())
     }
 
+    /// How many duties read the ring until it was empty: a duty that
+    /// raises it has read every message written before it began.
+    #[must_use]
+    pub const fn emptied(&self) -> u64 {
+        self.emptied
+    }
+
     /// The group's tracker, for its three values and its state.
     #[must_use]
     pub const fn tracker(&self) -> &PrefixTracker {
@@ -755,6 +802,29 @@ impl<D: Disk> CaptureJob<D> {
     #[must_use]
     pub const fn journal(&self) -> &GroupJournal<D> {
         &self.journal
+    }
+
+    /// Drains what the ring holds into the journal before a close: the
+    /// sender is refused ([`Refusal::Closing`]) first, so a live sender
+    /// cannot keep the drain going, and the drain is bounded by what the
+    /// ring can hold. A pass reads every message the ring can hold, and a
+    /// second reads one a sender wrote while the first ran. A message
+    /// written later still, by a sender that checked before the close, is
+    /// not journaled.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError`]: the group is then failed.
+    pub fn drain_to_close(&mut self, now: u64, coverage: &impl Coverage) -> Result<(), JobError> {
+        self.shared.closing.store(true, Ordering::Release);
+        // Every message takes at least a ring header.
+        let most = self.capacity / usize::try_from(RING_HEADER).unwrap_or(usize::MAX).max(1);
+        for _ in 0..2 {
+            if !self.duty(now, most, coverage)? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Closes the journal (syncing it); the group records nothing more.

@@ -56,10 +56,12 @@ pub trait Coverage {
     fn positions(&self, recording_id: u64) -> Option<(u64, u64)>;
 
     /// The durable end of recording `recording_id` once it ended, which
-    /// will never cover more: its stop for a `required` recording, 0 for
-    /// any other (it vouches for nothing). `None` while it records, or for
-    /// a recording this Archive does not know. A7d-1c: a reference that
-    /// reaches the journal after its recording ended is settled by it.
+    /// will never cover more: its stop for a `required` recording, or its
+    /// frames durable at a failure; 0 for any other (it vouches for
+    /// nothing), for a recording this Archive does not know, and for a
+    /// failed one whose entry was reclaimed (A7d-1c). `None` while it
+    /// records. A reference that reaches the journal after its recording
+    /// ended is settled by it.
     fn ended(&self, recording_id: u64) -> Option<u64>;
 
     /// Whether the checkpoint store holds `[position, end)`: `Some(true)`

@@ -179,3 +179,116 @@ fn a_lost_message_frees_its_own_entry() {
     assert_eq!(consumer.outstanding(), 0);
     assert_eq!(publisher.has_room(&ring), Ok(true));
 }
+
+/// A rewind to a message boundary reads the entries not released again,
+/// in order, each marked replayed; a message read after them is not.
+#[test]
+fn a_rewind_replays_the_unreleased_messages() {
+    use super::Scheduled;
+
+    let ring = ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    for (position, time) in [(0, 10), (64, 20), (128, 30)] {
+        push(&ring, &mut publisher, position, time);
+    }
+    for position in [0, 64] {
+        let _ = consumer.frame(&ring, data(position, true, true)).unwrap();
+    }
+    // The first left and was acknowledged: released. The second left
+    // and waits for its acknowledgement.
+    consumer.message_left(&ring).unwrap();
+    consumer.rewind(1).unwrap();
+    assert_eq!(consumer.outstanding(), 0);
+    let again = consumer
+        .frame_scheduled(&ring, data(64, true, true))
+        .unwrap();
+    assert_eq!(
+        again,
+        Some(Scheduled {
+            time: 20,
+            replayed: true
+        })
+    );
+    let next = consumer
+        .frame_scheduled(&ring, data(128, true, true))
+        .unwrap();
+    assert_eq!(
+        next,
+        Some(Scheduled {
+            time: 30,
+            replayed: false
+        })
+    );
+}
+
+/// A rewind inside a message (a block boundary between its fragments):
+/// its next fragment takes the message's own entry, at `head`, below it;
+/// with none below, the term is corrupt.
+#[test]
+fn a_rewind_inside_a_message_resumes_it() {
+    use super::Scheduled;
+
+    let ring = ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    push(&ring, &mut publisher, 0, 10);
+    let _ = consumer.frame(&ring, data(0, true, false)).unwrap();
+    let _ = consumer.frame(&ring, data(1408, false, false)).unwrap();
+    // Its first fragments left.
+    consumer.rewind(1).unwrap();
+    let resumed = consumer
+        .frame_scheduled(&ring, data(1408, false, false))
+        .unwrap();
+    assert_eq!(
+        resumed,
+        Some(Scheduled {
+            time: 10,
+            replayed: true
+        })
+    );
+    assert_eq!(consumer.frame(&ring, data(2816, false, true)), Ok(Some(10)));
+    consumer.message_left(&ring).unwrap();
+    assert_eq!(consumer.outstanding(), 0);
+    // An entry at or past the fragment is no message it continues.
+    let ring = super::tests::ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    push(&ring, &mut publisher, 4096, 10);
+    consumer.rewind(0).unwrap();
+    assert!(matches!(
+        consumer.frame_scheduled(&ring, data(1408, false, true)),
+        Err(ScheduleConsumerError::CorruptTerm { .. })
+    ));
+}
+
+/// A rewind resends at once only the messages that left: one read and held
+/// for its time keeps it, and a rewind naming more sent messages than are
+/// outstanding is refused.
+#[test]
+fn a_rewind_replays_only_the_messages_sent() {
+    use super::Scheduled;
+
+    let ring = ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    for (position, time) in [(0, 10), (64, 20), (128, 30)] {
+        push(&ring, &mut publisher, position, time);
+    }
+    for position in [0, 64, 128] {
+        let _ = consumer.frame(&ring, data(position, true, true)).unwrap();
+    }
+    assert!(matches!(
+        consumer.rewind(4),
+        Err(ScheduleConsumerError::CorruptTerm { .. })
+    ));
+    // The first left; the other two were read and held.
+    consumer.rewind(1).unwrap();
+    let expected = [(0, 10, true), (64, 20, false), (128, 30, false)];
+    for (position, time, replayed) in expected {
+        assert_eq!(
+            consumer.frame_scheduled(&ring, data(position, true, true)),
+            Ok(Some(Scheduled { time, replayed }))
+        );
+    }
+}

@@ -8,9 +8,10 @@
 //! `quantstratum-docs: karyos/design/recording-group-records.md` (A7a);
 //! the journal on disk ([`journal`], A7b); its three prefixes
 //! ([`prefix`], A7c); the records the Gateway needs (A7d-1a) and its
-//! capture path to the Archive's thread ([`capture`], A7d-1b); the
-//! checkpoint store, its writer and the Gateway's handoff ([`checkpoint`],
-//! A9-1). The Gateway itself follows.
+//! capture path to the Archive's thread ([`capture`], A7d-1b); the first
+//! part of their replay ([`replay`], A8); the checkpoint store, its writer
+//! and the Gateway's handoff ([`checkpoint`], A9-1). The Gateway itself
+//! follows.
 
 pub mod capture;
 pub mod checkpoint;
@@ -18,3 +19,4 @@ pub mod journal;
 pub mod order;
 pub mod prefix;
 pub mod record;
+pub mod replay;

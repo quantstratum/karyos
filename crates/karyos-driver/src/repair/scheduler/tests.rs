@@ -47,7 +47,7 @@ impl Log {
 }
 
 impl RepairRead for Log {
-    fn head(&mut self, lane: u8, from: u64) -> Result<Head, RepairReadError> {
+    fn head(&mut self, lane: u8, from: u64, _end: Option<u64>) -> Result<Head, RepairReadError> {
         self.reads += 1;
         if let Some(error) = self.errors.get(&(lane, from)) {
             return Err(*error);

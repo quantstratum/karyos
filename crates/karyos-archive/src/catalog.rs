@@ -5,7 +5,11 @@
 //!
 //! - **Format.** `catalog.kyc` is a header, then an append-only log of
 //!   records, each with its kind, length, payload and CRC-32C: a recording
-//!   started, stopped or forgotten, and the id watermark.
+//!   started, stopped or forgotten, and the id watermark. A `Started`
+//!   record ends with one optional byte, the recording's mode (A7d-1c): 1
+//!   `required`, 2 `async`. The CRC covers it like the rest of the
+//!   payload; a record without it, from before it was written, reads back
+//!   as `async`.
 //! - **Updates.** A record is durable (written, then synced) before the
 //!   call returns; the caller acts after it: a recording's `Started` is
 //!   durable before its segment store is created, and its store is closed
@@ -61,7 +65,9 @@ const MAGIC: u32 = u32::from_le_bytes(*b"KYCT");
 /// The catalog format version.
 /// Version 2: `Stopped` carries the `incomplete` flag and the reasons of
 /// A4. Version 3: `Started` carries the recorded stream's format (A5),
-/// which a replay needs (nothing of versions 1 or 2 was released).
+/// which a replay needs, then an optional mode byte (A7d-1c: 1
+/// `required`, 2 `async`; absent reads as `async`), under the record's
+/// CRC (nothing of versions 1 or 2 was released).
 const VERSION: u32 = 3;
 /// The header's length: magic, version, reserved, CRC.
 const HEADER: usize = 16;
@@ -76,6 +82,10 @@ const TAIL: usize = 4;
 pub const MAX_CHANNEL: usize = 1024;
 
 const STARTED: u16 = 1;
+/// A `Started` record's mode byte: `required`.
+const MODE_REQUIRED: u8 = 1;
+/// A `Started` record's mode byte: `async`.
+const MODE_ASYNC: u8 = 2;
 const STOPPED: u16 = 2;
 const NEXT_ID: u16 = 3;
 const FORGOTTEN: u16 = 4;
@@ -210,6 +220,11 @@ pub struct Recording {
     pub policy: SyncPolicy,
     /// The recorded stream's format.
     pub format: StreamFormat,
+    /// It was recorded as a `required` participant (ADR-0023), never
+    /// lapped, so every position below its end holds frames; otherwise
+    /// `async`, which may hold gaps. A recording group refers only to a
+    /// `required` one's frames (`recording-group-gateway.md` section 7).
+    pub required: bool,
     /// Where it stopped; `None` while it records.
     pub stop: Option<Stop>,
 }
@@ -233,6 +248,8 @@ pub struct NewRecording<'a> {
     pub policy: SyncPolicy,
     /// The recorded stream's format.
     pub format: StreamFormat,
+    /// It is recorded as a `required` participant.
+    pub required: bool,
 }
 
 /// The catalog's errors.
@@ -431,6 +448,11 @@ impl Record {
                 let channel = u16::try_from(recording.channel.len()).ok()?;
                 payload.bytes(&channel.to_le_bytes());
                 payload.bytes(&recording.channel);
+                payload.bytes(&[if recording.required {
+                    MODE_REQUIRED
+                } else {
+                    MODE_ASYNC
+                }]);
                 STARTED
             }
             Self::Stopped { id, stop } => {
@@ -488,6 +510,15 @@ impl Record {
                     return None;
                 }
                 let channel = input.take(channel)?.to_vec();
+                // The mode byte, absent from a record written before it.
+                let required = match input.0 {
+                    [] => false,
+                    _ => match input.u8()? {
+                        MODE_REQUIRED => true,
+                        MODE_ASYNC => false,
+                        _ => return None,
+                    },
+                };
                 Self::Started(Recording {
                     id,
                     stream_id,
@@ -498,6 +529,7 @@ impl Record {
                     geometry: Geometry::new(term_length, segment_length).ok()?,
                     policy: policy_of(policy, interval)?,
                     format,
+                    required,
                     stop: None,
                 })
             }
@@ -758,6 +790,7 @@ impl<D: Disk> Catalog<D> {
             geometry: new.geometry,
             policy: new.policy,
             format: new.format,
+            required: new.required,
             stop: None,
         };
         self.append(&Record::Started(recording.clone()))?;
