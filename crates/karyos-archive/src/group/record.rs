@@ -13,7 +13,9 @@
 //! A best-effort group marks the events it could not capture with a
 //! [`GapMarker`], and a reference its recording will never cover with a
 //! [`ReferenceUnavailable`] (A7d, `recording-group-gateway.md` section
-//! 10). As in A1, each record is a plain value whose variable field
+//! 10). A [`CheckpointRecord`] names a snapshot of the application's state
+//! in the group's checkpoint store (A9, `recording-group-checkpoints.md`
+//! section 4). As in A1, each record is a plain value whose variable field
 //! borrows the decoded input; [`GroupRecord::decode`] validates a whole
 //! record before any value exists, and `encode` writes into the caller's
 //! buffer. Nothing allocates.
@@ -82,6 +84,11 @@ pub const EVENT_END: Template = template(20, 13, 12 + 13);
 pub const GAP_MARKER: Template = template(21, 17, 12 + 17);
 /// `ReferenceUnavailable`, template 22.
 pub const REFERENCE_UNAVAILABLE: Template = template(22, 16, 12 + 16);
+/// `Checkpoint`, template 30.
+pub const CHECKPOINT: Template = template(30, 40, 12 + 40);
+/// A checkpoint record's `position` in a replay's capture: the replay's
+/// digest only, its bytes stored nowhere (A9-2).
+pub const CAPTURE_POSITION: u64 = u64::MAX;
 
 /// The longest record of any template.
 pub const MAX_RECORD: usize = 12 + 67 + 2 + 65_535 + 2 + 64;
@@ -147,6 +154,44 @@ pub struct JournalHeader<'a> {
     /// The caller's identity of what ran, opaque: 1 to [`MAX_MANIFEST`]
     /// bytes.
     pub manifest: &'a [u8],
+}
+
+/// A journal header this build cannot take, as its bytes name it: not a
+/// corrupt record, a journal of another contract or clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedHeader {
+    /// Another capture contract.
+    Contract {
+        /// The header's.
+        found: u16,
+    },
+    /// A clock this build does not know.
+    Clock {
+        /// The header's code.
+        found: u8,
+    },
+}
+
+/// What a journal header's bytes, `buf`, name that this build cannot take:
+/// `None` for anything else, a valid header or a record that is not one.
+#[must_use]
+pub fn unsupported_header(buf: &[u8]) -> Option<UnsupportedHeader> {
+    let envelope = Envelope::read(buf).ok()?;
+    if envelope.schema_id != SCHEMA_ID
+        || envelope.version != VERSION
+        || envelope.template_id != JOURNAL_HEADER.template_id
+    {
+        return None;
+    }
+    let block = |at: usize| buf.get(at.checked_add(12)?).copied();
+    let contract = u16::from_le_bytes([block(20)?, block(21)?]);
+    if contract != CONTRACT_VERSION {
+        return Some(UnsupportedHeader::Contract { found: contract });
+    }
+    match block(22)? {
+        1 => None,
+        found => Some(UnsupportedHeader::Clock { found }),
+    }
 }
 
 impl<'a> JournalHeader<'a> {
@@ -1669,6 +1714,83 @@ impl ReferenceUnavailable {
     }
 }
 
+/// A checkpoint of the application's state after event `group_seq`,
+/// stored at `position` in the group's checkpoint store (A9). It sits
+/// outside events, as a gap marker does, and is appended once its bytes
+/// are written, so events after `group_seq` may come before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointRecord {
+    /// The last event the state includes, never 0.
+    pub group_seq: u64,
+    /// Never 0, increasing within the group.
+    pub checkpoint_id: u64,
+    /// Where its range starts in the checkpoint store;
+    /// [`CAPTURE_POSITION`] in a replay's capture, which stores nothing.
+    pub position: u64,
+    /// The snapshot's bytes, at least 1.
+    pub length: u64,
+    /// The CRC-32C of the snapshot's bytes.
+    pub crc32c: u32,
+    /// The application's own tag for its snapshot format.
+    pub format: u32,
+}
+
+impl CheckpointRecord {
+    /// The end of its range in the checkpoint store; `None` in a replay's
+    /// capture.
+    #[must_use]
+    pub const fn end(&self) -> Option<u64> {
+        if self.position == CAPTURE_POSITION {
+            None
+        } else {
+            self.position.checked_add(self.length)
+        }
+    }
+
+    fn check(&self) -> Result<(), CodecError> {
+        id("group_seq", self.group_seq)?;
+        id("checkpoint_id", self.checkpoint_id)?;
+        if self.length == 0 {
+            return Err(out_of_range("length"));
+        }
+        if self.position != CAPTURE_POSITION && self.end().is_none() {
+            return Err(out_of_range("position"));
+        }
+        Ok(())
+    }
+
+    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+        decoder.finish()?;
+        let record = Self {
+            group_seq: block.u64(0)?,
+            checkpoint_id: block.u64(8)?,
+            position: block.u64(16)?,
+            length: block.u64(24)?,
+            crc32c: block.u32(32)?,
+            format: block.u32(36)?,
+        };
+        record.check()?;
+        Ok(record)
+    }
+
+    /// Encodes into `out`; returns the record's length.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &CHECKPOINT)?;
+        self.check()?;
+        encoder.u64(0, self.group_seq)?;
+        encoder.u64(8, self.checkpoint_id)?;
+        encoder.u64(16, self.position)?;
+        encoder.u64(24, self.length)?;
+        encoder.u32(32, self.crc32c)?;
+        encoder.u32(36, self.format)?;
+        encoder.finish()
+    }
+}
+
 /// Any record of schema 3, version 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupRecord<'a> {
@@ -1702,6 +1824,8 @@ pub enum GroupRecord<'a> {
     Gap(GapMarker),
     /// Template 22.
     Unavailable(ReferenceUnavailable),
+    /// Template 30.
+    Checkpoint(CheckpointRecord),
 }
 
 /// What a record is within its journal, for the order rules.
@@ -1752,6 +1876,13 @@ pub enum Role {
     Gap(GapMarker),
     /// A reference unavailable, naming its event's `group_seq`.
     Unavailable(u64),
+    /// A recorded checkpoint: its `group_seq` and `checkpoint_id`.
+    Checkpoint {
+        /// The last event its state includes.
+        group_seq: u64,
+        /// Its id.
+        checkpoint_id: u64,
+    },
 }
 
 impl<'a> GroupRecord<'a> {
@@ -1788,6 +1919,7 @@ impl<'a> GroupRecord<'a> {
             20 => &EVENT_END,
             21 => &GAP_MARKER,
             22 => &REFERENCE_UNAVAILABLE,
+            30 => &CHECKPOINT,
             _ => return Err(unsupported),
         };
         let (block, decoder) = Decoder::new(buf, template)?;
@@ -1806,7 +1938,8 @@ impl<'a> GroupRecord<'a> {
             15 => Self::Poll(DeliveryPoll::decode(block, decoder)?),
             20 => Self::End(EventEnd::decode(block, decoder)?),
             21 => Self::Gap(GapMarker::decode(block, decoder)?),
-            _ => Self::Unavailable(ReferenceUnavailable::decode(block, decoder)?),
+            22 => Self::Unavailable(ReferenceUnavailable::decode(block, decoder)?),
+            _ => Self::Checkpoint(CheckpointRecord::decode(block, decoder)?),
         })
     }
 
@@ -1832,6 +1965,7 @@ impl<'a> GroupRecord<'a> {
             Self::End(record) => record.encode(out),
             Self::Gap(record) => record.encode(out),
             Self::Unavailable(record) => record.encode(out),
+            Self::Checkpoint(record) => record.encode(out),
         }
     }
 
@@ -1885,6 +2019,10 @@ impl<'a> GroupRecord<'a> {
             Self::End(end) => Role::End(*end),
             Self::Gap(gap) => Role::Gap(*gap),
             Self::Unavailable(unavailable) => Role::Unavailable(unavailable.group_seq),
+            Self::Checkpoint(checkpoint) => Role::Checkpoint {
+                group_seq: checkpoint.group_seq,
+                checkpoint_id: checkpoint.checkpoint_id,
+            },
         }
     }
 }

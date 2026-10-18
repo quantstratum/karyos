@@ -1604,8 +1604,10 @@ fn child() {
             let before = open_descriptors();
             for _ in 1..ROUNDS {
                 let fetchable = grant(&mut client, true);
-                let subscription = client.take_subscription(&fetchable).unwrap();
-                drop(subscription);
+                // Only dropped: the Detach ends the last grant, so the
+                // driver reclaims the registration and more rounds than
+                // `max_exports_per_client` are admitted.
+                drop(client.take_subscription(&fetchable).unwrap());
             }
             // Every received descriptor was closed: the client's count is
             // where it started too.

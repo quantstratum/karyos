@@ -11,6 +11,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A remote client's registrations are capped at `max_exports_per_client`,
+  as its ledger's grants were before. Every add that makes a
+  registration counts: `AddPublication`, `AddConcurrentPublication`,
+  `AddSubscription`, `AddImageSubscription` and a conflated view; past
+  the cap each is refused with `ResourcesUnavailable`, and the client
+  stays served. A remote registration whose last grant ended (detached,
+  or ended unsent) is reclaimed, so a client that only drops its handles
+  never reaches the cap that way; a later `RemoveSubscription` or
+  `RemovePublication` of a reclaimed registration answers
+  `UnknownRegistration`, which the client facade ignores.
+- `Client::remove_subscription` removes a subscription as
+  `Client::remove_publication` removes a publication: a `karyos:ipc` one
+  at the driver, a `karyos:udp` one with every image it reads. A removal
+  that cannot be sent drops the handle and is counted:
+  `Client::subscription_releases_failed`, as the facade counts every
+  image handle it lets go of whose removal could not be sent.
 - A publication released through the client facade whose removal cannot
   be sent (the command ring full, a handle another connection issued, a
   closed link) is counted: `Client::publication_releases_failed`. The
@@ -289,6 +305,76 @@ release may break APIs, wire formats and shared-memory layouts.
   of its incarnation plus its cell position.
 
 ### Added
+
+- A group's checkpoints in the Archive agent (phase 3, A9-3).
+  `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and
+  `reopen_hold`) gives a group a checkpoint store in its journal
+  directory's `checkpoints` subdirectory (`checkpoint::store_dir`), made
+  or recovered with its journal, recovery cutting it to what the
+  journal's records name, a missing one marking their ranges lost, and
+  closed with the group. Settings that cannot work are refused before
+  anything is made (`AgentError::CheckpointConfig`). The group's sender
+  carries a `CheckpointHandle` (`CaptureSender::take_checkpoints`), the
+  Gateway's end of a one-slot handoff that moves the buffer both ways
+  with no copy and no allocation; once the group stops, fails or ends,
+  checkpoints are refused (`CheckpointError::Stopped`) with their buffer
+  kept. The agent writes a checkpoint once its journal holds the event
+  it names, in chunks of at most `AgentConfig::checkpoint_budget` bytes
+  a cycle, then syncs it and records template 30, which the capture
+  job's prefixes take (`CaptureJob::checkpoint`). The production
+  coverage answers `Coverage::checkpoint` from the group's store. The
+  capture job lifts its stop once a checkpoint opens a range, so the
+  in-flight bound applies again, and a restart counts a gap's events as
+  sent; an event the tracker has no room for then is taken again once,
+  after a sync, and the group fails, typed, only if it is still full.
+  The reopening window holds `reopen_hold` events (four times
+  `in_flight` by default), and a range that could not reopen over them
+  is counted (`PrefixTracker::failed_reopens`).
+  `GroupWaiter::durable_for` answers per event across ranges.
+
+- Replay with checkpoints (phase 3, A9-2; recording-group-checkpoints.md
+  section 6). `ReplayCursor::open_at_checkpoint` reads a checkpoint's
+  snapshot into the caller's buffer, checks its length and CRC-32C
+  (`ReplayError::CheckpointCorrupt` otherwise, also for a lost one in a
+  range it opened), and replays the events after its `group_seq` to the
+  end of its range's complete prefix. One unknown, past that prefix, in
+  a middle range (interim), or lost after a stop it never opened is
+  refused (`UnknownCheckpoint`, `NotInPrefix`), as is a short buffer.
+  The cursor gives each recorded checkpoint of the range right after its
+  event (`Step::Checkpoint`); `compare_state` compares the replay's
+  state there by length and digest and gives the capture's record at
+  `CAPTURE_POSITION`. `ReplayGateway` does it in the event's own
+  dispatch through the handler's new `checkpoint` hook
+  (`ReplayGateway::with_state`); a difference, or no state, is a
+  `DivergenceKind::StateCheckpoint` divergence, its index the event's
+  observation count, and a snapshot above the buffer is
+  `GatewayError::StateBuffer`. `ReplayCursor::step_from` skips the
+  checkpoints below its start; the diff does not compare checkpoints
+  yet. `Handler` gains `checkpoint` and `restore`, with
+  default bodies; `CaptureJournal::create_from` starts a capture after a
+  checkpoint. Steps allocate nothing.
+
+- Checkpoints of a recording group, the store and the record (phase 3,
+  A9-1; recording-group-checkpoints.md sections 2 to 5). Each group has
+  a `CheckpointStore` beside its journal, with the journal's sync policy.
+  `CheckpointWriter::write` checks the record against the order rules,
+  appends the snapshot's bytes and syncs them, then appends template 30
+  (`CheckpointRecord`, block 40): a failed write leaves no record, and
+  a recorded checkpoint is durable by construction. The Gateway's
+  one-slot handoff (`CheckpointSlot`) refuses a checkpoint in flight,
+  one above `max_checkpoint`, an empty one and any after a strict
+  journal's end, each typed and counted. A new order rule
+  (`OrderRule::Checkpoint`): recorded checkpoints name an ended event
+  and rise in `group_seq` and id. The prefix tracker follows ranges: a
+  checkpoint after a gap or an incomplete event opens a new one at its
+  record once the store holds its bytes (`Coverage::checkpoint`,
+  `CheckpointHeld`; a lost one opens nothing), reported by
+  `PrefixTracker::range`. The first range's final values are frozen
+  (`PrefixTracker::first_range`): replay from the start stops there,
+  and `PrefixView::durable_for` answers a wait for an event before the
+  current range from them. The replay cursor skips template 30.
+  Recovery cuts bytes no record names and marks as lost a range a
+  record names that the store lacks. Nothing allocates per checkpoint.
 
 - Timed lanes over the network (P2.11 PR1, the software route;
   timed-tx.md). `EmbeddedDriver::add_timed_network_publication` adds a
@@ -1063,6 +1149,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- An IPC driver no longer keeps the images a connected remote subscriber
+  read. A registration kept its stream from freeing, and a remote client
+  had no way to remove one, so every image it took stayed Retiring, with
+  its regions, descriptors and storage charge, until the client left. A
+  retiring stream now frees once no lease, remote grant or lingering
+  network publication holds it. An in-process registration whose
+  `Remove` is still queued stays until it is served, and the `Remove`
+  succeeds; a `ReportLoss` queued ahead of it is not a protocol
+  violation once the stream is freed (it is counted unverified). A remote
+  registration is reclaimed once its last grant ends. Stream ids and
+  registration ids are never reused, so neither names a later one. A
+  remote registration no longer keeps a replaced guarded incarnation by
+  itself: its grants do.
+  `RemoteClient::remove_subscription` removes a taken subscription, and
+  the client facade releases retired, dropped and late-granted image
+  handles with it (the doc-hidden `Connection::release_subscription`).
 - A removed network publication's sender closes its lane queues, its
   repair queue and its route at its next duty (#354 review P3-6;
   driver-network-agents.md §7: the sender drops its queues), on every

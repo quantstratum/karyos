@@ -856,6 +856,41 @@ impl RemoteClient {
         }
     }
 
+    /// Removes a subscription handle taken from a grant: `RemoveSubscription`
+    /// of its registration, as [`ClientConductor::remove_subscription`]. The
+    /// handle is dropped, detaching its export, only after the command is
+    /// written, and the driver then forgets the registration: without it,
+    /// the registration would stay until the client ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handle intact with the error, so the caller can retry:
+    /// [`ConductorError::ForeignHandle`] for a handle this client did not
+    /// take, and the errors of [`ClientConductor::remove_subscription`].
+    #[allow(
+        clippy::result_large_err,
+        reason = "the handle is returned intact so the caller can retry; boxing it would allocate on every Full"
+    )]
+    pub fn remove_subscription(
+        &mut self,
+        subscription: ClientSubscription<SharedTerms>,
+    ) -> Result<u64, (ClientSubscription<SharedTerms>, ConductorError)> {
+        let Some(registration) = self.taken_registration(subscription.generation_link()) else {
+            return Err((subscription, ConductorError::ForeignHandle));
+        };
+        let submitted = match self.conductor_mut() {
+            Ok(conductor) => conductor.remove_subscription_registration(registration),
+            Err(error) => Err(error),
+        };
+        match submitted {
+            Ok(sequence) => {
+                drop(subscription);
+                Ok(sequence)
+            }
+            Err(error) => Err((subscription, error)),
+        }
+    }
+
     /// The registration whose grant this client took the handle of
     /// `link` from; `None` for a handle it did not take.
     fn taken_registration(&self, link: Option<&Arc<GenerationLink<SharedTerms>>>) -> Option<u64> {

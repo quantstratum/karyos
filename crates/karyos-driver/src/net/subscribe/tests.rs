@@ -1594,7 +1594,15 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         let _ = c.do_work().unwrap();
         b.network_images(10).len() == 2
     });
-    let [(oldest, _), (newest, _)] = b.network_images(10)[..] else {
+    // Oldest is the lowest aggregate registration, as `find_stream`
+    // takes it, whatever order the images are listed in.
+    let mut images: Vec<_> = b
+        .network_images(10)
+        .into_iter()
+        .map(|(image, _)| image)
+        .collect();
+    images.sort_by_key(crate::embedded::AggregateHandle::registration);
+    let [oldest, newest] = images[..] else {
         panic!("two images");
     };
     let local = b.add_aggregate(aggregate(20, 1, 1)).unwrap();
@@ -1605,8 +1613,11 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         .unwrap();
     let mut observer = b.broadcast.receiver();
     let (client, mut producer) = remote_client(&mut b);
-    let serve = |b: &mut EmbeddedDriver| {
+    // Both publishers stay driven, so neither image goes stale or misses
+    // a repair while the commands are served.
+    let serve = |a: &mut EmbeddedDriver, c: &mut EmbeddedDriver, b: &mut EmbeddedDriver| {
         for _ in 0..20 {
+            let _ = (a.do_work().unwrap(), c.do_work().unwrap());
             let _ = b.do_work().unwrap();
         }
     };
@@ -1616,12 +1627,26 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         lane: Lane::try_new(lane).unwrap(),
         role: SubscriberRole::Required,
     };
+    let live = |b: &EmbeddedDriver| {
+        let mut live: Vec<u64> = b
+            .network_images(10)
+            .iter()
+            .map(|(image, _)| image.registration())
+            .collect();
+        live.sort_unstable();
+        live
+    };
+    assert_eq!(
+        live(&b),
+        [oldest.registration(), newest.registration()],
+        "both images live before the commands"
+    );
     add_remote_subscription(&mut producer, 1, (10, 3), SubscriberRole::Required);
     write_command(
         &mut producer,
         image_subscription(2, newest.registration(), 0),
     );
-    serve(&mut b);
+    serve(&mut a, &mut c, &mut b);
     let streams: Vec<u64> = b
         .ledger(client)
         .unwrap()
@@ -1644,7 +1669,7 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
     for (sequence, image, lane) in refused {
         write_command(&mut producer, image_subscription(sequence, image, lane));
     }
-    serve(&mut b);
+    serve(&mut a, &mut c, &mut b);
     let mut events = b.broadcast.receiver();
     assert!(b.remove_network_subscription(subscription).unwrap());
     pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_none());
@@ -1669,7 +1694,7 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         &mut producer,
         image_subscription(6, oldest.registration(), 0),
     );
-    serve(&mut b);
+    serve(&mut a, &mut c, &mut b);
     assert_eq!(grants(&b, client), 2, "nothing more granted");
     let errors: Vec<(u64, ErrorCode, u64)> = responses(&mut observer)
         .into_iter()
@@ -1776,4 +1801,185 @@ fn a_conductor_hears_each_image_and_attaches_by_alias_to_the_oldest() {
         Some(oldest),
         "the alias attaches the oldest image"
     );
+}
+
+/// Stages of the driver thread of a facade test.
+const PUBLISH: u8 = 1;
+const REMOVE: u8 = 2;
+const STOP: u8 = 3;
+
+/// An in-process facade over driver `b`, which a driver thread serves with
+/// a publisher `a`: one image of stream 10 per `PUBLISH`, retired at
+/// `REMOVE`. The thread publishes `b`'s registration count.
+struct FacadeRig {
+    client: karyos_client::Client<karyos_client::ClientConductor>,
+    reading: Option<karyos_client::Subscription<karyos_sys::term_bytes::HeapTerms>>,
+    stage: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    registrations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    thread: std::thread::JoinHandle<EmbeddedDriver>,
+}
+
+impl FacadeRig {
+    fn new() -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+        use karyos_client::{Client, Context, IdleStrategy};
+        use karyos_protocol::cnc::StreamId;
+
+        let port = free_port();
+        let stage = Arc::new(AtomicU8::new(0));
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let (send, receive) = std::sync::mpsc::channel();
+        let driving = Arc::clone(&stage);
+        let counting = Arc::clone(&registrations);
+        let thread = std::thread::spawn(move || {
+            let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+            send.send(b.connect().unwrap()).unwrap();
+            let destination = SocketAddr::new(LOOPBACK, port);
+            let mut publication = None;
+            loop {
+                match driving.load(Ordering::Acquire) {
+                    PUBLISH if publication.is_none() => {
+                        publication = Some(
+                            a.add_network_publication(aggregate(10, 3, 1), &channel(destination))
+                                .unwrap(),
+                        );
+                    }
+                    REMOVE => {
+                        if let Some(publication) = publication.take() {
+                            a.remove_aggregate(&publication).unwrap();
+                        }
+                    }
+                    STOP => break,
+                    _ => {}
+                }
+                let _ = a.do_work().unwrap();
+                let _ = b.do_work().unwrap();
+                counting.store(b.registrations.len(), Ordering::Release);
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            for _ in 0..50 {
+                let _ = b.do_work().unwrap();
+            }
+            let _ = (a.close_network(), b.close_network());
+            b
+        });
+        let context = Context::builder()
+            .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let mut client = Client::with_conductor(receive.recv().unwrap(), context);
+        let reading = client
+            .add_subscription(
+                &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+                StreamId::new(10),
+            )
+            .unwrap();
+        Self {
+            client,
+            reading: Some(reading),
+            stage,
+            registrations,
+            thread,
+        }
+    }
+
+    fn stage(&self, stage: u8) {
+        self.stage
+            .store(stage, std::sync::atomic::Ordering::Release);
+    }
+
+    fn registrations(&self) -> usize {
+        self.registrations
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Serves the client, and reads its subscription when `read`, until
+    /// `done`.
+    fn until(&mut self, read: bool, done: &dyn Fn(&Self) -> bool) {
+        let start = std::time::Instant::now();
+        while !done(self) {
+            assert!(start.elapsed() < Duration::from_secs(20), "not reached");
+            self.service(read);
+        }
+    }
+
+    fn service(&mut self, read: bool) {
+        let _ = self.client.poll();
+        if read && let Some(reading) = self.reading.as_mut() {
+            let _ = reading.poll(|_, _| {}, karyos_client::MessageLimit::new(64));
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+
+    /// Serves the client a while, so it releases what was let go of, then
+    /// stops the driver thread and asserts that `b` forgot every
+    /// registration by the command, none swept.
+    fn ends_with_none_swept(mut self) {
+        for _ in 0..100 {
+            self.service(false);
+        }
+        self.stage(STOP);
+        let b = self.thread.join().unwrap();
+        assert!(b.registrations.is_empty(), "the registration was removed");
+        assert_eq!(
+            b.counters.value(crate::counters::Event::RegistrationsSwept),
+            0,
+            "removed by the command, not swept"
+        );
+        drop((self.reading, self.client));
+    }
+}
+
+/// The client facade releases a retired image's handle with
+/// `RemoveSubscription` (`Connection::release_subscription`), so the driver
+/// forgets its registration by the command, not by sweeping a dropped
+/// handle: an in-process facade reads one image, the image retires, and
+/// the driver ends with no registration and none swept.
+#[test]
+fn the_facade_removes_a_retired_images_subscription() {
+    let mut rig = FacadeRig::new();
+    rig.stage(PUBLISH);
+    rig.until(true, &|rig| {
+        rig.reading.as_ref().is_some_and(|r| r.image_count() == 1)
+    });
+    rig.stage(REMOVE);
+    rig.until(true, &|rig| {
+        rig.reading.as_ref().is_some_and(|r| r.image_count() == 0)
+    });
+    rig.ends_with_none_swept();
+}
+
+/// An image that retires before its subscription ever polled it is
+/// released by the client at `ImageUnavailable`, with `RemoveSubscription`,
+/// not dropped: the subscription is never read, so the handle is still in
+/// the inbox when the image retires.
+#[test]
+fn the_facade_removes_an_image_retired_before_it_was_read() {
+    let mut rig = FacadeRig::new();
+    rig.stage(PUBLISH);
+    rig.until(false, &|rig| rig.registrations() == 1);
+    // The attach's answer reaches the inbox at the client's next services.
+    for _ in 0..100 {
+        rig.service(false);
+    }
+    rig.stage(REMOVE);
+    rig.until(false, &|rig| rig.registrations() == 0);
+    rig.ends_with_none_swept();
+}
+
+/// Dropping a network subscription that still reads an image releases the
+/// image's handle with `RemoveSubscription`, not by dropping it.
+#[test]
+fn a_dropped_network_subscription_removes_its_images() {
+    let mut rig = FacadeRig::new();
+    rig.stage(PUBLISH);
+    rig.until(true, &|rig| {
+        rig.reading.as_ref().is_some_and(|r| r.image_count() == 1)
+    });
+    drop(rig.reading.take());
+    rig.until(false, &|rig| rig.registrations() == 0);
+    rig.ends_with_none_swept();
 }
