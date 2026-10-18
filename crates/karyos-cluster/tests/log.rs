@@ -728,16 +728,37 @@ fn a_flip_in_a_middle_segment_is_corruption() {
     let mut bytes = std::fs::read(&segment).unwrap();
     bytes[100] ^= 1;
     std::fs::write(&segment, &bytes).unwrap();
-    match RaftLog::open(StdDisk, &dir.0, small()) {
-        Err(LogError::Corruption(corruption)) => assert_eq!(
-            corruption,
-            Corruption::BelowMark {
-                last: Some(2),
-                mark: 8
-            }
-        ),
-        other => panic!("{other:?}"),
+    let before = listing(&dir.0);
+    for _ in 0..2 {
+        match RaftLog::open(StdDisk, &dir.0, small()) {
+            Err(LogError::Corruption(corruption)) => assert_eq!(
+                corruption,
+                Corruption::BelowMark {
+                    last: Some(2),
+                    mark: 8
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
     }
+    // Refused before anything was cut: every file as it was.
+    assert_eq!(listing(&dir.0), before);
+}
+
+/// Every file of `dir`, sorted, with its length.
+fn listing(dir: &Path) -> Vec<(String, u64)> {
+    let mut files: Vec<(String, u64)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().into_string().unwrap(),
+                entry.metadata().unwrap().len(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 /// A flip inside one segment of a synced log: below the watermark too.
@@ -1080,35 +1101,21 @@ fn the_watermark_follows_syncs_and_survives_a_torn_slot() {
     assert_eq!((log.last_index(), log.mark()), (Some(4), Some(4)));
 }
 
-/// With no valid slot, the mark is unset, the conservative choice: a cut
-/// a full mark would refuse is taken for a crash's loss.
+/// With no valid slot beside a first-index file, the watermark is
+/// damaged: open refuses, so corruption detection is never switched off.
 #[test]
-fn no_valid_watermark_slot_accepts_any_cut() {
-    let dir = TempDir::new("no-mark");
-    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
-    let batch: Vec<Entry> = (1..=8)
-        .map(|index| entry(index, 1, &[index as u8; 2012]))
-        .collect();
-    log.append(&batch).unwrap();
-    log.sync().unwrap();
-    drop(log);
+fn no_valid_watermark_slot_is_refused() {
+    let dir = three_entries("no-mark");
     std::fs::write(dir.0.join(MARK_FILE), [0xA5u8; MARK_LEN]).unwrap();
-    let segment = data_file(&dir.0, 4096);
-    let mut bytes = std::fs::read(&segment).unwrap();
-    bytes[100] ^= 1;
-    std::fs::write(&segment, &bytes).unwrap();
-    let opened = RaftLog::open(StdDisk, &dir.0, small()).unwrap();
-    assert_eq!(opened.cut, Some(4096));
-    assert_eq!(
-        (opened.log.last_index(), opened.log.mark()),
-        (Some(2), Some(2))
-    );
-    // A missing file is the same, and is created again.
-    drop(opened);
+    assert!(matches!(
+        RaftLog::open(StdDisk, &dir.0, geometry()),
+        Err(LogError::Mark)
+    ));
     std::fs::remove_file(dir.0.join(MARK_FILE)).unwrap();
-    let log = open(StdDisk, &dir.0, small());
-    assert_eq!(log.mark(), Some(2));
-    assert!(dir.0.join(MARK_FILE).exists());
+    assert!(matches!(
+        RaftLog::open(StdDisk, &dir.0, geometry()),
+        Err(LogError::Mark)
+    ));
 }
 
 /// A segment roll syncs A2 ahead of the mark: the durable index reported

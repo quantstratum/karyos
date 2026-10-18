@@ -26,17 +26,19 @@
 //!   [`RaftLog::durable_index`] never passes it.
 //! - **Recovery.** A crash may lose any number of writes past the last
 //!   sync, in any order; what a sync reported durable it must not lose.
-//!   [`RaftLog::open`] loads the hard state and the watermark first, then
-//!   runs A2's recovery and walks the frames. A log that ends below the
-//!   watermark is [`LogError::Corruption`]; anything lost above it is a
-//!   crash's loss, reported in [`Opened::cut`]. The last write may hold
-//!   the first chunks of a frame whose later chunks were lost with the
-//!   next segment: that torn tail is cut, unless it is committed or below
-//!   the watermark. Any other frame that is not the next one is
-//!   [`LogError::Chain`]: a foreign magic, a CRC failure, a length past
-//!   the end, an index that does not follow, a term that goes back. (A2's
-//!   recovery runs before the decision; once A2 has a verifying mode, the
-//!   decision moves before any cut.)
+//!   [`RaftLog::open`] loads the hard state and the watermark (a first-index
+//!   file without a valid slot beside it is [`LogError::Mark`]), then asks
+//!   A2 for its recovery plan ([`SegmentStore::verify`], read-only) and
+//!   walks the frames the plan keeps, before anything is cut. A log that
+//!   would end below the watermark is [`LogError::Corruption`]; anything
+//!   lost above it is a crash's loss, reported in [`Opened::cut`]. The
+//!   last write may hold the first chunks of a frame whose later chunks
+//!   were lost with the next segment: that torn tail is cut, unless it is
+//!   committed or below the watermark. Any other frame that is not the
+//!   next one is [`LogError::Chain`]: a foreign magic, a CRC failure, a
+//!   length past the end, an index that does not follow, a term that goes
+//!   back. Only once all that passed does A2 apply its plan and the log cut
+//!   its torn tail.
 //! - **Hard state.** [`HardState`] lives in its own file, replaced
 //!   atomically; its stored commit only moves forward and never past the
 //!   durable last index, and no committed entry is ever truncated.
@@ -94,14 +96,6 @@ pub const FRAME_HEADER: usize = 36;
 /// [`FRAME_HEADER`] as a position.
 pub const FRAME_HEADER_LEN: u64 = 36;
 const MAGIC: [u8; 4] = *b"KRLE";
-/// An unset watermark, in slot 0: before any entry was reported durable.
-const UNSET: (usize, Slot) = (
-    0,
-    Slot {
-        sequence: 0,
-        durable: None,
-    },
-);
 /// A new watermark file's mark: slot 0, sequence 1, unset.
 const CREATED: (usize, Slot) = (
     0,
@@ -254,6 +248,8 @@ pub enum LogError {
     Corruption(Corruption),
     /// The first-index file is missing or not one this version wrote.
     FirstIndex,
+    /// The durable watermark has no valid slot beside a first-index file.
+    Mark,
     /// The hard-state record is refused.
     HardState(HardStateProblem),
     /// A commit index above the durable last index.
@@ -356,6 +352,7 @@ impl fmt::Display for LogError {
             }
             Self::Corruption(corruption) => write!(f, "the log is corrupt: {corruption:?}"),
             Self::FirstIndex => f.write_str("the first-index file is missing or invalid"),
+            Self::Mark => f.write_str("the durable watermark has no valid slot"),
             Self::HardState(problem) => write!(f, "the hard state is refused: {problem}"),
             Self::CommitBeyondDurable { commit, durable } => write!(
                 f,
@@ -516,18 +513,35 @@ impl<D: Disk + Clone> RaftLog<D> {
                 return Err(LogError::HardState(HardStateProblem::Length(length)));
             }
         };
-        // The newest valid slot; none (missing, torn or foreign) is an
-        // unset mark, the conservative choice.
-        let (mark_file, (mark_slot, mark)) = match file::read(&mut disk, dir, MARK_FILE, MARK_LEN)?
-        {
-            Read::Bytes(bytes) => (
-                disk.open(&dir.join(MARK_FILE))?,
-                mark::newest(&bytes).unwrap_or(UNSET),
-            ),
-            Read::Missing | Read::TooLong(_) => (mark::create(&mut disk, dir)?, CREATED),
+        // Creation writes the mark durably before the first-index file: a
+        // first-index file without a valid slot beside it is damage.
+        let (mark_slot, mark) = match file::read(&mut disk, dir, MARK_FILE, MARK_LEN)? {
+            Read::Bytes(bytes) => mark::newest(&bytes).ok_or(LogError::Mark)?,
+            Read::Missing | Read::TooLong(_) => return Err(LogError::Mark),
         };
-        if !store_exists(&mut disk, dir)? {
-            // A creation that stopped after its first-index file.
+        let mark_file = disk.open(&dir.join(MARK_FILE))?;
+        // Plan first: nothing is cut before the log decides.
+        let plan = match SegmentStore::verify(disk.clone(), dir, LOG_RECORDING, geometry) {
+            Ok(plan) => plan,
+            Err(SegmentError::BadHeader { base, .. }) => {
+                return Err(LogError::Corruption(Corruption::Segment { base }));
+            }
+            Err(error) => return Err(LogError::Store(error)),
+        };
+        let Some(kept) = plan.kept else {
+            // A creation that stopped before the store had a valid header:
+            // recovery removes what it began, and the log starts empty.
+            check_mark(mark.durable, None)?;
+            match SegmentStore::recover(
+                disk.clone(),
+                dir,
+                LOG_RECORDING,
+                geometry,
+                SyncPolicy::PerSegment,
+            ) {
+                Ok(_) | Err(SegmentError::NotFound { .. }) => {}
+                Err(error) => return Err(LogError::Store(error)),
+            }
             let log = Self::create_store(
                 disk,
                 dir,
@@ -537,146 +551,66 @@ impl<D: Disk + Clone> RaftLog<D> {
                 (mark_slot, mark),
             )?;
             return Ok(Opened { log, cut: None });
+        };
+        let walk = {
+            let mut reader = RawReader::new(&mut disk, dir, geometry);
+            walk(&mut reader, kept.start, kept.written, first_index, geometry)?
+        };
+        let last = index_after(first_index, walk.entries.len());
+        if let (Some((_, index)), Some(commit)) =
+            (walk.torn, hard_state.and_then(|state| state.commit))
+            && index <= commit
+        {
+            return Err(LogError::TornBelowCommit { index, commit });
         }
-        let recovered = match SegmentStore::recover(
+        check_mark(mark.durable, last)?;
+        if let Some(commit) = hard_state.and_then(|state| state.commit)
+            && last.is_none_or(|last| commit > last)
+        {
+            return Err(LogError::CommitBeyondDurable {
+                commit,
+                durable: last,
+            });
+        }
+        // Decided: apply A2's plan, then cut the torn tail.
+        let recovered = SegmentStore::recover(
             disk.clone(),
             dir,
             LOG_RECORDING,
             geometry,
             SyncPolicy::PerSegment,
-        ) {
-            Ok(recovered) => recovered,
-            Err(SegmentError::BadHeader { base, .. }) => {
-                return Err(LogError::Corruption(Corruption::Segment { base }));
-            }
-            // A creation that stopped inside the store's own creation: A2
-            // removed its files.
-            Err(SegmentError::NotFound { .. }) => {
-                let log = Self::create_store(
-                    disk,
-                    dir,
-                    geometry,
-                    first_index,
-                    mark_file,
-                    (mark_slot, mark),
-                )?;
-                return Ok(Opened { log, cut: None });
-            }
-            Err(error) => return Err(LogError::Store(error)),
-        };
+        )?;
+        let mut store = recovered.store;
+        if store.written() != kept.written {
+            return Err(LogError::Store(SegmentError::NotContiguous {
+                expected: kept.written,
+                got: store.written(),
+            }));
+        }
+        if let Some((position, _)) = walk.torn {
+            store.truncate(position)?;
+        }
         let mut log = Self {
-            store: recovered.store,
+            store,
             disk,
             dir: dir.to_path_buf(),
             first_index,
-            entries: Vec::new(),
+            entries: walk.entries,
             hard_state,
             poisoned: false,
             mark_file,
             mark_slot,
             mark,
         };
-        let torn = log.rebuild(geometry)?;
-        log.check_mark(log.last_index())?;
-        if let Some(commit) = log.hard_state.and_then(|state| state.commit) {
-            log.check_commit(commit)?;
-        }
-        // A2's recovery made everything kept durable: the mark follows.
+        // What recovery kept is durable: the mark follows it.
         log.write_mark(log.last_index())?;
         Ok(Opened {
             log,
-            cut: torn.or(recovered.cut.map(|cut| cut.position)),
+            cut: walk
+                .torn
+                .map(|(position, _)| position)
+                .or(plan.cut.map(|cut| cut.position)),
         })
-    }
-
-    /// Walks the frames from the start; returns where a torn tail was cut.
-    fn rebuild(&mut self, geometry: Geometry) -> Result<Option<u64>, LogError> {
-        let written = self.store.written();
-        let mut position = self.store.start();
-        let mut next = self.first_index;
-        let mut last_term = None;
-        while position < written {
-            let chain = |problem| LogError::Chain { position, problem };
-            let header_end = position
-                .checked_add(FRAME_HEADER_LEN)
-                .ok_or_else(|| chain(ChainProblem::PastEnd))?;
-            if header_end > written {
-                return self.cut_tail(position, next, geometry);
-            }
-            let mut header = [0u8; FRAME_HEADER];
-            self.store.read(position, &mut header)?;
-            let frame = Header::decode(&header).ok_or_else(|| chain(ChainProblem::Foreign))?;
-            let end = frame
-                .end(position)
-                .ok_or_else(|| chain(ChainProblem::PastEnd))?;
-            if end > written {
-                return self.cut_tail(position, next, geometry);
-            }
-            let length = usize::try_from(frame.length).map_err(|_| chain(ChainProblem::PastEnd))?;
-            let mut payload = vec![0u8; length];
-            self.store.read(header_end, &mut payload)?;
-            let mut crc = Crc32c::new();
-            crc.update(
-                header
-                    .split_first_chunk::<32>()
-                    .map_or(&[][..], |(head, _)| head),
-            );
-            crc.update(&payload);
-            if crc.finish() != frame.crc {
-                return Err(chain(ChainProblem::Checksum));
-            }
-            if frame.index != next {
-                return Err(chain(ChainProblem::Index {
-                    expected: next,
-                    got: frame.index,
-                }));
-            }
-            if let Some(last) = last_term.filter(|last| frame.term < *last) {
-                return Err(chain(ChainProblem::TermBack {
-                    last,
-                    got: frame.term,
-                }));
-            }
-            self.entries.push((position, frame.term));
-            last_term = Some(frame.term);
-            next = next
-                .checked_add(1)
-                .ok_or(LogError::TooLarge { index: next })?;
-            position = end;
-        }
-        Ok(None)
-    }
-
-    /// Cuts the torn frame of entry `index` at `position`, if the log ends
-    /// at a segment's end (A2 splits a write only there) and the entry is
-    /// neither committed nor below the watermark.
-    fn cut_tail(
-        &mut self,
-        position: u64,
-        index: u64,
-        geometry: Geometry,
-    ) -> Result<Option<u64>, LogError> {
-        let at_segment_end = self
-            .store
-            .written()
-            .is_multiple_of(geometry.segment_length());
-        if !at_segment_end {
-            return Err(LogError::Chain {
-                position,
-                problem: ChainProblem::PastEnd,
-            });
-        }
-        if let Some(commit) = self
-            .hard_state
-            .and_then(|state| state.commit)
-            .filter(|commit| index <= *commit)
-        {
-            return Err(LogError::TornBelowCommit { index, commit });
-        }
-        // A torn entry was never reported durable.
-        self.check_mark(index.checked_sub(1).filter(|_| index > self.first_index))?;
-        self.store.truncate(position)?;
-        Ok(Some(position))
     }
 
     /// The first index.
@@ -846,16 +780,6 @@ impl<D: Disk + Clone> RaftLog<D> {
     #[must_use]
     pub fn mark(&self) -> Option<u64> {
         self.mark.durable
-    }
-
-    /// Refuses a recovered or cut log ending at `last`, below the mark.
-    fn check_mark(&self, last: Option<u64>) -> Result<(), LogError> {
-        match self.mark.durable {
-            Some(mark) if last.is_none_or(|last| last < mark) => {
-                Err(LogError::Corruption(Corruption::BelowMark { last, mark }))
-            }
-            _ => Ok(()),
-        }
     }
 
     /// Records `durable` as the mark: in the older slot, with the next
@@ -1047,4 +971,161 @@ impl<D: Disk + Clone> RaftLog<D> {
             }
         }
     }
+}
+
+/// Refuses a log that would end at `last`, below the watermark `mark`.
+fn check_mark(mark: Option<u64>, last: Option<u64>) -> Result<(), LogError> {
+    match mark {
+        Some(mark) if last.is_none_or(|last| last < mark) => {
+            Err(LogError::Corruption(Corruption::BelowMark { last, mark }))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The last index of a log from `first` holding `count` entries.
+fn index_after(first: u64, count: usize) -> Option<u64> {
+    let count = u64::try_from(count).ok()?.checked_sub(1)?;
+    first.checked_add(count)
+}
+
+/// Reads the log's bytes from A2's data files, read-only, before recovery
+/// (A2 names a segment's data `<recording>-<base>.seg`, both 16 hex
+/// digits, and keeps position `p` at offset `p - base` of it).
+struct RawReader<'a, D: Disk> {
+    disk: &'a mut D,
+    dir: &'a Path,
+    geometry: Geometry,
+    open: Option<(u64, D::File)>,
+}
+
+impl<'a, D: Disk> RawReader<'a, D> {
+    fn new(disk: &'a mut D, dir: &'a Path, geometry: Geometry) -> Self {
+        Self {
+            disk,
+            dir,
+            geometry,
+            open: None,
+        }
+    }
+
+    fn read(&mut self, mut position: u64, mut buf: &mut [u8]) -> Result<(), LogError> {
+        let segment = self.geometry.segment_length();
+        let overflow = || LogError::Store(SegmentError::PositionOverflow);
+        while !buf.is_empty() {
+            let offset = position.checked_rem(segment).ok_or_else(overflow)?;
+            let base = position.checked_sub(offset).ok_or_else(overflow)?;
+            let room = segment.checked_sub(offset).ok_or_else(overflow)?;
+            let take = usize::try_from(room).map_or(buf.len(), |room| room.min(buf.len()));
+            if self.open.as_ref().is_none_or(|(open, _)| *open != base) {
+                let name = format!("{LOG_RECORDING:016x}-{base:016x}.seg");
+                self.open = Some((base, self.disk.open_read(&self.dir.join(name))?));
+            }
+            let (chunk, rest) = buf.split_at_mut(take);
+            if let Some((_, file)) = &self.open {
+                self.disk.read_at(file, offset, chunk)?;
+            }
+            position = position
+                .checked_add(u64::try_from(take).map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+            buf = rest;
+        }
+        Ok(())
+    }
+}
+
+/// What the frame walk found: the entries, and a torn tail to cut.
+struct Walk {
+    entries: Vec<(u64, u64)>,
+    /// The torn frame's position and index.
+    torn: Option<(u64, u64)>,
+}
+
+/// Walks the frames of `[start, written)`. A frame that runs past
+/// `written` is the torn tail when the log ends at a segment's end (A2
+/// splits a write only there); any other frame that is not the next one
+/// is [`LogError::Chain`].
+fn walk<D: Disk>(
+    reader: &mut RawReader<'_, D>,
+    start: u64,
+    written: u64,
+    first_index: u64,
+    geometry: Geometry,
+) -> Result<Walk, LogError> {
+    let mut entries = Vec::new();
+    let mut position = start;
+    let mut next = first_index;
+    let mut last_term = None;
+    let at_segment_end = written.is_multiple_of(geometry.segment_length());
+    while position < written {
+        let chain = |problem| LogError::Chain { position, problem };
+        let torn = |next| {
+            if at_segment_end {
+                Ok(Walk {
+                    entries: Vec::new(),
+                    torn: Some((position, next)),
+                })
+            } else {
+                Err(chain(ChainProblem::PastEnd))
+            }
+        };
+        let header_end = position
+            .checked_add(FRAME_HEADER_LEN)
+            .ok_or_else(|| chain(ChainProblem::PastEnd))?;
+        if header_end > written {
+            let cut = torn(next)?;
+            return Ok(Walk {
+                entries,
+                torn: cut.torn,
+            });
+        }
+        let mut header = [0u8; FRAME_HEADER];
+        reader.read(position, &mut header)?;
+        let frame = Header::decode(&header).ok_or_else(|| chain(ChainProblem::Foreign))?;
+        let end = frame
+            .end(position)
+            .ok_or_else(|| chain(ChainProblem::PastEnd))?;
+        if end > written {
+            let cut = torn(next)?;
+            return Ok(Walk {
+                entries,
+                torn: cut.torn,
+            });
+        }
+        let length = usize::try_from(frame.length).map_err(|_| chain(ChainProblem::PastEnd))?;
+        let mut payload = vec![0u8; length];
+        reader.read(header_end, &mut payload)?;
+        let mut crc = Crc32c::new();
+        crc.update(
+            header
+                .split_first_chunk::<32>()
+                .map_or(&[][..], |(head, _)| head),
+        );
+        crc.update(&payload);
+        if crc.finish() != frame.crc {
+            return Err(chain(ChainProblem::Checksum));
+        }
+        if frame.index != next {
+            return Err(chain(ChainProblem::Index {
+                expected: next,
+                got: frame.index,
+            }));
+        }
+        if let Some(last) = last_term.filter(|last| frame.term < *last) {
+            return Err(chain(ChainProblem::TermBack {
+                last,
+                got: frame.term,
+            }));
+        }
+        entries.push((position, frame.term));
+        last_term = Some(frame.term);
+        next = next
+            .checked_add(1)
+            .ok_or(LogError::TooLarge { index: next })?;
+        position = end;
+    }
+    Ok(Walk {
+        entries,
+        torn: None,
+    })
 }
