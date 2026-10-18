@@ -22,7 +22,7 @@
 //! The Gateway side: [`gateway::ReplayGateway`], the replay implementation
 //! of [`super::gateway::GroupGateway`], presents the events through
 //! [`effects::ReplayEffects`], which checks each call against its recorded
-//! observation; [`reference`] reads a payload by reference from its
+//! observation; [`mod@reference`] reads a payload by reference from its
 //! recording.
 
 use std::path::Path;
