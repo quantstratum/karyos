@@ -12,6 +12,7 @@
     reason = "test helpers, as ADR-0007 allows in tests"
 )]
 
+use std::io;
 use std::path::Path;
 
 use proptest::prelude::*;
@@ -898,6 +899,202 @@ fn a_last_segment_without_its_data_file_is_a_creation_cut_short() {
         raw.open(&Path::new(DIR).join(index_name(RECORDING, 256)))
             .is_err()
     );
+}
+
+/// A disk that refuses every open for writing, to show a scan opens only
+/// for reading; everything else goes to the disk it wraps.
+struct NoWritableOpen<D>(D);
+
+impl<D: Disk> Disk for NoWritableOpen<D> {
+    type File = D::File;
+
+    fn create(&mut self, path: &Path) -> io::Result<Self::File> {
+        self.0.create(path)
+    }
+
+    fn open(&mut self, _path: &Path) -> io::Result<Self::File> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "opened for writing",
+        ))
+    }
+
+    fn open_read(&mut self, path: &Path) -> io::Result<Self::File> {
+        self.0.open_read(path)
+    }
+
+    fn write_at(&mut self, file: &Self::File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.0.write_at(file, offset, bytes)
+    }
+
+    fn read_at(&mut self, file: &Self::File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.0.read_at(file, offset, buf)
+    }
+
+    fn len(&mut self, file: &Self::File) -> io::Result<u64> {
+        self.0.len(file)
+    }
+
+    fn set_len(&mut self, file: &Self::File, len: u64) -> io::Result<()> {
+        self.0.set_len(file, len)
+    }
+
+    fn sync(&mut self, file: &Self::File) -> io::Result<()> {
+        self.0.sync(file)
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
+        self.0.sync_dir(dir)
+    }
+
+    fn list(&mut self, dir: &Path) -> io::Result<Vec<String>> {
+        self.0.list(dir)
+    }
+
+    fn remove(&mut self, path: &Path) -> io::Result<()> {
+        self.0.remove(path)
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        self.0.rename(from, to)
+    }
+}
+
+/// #427 review P2-2: `verify` runs over a read-only disk
+/// (`disk::ReadOnly`) and never opens a file for writing: its plan there
+/// is the one it reports over the writable disk, and the disk is as it
+/// was.
+#[test]
+fn verify_opens_only_for_reading() {
+    let disk = FaultDisk::default();
+    {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(300)).unwrap();
+        store.close().unwrap();
+    }
+    // A torn entry on the last segment: the plan cuts its index.
+    let mut raw = disk.clone();
+    let index = raw
+        .open(&Path::new(DIR).join(index_name(RECORDING, 256)))
+        .unwrap();
+    let length = raw.len(&index).unwrap();
+    raw.set_len(&index, length - 1).unwrap();
+    let before = disk.snapshot();
+    let planned =
+        SegmentStore::verify(disk.clone(), Path::new(DIR), RECORDING, geometry()).unwrap();
+    let read_only = SegmentStore::verify(
+        NoWritableOpen(crate::disk::ReadOnly(disk.clone())),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+    )
+    .unwrap();
+    assert_eq!(read_only, planned);
+    assert!(planned.cut.is_some());
+    assert_eq!(disk.snapshot(), before);
+}
+
+/// #427 review P2-1: a last segment whose data file is gone but whose
+/// index holds entries is no creation: it is refused, typed, and the disk
+/// stays byte for byte as it was.
+#[test]
+fn a_last_segment_with_entries_and_no_data_file_is_refused() {
+    let disk = FaultDisk::default();
+    {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(300)).unwrap();
+        store.close().unwrap();
+    }
+    let mut raw = disk.clone();
+    raw.remove(&Path::new(DIR).join(data_name(RECORDING, 256)))
+        .unwrap();
+    let before = disk.snapshot();
+    assert!(matches!(
+        recover_checked(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+        ),
+        Err(SegmentError::BadHeader {
+            base: 256,
+            problem: HeaderProblem::Incomplete
+        })
+    ));
+    assert_eq!(disk.snapshot(), before);
+}
+
+/// #427 review P3: a creation gap that does not start where the recording
+/// ends (the segment before it is gone) cuts the recording at its end as
+/// `NotContiguous`, and the gap is removed.
+#[test]
+fn a_creation_gap_after_a_missing_segment_cuts_at_the_recording_end() {
+    let disk = FaultDisk::default();
+    {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(384)).unwrap();
+        store.close().unwrap();
+    }
+    let mut raw = disk.clone();
+    for name in [data_name(RECORDING, 128), index_name(RECORDING, 128)] {
+        raw.remove(&Path::new(DIR).join(name)).unwrap();
+    }
+    raw.remove(&Path::new(DIR).join(data_name(RECORDING, 256)))
+        .unwrap();
+    let index = raw
+        .open(&Path::new(DIR).join(index_name(RECORDING, 256)))
+        .unwrap();
+    raw.set_len(&index, HEADER).unwrap();
+    let plan = SegmentStore::verify(disk.clone(), Path::new(DIR), RECORDING, geometry()).unwrap();
+    assert_eq!(
+        plan.cut,
+        Some(Cut {
+            position: 128,
+            reason: CutReason::NotContiguous
+        })
+    );
+    assert_eq!(
+        plan.dropped,
+        [DroppedSegment {
+            base: 256,
+            reason: DropReason::CreationGap
+        }]
+    );
+    let recovered = recover_checked(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    assert_eq!(recovered.store.written(), 128);
+    assert_eq!(recovered.cut, plan.cut);
 }
 
 /// The same state before the last segment is never a creation: a middle
