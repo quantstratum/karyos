@@ -379,9 +379,11 @@ fn sent_high_never_decreases_across_paths() {
     }
 }
 
-/// rp-w7c, §8 Leaving: a path that flaps, leaving by lag and returning on
-/// its open queue each time, never asks for an endpoint reset, and sends
-/// again after each return.
+/// rp-w7c, §8 Leaving: a path that flaps, leaving through the
+/// `leave_before_serve` hook (not a lag window) and returning on its open
+/// queue each time, never asks for an endpoint reset, and sends again
+/// after each return. The retry-queue variant is
+/// `a_faulted_route_leaves_and_returns_by_retry`.
 #[test]
 fn a_flapping_path_returns_with_no_reset() {
     let (a, observer_a, _seen_a) = path(1, 0);

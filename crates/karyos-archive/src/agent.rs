@@ -66,6 +66,10 @@ pub struct AgentConfig {
     pub max_recordings: usize,
     /// Replays at once at most, prepared or running.
     pub max_replays: usize,
+    /// How long a prepared replay waits for its sink. Past it the agent
+    /// drops it, so a sink never attached, its post lost or its server
+    /// gone, does not hold a replay's slot.
+    pub prepared_timeout: Duration,
     /// How long an idle cycle waits for a command.
     pub idle: Duration,
 }
@@ -80,6 +84,7 @@ impl Default for AgentConfig {
             replay_budget: 1 << 20,
             max_recordings: 64,
             max_replays: 16,
+            prepared_timeout: Duration::from_secs(5),
             idle: Duration::from_millis(1),
         }
     }
@@ -782,6 +787,8 @@ struct ActiveReplay<D: Disk> {
 struct PreparedReplay<D: Disk> {
     id: u64,
     source: ReplaySource<D>,
+    /// When it was prepared, on the agent's clock.
+    at: u64,
 }
 
 /// The replays the agent runs or prepared, and the next id.
@@ -797,6 +804,13 @@ impl<D: Disk> Replays<D> {
     /// Replays prepared or running.
     fn len(&self) -> usize {
         self.active.len() + self.prepared.len()
+    }
+
+    /// Drops the prepared replays older than `timeout`.
+    fn expire(&mut self, now: u64, timeout: Duration) {
+        let timeout = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        self.prepared
+            .retain(|prepared| now.checked_sub(prepared.at).is_none_or(|age| age < timeout));
     }
 
     /// A new replay id.
@@ -956,6 +970,7 @@ fn run<D>(
             }
         }
         worked |= state.duty(outbox, now());
+        state.replays.expire(now(), config.prepared_timeout);
         // After the recorders: they keep priority.
         worked |= state
             .replays
@@ -1083,7 +1098,7 @@ impl<D: Disk + Clone> State<D> {
                 let _ = reply.send(result);
             }
             Command::Prepare(prepare, reply) => {
-                let _ = reply.send(self.prepare_replay(prepare, outbox));
+                let _ = reply.send(self.prepare_replay(prepare, outbox, now));
             }
             Command::Attach {
                 id,
@@ -1110,7 +1125,7 @@ impl<D: Disk + Clone> State<D> {
                 let _ = reply.send(result);
             }
             Command::Replay(start, reply) => {
-                let _ = reply.send(self.start_replay(*start, outbox));
+                let _ = reply.send(self.start_replay(*start, outbox, now));
             }
             Command::StopReplay(id, reply) => {
                 let replays = &mut self.replays;
@@ -1213,6 +1228,7 @@ impl<D: Disk + Clone> State<D> {
         &mut self,
         prepare: PrepareReplay,
         outbox: &Outbox,
+        now: u64,
     ) -> Result<Prepared, AgentError> {
         let id = prepare.recording_id;
         let recording = self.catalog.get(id).ok_or(AgentError::Unknown { id })?;
@@ -1249,6 +1265,7 @@ impl<D: Disk + Clone> State<D> {
         self.replays.prepared.push(PreparedReplay {
             id: replay_id,
             source,
+            at: now,
         });
         Ok(Prepared {
             replay_id,
@@ -1260,7 +1277,12 @@ impl<D: Disk + Clone> State<D> {
 
     /// Prepares a replay and runs it into its sink; a sink not taken is
     /// finished, incomplete.
-    fn start_replay(&mut self, mut start: StartReplay, outbox: &Outbox) -> Result<u64, AgentError> {
+    fn start_replay(
+        &mut self,
+        mut start: StartReplay,
+        outbox: &Outbox,
+        now: u64,
+    ) -> Result<u64, AgentError> {
         let from = start.from;
         let prepared = start
             .to
@@ -1278,6 +1300,7 @@ impl<D: Disk + Clone> State<D> {
                         rate: start.rate,
                     },
                     outbox,
+                    now,
                 )
             });
         let prepared = match prepared {
