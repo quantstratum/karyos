@@ -332,6 +332,9 @@ impl<'s> Sim<'s> {
                             + 1,
                         mtu: DEFAULT_MTU,
                         max_reserved: MIN_TERM_LENGTH / 8,
+                        // Replaced by the driver's draw at the add, which
+                        // `driver_config` pins to 7: this value decides
+                        // nothing, the field only has to be set.
                         initial_term_id: TermId::new(7),
                         lane: Lane::ZERO,
                         session_id: 1,
@@ -1017,8 +1020,41 @@ mod tests {
 
     /// Every simulated stream starts at term id 7, whatever the draw: the
     /// driver's override pins it, so a seed replays the same positions.
+    /// The driver `Sim::new` builds is asked for the first term id of each
+    /// stream it added: the driver replaces the stream config's own value
+    /// with its draw at the add, so the override is what decides.
     #[test]
     fn the_simulated_driver_pins_its_first_term_id() {
-        assert_eq!(driver_config().initial_term_id, Some(7));
+        let plan = |publication, publishers| StreamPlan {
+            publication,
+            publishers,
+            required: 1,
+            optional: 0,
+            clients: 0,
+            keys: 0,
+        };
+        let scenario = Scenario {
+            name: "pin",
+            streams: vec![
+                plan(PublicationMode::Exclusive, 1),
+                plan(
+                    PublicationMode::Concurrent {
+                        publishers: 2,
+                        allow_non_lse: true,
+                    },
+                    2,
+                ),
+            ],
+            faults: Faults::default(),
+            on_required_loss: LossPolicy::Hold,
+            steps: 0,
+        };
+        let mut sim = Sim::new(&scenario, 1).unwrap();
+        assert_eq!(sim.streams.len(), 2);
+        let handles: Vec<StreamHandle> = sim.streams.iter().map(|stream| stream.handle).collect();
+        for handle in handles {
+            let reader = sim.driver.recording_reader(handle, Role::Optional).unwrap();
+            assert_eq!(reader.format().initial_term_id, 7, "{handle:?}");
+        }
     }
 }
