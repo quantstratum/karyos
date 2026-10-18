@@ -641,6 +641,12 @@ impl<D: Disk> SegmentStore<D> {
         self.written
     }
 
+    /// Its sync policy.
+    #[must_use]
+    pub const fn policy(&self) -> SyncPolicy {
+        self.policy
+    }
+
     /// The end of what a sync made durable, data and index both.
     #[must_use]
     pub const fn durable(&self) -> u64 {

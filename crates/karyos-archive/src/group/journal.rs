@@ -422,6 +422,12 @@ impl<D: Disk> GroupJournal<D> {
         &self.check
     }
 
+    /// Its sync policy.
+    #[must_use]
+    pub const fn policy(&self) -> SyncPolicy {
+        self.store.policy()
+    }
+
     /// The end of the last record written.
     #[must_use]
     pub const fn written(&self) -> u64 {
