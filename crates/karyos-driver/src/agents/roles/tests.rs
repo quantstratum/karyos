@@ -2230,6 +2230,7 @@ fn a_guard_close_applies_without_a_tx_half() {
                 cell: Arc::clone(&cell),
                 epoch: 2,
                 rate: None,
+                frontier: Default::default(),
             },
             0,
         )
@@ -2945,6 +2946,7 @@ fn an_unestablished_guarded_publication_applies_a_close() {
             cell: Arc::clone(&cell),
             epoch: 2,
             rate: None,
+            frontier: Default::default(),
         }),
         roles: None,
     };

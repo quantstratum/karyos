@@ -295,6 +295,7 @@ fn a_guard_close_stops_every_path() {
         cell: Arc::clone(&cell),
         epoch: 2,
         rate: None,
+        frontier: Default::default(),
     };
     outbound.guard(spec, 0).unwrap();
     // The close lands as path A's socket sends.
@@ -1120,6 +1121,7 @@ fn a_close_after_a_leave_does_not_wait_on_the_left_path() {
                 cell: Arc::clone(&cell),
                 epoch: 2,
                 rate: None,
+                frontier: Default::default(),
             },
             0,
         )
@@ -1406,6 +1408,7 @@ fn a_close_does_not_wait_on_a_detached_left_path() {
                 cell: Arc::clone(&cell),
                 epoch: 2,
                 rate: None,
+                frontier: Default::default(),
             },
             0,
         )
@@ -1480,6 +1483,7 @@ fn a_close_never_forgets_a_lent_routes_copies() {
                 cell: Arc::clone(&cell),
                 epoch: 2,
                 rate: None,
+                frontier: Default::default(),
             },
             0,
         )
