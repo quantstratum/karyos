@@ -42,7 +42,8 @@ pub struct MessageInfo {
     /// Stream position of the message.
     pub position: u64,
     /// The bytes the message takes in the stream, its frames and their
-    /// alignment: the next message starts at `position + extent`.
+    /// alignment: its frames end at `position + extent` (a pad, an abort or a
+    /// gap may follow before the next message).
     pub extent: u32,
     /// Reserved value of the first fragment.
     pub reserved_value: i64,

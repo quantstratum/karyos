@@ -401,6 +401,42 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         Ok(Dispatched::Event { group_seq: seq })
     }
 
+    /// Records `first`'s event as incomplete, with no observation, and
+    /// does not deliver it: strict capture's end for an event it had to
+    /// take but cannot record whole (a message already read from a source
+    /// that does not keep it). The strict journal ends there, so the loss
+    /// is never silent.
+    pub(crate) fn end_incomplete(&mut self, first: &FirstRecord<'_>) -> GatewayError {
+        let seq = self.next_seq;
+        let Some(limit) = self.buffer.len().checked_sub(END) else {
+            return GatewayError::Ended;
+        };
+        let written = self
+            .buffer
+            .get_mut(..limit)
+            .and_then(|room| first(seq, room).ok())
+            .and_then(|length| {
+                let end = GroupRecord::End(EventEnd {
+                    group_seq: seq,
+                    observations: 0,
+                    outcome: EndOutcome::Incomplete,
+                });
+                let tail = self.buffer.get_mut(length..)?;
+                length.checked_add(end.encode(tail).ok()?)
+            });
+        let Some(total) = written else {
+            return GatewayError::Ended;
+        };
+        if self.advance().is_err() {
+            return GatewayError::Ended;
+        }
+        self.stats.bump(|stats| &mut stats.incomplete);
+        if let Some(records) = self.buffer.get(..total) {
+            let _ = self.sender.send(records, seq);
+        }
+        GatewayError::Ended
+    }
+
     /// An event that cannot be recorded: strict refuses it; best effort
     /// delivers it unrecorded and joins it to the pending gap.
     /// `None` is an event behind a pending gap, already counted; it joins

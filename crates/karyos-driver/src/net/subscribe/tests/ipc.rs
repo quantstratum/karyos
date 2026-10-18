@@ -54,15 +54,31 @@ impl Drop for TempDir {
 
 /// An IPC driver with a network, on the system clock, timeouts of 5 s.
 fn ipc_driver(dir: &Path) -> IpcDriver {
-    let timeout = 5_000_000_000;
-    EmbeddedDriver::with_ipc(
+    ipc_driver_with(
+        dir,
+        NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        },
+    )
+}
+
+/// As [`ipc_driver`], with `network`.
+fn ipc_driver_with(dir: &Path, network: NetworkConfig) -> IpcDriver {
+    ipc_driver_configured(
+        dir,
         DriverConfig {
-            network: Some(NetworkConfig {
-                threading: ThreadingMode::Shared,
-                ..NetworkConfig::default()
-            }),
+            network: Some(network),
             ..DriverConfig::default()
         },
+    )
+}
+
+/// As [`ipc_driver`], with `config`.
+fn ipc_driver_configured(dir: &Path, config: DriverConfig) -> IpcDriver {
+    let timeout = 5_000_000_000;
+    EmbeddedDriver::with_ipc(
+        config,
         IpcConfig {
             dir: dir.to_path_buf(),
             max_pending_hellos: 2,
@@ -411,6 +427,8 @@ fn a_remote_client_fetches_an_image_and_closes_at_its_retirement() {
     });
     let _ = (a.close_network(), b.close_network());
 }
+
+mod processes;
 
 /// Whether descriptor `fd` still names the file of inode `ino`: other tests
 /// of this process open regions too, and may take a closed number again.

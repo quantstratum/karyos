@@ -44,10 +44,27 @@ const DIR: &str = "KARYOS_PROCESS_DIR";
 /// The driver of these tests: IPC mode, every stream in a shared region.
 type IpcDriver = EmbeddedDriver<SharedTerms>;
 
-fn dir(name: &str) -> PathBuf {
+fn dir(name: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("karyos-proc-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    dir
+    TempDir(dir)
+}
+
+/// A test's directory, removed when the test ends, passed or not.
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A driver listening in `dir`. A process that another test forks holds

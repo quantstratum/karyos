@@ -316,6 +316,32 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A group's checkpoints in the Archive agent (phase 3, A9-3).
+  `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and
+  `reopen_hold`) gives a group a checkpoint store in its journal
+  directory's `checkpoints` subdirectory (`checkpoint::store_dir`), made
+  or recovered with its journal, recovery cutting it to what the
+  journal's records name, a missing one marking their ranges lost, and
+  closed with the group. Settings that cannot work are refused before
+  anything is made (`AgentError::CheckpointConfig`). The group's sender
+  carries a `CheckpointHandle` (`CaptureSender::take_checkpoints`), the
+  Gateway's end of a one-slot handoff that moves the buffer both ways
+  with no copy and no allocation; once the group stops, fails or ends,
+  checkpoints are refused (`CheckpointError::Stopped`) with their buffer
+  kept. The agent writes a checkpoint once its journal holds the event
+  it names, in chunks of at most `AgentConfig::checkpoint_budget` bytes
+  a cycle, then syncs it and records template 30, which the capture
+  job's prefixes take (`CaptureJob::checkpoint`). The production
+  coverage answers `Coverage::checkpoint` from the group's store. The
+  capture job lifts its stop once a checkpoint opens a range, so the
+  in-flight bound applies again, and a restart counts a gap's events as
+  sent; an event the tracker has no room for then is taken again once,
+  after a sync, and the group fails, typed, only if it is still full.
+  The reopening window holds `reopen_hold` events (four times
+  `in_flight` by default), and a range that could not reopen over them
+  is counted (`PrefixTracker::failed_reopens`).
+  `GroupWaiter::durable_for` answers per event across ranges.
+
 - Replay with checkpoints (phase 3, A9-2; recording-group-checkpoints.md
   section 6). `ReplayCursor::open_at_checkpoint` reads a checkpoint's
   snapshot into the caller's buffer, checks its length and CRC-32C
@@ -406,12 +432,37 @@ release may break APIs, wire formats and shared-memory layouts.
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
 - karyos-client's `MessageInfo` gains `extent`, the bytes the message takes in
-  the stream (the next message starts at `position + extent`), and is
+  the stream (its frames end at `position + extent`), and is
   `#[non_exhaustive]`, so later fields add without breaking; it was built only
   by the client. `ClientSubscription::poll_taking` is public: a handler that
   returns false declines the message, which stays pending for a required reader.
   karyos-sys's `FrameReader::ready_end` gives a complete message's end. For the
   recording group Gateway's sources (phase 3, A7d-2b).
+- The recording group Gateway takes its inputs (phase 3, A7d-2b;
+  `recording-group-gateway.md` sections 4 and 5). `Gateway::add_subscription`
+  adds a message source with its `SourceIdentity` and the `RecordingWord` of
+  the recording that holds its stream; `Gateway::add_conflated` adds a
+  conflated view, refused with `GatewayError::TooLarge` when its largest value
+  could not be recorded. A dispatch fires the earliest due timer first, else
+  takes one event from the next source or view in turn. A message whose
+  length exceeds the inline threshold and whose position the recording holds
+  is recorded by reference; otherwise inline up to `MAX_INLINE`; above it
+  strict capture declines the message (`TooLarge`) and best effort records
+  its payload as unavailable. `Event::Message` gains `extent`, `length` and
+  `payload: MessagePayload` (`Bytes` or `Unavailable`); replay presents the
+  same. A loss or an end a source reports stays held while strict capture
+  refuses it, and strict capture polls a view only when it can admit the
+  event, since reading a value consumes it. `set_inline_threshold` and
+  `set_observation_budget` tune placement and observation. The Archive's
+  `ArchiveHandle::recording_word(stream, session, lane)` gives the shared
+  word naming a required recording of that lane and its start; the word
+  clears when the recording stops, ends or fails. A Gateway takes one
+  source per stream and session (`GatewayError::DuplicateSource`). Strict
+  capture reads a source or a view only when it can admit the event; a
+  message it read and cannot record ends the journal at an incomplete
+  skipped range. `Event::Conflated` carries the value's key.
+  karyos-client's `ConflatedSubscription::config` gives a view's
+  table configuration.
 - The recording group Gateway (phase 3, A7d-2a; `recording-group-gateway.md`
   sections 3, 6 and 8). `karyos_archive::group::gateway` holds the
   `GroupGateway` trait that capture and replay share: `Event`, `Effects` (clock,
