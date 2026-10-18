@@ -467,6 +467,16 @@ pub enum AgentError {
         /// The group.
         id: u64,
     },
+    /// A journal whose recovery would cut it to nothing: a damaged
+    /// header, not one never written. Neither a restart nor a new start
+    /// takes it, and nothing is cut, so the journal can be copied.
+    #[error("group {id}'s journal lost its header: recovery cut it at {cut:?}")]
+    HeaderCut {
+        /// The group.
+        id: u64,
+        /// Where and why recovery cut it.
+        cut: crate::segment::Cut,
+    },
     /// A group's checkpoint writer could not start (A9-3).
     #[error(transparent)]
     Checkpoint(Box<CheckpointError>),
@@ -1695,6 +1705,20 @@ impl<D: Disk + Clone> State<D> {
             }
         };
         let checkpoint_dir = store_dir(&start.dir);
+        // Before a journal is recovered, its plan: a recovery that would
+        // cut it to nothing cuts away its header, and nothing takes it,
+        // with nothing written, on every start (the operator may copy the
+        // journal). One whose header was never written cuts nothing.
+        let verified = |disk: &D| -> Result<(), AgentError> {
+            let plan = GroupJournal::verify(disk.clone(), &start.dir, id, start.journal)?;
+            match plan.cut {
+                Some(cut) if cut.position == 0 => Err(AgentError::HeaderCut { id, cut }),
+                _ => Ok(()),
+            }
+        };
+        // The header a new group writes, once its store is open: a
+        // refusal writes nothing.
+        let mut pending_header = None;
         let journal = match &start.new {
             Some(new) => {
                 let header = JournalHeader {
@@ -1710,9 +1734,11 @@ impl<D: Disk + Clone> State<D> {
                 match GroupJournal::create(self.disk.clone(), &start.dir, &header, start.journal) {
                     Ok(journal) => journal,
                     // A journal whose header was never written: the new
-                    // group takes it over, writing its header first. One
-                    // with a header is the group's already.
+                    // group takes it over, its header written once its
+                    // store is open. One with a header is the group's
+                    // already.
                     Err(exists @ JournalError::Segment(SegmentError::Exists { .. })) => {
+                        verified(&self.disk)?;
                         let mut journal = GroupJournal::recover(
                             self.disk.clone(),
                             &start.dir,
@@ -1723,31 +1749,41 @@ impl<D: Disk + Clone> State<D> {
                         if journal.reopen_hold()?.is_some() {
                             return Err(exists.into());
                         }
-                        let _ = journal.write_header(&header)?;
+                        pending_header = Some(header);
                         journal
                     }
                     Err(error) => return Err(error.into()),
                 }
             }
             None => {
-                GroupJournal::recover(self.disk.clone(), &start.dir, id, start.journal)?.journal
+                verified(&self.disk)?;
+                let mut journal =
+                    GroupJournal::recover(self.disk.clone(), &start.dir, id, start.journal)?
+                        .journal;
+                if journal.reopen_hold()?.is_none() {
+                    return Err(AgentError::NoHeader { id });
+                }
+                journal
             }
         };
         let mut journal = journal;
         // A restart takes the header's window as recorded, before the
         // store or the capture path is touched; the journal's own
         // recovery, which may cut a torn tail, has run. The hold is fixed
-        // per group. A journal whose header was never written is refused:
-        // it is started as new.
+        // per group.
         if start.new.is_none() {
             let recorded = journal.reopen_hold()?.ok_or(AgentError::NoHeader { id })?;
             Self::check_hold(&start, recorded)?;
         }
         // The store beside the journal, made or recovered with it: a
-        // recovered one is cut to what the journal's records name.
+        // recovered one is cut to what the journal's records name. A
+        // journal taken over may have a store from the same crash: it is
+        // opened as a restart's, cut to nothing. Without checkpoints, a
+        // store left there is not read.
+        let taken_over = pending_header.is_some();
         let store = match &start.checkpoints {
             None => None,
-            Some(_) if start.new.is_some() => Some(CheckpointStore::create(
+            Some(_) if start.new.is_some() && !taken_over => Some(CheckpointStore::create(
                 self.disk.clone(),
                 &checkpoint_dir,
                 id,
@@ -1782,6 +1818,9 @@ impl<D: Disk + Clone> State<D> {
                 )
             }
         };
+        if let Some(header) = pending_header {
+            let _ = journal.write_header(&header)?;
+        }
         let recorded = Recorded {
             active: &self.active,
             failed: &self.failed,

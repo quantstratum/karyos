@@ -178,6 +178,28 @@ impl<D: Disk> GroupJournal<D> {
         Ok(journal)
     }
 
+    /// Reports what [`GroupJournal::recover`] would cut of group
+    /// `group_id`'s journal in `dir`, changing nothing
+    /// ([`SegmentStore::verify`]): a caller decides before anything is
+    /// cut.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::InvalidConfig`] and the store's errors.
+    pub fn verify(
+        disk: D,
+        dir: &Path,
+        group_id: u64,
+        config: JournalConfig,
+    ) -> Result<crate::segment::RecoveryPlan, JournalError> {
+        Ok(SegmentStore::verify(
+            disk,
+            dir,
+            group_id,
+            config.geometry()?,
+        )?)
+    }
+
     /// Recovers group `group_id`'s journal in `dir` after a crash or a
     /// close: the store keeps every whole, checked write, then every record
     /// it kept is read and checked again. A journal whose header was never

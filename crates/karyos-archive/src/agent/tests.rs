@@ -2560,6 +2560,104 @@ mod checkpoints {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A journal of group `GROUP` in `dir` whose header was never written.
+    fn headerless(dir: &Path, policy: SyncPolicy) {
+        let config = journal_config(policy);
+        let geometry =
+            crate::segment::Geometry::new(config.segment_length, u64::from(config.segment_length))
+                .unwrap();
+        drop(
+            crate::segment::SegmentStore::create(
+                StdDisk,
+                &dir.join("groups"),
+                GROUP,
+                geometry,
+                policy,
+                0,
+            )
+            .unwrap(),
+        );
+    }
+
+    /// #437 re-check t1: the crash after the journal and the store were
+    /// made, before the header: started as new, the empty store is opened
+    /// as a restart opens one, and the group runs; restarted, it recovers.
+    #[test]
+    fn a_takeover_opens_the_store_the_crash_left() {
+        let dir = dirs("checkpoint-takeover-store");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        headerless(&dir, policy);
+        drop(
+            crate::group::checkpoint::CheckpointStore::create(
+                StdDisk,
+                &store_dir(&dir.join("groups")),
+                GROUP,
+                journal_config(policy),
+            )
+            .unwrap(),
+        );
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let mut sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(1, Duration::from_secs(10)),
+            Ok(1)
+        );
+        agent.stop_group(GROUP).unwrap();
+        let restarted = agent.start_group(start_with(&dir, None, policy)).unwrap();
+        assert_eq!(restarted.view().durable_group_seq(), 1);
+        agent.stop_group(GROUP).unwrap();
+        // Mtake: a journal with its header is not taken over.
+        assert!(matches!(
+            agent.start_group(start_with(&dir, Some(Capture::Strict), policy)),
+            Err(AgentError::Journal(JournalError::Segment(
+                SegmentError::Exists { .. }
+            )))
+        ));
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 re-check t2: a journal durable to 8 whose header is damaged:
+    /// recovery cuts it all. Neither a restart nor a new start takes it;
+    /// both are refused as a cut header, and nothing is written.
+    #[test]
+    fn a_cut_header_is_refused_both_ways() {
+        let dir = reopened_over_six("checkpoint-header-cut");
+        let segment = walk(&dir)
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+            .unwrap();
+        let path = dir.join(segment);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Inside the header record, past its frame: its checksum fails.
+        bytes[40] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        // Every refusal, the first too, leaves the journal byte for byte
+        // as it was: nothing is cut, and the operator may copy it.
+        let before = std::fs::read(&path).unwrap();
+        let tree = files(&dir);
+        for start in [
+            holding(&dir, None, 2, Some(8)),
+            holding(&dir, Some(Capture::BestEffort), 2, Some(8)),
+            holding(&dir, None, 2, Some(8)),
+        ] {
+            let refused = agent.start_group(start);
+            assert!(
+                matches!(refused, Err(AgentError::HeaderCut { id: GROUP, .. })),
+                "{refused:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "the journal changed");
+            assert_eq!(files(&dir), tree, "a refusal wrote");
+        }
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// #437 review M6: a hold below `in_flight` is recorded as `in_flight`.
     #[test]
     fn a_hold_below_in_flight_is_recorded_as_in_flight() {
