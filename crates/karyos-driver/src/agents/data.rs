@@ -1064,14 +1064,15 @@ impl<T: StreamTerms> Outbound<T> {
                 let _ = timed.state.forget(lane, !rewinding);
                 if rewinding {
                     track.ends.clear();
-                    let unacknowledged = timed
-                        .unacknowledged
-                        .get_mut(lane)
-                        .map_or(0, |unacknowledged| {
-                            let sent = unacknowledged.len();
-                            unacknowledged.clear();
-                            sent
-                        });
+                    let unacknowledged =
+                        timed
+                            .unacknowledged
+                            .get_mut(lane)
+                            .map_or(0, |unacknowledged| {
+                                let sent = unacknowledged.len();
+                                unacknowledged.clear();
+                                sent
+                            });
                     let sent = unacknowledged
                         .checked_add(track.left_ends.len())
                         .and_then(|sent| sent.checked_add(usize::from(track.started)));

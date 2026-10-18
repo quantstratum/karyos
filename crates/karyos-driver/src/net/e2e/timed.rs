@@ -506,8 +506,7 @@ fn a_reset_after_part_of_the_window_is_acknowledged() {
         ));
     }
     let mut seen = 0u32;
-    let read = |reader: &mut karyos_client::aggregate::AggregateSubscription<_>,
-                    seen: &mut u32| {
+    let read = |reader: &mut karyos_client::aggregate::AggregateSubscription<_>, seen: &mut u32| {
         let _ = reader.poll(
             |bytes, _, _| {
                 let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
