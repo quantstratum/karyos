@@ -228,3 +228,108 @@ fn an_observation_index_does_not_wrap() {
         })
     );
 }
+
+/// A reference unavailable record (A7d): between events of a best-effort
+/// journal, naming an event that ended; refused in a strict journal, for
+/// an event not ended, inside an event, with a `group_seq` of 0, and after
+/// a strict journal's end.
+#[test]
+fn a_reference_unavailable_names_an_ended_event_of_a_best_effort_journal() {
+    let valid = check(&[
+        header(Capture::BestEffort, 1),
+        Role::Event(1),
+        complete(1, 0),
+        Role::Event(2),
+        complete(2, 0),
+        Role::Unavailable(1),
+        Role::Unavailable(2),
+        Role::Event(3),
+        complete(3, 0),
+    ])
+    .unwrap();
+    assert!(valid.at_boundary());
+    assert_eq!((valid.next_seq(), valid.records()), (4, 9));
+    let ended = [
+        header(Capture::BestEffort, 1),
+        Role::Event(1),
+        complete(1, 0),
+    ];
+    let cases: Vec<(Vec<Role>, Role, OrderRule)> = vec![
+        (
+            vec![header(Capture::Strict, 1), Role::Event(1), complete(1, 0)],
+            Role::Unavailable(1),
+            OrderRule::Unavailable,
+        ),
+        (ended.to_vec(), Role::Unavailable(2), OrderRule::Unavailable),
+        (ended.to_vec(), Role::Unavailable(0), OrderRule::Invalid),
+        (
+            vec![header(Capture::BestEffort, 1), Role::Event(1)],
+            Role::Unavailable(1),
+            OrderRule::Nested,
+        ),
+        (
+            vec![
+                header(Capture::Strict, 1),
+                Role::Event(1),
+                end(1, 0, EndOutcome::Incomplete),
+            ],
+            Role::Unavailable(1),
+            OrderRule::AfterIncomplete,
+        ),
+        (vec![], Role::Unavailable(1), OrderRule::Header),
+        // #405 review P3: below the first event.
+        (
+            vec![
+                header(Capture::BestEffort, 5),
+                Role::Event(5),
+                complete(5, 0),
+            ],
+            Role::Unavailable(4),
+            OrderRule::Unavailable,
+        ),
+        // An uncaptured payload in a strict journal, and nested.
+        (
+            vec![header(Capture::Strict, 1)],
+            Role::Uncaptured(1),
+            OrderRule::Unavailable,
+        ),
+        (
+            vec![header(Capture::BestEffort, 1), Role::Event(1)],
+            Role::Uncaptured(2),
+            OrderRule::Nested,
+        ),
+        (
+            vec![header(Capture::BestEffort, 1)],
+            Role::Uncaptured(2),
+            OrderRule::Sequence,
+        ),
+    ];
+    for (before, role, rule) in cases {
+        let mut checker = check(&before).unwrap();
+        let kept = checker;
+        assert_eq!(
+            checker.push(role),
+            Err(OrderError {
+                ordinal: u64::try_from(before.len()).unwrap(),
+                rule
+            }),
+            "{before:?} then {role:?}"
+        );
+        assert_eq!(checker, kept, "the checker stays as it was");
+    }
+}
+
+/// A best-effort journal holds an uncaptured payload as an event.
+#[test]
+fn a_best_effort_journal_holds_an_uncaptured_payload() {
+    let checker = check(&[
+        header(Capture::BestEffort, 1),
+        Role::Uncaptured(1),
+        Role::Observation(1, 0),
+        complete(1, 1),
+        Role::Event(2),
+        complete(2, 0),
+    ])
+    .unwrap();
+    assert_eq!(checker.next_seq(), 3);
+}
