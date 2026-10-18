@@ -210,6 +210,33 @@ impl<D: Disk> ReplayGateway<D> {
         Ok(())
     }
 
+    /// Hands checkpoint `record`'s snapshot to the handler's `restore`,
+    /// before the first dispatch of a replay from it (A9-2,
+    /// `recording-group-checkpoints.md` section 6): the cursor was opened
+    /// at `record` by [`ReplayCursor::open_at_checkpoint`], which checked
+    /// `snapshot` against the record.
+    ///
+    /// # Errors
+    ///
+    /// [`GatewayError::NotReproducible`] at the checkpoint's `group_seq`
+    /// when the handler refuses the bytes; replay stops there, and each
+    /// later dispatch returns the same.
+    pub fn restore(
+        &mut self,
+        record: &CheckpointRecord,
+        snapshot: &[u8],
+        handler: &mut dyn Handler,
+    ) -> Result<(), GatewayError> {
+        if handler.restore(snapshot) {
+            return Ok(());
+        }
+        let refused = GatewayError::NotReproducible {
+            group_seq: record.group_seq,
+        };
+        self.stopped = Some(Err(refused));
+        Err(refused)
+    }
+
     /// Writes what the handler does to `capture` (section 9): a journal
     /// created with the recorded header and the replaying caller's
     /// manifest.

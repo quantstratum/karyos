@@ -809,3 +809,60 @@ fn a_checkpoint_compares_the_handlers_state_in_its_events_dispatch() {
     let (first, _, _) = run(&[0u8; 100], Some(64));
     assert_eq!(first, diverged(0), "no state");
 }
+
+/// A handler that restores a checkpoint's state when it is `accepted`.
+struct Restoring {
+    echo: Echo,
+    accepted: &'static [u8],
+    restored: Vec<Vec<u8>>,
+}
+
+impl Handler for Restoring {
+    fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
+        self.echo.on_event(event, effects);
+    }
+
+    fn restore(&mut self, state: &[u8]) -> bool {
+        self.restored.push(state.to_vec());
+        state == self.accepted
+    }
+}
+
+/// A9-2: `restore` hands the snapshot to the handler. Accepted, replay
+/// goes on; refused, it is not reproducible at the checkpoint's
+/// `group_seq`, and replay stops there.
+#[test]
+fn a_refused_restore_stops_replay_not_reproducible() {
+    use crate::crc32c::crc32c;
+    use crate::group::record::CheckpointRecord;
+
+    let record = CheckpointRecord {
+        group_seq: 9,
+        checkpoint_id: 1,
+        position: 0,
+        length: 5,
+        crc32c: crc32c(b"state"),
+        format: 7,
+    };
+    for (snapshot, accepted) in [(&b"state"[..], true), (&b"other"[..], false)] {
+        let mut gateway = replaying(Capture::Strict, &offered(), false);
+        let mut handler = Restoring {
+            echo: Echo::default(),
+            accepted: b"state",
+            restored: Vec::new(),
+        };
+        let restored = gateway.restore(&record, snapshot, &mut handler);
+        assert_eq!(handler.restored, [snapshot.to_vec()]);
+        if accepted {
+            assert_eq!(restored, Ok(()));
+            assert!(matches!(
+                gateway.dispatch(&mut handler),
+                Ok(Dispatched::Event { .. })
+            ));
+        } else {
+            let refused = GatewayError::NotReproducible { group_seq: 9 };
+            assert_eq!(restored, Err(refused));
+            assert_eq!(gateway.dispatch(&mut handler), Err(refused));
+        }
+    }
+}
