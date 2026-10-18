@@ -2640,8 +2640,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         found.buffer = fresh.buffer;
         found.incarnation = plan.incarnation;
-        // A fresh incarnation has a fresh ring.
-        found.schedule_issued = false;
+        // A fresh incarnation has a fresh ring. A local lane takes new
+        // settings before its next handle; a network lane's are its
+        // sender's, fixed from the add: kept, with its counters, on every
+        // lane, so a reopen bypasses no refusal of the add.
+        if found.network == NetworkLane::Local {
+            found.schedule_issued = false;
+        }
         found.base = plan.base;
         found.members.clear();
         found.spare = None;

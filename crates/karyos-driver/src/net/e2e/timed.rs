@@ -52,6 +52,18 @@ fn timed_pair(
     (a, b, publication, reader)
 }
 
+/// The sender's timed lanes read their frames and their entries in step:
+/// no schedule fault (a double or a missed release shows as one) and no
+/// read error.
+fn assert_clean(a: &mut EmbeddedDriver) {
+    let counters = shared(a).sender.outbound_counters(0).unwrap();
+    assert_eq!(
+        (counters.schedule_faults, counters.read_errors),
+        (0, 0),
+        "{counters:?}"
+    );
+}
+
 /// P2.11 PR1: a timed lane's schedule ring is freed as its messages leave,
 /// so it takes more offers than its ring holds, each read once and in
 /// order. Before PR1 the network sender read no schedule ring: after
@@ -82,6 +94,7 @@ fn a_timed_network_lane_takes_more_offers_than_its_ring() {
         );
         seen == 16
     });
+    assert_clean(&mut a);
 }
 
 /// P2.11 PR1: a message offered for 150 ms from now is not read before
@@ -120,6 +133,7 @@ fn a_timed_network_message_is_not_sent_before_its_time() {
     assert_eq!(index, 0);
     assert!(when >= at, "read {} ns before its time", at - when);
     assert!(issued.elapsed() < Duration::from_nanos(AHEAD) + SLACK);
+    assert_clean(&mut a);
 }
 
 /// P2.11 PR1: a timed lane sends one message per datagram, so each waits
@@ -162,6 +176,7 @@ fn a_timed_lane_sends_one_message_per_datagram_and_counts_late_ones() {
     let cell = cells.late_sends.as_ref().unwrap();
     // The cell's value, read by adding nothing.
     assert_eq!(cell.increment(0).unwrap(), 8);
+    assert_clean(&mut a);
 }
 
 /// P2.11 PR1: an unreliable lane's reset drops the heads it held for
@@ -170,8 +185,9 @@ fn a_timed_lane_sends_one_message_per_datagram_and_counts_late_ones() {
 /// leak) and they are delivered.
 #[test]
 fn an_unreliable_reset_frees_the_ring_of_held_heads() {
+    // Held 4 s ahead: within a 5 s horizon, below the 10 s liveness.
     let options = ScheduleOptions {
-        max_horizon: 120_000_000_000,
+        max_horizon: 5_000_000_000,
         ..ScheduleOptions::default()
     };
     let (mut a, mut b, publication, _reader) = timed_pair(4, options);
@@ -179,7 +195,7 @@ fn an_unreliable_reset_frees_the_ring_of_held_heads() {
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();
     // Four heads held for a time far ahead: the ring is full.
-    let ahead = karyos_sys::host_clock::host_monotonic_ns() + 60_000_000_000;
+    let ahead = karyos_sys::host_clock::host_monotonic_ns() + 4_000_000_000;
     for index in 0..4u32 {
         assert!(matches!(
             lane.offer_at(&index.to_le_bytes(), ahead).unwrap(),
@@ -198,6 +214,16 @@ fn an_unreliable_reset_frees_the_ring_of_held_heads() {
             .staged
             == 4
     });
+    // Staged, not sent: their entries are still held, so the ring stays
+    // full through more cycles (an entry is freed when its message leaves,
+    // never when it is staged).
+    for _ in 0..20 {
+        let _ = (a.do_work().unwrap(), b.do_work().unwrap());
+    }
+    assert!(matches!(
+        lane.offer_at(&4u32.to_le_bytes(), ahead).unwrap(),
+        OfferOutcome::BackPressured
+    ));
     let (endpoint, alias) = a
         .net
         .as_ref()
@@ -226,6 +252,7 @@ fn an_unreliable_reset_frees_the_ring_of_held_heads() {
         }
         accepted == 4
     });
+    assert_clean(&mut a);
 }
 
 /// P2.11 PR1: a message larger than a datagram goes as fragments, each
@@ -263,6 +290,10 @@ fn a_fragmented_timed_message_is_read_whole_at_its_time() {
     assert!(read[0].1 >= at, "read before its time");
     let staged = shared(&mut a).sender.outbound_counters(0).unwrap().staged;
     assert!(staged >= 5, "a fragment per datagram: {staged}");
+    // Counted per message, not per fragment.
+    let counts = shared(&mut a).sender.outbound_timed_counts(0).unwrap();
+    assert_eq!(counts.sent, 2, "{counts:?}");
+    assert_clean(&mut a);
 }
 
 /// P2.11 PR1 (E5 for timed lanes): in steady state a network cycle of a
@@ -315,6 +346,7 @@ fn a_steady_timed_network_cycle_allocates_nothing() {
         work[0] > 0 && work[1] > 0,
         "counted cycles did work: {work:?}"
     );
+    assert_clean(&mut a);
 }
 
 /// P2.11 PR1: a guarded timed lane whose guard closes while its head waits
@@ -400,5 +432,7 @@ fn a_guard_close_ends_a_timed_head_that_waits() {
     }
     assert_eq!(seen, 0, "a held head left after the close");
     let counts = shared(&mut a).sender.outbound_timed_counts(0).unwrap();
-    assert_eq!(counts.sent, 0, "{counts:?}");
+    // Cancelled through the timed gate: its record is dropped too.
+    assert_eq!((counts.sent, counts.dropped), (0, 1), "{counts:?}");
+    assert_clean(&mut a);
 }

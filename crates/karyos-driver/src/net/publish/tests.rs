@@ -1944,22 +1944,21 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         cancel_on_deadline: true,
         ..ScheduleOptions::default()
     };
-    let mut cases = vec![
-        (
-            channel(destination),
-            ScheduleOptions::default(),
-            Unsupported::Reliable,
-        ),
+    let cases = vec![
         (unreliable.clone(), cancel, Unsupported::CancelOnDeadline),
+        // Refused before anything platform-specific: on every platform.
+        (unreliable.clone(), tai, Unsupported::TaiDomain),
+        (routed, ScheduleOptions::default(), Unsupported::Routed),
+        (
+            unreliable.clone(),
+            ScheduleOptions {
+                max_horizon: crate::agents::AgentConfig::default().image_liveness_timeout,
+                ..ScheduleOptions::default()
+            },
+            Unsupported::HorizonPastLiveness,
+        ),
     ];
-    // The Tai domain is Linux only; elsewhere the schedule refuses it first.
-    if cfg!(target_os = "linux") {
-        cases.push((unreliable.clone(), tai, Unsupported::TaiDomain));
-    }
     let mut driver = driver();
-    if driver.net.as_ref().unwrap().paths_isolated() {
-        cases.push((routed, ScheduleOptions::default(), Unsupported::Routed));
-    }
     for (channel, options, reason) in cases {
         let mut config = aggregate(10, 1);
         config.stream.buffer.schedule_capacity = 4;
@@ -1991,4 +1990,76 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         driver.schedule_stream(handle.lane(Lane::ZERO).unwrap(), ScheduleOptions::default()),
         Err(DriverError::InvalidConfig)
     );
+}
+
+/// #404 review P1: a timed guarded network publication of two lanes,
+/// closed by its guard and reopened, reincarnates both lanes on lane 0's
+/// call. Lane 1's settings stay its sender's: a change is refused (no
+/// way past the add's refusals), and its counter cells are the same.
+#[test]
+fn a_reincarnated_timed_lane_keeps_its_settings_and_counters() {
+    use karyos_client::schedule::ScheduleOptions;
+    use karyos_sys::guard::Closed;
+    use karyos_sys::log_buffer::SealReason;
+
+    use crate::net::NetworkGuard;
+
+    let mut driver = reincarnating_driver(20_000_000, 64);
+    let guard = open_guard(&mut driver, "timed");
+    let socket = receiver();
+    let unreliable = UdpConfig {
+        reliable: false,
+        ..channel(Destination::Unicast(socket.local_addr().unwrap()))
+    };
+    let mut config = aggregate(10, 2);
+    config.stream.buffer.spare_slots = 4;
+    config.stream.buffer.schedule_capacity = 4;
+    let handle = driver
+        .add_timed_network_publication(
+            config,
+            &unreliable,
+            Some(NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            }),
+            ScheduleOptions::default(),
+        )
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    let lanes = [Lane::ZERO, Lane::try_new(1).unwrap()].map(|lane| handle.lane(lane).unwrap());
+    let cells = driver.timed_counters(lanes[1]).unwrap().unwrap();
+    let publications = lanes.map(|lane| driver.publication(lane).unwrap());
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    drop(publications);
+    until(&mut driver, |driver| {
+        lanes
+            .iter()
+            .all(|lane| driver.seal_reason(*lane) == Ok(Some(SealReason::GuardClosed)))
+    });
+    let _ = driver.reopen_guard(guard, epoch, epoch).unwrap();
+    let mut taken = None;
+    until(&mut driver, |driver| match driver.publication(lanes[0]) {
+        Err(DriverError::GuardSealed { .. } | DriverError::QuarantinedAlias { .. }) => false,
+        other => {
+            taken = Some(other.map(drop));
+            true
+        }
+    });
+    assert_eq!(taken, Some(Ok(())));
+    assert_eq!(driver.trace_identity(lanes[1]).unwrap().incarnation, 2);
+    let cancel = ScheduleOptions {
+        cancel_on_deadline: true,
+        ..ScheduleOptions::default()
+    };
+    assert_eq!(
+        driver.schedule_stream(lanes[1], cancel),
+        Err(DriverError::InvalidConfig)
+    );
+    let kept = driver.timed_counters(lanes[1]).unwrap().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&cells, &kept), "one set of counters");
 }

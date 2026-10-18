@@ -294,8 +294,12 @@ release may break APIs, wire formats and shared-memory layouts.
   Lateness, late sends and heads dropped by an unreliable reset are
   counted; a guard close ends a head still waiting for its time. Refused
   for now, typed (`DriverError::TimedNetworkUnsupported`): redundant
-  paths, reliable channels (PR1b), the `Tai` domain and
-  cancel-on-deadline. The sender times heads on the host monotonic clock,
+  paths, reliable channels (PR1b), the `Tai` domain, cancel-on-deadline
+  and a `max_horizon` at or past `image_liveness_timeout` (a lane holding
+  only a head that far ahead sends nothing, so its images would retire).
+  A lane's settings and counter cells are fixed from the add, also across
+  a guard reopen's fresh incarnation. Counts are per message, not per
+  fragment. The sender times heads on the host monotonic clock,
   as `Monotonic` offers are timed; no time namespace is checked, as on the
   local route. `TimedGate` keeps its API over a `TimedState`, which a
   sender holds across cycles and gates through a `TimedView`.

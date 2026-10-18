@@ -184,6 +184,29 @@ impl ScheduleConsumer {
         self.release_done(ring)
     }
 
+    /// The message read last never left (its last fragment was read but
+    /// not staged): its entry, the newest outstanding, is done, and the
+    /// done entries at the front are released. An older message still
+    /// waiting to leave keeps its entry.
+    ///
+    /// # Errors
+    ///
+    /// [`ScheduleConsumerError::CorruptTerm`] with no message outstanding,
+    /// and ring errors.
+    pub fn message_lost(&mut self, ring: &[AtomicU64]) -> Result<(), ScheduleConsumerError> {
+        let newest = self
+            .outstanding
+            .iter_mut()
+            .rev()
+            .find(|done| !**done)
+            .ok_or(ScheduleConsumerError::CorruptTerm {
+                position: 0,
+                reason: "a message lost with none outstanding",
+            })?;
+        *newest = true;
+        self.release_done(ring)
+    }
+
     fn release_done(&mut self, ring: &[AtomicU64]) -> Result<(), ScheduleConsumerError> {
         while self.outstanding.front() == Some(&true) {
             self.reader.release(ring)?;

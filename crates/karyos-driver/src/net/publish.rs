@@ -192,7 +192,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// [`DriverError::TimedNetworkUnsupported`] for a channel with paths, a
-    /// reliable channel, the `Tai` domain or cancel-on-deadline;
+    /// reliable channel, the `Tai` domain, cancel-on-deadline or a
+    /// `max_horizon` at or past `image_liveness_timeout`;
     /// [`DriverError::InvalidConfig`] for lanes with no schedule ring; the
     /// errors of [`EmbeddedDriver::add_network_publication`] and of
     /// [`EmbeddedDriver::schedule_stream`]. Nothing is left configured on
@@ -226,7 +227,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let timed =
             (config.stream.buffer.schedule_capacity > 0).then(|| schedule.unwrap_or_default());
         if let Some(options) = timed {
-            timed_supported(channel, options)?;
+            let liveness = self
+                .config
+                .network
+                .map(|network| network.agents.image_liveness_timeout);
+            timed_supported(channel, options, liveness)?;
         }
         // Redundant paths need sockets isolated per interface; without it
         // they are refused and counted, as for subscriptions.
@@ -531,6 +536,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 fn timed_supported(
     channel: &UdpConfig,
     options: karyos_client::schedule::ScheduleOptions,
+    liveness: Option<u64>,
 ) -> Result<(), DriverError> {
     use crate::error::TimedNetworkUnsupported as Unsupported;
 
@@ -542,6 +548,8 @@ fn timed_supported(
         Some(Unsupported::TaiDomain)
     } else if options.cancel_on_deadline {
         Some(Unsupported::CancelOnDeadline)
+    } else if liveness.is_some_and(|liveness| options.max_horizon >= liveness) {
+        Some(Unsupported::HorizonPastLiveness)
     } else {
         None
     };

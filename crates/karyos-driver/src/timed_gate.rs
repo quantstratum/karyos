@@ -68,6 +68,9 @@ struct Head {
     /// Permitted at an exposure: from then on it may have been sent, so
     /// it never misses its deadline.
     exposed: bool,
+    /// It carries its message's last fragment: the message is counted
+    /// (sent, late, dropped) once, by it.
+    ends: bool,
 }
 
 /// A lane's late policy (timed-tx.md, TT-3, and G7).
@@ -466,9 +469,11 @@ impl TimedState {
         head.time.is_none_or(|time| time <= self.now)
     }
 
-    /// Records a datagram committed to `lane`'s queue, after `inner`
-    /// stages it wherever the sender keeps its record (an inner gate held
-    /// apart from this state, or the sender itself).
+    /// Records a datagram committed to `lane`'s queue with `token` and
+    /// `ticket`, for a message requested at `time`, after `inner` stages it
+    /// wherever the sender keeps its record (an inner gate held apart from
+    /// this state, or the sender itself); `ends` when it carries the
+    /// message's last fragment, which alone counts the message.
     ///
     /// # Errors
     ///
@@ -477,9 +482,8 @@ impl TimedState {
     pub fn stage_with<E>(
         &mut self,
         lane: usize,
-        token: SenderToken,
-        ticket: TxTicket,
-        time: Option<u64>,
+        (token, ticket): (SenderToken, TxTicket),
+        (time, ends): (Option<u64>, bool),
         inner: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), TimedStageError<E>> {
         let state = self
@@ -496,6 +500,7 @@ impl TimedState {
                 ticket,
                 time,
                 exposed: false,
+                ends,
             });
         }
         Ok(())
@@ -511,7 +516,7 @@ impl TimedState {
         let timed = state
             .heads
             .iter()
-            .filter(|head| head.time.is_some())
+            .filter(|head| head.time.is_some() && head.ends)
             .count();
         state.heads.clear();
         for _ in 0..timed {
@@ -551,7 +556,7 @@ impl<G: LaneGate> TimedView<'_, G> {
     ) -> Result<(), TimedStageError<E>> {
         let gate = &mut *self.inner;
         self.state
-            .stage_with(lane, token, ticket, time, || inner(gate))
+            .stage_with(lane, (token, ticket), (time, true), || inner(gate))
     }
 
     /// Forgets `lane`'s heads after `inner` reopens its queue (the inner
@@ -762,7 +767,9 @@ impl<G: LaneGate> LaneGate for TimedView<'_, G> {
                 );
             }
             Some(Head {
-                time: Some(time), ..
+                time: Some(time),
+                ends: true,
+                ..
             }) if how == Left::Submitted => {
                 bump(
                     &mut self.state.counts.sent,
@@ -800,7 +807,11 @@ impl<G: LaneGate> LaneGate for TimedView<'_, G> {
                     );
                 }
             }
-            Some(Head { time: Some(_), .. }) if how == Left::Returned => {
+            Some(Head {
+                time: Some(_),
+                ends: true,
+                ..
+            }) if how == Left::Returned => {
                 bump(
                     &mut self.state.counts.dropped,
                     &mut self.state.counts.overflows,
