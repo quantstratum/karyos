@@ -151,8 +151,10 @@ fn a_killed_remote_subscriber_of_an_image_is_reclaimed_at_its_exit_proof() {
     }
     let (held, held_charge) = image_table(&b);
     assert_eq!(held.reclaimed, counters.reclaimed);
-    // Nothing reached the receiver: its tombstone is not reclaimed.
+    // Nothing reached the receiver: its tombstone is not reclaimed, and
+    // no other image retired before it.
     let tombstones = reclaimed_tombstones(&b);
+    assert_eq!(tombstones, 0);
     assert_eq!(held_charge, charged);
     assert_eq!(b.stream_state(stream).unwrap(), StreamState::Retiring);
     let ended = grants_ended(&b);

@@ -2817,3 +2817,75 @@ mod checkpoints {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// A source of one chunk, then fenced at a cutover where it ends.
+struct FencedAfter {
+    position: u64,
+    chunk: Option<Vec<u8>>,
+}
+
+impl FrameSource for FencedAfter {
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
+        let Some(chunk) = self.chunk.take() else {
+            return Ok(Frames::Fenced { at: self.position });
+        };
+        let position = self.position;
+        out[..chunk.len()].copy_from_slice(&chunk);
+        self.position += chunk.len() as u64;
+        Ok(Frames::Copied {
+            position,
+            len: chunk.len(),
+            next: self.position,
+        })
+    }
+
+    fn consumed(&mut self, _position: u64) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        self.position = to;
+        Ok(to)
+    }
+}
+
+/// Gap 6: a recording fenced at a cutover ends there, incomplete, and the
+/// agent counts it, so the cause is known without a format change.
+#[test]
+fn a_fenced_recording_is_counted() {
+    let dir = temp_dir("fenced");
+    let config = AgentConfig {
+        idle: Duration::from_millis(1),
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    assert_eq!(agent.fenced_recordings(), 0);
+    let fenced = agent
+        .start(StartRecording {
+            source: Box::new(FencedAfter {
+                position: 0,
+                chunk: Some(vec![5u8; 3000]),
+            }),
+            ..start(Chunks::default())
+        })
+        .unwrap();
+    let event = agent.event(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        event,
+        Event::Ended {
+            id: fenced,
+            ended: Ended {
+                position: 3000,
+                reason: StopReason::Lapped,
+                incomplete: true
+            }
+        }
+    );
+    assert_eq!(agent.fenced_recordings(), 1);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
