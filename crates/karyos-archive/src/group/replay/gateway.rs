@@ -156,7 +156,8 @@ impl<D: Disk> ReplayGateway<D> {
 
     /// Compares the handler's state at each recorded checkpoint (A9-2):
     /// it writes it into a buffer of `max_state` bytes, allocated here.
-    /// Without one, a recorded checkpoint finds no state and diverges.
+    /// A recorded snapshot larger than the buffer (empty without this
+    /// call) stops the replay with [`GatewayError::StateBuffer`].
     ///
     /// # Errors
     ///
