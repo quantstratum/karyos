@@ -339,11 +339,12 @@ release may break APIs, wire formats and shared-memory layouts.
   active `required` recorder's written and durable positions, and a stopped
   `required` recording's end, also after a restart. A recording that fails, with
   no stop in the catalog, has its references settled by its frames durable at
-  the failure, also those drained after it. The catalog records each recording's
-  mode in its `Started` record (an optional last byte under version 3, covered
-  by the CRC; an entry without it reads back as `async`), and
-  `Recording::required` reports it. `AgentConfig` gains `max_groups` and
-  `group_budget`.
+  the failure, also those drained after it; it holds its slot under the
+  recording cap until every running group has read past the failure. The catalog
+  records each recording's mode in its `Started` record (an optional last byte
+  under version 3, covered by the CRC; an entry without it reads back as
+  `async`), and `Recording::required` reports it. `AgentConfig` gains
+  `max_groups` and `group_budget`.
 - A recording group's capture path (phase 3, A7d-1b;
   `recording-group-gateway.md` section 9). `karyos_archive::group::capture`
   makes a group's `CaptureSender`, for the event loop, and `CaptureJob`,

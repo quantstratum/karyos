@@ -251,6 +251,7 @@ pub fn capture<D: Disk>(
         in_flight,
         uncovered: Vec::with_capacity(config.in_flight),
         capacity: config.ring_capacity,
+        emptied: 0,
         signalled: 0,
         stop_notified: false,
     };
@@ -541,6 +542,8 @@ pub struct CaptureJob<D: Disk> {
     stop_notified: bool,
     /// The ring's capacity in bytes.
     capacity: usize,
+    /// How many duties found the ring empty.
+    emptied: u64,
 }
 
 /// Why the job stopped recording.
@@ -599,6 +602,7 @@ impl<D: Disk> CaptureJob<D> {
         let mut read = false;
         for _ in 0..budget {
             let Some(message) = self.consumer.read().map_err(|_| JobError::Ring)? else {
+                self.emptied = self.emptied.wrapping_add(1);
                 break;
             };
             read = true;
@@ -771,6 +775,13 @@ impl<D: Disk> CaptureJob<D> {
             self.tracker.record(&record, self.journal.written())?;
         }
         Ok(())
+    }
+
+    /// How many duties read the ring until it was empty: a duty that
+    /// raises it has read every message written before it began.
+    #[must_use]
+    pub const fn emptied(&self) -> u64 {
+        self.emptied
     }
 
     /// The group's tracker, for its three values and its state.

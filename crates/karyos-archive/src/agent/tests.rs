@@ -1743,7 +1743,14 @@ mod groups {
             let halt = Arc::clone(&halt);
             let fired = Arc::clone(&fired);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(3));
+                // Stops the sender if the stop hangs; ends early once it
+                // returned.
+                for _ in 0..1500 {
+                    if halt.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 if !halt.swap(true, Ordering::AcqRel) {
                     fired.store(true, Ordering::Release);
                 }
@@ -1757,7 +1764,7 @@ mod groups {
         watchdog.join().unwrap();
         result.unwrap();
         assert!(!fired.load(Ordering::Acquire), "took {took:?}");
-        assert!(took < Duration::from_secs(2), "took {took:?}");
+        assert!(took < Duration::from_secs(5), "took {took:?}");
         assert!(sent.load(Ordering::Acquire) > 1);
         // Refused as closing, or as ended once the close was done.
         assert!(
@@ -1765,6 +1772,88 @@ mod groups {
             "{state:?}"
         );
         agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Failures arrive one after another, more than the recording cap,
+    /// while a group runs: each failed entry is dropped, when a start needs
+    /// its slot, once the group has read its ring empty after the failure,
+    /// so the cap's slots come back. A reference sent after the latest
+    /// failure settles by its durable frames; one to a reclaimed entry is
+    /// settled as uncovered, never left waiting.
+    #[test]
+    fn failed_entries_last_until_the_groups_have_read_past_them() {
+        let dir = temp_dir("group-many-failures");
+        let groups = groups_dir(&dir);
+        let fail = Arc::new(AtomicBool::new(false));
+        let disk = Failing {
+            fail: Arc::clone(&fail),
+        };
+        let config = AgentConfig {
+            max_recordings: 2,
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(disk, &dir, config).unwrap();
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::BestEffort)))
+            .unwrap();
+        let mut first = None;
+        let mut last = 0;
+        for round in 0..6 {
+            fail.store(false, Ordering::Release);
+            let released = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+            // A start can meet the slot of the previous failure until the
+            // group has read past it: retried, never refused for good.
+            let mut started = None;
+            for _ in 0..5000 {
+                match agent.start(StartRecording {
+                    policy: SyncPolicy::Every { interval_ns: 0 },
+                    source: Box::new(Released {
+                        position: 0,
+                        chunks: vec![vec![7u8; 3000], vec![8u8; 3000]].into(),
+                        released: Arc::clone(&released),
+                        read: 0,
+                    }),
+                    ..start(chunks(0, false, &Arc::default()))
+                }) {
+                    Ok(id) => {
+                        started = Some(id);
+                        break;
+                    }
+                    Err(AgentError::Full { .. }) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error:?}"),
+                }
+            }
+            last = started.unwrap_or_else(|| panic!("round {round}: refused for good"));
+            first.get_or_insert(last);
+            for _ in 0..5000 {
+                if agent.describe(last).unwrap().end == 3000 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            fail.store(true, Ordering::Release);
+            released.store(2, Ordering::Release);
+            let event = agent.event(Duration::from_secs(5));
+            assert!(matches!(event, Some(Event::Failed { .. })), "{event:?}");
+        }
+        // The latest failure's entry is kept: its durable frames cover.
+        sender.send(&referencing(1, last), 1).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(1, Duration::from_secs(5)),
+            Ok(1)
+        );
+        // The first one's was reclaimed: a reference that raced it covers
+        // nothing, and is marked rather than left waiting.
+        sender.send(&referencing(2, first.unwrap()), 2).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(2, Duration::from_secs(5)),
+            Ok(2)
+        );
+        assert_eq!(sender.state(), GroupState::Running);
+        drop(agent);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

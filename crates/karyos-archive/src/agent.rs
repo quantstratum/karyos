@@ -25,7 +25,11 @@
 //!   positions cover its payloads. A recording that stops or fails
 //!   settles the groups' references to it: by its stop, or by its frames
 //!   durable at the failure, which the agent keeps beside the failed
-//!   recording for references drained later. A strict group that ended
+//!   recording for references drained later. A failed recording holds its
+//!   slot under the recording cap until every running group has read its
+//!   ring empty after the failure; a start that needs the slot then drops
+//!   the entry. A reference that raced the failure and arrives after that
+//!   covers nothing. A strict group that ended
 //!   because its recording failed short comes back running after a
 //!   restart when the recording recovers frames that cover the reference.
 //!   Its journal holds every event up to the end; the events the Gateway
@@ -51,7 +55,7 @@ use std::time::{Duration, Instant};
 use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
 use crate::group::capture::{
-    self, CaptureConfig, CaptureError, CaptureJob, CaptureSender, CaptureSetup,
+    self, CaptureConfig, CaptureError, CaptureJob, CaptureSender, CaptureSetup, GroupState,
 };
 use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
 use crate::group::prefix::Coverage;
@@ -1048,7 +1052,8 @@ fn run<D>(
         config,
         catalog,
         active: Vec::new(),
-        failed: Vec::with_capacity(FAILED_KEPT),
+        failed: Vec::new(),
+        failures: 0,
         replays: Replays {
             active: Vec::new(),
             prepared: Vec::new(),
@@ -1104,6 +1109,8 @@ struct State<D: Disk> {
     /// Recordings whose store failed: open in the catalog until the next
     /// start settles them.
     failed: Vec<Failed>,
+    /// How many recordings failed: each failed entry's number.
+    failures: u64,
     replays: Replays<D>,
     groups: Vec<ActiveGroup<D>>,
 }
@@ -1111,25 +1118,19 @@ struct State<D: Disk> {
 /// A recording that failed: no stop in the catalog, so the groups settle
 /// their references to it by `durable`, its frames durable at the failure.
 ///
-/// The agent keeps the latest [`FAILED_KEPT`] of them; a reference drained
-/// after its recording's entry was dropped is not settled, since the
-/// event loop sends references only to recordings it saw recording.
+/// The event loop stops naming a recording once it learns that it failed,
+/// so only references already in the groups' rings can name it. An entry
+/// is kept until every running group has read its ring empty in a duty
+/// that began after the failure (`seq`), and is dropped then when a start
+/// needs its slot. A failed recording
+/// holds its slot under the recording cap until then, so the list is
+/// bounded by the cap, and a start past it is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Failed {
     id: u64,
     durable: u64,
-}
-
-/// The failed recordings the agent keeps, oldest dropped first: a bound,
-/// since coverage scans them for each reference.
-const FAILED_KEPT: usize = 64;
-
-/// Keeps `entry`, dropping the oldest past [`FAILED_KEPT`].
-fn keep_failed(failed: &mut Vec<Failed>, entry: Failed) {
-    if failed.len() >= FAILED_KEPT {
-        failed.remove(0);
-    }
-    failed.push(entry);
+    /// The failure's number: the agent's count of failures with it.
+    seq: u64,
 }
 
 /// A recording group the agent captures.
@@ -1137,6 +1138,9 @@ fn keep_failed(failed: &mut Vec<Failed>, entry: Failed) {
 struct ActiveGroup<D: Disk> {
     id: u64,
     job: CaptureJob<D>,
+    /// The failures whose references this group has all read: its last
+    /// duty that read the ring empty began after them.
+    cleared: u64,
 }
 
 /// The recordings' frames as recording groups see them (A7d): an active
@@ -1180,11 +1184,22 @@ impl<D: Disk> Coverage for Recorded<'_, D> {
 
     fn ended(&self, recording_id: u64) -> Option<u64> {
         let recording = self.catalog.get(recording_id)?;
-        let end = recording
+        if let Some(end) = recording
             .stop
             .map(|stop| stop.position)
-            .or_else(|| self.failed(recording_id))?;
-        Some(if recording.required { end } else { 0 })
+            .or_else(|| self.failed(recording_id))
+        {
+            return Some(if recording.required { end } else { 0 });
+        }
+        // Open in the catalog and not recording: it failed, and its entry
+        // was dropped once the groups read past the failure. A reference
+        // sent later raced the failure; it covers nothing, so it is never
+        // over-vouched and never waits for good.
+        if self.active.iter().any(|active| active.id == recording_id) {
+            None
+        } else {
+            Some(0)
+        }
     }
 }
 
@@ -1197,12 +1212,17 @@ impl<D: Disk> Coverage for Recorded<'_, D> {
 fn fail_recording<D: Disk>(
     groups: &mut [ActiveGroup<D>],
     active: &[Active<D>],
-    failed: &mut Vec<Failed>,
+    (failed, failures): (&mut Vec<Failed>, &mut u64),
     catalog: &Catalog<D>,
     id: u64,
     durable: u64,
 ) {
-    keep_failed(failed, Failed { id, durable });
+    *failures = failures.wrapping_add(1);
+    failed.push(Failed {
+        id,
+        durable,
+        seq: *failures,
+    });
     let required = catalog.get(id).is_some_and(|recording| recording.required);
     let durable = if required { durable } else { 0 };
     let recorded = Recorded {
@@ -1264,7 +1284,7 @@ impl<D: Disk + Clone> State<D> {
                 fail_recording(
                     &mut self.groups,
                     &self.active,
-                    &mut self.failed,
+                    (&mut self.failed, &mut self.failures),
                     &self.catalog,
                     id,
                     durable,
@@ -1294,7 +1314,7 @@ impl<D: Disk + Clone> State<D> {
                             fail_recording(
                                 &mut self.groups,
                                 &self.active,
-                                &mut self.failed,
+                                (&mut self.failed, &mut self.failures),
                                 &self.catalog,
                                 id,
                                 durable,
@@ -1479,7 +1499,12 @@ impl<D: Disk + Clone> State<D> {
                 CaptureSetup::Config(error) => AgentError::Capture(error),
                 CaptureSetup::Journal(error) => AgentError::Journal(error),
             })?;
-        self.groups.push(ActiveGroup { id, job });
+        // A new ring holds no reference to a recording that failed.
+        self.groups.push(ActiveGroup {
+            id,
+            job,
+            cleared: self.failures,
+        });
         Ok(sender)
     }
 
@@ -1491,15 +1516,34 @@ impl<D: Disk + Clone> State<D> {
             failed: &self.failed,
             catalog: &self.catalog,
         };
+        let failures = self.failures;
         let mut worked = false;
         for group in &mut self.groups {
+            let emptied = group.job.emptied();
             // A job that fails reports it through its sender's state.
             worked |= group
                 .job
                 .duty(now, self.config.group_budget, &recorded)
                 .unwrap_or(false);
+            // A group that read its ring empty, or that reads nothing
+            // more, holds no reference to an earlier failure.
+            if group.job.emptied() != emptied || group.job.state() != GroupState::Running {
+                group.cleared = failures;
+            }
         }
         worked
+    }
+
+    /// Drops the failed entries no group's ring can still name: every
+    /// running group read its ring empty after the failure.
+    fn reclaim_failed(&mut self) {
+        let cleared = self
+            .groups
+            .iter()
+            .map(|group| group.cleared)
+            .min()
+            .unwrap_or(self.failures);
+        self.failed.retain(|failed| failed.seq > cleared);
     }
 
     fn start_recording(
@@ -1508,7 +1552,14 @@ impl<D: Disk + Clone> State<D> {
         outbox: &Outbox,
         now: u64,
     ) -> Result<u64, AgentError> {
-        if self.active.len() >= self.config.max_recordings {
+        // A failed recording holds its slot until no group's ring can
+        // still name it, which bounds the failed list by the cap. Its entry
+        // is kept until a start needs the slot, so a late reference still
+        // finds its durable end when nothing pressed for room.
+        if self.active.len().saturating_add(self.failed.len()) >= self.config.max_recordings {
+            self.reclaim_failed();
+        }
+        if self.active.len().saturating_add(self.failed.len()) >= self.config.max_recordings {
             return Err(outbox.refused("recordings", self.config.max_recordings));
         }
         let position = start.source.position();
@@ -1557,13 +1608,12 @@ impl<D: Disk + Clone> State<D> {
                     .is_err()
                 {
                     // Nothing was recorded, and no group refers to it yet.
-                    keep_failed(
-                        &mut self.failed,
-                        Failed {
-                            id,
-                            durable: position,
-                        },
-                    );
+                    self.failures = self.failures.wrapping_add(1);
+                    self.failed.push(Failed {
+                        id,
+                        durable: position,
+                        seq: self.failures,
+                    });
                 }
                 Err(error)
             }
