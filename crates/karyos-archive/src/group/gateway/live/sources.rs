@@ -442,13 +442,24 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     ///
     /// [`GatewayError::TooLarge`] for a view whose largest value exceeds
     /// `MAX_INLINE` or does not fit the event budget: its values could
-    /// not be recorded.
+    /// not be recorded. [`GatewayError::DuplicateSource`] for a second
+    /// view of one stream and session, which replay could not tell apart.
     pub fn add_conflated(
         &mut self,
         source: Box<dyn ConflatedSource + Send>,
         stream_id: i32,
         session_id: i32,
     ) -> Result<ConflatedId, GatewayError> {
+        if self
+            .views
+            .iter()
+            .any(|view| (view.stream_id, view.session_id) == (stream_id, session_id))
+        {
+            return Err(GatewayError::DuplicateSource {
+                stream_id,
+                session_id,
+            });
+        }
         let largest = source.config().value_capacity;
         let event = usize::from(CONFLATED_EVENT.block_length)
             .checked_add(12 + 2)
@@ -706,10 +717,11 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     /// Delivers a loss or an end source `index` reported; it stays held
     /// while strict capture refuses it.
     ///
-    /// Defensive: a source is read only after `strict_admit`, and nothing
-    /// between that check and this delivery uses the ring or the in
-    /// flight bound, so strict capture does not refuse here today; best
-    /// effort never refuses. The hold keeps a report from being lost
+    /// Defensive: a source is read only after `strict_admit`, admission
+    /// only loosens until this delivery (the job only frees room, and only
+    /// this Gateway's sends count in flight), and `Gateway::new`'s least
+    /// event budget holds every loss and lifecycle record, so strict
+    /// capture does not refuse here today; best effort never refuses. The hold keeps a report from being lost
     /// should a later change let admission fail in between.
     fn deliver_held(
         &mut self,
@@ -837,7 +849,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         // and is placed as without a word.
         let recorded = info.session_id == identity.session_id;
         // The word is read once: the record and the decision agree.
-        let payload = match word.read() {
+        let placement = match word.read() {
             // A recording that started after the message does not hold it.
             Some((recording_id, start))
                 if recorded && length > threshold && info.position >= start =>
@@ -850,7 +862,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             _ if length <= MAX_INLINE => Payload::Inline(bytes),
             _ => Payload::Unavailable { length: length32 },
         };
-        let placed = |group_seq: u64, out: &mut [u8]| {
+        let record = |group_seq: u64, payload: Payload<'_>, out: &mut [u8]| {
             let extension: Option<&[u8; EXTENSION]> = info.extension.as_ref();
             GroupRecord::Message(MessageEvent {
                 group_seq,
@@ -870,32 +882,46 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             .encode(out)
             .map_err(|_| Refusal::TooLarge)
         };
-        if self.capture == Capture::Strict && matches!(payload, Payload::Unavailable { .. }) {
+        // Whether the record fits the event buffer with its end: an inline
+        // payload under `MAX_INLINE` can still exceed the event budget.
+        let fits = self
+            .buffer
+            .len()
+            .checked_sub(super::END)
+            .and_then(|limit| self.buffer.get_mut(..limit))
+            .is_some_and(|room| record(self.next_seq, placement, room).is_ok());
+        // Best effort records an unavailable payload above `MAX_INLINE`
+        // (the record's rule); one under it that does not fit is refused
+        // into the pending gap, delivered unrecorded and counted.
+        let payload = placement;
+        let cannot = !fits || matches!(payload, Payload::Unavailable { .. });
+        if self.capture == Capture::Strict && cannot {
             // Strict cannot record its payload (a strict journal holds no
             // unavailable payload), and the message is already read: the
-            // journal ends at it, a skipped range ended incomplete and not
-            // delivered, never silently.
+            // journal ends at it, never silently. The handler gets the
+            // skipped range as a loss whose effects are refused from the
+            // start, as replay presents it.
             let _ = self.count(Refusal::TooLarge);
-            let end = info.position.checked_add(u64::from(info.extent));
-            let lost = |group_seq: u64, out: &mut [u8]| {
-                let end = end.ok_or(Refusal::TooLarge)?;
-                GroupRecord::Loss(LossEvent {
-                    group_seq,
-                    logical_time: now,
-                    incarnation: identity.incarnation,
+            let end = info
+                .position
+                .checked_add(u64::from(info.extent))
+                .ok_or(GatewayError::Ended)?;
+            self.incomplete_next = true;
+            return self.deliver_held(
+                usize::from(source.0),
+                Held::Loss {
+                    loss: Loss::Skipped(karyos_sys::log_buffer::SkipReason::MessageTooLarge),
                     from: info.position,
                     lost_to: end,
                     resume: end,
-                    stream_id: identity.stream_id,
-                    session_id: identity.session_id,
-                    lane: identity.lane,
-                    loss: Loss::Skipped(karyos_sys::log_buffer::SkipReason::MessageTooLarge),
-                })
-                .encode(out)
-                .map_err(|_| Refusal::TooLarge)
-            };
-            return Err(self.end_incomplete(&lost));
+                    // The message's image's.
+                    session_id: Some(info.session_id),
+                },
+                now,
+                handler,
+            );
         }
+        let placed = |group_seq: u64, out: &mut [u8]| record(group_seq, payload, out);
         let event = Event::Message {
             source,
             lane: identity.lane,
