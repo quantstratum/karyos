@@ -14,10 +14,17 @@
 //!   journal through the event's end, and the referenced payload, by the
 //!   storage persistence policy.
 //!
-//! An incomplete event, or a gap marker, stops both prefixes there for
-//! good: replay claims nothing across them (a consistent checkpoint, A9,
-//! is what lets a prefix resume). Each value is the `group_seq` of the
-//! last event in it; before any, it is `first_group_seq - 1`.
+//! An incomplete event, or a gap marker, stops both prefixes there: replay
+//! claims nothing across them. A checkpoint recorded after the stop opens
+//! a new range (A9, `recording-group-checkpoints.md` section 5): the state
+//! at its `group_seq` is known, so the events after it are replayable
+//! again. The tracker follows the current range only; recovery derives
+//! the earlier ones from the journal. A range a checkpoint opens starts
+//! its complete prefix at the checkpoint once its record is written (its
+//! bytes are then in the checkpoint store), and its durable prefix once
+//! the record and the bytes are durable. A checkpoint inside a range holds
+//! back nothing. Each value is the `group_seq` of the last event in it;
+//! before any, it is `first_group_seq - 1`.
 //!
 //! The tracker holds the events written and not yet durable in a queue
 //! sized when it is made: an event it has no room for is refused, which
@@ -56,6 +63,28 @@ pub trait Coverage {
     /// records. A reference that reaches the journal after its recording
     /// ended is settled by it.
     fn ended(&self, recording_id: u64) -> Option<u64>;
+
+    /// What the checkpoint store holds of `[position, end)`; the default,
+    /// with no checkpoint store, is [`CheckpointHeld::Missing`]. A lost
+    /// checkpoint never opens its range, and the next one may.
+    fn checkpoint(&self, position: u64, end: u64) -> CheckpointHeld {
+        let _ = (position, end);
+        CheckpointHeld::Missing
+    }
+}
+
+/// What a checkpoint store holds of a checkpoint's range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointHeld {
+    /// Not written yet.
+    Missing,
+    /// Lost: a crash took its bytes after its record was kept, or they
+    /// fail their check. It never will be held.
+    Lost,
+    /// Written, not yet durable.
+    Written,
+    /// Written and durable.
+    Durable,
 }
 
 /// Why the tracker refused a record.
@@ -95,14 +124,96 @@ struct Waiting {
     journal_end: u64,
     /// The recording and the end of the frames its payload names.
     reference: Option<(u64, u64)>,
+    /// For the checkpoint opening a range: its range in the checkpoint
+    /// store.
+    checkpoint: Option<(u64, u64)>,
 }
 
-/// The three values, for other threads.
+/// What the tracker keeps of the journal after a stop, for a checkpoint
+/// that may open a range there: an ended event, or a later stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Candidate {
+    /// A complete event.
+    Event(Waiting),
+    /// An incomplete event or a gap: the first event not queued, and the
+    /// lowest checkpoint `group_seq` past it.
+    Stop { stop: u64, reopen_at: u64 },
+}
+
+impl Candidate {
+    /// The checkpoint `group_seq` at or above which it lies behind.
+    const fn behind_at(&self) -> u64 {
+        match self {
+            Self::Event(waiting) => waiting.seq,
+            Self::Stop { reopen_at, .. } => *reopen_at,
+        }
+    }
+}
+
+/// The checkpoint that opened a range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeStart {
+    /// Its id.
+    pub checkpoint_id: u64,
+    /// The last event its state includes.
+    pub group_seq: u64,
+}
+
+/// The range the tracker follows (`recording-group-checkpoints.md`
+/// section 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    /// The checkpoint that opened it; `None` for the journal's first.
+    pub start: Option<RangeStart>,
+    /// Its `complete_recording_seq`. Until the checkpoint that opened it
+    /// completes, the value the previous range ended at.
+    pub complete: u64,
+    /// Its `durable_group_seq`, with the same rule.
+    pub durable: u64,
+}
+
+/// The journal's first range as it ended, frozen when a checkpoint opened
+/// another: replay from the journal's start stops there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstRange {
+    /// Its final `complete_recording_seq`.
+    pub complete: u64,
+    /// The journal position after its last complete event.
+    pub complete_end: u64,
+    /// Its final `durable_group_seq`.
+    pub durable: u64,
+}
+
+/// The three values, for other threads, and where the current range
+/// starts.
 #[derive(Debug, Default)]
 pub struct PrefixView {
     delivered: AtomicU64,
     complete: AtomicU64,
     durable: AtomicU64,
+    /// The `group_seq` of the checkpoint that opened the current range; 0
+    /// in the journal's first range.
+    range_start: AtomicU64,
+    /// The first range's `durable_group_seq`, once a checkpoint opened
+    /// another.
+    first_durable: AtomicU64,
+    /// The highest `group_seq` of the first range's events still
+    /// settling, 0 with none: up to it, an event may yet be durable.
+    first_settling: AtomicU64,
+}
+
+/// Whether an event is durable, as [`PrefixView::durable_for`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableFor {
+    /// It is: the `durable_group_seq` that covers it.
+    Reached(u64),
+    /// It never will be: an event before the current range that the first
+    /// range's durable prefix does not cover and that is not still
+    /// settling. The value is that prefix.
+    Never(u64),
+    /// Not yet: the current range's `durable_group_seq`, or, for an event
+    /// of the first range still settling, the first range's.
+    Pending(u64),
 }
 
 impl PrefixView {
@@ -118,13 +229,46 @@ impl PrefixView {
         self.complete.load(Ordering::Acquire)
     }
 
-    /// `durable_group_seq`.
+    /// `durable_group_seq`: the current range's. Across a checkpoint that
+    /// opened another range it says nothing of the events before it; a
+    /// wait for one event uses [`PrefixView::durable_for`].
     #[must_use]
     pub fn durable_group_seq(&self) -> u64 {
         self.durable.load(Ordering::Acquire)
     }
 
-    /// `(delivered_seq, complete_recording_seq, durable_group_seq)` read so
+    /// Whether event `seq` is durable. An event at or before the current
+    /// range's checkpoint is answered from the first range's final
+    /// durable prefix, frozen when a checkpoint opened another range: an
+    /// event of a middle range counts as never durable, a conservative
+    /// answer, since replay claims nothing across a stop.
+    #[must_use]
+    pub fn durable_for(&self, seq: u64) -> DurableFor {
+        // Durable first: a range's values are published after its start.
+        let durable = self.durable.load(Ordering::Acquire);
+        let start = self.range_start.load(Ordering::Acquire);
+        if start != 0 && seq <= start {
+            // Settling before durable: an emptied queue's last value is
+            // seen with it.
+            let settling = self.first_settling.load(Ordering::Acquire);
+            let first = self.first_durable.load(Ordering::Acquire);
+            return if seq <= first {
+                DurableFor::Reached(first)
+            } else if seq <= settling {
+                DurableFor::Pending(first)
+            } else {
+                DurableFor::Never(first)
+            };
+        }
+        if durable >= seq {
+            DurableFor::Reached(durable)
+        } else {
+            DurableFor::Pending(durable)
+        }
+    }
+
+    /// `(delivered_seq, complete_recording_seq, durable_group_seq)`, the
+    /// current range's values (see [`PrefixView::durable_group_seq`]), read so
     /// that durable is never above complete: durable first, then complete
     /// (each published value is at least the one before, and complete is
     /// published before durable). Three separate reads may see a newer
@@ -158,6 +302,29 @@ pub struct PrefixTracker {
     /// event not queued (the incomplete one, or the one after the gap),
     /// and no later one is either.
     stop: Option<u64>,
+    /// The lowest checkpoint `group_seq` that opens a range past `stop`.
+    reopen_at: u64,
+    /// After a stop: what a checkpoint opening a range needs, in order,
+    /// bounded by `capacity`.
+    candidates: VecDeque<Candidate>,
+    /// The highest `group_seq` a full `candidates` let go: a range opened
+    /// below it cannot advance, since what lies between is unknown.
+    lost_through: u64,
+    /// The checkpoint that opened the current range.
+    start: Option<RangeStart>,
+    /// A checkpoint past the stop whose bytes the coverage has not yet
+    /// answered for: its record, and where the record ends.
+    pending: Option<(super::record::CheckpointRecord, u64)>,
+    /// The checkpoint opening the current range, until it is durable: the
+    /// range's events wait behind it.
+    opening: Option<Waiting>,
+    /// The first range: its values once a checkpoint opened another, which
+    /// keep following the events it still waits on (`settling`).
+    first: Option<FirstRange>,
+    /// The first range's events still waiting when a checkpoint opened
+    /// another: they settle as before, into `first`, never into the new
+    /// range.
+    settling: VecDeque<Waiting>,
     view: Arc<PrefixView>,
 }
 
@@ -177,6 +344,14 @@ impl PrefixTracker {
             durable: 0,
             complete_end: 0,
             stop: None,
+            reopen_at: 0,
+            candidates: VecDeque::with_capacity(capacity),
+            lost_through: 0,
+            start: None,
+            pending: None,
+            opening: None,
+            first: None,
+            settling: VecDeque::with_capacity(capacity),
             view: Arc::new(PrefixView::default()),
         }
     }
@@ -253,8 +428,15 @@ impl PrefixTracker {
                     return Err(PrefixError::OutOfOrder);
                 }
                 if end.outcome == EndOutcome::Incomplete {
-                    let _ = self.stop.get_or_insert(seq);
-                } else if self.stop.is_none() {
+                    self.stopped_at(seq, seq);
+                } else if self.stop.is_some() {
+                    self.candidate(Candidate::Event(Waiting {
+                        seq,
+                        journal_end,
+                        reference,
+                        checkpoint: None,
+                    }));
+                } else {
                     if self.waiting.len() >= self.capacity {
                         return Err(PrefixError::Full {
                             capacity: self.capacity,
@@ -264,6 +446,7 @@ impl PrefixTracker {
                         seq,
                         journal_end,
                         reference,
+                        checkpoint: None,
                     });
                 }
                 self.open = None;
@@ -273,7 +456,19 @@ impl PrefixTracker {
                     return Err(PrefixError::OutOfOrder);
                 }
                 let after = gap.to_seq.checked_add(1).ok_or(PrefixError::Exhausted)?;
-                let _ = self.stop.get_or_insert(after);
+                self.stopped_at(after, gap.to_seq);
+            }
+            GroupRecord::Checkpoint(checkpoint) => {
+                if self.open.is_some() {
+                    return Err(PrefixError::OutOfOrder);
+                }
+                // It opens a range once the coverage says its bytes are
+                // held ([`PrefixTracker::advance`]); a later one past the
+                // stop takes its place.
+                let opens = self.stop.is_some() && checkpoint.group_seq >= self.reopen_at;
+                if opens && checkpoint.end().is_some() {
+                    self.pending = Some((*checkpoint, journal_end));
+                }
             }
             GroupRecord::Unavailable(unavailable) => {
                 if self.open.is_some() {
@@ -303,7 +498,20 @@ impl PrefixTracker {
             group_seq: seq,
             recording_id,
         };
-        if let Some(waiting) = self.waiting.iter_mut().find(|waiting| waiting.seq == seq) {
+        let candidates = self
+            .candidates
+            .iter_mut()
+            .filter_map(|candidate| match candidate {
+                Candidate::Event(waiting) => Some(waiting),
+                Candidate::Stop { .. } => None,
+            });
+        if let Some(waiting) = self
+            .waiting
+            .iter_mut()
+            .chain(self.settling.iter_mut())
+            .chain(candidates)
+            .find(|waiting| waiting.seq == seq)
+        {
             return match waiting.reference {
                 Some((recording, _)) if recording == recording_id => {
                     waiting.reference = None;
@@ -317,6 +525,88 @@ impl PrefixTracker {
         } else {
             Err(no_reference)
         }
+    }
+
+    /// An incomplete event or a gap: `stop` is the first event not queued,
+    /// `reopen_at` the lowest checkpoint past it. The first stops the
+    /// current range; a later one is kept for a range a checkpoint opens.
+    fn stopped_at(&mut self, stop: u64, reopen_at: u64) {
+        if self.stop.is_none() {
+            self.stop = Some(stop);
+            self.reopen_at = reopen_at;
+        } else {
+            self.candidate(Candidate::Stop { stop, reopen_at });
+        }
+    }
+
+    /// Keeps `candidate`, letting the oldest go when there is no room.
+    fn candidate(&mut self, candidate: Candidate) {
+        if self.candidates.len() >= self.capacity
+            && let Some(oldest) = self.candidates.pop_front()
+        {
+            self.lost_through = self.lost_through.max(oldest.behind_at());
+        }
+        self.candidates.push_back(candidate);
+    }
+
+    /// The checkpoint `checkpoint`, whose record ends at `journal_end`,
+    /// opens a range past the stop. The first range's values are kept, for
+    /// replay from the start and for [`PrefixView::durable_for`], and the
+    /// events it still waits on keep settling into them; a later range's
+    /// are let go. Neither is ever claimed by the new range. The range starts at the checkpoint,
+    /// then takes the events after it that ended before its record, up to
+    /// the next stop.
+    fn open_range(
+        &mut self,
+        checkpoint: &super::record::CheckpointRecord,
+        end: u64,
+        journal_end: u64,
+    ) -> Result<(), PrefixError> {
+        let seq = checkpoint.group_seq;
+        let after = seq.checked_add(1).ok_or(PrefixError::Exhausted)?;
+        if self.first.is_none() {
+            self.first = Some(FirstRange {
+                complete: self.complete,
+                complete_end: self.complete_end,
+                durable: self.durable,
+            });
+            // `settling` is empty: the first range's waiting events move
+            // there, and `waiting` is left empty, with its room.
+            std::mem::swap(&mut self.waiting, &mut self.settling);
+        }
+        self.waiting.clear();
+        self.opening = Some(Waiting {
+            seq,
+            journal_end,
+            reference: None,
+            checkpoint: Some((checkpoint.position, end)),
+        });
+        self.start = Some(RangeStart {
+            checkpoint_id: checkpoint.checkpoint_id,
+            group_seq: seq,
+        });
+        if self.lost_through > seq {
+            // What lies between is unknown: the range stays at the
+            // checkpoint, and a later one may open the next.
+            self.stop = Some(after);
+            self.reopen_at = after;
+            return Ok(());
+        }
+        self.stop = None;
+        while let Some(candidate) = self.candidates.pop_front() {
+            if candidate.behind_at() <= seq {
+                continue;
+            }
+            match candidate {
+                Candidate::Event(waiting) => self.waiting.push_back(waiting),
+                Candidate::Stop { stop, reopen_at } => {
+                    self.stop = Some(stop.max(after));
+                    self.reopen_at = reopen_at;
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn open_event(&mut self, seq: u64, reference: Option<(u64, u64)>) -> Result<(), PrefixError> {
@@ -338,7 +628,19 @@ impl PrefixTracker {
         durable: u64,
         mut uncovered: impl FnMut(u64),
     ) {
-        for waiting in &mut self.waiting {
+        let candidates = self
+            .candidates
+            .iter_mut()
+            .filter_map(|candidate| match candidate {
+                Candidate::Event(waiting) => Some(waiting),
+                Candidate::Stop { .. } => None,
+            });
+        for waiting in self
+            .waiting
+            .iter_mut()
+            .chain(self.settling.iter_mut())
+            .chain(candidates)
+        {
             match waiting.reference {
                 Some((recording, end)) if recording == recording_id => {
                     if end <= durable {
@@ -353,9 +655,21 @@ impl PrefixTracker {
     }
 
     /// The recordings and frame ends the waiting events' payloads name, in
-    /// order: `(recording_id, end)`.
+    /// order: `(recording_id, end)`. Past a stop, those of the events a
+    /// checkpoint may yet take into a range.
     pub fn references(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        self.waiting.iter().filter_map(|waiting| waiting.reference)
+        let candidates = self
+            .candidates
+            .iter()
+            .filter_map(|candidate| match candidate {
+                Candidate::Event(waiting) => waiting.reference,
+                Candidate::Stop { .. } => None,
+            });
+        self.waiting
+            .iter()
+            .chain(self.settling.iter())
+            .filter_map(|waiting| waiting.reference)
+            .chain(candidates)
     }
 
     /// Whether the queue has room for one more complete event: the strict
@@ -377,8 +691,29 @@ impl PrefixTracker {
     /// journal's `written` and `durable` positions, and the recordings'
     /// through `coverage`. Returns `(complete, durable)`.
     pub fn advance(&mut self, written: u64, durable: u64, coverage: &impl Coverage) -> (u64, u64) {
+        if let Some((checkpoint, journal_end)) = self.pending
+            && let Some(end) = checkpoint.end()
+        {
+            match coverage.checkpoint(checkpoint.position, end) {
+                CheckpointHeld::Missing => {}
+                // Lost: it opens nothing, and the next one may.
+                CheckpointHeld::Lost => self.pending = None,
+                CheckpointHeld::Written | CheckpointHeld::Durable => {
+                    self.pending = None;
+                    // Only a `group_seq` past `u64` fails, which the order
+                    // rules refuse: the range stays stopped.
+                    let _ = self.open_range(&checkpoint, end, journal_end);
+                }
+            }
+        }
         let covered = |waiting: &Waiting, durable_only: bool| match waiting.reference {
-            None => true,
+            None => waiting.checkpoint.is_none_or(|(position, end)| {
+                match coverage.checkpoint(position, end) {
+                    CheckpointHeld::Durable => true,
+                    CheckpointHeld::Written => !durable_only,
+                    CheckpointHeld::Missing | CheckpointHeld::Lost => false,
+                }
+            }),
             Some((recording, end)) => {
                 coverage
                     .positions(recording)
@@ -387,8 +722,58 @@ impl PrefixTracker {
                     })
             }
         };
+        // The first range's events still settling, into its values.
+        if let Some(first) = self.first.as_mut() {
+            while let Some(front) = self.settling.front().copied() {
+                if front.journal_end > durable || !covered(&front, true) {
+                    break;
+                }
+                first.durable = front.seq;
+                if front.seq > first.complete {
+                    first.complete = front.seq;
+                    first.complete_end = front.journal_end;
+                }
+                let _ = self.settling.pop_front();
+            }
+            for waiting in &self.settling {
+                if waiting.seq <= first.complete {
+                    continue;
+                }
+                if waiting.journal_end > written || !covered(waiting, false) {
+                    break;
+                }
+                first.complete = waiting.seq;
+                first.complete_end = waiting.journal_end;
+            }
+        }
+        // A range's opening checkpoint first: its events wait behind it.
+        if let Some(opening) = self.opening {
+            if opening.journal_end <= durable && covered(&opening, true) {
+                self.opening = None;
+                self.durable = opening.seq;
+                if opening.seq > self.complete {
+                    self.complete = opening.seq;
+                    self.complete_end = opening.journal_end;
+                }
+            } else {
+                if opening.seq > self.complete
+                    && opening.journal_end <= written
+                    && covered(&opening, false)
+                {
+                    self.complete = opening.seq;
+                    self.complete_end = opening.journal_end;
+                }
+                if self.complete < opening.seq {
+                    self.publish();
+                    return (self.complete, self.durable);
+                }
+            }
+        }
         // Durable events leave the queue; they are complete too.
         while let Some(front) = self.waiting.front().copied() {
+            if self.opening.is_some() {
+                break;
+            }
             if front.journal_end > durable || !covered(&front, true) {
                 break;
             }
@@ -414,6 +799,17 @@ impl PrefixTracker {
     }
 
     fn publish(&self) {
+        // The range's start before its values (PrefixView::durable_for).
+        if let (Some(first), Some(start)) = (self.first, self.start) {
+            let settling = self.settling.back().map_or(0, |waiting| waiting.seq);
+            self.view
+                .first_durable
+                .store(first.durable, Ordering::Release);
+            self.view.first_settling.store(settling, Ordering::Release);
+            self.view
+                .range_start
+                .store(start.group_seq, Ordering::Release);
+        }
         self.view.delivered.store(self.delivered, Ordering::Release);
         self.view.complete.store(self.complete, Ordering::Release);
         self.view.durable.store(self.durable, Ordering::Release);
@@ -442,6 +838,24 @@ impl PrefixTracker {
     #[must_use]
     pub const fn complete_end(&self) -> u64 {
         self.complete_end
+    }
+
+    /// The range it follows: the checkpoint that opened it, and its complete
+    /// and durable values.
+    #[must_use]
+    pub const fn range(&self) -> Range {
+        Range {
+            start: self.start,
+            complete: self.complete,
+            durable: self.durable,
+        }
+    }
+
+    /// The first range as it ended, once a checkpoint opened another:
+    /// replay from the journal's start stops there.
+    #[must_use]
+    pub const fn first_range(&self) -> Option<FirstRange> {
+        self.first
     }
 
     /// Whether an incomplete event or a gap stopped the prefixes.

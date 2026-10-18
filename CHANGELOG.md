@@ -290,6 +290,28 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Checkpoints of a recording group, the store and the record (phase 3,
+  A9-1; recording-group-checkpoints.md sections 2 to 5). Each group has
+  a `CheckpointStore` beside its journal, with the journal's sync policy.
+  `CheckpointWriter::write` checks the record against the order rules,
+  appends the snapshot's bytes and syncs them, then appends template 30
+  (`CheckpointRecord`, block 40): a failed write leaves no record, and
+  a recorded checkpoint is durable by construction. The Gateway's
+  one-slot handoff (`CheckpointSlot`) refuses a checkpoint in flight,
+  one above `max_checkpoint`, an empty one and any after a strict
+  journal's end, each typed and counted. A new order rule
+  (`OrderRule::Checkpoint`): recorded checkpoints name an ended event
+  and rise in `group_seq` and id. The prefix tracker follows ranges: a
+  checkpoint after a gap or an incomplete event opens a new one at its
+  record once the store holds its bytes (`Coverage::checkpoint`,
+  `CheckpointHeld`; a lost one opens nothing), reported by
+  `PrefixTracker::range`. The first range's final values are frozen
+  (`PrefixTracker::first_range`): replay from the start stops there,
+  and `PrefixView::durable_for` answers a wait for an event before the
+  current range from them. The replay cursor skips template 30.
+  Recovery cuts bytes no record names and marks as lost a range a
+  record names that the store lacks. Nothing allocates per checkpoint.
+
 - Timed lanes over the network (P2.11 PR1, the software route;
   timed-tx.md). `EmbeddedDriver::add_timed_network_publication` adds a
   network publication whose lanes have a schedule ring: its sender holds
