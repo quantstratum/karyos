@@ -231,7 +231,8 @@ fn an_ipc_drivers_publication_lives_in_regions_and_reaches_an_ipc_image() {
 /// E5 on shared terms (network-shared-terms n4): between two IPC drivers,
 /// a steady network cycle on either side allocates nothing, so the
 /// sender's staging and NAK reads and the receive owner's writes into
-/// regions allocate nothing either.
+/// regions allocate nothing either. The receiver loses one DATA datagram
+/// in the counted phase, so a NAK and its repair happen inside the count.
 #[test]
 fn a_steady_ipc_network_cycle_allocates_nothing() {
     use karyos_sys::alloc_count::count;
@@ -259,7 +260,10 @@ fn a_steady_ipc_network_cycle_allocates_nothing() {
         let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
         seen == 128
     });
-    // Then traffic keeps flowing while only the network cycles are counted.
+    // Then traffic keeps flowing while only the network cycles are counted,
+    // and the receiver loses its third DATA datagram from here on.
+    let warm = a.net.as_ref().unwrap().sender_counters().unwrap();
+    b.net.as_mut().unwrap().drop_receiver_data(&[2]);
     let mut work = [0u64; 2];
     for _ in 0..2_000 {
         while sent < 384 {
@@ -289,6 +293,11 @@ fn a_steady_ipc_network_cycle_allocates_nothing() {
     assert!(
         work[0] > 0 && work[1] > 0,
         "counted cycles did work: {work:?}"
+    );
+    let counted = a.net.as_ref().unwrap().sender_counters().unwrap();
+    assert!(
+        counted.naks > warm.naks && counted.repairs > warm.repairs,
+        "a NAK and a repair inside the count: {counted:?}"
     );
     drop(reader);
     let _ = (a.close_network(), b.close_network());
