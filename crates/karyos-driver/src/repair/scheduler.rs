@@ -118,12 +118,15 @@ pub enum RepairReadError {
 
 /// The lane reads repair uses.
 pub trait RepairRead {
-    /// The head of `lane` at `from`, from its word 0 only.
+    /// The head of `lane` at `from`, from its word 0 only, ending at or
+    /// before `end`, the request's end: a repair repeats only what the NAK
+    /// asked for, whatever the datagrams the lane first sent held (a timed
+    /// lane sends one frame per datagram).
     ///
     /// # Errors
     ///
     /// [`RepairReadError`].
-    fn head(&mut self, lane: u8, from: u64) -> Result<Head, RepairReadError>;
+    fn head(&mut self, lane: u8, from: u64, end: Option<u64>) -> Result<Head, RepairReadError>;
 
     /// The lane's retention floor now.
     fn floor(&self, lane: u8) -> u64;
@@ -287,7 +290,7 @@ impl<R: RepairRead, S: RepairSubmit> LaneSource for Source<'_, R, S> {
         };
         let key = pending.key;
         let end = key.start.checked_add(u64::from(key.length));
-        match self.read.head(lane_id, pending.cursor) {
+        match self.read.head(lane_id, pending.cursor, end) {
             Ok(head) if end.is_some_and(|end| head.next() <= end) => {
                 let charge = head.charge();
                 if charge == 0 || charge > self.max_charge || head.next() <= pending.cursor {

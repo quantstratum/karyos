@@ -28,10 +28,6 @@ pub enum TimedNetworkUnsupported {
     /// when a timed head is selected once is not designed yet.
     #[error("redundant paths")]
     Routed,
-    /// A reliable channel: a reset rewinds the lane below schedule entries
-    /// already released (PR1b).
-    #[error("a reliable channel")]
-    Reliable,
     /// The `Tai` clock domain: the sender runs on the monotonic clock.
     #[error("the Tai clock domain")]
     TaiDomain,

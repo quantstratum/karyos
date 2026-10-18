@@ -155,17 +155,36 @@ impl LaneGate for DataGate<'_> {
         };
         // Heads leave in staging order.
         let ends = track.ends.pop_front().unwrap_or(false);
+        let mut left_at = None;
         match track.staged.pop_front() {
-            Some((ticket, next)) if ticket == staged.ticket => match how {
-                Left::Submitted => track.submitted = Some(next),
-                Left::Returned | Left::Unknown => track.unsent = true,
-            },
+            Some((ticket, next)) if ticket == staged.ticket => {
+                match how {
+                    Left::Submitted => track.submitted = Some(next),
+                    Left::Returned | Left::Unknown => track.unsent = true,
+                }
+                left_at = Some(next);
+            }
             _ => track.mismatched = true,
         }
-        // A timed message's last fragment left, for good or not: its
-        // schedule entry is done (ScheduleConsumer::message_left).
-        if ends && let Some(ended) = track.ended.checked_add(1) {
-            track.ended = ended;
+        // A timed message's last fragment left (ScheduleConsumer::
+        // message_left): sent or maybe sent, at the position its message
+        // ends, which a reliable lane releases once acknowledged; returned
+        // unsent, which an unreliable lane never sends again.
+        let sent = matches!(how, Left::Submitted | Left::Unknown);
+        track.started = !ends && (sent || track.started);
+        if ends {
+            match (how, left_at) {
+                (Left::Submitted | Left::Unknown, Some(end))
+                    if track.left_ends.len() < track.left_ends.capacity() =>
+                {
+                    track.left_ends.push_back(end);
+                }
+                _ => {
+                    if let Some(returned) = track.returned_ends.checked_add(1) {
+                        track.returned_ends = returned;
+                    }
+                }
+            }
         }
     }
 }
@@ -196,8 +215,15 @@ struct LaneTrack {
     /// A timed lane's staged datagrams, in step with `staged`: whether each
     /// carries its message's last fragment.
     ends: VecDeque<bool>,
-    /// Timed messages whose last fragment left this call.
-    ended: u32,
+    /// Where each timed message whose last fragment was sent (or may have
+    /// been) this call ends, in order.
+    left_ends: VecDeque<u64>,
+    /// Timed messages whose last fragment was returned unsent this call.
+    returned_ends: u32,
+    /// A fragment of the timed message being sent left (submitted, or of
+    /// unknown exposure) and its last fragment has not: a reliable reset
+    /// counts that message as sent.
+    started: bool,
 }
 
 /// A timed publication's schedule (`quantstratum-docs:
@@ -210,6 +236,11 @@ struct Timed {
     state: TimedState,
     /// Per lane, the consumer of its ring; `None` for a lane with none.
     consumers: Vec<Option<ScheduleConsumer>>,
+    /// A reliable publication's lanes, per lane: where each sent timed
+    /// message ends, oldest first, until the registered position passes it
+    /// and its entry is released (a reset rewinds to that position and
+    /// reads the messages above it again). Sized by the lane's ring.
+    unacknowledged: Vec<VecDeque<u64>>,
 }
 
 /// The counters of one outbound publication; checked, sticky on overflow.
@@ -479,7 +510,9 @@ impl<T: StreamTerms> Outbound<T> {
                 mismatched: false,
                 waiting: false,
                 ends: VecDeque::with_capacity(bound),
-                ended: 0,
+                left_ends: VecDeque::with_capacity(bound),
+                returned_ends: 0,
+                started: false,
             })
             .collect();
         Ok(Self {
@@ -1017,12 +1050,43 @@ impl<T: StreamTerms> Outbound<T> {
             }
             repair.reopened(queue);
         }
-        // A timed lane's heads the reset dropped: an unreliable lane sends
+        // A timed lane's heads the reset returned. An unreliable lane sends
         // none of them again, so a message whose last fragment was among
-        // them is done, and each is counted dropped.
+        // them is done, and each is counted dropped. A reliable one reads
+        // again from its registered position, below which every entry is
+        // released, so its consumer rewinds to its oldest entry not
+        // released, and nothing is done or dropped. Only the messages that
+        // left (in whole, or in part) are resent at once; the ones only
+        // read keep their time.
+        let rewinding = self.opened.is_some() && self.reliable;
         if let Some(timed) = self.timed.as_deref_mut() {
             for (lane, track) in self.tracks.iter_mut().enumerate() {
-                let _ = timed.state.forget(lane);
+                let _ = timed.state.forget(lane, !rewinding);
+                if rewinding {
+                    track.ends.clear();
+                    let unacknowledged =
+                        timed
+                            .unacknowledged
+                            .get_mut(lane)
+                            .map_or(0, |unacknowledged| {
+                                let sent = unacknowledged.len();
+                                unacknowledged.clear();
+                                sent
+                            });
+                    let sent = unacknowledged
+                        .checked_add(track.left_ends.len())
+                        .and_then(|sent| sent.checked_add(usize::from(track.started)));
+                    track.left_ends.clear();
+                    track.returned_ends = 0;
+                    track.started = false;
+                    if let Some(Some(consumer)) = timed.consumers.get_mut(lane) {
+                        let rewound = sent.map(|sent| consumer.rewind(sent));
+                        if !matches!(rewound, Some(Ok(()))) {
+                            self.counters.bump(|c| &mut c.schedule_faults, 1);
+                        }
+                    }
+                    continue;
+                }
                 let ended = track.ends.iter().filter(|ends| **ends).count();
                 track.ends.clear();
                 let ring = self
@@ -1111,12 +1175,27 @@ impl<T: StreamTerms> Outbound<T> {
             consumers.push(consumer);
         }
         let mut state = TimedState::new(policies, usize::from(STAGED_PER_LANE), now);
+        state.set_resends_returned(self.reliable);
         for (lane, cells) in counters.into_iter().enumerate() {
             if let Some(cells) = cells {
                 state.attach_counters(lane, cells);
             }
         }
-        self.timed = Some(Box::new(Timed { state, consumers }));
+        let mut unacknowledged = Vec::with_capacity(self.readers.len());
+        for reader in &self.readers {
+            let buffer = reader.subscription().buffer();
+            let capacity = match (self.reliable, buffer.schedule_ring()) {
+                (true, Some(_)) => usize::try_from(buffer.config().schedule_capacity)
+                    .map_err(|_| OutboundError::Lanes)?,
+                _ => 0,
+            };
+            unacknowledged.push(VecDeque::with_capacity(capacity));
+        }
+        self.timed = Some(Box::new(Timed {
+            state,
+            consumers,
+            unacknowledged,
+        }));
         Ok(())
     }
 
@@ -1216,6 +1295,7 @@ impl<T: StreamTerms> Outbound<T> {
             }
         }
         self.advance_registered(consumption);
+        self.release_acknowledged();
         Ok(work)
     }
 
@@ -1246,15 +1326,65 @@ impl<T: StreamTerms> Outbound<T> {
             return;
         };
         for (lane, track) in self.tracks.iter_mut().enumerate() {
-            let ended = std::mem::take(&mut track.ended);
+            let returned = std::mem::take(&mut track.returned_ends);
             let ring = self
                 .readers
                 .get(lane)
                 .and_then(|reader| reader.subscription().buffer().schedule_ring());
             let (Some(Some(consumer)), Some(ring)) = (timed.consumers.get_mut(lane), ring) else {
+                track.left_ends.clear();
                 continue;
             };
-            for _ in 0..ended {
+            // A reliable lane holds a sent message's entry until it is
+            // acknowledged ([`Outbound::release_acknowledged`]); a message
+            // returned unsent is read again after the reset.
+            if self.reliable {
+                if let Some(unacknowledged) = timed.unacknowledged.get_mut(lane) {
+                    while let Some(end) = track.left_ends.pop_front() {
+                        if unacknowledged.len() < unacknowledged.capacity() {
+                            unacknowledged.push_back(end);
+                        } else {
+                            self.counters.bump(|c| &mut c.schedule_faults, 1);
+                        }
+                    }
+                }
+                continue;
+            }
+            let ended = track.left_ends.len();
+            track.left_ends.clear();
+            for _ in (0..ended).map(drop).chain((0..returned).map(drop)) {
+                if consumer.message_left(ring).is_err() {
+                    self.counters.bump(|c| &mut c.schedule_faults, 1);
+                }
+            }
+        }
+    }
+
+    /// Frees, in order, the entry of every timed message of a reliable lane
+    /// whose end its registered position passed: the receivers consumed
+    /// it, so no reset reads it again.
+    fn release_acknowledged(&mut self) {
+        let Some(timed) = self.timed.as_deref_mut() else {
+            return;
+        };
+        if !self.reliable {
+            return;
+        }
+        for (lane, reader) in self.readers.iter().enumerate() {
+            let acknowledged = reader.sent_position();
+            let ring = reader.subscription().buffer().schedule_ring();
+            let (Some(unacknowledged), Some(Some(consumer)), Some(ring)) = (
+                timed.unacknowledged.get_mut(lane),
+                timed.consumers.get_mut(lane),
+                ring,
+            ) else {
+                continue;
+            };
+            while unacknowledged
+                .front()
+                .is_some_and(|end| *end <= acknowledged)
+            {
+                let _ = unacknowledged.pop_front();
                 if consumer.message_left(ring).is_err() {
                     self.counters.bump(|c| &mut c.schedule_faults, 1);
                 }
@@ -1555,11 +1685,22 @@ impl<T: StreamTerms> Outbound<T> {
                 let (Some(ring), Some(consumer)) = (ring, consumer) else {
                     break;
                 };
-                let Ok(time) = consumer.frame(ring, lane_frame) else {
+                let Ok(scheduled) = consumer.frame_scheduled(ring, lane_frame) else {
                     self.counters.bump(|c| &mut c.schedule_faults, 1);
                     break;
                 };
                 let ends = matches!(lane_frame, LaneFrame::Data { end: true, .. });
+                // A message a reliable reset read again was sent once: it
+                // goes at once, outside the late policy, counted apart.
+                let time = match scheduled {
+                    Some(scheduled) if scheduled.replayed => {
+                        if let (Some(timed), true) = (self.timed.as_deref_mut(), ends) {
+                            timed.state.count_rewound();
+                        }
+                        None
+                    }
+                    scheduled => scheduled.map(|scheduled| scheduled.time),
+                };
                 schedule = Some((time, ends));
             }
             let record = record.is_some();
@@ -1805,8 +1946,6 @@ pub(crate) mod testing {
         outbound_joined(endpoint, alias, destination, term, lanes, reliable, 0)
     }
 
-    /// [`outbound`], with `before` 1000-byte messages appended on each lane
-    /// before its reader subscribes: the reader joins above 0.
     /// [`outbound`] of one lane with a schedule ring of `capacity`.
     pub(crate) fn outbound_timed(
         endpoint: EndpointId,
@@ -1829,6 +1968,8 @@ pub(crate) mod testing {
         )
     }
 
+    /// [`outbound`], with `before` 1000-byte messages appended on each lane
+    /// before its reader subscribes: the reader joins above 0.
     pub(crate) fn outbound_joined(
         endpoint: EndpointId,
         alias: Alias,

@@ -2001,11 +2001,6 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         ..ScheduleOptions::default()
     };
     let cases = vec![
-        (
-            channel(destination),
-            ScheduleOptions::default(),
-            Unsupported::Reliable,
-        ),
         (unreliable.clone(), cancel, Unsupported::CancelOnDeadline),
         // Refused before anything platform-specific: on every platform.
         (unreliable.clone(), tai, Unsupported::TaiDomain),
@@ -2036,6 +2031,16 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         driver.free_retired_streams();
         assert!(driver.streams.is_empty(), "{reason:?}");
     }
+    // A reliable channel is accepted (PR1b).
+    let mut config = aggregate(12, 1);
+    config.stream.buffer.schedule_capacity = 4;
+    let reliable = driver.add_timed_network_publication(
+        config,
+        &channel(destination),
+        None,
+        ScheduleOptions::default(),
+    );
+    assert!(reliable.is_ok(), "{reliable:?}");
     // A timed add of lanes with no ring is refused too.
     let refused = driver.add_timed_network_publication(
         aggregate(10, 1),
