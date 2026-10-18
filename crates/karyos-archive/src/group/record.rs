@@ -40,7 +40,7 @@ pub const MAX_INLINE: usize = 65_535;
 /// The longest manifest, in bytes.
 pub const MAX_MANIFEST: usize = 4096;
 /// The largest reopen hold a journal header records, in events (A9).
-pub const MAX_REOPEN_HOLD: u32 = 1 << 20;
+pub const MAX_REOPEN_HOLD: u32 = 1 << 16;
 /// The default inline threshold, in bytes.
 pub const DEFAULT_INLINE_THRESHOLD: u32 = 4096;
 
