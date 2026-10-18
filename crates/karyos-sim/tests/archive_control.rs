@@ -17,6 +17,14 @@
 //! - Pacing (as recorded and scaled) is covered where its clock can be
 //!   set: `ReplaySource`'s tests in karyos-archive. The agent paces on its
 //!   own monotonic clock.
+//! - The `replay` rejoin through the Archive (A6d): a lapped optional
+//!   reader in a `ReplayRejoin`, with the Archive's client as its
+//!   provider, recovers its gap from the recording over the control
+//!   streams and merges back into the live stream at its resume, every
+//!   message once, in order, byte-exact. A gap in the recording is
+//!   reported as the replay's local gap, and what follows it merges. With
+//!   no recording of the stream, the secondary policy applies, with
+//!   `NoRecording`.
 
 #![allow(
     clippy::unwrap_used,
@@ -25,18 +33,24 @@
     reason = "tests, as ADR-0007 allows"
 )]
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use karyos_archive::agent::{AgentConfig, ArchiveHandle, ReplaySink, SinkClosed};
 use karyos_archive::catalog::{Recording, SourceIncarnation, StopReason, StreamFormat};
+use karyos_archive::client::{
+    ArchiveClient, ClientConfig, ControlRequests, ControlResponses, ReplayTargets,
+};
 use karyos_archive::control::{
     self, ControlMessage, ControlResponse, RecordingSignal, ReplayRate, ResponseCode, Signal,
 };
 use karyos_archive::disk::StdDisk;
-use karyos_archive::recorder::Mode;
+use karyos_archive::recorder::{Mode, OnLap};
 use karyos_archive::segment::SyncPolicy;
 use karyos_archive::server::{
     ArchiveHost, ControlServer, HostRecording, HostRefusal, MAX_REQUEST, RequestSource,
@@ -44,12 +58,19 @@ use karyos_archive::server::{
 };
 use karyos_archive::source::Guarded;
 use karyos_client::aggregate::LaneEnd;
-use karyos_client::{ClientPublication, ClientSubscription, MessageLimit, OfferOutcome};
+use karyos_client::{
+    ClientPublication, ClientSubscription, MessageLimit, OfferOutcome, PollSummary, RejoinOutcome,
+    ReplayFallbackReason, ReplayRejoin, Secondary, SecondaryOutcome,
+};
+use karyos_driver::DriverError;
 use karyos_driver::embedded::{AggregateHandle, EmbeddedDriver, StreamConfig, StreamHandle};
+use karyos_driver::recording::RecordingReader;
 use karyos_driver::replay::{ReplayFeed, ReplayTargetConfig};
 use karyos_protocol::lanes::drr::Budget;
 use karyos_sys::frame::Lane;
-use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode, Role, SealReason};
+use karyos_sys::log_buffer::{
+    LogBufferConfig, LossPolicy, PublicationMode, Role, SealReason, SkipReason,
+};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 use karyos_sys::term_bytes::HeapTerms;
@@ -58,6 +79,10 @@ const DATA: i32 = 42;
 const REQUESTS: i32 = 100;
 const RESPONSES: i32 = 101;
 const TARGET: i32 = 200;
+/// The stream the Archive's client asks its replays onto (A6d).
+const REPLAYS: i32 = 201;
+/// The Archive's client's id, the high half of its correlation ids.
+const ARCHIVE_CLIENT: u32 = 0xA6;
 /// This client's correlation ids: its own id in the high 32 bits, so they
 /// never collide with another requester's (§7a).
 const CLIENT: u64 = 0xC1 << 32;
@@ -107,7 +132,25 @@ struct Host {
     opened: Vec<(i32, i32)>,
     /// Each replay target's reader, subscribed before the replay starts.
     targets: Vec<karyos_client::aggregate::AggregateSubscription<HeapTerms>>,
+    /// The targets of replays onto [`REPLAYS`], for the Archive's client.
+    replays: Replays,
+    /// A recording reader made before its recording starts, which the next
+    /// recording takes instead of a new one: it can be lapped before the
+    /// agent reads it.
+    prepared: Option<RecordingReader>,
     ended: (Sender<Ended>, Receiver<Ended>),
+}
+
+/// The targets of replays onto [`REPLAYS`], by stream and session: the
+/// host puts each lane 0 reader in as it opens the target, and the
+/// Archive's client takes it.
+#[derive(Clone, Default)]
+struct Replays(Arc<Mutex<HashMap<(i32, i32), ClientSubscription>>>);
+
+impl ReplayTargets for Replays {
+    fn subscribe(&mut self, stream_id: i32, session_id: i32) -> Option<ClientSubscription> {
+        self.0.lock().unwrap().remove(&(stream_id, session_id))
+    }
 }
 
 impl Host {
@@ -136,11 +179,20 @@ impl ArchiveHost for Host {
             .trace_identity(self.data)
             .map_err(|error| HostRefusal(error.to_string()))?;
         // The recorded lane's format, from its reader: the driver drew its
-        // initial term id.
-        let recording = self
-            .driver
-            .recording_reader(self.data, Role::Required)
-            .map_err(|error| HostRefusal(error.to_string()))?;
+        // initial term id. An async recording reads as an optional
+        // participant.
+        let recording = match self.prepared.take() {
+            Some(recording) => recording,
+            None => {
+                let role = match request.mode {
+                    Mode::Required => Role::Required,
+                    Mode::Async { .. } => Role::Optional,
+                };
+                self.driver
+                    .recording_reader(self.data, role)
+                    .map_err(|error| HostRefusal(error.to_string()))?
+            }
+        };
         let format = recording.format();
         let (reader, lease) = recording.into_parts();
         Ok(HostRecording {
@@ -185,16 +237,28 @@ impl ArchiveHost for Host {
             .map_err(|error| HostRefusal(error.to_string()))?;
         self.opened
             .push((request.target_stream_id, replay_session_id(replay_id)));
-        let reader = match self.driver.subscribe_aggregate(&handle, Role::Required) {
-            Ok(reader) => reader,
-            Err(error) => {
-                // Nothing was written, so ending the replay at `to` retires
-                // the target (ImageRetired) rather than leave it open.
-                let _ = self.driver.finish_replay(handle, feed, to);
-                return Err(HostRefusal(error.to_string()));
-            }
+        let subscribed = if request.target_stream_id == REPLAYS {
+            // The Archive's client's: lane 0's reader, which it finds by
+            // the target's stream and session.
+            let key = (request.target_stream_id, replay_session_id(replay_id));
+            handle
+                .lane(recording.format.lane)
+                .ok_or(DriverError::InvalidConfig)
+                .and_then(|lane| self.driver.subscribe(lane, Role::Required))
+                .map(|reader| {
+                    self.replays.0.lock().unwrap().insert(key, reader);
+                })
+        } else {
+            self.driver
+                .subscribe_aggregate(&handle, Role::Required)
+                .map(|reader| self.targets.push(reader))
         };
-        self.targets.push(reader);
+        if let Err(error) = subscribed {
+            // Nothing was written, so ending the replay at `to` retires
+            // the target (ImageRetired) rather than leave it open.
+            let _ = self.driver.finish_replay(handle, feed, to);
+            return Err(HostRefusal(error.to_string()));
+        }
         Ok(Box::new(Sink {
             feed: Some(feed),
             handle,
@@ -245,11 +309,12 @@ impl ReplaySink for Sink {
     }
 }
 
-/// The request stream, read by the server.
-struct Requests(ClientSubscription);
+/// A control stream's reading end: the request stream as the server
+/// reads it, the response stream as the Archive's client does.
+struct Reading(ClientSubscription);
 
-impl RequestSource for Requests {
-    fn next(&mut self, out: &mut [u8]) -> Option<usize> {
+impl Reading {
+    fn read(&mut self, out: &mut [u8]) -> Option<usize> {
         let mut length = None;
         let _ = self.0.poll(
             |bytes, _| {
@@ -262,12 +327,37 @@ impl RequestSource for Requests {
     }
 }
 
-/// The response stream, written by the server.
-struct Responses(ClientPublication);
+impl RequestSource for Reading {
+    fn next(&mut self, out: &mut [u8]) -> Option<usize> {
+        self.read(out)
+    }
+}
 
-impl ResponseSink for Responses {
-    fn send(&mut self, message: &[u8]) -> bool {
+impl ControlResponses for Reading {
+    fn next(&mut self, out: &mut [u8]) -> Option<usize> {
+        self.read(out)
+    }
+}
+
+/// A control stream's writing end: the response stream as the server
+/// writes it, the request stream as the Archive's client does.
+struct Writing(ClientPublication);
+
+impl Writing {
+    fn write(&mut self, message: &[u8]) -> bool {
         matches!(self.0.offer(message), Ok(OfferOutcome::Accepted { .. }))
+    }
+}
+
+impl ResponseSink for Writing {
+    fn send(&mut self, message: &[u8]) -> bool {
+        self.write(message)
+    }
+}
+
+impl ControlRequests for Writing {
+    fn send(&mut self, message: &[u8]) -> bool {
+        self.write(message)
     }
 }
 
@@ -278,17 +368,22 @@ struct Client {
 }
 
 struct Rig {
-    server: ControlServer<Host, Requests, Responses>,
-    client: Client,
+    server: ControlServer<Host, Reading, Writing>,
+    /// The rig's own requests, until the Archive's client takes its
+    /// streams.
+    client: Option<Client>,
     dir: PathBuf,
 }
 
 impl Rig {
     /// A rig whose recorded stream starts at `initial_term_id`.
     fn new(initial_term_id: u32) -> Self {
+        // A directory of its own: the tests run in parallel.
+        static RIGS: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "karyos-sim-archive-control-{}-{initial_term_id}",
-            std::process::id()
+            "karyos-sim-archive-control-{}-{}",
+            std::process::id(),
+            RIGS.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
@@ -310,19 +405,21 @@ impl Rig {
             requests: driver.publication(requests).unwrap(),
             responses: driver.subscribe(responses, Role::Required).unwrap(),
         };
-        let server_requests = Requests(driver.subscribe(requests, Role::Required).unwrap());
-        let server_responses = Responses(driver.publication(responses).unwrap());
+        let server_requests = Reading(driver.subscribe(requests, Role::Required).unwrap());
+        let server_responses = Writing(driver.publication(responses).unwrap());
         let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
         let host = Host {
             driver,
             data,
             opened: Vec::new(),
             targets: Vec::new(),
+            replays: Replays::default(),
+            prepared: None,
             ended: channel(),
         };
         Self {
             server: ControlServer::new(agent, host, server_requests, server_responses),
-            client,
+            client: Some(client),
             dir,
         }
     }
@@ -342,7 +439,8 @@ impl Rig {
         let mut out = vec![0u8; MAX_REQUEST];
         let length = message.encode(&mut out).unwrap();
         loop {
-            if let Ok(OfferOutcome::Accepted { .. }) = self.client.requests.offer(&out[..length]) {
+            let requests = &mut self.client.as_mut().unwrap().requests;
+            if let Ok(OfferOutcome::Accepted { .. }) = requests.offer(&out[..length]) {
                 return;
             }
             self.cycle();
@@ -359,7 +457,7 @@ impl Rig {
         while answers.len() < count {
             assert!(start.elapsed() < Duration::from_secs(10), "no answer");
             self.cycle();
-            let _ = self.client.responses.poll(
+            let _ = self.client.as_mut().unwrap().responses.poll(
                 |bytes, _| {
                     if [correlation_id, 0].contains(&correlation(bytes)) {
                         answers.push(bytes.to_vec());
@@ -370,6 +468,40 @@ impl Rig {
         }
         assert_eq!(answers.len(), count);
         answers
+    }
+
+    /// Starts recording the data stream in `mode`; returns its id.
+    fn start_recording(&mut self, mode: Mode) -> u64 {
+        self.request(&ControlMessage::StartRecording(control::StartRecording {
+            correlation_id: CLIENT + 1,
+            stream_id: DATA,
+            session_id: 1,
+            mode,
+            sync_policy: SyncPolicy::PerSegment,
+            segment_length: 0,
+            channel: "karyos:ipc",
+        }));
+        let answers = self.answers(CLIENT + 1, 2);
+        let started = response(&answers[0]);
+        assert_eq!(started.code, ResponseCode::Ok, "{}", started.message);
+        assert_eq!(signal(&answers[1]).signal, Signal::Started);
+        started.id
+    }
+
+    /// The Archive's client, on the rig's request and response streams,
+    /// asking its replays onto [`REPLAYS`]: the rig sends no more requests
+    /// of its own.
+    fn archive_client(&mut self) -> ArchiveClient<Writing, Reading, Replays> {
+        let Client {
+            requests,
+            responses,
+        } = self.client.take().unwrap();
+        let config = ClientConfig {
+            deadline: Duration::from_secs(10),
+            ..ClientConfig::new(ARCHIVE_CLIENT, REPLAYS)
+        };
+        let replays = self.server.host().replays.clone();
+        ArchiveClient::new(config, Writing(requests), Reading(responses), replays).unwrap()
     }
 }
 
@@ -608,5 +740,290 @@ fn made_and_replayed(initial_term_id: u32) {
     let answers = rig.answers(CLIENT + 5, 1);
     assert_eq!(response(&answers[0]).code, ResponseCode::InvalidRequest);
     drop(witness);
+    drop(publication);
+}
+
+/// A message published: where it starts, and its bytes.
+type Sent = (u64, Vec<u8>);
+
+/// Publishes messages of several sizes, some fragmented, cycling the rig,
+/// until the stream reaches `to`, or `count` messages when `to` is 0.
+/// Each message carries its sequence in its first four bytes.
+fn publish(
+    rig: &mut Rig,
+    publication: &mut ClientPublication,
+    sent: &mut Vec<Sent>,
+    to: u64,
+    count: usize,
+) {
+    let goal = sent.len() + count;
+    let start = Instant::now();
+    while if to == 0 {
+        sent.len() < goal
+    } else {
+        sent.last().is_none_or(|(position, _)| *position < to)
+    } {
+        assert!(start.elapsed() < Duration::from_secs(20), "not published");
+        let sequence = u32::try_from(sent.len()).unwrap();
+        let length = [100usize, 1400, 3000][sent.len() % 3];
+        let mut message = vec![u8::try_from(sequence % 251).unwrap(); length];
+        message[..4].copy_from_slice(&sequence.to_le_bytes());
+        if let Ok(OfferOutcome::Accepted { position, .. }) = publication.offer(&message) {
+            sent.push((position, message));
+        }
+        rig.cycle();
+    }
+}
+
+/// Polls `rejoin`, cycling the rig, until `done` holds of a poll's report
+/// and the count of messages delivered so far; returns every report that
+/// was not empty.
+fn rejoin_until(
+    rig: &mut Rig,
+    rejoin: &mut ReplayRejoin,
+    seen: &mut Vec<Sent>,
+    mut done: impl FnMut(&PollSummary, usize) -> bool,
+) -> Vec<PollSummary> {
+    let mut reports = Vec::new();
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "not done: {reports:?}"
+        );
+        rig.cycle();
+        let summary = rejoin
+            .poll(
+                |bytes, info| seen.push((info.position, bytes.to_vec())),
+                MessageLimit::new(64),
+            )
+            .unwrap();
+        let finished = done(&summary, seen.len());
+        if summary != PollSummary::default() {
+            reports.push(summary);
+        }
+        if finished {
+            return reports;
+        }
+    }
+}
+
+/// Publishes `count` messages one at a time, polling `rejoin` until each
+/// is delivered, so the live reader, polled, is never lapped; returns the
+/// reports that were not empty.
+fn publish_polled(
+    rig: &mut Rig,
+    publication: &mut ClientPublication,
+    rejoin: &mut ReplayRejoin,
+    sent: &mut Vec<Sent>,
+    seen: &mut Vec<Sent>,
+    count: usize,
+) -> Vec<PollSummary> {
+    let mut reports = Vec::new();
+    for _ in 0..count {
+        publish(rig, publication, sent, 0, 1);
+        let next = seen.len() + 1;
+        reports.extend(rejoin_until(rig, rejoin, seen, |_, count| count >= next));
+    }
+    reports
+}
+
+/// The outcomes `reports` carry, in order.
+fn outcomes(reports: &[PollSummary]) -> Vec<RejoinOutcome> {
+    reports.iter().filter_map(|report| report.rejoin).collect()
+}
+
+/// A lapped optional reader recovers its gap through the Archive: its
+/// rejoin asks the Archive's client for the gap, which lists the
+/// recording, asks for its replay over the request stream and finds the
+/// target; the replay merges back into the live stream at the resume.
+/// Every message comes once, in order, byte-exact, at its position.
+#[test]
+fn a_lapped_reader_recovers_its_gap_through_the_archive() {
+    let mut rig = Rig::new(INITIAL_TERM_ID);
+    let data = rig.server.host().data;
+    let mut publication = rig.driver().publication(data).unwrap();
+    let live = rig.driver().subscribe(data, Role::Optional).unwrap();
+    let source = rig.driver().trace_identity(data).unwrap();
+    let _ = rig.start_recording(Mode::Required);
+    let archive = rig.archive_client();
+    let mut rejoin = ReplayRejoin::new(live, source, Box::new(archive), Secondary::RejoinAtHead);
+
+    // Five terms: the live reader, not polled, is lapped; the recording,
+    // required, keeps every message.
+    let mut sent = Vec::new();
+    publish(
+        &mut rig,
+        &mut publication,
+        &mut sent,
+        5 * u64::from(MIN_TERM_LENGTH),
+        0,
+    );
+    let mut seen = Vec::new();
+    let reports = rejoin_until(&mut rig, &mut rejoin, &mut seen, |report, _| {
+        matches!(report.rejoin, Some(RejoinOutcome::Replayed { .. }))
+    });
+    let overrun = reports.iter().find_map(|report| report.overrun).unwrap();
+    assert_eq!(overrun.from, 0);
+    assert_eq!(
+        outcomes(&reports),
+        [
+            RejoinOutcome::Replaying,
+            RejoinOutcome::Replayed {
+                cutover: overrun.resume
+            }
+        ]
+    );
+    assert!(reports.iter().all(|report| report.skipped.is_none()));
+    assert!(!rejoin.is_recovering());
+
+    // The live reader goes on alone.
+    let reports = publish_polled(
+        &mut rig,
+        &mut publication,
+        &mut rejoin,
+        &mut sent,
+        &mut seen,
+        20,
+    );
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    assert_eq!(seen.len(), sent.len());
+    assert!(seen == sent, "once, in order, byte-exact, at its position");
+    drop(publication);
+}
+
+/// A gap in the recording: its reader was lapped before the agent read
+/// it, so the recording holds a gap from the stream's start. A lapped
+/// reader's replay reports the gap as its local gap and merges what
+/// follows it; every message past the gap comes once, in order.
+#[test]
+fn a_gap_in_the_recording_is_reported_and_what_follows_merges() {
+    let mut rig = Rig::new(INITIAL_TERM_ID);
+    let data = rig.server.host().data;
+    let mut publication = rig.driver().publication(data).unwrap();
+    let live = rig.driver().subscribe(data, Role::Optional).unwrap();
+    let source = rig.driver().trace_identity(data).unwrap();
+    let prepared = rig.driver().recording_reader(data, Role::Optional).unwrap();
+    rig.server.host_mut().prepared = Some(prepared);
+
+    // Five terms with no required reader: the recording's reader and the
+    // live reader are both lapped.
+    let mut sent = Vec::new();
+    let term = u64::from(MIN_TERM_LENGTH);
+    publish(&mut rig, &mut publication, &mut sent, 5 * term, 0);
+    let lost = sent.len();
+    let recording = rig.start_recording(Mode::Async {
+        on_lap: OnLap::Resume,
+    });
+    // The recording rejoins at the head, where the next message starts.
+    let start = Instant::now();
+    while !rig.server.agent().describe(recording).unwrap().incomplete {
+        assert!(start.elapsed() < Duration::from_secs(20), "never lapped");
+        rig.cycle();
+    }
+    // Less than a term, which the recording keeps.
+    publish(&mut rig, &mut publication, &mut sent, 0, 20);
+    let archive = rig.archive_client();
+    let mut rejoin = ReplayRejoin::new(live, source, Box::new(archive), Secondary::RejoinAtHead);
+
+    let mut seen = Vec::new();
+    let reports = rejoin_until(&mut rig, &mut rejoin, &mut seen, |report, _| {
+        matches!(report.rejoin, Some(RejoinOutcome::Replayed { .. }))
+    });
+    let overrun = reports.iter().find_map(|report| report.overrun).unwrap();
+    assert_eq!(overrun.from, 0);
+    assert_eq!(
+        outcomes(&reports),
+        [
+            RejoinOutcome::Replaying,
+            RejoinOutcome::Replayed {
+                cutover: overrun.resume
+            }
+        ]
+    );
+    // The recording's gap, reported from the stream's start, in reports
+    // that follow one another, up to where the recording rejoined; the
+    // replay merges the messages that follow it.
+    let mut gap = 0;
+    for skipped in reports.iter().filter_map(|report| report.skipped) {
+        assert!(
+            matches!(skipped.reason, SkipReason::LocalGap(_)),
+            "{skipped:?}"
+        );
+        assert_eq!(skipped.position, gap);
+        gap += u64::from(skipped.extent);
+    }
+    assert_eq!(gap, sent[lost].0);
+    assert!(seen == sent[lost..], "the replay's, past the gap");
+
+    // The live reader goes on alone.
+    let reports = publish_polled(
+        &mut rig,
+        &mut publication,
+        &mut rejoin,
+        &mut sent,
+        &mut seen,
+        20,
+    );
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    assert!(
+        seen == sent[lost..],
+        "past the gap: once, in order, byte-exact"
+    );
+    drop(publication);
+}
+
+/// No recording of the stream: the Archive's client finds none, and the
+/// secondary policy applies to the gap with `NoRecording`; the live reader
+/// goes on from its resume.
+#[test]
+fn a_stream_with_no_recording_falls_back_to_the_secondary() {
+    let mut rig = Rig::new(INITIAL_TERM_ID);
+    let data = rig.server.host().data;
+    let mut publication = rig.driver().publication(data).unwrap();
+    let live = rig.driver().subscribe(data, Role::Optional).unwrap();
+    let source = rig.driver().trace_identity(data).unwrap();
+    let archive = rig.archive_client();
+    let mut rejoin = ReplayRejoin::new(live, source, Box::new(archive), Secondary::RejoinAtHead);
+
+    let mut sent = Vec::new();
+    publish(
+        &mut rig,
+        &mut publication,
+        &mut sent,
+        5 * u64::from(MIN_TERM_LENGTH),
+        0,
+    );
+    let mut seen = Vec::new();
+    let reports = rejoin_until(&mut rig, &mut rejoin, &mut seen, |report, _| {
+        matches!(report.rejoin, Some(RejoinOutcome::ReplayFallback { .. }))
+    });
+    assert_eq!(
+        outcomes(&reports),
+        [
+            RejoinOutcome::Replaying,
+            RejoinOutcome::ReplayFallback {
+                reason: ReplayFallbackReason::NoRecording,
+                secondary: SecondaryOutcome::ResumedAtHead,
+            }
+        ]
+    );
+    assert!(seen.is_empty());
+    assert!(
+        rig.server.host().opened.is_empty(),
+        "no replay was asked for"
+    );
+
+    let before = sent.len();
+    let reports = publish_polled(
+        &mut rig,
+        &mut publication,
+        &mut rejoin,
+        &mut sent,
+        &mut seen,
+        20,
+    );
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    assert!(seen == sent[before..], "from the resume on");
     drop(publication);
 }
