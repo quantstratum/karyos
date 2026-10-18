@@ -221,13 +221,135 @@ fn a_removed_subscription_retires_and_reclaims_its_image() {
     });
 }
 
-/// Interim keying (ACS 15937): a second image with an alias in use is not
-/// exposed, and is counted; the first stays exposed.
+/// Two publishers of one alias on different sources (`quantstratum-docs:
+/// karyos/design/per-source-images.md`, D2-1): both images are exposed,
+/// each named by its registration with its own source; the alias resolves
+/// to the oldest; each image's reader gets only its publisher's messages,
+/// in order; removing the subscription retires and reclaims both.
 #[test]
-fn a_second_image_of_one_alias_is_counted_not_exposed() {
+fn two_images_of_one_alias_are_both_exposed_and_read() {
     let mut a = driver(ThreadingMode::Shared);
     let mut c = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
+    let publications = [
+        a.add_network_publication(aggregate(10, 3, 1), &channel(address))
+            .unwrap(),
+        c.add_network_publication(aggregate(10, 3, 1), &channel(address))
+            .unwrap(),
+    ];
+    pump(&mut a, &mut b, |_, b| {
+        let _ = c.do_work().unwrap();
+        b.network_images(10).len() == 2
+    });
+    assert_eq!(b.network_images_unexposed(), 0);
+    let images = b.network_images(10);
+    assert_ne!(images[0].1, images[1].1, "two sources");
+    assert!(images[0].0.registration() < images[1].0.registration());
+    assert_eq!(b.network_image(10, 3), Some(images[0].0), "the oldest");
+    let mut readers = [images[0].0, images[1].0]
+        .map(|image| b.subscribe_aggregate(&image, Role::Required).unwrap());
+    // Which publisher an image is from is learnt from its first message.
+    let mut lanes = [
+        a.publication(publications[0].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+        c.publication(publications[1].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+    ];
+    let messages = 64u32;
+    let mut sent = [0u32; 2];
+    let mut seen: [Vec<(u8, u32)>; 2] = [Vec::new(), Vec::new()];
+    pump(&mut a, &mut b, |_, _| {
+        let _ = c.do_work().unwrap();
+        for (publisher, lane) in lanes.iter_mut().enumerate() {
+            while sent[publisher] < messages {
+                let mut payload = [0u8; 100];
+                payload[0] = u8::try_from(publisher).unwrap();
+                payload[1..5].copy_from_slice(&sent[publisher].to_le_bytes());
+                match lane.offer(&payload).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent[publisher] += 1,
+                    _ => break,
+                }
+            }
+        }
+        for (image, reader) in readers.iter_mut().enumerate() {
+            let _ = reader.poll(
+                |bytes, _, _| {
+                    let index = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+                    seen[image].push((bytes[0], index));
+                },
+                BUDGET,
+            );
+        }
+        seen.iter().all(|seen| seen.len() == 64)
+    });
+    let mut publishers = [seen[0][0].0, seen[1][0].0];
+    for (image, seen) in seen.iter().enumerate() {
+        let publisher = publishers[image];
+        let expect: Vec<(u8, u32)> = (0..messages).map(|index| (publisher, index)).collect();
+        assert_eq!(seen, &expect, "image {image}: only its publisher, in order");
+    }
+    publishers.sort_unstable();
+    assert_eq!(publishers, [0, 1]);
+    drop(readers);
+    drop(lanes);
+    assert!(b.remove_network_subscription(subscription).unwrap());
+    pump(&mut a, &mut b, |_, b| {
+        let _ = c.do_work().unwrap();
+        b.net.as_ref().unwrap().image_count() == 0
+    });
+}
+
+/// The local key rule is symmetric (per-source-images.md, D2-1): an image
+/// whose alias is a live local stream's key stays unexposed and counted,
+/// and a local stream over a live image's key is `DuplicateStream`.
+#[test]
+fn a_local_key_and_an_image_alias_never_coexist() {
+    // A local stream first: the image of its key is not exposed.
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let _local = b.add_aggregate(aggregate(10, 3, 1)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_images_unexposed() == 1);
+    assert!(b.network_image(10, 3).is_none());
+    // An image first: a local stream of its key is refused.
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    assert!(matches!(
+        b.add_aggregate(aggregate(10, 3, 1)),
+        Err(crate::error::DriverError::DuplicateStream {
+            stream_id: 10,
+            session_id: 3
+        })
+    ));
+}
+
+/// An image the stream table has no room for is installed, fed and
+/// counted, not exposed; the first stays exposed.
+#[test]
+fn an_image_without_room_is_counted_not_exposed() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut c = driver(ThreadingMode::Shared);
+    let mut b = EmbeddedDriver::with_config(DriverConfig {
+        max_streams: 1,
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap();
     let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
     let address = bound(&b, 10);
     let _first = a
@@ -240,7 +362,7 @@ fn a_second_image_of_one_alias_is_counted_not_exposed() {
         let _ = c.do_work().unwrap();
         b.network_images_unexposed() == 1
     });
-    assert!(b.network_image(10, 3).is_some());
+    assert_eq!(b.network_images(10).len(), 1);
     // The unexposed image is still fed past its first term: its terms are
     // prepared by the network, so the reliable publisher is never held.
     let mut lane = c.publication(second.lane(Lane::ZERO).unwrap()).unwrap();
@@ -262,6 +384,54 @@ fn a_second_image_of_one_alias_is_counted_not_exposed() {
         let _ = c.do_work().unwrap();
         b.net.as_ref().unwrap().image_count() == 0
     });
+}
+
+/// A replay target has no source (per-source-images.md, D2-1): it is
+/// refused over a live image's key, as over any stream's, and an image
+/// over a replay target's key stays unexposed and counted.
+#[test]
+fn a_replay_target_and_an_image_never_share_a_key() {
+    use crate::replay::ReplayTargetConfig;
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH};
+
+    let target = |stream_id, session_id| ReplayTargetConfig {
+        stream_id,
+        session_id,
+        term_length: MIN_TERM_LENGTH,
+        initial_term_id: 7,
+        mtu: DEFAULT_MTU,
+        join: 0,
+        lane: Lane::ZERO,
+        source_stream_id: 42,
+        source_session_id: 1,
+    };
+    // An image first: a replay target of its key is refused.
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    assert!(matches!(
+        b.replay_target(target(10, 3)),
+        Err(crate::error::DriverError::DuplicateStream {
+            stream_id: 10,
+            session_id: 3
+        })
+    ));
+    // A replay target first: the image of its key is not exposed.
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let _target = b.replay_target(target(10, 3)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_images_unexposed() == 1);
+    assert!(b.network_images(10).is_empty());
 }
 
 /// #283 P2: two subscriptions of one endpoint and stream share the
@@ -1372,3 +1542,238 @@ fn eos_on_every_lane_ends_the_image_cleanly_after_the_last_message() {
 
 #[cfg(target_os = "linux")]
 mod ipc;
+
+/// Writes `command` to a remote client's ring.
+fn write_command(
+    producer: &mut karyos_sys::command_ring::RingProducer,
+    command: karyos_protocol::cnc::Command,
+) {
+    let mut bytes = [0u8; karyos_protocol::cnc::MAX_COMMAND_LENGTH];
+    let length = command.encode(&mut bytes).unwrap();
+    producer.write(command.type_id(), &bytes[..length]).unwrap();
+}
+
+/// The responses `observer` has not read yet.
+fn responses(
+    observer: &mut karyos_sys::broadcast::BroadcastReceiver,
+) -> Vec<karyos_protocol::cnc::Response> {
+    let mut out = Vec::new();
+    while let karyos_sys::broadcast::Received::Message {
+        type_id, payload, ..
+    } = observer.receive()
+    {
+        if let Ok(response) = karyos_protocol::cnc::Response::decode(type_id, payload) {
+            out.push(response);
+        }
+    }
+    out
+}
+
+/// Binding commands to images (`quantstratum-docs:
+/// karyos/design/per-source-images.md`, D2-2 and D2-3): with two images
+/// of one alias, `AddSubscription` by the alias grants the oldest and
+/// `AddImageSubscription` grants the image it names. A local stream's
+/// registration, a network publication's, a lane the image lacks and a
+/// retiring image are `UnknownStream`, the image registration its detail.
+#[test]
+fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
+    use karyos_protocol::cnc::{Command, ErrorCode, Response, SubscriberRole};
+
+    let mut a = driver(ThreadingMode::Shared);
+    let mut c = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
+    let _first = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let _second = c
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| {
+        let _ = c.do_work().unwrap();
+        b.network_images(10).len() == 2
+    });
+    let [(oldest, _), (newest, _)] = b.network_images(10)[..] else {
+        panic!("two images");
+    };
+    let local = b.add_aggregate(aggregate(20, 1, 1)).unwrap();
+    // A publication with no receiver sends to a socket the test holds.
+    let silent = UdpSocket::bind(ANY_PORT).unwrap();
+    let publication = b
+        .add_network_publication(aggregate(30, 1, 1), &channel(silent.local_addr().unwrap()))
+        .unwrap();
+    let mut observer = b.broadcast.receiver();
+    let (client, mut producer) = remote_client(&mut b);
+    let serve = |b: &mut EmbeddedDriver| {
+        for _ in 0..20 {
+            let _ = b.do_work().unwrap();
+        }
+    };
+    let image_subscription = |sequence, image, lane| Command::AddImageSubscription {
+        sequence,
+        image,
+        lane: Lane::try_new(lane).unwrap(),
+        role: SubscriberRole::Required,
+    };
+    add_remote_subscription(&mut producer, 1, (10, 3), SubscriberRole::Required);
+    write_command(
+        &mut producer,
+        image_subscription(2, newest.registration(), 0),
+    );
+    serve(&mut b);
+    let streams: Vec<u64> = b
+        .ledger(client)
+        .unwrap()
+        .grants()
+        .iter()
+        .map(|grant| grant.stream)
+        .collect();
+    assert_eq!(
+        streams,
+        [oldest.registration(), newest.registration()],
+        "the alias reaches the oldest, the registration its image"
+    );
+    let _ = responses(&mut observer);
+    // None of these is an image's live lane.
+    let refused = [
+        (3, local.registration(), 0),
+        (4, publication.registration(), 0),
+        (5, newest.registration(), 1),
+    ];
+    for (sequence, image, lane) in refused {
+        write_command(&mut producer, image_subscription(sequence, image, lane));
+    }
+    serve(&mut b);
+    let mut events = b.broadcast.receiver();
+    assert!(b.remove_network_subscription(subscription).unwrap());
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_none());
+    // Each image's retirement closes its lane naming the image (D2-3).
+    let mut closed = Vec::new();
+    while let karyos_sys::broadcast::Received::Message {
+        type_id, payload, ..
+    } = events.receive()
+    {
+        if let Ok(karyos_protocol::cnc::Event::PublicationClosed { stream, image, .. }) =
+            karyos_protocol::cnc::Event::decode(type_id, payload)
+        {
+            closed.push((stream.stream_id, image));
+        }
+    }
+    closed.sort_unstable();
+    assert_eq!(
+        closed,
+        [(10, oldest.registration()), (10, newest.registration())]
+    );
+    write_command(
+        &mut producer,
+        image_subscription(6, oldest.registration(), 0),
+    );
+    serve(&mut b);
+    assert_eq!(grants(&b, client), 2, "nothing more granted");
+    let errors: Vec<(u64, ErrorCode, u64)> = responses(&mut observer)
+        .into_iter()
+        .filter_map(|response| match response {
+            Response::Error {
+                request,
+                code,
+                detail,
+            } => Some((request.sequence, code, detail)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            (3, ErrorCode::UnknownStream, local.registration()),
+            (4, ErrorCode::UnknownStream, publication.registration()),
+            (5, ErrorCode::UnknownStream, newest.registration()),
+            (6, ErrorCode::UnknownStream, oldest.registration()),
+        ]
+    );
+}
+
+/// A client conductor of the subscribing driver (per-source-images.md,
+/// D2-3 and D2-5): a network subscription by URI hears two
+/// `ImageAvailable` events for two images of one alias, each naming its
+/// image registration and its source, and a plain `add_subscription` by
+/// the alias still attaches the oldest image.
+#[test]
+fn a_conductor_hears_each_image_and_attaches_by_alias_to_the_oldest() {
+    use karyos_client::Outcome;
+    use karyos_protocol::cnc::{Event, StreamKey, SubscriberRole};
+
+    let mut a = driver(ThreadingMode::Shared);
+    let mut c = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = SocketAddr::new(LOOPBACK, free_port());
+    let mut client = b.connect().unwrap();
+    let uri = format!("karyos:udp?endpoint={address}");
+    let subscribed = client
+        .add_network_subscription(&uri, 10, SubscriberRole::Required)
+        .unwrap();
+    let _first = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let _second = c
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let mut heard = Vec::new();
+    let mut outcomes = Vec::new();
+    pump(&mut a, &mut b, |_, _| {
+        let _ = c.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| outcomes.push(completion));
+        for event in client.take_events() {
+            if let Event::ImageAvailable {
+                stream,
+                image,
+                source,
+                ..
+            } = event
+            {
+                heard.push((stream, image, source));
+            }
+        }
+        heard.len() == 2
+    });
+    assert!(
+        outcomes
+            .iter()
+            .any(|completion| completion.sequence == subscribed
+                && matches!(completion.outcome, Outcome::NetworkSubscription { .. }))
+    );
+    let alias = StreamKey {
+        stream_id: 10,
+        session_id: 3,
+    };
+    heard.sort_unstable_by_key(|(_, image, _)| *image);
+    let images: Vec<_> = b
+        .network_images(10)
+        .into_iter()
+        .map(|(handle, source)| (alias, handle.registration(), source))
+        .collect();
+    assert_eq!(heard, images, "each image with its registration and source");
+    let attach = client
+        .add_subscription(alias, SubscriberRole::Required)
+        .unwrap();
+    pump(&mut a, &mut b, |_, _| {
+        let _ = c.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| outcomes.push(completion));
+        outcomes
+            .iter()
+            .any(|completion| completion.sequence == attach)
+    });
+    let completion = outcomes
+        .iter()
+        .find(|completion| completion.sequence == attach)
+        .unwrap();
+    assert!(matches!(completion.outcome, Outcome::Subscription(_)));
+    let oldest = images[0].1;
+    assert_eq!(
+        b.registrations
+            .last()
+            .map(crate::commands::Registration::stream),
+        Some(oldest),
+        "the alias attaches the oldest image"
+    );
+}

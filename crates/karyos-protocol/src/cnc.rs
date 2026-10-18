@@ -32,6 +32,7 @@
 //! | `0x0E` | `GuardReopen` | sequence | guard | expected closed epoch | operation id |
 //! | `0x0F` | `AddNetworkPublication` | sequence | stream id (low 32; high 32 zero) | flags as `AddPublication` | channel URI length |
 //! | `0x10` | `AddNetworkSubscription` | sequence | stream id (low 32; high 32 zero) | role as `AddSubscription` | channel URI length |
+//! | `0x11` | `AddImageSubscription` | sequence | image registration (nonzero) | role as `AddSubscription` | lane as `AddPublication` |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
@@ -152,17 +153,30 @@
 //! | --- | --- | --- | --- | --- | --- | --- |
 //! | `0xC1` | `ParticipantLost` | stream and session | registration | client | policy: 1 hold, 2 continue, 3 abort | position |
 //! | `0xC2` | `RequiredBoundWithdrawn` | stream and session | registration | position | | |
-//! | `0xC3` | `PublicationClosed` | stream and session | reason: 1 required participant lost | lane: below 4 | | |
+//! | `0xC3` | `PublicationClosed` | stream and session | reason: 1 required participant lost | lane: below 4 | image registration, or 0 | |
 //! | `0xC4` | `SuccessorReady` | stream and session | registration | hand-over key of the successor grant | base position | generation |
 //! | `0xC5` | `Fenced` | stream and session | registration | | | |
-//! | `0xC6` | `ImageAvailable` | stream and session | network subscription registration | | | |
-//! | `0xC7` | `ImageUnavailable` | stream and session | network subscription registration | | | |
+//! | `0xC6` | `ImageAvailable` | stream and session | network subscription registration | image registration (nonzero) | source port (bits 15 to 0) and family (bits 23 to 16: 4 or 6) | source address, first word |
+//! | `0xC7` | `ImageUnavailable` | stream and session | network subscription registration | image registration (nonzero) | | |
 //!
-//! `ImageAvailable` and `ImageUnavailable` (W5, the minimal image
-//! notification of D2): a remote publication's image became a stream of
-//! the driver under the publication's alias, or retired. A client of the
-//! network subscription attaches with `AddSubscription` naming that
-//! stream and session.
+//! `ImageAvailable` continues after its five words with word 5, the
+//! source address's second word: an IPv4 address is its four octets in
+//! network order in bits 31 to 0 of word 4, word 5 zero; an IPv6 address
+//! is octets 0 to 7 in network order in word 4 (octet 0 in bits 63 to
+//! 56) and octets 8 to 15 likewise in word 5. Scope and flow label are
+//! not carried; any other bit set is refused.
+//!
+//! `ImageAvailable` and `ImageUnavailable` (`quantstratum-docs:
+//! karyos/design/per-source-images.md`, D2-3): a remote publication's
+//! image became a stream of the driver, or retired. Images of one alias
+//! from several sources are each announced, named by their aggregate
+//! registration and their source. A client of the network subscription
+//! attaches to one with `AddImageSubscription` naming its registration;
+//! `AddSubscription` naming the alias reaches the oldest live image of it.
+//! `PublicationClosed` names the image registration when the closed lane
+//! is an image's, and 0 for any other stream.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::SealReason;
@@ -194,8 +208,10 @@ pub const MAX_COMMAND_LENGTH: usize =
 const CONFLATED_READY_WORDS: usize = 7;
 /// Largest encoded response, in bytes: `ConflatedReady`.
 pub const MAX_RESPONSE_LENGTH: usize = CONFLATED_READY_WORDS * 8;
-/// Largest encoded driver event, in bytes.
-pub const MAX_EVENT_LENGTH: usize = 5 * 8;
+/// Largest encoded driver event, in bytes: `ImageAvailable`.
+pub const MAX_EVENT_LENGTH: usize = IMAGE_AVAILABLE_WORDS * 8;
+/// Words of an encoded `ImageAvailable`.
+const IMAGE_AVAILABLE_WORDS: usize = 6;
 
 const ADD_PUBLICATION: u32 = 0x01;
 const ADD_SUBSCRIPTION: u32 = 0x02;
@@ -213,6 +229,7 @@ const GUARD_CLOSE: u32 = 0x0D;
 const GUARD_REOPEN: u32 = 0x0E;
 const ADD_NETWORK_PUBLICATION: u32 = 0x0F;
 const ADD_NETWORK_SUBSCRIPTION: u32 = 0x10;
+const ADD_IMAGE_SUBSCRIPTION: u32 = 0x11;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -665,6 +682,20 @@ pub enum Command {
         /// The channel.
         uri: ChannelUri,
     },
+    /// Admit a subscriber to one lane of the network image whose
+    /// aggregate registration is `image` (`quantstratum-docs:
+    /// karyos/design/per-source-images.md`, D2-3), as announced by
+    /// `ImageAvailable`.
+    AddImageSubscription {
+        /// Request sequence.
+        sequence: u64,
+        /// The image's aggregate registration (nonzero).
+        image: u64,
+        /// The lane of the image's aggregate.
+        lane: Lane,
+        /// The subscriber's role.
+        role: SubscriberRole,
+    },
     /// Subscribe `stream_id` on the channel `uri` (W5): its images are
     /// announced with `ImageAvailable`.
     AddNetworkSubscription {
@@ -1101,6 +1132,7 @@ impl Command {
             Self::GuardReopen { .. } => GUARD_REOPEN,
             Self::AddNetworkPublication { .. } => ADD_NETWORK_PUBLICATION,
             Self::AddNetworkSubscription { .. } => ADD_NETWORK_SUBSCRIPTION,
+            Self::AddImageSubscription { .. } => ADD_IMAGE_SUBSCRIPTION,
         }
     }
 
@@ -1123,7 +1155,8 @@ impl Command {
             | Self::GuardClose { sequence, .. }
             | Self::GuardReopen { sequence, .. }
             | Self::AddNetworkPublication { sequence, .. }
-            | Self::AddNetworkSubscription { sequence, .. } => sequence,
+            | Self::AddNetworkSubscription { sequence, .. }
+            | Self::AddImageSubscription { sequence, .. } => sequence,
         }
     }
 
@@ -1296,6 +1329,15 @@ impl Command {
                 &uri,
                 out,
             ),
+            Self::AddImageSubscription {
+                sequence,
+                image,
+                lane,
+                role,
+            } => write_words(
+                &[sequence, image, role_code(role), u64::from(lane.get())],
+                out,
+            ),
         }
     }
 
@@ -1344,6 +1386,18 @@ impl Command {
                     stream: stream_from(stream),
                     lane: lane_from(type_id, lane)?,
                     role,
+                })
+            }
+            ADD_IMAGE_SUBSCRIPTION => {
+                let [sequence, image, role, lane] = read_words::<4>(type_id, bytes)?;
+                if image == 0 {
+                    return Err(CncError::Reserved { type_id });
+                }
+                Ok(Self::AddImageSubscription {
+                    sequence,
+                    image,
+                    lane: lane_from(type_id, lane)?,
+                    role: role_from(role).ok_or(CncError::Reserved { type_id })?,
                 })
             }
             REMOVE_PUBLICATION => {
@@ -1529,6 +1583,47 @@ const fn role_from(code: u64) -> Option<SubscriberRole> {
         0 => Some(SubscriberRole::Required),
         1 => Some(SubscriberRole::Optional),
         2 => Some(SubscriberRole::Observer),
+        _ => None,
+    }
+}
+
+/// Address family codes of a source word.
+const FAMILY_V4: u64 = 4;
+const FAMILY_V6: u64 = 6;
+
+/// The three words of a source address: the port and family word, then
+/// the address in network order (`ImageAvailable`).
+fn source_words(source: SocketAddr) -> [u64; 3] {
+    let port = u64::from(source.port());
+    match source.ip() {
+        IpAddr::V4(ip) => [
+            port | FAMILY_V4 << 16,
+            u64::from(u32::from_be_bytes(ip.octets())),
+            0,
+        ],
+        IpAddr::V6(ip) => {
+            let bits = u128::from_be_bytes(ip.octets());
+            // The high and low halves of the address.
+            let high = u64::try_from(bits >> 64).unwrap_or(0);
+            let low = u64::try_from(bits & u128::from(u64::MAX)).unwrap_or(0);
+            [port | FAMILY_V6 << 16, high, low]
+        }
+    }
+}
+
+/// The source address of its three words; `None` for another family or a
+/// reserved bit set.
+fn source_from([word, first, second]: [u64; 3]) -> Option<SocketAddr> {
+    let port = u16::try_from(word & 0xFFFF).ok()?;
+    match word >> 16 {
+        FAMILY_V4 if second == 0 => {
+            let ip = u32::try_from(first).ok()?;
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port))
+        }
+        FAMILY_V6 => {
+            let bits = u128::from(first) << 64 | u128::from(second);
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(bits)), port))
+        }
         _ => None,
     }
 }
@@ -1958,6 +2053,11 @@ pub enum Event {
         lane: Lane,
         /// Why.
         reason: CloseReason,
+        /// The image's aggregate registration when the closed lane is a
+        /// network image's (`quantstratum-docs:
+        /// karyos/design/per-source-images.md`, D2-3); 0 for any other
+        /// stream.
+        image: u64,
     },
     /// A cutover opened on a stream where a remote client holds
     /// `registration` (`quantstratum-docs: karyos/design/ipc-data-path.md`,
@@ -1985,19 +2085,27 @@ pub enum Event {
         registration: u64,
     },
     /// A remote publication's image is a stream of the driver under its
-    /// alias `stream`, for the network subscription `registration` (W5).
+    /// alias `stream`, for the network subscription `registration` (W5),
+    /// named by its aggregate registration `image` and its `source`
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-3).
     ImageAvailable {
         /// The image's stream and session.
         stream: StreamKey,
         /// The network subscription.
         registration: u64,
+        /// The image's aggregate registration (nonzero).
+        image: u64,
+        /// The datagram source its binding names.
+        source: SocketAddr,
     },
-    /// The image of `stream` retired.
+    /// The image `image` of `stream` retired.
     ImageUnavailable {
         /// The image's stream and session.
         stream: StreamKey,
         /// The network subscription.
         registration: u64,
+        /// The image's aggregate registration (nonzero).
+        image: u64,
     },
 }
 
@@ -2055,8 +2163,14 @@ impl Event {
                 stream,
                 lane,
                 reason,
+                image,
             } => write_words(
-                &[stream_word(stream), reason.code(), u64::from(lane.get())],
+                &[
+                    stream_word(stream),
+                    reason.code(),
+                    u64::from(lane.get()),
+                    image,
+                ],
                 out,
             ),
             Self::SuccessorReady {
@@ -2072,15 +2186,31 @@ impl Event {
             Self::Fenced {
                 stream,
                 registration,
-            }
-            | Self::ImageAvailable {
-                stream,
-                registration,
-            }
-            | Self::ImageUnavailable {
-                stream,
-                registration,
             } => write_words(&[stream_word(stream), registration], out),
+            Self::ImageAvailable {
+                stream,
+                registration,
+                image,
+                source,
+            } => {
+                let [port, first, second] = source_words(source);
+                write_words(
+                    &[
+                        stream_word(stream),
+                        registration,
+                        image,
+                        port,
+                        first,
+                        second,
+                    ],
+                    out,
+                )
+            }
+            Self::ImageUnavailable {
+                stream,
+                registration,
+                image,
+            } => write_words(&[stream_word(stream), registration, image], out),
         }
     }
 
@@ -2113,11 +2243,12 @@ impl Event {
                 })
             }
             PUBLICATION_CLOSED => {
-                let [stream, reason, lane] = read_words::<3>(type_id, bytes)?;
+                let [stream, reason, lane, image] = read_words::<4>(type_id, bytes)?;
                 Ok(Self::PublicationClosed {
                     stream: stream_from(stream),
                     lane: lane_from(type_id, lane)?,
                     reason: CloseReason::from_code(reason).ok_or(CncError::Reserved { type_id })?,
+                    image,
                 })
             }
             SUCCESSOR_READY => {
@@ -2138,19 +2269,29 @@ impl Event {
                     registration,
                 })
             }
-            IMAGE_AVAILABLE | IMAGE_UNAVAILABLE => {
-                let [stream, registration] = read_words::<2>(type_id, bytes)?;
-                let stream = stream_from(stream);
-                Ok(if type_id == IMAGE_AVAILABLE {
-                    Self::ImageAvailable {
-                        stream,
-                        registration,
-                    }
-                } else {
-                    Self::ImageUnavailable {
-                        stream,
-                        registration,
-                    }
+            IMAGE_AVAILABLE => {
+                let [stream, registration, image, port, first, second] =
+                    read_words::<IMAGE_AVAILABLE_WORDS>(type_id, bytes)?;
+                if image == 0 {
+                    return Err(CncError::Reserved { type_id });
+                }
+                Ok(Self::ImageAvailable {
+                    stream: stream_from(stream),
+                    registration,
+                    image,
+                    source: source_from([port, first, second])
+                        .ok_or(CncError::Reserved { type_id })?,
+                })
+            }
+            IMAGE_UNAVAILABLE => {
+                let [stream, registration, image] = read_words::<3>(type_id, bytes)?;
+                if image == 0 {
+                    return Err(CncError::Reserved { type_id });
+                }
+                Ok(Self::ImageUnavailable {
+                    stream: stream_from(stream),
+                    registration,
+                    image,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -2191,6 +2332,7 @@ mod tests {
             stream: stream(),
             lane: Lane::ZERO,
             reason: CloseReason::StreamRemoved,
+            image: 0,
         };
         let mut out = [0u8; MAX_EVENT_LENGTH];
         let length = event.encode(&mut out).unwrap();
@@ -2481,16 +2623,191 @@ mod tests {
             Event::ImageAvailable {
                 stream: stream(),
                 registration: 77,
+                image: 12,
+                source: "10.1.2.3:4000".parse().unwrap(),
             },
             Event::ImageUnavailable {
                 stream: stream(),
                 registration: 77,
+                image: 12,
             },
         ] {
             let mut out = [0u8; MAX_EVENT_LENGTH];
             let length = event.encode(&mut out).unwrap();
             assert_eq!(Event::decode(event.type_id(), &out[..length]), Ok(event));
         }
+    }
+
+    /// Per-source images (`quantstratum-docs:
+    /// karyos/design/per-source-images.md`, D2-3): `ImageAvailable` names
+    /// the image and its IPv4 or IPv6 source in six words, with golden
+    /// bytes; `ImageUnavailable` names the image in three words.
+    #[test]
+    fn image_events_name_the_image_and_its_source() {
+        let v4 = Event::ImageAvailable {
+            stream: stream(),
+            registration: 77,
+            image: 12,
+            source: "10.1.2.3:4000".parse().unwrap(),
+        };
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let length = v4.encode(&mut out).unwrap();
+        assert_eq!(length, 48);
+        assert_eq!(
+            &out[16..48],
+            &[
+                12, 0, 0, 0, 0, 0, 0, 0, // image registration
+                0xA0, 0x0F, 4, 0, 0, 0, 0, 0, // port 4000, family 4
+                3, 2, 1, 10, 0, 0, 0, 0, // 10.1.2.3 in bits 31 to 0
+                0, 0, 0, 0, 0, 0, 0, 0, // nothing more
+            ]
+        );
+        assert_eq!(Event::decode(IMAGE_AVAILABLE, &out[..length]), Ok(v4));
+        let v6 = Event::ImageAvailable {
+            stream: stream(),
+            registration: 77,
+            image: 12,
+            source: "[2001:db8::1]:9".parse().unwrap(),
+        };
+        let length = v6.encode(&mut out).unwrap();
+        assert_eq!(
+            &out[24..48],
+            &[
+                9, 0, 6, 0, 0, 0, 0, 0, // port 9, family 6
+                0, 0, 0, 0, 0xB8, 0x0D, 0x01, 0x20, // 2001:0db8:0000:0000
+                1, 0, 0, 0, 0, 0, 0, 0, // 0000:0000:0000:0001
+            ]
+        );
+        assert_eq!(Event::decode(IMAGE_AVAILABLE, &out[..length]), Ok(v6));
+        let gone = Event::ImageUnavailable {
+            stream: stream(),
+            registration: 77,
+            image: 12,
+        };
+        let length = gone.encode(&mut out).unwrap();
+        assert_eq!(length, 24);
+        assert_eq!(Event::decode(IMAGE_UNAVAILABLE, &out[..length]), Ok(gone));
+    }
+
+    /// The image events are decoded strictly: the two-word layouts of a
+    /// build before D2 are `WrongLength`, and a family other than 4 or 6,
+    /// a reserved bit, a second word under IPv4 or an image of 0 are
+    /// `Reserved`.
+    #[test]
+    fn image_events_are_decoded_strictly() {
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let length = Event::ImageAvailable {
+            stream: stream(),
+            registration: 77,
+            image: 12,
+            source: "10.1.2.3:4000".parse().unwrap(),
+        }
+        .encode(&mut out)
+        .unwrap();
+        for type_id in [IMAGE_AVAILABLE, IMAGE_UNAVAILABLE] {
+            assert!(matches!(
+                Event::decode(type_id, &out[..16]),
+                Err(CncError::WrongLength { .. })
+            ));
+        }
+        let refused = |change: &dyn Fn(&mut [u8; MAX_EVENT_LENGTH])| {
+            let mut bytes = out;
+            change(&mut bytes);
+            matches!(
+                Event::decode(IMAGE_AVAILABLE, &bytes[..length]),
+                Err(CncError::Reserved { .. })
+            )
+        };
+        assert!(refused(&|bytes| bytes[26] = 5), "family 5");
+        assert!(refused(&|bytes| bytes[27] = 1), "a bit above the family");
+        assert!(
+            refused(&|bytes| bytes[36] = 1),
+            "an IPv4 address above 32 bits"
+        );
+        assert!(refused(&|bytes| bytes[40] = 1), "a second word under IPv4");
+        assert!(refused(&|bytes| bytes[16] = 0), "image 0");
+        let mut bytes = [0u8; 24];
+        bytes[16] = 0;
+        assert!(matches!(
+            Event::decode(IMAGE_UNAVAILABLE, &bytes),
+            Err(CncError::Reserved { .. })
+        ));
+        // The three-word close of a build before D2 is `WrongLength`.
+        let length = Event::PublicationClosed {
+            stream: stream(),
+            lane: Lane::ZERO,
+            reason: CloseReason::ImageRetired,
+            image: 12,
+        }
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(length, 32);
+        assert!(matches!(
+            Event::decode(PUBLICATION_CLOSED, &out[..24]),
+            Err(CncError::WrongLength { .. })
+        ));
+    }
+
+    /// `AddImageSubscription` names one lane of an image by its
+    /// registration, never 0.
+    #[test]
+    fn an_image_subscription_names_its_image() {
+        let command = Command::AddImageSubscription {
+            sequence: 5,
+            image: 12,
+            lane: Lane::try_new(1).unwrap(),
+            role: SubscriberRole::Optional,
+        };
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = command.encode(&mut out).unwrap();
+        assert_eq!(command.type_id(), 0x11);
+        assert_eq!(
+            &out[..length],
+            &[
+                5, 0, 0, 0, 0, 0, 0, 0, // sequence
+                12, 0, 0, 0, 0, 0, 0, 0, // image registration
+                1, 0, 0, 0, 0, 0, 0, 0, // optional
+                1, 0, 0, 0, 0, 0, 0, 0, // lane 1
+            ]
+        );
+        assert_eq!(Command::decode(0x11, &out[..length]), Ok(command));
+        out[8] = 0;
+        assert!(matches!(
+            Command::decode(0x11, &out[..length]),
+            Err(CncError::Reserved { .. })
+        ));
+    }
+
+    /// The longest event, 48 bytes, fits the broadcast of the smallest
+    /// capacity (`MIN_CAPACITY`, 1024 bytes: a 128-byte extent), and every
+    /// event fits `MAX_EVENT_LENGTH`.
+    #[test]
+    fn the_longest_event_fits_the_smallest_broadcast() {
+        use karyos_sys::broadcast::{MIN_CAPACITY, Received, broadcast};
+
+        assert_eq!(MAX_EVENT_LENGTH, 48);
+        let event = Event::ImageAvailable {
+            stream: stream(),
+            registration: 77,
+            image: 12,
+            source: "[2001:db8::1]:9".parse().unwrap(),
+        };
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let length = event.encode(&mut out).unwrap();
+        assert_eq!(length, MAX_EVENT_LENGTH);
+        let mut transmitter = broadcast(MIN_CAPACITY).unwrap();
+        assert!(transmitter.max_payload() >= MAX_EVENT_LENGTH);
+        let mut receiver = transmitter.receiver();
+        let _ = transmitter
+            .transmit(event.type_id(), &out[..length])
+            .unwrap();
+        let Received::Message {
+            type_id, payload, ..
+        } = receiver.receive()
+        else {
+            panic!("not received");
+        };
+        assert_eq!(Event::decode(type_id, payload), Ok(event));
     }
 
     #[test]
@@ -2758,7 +3075,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x11, &out[..length]),
+            Command::decode(0x12, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         // A lane word of 4 or more, or with any bit above the lane, is
@@ -3113,6 +3430,13 @@ mod tests {
                 stream: stream(),
                 lane: Lane::try_new(2).unwrap(),
                 reason: CloseReason::RequiredParticipantLost,
+                image: 0,
+            },
+            Event::PublicationClosed {
+                stream: stream(),
+                lane: Lane::try_new(1).unwrap(),
+                reason: CloseReason::ImageRetired,
+                image: 12,
             },
             Event::SuccessorReady {
                 stream: stream(),
@@ -3152,6 +3476,7 @@ mod tests {
             stream: stream(),
             lane: Lane::try_new(3).unwrap(),
             reason: CloseReason::RequiredParticipantLost,
+            image: 0,
         }
         .encode(&mut out)
         .unwrap();
@@ -3160,6 +3485,7 @@ mod tests {
             &[
                 1, 0, 0, 0, 0, 0, 0, 0, // reason: required participant lost
                 3, 0, 0, 0, 0, 0, 0, 0, // lane 3
+                0, 0, 0, 0, 0, 0, 0, 0, // no image
             ]
         );
         // A lane of 4 or more is refused.
@@ -3488,6 +3814,7 @@ mod properties {
             GUARD_REOPEN,
             ADD_NETWORK_PUBLICATION,
             ADD_NETWORK_SUBSCRIPTION,
+            ADD_IMAGE_SUBSCRIPTION,
         ],
     };
 
@@ -3666,6 +3993,17 @@ mod properties {
         })
     }
 
+    /// A source address as `ImageAvailable` carries it: no scope or flow
+    /// label.
+    fn source() -> impl Strategy<Value = SocketAddr> {
+        prop_oneof![
+            (any::<u32>(), any::<u16>())
+                .prop_map(|(ip, port)| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)),
+            (any::<u128>(), any::<u16>())
+                .prop_map(|(ip, port)| SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)),
+        ]
+    }
+
     fn request() -> impl Strategy<Value = RequestId> {
         (any::<u64>(), any::<u64>()).prop_map(|(client, sequence)| RequestId { client, sequence })
     }
@@ -3806,6 +4144,14 @@ mod properties {
                     stream_id,
                     allow_unconnected,
                     uri: ChannelUri::new(&uri).unwrap(),
+                }
+            ),
+            (any::<u64>(), 1..=u64::MAX, lane(), role.clone()).prop_map(
+                |(sequence, image, lane, role)| Command::AddImageSubscription {
+                    sequence,
+                    image,
+                    lane,
+                    role,
                 }
             ),
             (any::<u64>(), any::<i32>(), role, "\\PC{1,100}").prop_map(
@@ -4022,10 +4368,13 @@ mod properties {
                     position,
                 }
             }),
-            (stream(), lane()).prop_map(|(stream, lane)| Event::PublicationClosed {
-                stream,
-                lane,
-                reason: CloseReason::RequiredParticipantLost,
+            (stream(), lane(), any::<u64>()).prop_map(|(stream, lane, image)| {
+                Event::PublicationClosed {
+                    stream,
+                    lane,
+                    reason: CloseReason::RequiredParticipantLost,
+                    image,
+                }
             }),
             (stream(), any::<[u64; 4]>()).prop_map(
                 |(stream, [registration, key, base, generation])| Event::SuccessorReady {
@@ -4040,16 +4389,19 @@ mod properties {
                 stream,
                 registration,
             }),
-            (stream(), any::<u64>()).prop_map(|(stream, registration)| {
-                Event::ImageAvailable {
+            (stream(), any::<u64>(), 1..=u64::MAX, source()).prop_map(
+                |(stream, registration, image, source)| Event::ImageAvailable {
                     stream,
                     registration,
+                    image,
+                    source,
                 }
-            }),
-            (stream(), any::<u64>()).prop_map(|(stream, registration)| {
+            ),
+            (stream(), any::<u64>(), 1..=u64::MAX).prop_map(|(stream, registration, image)| {
                 Event::ImageUnavailable {
                     stream,
                     registration,
+                    image,
                 }
             }),
         ]
@@ -4076,6 +4428,7 @@ mod properties {
                     (ADD_CONFLATED_SUBSCRIPTION, 2),
                     (GUARD_CLOSE, 3),
                     (GUARD_REOPEN, 4),
+                    (ADD_IMAGE_SUBSCRIPTION, 4),
                 ],
             ),
         ) {
@@ -4111,9 +4464,11 @@ mod properties {
                 &[
                     (PARTICIPANT_LOST, 5),
                     (REQUIRED_BOUND_WITHDRAWN, 3),
-                    (PUBLICATION_CLOSED, 3),
+                    (PUBLICATION_CLOSED, 4),
                     (SUCCESSOR_READY, 5),
                     (FENCED, 2),
+                    (IMAGE_AVAILABLE, IMAGE_AVAILABLE_WORDS),
+                    (IMAGE_UNAVAILABLE, 3),
                 ],
             ),
         ) {
