@@ -90,7 +90,9 @@ fn path_carrying(
             return;
         }
         for datagram in datagrams {
-            let Ok(Datagram::DataBatch(data)) = classify(datagram) else {
+            // A data batch, or a header-only DATA record (an EOS, ACS 17249).
+            let Ok(Datagram::DataBatch(data) | Datagram::Heartbeat(data)) = classify(datagram)
+            else {
                 panic!("not a DATA datagram");
             };
             assert!(aliases.contains(&data.alias()), "{:?}", data.alias());
@@ -1697,3 +1699,196 @@ fn a_shared_bottleneck_evicts_no_path() {
 }
 
 mod validation;
+
+/// A routed publication, its two paths' halves and their sockets.
+type SealedRouted = (
+    Box<Outbound>,
+    Vec<(EndpointId, Half<ScriptedSocket>)>,
+    [ScriptedSocket; 2],
+);
+
+/// A removed routed publication's sealed lane, sent on A, and on B when
+/// `b_sends` (else B's socket blocks, so B still holds its copies): the
+/// test log's publication released and its seal positioned.
+fn sealed_routed(b_sends: bool) -> SealedRouted {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 32);
+    if b_sends {
+        sent(&observer_b, 32);
+    }
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    commit(&mut log, 0, 2);
+    for now in 0..4 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    log.publications.clear();
+    log.conductors[0].seal().unwrap();
+    let _ = log.conductors[0].duty_cycle().unwrap();
+    for now in 4..8 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    outbound.begin_removal(1, 1_000, 100);
+    (outbound, halves, [observer_a, observer_b])
+}
+
+/// ACS 17249: a removed routed publication's drained lane sends its EOS on
+/// every live path, counted once, and repeats it at its cadence.
+#[test]
+fn a_removed_routed_lane_sends_its_eos_on_every_path() {
+    let (mut outbound, mut halves, [observer_a, observer_b]) = sealed_routed(true);
+    let calls = (observer_a.send_calls(), observer_b.send_calls());
+    let step = outbound.serve_removal_routes(&mut halves, 10);
+    assert_eq!(step.sent, 1, "{step:?}");
+    assert_eq!(observer_a.send_calls(), calls.0 + 1, "EOS on A");
+    assert_eq!(observer_b.send_calls(), calls.1 + 1, "EOS on B");
+    // Not due again before the cadence; due after it.
+    assert_eq!(outbound.serve_removal_routes(&mut halves, 50).sent, 0);
+    assert_eq!(outbound.serve_removal_routes(&mut halves, 110).sent, 1);
+    assert_eq!(observer_b.send_calls(), calls.1 + 2);
+    // The linger runs in full from the first EOS.
+    assert!(!outbound.serve_removal_routes(&mut halves, 900).drained);
+    assert!(outbound.serve_removal_routes(&mut halves, 1_010).drained);
+}
+
+/// ACS 17249: a path whose TX half is detached, still holding its copies
+/// of the lane, neither holds the drain nor gets the EOS; the other path
+/// sends it.
+#[test]
+fn a_detached_path_does_not_hold_the_eos() {
+    let (mut outbound, mut halves, [observer_a, observer_b]) = sealed_routed(false);
+    assert!(outbound.routed_sender().unwrap().pending(0, 1).unwrap() > 0);
+    let b_half = halves.pop().unwrap();
+    let calls = (observer_a.send_calls(), observer_b.send_calls());
+    let step = outbound.serve_removal_routes(&mut halves, 10);
+    assert_eq!(step.sent, 1, "{step:?}");
+    assert_eq!(observer_a.send_calls(), calls.0 + 1);
+    assert_eq!(observer_b.send_calls(), calls.1, "B is detached");
+    // B back, its copies sent: nothing was waiting on it.
+    halves.push(b_half);
+    sent(&observer_b, 32);
+    for now in 11..20 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+}
+
+/// ACS 17249: a live path still holding its copies (its socket blocks)
+/// holds the drain: no EOS on any path, and at the drain bound the lane
+/// is given up, counted undrained, and the linger still ends.
+#[test]
+fn a_blocked_path_holds_the_drain_until_the_bound() {
+    let (mut outbound, mut halves, [observer_a, observer_b]) = sealed_routed(false);
+    assert!(outbound.routed_sender().unwrap().pending(0, 1).unwrap() > 0);
+    let calls = (observer_a.send_calls(), observer_b.send_calls());
+    let step = outbound.serve_removal_routes(&mut halves, 10);
+    assert_eq!((step.sent, step.gave_up), (0, false), "{step:?}");
+    assert_eq!(
+        observer_a.send_calls(),
+        calls.0,
+        "no EOS while B holds copies"
+    );
+    let step = outbound.serve_removal_routes(&mut halves, 1_010);
+    assert_eq!(step.sent, 0, "{step:?}");
+    assert!(step.gave_up && step.drained, "{step:?}");
+    // B's socket takes its copies again, so its half drops with nothing
+    // pending.
+    sent(&observer_b, 32);
+    for now in 1_011..1_020 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+}
+
+/// ACS 17249: a path out of the live set neither holds the drain nor gets
+/// the EOS; the live path sends it.
+#[test]
+fn a_path_out_of_the_live_set_does_not_hold_the_eos() {
+    let (mut outbound, mut halves, [observer_a, observer_b]) = sealed_routed(false);
+    outbound.leave_before_serve(1);
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 9).unwrap();
+    assert_eq!(outbound.path_state(1), Some((false, false)), "B left");
+    let calls = (observer_a.send_calls(), observer_b.send_calls());
+    let step = outbound.serve_removal_routes(&mut halves, 10);
+    assert_eq!(step.sent, 1, "{step:?}");
+    assert_eq!(observer_a.send_calls(), calls.0 + 1);
+    assert_eq!(
+        observer_b.send_calls(),
+        calls.1,
+        "no EOS to a path that left"
+    );
+}
+
+/// ACS 17249: a lane whose guard closed sends no EOS on any path (GC-6),
+/// and its linger still runs to the end.
+#[test]
+fn a_closed_guard_sends_no_eos_on_any_path() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (mut outbound, mut halves, [observer_a, observer_b]) = sealed_routed(true);
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    outbound
+        .guard(
+            GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::new(AppliedEpoch::new()),
+                epoch: 2,
+                rate: None,
+                frontier: Default::default(),
+            },
+            0,
+        )
+        .unwrap();
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 9).unwrap();
+    let calls = (observer_a.send_calls(), observer_b.send_calls());
+    assert_eq!(outbound.serve_removal_routes(&mut halves, 10).sent, 0);
+    assert_eq!(
+        (observer_a.send_calls(), observer_b.send_calls()),
+        calls,
+        "no EOS leaves a closed lane"
+    );
+    assert!(outbound.serve_removal_routes(&mut halves, 1_010).drained);
+}
+
+/// #354 review P3-6: a routed publication reports, per path, the route
+/// and lane queues it opened on that path's endpoint, for its removal to
+/// close; a route never opened reports none.
+#[test]
+fn a_routed_publication_reports_what_it_opened_per_path() {
+    use karyos_io::backend::TxBackend;
+
+    let (outbound, mut halves, _observers) = sealed_routed(true);
+    let mut opened = Vec::new();
+    outbound.opened_resources(|held| opened.push(held));
+    let endpoints: Vec<_> = opened.iter().map(|held| held.endpoint).collect();
+    assert_eq!(endpoints, [halves[0].0, halves[1].0]);
+    for held in &opened {
+        let (_, Half::Tx(tx)) = halves
+            .iter_mut()
+            .find(|(endpoint, _)| *endpoint == held.endpoint)
+            .unwrap()
+        else {
+            panic!("a TX half");
+        };
+        assert!(tx.route_info(held.route).is_ok());
+        let lanes: Vec<_> = held.queues[..4].iter().flatten().collect();
+        assert_eq!(lanes.len(), 1, "one lane queue");
+        assert!(tx.claim_tx(*lanes[0], 32).is_ok());
+    }
+    // A routed publication never opened reports nothing.
+    let (fresh, _log) = routed(0);
+    let mut none = Vec::new();
+    fresh.opened_resources(|held| none.push(held));
+    assert!(none.is_empty());
+}

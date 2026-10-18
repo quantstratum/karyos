@@ -20,7 +20,7 @@ use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SealReason};
 use karyos_sys::term_bytes::HeapTerms;
 
-use super::{BUDGET, aggregate, channel, free_address, pump};
+use super::{ANY_PORT, BUDGET, aggregate, bound, channel, pump, silent};
 use crate::agents::{AgentConfig, ThreadingMode};
 use crate::embedded::{AggregateHandle, DriverConfig, EmbeddedDriver, StreamState};
 use crate::net::{NetworkConfig, NetworkStreamDefaults};
@@ -56,10 +56,10 @@ fn pair(
     AggregateSubscription<HeapTerms>,
 ) {
     let (mut a, mut b) = (lingering(linger), lingering(linger));
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     let publication = a
         .add_network_publication(aggregate(10, 3, lanes), &channel(address, true))
         .unwrap();
@@ -387,7 +387,8 @@ fn a_zero_linger_gives_an_undrainable_lane_up_within_one_interval() {
 #[test]
 fn a_key_is_refused_during_the_linger_and_accepted_after_it() {
     let (mut a, mut b, publication, mut reader) = pair(200 * MS, 1);
-    let address = free_address();
+    let silent = silent();
+    let address = silent.local_addr().unwrap();
     a.remove_aggregate(&publication).unwrap();
     let (terminal, _, _) = read_to_end(&mut a, &mut b, &mut reader);
     assert!(terminal.clean);
@@ -429,10 +430,10 @@ fn a_closed_guard_sends_no_eos_at_removal() {
     let (mut a, mut b) = (lingering(100 * MS), lingering(100 * MS));
     let guard = a.add_guard("linger").unwrap();
     assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     // Spare slots for the sender's reservation and the guard's walker.
     let mut config = aggregate(10, 3, 1);
     config.stream.buffer.spare_slots = 4;
@@ -500,10 +501,10 @@ fn a_closed_guard_lane_is_given_up_at_the_drain_bound() {
     let (mut a, mut b) = (lingering(linger), lingering(linger));
     let guard = a.add_guard("give-up").unwrap();
     assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     let mut config = aggregate(10, 3, 1);
     config.stream.buffer.spare_slots = 4;
     let publication = a
@@ -555,8 +556,12 @@ fn a_closed_guard_lane_is_given_up_at_the_drain_bound() {
 #[test]
 fn a_removal_with_no_established_receiver_ends_at_once() {
     let mut a = lingering(60_000 * MS);
+    let silent = silent();
     let publication = a
-        .add_network_publication(aggregate(10, 3, 1), &channel(free_address(), true))
+        .add_network_publication(
+            aggregate(10, 3, 1),
+            &channel(silent.local_addr().unwrap(), true),
+        )
         .unwrap();
     for _ in 0..20 {
         let _ = a.do_work().unwrap();
@@ -636,6 +641,64 @@ fn a_removed_publication_sends_only_eos_through_its_linger() {
     assert_eq!(receiver.create_image, 1, "{receiver:?}");
 }
 
+/// rp-w5b follow-up (ACS 17249): a removed publication over two paths
+/// sends each lane's EOS on both paths; the tail is delivered once, in
+/// order, and the image ends cleanly at `EndOfStream`. Linux, after the
+/// multicast probe; the second path is loopback, as in
+/// `a_two_path_publication_reaches_a_two_path_subscription`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removed_two_path_publication_ends_at_its_eos_on_both_paths() {
+    use std::io::Write as _;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use karyos_protocol::channel::{Destination, Interface, Security, UdpConfig};
+
+    if let Err(why) = super::multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED a_removed_two_path_publication_ends_at_its_eos_on_both_paths: {why}"
+        );
+        return;
+    }
+    let port = free_address().port();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), port);
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ],
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b) = (lingering(200 * MS), lingering(200 * MS));
+    for side in [&mut a, &mut b] {
+        side.net.as_mut().unwrap().assume_isolated_paths();
+    }
+    let _ = b.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel)
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    offer_all(&mut a, &publication, 1, 8);
+    a.remove_aggregate(&publication).unwrap();
+    let (terminal, ends, seen) = read_to_end(&mut a, &mut b, &mut reader);
+    assert_eq!(seen[0], 8);
+    assert!(terminal.clean, "{ends:?}");
+    assert!(closed_at_eos(ends[0]), "{ends:?}");
+    assert!(eos_sent(&a) >= 1);
+}
+
 /// A guarded network publication reopened after a guard close takes its
 /// fresh incarnation end to end (guards-and-abort.md, On the network): the
 /// old image ends (no EOS: its guard closed), the next incarnation is
@@ -674,10 +737,10 @@ fn a_reopened_guarded_publication_reaches_a_new_image() {
     let (mut a, mut b) = (reincarnating(), reincarnating());
     let guard = a.add_guard("reincarnate").unwrap();
     assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     let mut config = aggregate(10, 3, 1);
     config.stream.buffer.spare_slots = 4;
     let publication = a
@@ -817,10 +880,10 @@ fn a_reincarnation_does_not_wait_for_the_linger() {
     let mut b = lingering(60_000 * MS);
     let guard = a.add_guard("no-linger").unwrap();
     assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     let mut config = aggregate(10, 3, 1);
     config.stream.buffer.spare_slots = 4;
     let publication = a

@@ -10,7 +10,8 @@
 //! - **Scope.** Unicast and multicast destinations on the trusted
 //!   profile, a local bind by address or the default route. Multi-
 //!   destination channels and interface names are refused
-//!   ([`DriverError::UnsupportedChannel`]). Heap terms only (D3, SPEC §18).
+//!   ([`DriverError::UnsupportedChannel`]). Either backing
+//!   (network-shared-terms n4): on an IPC driver the lanes are regions.
 //! - **Redundant paths** (redundant-paths.md, rp-w4b2c). A multicast IPv4
 //!   channel with `paths` sends on one endpoint per path, bound to that
 //!   path's interface address, every path toward the channel's group: one
@@ -28,22 +29,20 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
+use crate::embedded::StreamTerms;
 use karyos_protocol::channel::{Destination, Interface, UdpConfig};
 use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
 use karyos_sys::submission_frontier::SubmissionFrontier;
 use karyos_sys::term::TermId;
-use karyos_sys::term_bytes::HeapTerms;
 
 use super::{NetworkPublicationState, SenderChannel};
 use karyos_io::lanes::routes::MAX_ROUTES;
 
 use crate::agents::EndpointId;
 use crate::agents::data::{GuardSpec, Outbound};
-use crate::embedded::{
-    AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION, StreamTerms,
-};
+use crate::embedded::{AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION};
 use crate::error::DriverError;
 use crate::guards::{GuardHandle, GuardRate};
 use crate::membership::PublicationRoles;
@@ -100,7 +99,7 @@ pub struct NetworkGuard {
     pub rate: Option<GuardRate>,
 }
 
-impl EmbeddedDriver<HeapTerms> {
+impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Creates an aggregate publication, as [`EmbeddedDriver::add_aggregate`]
     /// does, whose lanes the sender agent sends over `channel` (control
     /// path). The publication is posted to the agents; its state is
@@ -252,9 +251,7 @@ impl EmbeddedDriver<HeapTerms> {
             .as_ref()?
             .publication_state(aggregate.registration())
     }
-}
 
-impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Guards every lane stream of `handle` with `guard`, unless a
     /// reincarnation already did (`guarded`), and registers the
     /// publication's sender gate with the guard's owner: the spec the

@@ -42,6 +42,8 @@
 #[cfg(test)]
 mod tests;
 
+use karyos_sys::frame::Lane;
+
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -58,8 +60,9 @@ const TEMPORARY: &str = "catalog.kyc.tmp";
 const MAGIC: u32 = u32::from_le_bytes(*b"KYCT");
 /// The catalog format version.
 /// Version 2: `Stopped` carries the `incomplete` flag and the reasons of
-/// A4 (nothing of version 1 was released).
-const VERSION: u32 = 2;
+/// A4. Version 3: `Started` carries the recorded stream's format (A5),
+/// which a replay needs (nothing of versions 1 or 2 was released).
+const VERSION: u32 = 3;
 /// The header's length: magic, version, reserved, CRC.
 const HEADER: usize = 16;
 /// [`HEADER`] as a file offset.
@@ -155,6 +158,37 @@ pub struct Stop {
     pub incomplete: bool,
 }
 
+/// What a replay of a recording needs of the recorded stream's
+/// configuration: its frames name their lane and are laid out in terms
+/// numbered from the initial term id, each at most the mtu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFormat {
+    /// The recorded lane.
+    pub lane: Lane,
+    /// The stream's initial term id.
+    pub initial_term_id: i32,
+    /// The stream's mtu: its largest frame.
+    pub mtu: core::num::NonZeroU32,
+    /// The source's incarnation, which a live merge matches (SPEC §8.2).
+    pub source: SourceIncarnation,
+}
+
+/// Which publication a recording captured: the driver's id, the
+/// publication's registration and its incarnation. For a local stream,
+/// its `PublicationIdentity` (kept across mapping cutovers); for a network
+/// image, the sender's, from the image's identity. A driver restart is a
+/// new `driver`, so an incarnation number reused across restarts still
+/// names another source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceIncarnation {
+    /// The driver's random 128-bit id, two words.
+    pub driver: [u64; 2],
+    /// The publication's registration in that driver.
+    pub registration: u64,
+    /// The publication's incarnation.
+    pub incarnation: u64,
+}
+
 /// A recording the catalog lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recording {
@@ -174,6 +208,8 @@ pub struct Recording {
     pub geometry: Geometry,
     /// Its sync policy.
     pub policy: SyncPolicy,
+    /// The recorded stream's format.
+    pub format: StreamFormat,
     /// Where it stopped; `None` while it records.
     pub stop: Option<Stop>,
 }
@@ -195,6 +231,8 @@ pub struct NewRecording<'a> {
     pub geometry: Geometry,
     /// Its sync policy.
     pub policy: SyncPolicy,
+    /// The recorded stream's format.
+    pub format: StreamFormat,
 }
 
 /// The catalog's errors.
@@ -378,6 +416,18 @@ impl Record {
                 let (policy, interval) = policy_code(recording.policy);
                 payload.bytes(&[policy]);
                 payload.bytes(&interval.to_le_bytes());
+                payload.bytes(&[recording.format.lane.get()]);
+                payload.bytes(&recording.format.initial_term_id.to_le_bytes());
+                payload.bytes(&recording.format.mtu.get().to_le_bytes());
+                let source = recording.format.source;
+                for word in [
+                    source.driver[0],
+                    source.driver[1],
+                    source.registration,
+                    source.incarnation,
+                ] {
+                    payload.bytes(&word.to_le_bytes());
+                }
                 let channel = u16::try_from(recording.channel.len()).ok()?;
                 payload.bytes(&channel.to_le_bytes());
                 payload.bytes(&recording.channel);
@@ -423,6 +473,16 @@ impl Record {
                 let segment_length = input.u64()?;
                 let policy = input.u8()?;
                 let interval = input.u64()?;
+                let format = StreamFormat {
+                    lane: Lane::try_new(input.u8()?).ok()?,
+                    initial_term_id: input.i32()?,
+                    mtu: core::num::NonZeroU32::new(input.u32()?)?,
+                    source: SourceIncarnation {
+                        driver: [input.u64()?, input.u64()?],
+                        registration: input.u64()?,
+                        incarnation: input.u64()?,
+                    },
+                };
                 let channel = usize::from(input.u16()?);
                 if channel > MAX_CHANNEL {
                     return None;
@@ -437,6 +497,7 @@ impl Record {
                     start_time_ns,
                     geometry: Geometry::new(term_length, segment_length).ok()?,
                     policy: policy_of(policy, interval)?,
+                    format,
                     stop: None,
                 })
             }
@@ -696,6 +757,7 @@ impl<D: Disk> Catalog<D> {
             start_time_ns: new.start_time_ns,
             geometry: new.geometry,
             policy: new.policy,
+            format: new.format,
             stop: None,
         };
         self.append(&Record::Started(recording.clone()))?;
