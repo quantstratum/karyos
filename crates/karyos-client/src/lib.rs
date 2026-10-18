@@ -30,6 +30,7 @@ pub mod ipc;
 pub mod journal;
 pub mod link;
 pub mod loss;
+pub mod merge;
 pub mod publication;
 pub mod schedule;
 pub mod subscription;
@@ -63,6 +64,10 @@ pub use karyos_protocol::cnc::StreamId;
 pub use karyos_sys::frame::Lane;
 pub use karyos_sys::freshness::Freshness;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
+pub use merge::{
+    LiveMerge, MergeError, MergeFailed, MergePoll, Replay, ReplayProvider, ReplayRequest,
+    ReplayStatus, ReplayStop, ReplayUnavailable,
+};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
     Aborted, ClientSubscription, InvalidExtensions, MessageInfo, MessageLimit, Overrun, PollError,
