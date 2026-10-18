@@ -37,11 +37,15 @@
 //!   compare.
 //! - **Not modelled.** A crash inside a write (the crashing operation is
 //!   not applied; tears happen at restart, to writes pending then); the
-//!   zero-filled length a file system may show after an append it lost; a
-//!   tear combined with drops in one restart (a mode tears, or drops, not
-//!   both); directories, which exist as soon as a path names them (a
-//!   missing one is never an error, unlike the operating system's); and a
-//!   rename across directories, which is refused as unsupported.
+//!   zero-filled length a file system may show after an append it lost;
+//!   reordering combined with tears in one restart (`Torn` keeps every
+//!   name and every operation but writes, and drops a write only when it
+//!   tears it to nothing); the pages a failed flush leaves readable (after
+//!   fsyncgate's drop, reads and listings show the durable state, where
+//!   Linux keeps the cached pages readable until eviction); directories,
+//!   which exist as soon as a path names them (a missing one is never an
+//!   error, unlike the operating system's); and a rename across
+//!   directories, which is refused as unsupported.
 //!
 //! It is single-threaded, as the simulator is: clones share one disk.
 
@@ -74,8 +78,10 @@ pub enum Survives {
         /// The seed.
         seed: u64,
     },
-    /// Every pending operation kept, each write torn by the seed to a
-    /// prefix of whole sectors, or kept whole.
+    /// Every pending name and every pending data operation but writes
+    /// kept; each write kept whole or, by the seed, torn at a sector
+    /// boundary of the disk inside it, or to nothing (a write within one
+    /// sector is whole or dropped).
     Torn {
         /// The seed.
         seed: u64,
@@ -126,7 +132,9 @@ pub enum Fate {
     Dropped,
     /// A write applied up to `kept` of its bytes.
     Torn {
-        /// The bytes kept, whole sectors.
+        /// The bytes kept: from the write's offset to a sector boundary of
+        /// the disk, so not a whole number of sectors when the write starts
+        /// inside one.
         kept: u64,
     },
 }
@@ -250,18 +258,27 @@ fn tear(rng: &mut Rng, offset: u64, length: usize, sector: u64) -> io::Result<Fa
         return Ok(Fate::Dropped);
     }
     // Boundaries `first`, `first + sector`, ... below `end`, and none.
-    let boundaries = (end - 1 - first) / sector + 1;
+    let boundaries = end
+        .checked_sub(1)
+        .and_then(|last| last.checked_sub(first))
+        .and_then(|span| span.checked_div(sector))
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(invalid)?;
     let pick = rng.below(boundaries.checked_add(1).ok_or_else(invalid)?);
-    if pick == 0 {
+    let Some(index) = pick.checked_sub(1) else {
         return Ok(Fate::Dropped);
-    }
-    let boundary = (pick - 1)
+    };
+    let kept = index
         .checked_mul(sector)
         .and_then(|past| first.checked_add(past))
+        .and_then(|boundary| boundary.checked_sub(offset))
         .ok_or_else(invalid)?;
-    Ok(Fate::Torn {
-        kept: boundary - offset,
-    })
+    Ok(Fate::Torn { kept })
+}
+
+/// A count past its type: an error of the model's own, not a crash.
+fn overflow() -> io::Error {
+    error(io::ErrorKind::InvalidInput, "a count past its type")
 }
 
 fn crashed() -> io::Error {
@@ -362,7 +379,7 @@ impl SimDisk {
         self
     }
 
-    /// Tears keep whole sectors of `sector` bytes, counted from the disk's
+    /// Tears end at boundaries of `sector` bytes, counted from the file's
     /// start (default [`SECTOR`]); at least 1.
     #[must_use]
     pub fn with_sector(self, sector: u64) -> Self {
@@ -518,7 +535,7 @@ impl SimDisk {
         if state.crashed {
             return Err(crashed());
         }
-        let op = state.ops.checked_add(1).ok_or_else(crashed)?;
+        let op = state.ops.checked_add(1).ok_or_else(overflow)?;
         state.ops = op;
         if state.budget.is_some_and(|budget| op > budget) {
             state.crashed = true;
@@ -530,7 +547,7 @@ impl SimDisk {
 
     /// Counts a flush; fails it if planned.
     fn flush(state: &mut State) -> io::Result<()> {
-        let sync = state.syncs.checked_add(1).ok_or_else(crashed)?;
+        let sync = state.syncs.checked_add(1).ok_or_else(overflow)?;
         state.syncs = sync;
         if state.failing.contains(&sync) {
             state.trace.push(Decision::FailedSync { sync });
@@ -578,7 +595,7 @@ impl Disk for SimDisk {
         }
         let (dir, name) = split(path)?;
         let inode = state.next_inode;
-        state.next_inode = inode.checked_add(1).ok_or_else(crashed)?;
+        state.next_inode = inode.checked_add(1).ok_or_else(overflow)?;
         let _ = state.files.insert(inode, File::default());
         state
             .dirs
@@ -633,7 +650,7 @@ impl Disk for SimDisk {
     fn len(&mut self, file: &SimFile) -> io::Result<u64> {
         let mut state = self.step("len")?;
         let live = Self::file(&mut state, file)?.live()?;
-        u64::try_from(live.len()).map_err(|_| crashed())
+        u64::try_from(live.len()).map_err(|_| overflow())
     }
 
     fn set_len(&mut self, file: &SimFile, len: u64) -> io::Result<()> {
