@@ -22,8 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_client::{
-    ClientError, ClientSubscription, ConflatedSubscription, MessageInfo, MessageLimit, PollError,
-    PollSummary, RejoinOutcome, ReplayFallbackReason, SecondaryOutcome,
+    ClientError, ClientSubscription, ConflatedSubscription, ImageChange, MessageInfo, MessageLimit,
+    PollError, PollSummary, RejoinOutcome, ReplayFallbackReason, SecondaryOutcome, Subscription,
+    SubscriptionError,
 };
 use karyos_sys::conflation::{Budget, ConflationConfig};
 use karyos_sys::frame::Lane;
@@ -114,6 +115,41 @@ pub trait MessageSource {
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
     ) -> Result<PollSummary, PollError>;
+
+    /// The oldest image change not yet taken: an image of a network
+    /// subscription attached or retired. None for a source of one image.
+    fn next_image_change(&mut self) -> Option<ImageChange> {
+        None
+    }
+}
+
+/// A network subscription's images, polled in turn: their messages carry
+/// each image's session, and their attaches and retirements are its
+/// image changes.
+impl<T: TermBytes> MessageSource for Subscription<T> {
+    fn poll_taking(
+        &mut self,
+        handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        limit: MessageLimit,
+    ) -> Result<PollSummary, PollError> {
+        match Subscription::poll_taking(self, handler, limit) {
+            // The image that reported more than deliveries: its report,
+            // with the deliveries over every image.
+            Ok(poll) => Ok(PollSummary {
+                delivered: poll.delivered,
+                ..poll.stopped.map(|stop| stop.summary).unwrap_or_default()
+            }),
+            Err(SubscriptionError::Poll { error, .. }) => Err(error),
+            Err(SubscriptionError::Closed(cause)) => Err(PollError {
+                summary: PollSummary::default(),
+                cause,
+            }),
+        }
+    }
+
+    fn next_image_change(&mut self) -> Option<ImageChange> {
+        Subscription::next_image_change(self)
+    }
 }
 
 impl<T: TermBytes> MessageSource for ClientSubscription<T> {
@@ -192,6 +228,12 @@ enum Held {
     Ended {
         position: u64,
         reason: EndReason,
+    },
+    /// An image of a network subscription attached or retired: it names
+    /// no position.
+    Image {
+        session_id: i32,
+        available: bool,
     },
 }
 
@@ -504,6 +546,16 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let Some(mut source) = slot.source.take() else {
             return Ok(None);
         };
+        // A poll's image changes come before its messages.
+        if let Some(change) = source.next_image_change() {
+            slot.source = Some(source);
+            let held = Held::Image {
+                session_id: change.session_id,
+                available: change.available,
+            };
+            slot.held = Some(held);
+            return self.deliver_held(index, held, now, handler).map(Some);
+        }
         let (identity, word) = (slot.identity, Arc::clone(&slot.word));
         let id = SubscriptionId(u16::try_from(index).unwrap_or(u16::MAX));
         let mut result = None;
@@ -605,6 +657,34 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 };
                 self.dispatch_event(&Event::Lifecycle { source, kind }, now, &first, handler)
             }
+            Held::Image {
+                session_id,
+                available,
+            } => {
+                let kind = if available {
+                    LifecycleKind::ImageAvailable
+                } else {
+                    LifecycleKind::ImageUnavailable
+                };
+                // The image's session: replay finds the source by stream
+                // and session, so two images of one alias with one session
+                // name one source (owner note item 20, the image id).
+                let first = |group_seq: u64, out: &mut [u8]| {
+                    GroupRecord::Lifecycle(LifecycleEvent {
+                        group_seq,
+                        logical_time: now,
+                        incarnation: identity.incarnation,
+                        position: 0,
+                        stream_id: identity.stream_id,
+                        session_id,
+                        lane: identity.lane,
+                        kind,
+                    })
+                    .encode(out)
+                    .map_err(|_| Refusal::TooLarge)
+                };
+                self.dispatch_event(&Event::Lifecycle { source, kind }, now, &first, handler)
+            }
         };
         if !matches!(result, Err(GatewayError::Refused(_)))
             && let Some(slot) = self.sources.get_mut(index)
@@ -658,7 +738,8 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 position: info.position,
                 extent: info.extent,
                 stream_id: identity.stream_id,
-                session_id: identity.session_id,
+                // The image's, which a network subscription's differ in.
+                session_id: info.session_id,
                 lane: identity.lane,
                 reserved_value: info.reserved_value,
                 end_of_stream: info.end_of_stream,
