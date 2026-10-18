@@ -1230,6 +1230,213 @@ fn a_reopened_guarded_network_publication_takes_a_fresh_incarnation() {
     );
 }
 
+/// A driver whose aliases are quarantined for `quarantine` ns and whose
+/// sender holds at most `publications`.
+fn reincarnating_driver(quarantine: u64, publications: usize) -> EmbeddedDriver {
+    use crate::agents::AgentConfig;
+    use crate::sessions::receive::SessionConfig;
+
+    EmbeddedDriver::with_config(DriverConfig {
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            agents: AgentConfig {
+                publications,
+                sessions: SessionConfig {
+                    alias_quarantine: quarantine,
+                    ..SessionConfig::default()
+                },
+                ..AgentConfig::default()
+            },
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap()
+}
+
+/// A guarded one-lane network publication on `driver`, closed by its
+/// guard, reopened, and refused once with `QuarantinedAlias` (its old
+/// session's removal posted): its handle, guard, open epoch, lane and
+/// receiving socket.
+fn waiting_reincarnation(
+    driver: &mut EmbeddedDriver,
+) -> (
+    AggregateHandle,
+    crate::guards::GuardHandle,
+    u64,
+    crate::embedded::StreamHandle,
+    UdpSocket,
+) {
+    use karyos_sys::guard::Closed;
+    use karyos_sys::log_buffer::SealReason;
+
+    use crate::net::NetworkGuard;
+
+    let guard = open_guard(driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let mut config = aggregate(10, 1);
+    config.stream.buffer.spare_slots = 4;
+    let handle = driver
+        .add_guarded_network_publication(
+            config,
+            &channel(destination),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    until(driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    let lane = handle.lane(Lane::ZERO).unwrap();
+    let publication = driver.publication(lane).unwrap();
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    drop(publication);
+    until(driver, |driver| {
+        driver.seal_reason(lane) == Ok(Some(SealReason::GuardClosed))
+    });
+    let epoch = driver.reopen_guard(guard, epoch, epoch).unwrap();
+    let mut first = None;
+    until(driver, |driver| match driver.publication(lane) {
+        Err(DriverError::GuardSealed { .. }) => false,
+        other => {
+            first = Some(other.map(drop));
+            true
+        }
+    });
+    assert!(
+        matches!(first, Some(Err(DriverError::QuarantinedAlias { .. }))),
+        "{first:?}"
+    );
+    (handle, guard, epoch, lane, socket)
+}
+
+/// #396 review P2: a network close while the reincarnation waits adds no
+/// sender, so the lane is refused, typed, and stays sealed at its first
+/// incarnation: no offer is accepted that no sender reads.
+#[test]
+fn a_network_close_mid_reincarnation_leaves_the_lane_sealed() {
+    use karyos_sys::log_buffer::SealReason;
+
+    let mut driver = reincarnating_driver(50_000_000, 64);
+    let (_handle, _guard, _epoch, lane, _socket) = waiting_reincarnation(&mut driver);
+    let _ = driver.close_network().unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            driver.publication(lane).map(drop),
+            Err(DriverError::NetworkUnavailable)
+        );
+    }
+    assert_eq!(driver.trace_identity(lane).unwrap().incarnation, 1);
+    assert_eq!(driver.seal_reason(lane), Ok(Some(SealReason::GuardClosed)));
+}
+
+/// #396 review P2: an agent failure while the reincarnation waits adds no
+/// sender either: the lane is refused with the failure and stays sealed.
+#[test]
+fn an_agent_failure_mid_reincarnation_leaves_the_lane_sealed() {
+    use karyos_sys::log_buffer::SealReason;
+
+    let mut driver = reincarnating_driver(50_000_000, 64);
+    let (_handle, _guard, _epoch, lane, _socket) = waiting_reincarnation(&mut driver);
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::Panic)
+        .unwrap();
+    assert!(matches!(
+        driver.do_work(),
+        Err(DriverError::NetworkAgent { .. })
+    ));
+    std::thread::sleep(Duration::from_millis(60));
+    for _ in 0..3 {
+        let _ = driver.do_work();
+        assert!(
+            matches!(
+                driver.publication(lane),
+                Err(DriverError::NetworkAgent { .. })
+            ),
+            "refused with the failure"
+        );
+    }
+    assert_eq!(driver.trace_identity(lane).unwrap().incarnation, 1);
+    assert_eq!(driver.seal_reason(lane), Ok(Some(SealReason::GuardClosed)));
+}
+
+/// #396 review P2: the quarantine runs from the old session's removal,
+/// not from when it was posted. The removal is held back (no duty runs
+/// for longer than the quarantine), so the swap still waits a full
+/// quarantine once the removal ends.
+#[test]
+fn the_quarantine_runs_from_the_removal_not_the_post() {
+    const QUARANTINE: u64 = 100_000_000;
+    let mut driver = reincarnating_driver(QUARANTINE, 64);
+    let (handle, _guard, _epoch, lane, _socket) = waiting_reincarnation(&mut driver);
+    // No duty: the removal posted stays unanswered past the quarantine.
+    std::thread::sleep(Duration::from_millis(150));
+    let resumed = driver.net.as_ref().unwrap().now();
+    let mut taken = None;
+    until(&mut driver, |driver| match driver.publication(lane) {
+        Err(DriverError::QuarantinedAlias { .. }) => false,
+        other => {
+            taken = Some(other.map(drop));
+            true
+        }
+    });
+    assert_eq!(taken, Some(Ok(())));
+    let waited = driver.net.as_ref().unwrap().now() - resumed;
+    assert!(
+        waited >= QUARANTINE,
+        "swapped {waited} ns after the removal"
+    );
+    assert_eq!(driver.trace_identity(lane).unwrap().incarnation, 2);
+    let _ = handle;
+}
+
+/// #396 review P3: a guard closed again while the reincarnation waits is
+/// reported as not open, not as a quarantine.
+#[test]
+fn a_guard_closed_again_while_waiting_is_not_open() {
+    let mut driver = reincarnating_driver(10_000_000_000, 64);
+    let (_handle, guard, epoch, lane, _socket) = waiting_reincarnation(&mut driver);
+    let _ = driver.close_guard(guard, epoch).unwrap();
+    assert!(matches!(
+        driver.publication(lane),
+        Err(DriverError::GuardNotOpen { .. })
+    ));
+}
+
+/// #396 review P3: a reincarnating publication keeps its room in the
+/// sender's table: another publication cannot take it during the wait.
+#[test]
+fn a_reincarnating_publication_keeps_its_room() {
+    let mut driver = reincarnating_driver(10_000_000_000, 1);
+    let (handle, _guard, _epoch, _lane, socket) = waiting_reincarnation(&mut driver);
+    until(&mut driver, |driver| {
+        !driver
+            .net
+            .as_ref()
+            .unwrap()
+            .is_network_aggregate(handle.registration())
+    });
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let other = driver.add_network_publication(aggregate(11, 1), &channel(destination));
+    assert!(
+        matches!(other, Err(DriverError::NetworkPublicationsFull)),
+        "{other:?}"
+    );
+}
+
 /// A reincarnation ends with its publication: removing the aggregate while
 /// it waits out the quarantine adds nothing, and its send endpoint retires.
 #[test]

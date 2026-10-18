@@ -303,6 +303,9 @@ pub(crate) struct SenderChannel {
 #[derive(Debug)]
 struct Reincarnation {
     registration: u64,
+    /// Its alias: its key on each held path stays reserved until the next
+    /// incarnation is added, so no other publication takes it meanwhile.
+    alias: Alias,
     /// One extra hold on each path's send endpoint, taken when the
     /// reincarnation starts, so the endpoints stay open for the next
     /// incarnation; released once its sender is posted.
@@ -1394,11 +1397,32 @@ impl<T: StreamTerms> Network<T> {
         }) {
             return Err(DriverError::NetworkBusy);
         }
+        // A reincarnating publication's key stays reserved for its next
+        // incarnation, the only add that takes it.
+        let others = || {
+            self.reincarnations
+                .iter()
+                .filter(move |next| next.registration != registration)
+        };
+        if others().any(|next| {
+            next.alias == alias
+                && next
+                    .held
+                    .iter()
+                    .any(|held| paths().any(|path| path == *held))
+        }) {
+            return Err(DriverError::NetworkBusy);
+        }
         // Each path's alias takes room, held or stale. A queued alias of
         // one of its keys is superseded by the add below, so it takes none.
-        let held = self.publications.iter().try_fold(0usize, |held, entry| {
-            held.checked_add(entry.paths().count())
-        });
+        // A reincarnating publication's paths keep their room, so its next
+        // incarnation's add is not refused for a full table.
+        let held = self
+            .publications
+            .iter()
+            .map(|entry| entry.paths().count())
+            .chain(others().map(|next| next.held.len()))
+            .try_fold(0usize, usize::checked_add);
         let stale_only = self
             .stale_aliases
             .iter()
@@ -1534,6 +1558,31 @@ impl<T: StreamTerms> Network<T> {
         true
     }
 
+    /// Why no publication can be added any more: an agent failed, or the
+    /// network closed; `None` while it can.
+    pub(crate) fn unusable(&self) -> Option<DriverError> {
+        if let Some(agent) = self.failed {
+            return Some(DriverError::NetworkAgent { agent });
+        }
+        matches!(self.agents, Agents::Closed).then_some(DriverError::NetworkUnavailable)
+    }
+
+    /// The publication identity of the image `handle` exposes (tests).
+    #[cfg(test)]
+    pub(crate) fn image_traced(
+        &self,
+        handle: &crate::embedded::AggregateHandle,
+    ) -> Option<karyos_protocol::trace_hook::PublicationIdentity> {
+        self.net_images
+            .iter()
+            .find(|image| {
+                image
+                    .exposed
+                    .is_some_and(|exposed| exposed.registration() == handle.registration())
+            })
+            .map(|image| image.traced)
+    }
+
     /// The network clock's reading.
     pub(crate) fn now(&self) -> u64 {
         (self.clock)()
@@ -1547,19 +1596,26 @@ impl<T: StreamTerms> Network<T> {
     /// # Errors
     ///
     /// [`DriverError::NetworkAgent`] once an agent failed,
-    /// [`DriverError::NetworkUnavailable`] once the network closed, and
-    /// [`DriverError::UnknownStream`] for a publication not tracked or not
-    /// added (refused or being removed). Nothing changes on error.
-    pub(crate) fn start_reincarnation(&mut self, registration: u64) -> Result<u64, DriverError> {
-        if let Some(agent) = self.failed {
-            return Err(DriverError::NetworkAgent { agent });
+    /// [`DriverError::NetworkUnavailable`] once the network closed,
+    /// [`DriverError::NetworkPublicationsFull`] past the reserved records,
+    /// and [`DriverError::UnknownStream`] (naming the lane `stream`) for a
+    /// publication not tracked or not added (refused or being removed).
+    /// Nothing changes on error.
+    pub(crate) fn start_reincarnation(
+        &mut self,
+        registration: u64,
+        stream: u64,
+        trace_closes: Vec<(Lane, u64)>,
+    ) -> Result<u64, DriverError> {
+        if let Some(error) = self.unusable() {
+            return Err(error);
         }
-        if matches!(self.agents, Agents::Closed) {
-            return Err(DriverError::NetworkUnavailable);
+        // One record per tracked publication, within the room reserved at
+        // start.
+        if self.reincarnations.len() >= self.reincarnations.capacity() {
+            return Err(DriverError::NetworkPublicationsFull);
         }
-        let unknown = DriverError::UnknownStream {
-            stream: registration,
-        };
+        let unknown = DriverError::UnknownStream { stream };
         let entry = self
             .publications
             .iter_mut()
@@ -1592,8 +1648,12 @@ impl<T: StreamTerms> Network<T> {
         let channel = entry.channel.take().ok_or(unknown)?;
         entry.state = NetworkPublicationState::Removing;
         entry.reincarnating = true;
+        // Its sender journals close first, in the same ring.
+        entry.trace_closes.extend(trace_closes);
+        let alias = entry.alias;
         self.reincarnations.push(Reincarnation {
             registration,
+            alias,
             held,
             removed: None,
             swapped: false,
@@ -1788,6 +1848,9 @@ impl<T: StreamTerms> Network<T> {
             &mut self.trace_events,
             &mut self.reincarnations,
         );
+        // The removal's end is read when its answer is applied, not at the
+        // cycle's start.
+        let clock = self.clock;
         let mut stale = Stale {
             queue: &mut self.stale_aliases,
             overflows: &mut self.stale_overflows,
@@ -1848,7 +1911,7 @@ impl<T: StreamTerms> Network<T> {
                     send_endpoints,
                     &mut stale,
                     released,
-                    (reincarnations, now),
+                    (reincarnations, clock),
                     event,
                 );
                 if let Some(registration) = added
@@ -2308,7 +2371,7 @@ fn publication_answer<T: StreamTerms>(
     send_endpoints: &mut [SendEndpoint],
     stale: &mut Stale<'_>,
     released: &mut ReleasedGuards,
-    (reincarnations, now): (&mut [Reincarnation], u64),
+    (reincarnations, clock): (&mut [Reincarnation], fn() -> u64),
     event: AgentEvent<OsSocket, T>,
 ) {
     // Each tracked publication releases its guard sender once, and the
@@ -2416,7 +2479,7 @@ fn publication_answer<T: StreamTerms>(
                         .iter_mut()
                         .find(|next| next.registration == registration)
                 {
-                    next.removed = Some(now);
+                    next.removed = Some(clock());
                 }
             }
         }

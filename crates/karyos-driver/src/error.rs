@@ -181,8 +181,9 @@ pub enum DriverError {
     /// `alias_quarantine` (default 10 s) from that removal before the next
     /// incarnation is added under it (`quantstratum-docs:
     /// karyos/design/network-sessions.md`). Retry at `until_ns` on the
-    /// network clock (the host monotonic clock); it is an estimate while
-    /// the old session is still being removed.
+    /// network clock (the host monotonic clock). While the old session is
+    /// still being removed it is an estimate, early by however long that
+    /// removal still takes; a retry then refuses again with the exact end.
     #[error("stream {stream}'s alias is quarantined until {until_ns} ns")]
     QuarantinedAlias {
         /// The stream id.

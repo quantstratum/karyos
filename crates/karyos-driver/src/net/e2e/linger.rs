@@ -816,9 +816,10 @@ fn a_reopened_guarded_publication_reaches_a_new_image() {
             .filter(|image| image.registration() != old.registration());
         fresh.is_some()
     });
-    let mut reader = b
-        .subscribe_aggregate(&fresh.unwrap(), Role::Required)
-        .unwrap();
+    let fresh = fresh.unwrap();
+    let traced = b.net.as_ref().unwrap().image_traced(&fresh).unwrap();
+    assert_eq!(traced.incarnation, 2, "{traced:?}");
+    let mut reader = b.subscribe_aggregate(&fresh, Role::Required).unwrap();
     // Sixteen offers on the new incarnation: each is read once and in
     // order on the new image, and its outcome is Submitted, named by
     // incarnation 2.

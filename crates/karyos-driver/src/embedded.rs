@@ -527,6 +527,10 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// retiring: served until their walker ended and their readers passed
     /// the seal.
     pub(crate) replaced: Vec<Replaced<T>>,
+    /// Whether it is a lane of a network publication, and whether its
+    /// sender serves the current incarnation: such a lane reincarnates
+    /// only through the network, never locally.
+    pub(crate) network: NetworkLane,
     /// A timed lane's settings (`quantstratum-docs:
     /// karyos/design/timed-tx.md`); the defaults when not set.
     pub(crate) schedule: Option<karyos_client::schedule::ScheduleOptions>,
@@ -588,6 +592,18 @@ impl TimedCounters {
             sender: Arc::new(sender),
         }
     }
+}
+
+/// Whether a stream is a lane of a network publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkLane {
+    /// Not a network publication's lane.
+    Local,
+    /// Its network sender serves the current incarnation.
+    Sending,
+    /// Swapped to its next incarnation, whose sender is not posted yet:
+    /// nothing is issued on it until it is.
+    AwaitingSender,
 }
 
 /// The next incarnation of a guarded stream, checked
@@ -996,6 +1012,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 guarded: None,
                 incarnation: FIRST_INCARNATION,
                 replaced: Vec::new(),
+                network: NetworkLane::Local,
                 schedule: None,
                 schedule_issued: false,
                 schedule_clock: None,
@@ -2166,6 +2183,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guarded: None,
             incarnation: FIRST_INCARNATION,
             replaced: Vec::new(),
+            network: NetworkLane::Local,
             schedule: None,
             schedule_issued: false,
             schedule_clock: None,
@@ -2438,9 +2456,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     fn reincarnate_if_reopened(&mut self, handle: StreamHandle) -> Result<(), DriverError> {
         let found = self.stream_ref(handle)?;
         let (registration, id) = (found.aggregate.registration, found.id);
-        if let Some(net) = self.net.as_ref()
-            && (net.is_network_aggregate(registration)
-                || net.reincarnation(registration)?.is_some())
+        let network = found.network != NetworkLane::Local;
+        if network
+            || self.net.as_ref().is_some_and(|net| {
+                net.is_network_aggregate(registration)
+                    || net
+                        .reincarnation(registration)
+                        .is_ok_and(|phase| phase.is_some())
+            })
         {
             return self.reincarnate_network(registration, id);
         }
@@ -2567,9 +2590,40 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// swaps in every lane's next incarnation and posts its sender.
     fn reincarnate_network(&mut self, registration: u64, stream: u64) -> Result<(), DriverError> {
         let handle = self.aggregate_of(registration)?;
+        // A network that closed or whose agent failed adds no sender: a
+        // lane swapped without one, or a reopened one, is refused and
+        // stays as it is (sealed), so no offer is accepted that no sender
+        // reads.
+        let unusable = match self.net.as_ref() {
+            None => Some(DriverError::NetworkUnavailable),
+            Some(net) => net.unusable(),
+        };
+        if let Some(error) = unusable {
+            for lane in handle.streams() {
+                let found = self.stream_ref(lane)?;
+                if found.network == NetworkLane::AwaitingSender
+                    || self.reincarnation_plan(lane)?.is_some()
+                {
+                    return Err(error);
+                }
+            }
+            return Ok(());
+        }
         let net = self.net.as_ref().ok_or(DriverError::NetworkUnavailable)?;
         let swapped = match net.reincarnation(registration)? {
             Some(crate::net::ReincarnationPhase::Waiting { until_ns }) => {
+                // A guard closed again while waiting is reported as such.
+                let found = self.stream_ref(StreamHandle {
+                    driver: self.id,
+                    stream,
+                })?;
+                if let Some(guarded) = &found.guarded
+                    && !self.guards.state(guarded.guard)?.open
+                {
+                    return Err(DriverError::GuardNotOpen {
+                        guard: guarded.guard.id(),
+                    });
+                }
                 return Err(DriverError::QuarantinedAlias { stream, until_ns });
             }
             Some(crate::net::ReincarnationPhase::Ready { swapped }) => Some(swapped),
@@ -2589,8 +2643,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 return Err(DriverError::GuardSealed { stream });
             }
             if swapped.is_none() {
+                // Its open sender journals close before the removal, as
+                // on `remove_aggregate`.
+                let closes = self.publication_journal_closes(registration);
                 let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
-                let until_ns = net.start_reincarnation(registration)?;
+                let until_ns = net.start_reincarnation(registration, stream, closes)?;
                 return Err(DriverError::QuarantinedAlias { stream, until_ns });
             }
             let mut fresh = Vec::with_capacity(plans.len());
@@ -2600,9 +2657,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     fresh.push((lane, plan, prepared));
                 }
             }
-            // Every lane is prepared: the swaps cannot fail.
+            // Every lane is prepared: the swaps cannot fail. Nothing is
+            // issued on them until their sender is posted.
             for (lane, plan, prepared) in fresh {
                 self.swap_incarnation(lane, plan, prepared)?;
+                self.stream(lane)?.network = NetworkLane::AwaitingSender;
             }
         }
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;

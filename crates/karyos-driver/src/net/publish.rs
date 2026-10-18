@@ -442,8 +442,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             for (endpoint, _) in &held {
                 net.release_send_endpoint(*endpoint);
             }
+            return posted;
         }
-        posted
+        // Its sender serves this incarnation of every lane.
+        for stream in handle.streams() {
+            self.stream(stream)?.network = crate::embedded::NetworkLane::Sending;
+        }
+        Ok(())
     }
 }
 
