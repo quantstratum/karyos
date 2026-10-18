@@ -644,3 +644,36 @@ fn the_tick_order_is_drawn_from_the_seed() {
     distinct.dedup();
     assert!(distinct.len() > 1);
 }
+
+/// Two links of one configuration and one seed draw different sequences:
+/// faults on different links are not correlated.
+#[test]
+fn links_draw_different_sequences() {
+    let mut sim = quiet(
+        9,
+        3,
+        lossy(LinkFaults {
+            loss_ppm: 500_000,
+            ..NONE
+        }),
+    );
+    for number in 0..50 {
+        let _ = sim.send(0, 1, Echo::Pong(number)).unwrap();
+        let _ = sim.send(0, 2, Echo::Pong(number)).unwrap();
+    }
+    sim.run_for(1).unwrap();
+    // The loss draws of each link, in send order: even ids went to 1.
+    let draws = |link: u64| -> Vec<String> {
+        sim.trace()
+            .iter()
+            .filter_map(|line| {
+                let rest = line.split("] #").nth(1)?;
+                let (id, draw) = rest.split_once(" loss draw ")?;
+                (id.parse::<u64>().ok()? % 2 == link).then(|| draw.to_owned())
+            })
+            .collect()
+    };
+    let (one, two) = (draws(0), draws(1));
+    assert_eq!((one.len(), two.len()), (50, 50));
+    assert_ne!(one, two);
+}
