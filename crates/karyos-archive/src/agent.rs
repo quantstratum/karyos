@@ -467,9 +467,11 @@ pub enum AgentError {
         /// The group.
         id: u64,
     },
-    /// A journal whose recovery would cut it to nothing: a damaged
-    /// header, not one never written. Neither a restart nor a new start
-    /// takes it, and nothing is cut, so the journal can be copied.
+    /// A journal whose recovery would cut it to nothing, dropping more
+    /// than the header's own write: a damaged header that events
+    /// followed, not one torn while it was written. Neither a restart nor
+    /// a new start takes it, and nothing is cut, so the journal can be
+    /// copied.
     #[error("group {id}'s journal lost its header: recovery cut it at {cut:?}")]
     HeaderCut {
         /// The group.
@@ -1705,14 +1707,20 @@ impl<D: Disk + Clone> State<D> {
             }
         };
         let checkpoint_dir = store_dir(&start.dir);
-        // Before a journal is recovered, its plan: a recovery that would
-        // cut it to nothing cuts away its header, and nothing takes it,
-        // with nothing written, on every start (the operator may copy the
-        // journal). One whose header was never written cuts nothing.
+        // Before a journal is recovered, its plan. A recovery that would
+        // cut it to nothing, dropping more than the header's own write,
+        // cuts away a header that events followed: nothing takes it, with
+        // nothing written, on every start (the operator may copy the
+        // journal). A crash while the header was written tears that one
+        // write only, with nothing after it; that journal is taken over as
+        // never written, since nothing of it was ever reported durable.
         let verified = |disk: &D| -> Result<(), AgentError> {
             let plan = GroupJournal::verify(disk.clone(), &start.dir, id, start.journal)?;
+            let dropped = plan.kept.as_ref().map_or(0, |kept| kept.dropped_entries);
             match plan.cut {
-                Some(cut) if cut.position == 0 => Err(AgentError::HeaderCut { id, cut }),
+                Some(cut) if cut.position == 0 && (dropped > 1 || !plan.dropped.is_empty()) => {
+                    Err(AgentError::HeaderCut { id, cut })
+                }
                 _ => Ok(()),
             }
         };

@@ -2658,6 +2658,53 @@ mod checkpoints {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// #437 re-check: a crash while the header was written tears that one
+    /// write, with nothing after it. A restart finds no header (typed);
+    /// a new start takes the journal over, as never written.
+    #[test]
+    fn a_torn_header_alone_is_taken_over() {
+        let dir = dirs("checkpoint-torn-header");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let header = crate::group::record::JournalHeader {
+            group_id: GROUP,
+            first_group_seq: 1,
+            inline_threshold: 4096,
+            contract_version: crate::group::record::CONTRACT_VERSION,
+            clock: crate::group::record::Clock::HostMonotonic,
+            capture: Capture::Strict,
+            reopen_hold: 0,
+            manifest: b"m",
+        };
+        let journal = GroupJournal::create(
+            StdDisk,
+            &dir.join("groups"),
+            &header,
+            journal_config(policy),
+        )
+        .unwrap();
+        let _ = journal.close().unwrap();
+        let segment = walk(&dir)
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+            .unwrap();
+        let path = dir.join(segment);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[20] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        assert!(matches!(
+            agent.start_group(start_with(&dir, None, policy)),
+            Err(AgentError::NoHeader { id: GROUP })
+        ));
+        let sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        assert_eq!(sender.state(), GroupState::Running);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// #437 review M6: a hold below `in_flight` is recorded as `in_flight`.
     #[test]
     fn a_hold_below_in_flight_is_recorded_as_in_flight() {
