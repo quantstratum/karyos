@@ -224,22 +224,29 @@ impl<D: Disk> ReplayGateway<D> {
     /// # Errors
     ///
     /// Without calling the handler: the stop of a gateway already
-    /// stopped; [`GatewayError::RestoreOrder`] after a dispatch, for a
+    /// stopped by an error; [`GatewayError::RestoreOrder`] after a
+    /// dispatch (the stop of one stopped at its end is kept), for a
     /// second restore, or for a checkpoint the cursor was not opened at;
     /// [`GatewayError::CheckpointCorrupt`] for a snapshot whose length or
     /// crc32c differs from `record`. [`GatewayError::NotReproducible`] at
     /// the checkpoint's `group_seq` when the handler refuses the bytes.
     /// Replay stops at each, and each later dispatch returns the same.
+    /// A replay opened at a checkpoint restores before its first
+    /// dispatch: one without it returns [`GatewayError::RestoreOrder`]
+    /// and stops.
     pub fn restore(
         &mut self,
         record: &CheckpointRecord,
         snapshot: &[u8],
         handler: &mut dyn Handler,
     ) -> Result<(), GatewayError> {
-        if let Some(Err(stopped)) = self.stopped {
-            return Err(stopped);
-        }
         let group_seq = record.group_seq;
+        match self.stopped {
+            Some(Err(stopped)) => return Err(stopped),
+            // Stopped at its end: refused, the stop kept.
+            Some(Ok(_)) => return Err(GatewayError::RestoreOrder { group_seq }),
+            None => {}
+        }
         let refused = if !std::mem::replace(&mut self.restorable, false)
             || self.cursor.opened_at() != Some(group_seq)
         {
@@ -344,7 +351,13 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
         if let Some(stopped) = self.stopped {
             return stopped;
         }
-        self.restorable = false;
+        // Opened at a checkpoint, replay starts from its restored state:
+        // never from the handler's empty one.
+        if std::mem::replace(&mut self.restorable, false)
+            && let Some(group_seq) = self.cursor.opened_at()
+        {
+            return self.stop(Err(GatewayError::RestoreOrder { group_seq }));
+        }
         let event = match self.cursor.step() {
             Ok(Step::Event(event)) => event,
             // Never: an event's checkpoints are compared in its own

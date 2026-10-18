@@ -865,6 +865,7 @@ fn a_restore_out_of_order_or_corrupt_is_refused() {
     // After the first dispatch.
     let (mut gateway, record, snapshot) = recorded.gateway_at(2);
     let mut seen = handler();
+    assert_eq!(gateway.restore(&record, &snapshot, &mut seen), Ok(()));
     assert!(gateway.dispatch(&mut seen).is_ok());
     assert_eq!(gateway.restore(&record, &snapshot, &mut seen), order(2));
     // A second restore.
@@ -895,6 +896,45 @@ fn a_restore_out_of_order_or_corrupt_is_refused() {
     assert_eq!(gateway.restore(&longer, &snapshot, &mut seen), corrupt);
     // On a stopped gateway, its stop.
     assert_eq!(gateway.restore(&record, &snapshot, &mut seen), corrupt);
-    // Only the one restore in order reached the handler.
-    assert_eq!(seen.restored, [b"state at 2".to_vec()]);
+    // Only the two restores in order reached the handler.
+    assert_eq!(
+        seen.restored,
+        [b"state at 2".to_vec(), b"state at 2".to_vec()]
+    );
+}
+
+/// #431 re-check: a replay opened at a checkpoint never dispatches from
+/// the handler's empty state; without a restore its first dispatch is
+/// refused and stops replay. A restore after replay ended is refused,
+/// that end kept.
+#[test]
+fn a_replay_opened_at_a_checkpoint_dispatches_only_after_its_restore() {
+    let recorded = Recorded::new(
+        Capture::Strict,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Checkpoint(1, b"state at 2"),
+            Write::Records(event(2, EndOutcome::Complete)),
+        ],
+    );
+    let order = Err(GatewayError::RestoreOrder { group_seq: 1 });
+    let (mut gateway, record, snapshot) = recorded.gateway_at(1);
+    let mut seen = handler();
+    assert_eq!(gateway.dispatch(&mut seen), order);
+    assert_eq!(gateway.dispatch(&mut seen), order);
+    assert_eq!(seen.events, 0);
+    let (mut gateway, record_again, _) = recorded.gateway_at(1);
+    assert_eq!(record_again, record);
+    assert_eq!(gateway.restore(&record, &snapshot, &mut seen), Ok(()));
+    assert_eq!(
+        gateway.dispatch(&mut seen),
+        Ok(Dispatched::Event { group_seq: 2 })
+    );
+    let end = gateway.dispatch(&mut seen);
+    assert!(matches!(end, Ok(Dispatched::End)), "{end:?}");
+    assert_eq!(
+        gateway.restore(&record, &snapshot, &mut seen),
+        Err(GatewayError::RestoreOrder { group_seq: 1 })
+    );
+    assert_eq!(gateway.dispatch(&mut seen), end);
 }
