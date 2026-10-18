@@ -2,12 +2,14 @@
 
 //! The Raft log of C4 (karyos-cluster) over C2's crashing disk
 //! (quantstratum-docs: karyos/design/cluster-gap-analysis.md §6, C4): the
-//! eight crash cases of the `log` module and three more truncations, each
+//! eight crash cases of the `log` module and four more truncations, each
 //! run once per disk operation with the disk crashing at that operation
 //! (and once after the last step), then reopened under every survival mode
 //! of [`Survives`]: `Synced` and `Everything` once, `Subset` and `Torn` once
-//! per seed of [`scenarios::seeds`]. The run without a crash must complete
-//! every step, so no case is cut short by a refusal of its own.
+//! per seed of [`scenarios::seeds`]. Case 5 runs only at 8-byte sectors,
+//! where a 44-byte hard state and a 32-byte watermark slot can tear, and
+//! case 3 runs at both. The run without a crash must complete every step,
+//! so no case is cut short by a refusal of its own.
 //!
 //! The invariant, checked by [`check`] at every crash point:
 //!
@@ -18,8 +20,8 @@
 //!    the reopened log claims no durable index past its last;
 //! 3. the term and vote are the last saved record or the one in flight,
 //!    never torn, so no vote is cast twice in a term;
-//! 4. the stored commit is durable: every committed entry is present, as
-//!    the log reported it durable;
+//! 4. the stored commit is durable: every entry up to it is present, and
+//!    each that the log reported durable is the entry it reported;
 //! 5. open never refuses a legitimate crash: it is `Ok`, a torn tail or a
 //!    crash's loss above the watermark cut at most. Crash points whose
 //!    recovery removes a segment its creation left without a data file
@@ -293,15 +295,18 @@ fn check_all(
     label: &dyn Fn(Survives) -> String,
     failures: &mut Vec<String>,
 ) {
-    let mut modes = vec![Survives::Synced, Survives::Everything];
-    for seed in seeds {
+    // With the base seed of each seeded mode, which `KARYOS_SIM_SEED`
+    // replays.
+    let mut modes = vec![(Survives::Synced, None), (Survives::Everything, None)];
+    for &seed in seeds {
         let mixed = Rng::new(seed ^ point.rotate_left(32)).next_u64();
-        modes.push(Survives::Subset { seed: mixed });
-        modes.push(Survives::Torn { seed: mixed });
+        modes.push((Survives::Subset { seed: mixed }, Some(seed)));
+        modes.push((Survives::Torn { seed: mixed }, Some(seed)));
     }
-    for survives in modes {
+    for (survives, base) in modes {
         if let Err(broken) = check(disk, survives, model) {
-            failures.push(format!("{}: {broken}", label(survives)));
+            let seed = base.map_or_else(String::new, |seed| format!(" (KARYOS_SIM_SEED={seed})"));
+            failures.push(format!("{}{seed}: {broken}", label(survives)));
         }
     }
 }
@@ -545,9 +550,11 @@ const CASE_8: Sweep = Sweep {
 };
 
 /// Tears at 8-byte sectors, so a 44-byte record and a 32-byte slot tear.
+/// Seeds 12 and 19 are swept whatever `KARYOS_SIM_SEED` selects: at
+/// 4 seeds a torn newer watermark slot taken still passes without them.
 const TORN_SMALL: Sweep = Sweep {
     sector: Some(8),
-    extra_seeds: &[],
+    extra_seeds: &[12, 19],
 };
 
 /// Case 8: a crash inside `create`: the directory opens empty, or is
@@ -658,4 +665,30 @@ fn case_11_saves_mixed_with_truncation() {
     ];
     let (points, flushes) = sweep("case 11", &steps, Sweep::DEFAULT);
     println!("case 11: {points} crash points, {flushes} failed flushes");
+}
+
+/// Case 12: truncations at an exact multiple of the segment length.
+/// Each entry is one KiB (a 36-byte header and 988 bytes), four to a 4 KiB
+/// segment, so truncating from entry 5 cuts at byte 4096, the end of the
+/// first segment, with every crash point of the cut swept. The first
+/// truncation, at `last + 1`, is the log's no-op and never reaches A2; the
+/// second has entries past the cut, so their segment exists. A2's choice
+/// of the segment a cut at a segment end keeps (`is_multiple_of` in
+/// `SegmentStore::truncate`) is equivalent through the log, which never
+/// cuts at a segment end before the next segment exists; A2's own
+/// `a_truncation_to_a_segment_end_keeps_it` pins it.
+#[test]
+fn case_12_truncating_at_a_segment_end() {
+    let steps = [
+        appends(1..5, 1, 988),
+        Step::Sync,
+        Step::Truncate(5),
+        appends(5..9, 1, 988),
+        Step::Sync,
+        Step::Truncate(5),
+        appends(5..7, 2, 988),
+        Step::Sync,
+    ];
+    let (points, flushes) = sweep("case 12", &steps, Sweep::DEFAULT);
+    println!("case 12: {points} crash points, {flushes} failed flushes");
 }
