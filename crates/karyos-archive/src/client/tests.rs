@@ -95,6 +95,8 @@ struct Archive {
     opened: Arc<Mutex<Vec<(i32, i32)>>>,
     /// Every request it read, decoded to its kind and fields.
     seen: Vec<Seen>,
+    /// Every request's correlation id, in order.
+    correlations: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +153,14 @@ impl Archive {
             let Some(bytes) = self.sent.lock().unwrap().pop_front() else {
                 return;
             };
-            match ControlMessage::decode(&bytes).unwrap() {
+            let message = ControlMessage::decode(&bytes).unwrap();
+            self.correlations.push(match &message {
+                ControlMessage::ListRecordings(list) => list.correlation_id,
+                ControlMessage::Replay(replay) => replay.correlation_id,
+                ControlMessage::StopReplay(stop) => stop.correlation_id,
+                other => panic!("not a request: {other:?}"),
+            });
+            match message {
                 ControlMessage::ListRecordings(list) => {
                     self.seen.push(Seen::List {
                         from_id: list.from_id,
@@ -342,7 +351,8 @@ fn connect(archive: &Archive, config: ClientConfig) -> (Client, Arc<AtomicU64>, 
             hidden: Arc::clone(&hidden),
         },
         Box::new(move || now.load(Ordering::Acquire)),
-    );
+    )
+    .unwrap();
     (client, clock, hidden)
 }
 
@@ -659,4 +669,187 @@ fn an_abandoned_replay_is_stopped() {
     ));
     archive.serve();
     assert_eq!(archive.stops().len(), 4);
+}
+
+/// #397 review P2: a stop waiting for room keeps the correlation id it was
+/// queued with, however many calls pass: the ids sent run on, none lost.
+#[test]
+fn a_stop_waiting_for_room_uses_no_more_ids() {
+    let mut archive = Archive::new(vec![recording_of_source(1, 0, 9000, false)]);
+    let (mut client, _, _) = connect(&archive, config());
+    let ReplayStatus::Ready(replay) = ask(&mut client, &mut archive, &request(1000, 5000)) else {
+        panic!("no replay");
+    };
+    archive.room.store(false, Ordering::Release);
+    drop(replay);
+    for _ in 0..10 {
+        client.duty();
+    }
+    archive.room.store(true, Ordering::Release);
+    client.duty();
+    archive.serve();
+    let low: Vec<u64> = archive
+        .correlations
+        .iter()
+        .map(|id| {
+            assert_eq!(id >> 32, u64::from(CLIENT));
+            id & u64::from(u32::MAX)
+        })
+        .collect();
+    assert_eq!(low, [1, 2, 3]);
+    assert_eq!(archive.stops(), [0x1_0000_0041]);
+}
+
+/// #397 review P2: a replay withdrawn before its answer is stopped by the
+/// host's duty once the answer comes, with no later replay call; dropping
+/// the client stops a replay whose target it was looking for.
+#[test]
+fn a_withdrawn_replay_is_stopped_without_another_call() {
+    let mut archive = Archive::new(vec![recording_of_source(1, 0, 9000, false)]);
+    let (mut client, _, hidden) = connect(&archive, config());
+    let range = request(1000, 5000);
+    // Listed, then the replay asked, unanswered.
+    assert!(matches!(client.replay(&range), ReplayStatus::Pending));
+    archive.serve();
+    assert!(matches!(client.replay(&range), ReplayStatus::Pending));
+    ReplayProvider::<HeapTerms>::cancel(&mut client);
+    archive.serve();
+    assert!(archive.stops().is_empty());
+    client.duty();
+    archive.serve();
+    assert_eq!(archive.stops(), [0x1_0000_0041]);
+
+    hidden.store(true, Ordering::Release);
+    for _ in 0..4 {
+        assert!(matches!(client.replay(&range), ReplayStatus::Pending));
+        archive.serve();
+    }
+    drop(client);
+    archive.serve();
+    assert_eq!(archive.stops(), [0x1_0000_0041, 0x1_0000_0042]);
+}
+
+/// #397 review P2: a recording behind that has not caught up by the
+/// deadline is behind, even when the deadline finds a list again
+/// unanswered; the list again starts at the source's first recording in
+/// time.
+#[test]
+fn the_deadline_during_a_list_again_is_behind() {
+    let mut archive = Archive::new(vec![
+        Listed {
+            session_id: 9,
+            ..recording_of_source(1, 0, 9000, false)
+        },
+        recording_of_source(2, 0, 3000, true),
+    ]);
+    let (mut client, clock, _) = connect(&archive, config());
+    let range = request(1000, 5000);
+    for _ in 0..3 {
+        assert!(matches!(client.replay(&range), ReplayStatus::Pending));
+        archive.serve();
+    }
+    // The list again goes out, and the Archive does not answer it.
+    clock.store(20 * MS, Ordering::Release);
+    assert!(matches!(client.replay(&range), ReplayStatus::Pending));
+    let lists: Vec<u64> = archive
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|bytes| match ControlMessage::decode(bytes).unwrap() {
+            ControlMessage::ListRecordings(list) => list.from_id,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(lists, [2]);
+    clock.store(200 * MS, Ordering::Release);
+    assert_eq!(
+        unavailable(client.replay(&range)),
+        ReplayUnavailable::RecordingBehind
+    );
+}
+
+/// Another requester's descriptors and replay answers are skipped, and so
+/// are recordings of another driver or registration of the source.
+#[test]
+fn others_lists_replays_and_publications_are_not_taken() {
+    let mut archive = Archive::new(vec![
+        Listed {
+            source: SourceIncarnation {
+                driver: [1, 3],
+                ..recording_of_source(1, 0, 9000, false).source
+            },
+            ..recording_of_source(1, 0, 9000, false)
+        },
+        Listed {
+            source: SourceIncarnation {
+                registration: 4,
+                ..recording_of_source(2, 0, 9000, false).source
+            },
+            ..recording_of_source(2, 0, 9000, false)
+        },
+    ]);
+    let (mut client, _, _) = connect(&archive, config());
+    assert_eq!(
+        unavailable(ask(&mut client, &mut archive, &request(1000, 5000))),
+        ReplayUnavailable::NoRecording
+    );
+
+    let mut archive = Archive::new(vec![recording_of_source(1, 0, 9000, false)]);
+    let (mut client, _, _) = connect(&archive, config());
+    let range = request(1000, 5000);
+    let other = u64::from(CLIENT + 1) << 32 | 1;
+    assert!(matches!(client.replay(&range), ReplayStatus::Pending));
+    // Another requester's covering descriptor and its list's count first.
+    archive.answer(&ControlMessage::RecordingDescriptor(descriptor(
+        other,
+        &recording_of_source(7, 0, 9000, false),
+    )));
+    archive.respond(other, 1, ResponseCode::Ok);
+    archive.serve();
+    // The replay asked is of this list's recording; another requester's
+    // replay answer comes before this one's.
+    assert!(matches!(client.replay(&range), ReplayStatus::Pending));
+    archive.respond(other, 0x1_0000_0099, ResponseCode::Ok);
+    archive.serve();
+    assert!(matches!(
+        archive.seen.last(),
+        Some(Seen::Replay {
+            recording_id: 1,
+            ..
+        })
+    ));
+    let ReplayStatus::Ready(_replay) = ask(&mut client, &mut archive, &range) else {
+        panic!("no replay");
+    };
+    assert_eq!(
+        *archive.opened.lock().unwrap(),
+        [(TARGET, replay_session_id(0x1_0000_0041))]
+    );
+}
+
+/// A target channel no request can carry is refused up front.
+#[test]
+fn a_target_channel_is_checked_up_front() {
+    let archive = Archive::new(vec![]);
+    for channel in [String::new(), "x".repeat(control::MAX_CHANNEL + 1)] {
+        let refused = ArchiveClient::with_clock(
+            ClientConfig {
+                target_channel: channel,
+                ..config()
+            },
+            Requests {
+                sent: Arc::clone(&archive.sent),
+                room: Arc::clone(&archive.room),
+            },
+            Responses(Arc::clone(&archive.answers)),
+            Targets {
+                opened: Arc::clone(&archive.opened),
+                conductor: buffer().conductor_owned().unwrap(),
+                hidden: Arc::default(),
+            },
+            Box::new(|| 0),
+        );
+        assert!(matches!(refused, Err(ConfigError::TargetChannel)));
+    }
 }

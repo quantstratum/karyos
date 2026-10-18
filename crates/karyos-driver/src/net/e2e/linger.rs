@@ -640,3 +640,65 @@ fn a_removed_publication_sends_only_eos_through_its_linger() {
     let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
     assert_eq!(receiver.create_image, 1, "{receiver:?}");
 }
+
+/// rp-w5b follow-up (ACS 17249): a removed publication over two paths
+/// sends each lane's EOS on both paths; the tail is delivered once, in
+/// order, and the image ends cleanly at `EndOfStream`. Linux, after the
+/// multicast probe; the second path is loopback, as in
+/// `a_two_path_publication_reaches_a_two_path_subscription`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removed_two_path_publication_ends_at_its_eos_on_both_paths() {
+    use std::io::Write as _;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use karyos_protocol::channel::{Destination, Interface, Security, UdpConfig};
+
+    if let Err(why) = super::multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED a_removed_two_path_publication_ends_at_its_eos_on_both_paths: {why}"
+        );
+        return;
+    }
+    // The group's port: one the OS just handed out on loopback.
+    let port = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .and_then(|socket| socket.local_addr())
+        .unwrap()
+        .port();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), port);
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ],
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b) = (lingering(200 * MS), lingering(200 * MS));
+    for side in [&mut a, &mut b] {
+        side.net.as_mut().unwrap().assume_isolated_paths();
+    }
+    let _ = b.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel)
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    offer_all(&mut a, &publication, 1, 8);
+    a.remove_aggregate(&publication).unwrap();
+    let (terminal, ends, seen) = read_to_end(&mut a, &mut b, &mut reader);
+    assert_eq!(seen[0], 8);
+    assert!(terminal.clean, "{ends:?}");
+    assert!(closed_at_eos(ends[0]), "{ends:?}");
+    assert!(eos_sent(&a) >= 1);
+}
