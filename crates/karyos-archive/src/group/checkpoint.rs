@@ -55,6 +55,19 @@ use crate::segment::{Geometry, SegmentError, SegmentStore};
 #[cfg(test)]
 mod tests;
 
+/// The name of a group journal directory's subdirectory that holds the
+/// groups' checkpoint stores: a store is named by its group, as its
+/// journal is, so it cannot share the journals' directory.
+pub const CHECKPOINT_DIR: &str = "checkpoints";
+
+/// Where the checkpoint stores of the groups whose journals are in
+/// `journal_dir` live: `<journal_dir>/checkpoints`, found so by the
+/// Archive, by replay and by `replay diff --from-checkpoint`.
+#[must_use]
+pub fn store_dir(journal_dir: &Path) -> std::path::PathBuf {
+    journal_dir.join(CHECKPOINT_DIR)
+}
+
 /// The encoded length of a checkpoint record.
 const RECORD_LENGTH: usize = 12 + 40;
 /// The same, as the template declares it.
@@ -90,6 +103,14 @@ pub enum CheckpointError {
     /// names them. The store then fails until recovered.
     #[error(transparent)]
     Store(#[from] SegmentError),
+    /// The group stopped, failed or ended: the checkpoint is not written,
+    /// and its buffer comes back.
+    #[error("the group stopped")]
+    Stopped,
+    /// No checkpoint is being written, or `advance` was given another
+    /// request than `begin`.
+    #[error("no checkpoint is being written for this request")]
+    NotStarted,
     /// The store's sync left the bytes short of durable (`durable`, below
     /// their `end`): no record is appended. Under `SyncPolicy::None`,
     /// which capture refuses for a journal, a checkpoint crossing a
@@ -180,6 +201,22 @@ impl<D: Disk> CheckpointStore<D> {
         } else {
             CheckpointHeld::Written
         }
+    }
+
+    /// Marks `[written, end)` lost, for a store recreated after it went
+    /// missing while its journal's records name ranges up to `end`: they
+    /// read as lost, never open their ranges, and are never reused.
+    ///
+    /// # Errors
+    ///
+    /// The store's errors.
+    pub fn mark_lost(&mut self, end: u64) -> Result<(), SegmentError> {
+        let written = self.store.written();
+        if end > written {
+            let _ = self.store.append_gap(written, end)?;
+            let _ = self.store.sync()?;
+        }
+        Ok(())
     }
 
     /// Reads `buf.len()` bytes at `position`.
@@ -436,6 +473,22 @@ pub struct CheckpointWriter<D: Disk> {
     store: CheckpointStore<D>,
     next_id: u64,
     record: [u8; RECORD_LENGTH],
+    /// The checkpoint being written in chunks: its record, and how many of
+    /// its bytes are in the store.
+    writing: Option<(CheckpointRecord, usize)>,
+}
+
+/// How far [`CheckpointWriter::advance`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Its bytes are written up to `written`; the record waits for the
+    /// rest.
+    Writing {
+        /// The bytes in the store so far.
+        written: usize,
+    },
+    /// Written, synced, and recorded.
+    Recorded(CheckpointRecord),
 }
 
 impl<D: Disk> CheckpointWriter<D> {
@@ -458,7 +511,126 @@ impl<D: Disk> CheckpointWriter<D> {
             store,
             next_id,
             record: [0; RECORD_LENGTH],
+            writing: None,
         })
+    }
+
+    /// Starts writing `request` in chunks ([`CheckpointWriter::advance`]):
+    /// its record is fixed and checked against `journal`'s order rules, so
+    /// a refusal writes nothing. A checkpoint already being written is let
+    /// go: its bytes stay unnamed.
+    ///
+    /// # Errors
+    ///
+    /// As [`CheckpointWriter::write`] before anything is written.
+    pub fn begin(
+        &mut self,
+        journal: &GroupJournal<D>,
+        request: &CheckpointRequest,
+    ) -> Result<(), CheckpointError> {
+        self.writing = None;
+        let bytes = request.bytes();
+        let length = u64::try_from(bytes.len()).map_err(|_| SegmentError::PositionOverflow)?;
+        let record = CheckpointRecord {
+            group_seq: request.group_seq,
+            checkpoint_id: self.next_id,
+            position: self.store.written(),
+            length,
+            crc32c: crc32c(bytes),
+            format: request.format,
+        };
+        let mut check = *journal.order();
+        check.push(GroupRecord::Checkpoint(record).role())?;
+        let _ = self.next_id.checked_add(1).ok_or(OrderError {
+            ordinal: journal.order().records(),
+            rule: super::order::OrderRule::Exhausted,
+        })?;
+        self.writing = Some((record, 0));
+        Ok(())
+    }
+
+    /// Writes at most `budget` more bytes of the checkpoint
+    /// [`CheckpointWriter::begin`] started, `request` the same; once they
+    /// are all written, syncs them and appends its record to `journal`.
+    /// A crash before then leaves no record, and recovery cuts the bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`CheckpointError::NotStarted`] with none begun, or for another
+    /// request; then as [`CheckpointWriter::write`]. On an error the
+    /// checkpoint is let go.
+    pub fn advance(
+        &mut self,
+        journal: &mut GroupJournal<D>,
+        request: &CheckpointRequest,
+        budget: usize,
+    ) -> Result<Progress, CheckpointError> {
+        let result = self.advance_inner(journal, request, budget);
+        if !matches!(result, Ok(Progress::Writing { .. })) {
+            self.writing = None;
+        }
+        result
+    }
+
+    fn advance_inner(
+        &mut self,
+        journal: &mut GroupJournal<D>,
+        request: &CheckpointRequest,
+        budget: usize,
+    ) -> Result<Progress, CheckpointError> {
+        let (record, written) = self.writing.ok_or(CheckpointError::NotStarted)?;
+        let bytes = request.bytes();
+        if record.group_seq != request.group_seq
+            || u64::try_from(bytes.len()).ok() != Some(record.length)
+        {
+            return Err(CheckpointError::NotStarted);
+        }
+        let take = budget.min(
+            bytes
+                .len()
+                .checked_sub(written)
+                .ok_or(CheckpointError::NotStarted)?,
+        );
+        let to = written
+            .checked_add(take)
+            .ok_or(CheckpointError::NotStarted)?;
+        let chunk = bytes.get(written..to).ok_or(CheckpointError::NotStarted)?;
+        let at = record
+            .position
+            .checked_add(u64::try_from(written).map_err(|_| SegmentError::PositionOverflow)?)
+            .ok_or(SegmentError::PositionOverflow)?;
+        if !chunk.is_empty() {
+            let _ = self.store.store.append(at, chunk)?;
+        }
+        if to < bytes.len() {
+            self.writing = Some((record, to));
+            return Ok(Progress::Writing { written: to });
+        }
+        // Checked again: the journal moved on while the bytes were written.
+        let mut check = *journal.order();
+        check.push(GroupRecord::Checkpoint(record).role())?;
+        let encoded = record
+            .encode(&mut self.record)
+            .map_err(JournalError::Record)?;
+        let next_id = self.next_id.checked_add(1).ok_or(OrderError {
+            ordinal: journal.order().records(),
+            rule: super::order::OrderRule::Exhausted,
+        })?;
+        let end = record.end().ok_or(SegmentError::PositionOverflow)?;
+        // Durable before its record: a kept record never names lost bytes.
+        let durable = self.store.store.sync()?;
+        if durable < end {
+            return Err(CheckpointError::NotDurable { durable, end });
+        }
+        let _ = journal.append(self.record.get(..encoded).unwrap_or_default())?;
+        self.next_id = next_id;
+        Ok(Progress::Recorded(record))
+    }
+
+    /// Whether a checkpoint is being written.
+    #[must_use]
+    pub const fn writing(&self) -> bool {
+        self.writing.is_some()
     }
 
     /// Writes `request`'s bytes to the store, then its record to
@@ -476,35 +648,12 @@ impl<D: Disk> CheckpointWriter<D> {
         journal: &mut GroupJournal<D>,
         request: &CheckpointRequest,
     ) -> Result<CheckpointRecord, CheckpointError> {
-        let bytes = request.bytes();
-        let length = u64::try_from(bytes.len()).map_err(|_| SegmentError::PositionOverflow)?;
-        let record = CheckpointRecord {
-            group_seq: request.group_seq,
-            checkpoint_id: self.next_id,
-            position: self.store.written(),
-            length,
-            crc32c: crc32c(bytes),
-            format: request.format,
-        };
-        // Checked first: a refusal writes nothing.
-        let mut check = *journal.order();
-        check.push(GroupRecord::Checkpoint(record).role())?;
-        let encoded = record
-            .encode(&mut self.record)
-            .map_err(JournalError::Record)?;
-        let next_id = self.next_id.checked_add(1).ok_or(OrderError {
-            ordinal: journal.order().records(),
-            rule: super::order::OrderRule::Exhausted,
-        })?;
-        let end = self.store.store.append(record.position, bytes)?;
-        // Durable before its record: a kept record never names lost bytes.
-        let durable = self.store.store.sync()?;
-        if durable < end {
-            return Err(CheckpointError::NotDurable { durable, end });
+        self.begin(journal, request)?;
+        match self.advance(journal, request, usize::MAX)? {
+            Progress::Recorded(record) => Ok(record),
+            // Never with an unbounded budget.
+            Progress::Writing { .. } => Err(CheckpointError::NotStarted),
         }
-        let _ = journal.append(self.record.get(..encoded).unwrap_or_default())?;
-        self.next_id = next_id;
-        Ok(record)
     }
 
     /// The store.
@@ -516,5 +665,154 @@ impl<D: Disk> CheckpointWriter<D> {
     /// The store, to sync or read.
     pub fn store_mut(&mut self) -> &mut CheckpointStore<D> {
         &mut self.store
+    }
+
+    /// Closes the store with everything written durable.
+    ///
+    /// # Errors
+    ///
+    /// The store's errors.
+    pub fn close(self) -> Result<u64, SegmentError> {
+        self.store.close()
+    }
+}
+
+/// What one handoff holds: the request the writer has to take, and the
+/// one it gave back, with how its write ended.
+#[derive(Debug, Default)]
+struct Handoff {
+    request: Option<CheckpointRequest>,
+    returned: Option<(CheckpointRequest, Result<CheckpointRecord, CheckpointError>)>,
+    /// The group stopped, failed or ended: nothing more is written.
+    closed: bool,
+}
+
+/// The one-slot handoff between the Gateway's thread and the Archive's,
+/// shared by a [`CheckpointHandle`] and a [`CheckpointInbox`]. Each side
+/// locks it only to move the buffer, by ownership: nothing is copied or
+/// allocated per checkpoint.
+type Shared = std::sync::Arc<std::sync::Mutex<Handoff>>;
+
+fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Handoff> {
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The Gateway's end of a group's checkpoints (A9-3): its
+/// [`CheckpointSlot`], and the handoff to the Archive's writer.
+#[derive(Debug)]
+pub struct CheckpointHandle {
+    slot: CheckpointSlot,
+    shared: Shared,
+}
+
+/// The Archive's end: it takes the requests and gives the buffers back.
+#[derive(Debug)]
+pub struct CheckpointInbox {
+    shared: Shared,
+}
+
+/// A handoff of `max_checkpoint` bytes: both ends, allocated here only.
+#[must_use]
+pub fn handoff(max_checkpoint: usize) -> (CheckpointHandle, CheckpointInbox) {
+    let shared = Shared::default();
+    // A platform mutex may allocate at its first lock: done here, so no
+    // checkpoint does.
+    drop(lock(&shared));
+    (
+        CheckpointHandle {
+            slot: CheckpointSlot::new(max_checkpoint),
+            shared: std::sync::Arc::clone(&shared),
+        },
+        CheckpointInbox { shared },
+    )
+}
+
+impl CheckpointHandle {
+    /// Takes a checkpoint of the state after event `group_seq`, as
+    /// [`CheckpointSlot::take`] does, and hands it to the Archive's writer.
+    ///
+    /// # Errors
+    ///
+    /// [`CheckpointSlot::take`]'s, each counted.
+    pub fn checkpoint(
+        &mut self,
+        group_seq: u64,
+        format: u32,
+        write: impl FnOnce(&mut [u8]) -> usize,
+    ) -> Result<(), CheckpointError> {
+        self.poll();
+        let request = self.slot.take(group_seq, format, write)?;
+        let mut shared = lock(&self.shared);
+        if shared.closed {
+            drop(shared);
+            // The buffer stays here, the refusal counted as a failure.
+            self.slot.returned(request, &Err(CheckpointError::Stopped));
+            return Err(CheckpointError::Stopped);
+        }
+        shared.request = Some(request);
+        Ok(())
+    }
+
+    /// Takes back the buffer of a write that ended, if one did: its result
+    /// is then [`CheckpointHandle::last_checkpoint`]'s.
+    pub fn poll(&mut self) {
+        let returned = lock(&self.shared).returned.take();
+        if let Some((request, result)) = returned {
+            self.slot.returned(request, &result);
+        }
+    }
+
+    /// A strict journal ended: every later checkpoint is refused.
+    pub fn end(&mut self) {
+        self.slot.end();
+    }
+
+    /// Whether a checkpoint handed over still waits for the writer to
+    /// take it.
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        lock(&self.shared).request.is_some()
+    }
+
+    /// How the last checkpoint the writer took ended.
+    #[must_use]
+    pub const fn last_checkpoint(&self) -> Option<LastCheckpoint> {
+        self.slot.last_checkpoint()
+    }
+
+    /// Its counts.
+    #[must_use]
+    pub const fn stats(&self) -> CheckpointStats {
+        self.slot.stats()
+    }
+}
+
+impl CheckpointInbox {
+    /// The request waiting, taken.
+    #[must_use]
+    pub fn take(&self) -> Option<CheckpointRequest> {
+        lock(&self.shared).request.take()
+    }
+
+    /// Closes the handoff: the group stopped, failed or ended. A request
+    /// still waiting goes back, [`CheckpointError::Stopped`], and every
+    /// later one is refused so.
+    pub fn close(&self) {
+        let mut shared = lock(&self.shared);
+        shared.closed = true;
+        if let Some(request) = shared.request.take() {
+            shared.returned = Some((request, Err(CheckpointError::Stopped)));
+        }
+    }
+
+    /// Gives `request`'s buffer back, with how its write ended.
+    pub fn give_back(
+        &self,
+        request: CheckpointRequest,
+        result: Result<CheckpointRecord, CheckpointError>,
+    ) {
+        lock(&self.shared).returned = Some((request, result));
     }
 }
