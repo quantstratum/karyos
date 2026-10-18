@@ -65,12 +65,20 @@ fn ipc_driver(dir: &Path) -> IpcDriver {
 
 /// As [`ipc_driver`], with `network`.
 fn ipc_driver_with(dir: &Path, network: NetworkConfig) -> IpcDriver {
-    let timeout = 5_000_000_000;
-    EmbeddedDriver::with_ipc(
+    ipc_driver_configured(
+        dir,
         DriverConfig {
             network: Some(network),
             ..DriverConfig::default()
         },
+    )
+}
+
+/// As [`ipc_driver`], with `config`.
+fn ipc_driver_configured(dir: &Path, config: DriverConfig) -> IpcDriver {
+    let timeout = 5_000_000_000;
+    EmbeddedDriver::with_ipc(
+        config,
         IpcConfig {
             dir: dir.to_path_buf(),
             max_pending_hellos: 2,

@@ -68,10 +68,27 @@ const BUDGET: Budget = Budget {
 
 type IpcDriver = EmbeddedDriver<SharedTerms>;
 
-fn dir(name: &str) -> PathBuf {
+fn dir(name: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("karyos-netproc-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    dir
+    TempDir(dir)
+}
+
+/// A test's directory, removed when the test ends, passed or not.
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// The network of every driver here: Shared agents, so each duty cycle
@@ -129,7 +146,12 @@ fn heap_driver(network: NetworkConfig) -> EmbeddedDriver {
 }
 
 /// A loopback address on a port the OS picked as free, for a `karyos:udp`
-/// URI, which cannot name port 0.
+/// URI, which cannot name port 0. The probe socket closes before the child
+/// subscribes, so another process may take the port in between: the child
+/// cannot bind it itself, since a subscription URI names its port and a
+/// remote client has no call that reads back the address a driver bound.
+/// The window is one process spawn; a collision fails the subscription
+/// loudly, never silently.
 fn free_address() -> SocketAddr {
     std::net::UdpSocket::bind(ANY_PORT)
         .unwrap()
@@ -284,9 +306,15 @@ fn counter<T: StreamTerms>(driver: &EmbeddedDriver<T>, label: &str) -> u64 {
         .unwrap()
 }
 
-/// Descriptors open in this process.
-fn open_descriptors() -> usize {
-    std::fs::read_dir("/proc/self/fd").unwrap().count()
+/// The open descriptors of shared regions (`/memfd:karyos-region`, as
+/// `/proc/self/fd` links name them): what an image or a grant leaks.
+/// Sockets are not counted, since a removed publication's socket closes
+/// on its own schedule.
+fn region_descriptors() -> usize {
+    descriptor_targets()
+        .iter()
+        .filter(|target| target.starts_with("/memfd:karyos-region"))
+        .count()
 }
 
 /// What each open descriptor names, for a failure's report.
@@ -499,8 +527,12 @@ fn a_remote_udp_publisher_killed_mid_offer_is_resolved_and_sent_past() {
 }
 
 /// Case 6, resolution 9: the image is retired while a remote `Fetch` of
-/// its `Held` grant is in flight. The grant is either refused, or fetched
-/// and then reports closed at the seal; never left open.
+/// its `Held` grant is in flight. B runs until the image's stream is
+/// retiring (held by the grant, so not freed) before the child sends its
+/// `Fetch`, so the fetch always meets a retired image. The grant is either
+/// refused (`AttachError::Refused` only: a timeout or any other error
+/// fails), or fetched and then reports closed at the seal; never left
+/// open, and the stream frees once the subscriber leaves.
 #[test]
 fn an_image_retired_during_a_remote_fetch_never_leaves_the_grant_open() {
     let dir = dir("fetch-retire");
@@ -513,20 +545,18 @@ fn an_image_retired_during_a_remote_fetch_never_leaves_the_grant_open() {
     let publication = a
         .add_network_publication(aggregate(3), &channel(address))
         .unwrap();
+    let mut image = None;
     pump(&mut a, &mut b, "the image", |_, b| {
-        b.network_image(STREAM_ID, 3).is_some()
+        image = b.network_image(STREAM_ID, 3);
+        image.is_some()
     });
+    let lane = image.unwrap().lane(Lane::ZERO).unwrap();
     let (mut child, reports) = spawn("image-fetch-on-go", &dir, "3");
     let _ = pump_until_report(&mut a, &mut b, &reports, "granted");
-    // The removal's EOS reaches B's socket while B is idle; then the
-    // child fetches, and B serves the EOS, the retirement and the fetch
-    // in the same cycles.
     a.remove_aggregate(&publication).unwrap();
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(300) {
-        let _ = a.do_work().unwrap();
-        std::thread::sleep(Duration::from_micros(50));
-    }
+    pump(&mut a, &mut b, "the image retiring", |_, b| {
+        b.stream_state(lane).unwrap() == karyos_driver::StreamState::Retiring
+    });
     tell(&mut child.0, "go");
     let _ = pump_until_report(&mut a, &mut b, &reports, "fetching");
     let outcome = pump_until_report(&mut a, &mut b, &reports, "");
@@ -539,9 +569,10 @@ fn an_image_retired_during_a_remote_fetch_never_leaves_the_grant_open() {
         b.clients() == 0
     });
     assert!(child.0.wait().unwrap().success());
-    // Whichever it was, nothing names the image any more.
+    // Whichever it was, nothing holds the image's stream any more:
+    // `network_image` hides a retiring stream, so the state is read.
     pump(&mut a, &mut b, "the image freed", |_, b| {
-        b.network_image(STREAM_ID, 3).is_none()
+        b.stream_state(lane).unwrap() == karyos_driver::StreamState::Freed
     });
 }
 
@@ -558,8 +589,11 @@ fn image_rounds_with_remote_subscribers_keep_the_descriptor_count() {
     assert!(child.0.wait().unwrap().success());
 }
 
-/// Image rounds of the descriptor test.
-const ROUNDS: i32 = 16;
+/// Image rounds of the descriptor test, after its warm-up round. With the
+/// warm-up they make 16 registrations, the remote client's cap
+/// (`max_exports_per_client`), so a reclaim regression shows as leaked
+/// region descriptors in the report, not as a refused 17th subscription.
+const ROUNDS: i32 = 15;
 
 /// One image round: A publishes `session`, B installs its image, the
 /// remote subscriber takes and reads it, A removes the publication, and
@@ -625,21 +659,21 @@ fn image_descriptor_driver(dir: &Path) {
     let _ = pump_until_report(&mut a, &mut b, &reports, "attached");
     // Warm up: the first round creates what the drivers keep.
     image_round(&mut a, &mut b, &mut client.0, &reports, address, 1);
-    let before = open_descriptors();
+    let before = region_descriptors();
     let before_targets = descriptor_targets();
     let detached = counter(&b, "grants detached");
     for session in 2..2 + ROUNDS {
         image_round(&mut a, &mut b, &mut client.0, &reports, address, session);
     }
-    // A's last removals finish their EOS interval: run until the count is
-    // back, within a bound, so a leak shows as a difference.
-    let mut after = open_descriptors();
+    // The last image's regions go once its stream frees: run until the
+    // count is back, within a bound, so a leak shows as a difference.
+    let mut after = region_descriptors();
     let start = Instant::now();
     while after != before && start.elapsed() < Duration::from_secs(5) {
         let _ = a.do_work().unwrap();
         let _ = b.do_work().unwrap();
         std::thread::sleep(Duration::from_millis(1));
-        after = open_descriptors();
+        after = region_descriptors();
     }
     let after_targets = descriptor_targets();
     let rounds = u64::try_from(ROUNDS).unwrap();
@@ -650,7 +684,7 @@ fn image_descriptor_driver(dir: &Path) {
     assert!(client.0.wait().unwrap().success());
     if after != before || counter(&b, "grants detached") != detached + rounds {
         report(&format!(
-            "descriptors before {before} after {after}, detached {} of {}, before {before_targets:?} after {:?}",
+            "region descriptors before {before} after {after}, detached {} of {}, before {before_targets:?} after {:?}",
             counter(&b, "grants detached") - detached,
             rounds,
             after_targets
@@ -867,7 +901,8 @@ fn child() {
             let _ = wait_for_line();
             report("fetching");
             match client.take_subscription(&grant) {
-                Err(_) => report("refused"),
+                Err(karyos_client::ipc::AttachError::Refused { .. }) => report("refused"),
+                Err(other) => report(&format!("failed {other:?}")),
                 Ok(mut subscription) => {
                     let (_, reason) = read_to_close(&mut subscription);
                     report(&format!("closed {:?}", reason.unwrap()));

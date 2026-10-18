@@ -395,6 +395,24 @@ pub struct ReceiveSessions {
 }
 
 impl ReceiveSessions {
+    /// Retired images whose `StorageReclaimed` arrived and whose tombstone
+    /// still waits out its quarantine (tests).
+    #[cfg(test)]
+    pub(crate) fn reclaimed_tombstones(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot.state,
+                    State::Retired {
+                        reclaimed: true,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
     /// A table for the receiver started with `boot_id` (random, not all
     /// zero); every slot is allocated here.
     ///
