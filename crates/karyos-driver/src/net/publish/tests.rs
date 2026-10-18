@@ -2007,8 +2007,11 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         (routed, ScheduleOptions::default(), Unsupported::Routed),
         (
             unreliable.clone(),
+            // The horizon plus one heartbeat interval (the silence before
+            // a held head) reaches the liveness timeout.
             ScheduleOptions {
-                max_horizon: crate::agents::AgentConfig::default().image_liveness_timeout,
+                max_horizon: crate::agents::AgentConfig::default().image_liveness_timeout
+                    - crate::agents::AgentConfig::default().sender_heartbeat_interval,
                 ..ScheduleOptions::default()
             },
             Unsupported::HorizonPastLiveness,
@@ -2028,6 +2031,16 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         driver.free_retired_streams();
         assert!(driver.streams.is_empty(), "{reason:?}");
     }
+    // A reliable channel is accepted (PR1b).
+    let mut config = aggregate(12, 1);
+    config.stream.buffer.schedule_capacity = 4;
+    let reliable = driver.add_timed_network_publication(
+        config,
+        &channel(destination),
+        None,
+        ScheduleOptions::default(),
+    );
+    assert!(reliable.is_ok(), "{reliable:?}");
     // A timed add of lanes with no ring is refused too.
     let refused = driver.add_timed_network_publication(
         aggregate(10, 1),

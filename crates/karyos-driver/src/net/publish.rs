@@ -200,7 +200,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// [`DriverError::TimedNetworkUnsupported`] for a channel with paths,
-    /// the `Tai` domain, cancel-on-deadline or a `max_horizon` at or past
+    /// the `Tai` domain, cancel-on-deadline or a `max_horizon` that, with
+    /// one `sender_heartbeat_interval`, reaches
     /// `image_liveness_timeout`;
     /// [`DriverError::InvalidConfig`] for lanes with no schedule ring; the
     /// errors of [`EmbeddedDriver::add_network_publication`] and of
@@ -235,10 +236,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let timed =
             (config.stream.buffer.schedule_capacity > 0).then(|| schedule.unwrap_or_default());
         if let Some(options) = timed {
-            let liveness = self
-                .config
-                .network
-                .map(|network| network.agents.image_liveness_timeout);
+            let liveness = self.config.network.map(|network| {
+                (
+                    network.agents.image_liveness_timeout,
+                    network.agents.sender_heartbeat_interval,
+                )
+            });
             timed_supported(channel, options, liveness)?;
         }
         // Redundant paths need sockets isolated per interface; without it
@@ -544,7 +547,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 fn timed_supported(
     channel: &UdpConfig,
     options: karyos_client::schedule::ScheduleOptions,
-    liveness: Option<u64>,
+    liveness: Option<(u64, u64)>,
 ) -> Result<(), DriverError> {
     use crate::error::TimedNetworkUnsupported as Unsupported;
 
@@ -554,7 +557,14 @@ fn timed_supported(
         Some(Unsupported::TaiDomain)
     } else if options.cancel_on_deadline {
         Some(Unsupported::CancelOnDeadline)
-    } else if liveness.is_some_and(|liveness| options.max_horizon >= liveness) {
+    } else if liveness.is_some_and(|(liveness, heartbeat)| {
+        // A lane's last heartbeat can come one interval before its held
+        // head: the silence is up to the horizon plus that interval.
+        options
+            .max_horizon
+            .checked_add(heartbeat)
+            .is_none_or(|silence| silence >= liveness)
+    }) {
         Some(Unsupported::HorizonPastLiveness)
     } else {
         None

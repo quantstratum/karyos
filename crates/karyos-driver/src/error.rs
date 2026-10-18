@@ -35,12 +35,13 @@ pub enum TimedNetworkUnsupported {
     /// the sender agent does not hold.
     #[error("cancel-on-deadline")]
     CancelOnDeadline,
-    /// A horizon at or past the image liveness timeout: a lane holding
-    /// only a head that far ahead sends nothing (no DATA, and no idle
-    /// heartbeat while a head is staged), so its receivers' images would
-    /// retire before it leaves. Receivers are assumed to use this driver's
-    /// `image_liveness_timeout`.
-    #[error("a horizon at or past the image liveness timeout")]
+    /// A horizon that, with one heartbeat interval, reaches the image
+    /// liveness timeout: a lane holding only a head that far ahead sends
+    /// nothing (no DATA, and no idle heartbeat while a head is staged),
+    /// and its last heartbeat can come one interval before, so its
+    /// receivers' images would retire before it leaves. Receivers are
+    /// assumed to use this driver's `image_liveness_timeout`.
+    #[error("a horizon that, with a heartbeat interval, reaches the image liveness timeout")]
     HorizonPastLiveness,
 }
 
