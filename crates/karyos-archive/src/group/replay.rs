@@ -412,8 +412,9 @@ pub(crate) fn allocate<T>(capacity: usize) -> Result<Vec<T>, ReplayError> {
 /// in it, each recorded checkpoint given right after its event.
 ///
 /// It allocates only when opened: the buffer, the events a reference
-/// unavailable names, and the replayed range's checkpoints. Each [`ReplayCursor::step`] reads one
-/// event's records into the buffer and lends them until the next call.
+/// unavailable names, and the replayed range's checkpoints. Each
+/// [`ReplayCursor::step`] reads one event's records into the buffer and
+/// lends them until the next call.
 #[derive(Debug)]
 pub struct ReplayCursor<D: Disk> {
     journal: GroupJournal<D>,

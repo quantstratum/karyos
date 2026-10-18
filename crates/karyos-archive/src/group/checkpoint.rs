@@ -160,6 +160,28 @@ impl<D: Disk> CheckpointStore<D> {
         Ok(Self { store })
     }
 
+    /// Opens group `group_id`'s store in `dir` for reading, as
+    /// [`CheckpointStore::recover`] would leave it, changing nothing (a
+    /// replay diff's view, over a read-only directory): the store's
+    /// recovery plan applied in memory, its bytes past `recorded_end`
+    /// unnamed, and a range up to it that the store lost held as lost.
+    ///
+    /// # Errors
+    ///
+    /// The store's errors.
+    pub fn open_verified(
+        disk: D,
+        dir: &Path,
+        group_id: u64,
+        config: JournalConfig,
+        recorded_end: u64,
+    ) -> Result<Self, SegmentError> {
+        let mut store =
+            SegmentStore::open_verified(disk, dir, group_id, geometry(config)?, config.policy)?;
+        store.view_until(recorded_end);
+        Ok(Self { store })
+    }
+
     /// What it holds of `[position, end)`, the prefix tracker's
     /// [`super::prefix::Coverage::checkpoint`]: lost when recovery marked
     /// it so, or below the store's start; missing past its written

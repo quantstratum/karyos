@@ -15,10 +15,14 @@
 //! bounded only by incomplete events and gap markers. A payload not
 //! captured, or a reference unavailable, in the range is not comparable.
 //!
-//! Recorded checkpoints (A9-2, template 30) are not compared yet: the
-//! cursor gives them right after their events, and the diff passes over
-//! them. Their comparison, matched by `group_seq` with the `state
-//! checkpoint` kind, and `--from-checkpoint` follow (A8-2).
+//! Recorded checkpoints (template 30, A8-2) are compared as records,
+//! matched by `group_seq`: their length, crc32c and format; a difference,
+//! or a checkpoint on one side only, is the `state checkpoint` kind.
+//! `--from-checkpoint <id>` opens the left journal at its checkpoint
+//! `<id>` and the right one at its checkpoint with the same `group_seq`,
+//! each through its store opened read only: what the store's recovery
+//! would cut or mark lost reads as lost, so a damaged checkpoint is not
+//! comparable.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -53,8 +57,10 @@ Usage: karyos-tools replay diff <left-dir> <left-group> <right-dir> <right-group
                         complete prefix]
   --json                one JSON object instead of text
   --accept-manifest     compare journals whose manifests differ
-  --from-checkpoint <id>  compare from the event after checkpoint <id>, in
-                        the range it opens (its store in <dir>/checkpoints)
+  --from-checkpoint <id>  compare from the event after the left journal's
+                        checkpoint <id> and the right one's at its group_seq
+                        (stores in <dir>/checkpoints; a replay capture has
+                        none, so it is not comparable)
   -h, --help            print this text
 
 Exit status: 0 identical over the range; 1 diverged, the first difference
@@ -117,13 +123,18 @@ pub fn parse_diff(args: impl IntoIterator<Item = OsString>) -> Result<Option<Dif
             "--json" => json = true,
             "--accept-manifest" => accept_manifest = true,
             "--from" | "--to" | "--from-checkpoint" => {
+                let what = if text == "--from-checkpoint" {
+                    "a checkpoint id"
+                } else {
+                    "a group_seq"
+                };
                 let value = args
                     .next()
                     .and_then(|value| value.to_str().map(str::to_owned))
-                    .ok_or_else(|| format!("{text} needs a group_seq"))?;
+                    .ok_or_else(|| format!("{text} needs {what}"))?;
                 let seq = value
                     .parse::<u64>()
-                    .map_err(|_| format!("{text}: not a group_seq: {value}"))?;
+                    .map_err(|_| format!("{text}: not {what}: {value}"))?;
                 match text {
                     "--from" => from = Some(seq),
                     "--to" => to = Some(seq),
@@ -382,23 +393,78 @@ impl Coverage for Records {
     }
 }
 
+/// As [`Records`], with checkpoints as a store opened read only holds
+/// them: one it lost never opens its range (`--from-checkpoint`).
+struct Stored<'s, D: Disk>(&'s CheckpointStore<D>);
+
+impl<D: Disk> Coverage for Stored<'_, D> {
+    fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
+        Records.positions(recording_id)
+    }
+
+    fn ended(&self, recording_id: u64) -> Option<u64> {
+        Records.ended(recording_id)
+    }
+
+    fn checkpoint(&self, position: u64, end: u64) -> CheckpointHeld {
+        self.0.holds(position, end)
+    }
+}
+
+/// Where a journal opens for the diff.
+#[derive(Debug, Clone, Copy)]
+enum At {
+    /// At its first event.
+    Start,
+    /// After its checkpoint with this id (the left journal's).
+    Id(u64),
+    /// After its checkpoint at this `group_seq` (the right journal's).
+    GroupSeq(u64),
+}
+
+impl At {
+    /// Whether `checkpoint` is the one this opens at.
+    fn names(self, checkpoint: &CheckpointRecord) -> bool {
+        match self {
+            Self::Start => false,
+            Self::Id(id) => checkpoint.checkpoint_id == id,
+            Self::GroupSeq(group_seq) => checkpoint.group_seq == group_seq,
+        }
+    }
+}
+
 /// The checkpoint directory beside a group's journal (A9 section 2).
 pub const CHECKPOINTS: &str = "checkpoints";
 
-/// The snapshot length checkpoint `checkpoint_id`'s record names in
-/// `journal`, 0 when it names none (the open then says it is unknown).
-fn checkpoint_length<D: Disk>(journal: &mut GroupJournal<D>, checkpoint_id: u64) -> usize {
-    let mut length = 0;
+/// The first checkpoint record in `journal` that `found` accepts.
+fn find_checkpoint<D: Disk>(
+    journal: &mut GroupJournal<D>,
+    found: impl Fn(&CheckpointRecord) -> bool,
+) -> Result<Option<CheckpointRecord>, JournalError> {
+    let mut checkpoint = None;
     let _ = journal.walk(0, |_, _, record| {
-        if let GroupRecord::Checkpoint(checkpoint) = record
-            && checkpoint.checkpoint_id == checkpoint_id
+        if let GroupRecord::Checkpoint(recorded) = record
+            && found(recorded)
         {
-            length = usize::try_from(checkpoint.length).unwrap_or(0);
+            checkpoint = Some(*recorded);
             return false;
         }
         true
-    });
-    length
+    })?;
+    Ok(checkpoint)
+}
+
+/// A zeroed buffer for `checkpoint`'s snapshot, one allocation that fails
+/// typed; empty for none (the open then says it is unknown).
+fn snapshot_buffer(checkpoint: Option<&CheckpointRecord>) -> Result<Vec<u8>, String> {
+    let length = checkpoint.map_or(0, |checkpoint| checkpoint.length);
+    let length = usize::try_from(length).map_err(|_| format!("a snapshot of {length} bytes"))?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| format!("a snapshot of {length} bytes cannot be allocated"))?;
+    buffer.resize(length, 0);
+    Ok(buffer)
 }
 
 /// A journal open for the diff: its cursor, its header's manifest and
@@ -427,7 +493,7 @@ fn open<D: Disk + Clone>(
     disk: D,
     journal: &Journal,
     side: &str,
-    from_checkpoint: Option<u64>,
+    at: At,
 ) -> Result<Opened<D>, Report> {
     let mut disk = ReadOnly(disk);
     let store_disk = disk.clone();
@@ -520,8 +586,6 @@ fn open<D: Disk + Clone>(
         })
         .map_err(|failure| context(&failure))?;
     let (manifest, first) = header.ok_or_else(|| context(&"no header"))?;
-    let recovery = recover(&mut recovered, &Records, RECOVERY_CAPACITY)
-        .map_err(|failure| context(&failure))?;
     let config = ReplayConfig {
         manifest: &manifest,
         accept_manifest: false,
@@ -530,15 +594,31 @@ fn open<D: Disk + Clone>(
         bytes: largest.max(1),
         records: most.max(2),
     };
-    let opened = match from_checkpoint {
-        None => {
+    let opened = match at {
+        At::Start => {
+            let recovery = recover(&mut recovered, &Records, RECOVERY_CAPACITY)
+                .map_err(|failure| context(&failure))?;
             ReplayCursor::open(recovered, &recovery, &config, room).map(|cursor| (cursor, None))
         }
-        Some(checkpoint_id) => {
+        At::Id(_) | At::GroupSeq(_) => {
+            let found = find_checkpoint(&mut recovered, |found| at.names(found))
+                .map_err(|failure| context(&failure))?;
+            let checkpoint_id = match (found, at) {
+                (Some(found), _) => found.checkpoint_id,
+                // Unknown: the open says so.
+                (None, At::Id(id)) => id,
+                (None, At::GroupSeq(group_seq)) => {
+                    return Err(not_comparable(format!(
+                        "{side} journal: no checkpoint at group_seq {group_seq}"
+                    )));
+                }
+                (None, At::Start) => return Err(context(&"no checkpoint to open at")),
+            };
             // The group's checkpoint store, in the checkpoint directory
-            // beside its journal (A9 section 2), read only too.
+            // beside its journal (A9 section 2), opened as its recovery
+            // would leave it, without repairing it.
             let ended = recorded_end(&mut recovered).map_err(|failure| context(&failure))?;
-            let mut store = match CheckpointStore::recover(
+            let mut store = match CheckpointStore::open_verified(
                 store_disk,
                 &journal.dir.join(CHECKPOINTS),
                 journal.group,
@@ -559,13 +639,12 @@ fn open<D: Disk + Clone>(
                         "{side} journal: checkpoint {checkpoint_id}'s store is not there"
                     )));
                 }
-                Err(failure) => {
-                    return Err(context(&format_args!(
-                        "{failure}; the checkpoint store needs recovery"
-                    )));
-                }
+                Err(failure) => return Err(context(&failure)),
             };
-            let mut snapshot = vec![0u8; checkpoint_length(&mut recovered, checkpoint_id)];
+            let recovery = recover(&mut recovered, &Stored(&store), RECOVERY_CAPACITY)
+                .map_err(|failure| context(&failure))?;
+            let mut snapshot =
+                snapshot_buffer(found.as_ref()).map_err(|failure| context(&failure))?;
             ReplayCursor::open_at_checkpoint(
                 recovered,
                 &recovery,
@@ -607,11 +686,17 @@ pub fn diff(args: &DiffArgs) -> Report {
 /// Compares the journals `args` names on `disk`.
 #[must_use]
 pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
-    let mut left = match open(disk.clone(), &args.left, "left", args.from_checkpoint) {
+    let at = args.from_checkpoint.map_or(At::Start, At::Id);
+    let mut left = match open(disk.clone(), &args.left, "left", at) {
         Ok(left) => left,
         Err(report) => return report,
     };
-    let mut right = match open(disk, &args.right, "right", args.from_checkpoint) {
+    // The id names the left journal's checkpoint; the right journal's is
+    // the one at the same `group_seq`.
+    let at = left
+        .checkpoint
+        .map_or(At::Start, |checkpoint| At::GroupSeq(checkpoint.group_seq));
+    let mut right = match open(disk, &args.right, "right", at) {
         Ok(right) => right,
         Err(report) => return report,
     };
@@ -644,9 +729,12 @@ pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
     let from = args.from.unwrap_or(first);
     // Below a journal's first event, its events are not there to compare.
     if from < first {
-        return not_comparable(format!(
-            "--from {from} is before a journal's first event, group_seq {first}"
-        ));
+        let what = if left.checkpoint.is_some() {
+            "the event after the checkpoint"
+        } else {
+            "a journal's first event"
+        };
+        return not_comparable(format!("--from {from} is before {what}, group_seq {first}"));
     }
     compare(
         &mut left.cursor,
