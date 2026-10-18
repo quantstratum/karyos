@@ -189,6 +189,12 @@ fn each_rule_is_enforced() {
             vec![header(Capture::BestEffort, 1), gap(1, u64::MAX)],
             OrderRule::Exhausted,
         ),
+        // Roles no decoded record has, refused by the checker itself.
+        (vec![header(Capture::Strict, 0)], OrderRule::Invalid),
+        (
+            vec![header(Capture::BestEffort, 5), gap(5, 2)],
+            OrderRule::Invalid,
+        ),
     ];
     for (roles, rule) in cases {
         let (last, before) = roles.split_last().unwrap();

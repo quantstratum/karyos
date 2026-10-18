@@ -41,6 +41,9 @@ fn journal() -> [GroupRecord<'static>; 5] {
             stream_id: 10,
             session_id: 3,
             lane: Lane::ZERO,
+            reserved_value: 7,
+            end_of_stream: false,
+            extension: None,
             payload: Payload::Inline(b"payload"),
         }),
         GroupRecord::Outcome(OutcomeObservation {

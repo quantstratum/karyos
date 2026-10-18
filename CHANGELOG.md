@@ -180,10 +180,12 @@ release may break APIs, wire formats and shared-memory layouts.
   A7a; SPEC §8.3, ADR-0024). `karyos_archive::group::record` holds the
   journal header (group, first `group_seq`, inline threshold, capture
   contract, clock provenance, strict or best-effort capture, the
-  caller's manifest), five event records (message inline or by recording
-  reference, conflated value, timer, lifecycle, external), three
-  observations (offer and claim outcomes, timer create and cancel,
-  external), the event end and the gap marker, hand written on the
+  caller's manifest), five event records (a message with its reserved
+  value, end of stream and trace extension, inline or by reference to a
+  required recording; conflated value; timer; lifecycle; external), four
+  observations (offer, claim and commit outcomes with the client error
+  code; timer create and cancel; external; delivery outcomes), the event
+  end and the gap marker, hand written on the
   `karyos-codec` runtime as A1. `karyos_archive::group::order` checks a
   journal's order rules with fixed state. Nothing allocates.
 - Per-path datagram and byte counts (RP-10; rp-w9). Each route of a
