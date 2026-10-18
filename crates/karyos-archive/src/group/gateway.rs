@@ -101,46 +101,38 @@ pub enum Event<'a> {
     },
 }
 
-/// A claim the handler writes into before [`Effects::commit`].
+/// A claim the handler writes into, through [`Effects::claim_bytes`],
+/// before [`Effects::commit`].
 ///
-/// The Gateway's own type, not the client's: under capture it is the
+/// The Gateway's own type, not the client's: a handle that borrows
+/// nothing, so the handler can call other effects between the claim and
+/// its commit, as the client allows. Under capture its bytes are the
 /// log's reserved bytes; under replay, a scratch buffer of the largest
 /// claim, owned by the Gateway and checked at `commit`. Only a Gateway
-/// makes one.
-#[expect(
-    dead_code,
-    reason = "the live Gateway (A7d-2a) and ReplayGateway (A8) make claims"
-)]
-#[derive(Debug)]
-pub struct Claim<'a> {
+/// makes one, and a claim not committed is aborted when its event ends.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Claim {
     publication: PublicationId,
     token: u64,
-    bytes: &'a mut [u8],
+    length: usize,
 }
 
-#[expect(
-    dead_code,
-    reason = "the live Gateway (A7d-2a) and ReplayGateway (A8) make claims"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the live Gateway (A7d-2a) and ReplayGateway (A8) make claims"
+    )
 )]
-impl<'a> Claim<'a> {
-    /// A claim over `bytes` for `publication`. `token` is the
+impl Claim {
+    /// A claim of `length` bytes on `publication`. `token` is the
     /// implementation's own handle on the reservation.
-    pub(crate) fn new(publication: PublicationId, token: u64, bytes: &'a mut [u8]) -> Self {
+    pub(crate) fn new(publication: PublicationId, token: u64, length: usize) -> Self {
         Self {
             publication,
             token,
-            bytes,
+            length,
         }
-    }
-
-    /// The publication it was claimed on.
-    pub fn publication(&self) -> PublicationId {
-        self.publication
-    }
-
-    /// The bytes to write.
-    pub fn bytes(&mut self) -> &mut [u8] {
-        self.bytes
     }
 
     /// The implementation's handle on the reservation.
@@ -149,11 +141,25 @@ impl<'a> Claim<'a> {
     }
 }
 
+impl Claim {
+    /// The publication it was claimed on.
+    #[must_use]
+    pub fn publication(&self) -> PublicationId {
+        self.publication
+    }
+
+    /// The bytes claimed.
+    #[must_use]
+    pub fn length(&self) -> usize {
+        self.length
+    }
+}
+
 /// The claim's outcome: a claim to write, or what refused it.
-#[derive(Debug)]
-pub enum ClaimResult<'a> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClaimResult {
     /// The bytes reserved.
-    Claimed(Claim<'a>),
+    Claimed(Claim),
     /// Any outcome other than a reservation.
     Refused(Outcome),
 }
@@ -168,10 +174,13 @@ pub trait Effects {
     fn offer(&mut self, publication: PublicationId, payload: &[u8]) -> Outcome;
 
     /// Claims `length` bytes on `publication`.
-    fn claim(&mut self, publication: PublicationId, length: usize) -> ClaimResult<'_>;
+    fn claim(&mut self, publication: PublicationId, length: usize) -> ClaimResult;
+
+    /// The bytes of `claim`, to write before its commit.
+    fn claim_bytes(&mut self, claim: &Claim) -> &mut [u8];
 
     /// Commits a claim.
-    fn commit(&mut self, claim: Claim<'_>) -> Outcome;
+    fn commit(&mut self, claim: Claim) -> Outcome;
 
     /// Presents a guarded publication's next delivery outcomes, at most
     /// `max`, to `each`. Returns how many it presented.
@@ -300,4 +309,76 @@ pub trait GroupGateway {
         value: &[u8],
         handler: &mut dyn Handler,
     ) -> Result<Dispatched, GatewayError>;
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        reason = "test helpers, as ADR-0007 allows in tests"
+    )]
+
+    use super::*;
+
+    /// Effects over one scratch buffer, enough to drive a handler.
+    struct Scratch {
+        buffer: Vec<u8>,
+        committed: Vec<u8>,
+    }
+
+    impl Effects for Scratch {
+        fn clock(&self) -> u64 {
+            7
+        }
+        fn offer(&mut self, _: PublicationId, _: &[u8]) -> Outcome {
+            Outcome::BackPressured
+        }
+        fn claim(&mut self, publication: PublicationId, length: usize) -> ClaimResult {
+            ClaimResult::Claimed(Claim::new(publication, 1, length))
+        }
+        fn claim_bytes(&mut self, claim: &Claim) -> &mut [u8] {
+            assert_eq!(claim.token(), 1);
+            &mut self.buffer[..claim.length()]
+        }
+        fn commit(&mut self, claim: Claim) -> Outcome {
+            self.committed = self.buffer[..claim.length()].to_vec();
+            Outcome::BackPressured
+        }
+        fn poll_outcomes(
+            &mut self,
+            _: PublicationId,
+            _: u32,
+            _: &mut dyn FnMut(&DeliveryOutcome),
+        ) -> u32 {
+            0
+        }
+        fn schedule(&mut self, _: TimerId, _: u64) {}
+        fn cancel(&mut self, _: TimerId) {}
+        fn external(&mut self, _: u32, _: &mut dyn FnMut(&mut [u8]) -> usize) -> &[u8] {
+            &[]
+        }
+    }
+
+    /// A handler claims, calls another effect, writes and commits: the
+    /// claim borrows nothing from the effects.
+    #[test]
+    fn a_handler_claims_writes_and_commits() {
+        let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
+            let ClaimResult::Claimed(claim) = effects.claim(PublicationId(1), 4) else {
+                panic!("refused");
+            };
+            let _ = effects.offer(PublicationId(2), b"x");
+            effects.claim_bytes(&claim).fill(9);
+            assert_eq!(claim.publication(), PublicationId(1));
+            let _ = effects.commit(claim);
+        };
+        let mut effects = Scratch {
+            buffer: vec![0; 8],
+            committed: Vec::new(),
+        };
+        handler.on_event(&Event::Timer { timer: TimerId(0) }, &mut effects);
+        assert_eq!(effects.committed, [9; 4]);
+    }
 }
