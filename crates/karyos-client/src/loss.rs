@@ -133,7 +133,22 @@ impl LossReporter {
             RejoinPolicy::Close => RejoinPolicyCode::Close,
             RejoinPolicy::Replay { .. } => RejoinPolicyCode::Replay,
         };
+        self.report_as(lane, overrun, configured, outcome);
+    }
+
+    /// Queues the report of `overrun` on `lane`, handled by the policy
+    /// `configured` with `outcome`. `Replaying` is no outcome yet: nothing
+    /// is reported until it resolves.
+    pub(crate) fn report_as(
+        &self,
+        lane: u8,
+        overrun: &Overrun,
+        configured: RejoinPolicyCode,
+        outcome: RejoinOutcome,
+    ) {
         let (applied, fallback) = match outcome {
+            RejoinOutcome::Replaying => return,
+            RejoinOutcome::Replayed { .. } => (RejoinOutcomeCode::Replayed, None),
             RejoinOutcome::ResumedAtHead => (RejoinOutcomeCode::ResumedAtHead, None),
             RejoinOutcome::SnapshotRebuilt => (RejoinOutcomeCode::SnapshotRebuilt, None),
             RejoinOutcome::SnapshotFailed => (RejoinOutcomeCode::SnapshotFailed, None),
@@ -149,6 +164,10 @@ impl LossReporter {
                     ReplayFallbackReason::NoArchive => FallbackReasonCode::NoArchive,
                     ReplayFallbackReason::NoRecording => FallbackReasonCode::NoRecording,
                     ReplayFallbackReason::RetentionShort => FallbackReasonCode::RetentionShort,
+                    ReplayFallbackReason::RecordingBehind => FallbackReasonCode::RecordingBehind,
+                    ReplayFallbackReason::Refused => FallbackReasonCode::Refused,
+                    ReplayFallbackReason::MergeFailed => FallbackReasonCode::MergeFailed,
+                    ReplayFallbackReason::Withdrawn => FallbackReasonCode::Withdrawn,
                 }),
             ),
         };
@@ -259,5 +278,71 @@ mod tests {
                 fallback: Some(FallbackReasonCode::NoArchive),
             })
         );
+    }
+
+    /// A replay that recovered reports `Replayed` with no reason; one that
+    /// fell back carries the phase 3 reasons; one still replaying reports
+    /// nothing yet.
+    #[test]
+    fn a_replay_rejoin_reports_once_it_resolved() {
+        let reports = Arc::new(LossReports::default());
+        let reporter = LossReporter {
+            publication: PublicationIdentity::default(),
+            registration: 10,
+            reports: Arc::clone(&reports),
+        };
+        let overrun = Overrun {
+            from: 64,
+            lost_to: 4096,
+            resume: 4096,
+        };
+        let replay = RejoinPolicyCode::Replay;
+        reporter.report_as(0, &overrun, replay, RejoinOutcome::Replaying);
+        assert_eq!(reports.pop(), None);
+        reporter.report_as(
+            0,
+            &overrun,
+            replay,
+            RejoinOutcome::Replayed { cutover: 4096 },
+        );
+        let replayed = reports.pop().unwrap();
+        assert_eq!(
+            (replayed.applied, replayed.fallback),
+            (RejoinOutcomeCode::Replayed, None)
+        );
+        for (reason, code) in [
+            (
+                ReplayFallbackReason::RecordingBehind,
+                FallbackReasonCode::RecordingBehind,
+            ),
+            (ReplayFallbackReason::Refused, FallbackReasonCode::Refused),
+            (
+                ReplayFallbackReason::MergeFailed,
+                FallbackReasonCode::MergeFailed,
+            ),
+            (
+                ReplayFallbackReason::Withdrawn,
+                FallbackReasonCode::Withdrawn,
+            ),
+        ] {
+            reporter.report_as(
+                0,
+                &overrun,
+                replay,
+                RejoinOutcome::ReplayFallback {
+                    reason,
+                    secondary: SecondaryOutcome::ResumedAtHead,
+                },
+            );
+            let fell_back = reports.pop().unwrap();
+            assert_eq!(
+                (fell_back.configured, fell_back.applied, fell_back.fallback),
+                (
+                    RejoinPolicyCode::Replay,
+                    RejoinOutcomeCode::ResumedAtHead,
+                    Some(code)
+                )
+            );
+        }
     }
 }
