@@ -50,6 +50,9 @@ pub struct MessageInfo {
     pub end_of_stream: bool,
     /// The opaque trace extension, if the message carries one.
     pub extension: Option<[u8; EXTENSION_LENGTH as usize]>,
+    /// The session of the image it came from: a network subscription's
+    /// images differ in it.
+    pub session_id: i32,
 }
 
 impl MessageInfo {
@@ -656,6 +659,7 @@ impl<T: TermBytes> ClientSubscription<T> {
                         reserved_value,
                         end_of_stream,
                         extension,
+                        session_id: inner.buffer().config().session_id,
                     };
                     if let Some(trace) = &mut self.trace {
                         let decoded = info.trace();
