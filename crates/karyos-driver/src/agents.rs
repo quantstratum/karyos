@@ -1053,6 +1053,13 @@ pub struct ReceiverAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
 }
 
 impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
+    /// Retired images whose `StorageReclaimed` the receiver handled, still
+    /// in quarantine (tests).
+    #[cfg(test)]
+    pub(crate) fn reclaimed_tombstones(&self) -> usize {
+        self.role.reclaimed_tombstones()
+    }
+
     /// Whether `alias` is published on `endpoint` (tests).
     #[cfg(test)]
     pub(crate) fn is_published(

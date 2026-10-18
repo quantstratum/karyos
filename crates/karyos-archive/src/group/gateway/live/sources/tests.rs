@@ -26,7 +26,7 @@ use karyos_sys::term::TermId;
 
 use super::*;
 use crate::fault::FaultDisk;
-use crate::group::capture::{CaptureConfig, CaptureJob, capture};
+use crate::group::capture::{CaptureConfig, CaptureJob, GroupState, capture};
 use crate::group::gateway::live::{Gateway, Port};
 use crate::group::gateway::{ClaimCommit, DeliveryOutcome, Effects, GroupGateway, PublicationId};
 use crate::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
@@ -89,7 +89,8 @@ fn log(term_length: u32) -> Arc<LogBuffer> {
     Arc::new(
         LogBuffer::new(LogBufferConfig {
             term_length: TermLength::try_new(term_length).unwrap(),
-            spare_slots: 2,
+            // Room for an optional or observer reader's credit.
+            spare_slots: 4,
             max_subscribers: 2,
             mtu: DEFAULT_MTU,
             max_reserved: term_length / 8,
@@ -119,6 +120,17 @@ struct Rig {
 /// A Gateway over one required subscription of a fresh log, the clock
 /// reading 1000 at every call.
 fn rig(mode: Capture, ring_capacity: usize, max_event: usize, term_length: u32) -> Rig {
+    rig_as(Role::Required, mode, ring_capacity, max_event, term_length)
+}
+
+/// [`rig`] with a subscription of `role`.
+fn rig_as(
+    role: Role,
+    mode: Capture,
+    ring_capacity: usize,
+    max_event: usize,
+    term_length: u32,
+) -> Rig {
     let disk = FaultDisk::default();
     let header = JournalHeader {
         group_id: 1,
@@ -151,7 +163,7 @@ fn rig(mode: Capture, ring_capacity: usize, max_event: usize, term_length: u32) 
     gateway.set_inline_threshold(64);
     let buffer = log(term_length);
     let mut conductor = buffer.conductor_owned().unwrap();
-    let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+    let subscription = ClientSubscription::new(conductor.subscribe(role).unwrap());
     let publication = buffer.publication_owned().unwrap().unwrap();
     let word = Arc::new(RecordingWord::new());
     let _ = gateway
@@ -345,8 +357,10 @@ fn strict_declines_a_message_it_cannot_record() {
     assert_eq!(taken + delivered, 12);
 }
 
-/// A payload above `MAX_INLINE` with no recording: strict declines it,
-/// best effort records it with payload unavailable.
+/// A payload above `MAX_INLINE` with no recording, already read from its
+/// source: strict ends the journal at it, a skipped range recorded
+/// incomplete and not delivered, never silently; best effort delivers it and records its
+/// payload unavailable.
 #[test]
 fn a_payload_past_max_inline_is_unavailable() {
     for mode in [Capture::Strict, Capture::BestEffort] {
@@ -358,8 +372,23 @@ fn a_payload_past_max_inline_is_unavailable() {
             .dispatch(&mut |_: &Event<'_>, _: &mut dyn Effects| ran = true);
         match mode {
             Capture::Strict => {
-                assert_eq!(result, Err(GatewayError::Refused(Refusal::TooLarge)));
+                assert_eq!(result, Err(GatewayError::Ended));
                 assert!(!ran);
+                assert_eq!(rig.gateway.stats().incomplete, 1);
+                // The journal ended at it: the job ends the group.
+                let mut job = rig.job;
+                while job.duty(0, 1024, &NoRecordings).unwrap() {}
+                assert_eq!(job.state(), GroupState::Ended);
+                let bytes = records(job, &rig.disk);
+                let records = decoded(&bytes);
+                assert!(records.iter().any(|record| matches!(
+                    record,
+                    GroupRecord::Loss(LossEvent {
+                        group_seq: 1,
+                        loss: Loss::Skipped(karyos_sys::log_buffer::SkipReason::MessageTooLarge),
+                        ..
+                    })
+                )));
             }
             Capture::BestEffort => {
                 assert_eq!(result, Ok(Dispatched::Event { group_seq: 1 }));
@@ -538,8 +567,8 @@ fn conflated_values_are_events() {
     writer.write(3, b"three").unwrap();
     let mut values = Vec::new();
     let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
-        if let Event::Conflated { value, .. } = event {
-            values.push(value.to_vec());
+        if let Event::Conflated { key, value, .. } = event {
+            values.push((*key, value.to_vec()));
         }
     };
     let mut dispatched = 0;
@@ -547,8 +576,9 @@ fn conflated_values_are_events() {
         dispatched += 1;
     }
     assert_eq!(dispatched, 2);
+    // Each value with its own key, in whichever order the view gave them.
     values.sort();
-    assert_eq!(values, [b"three".to_vec(), b"two".to_vec()]);
+    assert_eq!(values, [(2, b"two".to_vec()), (3, b"three".to_vec())]);
     let bytes = records(rig.job, &rig.disk);
     let keys: Vec<(u32, i32)> = decoded(&bytes)
         .into_iter()
@@ -580,7 +610,10 @@ fn strict_leaves_a_view_unread_without_room() {
             seen += 1;
         }
     };
-    assert_eq!(rig.gateway.dispatch(&mut handler), Ok(Dispatched::Idle));
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Err(GatewayError::Refused(Refusal::RingFull))
+    );
     let mut job = rig.job;
     while job.duty(0, 1024, &NoRecordings).unwrap() {}
     assert!(matches!(
@@ -588,4 +621,319 @@ fn strict_leaves_a_view_unread_without_room() {
         Ok(Dispatched::Event { .. })
     ));
     assert_eq!(seen, 1);
+}
+
+/// The placement's bounds, exactly: a payload of the inline threshold's
+/// length stays inline though the word names a recording, and one of
+/// `MAX_INLINE` bytes is recorded inline by strict capture.
+#[test]
+fn placement_bounds_are_exact() {
+    let mut rig = rig(Capture::Strict, 1 << 20, 70_000, 1024 * 1024);
+    append(&mut rig, &[9u8; 64]);
+    append(&mut rig, &vec![5u8; MAX_INLINE]);
+    rig.word.set(7, 0);
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    assert_eq!(
+        rig.gateway.dispatch(noop),
+        Ok(Dispatched::Event { group_seq: 1 })
+    );
+    rig.word.clear();
+    assert_eq!(
+        rig.gateway.dispatch(noop),
+        Ok(Dispatched::Event { group_seq: 2 })
+    );
+    let bytes = records(rig.job, &rig.disk);
+    let lengths: Vec<Option<usize>> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Message(message) => Some(match message.payload {
+                Payload::Inline(bytes) => Some(bytes.len()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lengths, [Some(64), Some(MAX_INLINE)]);
+}
+
+/// A timer due exactly at the dispatch's read fires; of two due timers
+/// the earlier deadline goes first.
+#[test]
+fn due_timers_fire_earliest_first_at_their_deadline() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    rig.gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            effects.schedule(TimerId(1), 1000);
+            effects.schedule(TimerId(2), 800);
+        })
+        .unwrap();
+    let mut fired = Vec::new();
+    let mut handler = |event: &Event<'_>, effects: &mut dyn Effects| {
+        if let Event::Timer { timer } = event {
+            fired.push((*timer, effects.clock()));
+        }
+    };
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+    assert_eq!(fired, [(TimerId(2), 800), (TimerId(1), 1000)]);
+}
+
+/// A view whose largest value is exactly `MAX_INLINE` is accepted.
+#[test]
+fn a_view_of_max_inline_values_is_accepted() {
+    let mut rig = rig(Capture::Strict, 1 << 20, 70_000, 64 * 1024);
+    let (_writer, view) = view(MAX_INLINE);
+    assert!(rig.gateway.add_conflated(Box::new(view), 5, 1).is_ok());
+}
+
+/// A second source of the same stream and session is refused, even on
+/// another lane: replay names a source by stream and session.
+#[test]
+fn a_second_source_of_a_stream_and_session_is_refused() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let subscription = ClientSubscription::new(rig.conductor.subscribe(Role::Required).unwrap());
+    let other_lane = SourceIdentity {
+        lane: Lane::try_new(1).unwrap(),
+        ..IDENTITY
+    };
+    assert_eq!(
+        rig.gateway.add_subscription(
+            Box::new(subscription),
+            other_lane,
+            Arc::new(RecordingWord::new())
+        ),
+        Err(GatewayError::DuplicateSource {
+            stream_id: 2,
+            session_id: 1
+        })
+    );
+}
+
+/// Strict capture reads an optional or observer source only when it can
+/// record what it reads: such a reader acknowledges on copy, so a message
+/// read and then refused would be lost without trace. With the ring full
+/// nothing is read, and every message comes once there is room.
+#[test]
+fn strict_reads_an_optional_source_only_with_room() {
+    for role in [Role::Optional, Role::Observer] {
+        let mut rig = rig_as(role, Capture::Strict, 8 * 1024, 1000, 64 * 1024);
+        for index in 0..12u8 {
+            append(&mut rig, &[index; 600]);
+        }
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+            if let Event::Message {
+                payload: MessagePayload::Bytes(bytes),
+                ..
+            } = event
+            {
+                seen.borrow_mut().push(bytes[0]);
+            }
+        };
+        let mut job = rig.job;
+        let mut refused = 0;
+        while seen.borrow().len() < 12 {
+            match rig.gateway.dispatch(&mut handler) {
+                Ok(Dispatched::Event { .. }) => {}
+                Err(GatewayError::Refused(Refusal::RingFull | Refusal::InFlight)) => {
+                    refused += 1;
+                    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+                }
+                other => panic!("{role:?}: {other:?} after {:?}", seen.borrow()),
+            }
+            assert!(refused < 100, "{role:?}: no progress");
+        }
+        assert!(refused > 0, "{role:?}: the ring never filled");
+        assert_eq!(*seen.borrow(), (0..12).collect::<Vec<u8>>(), "{role:?}");
+    }
+}
+
+/// A message source that reports one scripted poll summary, then nothing.
+struct Scripted(Option<karyos_client::PollSummary>);
+
+impl MessageSource for Scripted {
+    fn poll_taking(
+        &mut self,
+        _: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        _: MessageLimit,
+    ) -> Result<karyos_client::PollSummary, karyos_client::PollError> {
+        Ok(self.0.take().unwrap_or_default())
+    }
+}
+
+/// The loss events a scripted source's summary makes, as recorded.
+fn scripted_losses(summary: karyos_client::PollSummary) -> Vec<(u64, u64, u64, Loss)> {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let identity = SourceIdentity {
+        stream_id: 9,
+        ..IDENTITY
+    };
+    let _ = rig
+        .gateway
+        .add_subscription(
+            Box::new(Scripted(Some(summary))),
+            identity,
+            Arc::new(RecordingWord::new()),
+        )
+        .unwrap();
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(noop) {}
+    let bytes = records(rig.job, &rig.disk);
+    decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Loss(loss) => Some((loss.from, loss.lost_to, loss.resume, loss.loss)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An overrun is a loss event with its three positions, each its own, and
+/// its rejoin outcome.
+#[test]
+fn an_overrun_is_a_loss_event_with_its_positions() {
+    let summary = karyos_client::PollSummary {
+        overrun: Some(karyos_client::Overrun {
+            from: 100,
+            lost_to: 200,
+            resume: 300,
+        }),
+        rejoin: Some(RejoinOutcome::ResumedAtHead),
+        ..Default::default()
+    };
+    assert_eq!(
+        scripted_losses(summary),
+        [(
+            100,
+            200,
+            300,
+            Loss::Overrun {
+                outcome: OverrunOutcome::ResumedAtHead,
+                fallback: None
+            }
+        )]
+    );
+}
+
+/// A skipped range is a loss event from its position to its end, where
+/// delivery resumes, with its reason.
+#[test]
+fn a_skipped_range_is_a_loss_event() {
+    let summary = karyos_client::PollSummary {
+        skipped: Some(karyos_client::Skipped {
+            position: 64,
+            extent: 32,
+            reason: karyos_sys::log_buffer::SkipReason::MissingEnd,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        scripted_losses(summary),
+        [(
+            64,
+            96,
+            96,
+            Loss::Skipped(karyos_sys::log_buffer::SkipReason::MissingEnd)
+        )]
+    );
+}
+
+/// A due timer strict capture refuses stays due, at its deadline, and
+/// fires once there is room.
+#[test]
+fn a_refused_timer_stays_due() {
+    let mut rig = rig(Capture::Strict, 8 * 1024, 1000, 64 * 1024);
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    rig.gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+            effects.schedule(TimerId(2), 900);
+        })
+        .unwrap();
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.deliver_external(1, &[0u8; 600], noop) {}
+    let mut fired = Vec::new();
+    let mut handler = |event: &Event<'_>, effects: &mut dyn Effects| {
+        if let Event::Timer { timer } = event {
+            fired.push((*timer, effects.clock()));
+        }
+    };
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Err(GatewayError::Refused(Refusal::RingFull))
+    );
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    assert!(matches!(
+        rig.gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { .. })
+    ));
+    assert_eq!(fired, [(TimerId(2), 900)]);
+}
+
+/// A seal with no cause ends the source as its stream's end; a seal with
+/// a cause closes it.
+#[test]
+fn a_seal_reason_names_the_end() {
+    for (reason, expected) in [
+        (None, EndReason::EndOfStream),
+        (
+            Some(karyos_sys::log_buffer::SealReason::Unspecified),
+            EndReason::EndOfStream,
+        ),
+        (
+            Some(karyos_sys::log_buffer::SealReason::StreamRemoved),
+            EndReason::Closed,
+        ),
+    ] {
+        let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+        let summary = karyos_client::PollSummary {
+            closed: Some(640),
+            close_reason: reason,
+            ..Default::default()
+        };
+        let _ = rig
+            .gateway
+            .add_subscription(
+                Box::new(Scripted(Some(summary))),
+                SourceIdentity {
+                    stream_id: 9,
+                    ..IDENTITY
+                },
+                Arc::new(RecordingWord::new()),
+            )
+            .unwrap();
+        let mut ends = Vec::new();
+        let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+            if let Event::Lifecycle { kind, .. } = event {
+                ends.push(*kind);
+            }
+        };
+        while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+        assert_eq!(
+            ends,
+            [LifecycleKind::SubscriptionEnded(expected)],
+            "{reason:?}"
+        );
+    }
+}
+
+/// A view whose largest value makes an event of exactly the byte budget is
+/// accepted; one byte more is refused.
+#[test]
+fn a_view_at_the_event_budget_is_accepted() {
+    let budget = 512;
+    let rig_budget = || rig(Capture::Strict, 1 << 16, budget, 64 * 1024);
+    let head =
+        usize::from(CONFLATED_EVENT.block_length) + 12 + 2 + crate::group::gateway::live::END;
+    let fits = budget - head;
+    let (_writer, at) = view(fits);
+    assert!(
+        rig_budget()
+            .gateway
+            .add_conflated(Box::new(at), 5, 1)
+            .is_ok()
+    );
+    let (_writer, over) = view(fits + 1);
+    assert_eq!(
+        rig_budget().gateway.add_conflated(Box::new(over), 5, 1),
+        Err(GatewayError::TooLarge(fits + 1))
+    );
 }

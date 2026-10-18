@@ -21,8 +21,8 @@
 //! [`super::reference::read_message`] (A5's replay source), when the
 //! Gateway has the Archive that holds it; a recording that no longer
 //! holds the frames leaves the payload unavailable. The configuration
-//! can opt in to present a message whose payload replay cannot give with
-//! an empty one.
+//! can opt in to present a message whose payload replay cannot give as
+//! `MessagePayload::Unavailable`, with its recorded length and extent.
 //!
 //! With a [`CaptureJournal`] it writes what the handler did (section 9):
 //! each presented event's records as the handler matched them, which are
@@ -66,7 +66,8 @@ pub struct GatewayConfig<'a> {
     /// The largest payload by reference, for the buffer it is read into.
     pub max_payload: usize,
     /// Present a message whose payload replay cannot give (not captured,
-    /// unavailable, or by reference) with an empty payload, for a handler
+    /// unavailable, or by reference) as `MessagePayload::Unavailable`,
+    /// with its recorded length and extent, for a handler
     /// that only counts or routes such messages (section 7). Off, such a
     /// message is not reproducible.
     pub present_unavailable: bool,
@@ -387,6 +388,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
             GroupRecord::Conflated(view) => id_of(&self.conflated, view.stream_id, view.session_id)
                 .map(|source| Event::Conflated {
                     source: ConflatedId(source),
+                    key: view.key,
                     version: view.version,
                     freshness: view.freshness,
                     value: view.value,

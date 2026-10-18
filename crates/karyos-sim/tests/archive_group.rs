@@ -27,7 +27,10 @@ use karyos_archive::group::gateway::{
     ClaimCommit, DeliveryOutcome, Dispatched, Effects, Event, GroupGateway, PublicationId, TimerId,
 };
 use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
+use karyos_archive::group::prefix::{Coverage, recover};
 use karyos_archive::group::record::{Capture, GroupRecord, Outcome, Payload};
+use karyos_archive::group::replay::gateway::{Archive, GatewayConfig, ReplayGateway};
+use karyos_archive::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
 use karyos_archive::recorder::Mode;
 use karyos_archive::segment::{Geometry, SyncPolicy};
 use karyos_archive::source::Guarded;
@@ -43,10 +46,13 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
+        // Unique within the process too: an elapsed time read at once is
+        // about 0 for every caller.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "karyos-sim-group-{name}-{}-{}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
@@ -95,6 +101,18 @@ impl Port for Inert {
     }
     fn schedule(&mut self, _: TimerId, _: u64) {}
     fn cancel(&mut self, _: TimerId) {}
+}
+
+/// Coverage that vouches for every reference: the recording is closed
+/// and holds every frame.
+struct All;
+impl Coverage for All {
+    fn positions(&self, _: u64) -> Option<(u64, u64)> {
+        Some((u64::MAX, u64::MAX))
+    }
+    fn ended(&self, _: u64) -> Option<u64> {
+        None
+    }
 }
 
 const STREAM: i32 = 42;
@@ -173,7 +191,10 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
             source: Box::new(Guarded::new(reader, lease)),
         })
         .unwrap();
-    let word = archive.recording_word(STREAM, 1).unwrap().unwrap();
+    let word = archive
+        .recording_word(STREAM, 1, Lane::ZERO)
+        .unwrap()
+        .unwrap();
     assert_eq!(word.read().map(|(id, _)| id), Some(recording));
     let sender = archive
         .start_group(StartGroup {
@@ -191,6 +212,7 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
                 max_event: 4096,
                 in_flight: 64,
             },
+            checkpoints: None,
         })
         .unwrap();
     let waiter = sender.waiter();
@@ -211,7 +233,32 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
     let mut publication = driver.publication(handle).unwrap();
     let mut seen = Vec::new();
     let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
-        if let Event::Message { position, .. } = event {
+        if let Event::Message {
+            position,
+            length,
+            extent,
+            payload: presented,
+            ..
+        } = event
+        {
+            let index = u64::try_from(seen.len()).unwrap();
+            let expected = payload(index);
+            assert_eq!(
+                usize::try_from(*length).unwrap(),
+                expected.len(),
+                "length {index}"
+            );
+            // Its frames: the payload behind a 32-byte header, aligned.
+            assert!(
+                usize::try_from(*extent).unwrap() >= expected.len() + 32,
+                "extent {index}: {extent}"
+            );
+            match presented {
+                karyos_archive::group::gateway::MessagePayload::Bytes(bytes) => {
+                    assert_eq!(*bytes, &expected[..], "bytes {index}");
+                }
+                other => panic!("{index}: {other:?}"),
+            }
             seen.push(*position);
         }
     };
@@ -286,5 +333,80 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
     }
     for pair in messages.windows(2) {
         assert_eq!(pair[0].1 + u64::from(pair[0].2), pair[1].1);
+    }
+
+    // Replay the journal: every message as published, the references read
+    // back from the recording.
+    let mut journal = GroupJournal::recover(StdDisk, &groups, 1, JOURNAL)
+        .unwrap()
+        .journal;
+    let recovery = recover(&mut journal, &All, 64).unwrap();
+    let cursor = ReplayCursor::open(
+        journal,
+        &recovery,
+        &ReplayConfig {
+            manifest: b"e2e",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 1 << 16,
+            records: 64,
+        },
+    )
+    .unwrap();
+    let mut replay = ReplayGateway::new(
+        cursor,
+        &GatewayConfig {
+            publications: &[],
+            subscriptions: &[(STREAM, 1)],
+            conflated: &[],
+            max_claim: 64,
+            max_payload: 4096,
+            present_unavailable: false,
+        },
+        Some(Archive {
+            disk: StdDisk,
+            dir: dir.path().to_path_buf(),
+            recordings: vec![(
+                recording,
+                Geometry::new(MIN_TERM_LENGTH, 2 * u64::from(MIN_TERM_LENGTH)).unwrap(),
+            )],
+        }),
+    )
+    .unwrap();
+    let mut replayed = Vec::new();
+    let mut probe = |event: &Event<'_>, _: &mut dyn Effects| {
+        if let Event::Message {
+            position,
+            length,
+            extent,
+            payload: karyos_archive::group::gateway::MessagePayload::Bytes(bytes),
+            ..
+        } = event
+        {
+            replayed.push((*position, *length, *extent, bytes.to_vec()));
+        }
+    };
+    loop {
+        match replay.dispatch(&mut probe) {
+            Ok(Dispatched::Event { .. }) => {}
+            Ok(Dispatched::End) => break,
+            other => panic!("replay: {other:?} after {}", replayed.len()),
+        }
+    }
+    assert_eq!(replayed.len(), messages.len());
+    for (index, (position, length, extent, bytes)) in replayed.iter().enumerate() {
+        assert_eq!(*position, messages[index].1, "position {index}");
+        assert_eq!(*extent, messages[index].2, "extent {index}");
+        assert_eq!(
+            usize::try_from(*length).unwrap(),
+            bytes.len(),
+            "length {index}"
+        );
+        assert_eq!(
+            bytes,
+            &payload(u64::try_from(index).unwrap()),
+            "bytes {index}"
+        );
     }
 }
