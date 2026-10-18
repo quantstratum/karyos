@@ -30,6 +30,11 @@ use crate::group::record::{
 use crate::segment::SyncPolicy;
 
 const JOURNALS: &str = "/groups";
+
+thread_local! {
+    /// The chunk the tests' checkpoints are written in, or whole.
+    static CHUNK: Cell<Option<usize>> = const { Cell::new(None) };
+}
 const CHECKPOINTS: &str = "/checkpoints";
 const GROUP: u64 = 9;
 
@@ -119,15 +124,33 @@ impl Group {
         }
     }
 
-    /// Takes and writes a checkpoint of `bytes` after event `seq`.
+    /// Takes and writes a checkpoint of `bytes` after event `seq`: whole,
+    /// or in chunks of [`CHUNK`] bytes when set.
     fn checkpoint(&mut self, seq: u64, bytes: &[u8]) -> Result<CheckpointRecord, CheckpointError> {
         let request = self.slot.take(seq, 7, |buffer| {
             buffer[..bytes.len()].copy_from_slice(bytes);
             bytes.len()
         })?;
-        let result = self.writer.write(&mut self.journal, &request);
+        let result = match CHUNK.get() {
+            None => self.writer.write(&mut self.journal, &request),
+            Some(chunk) => self.chunked(&request, chunk),
+        };
         self.slot.returned(request, &result);
         result
+    }
+
+    fn chunked(
+        &mut self,
+        request: &CheckpointRequest,
+        chunk: usize,
+    ) -> Result<CheckpointRecord, CheckpointError> {
+        self.writer.begin(&self.journal, request)?;
+        loop {
+            match self.writer.advance(&mut self.journal, request, chunk)? {
+                Progress::Writing { .. } => {}
+                Progress::Recorded(record) => return Ok(record),
+            }
+        }
     }
 
     fn records(&mut self) -> Vec<CheckpointRecord> {
@@ -679,6 +702,88 @@ fn crash_points_keep_the_journal_and_the_store_consistent() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The gate again with each checkpoint written in 4 kB chunks, as the
+/// agent writes it under its cycle's budget (A9-3): a crash between two
+/// chunks leaves no record, and recovery cuts the bytes written.
+#[test]
+fn crash_points_keep_the_store_consistent_with_chunked_writes() {
+    CHUNK.set(Some(4096));
+    let snapshots = vec![snapshot(1, 3000), snapshot(2, 200_000), snapshot(3, 100)];
+    let free = FaultDisk::default();
+    assert!(run(&free, &snapshots));
+    let step = usize::try_from(free.used() / 600).unwrap().max(1);
+    let mut failures = Vec::new();
+    for budget in (0..=free.used()).step_by(step).chain(0..64) {
+        let disk = FaultDisk::with_budget(budget);
+        let _ = run(&disk, &snapshots);
+        for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
+            if let Err(failure) = check(&disk, survives, &snapshots) {
+                failures.push(format!("budget {budget}, {survives:?}: {failure}"));
+            }
+        }
+    }
+    CHUNK.set(None);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Chunks: a request other than the one begun, or none begun, is refused,
+/// and the checkpoint let go; the bytes come in budget-sized writes and
+/// the record only once they are all in.
+#[test]
+fn a_chunked_write_records_only_once_whole() {
+    let disk = FaultDisk::default();
+    let mut group = Group::create(&disk, Capture::Strict, 64);
+    let _ = group
+        .journal
+        .append(&event(1, EndOutcome::Complete))
+        .unwrap();
+    let request = group
+        .slot
+        .take(1, 7, |buffer| {
+            buffer[..10].copy_from_slice(b"0123456789");
+            10
+        })
+        .unwrap();
+    assert!(matches!(
+        group.writer.advance(&mut group.journal, &request, 4),
+        Err(CheckpointError::NotStarted)
+    ));
+    group.writer.begin(&group.journal, &request).unwrap();
+    assert_eq!(
+        group
+            .writer
+            .advance(&mut group.journal, &request, 4)
+            .unwrap(),
+        Progress::Writing { written: 4 }
+    );
+    assert_eq!(
+        group
+            .writer
+            .advance(&mut group.journal, &request, 4)
+            .unwrap(),
+        Progress::Writing { written: 8 }
+    );
+    assert!(
+        group.records().is_empty(),
+        "no record before the last chunk"
+    );
+    let Progress::Recorded(record) = group
+        .writer
+        .advance(&mut group.journal, &request, 4)
+        .unwrap()
+    else {
+        panic!("not recorded");
+    };
+    assert_eq!(read(group.writer.store_mut(), &record), b"0123456789");
+    assert!(!group.writer.writing());
+    group.slot.returned(request, &Ok(record));
+    let other = group.slot.take(1, 7, |_| 3).unwrap();
+    assert!(matches!(
+        group.writer.advance(&mut group.journal, &other, 4),
+        Err(CheckpointError::NotStarted)
+    ));
 }
 
 /// The checkpoint store, as the prefixes' coverage.
@@ -1262,4 +1367,59 @@ fn a_checkpoint_is_durable_before_its_record_under_no_policy() {
         Err(CheckpointError::NotDurable { .. }) => assert!(group.records().is_empty()),
         Err(error) => panic!("{error}"),
     }
+}
+
+/// #426 review P2: the reopening window has its own capacity. With room
+/// for 2 events in flight, 6 end while the checkpoint is written: a hold
+/// of 8 keeps them all and the range opens over them; the default hold
+/// (the capacity) lets the first go, the range stays at the checkpoint,
+/// and the failed reopen is counted.
+#[test]
+fn the_reopen_hold_keeps_the_events_a_checkpoint_write_spans() {
+    let run = |hold: Option<usize>| {
+        let mut tracker = PrefixTracker::new(2);
+        if let Some(hold) = hold {
+            tracker.reserve_reopen_hold(hold).unwrap();
+        }
+        let store = Store::default();
+        store.written.set(100);
+        store.durable.set(100);
+        let mut at = feed(
+            &mut tracker,
+            &encode(&GroupRecord::Header(header(Capture::BestEffort))),
+            0,
+        );
+        at = feed(&mut tracker, &gap(1, 1), at);
+        for seq in 2..=7 {
+            at = feed(&mut tracker, &event(seq, EndOutcome::Complete), at);
+        }
+        at = feed(&mut tracker, &checkpoint_record(1, 1, 0), at);
+        (tracker.advance(at, at, &store), tracker.failed_reopens())
+    };
+    assert_eq!(run(Some(8)), ((7, 7), 0), "fits");
+    assert_eq!(run(None), ((1, 1), 1), "overflows, counted");
+}
+
+/// #426 re-check h5: a hold below the tracker's capacity is taken as the
+/// capacity. With room for 2 in flight and a hold of 1, the 2 events
+/// that end while the checkpoint is written are both kept.
+#[test]
+fn a_hold_below_the_capacity_is_the_capacity() {
+    let mut tracker = PrefixTracker::new(2);
+    tracker.reserve_reopen_hold(1).unwrap();
+    let store = Store::default();
+    store.written.set(100);
+    store.durable.set(100);
+    let mut at = feed(
+        &mut tracker,
+        &encode(&GroupRecord::Header(header(Capture::BestEffort))),
+        0,
+    );
+    at = feed(&mut tracker, &gap(1, 1), at);
+    for seq in 2..=3 {
+        at = feed(&mut tracker, &event(seq, EndOutcome::Complete), at);
+    }
+    at = feed(&mut tracker, &checkpoint_record(1, 1, 0), at);
+    assert_eq!(tracker.advance(at, at, &store), (3, 3));
+    assert_eq!(tracker.failed_reopens(), 0);
 }
