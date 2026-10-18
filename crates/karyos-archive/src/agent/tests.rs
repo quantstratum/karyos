@@ -1037,6 +1037,35 @@ mod groups {
         }
     }
 
+    /// A `required` recording's word names it and its start while it
+    /// records, and is cleared once it stops; an `async` recording has
+    /// none, nor does a stream not recorded.
+    #[test]
+    fn a_required_recording_has_a_word_until_it_stops() {
+        let dir = temp_dir("group-word");
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        let word = agent.recording_word(10, 3).unwrap().unwrap();
+        assert_eq!(word.read(), Some((recording, 0)));
+        assert!(agent.recording_word(10, 4).unwrap().is_none());
+        agent.stop(recording).unwrap();
+        assert_eq!(word.read(), None);
+        assert!(agent.recording_word(10, 3).unwrap().is_none());
+        let other = Arc::new(AtomicBool::new(false));
+        let _ = agent
+            .start(StartRecording {
+                mode: Mode::Async {
+                    on_lap: crate::recorder::OnLap::Resume,
+                },
+                ..start(chunks(3000, false, &other))
+            })
+            .unwrap();
+        assert!(agent.recording_word(10, 3).unwrap().is_none());
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn start_group(dir: &Path, capture: Option<Capture>) -> StartGroup {
         StartGroup {
             group_id: GROUP,

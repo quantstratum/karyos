@@ -57,6 +57,7 @@ use crate::disk::Disk;
 use crate::group::capture::{
     self, CaptureConfig, CaptureError, CaptureJob, CaptureSender, CaptureSetup, GroupState,
 };
+use crate::group::gateway::live::RecordingWord;
 use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
 use crate::group::prefix::Coverage;
 use crate::group::record::{CONTRACT_VERSION, Capture, Clock, JournalHeader};
@@ -420,6 +421,11 @@ enum Command {
     Start(Box<StartRecording>, Reply<u64>),
     Stop(u64, Reply<Ended>),
     List(Reply<Vec<Recording>>),
+    Word {
+        stream_id: i32,
+        session_id: i32,
+        reply: Reply<Option<Arc<RecordingWord>>>,
+    },
     Snapshot {
         from_id: u64,
         max: usize,
@@ -483,6 +489,15 @@ impl core::fmt::Debug for Command {
             Self::Start(start, _) => f.debug_tuple("Start").field(start).finish(),
             Self::Stop(id, _) => f.debug_tuple("Stop").field(id).finish(),
             Self::List(_) => f.write_str("List"),
+            Self::Word {
+                stream_id,
+                session_id,
+                ..
+            } => f
+                .debug_struct("Word")
+                .field("stream_id", stream_id)
+                .field("session_id", session_id)
+                .finish_non_exhaustive(),
             Self::Snapshot { from_id, max, .. } => f
                 .debug_struct("Snapshot")
                 .field("from_id", from_id)
@@ -665,6 +680,27 @@ impl ArchiveHandle {
     /// [`AgentError::Gone`].
     pub fn recordings(&self) -> Result<Vec<Recording>, AgentError> {
         self.call(Command::List)
+    }
+
+    /// The word of the `required` recording of stream `stream_id`, session
+    /// `session_id` this Archive records, if any: a recording group
+    /// Gateway's source reads it to place payloads by reference. It names
+    /// the recording and its start while it records, and is cleared when
+    /// the recording stops, ends or fails. Configuration path only.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Gone`].
+    pub fn recording_word(
+        &self,
+        stream_id: i32,
+        session_id: i32,
+    ) -> Result<Option<Arc<RecordingWord>>, AgentError> {
+        self.call(|reply| Command::Word {
+            stream_id,
+            session_id,
+            reply,
+        })
     }
 
     /// Posts a snapshot of at most `max` recordings from id `from_id` on,
@@ -859,6 +895,22 @@ impl Outbox {
 struct Active<D: Disk> {
     id: u64,
     recorder: Recorder<D, Box<dyn FrameSource + Send>>,
+    stream_id: i32,
+    session_id: i32,
+    /// A `required` recording's word, which recording group Gateways read
+    /// to place payloads by reference; cleared when the recording leaves
+    /// the active set, however it stopped, ended or failed.
+    word: Option<WordGuard>,
+}
+
+/// Clears a recording's word when the recording leaves the active set.
+#[derive(Debug)]
+struct WordGuard(Arc<RecordingWord>);
+
+impl Drop for WordGuard {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
 }
 
 impl FrameSource for Box<dyn FrameSource + Send> {
@@ -1348,6 +1400,20 @@ impl<D: Disk + Clone> State<D> {
             Command::List(reply) => {
                 let _ = reply.send(Ok(self.catalog.recordings().to_vec()));
             }
+            Command::Word {
+                stream_id,
+                session_id,
+                reply,
+            } => {
+                let word = self
+                    .active
+                    .iter()
+                    .filter(|active| {
+                        active.stream_id == stream_id && active.session_id == session_id
+                    })
+                    .find_map(|active| active.word.as_ref().map(|guard| Arc::clone(&guard.0)));
+                let _ = reply.send(Ok(word));
+            }
             Command::Snapshot {
                 from_id,
                 max,
@@ -1624,7 +1690,18 @@ impl<D: Disk + Clone> State<D> {
         });
         match recorder {
             Ok(recorder) => {
-                self.active.push(Active { id, recorder });
+                let word = matches!(start.mode, Mode::Required).then(|| {
+                    let word = Arc::new(RecordingWord::new());
+                    word.set(id, position);
+                    WordGuard(word)
+                });
+                self.active.push(Active {
+                    id,
+                    recorder,
+                    stream_id: start.stream_id,
+                    session_id: start.session_id,
+                    word,
+                });
                 Ok(id)
             }
             Err(error) => {
