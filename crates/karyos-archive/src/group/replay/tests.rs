@@ -345,6 +345,15 @@ fn an_incomplete_event_stops_the_cursor() {
     ];
     let mut cursor = cursor(&records, Capture::Strict);
     assert_eq!(event(&mut cursor).0, 1);
+    // The incomplete event comes once, with its records, then the stop.
+    match cursor.step().unwrap() {
+        Step::Event(event) => {
+            assert_eq!((event.group_seq(), event.incomplete()), (2, true));
+            assert_eq!(event.len(), 2);
+        }
+        Step::Stop(stop) => panic!("{stop:?}"),
+    }
+    assert_eq!(stop(&mut cursor), Stop::Incomplete { group_seq: 2 });
     assert_eq!(stop(&mut cursor), Stop::Incomplete { group_seq: 2 });
 }
 
@@ -440,7 +449,10 @@ fn an_event_says_a_reference_unavailable_names_it() {
     let mut c = cursor(&after_an_incomplete_event, Capture::BestEffort);
     assert_eq!(
         steps(&mut c),
-        (vec![(1, true)], Stop::Incomplete { group_seq: 2 })
+        (
+            vec![(1, true), (2, false)],
+            Stop::Incomplete { group_seq: 2 }
+        )
     );
 }
 

@@ -36,6 +36,10 @@ use crate::disk::Disk;
 #[cfg(test)]
 mod tests;
 
+pub mod effects;
+pub mod gateway;
+pub mod reference;
+
 /// The clock replay presents the readings of.
 const CLOCK: Clock = Clock::HostMonotonic;
 
@@ -204,6 +208,7 @@ pub enum Step<'c> {
 pub struct ReplayEvent<'c> {
     group_seq: u64,
     reference_unavailable: bool,
+    incomplete: bool,
     bytes: &'c [u8],
     spans: &'c [(usize, usize)],
 }
@@ -222,6 +227,15 @@ impl<'c> ReplayEvent<'c> {
     #[must_use]
     pub const fn reference_unavailable(&self) -> bool {
         self.reference_unavailable
+    }
+
+    /// Whether the event's capture is incomplete: its records are those
+    /// captured, and its end says incomplete. Replay presents it with its
+    /// recorded observations, and stops after it (section 7); the cursor
+    /// gives [`Stop::Incomplete`] next.
+    #[must_use]
+    pub const fn incomplete(&self) -> bool {
+        self.incomplete
     }
 
     /// The number of records, its first and its end included.
@@ -298,6 +312,9 @@ pub struct ReplayCursor<D: Disk> {
     spans: Vec<(usize, usize)>,
     /// The final stop, once reached.
     stopped: Option<Stop>,
+    /// The incomplete event the prefix stopped at, while the cursor gives
+    /// its records.
+    incomplete: Option<u64>,
 }
 
 impl<D: Disk> ReplayCursor<D> {
@@ -370,12 +387,15 @@ impl<D: Disk> ReplayCursor<D> {
             buffer,
             spans: allocate(room.records)?,
             stopped: None,
+            incomplete: None,
         })
     }
 
     /// The next event of the complete prefix, or why there is none. A
     /// reference unavailable record is not an event, and is skipped: its
-    /// event says it was named.
+    /// event says it was named. An incomplete event the prefix stopped at
+    /// is given once, marked [`ReplayEvent::incomplete`], before
+    /// [`Stop::Incomplete`].
     ///
     /// # Errors
     ///
@@ -389,7 +409,11 @@ impl<D: Disk> ReplayCursor<D> {
         }
         loop {
             if self.position >= self.complete_end {
-                return self.past_prefix().map(Step::Stop);
+                match self.past_prefix()? {
+                    Some(stop) => return Ok(Step::Stop(stop)),
+                    // The incomplete event: read it, up to its end.
+                    None => continue,
+                }
             }
             self.spans.clear();
             let (buffer, spans) = (&mut self.buffer, &mut self.spans);
@@ -465,8 +489,13 @@ impl<D: Disk> ReplayCursor<D> {
                 (Some((end, false)), _) => self.position = end,
                 (Some((end, true)), Some(group_seq)) if end <= self.complete_end => {
                     self.position = end;
+                    let incomplete = self.incomplete == Some(group_seq);
+                    if incomplete {
+                        self.stopped = Some(Stop::Incomplete { group_seq });
+                    }
                     return Ok(Step::Event(ReplayEvent {
                         group_seq,
+                        incomplete,
                         reference_unavailable: self.unavailable.binary_search(&group_seq).is_ok(),
                         bytes: &self.buffer,
                         spans: &self.spans,
@@ -482,21 +511,28 @@ impl<D: Disk> ReplayCursor<D> {
     }
 
     /// The stop at the end of the complete prefix, from the records after
-    /// it: the gap or the incomplete event the prefix stopped at, if one
-    /// comes before the next complete event. Reference unavailable records
-    /// are skipped: the cursor found those of the prefix when it opened.
-    fn past_prefix(&mut self) -> Result<Stop, ReplayError> {
+    /// it: the gap the prefix stopped at, if one comes before the next
+    /// complete event. At an incomplete event it gives `None`, having set
+    /// the cursor to give that event's records next. Reference unavailable
+    /// records are skipped: the cursor found those of the prefix when it
+    /// opened.
+    fn past_prefix(&mut self) -> Result<Option<Stop>, ReplayError> {
+        if self.incomplete.is_some() {
+            // The incomplete event's records ended before its end record.
+            return Err(ReplayError::Torn {
+                position: self.position,
+            });
+        }
         let mut stop = None;
-        let _ = self.journal.walk(self.position, |_, _, record| {
+        let mut incomplete = None;
+        let _ = self.journal.walk(self.position, |_, end, record| {
             match record {
                 GroupRecord::Gap(gap) => {
                     stop = Some(Stop::Gap(*gap));
                     return false;
                 }
-                GroupRecord::End(end) if end.outcome == EndOutcome::Incomplete => {
-                    stop = Some(Stop::Incomplete {
-                        group_seq: end.group_seq,
-                    });
+                GroupRecord::End(record) if record.outcome == EndOutcome::Incomplete => {
+                    incomplete = Some((record.group_seq, end));
                     return false;
                 }
                 // The first event past the prefix is complete and waits on
@@ -506,11 +542,16 @@ impl<D: Disk> ReplayCursor<D> {
             }
             true
         })?;
+        if let Some((group_seq, end)) = incomplete {
+            self.incomplete = Some(group_seq);
+            self.complete_end = end;
+            return Ok(None);
+        }
         let stop = stop.unwrap_or(Stop::EndOfPrefix {
             complete_recording_seq: self.complete_seq,
         });
         self.stopped = Some(stop);
-        Ok(stop)
+        Ok(Some(stop))
     }
 
     /// The journal, given back.
