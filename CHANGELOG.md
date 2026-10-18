@@ -196,6 +196,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A segment store is truncated at the end of a write
+  (`SegmentStore::truncate`; phase 3, for a recording group's recovery
+  to its complete prefix, SPEC §8.3). Everything after the cut is
+  removed on disk and what is kept is durable on return; a crash inside
+  recovers either as before or at the cut. A position outside the
+  recording or inside a write is refused, typed, with nothing changed.
 - `karyos_sys::submission_frontier::SubmissionFrontier`: a guarded
   network lane's submission frontier, which its sender gate publishes
   for the driver's outcome walker. Per lane, `resolved` (Release),
@@ -811,6 +817,9 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- The segment store's arithmetic is checked (SPEC §14): five
+  saturating operations in the interval sync and in recovery's counts
+  are checked ones. A clock that steps back still syncs nothing.
 - A guarded network publication that a guard close sealed no longer
   takes a fresh incarnation after the reopen: `publication()` refuses with
   `DriverError::NetworkReincarnation`. The network sender did not follow
