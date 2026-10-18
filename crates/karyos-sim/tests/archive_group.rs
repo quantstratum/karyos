@@ -624,7 +624,7 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
         lane: Lane::ZERO,
     };
     let word = archive
-        .recording_word(STREAM, 1)
+        .recording_word(STREAM, 1, Lane::ZERO)
         .unwrap()
         .unwrap_or_default();
     let _ = gateway
