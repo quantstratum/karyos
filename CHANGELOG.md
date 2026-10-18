@@ -11,6 +11,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The Archive's `RecordingDescriptor` (control schema 1, A6b) carries
+  the recorded publication's identity (`source`, a `SourceIncarnation`)
+  and, while it records, the position written so far
+  (`RecordingState::Recording { written, .. }`): its block grows from 70
+  to 110 bytes, and a descriptor whose `written` lies below its start or
+  away from its stop is refused. A replay target's session id is the
+  replay id's low 32 bits (`server::replay_session_id`), and
+  `ArchiveHost::open_replay` takes the replay id. A prepared replay whose
+  sink never comes is dropped after `AgentConfig::prepared_timeout`, so
+  it no longer holds a replay's slot.
 - The live merge (phase 3, A6a; SPEC.md §8.2).
   `karyos_client::LiveMerge` merges a `Replay` of a recording into the
   live subscription of the same publication at an explicit cutover: the

@@ -55,7 +55,7 @@ pub const MAX_REQUEST: usize = 1079;
 /// The longest message the server sends: a `RecordingDescriptor` with the
 /// longest channel (the envelope, its block, and the channel's length and
 /// bytes).
-pub const MAX_ANSWER: usize = 12 + 70 + 2 + MAX_CHANNEL;
+pub const MAX_ANSWER: usize = 12 + 110 + 2 + MAX_CHANNEL;
 
 /// The host's side of the Archive: the driver's streams.
 pub trait ArchiveHost {
@@ -70,10 +70,14 @@ pub trait ArchiveHost {
         request: &control::StartRecording<'_>,
     ) -> Result<HostRecording, HostRefusal>;
 
-    /// Opens the target stream of a replay of `recording` over
+    /// Opens the target stream of replay `replay_id` of `recording` over
     /// `[from, to)`, a range the agent found readable: an image that keeps
-    /// the recorded positions. The sink's `finish` names where the replay
-    /// ended; it reached its end only at `to`.
+    /// the recorded positions, at the request's `target_stream_id` with
+    /// the replay id's low 32 bits as its session id, where the requester
+    /// finds it (archive-control-codec.md section 4.1). A target whose
+    /// stream and session collide with a stream the host has is refused.
+    /// The sink's `finish` names where the replay ended; it reached its
+    /// end only at `to`.
     ///
     /// # Errors
     ///
@@ -82,6 +86,7 @@ pub trait ArchiveHost {
         &mut self,
         request: &control::Replay<'_>,
         recording: &Recording,
+        replay_id: u64,
         from: u64,
         to: u64,
     ) -> Result<Box<dyn ReplaySink + Send>, HostRefusal>;
@@ -724,6 +729,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             let state = match recording.stop {
                 Some(stop) => RecordingState::Stopped(stop),
                 None => RecordingState::Recording {
+                    written: described.end,
                     incomplete: described.incomplete,
                 },
             };
@@ -737,6 +743,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 start_time_ns: recording.start_time_ns,
                 state,
                 geometry: recording.geometry,
+                source: recording.format.source,
                 stream_id: recording.stream_id,
                 session_id: recording.session_id,
                 channel,
@@ -752,10 +759,13 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
     fn open_replay(&mut self, correlation_id: u64, length: usize, prepared: &Prepared) {
         let decoded = self.request.get(..length).map(ControlMessage::decode);
         let opened = match decoded {
-            Some(Ok(ControlMessage::Replay(request))) => {
-                self.host
-                    .open_replay(&request, &prepared.recording, prepared.from, prepared.to)
-            }
+            Some(Ok(ControlMessage::Replay(request))) => self.host.open_replay(
+                &request,
+                &prepared.recording,
+                prepared.replay_id,
+                prepared.from,
+                prepared.to,
+            ),
             // It decoded when it was served, and stays in the buffer while
             // it waits.
             _ => Err(HostRefusal("the request is gone".to_owned())),
@@ -776,6 +786,14 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             answer,
         });
     }
+}
+
+/// The session id of replay `replay_id`'s target: the id's low 32 bits,
+/// as Aeron does (archive-control-codec.md section 4.1).
+#[must_use]
+pub fn replay_session_id(replay_id: u64) -> i32 {
+    let low = u32::try_from(replay_id & u64::from(u32::MAX)).unwrap_or_default();
+    low.cast_signed()
 }
 
 /// Adds one to `counter`; once at `u64::MAX` it stays there, never
