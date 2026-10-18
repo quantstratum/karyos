@@ -258,21 +258,47 @@ impl ConsensusCore for Reference {
         if self.waiting {
             return None;
         }
-        // Committed entries are applied once durable here.
+        // Committed entries, written or in this Ready: `drive` applies
+        // them after persisting it.
         let start = self
             .handed
             .map_or(Some(log.first_index()), |handed| handed.checked_add(1));
+        let written = match self.truncate {
+            Some(from) => from
+                .checked_sub(1)
+                .filter(|last| *last >= log.first_index()),
+            None => log.last_index(),
+        };
         let end = self
             .commit
-            .min(log.durable_index())
+            .min(written)
             .and_then(|last| last.checked_add(1));
-        let committed = match (start, end) {
+        let mut committed = match (start, end) {
             // A failed read applies none; the next Ready retries.
             (Some(start), Some(end)) if start < end => {
                 log.entries(start..end, u64::MAX).unwrap_or_default()
             }
             _ => Vec::new(),
         };
+        let next = committed
+            .last()
+            .map(|entry| entry.index.checked_add(1))
+            .unwrap_or(start);
+        // Only what continues the entries above, so nothing is skipped.
+        let mut expected = next;
+        for entry in &self.unpersisted {
+            if Some(entry.index) > self.commit {
+                break;
+            }
+            if Some(entry.index) < expected {
+                continue;
+            }
+            if Some(entry.index) != expected {
+                break;
+            }
+            committed.push(entry.clone());
+            expected = entry.index.checked_add(1);
+        }
         let hard_state = self.dirty.then_some(HardState {
             current_term: TERM,
             voted_for: Some(u64::from(LEADER)),

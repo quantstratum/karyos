@@ -7,6 +7,9 @@
 //! - the reference passes W1, W4 and W6, and W3's safety predicates;
 //! - W3's leader crash, and W4's lost durable majority, show a liveness
 //!   gap, not a violation;
+//! - a retried command is applied twice and answered once, by the
+//!   service's deduplication, and the state digest is the linearized
+//!   history's;
 //! - W2 and W5 are typed as not yet runnable.
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
@@ -109,6 +112,20 @@ fn w4_passes_and_a_lost_majority_is_a_gap() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn slow_replies_are_retried_and_deduplicated() {
+    let case = W6::skeleton()
+        .cases()
+        .into_iter()
+        .find(|case| case.name == "W6 slow replies")
+        .unwrap();
+    for seed in corpus() {
+        let outcome = workloads::run::<Reference>(&case, seed).unwrap();
+        assert_eq!(workloads::pass(&case, &outcome), Ok(None), "seed {seed}");
+        assert!(outcome.deduplicated > 0, "seed {seed}: nothing retried");
     }
 }
 

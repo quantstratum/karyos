@@ -27,11 +27,14 @@ use karyos_cluster::LogError;
 
 use super::check::{self, Violation};
 use super::core::ConsensusCore;
-use super::node::{ClientNode, Member, Observation, Op, Recorder, Ret, ServerNode, Shared, Wire};
+use super::node::{
+    ClientNode, Member, Observation, Op, RETRY_AFTER, Recorder, Ret, ServerNode, ServiceModel,
+    Shared, TestService, Wire,
+};
 use super::reference;
 use crate::cluster::{ClusterSim, NodeError};
 use crate::disk::{SimDisk, Survives};
-use crate::lin::History;
+use crate::lin::{self, Event, History, Verdict};
 use crate::net::{LinkConfig, LinkConfigError, LinkFaults, LinkState, NodeId};
 use crate::sim::Failure;
 
@@ -70,7 +73,7 @@ pub fn w5() -> Result<Vec<Case>, NotYet> {
     Err(NotYet {
         workload: "W5",
         reason: "needs snapshots and compaction in the core interface and the \
-                 log, and client retries across a leader change",
+                 log, and a leader change for its lost-reply retries",
     })
 }
 
@@ -126,6 +129,10 @@ pub struct Case {
     pub payload: usize,
     /// The links between servers; clients' links stay up and in order.
     pub server_links: LinkConfig,
+    /// The delay of every server-to-client link.
+    pub reply_delay: u64,
+    /// Ticks a client waits for an answer before it sends again.
+    pub retry_after: u64,
     /// What a server's crash keeps of its pending disk operations.
     pub survives: Survives,
     /// Servers whose flushes fail, from the first after
@@ -156,6 +163,8 @@ impl Case {
             operations,
             payload: 32,
             server_links: LinkConfig::default(),
+            reply_delay: 1,
+            retry_after: RETRY_AFTER,
             survives: Survives::Synced,
             failing_flushes: Vec::new(),
             flushes_before_failure: 0,
@@ -196,6 +205,8 @@ pub struct Outcome {
     pub digest: u64,
     /// Each server that is up: its last applied index and state digest.
     pub states: Vec<(NodeId, Option<u64>, u64)>,
+    /// Retried commands the up servers answered from deduplication.
+    pub deduplicated: u64,
 }
 
 /// A case its run did not pass.
@@ -209,6 +220,13 @@ pub enum Failed {
     Diverged(Vec<(NodeId, Option<u64>, u64)>),
     /// The same seed gave a different run.
     NotReplayed,
+    /// The servers' state is not the linearized history's.
+    WrongState {
+        /// The linearized history's digest.
+        expected: u64,
+        /// The up servers' last applied index and digest.
+        states: Vec<(NodeId, Option<u64>, u64)>,
+    },
 }
 
 /// A run that could not be set up or stepped.
@@ -338,7 +356,8 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .ok()
             .and_then(|index| servers.checked_add(index))
             .ok_or(RunError::Count)?;
-        let client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder));
+        let client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
+            .with_retry_after(case.retry_after);
         let added = sim
             .add_node(Member::Client(client), 0, 0)
             .map_err(RunError::Sim)?;
@@ -348,6 +367,16 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         for &to in peers.iter().filter(|to| **to != from) {
             sim.net_mut()
                 .configure(from, to, case.server_links)
+                .map_err(RunError::Link)?;
+        }
+        let replies = LinkConfig {
+            min_delay: case.reply_delay,
+            max_delay: case.reply_delay,
+            ..LinkConfig::default()
+        };
+        for &client in &clients {
+            sim.net_mut()
+                .configure(from, client, replies)
                 .map_err(RunError::Link)?;
         }
     }
@@ -399,6 +428,20 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         .iter()
         .map(|(id, server)| (*id, server.service().applied(), server.service().digest()))
         .collect();
+    let deduplicated = up
+        .iter()
+        .map(|(_, server)| server.service().deduplicated())
+        .try_fold(0u64, u64::checked_add)
+        .ok_or(RunError::Count)?;
+    // Every crashed server restarts before the checks, so what it held
+    // durably is verified (`check::durable_kept`); a server whose log
+    // failed is up to the simulator, and is not restarted.
+    for &id in &peers {
+        match sim.restart(id) {
+            Ok(()) | Err(NodeError::AlreadyUp(_)) => {}
+            Err(error) => return Err(RunError::Node(error)),
+        }
+    }
     let recorded = recorder.borrow();
     Ok(Outcome {
         safety: check::all(&recorded.observations, &recorded.history, case.servers),
@@ -408,13 +451,16 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         trace: sim.trace().to_vec(),
         digest: sim.digest(),
         states,
+        deduplicated,
     })
 }
 
-/// The pass predicate shared by W1, W3 and W4: every safety check holds;
-/// progress completes where the case expects it, else a stop is returned
-/// as the gap it is; and the up servers that applied the most agree on
-/// the state.
+/// The pass predicate of W1, W3, W4 and W6: every safety check holds,
+/// canonical responses included ([`check::responses_agree`]); progress
+/// completes where the case expects it, else a stop is returned as the
+/// gap it is; the up servers that applied the most agree on the state
+/// digest; and where every client finished, that digest is the one the
+/// linearized history builds, each append once.
 ///
 /// # Errors
 ///
@@ -439,7 +485,51 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
     if digests.any(|digest| Some(digest) != first) {
         return Err(Failed::Diverged(outcome.states.clone()));
     }
+    // Where every client finished, the state is the register the
+    // clients' linearized appends make, each once.
+    if gap.is_none()
+        && let Some(state) = first
+    {
+        let expected = linearized_digest(&outcome.history)?;
+        if state != expected {
+            return Err(Failed::WrongState {
+                expected,
+                states: outcome.states.clone(),
+            });
+        }
+    }
     Ok(gap)
+}
+
+/// The digest of the register the linearization of `history` builds.
+fn linearized_digest(history: &History<Op, Ret>) -> Result<u64, Failed> {
+    let violation = match lin::check(&ServiceModel, history, check::LIMIT) {
+        Ok(Verdict::Linearizable(order)) => return Ok(digest_in(history, &order)),
+        Ok(Verdict::NotLinearizable(counterexample)) => Violation::NotLinearizable(counterexample),
+        Ok(Verdict::Undecided { explored }) => Violation::Undecided { explored },
+        Err(error) => Violation::MalformedHistory(error),
+    };
+    Err(Failed::Safety(Box::new(violation)))
+}
+
+/// The digest of the register the appends of `history` build in `order`.
+fn digest_in(history: &History<Op, Ret>, order: &[usize]) -> u64 {
+    let ops: Vec<&Op> = history
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            Event::Invoke { op, .. } => Some(op),
+            Event::Return { .. } => None,
+        })
+        .collect();
+    let values: Vec<Vec<u8>> = order
+        .iter()
+        .filter_map(|index| match ops.get(*index) {
+            Some(Op::Append(value)) => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
+    TestService::digest_of(&values)
 }
 
 /// W1, normal sequencer and OMS-like commands.
@@ -716,8 +806,8 @@ impl W4 {
                             vec![(step, Action::Crash(2)), (step + 40, Action::Restart(2))];
                     }
                     W4Cut::LeaderCrash { step } => {
-                        // Without client retries, requests the leader held
-                        // are lost with it: a stop is a gap.
+                        // The requests the leader held are lost with it;
+                        // a client retries, but a stop is a gap.
                         case.progress = Progress::MayStop;
                         case.schedule =
                             vec![(step, Action::Crash(0)), (step + 40, Action::Restart(0))];
@@ -778,7 +868,14 @@ impl W6 {
         crash.name = "W6 follower crash".to_owned();
         crash.survives = Survives::Torn { seed: 7 };
         crash.schedule = vec![(12, Action::Crash(1)), (50, Action::Restart(1))];
-        vec![healthy, crash]
+        // Replies slower than the clients' patience: every request is
+        // sent again and applied twice, and deduplication answers it.
+        let mut retried = healthy.clone();
+        retried.name = "W6 slow replies".to_owned();
+        retried.reply_delay = 50;
+        retried.retry_after = 30;
+        retried.steps = 1200;
+        vec![healthy, crash, retried]
     }
 
     /// `case` of core `C` repeated under `seed`: every run must give the

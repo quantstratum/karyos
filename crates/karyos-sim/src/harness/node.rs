@@ -34,7 +34,7 @@ use std::rc::Rc;
 use karyos_archive::segment::Geometry;
 use karyos_cluster::{Entry, LogError, RaftLog};
 
-use super::core::{ConsensusCore, DriveError, LogView, Release, Step, drive};
+use super::core::{Applying, ConsensusCore, DriveError, LogView, Release, Step, drive};
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
 use crate::lin::{self, History};
@@ -86,6 +86,30 @@ impl Ret {
             }
         }
         bytes
+    }
+
+    /// The answer in canonical response bytes, if they are some.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let (tag, mut rest) = bytes.split_first()?;
+        match tag {
+            0 => {
+                let length = rest.first_chunk::<8>()?;
+                (rest.len() == 8).then(|| Self::Appended(u64::from_le_bytes(*length)))
+            }
+            1 => {
+                let mut values = Vec::new();
+                while !rest.is_empty() {
+                    let (length, tail) = rest.split_first_chunk::<4>()?;
+                    let length = usize::try_from(u32::from_le_bytes(*length)).ok()?;
+                    let value = tail.get(..length)?;
+                    values.push(value.to_vec());
+                    rest = tail.get(length..)?;
+                }
+                Some(Self::Values(values))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -145,6 +169,7 @@ pub struct TestService {
     /// Per client, its last sequence applied and its answer.
     answered: BTreeMap<NodeId, (u64, Ret)>,
     applied: Option<u64>,
+    deduplicated: u64,
 }
 
 impl TestService {
@@ -157,6 +182,9 @@ impl TestService {
         if let Some((sequence, ret)) = self.answered.get(&command.client)
             && *sequence == command.sequence
         {
+            if let Some(count) = self.deduplicated.checked_add(1) {
+                self.deduplicated = count;
+            }
             return Some((command, ret.clone()));
         }
         let ret = match &command.op {
@@ -178,12 +206,25 @@ impl TestService {
         self.applied
     }
 
-    /// A digest of the state: FNV-1a over the values (its multiplication
-    /// wraps by the hash's definition).
+    /// Retried commands it answered from its deduplication table.
+    #[must_use]
+    pub fn deduplicated(&self) -> u64 {
+        self.deduplicated
+    }
+
+    /// A digest of the state: see [`TestService::digest_of`].
     #[must_use]
     pub fn digest(&self) -> u64 {
+        Self::digest_of(&self.values)
+    }
+
+    /// The digest of a register holding `values`: FNV-1a over them, each
+    /// closed by a 0xFF (its multiplication wraps by the hash's
+    /// definition).
+    #[must_use]
+    pub fn digest_of(values: &[Vec<u8>]) -> u64 {
         let mut digest = 0xCBF2_9CE4_8422_2325u64;
-        for value in &self.values {
+        for value in values {
             for byte in value.iter().chain(&[0xFF]) {
                 digest ^= u64::from(*byte);
                 digest = digest.wrapping_mul(0x0000_0100_0000_01B3);
@@ -291,6 +332,10 @@ pub enum Observation {
         node: NodeId,
         /// The entry.
         entry: Entry,
+        /// What the log held then.
+        applying: Applying,
+        /// The service's canonical response bytes, for a command.
+        response: Option<Vec<u8>>,
     },
     /// A client got a successful answer to the command at `index`.
     Success {
@@ -400,8 +445,8 @@ pub enum Wire<M> {
     Response {
         /// The client's sequence number.
         sequence: u64,
-        /// The answer.
-        ret: Ret,
+        /// The answer, in canonical response bytes ([`Ret::canonical`]).
+        bytes: Vec<u8>,
         /// The entry's index.
         index: u64,
     },
@@ -532,7 +577,7 @@ impl<C: ConsensusCore> ServerNode<C> {
                 }
                 out.push((to, Wire::Core(message)));
             },
-            &mut |entry| applied.push(entry.clone()),
+            &mut |entry, applying| applied.push((entry.clone(), applying)),
             &mut |step| {
                 recorder
                     .borrow_mut()
@@ -563,8 +608,10 @@ impl<C: ConsensusCore> ServerNode<C> {
             self.observe(observation);
             return;
         }
-        for entry in applied {
-            if let Some((command, ret)) = self.service.apply(&entry)
+        for (entry, applying) in applied {
+            let answer = self.service.apply(&entry);
+            let response = answer.as_ref().map(|(_, ret)| ret.canonical());
+            if let Some((command, ret)) = answer
                 && self.pending.remove(&(command.client, command.sequence))
             {
                 self.observe(Observation::Reply {
@@ -577,12 +624,17 @@ impl<C: ConsensusCore> ServerNode<C> {
                     command.client,
                     Wire::Response {
                         sequence: command.sequence,
-                        ret,
+                        bytes: ret.canonical(),
                         index: entry.index,
                     },
                 ));
             }
-            self.observe(Observation::Applied { node, entry });
+            self.observe(Observation::Applied {
+                node,
+                entry,
+                applying,
+                response,
+            });
         }
         let committed = core.committed();
         if committed > self.commit
@@ -716,15 +768,25 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     }
 }
 
-/// A scripted client: each step, it sends its next request to its server
-/// once the last one was answered.
+/// Ticks a client waits for an answer before it sends its request
+/// again, by default.
+pub const RETRY_AFTER: u64 = 400;
+
+/// A scripted client: it sends its next request to its server once the
+/// last one was answered, and sends an unanswered one again (the same
+/// sequence number) when it is refused or after its retry delay, so the
+/// service's deduplication answers a command applied twice.
 #[derive(Debug, Clone)]
 pub struct ClientNode {
     id: NodeId,
     server: NodeId,
     script: Vec<Op>,
     next: usize,
-    open: Option<u64>,
+    /// The request waiting for its answer, and when it was last sent.
+    open: Option<(Command, u64)>,
+    retry_after: u64,
+    /// The open request was refused: send it again now.
+    refused: bool,
     recorder: Shared,
 }
 
@@ -738,8 +800,17 @@ impl ClientNode {
             script,
             next: 0,
             open: None,
+            retry_after: RETRY_AFTER,
+            refused: false,
             recorder,
         }
+    }
+
+    /// Sends an unanswered request again after `ticks`.
+    #[must_use]
+    pub fn with_retry_after(mut self, ticks: u64) -> Self {
+        self.retry_after = ticks;
+        self
     }
 
     /// Whether every request of its script was answered.
@@ -750,8 +821,16 @@ impl ClientNode {
 }
 
 impl<M> Node<Wire<M>> for ClientNode {
-    fn tick(&mut self, _now: u64, out: &mut Outbox<Wire<M>>) {
-        if self.open.is_some() {
+    fn tick(&mut self, now: u64, out: &mut Outbox<Wire<M>>) {
+        if let Some((command, sent)) = self.open.as_mut() {
+            let due = now
+                .checked_sub(*sent)
+                .is_some_and(|waited| waited >= self.retry_after);
+            if self.refused || due {
+                self.refused = false;
+                *sent = now;
+                out.push((self.server, Wire::Request(command.clone())));
+            }
             return;
         }
         let Some(op) = self.script.get(self.next).cloned() else {
@@ -765,37 +844,43 @@ impl<M> Node<Wire<M>> for ClientNode {
         };
         // `next` indexes the script, so it is below `usize::MAX`.
         self.next += 1;
-        self.open = Some(sequence);
         let _ = self
             .recorder
             .borrow_mut()
             .history
             .invoke(self.id, op.clone());
-        out.push((
-            self.server,
-            Wire::Request(Command {
-                client: self.id,
-                sequence,
-                op,
-            }),
-        ));
+        let command = Command {
+            client: self.id,
+            sequence,
+            op,
+        };
+        out.push((self.server, Wire::Request(command.clone())));
+        self.open = Some((command, now));
     }
 
     fn deliver(&mut self, _from: NodeId, message: Wire<M>, _now: u64, _out: &mut Outbox<Wire<M>>) {
-        if let Wire::Response {
-            sequence,
-            ret,
-            index,
-        } = message
-            && self.open == Some(sequence)
-        {
-            self.open = None;
-            let mut recorder = self.recorder.borrow_mut();
-            let _ = recorder.history.ret(self.id, ret);
-            recorder.observations.push(Observation::Success {
-                client: self.id,
+        let open = self.open.as_ref().map(|(command, _)| command.sequence);
+        match message {
+            Wire::Response {
+                sequence,
+                bytes,
                 index,
-            });
+            } if open == Some(sequence) => {
+                // Bytes that do not decode are no answer: the retry asks
+                // again.
+                let Some(ret) = Ret::decode(&bytes) else {
+                    return;
+                };
+                self.open = None;
+                let mut recorder = self.recorder.borrow_mut();
+                let _ = recorder.history.ret(self.id, ret);
+                recorder.observations.push(Observation::Success {
+                    client: self.id,
+                    index,
+                });
+            }
+            Wire::Refused { sequence } if open == Some(sequence) => self.refused = true,
+            _ => {}
         }
     }
 }

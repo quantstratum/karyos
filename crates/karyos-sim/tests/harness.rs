@@ -30,8 +30,8 @@ use karyos_sim::cluster::ClusterSim;
 use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::check::{self, Violation};
 use karyos_sim::harness::core::{
-    ConsensusCore, DriveError, LogView, MAX_READIES, NotLeader, Persisted, Ready, Release, Step,
-    drive,
+    Applying, ConsensusCore, DriveError, LogView, MAX_READIES, NotLeader, Persisted, Ready,
+    Release, Step, drive,
 };
 use karyos_sim::harness::node::{
     Breach, ClientNode, LOG_DIR, Member, Observation, Op, Positions, Recorder, Ret, ServerNode,
@@ -329,6 +329,20 @@ fn entry(index: u64, term: u64, payload: u8) -> Entry {
     }
 }
 
+/// `entry` applied by `node` once durable.
+fn applied(node: NodeId, entry: Entry) -> Observation {
+    let applying = Applying {
+        durable: Some(entry.index),
+        logged_term: Some(entry.term),
+    };
+    Observation::Applied {
+        node,
+        entry,
+        applying,
+        response: None,
+    }
+}
+
 fn positions(durable: Option<u64>) -> Positions {
     Positions {
         received: Some(1),
@@ -378,22 +392,10 @@ fn a_history_that_is_not_linearizable_is_caught() {
 #[test]
 fn divergent_committed_prefixes_are_caught() {
     let observations = vec![
-        Observation::Applied {
-            node: 0,
-            entry: entry(1, 1, 1),
-        },
-        Observation::Applied {
-            node: 1,
-            entry: entry(1, 1, 1),
-        },
-        Observation::Applied {
-            node: 1,
-            entry: entry(2, 1, 2),
-        },
-        Observation::Applied {
-            node: 0,
-            entry: entry(2, 1, 3),
-        },
+        applied(0, entry(1, 1, 1)),
+        applied(1, entry(1, 1, 1)),
+        applied(1, entry(2, 1, 2)),
+        applied(0, entry(2, 1, 3)),
     ];
     check::committed_prefixes_agree(&observations[..3]).unwrap();
     assert_eq!(
@@ -585,10 +587,7 @@ fn lost_durable_entries_are_caught() {
     // Truncating an entry the cluster applied.
     let truncated = vec![
         persisted(1, None, vec![(1, 1), (2, 1)]),
-        Observation::Applied {
-            node: 0,
-            entry: entry(2, 1, 9),
-        },
+        applied(0, entry(2, 1, 9)),
         persisted(1, Some(2), vec![(2, 3)]),
     ];
     assert_eq!(
@@ -661,7 +660,7 @@ fn drive_stops_at_its_work_budget() {
         &mut core,
         &mut log,
         &mut |_, (), _| sent += 1,
-        &mut |_| {},
+        &mut |_, _| {},
         &mut |_| {},
     );
     assert!(
@@ -695,4 +694,69 @@ fn drive_stops_at_its_work_budget() {
             ..
         })
     ));
+}
+
+#[test]
+fn an_entry_applied_before_it_is_durable_is_caught() {
+    check::applied_durable(&[applied(1, entry(2, 1, 0))]).unwrap();
+    for applying in [
+        Applying {
+            durable: Some(1),
+            logged_term: Some(1),
+        },
+        Applying {
+            durable: Some(2),
+            logged_term: None,
+        },
+    ] {
+        let early = Observation::Applied {
+            node: 1,
+            entry: entry(2, 1, 0),
+            applying,
+            response: None,
+        };
+        assert_eq!(
+            check::applied_durable(&[early]),
+            Err(Violation::AppliedNotDurable {
+                node: 1,
+                index: 2,
+                applying,
+            })
+        );
+    }
+}
+
+#[test]
+fn divergent_responses_are_caught() {
+    let answered = |node, bytes: Vec<u8>| Observation::Applied {
+        node,
+        entry: entry(1, 1, 0),
+        applying: Applying {
+            durable: Some(1),
+            logged_term: Some(1),
+        },
+        response: Some(bytes),
+    };
+    check::responses_agree(&[answered(0, vec![0, 1]), answered(1, vec![0, 1])]).unwrap();
+    assert_eq!(
+        check::responses_agree(&[answered(0, vec![0, 1]), answered(1, vec![0, 2])]),
+        Err(Violation::DivergentResponse {
+            index: 1,
+            first: 0,
+            second: 1,
+        })
+    );
+}
+
+#[test]
+fn responses_round_trip_in_canonical_bytes() {
+    for ret in [
+        Ret::Appended(7),
+        Ret::Values(Vec::new()),
+        Ret::Values(vec![vec![1, 2], Vec::new(), vec![3]]),
+    ] {
+        assert_eq!(Ret::decode(&ret.canonical()), Some(ret));
+    }
+    assert_eq!(Ret::decode(&[0, 1]), None);
+    assert_eq!(Ret::decode(&[1, 9, 0, 0, 0]), None);
 }
