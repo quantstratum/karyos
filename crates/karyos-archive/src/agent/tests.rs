@@ -2621,6 +2621,38 @@ mod checkpoints {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// #437 re-check Morder: the header is written only once the store is
+    /// open. A takeover whose store cannot be opened leaves the journal
+    /// as it was, headerless, and fails.
+    #[test]
+    fn a_takeover_whose_store_fails_writes_no_header() {
+        let dir = dirs("checkpoint-takeover-store-fails");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        headerless(&dir, policy);
+        // The store's directory is a file: the store cannot be opened.
+        let stores = store_dir(&dir.join("groups"));
+        std::fs::remove_dir_all(&stores).unwrap();
+        std::fs::write(&stores, b"not a directory").unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let before = files(&dir);
+        assert!(
+            agent
+                .start_group(start_with(&dir, Some(Capture::Strict), policy))
+                .is_err()
+        );
+        assert_eq!(files(&dir), before, "the journal changed");
+        agent.shutdown().unwrap();
+        let plan =
+            GroupJournal::verify(StdDisk, &dir.join("groups"), GROUP, journal_config(policy))
+                .unwrap();
+        assert_eq!(
+            plan.kept.map(|kept| kept.written),
+            Some(0),
+            "still headerless"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// #437 re-check t2: a journal durable to 8 whose header is damaged:
     /// recovery cuts it all. Neither a restart nor a new start takes it;
     /// both are refused as a cut header, and nothing is written.
