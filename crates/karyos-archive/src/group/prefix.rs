@@ -975,8 +975,9 @@ pub fn recover<D: crate::disk::Disk>(
 ) -> Result<Recovery, super::journal::JournalError> {
     // The reopening window is the header's (A9), as the run's was.
     let allocation = |_| super::journal::JournalError::Allocation;
-    let hold = usize::try_from(journal.reopen_hold()?)
-        .map_err(|_| super::journal::JournalError::Allocation)?;
+    // A journal without a header holds no event: no window.
+    let recorded = journal.reopen_hold()?.unwrap_or(0);
+    let hold = usize::try_from(recorded).map_err(|_| super::journal::JournalError::Allocation)?;
     let mut tracker = PrefixTracker::try_new(capacity).map_err(allocation)?;
     tracker.reserve_reopen_hold(hold).map_err(allocation)?;
     let mut last_seen = 0u64;

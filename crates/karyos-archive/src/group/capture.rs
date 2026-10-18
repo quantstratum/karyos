@@ -213,7 +213,10 @@ pub fn capture<D: Disk>(
     })?;
     // The reopening window is the header's (A9): recovery and the running
     // tracker take the same.
-    let reopen_hold = journal.reopen_hold().map_err(CaptureSetup::Journal)?;
+    let reopen_hold = journal
+        .reopen_hold()
+        .map_err(CaptureSetup::Journal)?
+        .unwrap_or(0);
     let recovery =
         prefix::recover(&mut journal, coverage, config.in_flight).map_err(CaptureSetup::Journal)?;
     if recovery.full {
@@ -327,9 +330,8 @@ fn check(config: CaptureConfig, policy: SyncPolicy) -> Result<(u64, u64, u64), C
         Ok(0) | Err(_) => return Err(CaptureError::InFlight),
         Ok(in_flight) => in_flight,
     };
-    // The events a recording that ended may leave uncovered: the tracker's
-    // queue, the first range's events still settling, and, past a stop,
-    // the events a checkpoint may yet take.
+    // The tracker's queues are allocated to the bound when the group
+    // starts: it is capped.
     if config.in_flight > MAX_IN_FLIGHT {
         return Err(CaptureError::InFlight);
     }

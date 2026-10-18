@@ -2488,10 +2488,19 @@ mod checkpoints {
         refused(holding(&dir, None, 2, Some(4)), "a smaller hold");
         refused(holding(&dir, None, 2, Some(16)), "a larger hold");
         refused(holding(&dir, None, 9, None), "in_flight above the hold");
+        refused(
+            StartGroup {
+                checkpoints: None,
+                ..holding(&dir, None, 2, None)
+            },
+            "checkpoints off",
+        );
         for (what, start) in [
             ("the same settings", holding(&dir, None, 2, Some(8))),
             ("no hold named", holding(&dir, None, 2, None)),
             ("a lower in_flight", holding(&dir, None, 1, None)),
+            // The effective window, max(4, 8), is the recorded 8.
+            ("a hold below in_flight", holding(&dir, None, 8, Some(4))),
         ] {
             let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
             let recovered = agent.start_group(start).unwrap();
@@ -2499,6 +2508,35 @@ mod checkpoints {
             agent.stop_group(GROUP).unwrap();
             agent.shutdown().unwrap();
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 review P3: the default hold is computed only when the group is
+    /// made: a restart naming no hold, with an `in_flight` whose default
+    /// would pass the cap, takes the recorded hold.
+    #[test]
+    fn a_restart_computes_no_default_hold() {
+        let dir = dirs("checkpoint-hold-no-default");
+        let in_flight = MAX_REOPEN_HOLD / 4 + 1;
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let sender = agent
+            .start_group(holding(
+                &dir,
+                Some(Capture::Strict),
+                in_flight,
+                Some(MAX_REOPEN_HOLD),
+            ))
+            .unwrap();
+        drop(sender);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let recovered = agent
+            .start_group(holding(&dir, None, in_flight, None))
+            .unwrap();
+        assert_eq!(recovered.state(), GroupState::Running);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

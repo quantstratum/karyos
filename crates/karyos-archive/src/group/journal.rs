@@ -237,17 +237,17 @@ impl<D: Disk> GroupJournal<D> {
         })
     }
 
-    /// The reopen hold its header records (A9): 0 for a group without
-    /// checkpoints, or a journal without a header yet.
+    /// The reopen hold its header records (A9), 0 for a group without
+    /// checkpoints; `None` for a journal without a header yet.
     ///
     /// # Errors
     ///
     /// The journal's read errors.
-    pub fn reopen_hold(&mut self) -> Result<u32, JournalError> {
-        let mut hold = 0;
+    pub fn reopen_hold(&mut self) -> Result<Option<u32>, JournalError> {
+        let mut hold = None;
         self.walk(0, |_, _, record| {
             if let GroupRecord::Header(header) = record {
-                hold = header.reopen_hold;
+                hold = Some(header.reopen_hold);
             }
             false
         })?;

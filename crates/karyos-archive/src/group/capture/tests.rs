@@ -1104,3 +1104,20 @@ fn a_queue_still_full_after_the_retry_fails_the_group() {
     ));
     assert_eq!(sender.state(), GroupState::Failed);
 }
+
+/// #437 review M8: the list of events a recording leaves uncovered is
+/// reserved when the group starts, three times `in_flight`, so the job
+/// never grows it.
+#[test]
+fn the_uncovered_list_is_reserved_at_start() {
+    let (_sender, job) = new(
+        Capture::BestEffort,
+        SyncPolicy::PerSegment,
+        settings(1 << 16, 4096, 5),
+    );
+    assert!(
+        job.uncovered.capacity() >= 15,
+        "{}",
+        job.uncovered.capacity()
+    );
+}

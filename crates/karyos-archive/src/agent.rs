@@ -170,11 +170,13 @@ pub struct GroupCheckpoints {
     /// A hold below `in_flight` is taken as `in_flight`; one above
     /// [`MAX_REOPEN_HOLD`] is refused ([`AgentError::CheckpointConfig`]).
     /// It is fixed when the group is made and recorded in its journal's
-    /// header, which recovery and the running tracker both take. A
-    /// restart is refused when it names another hold, an `in_flight`
-    /// above the recorded hold, or checkpoints for a group made without
-    /// them. Raising a group's hold would take a record of the raise in
-    /// its journal; none exists yet.
+    /// header, which recovery and the running tracker both take; the
+    /// default is computed only then. A restart is refused when the
+    /// effective window it names, `max(hold, in_flight)`, differs from
+    /// the recorded one, when its `in_flight` is above it, or when it
+    /// turns checkpoints on or off: they are fixed per group. Raising a
+    /// group's hold would take a record of the raise in its journal; none
+    /// exists yet.
     pub reopen_hold: Option<usize>,
 }
 
@@ -184,6 +186,10 @@ pub struct GroupCheckpoints {
 /// the cap. The journal header's bound
 /// ([`crate::group::record::MAX_REOPEN_HOLD`]).
 pub const MAX_REOPEN_HOLD: usize = 1 << 16;
+
+// The agent's bound is the header's.
+const _: () =
+    assert!(MAX_REOPEN_HOLD == 1 << 16 && crate::group::record::MAX_REOPEN_HOLD == 1 << 16);
 
 /// A new group's journal header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1612,13 +1618,21 @@ impl<D: Disk + Clone> State<D> {
     }
 
     /// Checks a restart against the reopen hold its journal's header
-    /// records (A9): the hold is fixed per group. Refused
+    /// records (A9): the hold and checkpoints are fixed per group. Refused
     /// ([`AgentError::CheckpointConfig`]): checkpoints on a group made
-    /// without them, an explicit hold other than the recorded one, and an
-    /// `in_flight` above it (the clamp would raise the running window).
+    /// without them, or off for one made with them; an explicit hold whose
+    /// effective window, `max(hold, in_flight)`, differs from the recorded
+    /// one; and an `in_flight` above it (the clamp would raise the running
+    /// window).
     fn check_hold(start: &StartGroup, recorded: u32) -> Result<(), AgentError> {
         let Some(checkpoints) = &start.checkpoints else {
-            return Ok(());
+            // Checkpoints off for a group made with them would take back
+            // the durability its reopened ranges reported.
+            return if recorded == 0 {
+                Ok(())
+            } else {
+                Err(AgentError::CheckpointConfig)
+            };
         };
         let recorded = usize::try_from(recorded).map_err(|_| AgentError::CheckpointConfig)?;
         let differs = checkpoints
@@ -1654,9 +1668,9 @@ impl<D: Disk + Clone> State<D> {
         // A new group's reopening window, recorded in its header (A9) and
         // checked here, before the journal exists: configured, or four
         // times `in_flight`, at least `in_flight`; 0 without checkpoints.
-        let new_hold = match &start.checkpoints {
-            None => 0,
-            Some(checkpoints) => {
+        let new_hold = match (&start.new, &start.checkpoints) {
+            (None, _) | (Some(_), None) => 0,
+            (Some(_), Some(checkpoints)) => {
                 let hold = match checkpoints.reopen_hold {
                     Some(hold) => hold,
                     None => start
@@ -1694,10 +1708,14 @@ impl<D: Disk + Clone> State<D> {
             }
         };
         let mut journal = journal;
-        if start.new.is_none() {
-            // A restart takes the header's window as recorded, before the
-            // store is touched: the hold is fixed per group.
-            let recorded = journal.reopen_hold()?;
+        // A restart takes the header's window as recorded, before the
+        // store or the capture path is touched (the journal's own
+        // recovery, which may cut a torn tail, has run): the hold is fixed
+        // per group. A journal whose header was never written takes its
+        // header as a new one would, with nothing to check.
+        if start.new.is_none()
+            && let Some(recorded) = journal.reopen_hold()?
+        {
             Self::check_hold(&start, recorded)?;
         }
         // The store beside the journal, made or recovered with it: a

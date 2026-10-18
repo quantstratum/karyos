@@ -1875,3 +1875,29 @@ fn a_checkpoint_record_refuses_what_names_nothing() {
         );
     }
 }
+
+/// #437 review M9: a header whose reopen hold passes the cap does not
+/// encode.
+#[test]
+fn a_header_above_the_hold_cap_does_not_encode() {
+    let header = |reopen_hold| {
+        GroupRecord::Header(JournalHeader {
+            group_id: 7,
+            first_group_seq: 1,
+            inline_threshold: 4096,
+            contract_version: 1,
+            clock: Clock::HostMonotonic,
+            capture: Capture::BestEffort,
+            reopen_hold,
+            manifest: b"m",
+        })
+    };
+    let mut out = vec![0u8; MAX_RECORD];
+    assert!(header(MAX_REOPEN_HOLD).encode(&mut out).is_ok());
+    assert_eq!(
+        header(MAX_REOPEN_HOLD + 1).encode(&mut out).unwrap_err(),
+        CodecError::ValueOutOfRange {
+            field: "reopen_hold"
+        }
+    );
+}
