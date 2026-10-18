@@ -232,6 +232,18 @@ pub struct ReplaySource<D: Disk> {
     ended: bool,
     /// An earlier poll failed.
     failed: bool,
+    /// The state before the last step, for [`ReplaySource::hold`].
+    before: Option<Snapshot>,
+}
+
+/// Where a replay was before a step.
+#[derive(Debug, Clone, Copy)]
+struct Snapshot {
+    position: u64,
+    current: Option<Current>,
+    ended: bool,
+    base: Option<u64>,
+    next_entry: u64,
 }
 
 impl<D: Disk> ReplaySource<D> {
@@ -282,6 +294,7 @@ impl<D: Disk> ReplaySource<D> {
             origin: None,
             ended: false,
             failed: false,
+            before: None,
         };
         let held = source.held(from, to)?;
         source.to = to.min(held);
@@ -583,6 +596,13 @@ impl<D: Disk> ReplaySource<D> {
         if self.failed {
             return Err(ReplayError::Failed);
         }
+        self.before = Some(Snapshot {
+            position: self.position,
+            current: self.current,
+            ended: self.ended,
+            base: self.open.as_ref().map(|open| open.base),
+            next_entry: self.open.as_ref().map_or(0, |open| open.next_entry),
+        });
         let next = match self.next(now_ns) {
             Ok(next) => next,
             Err(error) => {
@@ -606,6 +626,41 @@ impl<D: Disk> ReplaySource<D> {
             Next::Wait { until_ns } => Step::Wait { until_ns },
             Next::End { position } => Step::End { position },
         })
+    }
+
+    /// Takes back the last step, so the next poll yields it again: for a
+    /// target that had no room for it. A no-op before the first poll and
+    /// after a hold.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`ReplaySource::open`]'s seek, when the step crossed
+    /// into the next segment and the replay seeks back; such an error is
+    /// final.
+    pub fn hold(&mut self) -> Result<(), ReplayError> {
+        let Some(before) = self.before.take() else {
+            return Ok(());
+        };
+        if self.failed {
+            return Err(ReplayError::Failed);
+        }
+        self.position = before.position;
+        self.current = before.current;
+        self.ended = before.ended;
+        if let (Some(open), Some(base)) = (self.open.as_mut(), before.base)
+            && open.base == base
+        {
+            open.next_entry = before.next_entry;
+            return Ok(());
+        }
+        // The step crossed into the next segment: seek back.
+        self.open = None;
+        self.current = None;
+        let sought = self.seek(before.position);
+        if sought.is_err() {
+            self.failed = true;
+        }
+        sought
     }
 
     /// The next step, its bytes left in the buffer.
