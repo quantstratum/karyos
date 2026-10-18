@@ -60,9 +60,10 @@ Usage: karyos-tools replay diff <left-dir> <left-group> <right-dir> <right-group
   --from-checkpoint <id>  compare from the event after the left journal's
                         checkpoint <id> and the right one's at its group_seq
                         (stores in <dir>/checkpoints; a replay capture has
-                        none, so it is not comparable). Ranges are recovered
-                        with the default reopen hold: the journal does not
-                        record the group's own yet
+                        none, so it is not comparable). The prefix is
+                        recovered holding up to 64 events waiting at once
+                        (the journal does not record the group's own reopen
+                        hold yet)
   -h, --help            print this text
 
 Exit status: 0 identical over the range; 1 diverged, the first difference
@@ -644,10 +645,22 @@ fn open<D: Disk + Clone>(
                 Err(failure) => return Err(context(&failure)),
             };
             // Which ranges recover depends on the group's reopen hold,
-            // which the journal does not record yet: the default one, until
-            // its header carries it (a follow-up).
+            // which the journal does not record yet: RECOVERY_CAPACITY
+            // stands for it until its header carries it (A9-5).
             let recovery = recover(&mut recovered, &Stored(&store), RECOVERY_CAPACITY)
                 .map_err(|failure| context(&failure))?;
+            // A checkpoint the store does not hold is not comparable, before
+            // its snapshot's buffer is reserved.
+            if let Some(found) = found
+                && !matches!(
+                    found.end().map(|end| store.holds(found.position, end)),
+                    Some(CheckpointHeld::Durable | CheckpointHeld::Written)
+                )
+            {
+                return Err(not_comparable(format!(
+                    "{side} journal: checkpoint {checkpoint_id}'s snapshot is lost or corrupt"
+                )));
+            }
             let mut snapshot =
                 snapshot_buffer(found.as_ref()).map_err(|failure| context(&failure))?;
             ReplayCursor::open_at_checkpoint(

@@ -609,13 +609,22 @@ fn check(crashed: &FaultDisk, survives: Survives, snapshots: &[Vec<u8>]) -> Resu
         Err(SegmentError::NotFound { .. }) => None,
         Err(error) => return Err(format!("store open_verified: {error}")),
     };
-    let store = match CheckpointStore::recover(
+    let recovered = CheckpointStore::recover(
         disk.clone(),
         Path::new(CHECKPOINTS),
         GROUP,
         config(SyncPolicy::PerSegment),
         end,
-    ) {
+    );
+    // Both find the store, or neither does.
+    if verified.is_none() != matches!(recovered, Err(SegmentError::NotFound { .. })) {
+        return Err(format!(
+            "open_verified found a store: {}, recovery: {}",
+            verified.is_some(),
+            recovered.is_ok()
+        ));
+    }
+    let store = match recovered {
         Ok(store) => store,
         Err(SegmentError::NotFound { .. }) => {
             if end > 0 {

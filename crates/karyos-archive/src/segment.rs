@@ -1366,7 +1366,7 @@ impl<D: Disk> SegmentStore<D> {
                 Some(open) => self.disk.read_at(&open.data, offset, chunk)?,
                 None => {
                     let path = self.dir.join(data_name(self.recording, base));
-                    let file = self.disk.open(&path)?;
+                    let file = self.disk.open_read(&path)?;
                     self.disk.read_at(&file, offset, chunk)?;
                 }
             }
@@ -1505,7 +1505,10 @@ impl<D: Disk> SegmentStore<D> {
     /// Ends the store's view at `end`, in memory only, for a store opened
     /// by [`SegmentStore::open_verified`]: what lies past it is not
     /// written, and a range up to it that the store does not hold is a
-    /// gap.
+    /// gap. It is more lenient than [`SegmentStore::recover`] with a
+    /// truncation or a gap: an end inside a write, an end below the start
+    /// and any number of gaps are taken as they are, which a read-only
+    /// view may do and a recovery may not.
     pub(crate) fn view_until(&mut self, end: u64) {
         if self.written > end {
             self.written = end.max(self.start);

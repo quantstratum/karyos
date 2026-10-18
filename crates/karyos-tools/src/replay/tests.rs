@@ -1195,3 +1195,59 @@ fn a_lost_checkpoint_opens_no_range() {
     let report = diff_from_checkpoint(&dirs[0], &dirs[1], 2);
     assert_eq!(report.exit_code(), 2, "{report:?}");
 }
+
+/// #430 re-check: a store that a recovery already marked lost (a cut
+/// store, then `CheckpointStore::recover` on it) is read with its lost
+/// range: that checkpoint is not comparable, the earlier one compares.
+#[test]
+fn a_store_marked_lost_by_recovery_is_not_comparable() {
+    use karyos_archive::group::checkpoint::CheckpointStore;
+
+    let events = timers(1, 4);
+    let two: &[(u64, &[u8])] = &[(1, b"first state"), (3, b"second state")];
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    let header = header(Capture::Strict, b"m");
+    write_with_checkpoints(&left, &header, &events, two);
+    write_with_checkpoints(&right, &header, &events, two);
+    let data = store_data(&right);
+    let file = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
+    file.set_len(std::fs::metadata(&data).unwrap().len() - 4)
+        .unwrap();
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let mut journal = GroupJournal::recover(StdDisk, &right, 1, config)
+        .unwrap()
+        .journal;
+    let end = recorded_end(&mut journal).unwrap();
+    drop(journal);
+    let store =
+        CheckpointStore::recover(StdDisk, &right.join(CHECKPOINTS), 1, config, end).unwrap();
+    drop(store);
+    let report = diff_from_checkpoint(&left, &right, 2);
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    assert_eq!(diff_from_checkpoint(&left, &right, 1).exit_code(), 0);
+}
+
+/// A checkpoint directory with no store in it is not comparable, as a
+/// missing directory is.
+#[test]
+fn an_empty_checkpoint_directory_is_not_comparable() {
+    let events = timers(1, 4);
+    let at_two: &[(u64, &[u8])] = &[(2, b"state at 2")];
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    let header = header(Capture::Strict, b"m");
+    write_with_checkpoints(&left, &header, &events, at_two);
+    write_with_checkpoints(&right, &header, &events, at_two);
+    for entry in std::fs::read_dir(right.join(CHECKPOINTS)).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let report = diff_from_checkpoint(&left, &right, 1);
+    assert!(
+        matches!(&report, Report::NotComparable { reason } if reason.contains("store is not there")),
+        "{report:?}"
+    );
+}
