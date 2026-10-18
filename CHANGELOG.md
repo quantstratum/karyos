@@ -454,9 +454,14 @@ release may break APIs, wire formats and shared-memory layouts.
   refuses it, and strict capture polls a view only when it can admit the
   event, since reading a value consumes it. `set_inline_threshold` and
   `set_observation_budget` tune placement and observation. The Archive's
-  `ArchiveHandle::recording_word` gives the shared word naming a required
-  recording and its start; the word clears when the recording stops, ends
-  or fails. karyos-client's `ConflatedSubscription::config` gives a view's
+  `ArchiveHandle::recording_word(stream, session, lane)` gives the shared
+  word naming a required recording of that lane and its start; the word
+  clears when the recording stops, ends or fails. A Gateway takes one
+  source per stream and session (`GatewayError::DuplicateSource`). Strict
+  capture reads a source or a view only when it can admit the event; a
+  message it read and cannot record ends the journal at an incomplete
+  skipped range. `Event::Conflated` carries the value's key.
+  karyos-client's `ConflatedSubscription::config` gives a view's
   table configuration.
 - The recording group Gateway (phase 3, A7d-2a; `recording-group-gateway.md`
   sections 3, 6 and 8). `karyos_archive::group::gateway` holds the
