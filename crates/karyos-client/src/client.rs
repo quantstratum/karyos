@@ -775,6 +775,8 @@ pub struct Client<C: Connection> {
     late_released: u64,
     /// Publication handles released whose removal could not be sent.
     releases_failed: u64,
+    /// Subscription handles released whose removal could not be sent.
+    subscription_releases_failed: u64,
     completions: Vec<Completion>,
     events: Vec<Event>,
 }
@@ -819,6 +821,7 @@ impl<C: Connection> Client<C> {
             laps,
             late_released: 0,
             releases_failed: 0,
+            subscription_releases_failed: 0,
             completions: Vec::new(),
             events: Vec::new(),
         }
@@ -839,6 +842,16 @@ impl<C: Connection> Client<C> {
     #[must_use]
     pub fn publication_releases_failed(&self) -> u64 {
         self.releases_failed
+    }
+
+    /// Subscription handles released ([`Client::remove_subscription`], or
+    /// an image's handle let go of) whose removal could not be sent: the
+    /// handle was dropped instead. In process its lease ends; for a remote
+    /// client its export is detached, and the driver reclaims the
+    /// registration once its last grant ends. Sticky at `u64::MAX`.
+    #[must_use]
+    pub fn subscription_releases_failed(&self) -> u64 {
+        self.subscription_releases_failed
     }
 
     /// The exclusive publication of `stream_id` on the channel `uri`: a
@@ -958,6 +971,28 @@ impl<C: Connection> Client<C> {
                 bump(&mut self.releases_failed);
             }
         }
+    }
+
+    /// Removes a subscription this client handed out, as
+    /// [`Client::remove_publication`] does a publication: a `karyos:ipc`
+    /// one is removed at the driver; a `karyos:udp` one releases every
+    /// image it reads, and its network subscription is removed. A removal
+    /// that cannot be sent drops the handle instead and is counted
+    /// ([`Client::subscription_releases_failed`]). Dropping a subscription
+    /// without this ends it too: in process its lease ends, and for a
+    /// remote client the driver reclaims its registration once its grant
+    /// is detached.
+    pub fn remove_subscription(&mut self, subscription: Subscription<C::Terms>) {
+        match subscription.kind {
+            Kind::Stream(subscription) => {
+                if !self.connection.release_subscription(*subscription) {
+                    bump(&mut self.subscription_releases_failed);
+                }
+            }
+            // Its images go to the client's release bin as it drops.
+            Kind::Images(images) => drop(images),
+        }
+        self.remove_dropped();
     }
 
     /// A subscription of `stream_id` on the channel `uri`: a `karyos:ipc`
@@ -1204,8 +1239,9 @@ impl<C: Connection> Client<C> {
                 .inbox
                 .upgrade()
                 .and_then(|inbox| inbox.retire(slot.id))
+                && !self.connection.release_subscription(subscription)
             {
-                let _ = self.connection.release_subscription(subscription);
+                bump(&mut self.subscription_releases_failed);
             }
         } else if let Some(attach) = self
             .attaches
@@ -1227,7 +1263,9 @@ impl<C: Connection> Client<C> {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
             for subscription in released {
-                let _ = self.connection.release_subscription(subscription);
+                if !self.connection.release_subscription(subscription) {
+                    bump(&mut self.subscription_releases_failed);
+                }
             }
         }
         let removals = &mut self.removals;
@@ -1385,11 +1423,16 @@ impl<T: TermBytes> Images<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Keyed by attach id: a session retired and announced again is a
-        // new image, whatever the order of the two.
-        let mut let_go = Vec::new();
+        // new image, whatever the order of the two. What it lets go of goes
+        // straight to the client's bin, reserved for `max_images`, so the
+        // poll path allocates nothing.
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for id in state.retired.drain(..) {
             if let Some(index) = self.images.iter().position(|image| image.id == id) {
-                let_go.push(self.images.remove(index));
+                released.push(self.images.remove(index).subscription);
             }
         }
         self.images.append(&mut state.arrived);
@@ -1398,9 +1441,9 @@ impl<T: TermBytes> Images<T> {
         }
         drop(state);
         if self.closed.is_some() {
-            let_go.append(&mut self.images);
+            released.extend(self.images.drain(..).map(|image| image.subscription));
         }
-        self.release(let_go);
+        drop(released);
         if self.next >= self.images.len() {
             self.next = 0;
         }

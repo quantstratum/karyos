@@ -636,3 +636,46 @@ fn test_a_withdrawn_replay_rejoin_reports_its_overrun() {
         assert_eq!(counter(&driver, "replay fallbacks"), 1);
     }
 }
+
+/// #420 review P1: a valid loss report served after its subscription's
+/// stream was freed is not a protocol violation. The overrun subscriber's
+/// report is sent, then its `Remove` is queued behind it; the stream is
+/// removed, and the next cycle frees it (no lease is left) before serving
+/// the two commands. The report is counted unverified, the client is not
+/// retired, and the `Remove` then succeeds.
+#[test]
+fn test_a_loss_report_after_its_stream_is_freed_does_not_retire_the_client() {
+    let (mut driver, stream, mut publication, mut client, mut subscription) =
+        setup(RejoinPolicy::RejoinAtHead);
+    let _ = overrun(&mut driver, &mut publication, &mut subscription);
+    assert_eq!(client.loss_reports_queued(), 1);
+    drop(publication);
+    // The report goes first, then the Remove, in one ring.
+    let _ = client.poll(usize::MAX, |completion| {
+        panic!("unexpected completion {completion:?}");
+    });
+    assert_eq!(client.loss_reports_queued(), 0);
+    let remove = client.remove_subscription(subscription).unwrap();
+    driver.remove_stream(stream).unwrap();
+    let _ = driver.do_work().unwrap();
+    assert_eq!(
+        driver.stream_state(stream).unwrap(),
+        karyos_driver::StreamState::Freed
+    );
+    // One command per ring per visit: the Remove is served after the
+    // report.
+    let mut done = Vec::new();
+    for _ in 0..10 {
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        if !done.is_empty() {
+            break;
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].sequence, remove);
+    assert!(matches!(done[0].outcome, Outcome::Succeeded));
+    assert_eq!(counter(&driver, "clients faulty"), 0);
+    assert_eq!(counter(&driver, "loss reports unverified"), 1);
+    assert_eq!(driver.clients(), 1, "the client is still served");
+}

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use karyos_client::ipc::{AttachError, RemoteClient, attach};
 use karyos_client::{MessageLimit, OfferOutcome, Outcome};
-use karyos_protocol::cnc::{StreamKey, SubscriberRole};
+use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SealReason};
 use karyos_sys::sizing::{MIN_TERM_LENGTH, TermLength};
@@ -520,6 +520,23 @@ fn images_free_while_a_remote_subscriber_stays(let_go: LetGo) {
                     LetGo::Drop => drop(subscription),
                     LetGo::Remove => {
                         assert!(client.remove_subscription(subscription).is_ok());
+                        // The retirement ended the last grant, so the driver
+                        // may have reclaimed the registration first: the
+                        // Remove then answers UnknownRegistration.
+                        let mut removed = false;
+                        let start = Instant::now();
+                        while !removed {
+                            assert!(start.elapsed() < Duration::from_secs(10), "no removal");
+                            let _ =
+                                client.poll(usize::MAX, |completion| match completion.outcome {
+                                    Outcome::Succeeded
+                                    | Outcome::Refused {
+                                        code: ErrorCode::UnknownRegistration,
+                                        ..
+                                    } => removed = true,
+                                    other => panic!("unexpected removal {other:?}"),
+                                });
+                        }
                     }
                 }
                 done_out.send(seen).unwrap();
@@ -578,6 +595,9 @@ fn images_free_while_a_remote_subscriber_stays(let_go: LetGo) {
             b.streams.iter().all(|stream| stream.source.is_none()),
             "no image stream left"
         );
+        // Removed (Remove) or reclaimed once detached (Drop): no
+        // registration is left either way.
+        assert!(b.registrations.is_empty(), "registrations left");
         assert_eq!(opened.len(), usize::try_from(rounds).unwrap());
         let left: Vec<_> = opened
             .iter()

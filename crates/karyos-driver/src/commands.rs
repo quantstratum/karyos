@@ -191,6 +191,11 @@ impl Registration {
     pub(crate) fn incarnation(&self) -> u64 {
         self.incarnation
     }
+
+    /// The client it belongs to.
+    pub(crate) fn client(&self) -> u64 {
+        self.client
+    }
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
@@ -572,14 +577,37 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
-    /// Forgets registrations whose capability was dropped without
-    /// `remove`, so dropping handles cannot accumulate registration
-    /// records. A registration whose handle was dropped by `remove` stays
-    /// until its queued `Remove` is served (or its client is retired).
+    /// Forgets registrations that ended without a `Remove`, so dropping
+    /// handles cannot accumulate registration records:
+    ///
+    /// - an in-process one whose capability was dropped without `remove`;
+    ///   one whose handle was dropped by `remove` stays until its queued
+    ///   `Remove` is served (or its client is retired);
+    /// - a remote one with no grant left in its client's ledger, journal
+    ///   grants included: its last grant was detached, or ended unsent.
+    ///   It can never get another, since a successor grant is reserved
+    ///   only from a grant still in the ledger
+    ///   (`open_remote_successors`), and registration ids are never reused.
+    ///   A later `RemoveSubscription` or `RemovePublication` of it answers
+    ///   `UnknownRegistration`, which the client facade ignores.
     pub(crate) fn sweep_ended_registrations(&mut self) {
         let before = self.registrations.len();
-        self.registrations
-            .retain(|registration| registration.end.state() != LeaseState::Dropped);
+        let clients = &self.clients;
+        self.registrations.retain(|registration| {
+            if registration.end.state() == LeaseState::Dropped {
+                return false;
+            }
+            clients
+                .iter()
+                .find(|slot| slot.id == registration.client)
+                .and_then(|slot| slot.ledger.as_ref())
+                .is_none_or(|ledger| {
+                    ledger
+                        .grants()
+                        .iter()
+                        .any(|grant| grant.registration == registration.id)
+                })
+        });
         let swept = before - self.registrations.len();
         if swept > 0 {
             self.counters.add(
@@ -807,6 +835,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }) =>
             {
                 true
+            }
+            // The client's own subscription whose stream was freed: ended,
+            // as a registration that is gone (a `ReportLoss` queued ahead of
+            // its `Remove` is served after the stream frees).
+            Some(live)
+                if live.client == client
+                    && live.kind == Kind::Subscription
+                    && !self.streams.iter().any(|s| s.id == live.stream) =>
+            {
+                false
             }
             Some(_) => {
                 return Err(
@@ -1830,16 +1868,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .and_then(|slot| slot.ledger.as_mut())
     }
 
-    /// A remote client's `Remove*` of `registration`: a grant never sent is
-    /// ended at once, its participant released in the buffer; a sent one
-    /// stays charged until its `Detach` or the client's exit proof.
     /// Whether remote client `client` can take no more: its ledger is full,
     /// or it holds as many registrations as its ledger holds grants
-    /// (`max_exports_per_client`). A registration outlives its stream as a
-    /// tombstone until the client removes it, so this bounds the tombstones
-    /// of a client that never removes; it is then refused, typed, with
-    /// `ResourcesUnavailable`. `None` for an in-process client, whose
-    /// registrations end with their handles (`sweep_ended_registrations`).
+    /// (`max_exports_per_client`). This caps every add that makes a
+    /// registration: `AddPublication`, `AddConcurrentPublication`,
+    /// `AddSubscription`, `AddImageSubscription` and a conflated view, each
+    /// refused, typed, with `ResourcesUnavailable`. A remote registration
+    /// whose last grant left the ledger is reclaimed
+    /// (`sweep_ended_registrations`), so this counts only what the client
+    /// still holds. `None` for an in-process client, whose registrations
+    /// end with their handles.
     fn remote_full(&self, client: u64) -> Option<bool> {
         let ledger = self.ledger(client)?;
         let registrations = self
@@ -1850,6 +1888,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Some(ledger.full() || registrations >= ledger.limit())
     }
 
+    /// A remote client's `Remove*` of `registration`: a grant never sent is
+    /// ended at once, its participant released in the buffer; a sent one
+    /// stays charged until its `Detach` or the client's exit proof.
     fn remove_remote(&mut self, client: u64, registration: u64) {
         let Some(ledger) = self.ledger_mut(client) else {
             return;
@@ -2815,25 +2856,41 @@ mod tests {
             .any(|grant| grant.stream == stream)
     }
 
-    /// A registration does not keep its retiring stream: a remote
-    /// subscription whose grant was detached leaves only its registration,
-    /// and the stream frees once removed. The registration stays as a
-    /// tombstone; a later `RemoveSubscription` on it succeeds and removes
-    /// it.
+    /// The errors `observer` has not read yet, as (sequence, code, detail).
+    fn errors(
+        observer: &mut karyos_sys::broadcast::BroadcastReceiver,
+    ) -> Vec<(u64, ErrorCode, u64)> {
+        responses(observer)
+            .into_iter()
+            .filter_map(|response| match response {
+                Response::Error {
+                    request,
+                    code,
+                    detail,
+                } => Some((request.sequence, code, detail)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A remote registration whose last grant left the ledger is reclaimed
+    /// at the next cycle: it does not keep its retiring stream, which
+    /// frees; a later `RemoveSubscription` of it answers
+    /// `UnknownRegistration`, and the client is still served.
     #[test]
-    fn a_retiring_stream_with_only_a_registration_frees() {
+    fn a_remote_registration_with_no_grant_left_is_reclaimed() {
         let (mut driver, stream) = driver_with_stream();
         let mut observer = driver.broadcast.receiver();
         let (client, mut producer) = remote_client(&mut driver, 4);
         let registration = detached_subscription(&mut driver, &mut producer, client, 1);
-        assert_eq!(driver.registrations.len(), 1);
+        let _ = driver.do_work().unwrap();
+        assert!(driver.registrations.is_empty(), "reclaimed");
         driver.remove_stream(stream).unwrap();
         let _ = driver.do_work().unwrap();
         assert_eq!(
             driver.stream_state(stream).unwrap(),
             crate::embedded::StreamState::Freed
         );
-        assert_eq!(driver.registrations.len(), 1, "the tombstone stays");
         let _ = responses(&mut observer);
         write(
             &mut producer,
@@ -2844,26 +2901,50 @@ mod tests {
         );
         let _ = driver.do_work().unwrap();
         assert_eq!(
-            responses(&mut observer),
-            [Response::OperationSucceeded {
-                request: RequestId {
-                    client,
-                    sequence: 2,
-                },
-            }]
+            errors(&mut observer),
+            [(2, ErrorCode::UnknownRegistration, registration)]
         );
-        assert!(driver.registrations.is_empty());
+        assert!(
+            driver
+                .clients
+                .iter()
+                .any(|slot| slot.id == client && slot.serving())
+        );
     }
 
-    /// A tombstone names its freed stream's id, which is never reused: a
-    /// new stream of the same key in the freed slot gets a new id, and a
-    /// `RemoveSubscription` on the tombstone removes only the tombstone,
-    /// leaving the new stream, its registration and its grant untouched.
+    /// A registration that still has a grant is kept: an undetached remote
+    /// subscription stays registered across cycles.
     #[test]
-    fn a_tombstone_never_names_a_later_stream() {
-        let (mut driver, stream) = driver_with_stream();
+    fn a_remote_registration_with_a_grant_is_kept() {
+        let (mut driver, _stream) = driver_with_stream();
         let (client, mut producer) = remote_client(&mut driver, 4);
-        let tombstone = detached_subscription(&mut driver, &mut producer, client, 1);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                lane: Lane::ZERO,
+                role: SubscriberRole::Optional,
+            },
+        );
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(ledger(&driver, client).len(), 1);
+        assert_eq!(driver.registrations.len(), 1, "its grant keeps it");
+    }
+
+    /// A reclaimed registration's id is never reused, nor its stream's: a
+    /// new stream of the same key in the freed slot gets a new id, and a
+    /// `RemoveSubscription` of the old registration answers
+    /// `UnknownRegistration`, leaving the new stream, its registration and
+    /// its grant untouched.
+    #[test]
+    fn a_reclaimed_registration_never_names_a_later_stream() {
+        let (mut driver, stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let old = detached_subscription(&mut driver, &mut producer, client, 1);
         let freed_id = driver.streams[0].id;
         driver.remove_stream(stream).unwrap();
         let _ = driver.do_work().unwrap();
@@ -2900,21 +2981,27 @@ mod tests {
             },
         );
         let _ = driver.do_work().unwrap();
-        assert!(ledger_names(&driver, client, later_id));
+        let new = ledger(&driver, client)[0].registration;
+        assert_ne!(new, old, "a registration id is never reused");
+        let _ = responses(&mut observer);
         write(
             &mut producer,
             Command::RemoveSubscription {
                 sequence: 3,
-                registration: tombstone,
+                registration: old,
             },
         );
         let _ = driver.do_work().unwrap();
+        assert_eq!(
+            errors(&mut observer),
+            [(3, ErrorCode::UnknownRegistration, old)]
+        );
         let left: Vec<u64> = driver
             .registrations
             .iter()
             .map(Registration::stream)
             .collect();
-        assert_eq!(left, [later_id], "only the tombstone went");
+        assert_eq!(left, [later_id], "the later stream's registration stays");
         assert!(ledger_names(&driver, client, later_id), "its grant stays");
         assert_eq!(
             driver.stream_state(later).unwrap(),
@@ -2922,36 +3009,32 @@ mod tests {
         );
     }
 
-    /// Tombstones are bounded: a remote client that never removes its
-    /// registrations holds at most `max_exports_per_client` of them (its
-    /// ledger's limit), and the next add is refused, typed, with
-    /// `ResourcesUnavailable`; the driver keeps serving.
+    /// The cap: a remote client holds at most `max_exports_per_client`
+    /// registrations (its ledger's limit), and the next add is refused,
+    /// typed, with `ResourcesUnavailable`; the client is still served.
     #[test]
-    fn a_client_that_never_removes_is_refused_at_its_ledger_limit() {
+    fn a_remote_client_is_refused_at_its_ledger_limit() {
         let (mut driver, _stream) = driver_with_stream();
         let mut observer = driver.broadcast.receiver();
         let (client, mut producer) = remote_client(&mut driver, 2);
-        for sequence in 1..=2 {
-            let _ = detached_subscription(&mut driver, &mut producer, client, sequence);
+        for sequence in 1..=3 {
+            write(
+                &mut producer,
+                Command::AddSubscription {
+                    sequence,
+                    stream: KEY,
+                    lane: Lane::ZERO,
+                    role: SubscriberRole::Required,
+                },
+            );
         }
-        assert!(ledger(&driver, client).is_empty(), "no grant is held");
-        let _ = responses(&mut observer);
-        write(
-            &mut producer,
-            Command::AddSubscription {
-                sequence: 3,
-                stream: KEY,
-                lane: Lane::ZERO,
-                role: SubscriberRole::Optional,
-            },
-        );
-        let _ = driver.do_work().unwrap();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(driver.registrations.len(), 2);
         assert!(matches!(
-            responses(&mut observer)[..],
-            [Response::Error {
-                code: ErrorCode::ResourcesUnavailable,
-                ..
-            }]
+            errors(&mut observer)[..],
+            [(3, ErrorCode::ResourcesUnavailable, _)]
         ));
         assert!(
             driver

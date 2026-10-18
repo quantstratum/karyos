@@ -1630,10 +1630,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Frees retiring streams with no live lease and no remote grant. A
     /// registration does not keep its stream: once the stream is freed it
-    /// stays as a tombstone, naming a stream id that is never reused, until
-    /// its client removes it or ends. A remote client's grants (its ledger)
-    /// keep the stream until they end, at their `Detach` or the client's
-    /// exit proof. A network publication's lanes stay while its removal lingers: its
+    /// stays, naming a stream id that is never reused, until its client
+    /// removes it, a remote one's last grant ends (it is then reclaimed,
+    /// `sweep_ended_registrations`) or the client ends. A remote client's
+    /// grants (its ledger) keep the stream until they end, at their
+    /// `Detach` or the client's exit proof. A network publication's lanes
+    /// stay while its removal lingers: its
     /// sender still reads them to their seals and serves repair from them,
     /// with no lease (driver-network-agents.md §7). A stopped or failed
     /// network holds nothing, so they free with no linger.
@@ -3088,13 +3090,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut work = 0u32;
         let mut first_error = None;
         let mut lapped = Vec::new();
-        // The (stream, incarnation) pairs a registration, a remote grant or
-        // a held bound still names: a replaced incarnation they name is
-        // kept, so a remote reader can read it to its seal. A dead remote
-        // client releases them through its liveness timeout or exit proof.
+        // The (stream, incarnation) pairs an in-process registration, a
+        // remote grant or a held bound still names: a replaced incarnation
+        // they name is kept, so a reader can read it to its seal. A remote
+        // registration pins through its grants, not by itself: one with no
+        // grant left reads nothing and is reclaimed. A dead remote client
+        // releases them through its liveness timeout or exit proof.
+        let clients = &self.clients;
         let mut pinned: Vec<(u64, u64)> = self
             .registrations
             .iter()
+            .filter(|registration| {
+                clients
+                    .iter()
+                    .find(|slot| slot.id() == registration.client())
+                    .is_none_or(|slot| slot.ledger.is_none())
+            })
             .map(|registration| (registration.stream(), registration.incarnation()))
             .chain(
                 self.holding
