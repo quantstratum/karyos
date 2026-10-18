@@ -506,7 +506,7 @@ impl<D: Disk> CaptureJob<D> {
                 // Only an end's and a header's positions count, and a
                 // message ends at the event's end.
                 self.tracker.record(&record, written)?;
-                if let Role::Event(seq) = record.role() {
+                if let Role::Event(seq) | Role::Uncaptured(seq) = record.role() {
                     self.tracker.delivered(seq);
                 }
                 records = rest;

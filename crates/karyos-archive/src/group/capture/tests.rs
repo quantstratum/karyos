@@ -529,3 +529,40 @@ fn the_framing_is_the_rings() {
         }
     }
 }
+
+/// A message whose payload was not captured (payload 3) is an event like
+/// the others: delivered, complete and durable in a best-effort group.
+#[test]
+fn an_uncaptured_message_is_delivered() {
+    let none = Recordings::default();
+    let (mut sender, mut job) = new(Capture::BestEffort, NONE, settings(4096, 400, 8));
+    let message = GroupRecord::Message(MessageEvent {
+        group_seq: 1,
+        logical_time: 1,
+        incarnation: 1,
+        position: 0,
+        extent: 70_048,
+        stream_id: 1,
+        session_id: 1,
+        lane: Lane::ZERO,
+        reserved_value: 0,
+        end_of_stream: false,
+        extension: None,
+        payload: Payload::Unavailable { length: 70_000 },
+    });
+    let end = GroupRecord::End(EventEnd {
+        group_seq: 1,
+        observations: 0,
+        outcome: EndOutcome::Complete,
+    });
+    let mut out = vec![0u8; MAX_RECORD];
+    let mut bytes = Vec::new();
+    for record in [message, end] {
+        let length = record.encode(&mut out).unwrap();
+        bytes.extend_from_slice(&out[..length]);
+    }
+    sender.send(&bytes, 1).unwrap();
+    job.duty(0, 16, &none).unwrap();
+    job.sync(&none).unwrap();
+    assert_eq!(sender.view().snapshot(), (1, 1, 1));
+}
