@@ -15,18 +15,33 @@
 //!   fails, and so does every later one. [`SimDisk::after_crash`] gives
 //!   the disk a restart finds, by [`Survives`]: only what was durable,
 //!   everything, any seeded subset of the pending operations, or all of
-//!   them with seeded writes torn to a sector prefix. A subset keeps a
-//!   later write without an earlier one: writeback in another order. Data
-//!   and names are chosen apart, as a file system orders them, and a name
-//!   operation whose file was not kept, or whose name is gone, does
-//!   nothing.
+//!   them with seeded writes torn. A subset keeps a later write without an
+//!   earlier one: writeback in another order. Data and names are chosen
+//!   apart, as a file system orders them; a name operation whose name is
+//!   gone (a rename or removal of a name not kept) does nothing, and a
+//!   name kept for a file whose data was not leaves the file with what it
+//!   holds.
+//! - **A torn write** keeps a prefix that ends at a whole-sector boundary
+//!   of the disk ([`SimDisk::with_sector`], [`SECTOR`] by default), counted
+//!   from the file's start and strictly inside the write, or nothing. A
+//!   write within one sector is atomic: whole or dropped.
 //! - **A failed flush.** [`SimDisk::with_failed_syncs`] makes chosen
 //!   `sync` and `sync_dir` calls, counted from 1, fail with nothing made
-//!   durable. Their pending operations stay pending.
+//!   durable. By default the flush's pending operations are then dropped,
+//!   neither durable nor pending, and a later flush succeeds without them,
+//!   as Linux behaves after a writeback error ("fsyncgate");
+//!   [`SimDisk::with_optimistic_flushes`] keeps them pending instead.
 //! - **Determinism.** One seed gives one outcome: the state is in ordered
 //!   maps, every count is checked integer arithmetic, and every fault
 //!   decision is appended to a [`Decision`] trace a test can print or
 //!   compare.
+//! - **Not modelled.** A crash inside a write (the crashing operation is
+//!   not applied; tears happen at restart, to writes pending then); the
+//!   zero-filled length a file system may show after an append it lost; a
+//!   tear combined with drops in one restart (a mode tears, or drops, not
+//!   both); directories, which exist as soon as a path names them (a
+//!   missing one is never an error, unlike the operating system's); and a
+//!   rename across directories, which is refused as unsupported.
 //!
 //! It is single-threaded, as the simulator is: clones share one disk.
 
@@ -161,7 +176,7 @@ struct Dir {
     pending: Vec<NameOp>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct State {
     files: BTreeMap<u64, File>,
     dirs: BTreeMap<PathBuf, Dir>,
@@ -175,7 +190,30 @@ struct State {
     syncs: u64,
     /// The flushes that fail.
     failing: BTreeSet<u64>,
+    /// The sector a tear keeps whole ones of.
+    sector: u64,
+    /// A failed flush keeps its operations pending, to be made durable by
+    /// a later one; by default it drops them, as Linux does ("fsyncgate").
+    optimistic: bool,
     trace: Vec<Decision>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            files: BTreeMap::new(),
+            dirs: BTreeMap::new(),
+            next_inode: 0,
+            ops: 0,
+            budget: None,
+            crashed: false,
+            syncs: 0,
+            failing: BTreeSet::new(),
+            sector: SECTOR,
+            optimistic: false,
+            trace: Vec::new(),
+        }
+    }
 }
 
 /// An open file: its inode, and whether it was opened for writing.
@@ -191,6 +229,39 @@ pub struct SimDisk(Rc<RefCell<State>>);
 
 fn error(kind: io::ErrorKind, what: &str) -> io::Error {
     io::Error::new(kind, what.to_owned())
+}
+
+/// What a tear leaves of a write of `length` bytes at `offset`: a prefix
+/// that ends at a whole-sector boundary of the disk, counted from 0, and
+/// strictly inside the write, or nothing. A write within one sector is
+/// atomic: kept whole (the caller's other case) or dropped.
+fn tear(rng: &mut Rng, offset: u64, length: usize, sector: u64) -> io::Result<Fate> {
+    let invalid = || error(io::ErrorKind::InvalidInput, "a write past u64");
+    let end = u64::try_from(length)
+        .ok()
+        .and_then(|length| offset.checked_add(length))
+        .ok_or_else(invalid)?;
+    // The first boundary after the write's start.
+    let first = (offset / sector)
+        .checked_add(1)
+        .and_then(|sectors| sectors.checked_mul(sector))
+        .ok_or_else(invalid)?;
+    if first >= end {
+        return Ok(Fate::Dropped);
+    }
+    // Boundaries `first`, `first + sector`, ... below `end`, and none.
+    let boundaries = (end - 1 - first) / sector + 1;
+    let pick = rng.below(boundaries.checked_add(1).ok_or_else(invalid)?);
+    if pick == 0 {
+        return Ok(Fate::Dropped);
+    }
+    let boundary = (pick - 1)
+        .checked_mul(sector)
+        .and_then(|past| first.checked_add(past))
+        .ok_or_else(invalid)?;
+    Ok(Fate::Torn {
+        kept: boundary - offset,
+    })
 }
 
 fn crashed() -> io::Error {
@@ -291,6 +362,25 @@ impl SimDisk {
         self
     }
 
+    /// Tears keep whole sectors of `sector` bytes, counted from the disk's
+    /// start (default [`SECTOR`]); at least 1.
+    #[must_use]
+    pub fn with_sector(self, sector: u64) -> Self {
+        self.0.borrow_mut().sector = sector.max(1);
+        self
+    }
+
+    /// A failed flush keeps its operations pending, so a later one makes
+    /// them durable: the optimistic model. By default a failed `sync`
+    /// drops the file's pending operations and a failed `sync_dir` the
+    /// directory's, neither durable nor pending, as Linux does after a
+    /// writeback error ("fsyncgate"); a later flush succeeds without them.
+    #[must_use]
+    pub fn with_optimistic_flushes(self) -> Self {
+        self.0.borrow_mut().optimistic = true;
+        self
+    }
+
     /// The operations made so far.
     #[must_use]
     pub fn used(&self) -> u64 {
@@ -337,15 +427,10 @@ impl SimDisk {
                         }
                     }
                     Survives::Torn { .. } => match op {
-                        DataOp::Write { bytes: data, .. } if rng.chance(1, 2) => {
-                            let length = u64::try_from(data.len()).unwrap_or(u64::MAX);
-                            let sectors = length / SECTOR;
-                            let kept = rng
-                                .below(sectors.checked_add(1).unwrap_or(sectors))
-                                .checked_mul(SECTOR)
-                                .unwrap_or(0);
-                            Fate::Torn { kept }
-                        }
+                        DataOp::Write {
+                            offset,
+                            bytes: data,
+                        } if rng.chance(1, 2) => tear(&mut rng, *offset, data.len(), state.sector)?,
                         _ => Fate::Kept,
                     },
                 };
@@ -358,10 +443,15 @@ impl SimDisk {
                             bytes: data,
                         },
                     ) => {
-                        let kept = usize::try_from(kept).unwrap_or(usize::MAX).min(data.len());
+                        let kept = usize::try_from(kept)
+                            .ok()
+                            .and_then(|kept| data.get(..kept))
+                            .ok_or_else(|| {
+                                error(io::ErrorKind::InvalidInput, "a tear past its write")
+                            })?;
                         let prefix = DataOp::Write {
                             offset: *offset,
-                            bytes: data.get(..kept).unwrap_or_default().to_vec(),
+                            bytes: kept.to_vec(),
                         };
                         apply(&mut bytes, &prefix)?;
                     }
@@ -416,6 +506,8 @@ impl SimDisk {
             dirs,
             next_inode: state.next_inode,
             trace,
+            sector: state.sector,
+            optimistic: state.optimistic,
             ..State::default()
         }))))
     }
@@ -557,7 +649,12 @@ impl Disk for SimDisk {
 
     fn sync(&mut self, file: &SimFile) -> io::Result<()> {
         let mut state = self.step("sync")?;
-        Self::flush(&mut state)?;
+        if let Err(failure) = Self::flush(&mut state) {
+            if !state.optimistic {
+                Self::file(&mut state, file)?.pending.clear();
+            }
+            return Err(failure);
+        }
         let entry = Self::file(&mut state, file)?;
         entry.durable = entry.live()?;
         entry.pending.clear();
@@ -566,7 +663,14 @@ impl Disk for SimDisk {
 
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
         let mut state = self.step("sync_dir")?;
-        Self::flush(&mut state)?;
+        if let Err(failure) = Self::flush(&mut state) {
+            if !state.optimistic
+                && let Some(entry) = state.dirs.get_mut(dir)
+            {
+                entry.pending.clear();
+            }
+            return Err(failure);
+        }
         if let Some(entry) = state.dirs.get_mut(dir) {
             entry.durable = entry.live();
             entry.pending.clear();
