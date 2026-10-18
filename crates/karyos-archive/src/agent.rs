@@ -52,6 +52,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use karyos_sys::frame::Lane;
+
 use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
 use crate::group::capture::{
@@ -470,6 +472,7 @@ enum Command {
     Word {
         stream_id: i32,
         session_id: i32,
+        lane: Lane,
         reply: Reply<Option<Arc<RecordingWord>>>,
     },
     Snapshot {
@@ -538,11 +541,13 @@ impl core::fmt::Debug for Command {
             Self::Word {
                 stream_id,
                 session_id,
+                lane,
                 ..
             } => f
                 .debug_struct("Word")
                 .field("stream_id", stream_id)
                 .field("session_id", session_id)
+                .field("lane", lane)
                 .finish_non_exhaustive(),
             Self::Snapshot { from_id, max, .. } => f
                 .debug_struct("Snapshot")
@@ -729,7 +734,9 @@ impl ArchiveHandle {
     }
 
     /// The word of the `required` recording of stream `stream_id`, session
-    /// `session_id` this Archive records, if any: a recording group
+    /// `session_id`, lane `lane` this Archive records, if any: recordings
+    /// are per lane, and a word for another lane would place references
+    /// into the wrong frames. a recording group
     /// Gateway's source reads it to place payloads by reference. It names
     /// the recording and its start while it records, and is cleared when
     /// the recording stops, ends or fails. Configuration path only.
@@ -741,10 +748,12 @@ impl ArchiveHandle {
         &self,
         stream_id: i32,
         session_id: i32,
+        lane: Lane,
     ) -> Result<Option<Arc<RecordingWord>>, AgentError> {
         self.call(|reply| Command::Word {
             stream_id,
             session_id,
+            lane,
             reply,
         })
     }
@@ -943,6 +952,8 @@ struct Active<D: Disk> {
     recorder: Recorder<D, Box<dyn FrameSource + Send>>,
     stream_id: i32,
     session_id: i32,
+    /// The lane it records: a recording is per lane.
+    lane: Lane,
     /// A `required` recording's word, which recording group Gateways read
     /// to place payloads by reference; cleared when the recording leaves
     /// the active set, however it stopped, ended or failed.
@@ -1518,13 +1529,16 @@ impl<D: Disk + Clone> State<D> {
             Command::Word {
                 stream_id,
                 session_id,
+                lane,
                 reply,
             } => {
                 let word = self
                     .active
                     .iter()
                     .filter(|active| {
-                        active.stream_id == stream_id && active.session_id == session_id
+                        active.stream_id == stream_id
+                            && active.session_id == session_id
+                            && active.lane == lane
                     })
                     .find_map(|active| active.word.as_ref().map(|guard| Arc::clone(&guard.0)));
                 let _ = reply.send(Ok(word));
@@ -1940,6 +1954,7 @@ impl<D: Disk + Clone> State<D> {
                     recorder,
                     stream_id: start.stream_id,
                     session_id: start.session_id,
+                    lane: start.format.lane,
                     word,
                 });
                 Ok(id)

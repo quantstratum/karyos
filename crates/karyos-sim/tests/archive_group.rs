@@ -173,7 +173,10 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
             source: Box::new(Guarded::new(reader, lease)),
         })
         .unwrap();
-    let word = archive.recording_word(STREAM, 1).unwrap().unwrap();
+    let word = archive
+        .recording_word(STREAM, 1, Lane::ZERO)
+        .unwrap()
+        .unwrap();
     assert_eq!(word.read().map(|(id, _)| id), Some(recording));
     let sender = archive
         .start_group(StartGroup {

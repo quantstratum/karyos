@@ -1039,19 +1039,40 @@ mod groups {
 
     /// A `required` recording's word names it and its start while it
     /// records, and is cleared once it stops; an `async` recording has
-    /// none, nor does a stream not recorded.
+    /// none, nor does a stream not recorded, nor another lane of the
+    /// recorded stream: recordings are per lane.
     #[test]
     fn a_required_recording_has_a_word_until_it_stops() {
+        use karyos_sys::frame::Lane;
+        let lane1 = Lane::try_new(1).unwrap();
         let dir = temp_dir("group-word");
         let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
         let drained = Arc::new(AtomicBool::new(false));
         let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
-        let word = agent.recording_word(10, 3).unwrap().unwrap();
+        let word = agent.recording_word(10, 3, Lane::ZERO).unwrap().unwrap();
         assert_eq!(word.read(), Some((recording, 0)));
-        assert!(agent.recording_word(10, 4).unwrap().is_none());
+        assert!(agent.recording_word(10, 4, Lane::ZERO).unwrap().is_none());
+        assert!(agent.recording_word(10, 3, lane1).unwrap().is_none());
+        // Lane 1 of the same stream and session, recorded on its own.
+        let second = Arc::new(AtomicBool::new(false));
+        let mut on_lane1 = start(chunks(3000, false, &second));
+        on_lane1.format.lane = lane1;
+        let lane1_recording = agent.start(on_lane1).unwrap();
+        let lane1_word = agent.recording_word(10, 3, lane1).unwrap().unwrap();
+        assert_eq!(lane1_word.read(), Some((lane1_recording, 0)));
+        assert_eq!(
+            agent
+                .recording_word(10, 3, Lane::ZERO)
+                .unwrap()
+                .unwrap()
+                .read(),
+            Some((recording, 0))
+        );
         agent.stop(recording).unwrap();
         assert_eq!(word.read(), None);
-        assert!(agent.recording_word(10, 3).unwrap().is_none());
+        assert!(agent.recording_word(10, 3, Lane::ZERO).unwrap().is_none());
+        assert_eq!(lane1_word.read(), Some((lane1_recording, 0)));
+        agent.stop(lane1_recording).unwrap();
         let other = Arc::new(AtomicBool::new(false));
         let _ = agent
             .start(StartRecording {
@@ -1061,7 +1082,7 @@ mod groups {
                 ..start(chunks(3000, false, &other))
             })
             .unwrap();
-        assert!(agent.recording_word(10, 3).unwrap().is_none());
+        assert!(agent.recording_word(10, 3, Lane::ZERO).unwrap().is_none());
         agent.shutdown().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }

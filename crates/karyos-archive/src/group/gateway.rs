@@ -307,6 +307,15 @@ pub enum GatewayError {
     /// An external value over `MAX_INLINE` under strict capture.
     #[error("value too large: {0} bytes")]
     TooLarge(usize),
+    /// A second source of the same stream and session: replay names a
+    /// source by its stream and session, so each pair is added once.
+    #[error("stream {stream_id} session {session_id} already has a source")]
+    DuplicateSource {
+        /// The stream.
+        stream_id: i32,
+        /// The session.
+        session_id: i32,
+    },
 }
 
 /// The trait both the live Gateway and `ReplayGateway` implement.
