@@ -978,6 +978,8 @@ fn grant(client: &mut RemoteClient, subscribe: bool) -> Fetchable {
         assert!(start.elapsed() < Duration::from_secs(10), "no grant");
         let _ = client.poll(usize::MAX, |completion| match completion.outcome {
             Outcome::Fetchable(grant) => fetchable = Some(grant),
+            // The answer to an earlier round's removal.
+            Outcome::Succeeded => {}
             other => panic!("expected a grant, got {other:?}"),
         });
         std::thread::yield_now();
@@ -1605,7 +1607,10 @@ fn child() {
             for _ in 1..ROUNDS {
                 let fetchable = grant(&mut client, true);
                 let subscription = client.take_subscription(&fetchable).unwrap();
-                drop(subscription);
+                // Removed, not only dropped: a remote client's registrations
+                // are capped at `max_exports_per_client`, and a dropped
+                // handle's registration stays until removed.
+                assert!(client.remove_subscription(subscription).is_ok());
             }
             // Every received descriptor was closed: the client's count is
             // where it started too.

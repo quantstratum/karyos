@@ -1628,13 +1628,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(())
     }
 
-    /// Frees retiring streams with no live lease and no registration.
-    /// A network publication's lanes stay while its removal lingers: its
+    /// Frees retiring streams with no live lease and no remote grant. A
+    /// registration does not keep its stream: once the stream is freed it
+    /// stays as a tombstone, naming a stream id that is never reused, until
+    /// its client removes it or ends. A remote client's grants (its ledger)
+    /// keep the stream until they end, at their `Detach` or the client's
+    /// exit proof. A network publication's lanes stay while its removal lingers: its
     /// sender still reads them to their seals and serves repair from them,
     /// with no lease (driver-network-agents.md §7). A stopped or failed
     /// network holds nothing, so they free with no linger.
     pub(crate) fn free_retired_streams(&mut self) {
-        let registrations = &self.registrations;
         let clients = &self.clients;
         let net = self.net.as_ref();
         // A remote grant keeps its stream until it ends, even after its
@@ -1645,9 +1648,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 stream.retiring
                     && stream.leases.live() == 0
                     && !net.is_some_and(|net| net.holds_publication(stream.aggregate.registration))
-                    && !registrations
-                        .iter()
-                        .any(|registration| registration.stream() == stream.id)
                     && !clients.iter().any(|client| {
                         client
                             .ledger

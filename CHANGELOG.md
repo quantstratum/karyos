@@ -11,6 +11,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A remote client's registrations, live ones and those whose stream was
+  freed, are capped at `max_exports_per_client`, as its ledger's grants
+  were before: an `AddSubscription` (by alias or by image) or a conflated
+  view past the cap is refused with `ResourcesUnavailable`, and the
+  client stays served. A registration no longer keeps its stream (below),
+  so it can outlive it until the client removes it; the cap bounds what a
+  client that never removes keeps. The client facade removes every image
+  handle it lets go of, so it never reaches the cap that way.
 - A publication released through the client facade whose removal cannot
   be sent (the command ring full, a handle another connection issued, a
   closed link) is counted: `Client::publication_releases_failed`. The
@@ -1041,6 +1049,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- An IPC driver no longer keeps the images a connected remote subscriber
+  read. A registration kept its stream from freeing, and a remote client
+  had no way to remove one, so every image it took stayed Retiring, with
+  its regions, descriptors and storage charge, until the client left. A
+  retiring stream now frees once no lease, remote grant or lingering
+  network publication holds it; its registration stays until removed,
+  and a later `RemoveSubscription` on it succeeds. Stream ids are never
+  reused, so it never names a later stream.
+  `RemoteClient::remove_subscription` removes a taken subscription, and
+  the client facade releases retired, dropped and late-granted image
+  handles with it (the doc-hidden `Connection::release_subscription`).
 - A removed network publication's sender closes its lane queues, its
   repair queue and its route at its next duty (#354 review P3-6;
   driver-network-agents.md §7: the sender drops its queues), on every

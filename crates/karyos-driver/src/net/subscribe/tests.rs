@@ -1777,3 +1777,102 @@ fn a_conductor_hears_each_image_and_attaches_by_alias_to_the_oldest() {
         "the alias attaches the oldest image"
     );
 }
+
+/// The client facade releases a retired image's handle with
+/// `RemoveSubscription` (`Connection::release_subscription`), so the driver
+/// forgets its registration by the command, not by sweeping a dropped
+/// handle: an in-process facade reads one image, the image retires, and
+/// the driver ends with no registration and none swept.
+#[test]
+fn the_facade_removes_a_retired_images_subscription() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use karyos_client::{Client, Context, IdleStrategy, MessageLimit};
+    use karyos_protocol::cnc::StreamId;
+
+    const PUBLISH: u8 = 1;
+    const REMOVE: u8 = 2;
+    const STOP: u8 = 3;
+    let port = free_port();
+    let stage = Arc::new(AtomicU8::new(0));
+    let (send, receive) = std::sync::mpsc::channel();
+    let driving = Arc::clone(&stage);
+    let thread = std::thread::spawn(move || {
+        let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+        send.send(b.connect().unwrap()).unwrap();
+        let destination = SocketAddr::new(LOOPBACK, port);
+        let mut publication = None;
+        loop {
+            match driving.load(Ordering::Acquire) {
+                PUBLISH if publication.is_none() => {
+                    publication = Some(
+                        a.add_network_publication(aggregate(10, 3, 1), &channel(destination))
+                            .unwrap(),
+                    );
+                }
+                REMOVE => {
+                    if let Some(publication) = publication.take() {
+                        a.remove_aggregate(&publication).unwrap();
+                    }
+                }
+                STOP => break,
+                _ => {}
+            }
+            let _ = a.do_work().unwrap();
+            let _ = b.do_work().unwrap();
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        for _ in 0..50 {
+            let _ = b.do_work().unwrap();
+        }
+        let _ = (a.close_network(), b.close_network());
+        b
+    });
+    let context = Context::builder()
+        .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut client = Client::with_conductor(receive.recv().unwrap(), context);
+    let mut reading = client
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(10),
+        )
+        .unwrap();
+    let until = |client: &mut Client<_>,
+                 reading: &mut karyos_client::Subscription<_>,
+                 done: &dyn Fn(&karyos_client::Subscription<_>) -> bool| {
+        let start = std::time::Instant::now();
+        while !done(reading) {
+            assert!(start.elapsed() < Duration::from_secs(20), "not reached");
+            let _ = client.poll();
+            let _ = reading.poll(|_, _| {}, MessageLimit::new(64));
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    };
+    stage.store(PUBLISH, Ordering::Release);
+    until(&mut client, &mut reading, &|reading| {
+        reading.image_count() == 1
+    });
+    stage.store(REMOVE, Ordering::Release);
+    until(&mut client, &mut reading, &|reading| {
+        reading.image_count() == 0
+    });
+    // The facade releases what its subscription let go of at its next
+    // service.
+    for _ in 0..100 {
+        let _ = client.poll();
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    stage.store(STOP, Ordering::Release);
+    let b = thread.join().unwrap();
+    assert!(b.registrations.is_empty(), "the registration was removed");
+    assert_eq!(
+        b.counters.value(crate::counters::Event::RegistrationsSwept),
+        0,
+        "removed by the command, not swept"
+    );
+    drop((reading, client));
+}
