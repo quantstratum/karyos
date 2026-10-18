@@ -192,3 +192,31 @@ fn a_fill_or_a_missing_end_is_unavailable() {
         None
     );
 }
+
+/// A frame with the trace extension has a 96-byte header: the payload is
+/// read after it, and the source's buffer holds such a frame whole.
+#[test]
+fn a_frame_with_the_trace_extension_is_read() {
+    let payload = [5u8; 200];
+    let length = 96 + payload.len();
+    let word0 = Word0::new(
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, false, true, Lane::ZERO),
+        FrameType::Data,
+    );
+    let mut frame = vec![0u8; length.next_multiple_of(32)];
+    frame[..8].copy_from_slice(&word0.pack().to_le_bytes());
+    frame[96..length].copy_from_slice(&payload);
+    let disk = recorded(&[Ok(frame.clone())]);
+    assert_eq!(
+        read(
+            &disk,
+            Frames {
+                position: 0,
+                extent: u32::try_from(frame.len()).unwrap(),
+                length: 200,
+            }
+        ),
+        Some(payload.to_vec())
+    );
+}

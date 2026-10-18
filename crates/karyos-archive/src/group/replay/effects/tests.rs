@@ -161,6 +161,16 @@ fn encode(record: &GroupRecord<'_>) -> Vec<u8> {
 
 /// A cursor over one timer event with `observations`.
 fn cursor(observations: &[GroupRecord<'_>]) -> ReplayCursor<FaultDisk> {
+    cursor_with(observations, EndOutcome::Complete)
+}
+
+/// A cursor over one timer event with `observations`, its capture
+/// incomplete.
+fn cursor_incomplete(observations: &[GroupRecord<'_>]) -> ReplayCursor<FaultDisk> {
+    cursor_with(observations, EndOutcome::Incomplete)
+}
+
+fn cursor_with(observations: &[GroupRecord<'_>], outcome: EndOutcome) -> ReplayCursor<FaultDisk> {
     let disk = FaultDisk::default();
     let mut journal =
         GroupJournal::create(disk.clone(), Path::new("/g"), &header(), CONFIG).unwrap();
@@ -173,7 +183,7 @@ fn cursor(observations: &[GroupRecord<'_>]) -> ReplayCursor<FaultDisk> {
     records.push(GroupRecord::End(EventEnd {
         group_seq: SEQ,
         observations: u32::try_from(observations.len()).unwrap(),
-        outcome: EndOutcome::Complete,
+        outcome,
     }));
     for record in &records {
         journal.append(&encode(record)).unwrap();
@@ -541,4 +551,27 @@ fn a_claim_starts_from_zeroed_bytes() {
         }),
         Ok(())
     );
+}
+
+/// Past an incomplete event's recorded observations, a call replay
+/// cannot even digest is no divergence either (the capture stopped
+/// there), as `take` treats one it can.
+#[test]
+fn an_undigestible_call_past_an_incomplete_event_is_no_divergence() {
+    let records = [outcome(0, Operation::Offer, accepted(0), PAYLOAD)];
+    let mut cursor = cursor_incomplete(&records);
+    let Step::Event(event) = cursor.step().unwrap() else {
+        panic!("no event");
+    };
+    assert!(event.incomplete());
+    let mut scratch = [0u8; 64];
+    let mut effects = ReplayEffects::new(event, &PUBLICATIONS, &mut scratch).unwrap();
+    assert_eq!(effects.offer(PublicationId(0), PAYLOAD), accepted(0));
+    effects.diverge(Call::Offer {
+        publication: PublicationId(0),
+        length: u32::MAX,
+        crc32c: 0,
+    });
+    assert_eq!(effects.divergence(), None);
+    assert_eq!(effects.finish(), Ok(()));
 }

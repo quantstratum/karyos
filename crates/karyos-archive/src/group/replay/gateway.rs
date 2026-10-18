@@ -268,8 +268,8 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                     _ => None,
                 };
                 let payload = match (message.payload, read) {
-                    // A reference unavailable names only an event whose payload is by
-                    // reference (the prefix tracker refuses any other).
+                    // Inline bytes are in the record itself: replay always has
+                    // them, whatever names the event.
                     (Payload::Inline(bytes), _) => Some(bytes),
                     (Payload::Reference { .. }, Some(length)) => self.payload.get(..length),
                     _ if self.present_unavailable => Some(&[][..]),

@@ -351,10 +351,16 @@ impl<'e, 's> ReplayEffects<'e, 's> {
     /// Diverges at the next observation, unless replay already did:
     /// `call` is not the recorded one there.
     fn diverge(&mut self, call: Call) {
-        if self.diverged.is_some() {
+        if self.diverged.is_some() || self.past_recorded {
             return;
         }
         let kind = match self.peek() {
+            // Past an incomplete event's recorded observations, as `take`
+            // treats a call there: no divergence.
+            None if self.incomplete => {
+                self.past_recorded = true;
+                return;
+            }
             Some(record) => DivergenceKind::Call {
                 expected: recorded(&record),
                 found: call,
