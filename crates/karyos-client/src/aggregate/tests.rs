@@ -112,7 +112,7 @@ fn an_interrupted_skip_is_applied_by_the_probe() {
     .unwrap();
     let mut delivered = Vec::new();
     let report = aggregate.poll(
-        |bytes, lane, info| delivered.push((lane, info.position, bytes.len())),
+        |bytes, lane, info| delivered.push((lane, info.position, bytes.len(), info.extent)),
         Budget {
             work: 16,
             bytes: 10 * frame,
@@ -125,7 +125,8 @@ fn an_interrupted_skip_is_applied_by_the_probe() {
         report.drr.lanes[0].served_bytes,
         64 + u64::from(STEP_CHARGE) + 64
     );
-    assert_eq!(delivered, [(Lane::ZERO, 128, 32)]);
+    // The message's one frame: its extent.
+    assert_eq!(delivered, [(Lane::ZERO, 128, 32, 64)]);
     let lane = report.lanes[0];
     assert_eq!(
         lane.skipped.map(|skipped| skipped.reason),

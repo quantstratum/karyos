@@ -221,9 +221,15 @@ impl<T: TermBytes> LaneState<T> {
         let base = self.base;
         let lane = self.lane;
         let mut taken = None;
+        let end = reader.ready_end();
         let delivered = reader.take(|bytes, info| {
+            let extent = end
+                .and_then(|end| end.checked_sub(info.position))
+                .and_then(|extent| u32::try_from(extent).ok())
+                .unwrap_or(0);
             let info = MessageInfo {
                 position: base + info.position,
+                extent,
                 reserved_value: info.reserved_value,
                 end_of_stream: info.end_of_stream,
                 extension: info.extension,

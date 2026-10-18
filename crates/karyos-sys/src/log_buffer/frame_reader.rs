@@ -300,6 +300,16 @@ impl<O: BufferOwner> FrameReader<O> {
         .peek(assembly)
     }
 
+    /// The stream position after the complete message, the one `take`
+    /// moves the cursor to; `None` when no message is complete.
+    #[must_use]
+    pub fn ready_end(&self) -> Option<u64> {
+        match self.state {
+            State::Ready(_, next) => Some(next),
+            _ => None,
+        }
+    }
+
     /// Delivers the complete message once to `deliver`, borrowing the
     /// assembly with no loan held, then moves the cursor past it and
     /// publishes the position (a required reader's acknowledgement, after

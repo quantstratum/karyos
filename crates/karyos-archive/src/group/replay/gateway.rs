@@ -21,8 +21,8 @@
 //! [`super::reference::read_message`] (A5's replay source), when the
 //! Gateway has the Archive that holds it; a recording that no longer
 //! holds the frames leaves the payload unavailable. The configuration
-//! can opt in to present a message whose payload replay cannot give with
-//! an empty one.
+//! can opt in to present a message whose payload replay cannot give as
+//! `MessagePayload::Unavailable`, with its recorded length and extent.
 //!
 //! With a [`CaptureJournal`] it writes what the handler did (section 9):
 //! each presented event's records as the handler matched them, which are
@@ -39,7 +39,8 @@ use super::{
 use crate::crc32c::crc32c;
 use crate::disk::Disk;
 use crate::group::gateway::{
-    ConflatedId, Dispatched, Event, GatewayError, GroupGateway, Handler, SubscriptionId, TimerId,
+    ConflatedId, Dispatched, Event, GatewayError, GroupGateway, Handler, MessagePayload,
+    SubscriptionId, TimerId,
 };
 use crate::group::journal::JournalError;
 use crate::group::record::{CheckpointRecord, EndOutcome, EventEnd, GroupRecord, Payload};
@@ -66,7 +67,8 @@ pub struct GatewayConfig<'a> {
     /// The largest payload by reference, for the buffer it is read into.
     pub max_payload: usize,
     /// Present a message whose payload replay cannot give (not captured,
-    /// unavailable, or by reference) with an empty payload, for a handler
+    /// unavailable, or by reference) as `MessagePayload::Unavailable`,
+    /// with its recorded length and extent, for a handler
     /// that only counts or routes such messages (section 7). Off, such a
     /// message is not reproducible.
     pub present_unavailable: bool,
@@ -410,22 +412,33 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                     ),
                     _ => None,
                 };
+                let length = match message.payload {
+                    Payload::Inline(bytes) => u32::try_from(bytes.len()).ok(),
+                    Payload::Reference { length, .. } | Payload::Unavailable { length } => {
+                        Some(length)
+                    }
+                };
                 let payload = match (message.payload, read) {
                     // Inline bytes are in the record itself: replay always has
                     // them, whatever names the event.
-                    (Payload::Inline(bytes), _) => Some(bytes),
-                    (Payload::Reference { .. }, Some(length)) => self.payload.get(..length),
-                    _ if self.present_unavailable => Some(&[][..]),
+                    (Payload::Inline(bytes), _) => Some(MessagePayload::Bytes(bytes)),
+                    (Payload::Reference { .. }, Some(length)) => {
+                        self.payload.get(..length).map(MessagePayload::Bytes)
+                    }
+                    _ if self.present_unavailable => Some(MessagePayload::Unavailable),
                     _ => None,
                 };
                 match (
                     payload,
+                    length,
                     id_of(&self.subscriptions, message.stream_id, message.session_id),
                 ) {
-                    (Some(payload), Some(source)) => Some(Event::Message {
+                    (Some(payload), Some(length), Some(source)) => Some(Event::Message {
                         source: SubscriptionId(source),
                         lane: message.lane,
                         position: message.position,
+                        extent: message.extent,
+                        length,
                         reserved_value: message.reserved_value,
                         end_of_stream: message.end_of_stream,
                         extension: message.extension,
@@ -437,6 +450,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
             GroupRecord::Conflated(view) => id_of(&self.conflated, view.stream_id, view.session_id)
                 .map(|source| Event::Conflated {
                     source: ConflatedId(source),
+                    key: view.key,
                     version: view.version,
                     freshness: view.freshness,
                     value: view.value,

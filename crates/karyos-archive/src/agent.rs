@@ -52,6 +52,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use karyos_sys::frame::Lane;
+
 use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
 use crate::group::capture::{
@@ -62,6 +64,7 @@ use crate::group::checkpoint::{
     CheckpointError, CheckpointInbox, CheckpointRequest, CheckpointStore, CheckpointWriter,
     handoff, recorded_end, store_dir,
 };
+use crate::group::gateway::live::RecordingWord;
 use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
 use crate::group::prefix::{CheckpointHeld, Coverage};
 use crate::group::record::{CONTRACT_VERSION, Capture, Clock, JournalHeader};
@@ -466,6 +469,12 @@ enum Command {
     Start(Box<StartRecording>, Reply<u64>),
     Stop(u64, Reply<Ended>),
     List(Reply<Vec<Recording>>),
+    Word {
+        stream_id: i32,
+        session_id: i32,
+        lane: Lane,
+        reply: Reply<Option<Arc<RecordingWord>>>,
+    },
     Snapshot {
         from_id: u64,
         max: usize,
@@ -530,6 +539,17 @@ impl core::fmt::Debug for Command {
             Self::Start(start, _) => f.debug_tuple("Start").field(start).finish(),
             Self::Stop(id, _) => f.debug_tuple("Stop").field(id).finish(),
             Self::List(_) => f.write_str("List"),
+            Self::Word {
+                stream_id,
+                session_id,
+                lane,
+                ..
+            } => f
+                .debug_struct("Word")
+                .field("stream_id", stream_id)
+                .field("session_id", session_id)
+                .field("lane", lane)
+                .finish_non_exhaustive(),
             Self::Snapshot { from_id, max, .. } => f
                 .debug_struct("Snapshot")
                 .field("from_id", from_id)
@@ -712,6 +732,31 @@ impl ArchiveHandle {
     /// [`AgentError::Gone`].
     pub fn recordings(&self) -> Result<Vec<Recording>, AgentError> {
         self.call(Command::List)
+    }
+
+    /// The word of the `required` recording of stream `stream_id`, session
+    /// `session_id`, lane `lane` this Archive records, if any: recordings
+    /// are per lane, and a word for another lane would place references
+    /// into the wrong frames. A recording group Gateway's source reads it
+    /// to place payloads by reference. It names
+    /// the recording and its start while it records, and is cleared when
+    /// the recording stops, ends or fails. Configuration path only.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Gone`].
+    pub fn recording_word(
+        &self,
+        stream_id: i32,
+        session_id: i32,
+        lane: Lane,
+    ) -> Result<Option<Arc<RecordingWord>>, AgentError> {
+        self.call(|reply| Command::Word {
+            stream_id,
+            session_id,
+            lane,
+            reply,
+        })
     }
 
     /// Posts a snapshot of at most `max` recordings from id `from_id` on,
@@ -921,6 +966,24 @@ impl Outbox {
 struct Active<D: Disk> {
     id: u64,
     recorder: Recorder<D, Box<dyn FrameSource + Send>>,
+    stream_id: i32,
+    session_id: i32,
+    /// The lane it records: a recording is per lane.
+    lane: Lane,
+    /// A `required` recording's word, which recording group Gateways read
+    /// to place payloads by reference; cleared when the recording leaves
+    /// the active set, however it stopped, ended or failed.
+    word: Option<WordGuard>,
+}
+
+/// Clears a recording's word when the recording leaves the active set.
+#[derive(Debug)]
+struct WordGuard(Arc<RecordingWord>);
+
+impl Drop for WordGuard {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
 }
 
 impl FrameSource for Box<dyn FrameSource + Send> {
@@ -1184,8 +1247,9 @@ struct State<D: Disk> {
 /// A recording that failed: no stop in the catalog, so the groups settle
 /// their references to it by `durable`, its frames durable at the failure.
 ///
-/// The event loop stops naming a recording once it learns that it failed,
-/// so only references already in the groups' rings can name it. An entry
+/// A Gateway stops naming a recording once its word is cleared, which
+/// happens when it leaves the active set, so only references sent before
+/// that can name it. An entry
 /// is kept until every running group has read its ring empty in a duty
 /// that began after the failure (`seq`), and is dropped then when a start
 /// needs its slot. A failed recording
@@ -1481,6 +1545,23 @@ impl<D: Disk + Clone> State<D> {
             }
             Command::List(reply) => {
                 let _ = reply.send(Ok(self.catalog.recordings().to_vec()));
+            }
+            Command::Word {
+                stream_id,
+                session_id,
+                lane,
+                reply,
+            } => {
+                let word = self
+                    .active
+                    .iter()
+                    .filter(|active| {
+                        active.stream_id == stream_id
+                            && active.session_id == session_id
+                            && active.lane == lane
+                    })
+                    .find_map(|active| active.word.as_ref().map(|guard| Arc::clone(&guard.0)));
+                let _ = reply.send(Ok(word));
             }
             Command::Snapshot {
                 from_id,
@@ -1883,7 +1964,19 @@ impl<D: Disk + Clone> State<D> {
         });
         match recorder {
             Ok(recorder) => {
-                self.active.push(Active { id, recorder });
+                let word = matches!(start.mode, Mode::Required).then(|| {
+                    let word = Arc::new(RecordingWord::new());
+                    word.set(id, position);
+                    WordGuard(word)
+                });
+                self.active.push(Active {
+                    id,
+                    recorder,
+                    stream_id: start.stream_id,
+                    session_id: start.session_id,
+                    lane: start.format.lane,
+                    word,
+                });
                 Ok(id)
             }
             Err(error) => {
@@ -2045,8 +2138,13 @@ fn stop<D: Disk>(
     reason: StopReason,
     now: u64,
 ) -> Result<Ended, AgentError> {
-    let id = recording.id;
-    let ended = recording.recorder.close(reason)?;
+    let Active {
+        id, recorder, word, ..
+    } = recording;
+    // Cleared first: a Gateway stops naming the recording before the close
+    // and the catalog's stop, which take time.
+    drop(word);
+    let ended = recorder.close(reason)?;
     catalog.stop(id, ended.position, now, ended.reason, ended.incomplete)?;
     Ok(ended)
 }
