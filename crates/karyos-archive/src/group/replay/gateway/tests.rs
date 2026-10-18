@@ -18,7 +18,7 @@ use karyos_sys::frame::Lane;
 
 use super::*;
 use crate::fault::{FaultDisk, Survives};
-use crate::group::gateway::{Effects, PublicationId};
+use crate::group::gateway::{Effects, MessagePayload, PublicationId};
 use crate::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
 use crate::group::prefix::{Coverage, recover};
 use crate::group::record::{
@@ -176,7 +176,10 @@ struct Echo {
 impl Handler for Echo {
     fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
         self.seen.push(format!("{event:?} at {}", effects.clock()));
-        if let Event::Message { payload, .. } = event
+        if let Event::Message {
+            payload: MessagePayload::Bytes(payload),
+            ..
+        } = event
             && !payload.is_empty()
         {
             let _ = effects.offer(PublicationId(0), payload);
@@ -244,10 +247,12 @@ fn each_event_is_presented_as_recorded_then_the_end() {
                 source,
                 lane: Lane::ZERO,
                 position: 64,
+                extent: 64,
+                length: 2,
                 reserved_value: 7,
                 end_of_stream: false,
                 extension: None,
-                payload: b"hi",
+                payload: MessagePayload::Bytes(b"hi"),
             }
         ),
         format!("{:?} at 20", Event::Timer { timer: TimerId(4) }),
@@ -337,7 +342,11 @@ fn what_replay_cannot_give_is_not_reproducible() {
         presented.dispatch(&mut echo),
         Ok(Dispatched::Event { group_seq: 1 })
     );
-    assert!(echo.seen[0].contains("payload: []"), "{:?}", echo.seen);
+    assert!(
+        echo.seen[0].contains("length: 70000") && echo.seen[0].contains("payload: Unavailable"),
+        "{:?}",
+        echo.seen
+    );
     // Another stream than the configuration's subscriptions.
     let elsewhere = [
         message(1, 11, Payload::Inline(b"hi")),
@@ -457,7 +466,10 @@ fn a_payload_by_reference_is_read_from_its_recording() {
     let mut payloads = Vec::new();
     let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
         if let Event::Message { payload, .. } = event {
-            payloads.push(payload.to_vec());
+            payloads.push(match payload {
+                MessagePayload::Bytes(bytes) => bytes.to_vec(),
+                MessagePayload::Unavailable => Vec::new(),
+            });
         }
     };
     assert_eq!(
@@ -634,7 +646,10 @@ fn a_reference_named_unavailable_is_not_read() {
     let mut payloads = Vec::new();
     let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
         if let Event::Message { payload, .. } = event {
-            payloads.push(payload.to_vec());
+            payloads.push(match payload {
+                MessagePayload::Bytes(bytes) => bytes.to_vec(),
+                MessagePayload::Unavailable => Vec::new(),
+            });
         }
     };
     assert_eq!(

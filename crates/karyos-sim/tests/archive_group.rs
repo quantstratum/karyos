@@ -191,6 +191,7 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
                 max_event: 4096,
                 in_flight: 64,
             },
+            checkpoints: None,
         })
         .unwrap();
     let waiter = sender.waiter();
