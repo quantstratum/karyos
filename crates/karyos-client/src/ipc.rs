@@ -794,6 +794,53 @@ impl RemoteClient {
             .remove_network_subscription(registration)
     }
 
+    /// Removes a publication taken from this client's grant, as
+    /// [`ClientConductor::remove_publication`]: the handle is dropped,
+    /// detaching its export, only after the command is written. A network
+    /// publication the client created by URI then ends at the driver as
+    /// an in-process one does, with its linger and EOS.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handle intact with the error, so the caller can retry:
+    /// [`ConductorError::ForeignHandle`] for a handle this client did not
+    /// take, and the errors of [`ClientConductor::remove_publication`].
+    #[allow(
+        clippy::result_large_err,
+        reason = "the handle is returned intact so the caller can retry; boxing it would allocate on every Full"
+    )]
+    pub fn remove_publication(
+        &mut self,
+        publication: ClientPublication<SharedTerms>,
+    ) -> Result<u64, (ClientPublication<SharedTerms>, ConductorError)> {
+        let Some(registration) = self.taken_registration(publication.generation_link()) else {
+            return Err((publication, ConductorError::ForeignHandle));
+        };
+        let submitted = match self.conductor_mut() {
+            Ok(conductor) => conductor.remove_publication_registration(registration),
+            Err(error) => Err(error),
+        };
+        match submitted {
+            Ok(sequence) => {
+                drop(publication);
+                Ok(sequence)
+            }
+            Err(error) => Err((publication, error)),
+        }
+    }
+
+    /// The registration whose grant this client took the handle of
+    /// `link` from; `None` for a handle it did not take.
+    fn taken_registration(&self, link: Option<&Arc<GenerationLink<SharedTerms>>>) -> Option<u64> {
+        let link = link?;
+        self.session
+            .as_ref()?
+            .links()
+            .iter()
+            .find(|entry| std::ptr::eq(entry.link.as_ptr(), Arc::as_ptr(link)))
+            .map(|entry| entry.registration)
+    }
+
     /// Requests a publication on one lane of `stream`'s aggregate.
     ///
     /// # Errors
