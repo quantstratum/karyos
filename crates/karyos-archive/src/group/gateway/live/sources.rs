@@ -585,6 +585,12 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
 
     /// Delivers a loss or an end source `index` reported; it stays held
     /// while strict capture refuses it.
+    ///
+    /// Defensive: a source is read only after `strict_admit`, and nothing
+    /// between that check and this delivery uses the ring or the in
+    /// flight bound, so strict capture does not refuse here today; best
+    /// effort never refuses. The hold keeps a report from being lost
+    /// should a later change let admission fail in between.
     fn deliver_held(
         &mut self,
         index: usize,
