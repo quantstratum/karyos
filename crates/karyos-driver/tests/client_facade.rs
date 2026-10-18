@@ -1267,3 +1267,181 @@ fn a_release_whose_removal_cannot_be_sent_is_counted() {
         assert_eq!(a.publication_releases_failed(), 0);
     });
 }
+
+/// Task 2 (A7d-3): a network subscription reports each image it attaches
+/// and retires, in order, with its attach id: a publication that goes and
+/// one that comes back are two images. Polling without draining keeps
+/// the latest `3 * max_images` changes and counts the ones dropped.
+#[test]
+fn a_network_subscription_reports_its_image_changes() {
+    for drain in [true, false] {
+        let (_a, mut a) = driven(2, None);
+        let (_b, mut b) = driven(1, Some(500_000_000));
+        let mut first = Client::with_conductor(a.remove(0), context());
+        let mut second = Client::with_conductor(a.remove(0), context());
+        let mut subscriber = Client::with_conductor(
+            b.remove(0),
+            Context::builder()
+                .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+                .max_images(1)
+                .build()
+                .unwrap(),
+        );
+        let port = port();
+        let mut reading = subscriber
+            .add_subscription(
+                &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+                StreamId::new(11),
+            )
+            .unwrap();
+        let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1");
+        let mut changes = Vec::new();
+        let take = |reading: &mut karyos_client::Subscription<_>,
+                    changes: &mut Vec<karyos_client::ImageChange>| {
+            if drain {
+                reading.image_changes(&mut |change| changes.push(change));
+            } else {
+                let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+            }
+        };
+        let one = first
+            .add_exclusive_publication(&uri, StreamId::new(11))
+            .unwrap();
+        until(&mut [&mut subscriber, &mut first], || {
+            take(&mut reading, &mut changes);
+            reading.image_count() == 1
+        });
+        drop(one);
+        until(&mut [&mut subscriber, &mut first], || {
+            take(&mut reading, &mut changes);
+            reading.image_count() == 0
+        });
+        let two = second
+            .add_exclusive_publication(&uri, StreamId::new(11))
+            .unwrap();
+        until(&mut [&mut subscriber, &mut second], || {
+            take(&mut reading, &mut changes);
+            reading.image_count() == 1
+        });
+        if !drain {
+            // A fourth change: one more than the queue holds.
+            drop(two);
+            until(&mut [&mut subscriber, &mut second], || {
+                take(&mut reading, &mut changes);
+                reading.image_count() == 0
+            });
+        }
+        if drain {
+            let seen: Vec<_> = changes.iter().map(|change| change.available).collect();
+            assert_eq!(seen, [true, false, true]);
+            assert_eq!(changes[0].image_id, changes[1].image_id);
+            assert_ne!(changes[1].image_id, changes[2].image_id, "a new image");
+            assert_eq!(reading.image_changes_lost(), 0);
+        } else {
+            // Room for three: the first attach was dropped, counted.
+            // Taken one at a time.
+            while let Some(change) = reading.next_image_change() {
+                changes.push(change);
+            }
+            let seen: Vec<_> = changes.iter().map(|change| change.available).collect();
+            assert_eq!(seen, [false, true, false]);
+            assert_eq!(reading.image_changes_lost(), 1);
+        }
+    }
+}
+
+/// A7d-3: `poll_taking` over a network subscription's images. A decline
+/// in one image stops the poll; that message is the next one delivered,
+/// from that image, and is then taken once; what the other image
+/// delivered stays taken. Each message carries its image's session.
+#[test]
+fn a_network_subscription_takes_messages_and_declines_one() {
+    let (_a, mut a) = driven(2, None);
+    let (_b, mut b) = driven(1, None);
+    let mut first = Client::with_conductor(a.remove(0), context());
+    let mut second = Client::with_conductor(a.remove(0), context());
+    let mut subscriber = Client::with_conductor(b.remove(0), context());
+    let port = port();
+    let mut reading = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(12),
+        )
+        .unwrap();
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1");
+    let mut one = first
+        .add_exclusive_publication(&uri, StreamId::new(12))
+        .unwrap();
+    let mut two = second
+        .add_exclusive_publication(&uri, StreamId::new(12))
+        .unwrap();
+    until(&mut [&mut subscriber, &mut first, &mut second], || {
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        reading.image_count() == 2
+    });
+    let mut offered = [0u8; 2];
+    let start = Instant::now();
+    while offered != [8, 8] {
+        assert!(start.elapsed() < Duration::from_secs(20), "{offered:?}");
+        let _ = (first.poll(), second.poll(), subscriber.poll());
+        for (index, (publication, tag)) in
+            [(&mut one, b'1'), (&mut two, b'2')].into_iter().enumerate()
+        {
+            if offered[index] < 8 && publication.offer(&[tag, offered[index]]).is_ok() {
+                offered[index] += 1;
+            }
+        }
+    }
+    // Every delivery, declined or taken, with its session; one a poll, so
+    // the images alternate and both hold messages at the decline.
+    let mut delivered: Vec<(u8, u8, i32, bool)> = Vec::new();
+    let mut declined = false;
+    let start = Instant::now();
+    while delivered.iter().filter(|(.., taken)| *taken).count() < 16 {
+        assert!(start.elapsed() < Duration::from_secs(20), "{delivered:?}");
+        let _ = (first.poll(), second.poll(), subscriber.poll());
+        let _ = reading
+            .poll_taking(
+                |bytes, info| {
+                    let take = declined || (bytes[0], bytes[1]) != (b'2', 3);
+                    if !take {
+                        declined = true;
+                    }
+                    delivered.push((bytes[0], bytes[1], info.session_id, take));
+                    take
+                },
+                MessageLimit::new(1),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let at = delivered
+        .iter()
+        .position(|(tag, index, _, taken)| (*tag, *index, *taken) == (b'2', 3, false))
+        .expect("the decline happened");
+    // The declined message comes next, from its image, and is taken.
+    assert_eq!(
+        (
+            delivered[at + 1].0,
+            delivered[at + 1].1,
+            delivered[at + 1].3
+        ),
+        (b'2', 3, true)
+    );
+    for tag in *b"12" {
+        let taken: Vec<u8> = delivered
+            .iter()
+            .filter(|(t, .., taken)| *t == tag && *taken)
+            .map(|(_, index, ..)| *index)
+            .collect();
+        assert_eq!(taken, (0..8).collect::<Vec<u8>>(), "image {}", tag as char);
+        let sessions: std::collections::BTreeSet<i32> = delivered
+            .iter()
+            .filter(|(t, ..)| *t == tag)
+            .map(|(_, _, session, _)| *session)
+            .collect();
+        assert_eq!(sessions.len(), 1, "one session per image");
+    }
+    let session = |tag| delivered.iter().find(|(t, ..)| *t == tag).unwrap().2;
+    assert_ne!(session(b'1'), session(b'2'));
+}
