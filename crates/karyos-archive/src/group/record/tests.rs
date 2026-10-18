@@ -1720,3 +1720,44 @@ fn loss_codes_follow_the_tables() {
     }
     assert_eq!(codes(loss(Loss::Aborted)), (3, 0, 0));
 }
+
+/// A header of another contract or clock is named as such, not taken as
+/// a corrupt record.
+#[test]
+fn an_unsupported_header_is_named() {
+    let header = GroupRecord::Header(JournalHeader {
+        group_id: 1,
+        first_group_seq: 1,
+        inline_threshold: 4096,
+        contract_version: CONTRACT_VERSION,
+        clock: Clock::HostMonotonic,
+        capture: Capture::Strict,
+        manifest: b"m",
+    });
+    let mut bytes = vec![0u8; MAX_RECORD];
+    let length = header.encode(&mut bytes).unwrap();
+    bytes.truncate(length);
+    assert_eq!(unsupported_header(&bytes), None);
+    let mut contract = bytes.clone();
+    contract[12 + 20..12 + 22].copy_from_slice(&2u16.to_le_bytes());
+    assert!(GroupRecord::decode(&contract).is_err());
+    assert_eq!(
+        unsupported_header(&contract),
+        Some(UnsupportedHeader::Contract { found: 2 })
+    );
+    let mut clock = bytes.clone();
+    clock[12 + 22] = 7;
+    assert_eq!(
+        unsupported_header(&clock),
+        Some(UnsupportedHeader::Clock { found: 7 })
+    );
+    // Another record is no header.
+    let end = GroupRecord::End(EventEnd {
+        group_seq: 1,
+        observations: 0,
+        outcome: EndOutcome::Complete,
+    });
+    let mut other = vec![0u8; MAX_RECORD];
+    let length = end.encode(&mut other).unwrap();
+    assert_eq!(unsupported_header(&other[..length]), None);
+}

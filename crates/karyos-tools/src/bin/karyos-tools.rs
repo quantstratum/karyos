@@ -22,19 +22,26 @@ const EXIT_ERROR: u8 = 3;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
-    let command = args.next();
-    let sub = args.next();
-    match (
-        command.as_deref().and_then(|c| c.to_str()),
-        sub.as_deref().and_then(|s| s.to_str()),
-    ) {
-        (Some("replay"), Some("diff")) => diff(args),
-        (None | Some("-h" | "--help"), _) => {
+    let (command, sub) = (args.next(), args.next());
+    match (text(command.as_ref()), text(sub.as_ref())) {
+        // A command that is not UTF-8 is no command: an error, not help.
+        (Some(None), _) | (_, Some(None)) => fail(&"an argument is not UTF-8"),
+        (Some(Some("replay")), Some(Some("diff"))) => diff(args),
+        (Some(Some("replay")), None | Some(Some("-h" | "--help"))) => {
+            let _ = std::io::stdout().write_all(replay::HELP.as_bytes());
+            ExitCode::SUCCESS
+        }
+        (None | Some(Some("-h" | "--help")), _) => {
             let _ = std::io::stdout().write_all(HELP.as_bytes());
             ExitCode::SUCCESS
         }
         _ => fail(&"unknown subcommand (karyos-tools --help lists them)"),
     }
+}
+
+/// An argument as text: `Some(None)` when it is not UTF-8.
+fn text(arg: Option<&std::ffi::OsString>) -> Option<Option<&str>> {
+    arg.map(|arg| arg.to_str())
 }
 
 fn diff(args: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
@@ -44,7 +51,11 @@ fn diff(args: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
             let _ = std::io::stdout().write_all(replay::HELP.as_bytes());
             return ExitCode::SUCCESS;
         }
-        Err(error) => return fail(&error),
+        Err(error) => {
+            return fail(&format_args!(
+                "{error} (karyos-tools replay diff --help for the usage)"
+            ));
+        }
     };
     let report = replay::diff(&parsed);
     let output = if parsed.json {

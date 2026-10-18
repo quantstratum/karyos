@@ -20,9 +20,11 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use karyos_archive::disk::{Disk, ReadOnly};
-use karyos_archive::group::journal::{GroupJournal, JournalConfig};
+use karyos_archive::group::journal::{GroupJournal, JournalConfig, JournalError};
 use karyos_archive::group::prefix::{Coverage, recover};
-use karyos_archive::group::record::{GroupRecord, Operation, Role};
+use karyos_archive::group::record::{
+    CONTRACT_VERSION, GroupRecord, Operation, Payload, Role, UnsupportedHeader,
+};
 use karyos_archive::group::replay::{
     CursorConfig, ReplayConfig, ReplayCursor, ReplayError, ReplayEvent, Step, Stop,
 };
@@ -51,11 +53,9 @@ reported; 2 not comparable; 3 error (arguments, I/O, or a journal that does
 not recover read only).
 ";
 
-/// The events of one event's records an event holds at most: its first,
-/// its observations and its end.
+/// The records one event may hold, its first, its observations and its
+/// end: an event past it is an error (exit 3).
 const MAX_RECORDS: usize = 16_384;
-/// The bytes of one event's records the diff holds at most.
-const MAX_BYTES: usize = 64 << 20;
 /// The events the prefix recovery holds waiting at once.
 const RECOVERY_CAPACITY: usize = 64;
 
@@ -117,7 +117,10 @@ pub fn parse_diff(args: impl IntoIterator<Item = OsString>) -> Result<Option<Dif
                     to = Some(seq);
                 }
             }
-            option if option.starts_with("--") => return Err(format!("unknown option {option}")),
+            // Any dash but a lone one is an option; none other is known.
+            option if option.starts_with('-') && option.len() > 1 => {
+                return Err(format!("unknown option {option}"));
+            }
             _ => positional.push(text.to_owned()),
         }
     }
@@ -394,9 +397,64 @@ fn open<D: Disk>(disk: D, journal: &Journal, side: &str) -> Result<Opened<D>, Re
         segment_length,
         policy: SyncPolicy::PerSegment,
     };
-    let mut recovered = GroupJournal::recover(disk, &journal.dir, journal.group, config)
-        .map_err(|failure| context(&format_args!("{failure}; the journal needs recovery")))?
-        .journal;
+    let mut recovered = match GroupJournal::recover(disk, &journal.dir, journal.group, config) {
+        Ok(recovered) => recovered.journal,
+        // Another contract or clock: another journal, not a corrupt one.
+        Err(JournalError::Unsupported(header)) => {
+            return Err(not_comparable(format!(
+                "{side} journal: {}",
+                match header {
+                    UnsupportedHeader::Contract { found } => {
+                        format!(
+                            "captured under contract {found}, this build replays {CONTRACT_VERSION}"
+                        )
+                    }
+                    UnsupportedHeader::Clock { found } =>
+                        format!("a clock this build does not know ({found})"),
+                }
+            )));
+        }
+        Err(failure) => {
+            return Err(context(&format_args!(
+                "{failure}; the journal needs recovery"
+            )));
+        }
+    };
+    // The largest event, so the cursor's buffer is sized by the journal,
+    // not by a bound.
+    let (mut bytes, mut records, mut largest, mut most) = (0u64, 0usize, 0u64, 0usize);
+    let mut too_many = false;
+    let _ = recovered
+        .walk(0, |position, end, record| {
+            if matches!(
+                record,
+                GroupRecord::Header(_) | GroupRecord::Gap(_) | GroupRecord::Unavailable(_)
+            ) {
+                return true;
+            }
+            let grown = end
+                .checked_sub(position)
+                .and_then(|length| bytes.checked_add(length))
+                .zip(records.checked_add(1));
+            let Some((grown, counted)) = grown else {
+                too_many = true;
+                return false;
+            };
+            (bytes, records) = (grown, counted);
+            if matches!(record, GroupRecord::End(_)) {
+                largest = largest.max(bytes);
+                most = most.max(records);
+                (bytes, records) = (0, 0);
+            }
+            true
+        })
+        .map_err(|failure| context(&failure))?;
+    if too_many || most > MAX_RECORDS {
+        return Err(context(&format_args!(
+            "an event of more than {MAX_RECORDS} records"
+        )));
+    }
+    let largest = usize::try_from(largest).map_err(|_| context(&"an event past usize"))?;
     let mut header = None;
     let _ = recovered
         .walk(0, |_, _, record| {
@@ -414,8 +472,8 @@ fn open<D: Disk>(disk: D, journal: &Journal, side: &str) -> Result<Opened<D>, Re
         accept_manifest: false,
     };
     let room = CursorConfig {
-        bytes: MAX_BYTES,
-        records: MAX_RECORDS,
+        bytes: largest.max(1),
+        records: most.max(2),
     };
     let cursor = match ReplayCursor::open(recovered, &recovery, &config, room) {
         Ok(cursor) => cursor,
@@ -451,7 +509,14 @@ pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
     if !args.accept_manifest && left.manifest != right.manifest {
         return not_comparable("the manifests differ (--accept-manifest compares them)");
     }
-    let from = args.from.unwrap_or(left.first.max(right.first));
+    let first = left.first.max(right.first);
+    let from = args.from.unwrap_or(first);
+    // Below a journal's first event, its events are not there to compare.
+    if from < first {
+        return not_comparable(format!(
+            "--from {from} is before a journal's first event, group_seq {first}"
+        ));
+    }
     compare(&mut left.cursor, &mut right.cursor, from, args.to)
 }
 
@@ -474,7 +539,18 @@ fn next_from<'c, D: Disk>(
     }
 }
 
-/// Describes `record` for the output.
+/// Bytes as the output shows them: their length and digest, never the
+/// bytes themselves.
+fn bytes(bytes: &[u8]) -> String {
+    format!(
+        "length {}, crc32c {:#010x}",
+        bytes.len(),
+        karyos_archive::crc32c::crc32c(bytes)
+    )
+}
+
+/// Describes `record` for the output: its fields, with any payload or
+/// value as its length and digest.
 fn describe(record: Option<&GroupRecord<'_>>) -> String {
     match record {
         None => "none".to_owned(),
@@ -485,14 +561,57 @@ fn describe(record: Option<&GroupRecord<'_>>) -> String {
                 Operation::Commit => "commit",
             };
             format!(
-                "{operation}, stream {} session {}, {:?}, length {}, crc32c {:#010x}",
+                "{operation}, stream {} session {}, length {}, crc32c {:#010x}, {:?}",
                 outcome.stream_id,
                 outcome.session_id,
-                outcome.outcome,
                 outcome.length,
-                outcome.crc32c
+                outcome.crc32c,
+                outcome.outcome
             )
         }
+        Some(GroupRecord::Message(message)) => {
+            let payload = match message.payload {
+                Payload::Inline(inline) => format!("inline, {}", bytes(inline)),
+                Payload::Reference {
+                    recording_id,
+                    length,
+                } => format!("by reference to recording {recording_id}, length {length}"),
+                Payload::Unavailable { length } => format!("not captured, length {length}"),
+            };
+            format!(
+                "message {}, stream {} session {} lane {}, position {}, extent {}, \
+                 reserved {}, end of stream {}, payload {payload}",
+                message.group_seq,
+                message.stream_id,
+                message.session_id,
+                message.lane.get(),
+                message.position,
+                message.extent,
+                message.reserved_value,
+                message.end_of_stream
+            )
+        }
+        Some(GroupRecord::Conflated(view)) => format!(
+            "conflated {}, stream {} session {}, key {}, version {}, {:?}, value {}",
+            view.group_seq,
+            view.stream_id,
+            view.session_id,
+            view.key,
+            view.version,
+            view.freshness,
+            bytes(view.value)
+        ),
+        Some(GroupRecord::External(external)) => format!(
+            "external {}, kind {}, value {}",
+            external.group_seq,
+            external.kind,
+            bytes(external.value)
+        ),
+        Some(GroupRecord::ExternalObservation(observation)) => format!(
+            "external value, kind {}, {}",
+            observation.kind,
+            bytes(observation.value)
+        ),
         Some(record) => format!("{record:?}"),
     }
 }
@@ -543,36 +662,50 @@ fn first_missing(stop: &Stop) -> Option<u64> {
     }
 }
 
-/// An item as a stop: an incomplete event is outside the complete prefix,
-/// so the comparison stops there.
-fn as_stop(item: &Item<'_>) -> Option<Stop> {
+/// One side's state at a step: an event in the range, the range's end
+/// on that side (an event past `to`), or a stop.
+enum Side<'c> {
+    Event(ReplayEvent<'c>),
+    Past,
+    Stop(Stop),
+}
+
+fn side<'c>(item: Item<'c>, to: Option<u64>) -> Side<'c> {
     match item {
-        Item::Stop(stop) => Some(*stop),
-        Item::Event(event) if event.incomplete() => Some(Stop::Incomplete {
+        Item::Event(event) if event.incomplete() => Side::Stop(Stop::Incomplete {
             group_seq: event.group_seq(),
         }),
-        Item::Event(_) => None,
+        Item::Event(event) if to.is_some_and(|to| event.group_seq() > to) => Side::Past,
+        Item::Event(event) => Side::Event(event),
+        Item::Stop(stop) => Side::Stop(stop),
     }
 }
 
-/// Compares two cursors' events from `from` to `to`. Without `to`, the
-/// range ends where either complete prefix does; with it, a prefix that
-/// ends before it is not comparable.
+/// Compares two cursors' events from `from` to `to`, or, without `to`, to
+/// the end of the longer complete prefix (section 10 as built): records
+/// on one side only are the `end` kind, unless that side stopped at a gap
+/// or an incomplete event, which is not comparable; so is a range past
+/// either complete prefix.
 fn compare<L: Disk, R: Disk>(
     left: &mut ReplayCursor<L>,
     right: &mut ReplayCursor<R>,
     from: u64,
     to: Option<u64>,
 ) -> Report {
+    if let Some(to) = to
+        && to < from
+    {
+        return not_comparable(format!("the range from {from} to {to} is empty"));
+    }
     let mut events = 0u64;
     let mut last = None;
     loop {
-        let left_item = match next_from(left, from, "left") {
-            Ok(item) => item,
+        let left_side = match next_from(left, from, "left") {
+            Ok(item) => side(item, to),
             Err(report) => return report,
         };
-        let right_item = match next_from(right, from, "right") {
-            Ok(item) => item,
+        let right_side = match next_from(right, from, "right") {
+            Ok(item) => side(item, to),
             Err(report) => return report,
         };
         let identical = Report::Identical {
@@ -580,44 +713,138 @@ fn compare<L: Disk, R: Disk>(
             to: last,
             events,
         };
-        let past_to = |item: &Item<'_>| match item {
-            Item::Event(event) => to.is_some_and(|to| event.group_seq() > to),
-            Item::Stop(_) => false,
+        // A gap or an incomplete event inside the range is not comparable,
+        // the left side first.
+        let inside = |stop: &Stop| {
+            !matches!(stop, Stop::EndOfPrefix { .. })
+                && first_missing(stop).is_some_and(|seq| to.is_none_or(|to| seq <= to))
         };
-        // Both past the range's end: done.
-        if past_to(&left_item) && past_to(&right_item) {
-            return identical;
+        for (stopped_side, name) in [(&left_side, "left"), (&right_side, "right")] {
+            if let Side::Stop(stop) = stopped_side
+                && inside(stop)
+            {
+                return not_comparable(stopped(*stop, name));
+            }
         }
-        let (left_stop, right_stop) = (as_stop(&left_item), as_stop(&right_item));
-        if left_stop.is_some() || right_stop.is_some() {
-            let Some(to) = to else {
+        match (left_side, right_side) {
+            (Side::Event(left_event), Side::Event(right_event)) => {
+                if let Some(reason) = uncomparable(&left_event, "left")
+                    .or_else(|| uncomparable(&right_event, "right"))
+                {
+                    return not_comparable(reason);
+                }
+                if let Some(report) = compare_events(&left_event, &right_event) {
+                    return report;
+                }
+                events = match events.checked_add(1) {
+                    Some(events) => events,
+                    None => return error("more events than a u64 counts"),
+                };
+                last = Some(left_event.group_seq());
+            }
+            // One side has an event in the range, the other's next event is
+            // past it: the event is missing there.
+            (Side::Event(event), Side::Past) => {
+                return one_sided(&event, "right");
+            }
+            (Side::Past, Side::Event(event)) => {
+                return one_sided(&event, "left");
+            }
+            (Side::Event(event), Side::Stop(stop)) => {
+                return past_start(stop, from, to, "right")
+                    .unwrap_or_else(|| ended_one_side(&event, stop, "right"));
+            }
+            (Side::Stop(stop), Side::Event(event)) => {
+                return past_start(stop, from, to, "left")
+                    .unwrap_or_else(|| ended_one_side(&event, stop, "left"));
+            }
+            // Both sides ended, or are past the range.
+            (left_end, right_end) => {
+                for (end, name) in [(left_end, "left"), (right_end, "right")] {
+                    let Side::Stop(stop) = end else {
+                        continue;
+                    };
+                    let missing = first_missing(&stop);
+                    // A range that names events past this prefix.
+                    if let (Some(to), Some(missing)) = (to, missing)
+                        && missing <= to
+                    {
+                        return not_comparable(stopped(stop, name));
+                    }
+                    if events == 0 && missing.is_some_and(|missing| missing < from) {
+                        return not_comparable(format!(
+                            "--from {from} is past the {name} journal's complete prefix, \
+                             which ends at group_seq {}",
+                            missing
+                                .and_then(|missing| missing.checked_sub(1))
+                                .unwrap_or(0)
+                        ));
+                    }
+                }
                 return identical;
-            };
-            // A stop inside the range: the first event it leaves out is at
-            // or before `to`.
-            let inside = |stop: &Stop| first_missing(stop).is_some_and(|seq| seq <= to);
-            return match (left_stop, right_stop) {
-                (Some(stop), _) if inside(&stop) => not_comparable(stopped(stop, "left")),
-                (_, Some(stop)) if inside(&stop) => not_comparable(stopped(stop, "right")),
-                _ => identical,
-            };
+            }
         }
-        let (Item::Event(left_event), Item::Event(right_event)) = (left_item, right_item) else {
-            return error("an event without its pair");
-        };
-        if let Some(reason) =
-            uncomparable(&left_event, "left").or_else(|| uncomparable(&right_event, "right"))
-        {
-            return not_comparable(reason);
-        }
-        if let Some(report) = compare_events(&left_event, &right_event) {
-            return report;
-        }
-        events = match events.checked_add(1) {
-            Some(events) => events,
-            None => return error("more events than a u64 counts"),
-        };
-        last = Some(left_event.group_seq());
+    }
+}
+
+/// A range past the `side` journal's complete prefix, which ended at
+/// `stop`: one that starts past it, or an explicit end that names events
+/// past it. Not comparable.
+fn past_start(stop: Stop, from: u64, to: Option<u64>, side: &str) -> Option<Report> {
+    let missing = first_missing(&stop)?;
+    if to.is_some_and(|to| missing <= to) {
+        return Some(not_comparable(stopped(stop, side)));
+    }
+    (missing < from).then(|| {
+        not_comparable(format!(
+            "--from {from} is past the {side} journal's complete prefix, whose first \
+             event left out is group_seq {missing}"
+        ))
+    })
+}
+
+/// `event` is on one side only, and the `missing` side's next event is
+/// past the range.
+fn one_sided(event: &ReplayEvent<'_>, missing: &str) -> Report {
+    let record = describe(decoded(event, 0).as_ref());
+    let none = format!("none (the {missing} journal's next event is past the range)");
+    let (expected, found) = if missing == "left" {
+        (none, record)
+    } else {
+        (record, none)
+    };
+    Report::Diverged {
+        group_seq: event.group_seq(),
+        index: None,
+        kind: Kind::InputEvent,
+        expected,
+        found,
+    }
+}
+
+/// The records of `event` are on one side only: the other side's complete
+/// prefix ended at `stop`.
+fn ended_one_side(event: &ReplayEvent<'_>, stop: Stop, ended: &str) -> Report {
+    let record = describe(decoded(event, 0).as_ref());
+    let none = match stop {
+        Stop::EndOfPrefix {
+            complete_recording_seq,
+        } => format!(
+            "none (the {ended} journal's complete prefix ends at group_seq {complete_recording_seq})"
+        ),
+        stop => format!("none ({})", stopped(stop, ended)),
+    };
+    let (expected, found) = if ended == "left" {
+        (none, record)
+    } else {
+        (record, none)
+    };
+    Report::Diverged {
+        group_seq: event.group_seq(),
+        index: None,
+        kind: Kind::End,
+        expected,
+        found,
     }
 }
 

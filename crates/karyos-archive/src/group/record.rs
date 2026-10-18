@@ -149,6 +149,44 @@ pub struct JournalHeader<'a> {
     pub manifest: &'a [u8],
 }
 
+/// A journal header this build cannot take, as its bytes name it: not a
+/// corrupt record, a journal of another contract or clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedHeader {
+    /// Another capture contract.
+    Contract {
+        /// The header's.
+        found: u16,
+    },
+    /// A clock this build does not know.
+    Clock {
+        /// The header's code.
+        found: u8,
+    },
+}
+
+/// What a journal header's bytes, `buf`, name that this build cannot take:
+/// `None` for anything else, a valid header or a record that is not one.
+#[must_use]
+pub fn unsupported_header(buf: &[u8]) -> Option<UnsupportedHeader> {
+    let envelope = Envelope::read(buf).ok()?;
+    if envelope.schema_id != SCHEMA_ID
+        || envelope.version != VERSION
+        || envelope.template_id != JOURNAL_HEADER.template_id
+    {
+        return None;
+    }
+    let block = |at: usize| buf.get(at.checked_add(12)?).copied();
+    let contract = u16::from_le_bytes([block(20)?, block(21)?]);
+    if contract != CONTRACT_VERSION {
+        return Some(UnsupportedHeader::Contract { found: contract });
+    }
+    match block(22)? {
+        1 => None,
+        found => Some(UnsupportedHeader::Clock { found }),
+    }
+}
+
 impl<'a> JournalHeader<'a> {
     fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
         let inline_threshold = block.u32(16)?;

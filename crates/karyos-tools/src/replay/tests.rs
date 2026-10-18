@@ -474,3 +474,230 @@ fn errors_exit_3() {
     }
     assert_eq!(parse_diff([OsString::from("--help")]), Ok(None));
 }
+
+/// `count` timer events from `first`, each with no observation.
+fn timers(first: u64, count: u64) -> Vec<GroupRecord<'static>> {
+    (first..first + count)
+        .flat_map(|seq| {
+            [
+                GroupRecord::Timer(TimerEvent {
+                    group_seq: seq,
+                    logical_time: seq,
+                    timer_id: 1,
+                }),
+                end(seq, 0, EndOutcome::Complete),
+            ]
+        })
+        .collect()
+}
+
+/// The default range runs to the longer complete prefix: events on one
+/// side only are the `end` kind, exit 1, with the side that ended named.
+#[test]
+fn the_longer_prefix_is_compared_and_one_sided_events_are_the_end() {
+    let report = run(&timers(1, 3), &timers(1, 2), |_| {});
+    let Report::Diverged {
+        group_seq,
+        index,
+        kind,
+        found,
+        ..
+    } = &report
+    else {
+        panic!("{report:?}");
+    };
+    assert_eq!((*group_seq, *index, *kind), (3, None, Kind::End));
+    assert!(
+        found.contains("right journal's complete prefix ends at group_seq 2"),
+        "{found}"
+    );
+    assert_eq!(report.exit_code(), 1);
+    // An empty journal against a full one.
+    let report = run(&[], &timers(1, 2), |_| {});
+    assert!(
+        matches!(
+            report,
+            Report::Diverged {
+                kind: Kind::End,
+                group_seq: 1,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    // The side that stopped at a gap is not comparable, the left one too.
+    let effort = header(Capture::BestEffort, b"m");
+    let mut gapped = timers(1, 1);
+    gapped.push(GroupRecord::Gap(GapMarker {
+        from_seq: 2,
+        to_seq: 2,
+        reason: GapReason::RingFull,
+    }));
+    let report = run_with((&effort, &gapped), (&effort, &timers(1, 3)), |_| {});
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    assert!(
+        report.text().contains("left journal: a gap marker"),
+        "{}",
+        report.text()
+    );
+}
+
+/// A range past a complete prefix is not comparable, `--from` alone too;
+/// the prefix's last event itself is in it.
+#[test]
+fn a_range_past_a_prefix_is_not_comparable() {
+    let (long, short) = (timers(1, 7), timers(1, 3));
+    for options in [(Some(5), None), (Some(5), Some(6)), (None, Some(4))] {
+        let report = run(&long, &short, |args| (args.from, args.to) = options);
+        assert_eq!(report.exit_code(), 2, "{options:?}: {report:?}");
+    }
+    // To the prefix's last event exactly: compared, and identical.
+    let report = run(&long, &short, |args| args.to = Some(3));
+    assert_eq!(
+        report,
+        Report::Identical {
+            from: 1,
+            to: Some(3),
+            events: 3
+        }
+    );
+}
+
+/// Empty and inverted ranges, and a `--from` before a journal's first
+/// event, are not comparable; the default `--from` is the later first.
+#[test]
+fn empty_ranges_and_early_starts_are_not_comparable() {
+    let both = timers(1, 3);
+    let report = run(&both, &both, |args| args.to = Some(0));
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    let later = JournalHeader {
+        first_group_seq: 2,
+        ..header(Capture::Strict, b"m")
+    };
+    let left = (&header(Capture::Strict, b"m"), &both[..]);
+    let from_two = timers(2, 2);
+    let report = run_with(left, (&later, &from_two), |_| {});
+    assert_eq!(
+        report,
+        Report::Identical {
+            from: 2,
+            to: Some(3),
+            events: 2
+        }
+    );
+    let report = run_with(left, (&later, &from_two), |args| args.from = Some(1));
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    assert!(
+        report.text().contains("before a journal's first event"),
+        "{}",
+        report.text()
+    );
+    let report = run_with(left, (&later, &from_two), |args| args.to = Some(1));
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+}
+
+/// A reference unavailable in the range is not comparable.
+#[test]
+fn a_reference_unavailable_in_the_range_is_not_comparable() {
+    use karyos_archive::group::record::ReferenceUnavailable;
+
+    let effort = header(Capture::BestEffort, b"m");
+    let referenced = [
+        message(
+            1,
+            Payload::Reference {
+                recording_id: 8,
+                length: 10,
+            },
+        ),
+        end(1, 0, EndOutcome::Complete),
+        GroupRecord::Unavailable(ReferenceUnavailable {
+            group_seq: 1,
+            recording_id: 8,
+        }),
+    ];
+    let report = run_with((&effort, &referenced), (&effort, &referenced), |_| {});
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    assert!(
+        report.text().contains("reference is unavailable"),
+        "{}",
+        report.text()
+    );
+}
+
+/// A journal of another capture contract is not comparable, not a
+/// corrupt one: its header names the contract.
+#[test]
+fn another_contract_is_not_comparable() {
+    use karyos_archive::group::journal::MIN_SEGMENT_LENGTH;
+    use karyos_archive::segment::{Geometry, SegmentStore};
+
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    write(&left, &header(Capture::Strict, b"m"), &timers(1, 1));
+    // The right journal's header, under contract 2, appended raw.
+    let mut bytes = vec![0u8; MAX_RECORD];
+    let length = GroupRecord::Header(header(Capture::Strict, b"m"))
+        .encode(&mut bytes)
+        .unwrap();
+    bytes.truncate(length);
+    bytes[12 + 20..12 + 22].copy_from_slice(&2u16.to_le_bytes());
+    let length = u64::from(MIN_SEGMENT_LENGTH);
+    let mut store = SegmentStore::create(
+        StdDisk,
+        &right,
+        1,
+        Geometry::new(MIN_SEGMENT_LENGTH, length).unwrap(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    let _ = store.append(0, &bytes).unwrap();
+    let _ = store.close().unwrap();
+    let report = diff(&DiffArgs {
+        left: Journal {
+            dir: left,
+            group: 1,
+        },
+        right: Journal {
+            dir: right,
+            group: 1,
+        },
+        from: None,
+        to: None,
+        json: false,
+        accept_manifest: false,
+    });
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    assert!(report.text().contains("contract 2"), "{}", report.text());
+}
+
+/// JSON strings escape quotes, backslashes and control characters.
+#[test]
+fn json_escapes_what_it_must() {
+    assert_eq!(quoted("a\"b\\c\nd\u{1}é"), "\"a\\\"b\\\\c\\nd\\u0001é\"");
+}
+
+/// A payload is shown by its length and digest, never as its bytes.
+#[test]
+fn a_payload_is_shown_by_length_and_digest() {
+    let big = vec![7u8; 4000];
+    let leaked: &'static [u8] = Box::leak(big.into_boxed_slice());
+    let mut changed = timers(1, 1);
+    let GroupRecord::Message(event) = message(1, Payload::Inline(leaked)) else {
+        panic!("a message");
+    };
+    changed[0] = GroupRecord::Message(MessageEvent {
+        extent: 4064,
+        ..event
+    });
+    let mut original = timers(1, 1);
+    original[0] = message(1, Payload::Inline(b"a"));
+    let report = run(&original, &changed, |_| {});
+    let text = report.text();
+    assert!(
+        text.contains("payload inline, length 4000, crc32c 0x"),
+        "{text}"
+    );
+    assert!(text.len() < 1000, "{} bytes", text.len());
+}
