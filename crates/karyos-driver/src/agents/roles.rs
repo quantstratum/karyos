@@ -5071,27 +5071,25 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
                 continue;
             }
-            // TODO(rp-w5a/rp-w5b): a routed publication's EOS goes on every
-            // path through its routed lane sender (data/routed.rs); until
-            // then it lingers without EOS and its receivers fall back to
-            // their liveness timeout.
-            if outbound.is_routed() {
-                if let Some(outbound) = self.publications.get_mut(index) {
-                    outbound.linger_without_eos(now);
-                }
-                continue;
-            }
-            let endpoint = outbound.endpoint();
-            // Without its TX half (an endpoint being reset) the drain bound
-            // still runs: nothing waits for the half to come back.
-            let tx = halves.iter_mut().find_map(|(held, half)| match half {
-                Half::Tx(tx) if *held == endpoint => Some(&mut **tx),
-                _ => None,
-            });
-            let Some(outbound) = self.publications.get_mut(index) else {
-                continue;
+            // A routed publication's EOS goes on every live path.
+            let step = if outbound.is_routed() {
+                let Some(outbound) = self.publications.get_mut(index) else {
+                    continue;
+                };
+                outbound.serve_removal_routes(halves, now)
+            } else {
+                let endpoint = outbound.endpoint();
+                // Without its TX half (an endpoint being reset) the drain bound
+                // still runs: nothing waits for the half to come back.
+                let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                    Half::Tx(tx) if *held == endpoint => Some(&mut **tx),
+                    _ => None,
+                });
+                let Some(outbound) = self.publications.get_mut(index) else {
+                    continue;
+                };
+                outbound.serve_removal(tx, now)
             };
-            let step = outbound.serve_removal(tx, now);
             sent = sent.checked_add(step.sent).unwrap_or(sent);
             for _ in 0..step.sent {
                 self.count(|c| &mut c.eos_sent);

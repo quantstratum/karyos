@@ -38,6 +38,7 @@ use karyos_sys::log_buffer::{ReadError, ReadOrigin, ReadOutcome};
 
 use super::super::repair::RouteRepairCounts;
 use super::super::{AgentError, AgentKind, EndpointId, Half};
+use super::removal::{EosSent, RemovalStep};
 use super::{Limit, Outbound, OutboundError, STAGED_PER_LANE, align_frame, messages_started};
 use crate::guard_gate::{GateHead, GuardGate};
 use crate::repair::scheduler::RepairBudget;
@@ -789,6 +790,101 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             }
         }
         served
+    }
+
+    /// The removal step of a routed publication at `now` (its EOS on every
+    /// path): as [`Outbound::serve_removal`], with a lane drained once its
+    /// first sends reached its seal on every live path whose TX half is in
+    /// `halves`, and its EOS sent on each of them. A route detached (no TX
+    /// half), resetting or out of the live set neither holds the drain nor
+    /// gets the EOS; one that comes back during the linger gets the repeats.
+    /// The EOS counts as sent once one path submitted it.
+    pub(crate) fn serve_removal_routes<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+    ) -> RemovalStep {
+        let Some(routed) = self.routed.as_deref() else {
+            return RemovalStep::default();
+        };
+        // The routes that can send now, by route.
+        let mut sending = [false; MAX_ROUTES];
+        for (held, half) in halves.iter() {
+            let Half::Tx(tx) = half else {
+                continue;
+            };
+            if let Some(index) = routed
+                .routes
+                .iter()
+                .position(|route| route.endpoint == *held)
+                && routed.repair_live(index, tx.capabilities().epoch)
+                && let Some(slot) = sending.get_mut(index)
+            {
+                *slot = true;
+            }
+        }
+        self.serve_removal_with(
+            now,
+            |outbound, lane| outbound.routed_drained_seal(lane, &sending),
+            |outbound, lane, seal| outbound.send_eos_routes(halves, &sending, lane, seal),
+        )
+    }
+
+    /// The seal of `lane` once its first sends reached it on the `sending`
+    /// routes: the seal is positioned, every frame below it was submitted,
+    /// and none of those routes holds a copy of the lane.
+    fn routed_drained_seal(&self, lane: usize, sending: &[bool; MAX_ROUTES]) -> Option<u64> {
+        let routed = self.routed.as_deref()?;
+        let reader = self.readers.get(lane)?;
+        let seal = reader.seal_position()?;
+        let high = self.tracks.get(lane)?.high;
+        let track = routed.tracks.get(lane)?;
+        let idle = sending
+            .iter()
+            .enumerate()
+            .filter(|(_, sending)| **sending)
+            .all(|(route, _)| {
+                routed.sender.pending(lane, route).unwrap_or(0) == 0
+                    && track.staged.get(route).is_none_or(VecDeque::is_empty)
+            });
+        (idle && high >= seal && reader.position() >= seal).then_some(seal)
+    }
+
+    /// Sends `lane`'s EOS at `seal` on every `sending` route's lane queue.
+    fn send_eos_routes<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        sending: &[bool; MAX_ROUTES],
+        lane: usize,
+        seal: u64,
+    ) -> EosSent {
+        if self.eos_closed(lane) {
+            return EosSent::Closed;
+        }
+        let Some(routed) = self.routed.as_deref() else {
+            return EosSent::NotSent;
+        };
+        let mut queues: [Option<(EndpointId, TxQueueId)>; MAX_ROUTES] = [None; MAX_ROUTES];
+        for ((slot, route), sending) in queues.iter_mut().zip(&routed.routes).zip(sending) {
+            if *sending {
+                *slot = route.queues.get(lane).map(|queue| (route.endpoint, *queue));
+            }
+        }
+        let mut submitted = false;
+        for (endpoint, queue) in queues.into_iter().flatten() {
+            let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                Half::Tx(tx) if *held == endpoint => Some(&mut **tx),
+                _ => None,
+            });
+            if let Some(tx) = tx {
+                submitted |= self.write_heartbeat_on(tx, queue, lane, seal, true);
+            }
+        }
+        if submitted {
+            EosSent::Submitted
+        } else {
+            EosSent::NotSent
+        }
     }
 
     /// What its repair path counted on `route` (RP-11); `None` on one path,
