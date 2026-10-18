@@ -165,6 +165,14 @@ pub enum LogError {
     },
     /// Purging a prefix waits for snapshots (C8).
     PurgeUnsupported,
+    /// A truncation that would remove an entry at or below the stored
+    /// commit: committed entries are never removed.
+    TruncateBelowCommit {
+        /// The first index the truncation would remove.
+        from: u64,
+        /// The stored commit.
+        commit: u64,
+    },
     /// A frame found at recovery that does not continue the chain.
     Chain {
         /// The frame's position.
@@ -183,8 +191,8 @@ pub enum LogError {
         /// The durable last index.
         durable: u64,
     },
-    /// A hard-state save failed earlier: writes are refused until the log
-    /// is reopened.
+    /// A log sync or a hard-state save failed earlier: writes are refused
+    /// until the log is reopened.
     Poisoned,
     /// The segment store's error.
     Store(SegmentError),
@@ -232,6 +240,12 @@ impl fmt::Display for LogError {
                 write!(f, "index {index} is outside [{first}, {last} + 1]")
             }
             Self::PurgeUnsupported => f.write_str("purging a prefix waits for snapshots"),
+            Self::TruncateBelowCommit { from, commit } => {
+                write!(
+                    f,
+                    "truncating from {from} would remove committed entries up to {commit}"
+                )
+            }
             Self::Chain { position, problem } => {
                 write!(f, "the frame at {position} breaks the chain: {problem:?}")
             }
@@ -243,7 +257,7 @@ impl fmt::Display for LogError {
                     "commit {commit} is above the durable last index {durable}"
                 )
             }
-            Self::Poisoned => f.write_str("a save failed: reopen the log"),
+            Self::Poisoned => f.write_str("a sync or a save failed: reopen the log"),
             Self::Store(error) => write!(f, "segment store: {error}"),
             Self::Io(error) => write!(f, "disk: {error}"),
         }
@@ -551,9 +565,15 @@ impl<D: Disk + Clone> RaftLog<D> {
     ///
     /// # Errors
     ///
-    /// The store's errors, after which it refuses writes until reopened.
+    /// [`LogError::Poisoned`]; the store's errors, which poison the log:
+    /// every later write is refused with [`LogError::Poisoned`] until it is
+    /// reopened.
     pub fn sync(&mut self) -> Result<u64, LogError> {
-        self.store.sync()?;
+        self.check_writable()?;
+        if let Err(error) = self.store.sync() {
+            self.poisoned = true;
+            return Err(LogError::Store(error));
+        }
         Ok(self.durable_index())
     }
 
@@ -562,10 +582,20 @@ impl<D: Disk + Clone> RaftLog<D> {
     ///
     /// # Errors
     ///
-    /// [`LogError::OutOfRange`] outside `[first_index, last_index + 1]`;
-    /// [`LogError::Poisoned`]; the store's errors.
+    /// [`LogError::OutOfRange`] outside `[first_index, last_index + 1]`
+    /// and [`LogError::TruncateBelowCommit`] at or below the stored
+    /// commit, which change nothing; [`LogError::Poisoned`]; the store's
+    /// errors.
     pub fn truncate_suffix(&mut self, from_index: u64) -> Result<(), LogError> {
         self.check_writable()?;
+        if let Some(commit) = self.hard_state.and_then(|state| state.commit)
+            && from_index <= commit
+        {
+            return Err(LogError::TruncateBelowCommit {
+                from: from_index,
+                commit,
+            });
+        }
         let out = LogError::OutOfRange {
             index: from_index,
             first: self.first_index,

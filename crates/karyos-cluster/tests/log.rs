@@ -333,16 +333,51 @@ fn a_commit_above_the_durable_index_is_refused() {
             durable: 3
         })
     ));
-    // A stored commit above the log found at open is refused too.
-    log.truncate_suffix(2).unwrap();
+    // A stored commit above the log found at open is refused too: the
+    // record is replaced behind the log's back.
     drop(log);
+    let higher = HardState {
+        commit: Some(9),
+        ..state
+    };
+    std::fs::write(dir.0.join(HARD_STATE_FILE), higher.encode()).unwrap();
     assert!(matches!(
         RaftLog::open(StdDisk, &dir.0, geometry()),
         Err(LogError::CommitBeyondDurable {
-            commit: 2,
-            durable: 1
+            commit: 9,
+            durable: 3
         })
     ));
+}
+
+/// Committed entries are never removed: a truncation at or below the
+/// stored commit is refused, with nothing changed.
+#[test]
+fn a_truncation_below_the_commit_is_refused() {
+    let dir = TempDir::new("below-commit");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..6, 1)).unwrap();
+    log.sync().unwrap();
+    log.save_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: Some(3),
+    })
+    .unwrap();
+    let written = log.written();
+    for from in [1, 3] {
+        assert!(matches!(
+            log.truncate_suffix(from),
+            Err(LogError::TruncateBelowCommit { from: f, commit: 3 }) if f == from
+        ));
+    }
+    assert_eq!((log.last_index(), log.written()), (5, written));
+    log.truncate_suffix(4).unwrap();
+    assert_eq!(log.last_index(), 3);
+    assert_eq!(
+        LogError::TruncateBelowCommit { from: 2, commit: 3 }.to_string(),
+        "truncating from 2 would remove committed entries up to 3"
+    );
 }
 
 /// The standard disk, whose syncs fail while `fail` is set.
@@ -445,15 +480,26 @@ fn a_failed_flush_poisons_until_reopened() {
     drop(log);
     let mut log = open(disk.clone(), &dir.0, geometry());
     log.save_hard_state(state).unwrap();
-    // A failed log sync: the store refuses writes until recovered.
+    // A failed log sync poisons the same way.
     log.append(&entries(3..4, 1)).unwrap();
     disk.fail.store(true, Ordering::Relaxed);
-    assert!(log.sync().is_err());
+    assert!(matches!(log.sync(), Err(LogError::Store(_))));
     disk.fail.store(false, Ordering::Relaxed);
     assert!(matches!(
         log.append(&entries(4..5, 1)),
-        Err(LogError::Store(_))
+        Err(LogError::Poisoned)
     ));
+    assert!(matches!(log.truncate_suffix(3), Err(LogError::Poisoned)));
+    assert!(matches!(
+        log.save_hard_state(state),
+        Err(LogError::Poisoned)
+    ));
+    assert!(matches!(log.sync(), Err(LogError::Poisoned)));
+    drop(log);
+    let mut log = open(disk.clone(), &dir.0, geometry());
+    let next = log.last_index() + 1;
+    log.append(&entries(next..next + 1, 1)).unwrap();
+    log.sync().unwrap();
 }
 
 /// Appends raw frames after the log's end through the segment store.
