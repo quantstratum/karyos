@@ -237,7 +237,8 @@ impl ConsensusCore for Fixed {
                 .flatten()
                 .map_or(log.first_index(), |index| index + 1);
             let entries = if from < end {
-                log.entries(from..end, BATCH_BYTES).unwrap()
+                // A failed read sends none; the next resend retries.
+                log.entries(from..end, BATCH_BYTES).unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -259,7 +260,8 @@ impl ConsensusCore for Fixed {
         let start = self.handed.map_or(log.first_index(), |handed| handed + 1);
         let end = self.commit.min(log.durable_index()).map(|last| last + 1);
         let committed = match end {
-            Some(end) if start < end => log.entries(start..end, u64::MAX).unwrap(),
+            // A failed read applies none; the next Ready retries.
+            Some(end) if start < end => log.entries(start..end, u64::MAX).unwrap_or_default(),
             _ => Vec::new(),
         };
         let hard_state = self.dirty.then_some(HardState {
@@ -499,14 +501,15 @@ fn restart_reopens_the_log() {
         sim.run_for(40).unwrap();
         sim.restart(2).unwrap();
         let server = sim.node(2).and_then(Member::server).unwrap();
-        assert!(server.is_up(), "seed {seed}: the log did not reopen");
-        // Survives::Synced keeps what the follower acknowledged.
         let reopened = server.core().and_then(ConsensusCore::received);
-        assert!(reopened >= held.min(reopened), "seed {seed}");
-        assert!(reopened.is_some(), "seed {seed}: the reopened log is empty");
         sim.run_for(400).unwrap();
         // The checks first: a breach is reported as the violation it is.
         all_checks(&recorder, 3);
+        // Survives::Synced keeps what the follower held.
+        assert!(
+            reopened.is_some(),
+            "seed {seed}: the log did not reopen, or empty"
+        );
         assert!(
             sim.node(client).and_then(Member::client).unwrap().done(),
             "seed {seed}"
@@ -826,7 +829,7 @@ fn lost_durable_entries_are_caught() {
     let mut kept = before.clone();
     kept.push(recovered(vec![(1, 1), (2, 1)]));
     check::durable_kept(&kept).unwrap();
-    let mut lost = before;
+    let mut lost = before.clone();
     lost.push(recovered(vec![(1, 1)]));
     assert_eq!(
         check::durable_kept(&lost),
@@ -835,6 +838,25 @@ fn lost_durable_entries_are_caught() {
             index: 2,
             term: 1,
         })
+    );
+    // A log that does not reopen after the crash lost its entries.
+    let mut unopened = before.clone();
+    unopened.push(Observation::OpenFailed {
+        node: 1,
+        error: "the first-index file is missing or invalid".into(),
+    });
+    assert_eq!(
+        check::durable_kept(&unopened),
+        Err(Violation::DurableLost {
+            node: 1,
+            index: 1,
+            term: 1,
+        })
+    );
+    // A server still down at the end leaves its entries unverified.
+    assert_eq!(
+        check::durable_kept(&before),
+        Err(Violation::Unverified { node: 1 })
     );
     // Truncating an entry the cluster applied.
     let truncated = vec![

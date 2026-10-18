@@ -44,6 +44,16 @@ use crate::net::NodeId;
 
 /// A core's read-only view of its node's C4 log: what is written, what is
 /// durable, and the stored hard state. Only [`drive`] writes the log.
+///
+/// It is borrowed for each call: an adapter whose library owns its storage
+/// (raft-rs's `RawNode`, openraft's log reader) copies what it needs. The
+/// C5 adapters give the core an owned read-only handle over a shared log
+/// instead (`Rc<RefCell<RaftLog>>`; the simulation is single-threaded),
+/// which [`drive`] borrows mutably only between core calls.
+///
+/// Its reads are disk operations: they count toward [`SimDisk`]'s crash
+/// budget and appear in its trace, so a budget crash can land in a core's
+/// read. A core handles a read error; it does not unwrap it.
 pub struct LogView<'a> {
     log: &'a mut RaftLog<SimDisk>,
 }

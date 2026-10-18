@@ -4,7 +4,7 @@
 //! through C3's checker, and the safety properties over the
 //! [`Observation`]s. Each returns the first [`Violation`] it finds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use karyos_cluster::Entry;
 
@@ -97,6 +97,12 @@ pub enum Violation {
         index: u64,
         /// The entry's term.
         term: u64,
+    },
+    /// A server crashed holding durable entries and was not restarted, so
+    /// whether it kept them is unknown.
+    Unverified {
+        /// The server.
+        node: NodeId,
     },
     /// A server truncated an entry the cluster had applied.
     CommittedTruncated {
@@ -281,19 +287,37 @@ pub fn durable_majority_before_reply(
 
 /// A restarted server's reopened log holds every entry it held durably
 /// before the crash, and no server truncates an entry the cluster applied.
+/// A crashed server whose log then fails to open lost what it held; one
+/// still down at the end leaves what it held unverified, so a run should
+/// restart every crashed server before its checks.
 ///
 /// # Errors
 ///
-/// [`Violation::DurableLost`] and [`Violation::CommittedTruncated`].
+/// [`Violation::DurableLost`], [`Violation::Unverified`] and
+/// [`Violation::CommittedTruncated`].
 pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
     let mut logs = DurableLogs::default();
     let mut applied: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut down: BTreeSet<NodeId> = BTreeSet::new();
     for observation in observations {
         match observation {
+            Observation::Crashed { node } => {
+                let _ = down.insert(*node);
+            }
+            Observation::OpenFailed { node, .. } if down.contains(node) => {
+                if let Some((index, term)) = logs.logs.get(node).and_then(|log| log.iter().next()) {
+                    return Err(Violation::DurableLost {
+                        node: *node,
+                        index: *index,
+                        term: *term,
+                    });
+                }
+            }
             Observation::Applied { entry, .. } => {
                 let _ = applied.insert(entry.index, entry.term);
             }
             Observation::Recovered { node, entries, .. } => {
+                let _ = down.remove(node);
                 if let Some(before) = logs.logs.get(node) {
                     let reopened: BTreeMap<u64, u64> = entries.iter().copied().collect();
                     if let Some((index, term)) = before
@@ -314,6 +338,11 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
             if applied.get(&index) == Some(&term) {
                 return Err(Violation::CommittedTruncated { node, index });
             }
+        }
+    }
+    for node in down {
+        if logs.logs.get(&node).is_some_and(|log| !log.is_empty()) {
+            return Err(Violation::Unverified { node });
         }
     }
     Ok(())
