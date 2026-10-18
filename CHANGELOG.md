@@ -11,6 +11,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The Archive's client (phase 3, A6b-2).
+  `karyos_archive::client::ArchiveClient` is a `ReplayProvider` over the
+  Archive's control streams (`ControlRequests`, `ControlResponses`): asked
+  for a source's range, it lists the recordings, picks one of that
+  publication and incarnation that covers the range, asks for a replay of
+  exactly that range onto `ClientConfig::target_stream_id`, and hands out
+  the target's subscription, which the host's `ReplayTargets` finds at the
+  replay id's low 32 bits. It never blocks; a recording behind is listed
+  again until `ClientConfig::deadline`. No replay comes as `NoRecording`,
+  `RetentionShort`, `RecordingBehind` or `Refused`. A handed-out replay
+  stops by `StopReplay`, queued when the request stream has no room.
+  `karyos_client` re-exports `PublicationIdentity`, which its merge API
+  names.
 - The Archive's `RecordingDescriptor` (control schema 1, A6b) carries
   the recorded publication's identity (`source`, a `SourceIncarnation`)
   and, while it records, the position written so far

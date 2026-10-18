@@ -61,6 +61,8 @@ pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
 pub use karyos_protocol::cnc::StreamId;
+/// The publication identity a replay and a live merge name (merge module).
+pub use karyos_protocol::trace_hook::PublicationIdentity;
 pub use karyos_sys::frame::Lane;
 pub use karyos_sys::freshness::Freshness;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
