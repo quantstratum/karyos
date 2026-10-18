@@ -809,7 +809,7 @@ fn rejoin_until(
 }
 
 /// Publishes `count` messages one at a time, polling `rejoin` until each
-/// is delivered, so the live reader, polled, is never lapped; returns the
+/// is delivered and every overrun it reported resolved; returns the
 /// reports that were not empty.
 fn publish_polled(
     rig: &mut Rig,
@@ -823,7 +823,13 @@ fn publish_polled(
     for _ in 0..count {
         publish(rig, publication, sent, 0, 1);
         let next = seen.len() + 1;
-        reports.extend(rejoin_until(rig, rejoin, seen, |_, count| count >= next));
+        let mut recovering = false;
+        reports.extend(rejoin_until(rig, rejoin, seen, |report, count| {
+            if let Some(outcome) = report.rejoin {
+                recovering = outcome == RejoinOutcome::Replaying;
+            }
+            count >= next && !recovering
+        }));
     }
     reports
 }
@@ -837,7 +843,8 @@ fn outcomes(reports: &[PollSummary]) -> Vec<RejoinOutcome> {
 /// rejoin asks the Archive's client for the gap, which lists the
 /// recording, asks for its replay over the request stream and finds the
 /// target; the replay merges back into the live stream at the resume.
-/// Every message comes once, in order, byte-exact, at its position.
+/// Every message comes once, in order, byte-exact, at its position, also
+/// across the overruns that follow, each recovered the same way.
 #[test]
 fn a_lapped_reader_recovers_its_gap_through_the_archive() {
     let mut rig = Rig::new(INITIAL_TERM_ID);
@@ -877,7 +884,10 @@ fn a_lapped_reader_recovers_its_gap_through_the_archive() {
     assert!(reports.iter().all(|report| report.skipped.is_none()));
     assert!(!rejoin.is_recovering());
 
-    // The live reader goes on alone.
+    // The live reader goes on. Behind the required recording it is
+    // overrun as soon as the recording reads past it (the retention
+    // floor follows the recording), and each overrun is recovered the
+    // same way.
     let reports = publish_polled(
         &mut rig,
         &mut publication,
@@ -886,7 +896,14 @@ fn a_lapped_reader_recovers_its_gap_through_the_archive() {
         &mut seen,
         20,
     );
-    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    let later = outcomes(&reports);
+    assert!(
+        later.chunks(2).all(|pair| matches!(
+            pair,
+            [RejoinOutcome::Replaying, RejoinOutcome::Replayed { .. }]
+        )),
+        "{later:?}"
+    );
     assert_eq!(seen.len(), sent.len());
     assert!(seen == sent, "once, in order, byte-exact, at its position");
     drop(publication);
