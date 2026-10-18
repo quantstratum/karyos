@@ -20,7 +20,7 @@ use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SealReason};
 use karyos_sys::term_bytes::HeapTerms;
 
-use super::{BUDGET, aggregate, channel, free_address, pump};
+use super::{ANY_PORT, BUDGET, aggregate, bound, channel, pump, silent};
 use crate::agents::{AgentConfig, ThreadingMode};
 use crate::embedded::{AggregateHandle, DriverConfig, EmbeddedDriver, StreamState};
 use crate::net::{NetworkConfig, NetworkStreamDefaults};
@@ -56,10 +56,10 @@ fn pair(
     AggregateSubscription<HeapTerms>,
 ) {
     let (mut a, mut b) = (lingering(linger), lingering(linger));
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     let publication = a
         .add_network_publication(aggregate(10, 3, lanes), &channel(address, true))
         .unwrap();
@@ -387,7 +387,8 @@ fn a_zero_linger_gives_an_undrainable_lane_up_within_one_interval() {
 #[test]
 fn a_key_is_refused_during_the_linger_and_accepted_after_it() {
     let (mut a, mut b, publication, mut reader) = pair(200 * MS, 1);
-    let address = free_address();
+    let silent = silent();
+    let address = silent.local_addr().unwrap();
     a.remove_aggregate(&publication).unwrap();
     let (terminal, _, _) = read_to_end(&mut a, &mut b, &mut reader);
     assert!(terminal.clean);
@@ -429,10 +430,10 @@ fn a_closed_guard_sends_no_eos_at_removal() {
     let (mut a, mut b) = (lingering(100 * MS), lingering(100 * MS));
     let guard = a.add_guard("linger").unwrap();
     assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     // Spare slots for the sender's reservation and the guard's walker.
     let mut config = aggregate(10, 3, 1);
     config.stream.buffer.spare_slots = 4;
@@ -500,10 +501,10 @@ fn a_closed_guard_lane_is_given_up_at_the_drain_bound() {
     let (mut a, mut b) = (lingering(linger), lingering(linger));
     let guard = a.add_guard("give-up").unwrap();
     assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     let mut config = aggregate(10, 3, 1);
     config.stream.buffer.spare_slots = 4;
     let publication = a
@@ -555,8 +556,12 @@ fn a_closed_guard_lane_is_given_up_at_the_drain_bound() {
 #[test]
 fn a_removal_with_no_established_receiver_ends_at_once() {
     let mut a = lingering(60_000 * MS);
+    let silent = silent();
     let publication = a
-        .add_network_publication(aggregate(10, 3, 1), &channel(free_address(), true))
+        .add_network_publication(
+            aggregate(10, 3, 1),
+            &channel(silent.local_addr().unwrap(), true),
+        )
         .unwrap();
     for _ in 0..20 {
         let _ = a.do_work().unwrap();

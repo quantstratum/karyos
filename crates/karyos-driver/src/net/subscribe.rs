@@ -266,6 +266,17 @@ impl EmbeddedDriver<HeapTerms> {
 /// network channels (network-shared-terms n4); an IPC driver's images
 /// are reached through these meanwhile (its tests).
 impl<T: StreamTerms> EmbeddedDriver<T> {
+    /// Tests only, not part of the API: the address the endpoint of
+    /// `stream_id`'s network subscription is bound to, so a test can
+    /// subscribe on port 0 and publish to the port the kernel chose,
+    /// instead of picking a free port that another process may take
+    /// before the bind. `None` without such a subscription.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn network_subscription_address(&self, stream_id: i32) -> Option<std::net::SocketAddr> {
+        self.net.as_ref()?.subscription_address(stream_id)
+    }
+
     pub(crate) fn subscribe_network(
         &mut self,
         stream_id: i32,
