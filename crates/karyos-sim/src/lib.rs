@@ -17,12 +17,14 @@
 //! which belongs to IPC. A linearizability checker over recorded
 //! histories ([`lin`], cluster-gap-analysis.md C3) and the multi-node
 //! host (C1), which runs several message level nodes on skewed clocks over
-//! a faulty network (`cluster`, `net`), are the Cluster's first pieces.
-//! The backend ring models, the disk model, the Archive and the Cluster
-//! do not exist yet.
+//! a faulty network (`cluster`, `net`), are the Cluster's first pieces,
+//! with a disk that crashes, reorders, tears and fails flushes ([`disk`],
+//! C2). The backend ring models, the Archive and the Cluster do not exist
+//! yet.
 
 pub mod clock;
 pub mod cluster;
+pub mod disk;
 pub mod lin;
 pub mod net;
 pub mod oracle;
