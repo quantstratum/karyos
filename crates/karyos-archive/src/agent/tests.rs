@@ -1039,19 +1039,40 @@ mod groups {
 
     /// A `required` recording's word names it and its start while it
     /// records, and is cleared once it stops; an `async` recording has
-    /// none, nor does a stream not recorded.
+    /// none, nor does a stream not recorded, nor another lane of the
+    /// recorded stream: recordings are per lane.
     #[test]
     fn a_required_recording_has_a_word_until_it_stops() {
+        use karyos_sys::frame::Lane;
+        let lane1 = Lane::try_new(1).unwrap();
         let dir = temp_dir("group-word");
         let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
         let drained = Arc::new(AtomicBool::new(false));
         let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
-        let word = agent.recording_word(10, 3).unwrap().unwrap();
+        let word = agent.recording_word(10, 3, Lane::ZERO).unwrap().unwrap();
         assert_eq!(word.read(), Some((recording, 0)));
-        assert!(agent.recording_word(10, 4).unwrap().is_none());
+        assert!(agent.recording_word(10, 4, Lane::ZERO).unwrap().is_none());
+        assert!(agent.recording_word(10, 3, lane1).unwrap().is_none());
+        // Lane 1 of the same stream and session, recorded on its own.
+        let second = Arc::new(AtomicBool::new(false));
+        let mut on_lane1 = start(chunks(3000, false, &second));
+        on_lane1.format.lane = lane1;
+        let lane1_recording = agent.start(on_lane1).unwrap();
+        let lane1_word = agent.recording_word(10, 3, lane1).unwrap().unwrap();
+        assert_eq!(lane1_word.read(), Some((lane1_recording, 0)));
+        assert_eq!(
+            agent
+                .recording_word(10, 3, Lane::ZERO)
+                .unwrap()
+                .unwrap()
+                .read(),
+            Some((recording, 0))
+        );
         agent.stop(recording).unwrap();
         assert_eq!(word.read(), None);
-        assert!(agent.recording_word(10, 3).unwrap().is_none());
+        assert!(agent.recording_word(10, 3, Lane::ZERO).unwrap().is_none());
+        assert_eq!(lane1_word.read(), Some((lane1_recording, 0)));
+        agent.stop(lane1_recording).unwrap();
         let other = Arc::new(AtomicBool::new(false));
         let _ = agent
             .start(StartRecording {
@@ -1061,7 +1082,7 @@ mod groups {
                 ..start(chunks(3000, false, &other))
             })
             .unwrap();
-        assert!(agent.recording_word(10, 3).unwrap().is_none());
+        assert!(agent.recording_word(10, 3, Lane::ZERO).unwrap().is_none());
         agent.shutdown().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2795,4 +2816,76 @@ mod checkpoints {
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+/// A source of one chunk, then fenced at a cutover where it ends.
+struct FencedAfter {
+    position: u64,
+    chunk: Option<Vec<u8>>,
+}
+
+impl FrameSource for FencedAfter {
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
+        let Some(chunk) = self.chunk.take() else {
+            return Ok(Frames::Fenced { at: self.position });
+        };
+        let position = self.position;
+        out[..chunk.len()].copy_from_slice(&chunk);
+        self.position += chunk.len() as u64;
+        Ok(Frames::Copied {
+            position,
+            len: chunk.len(),
+            next: self.position,
+        })
+    }
+
+    fn consumed(&mut self, _position: u64) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        self.position = to;
+        Ok(to)
+    }
+}
+
+/// Gap 6: a recording fenced at a cutover ends there, incomplete, and the
+/// agent counts it, so the cause is known without a format change.
+#[test]
+fn a_fenced_recording_is_counted() {
+    let dir = temp_dir("fenced");
+    let config = AgentConfig {
+        idle: Duration::from_millis(1),
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    assert_eq!(agent.fenced_recordings(), 0);
+    let fenced = agent
+        .start(StartRecording {
+            source: Box::new(FencedAfter {
+                position: 0,
+                chunk: Some(vec![5u8; 3000]),
+            }),
+            ..start(Chunks::default())
+        })
+        .unwrap();
+    let event = agent.event(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        event,
+        Event::Ended {
+            id: fenced,
+            ended: Ended {
+                position: 3000,
+                reason: StopReason::Lapped,
+                incomplete: true
+            }
+        }
+    );
+    assert_eq!(agent.fenced_recordings(), 1);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -33,8 +33,9 @@ use crate::group::capture::{CaptureSender, GroupState, Refusal};
 use crate::group::record::{
     Capture, DEFAULT_INLINE_THRESHOLD, DELIVERY_OBSERVATION, DELIVERY_POLL, DeliveryObservation,
     DeliveryPoll, EVENT_END, EXTERNAL_OBSERVATION, EndOutcome, EventEnd, ExternalEvent,
-    ExternalObservation, GapMarker, GapReason, GroupRecord, MAX_INLINE, OUTCOME_OBSERVATION,
-    Operation, Outcome, OutcomeObservation, TIMER_OBSERVATION, TimerAction, TimerObservation,
+    ExternalObservation, GapMarker, GapReason, GroupRecord, MAX_INLINE, MESSAGE_EVENT,
+    OUTCOME_OBSERVATION, Operation, Outcome, OutcomeObservation, TIMER_OBSERVATION, TimerAction,
+    TimerObservation,
 };
 
 mod sources;
@@ -147,6 +148,12 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
     inline_threshold: u32,
     /// Observations recorded per event at most.
     observation_budget: u32,
+    /// Strict capture sent an incomplete end: the journal ends there, and
+    /// every later dispatch is refused, before the job ends the group.
+    ended: bool,
+    /// The next event's effects start incomplete: an event delivered so
+    /// that its record ends the strict journal, every call refused.
+    incomplete_next: bool,
 }
 
 /// Why a Gateway could not be configured.
@@ -189,8 +196,11 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         if next_seq == 0 {
             return Err(ConfigError::FirstSeq);
         }
-        // An external event with an empty value, and its end.
-        let least = 12 + 20 + 2 + END;
+        // The largest event head with no payload, and its end: a message
+        // with an empty payload and a trace extension (above a loss, a
+        // lifecycle or an external head), so every source's report and the
+        // strict end's loss fit.
+        let least = 12 + MESSAGE_EVENT.block_length as usize + 2 + 2 + 64 + END;
         if max_event < least {
             return Err(ConfigError::Buffer(max_event));
         }
@@ -210,6 +220,8 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             turn: 0,
             inline_threshold: DEFAULT_INLINE_THRESHOLD,
             observation_budget: u32::MAX,
+            ended: false,
+            incomplete_next: false,
         })
     }
 
@@ -318,6 +330,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         first: &FirstRecord<'_>,
         handler: &mut dyn Handler,
     ) -> Result<Dispatched, GatewayError> {
+        let forced = core::mem::take(&mut self.incomplete_next);
         let state = self.sender.state();
         if state != GroupState::Running {
             if self.capture == Capture::Strict {
@@ -367,7 +380,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             seq,
             index: 0,
             logical_time,
-            incomplete: false,
+            incomplete: forced,
             recording: true,
             strict: self.capture == Capture::Strict,
             deadlines: &mut self.deadlines,
@@ -398,6 +411,8 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         self.sender
             .send(written, seq)
             .map_err(|_| GatewayError::Ended)?;
+        // A strict journal ends at an incomplete event: nothing follows it.
+        self.ended |= incomplete && self.capture == Capture::Strict;
         Ok(Dispatched::Event { group_seq: seq })
     }
 
@@ -472,7 +487,9 @@ impl<P: Port, C: FnMut() -> u64> GroupGateway for Gateway<P, C> {
     /// Takes the next event, a timer due now or a source's, and delivers
     /// it.
     fn dispatch(&mut self, handler: &mut dyn Handler) -> Result<Dispatched, GatewayError> {
-        if self.capture == Capture::Strict && self.sender.state() != GroupState::Running {
+        if self.ended
+            || (self.capture == Capture::Strict && self.sender.state() != GroupState::Running)
+        {
             return Err(GatewayError::Ended);
         }
         self.dispatch_next(handler)
@@ -484,6 +501,9 @@ impl<P: Port, C: FnMut() -> u64> GroupGateway for Gateway<P, C> {
         value: &[u8],
         handler: &mut dyn Handler,
     ) -> Result<Dispatched, GatewayError> {
+        if self.ended {
+            return Err(GatewayError::Ended);
+        }
         let logical_time = (self.clock)();
         let event = Event::External { kind, value };
         let first = |group_seq: u64, out: &mut [u8]| {

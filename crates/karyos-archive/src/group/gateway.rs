@@ -81,6 +81,8 @@ pub enum Event<'a> {
     Conflated {
         /// The view.
         source: ConflatedId,
+        /// The value's key in the view.
+        key: u32,
         /// The value's version.
         version: u64,
         /// Its freshness.
@@ -291,6 +293,20 @@ pub enum GatewayError {
         /// The recorded snapshot's length.
         length: u64,
     },
+    /// A restore out of order: after the first dispatch, a second one,
+    /// or at a checkpoint the replay was not opened at.
+    #[error("restore at group_seq {group_seq} out of order")]
+    RestoreOrder {
+        /// The restored checkpoint's event.
+        group_seq: u64,
+    },
+    /// A snapshot whose length or crc32c differs from its checkpoint
+    /// record: not comparable.
+    #[error("checkpoint {group_seq}: the snapshot differs from its record")]
+    CheckpointCorrupt {
+        /// The event the checkpoint follows.
+        group_seq: u64,
+    },
     /// A replay's handler diverged from its recording.
     #[error("replay diverged at group_seq {}, observation {}", .0.group_seq, .0.index)]
     Diverged(Divergence),
@@ -307,6 +323,15 @@ pub enum GatewayError {
     /// An external value over `MAX_INLINE` under strict capture.
     #[error("value too large: {0} bytes")]
     TooLarge(usize),
+    /// A second source of the same stream and session: replay names a
+    /// source by its stream and session, so each pair is added once.
+    #[error("stream {stream_id} session {session_id} already has a source")]
+    DuplicateSource {
+        /// The stream.
+        stream_id: i32,
+        /// The session.
+        session_id: i32,
+    },
 }
 
 /// The trait both the live Gateway and `ReplayGateway` implement.
