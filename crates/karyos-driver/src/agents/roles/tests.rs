@@ -3942,6 +3942,17 @@ fn header_only_frames() -> (
     Headers,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    let (half, frames, data, _rx) = header_only_endpoint();
+    (half, frames, data)
+}
+
+/// [`header_only_frames`], with the endpoint's RX half, to reset it.
+fn header_only_endpoint() -> (
+    super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+    Headers,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    karyos_io::sockets::endpoint::SocketsRx<karyos_io::sockets::scripted::ScriptedSocket>,
+) {
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -3978,8 +3989,8 @@ fn header_only_frames() -> (
     }
     let instance = InstanceId::new(NonZeroU32::new(1).unwrap());
     let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
-    let (tx, _rx) = endpoint.split().unwrap();
-    (super::super::Half::Tx(Box::new(tx)), frames, data)
+    let (tx, rx) = endpoint.split().unwrap();
+    (super::super::Half::Tx(Box::new(tx)), frames, data, rx)
 }
 
 /// SPEC §6: an established single-path lane that sent no DATA for
@@ -4117,4 +4128,205 @@ fn the_sender_heartbeat_interval_is_bounded() {
         };
         assert_eq!(config.validate().is_ok(), valid, "{interval}");
     }
+}
+
+/// A scripted half per path, its sends accepted.
+type Halves = Vec<(
+    EndpointId,
+    super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+)>;
+
+/// The sender of a removed single-path publication added and established
+/// on endpoint 1, its queues opened by a few cycles; the halves.
+fn removed_after_opening() -> (super::SenderRole, Halves, super::super::data::Opened, Rxs) {
+    let (sender, halves, mut opened, rxs) =
+        removed_after_opening_on(&[(EndpointId(1), "10.0.0.9:5000".parse().unwrap())], false);
+    (sender, halves, opened.remove(0), rxs)
+}
+
+/// Each path's RX half, in path order.
+type Rxs =
+    Vec<karyos_io::sockets::endpoint::SocketsRx<karyos_io::sockets::scripted::ScriptedSocket>>;
+
+/// The sender of a removed publication on `routes` (routed with more than
+/// one), reliable or not, added and established on every path, its routes
+/// and queues opened by a few cycles; the halves and what it opened on
+/// each path.
+fn removed_after_opening_on(
+    routes: &[(EndpointId, SocketAddr)],
+    reliable: bool,
+) -> (
+    super::SenderRole,
+    Halves,
+    Vec<super::super::data::Opened>,
+    Rxs,
+) {
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let term = publication(EndpointId(1)).term;
+    let (path, _log) = match routes {
+        [(endpoint, destination)] => super::super::data::testing::outbound(
+            *endpoint,
+            alias(),
+            *destination,
+            term,
+            1,
+            reliable,
+        ),
+        _ => super::super::data::testing::outbound_routed(routes, alias(), term, 1, reliable),
+    };
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    let (mut halves, mut rxs) = (Vec::new(), Vec::new());
+    for (endpoint, _) in routes {
+        let (half, _frames, _data, rx) = header_only_endpoint();
+        halves.push((*endpoint, half));
+        rxs.push(rx);
+    }
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    for (endpoint, _) in routes {
+        sender.bind(*endpoint, receiver, &sm_answer([7, 8], 0), 0);
+        sender.status(*endpoint, receiver, &sm_status([7, 8], 0), 1);
+    }
+    for now in 2..4 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    let mut opened = Vec::new();
+    sender.publications[0].opened_resources(|held| opened.push(held));
+    assert_eq!(opened.len(), routes.len(), "a route on every path");
+    let removed = sender.command(AgentCommand::<OsSocket>::RemoveSenderSession {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias: alias(),
+        registration: 1,
+    });
+    assert!(matches!(
+        removed,
+        Some((_, AgentEvent::PublicationRemoved { .. }))
+    ));
+    (sender, halves, opened, rxs)
+}
+
+/// Every queue and the route of `opened` are open (`open`) or closed on
+/// its path's half.
+fn assert_opened(halves: &mut Halves, opened: &[super::super::data::Opened], open: bool) {
+    use karyos_io::backend::TxBackend;
+
+    for held in opened {
+        let Some((_, super::super::Half::Tx(tx))) = halves
+            .iter_mut()
+            .find(|(endpoint, _)| *endpoint == held.endpoint)
+        else {
+            panic!("a TX half for {:?}", held.endpoint);
+        };
+        for queue in held.queues.into_iter().flatten() {
+            assert_eq!(tx.claim_tx(queue, 32).is_ok(), open, "{queue:?}");
+        }
+        assert_eq!(tx.route_info(held.route).is_ok(), open, "{:?}", held.route);
+    }
+}
+
+/// #393 review P2: a reliable publication's repair queue is closed with
+/// its lane queues and route, on a single path and on each path of a
+/// routed one, through `RemoveSenderSession` and the next duty.
+#[test]
+fn a_removed_reliable_publication_closes_its_repair_queue_on_every_path() {
+    let single = [(EndpointId(1), "10.0.0.9:5000".parse().unwrap())];
+    let routed = [
+        (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
+        (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
+    ];
+    for routes in [&single[..], &routed[..]] {
+        let (mut sender, mut halves, opened, _rxs) = removed_after_opening_on(routes, true);
+        // A lane queue and the repair queue on every path.
+        for held in &opened {
+            assert_eq!(held.queues.iter().flatten().count(), 2, "{held:?}");
+        }
+        assert_opened(&mut halves, &opened, true);
+        let _ = sender.duty(&mut halves, 4).unwrap();
+        assert_opened(&mut halves, &opened, false);
+        let closed: usize = opened
+            .iter()
+            .map(|held| held.queues.iter().flatten().count() + 1)
+            .sum();
+        assert_eq!(
+            sender.counters().removed_closed,
+            u64::try_from(closed).unwrap(),
+            "{routes:?}"
+        );
+    }
+}
+
+/// #354 review P3-6 (driver-network-agents.md §7: the sender drops its
+/// queues): a removed publication's lane queues and route are closed at
+/// the sender's next duty; none stays open.
+#[test]
+fn a_removed_publication_closes_its_queues_and_route() {
+    use karyos_io::backend::TxBackend;
+
+    let (mut sender, mut halves, opened, _rxs) = removed_after_opening();
+    let queues: Vec<_> = opened.queues.into_iter().flatten().collect();
+    assert!(!queues.is_empty());
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    for queue in &queues {
+        assert!(tx.claim_tx(*queue, 32).is_ok(), "open before the duty");
+    }
+    assert!(tx.route_info(opened.route).is_ok());
+    let _ = sender.duty(&mut halves, 4).unwrap();
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    for queue in &queues {
+        assert!(tx.claim_tx(*queue, 32).is_err(), "{queue:?} still open");
+    }
+    assert!(
+        tx.route_info(opened.route).is_err(),
+        "the route is still open"
+    );
+    let closed = u64::try_from(queues.len() + 1).unwrap();
+    assert_eq!(sender.counters().removed_closed, closed);
+    // Nothing is left to close.
+    let _ = sender.duty(&mut halves, 5).unwrap();
+    assert_eq!(sender.counters().removed_closed, closed);
+}
+
+/// P3-6: with no TX half when the duty comes (its endpoint is being reset
+/// or retired), the removed publication's queues are dropped by that
+/// reset, so nothing is closed and nothing waits: the half that comes
+/// back is the endpoint's next epoch, where they no longer exist.
+#[test]
+fn a_removed_publication_with_no_half_closes_nothing() {
+    use karyos_io::backend::{TxBackend, TxReport};
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+
+    let (mut sender, mut halves, opened, mut rxs) = removed_after_opening();
+    let (endpoint, super::super::Half::Tx(tx)) = halves.pop().unwrap() else {
+        panic!("a TX half");
+    };
+    let _ = sender.duty(&mut halves, 4).unwrap();
+    assert_eq!(sender.counters().removed_closed, 0);
+    // The endpoint's reset and reopen, as the endpoint table does.
+    let mut joined = SocketsEndpoint::join(*tx, rxs.remove(0)).ok().unwrap();
+    let mut report = TxReport::new();
+    while joined.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    let _ = joined.reopen(&loopback()).unwrap();
+    let (mut tx, _rx) = joined.split().unwrap();
+    assert_ne!(tx.capabilities().epoch, opened.epoch, "a new epoch");
+    for queue in opened.queues.into_iter().flatten() {
+        assert!(tx.claim_tx(queue, 32).is_err(), "gone with the reset");
+    }
+    halves.push((endpoint, super::super::Half::Tx(Box::new(tx))));
+    let _ = sender.duty(&mut halves, 5).unwrap();
+    assert_eq!(sender.counters().removed_closed, 0, "nothing waited");
 }

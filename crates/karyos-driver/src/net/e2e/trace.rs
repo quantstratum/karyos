@@ -15,7 +15,9 @@ use karyos_protocol::trace_hook::{
 use karyos_sys::counters::CellRead;
 use karyos_sys::trace_mirror::{EntryRead, JournalEntry, JournalState};
 
-use super::{aggregate, channel, connected, driver, driver_with, fast_driver, free_address, pump};
+use super::{
+    ANY_PORT, aggregate, bound, channel, connected, driver, driver_with, fast_driver, pump,
+};
 use crate::EmbeddedDriver;
 use crate::agents::ThreadingMode;
 use karyos_client::OfferOutcome;
@@ -332,10 +334,10 @@ fn a_repeated_removal_keeps_the_pending_closes() {
     for _ in 0..4 {
         let _ = a.do_work().unwrap();
     }
-    let address = free_address();
     let _subscription = b
-        .add_network_subscription(10, &channel(address, false))
+        .add_network_subscription(10, &channel(ANY_PORT, false))
         .unwrap();
+    let address = bound(&b, 10);
     let publication = a
         .add_network_publication(aggregate(10, 3, 2), &channel(address, false))
         .unwrap();

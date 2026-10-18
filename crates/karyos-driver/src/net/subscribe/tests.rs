@@ -74,12 +74,15 @@ fn channel(address: SocketAddr) -> UdpConfig {
     }
 }
 
-/// A loopback address with a port free a moment ago.
-fn free_address() -> SocketAddr {
-    UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
+/// A loopback address for a subscription to bind on any port: the kernel
+/// picks it at the bind, and [`bound`] reads it back, so no other process
+/// can take it in between.
+const ANY_PORT: SocketAddr = SocketAddr::new(LOOPBACK, 0);
+
+/// The address `driver`'s network subscription of `stream_id` is bound
+/// to.
+fn bound(driver: &EmbeddedDriver, stream_id: i32) -> SocketAddr {
+    driver.network_subscription_address(stream_id).unwrap()
 }
 
 /// Runs both drivers until `done`.
@@ -112,8 +115,8 @@ fn messages_reach_a_subscriber_of_the_image() {
     for mode in [ThreadingMode::Shared, ThreadingMode::Dedicated] {
         let mut a = driver(mode);
         let mut b = driver(mode);
-        let address = free_address();
-        let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+        let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+        let address = bound(&b, 10);
         let publication = a
             .add_network_publication(aggregate(10, 3, 2), &channel(address))
             .unwrap();
@@ -170,8 +173,8 @@ fn messages_reach_a_subscriber_of_the_image() {
 fn a_removed_subscription_retires_and_reclaims_its_image() {
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
-    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -228,8 +231,8 @@ fn two_images_of_one_alias_are_both_exposed_and_read() {
     let mut a = driver(ThreadingMode::Shared);
     let mut c = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
-    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let publications = [
         a.add_network_publication(aggregate(10, 3, 1), &channel(address))
             .unwrap(),
@@ -306,9 +309,9 @@ fn a_local_key_and_an_image_alias_never_coexist() {
     // A local stream first: the image of its key is not exposed.
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
     let _local = b.add_aggregate(aggregate(10, 3, 1)).unwrap();
-    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -317,8 +320,8 @@ fn a_local_key_and_an_image_alias_never_coexist() {
     // An image first: a local stream of its key is refused.
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
-    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -347,8 +350,8 @@ fn an_image_without_room_is_counted_not_exposed() {
         ..DriverConfig::default()
     })
     .unwrap();
-    let address = free_address();
-    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _first = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -405,8 +408,8 @@ fn a_replay_target_and_an_image_never_share_a_key() {
     // An image first: a replay target of its key is refused.
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
-    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -421,9 +424,9 @@ fn a_replay_target_and_an_image_never_share_a_key() {
     // A replay target first: the image of its key is not exposed.
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
     let _target = b.replay_target(target(10, 3)).unwrap();
-    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -438,9 +441,9 @@ fn a_replay_target_and_an_image_never_share_a_key() {
 fn subscriptions_of_one_key_are_counted() {
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
-    let first = b.add_network_subscription(10, &channel(address)).unwrap();
-    let second = b.add_network_subscription(10, &channel(address)).unwrap();
+    let first = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let second = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -463,7 +466,7 @@ fn subscriptions_of_one_key_are_counted() {
 #[test]
 fn a_subscription_with_another_reliability_is_refused() {
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
+    let address = ANY_PORT;
     let reliable = channel(address);
     let unreliable = UdpConfig {
         reliable: false,
@@ -506,28 +509,27 @@ fn a_subscription_with_another_identity_is_refused() {
         group_tag,
     };
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
     let first = b
-        .add_network_subscription_as(10, &channel(address), identity(77, 5))
+        .add_network_subscription_as(10, &channel(ANY_PORT), identity(77, 5))
         .unwrap();
     for other in [identity(78, 5), identity(77, 6)] {
         assert_eq!(
-            b.add_network_subscription_as(10, &channel(address), other),
+            b.add_network_subscription_as(10, &channel(ANY_PORT), other),
             Err(crate::DriverError::ReceiverIdentityMismatch)
         );
     }
     assert_eq!(
-        b.add_network_subscription(10, &channel(address)),
+        b.add_network_subscription(10, &channel(ANY_PORT)),
         Err(crate::DriverError::ReceiverIdentityMismatch),
         "none where the first has one"
     );
     let second = b
-        .add_network_subscription_as(10, &channel(address), identity(77, 5))
+        .add_network_subscription_as(10, &channel(ANY_PORT), identity(77, 5))
         .unwrap();
     // Another stream, derived identity: one where it has none is refused.
-    let derived = b.add_network_subscription(11, &channel(address)).unwrap();
+    let derived = b.add_network_subscription(11, &channel(ANY_PORT)).unwrap();
     assert_eq!(
-        b.add_network_subscription_as(11, &channel(address), identity(77, 5)),
+        b.add_network_subscription_as(11, &channel(ANY_PORT), identity(77, 5)),
         Err(crate::DriverError::ReceiverIdentityMismatch)
     );
     for subscription in [first, second, derived] {
@@ -550,16 +552,15 @@ fn a_subscription_with_another_conflated_lane_is_refused() {
         };
     let lane1 = Lane::try_new(1).unwrap();
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
     let first = b
-        .add_network_subscription_conflated(10, &channel(address), Lane::ZERO, CONFIG)
+        .add_network_subscription_conflated(10, &channel(ANY_PORT), Lane::ZERO, CONFIG)
         .unwrap();
     assert_eq!(
-        b.add_network_subscription_conflated(10, &channel(address), lane1, CONFIG),
+        b.add_network_subscription_conflated(10, &channel(ANY_PORT), lane1, CONFIG),
         Err(crate::DriverError::ConflationMismatch)
     );
     assert_eq!(
-        b.add_network_subscription(10, &channel(address)),
+        b.add_network_subscription(10, &channel(ANY_PORT)),
         Err(crate::DriverError::ConflationMismatch),
         "none where the first has one"
     );
@@ -568,16 +569,16 @@ fn a_subscription_with_another_conflated_lane_is_refused() {
         ..CONFIG
     };
     assert_eq!(
-        b.add_network_subscription_conflated(10, &channel(address), Lane::ZERO, other),
+        b.add_network_subscription_conflated(10, &channel(ANY_PORT), Lane::ZERO, other),
         Err(crate::DriverError::ConflationMismatch),
         "the same lane with another table"
     );
     let second = b
-        .add_network_subscription_conflated(10, &channel(address), Lane::ZERO, CONFIG)
+        .add_network_subscription_conflated(10, &channel(ANY_PORT), Lane::ZERO, CONFIG)
         .unwrap();
-    let plain = b.add_network_subscription(11, &channel(address)).unwrap();
+    let plain = b.add_network_subscription(11, &channel(ANY_PORT)).unwrap();
     assert_eq!(
-        b.add_network_subscription_conflated(11, &channel(address), Lane::ZERO, CONFIG),
+        b.add_network_subscription_conflated(11, &channel(ANY_PORT), Lane::ZERO, CONFIG),
         Err(crate::DriverError::ConflationMismatch),
         "one where the first has none"
     );
@@ -601,11 +602,10 @@ fn the_receivers_subscription_table_is_mirrored() {
         ..DriverConfig::default()
     })
     .unwrap();
-    let address = free_address();
-    let first = b.add_network_subscription(10, &channel(address)).unwrap();
-    let shared = b.add_network_subscription(10, &channel(address)).unwrap();
+    let first = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let shared = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
     assert_eq!(
-        b.add_network_subscription(11, &channel(address)),
+        b.add_network_subscription(11, &channel(ANY_PORT)),
         Err(crate::error::DriverError::NetworkSubscriptionsFull)
     );
     for _ in 0..50 {
@@ -615,7 +615,7 @@ fn the_receivers_subscription_table_is_mirrored() {
     // Removing every handle of the key frees its entry.
     assert!(b.remove_network_subscription(first).unwrap());
     assert!(b.remove_network_subscription(shared).unwrap());
-    let _other = b.add_network_subscription(11, &channel(address)).unwrap();
+    let _other = b.add_network_subscription(11, &channel(ANY_PORT)).unwrap();
     for _ in 0..50 {
         let _ = b.do_work().unwrap();
     }
@@ -624,7 +624,11 @@ fn the_receivers_subscription_table_is_mirrored() {
 
 /// A free port, for a multicast group endpoint.
 fn free_port() -> u16 {
-    free_address().port()
+    UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// RC-15 interim table (ACS 16103): an invalid control group table is
@@ -740,7 +744,7 @@ fn control_group_attempt() -> Result<bool, crate::error::DriverError> {
 fn a_unicast_subscription_is_not_multicast() {
     let mut driver = driver(ThreadingMode::Shared);
     let subscription = driver
-        .add_network_subscription(9, &channel(free_address()))
+        .add_network_subscription(9, &channel(ANY_PORT))
         .unwrap();
     for _ in 0..20 {
         let _ = driver.do_work().unwrap();
@@ -867,7 +871,7 @@ fn every_path_of_a_subscription_carries_its_identity() {
 fn unicast_paths_are_refused() {
     let mut driver = driver(ThreadingMode::Shared);
     driver.net.as_mut().unwrap().assume_isolated_paths();
-    let address = free_address();
+    let address = ANY_PORT;
     let channel = UdpConfig {
         interface: None,
         paths: vec![Interface::Address(LOOPBACK), Interface::Address(LOOPBACK)],
@@ -893,10 +897,9 @@ fn an_unsubscription_waits_for_room_in_the_ring() {
         ..DriverConfig::default()
     })
     .unwrap();
-    let address = free_address();
     // Its endpoint and its subscription fill the ring until the next
     // cycle.
-    let first = b.add_network_subscription(10, &channel(address)).unwrap();
+    let first = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
     let net = b.net.as_mut().unwrap();
     net.remove_subscription_later(first);
     assert_eq!(net.pending_unsubscribes(), 1, "the full ring refused it");
@@ -922,7 +925,7 @@ fn a_unicast_channel_with_one_path_is_refused() {
     let channel = UdpConfig {
         interface: None,
         paths: vec![Interface::Address(LOOPBACK)],
-        ..channel(free_address())
+        ..channel(ANY_PORT)
     };
     assert_eq!(
         driver.add_network_subscription(6, &channel),
@@ -1063,7 +1066,7 @@ fn the_mirror_counts_every_paths_entry() {
     net.subscriptions.push(entry(100, 6, &[101]));
     net.subscriptions.push(entry(102, 7, &[103]));
     assert_eq!(
-        driver.add_network_subscription(8, &channel(free_address())),
+        driver.add_network_subscription(8, &channel(ANY_PORT)),
         Err(crate::error::DriverError::NetworkSubscriptionsFull)
     );
 }
@@ -1074,18 +1077,17 @@ fn the_mirror_counts_every_paths_entry() {
 #[test]
 fn a_first_path_never_shares_a_later_paths_entry() {
     let mut driver = driver(ThreadingMode::Shared);
-    let address = free_address();
     // Open the endpoint as an ordinary subscription of another stream, then
     // make it a later path of stream 6 in the table.
     let other = driver
-        .add_network_subscription(9, &channel(address))
+        .add_network_subscription(9, &channel(ANY_PORT))
         .unwrap();
     let endpoint = other.endpoint();
     let net = driver.net.as_mut().unwrap();
     net.subscriptions.push(entry(200, 6, &[endpoint.0]));
     let held = driver.network_held_endpoints();
     assert_eq!(
-        driver.add_network_subscription(6, &channel(address)),
+        driver.add_network_subscription(6, &channel(ANY_PORT)),
         Err(crate::error::DriverError::UnsupportedChannel)
     );
     assert_eq!(driver.network_held_endpoints(), held);
@@ -1158,8 +1160,8 @@ fn a_new_keys_later_paths_need_room() {
 fn reconfiguring_an_exposed_image_is_refused() {
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
-    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -1269,8 +1271,8 @@ fn an_image_lane_admits_as_many_optional_readers_as_its_spare_credits() {
     let run = |spare_slots: u8, check: &mut dyn FnMut(&mut EmbeddedDriver)| {
         let mut a = driver(ThreadingMode::Shared);
         let mut b = image_driver(spare_slots);
-        let address = free_address();
-        let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+        let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+        let address = bound(&b, 10);
         let _publication = a
             .add_network_publication(aggregate(10, 3, 1), &channel(address))
             .unwrap();
@@ -1376,8 +1378,8 @@ fn a_liveness_retirement_ends_unsent_image_grants_and_the_exit_proof_the_rest() 
         Box::new(clock.clone()),
     )
     .unwrap();
-    let address = free_address();
-    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -1461,8 +1463,8 @@ fn a_liveness_retirement_ends_unsent_image_grants_and_the_exit_proof_the_rest() 
 fn eos_on_every_lane_ends_the_image_cleanly_after_the_last_message() {
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
-    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let publication = a
         .add_network_publication(aggregate(10, 3, 2), &channel(address))
         .unwrap();
@@ -1580,8 +1582,8 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
     let mut a = driver(ThreadingMode::Shared);
     let mut c = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
-    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = bound(&b, 10);
     let _first = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
@@ -1596,8 +1598,10 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         panic!("two images");
     };
     let local = b.add_aggregate(aggregate(20, 1, 1)).unwrap();
+    // A publication with no receiver sends to a socket the test holds.
+    let silent = UdpSocket::bind(ANY_PORT).unwrap();
     let publication = b
-        .add_network_publication(aggregate(30, 1, 1), &channel(free_address()))
+        .add_network_publication(aggregate(30, 1, 1), &channel(silent.local_addr().unwrap()))
         .unwrap();
     let mut observer = b.broadcast.receiver();
     let (client, mut producer) = remote_client(&mut b);
@@ -1702,7 +1706,7 @@ fn a_conductor_hears_each_image_and_attaches_by_alias_to_the_oldest() {
     let mut a = driver(ThreadingMode::Shared);
     let mut c = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
-    let address = free_address();
+    let address = SocketAddr::new(LOOPBACK, free_port());
     let mut client = b.connect().unwrap();
     let uri = format!("karyos:udp?endpoint={address}");
     let subscribed = client

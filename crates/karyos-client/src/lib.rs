@@ -30,6 +30,7 @@ pub mod ipc;
 pub mod journal;
 pub mod link;
 pub mod loss;
+pub mod merge;
 pub mod publication;
 pub mod schedule;
 pub mod subscription;
@@ -60,9 +61,15 @@ pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
 pub use karyos_protocol::cnc::StreamId;
+/// The publication identity a replay and a live merge name (merge module).
+pub use karyos_protocol::trace_hook::PublicationIdentity;
 pub use karyos_sys::frame::Lane;
 pub use karyos_sys::freshness::Freshness;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
+pub use merge::{
+    LiveMerge, MergeError, MergeFailed, MergePoll, Replay, ReplayProvider, ReplayRequest,
+    ReplayStatus, ReplayStop, ReplayUnavailable,
+};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
     Aborted, ClientSubscription, InvalidExtensions, MessageInfo, MessageLimit, Overrun, PollError,

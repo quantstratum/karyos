@@ -1136,6 +1136,17 @@ impl<T: StreamTerms> Network<T> {
         self.net_images.iter().filter_map(|image| image.exposed)
     }
 
+    /// The bound local address of the endpoint `stream_id`'s first
+    /// subscription path is on, in its current epoch (a port 0 bind
+    /// resolved by the kernel); `None` without such a subscription.
+    pub(crate) fn subscription_address(&self, stream_id: i32) -> Option<SocketAddr> {
+        let entry = self
+            .subscriptions
+            .iter()
+            .find(|entry| entry.stream_id == stream_id)?;
+        self.endpoints.local_address(entry.endpoint)
+    }
+
     /// The exposed image aggregate that `matches`, the oldest first.
     pub(crate) fn exposed_image(
         &self,

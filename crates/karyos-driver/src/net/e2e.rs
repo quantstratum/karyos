@@ -104,11 +104,27 @@ fn channel(address: SocketAddr, reliable: bool) -> UdpConfig {
     }
 }
 
-fn free_address() -> SocketAddr {
-    UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
+/// A loopback address for a subscription to bind on any port: the kernel
+/// picks it at the bind, and [`bound`] reads it back, so no other process
+/// can take it in between.
+const ANY_PORT: SocketAddr = SocketAddr::new(LOOPBACK, 0);
+
+/// The address `driver`'s network subscription of `stream_id` is bound
+/// to.
+fn bound<T: StreamTerms>(driver: &EmbeddedDriver<T>, stream_id: i32) -> SocketAddr {
+    driver.network_subscription_address(stream_id).unwrap()
+}
+
+/// A loopback socket nobody reads, for a publication with no receiver to
+/// send to: held while the test runs, so no other process takes its port.
+fn silent() -> UdpSocket {
+    UdpSocket::bind(SocketAddr::new(LOOPBACK, 0)).unwrap()
+}
+
+/// A port for a multicast group, free a moment ago: a group's port is
+/// named before any bind, so it cannot be read back from one.
+fn free_port() -> u16 {
+    silent().local_addr().unwrap().port()
 }
 
 /// Runs every driver until `done`, at most about four seconds.
@@ -144,10 +160,10 @@ fn connected<T: StreamTerms>(
     reliable: bool,
     stream_id: i32,
 ) -> (AggregateHandle, AggregateHandle) {
-    let address = free_address();
     let _ = b
-        .add_network_subscription(stream_id, &channel(address, reliable))
+        .add_network_subscription(stream_id, &channel(ANY_PORT, reliable))
         .unwrap();
+    let address = bound(b, stream_id);
     let publication = a
         .add_network_publication(aggregate(stream_id, 3, 1), &channel(address, reliable))
         .unwrap();
@@ -478,7 +494,7 @@ fn a_multicast_publication_reaches_every_subscriber() {
         skip(&why);
         return;
     }
-    let port = free_address().port();
+    let port = free_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 1)), port);
     let channel = UdpConfig {
         destination: Destination::Multicast { group, ttl: None },
@@ -563,10 +579,7 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
         );
         return;
     }
-    let group = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)),
-        free_address().port(),
-    );
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), free_port());
     let channel = UdpConfig {
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
@@ -725,7 +738,7 @@ fn a_required_receiver_bounds_every_strategy() {
         ),
     ];
     for (name, strategy, required, tags, c_identity, held) in cases {
-        let port = free_address().port();
+        let port = free_port();
         let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), port);
         let channel = UdpConfig {
             destination: Destination::Multicast { group, ttl: None },
@@ -865,10 +878,10 @@ fn multicast_probe() -> Result<(), String> {
 fn two_lanes_deliver_in_order_on_either_kind() {
     for reliable in [true, false] {
         let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
-        let address = free_address();
         let _ = b
-            .add_network_subscription(10, &channel(address, reliable))
+            .add_network_subscription(10, &channel(ANY_PORT, reliable))
             .unwrap();
+        let address = bound(&b, 10);
         let publication = a
             .add_network_publication(aggregate(10, 3, 2), &channel(address, reliable))
             .unwrap();
@@ -1002,14 +1015,8 @@ fn multicast_cycles_run_on_the_network_clock() {
         );
         return;
     }
-    let group = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)),
-        free_address().port(),
-    );
-    let control = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)),
-        free_address().port(),
-    );
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), free_port());
+    let control = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), free_port());
     let mut table = [None; MAX_CONTROL_GROUPS];
     table[0] = Some(ControlGroup {
         data_group: group,
@@ -1142,10 +1149,10 @@ fn a_conflated_network_view_reads_its_values_fresh() {
     use karyos_sys::freshness::Freshness;
 
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
-    let address = free_address();
     let _subscription = b
-        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .add_network_subscription_conflated(10, &channel(ANY_PORT, false), Lane::ZERO, VIEW)
         .unwrap();
+    let address = bound(&b, 10);
     let publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
         .unwrap();
@@ -1181,10 +1188,10 @@ fn two_images_of_one_alias_get_a_view_each() {
         driver(ThreadingMode::Shared),
         driver(ThreadingMode::Shared),
     );
-    let address = free_address();
     let _subscription = b
-        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .add_network_subscription_conflated(10, &channel(ANY_PORT, false), Lane::ZERO, VIEW)
         .unwrap();
+    let address = bound(&b, 10);
     let publications = [
         a1.add_network_publication(aggregate(10, 3, 1), &channel(address, false))
             .unwrap(),
@@ -1256,10 +1263,10 @@ fn a_lost_update_stales_the_view_until_replaced() {
     use karyos_sys::freshness::Freshness;
 
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
-    let address = free_address();
     let _subscription = b
-        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .add_network_subscription_conflated(10, &channel(ANY_PORT, false), Lane::ZERO, VIEW)
         .unwrap();
+    let address = bound(&b, 10);
     let publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
         .unwrap();
@@ -1316,10 +1323,10 @@ fn a_lost_update_stales_the_view_until_replaced() {
 #[test]
 fn a_published_terminal_cell_closes_the_network_view() {
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
-    let address = free_address();
     let _subscription = b
-        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .add_network_subscription_conflated(10, &channel(ANY_PORT, false), Lane::ZERO, VIEW)
         .unwrap();
+    let address = bound(&b, 10);
     let publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
         .unwrap();
@@ -1368,10 +1375,10 @@ fn conflated_pair(
     crate::embedded::AggregateHandle,
     crate::net::NetworkSubscription,
 ) {
-    let address = free_address();
     let subscription = b
-        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, config)
+        .add_network_subscription_conflated(10, &channel(ANY_PORT, false), Lane::ZERO, config)
         .unwrap();
+    let address = bound(b, 10);
     let publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
         .unwrap();
@@ -1651,7 +1658,7 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
         let _ = writeln!(std::io::stderr(), "SKIPPED T9 retention floor: {why}");
         return None;
     }
-    let port = free_address().port();
+    let port = free_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), port);
     let channel = UdpConfig {
         destination: Destination::Multicast { group, ttl: None },
@@ -1815,7 +1822,7 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
         );
         return;
     }
-    let port = free_address().port();
+    let port = free_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), port);
     let channel = UdpConfig {
         destination: Destination::Multicast { group, ttl: None },
@@ -1916,10 +1923,10 @@ fn a_guard_close_on_a_trusted_channel_ends_the_remote_image_at_liveness() {
     );
     let guard = a.add_guard("trusted").unwrap();
     assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     let mut config = aggregate(10, 3, 1);
     // The sender's reservation and the guard's walker.
     config.stream.buffer.spare_slots = 4;
@@ -2078,10 +2085,10 @@ fn a_receiver_failure_on_a_dedicated_runner_leaves_the_gates_deciding() {
     );
     let guard = a.add_guard("dedicated").unwrap();
     assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
-    let address = free_address();
     let _ = b
-        .add_network_subscription(10, &channel(address, true))
+        .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
+    let address = bound(&b, 10);
     let mut config = aggregate(10, 3, 1);
     // The sender's reservation and the guard's walker.
     config.stream.buffer.spare_slots = 4;

@@ -359,6 +359,17 @@ pub struct SenderCounters {
     /// single-path lanes that sent nothing for `sender_heartbeat_interval`
     /// (SPEC §6).
     pub heartbeats_sent: u64,
+    /// Queues and routes of removed publications the sender closed at its
+    /// next duty (driver-network-agents.md §7: the sender drops its
+    /// queues); a repair queue counts as one, a route as one.
+    pub removed_closed: u64,
+    /// Items still pending in a removed publication's queues when they
+    /// closed, returned with `QueueClosed`.
+    pub removed_returned: u64,
+    /// Removed publications' routes or queues not recorded for closing:
+    /// the preallocated close list was full (never, by construction; their
+    /// endpoint's next reset drops them).
+    pub removed_unrecorded: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -1449,6 +1460,12 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     path_heartbeat_interval: u64,
     /// `sender_heartbeat_interval` in ns (SPEC §6).
     sender_heartbeat_interval: u64,
+    /// Removed publications' routes and queues, closed at the next duty
+    /// with the TX halves (allocated at creation: `publications` routes'
+    /// worth, the most removals can leave).
+    closing: Vec<super::data::Opened>,
+    /// Report storage for those closes (allocated at creation).
+    close_report: karyos_io::backend::TxReport,
     /// When a routed publication's path leaves the live set (RP-8).
     path_policy: super::data::PathPolicy,
     /// The receivers answered, at most `receiver_bindings` (allocated at
@@ -1590,6 +1607,13 @@ pub(super) fn roles<T: StreamTerms>(
             due: Vec::with_capacity(config.publications),
             path_heartbeat_interval: config.path_heartbeat_interval,
             sender_heartbeat_interval: config.sender_heartbeat_interval,
+            closing: Vec::with_capacity(
+                config
+                    .publications
+                    .checked_mul(karyos_io::lanes::routes::MAX_ROUTES)
+                    .ok_or(AgentError::InvalidConfig("publications too large"))?,
+            ),
+            close_report: karyos_io::backend::TxReport::new(),
             path_policy: config.path_policy,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
@@ -4639,6 +4663,22 @@ impl<T: StreamTerms> SenderRole<T> {
         if let Some(outbound) = outbound.as_deref_mut() {
             outbound.finish_removed();
         }
+        // Its routes and queues close at the next duty, which holds the TX
+        // halves (driver-network-agents.md §7).
+        if let Some(outbound) = outbound.as_deref() {
+            let (closing, mut full) = (&mut self.closing, 0u64);
+            outbound.opened_resources(|opened| {
+                if closing.len() < closing.capacity() {
+                    closing.push(opened);
+                } else if let Some(count) = full.checked_add(1) {
+                    full = count;
+                }
+            });
+            debug_assert_eq!(full, 0, "the close list holds every route");
+            for _ in 0..full {
+                self.count(|c| &mut c.removed_unrecorded);
+            }
+        }
         // Every path's SETUP side and bindings go with it.
         match outbound.as_deref() {
             Some(outbound) => {
@@ -4680,6 +4720,44 @@ impl<T: StreamTerms> SenderRole<T> {
             alias,
             registration,
             outbound,
+        }
+    }
+
+    /// Closes the routes and queues removed publications left (see
+    /// [`SenderRole::remove`]), on each endpoint whose TX half it holds in
+    /// the same epoch. An endpoint whose half it does not hold, or now in
+    /// another epoch, dropped them already (a reset or a retirement).
+    fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
+        while let Some(opened) = self.closing.pop() {
+            let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
+                Half::Tx(tx) if *held == opened.endpoint => Some(tx),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if tx.capabilities().epoch != opened.epoch {
+                continue;
+            }
+            for queue in opened.queues.into_iter().flatten() {
+                // A full report leaves items pending: emptied and called
+                // again until none remains, each call returning at least
+                // one, so the queue's depth bounds the loop.
+                while let Ok(outcome) = tx.close_queue(queue, &mut self.close_report) {
+                    while self.close_report.pop_front().is_some() {
+                        self.count(|c| &mut c.removed_returned);
+                    }
+                    if !outcome.more {
+                        self.count(|c| &mut c.removed_closed);
+                        break;
+                    }
+                    if outcome.returned == 0 {
+                        break;
+                    }
+                }
+            }
+            if tx.remove_route(opened.route).is_ok() {
+                self.count(|c| &mut c.removed_closed);
+            }
         }
     }
 
@@ -4817,6 +4895,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);
+        self.close_removed(halves);
         self.naks_this_cycle = 0;
         // Bindings past their lifetime go even when nothing arrives.
         self.expire_bindings(now);
@@ -5072,27 +5151,25 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
                 continue;
             }
-            // TODO(rp-w5a/rp-w5b): a routed publication's EOS goes on every
-            // path through its routed lane sender (data/routed.rs); until
-            // then it lingers without EOS and its receivers fall back to
-            // their liveness timeout.
-            if outbound.is_routed() {
-                if let Some(outbound) = self.publications.get_mut(index) {
-                    outbound.linger_without_eos(now);
-                }
-                continue;
-            }
-            let endpoint = outbound.endpoint();
-            // Without its TX half (an endpoint being reset) the drain bound
-            // still runs: nothing waits for the half to come back.
-            let tx = halves.iter_mut().find_map(|(held, half)| match half {
-                Half::Tx(tx) if *held == endpoint => Some(&mut **tx),
-                _ => None,
-            });
-            let Some(outbound) = self.publications.get_mut(index) else {
-                continue;
+            // A routed publication's EOS goes on every live path.
+            let step = if outbound.is_routed() {
+                let Some(outbound) = self.publications.get_mut(index) else {
+                    continue;
+                };
+                outbound.serve_removal_routes(halves, now)
+            } else {
+                let endpoint = outbound.endpoint();
+                // Without its TX half (an endpoint being reset) the drain bound
+                // still runs: nothing waits for the half to come back.
+                let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                    Half::Tx(tx) if *held == endpoint => Some(&mut **tx),
+                    _ => None,
+                });
+                let Some(outbound) = self.publications.get_mut(index) else {
+                    continue;
+                };
+                outbound.serve_removal(tx, now)
             };
-            let step = outbound.serve_removal(tx, now);
             sent = sent.checked_add(step.sent).unwrap_or(sent);
             for _ in 0..step.sent {
                 self.count(|c| &mut c.eos_sent);
