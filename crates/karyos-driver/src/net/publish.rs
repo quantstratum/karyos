@@ -231,8 +231,9 @@ impl EmbeddedDriver<HeapTerms> {
         let mut word = [0u64; 1];
         karyos_sys::random::fill_u64s(&mut word)?;
         let [value] = word;
-        // The high half: always fits.
-        Ok(u32::try_from(value >> 32).unwrap_or(0))
+        // The high half.
+        let [a, b, c, d, ..] = value.to_be_bytes();
+        Ok(u32::from_be_bytes([a, b, c, d]))
     }
 
     /// The state of the network publication `aggregate`; `None` when it

@@ -5018,7 +5018,9 @@ impl<T: StreamTerms> SenderRole<T> {
             )?;
             work = work.checked_add(served).ok_or(overflow.clone())?;
             // An idle lane's heartbeat (SPEC §6), after its first sends.
-            let beats = outbound.serve_heartbeats(tx, now, self.sender_heartbeat_interval);
+            let beats = outbound
+                .serve_heartbeats(tx, now, self.sender_heartbeat_interval)
+                .ok_or(overflow.clone())?;
             work = work.checked_add(beats).ok_or(overflow.clone())?;
             let needs_reset = outbound.needs_reset();
             for _ in 0..beats {

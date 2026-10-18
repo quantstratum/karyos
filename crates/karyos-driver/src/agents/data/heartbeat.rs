@@ -25,9 +25,17 @@ use karyos_io::lanes::LaneGate;
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::frame::{Flags, FrameType, HEADER_LENGTH, Lane, Word0};
+use karyos_sys::term::TermCount;
 
 use super::Outbound;
 use crate::embedded::StreamTerms;
+
+/// A header-only frame's length in bytes: the DATA header alone.
+const HEADER: usize = 32;
+const _: () = assert!(
+    HEADER_LENGTH == 32,
+    "a header-only frame is the 32-byte header"
+);
 
 /// The gate of a header-only frame: one frame, always permitted (a lane
 /// whose guard does not admit it sends none, checked before the frame is
@@ -50,15 +58,16 @@ impl<T: StreamTerms> Outbound<T> {
     /// The idle heartbeats due at `now`: each lane idle for `interval`,
     /// with nothing staged or pending, sends one at its next position.
     /// None while the publication is removed (its EOS replaces them).
-    /// Returns the heartbeats submitted.
+    /// Returns the heartbeats submitted; `None` only if their count
+    /// overflowed, which at most four lanes cannot.
     pub(crate) fn serve_heartbeats<O: SocketOps>(
         &mut self,
         tx: &mut SocketsTx<O>,
         now: u64,
         interval: u64,
-    ) -> u32 {
+    ) -> Option<u32> {
         if self.removing() {
-            return 0;
+            return Some(0);
         }
         let mut sent = 0u32;
         for lane in 0..self.readers.len() {
@@ -92,10 +101,10 @@ impl<T: StreamTerms> Outbound<T> {
                 if let Some(slot) = self.idle_since.get_mut(lane) {
                     *slot = Some(now);
                 }
-                sent = sent.checked_add(1).unwrap_or(sent);
+                sent = sent.checked_add(1)?;
             }
         }
-        sent
+        Some(sent)
     }
 
     /// Claims, writes and flushes a header-only DATA frame of `lane` at
@@ -145,14 +154,20 @@ impl<T: StreamTerms> Outbound<T> {
         else {
             return false;
         };
-        let header = HEADER_LENGTH as usize;
-        let mut bytes = [0u8; HEADER_LENGTH as usize];
+        let Ok(length) = i32::try_from(HEADER_LENGTH) else {
+            return false;
+        };
+        let header = HEADER;
+        let mut bytes = [0u8; HEADER];
         let word0 = Word0::new(
-            HEADER_LENGTH as i32,
+            length,
             Flags::new(true, true, eos, false, lane_id),
             FrameType::Data,
         );
-        let term_id = config.initial_term_id.get().wrapping_add(count);
+        let Ok(count) = TermCount::try_new(count) else {
+            return false;
+        };
+        let term_id = config.initial_term_id.advanced_by(count).get();
         for (at, field) in [
             (0, word0.pack().to_le_bytes().as_slice()),
             (8, offset.to_le_bytes().as_slice()),
