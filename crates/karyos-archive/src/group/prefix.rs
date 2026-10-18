@@ -334,7 +334,35 @@ pub struct PrefixTracker {
     view: Arc<PrefixView>,
 }
 
+/// Makes room in `queue` for `hold` entries in all, fallibly.
+fn hold_room<T>(
+    queue: &mut VecDeque<T>,
+    hold: usize,
+) -> Result<(), std::collections::TryReserveError> {
+    if let Some(more) = hold.checked_sub(queue.len()) {
+        queue.try_reserve_exact(more)?;
+    }
+    Ok(())
+}
+
 impl PrefixTracker {
+    /// [`PrefixTracker::new`], allocating fallibly: the configured bound
+    /// may be one the host cannot hold.
+    ///
+    /// # Errors
+    ///
+    /// The allocation's failure.
+    pub fn try_new(capacity: usize) -> Result<Self, std::collections::TryReserveError> {
+        let mut tracker = Self::new(1);
+        let capacity = capacity.max(1);
+        hold_room(&mut tracker.waiting, capacity)?;
+        hold_room(&mut tracker.candidates, capacity)?;
+        hold_room(&mut tracker.settling, capacity)?;
+        tracker.capacity = capacity;
+        tracker.hold = capacity;
+        Ok(tracker)
+    }
+
     /// A tracker with room for `capacity` events written and not yet
     /// durable, at least 1.
     #[must_use]
@@ -878,14 +906,9 @@ impl PrefixTracker {
         hold: usize,
     ) -> Result<(), std::collections::TryReserveError> {
         let hold = hold.max(self.capacity);
-        if let Some(more) = hold.checked_sub(self.candidates.len()) {
-            self.candidates.try_reserve_exact(more)?;
-        }
-        for queue in [&mut self.waiting, &mut self.settling] {
-            if let Some(more) = hold.checked_sub(queue.len()) {
-                queue.try_reserve_exact(more)?;
-            }
-        }
+        hold_room(&mut self.candidates, hold)?;
+        hold_room(&mut self.waiting, hold)?;
+        hold_room(&mut self.settling, hold)?;
         self.hold = hold;
         Ok(())
     }
@@ -943,20 +966,19 @@ pub struct Recovery {
 /// # Errors
 ///
 /// The journal's read errors, and
-/// [`JournalError::InvalidConfig`](super::journal::JournalError::InvalidConfig)
-/// for a hold that cannot be allocated.
+/// [`JournalError::Allocation`](super::journal::JournalError::Allocation)
+/// for a tracker or a hold that cannot be allocated.
 pub fn recover<D: crate::disk::Disk>(
     journal: &mut super::journal::GroupJournal<D>,
     coverage: &impl Coverage,
     capacity: usize,
 ) -> Result<Recovery, super::journal::JournalError> {
     // The reopening window is the header's (A9), as the run's was.
+    let allocation = |_| super::journal::JournalError::Allocation;
     let hold = usize::try_from(journal.reopen_hold()?)
-        .map_err(|_| super::journal::JournalError::InvalidConfig)?;
-    let mut tracker = PrefixTracker::new(capacity);
-    tracker
-        .reserve_reopen_hold(hold)
-        .map_err(|_| super::journal::JournalError::InvalidConfig)?;
+        .map_err(|_| super::journal::JournalError::Allocation)?;
+    let mut tracker = PrefixTracker::try_new(capacity).map_err(allocation)?;
+    tracker.reserve_reopen_hold(hold).map_err(allocation)?;
     let mut last_seen = 0u64;
     let mut full = false;
     let durable = journal.durable();

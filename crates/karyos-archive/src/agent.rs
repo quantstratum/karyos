@@ -178,9 +178,12 @@ pub struct GroupCheckpoints {
     pub reopen_hold: Option<usize>,
 }
 
-/// The largest reopen hold a group takes, in events: the window's three
-/// queues are allocated to it when the group starts.
-pub const MAX_REOPEN_HOLD: usize = 1 << 20;
+/// The largest reopening window a group takes, in events: its hold, or
+/// its `in_flight` when larger. The window's three queues are allocated
+/// to it when the group starts, about 216 bytes an event, about 14 MiB at
+/// the cap. The journal header's bound
+/// ([`crate::group::record::MAX_REOPEN_HOLD`]).
+pub const MAX_REOPEN_HOLD: usize = 1 << 16;
 
 /// A new group's journal header.
 #[derive(Debug, Clone, PartialEq, Eq)]

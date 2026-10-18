@@ -58,6 +58,10 @@ const RING_HEADER: u64 = 8;
 /// A reference unavailable record's length: the envelope and its block.
 const UNAVAILABLE_LENGTH: usize = 12 + 16;
 
+/// The largest in-flight bound a group takes: about 14 MiB of tracker
+/// queues at about 216 bytes an event.
+pub const MAX_IN_FLIGHT: usize = 1 << 16;
+
 /// A capture path's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureConfig {
@@ -66,7 +70,9 @@ pub struct CaptureConfig {
     pub ring_capacity: usize,
     /// The largest event, in bytes of records: the event byte budget.
     pub max_event: usize,
-    /// The events written and not yet durable the tracker holds, at least 1.
+    /// The events written and not yet durable the tracker holds: 1 to
+    /// [`MAX_IN_FLIGHT`]. Each takes about 216 bytes of the tracker's
+    /// queues, allocated when the group starts.
     pub in_flight: usize,
 }
 
@@ -257,10 +263,14 @@ pub fn capture<D: Disk>(
         in_flight,
         checkpoints: None,
     };
-    let uncovered = config
+    let bound = config
         .in_flight
         .checked_mul(3)
         .ok_or(CaptureSetup::Config(CaptureError::InFlight))?;
+    let mut uncovered = Vec::new();
+    uncovered
+        .try_reserve_exact(bound)
+        .map_err(|_| CaptureSetup::Journal(JournalError::Allocation))?;
     let job = CaptureJob {
         consumer,
         journal,
@@ -269,7 +279,7 @@ pub fn capture<D: Disk>(
         capture,
         sync_at_bound: policy == SyncPolicy::PerSegment,
         in_flight,
-        uncovered: Vec::with_capacity(uncovered),
+        uncovered,
         capacity: config.ring_capacity,
         emptied: 0,
         signalled: 0,
@@ -320,7 +330,7 @@ fn check(config: CaptureConfig, policy: SyncPolicy) -> Result<(u64, u64, u64), C
     // The events a recording that ended may leave uncovered: the tracker's
     // queue, the first range's events still settling, and, past a stop,
     // the events a checkpoint may yet take.
-    if config.in_flight.checked_mul(3).is_none() {
+    if config.in_flight > MAX_IN_FLIGHT {
         return Err(CaptureError::InFlight);
     }
     if policy == SyncPolicy::None {

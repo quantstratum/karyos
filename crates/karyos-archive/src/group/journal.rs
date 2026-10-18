@@ -84,6 +84,10 @@ pub enum JournalError {
     /// The configuration is invalid.
     #[error("invalid journal configuration")]
     InvalidConfig,
+    /// What reading the journal needs could not be allocated: a prefix
+    /// tracker, or the reopening window its header records.
+    #[error("the journal's recovery could not be allocated")]
+    Allocation,
     /// A record that does not decode: refused, nothing written.
     #[error("invalid record: {0}")]
     Record(#[from] CodecError),

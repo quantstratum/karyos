@@ -2393,6 +2393,171 @@ mod checkpoints {
         out
     }
 
+    /// A group whose checkpoints keep `hold` events, `in_flight` events
+    /// in flight.
+    fn holding(
+        dir: &Path,
+        capture: Option<Capture>,
+        in_flight: usize,
+        hold: Option<usize>,
+    ) -> StartGroup {
+        StartGroup {
+            checkpoints: Some(GroupCheckpoints {
+                max_checkpoint: 300_000,
+                reopen_hold: hold,
+            }),
+            ..start(
+                dir,
+                capture,
+                SyncPolicy::Every { interval_ns: 0 },
+                in_flight,
+            )
+        }
+    }
+
+    /// The shrink scenario of the #426 re-check: a best-effort group with
+    /// room for 2 in flight and a hold of 8; event 1, gap 2, a checkpoint
+    /// at 2 written 1 byte a cycle while events 3 to 8 end. The range
+    /// opens over them: durable to 8. Returns the directory.
+    fn reopened_over_six(name: &str) -> PathBuf {
+        let dir = dirs(name);
+        let slow = AgentConfig {
+            checkpoint_budget: 1,
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, slow).unwrap();
+        let mut sender = agent
+            .start_group(holding(&dir, Some(Capture::BestEffort), 2, Some(8)))
+            .unwrap();
+        let mut handle = sender.take_checkpoints().unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        sender.room().unwrap();
+        sender.send(&gap(2), 2).unwrap();
+        handle
+            .checkpoint(2, 7, |buffer| {
+                buffer[..20_000].fill(5);
+                20_000
+            })
+            .unwrap();
+        for seq in 3..=8 {
+            admitted(&sender);
+            sender.send(&event(seq), seq).unwrap();
+        }
+        assert!(matches!(ended(&mut handle), LastCheckpoint::Recorded(_)));
+        assert_eq!(
+            sender.waiter().wait_durable(8, Duration::from_secs(10)),
+            Ok(8)
+        );
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        dir
+    }
+
+    /// Every file under `dir` with its length.
+    fn files(dir: &Path) -> Vec<(PathBuf, u64)> {
+        let mut files: Vec<_> = walk(dir)
+            .into_iter()
+            .map(|path| {
+                let length = std::fs::metadata(dir.join(&path)).unwrap().len();
+                (path, length)
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A9-5: the reopen hold is the journal header's, fixed per group. A
+    /// restart with the same settings, with no hold named, or with a
+    /// lower `in_flight` recovers the range at 8; one naming a smaller or
+    /// larger hold, or an `in_flight` above the recorded hold, is
+    /// refused, typed, and writes nothing.
+    #[test]
+    fn a_restart_takes_the_recorded_hold() {
+        let dir = reopened_over_six("checkpoint-hold-recorded");
+        let refused = |start: StartGroup, what: &str| {
+            let before = files(&dir);
+            let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+            assert!(
+                matches!(agent.start_group(start), Err(AgentError::CheckpointConfig)),
+                "{what}"
+            );
+            agent.shutdown().unwrap();
+            assert_eq!(files(&dir), before, "{what}: something was written");
+        };
+        refused(holding(&dir, None, 2, Some(4)), "a smaller hold");
+        refused(holding(&dir, None, 2, Some(16)), "a larger hold");
+        refused(holding(&dir, None, 9, None), "in_flight above the hold");
+        for (what, start) in [
+            ("the same settings", holding(&dir, None, 2, Some(8))),
+            ("no hold named", holding(&dir, None, 2, None)),
+            ("a lower in_flight", holding(&dir, None, 1, None)),
+        ] {
+            let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+            let recovered = agent.start_group(start).unwrap();
+            assert_eq!(recovered.view().durable_group_seq(), 8, "{what}");
+            agent.stop_group(GROUP).unwrap();
+            agent.shutdown().unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A9-5: a group made without checkpoints records a hold of 0, and a
+    /// restart with checkpoints is refused, typed.
+    #[test]
+    fn checkpoints_cannot_be_turned_on_at_a_restart() {
+        let dir = dirs("checkpoint-hold-off-on");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let without = StartGroup {
+            checkpoints: None,
+            ..start_with(&dir, Some(Capture::Strict), policy)
+        };
+        let mut sender = agent.start_group(without).unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        assert!(matches!(
+            agent.start_group(start_with(&dir, None, policy)),
+            Err(AgentError::CheckpointConfig)
+        ));
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #426 re-check P2 (pre-existing): an `in_flight` above
+    /// `MAX_IN_FLIGHT` is refused, typed, and the agent keeps running.
+    #[test]
+    fn a_huge_in_flight_is_refused_and_the_agent_survives() {
+        let dir = dirs("checkpoint-huge-in-flight");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        for in_flight in [1 << 60, crate::group::capture::MAX_IN_FLIGHT + 1] {
+            let huge = StartGroup {
+                checkpoints: None,
+                ..start(&dir, Some(Capture::Strict), policy, in_flight)
+            };
+            assert!(
+                matches!(
+                    agent.start_group(huge),
+                    Err(AgentError::Capture(
+                        crate::group::capture::CaptureError::InFlight
+                    ))
+                ),
+                "{in_flight}"
+            );
+        }
+        let sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        assert_eq!(sender.state(), GroupState::Running);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// #426 re-check P2: a reopen hold too large to allocate is refused,
     /// typed, before the journal exists; the agent keeps running and
     /// starts the group with a hold it can take.

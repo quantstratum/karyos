@@ -907,3 +907,12 @@ fn a_loss_event_and_an_uncaptured_payload_complete_alone() {
     );
     assert_eq!(tracker.advance(at, at, &none), (2, 2));
 }
+
+/// #426 re-check P3: the tracker and its reopening window reserve
+/// fallibly: a bound the host cannot hold is an error, not a panic.
+#[test]
+fn an_impossible_window_is_an_error() {
+    assert!(PrefixTracker::try_new(usize::MAX).is_err());
+    let mut tracker = PrefixTracker::new(2);
+    assert!(tracker.reserve_reopen_hold(usize::MAX).is_err());
+}
