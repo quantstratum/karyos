@@ -1809,7 +1809,8 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
 /// SPEC.md §15 "Guarded session abort", the trusted half
 /// (guards-and-abort.md "Trusted sockets in Phase 2", O-11 and GC-6): a
 /// guard close on a trusted socket channel is local. Messages written but
-/// not sent before it never leave; the sender then sends nothing, no
+/// not sent before it never leave and are recorded `Aborted`; the sender
+/// then sends nothing, no
 /// DATA, repair, control, `SESSION_ABORT` or EOS; the close
 /// acknowledgement names the last position submitted under the old epoch;
 /// and the remote image ends at its liveness timeout with the messages
@@ -1909,21 +1910,27 @@ fn a_guard_close_on_a_trusted_channel_ends_the_remote_image_at_liveness() {
     let mut ended = Vec::new();
     pump(&mut [&mut a, &mut b], |drivers| {
         let _ = lane
-            .poll_outcomes(64, |_, record| ended.push(record.kind))
+            .poll_outcomes(64, |_, record| ended.push((record.kind, record.reason)))
             .unwrap();
         drivers[0]
             .close_guard_ack(guard, epoch)
             .unwrap()
             .effective()
             == Some(true)
-            && ended.last() == Some(&Kind::Ended)
+            && ended.last().is_some_and(|(kind, _)| *kind == Kind::Ended)
     });
-    // One final record each, then `Ended`. The three never left: the
-    // design gives them `Aborted`, but the walker records a committed
-    // message `Submitted` (the log as the backend), so their kind is not
-    // checked here; the acknowledgement below says they were not sent.
-    assert_eq!(ended.len(), 4, "{ended:?}");
-    assert_eq!(ended.last(), Some(&Kind::Ended));
+    // The three never left: each is `Aborted` by the close, then `Ended`
+    // (records from the sender gate's submissions, not at commit).
+    let closed = (Kind::Aborted, crate::guard_streams::REASON_GUARD_CLOSED);
+    assert_eq!(
+        ended,
+        [
+            closed,
+            closed,
+            closed,
+            (Kind::Ended, crate::guard_streams::REASON_GUARD_CLOSED)
+        ]
+    );
     let ack = a.close_guard_ack(guard, epoch).unwrap();
     let [(_, SenderAck::Applied { positions, .. })] = ack.senders[..] else {
         panic!("{ack:?}");
@@ -1969,4 +1976,107 @@ fn a_guard_close_on_a_trusted_channel_ends_the_remote_image_at_liveness() {
         (1, 0),
         "ended at liveness, not by an EOS"
     );
+}
+
+/// #381 review P1: on a dedicated runner a receiver failure leaves the
+/// sender's thread, and its gates, running. The driver must not end their
+/// lanes: a message the sender submits after the failure is recorded
+/// `Submitted`, never `Aborted`.
+#[test]
+fn a_receiver_failure_on_a_dedicated_runner_leaves_the_gates_deciding() {
+    use karyos_sys::outcome_ring::Kind;
+
+    use crate::net::NetworkGuard;
+
+    let (mut a, mut b) = (
+        driver(ThreadingMode::Dedicated),
+        driver(ThreadingMode::Shared),
+    );
+    let guard = a.add_guard("dedicated").unwrap();
+    assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
+    let address = free_address();
+    let _ = b
+        .add_network_subscription(10, &channel(address, true))
+        .unwrap();
+    let mut config = aggregate(10, 3, 1);
+    // The sender's reservation and the guard's walker.
+    config.stream.buffer.spare_slots = 4;
+    let publication = a
+        .add_guarded_network_publication(
+            config,
+            &channel(address, true),
+            NetworkGuard {
+                guard,
+                messages: 4,
+                rate: None,
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Optional)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // Connected: two messages delivered and recorded.
+    let (mut sent, mut seen, mut kinds) = (0u8, 0u32, Vec::new());
+    pump(&mut [&mut a, &mut b], |_| {
+        if sent < 2
+            && matches!(
+                lane.offer(&[sent; 100]).unwrap(),
+                OfferOutcome::Accepted { .. }
+            )
+        {
+            sent += 1;
+        }
+        let _ = lane
+            .poll_outcomes(8, |_, record| kinds.push(record.kind))
+            .unwrap();
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        seen == 2 && kinds.len() == 2
+    });
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .receiver
+        .post(|_reply| crate::agents::AgentCommand::Panic)
+        .unwrap();
+    let mut failed = false;
+    for _ in 0..40_000 {
+        if a.do_work().is_err() {
+            failed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert!(failed, "the receiver failed");
+    // Two more, after the failure: the sender's gate submits them.
+    for _ in 0..40_000 {
+        if sent < 4
+            && matches!(
+                lane.offer(&[sent; 100]).unwrap(),
+                OfferOutcome::Accepted { .. }
+            )
+        {
+            sent += 1;
+        }
+        let _ = a.do_work();
+        let _ = b.do_work().unwrap();
+        let _ = lane
+            .poll_outcomes(8, |_, record| kinds.push(record.kind))
+            .unwrap();
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        if kinds.len() == 4 && seen == 4 {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert_eq!((sent, seen), (4, 4), "sent after the failure");
+    assert_eq!(kinds, [Kind::Submitted; 4]);
 }
