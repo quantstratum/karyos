@@ -1330,8 +1330,11 @@ fn a_network_subscription_reports_its_image_changes() {
             assert_ne!(changes[1].image_id, changes[2].image_id, "a new image");
             assert_eq!(reading.image_changes_lost(), 0);
         } else {
-            // Room for two: the first attach was dropped, counted.
-            reading.image_changes(&mut |change| changes.push(change));
+            // Room for two: the first attach was dropped, counted. Taken
+            // one at a time.
+            while let Some(change) = reading.next_image_change() {
+                changes.push(change);
+            }
             let seen: Vec<_> = changes.iter().map(|change| change.available).collect();
             assert_eq!(seen, [false, true]);
             assert_eq!(reading.image_changes_lost(), 1);

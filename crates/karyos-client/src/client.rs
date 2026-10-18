@@ -1400,10 +1400,20 @@ impl<T: TermBytes> Subscription<T> {
     /// (twice [`Context::max_images`]) drop the oldest, counted by
     /// [`Subscription::image_changes_lost`].
     pub fn image_changes(&mut self, each: &mut dyn FnMut(ImageChange)) {
-        if let Kind::Images(images) = &mut self.kind {
-            images.adopt();
-            while let Some(change) = images.changes.pop_front() {
-                each(change);
+        while let Some(change) = self.next_image_change() {
+            each(change);
+        }
+    }
+
+    /// The oldest image change not yet drained, taken: one at a time, as
+    /// [`Subscription::image_changes`] gives them all. `None` for a
+    /// stream or once none is left.
+    pub fn next_image_change(&mut self) -> Option<ImageChange> {
+        match &mut self.kind {
+            Kind::Stream(_) => None,
+            Kind::Images(images) => {
+                images.adopt();
+                images.changes.pop_front()
             }
         }
     }
