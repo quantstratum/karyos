@@ -333,3 +333,104 @@ fn a_best_effort_journal_holds_an_uncaptured_payload() {
     .unwrap();
     assert_eq!(checker.next_seq(), 3);
 }
+
+fn checkpoint(group_seq: u64, checkpoint_id: u64) -> Role {
+    Role::Checkpoint {
+        group_seq,
+        checkpoint_id,
+    }
+}
+
+/// A9-1: a checkpoint sits between events and names one already ended,
+/// at or after the first; recorded checkpoints rise in `group_seq` and in
+/// id. Events after its `group_seq` may come before it (its record lags
+/// the write). A strict journal holds them too, but nothing after its
+/// incomplete end.
+#[test]
+fn checkpoints_name_ended_events_in_rising_order() {
+    let checker = check(&[
+        header(Capture::Strict, 5),
+        Role::Event(5),
+        complete(5, 0),
+        Role::Event(6),
+        complete(6, 0),
+        checkpoint(5, 1),
+        checkpoint(6, 4),
+    ])
+    .unwrap();
+    assert_eq!(checker.last_checkpoint(), Some((6, 4)));
+    let cases = [
+        (
+            vec![header(Capture::Strict, 5)],
+            checkpoint(0, 1),
+            OrderRule::Invalid,
+        ),
+        (
+            vec![header(Capture::Strict, 5)],
+            checkpoint(1, 0),
+            OrderRule::Invalid,
+        ),
+        (
+            vec![header(Capture::Strict, 5)],
+            checkpoint(5, 1),
+            OrderRule::Checkpoint,
+        ),
+        (
+            vec![header(Capture::Strict, 5), Role::Event(5), complete(5, 0)],
+            checkpoint(4, 1),
+            OrderRule::Checkpoint,
+        ),
+        (
+            vec![
+                header(Capture::Strict, 5),
+                Role::Event(5),
+                complete(5, 0),
+                checkpoint(5, 2),
+            ],
+            checkpoint(5, 3),
+            OrderRule::Checkpoint,
+        ),
+        (
+            vec![
+                header(Capture::Strict, 5),
+                Role::Event(5),
+                complete(5, 0),
+                Role::Event(6),
+                complete(6, 0),
+                checkpoint(5, 2),
+            ],
+            checkpoint(6, 2),
+            OrderRule::Checkpoint,
+        ),
+        (
+            vec![header(Capture::Strict, 5), Role::Event(5)],
+            checkpoint(5, 1),
+            OrderRule::Nested,
+        ),
+        (
+            vec![
+                header(Capture::Strict, 5),
+                Role::Event(5),
+                end(5, 0, EndOutcome::Incomplete),
+            ],
+            checkpoint(5, 1),
+            OrderRule::AfterIncomplete,
+        ),
+    ];
+    for (before, role, rule) in cases {
+        let mut checker = check(&before).unwrap();
+        let kept = checker;
+        assert_eq!(
+            checker.push(role),
+            Err(OrderError {
+                ordinal: u64::try_from(before.len()).unwrap(),
+                rule
+            }),
+            "{before:?} then {role:?}"
+        );
+        assert_eq!(checker, kept, "the checker stays as it was");
+    }
+    // In best effort, after a gap: the gap's events count as ended.
+    let checker = check(&[header(Capture::BestEffort, 1), gap(1, 3), checkpoint(3, 1)]).unwrap();
+    assert_eq!(checker.next_seq(), 4);
+}

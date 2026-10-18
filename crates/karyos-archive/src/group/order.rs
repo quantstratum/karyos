@@ -39,10 +39,16 @@ pub enum OrderRule {
     /// it holds the events waiting on their payloads, and this checker
     /// holds a few words.
     Unavailable,
+    /// A checkpoint naming an event before the first or not ended, or one
+    /// whose `group_seq` or `checkpoint_id` is not above the previous
+    /// recorded checkpoint's (A9). A failed write leaves no record, so
+    /// only recorded checkpoints count.
+    Checkpoint,
     /// A `group_seq` or index past `u64` or `u32`.
     Exhausted,
     /// A role no decoded record has: a header whose first `group_seq` is
-    /// 0, or a gap that ends before it starts. Roles are plain values, so
+    /// 0, a gap that ends before it starts, or a checkpoint whose
+    /// `group_seq` or `checkpoint_id` is 0. Roles are plain values, so
     /// the checker refuses these itself.
     Invalid,
 }
@@ -78,6 +84,8 @@ pub struct OrderCheck {
     first_seq: u64,
     next_seq: u64,
     ordinal: u64,
+    /// The last recorded checkpoint's `(group_seq, checkpoint_id)`.
+    checkpoint: Option<(u64, u64)>,
 }
 
 impl Default for OrderCheck {
@@ -96,6 +104,7 @@ impl OrderCheck {
             first_seq: 0,
             next_seq: 0,
             ordinal: 0,
+            checkpoint: None,
         }
     }
 
@@ -173,10 +182,34 @@ impl OrderCheck {
                 Err(OrderRule::Unavailable)
             }
             (State::Between, Role::Unavailable(_)) => Ok(State::Between),
+            (
+                State::Between,
+                Role::Checkpoint {
+                    group_seq,
+                    checkpoint_id,
+                },
+            ) => {
+                if group_seq == 0 || checkpoint_id == 0 {
+                    return Err(OrderRule::Invalid);
+                }
+                let ended = group_seq >= self.first_seq && group_seq < self.next_seq;
+                let above = self
+                    .checkpoint
+                    .is_none_or(|(seq, id)| group_seq > seq && checkpoint_id > id);
+                if !ended || !above {
+                    return Err(OrderRule::Checkpoint);
+                }
+                self.checkpoint = Some((group_seq, checkpoint_id));
+                Ok(State::Between)
+            }
             (State::Between, Role::Observation(..) | Role::End(_)) => Err(OrderRule::OutsideEvent),
             (
                 State::InEvent { .. },
-                Role::Event(_) | Role::Uncaptured(_) | Role::Gap(_) | Role::Unavailable(_),
+                Role::Event(_)
+                | Role::Uncaptured(_)
+                | Role::Gap(_)
+                | Role::Unavailable(_)
+                | Role::Checkpoint { .. },
             ) => Err(OrderRule::Nested),
             (State::InEvent { seq, index }, Role::Observation(of, at)) => {
                 if of != seq {
@@ -217,6 +250,12 @@ impl OrderCheck {
     #[must_use]
     pub const fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// The last recorded checkpoint's `(group_seq, checkpoint_id)`.
+    #[must_use]
+    pub const fn last_checkpoint(&self) -> Option<(u64, u64)> {
+        self.checkpoint
     }
 
     /// How many records it took.
