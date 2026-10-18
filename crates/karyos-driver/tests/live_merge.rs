@@ -1007,7 +1007,7 @@ fn lapped_client_rejoin(
     PublicationIdentity,
     karyos_client::ClientConductor,
 ) {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let mut recorded = Recorded::new(&mut driver, SOURCE);
     let mut client = driver.connect().unwrap();
     let _ = client
