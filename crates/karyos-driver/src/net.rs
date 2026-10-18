@@ -2133,6 +2133,20 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// The Shared receiver's retired images whose `StorageReclaimed` it
+    /// handled, for tests.
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux image process tests (n5)")
+    )]
+    pub(crate) fn receiver_reclaimed_tombstones(&self) -> Option<usize> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.receiver.reclaimed_tombstones()),
+            _ => None,
+        }
+    }
+
     /// The sender agent's counters, in Shared mode (tests).
     #[cfg(test)]
     #[cfg_attr(
@@ -2206,6 +2220,16 @@ impl<T: StreamTerms> Network<T> {
     #[cfg(test)]
     pub(crate) fn image_charge(&self) -> u64 {
         self.images.charged()
+    }
+
+    /// The image table's counters, for tests.
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux image process tests (n5)")
+    )]
+    pub(crate) fn image_counters(&self) -> crate::agents::images::ImageCounters {
+        self.images.counters()
     }
 
     /// Stale aliases that found the queue full, for tests.
