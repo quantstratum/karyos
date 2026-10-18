@@ -16,8 +16,14 @@
 //! 3. the term and vote are the last saved record or the one in flight,
 //!    never torn, so no vote is cast twice in a term;
 //! 4. the stored commit never exceeds the durable last index;
-//! 5. open never drops a durable entry silently: it is `Ok` (a torn tail
-//!    cut, at most), or a typed refusal the case allows.
+//! 5. open never refuses a legitimate crash: it is `Ok`, a torn tail or a
+//!    crash's loss above the watermark cut at most. Crash points whose
+//!    recovery removes a segment its creation left without a data file
+//!    (A2's `CreationGap`) are counted, and must open too.
+//!
+//! A failed flush ends a workload: the log is poisoned, the workload never
+//! retries the flush or counts its data durable, and only a reopen goes
+//! on.
 
 #![allow(
     clippy::unwrap_used,
@@ -30,7 +36,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use karyos_archive::segment::Geometry;
+use karyos_archive::segment::{DropReason, Geometry, SegmentStore};
 use karyos_cluster::{Corruption, Entry, HardState, LogError, RaftLog};
 use karyos_sim::disk::{Decision, SimDisk, Survives};
 use karyos_sim::rng::Rng;
@@ -152,16 +158,10 @@ struct Allowed {
     first_index_before_create: bool,
 }
 
-/// A2's recovery refuses a segment whose creation a crash interrupted when
-/// the directory kept its index file's name but not its data file's
-/// (`BadHeader { problem: Incomplete }`), where it should remove it as one
-/// being created. Until A2 does, that refusal is counted, not failed; it
-/// loses nothing, and every other property is still checked.
-const A2_CREATION_GAP: bool = true;
-
 thread_local! {
-    /// The refusals of the known A2 gap, per test.
-    static GAP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Crash points whose recovery removes a segment its creation left
+    /// with no data file (A2's `CreationGap`), per test: they must open.
+    static GAPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The invariant: `Ok` when the reopened log keeps it, else what broke.
@@ -174,13 +174,17 @@ fn check(
     let restarted = disk
         .after_crash(survives)
         .map_err(|error| error.to_string())?;
+    if let Ok(plan) = SegmentStore::verify(restarted.clone(), Path::new(DIR), 1, geometry())
+        && plan
+            .dropped
+            .iter()
+            .any(|dropped| dropped.reason == DropReason::CreationGap)
+    {
+        GAPS.with(|gaps| gaps.set(gaps.get() + 1));
+    }
     let mut log = match RaftLog::open(restarted, Path::new(DIR), geometry()) {
         Ok(opened) => opened.log,
         Err(LogError::FirstIndex) if allowed.first_index_before_create && !model.created => {
-            return Ok(());
-        }
-        Err(LogError::Corruption(Corruption::Segment { .. })) if A2_CREATION_GAP => {
-            GAP.with(|gap| gap.set(gap.get() + 1));
             return Ok(());
         }
         Err(error) => return Err(format!("open refused: {error}")),
@@ -349,8 +353,8 @@ fn case_1_an_append_spanning_segments() {
     ];
     let (points, flushes) = sweep("case 1", &steps, STRICT);
     println!(
-        "case 1: {points} crash points, {flushes} failed flushes, {} A2 creation-gap refusals",
-        GAP.with(std::cell::Cell::get)
+        "case 1: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
+        GAPS.with(std::cell::Cell::get)
     );
 }
 
@@ -365,8 +369,8 @@ fn case_2_a_crash_between_append_and_sync() {
     ];
     let (points, flushes) = sweep("case 2", &steps, STRICT);
     println!(
-        "case 2: {points} crash points, {flushes} failed flushes, {} A2 creation-gap refusals",
-        GAP.with(std::cell::Cell::get)
+        "case 2: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
+        GAPS.with(std::cell::Cell::get)
     );
 }
 
@@ -383,8 +387,8 @@ fn case_3_every_step_of_truncate() {
     ];
     let (points, flushes) = sweep("case 3", &steps, STRICT);
     println!(
-        "case 3: {points} crash points, {flushes} failed flushes, {} A2 creation-gap refusals",
-        GAP.with(std::cell::Cell::get)
+        "case 3: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
+        GAPS.with(std::cell::Cell::get)
     );
 }
 
@@ -401,8 +405,8 @@ fn case_4_every_step_of_a_hard_state_save() {
     ];
     let (points, flushes) = sweep("case 4", &steps, STRICT);
     println!(
-        "case 4: {points} crash points, {flushes} failed flushes, {} A2 creation-gap refusals",
-        GAP.with(std::cell::Cell::get)
+        "case 4: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
+        GAPS.with(std::cell::Cell::get)
     );
 }
 
@@ -418,8 +422,8 @@ fn case_5_a_torn_record() {
     ];
     let (points, flushes) = sweep("case 5", &steps, STRICT);
     println!(
-        "case 5: {points} crash points, {flushes} failed flushes, {} A2 creation-gap refusals",
-        GAP.with(std::cell::Cell::get)
+        "case 5: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
+        GAPS.with(std::cell::Cell::get)
     );
 }
 
@@ -438,8 +442,8 @@ fn case_6_a_failed_flush_of_the_log_or_the_hard_state() {
     let (points, flushes) = sweep("case 6", &steps, STRICT);
     assert!(flushes > 0);
     println!(
-        "case 6: {points} crash points, {flushes} failed flushes, {} A2 creation-gap refusals",
-        GAP.with(std::cell::Cell::get)
+        "case 6: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
+        GAPS.with(std::cell::Cell::get)
     );
 }
 
@@ -458,8 +462,8 @@ fn case_7_a_reopened_commit_against_the_recovered_log() {
     ];
     let (points, flushes) = sweep("case 7", &steps, STRICT);
     println!(
-        "case 7: {points} crash points, {flushes} failed flushes, {} A2 creation-gap refusals",
-        GAP.with(std::cell::Cell::get)
+        "case 7: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
+        GAPS.with(std::cell::Cell::get)
     );
 }
 
@@ -468,9 +472,13 @@ fn case_7_a_reopened_commit_against_the_recovered_log() {
 #[test]
 fn case_8_a_crash_inside_create() {
     let (points, flushes) = sweep("case 8", &[], STRICT);
+    assert!(
+        GAPS.with(std::cell::Cell::get) > 0,
+        "no crash point left a creation gap"
+    );
     println!(
-        "case 8: {points} crash points, {flushes} failed flushes, {} A2 creation-gap refusals",
-        GAP.with(std::cell::Cell::get)
+        "case 8: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
+        GAPS.with(std::cell::Cell::get)
     );
 }
 
