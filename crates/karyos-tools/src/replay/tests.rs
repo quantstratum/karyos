@@ -188,6 +188,7 @@ fn run_with(
         to: None,
         json: false,
         accept_manifest: false,
+        from_checkpoint: None,
     };
     options(&mut args);
     diff(&args)
@@ -419,6 +420,7 @@ fn errors_exit_3() {
         to: None,
         json: true,
         accept_manifest: false,
+        from_checkpoint: None,
     };
     let report = diff(&missing);
     assert_eq!(report.exit_code(), 3, "{report:?}");
@@ -452,6 +454,7 @@ fn errors_exit_3() {
         to: None,
         json: false,
         accept_manifest: false,
+        from_checkpoint: None,
     };
     let report = diff(&args);
     assert_eq!(report.exit_code(), 3, "{report:?}");
@@ -667,6 +670,7 @@ fn another_contract_is_not_comparable() {
         to: None,
         json: false,
         accept_manifest: false,
+        from_checkpoint: None,
     });
     assert_eq!(report.exit_code(), 2, "{report:?}");
     assert!(report.text().contains("contract 2"), "{}", report.text());
@@ -752,4 +756,226 @@ fn an_event_past_the_record_bound_is_an_error() {
     let report = run(&records, &records, |_| {});
     assert_eq!(report.exit_code(), 3, "{report:?}");
     assert!(report.text().contains("16384 records"), "{}", report.text());
+}
+
+/// Writes `records` to a journal in `dir`, with a checkpoint of each
+/// `snapshot` taken after its event, its store in `dir/checkpoints`.
+fn write_with_checkpoints(
+    dir: &Path,
+    header: &JournalHeader<'_>,
+    records: &[GroupRecord<'_>],
+    checkpoints: &[(u64, &[u8])],
+) {
+    use karyos_archive::group::checkpoint::{CheckpointSlot, CheckpointStore, CheckpointWriter};
+
+    let config = JournalConfig {
+        segment_length: karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let mut journal = GroupJournal::create(StdDisk, dir, header, config).unwrap();
+    let store_dir = dir.join(CHECKPOINTS);
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let store = CheckpointStore::create(StdDisk, &store_dir, header.group_id, config).unwrap();
+    let mut writer = CheckpointWriter::new(store, &journal).unwrap();
+    let mut slot = CheckpointSlot::new(1024);
+    let mut out = vec![0u8; MAX_RECORD];
+    for record in records {
+        let length = record.encode(&mut out).unwrap();
+        let _ = journal.append(&out[..length]).unwrap();
+        if let GroupRecord::End(end) = record {
+            for (_, snapshot) in checkpoints
+                .iter()
+                .filter(|(after, _)| *after == end.group_seq)
+            {
+                let request = slot
+                    .take(end.group_seq, 1, |buffer| {
+                        buffer[..snapshot.len()].copy_from_slice(snapshot);
+                        snapshot.len()
+                    })
+                    .unwrap();
+                let written = writer.write(&mut journal, &request);
+                slot.returned(request, &written);
+                let _ = written.unwrap();
+            }
+        }
+    }
+    let _ = journal.close().unwrap();
+}
+
+/// Diffs two journals written with checkpoints.
+fn run_checkpoints(
+    left: (&[GroupRecord<'_>], &[(u64, &[u8])]),
+    right: (&[GroupRecord<'_>], &[(u64, &[u8])]),
+    options: impl FnOnce(&mut DiffArgs),
+) -> Report {
+    let scratch = Scratch::new();
+    let (left_dir, right_dir) = (scratch.side("left"), scratch.side("right"));
+    let header = header(Capture::Strict, b"m");
+    write_with_checkpoints(&left_dir, &header, left.0, left.1);
+    write_with_checkpoints(&right_dir, &header, right.0, right.1);
+    let mut args = DiffArgs {
+        left: Journal {
+            dir: left_dir,
+            group: 1,
+        },
+        right: Journal {
+            dir: right_dir,
+            group: 1,
+        },
+        from: None,
+        to: None,
+        json: false,
+        accept_manifest: false,
+        from_checkpoint: None,
+    };
+    options(&mut args);
+    diff(&args)
+}
+
+/// Checkpoints are compared as records, matched by `group_seq`: equal
+/// ones are identical; a different snapshot, or one on one side only, is
+/// the `state checkpoint` kind at its `group_seq`.
+#[test]
+fn checkpoints_are_compared_as_records() {
+    let events = timers(1, 4);
+    let same: &[(u64, &[u8])] = &[(2, b"state at 2")];
+    let report = run_checkpoints((&events, same), (&events, same), |_| {});
+    assert_eq!(
+        report,
+        Report::Identical {
+            from: 1,
+            to: Some(4),
+            events: 4
+        }
+    );
+    let other: &[(u64, &[u8])] = &[(2, b"state at 2!")];
+    let report = run_checkpoints((&events, same), (&events, other), |_| {});
+    let Report::Diverged {
+        group_seq,
+        kind,
+        expected,
+        found,
+        ..
+    } = &report
+    else {
+        panic!("{report:?}");
+    };
+    assert_eq!((*group_seq, *kind), (2, Kind::StateCheckpoint));
+    assert!(
+        expected.contains("length 10") && found.contains("length 11"),
+        "{expected} / {found}"
+    );
+    assert!(
+        report.json().contains("\"kind\":\"state checkpoint\""),
+        "{}",
+        report.json()
+    );
+    let report = run_checkpoints((&events, same), (&events, &[]), |_| {});
+    assert!(
+        matches!(&report, Report::Diverged { kind: Kind::StateCheckpoint, group_seq: 2, found, .. } if found == "none"),
+        "{report:?}"
+    );
+    // Matched by `group_seq`: at another event it differs there, the
+    // earlier one first.
+    let later: &[(u64, &[u8])] = &[(3, b"state at 2")];
+    let report = run_checkpoints((&events, same), (&events, later), |_| {});
+    assert!(
+        matches!(
+            &report,
+            Report::Diverged {
+                kind: Kind::StateCheckpoint,
+                group_seq: 2,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+}
+
+/// `--from-checkpoint` compares from the event after it: events before
+/// it may differ. An unknown checkpoint, or a store that is not there,
+/// is not comparable.
+#[test]
+fn from_a_checkpoint_the_range_starts_after_it() {
+    let mut left = timers(1, 4);
+    let mut right = timers(1, 4);
+    // Event 1 differs, before the checkpoint after event 2.
+    left[0] = GroupRecord::Timer(TimerEvent {
+        group_seq: 1,
+        logical_time: 1,
+        timer_id: 5,
+    });
+    right[0] = GroupRecord::Timer(TimerEvent {
+        group_seq: 1,
+        logical_time: 1,
+        timer_id: 6,
+    });
+    let at_two: &[(u64, &[u8])] = &[(2, b"state at 2")];
+    let report = run_checkpoints((&left, at_two), (&right, at_two), |_| {});
+    assert_eq!(report.exit_code(), 1, "{report:?}");
+    let report = run_checkpoints((&left, at_two), (&right, at_two), |args| {
+        args.from_checkpoint = Some(1);
+    });
+    assert_eq!(
+        report,
+        Report::Identical {
+            from: 3,
+            to: Some(4),
+            events: 2
+        }
+    );
+    let report = run_checkpoints((&left, at_two), (&right, at_two), |args| {
+        args.from_checkpoint = Some(9);
+    });
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    // The two checkpoints differ: the state checkpoint kind, first.
+    let other: &[(u64, &[u8])] = &[(2, b"state at 2!")];
+    let report = run_checkpoints((&left, at_two), (&right, other), |args| {
+        args.from_checkpoint = Some(1);
+    });
+    assert!(
+        matches!(
+            report,
+            Report::Diverged {
+                kind: Kind::StateCheckpoint,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    // A store that is not there.
+    let scratch = Scratch::new();
+    let (left_dir, right_dir) = (scratch.side("left"), scratch.side("right"));
+    let header = header(Capture::Strict, b"m");
+    write_with_checkpoints(&left_dir, &header, &left, at_two);
+    write_with_checkpoints(&right_dir, &header, &right, at_two);
+    std::fs::remove_dir_all(right_dir.join(CHECKPOINTS)).unwrap();
+    let report = diff(&DiffArgs {
+        left: Journal {
+            dir: left_dir,
+            group: 1,
+        },
+        right: Journal {
+            dir: right_dir,
+            group: 1,
+        },
+        from: None,
+        to: None,
+        json: false,
+        accept_manifest: false,
+        from_checkpoint: Some(1),
+    });
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+}
+
+#[test]
+fn from_checkpoint_parses() {
+    let args = parse_diff(
+        ["a", "1", "b", "1", "--from-checkpoint", "3"]
+            .iter()
+            .map(OsString::from),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(args.from_checkpoint, Some(3));
 }
