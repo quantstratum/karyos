@@ -363,6 +363,13 @@ pub struct SenderCounters {
     /// next duty (driver-network-agents.md §7: the sender drops its
     /// queues); a repair queue counts as one, a route as one.
     pub removed_closed: u64,
+    /// Items still pending in a removed publication's queues when they
+    /// closed, returned with `QueueClosed`.
+    pub removed_returned: u64,
+    /// Removed publications' routes or queues not recorded for closing:
+    /// the preallocated close list was full (never, by construction; their
+    /// endpoint's next reset drops them).
+    pub removed_unrecorded: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -4658,12 +4665,18 @@ impl<T: StreamTerms> SenderRole<T> {
         // Its routes and queues close at the next duty, which holds the TX
         // halves (driver-network-agents.md §7).
         if let Some(outbound) = outbound.as_deref() {
-            let closing = &mut self.closing;
+            let (closing, mut full) = (&mut self.closing, 0u64);
             outbound.opened_resources(|opened| {
                 if closing.len() < closing.capacity() {
                     closing.push(opened);
+                } else if let Some(count) = full.checked_add(1) {
+                    full = count;
                 }
             });
+            debug_assert_eq!(full, 0, "the close list holds every route");
+            for _ in 0..full {
+                self.count(|c| &mut c.removed_unrecorded);
+            }
         }
         // Every path's SETUP side and bindings go with it.
         match outbound.as_deref() {
@@ -4725,10 +4738,20 @@ impl<T: StreamTerms> SenderRole<T> {
                 continue;
             }
             for queue in opened.queues.into_iter().flatten() {
-                let closed = tx.close_queue(queue, &mut self.close_report).is_ok();
-                while self.close_report.pop_front().is_some() {}
-                if closed {
-                    self.count(|c| &mut c.removed_closed);
+                // A full report leaves items pending: emptied and called
+                // again until none remains, each call returning at least
+                // one, so the queue's depth bounds the loop.
+                while let Ok(outcome) = tx.close_queue(queue, &mut self.close_report) {
+                    while self.close_report.pop_front().is_some() {
+                        self.count(|c| &mut c.removed_returned);
+                    }
+                    if !outcome.more {
+                        self.count(|c| &mut c.removed_closed);
+                        break;
+                    }
+                    if outcome.returned == 0 {
+                        break;
+                    }
                 }
             }
             if tx.remove_route(opened.route).is_ok() {

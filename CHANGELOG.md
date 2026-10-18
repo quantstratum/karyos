@@ -862,7 +862,10 @@ release may break APIs, wire formats and shared-memory layouts.
   driver-network-agents.md §7: the sender drops its queues), on every
   path of a routed one, instead of leaving them open until the endpoint
   retires. A half the sender does not hold then, or one in another
-  epoch, dropped them already. Counted (`removed_closed`).
+  epoch, dropped them already. Counted (`removed_closed`); items still
+  pending in a closing queue are returned and counted
+  (`removed_returned`), and a full close list, never expected, is
+  counted (`removed_unrecorded`).
 - The segment store's arithmetic is checked (SPEC §14): five
   saturating operations in the interval sync and in recovery's counts
   are checked ones. A clock that steps back still syncs nothing.

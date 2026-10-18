@@ -1735,6 +1735,10 @@ pub(crate) mod testing {
 
 /// A lane queue per lane, then the repair queue.
 pub(crate) const OPENED_QUEUES: usize = 5;
+const _: () = assert!(
+    karyos_sys::frame::Lane::COUNT == 4,
+    "OPENED_QUEUES is a queue per lane and the repair queue"
+);
 
 /// A publication's route and queues on one endpoint, in one epoch
 /// ([`Outbound::opened_resources`]).
