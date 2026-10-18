@@ -736,8 +736,8 @@ impl ArchiveHandle {
     /// The word of the `required` recording of stream `stream_id`, session
     /// `session_id`, lane `lane` this Archive records, if any: recordings
     /// are per lane, and a word for another lane would place references
-    /// into the wrong frames. a recording group
-    /// Gateway's source reads it to place payloads by reference. It names
+    /// into the wrong frames. A recording group Gateway's source reads it
+    /// to place payloads by reference. It names
     /// the recording and its start while it records, and is cleared when
     /// the recording stops, ends or fails. Configuration path only.
     ///

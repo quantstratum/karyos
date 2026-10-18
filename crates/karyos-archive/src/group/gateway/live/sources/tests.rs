@@ -357,53 +357,115 @@ fn strict_declines_a_message_it_cannot_record() {
     assert_eq!(taken + delivered, 12);
 }
 
-/// A payload above `MAX_INLINE` with no recording, already read from its
-/// source: strict ends the journal at it, a skipped range recorded
-/// incomplete and not delivered, never silently; best effort delivers it and records its
-/// payload unavailable.
+/// A payload that cannot be recorded, already read from its source:
+/// above `MAX_INLINE` with no recording, or under it but past the event
+/// budget. Strict ends the journal at it: the handler gets the skipped
+/// range as a loss whose effects are refused from the start, the Gateway
+/// refuses every later dispatch at once, and the job ends the group
+/// (not failed). Best effort delivers the message: its payload recorded
+/// unavailable above `MAX_INLINE`, else the message is a gap.
 #[test]
-fn a_payload_past_max_inline_is_unavailable() {
-    for mode in [Capture::Strict, Capture::BestEffort] {
-        let mut rig = rig(mode, 1 << 20, 4096, 1024 * 1024);
-        append(&mut rig, &vec![5u8; MAX_INLINE + 1]);
-        let mut ran = false;
-        let result = rig
-            .gateway
-            .dispatch(&mut |_: &Event<'_>, _: &mut dyn Effects| ran = true);
-        match mode {
-            Capture::Strict => {
-                assert_eq!(result, Err(GatewayError::Ended));
-                assert!(!ran);
-                assert_eq!(rig.gateway.stats().incomplete, 1);
-                // The journal ended at it: the job ends the group.
-                let mut job = rig.job;
-                while job.duty(0, 1024, &NoRecordings).unwrap() {}
-                assert_eq!(job.state(), GroupState::Ended);
-                let bytes = records(job, &rig.disk);
-                let records = decoded(&bytes);
-                assert!(records.iter().any(|record| matches!(
-                    record,
-                    GroupRecord::Loss(LossEvent {
-                        group_seq: 1,
-                        loss: Loss::Skipped(karyos_sys::log_buffer::SkipReason::MessageTooLarge),
-                        ..
-                    })
-                )));
+fn a_payload_that_cannot_be_recorded() {
+    for (length, max_event) in [(MAX_INLINE + 1, 4096), (2000, 1000)] {
+        for mode in [Capture::Strict, Capture::BestEffort] {
+            let mut rig = rig(mode, 1 << 20, max_event, 1024 * 1024);
+            append(&mut rig, &vec![5u8; length]);
+            let mut seen = Vec::new();
+            let result =
+                rig.gateway
+                    .dispatch(&mut |event: &Event<'_>, effects: &mut dyn Effects| {
+                        seen.push((
+                            matches!(
+                                event,
+                                Event::Loss {
+                                    loss: Loss::Skipped(
+                                        karyos_sys::log_buffer::SkipReason::MessageTooLarge
+                                    ),
+                                    ..
+                                }
+                            ),
+                            effects.offer(PublicationId(1), b"p"),
+                        ));
+                    });
+            match (mode, length > MAX_INLINE) {
+                (Capture::BestEffort, false) => assert_eq!(result, Ok(Dispatched::Uncaptured)),
+                _ => assert_eq!(result, Ok(Dispatched::Event { group_seq: 1 }), "{length}"),
             }
-            Capture::BestEffort => {
-                assert_eq!(result, Ok(Dispatched::Event { group_seq: 1 }));
-                assert!(ran);
-                let bytes = records(rig.job, &rig.disk);
-                assert!(decoded(&bytes).iter().any(|record| matches!(
-                    record,
-                    GroupRecord::Message(MessageEvent {
-                        payload: Payload::Unavailable { .. },
-                        ..
-                    })
-                )));
+            match mode {
+                Capture::Strict => {
+                    assert_eq!(seen, [(true, Outcome::Gated)], "{length}");
+                    assert_eq!(rig.gateway.stats().incomplete, 1);
+                    // Latched: refused before the job runs.
+                    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+                    assert_eq!(rig.gateway.dispatch(noop), Err(GatewayError::Ended));
+                    assert_eq!(
+                        rig.gateway.deliver_external(1, b"", noop),
+                        Err(GatewayError::Ended)
+                    );
+                    let mut job = rig.job;
+                    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+                    assert_eq!(job.state(), GroupState::Ended, "{length}");
+                    let bytes = records(job, &rig.disk);
+                    let records = decoded(&bytes);
+                    assert!(records.iter().any(|record| matches!(
+                        record,
+                        GroupRecord::Loss(LossEvent {
+                            group_seq: 1,
+                            loss: Loss::Skipped(
+                                karyos_sys::log_buffer::SkipReason::MessageTooLarge
+                            ),
+                            ..
+                        })
+                    )));
+                }
+                Capture::BestEffort => {
+                    assert_eq!(seen.len(), 1);
+                    assert!(!seen[0].0, "{length}: a message");
+                    let bytes = records(rig.job, &rig.disk);
+                    let records = decoded(&bytes);
+                    if length > MAX_INLINE {
+                        assert!(records.iter().any(|record| matches!(
+                            record,
+                            GroupRecord::Message(MessageEvent {
+                                payload: Payload::Unavailable { .. },
+                                ..
+                            })
+                        )));
+                    } else {
+                        // Under `MAX_INLINE`, an unavailable payload is not
+                        // a record: the message is a gap, delivered.
+                        assert!(
+                            records
+                                .iter()
+                                .any(|record| matches!(record, GroupRecord::Gap(_)))
+                        );
+                    }
+                }
             }
         }
     }
+}
+
+/// An event the observation budget ends incomplete ends the strict
+/// journal: the Gateway refuses every later dispatch at once, before the
+/// job ends the group, which ends (not fails).
+#[test]
+fn a_strict_incomplete_event_is_latched() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    rig.gateway.set_observation_budget(0);
+    append(&mut rig, b"one");
+    append(&mut rig, b"two");
+    let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
+        assert_eq!(effects.offer(PublicationId(1), b"p"), Outcome::Gated);
+    };
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { group_seq: 1 })
+    );
+    assert_eq!(rig.gateway.dispatch(&mut handler), Err(GatewayError::Ended));
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    assert_eq!(job.state(), GroupState::Ended);
 }
 
 /// The kinds of events a handler saw, dispatching until idle.
@@ -936,4 +998,123 @@ fn a_view_at_the_event_budget_is_accepted() {
         rig_budget().gateway.add_conflated(Box::new(over), 5, 1),
         Err(GatewayError::TooLarge(fits + 1))
     );
+}
+
+/// The strict end at a payload that cannot be recorded: live and replay
+/// present the same loss, with every call refused.
+#[test]
+fn the_strict_end_replays_as_it_was_captured() {
+    use crate::group::prefix::recover;
+    use crate::group::replay::gateway::{GatewayConfig, ReplayGateway};
+    use crate::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
+    let mut rig = rig(Capture::Strict, 1 << 20, 4096, 1024 * 1024);
+    append(&mut rig, &vec![5u8; MAX_INLINE + 1]);
+    struct Seen(Vec<(String, Outcome)>);
+    impl Handler for Seen {
+        fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
+            self.0
+                .push((format!("{event:?}"), effects.offer(PublicationId(1), b"p")));
+        }
+    }
+    let mut live = Seen(Vec::new());
+    let _ = rig.gateway.dispatch(&mut live).unwrap();
+    let live = live.0;
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    job.close().unwrap();
+    let mut journal = GroupJournal::recover(
+        rig.disk.clone(),
+        Path::new("/g"),
+        1,
+        JournalConfig {
+            segment_length: MIN_SEGMENT_LENGTH,
+            policy: SyncPolicy::Every {
+                interval_ns: u64::MAX,
+            },
+        },
+    )
+    .unwrap()
+    .journal;
+    let recovery = recover(&mut journal, &NoRecordings, 8).unwrap();
+    let cursor = ReplayCursor::open(
+        journal,
+        &recovery,
+        &ReplayConfig {
+            manifest: b"m",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 4096,
+            records: 8,
+        },
+    )
+    .unwrap();
+    let mut replay = ReplayGateway::new(
+        cursor,
+        &GatewayConfig {
+            publications: &[(1, 1)],
+            subscriptions: &[(2, 1)],
+            conflated: &[],
+            max_claim: 64,
+            max_payload: 0,
+            present_unavailable: false,
+        },
+        None,
+    )
+    .unwrap();
+    let mut replayed = Seen(Vec::new());
+    while let Ok(Dispatched::Event { .. }) = replay.dispatch(&mut replayed) {}
+    let replayed = replayed.0;
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].1, Outcome::Gated);
+    assert_eq!(replayed, live);
+}
+
+/// A second view of one stream and session is refused: replay names a
+/// view by the pair.
+#[test]
+fn a_second_view_of_a_stream_and_session_is_refused() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let (_first, one) = view(64);
+    let (_second, two) = view(64);
+    rig.gateway.add_conflated(Box::new(one), 5, 1).unwrap();
+    assert_eq!(
+        rig.gateway.add_conflated(Box::new(two), 5, 1),
+        Err(GatewayError::DuplicateSource {
+            stream_id: 5,
+            session_id: 1
+        })
+    );
+}
+
+/// A view alone, with the ring full: strict reads none of its values and
+/// refuses the dispatch; once there is room the value comes, once.
+#[test]
+fn strict_reads_a_view_only_with_room() {
+    let mut rig = rig(Capture::Strict, 8 * 1024, 1000, 64 * 1024);
+    // Only the view: the message source ended, polled no more.
+    rig.gateway.sources[0].ended = true;
+    let (mut writer, view) = view(64);
+    rig.gateway.add_conflated(Box::new(view), 5, 1).unwrap();
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.deliver_external(1, &[0u8; 600], noop) {}
+    writer.write(1, b"kept").unwrap();
+    let mut seen = 0;
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+        if matches!(event, Event::Conflated { .. }) {
+            seen += 1;
+        }
+    };
+    assert_eq!(
+        rig.gateway.dispatch(&mut handler),
+        Err(GatewayError::Refused(Refusal::RingFull))
+    );
+    let mut job = rig.job;
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    assert!(matches!(
+        rig.gateway.dispatch(&mut handler),
+        Ok(Dispatched::Event { .. })
+    ));
+    assert_eq!(rig.gateway.dispatch(&mut handler), Ok(Dispatched::Idle));
+    assert_eq!(seen, 1);
 }
