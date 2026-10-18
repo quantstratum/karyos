@@ -843,6 +843,30 @@ fn only_lane_zero_merges() {
             replay: Some(Lane::ZERO),
         })
     );
+    // A failed merge reports its failure even to a poll of no message.
+    assert!(matches!(
+        merge.poll(|_, _| panic!("delivered"), MessageLimit::new(0)),
+        Err(failed) if matches!(failed.cause, MergeError::Lane { .. })
+    ));
+
+    // A replay read on another lane than 0, merged into a lane 0 reader.
+    let live = driver.subscribe(recorded.handle, Role::Required).unwrap();
+    let source = driver.trace_identity(recorded.handle).unwrap();
+    let other = Lane::try_new(1).unwrap();
+    let replay = Box::new(Replay::new(
+        driver
+            .subscribe(lanes.lane(other).unwrap(), Role::Required)
+            .unwrap(),
+        source,
+    ));
+    let merge = LiveMerge::new(live, source, replay);
+    assert_eq!(
+        merge.failure(),
+        Some(MergeError::Lane {
+            live: Some(Lane::ZERO),
+            replay: Some(other),
+        })
+    );
 }
 
 /// A poll with a limit of 0 does nothing: not at the cutover, where the

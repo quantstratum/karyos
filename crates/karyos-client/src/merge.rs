@@ -365,8 +365,11 @@ impl<T: TermBytes> LiveMerge<T> {
 
     /// Gives the live reader back, stopping the replay if it still runs.
     /// It is where the merge left it: at the cutover until the merge
-    /// switched, except after a [`MergeError::Mismatch`] on an optional
-    /// live reader's first message, which it acknowledged.
+    /// switched. After a [`MergeError::Mismatch`] on its first message, a
+    /// required live reader is just before that message: at the cutover,
+    /// or at the next term's start when term padding lies at the cutover
+    /// (it stepped over it); an optional or observer one acknowledged the
+    /// message, and is past it.
     #[must_use]
     pub fn into_live(self) -> ClientSubscription<T> {
         self.live
@@ -374,7 +377,7 @@ impl<T: TermBytes> LiveMerge<T> {
 
     /// Delivers up to `message_limit` messages to `handler`: the replay's
     /// below the cutover, then the live reader's. A limit of 0 does
-    /// nothing. A poll stops at the replay's first report (a skipped range
+    /// nothing, but a failed merge still reports its failure. A poll stops at the replay's first report (a skipped range
     /// or an aborted block below the cutover) and at the cutover itself;
     /// after it, the live reader is polled as [`ClientSubscription::poll`]
     /// polls.
@@ -399,6 +402,9 @@ impl<T: TermBytes> LiveMerge<T> {
         H: FnMut(&[u8], MessageInfo),
     {
         let mut poll = MergePoll::default();
+        if let State::Failed(cause) = self.state {
+            return Err(MergeFailed { poll, cause });
+        }
         if message_limit.get() == 0 {
             return Ok(poll);
         }
