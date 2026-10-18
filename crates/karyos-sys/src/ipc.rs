@@ -943,7 +943,16 @@ pub fn own_uid() -> u32 {
 /// `None` when it is unlimited.
 #[must_use]
 pub fn descriptor_limit() -> Option<u64> {
-    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+    descriptor_limits().0
+}
+
+/// This process's soft and hard limits of open descriptors
+/// (`RLIMIT_NOFILE`); `None` for an unlimited one. The soft limit may be
+/// raised up to the hard one without privilege.
+#[must_use]
+pub fn descriptor_limits() -> (Option<u64>, Option<u64>) {
+    let limits = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    (limits.current, limits.maximum)
 }
 
 /// Checks that `path` is a directory (not a symbolic link) owned by this

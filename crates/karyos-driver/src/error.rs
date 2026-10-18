@@ -131,6 +131,22 @@ pub enum DriverError {
     /// A control-channel limit or size is invalid.
     #[error("invalid driver configuration")]
     InvalidConfig,
+    /// A replay's feed wrote past the end it was finished at; its target
+    /// retired.
+    #[error("a replay finished at {end} but written to {written}")]
+    ReplayOutstanding {
+        /// The end asked for.
+        end: u64,
+        /// Where the feed wrote up to.
+        written: u64,
+    },
+    /// A replay target of a lane other than 0: only lane 0 recordings are
+    /// replayed (A5).
+    #[error("a replay of lane {lane}: only lane 0 is replayed")]
+    ReplayLane {
+        /// The recorded lane.
+        lane: u8,
+    },
     /// No such guard: a foreign handle or an unknown id.
     #[error("unknown guard")]
     UnknownGuard,
@@ -156,6 +172,18 @@ pub enum DriverError {
     /// conflated or held by a remote client (remote incarnations: G-d2b).
     #[error("stream {stream} was sealed by a guard close")]
     GuardSealed {
+        /// The stream id.
+        stream: u64,
+    },
+    /// A lane of a guarded network publication that a guard close sealed
+    /// takes no fresh incarnation after the reopen: the network sender
+    /// does not follow a reincarnation yet (it would keep reading the
+    /// sealed log, and no SETUP would announce the new incarnation), so
+    /// the offer would be accepted and never sent. The publication is
+    /// removed and added again instead (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, On the network).
+    #[error("stream {stream} is a guarded network publication: it takes no fresh incarnation")]
+    NetworkReincarnation {
         /// The stream id.
         stream: u64,
     },
@@ -275,12 +303,17 @@ pub enum DriverError {
     /// An IPC driver with a network could hold more descriptors than this
     /// process may open (`RLIMIT_NOFILE`): its image lanes, stream
     /// mappings and clients at their configured bounds. Checked at start.
-    #[error("the driver may need {needed} descriptors, above the limit of {limit}")]
+    /// When `needed` is within `hard`, raising the soft limit is enough.
+    #[error(
+        "the driver may need {needed} descriptors, above the soft limit of {limit} (hard limit {hard:?})"
+    )]
     DescriptorLimit {
         /// Descriptors the configured bounds can hold.
         needed: u64,
         /// The process's soft limit.
         limit: u64,
+        /// The process's hard limit; `None` when unlimited.
+        hard: Option<u64>,
     },
     /// Every publication the stream can issue is out: its exclusive
     /// publication, or all `P` publisher slots of a concurrent stream.

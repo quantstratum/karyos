@@ -1809,15 +1809,16 @@ fn a_held_grant_fetched_on_a_retiring_stream_reports_closed_at_the_seal() {
 
 /// Resolution 4 (network streams over shared terms): an IPC driver with a
 /// network checks its descriptor limit at start. Bounds no `RLIMIT_NOFILE`
-/// can cover fail with the typed error naming both numbers; the default
-/// bounds start (480 descriptors, under any usual soft limit).
+/// can cover fail with the typed error naming the needed count and the soft
+/// and hard limits; the default bounds start (496 descriptors, under any
+/// usual soft limit).
 #[test]
 fn an_ipc_driver_with_a_network_checks_its_descriptor_limit_at_start() {
     let network = karyos_driver::net::NetworkConfig {
         threading: karyos_driver::agents::ThreadingMode::Shared,
         ..karyos_driver::net::NetworkConfig::default()
     };
-    let limit = karyos_sys::ipc::descriptor_limit();
+    let (limit, hard) = karyos_sys::ipc::descriptor_limits();
     let over_dir = dir("descriptors-over");
     let over = EmbeddedDriver::<SharedTerms>::with_ipc(
         DriverConfig {
@@ -1832,8 +1833,8 @@ fn an_ipc_driver_with_a_network_checks_its_descriptor_limit_at_start() {
         Some(limit) => assert!(
             matches!(
                 over,
-                Err(karyos_driver::DriverError::DescriptorLimit { needed, limit: l })
-                    if l == limit && needed == 64 * 4 + (1u64 << 40) * 3 + 16 * 2
+                Err(karyos_driver::DriverError::DescriptorLimit { needed, limit: l, hard: h })
+                    if l == limit && h == hard && needed == 64 * 4 + (1u64 << 40) * 3 + 16 * 3
             ),
             "{over:?}"
         ),

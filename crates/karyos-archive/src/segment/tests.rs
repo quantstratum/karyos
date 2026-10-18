@@ -38,6 +38,8 @@ enum Step {
     Append(usize),
     Sync,
     Tick(u64),
+    /// Truncates to the start plus this many bytes.
+    Truncate(u64),
 }
 
 /// What a workload reported before it stopped.
@@ -91,6 +93,9 @@ fn run(
             }
             Step::Sync => store.sync().map(drop),
             Step::Tick(now) => store.tick(now).map(drop),
+            Step::Truncate(offset) => store.truncate(start + offset).map(|_| {
+                position = start + offset;
+            }),
         };
         // What the store claims, failures included: a claim made before a
         // failure must hold too.
@@ -723,7 +728,7 @@ fn bad_headers_are_typed_errors() {
         term_length: 64,
     }
     .encode();
-    header[4..8].copy_from_slice(&2u32.to_le_bytes());
+    header[4..8].copy_from_slice(&3u32.to_le_bytes());
     let crc = crc32c(&header[..44]);
     header[44..].copy_from_slice(&crc.to_le_bytes());
     overwrite_header(&disk, 128, &header);
@@ -1171,6 +1176,7 @@ fn an_unknown_entry_kind_is_refused() {
         length: 4,
         data_crc: 0,
         kind: EntryKind::Gap,
+        time_ns: 0,
     };
     let mut bytes = entry.encode();
     bytes[16] = 9;
@@ -1277,6 +1283,7 @@ fn an_index_with_too_many_gaps_is_refused() {
         length: 1,
         data_crc: 0,
         kind: EntryKind::Gap,
+        time_ns: 0,
     };
     let mut raw = disk.clone();
     let index = raw.open(&dir.join(index_name(RECORDING, 0))).unwrap();
@@ -1286,4 +1293,159 @@ fn an_index_with_too_many_gaps_is_refused() {
         SegmentStore::recover(disk, dir, RECORDING, geometry, SyncPolicy::None),
         Err(SegmentError::TooManyGaps)
     ));
+}
+
+/// The truncation gate: appends, truncations inside a segment, at a
+/// segment's end and back to the start, each followed by more appends. At
+/// every crash point and under the three crash models, recovery keeps at
+/// least what was reported durable (a truncation lowers it), reads the
+/// stream back exactly, and continues.
+#[test]
+fn every_crash_point_survives_a_truncation() {
+    let steps = [
+        Step::Append(50),
+        Step::Append(100),
+        Step::Sync,
+        Step::Append(30),
+        // Inside the third segment, at the end of a write.
+        Step::Truncate(150),
+        Step::Append(40),
+        Step::Append(90),
+        // At the end of the first segment: a write ends there.
+        Step::Truncate(128),
+        Step::Append(20),
+        // Back to the start.
+        Step::Truncate(0),
+        Step::Append(70),
+    ];
+    for (policy, start) in [
+        (SyncPolicy::PerSegment, 0),
+        (SyncPolicy::None, 0),
+        (SyncPolicy::Every { interval_ns: 1 }, 0),
+    ] {
+        let failures = crash_everywhere(&steps, policy, start, false);
+        assert!(
+            failures.is_empty(),
+            "{policy:?} from {start}: {failures:#?}"
+        );
+    }
+}
+
+/// Once `truncate` returns, a crash recovers exactly to its position,
+/// whatever survives.
+#[test]
+fn a_truncation_holds_once_it_returns() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        dir,
+        RECORDING,
+        geometry(),
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    let bytes = stream(300);
+    store.append(0, &bytes[..100]).unwrap();
+    store.append(100, &bytes[100..300]).unwrap();
+    assert_eq!(store.truncate(100).unwrap(), 100);
+    assert_eq!((store.written(), store.durable()), (100, 100));
+    // No stale byte lingers past the written position.
+    let mut files = disk.clone();
+    let data = files.open(&dir.join(data_name(RECORDING, 0))).unwrap();
+    assert_eq!(files.len(&data).unwrap(), 100);
+    let mut beyond = [0u8; 1];
+    assert!(matches!(
+        store.read(100, &mut beyond),
+        Err(SegmentError::OutOfRange { .. })
+    ));
+    for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
+        let recovered = SegmentStore::recover(
+            disk.after_crash(survives),
+            dir,
+            RECORDING,
+            geometry(),
+            SyncPolicy::None,
+        )
+        .unwrap();
+        assert_eq!(recovered.store.written(), 100, "{survives:?}");
+        assert_eq!(recovered.cut, None, "{survives:?}");
+        assert_eq!(recovered.dropped_segments, 0, "{survives:?}");
+    }
+}
+
+/// A position outside the recording, or inside a write, is refused with
+/// nothing changed; truncating to the written position changes nothing.
+#[test]
+fn an_invalid_truncation_changes_nothing() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut store =
+        SegmentStore::create(disk, dir, RECORDING, geometry(), SyncPolicy::None, 10).unwrap();
+    let bytes = stream(100);
+    store.append(10, &bytes[..40]).unwrap();
+    store.append(50, &bytes[40..100]).unwrap();
+    for position in [9, 111, 30, 64 + 10] {
+        assert!(
+            matches!(
+                store.truncate(position),
+                Err(SegmentError::InvalidTruncate { .. })
+            ),
+            "{position}"
+        );
+        assert_eq!(store.written(), 110);
+    }
+    assert_eq!(store.truncate(110).unwrap(), 110);
+    store.append(110, &bytes[..1]).unwrap();
+    assert_eq!(store.truncate(10).unwrap(), 10);
+    assert_eq!(store.written(), 10);
+}
+
+/// The truncation's terminator never decodes as an entry: its own CRC
+/// fails, so recovery cuts there.
+#[test]
+fn the_terminator_is_never_an_entry() {
+    assert_eq!(Entry::decode(&[0u8; 32]), None);
+}
+
+/// A truncation to a segment's end keeps that segment whole, also when the
+/// next segment was never created (nothing written past the end).
+#[test]
+fn a_truncation_to_a_segment_end_keeps_it() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut store =
+        SegmentStore::create(disk, dir, RECORDING, geometry(), SyncPolicy::None, 0).unwrap();
+    let bytes = stream(200);
+    store.append(0, &bytes[..128]).unwrap();
+    assert_eq!(store.truncate(128).unwrap(), 128);
+    store.append(128, &bytes[128..200]).unwrap();
+    assert_eq!(store.truncate(128).unwrap(), 128);
+    store.append(128, &bytes[128..200]).unwrap();
+    let mut all = vec![0u8; 200];
+    store.read(0, &mut all).unwrap();
+    assert_eq!(all, bytes);
+}
+
+/// A clock read before the last sync (it stepped back) is no interval: the
+/// interval policy does not sync on it.
+#[test]
+fn a_backward_clock_does_not_sync() {
+    let dir = Path::new(DIR);
+    let mut store = SegmentStore::create(
+        FaultDisk::default(),
+        dir,
+        RECORDING,
+        geometry(),
+        SyncPolicy::Every { interval_ns: 10 },
+        0,
+    )
+    .unwrap();
+    let bytes = stream(20);
+    store.append(0, &bytes[..10]).unwrap();
+    assert_eq!(store.tick(100).unwrap(), 10);
+    store.append(10, &bytes[10..20]).unwrap();
+    assert_eq!(store.tick(50).unwrap(), 10, "no sync on a backward step");
+    assert_eq!(store.tick(110).unwrap(), 20);
 }

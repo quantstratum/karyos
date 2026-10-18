@@ -378,3 +378,179 @@ fn sent_high_never_decreases_across_paths() {
         );
     }
 }
+
+/// rp-w7c, §8 Leaving: a path that flaps, leaving by lag and returning on
+/// its open queue each time, never asks for an endpoint reset, and sends
+/// again after each return.
+#[test]
+fn a_flapping_path_returns_with_no_reset() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    let mut now = 1000;
+    for (flap, wait) in [10u64, 20, 40, 40].into_iter().enumerate() {
+        outbound.leave_before_serve(1);
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+        assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now + wait)
+            .unwrap();
+        assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+        let calls = observer_b.send_calls();
+        commit(&mut log, u8::try_from(flap).unwrap(), 1);
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now + wait + 1)
+            .unwrap();
+        assert!(
+            observer_b.send_calls() > calls,
+            "flap {flap}: B sends again"
+        );
+        assert!(!outbound.needs_reset(), "flap {flap}: no endpoint reset");
+        now += wait + 2;
+    }
+    let counters = outbound.path_counters(1).unwrap();
+    assert_eq!((counters.exits, counters.entries), (4, 4));
+}
+
+/// rp-w7c, §8 Leaving: a lagging path never fills `repair_jobs`. With room
+/// for 4 jobs and B blocked for good, 12 NAKs in turn each make a job that
+/// completes on A while B skips it: the table never fills.
+#[test]
+fn a_lagging_path_never_fills_repair_jobs() {
+    use crate::agents::repair::{NakOutcome, RepairConfig};
+    use crate::repair::jobs::JobsConfig;
+    use crate::repair::scheduler::RepairBudget;
+
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 1);
+    let mut halves = vec![a, b];
+    let routes = [
+        (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
+        (EndpointId(2), SocketAddr::from(([127, 0, 0, 2], 41_000))),
+    ];
+    let (mut outbound, mut log) = outbound_routed(&routes, ALIAS, TERM, 1, true);
+    let config = RepairConfig {
+        jobs: JobsConfig {
+            repair_jobs: 4,
+            ..JobsConfig::default()
+        },
+        ..RepairConfig::default()
+    };
+    outbound
+        .enable_repair(&config, TERM.term_length, repair_identity())
+        .unwrap();
+    outbound.set_path_policy(super::super::PathPolicy::default());
+    commit(&mut log, 0, 1);
+    for now in 0..4 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    // Each NAK past the last job's linger: a new job each time.
+    let linger = JobsConfig::default().repair_linger;
+    for round in 0..12u64 {
+        let now = 10 + round * 2 * linger;
+        assert_eq!(
+            outbound.nak_on(&first_nak(), MEMBER, (0, true), now),
+            NakOutcome::Queued,
+            "round {round}"
+        );
+        let mut budget = RepairBudget::default();
+        assert_eq!(
+            outbound.serve_repair_routes(&mut halves, &mut budget, now),
+            1,
+            "round {round}"
+        );
+    }
+    let (_, jobs, _) = outbound.repair().unwrap().parts();
+    let counts = jobs.counts();
+    assert_eq!((counts.done, counts.full), (12, 0), "{counts:?}");
+    assert_eq!(outbound.repair_route_counts(1).unwrap().skipped, 12);
+    drain(
+        &mut outbound,
+        &mut halves,
+        &[&observer_a, &observer_b],
+        1_000_000_000,
+    );
+}
+
+/// rp-w7c, §8 Absorption table: with the table full, a NAK's copy on the
+/// other path is served as an ordinary NAK (it joins its job), not
+/// absorbed and not dropped.
+#[test]
+fn a_full_absorption_table_serves_copies_as_naks() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, _halves, _seen, _observer_b) = repair_rig();
+    outbound.set_path_policy(super::super::PathPolicy {
+        copy_entries: 1,
+        ..super::super::PathPolicy::default()
+    });
+    let mut second = first_nak();
+    second.receiver.receiver_id = 2;
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
+        NakOutcome::Queued
+    );
+    // The table's one entry holds the first NAK: the second is not
+    // recorded.
+    assert_eq!(
+        outbound.nak_on(&second, MEMBER, (0, true), 11),
+        NakOutcome::Queued
+    );
+    assert_eq!(outbound.repair().unwrap().absorb_counts().full, 1);
+    assert!(outbound.absorbs(&first_nak(), 1, 12), "the recorded one is");
+    assert!(
+        !outbound.absorbs(&second, 1, 12),
+        "the unrecorded one is not"
+    );
+    // Served as an ordinary NAK: it joins the pending job.
+    assert_eq!(
+        outbound.nak_on(&second, MEMBER, (1, true), 12),
+        NakOutcome::Queued
+    );
+}
+
+/// rp-w9, RP-10: `path_counters` reports each path's own datagrams and
+/// bytes submitted, for capacity planning: two datagrams on both paths,
+/// then one on A alone while B blocks.
+#[test]
+fn each_path_reports_its_datagrams_and_bytes() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 2);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    commit(&mut log, 0, 2);
+    for now in 0..4 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    commit(&mut log, 2, 1);
+    for now in 4..8 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    let (a, b) = (
+        outbound.path_counters(0).unwrap(),
+        outbound.path_counters(1).unwrap(),
+    );
+    // Each datagram carries one 1000-byte message: its 32-byte header and
+    // payload, 1032 bytes (the frame's aligned length, FRAME, is 1056).
+    const DATAGRAM: u64 = 1032;
+    assert_eq!((a.datagrams, a.bytes), (3, 3 * DATAGRAM), "{a:?}");
+    assert_eq!((b.datagrams, b.bytes), (2, 2 * DATAGRAM), "{b:?}");
+    drain(&mut outbound, &mut halves, &[&observer_a, &observer_b], 10);
+}

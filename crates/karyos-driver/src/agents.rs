@@ -144,6 +144,18 @@ impl IdleStrategy for YieldThenSleep {
 /// RSP_SETUP and SM slots (network-sessions.md S5 `control_queue_floor`).
 const CONTROL_FLOOR: usize = 32;
 
+/// The most bytes the receiver's path queues may allocate (64 MiB):
+/// `sessions.max_paths × path_queue_datagrams × MAX_DATAGRAM`.
+pub const MAX_PATH_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The bytes the receiver's path queues allocate for `config`; `None` past
+/// `usize`.
+pub(crate) fn path_queue_bytes(config: &AgentConfig) -> Option<usize> {
+    usize::from(config.sessions.max_paths)
+        .checked_mul(usize::from(config.path_queue_datagrams))?
+        .checked_mul(usize::from(karyos_io::sockets::endpoint::MAX_DATAGRAM))
+}
+
 /// Configuration of the agents and their rings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentConfig {
@@ -193,6 +205,19 @@ pub struct AgentConfig {
     pub control_routes: usize,
     /// Datagrams the receiver reads per endpoint and cycle, at least 1.
     pub rx_datagrams: u32,
+    /// `path_queue_datagrams` (redundant-paths.md section 5): the datagrams
+    /// each path queue of the receiver holds (default 256, the design's, at
+    /// least 1). A multi-path image's datagrams wait in their path's queue
+    /// between the endpoint's receive poll and the image, served round
+    /// robin across paths. The queues are per local receive endpoint. The
+    /// receiver allocates `sessions.max_paths × path_queue_datagrams ×
+    /// MAX_DATAGRAM` (8 KiB) bytes for them, in one slab, when it first
+    /// binds a later path of an image (8 MiB by default), at most
+    /// [`MAX_PATH_QUEUE_BYTES`]; a single-path receiver allocates none.
+    /// At least `rx_datagrams` (the defaults: 256 and 64), one poll never
+    /// fills a queue, since every queue is drained after each cycle's
+    /// polls; a smaller queue drops a poll's excess.
+    pub path_queue_datagrams: u16,
     /// Subscribed streams and published aliases the receiver tracks, each
     /// at least 1.
     pub subscriptions: usize,
@@ -262,6 +287,7 @@ impl Default for AgentConfig {
             control_capacity: 512,
             control_routes: 8,
             rx_datagrams: 64,
+            path_queue_datagrams: 256,
             subscriptions: 64,
             rsp_setup_per_destination: 20,
             rsp_setup_destinations: 64,
@@ -325,6 +351,7 @@ impl AgentConfig {
             || self.control_capacity == 0
             || self.control_routes == 0
             || self.rx_datagrams == 0
+            || self.path_queue_datagrams == 0
             || self.subscriptions == 0
             || self.rsp_setup_per_destination == 0
             || self.rsp_setup_destinations == 0
@@ -335,6 +362,11 @@ impl AgentConfig {
         {
             return Err(AgentError::InvalidConfig(
                 "a network capacity or budget is zero",
+            ));
+        }
+        if path_queue_bytes(self).is_none_or(|bytes| bytes > MAX_PATH_QUEUE_BYTES) {
+            return Err(AgentError::InvalidConfig(
+                "sessions.max_paths × path_queue_datagrams × MAX_DATAGRAM must be at most 64 MiB",
             ));
         }
         if self.max_endpoints == 0 {
@@ -1060,6 +1092,23 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     #[cfg(test)]
     pub(crate) fn ignore_naks(&mut self) {
         self.role.ignore_naks();
+    }
+
+    /// Lane `lane`'s sent frontier in its `index`-th publication: the
+    /// highest position a submitted datagram reached, `sent_high` (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast test (MC-1)")
+    )]
+    pub(crate) fn sent_high(&self, index: usize, lane: usize) -> Option<u64> {
+        self.role.outbound(index)?.sent_high(lane)
+    }
+
+    /// The counters of its `index`-th publication's data path (tests).
+    #[cfg(test)]
+    pub(crate) fn outbound_counters(&self, index: usize) -> Option<data::OutboundCounters> {
+        self.role.outbound(index).map(data::Outbound::counters)
     }
 
     /// Reads NAKs again after [`SenderAgent::ignore_naks`] (tests).

@@ -1738,6 +1738,7 @@ fn a_guard_closed_publication_ends_its_image_at_liveness() {
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
             rate: None,
+            frontier: Default::default(),
         }),
         ..Setup::default()
     });
@@ -2041,16 +2042,17 @@ fn aborted_over_the_network(lose: bool) {
         return;
     }
     // The hole is the aborted extent, whole, and every NAK (a retry while
-    // the repair is in flight) stays inside it.
+    // the repair is in flight) names exactly it: none past its end.
     assert!(!posted.is_empty());
     assert_eq!(
         (posted[0].range.start, posted[0].range.length),
         (start, extent)
     );
+    assert_eq!(start + u64::from(extent), end);
     for nak in posted {
-        assert!(
-            nak.range.start >= start && nak.range.start + u64::from(nak.range.length) <= end,
-            "a NAK outside the aborted extent [{start}, {end}): {nak:?}"
+        assert_eq!(
+            nak.range, posted[0].range,
+            "a NAK of another range: {nak:?}"
         );
     }
     let counters = rig.agents.receiver.role.loss_counters(slot).unwrap();
@@ -2080,8 +2082,13 @@ fn peer_frame(
     reserved_value: i64,
     payload: &[u8],
 ) -> Vec<u8> {
-    let term_length = 65_536;
-    let term_id = 9 + u32::try_from(position / term_length).unwrap();
+    // The rig publication's terms, as `Rig::new` announces them.
+    let params = term(65_536);
+    let term_length = u64::from(params.term_length);
+    let term_id = params
+        .initial_term_id
+        .cast_unsigned()
+        .wrapping_add(u32::try_from(position / term_length).unwrap());
     let term_offset = u32::try_from(position % term_length).unwrap();
     let mut bytes = Vec::with_capacity(32 + payload.len());
     bytes.extend_from_slice(&word0.pack().to_le_bytes());
@@ -4135,6 +4142,7 @@ fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
             rate: None,
+            frontier: Default::default(),
         }),
         ..Setup::default()
     });
@@ -4261,6 +4269,7 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
             rate: None,
+            frontier: Default::default(),
         }),
         ..Setup::default()
     });
@@ -4370,6 +4379,169 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
             ..
         }
     ));
+}
+
+/// T6 (contract-traceability-phase-2.md, "Receiver restart freshness",
+/// the trusted half; SPEC §13): a restarted receiver, here a fresh rig
+/// with a new boot id and no binding, challenge or quarantine state, while
+/// the publisher stays live. Replayed old DATA is unbound and delivered
+/// nowhere. The replayed SETUP makes the receiver challenge afresh, and
+/// while that challenge is pending a replayed old SETUP_ANSWER, echoing the
+/// old boot id and nonce, is dropped and binds nothing: only the fresh
+/// challenge's answer binds. Once bound, above a join point, old DATA
+/// below the join and every replayed copy of a committed frame are not
+/// delivered: each message reaches the subscriber once. `multicast` only
+/// changes how the image times its NAKs here (the rig runs on loopback
+/// unicast). The MAC cases need the authenticated profile (owner decision
+/// 5, ADR-0035).
+fn a_restarted_receiver_binds_only_through_a_fresh_challenge(multicast: bool) {
+    use karyos_protocol::network::{ChallengeBlock, Control, SetupAnswer};
+    use karyos_sys::log_buffer::{AppendOptions, PollOutcome, Role};
+
+    let (mut rig, b) = Rig::new(Setup {
+        multicast,
+        before: 2,
+        ..Setup::default()
+    });
+    // The subscription and the publication are added.
+    rig.round(true);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert_eq!(sessions.installed, 0);
+    // The answer the receiver got before its restart, replayed.
+    let old_answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: term(65_536),
+        challenge: ChallengeBlock {
+            receiver_boot_id: [0x0b00_7001, 1],
+            nonce: [0x0001_d001, 2],
+        },
+        joins: Lanes::new(&[0, 0]).unwrap(),
+    };
+    // Old DATA of the alias, replayed: no image binds it.
+    let unbound = rig.agents.receiver.counters().data_unbound;
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_data(
+        &receiver.sessions,
+        b,
+        source,
+        alias(),
+        &stale_frame(9, 0, 32),
+        rig.now,
+    );
+    assert_eq!(rig.agents.receiver.counters().data_unbound, unbound + 1);
+    // The old SETUP, replayed: the receiver challenges with its new boot
+    // id, and that challenge is pending.
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::SetupAnnounce(announce(65_536)),
+        rig.now,
+    );
+    // (The old DATA solicited; the SETUP's challenge replaces that.)
+    let pending = rig.agents.receiver.role.session_counters();
+    assert!(
+        pending.challenges + pending.challenges_replaced
+            > sessions.challenges + sessions.challenges_replaced,
+        "no challenge pending: {pending:?}"
+    );
+    // The old answer, replayed while it is: its boot id and nonce are not
+    // the pending challenge's, so it is dropped and binds nothing.
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::SetupAnswer(old_answer),
+        rig.now,
+    );
+    let after = rig.agents.receiver.role.session_counters();
+    assert_eq!(after.dropped, pending.dropped + 1, "the old answer");
+    assert_eq!(after.installed, 0);
+    // Only the fresh challenge's answer, from the live publisher, binds.
+    let slot = established(&mut rig);
+    let challenges: Vec<_> = rig
+        .agents
+        .receiver
+        .role
+        .posted_challenges()
+        .iter()
+        .filter_map(|(_, control)| match control {
+            Control::Challenge(challenge) => Some(challenge.challenge),
+            _ => None,
+        })
+        .collect();
+    // Every challenge carries the restarted receiver's own boot id.
+    let boot_id = challenges.first().unwrap().receiver_boot_id;
+    assert!(
+        challenges
+            .iter()
+            .all(|challenge| challenge.receiver_boot_id == boot_id),
+        "{challenges:?}"
+    );
+    assert_eq!(rig.agents.receiver.role.session_counters().installed, 1);
+    // The image joins above 0: after the two messages appended first.
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let join = 2 * 1056;
+    // Every DATA datagram from here arrives twice, as replays would.
+    let dropped = rig.agents.receiver.counters().data_dropped;
+    rig.agents.receiver.role.drop_data(&[]);
+    rig.agents.receiver.role.repeat_data_from(0);
+    let log = rig.log.as_mut().unwrap();
+    for i in 0..3u8 {
+        let _ = log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let mut delivered = Vec::new();
+    let mut out = vec![0u8; 2048];
+    for _ in 0..200 {
+        rig.round(true);
+        while let PollOutcome::Message { position, .. } = subscriber.poll(&mut out).unwrap() {
+            subscriber.acknowledge();
+            delivered.push(position);
+        }
+        if delivered.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(delivered, [join, join + 1056, join + 2 * 1056]);
+    // Each frame's copy was dropped as a duplicate.
+    let copies = rig.agents.receiver.counters().data_dropped - dropped;
+    assert!(copies >= 3, "{copies} copies dropped");
+    // Old DATA below the join point, replayed.
+    let dropped = rig.agents.receiver.counters().data_dropped;
+    let committed = rig.agents.receiver.counters().data_committed;
+    for offset in [0, 1056] {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_data(
+            &receiver.sessions,
+            b,
+            source,
+            alias(),
+            &stale_frame(9, offset, 1000),
+            rig.now,
+        );
+    }
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.counters().data_committed, committed);
+    assert!(rig.agents.receiver.counters().data_dropped >= dropped + 2);
+    assert_eq!(subscriber.poll(&mut out).unwrap(), PollOutcome::Pending);
+}
+
+#[test]
+fn a_restarted_unicast_receiver_binds_only_through_a_fresh_challenge() {
+    a_restarted_receiver_binds_only_through_a_fresh_challenge(false);
+}
+
+#[test]
+fn a_restarted_multicast_receiver_binds_only_through_a_fresh_challenge() {
+    a_restarted_receiver_binds_only_through_a_fresh_challenge(true);
 }
 
 /// P2.12 step 3 PR 2: a hook that records the receiver's commits and its
@@ -5167,6 +5339,23 @@ fn a_lane_that_cannot_be_created_refuses_the_whole_image() {
     );
 }
 
+/// A CreateImage still queued when the network closes is refused, with no
+/// lane built: the closing source lends neither memory nor regions.
+#[test]
+fn a_closing_network_refuses_a_queued_image() {
+    let mut chain = Chain::<karyos_sys::term_bytes::HeapTerms>::new(ImageTemplate::default());
+    chain.create(1, 4);
+    chain.poll(&mut LaneSource::closing());
+    assert!(matches!(
+        chain.end.commands.try_take().unwrap(),
+        Some(SessionCommand::RefuseImage { .. })
+    ));
+    let counters = chain.images.counters();
+    assert_eq!((counters.refused_storage, counters.offered), (1, 0));
+    assert_eq!(chain.images.charged(), 0);
+    assert!(chain.images.last_lanes.is_empty(), "no lane was built");
+}
+
 #[cfg(target_os = "linux")]
 mod shared {
     //! The image table over the shared lane source (network-shared-terms
@@ -5320,6 +5509,85 @@ mod shared {
         chain.create(1, 1);
         chain.poll(&mut LaneSource::heap());
         assert_eq!(chain.images.counters().refused_storage, 1);
+    }
+
+    /// The marker of the child that runs out of descriptors.
+    const EMFILE_CHILD: &str = "KARYOS_IMAGES_EMFILE_CHILD";
+
+    /// A real `Region::create` failure, not a test hook: a child of this
+    /// test binary, under a small `RLIMIT_NOFILE`, runs
+    /// [`a_region_that_cannot_be_created_refuses_the_image_child`]. The
+    /// limit is the child's own, so no other test runs short.
+    #[test]
+    fn a_region_that_cannot_be_created_refuses_the_image() {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -n 64 && exec \"$0\" \"$@\"")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "agents::images::tests::shared::a_region_that_cannot_be_created_refuses_the_image_child",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD, "1")
+            .output()
+            .unwrap();
+        // A filter that matches nothing also exits 0: the child must have
+        // run its one test.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+    }
+
+    /// The child: every descriptor but one is taken, so a four-lane image
+    /// creates its first lane's region and fails the second's `memfd`
+    /// (`EMFILE`) in `LogBuffer::create_in`. The image is refused as
+    /// storage, and the first region is dropped: its descriptor is free
+    /// again. A no-op outside the child.
+    #[test]
+    #[ignore = "run by a_region_that_cannot_be_created_refuses_the_image"]
+    fn a_region_that_cannot_be_created_refuses_the_image_child() {
+        if std::env::var_os(EMFILE_CHILD).is_none() {
+            return;
+        }
+        let mut next = 1u64;
+        let mut chain = Chain::<SharedTerms>::new(ImageTemplate::default());
+        chain.create(1, 4);
+        let mut held = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(24), "EMFILE");
+                    break;
+                }
+            }
+        }
+        // One descriptor free: the first lane's region takes it.
+        drop(held.pop());
+        chain.poll(&mut LaneSource::regions(RegionIds::new(
+            INSTANCE, &mut next,
+        )));
+        assert!(matches!(
+            chain.end.commands.try_take().unwrap(),
+            Some(SessionCommand::RefuseImage { .. })
+        ));
+        let counters = chain.images.counters();
+        assert_eq!((counters.refused_storage, counters.offered), (1, 0));
+        assert_eq!(chain.images.charged(), 0);
+        assert_eq!(chain.images.last_lanes.len(), 1, "one region was created");
+        assert!(
+            chain
+                .images
+                .last_lanes
+                .iter()
+                .all(|lane| lane.upgrade().is_none())
+        );
+        // Its descriptor came back with the dropped region, and only it.
+        held.push(std::fs::File::open("/dev/null").unwrap());
+        assert!(std::fs::File::open("/dev/null").is_err());
+        assert_eq!(next, 3, "two region ids were taken, none reused");
     }
 }
 
@@ -5749,6 +6017,98 @@ fn a_different_eos_bound_is_refused_at_the_intake() {
     assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 1));
 }
 
+/// rp-w8: a one-path receiver allocates no path queues and queues nothing.
+#[test]
+fn a_one_path_receiver_has_no_path_queues() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    for _ in 0..200 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() == 4 {
+            break;
+        }
+    }
+    assert_eq!(seen, [0, 1, 2, 3]);
+    assert!(!rig.agents.receiver.role.has_path_queues());
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        (counters.path_queue_drops, counters.path_queue_bypassed),
+        (0, 0)
+    );
+}
+
+/// rp-w8, §8 "Queues and statistics": over two paths, the path queues are
+/// allocated when the later path binds. With one-entry queues, a burst
+/// fills them: each full queue drops only its own path's datagram,
+/// counted, and the other path's copy, or repair once later data shows
+/// the gap, still delivers every message once, in order.
+#[test]
+fn a_full_path_queue_drops_only_its_paths_copy() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        tune: Some(|config: &mut AgentConfig| config.path_queue_datagrams = 1),
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    assert!(rig.agents.receiver.role.has_path_queues());
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    for i in 0..8u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    // Then one message every ten rounds: later data shows the receiver
+    // the gaps the drops left, and repair fills them.
+    let mut seen = Vec::new();
+    let mut next = 8u8;
+    for round in 0..600 {
+        if round % 10 == 0 && next < 16 {
+            let log = rig.log.as_mut().unwrap();
+            let _ = log.publications[0]
+                .append(&[next; 900], AppendOptions::default())
+                .unwrap();
+            next += 1;
+        }
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() >= 16 {
+            break;
+        }
+    }
+    for _ in 0..50 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+    }
+    assert_eq!(seen, (0..16).collect::<Vec<u8>>());
+    let counters = rig.agents.receiver.counters();
+    assert!(counters.path_queue_drops > 0, "{counters:?}");
+}
+
 /// An EOS data frame the receive owner does not commit names no bound: a
 /// frame two terms ahead of the rebuild position reads `Received::Ahead`
 /// (beyond the window `{r, r + 1}`) and is dropped, and the lane's real
@@ -5796,4 +6156,153 @@ fn a_heartbeat_past_the_terminal_bound_is_counted() {
         "classified at the bound"
     );
     assert_eq!(after.eos_refused, before.eos_refused);
+}
+
+/// rp-w8b: a receiver that has path queues still bypasses them for an
+/// image with one live path. While the later path is live, the founding
+/// path's datagrams are queued; once it is lost, they are not, and none is
+/// bypassed for lack of a queue.
+#[test]
+fn a_single_path_image_bypasses_the_path_queues() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    assert!(rig.agents.receiver.role.has_path_queues());
+    let send = |rig: &mut Rig, byte: u8| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[byte; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..5 {
+            rig.round(true);
+        }
+    };
+    send(&mut rig, 0);
+    assert!(
+        rig.agents.receiver.counters().path_queued > 0,
+        "two live paths: queued"
+    );
+    // The silent later path times out: one live path is left.
+    for second in 1..=15u8 {
+        rig.now += 1_000_000_000;
+        send(&mut rig, second);
+        if rig.agents.receiver.role.live_paths(slot) == 1 {
+            break;
+        }
+    }
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1);
+    let queued = rig.agents.receiver.counters().path_queued;
+    for byte in 100..104u8 {
+        send(&mut rig, byte);
+    }
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(counters.path_queued, queued, "one live path: bypassed");
+    assert_eq!(counters.path_queue_bypassed, 0, "{counters:?}");
+    assert!(rig.agents.receiver.role.has_path_queues(), "kept");
+}
+
+/// rp-w7c, §8 Liveness: an idle path kept by PATH_HB stays live. Data
+/// flows every second on path A only (path A2 takes no copy: its
+/// selections are skipped, too few bytes for it to leave), for 15 s, past
+/// the path liveness timeout: A2 stays bound on the sender's PATH_HB
+/// alone, which never counts as image evidence (RP-2).
+#[test]
+fn an_idle_path_kept_by_path_heartbeats_stays_live() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents
+        .sender
+        .role
+        .publication_mut(0)
+        .unwrap()
+        .withhold_route(1, 1_000);
+    let heartbeats = rig.agents.receiver.counters().path_heartbeats;
+    for second in 0..15u8 {
+        rig.now += 1_000_000_000;
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[second; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..5 {
+            rig.round(true);
+        }
+        assert_eq!(
+            rig.agents.receiver.role.live_paths(slot),
+            2,
+            "both paths live after {} s",
+            second + 1
+        );
+    }
+    assert!(rig.agents.receiver.counters().path_heartbeats > heartbeats);
+    let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
+    assert_eq!(
+        outbound.path_state(1).map(|state| state.0),
+        Some(true),
+        "A2 never left"
+    );
+}
+
+/// rp-w7c, §8 Join reconciliation: a later path lost (silent past its
+/// liveness timeout) and bound again reconciles as a new later path: the
+/// image's position does not move, and its subscriber reads every message
+/// once, in order, across the loss and the rebind.
+#[test]
+fn a_path_lost_and_bound_again_moves_no_cursor() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let mut seen = Vec::new();
+    let mut next = 0u8;
+    let mut send = |rig: &mut Rig, seen: &mut Vec<u8>| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[next; 100], AppendOptions::default())
+            .unwrap();
+        next += 1;
+        for _ in 0..5 {
+            rig.round(true);
+            while let Some(message) = poll_message(&mut subscriber) {
+                seen.push(message[0]);
+            }
+        }
+    };
+    // The later path is silent: it times out while data flows.
+    for _ in 0..15 {
+        rig.now += 1_000_000_000;
+        send(&mut rig, &mut seen);
+        if rig.agents.receiver.role.live_paths(slot) == 1 {
+            break;
+        }
+    }
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1, "B2 lost");
+    // Bound again, at the sender's position now.
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    for _ in 0..4 {
+        send(&mut rig, &mut seen);
+    }
+    assert_eq!(seen, (0..next).collect::<Vec<u8>>());
+    assert!(rig.agents.receiver.role.has_image(slot));
 }

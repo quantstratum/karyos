@@ -32,6 +32,12 @@
 //!   equals `written` afterwards. A write the index does not cover was
 //!   never `written`, so a torn write is never read back. The data file is
 //!   shortened to `written`, so no stale byte past it lingers.
+//! - **Truncation.** [`SegmentStore::truncate`] cuts the recording at the
+//!   end of a write: it syncs everything, writes an invalid entry right
+//!   after the last write kept and syncs it (from then on recovery cuts
+//!   there and removes every later segment unread), then shortens the
+//!   data file, removes the later segments and drops the invalid entry.
+//!   A crash inside recovers either as before or at the cut.
 //! - **Headers.** Only the last segment can be one being created, and
 //!   recovery removes it: its index header is missing, short or zeroed, or
 //!   torn (failing its CRC) with no data and no entry behind it. Creation
@@ -49,9 +55,18 @@
 //!   a range an async recording lost: nothing is stored, and a read inside
 //!   it is refused. Positions stay contiguous across all three. An entry of
 //!   a kind this version does not know is refused at recovery, never cut.
+//! - **Record time.** Index version 2 stamps each entry with the time the
+//!   Archive wrote it (bytes 20 to 27: nanoseconds of the recorder's
+//!   monotonic clock, set by [`SegmentStore::stamp`]; 0 when unknown). It
+//!   is the arrival cadence the recorder saw, not the publish time, and it
+//!   serves only relative pacing of a replay: its origin is the Archive
+//!   process, so only differences within one recording mean anything. The
+//!   wall-clock start stays in the catalog.
 
 #[cfg(test)]
 mod tests;
+
+pub mod replay;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -65,8 +80,8 @@ pub const DEFAULT_SEGMENT_LENGTH: u64 = 128 << 20;
 
 /// "KYSX", the index magic.
 const MAGIC: u32 = u32::from_le_bytes(*b"KYSX");
-/// The index format version.
-const VERSION: u32 = 1;
+/// The index format version: 2 adds the record time of each entry.
+const VERSION: u32 = 2;
 /// The index header's length.
 const HEADER: u64 = 48;
 /// An index entry's length.
@@ -291,6 +306,17 @@ pub enum SegmentError {
     /// The store records [`MAX_GAPS`] lost ranges already.
     #[error("more than {MAX_GAPS} lost ranges")]
     TooManyGaps,
+    /// A truncation to a position outside `[start, written]`, or inside a
+    /// write: nothing changed.
+    #[error("cannot truncate to {position}: not a write boundary in [{start}, {written}]")]
+    InvalidTruncate {
+        /// The position asked.
+        position: u64,
+        /// The recording's first position.
+        start: u64,
+        /// The written position.
+        written: u64,
+    },
     /// A segment's index header is bad where recovery cannot treat it as a
     /// segment being created; nothing was removed.
     #[error("the index header of the segment at {base} is bad: {problem:?}")]
@@ -381,19 +407,22 @@ pub struct SegmentStore<D: Disk> {
     /// A sync ran since the last tick (explicit, or a roll's).
     synced_since_tick: bool,
     failed: bool,
+    /// The record time stamped on the next entries ([`SegmentStore::stamp`]).
+    time_ns: u64,
     /// Test only: the index is not synced (a negative control).
     #[cfg(test)]
     skip_index_sync: bool,
 }
 
-/// An index entry: its range, its kind (byte 16, zero in the first
-/// version's entries, which were all data) and the CRC of what it stored.
+/// An index entry: its range, its kind (byte 16), the CRC of what it
+/// stored and its record time (bytes 20 to 27; 0 when unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     start: u64,
     length: u32,
     data_crc: u32,
     kind: EntryKind,
+    time_ns: u64,
 }
 
 /// A decoded entry, or the code of a kind this version does not know.
@@ -406,6 +435,7 @@ impl Entry {
         put(&mut bytes, 8, &self.length.to_le_bytes());
         put(&mut bytes, 12, &self.data_crc.to_le_bytes());
         put(&mut bytes, 16, &[self.kind.code()]);
+        put(&mut bytes, 20, &self.time_ns.to_le_bytes());
         let crc = crc32c(bytes.get(..28).unwrap_or_default());
         put(&mut bytes, 28, &crc.to_le_bytes());
         bytes
@@ -426,6 +456,7 @@ impl Entry {
             length: u32_at(bytes, 8)?,
             data_crc: u32_at(bytes, 12)?,
             kind,
+            time_ns: u64_at(bytes, 20)?,
         }))
     }
 
@@ -585,6 +616,7 @@ impl<D: Disk> SegmentStore<D> {
             last_sync_ns: 0,
             synced_since_tick: false,
             failed: false,
+            time_ns: 0,
             #[cfg(test)]
             skip_index_sync: false,
         };
@@ -712,6 +744,7 @@ impl<D: Disk> SegmentStore<D> {
             length,
             data_crc: crc32c(chunk),
             kind: EntryKind::Data,
+            time_ns: self.time_ns,
         };
         self.write_entry(entry, chunk, None)
     }
@@ -802,6 +835,7 @@ impl<D: Disk> SegmentStore<D> {
             length: extent,
             data_crc: crc32c(record),
             kind: EntryKind::Fill,
+            time_ns: self.time_ns,
         };
         let end = entry.end().ok_or(SegmentError::PositionOverflow)?;
         let extent_end = end
@@ -855,6 +889,7 @@ impl<D: Disk> SegmentStore<D> {
                 length,
                 data_crc: 0,
                 kind: EntryKind::Gap,
+                time_ns: self.time_ns,
             };
             self.write_entry(entry, &[], None)?;
         }
@@ -956,7 +991,9 @@ impl<D: Disk> SegmentStore<D> {
             self.last_sync_ns = now_ns;
         }
         if let SyncPolicy::Every { interval_ns } = self.policy
-            && now_ns.saturating_sub(self.last_sync_ns) >= interval_ns
+            && now_ns
+                .checked_sub(self.last_sync_ns)
+                .is_some_and(|elapsed| elapsed >= interval_ns)
             && self.written > self.durable
         {
             self.last_sync_ns = now_ns;
@@ -1020,11 +1057,160 @@ impl<D: Disk> SegmentStore<D> {
         Ok(())
     }
 
+    /// Truncates the recording to `position`, the end of a write (or the
+    /// start): everything after it is removed, on disk and in the store,
+    /// and what is kept is durable on return. Returns the durable
+    /// position, `position`.
+    ///
+    /// A crash at any point inside leaves a recording that recovers either
+    /// as it was or to `position`. First everything is synced, and an
+    /// invalid entry is written right after the last write kept and
+    /// synced: from then on recovery cuts there, and removes every later
+    /// segment without reading it. Then the data file is shortened, the
+    /// later segments are removed, and the invalid entry is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::InvalidTruncate`] for a position outside `[start,
+    /// written]` or inside a write, which changes nothing;
+    /// [`SegmentError::Failed`] after an earlier failure; the operating
+    /// system's errors, after which the store fails until recovered.
+    pub fn truncate(&mut self, position: u64) -> Result<u64, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        let invalid = SegmentError::InvalidTruncate {
+            position,
+            start: self.start,
+            written: self.written,
+        };
+        if position < self.start || position > self.written {
+            return Err(invalid);
+        }
+        // The segment that keeps the last write: at a segment's end, the
+        // one it ends; at the start, the first.
+        let segment_length = self.geometry.segment_length;
+        let base = if position > self.start && position.is_multiple_of(segment_length) {
+            position
+                .checked_sub(segment_length)
+                .ok_or(SegmentError::PositionOverflow)?
+        } else {
+            self.geometry.base_of(position)
+        };
+        let result = self.boundary(base, position);
+        let entries = match self.guard(result)? {
+            Some(entries) => entries,
+            None => return Err(invalid),
+        };
+        let result = self.cut(base, entries, position);
+        self.guard(result)?;
+        Ok(self.durable)
+    }
+
+    /// The number of entries of the segment at `base` that end at
+    /// `position`; `None` when no write ends there.
+    fn boundary(&mut self, base: u64, position: u64) -> Result<Option<u64>, SegmentError> {
+        let index = self
+            .disk
+            .open(&self.dir.join(index_name(self.recording, base)))?;
+        let mut header = [0u8; 48];
+        self.disk.read_at(&index, 0, &mut header)?;
+        let HeaderRead::Valid(header) = Header::read(Some(&header)) else {
+            return Err(SegmentError::BadHeader {
+                base,
+                problem: HeaderProblem::Corrupt,
+            });
+        };
+        let mut at = header.start;
+        let mut entries = 0u64;
+        let length = self.disk.len(&index)?;
+        while at < position {
+            let offset = entry_offset(entries).ok_or(SegmentError::PositionOverflow)?;
+            if offset >= length {
+                return Ok(None);
+            }
+            let mut bytes = [0u8; 32];
+            self.disk.read_at(&index, offset, &mut bytes)?;
+            let Some(Ok(entry)) = Entry::decode(&bytes) else {
+                return Ok(None);
+            };
+            at = entry.end().ok_or(SegmentError::PositionOverflow)?;
+            entries = entries
+                .checked_add(1)
+                .ok_or(SegmentError::PositionOverflow)?;
+        }
+        Ok((at == position).then_some(entries))
+    }
+
+    /// Cuts the recording after the first `entries` entries of the segment
+    /// at `base`, which end at `position` (see [`SegmentStore::truncate`]
+    /// for the order).
+    fn cut(&mut self, base: u64, entries: u64, position: u64) -> Result<(), SegmentError> {
+        self.sync_behind()?;
+        self.sync_open()?;
+        let index_path = self.dir.join(index_name(self.recording, base));
+        let data_path = self.dir.join(data_name(self.recording, base));
+        let index = self.disk.open(&index_path)?;
+        let data = self.disk.open(&data_path)?;
+        // From here a crash may recover to `position`: nothing past it is
+        // claimed written or durable any more.
+        self.written = position;
+        self.durable = self.durable.min(position);
+        // The invalid entry: its own CRC fails, so recovery cuts there.
+        let keep = entry_offset(entries).ok_or(SegmentError::PositionOverflow)?;
+        let terminator = entry_offset(
+            entries
+                .checked_add(1)
+                .ok_or(SegmentError::PositionOverflow)?,
+        )
+        .ok_or(SegmentError::PositionOverflow)?;
+        self.disk.write_at(&index, keep, &[0u8; 32])?;
+        self.disk.set_len(&index, terminator)?;
+        self.disk.sync(&index)?;
+        let length = position
+            .checked_sub(base)
+            .ok_or(SegmentError::PositionOverflow)?;
+        self.disk.set_len(&data, length)?;
+        self.disk.sync(&data)?;
+        // The open and finished segments go before their files do.
+        self.current = None;
+        self.finished.clear();
+        for later in bases(self.recording, &self.disk.list(&self.dir)?)
+            .into_iter()
+            .filter(|later| *later > base)
+            .rev()
+        {
+            remove_segment(&mut self.disk, &self.dir, self.recording, later)?;
+        }
+        self.disk.sync_dir(&self.dir)?;
+        self.disk.set_len(&index, keep)?;
+        self.disk.sync(&index)?;
+        self.gaps.retain(|(from, _)| *from < position);
+        self.written = position;
+        self.durable = position;
+        self.unsynced_behind = None;
+        self.current = Some(Open {
+            base,
+            data,
+            index,
+            entries,
+            dirty: false,
+        });
+        Ok(())
+    }
+
     /// Whether the store records a gap at the written position: it merges
     /// with the last one, or fewer than [`MAX_GAPS`] are recorded.
     #[must_use]
     pub fn gap_fits(&self) -> bool {
         self.gaps.len() < MAX_GAPS || self.gaps.last().is_some_and(|last| last.1 == self.written)
+    }
+
+    /// Sets the record time stamped on the entries written next: the
+    /// recorder's monotonic clock in nanoseconds. 0 means unknown, so a
+    /// time of 0 is stamped as 1.
+    pub fn stamp(&mut self, now_ns: u64) {
+        self.time_ns = now_ns.max(1);
     }
 
     /// Reads `buf.len()` bytes at `position`, within `[start, written)`.
@@ -1109,7 +1295,10 @@ impl<D: Disk> SegmentStore<D> {
             // After a cut nothing continues the recording.
             if scan.cut.is_some() {
                 remove_segment(&mut disk, dir, recording, base)?;
-                scan.dropped = scan.dropped.saturating_add(1);
+                scan.dropped = scan
+                    .dropped
+                    .checked_add(1)
+                    .ok_or(SegmentError::PositionOverflow)?;
                 continue;
             }
             let is_last = Some(base) == last;
@@ -1123,7 +1312,10 @@ impl<D: Disk> SegmentStore<D> {
                 }
                 None => {
                     remove_segment(&mut disk, dir, recording, base)?;
-                    scan.dropped = scan.dropped.saturating_add(1);
+                    scan.dropped = scan
+                        .dropped
+                        .checked_add(1)
+                        .ok_or(SegmentError::PositionOverflow)?;
                 }
             }
         }
@@ -1164,6 +1356,7 @@ impl<D: Disk> SegmentStore<D> {
             last_sync_ns: 0,
             synced_since_tick: false,
             failed: false,
+            time_ns: 0,
             #[cfg(test)]
             skip_index_sync: false,
         };
@@ -1326,7 +1519,10 @@ fn scan_segment<D: Disk>(
         return Ok(None);
     }
     let length = disk.len(&index)?;
-    let whole = length.saturating_sub(HEADER) / ENTRY;
+    // An index shorter than its header holds no entry.
+    let whole = length
+        .checked_sub(HEADER)
+        .map_or(0, |entries| entries / ENTRY);
     let torn = length > HEADER && !(length - HEADER).is_multiple_of(ENTRY);
     let end = base
         .checked_add(geometry.segment_length)
@@ -1391,7 +1587,9 @@ fn scan_segment<D: Disk>(
             return Err(SegmentError::TooManyGaps);
         }
         expected_start = entry_end;
-        kept = index_entry.saturating_add(1);
+        kept = index_entry
+            .checked_add(1)
+            .ok_or(SegmentError::PositionOverflow)?;
     }
     if cut.is_none() && torn {
         cut = Some(CutReason::TornEntry);

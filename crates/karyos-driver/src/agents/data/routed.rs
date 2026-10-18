@@ -94,7 +94,8 @@ impl Default for PathPolicy {
     }
 }
 
-/// What a path did in and out of the live set (RP-8).
+/// What a path did in and out of the live set (RP-8), and what it sent
+/// (RP-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PathCounters {
     /// Times it left the live set.
@@ -107,7 +108,16 @@ pub struct PathCounters {
     /// receivers get them by NAK (reliable) or close the gap by their gap
     /// policy (unreliable).
     pub copies_abandoned: u64,
-    /// An increment did not apply.
+    /// The first-send DATA copies it submitted, catch-up copies included:
+    /// each path's own count, for capacity planning (RP-10). Its route's
+    /// `RouteCounters::datagrams`; repairs are in
+    /// [`Outbound::repair_route_counts`], and PATH_HB, other controls and
+    /// `Flushed::Unknown` copies are not counted.
+    pub datagrams: u64,
+    /// The bytes of those copies (RP-10), with the same scope. Its route's
+    /// `RouteCounters::bytes`.
+    pub bytes: u64,
+    /// An increment did not apply, here or in its route's counters.
     pub overflowed: bool,
 }
 
@@ -660,10 +670,15 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     #[must_use]
     #[inline]
     pub fn path_counters(&self, route: usize) -> Option<PathCounters> {
-        self.routed
-            .as_deref()
-            .and_then(|routed| routed.routes.get(route))
-            .map(|route| route.counters)
+        let routed = self.routed.as_deref()?;
+        let mut counters = routed.routes.get(route)?.counters;
+        // The datagrams and bytes are the routed sender's, per route.
+        if let Some(sent) = routed.sender.counters(route) {
+            counters.datagrams = sent.datagrams;
+            counters.bytes = sent.bytes;
+            counters.overflowed |= sent.overflowed;
+        }
+        Some(counters)
     }
 
     /// Whether path `route` is in the live set and whether it is
@@ -853,6 +868,8 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             // from its registered position, as on one path; the copies at
             // or below its debited position go as catch-up, debiting nothing.
             let reopened = slot.opened.is_some();
+            // Per lane, whether it reads again what the reset returned.
+            let mut rewound = [false; karyos_sys::frame::Lane::COUNT as usize];
             for (lane, reader) in self.readers.iter_mut().enumerate() {
                 // Only a route that can still send them holds copies: one
                 // resetting or never opened will drop its own (#331 review).
@@ -864,6 +881,9 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 if reopened && self.reliable && !others {
                     // A faulted reader cannot rewind: its lane already ended.
                     let _ = reader.rewind();
+                    if let Some(flag) = rewound.get_mut(lane) {
+                        *flag = true;
+                    }
                 }
             }
             // The route's repair queue, outside the lane sender: every
@@ -885,7 +905,13 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 // A guarded lane reopens through its gate, which refunds what
                 // only this route held.
                 match self.guard.as_deref_mut() {
-                    Some(guard) => guard.reopen_route(&mut routed.sender, lane, index, *queue),
+                    Some(guard) => guard.reopen_route(
+                        &mut routed.sender,
+                        lane,
+                        index,
+                        *queue,
+                        rewound.get(lane).copied().unwrap_or(false),
+                    ),
                     None => routed.sender.reopen(lane, index, *queue),
                 }
                 if let Some(track) = routed.tracks.get_mut(lane) {
@@ -1063,6 +1089,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                                 token,
                                 length: u64::from(len16),
                                 messages,
+                                start: from,
                                 end: next,
                             },
                         )

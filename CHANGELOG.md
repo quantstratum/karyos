@@ -11,6 +11,45 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A guarded network publication's outcome records come from its sender
+  gate's submissions, not from the commit (guards-and-abort.md, "Trusted
+  sockets in Phase 2"). A message is `Submitted` once a backend took
+  every frame of it, `Unknown` when it may have left whole unproven (an
+  `Unknown` report, an exposure a reset or a removal cut short, a
+  position no first send took, which a reliable lane may still repair,
+  or a later route's submission above a position that never left), and
+  `Aborted` when it never leaves whole: its last frame was not sent when
+  a close, a removal or a network close ended the lane (a partial
+  fragmented message is `Aborted`, as the design's kind table says). A message's
+  reservation is therefore released at its network submission, so the
+  publisher holds at most `C_m` messages committed and not yet sent: the
+  effective window is the smaller of the receivers' and `C_m` messages.
+  The close acknowledgement's `positions` are each lane's prefix-closed
+  frontier: below it every message was handed to a backend or is
+  reported `Unknown` (before, the highest position submitted, which an
+  unproven or skipped one could sit below). `GateHead` gains `start`,
+  and `GuardGate::reopen` and `reopen_route` take whether the lane is
+  rewound; `GuardSpec` gains `frontier`. Code that names every field in
+  a struct literal must add them.
+- `RouteCounters` (`karyos-io`) and `PathCounters` (`karyos-driver`)
+  gained the public fields `datagrams` and `bytes` (rp-w9). Neither
+  struct is `#[non_exhaustive]`, so a struct literal that names every
+  field must add them. Both count the lane sender's first sends of DATA
+  only, catch-up copies included: repairs (`repair_route_counts`),
+  PATH_HB and other controls, and `Flushed::Unknown` are not in them.
+- An Archive replay's target stream (phase 3, A5b).
+  `EmbeddedDriver::replay_target(ReplayTargetConfig)` makes a one-lane
+  image with local gaps, joined at the replay's first position and
+  exposed as an aggregate of lane streams as a network image is (n3), on
+  the heap or, on an IPC driver, in a region with a fresh id. Its
+  `ReplayFeed`, the image's only writer, takes a recording's whole frames
+  and PAD or ABORTED records at their recorded positions, each frame's
+  session and stream ids written as the target's, and seals a lost range
+  as a local gap (`GapReason::RangeUnavailable`); a term not ready yet is
+  offered again later. `EmbeddedDriver::finish_replay` seals the target
+  with `EndOfStream` when the feed reached the replay's end, else
+  `ImageRetired`. Only lane 0 is replayed (`DriverError::ReplayLane`).
+  The `EndOfStream` and `ImageRetired` docs now cover a replay's end.
 - The Archive's control messages, version 1, written by hand (phase 3,
   A1; ADR-0036). `karyos-codec` becomes the runtime of the minimum v1
   schema: checked little-endian reads and writes, a 12-byte envelope
@@ -21,6 +60,23 @@ release may break APIs, wire formats and shared-memory layouts.
   of schema 1, validated whole on decode and encoded into the caller's
   buffer without allocating; an encoding that fails leaves no message
   in the buffer, not even an earlier one.
+- An Archive recording is read back for replay (phase 3, A5a).
+  `karyos_archive::replay::ReplaySource` reads a recording's range
+  without changing it, through read-only files (`Disk::open_read`):
+  whole frames, fills and gaps in order, from a frame boundary to the
+  last whole frame below the range's end, the end clamped to what the
+  recording held at open. No byte goes out before its entry's CRC holds:
+  an entry not delivered whole in one read is first read whole through
+  the buffer, its CRC and frame lengths checked. A segment missing inside
+  the range is an error, never the recording's end. It paces at full
+  speed, as recorded or scaled (`NonZeroU32` parts per million). The
+  segment index becomes version 2: each entry carries its record time
+  (the Archive's write time on its monotonic clock, 0 when unknown),
+  stamped by `SegmentStore::stamp` each recorder duty; a paced replay of
+  entries without one is refused, and a version 1 index is foreign: an
+  archive directory where an earlier build left a recording open fails
+  every agent start, since each start's settle recovers that recording.
+  A replay's error is final.
 - The driver hands an Archive recording a lane's reader (phase 3,
   A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
   reserved required or an optional cell and returns a `RecordingReader`:
@@ -140,6 +196,44 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A segment store is truncated at the end of a write
+  (`SegmentStore::truncate`; phase 3, for a recording group's recovery
+  to its complete prefix, SPEC §8.3). Everything after the cut is
+  removed on disk and what is kept is durable on return; a crash inside
+  recovers either as before or at the cut. A position outside the
+  recording or inside a write is refused, typed, with nothing changed.
+- `karyos_sys::submission_frontier::SubmissionFrontier`: a guarded
+  network lane's submission frontier, which its sender gate publishes
+  for the driver's outcome walker. Per lane, `resolved` (Release),
+  `unknown_hi`, `sent_hi` and `staged_hi` (Relaxed, stored before it),
+  all monotone and written by the gate alone, and a final word that the gate
+  (`finish`) or, once the gate stopped for good, the conductor
+  (`supersede`) sets once, by compare-exchange. A Loom model
+  (`loom_submission_frontier`) checks the orders and the race of the two
+  final writers, with three negative controls.
+- Per-path datagram and byte counts (RP-10; rp-w9). Each route of a
+  routed publication counts the datagrams and bytes it submitted,
+  catch-up copies included (`RouteCounters::datagrams`, `bytes`), and
+  `Outbound::path_counters` reports them (`PathCounters::datagrams`,
+  `bytes`) for capacity planning. The DRR still charges a frame once,
+  however many paths take it.
+- Receive path queues (redundant-paths.md section 5; rp-w8). A multi-path
+  image's DATA datagrams and heartbeats wait in their path's queue between
+  the endpoint's receive poll and the image, and the receiver serves the
+  queues round robin after every poll, so a fast path cannot starve a slow
+  one. A full queue drops only that path's datagram, counted in
+  `ReceiverCounters::path_queue_drops`; with no free queue a datagram is
+  delivered at once (`path_queue_bypassed`), and a path never switches
+  between the two while its queue holds datagrams, so its order holds.
+  Each datagram keeps its poll's time as its arrival for the statistics,
+  skew detection and liveness. `AgentConfig::path_queue_datagrams` (256)
+  sizes each queue; the queues take `sessions.max_paths ×
+  path_queue_datagrams × 8 KiB` (8 MiB by default, at most 64 MiB,
+  validated), allocated when the first later path is bound and kept: a
+  single-path receiver allocates none. The queues are per local receive
+  endpoint and live in one slab; a control on an endpoint first delivers
+  that path's queued datagrams, so a reply never overtakes them; queued
+  datagrams are counted (`path_queued`) (rp-w8b).
 - The live set of a routed publication's paths (redundant-paths.md section
   7, RP-8; rp-w5a). Each path keeps a `path_lag_limit` window (100 ms) of
   bytes selected and skipped: one that skipped anything is `Degraded`, and
@@ -723,6 +817,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- The segment store's arithmetic is checked (SPEC §14): five
+  saturating operations in the interval sync and in recovery's counts
+  are checked ones. A clock that steps back still syncs nothing.
+- A guarded network publication that a guard close sealed no longer
+  takes a fresh incarnation after the reopen: `publication()` refuses with
+  `DriverError::NetworkReincarnation`. The network sender did not follow
+  the reincarnation (it kept reading the sealed log, and no SETUP
+  announced the new incarnation), so offers were accepted and never sent.
+  The publication is removed and added again until the sender follows a
+  reincarnation.
 - The network keeps one time base in every threading mode. In
   `ThreadingMode::Shared` the agents' cycles took the driver's injectable
   clock while their role clocks read `host_monotonic_ns`. On Linux every
@@ -730,6 +834,13 @@ release may break APIs, wire formats and shared-memory layouts.
   again for a hole whose NAK or repair was lost. The network now reads
   `host_monotonic_ns` for its cycles and its close, as runner threads do;
   the driver's clock times claim deadlines only.
+- A replay target checks what it is fed (#374 review). A frame whose
+  header (term id and offset, from the recorded initial term id) names
+  another position than where it lies in the run is refused, and a fill
+  must be a PAD or ABORTED record whose extent is the one given.
+  `finish_replay` and the reaping of a dropped feed refresh the stream
+  gauges, and a dropped feed's target whose retire fails is counted
+  (`replay targets not retired`) instead of ignored.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

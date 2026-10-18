@@ -208,6 +208,15 @@ fn the_configuration_is_checked() {
             path_heartbeat_interval: 0,
             ..AgentConfig::default()
         },
+        // rp-w8: path queues of at least 1 datagram, at most 64 MiB in all.
+        AgentConfig {
+            path_queue_datagrams: 0,
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_queue_datagrams: u16::MAX,
+            ..AgentConfig::default()
+        },
         // RP-9's backoffs: at least 1 ns, the maximum at least the initial.
         AgentConfig {
             path_policy: crate::agents::data::PathPolicy {

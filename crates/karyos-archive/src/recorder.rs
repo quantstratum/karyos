@@ -315,6 +315,8 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         if self.ended.is_some() {
             return Ok(duty);
         }
+        // Every write of this duty carries its record time.
+        self.store.stamp(now_ns);
         let start = self.store.written();
         if let Some(to) = self.resume
             && !self.resume_after_lap(to)?
