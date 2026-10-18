@@ -237,6 +237,24 @@ impl<D: Disk> GroupJournal<D> {
         })
     }
 
+    /// Writes `header` into a journal that has none yet: one whose header
+    /// was never written, which recovery brought back empty.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::Record`] for a header that does not encode,
+    /// [`JournalError::InvalidConfig`] for another group's,
+    /// [`JournalError::Order`] for a journal that holds records already,
+    /// and the store's errors.
+    pub fn write_header(&mut self, header: &JournalHeader<'_>) -> Result<u64, JournalError> {
+        if header.group_id != self.group_id {
+            return Err(JournalError::InvalidConfig);
+        }
+        let mut encoded = [0u8; MAX_HEADER];
+        let length = header.encode(&mut encoded)?;
+        self.append(encoded.get(..length).ok_or(JournalError::InvalidConfig)?)
+    }
+
     /// The reopen hold its header records (A9), 0 for a group without
     /// checkpoints; `None` for a journal without a header yet.
     ///
@@ -501,8 +519,12 @@ impl<D: Disk> GroupJournal<D> {
     }
 }
 
-/// The longest header record.
-const MAX_HEADER: usize = 12 + 24 + 2 + super::record::MAX_MANIFEST;
+/// The longest header record: the envelope, the block, the manifest's
+/// length prefix and the longest manifest.
+const MAX_HEADER: usize = 12 + 32 + 2 + super::record::MAX_MANIFEST;
+
+// The header's block, as the template declares it.
+const _: () = assert!(super::record::JOURNAL_HEADER.block_length == 32);
 
 /// The length of the record at `offset` of `records`, from its envelope.
 fn record_length(records: &[u8], offset: usize) -> Result<usize, JournalError> {

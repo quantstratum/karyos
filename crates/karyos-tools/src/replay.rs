@@ -61,9 +61,8 @@ Usage: karyos-tools replay diff <left-dir> <left-group> <right-dir> <right-group
                         checkpoint <id> and the right one's at its group_seq
                         (stores in <dir>/checkpoints; a replay capture has
                         none, so it is not comparable). The prefix is
-                        recovered holding up to 64 events waiting at once
-                        (the journal does not record the group's own reopen
-                        hold yet)
+                        recovered with the reopen hold the journal's header
+                        records, as the run kept it
   -h, --help            print this text
 
 Exit status: 0 identical over the range; 1 diverged, the first difference
@@ -644,9 +643,9 @@ fn open<D: Disk + Clone>(
                 }
                 Err(failure) => return Err(context(&failure)),
             };
-            // Which ranges recover depends on the group's reopen hold,
-            // which the journal does not record yet: RECOVERY_CAPACITY
-            // stands for it until its header carries it (A9-5).
+            // Which ranges recover depends on the group's reopen hold:
+            // recovery takes the header's (A9-5); RECOVERY_CAPACITY only
+            // sizes the tracker's queues.
             let recovery = recover(&mut recovered, &Stored(&store), RECOVERY_CAPACITY)
                 .map_err(|failure| context(&failure))?;
             // A checkpoint the store does not hold is not comparable, before

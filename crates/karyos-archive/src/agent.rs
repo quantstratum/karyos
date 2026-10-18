@@ -459,6 +459,14 @@ pub enum AgentError {
     /// above [`MAX_REOPEN_HOLD`]. Nothing is made (A9-3).
     #[error("invalid checkpoint configuration")]
     CheckpointConfig,
+    /// A restart of a group whose journal never got its header: nothing
+    /// says how it was made. Start it as new (`StartGroup::new`), which
+    /// writes the header into the empty journal.
+    #[error("group {id}'s journal has no header: start it as new")]
+    NoHeader {
+        /// The group.
+        id: u64,
+    },
     /// A group's checkpoint writer could not start (A9-3).
     #[error(transparent)]
     Checkpoint(Box<CheckpointError>),
@@ -1688,10 +1696,8 @@ impl<D: Disk + Clone> State<D> {
         };
         let checkpoint_dir = store_dir(&start.dir);
         let journal = match &start.new {
-            Some(new) => GroupJournal::create(
-                self.disk.clone(),
-                &start.dir,
-                &JournalHeader {
+            Some(new) => {
+                let header = JournalHeader {
                     group_id: id,
                     first_group_seq: new.first_group_seq,
                     inline_threshold: new.inline_threshold,
@@ -1700,22 +1706,41 @@ impl<D: Disk + Clone> State<D> {
                     capture: new.capture,
                     reopen_hold: new_hold,
                     manifest: &new.manifest,
-                },
-                start.journal,
-            )?,
+                };
+                match GroupJournal::create(self.disk.clone(), &start.dir, &header, start.journal) {
+                    Ok(journal) => journal,
+                    // A journal whose header was never written: the new
+                    // group takes it over, writing its header first. One
+                    // with a header is the group's already.
+                    Err(exists @ JournalError::Segment(SegmentError::Exists { .. })) => {
+                        let mut journal = GroupJournal::recover(
+                            self.disk.clone(),
+                            &start.dir,
+                            id,
+                            start.journal,
+                        )?
+                        .journal;
+                        if journal.reopen_hold()?.is_some() {
+                            return Err(exists.into());
+                        }
+                        let _ = journal.write_header(&header)?;
+                        journal
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             None => {
                 GroupJournal::recover(self.disk.clone(), &start.dir, id, start.journal)?.journal
             }
         };
         let mut journal = journal;
         // A restart takes the header's window as recorded, before the
-        // store or the capture path is touched (the journal's own
-        // recovery, which may cut a torn tail, has run): the hold is fixed
-        // per group. A journal whose header was never written takes its
-        // header as a new one would, with nothing to check.
-        if start.new.is_none()
-            && let Some(recorded) = journal.reopen_hold()?
-        {
+        // store or the capture path is touched; the journal's own
+        // recovery, which may cut a torn tail, has run. The hold is fixed
+        // per group. A journal whose header was never written is refused:
+        // it is started as new.
+        if start.new.is_none() {
+            let recorded = journal.reopen_hold()?.ok_or(AgentError::NoHeader { id })?;
             Self::check_hold(&start, recorded)?;
         }
         // The store beside the journal, made or recovered with it: a

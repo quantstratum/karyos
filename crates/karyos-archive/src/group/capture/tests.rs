@@ -1110,13 +1110,21 @@ fn a_queue_still_full_after_the_retry_fails_the_group() {
 /// never grows it.
 #[test]
 fn the_uncovered_list_is_reserved_at_start() {
-    let (_sender, job) = new(
-        Capture::BestEffort,
-        SyncPolicy::PerSegment,
-        settings(1 << 16, 4096, 5),
-    );
+    // A hold above `in_flight`: the list is three times the hold.
+    let journal = GroupJournal::create(
+        FaultDisk::default(),
+        Path::new("/g"),
+        &JournalHeader {
+            reopen_hold: 9,
+            ..header(Capture::BestEffort)
+        },
+        config(SyncPolicy::PerSegment),
+    )
+    .unwrap();
+    let (_sender, job) =
+        capture(settings(1 << 16, 4096, 5), journal, &Recordings::default()).unwrap();
     assert!(
-        job.uncovered.capacity() >= 15,
+        job.uncovered.capacity() >= 27,
         "{}",
         job.uncovered.capacity()
     );

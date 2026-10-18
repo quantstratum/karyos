@@ -891,12 +891,13 @@ impl PrefixTracker {
         }
     }
 
-    /// Sizes the reopening window (A9-3): past a stop, `hold` events,
-    /// at least the tracker's capacity, are kept for a checkpoint that may
-    /// open a range, and the queue has room for them once it does. The
-    /// events expected while one checkpoint is written, under the Gateway
-    /// unbounded while stopped, are its measure. Allocates here, at
-    /// configuration, before any record.
+    /// Sizes the reopening window (A9-3): past a stop, exactly `hold`
+    /// events (the tracker's capacity for a hold of 0) are kept for a
+    /// checkpoint that may open a range, and the queues have room for
+    /// them once it does, at least the capacity. The events expected
+    /// while one checkpoint is written, under the Gateway unbounded while
+    /// stopped, are its measure. Allocates here, at configuration, before
+    /// any record.
     ///
     /// # Errors
     ///
@@ -905,10 +906,11 @@ impl PrefixTracker {
         &mut self,
         hold: usize,
     ) -> Result<(), std::collections::TryReserveError> {
-        let hold = hold.max(self.capacity);
-        hold_room(&mut self.candidates, hold)?;
-        hold_room(&mut self.waiting, hold)?;
-        hold_room(&mut self.settling, hold)?;
+        let hold = if hold == 0 { self.capacity } else { hold };
+        let room = hold.max(self.capacity);
+        hold_room(&mut self.candidates, room)?;
+        hold_room(&mut self.waiting, room)?;
+        hold_room(&mut self.settling, room)?;
         self.hold = hold;
         Ok(())
     }
@@ -973,7 +975,8 @@ pub fn recover<D: crate::disk::Disk>(
     coverage: &impl Coverage,
     capacity: usize,
 ) -> Result<Recovery, super::journal::JournalError> {
-    // The reopening window is the header's (A9), as the run's was.
+    // The reopening window is exactly the header's (A9), as the run's
+    // was, whatever `capacity` the reader gives: that sizes the queues.
     let allocation = |_| super::journal::JournalError::Allocation;
     // A journal without a header holds no event: no window.
     let recorded = journal.reopen_hold()?.unwrap_or(0);

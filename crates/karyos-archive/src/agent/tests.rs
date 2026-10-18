@@ -2511,6 +2511,75 @@ mod checkpoints {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// #437 review P3: a journal whose header was never written. A restart
+    /// is refused, typed, before the store is touched; started as new, the
+    /// group writes its header into it and runs.
+    #[test]
+    fn a_headerless_journal_is_started_as_new() {
+        let dir = dirs("checkpoint-headerless");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let config = journal_config(policy);
+        let geometry =
+            crate::segment::Geometry::new(config.segment_length, u64::from(config.segment_length))
+                .unwrap();
+        let store = crate::segment::SegmentStore::create(
+            StdDisk,
+            &dir.join("groups"),
+            GROUP,
+            geometry,
+            policy,
+            0,
+        )
+        .unwrap();
+        drop(store);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let before = files(&dir);
+        assert!(matches!(
+            agent.start_group(start_with(&dir, None, policy)),
+            Err(AgentError::NoHeader { id: GROUP })
+        ));
+        assert_eq!(files(&dir), before, "the store was touched");
+        let mut sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        assert_eq!(sender.state(), GroupState::Running);
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(1, Duration::from_secs(10)),
+            Ok(1)
+        );
+        agent.stop_group(GROUP).unwrap();
+        // Its header now there, starting it as new again is refused.
+        assert!(
+            agent
+                .start_group(start_with(&dir, Some(Capture::Strict), policy))
+                .is_err()
+        );
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 review M6: a hold below `in_flight` is recorded as `in_flight`.
+    #[test]
+    fn a_hold_below_in_flight_is_recorded_as_in_flight() {
+        let dir = dirs("checkpoint-hold-recorded-in-flight");
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let sender = agent
+            .start_group(holding(&dir, Some(Capture::Strict), 4, Some(1)))
+            .unwrap();
+        drop(sender);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let mut journal =
+            GroupJournal::recover(StdDisk, &dir.join("groups"), GROUP, journal_config(policy))
+                .unwrap()
+                .journal;
+        assert_eq!(journal.reopen_hold().unwrap(), Some(4));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// #437 review P3: the default hold is computed only when the group is
     /// made: a restart naming no hold, with an `in_flight` whose default
     /// would pass the cap, takes the recorded hold.

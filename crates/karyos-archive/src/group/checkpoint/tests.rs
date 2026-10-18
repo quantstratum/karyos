@@ -1441,13 +1441,15 @@ fn the_reopen_hold_keeps_the_events_a_checkpoint_write_spans() {
     assert_eq!(run(None), ((1, 1), 1), "overflows, counted");
 }
 
-/// #426 re-check h5: a hold below the tracker's capacity is taken as the
-/// capacity. With room for 2 in flight and a hold of 1, the 2 events
-/// that end while the checkpoint is written are both kept.
+/// #437 review P2: the window is exactly the hold, whatever the
+/// capacity: a reader with room for 64 in flight, over a run whose hold
+/// was 2, lets go of the events past 2 as the run did, and the range
+/// stays at the checkpoint, the failed reopen counted. (The agent records
+/// a hold of at least `in_flight`.)
 #[test]
-fn a_hold_below_the_capacity_is_the_capacity() {
-    let mut tracker = PrefixTracker::new(2);
-    tracker.reserve_reopen_hold(1).unwrap();
+fn the_window_is_exactly_the_hold() {
+    let mut tracker = PrefixTracker::new(64);
+    tracker.reserve_reopen_hold(2).unwrap();
     let store = Store::default();
     store.written.set(100);
     store.durable.set(100);
@@ -1457,10 +1459,10 @@ fn a_hold_below_the_capacity_is_the_capacity() {
         0,
     );
     at = feed(&mut tracker, &gap(1, 1), at);
-    for seq in 2..=3 {
+    for seq in 2..=7 {
         at = feed(&mut tracker, &event(seq, EndOutcome::Complete), at);
     }
     at = feed(&mut tracker, &checkpoint_record(1, 1, 0), at);
-    assert_eq!(tracker.advance(at, at, &store), (3, 3));
-    assert_eq!(tracker.failed_reopens(), 0);
+    assert_eq!(tracker.advance(at, at, &store), (1, 1));
+    assert_eq!(tracker.failed_reopens(), 1);
 }

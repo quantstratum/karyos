@@ -578,3 +578,25 @@ fn recovery_refuses_a_record_past_the_written_end() {
         );
     }
 }
+
+/// #437 review: a header of the longest manifest fits the header record's
+/// bound, and an empty journal takes its header once.
+#[test]
+fn the_longest_header_is_written_and_an_empty_journal_takes_one() {
+    let disk = FaultDisk::default();
+    let manifest = vec![7u8; crate::group::record::MAX_MANIFEST];
+    let header = JournalHeader {
+        manifest: &manifest,
+        reopen_hold: 9,
+        ..header()
+    };
+    let mut journal = GroupJournal::create(
+        disk,
+        Path::new("/g"),
+        &header,
+        config(SyncPolicy::PerSegment),
+    )
+    .unwrap();
+    assert_eq!(journal.reopen_hold().unwrap(), Some(9));
+    assert!(journal.write_header(&header).is_err(), "a second header");
+}
