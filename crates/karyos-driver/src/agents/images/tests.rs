@@ -676,6 +676,7 @@ fn an_accepted_answer_installs_an_image() {
         ImageEvent::Installed {
             slot,
             endpoint,
+            source,
             identity: installed,
             alias: arrived,
         },
@@ -684,6 +685,8 @@ fn an_accepted_answer_installs_an_image() {
         panic!("{:?}", rig.events);
     };
     assert_eq!((*endpoint, *installed, *arrived), (b, identity(), alias()));
+    // The source is the publisher's endpoint, as the binding names it.
+    assert_eq!(Some(*source), rig.endpoints.local_address(rig.publisher));
     let lanes = rig.images.installed(*slot).unwrap();
     assert_eq!(lanes.len(), 2);
     // The joins are the sender's read cursors: nothing was published yet.
@@ -5269,6 +5272,7 @@ impl<T: StreamTerms> Chain<T> {
         };
         let event = SessionEvent::CreateImage {
             endpoint: EndpointId(1),
+            source: std::net::SocketAddr::from(([127, 0, 0, 1], 40_000)),
             alias: alias(),
             slot: SlotRef {
                 slot,
