@@ -871,3 +871,87 @@ fn a_lost_timed_message_frees_its_own_entry() {
         while report.pop_front().is_some() {}
     }
 }
+
+/// #412 review P3: a reliable timed message reset after its first
+/// fragment was submitted and before its last counts as sent: the reset
+/// resends it at once, outside the late policy, counted rewound, never
+/// late, though its time is long past.
+#[test]
+fn a_partly_sent_timed_message_is_replayed_after_a_reset() {
+    use karyos_io::backend::TxReport;
+    use karyos_sys::log_buffer::ScheduledOutcome;
+
+    use super::testing::outbound_timed_reliable;
+    use crate::timed_gate::LatePolicy;
+
+    // One send taken, the rest block: the first fragment leaves, the
+    // others stay staged.
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    observer.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (mut path, mut log) = outbound_timed_reliable(EndpointId(1), alias, destination, term, 2);
+    path.set_timed(&[LatePolicy::default()], vec![None], 0)
+        .unwrap();
+    assert!(matches!(
+        log.publications[0]
+            .append_scheduled(&[7; 3000], AppendOptions::default(), 0)
+            .unwrap(),
+        ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+    ));
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    for now in 1..4 {
+        let _ = path.serve(&mut tx, budget, None, now).unwrap();
+    }
+    let counts = path.timed_counts().unwrap();
+    assert_eq!((counts.sent, counts.rewound), (0, 0), "{counts:?}");
+    // The endpoint is reset and reopened; everything is sent now, 10 s
+    // past the message's time.
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    let _ = endpoint.reopen(&local).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    for _ in 0..8 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let late = 10_000_000_000;
+    for now in late..late + 4 {
+        let _ = path.serve(&mut tx, budget, None, now).unwrap();
+    }
+    let counts = path.timed_counts().unwrap();
+    assert_eq!(counts.rewound, 1, "{counts:?}");
+    assert_eq!(counts.late_sends, 0, "a replay is not late: {counts:?}");
+    assert_eq!(path.counters().schedule_faults, 0);
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    while !matches!(
+        endpoint.retire(&mut report),
+        karyos_io::sockets::endpoint::Retired::Complete { .. }
+    ) {
+        while report.pop_front().is_some() {}
+    }
+}
