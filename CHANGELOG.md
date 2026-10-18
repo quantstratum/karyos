@@ -11,6 +11,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The `replay` rejoin with an Archive (phase 3, A6c; SPEC.md §4).
+  `karyos_client::ReplayRejoin` wraps a subscription: on an overrun the
+  live reader rejoins at the head, the poll reports the overrun as
+  `RejoinOutcome::Replaying`, and a `ReplayProvider` is asked for the gap,
+  across polls; its replay is merged in (`LiveMerge`), and the poll on
+  which the merge settles reports `RejoinOutcome::Replayed { cutover }`.
+  With no replay, or a merge that fails, the secondary policy applies and
+  the poll reports `ReplayFallback` with the reason, which gains
+  `RecordingBehind`, `Refused` and `MergeFailed`. Each overrun is
+  reported to the driver once, when it resolved; a gap given up first,
+  when the rejoin is dropped or its live reader taken back
+  (`into_live`, which gives back the reader's own policy and loss
+  reports), is reported as `Withdrawn`. The loss report gains the outcome
+  code `Replayed` (5, with no reason) and the reasons 4 to 7, in place
+  under admission version 2, and the driver counts `overruns replayed`.
+  A plain `RejoinPolicy::Replay`, with no provider, still falls back with
+  `NoArchive`. `LiveMerge::is_settled` tells when a merge is done.
 - The Archive's client (phase 3, A6b-2).
   `karyos_archive::client::ArchiveClient` is a `ReplayProvider` over the
   Archive's control streams (`ControlRequests`, `ControlResponses`): asked
