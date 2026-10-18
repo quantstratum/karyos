@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use karyos_sys::frame::Lane;
 
-use super::record::{Freshness, Outcome};
+use super::record::{EXTENSION, Freshness, LifecycleKind, Loss, Outcome};
 
 /// A publication added to a Gateway at configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +45,12 @@ pub enum Event<'a> {
         lane: Lane,
         /// Its position.
         position: u64,
+        /// The frame's reserved value.
+        reserved_value: i64,
+        /// Whether it ended its stream.
+        end_of_stream: bool,
+        /// Its trace extension, if it had one.
+        extension: Option<&'a [u8; EXTENSION]>,
         /// Its payload.
         payload: &'a [u8],
     },
@@ -53,6 +59,8 @@ pub enum Event<'a> {
     Loss {
         /// The subscription.
         source: SubscriptionId,
+        /// What was lost, and how the source resolved it.
+        loss: Loss,
         /// The first position not delivered.
         from: u64,
         /// The end known lost.
@@ -80,6 +88,8 @@ pub enum Event<'a> {
     Lifecycle {
         /// The subscription.
         source: SubscriptionId,
+        /// What it announced.
+        kind: LifecycleKind,
     },
     /// An input from outside Karyos, delivered by
     /// [`GroupGateway::deliver_external`].
@@ -148,15 +158,6 @@ pub enum ClaimResult<'a> {
     Refused(Outcome),
 }
 
-/// What a timer operation did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimerResult {
-    /// Scheduled, or cancelled while pending.
-    Done,
-    /// A cancel of a timer not pending.
-    NotPending,
-}
-
 /// The handler's only way to act during an event. Each call but
 /// [`clock`](Effects::clock) is one observation.
 pub trait Effects {
@@ -181,11 +182,12 @@ pub trait Effects {
         each: &mut dyn FnMut(&DeliveryOutcome),
     ) -> u32;
 
-    /// Schedules `timer` at `deadline`.
-    fn schedule(&mut self, timer: TimerId, deadline: u64) -> TimerResult;
+    /// Schedules `timer` at `deadline`, replacing a pending deadline.
+    fn schedule(&mut self, timer: TimerId, deadline: u64);
 
-    /// Cancels `timer`.
-    fn cancel(&mut self, timer: TimerId) -> TimerResult;
+    /// Cancels `timer`, if it is pending. Nothing is returned: template
+    /// 12 records the call, not whether the timer was pending.
+    fn cancel(&mut self, timer: TimerId);
 
     /// A value read from outside Karyos: `read` runs under capture and
     /// writes into the buffer, returning its length; under replay the
@@ -237,6 +239,23 @@ pub enum Dispatched {
     /// Best effort: the event could not be captured; it ran unrecorded
     /// and joins the pending gap.
     Uncaptured,
+    /// Replay: the complete prefix has no event left.
+    End,
+}
+
+/// Where a replay first differed from its recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Divergence {
+    /// The event.
+    pub group_seq: u64,
+    /// The observation's index within it, or the recorded count for an
+    /// event that ended with fewer observations.
+    pub index: u32,
+    /// What the recording holds there, as its template id (0 for none).
+    pub expected: u16,
+    /// What the handler did, as the template id it would record (0 for
+    /// none).
+    pub found: u16,
 }
 
 /// Why a Gateway call failed.
@@ -251,11 +270,18 @@ pub enum GatewayError {
     #[error("external events are not delivered in replay")]
     ExternalInReplay,
     /// A replay's handler diverged from its recording.
-    #[error("replay diverged at group_seq {group_seq}")]
-    Diverged {
+    #[error("replay diverged at group_seq {}, observation {}", .0.group_seq, .0.index)]
+    Diverged(Divergence),
+    /// Replay reached an event it cannot reproduce: an incomplete event, a
+    /// gap, or a payload or reference unavailable.
+    #[error("event {group_seq} cannot be reproduced")]
+    NotReproducible {
         /// The event.
         group_seq: u64,
     },
+    /// Replay's manifest differs from the journal's and was not accepted.
+    #[error("the manifest differs from the journal's")]
+    Manifest,
     /// An external value over `MAX_INLINE` under strict capture.
     #[error("value too large: {0} bytes")]
     TooLarge(usize),
