@@ -832,11 +832,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     Event::OverrunsSnapshot
                 }
                 RejoinOutcomeCode::Closed => Event::OverrunsClose,
+                RejoinOutcomeCode::Replayed => Event::OverrunsReplayed,
             },
             1,
         );
-        // Only a replay that fell back: once replay can succeed (phase 3)
-        // it reports no fallback reason and is not counted here.
+        // Only a replay that fell back: one that recovered reports no
+        // fallback reason, and is counted as replayed above.
         if loss.fallback.is_some() {
             self.counters.add(Event::ReplayFallbacks, 1);
         }
@@ -4434,6 +4435,8 @@ mod tests {
                 replay,
             ),
             (RejoinPolicyCode::Replay, RejoinOutcomeCode::Closed, replay),
+            // A replay that recovered: no fallback reason.
+            (RejoinPolicyCode::Replay, RejoinOutcomeCode::Replayed, None),
         ];
         for (sequence, (configured, applied, fallback)) in (2..).zip(reports) {
             let loss = ReportedLoss {
@@ -4448,10 +4451,11 @@ mod tests {
         assert_eq!(counter(&driver, "overruns rejoin at head"), 2);
         assert_eq!(counter(&driver, "overruns snapshot"), 3);
         assert_eq!(counter(&driver, "overruns close"), 2);
+        assert_eq!(counter(&driver, "overruns replayed"), 1);
         assert_eq!(counter(&driver, "replay fallbacks"), 3);
         assert_eq!(counter(&driver, "loss reports unverified"), 0);
         let records = losses(&driver);
-        assert_eq!(records.len(), 7);
+        assert_eq!(records.len(), 8);
         // A fallback keeps its reason and its secondary's outcome.
         assert_eq!(
             records
@@ -4465,7 +4469,8 @@ mod tests {
                 (3, 4, 0),
                 (4, 1, 1),
                 (4, 3, 1),
-                (4, 4, 1)
+                (4, 4, 1),
+                (4, 5, 0)
             ]
         );
     }

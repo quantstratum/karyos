@@ -35,6 +35,13 @@ pub enum TimedNetworkUnsupported {
     /// the sender agent does not hold.
     #[error("cancel-on-deadline")]
     CancelOnDeadline,
+    /// A horizon at or past the image liveness timeout: a lane holding
+    /// only a head that far ahead sends nothing (no DATA, and no idle
+    /// heartbeat while a head is staged), so its receivers' images would
+    /// retire before it leaves. Receivers are assumed to use this driver's
+    /// `image_liveness_timeout`.
+    #[error("a horizon at or past the image liveness timeout")]
+    HorizonPastLiveness,
 }
 
 /// Errors returned by the embedded driver.
@@ -194,16 +201,20 @@ pub enum DriverError {
         stream: u64,
     },
     /// A lane of a guarded network publication that a guard close sealed
-    /// takes no fresh incarnation after the reopen: the network sender
-    /// does not follow a reincarnation yet (it would keep reading the
-    /// sealed log, and no SETUP would announce the new incarnation), so
-    /// the offer would be accepted and never sent. The publication is
-    /// removed and added again instead (`quantstratum-docs:
-    /// karyos/design/guards-and-abort.md`, On the network).
-    #[error("stream {stream} is a guarded network publication: it takes no fresh incarnation")]
-    NetworkReincarnation {
+    /// is between incarnations after the reopen: the old incarnation's
+    /// session is removed, and its alias stays quarantined for
+    /// `alias_quarantine` (default 10 s) from that removal before the next
+    /// incarnation is added under it (`quantstratum-docs:
+    /// karyos/design/network-sessions.md`). Retry at `until_ns` on the
+    /// network clock (the host monotonic clock). While the old session is
+    /// still being removed it is an estimate, early by however long that
+    /// removal still takes; a retry then refuses again with the exact end.
+    #[error("stream {stream}'s alias is quarantined until {until_ns} ns")]
+    QuarantinedAlias {
         /// The stream id.
         stream: u64,
+        /// The earliest retry, in ns on the network clock.
+        until_ns: u64,
     },
     /// `guard_stream` could not admit the stream's walker, a reader that
     /// holds one spare-slot credit for the stream's life

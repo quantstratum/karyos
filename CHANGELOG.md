@@ -11,6 +11,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The `replay` rejoin with an Archive (phase 3, A6c; SPEC.md §4).
+  `karyos_client::ReplayRejoin` wraps a subscription: on an overrun the
+  live reader rejoins at the head, the poll reports the overrun as
+  `RejoinOutcome::Replaying`, and a `ReplayProvider` is asked for the gap,
+  across polls; its replay is merged in (`LiveMerge`), and the poll on
+  which the merge settles reports `RejoinOutcome::Replayed { cutover }`.
+  With no replay, or a merge that fails, the secondary policy applies and
+  the poll reports `ReplayFallback` with the reason, which gains
+  `RecordingBehind`, `Refused` and `MergeFailed`. Each overrun is
+  reported to the driver once, when it resolved; a gap given up first,
+  when the rejoin is dropped or its live reader taken back
+  (`into_live`, which gives back the reader's own policy and loss
+  reports), is reported as `Withdrawn`. The loss report gains the outcome
+  code `Replayed` (5, with no reason) and the reasons 4 to 7, in place
+  under admission version 2, and the driver counts `overruns replayed`.
+  A plain `RejoinPolicy::Replay`, with no provider, still falls back with
+  `NoArchive`. `LiveMerge::is_settled` tells when a merge is done.
 - The Archive's client (phase 3, A6b-2).
   `karyos_archive::client::ArchiveClient` is a `ReplayProvider` over the
   Archive's control streams (`ControlRequests`, `ControlResponses`): asked
@@ -277,11 +294,15 @@ release may break APIs, wire formats and shared-memory layouts.
   Lateness, late sends and heads dropped by an unreliable reset are
   counted; a guard close ends a head still waiting for its time. Refused
   for now, typed (`DriverError::TimedNetworkUnsupported`): redundant
-  paths, the `Tai` domain and cancel-on-deadline. On a reliable channel
-  (PR1b) a message's schedule entry is held until the receivers
-  acknowledge it, so `schedule_capacity` must cover the unacknowledged
-  window (a smaller ring back-pressures offers until they consume); a
-  reset reads the held entries again with
+  paths, the `Tai` domain, cancel-on-deadline and a `max_horizon` at or
+  past `image_liveness_timeout` (a lane holding only a head that far
+  ahead sends nothing, so its images would retire). A lane's settings and
+  counter cells are fixed from the add, also across a guard reopen's
+  fresh incarnation. Counts are per message, not per fragment. On a
+  reliable channel (PR1b) a message's schedule entry is held until the
+  receivers acknowledge it, so `schedule_capacity` must cover the
+  unacknowledged window (a smaller ring back-pressures offers until they
+  consume); a reset reads the held entries again with
   `ScheduleReader::rewind_to_released`, and the messages it resends go at
   once, outside the late policy, counted as rewound. A NAK repair reads
   only the frames its request covers, as a timed lane sends one frame per
@@ -978,13 +999,21 @@ release may break APIs, wire formats and shared-memory layouts.
 - The segment store's arithmetic is checked (SPEC §14): five
   saturating operations in the interval sync and in recovery's counts
   are checked ones. A clock that steps back still syncs nothing.
-- A guarded network publication that a guard close sealed no longer
-  takes a fresh incarnation after the reopen: `publication()` refuses with
-  `DriverError::NetworkReincarnation`. The network sender did not follow
-  the reincarnation (it kept reading the sealed log, and no SETUP
-  announced the new incarnation), so offers were accepted and never sent.
-  The publication is removed and added again until the sender follows a
-  reincarnation.
+- A guarded network publication that a guard close sealed takes its
+  fresh incarnation after the reopen as a new publication identity on
+  the wire, every lane at once. The first `publication()` after the
+  reopen removes the old session with no linger (its closed guard sends
+  no EOS) and refuses with `DriverError::QuarantinedAlias { stream,
+  until_ns }`. Once the alias's `alias_quarantine` (default 10 s) has
+  passed from that removal, the next call swaps in every lane and adds
+  the sender again under the same alias, with incarnation N in its
+  SETUP and its guard gate registered again; the send endpoints stay
+  held between incarnations. Remote receivers are assumed to use the
+  same `alias_quarantine`. `NetworkPublicationState::Reincarnating`
+  reports the wait, and `DriverError::NetworkReincarnation` is gone. A
+  network close or an agent failure before the next incarnation is
+  added refuses its lanes (`NetworkUnavailable`, `NetworkAgent`) and
+  leaves them sealed: they never reincarnate locally.
 - The network keeps one time base in every threading mode. In
   `ThreadingMode::Shared` the agents' cycles took the driver's injectable
   clock while their role clocks read `host_monotonic_ns`. On Linux every

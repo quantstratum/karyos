@@ -160,6 +160,26 @@ fn a_ring_that_is_not_one_is_refused() {
     );
 }
 
+/// A message lost before it left (its last fragment never staged) frees
+/// its own entry, the newest; an older one still waiting keeps its slot.
+#[test]
+fn a_lost_message_frees_its_own_entry() {
+    let ring = ring(2);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    push(&ring, &mut publisher, 0, 10);
+    push(&ring, &mut publisher, 64, 20);
+    let _ = consumer.frame(&ring, data(0, true, true)).unwrap();
+    let _ = consumer.frame(&ring, data(64, true, true)).unwrap();
+    consumer.message_lost(&ring).unwrap();
+    // The first still waits: nothing is released, the ring is still full.
+    assert_eq!(consumer.outstanding(), 2);
+    assert_eq!(publisher.has_room(&ring), Ok(false));
+    consumer.message_left(&ring).unwrap();
+    assert_eq!(consumer.outstanding(), 0);
+    assert_eq!(publisher.has_room(&ring), Ok(true));
+}
+
 /// A rewind to a message boundary reads the entries not released again,
 /// in order, each marked replayed; a message read after them is not.
 #[test]

@@ -688,6 +688,7 @@ impl<T: StreamTerms> Outbound<T> {
             tracks,
             readers,
             counters,
+            timed,
             ..
         } = self
         else {
@@ -703,7 +704,12 @@ impl<T: StreamTerms> Outbound<T> {
                 held: false,
                 guard: Some(&mut **guard),
             };
-            match sender.cancel(tx, lane, &mut gate) {
+            // A timed lane's heads leave its timed record too, as dropped.
+            let cancelled_now = match timed.as_deref_mut() {
+                Some(timed) => sender.cancel(tx, lane, &mut timed.state.view(&mut gate)),
+                None => sender.cancel(tx, lane, &mut gate),
+            };
+            match cancelled_now {
                 Ok(_) => cancelled = true,
                 Err(_) => counters.bump(|c| &mut c.queue_failures, 1),
             }
@@ -1145,6 +1151,7 @@ impl<T: StreamTerms> Outbound<T> {
             consumers.push(consumer);
         }
         let mut state = TimedState::new(policies, usize::from(STAGED_PER_LANE), now);
+        state.set_resends_returned(self.reliable);
         for (lane, cells) in counters.into_iter().enumerate() {
             if let Some(cells) = cells {
                 state.attach_counters(lane, cells);
@@ -1240,13 +1247,14 @@ impl<T: StreamTerms> Outbound<T> {
             }
             None => self.sender.serve(tx, &mut gate, budget),
         };
-        self.release_ended();
         // Once a cycle, even with nothing flushed, so a close becomes
         // effective with no pending traffic (DN 3.1 step 10).
         if let Some(guard) = self.guard.as_deref_mut() {
             guard.between_gates();
         }
         self.cancel_aborted(tx);
+        // After the cancel, whose returned heads end their messages too.
+        self.release_ended();
         self.handle_failure(tx, report.failure);
         for (track, idle) in self.tracks.iter_mut().zip(&mut self.idle_since) {
             if std::mem::take(&mut track.unsent) {
@@ -1268,7 +1276,8 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// A timed message of `lane` whose last fragment never reached the
-    /// queue: its schedule entry is done.
+    /// queue: its own schedule entry, the newest read, is done; older
+    /// messages still queued keep theirs.
     fn timed_message_lost(&mut self, lane: usize) {
         let ring = self
             .readers
@@ -1280,7 +1289,7 @@ impl<T: StreamTerms> Outbound<T> {
             .and_then(|timed| timed.consumers.get_mut(lane))
             .and_then(Option::as_mut);
         if let (Some(ring), Some(consumer)) = (ring, consumer)
-            && consumer.message_left(ring).is_err()
+            && consumer.message_lost(ring).is_err()
         {
             self.counters.bump(|c| &mut c.schedule_faults, 1);
         }
@@ -1753,9 +1762,9 @@ impl<T: StreamTerms> Outbound<T> {
                 None => sender.staged(lane, staged_head).map_err(drop),
             };
             let refused = match (schedule, self.timed.as_deref_mut()) {
-                (Some((time, _)), Some(timed)) => timed
+                (Some((time, ends)), Some(timed)) => timed
                     .state
-                    .stage_with(lane, token, ticket, time, inner)
+                    .stage_with(lane, (token, ticket), (time, ends), inner)
                     .is_err(),
                 _ => inner().is_err(),
             };

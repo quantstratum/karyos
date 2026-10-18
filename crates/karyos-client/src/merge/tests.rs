@@ -105,3 +105,81 @@ fn a_merge_poll_does_not_allocate() {
     assert_eq!(seen, (0..30).collect::<Vec<_>>());
     assert_eq!(cutovers, 1);
 }
+
+/// A provider's reason is the fallback's reason, one for one.
+#[test]
+fn a_provider_reason_is_the_fallback_reason() {
+    for (unavailable, reason) in [
+        (
+            ReplayUnavailable::NoRecording,
+            ReplayFallbackReason::NoRecording,
+        ),
+        (
+            ReplayUnavailable::RetentionShort,
+            ReplayFallbackReason::RetentionShort,
+        ),
+        (
+            ReplayUnavailable::RecordingBehind,
+            ReplayFallbackReason::RecordingBehind,
+        ),
+        (ReplayUnavailable::Refused, ReplayFallbackReason::Refused),
+    ] {
+        assert_eq!(ReplayFallbackReason::from(unavailable), reason);
+    }
+}
+
+/// A provider that keeps the requests it is asked, and answers none yet.
+#[derive(Clone, Default)]
+struct Asked(Arc<std::sync::Mutex<Vec<ReplayRequest>>>);
+
+impl ReplayProvider for Asked {
+    fn replay(&mut self, request: &ReplayRequest) -> ReplayStatus {
+        self.0.lock().unwrap().push(*request);
+        ReplayStatus::Pending
+    }
+
+    fn cancel(&mut self) {}
+}
+
+/// The gap asked for runs to the overrun's resume, where the live reader
+/// rejoined, not to the end of the range known lost: an overrun whose
+/// `lost_to` lies below its `resume` also skipped messages still
+/// retained, and the replay must hold them too.
+#[test]
+fn the_gap_asked_for_runs_to_the_resume() {
+    let reader = ClientSubscription::new(
+        buffer()
+            .conductor_owned()
+            .unwrap()
+            .subscribe(Role::Required)
+            .unwrap(),
+    );
+    let asked = Asked::default();
+    let source = PublicationIdentity::default();
+    let mut rejoin = ReplayRejoin::new(
+        reader,
+        source,
+        Box::new(asked.clone()),
+        Secondary::RejoinAtHead,
+    );
+    let overrun = Overrun {
+        from: 64,
+        lost_to: 4096,
+        resume: 8192,
+    };
+    rejoin.state = match std::mem::replace(&mut rejoin.state, Rejoin::Moving) {
+        Rejoin::Live(live) => Rejoin::Asking { live, overrun },
+        other => other,
+    };
+    assert!(rejoin.is_recovering());
+    assert_eq!(rejoin.ask(overrun), None);
+    assert_eq!(
+        *asked.0.lock().unwrap(),
+        [ReplayRequest {
+            source,
+            from: 64,
+            to: 8192,
+        }]
+    );
+    assert!(rejoin.is_recovering(), "still asking");
+}

@@ -535,6 +535,10 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// retiring: served until their walker ended and their readers passed
     /// the seal.
     pub(crate) replaced: Vec<Replaced<T>>,
+    /// Whether it is a lane of a network publication, and whether its
+    /// sender serves the current incarnation: such a lane reincarnates
+    /// only through the network, never locally.
+    pub(crate) network: NetworkLane,
     /// A timed lane's settings (`quantstratum-docs:
     /// karyos/design/timed-tx.md`); the defaults when not set.
     pub(crate) schedule: Option<karyos_client::schedule::ScheduleOptions>,
@@ -596,6 +600,39 @@ impl TimedCounters {
             sender: Arc::new(sender),
         }
     }
+}
+
+/// Whether a stream is a lane of a network publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkLane {
+    /// Not a network publication's lane.
+    Local,
+    /// Its network sender serves the current incarnation.
+    Sending,
+    /// Swapped to its next incarnation, whose sender is not posted yet:
+    /// nothing is issued on it until it is.
+    AwaitingSender,
+}
+
+/// The next incarnation of a guarded stream, checked
+/// (`EmbeddedDriver::reincarnation_plan`).
+#[derive(Debug)]
+struct Incarnation {
+    incarnation: u64,
+    base: u64,
+    config: LogBufferConfig,
+    generation: Generation,
+    guard: crate::guards::GuardHandle,
+    messages: u64,
+    rate: Option<karyos_sys::rate_limit::RatePolicy>,
+}
+
+/// A prepared incarnation's log, not installed yet.
+struct Fresh<T: StreamTerms> {
+    buffer: Arc<LogBuffer<T>>,
+    conductor: Conductor<Arc<LogBuffer<T>>>,
+    walker: karyos_sys::log_buffer::Subscription<Arc<LogBuffer<T>>>,
+    scratch: usize,
 }
 
 /// A sealed incarnation a fresh one replaced, retiring like a removed
@@ -983,6 +1020,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 guarded: None,
                 incarnation: FIRST_INCARNATION,
                 replaced: Vec::new(),
+                network: NetworkLane::Local,
                 schedule: None,
                 schedule_issued: false,
                 schedule_clock: None,
@@ -1862,6 +1900,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Reopens a guard closed at `expected` for the in-process caller (G1),
     /// returning the new open epoch.
     ///
+    /// A guarded stream the close sealed takes its fresh incarnation at its
+    /// next [`EmbeddedDriver::publication`]. A guarded network publication
+    /// takes it as a new publication identity on the wire, under the same
+    /// alias: its old session is removed first, and the alias is then
+    /// quarantined for `alias_quarantine` (default 10 s) from that removal,
+    /// so `publication()` refuses with [`DriverError::QuarantinedAlias`]
+    /// until then.
+    ///
     /// # Errors
     ///
     /// [`DriverError::UnknownGuard`] and [`DriverError::Guard`]
@@ -2206,6 +2252,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guarded: None,
             incarnation: FIRST_INCARNATION,
             replaced: Vec::new(),
+            network: NetworkLane::Local,
             schedule: None,
             schedule_issued: false,
             schedule_clock: None,
@@ -2225,8 +2272,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// On a guarded stream also [`DriverError::GuardNotOpen`],
     /// [`DriverError::GuardSealed`], [`DriverError::IncarnationsExhausted`],
     /// [`DriverError::PositionsExhausted`] and, for a lane of a network
-    /// publication, [`DriverError::NetworkReincarnation`] (see
-    /// `reincarnate_if_reopened`), with nothing created or taken.
+    /// publication between incarnations after a guard reopen,
+    /// [`DriverError::QuarantinedAlias`]: retryable, at its `until_ns`. The
+    /// first call after the reopen removes the old incarnation's session;
+    /// the call past the alias's quarantine adds the next one, every lane
+    /// at once (see [`EmbeddedDriver::reopen_guard`]). Nothing is taken on
+    /// error.
     pub fn publication(
         &mut self,
         stream: StreamHandle,
@@ -2460,6 +2511,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// that is not guarded, not sealed by a guard close, or whose guard is
     /// still closed is left as it is.
     ///
+    /// A lane of a network publication reincarnates with its whole
+    /// aggregate, as a new publication identity on the wire
+    /// (`reincarnate_network`).
+    ///
     /// # Errors
     ///
     /// [`DriverError::GuardSealed`] while the sealed incarnation's
@@ -2467,13 +2522,37 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// conflated stream or one with a cutover or retained mappings (remote
     /// holders stay on the replaced incarnation, which they pin);
     /// [`DriverError::IncarnationsExhausted`]; [`DriverError::PositionsExhausted`];
-    /// [`DriverError::NetworkReincarnation`] for a lane of a network
-    /// publication, which takes no fresh incarnation yet; and the buffer's
-    /// allocation errors.
+    /// [`DriverError::QuarantinedAlias`] for a lane of a network
+    /// publication between incarnations; and the buffer's allocation
+    /// errors.
     fn reincarnate_if_reopened(&mut self, handle: StreamHandle) -> Result<(), DriverError> {
         let found = self.stream_ref(handle)?;
-        let Some(guarded) = &found.guarded else {
+        let (registration, id) = (found.aggregate.registration, found.id);
+        let network = found.network != NetworkLane::Local;
+        if network
+            || self.net.as_ref().is_some_and(|net| {
+                net.is_network_aggregate(registration)
+                    || net
+                        .reincarnation(registration)
+                        .is_ok_and(|phase| phase.is_some())
+            })
+        {
+            return self.reincarnate_network(registration, id);
+        }
+        let Some(plan) = self.reincarnation_plan(handle)? else {
             return Ok(());
+        };
+        let fresh = self.prepare_incarnation(&plan)?;
+        self.swap_incarnation(handle, plan, fresh)
+    }
+
+    /// The next incarnation of a guarded stream a guard close sealed, once
+    /// its guard is open again, with every check of
+    /// `reincarnate_if_reopened` done; `None` for a stream left as it is.
+    fn reincarnation_plan(&self, handle: StreamHandle) -> Result<Option<Incarnation>, DriverError> {
+        let found = self.stream_ref(handle)?;
+        let Some(guarded) = &found.guarded else {
+            return Ok(None);
         };
         // A removed stream is refused by `publication()` itself; nothing is
         // created for it.
@@ -2481,17 +2560,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             || found.conductor.seal_reason() != Some(SealReason::GuardClosed)
             || !self.guards.state(guarded.guard)?.open
         {
-            return Ok(());
-        }
-        // The network sender does not follow a reincarnation yet: refused,
-        // rather than accepting offers no SETUP announces and no sender
-        // reads. Every check comes first, so nothing changes.
-        if self
-            .net
-            .as_ref()
-            .is_some_and(|net| net.is_network_aggregate(found.aggregate.registration))
-        {
-            return Err(DriverError::NetworkReincarnation { stream: found.id });
+            return Ok(None);
         }
         let sealed = DriverError::GuardSealed { stream: found.id };
         let position = match found.conductor.seal_state() {
@@ -2511,42 +2580,211 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .base
             .checked_add(position)
             .ok_or(DriverError::PositionsExhausted)?;
-        let (config, generation, guard, messages, rate) = (
-            found.config,
-            found.generation,
-            guarded.guard,
-            guarded.messages,
-            guarded.rate,
-        );
-        let buffer = Arc::new(<T as sealed::Create>::create(self, config, generation)?);
+        Ok(Some(Incarnation {
+            incarnation,
+            base,
+            config: found.config,
+            generation: found.generation,
+            guard: guarded.guard,
+            messages: guarded.messages,
+            rate: guarded.rate,
+        }))
+    }
+
+    /// The buffer, conductor and walker of the incarnation `plan`, not
+    /// installed yet.
+    fn prepare_incarnation(&mut self, plan: &Incarnation) -> Result<Fresh<T>, DriverError> {
+        let buffer = Arc::new(<T as sealed::Create>::create(
+            self,
+            plan.config,
+            plan.generation,
+        )?);
         let mut conductor = buffer
             .conductor_owned()
             .ok_or(karyos_sys::error::SysError::ResourcesUnavailable)?;
         let walker = conductor.subscribe(Role::Walker)?;
         let scratch =
             usize::try_from(buffer.max_message_length()).map_err(|_| DriverError::InvalidConfig)?;
-        // Every check passed: the swap cannot fail.
+        Ok(Fresh {
+            buffer,
+            conductor,
+            walker,
+            scratch,
+        })
+    }
+
+    /// Installs the prepared incarnation `plan` of `handle`; the sealed
+    /// one is kept until it retires.
+    fn swap_incarnation(
+        &mut self,
+        handle: StreamHandle,
+        plan: Incarnation,
+        fresh: Fresh<T>,
+    ) -> Result<(), DriverError> {
         let found = self.stream(handle)?;
-        let fresh =
-            crate::guard_streams::GuardedStream::new(guard, messages, rate, walker, scratch);
-        if let Some(old) = found.guarded.replace(fresh) {
+        let guarded = crate::guard_streams::GuardedStream::new(
+            plan.guard,
+            plan.messages,
+            plan.rate,
+            fresh.walker,
+            fresh.scratch,
+        );
+        if let Some(old) = found.guarded.replace(guarded) {
             found.replaced.push(Replaced {
                 incarnation: found.incarnation,
                 base: found.base,
                 buffer: Arc::clone(&found.buffer),
-                conductor: std::mem::replace(&mut found.conductor, conductor),
+                conductor: std::mem::replace(&mut found.conductor, fresh.conductor),
                 guarded: old,
             });
         }
-        found.buffer = buffer;
-        found.incarnation = incarnation;
-        // A fresh incarnation has a fresh ring.
-        found.schedule_issued = false;
-        found.base = base;
+        found.buffer = fresh.buffer;
+        found.incarnation = plan.incarnation;
+        // A fresh incarnation has a fresh ring. A local lane takes new
+        // settings before its next handle; a network lane's are its
+        // sender's, fixed from the add: kept, with its counters, on every
+        // lane, so a reopen bypasses no refusal of the add.
+        if found.network == NetworkLane::Local {
+            found.schedule_issued = false;
+        }
+        found.base = plan.base;
         found.members.clear();
         found.spare = None;
         found.claim_waiting = false;
         Ok(())
+    }
+
+    /// Reincarnates the network publication `registration`, every lane at
+    /// once, as a new publication identity on the wire (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, On the network). The first call
+    /// after the reopen removes the old incarnation's session, with no
+    /// linger (its closed guard sends no EOS); its alias then stays
+    /// quarantined for `alias_quarantine` from that removal, as remote
+    /// receivers quarantine it, and the next incarnation is added under the
+    /// same alias only after that. No incarnation overlaps the other on
+    /// the sender. Until then each call refuses with
+    /// [`DriverError::QuarantinedAlias`]; the call past the quarantine
+    /// swaps in every lane's next incarnation and posts its sender.
+    fn reincarnate_network(&mut self, registration: u64, stream: u64) -> Result<(), DriverError> {
+        let handle = self.aggregate_of(registration)?;
+        // A network that closed or whose agent failed adds no sender: a
+        // lane swapped without one, or a reopened one, is refused and
+        // stays as it is (sealed), so no offer is accepted that no sender
+        // reads.
+        let unusable = match self.net.as_ref() {
+            None => Some(DriverError::NetworkUnavailable),
+            Some(net) => net.unusable(),
+        };
+        if let Some(error) = unusable {
+            for lane in handle.streams() {
+                let found = self.stream_ref(lane)?;
+                if found.network == NetworkLane::AwaitingSender
+                    || self.reincarnation_plan(lane)?.is_some()
+                {
+                    return Err(error);
+                }
+            }
+            return Ok(());
+        }
+        let net = self.net.as_ref().ok_or(DriverError::NetworkUnavailable)?;
+        let swapped = match net.reincarnation(registration)? {
+            Some(crate::net::ReincarnationPhase::Waiting { until_ns }) => {
+                // A guard closed again while waiting is reported as such.
+                let found = self.stream_ref(StreamHandle {
+                    driver: self.id,
+                    stream,
+                })?;
+                if let Some(guarded) = &found.guarded
+                    && !self.guards.state(guarded.guard)?.open
+                {
+                    return Err(DriverError::GuardNotOpen {
+                        guard: guarded.guard.id(),
+                    });
+                }
+                return Err(DriverError::QuarantinedAlias { stream, until_ns });
+            }
+            Some(crate::net::ReincarnationPhase::Ready { swapped }) => Some(swapped),
+            None => None,
+        };
+        if swapped != Some(true) {
+            // Every lane's checks first: all lanes reincarnate, or none.
+            let mut plans = Vec::with_capacity(usize::from(handle.lanes()));
+            for lane in handle.streams() {
+                plans.push((lane, self.reincarnation_plan(lane)?));
+            }
+            let reopened = plans.iter().filter(|(_, plan)| plan.is_some()).count();
+            if reopened == 0 {
+                return Ok(());
+            }
+            if reopened != plans.len() {
+                return Err(DriverError::GuardSealed { stream });
+            }
+            if swapped.is_none() {
+                // Its open sender journals close before the removal, as
+                // on `remove_aggregate`.
+                let closes = self.publication_journal_closes(registration);
+                let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
+                let until_ns = net.start_reincarnation(registration, stream, closes)?;
+                return Err(DriverError::QuarantinedAlias { stream, until_ns });
+            }
+            let mut fresh = Vec::with_capacity(plans.len());
+            for (lane, plan) in plans {
+                if let Some(plan) = plan {
+                    let prepared = self.prepare_incarnation(&plan)?;
+                    fresh.push((lane, plan, prepared));
+                }
+            }
+            // Every lane is prepared: the swaps cannot fail. Nothing is
+            // issued on them until their sender is posted.
+            for (lane, plan, prepared) in fresh {
+                self.swap_incarnation(lane, plan, prepared)?;
+                self.stream(lane)?.network = NetworkLane::AwaitingSender;
+            }
+        }
+        let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
+        let channel = net
+            .reincarnation_swapped(registration)
+            .ok_or(DriverError::UnknownStream { stream })?;
+        let incarnation = self.stream_ref(StreamHandle {
+            driver: self.id,
+            stream: registration,
+        })?;
+        let incarnation = incarnation.incarnation;
+        // A refused add leaves the lanes swapped: a later call posts the
+        // sender again, and nothing is issued meanwhile.
+        self.attach_sender(&handle, channel, incarnation, true)?;
+        if let Some(net) = self.net.as_mut() {
+            let _ = net.end_reincarnation(registration);
+        }
+        Ok(())
+    }
+
+    /// The handle of the aggregate `registration`, from its lanes.
+    fn aggregate_of(&self, registration: u64) -> Result<AggregateHandle, DriverError> {
+        let first = self.stream_ref(StreamHandle {
+            driver: self.id,
+            stream: registration,
+        })?;
+        let mut handle = AggregateHandle {
+            driver: self.id,
+            registration,
+            lanes: [None; MAX_LANES],
+        };
+        for offset in 0..u64::from(first.aggregate.lanes) {
+            let id = registration
+                .checked_add(offset)
+                .ok_or(DriverError::UnknownStream {
+                    stream: registration,
+                })?;
+            let lane = self.stream_ref(StreamHandle {
+                driver: self.id,
+                stream: id,
+            })?;
+            if let Some(slot) = handle.lanes.get_mut(usize::from(lane.config.lane.get())) {
+                *slot = Some(id);
+            }
+        }
+        Ok(handle)
     }
 
     /// The guard binding of a handle about to be issued on a guarded
