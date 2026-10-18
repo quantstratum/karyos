@@ -54,13 +54,21 @@ impl Drop for TempDir {
 
 /// An IPC driver with a network, on the system clock, timeouts of 5 s.
 fn ipc_driver(dir: &Path) -> IpcDriver {
+    ipc_driver_with(
+        dir,
+        NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        },
+    )
+}
+
+/// As [`ipc_driver`], with `network`.
+fn ipc_driver_with(dir: &Path, network: NetworkConfig) -> IpcDriver {
     let timeout = 5_000_000_000;
     EmbeddedDriver::with_ipc(
         DriverConfig {
-            network: Some(NetworkConfig {
-                threading: ThreadingMode::Shared,
-                ..NetworkConfig::default()
-            }),
+            network: Some(network),
             ..DriverConfig::default()
         },
         IpcConfig {
@@ -411,3 +419,5 @@ fn a_remote_client_fetches_an_image_and_closes_at_its_retirement() {
     });
     let _ = (a.close_network(), b.close_network());
 }
+
+mod processes;

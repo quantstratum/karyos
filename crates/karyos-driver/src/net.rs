@@ -2182,6 +2182,16 @@ impl<T: StreamTerms> Network<T> {
         self.images.charged()
     }
 
+    /// The image table's counters, for tests.
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux image process tests (n5)")
+    )]
+    pub(crate) fn image_counters(&self) -> crate::agents::images::ImageCounters {
+        self.images.counters()
+    }
+
     /// Stale aliases that found the queue full, for tests.
     #[cfg(test)]
     pub(crate) fn stale_overflows(&self) -> u64 {
