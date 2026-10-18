@@ -289,11 +289,14 @@ fn collect_attached<T: StreamTerms>(stream: &Stream<T>, out: &mut Vec<Attached>)
     let generation = stream.generation.get();
     let offered = |cell: usize| {
         stream.members.iter().any(|member| {
-            matches!(member.kind, MemberKind::Subscriber { cell: held, .. } if held == cell)
-                && member
-                    .link
-                    .upgrade()
-                    .is_some_and(|link| link.status() == LinkStatus::Offered)
+            matches!(
+                member.kind,
+                MemberKind::Subscriber { cell: held, .. } | MemberKind::Recording { cell: held, .. }
+                    if held == cell
+            ) && member
+                .link
+                .upgrade()
+                .is_some_and(|link| link.status() == LinkStatus::Offered)
         })
     };
     out.extend(
@@ -730,6 +733,42 @@ mod tests {
             .unwrap();
         assert_eq!(successor.1, base);
         assert!(sampled.iter().all(|(_, position)| *position <= base));
+    }
+
+    /// Gap 6: a recording reader that has not moved reports its
+    /// predecessor cell only, not the successor cell reserved for it.
+    #[test]
+    fn a_recording_that_has_not_moved_reports_its_predecessor_position() {
+        let mut driver = driver(64);
+        let handle = driver.add_stream(stream_config(2)).unwrap();
+        let _recording = driver.recording_reader(handle, Role::Optional).unwrap();
+        let mut writer = driver.publication(handle).unwrap();
+        let _ = writer.offer(b"one").unwrap();
+        let _ = driver.do_work().unwrap();
+        let cell = driver.streams[0]
+            .conductor
+            .subscribers()
+            .next()
+            .unwrap()
+            .cell;
+        let _ = driver
+            .reconfigure_stream(
+                handle,
+                crate::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 5,
+                },
+            )
+            .unwrap();
+        let _ = writer.offer(b"two").unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_ne!(driver.streams[0].base, 0);
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            subscribers(&driver),
+            vec![(format!("subscriber position generation 0 cell {cell}"), 0)]
+        );
     }
 
     #[test]

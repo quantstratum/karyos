@@ -10,8 +10,14 @@
 //! after the copy, and the segment holds the frames exactly where the log
 //! does.
 
+use std::sync::Arc;
+
+use karyos_client::{GenerationLink, Next, Successor};
 use karyos_sys::frame::FRAME_ALIGNMENT;
-use karyos_sys::log_buffer::{BufferOwner, ReadError, ReadOrigin, ReadOutcome, SenderRead};
+use karyos_sys::log_buffer::{
+    BufferOwner, LogBuffer, ReadError, ReadOrigin, ReadOutcome, SenderRead,
+};
+use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::recorder::{FrameSource, Frames, SourceError};
 
@@ -88,9 +94,8 @@ impl<O: BufferOwner> FrameSource for SenderRead<O> {
                 })
             }
             Ok(ReadOutcome::Canonical { next, .. }) => Ok(Frames::Fill { position, next }),
-            // A seal with a successor: this reader holds no link to it (the
-            // driver does not offer recordings one yet), so it cannot follow
-            // the cutover and is fenced there.
+            // A seal with a successor: a bare reader holds no link to it, so
+            // it is fenced there. `Following` asks its link instead.
             Ok(ReadOutcome::Pending) => Ok(match self.seal_position() {
                 Some(at) if at == position && self.sealed_with_successor() => Frames::Fenced { at },
                 Some(at) if at == position => Frames::Sealed { at },
@@ -133,5 +138,116 @@ impl<O: BufferOwner> FrameSource for SenderRead<O> {
             Err(ReadError::Faulted { position }) => Err(SourceError::Faulted { position }),
             Ok(_) | Err(_) => Err(SourceError::Invariant),
         }
+    }
+}
+
+/// A recording reader that follows its stream's mapping cutovers
+/// (quantstratum-docs: karyos/design/mapping-generations.md,
+/// "Recordings"): the reader of the current mapping, the generation link
+/// that offers it the successor's, and the mapping's base. It reports
+/// stream positions (the mapping's local positions plus the base), so a
+/// recording is continuous across a cutover.
+///
+/// At a seal with a successor it takes the offered successor reader:
+/// [`Frames::Cutover`] at the seal, and the next read is the successor's.
+/// While the successor is not offered yet it is [`Frames::Pending`]; a
+/// fenced reader gets [`Frames::Fenced`] at the seal.
+#[derive(Debug)]
+pub struct Following<T: TermBytes = HeapTerms> {
+    reader: SenderRead<Arc<LogBuffer<T>>>,
+    link: Arc<GenerationLink<T>>,
+    base: u64,
+}
+
+impl<T: TermBytes> Following<T> {
+    /// `reader`, whose mapping starts at stream position `base`, following
+    /// `link`.
+    pub const fn new(
+        reader: SenderRead<Arc<LogBuffer<T>>>,
+        link: Arc<GenerationLink<T>>,
+        base: u64,
+    ) -> Self {
+        Self { reader, link, base }
+    }
+
+    /// The stream position of the reader's local `position`.
+    fn stream(&self, position: u64) -> Result<u64, SourceError> {
+        self.base
+            .checked_add(position)
+            .ok_or(SourceError::Invariant)
+    }
+
+    /// The reader's local position of the stream's `position`.
+    fn local(&self, position: u64) -> Result<u64, SourceError> {
+        position
+            .checked_sub(self.base)
+            .ok_or(SourceError::Invariant)
+    }
+}
+
+impl<T: TermBytes> FrameSource for Following<T> {
+    fn position(&self) -> u64 {
+        // The link refuses a base whose mapping could pass `2^63`.
+        self.base.saturating_add(self.reader.position())
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
+        Ok(match self.reader.read(out)? {
+            Frames::Copied {
+                position,
+                len,
+                next,
+            } => Frames::Copied {
+                position: self.stream(position)?,
+                len,
+                next: self.stream(next)?,
+            },
+            Frames::Fill { position, next } => Frames::Fill {
+                position: self.stream(position)?,
+                next: self.stream(next)?,
+            },
+            Frames::Pending => Frames::Pending,
+            Frames::Sealed { at } => Frames::Sealed {
+                at: self.stream(at)?,
+            },
+            Frames::Lost { from, to } => Frames::Lost {
+                from: self.stream(from)?,
+                to: self.stream(to)?,
+            },
+            // The reader's seal marks a successor: the link says whether
+            // this reader moves to it.
+            Frames::Fenced { at } | Frames::Cutover { at } => {
+                let at = self.stream(at)?;
+                match self.link.next(true) {
+                    Next::Moved {
+                        base,
+                        successor: Successor::Recording(reader),
+                    } => {
+                        // The successor starts exactly at the seal.
+                        if base != at {
+                            return Err(SourceError::Invariant);
+                        }
+                        self.reader = *reader;
+                        self.base = base;
+                        Frames::Cutover { at }
+                    }
+                    Next::Wait => Frames::Pending,
+                    Next::End => Frames::Fenced { at },
+                    // The driver offers a recording only a recording cell.
+                    _ => return Err(SourceError::Invariant),
+                }
+            }
+        })
+    }
+
+    fn consumed(&mut self, position: u64) -> Result<(), SourceError> {
+        let position = self.local(position)?;
+        self.reader.consumed(position)
+    }
+
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        let to = self.local(to)?;
+        let resumed = self.reader.resume(to)?;
+        self.stream(resumed)
     }
 }

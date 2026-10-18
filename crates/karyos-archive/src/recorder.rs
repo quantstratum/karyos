@@ -71,7 +71,7 @@ pub enum Frames {
     },
     /// The publication was sealed at `at` for a cutover, and the source
     /// cannot follow it: it was fenced at the cutover deadline. The
-    /// recording follows its lap policy from `at`.
+    /// recording ends at `at`, incomplete, whatever its lap policy.
     Fenced {
         /// The seal position.
         at: u64,
@@ -417,23 +417,12 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                         }));
                     }
                     duty.fenced = true;
+                    // A fenced reader has no cell past the seal to rejoin
+                    // at, whatever the lap policy: the recording ends at the
+                    // seal, which it recorded whole, and the host may start
+                    // another on the stream.
                     self.incomplete = true;
-                    // Resuming joins the successor at its head, a gap from
-                    // the seal; a recording that stops, or a required one,
-                    // ends at the seal, which it recorded whole.
-                    let resume = matches!(
-                        self.mode,
-                        Mode::Async {
-                            on_lap: OnLap::Resume
-                        }
-                    );
-                    if !resume || !self.store.gap_fits() {
-                        duty.ended = Some(self.end(at, StopReason::Lapped));
-                        break;
-                    }
-                    // Resumed or not, the duty ends here: a source fenced again
-                    // at the same position cannot hold this thread.
-                    let _ = self.resume_after_lap(at)?;
+                    duty.ended = Some(self.end(at, StopReason::Lapped));
                     break;
                 }
                 Frames::Lost { from, to } => {

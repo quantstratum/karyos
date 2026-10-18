@@ -218,32 +218,69 @@ fn a_recording_reader_keeps_a_removed_stream_to_its_seal() {
     ));
 }
 
-/// #352 review P2: a recording's reader follows one mapping, so a stream it
-/// holds refuses a cutover until the reader and its lease are dropped.
+/// Gap 6: a recording's reader is a member of the stream's cutovers. A
+/// recorded stream is reconfigured, and once the reader reads to the
+/// seal, its link offers it a successor recording cell at the seal's
+/// stream position.
 #[test]
-fn a_recorded_stream_refuses_a_cutover() {
+fn a_recorded_stream_cuts_over_and_offers_the_reader_a_successor() {
+    use karyos_client::{LinkStatus, Next, Successor};
+
     let mut driver = EmbeddedDriver::new().unwrap();
     let handle = driver.add_stream(stream()).unwrap();
     let reconfiguration = crate::generations::Reconfiguration {
         term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
         spare_slots: 6,
     };
-    let (reader, lease) = driver
-        .recording_reader(handle, Role::Required)
-        .unwrap()
-        .into_parts();
+    let recording = driver.recording_reader(handle, Role::Required).unwrap();
+    let (link, base) = (Arc::clone(recording.link()), recording.base());
+    assert_eq!(base, 0);
+    let (mut reader, _lease) = recording.into_parts();
+    let mut publication = driver.publication(handle).unwrap();
     assert!(matches!(
-        driver.reconfigure_stream(handle, reconfiguration),
-        Err(DriverError::RecordingCutover { .. })
+        publication.offer(&[3u8; 100]).unwrap(),
+        OfferOutcome::Accepted { .. }
     ));
-    // The reader alone dropped: the lease still holds the stream.
-    drop(reader);
-    assert!(matches!(
-        driver.reconfigure_stream(handle, reconfiguration),
-        Err(DriverError::RecordingCutover { .. })
-    ));
-    drop(lease);
-    assert!(driver.reconfigure_stream(handle, reconfiguration).is_ok());
+    driver.reconfigure_stream(handle, reconfiguration).unwrap();
+    assert_eq!(link.status(), LinkStatus::Pending);
+    // The writer's release positions the seal; the cutover opens.
+    assert_eq!(
+        publication.offer(&[4u8; 100]).unwrap(),
+        OfferOutcome::AdminAction
+    );
+    let _ = driver.do_work().unwrap();
+    assert_eq!(link.status(), LinkStatus::Offered);
+    let seal = driver.generations(handle).unwrap()[0].seal.unwrap();
+    // The reader drains to the seal, then moves.
+    let mut out = vec![0u8; 4096];
+    let next = loop {
+        let position = reader.position();
+        match reader
+            .read_committed(
+                position,
+                karyos_sys::log_buffer::ReadOrigin::Cursor,
+                &mut out,
+            )
+            .unwrap()
+        {
+            karyos_sys::log_buffer::ReadOutcome::Copied { next, .. } => {
+                reader.sent(next).unwrap();
+            }
+            karyos_sys::log_buffer::ReadOutcome::Pending => break position,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(next, seal);
+    assert!(reader.sealed_with_successor());
+    let Next::Moved {
+        base,
+        successor: Successor::Recording(successor),
+    } = link.next(true)
+    else {
+        panic!("no successor recording cell");
+    };
+    assert_eq!(base, seal);
+    assert_eq!(successor.position(), 0);
 }
 
 /// A required recording of a stream starting at `initial_term_id` reads
