@@ -201,7 +201,10 @@ fn crashed() -> io::Error {
 fn apply(bytes: &mut Vec<u8>, op: &DataOp) -> io::Result<()> {
     let too_large = || error(io::ErrorKind::InvalidInput, "a file past usize");
     match op {
-        DataOp::Write { offset, bytes: data } => {
+        DataOp::Write {
+            offset,
+            bytes: data,
+        } => {
             let start = usize::try_from(*offset).map_err(|_| too_large())?;
             let end = start.checked_add(data.len()).ok_or_else(too_large)?;
             if bytes.len() < end {
@@ -348,7 +351,13 @@ impl SimDisk {
                 };
                 match (fate, op) {
                     (Fate::Kept, op) => apply(&mut bytes, op)?,
-                    (Fate::Torn { kept }, DataOp::Write { offset, bytes: data }) => {
+                    (
+                        Fate::Torn { kept },
+                        DataOp::Write {
+                            offset,
+                            bytes: data,
+                        },
+                    ) => {
                         let kept = usize::try_from(kept).unwrap_or(usize::MAX).min(data.len());
                         let prefix = DataOp::Write {
                             offset: *offset,
@@ -461,9 +470,15 @@ impl Disk for SimDisk {
     fn create(&mut self, path: &Path) -> io::Result<SimFile> {
         let mut state = self.step("create")?;
         if let Ok(inode) = Self::resolve(&state, path) {
-            Self::file(&mut state, &SimFile { inode, writable: true })?
-                .pending
-                .push(DataOp::SetLen(0));
+            Self::file(
+                &mut state,
+                &SimFile {
+                    inode,
+                    writable: true,
+                },
+            )?
+            .pending
+            .push(DataOp::SetLen(0));
             return Ok(SimFile {
                 inode,
                 writable: true,
@@ -534,7 +549,9 @@ impl Disk for SimDisk {
         if !file.writable {
             return Err(error(io::ErrorKind::PermissionDenied, "opened for reading"));
         }
-        Self::file(&mut state, file)?.pending.push(DataOp::SetLen(len));
+        Self::file(&mut state, file)?
+            .pending
+            .push(DataOp::SetLen(len));
         Ok(())
     }
 
