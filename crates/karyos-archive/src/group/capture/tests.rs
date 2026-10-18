@@ -913,3 +913,71 @@ fn a_close_drains_the_ring_and_refuses_the_sender() {
     job.close().unwrap();
     assert_eq!(sender.admit(), Err(Refusal::Ended));
 }
+
+/// Holds every checkpoint's bytes, durable; no recording.
+struct CheckpointsHeld;
+
+impl Coverage for CheckpointsHeld {
+    fn positions(&self, _recording_id: u64) -> Option<(u64, u64)> {
+        None
+    }
+
+    fn ended(&self, _recording_id: u64) -> Option<u64> {
+        None
+    }
+
+    fn checkpoint(&self, _position: u64, _end: u64) -> crate::group::prefix::CheckpointHeld {
+        crate::group::prefix::CheckpointHeld::Durable
+    }
+}
+
+/// #414 re-check P3 (mutant N): a waiter on an event a new range let go
+/// hears of it when the range opens, though no durable value rose: event
+/// 1 is written, not durable; a gap at 2; a checkpoint at 2 opens a range.
+/// The waiter on event 2, a gap's, returns Stopped at once, not at its
+/// deadline.
+#[test]
+fn a_waiter_on_a_let_go_event_is_woken_when_a_range_opens() {
+    use crate::group::record::CheckpointRecord;
+
+    let held = CheckpointsHeld;
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 8));
+    let waiter = sender.waiter();
+    sender.send(&event(1, 10, None), 1).unwrap();
+    sender.room().unwrap();
+    sender.send(&gap(2, 2), 2).unwrap();
+    job.duty(0, 16, &held).unwrap();
+    let waiting = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        (
+            waiter.wait_durable(2, Duration::from_secs(20)),
+            start.elapsed(),
+        )
+    });
+    // Let the waiter park first.
+    std::thread::sleep(Duration::from_millis(50));
+    let mut record = vec![0u8; 64];
+    let length = GroupRecord::Checkpoint(CheckpointRecord {
+        group_seq: 2,
+        checkpoint_id: 1,
+        position: 0,
+        length: 10,
+        crc32c: 0,
+        format: 7,
+    })
+    .encode(&mut record)
+    .unwrap();
+    sender.room().unwrap();
+    sender.send(&record[..length], 2).unwrap();
+    job.duty(0, 16, &held).unwrap();
+    assert_eq!(job.tracker().range().start.unwrap().group_seq, 2);
+    let (woke, after) = waiting.join().unwrap();
+    assert!(
+        matches!(woke, Err(WaitError::Stopped { durable: 0, .. })),
+        "{woke:?}"
+    );
+    assert!(
+        after < Duration::from_secs(10),
+        "woken at the deadline: {after:?}"
+    );
+}

@@ -333,7 +333,15 @@ impl<D: Disk> ReplayCursor<D> {
             false
         })?;
         checked.ok_or(ReplayError::NoHeader)??;
-        let complete_seq = recovery.tracker.complete_recording_seq();
+        // Replay from the start stops at the first range's end: a later
+        // range a checkpoint opened is replayed from it (A9-2).
+        let (complete_seq, complete_end) = recovery.tracker.first_range().map_or(
+            (
+                recovery.tracker.complete_recording_seq(),
+                recovery.tracker.complete_end(),
+            ),
+            |first| (first.complete, first.complete_end),
+        );
         // Counted first, so the list is one allocation that fails typed.
         let names = |record: &GroupRecord<'_>| match record {
             GroupRecord::Unavailable(record) if record.group_seq <= complete_seq => {
@@ -364,7 +372,7 @@ impl<D: Disk> ReplayCursor<D> {
         Ok(Self {
             journal,
             position: header_end,
-            complete_end: recovery.tracker.complete_end().max(header_end),
+            complete_end: complete_end.max(header_end),
             complete_seq,
             unavailable,
             buffer,
@@ -400,7 +408,9 @@ impl<D: Disk> ReplayCursor<D> {
             let _ = self.journal.walk(self.position, |position, end, record| {
                 if spans.is_empty() {
                     match record.role() {
-                        Role::Unavailable(_) => {
+                        // Not events: a reference unavailable, and a
+                        // checkpoint (A9), which A9-2 replays against.
+                        Role::Unavailable(_) | Role::Checkpoint { .. } => {
                             done = Some((end, false));
                             return false;
                         }
@@ -461,7 +471,7 @@ impl<D: Disk> ReplayCursor<D> {
                 return Err(error);
             }
             match (done, first) {
-                // A reference unavailable record: skipped.
+                // A reference unavailable or a checkpoint record: skipped.
                 (Some((end, false)), _) => self.position = end,
                 (Some((end, true)), Some(group_seq)) if end <= self.complete_end => {
                     self.position = end;
