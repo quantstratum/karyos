@@ -21,7 +21,11 @@ release may break APIs, wire formats and shared-memory layouts.
   replay id's low 32 bits. It never blocks; a recording behind is listed
   again until `ClientConfig::deadline`. No replay comes as `NoRecording`,
   `RetentionShort`, `RecordingBehind` or `Refused`. A handed-out replay
-  stops by `StopReplay`, queued when the request stream has no room.
+  stops by `StopReplay`, queued when the request stream has no room, and
+  a replay withdrawn before its answer is stopped when the answer comes:
+  `ArchiveClient::duty` does this while no replay is asked for, and a
+  cancel or a drop sends what it can. The constructors refuse a target
+  channel no request can carry (`ConfigError`).
   `karyos_client` re-exports `PublicationIdentity`, which its merge API
   names.
 - The Archive's `RecordingDescriptor` (control schema 1, A6b) carries

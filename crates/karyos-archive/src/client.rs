@@ -26,8 +26,14 @@
 //! Correlation ids carry [`ClientConfig::client_id`] in their high 32
 //! bits; answers to other requesters, and signals, are skipped. A replay
 //! handed out stops through its [`ReplayStop`], which sends a
-//! `StopReplay`, or queues it for the client's next call when the request
-//! stream has no room.
+//! `StopReplay`, or queues it when the request stream has no room. A
+//! replay withdrawn before it was handed out is stopped when its answer
+//! comes. Queued stops and late answers are handled by every call, and by
+//! [`ArchiveClient::duty`], which a host calls while no replay is asked
+//! for; dropping the client sends what it can.
+//!
+//! A descriptor names no lane: a recording of another lane of the same
+//! publication cannot be told apart. Only lane 0 is replayed (A6, Q6).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,8 +46,8 @@ use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::catalog::SourceIncarnation;
 use crate::control::{
-    self, ControlMessage, ControlResponse, MAX_LIST_COUNT, RecordingDescriptor, RecordingState,
-    ReplayRate, ResponseCode,
+    self, ControlMessage, ControlResponse, MAX_CHANNEL, MAX_LIST_COUNT, RecordingDescriptor,
+    RecordingState, ReplayRate, ResponseCode,
 };
 use crate::server::{MAX_ANSWER, MAX_REQUEST, replay_session_id};
 
@@ -53,6 +59,10 @@ const ANSWERS_PER_CALL: usize = 64;
 
 /// Withdrawn replay requests remembered at most.
 const MAX_ORPHANS: usize = 64;
+
+/// Stops queued at most; past it, the oldest is dropped, and its replay
+/// runs to its end.
+const MAX_STOPS: usize = 64;
 
 /// The request stream, as a requester writes it.
 pub trait ControlRequests: Send {
@@ -81,12 +91,13 @@ pub trait ReplayTargets<T: TermBytes = HeapTerms>: Send {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     /// This client's id, the high 32 bits of its correlation ids, unique
-    /// among the Archive's requesters (archive-control-codec.md §7a).
+    /// among the Archive's requesters (archive-control-codec.md §7a), and
+    /// for each client instance: the low 32 bits restart at 1 with each.
     pub client_id: u32,
     /// The stream replays are asked onto: kept for replays, so a target's
     /// key never collides with another stream's.
     pub target_stream_id: i32,
-    /// The channel named in replay requests.
+    /// The channel named in replay requests, 1 to [`MAX_CHANNEL`] bytes.
     pub target_channel: String,
     /// How long a request waits, from its first call, for a recording to
     /// cover its range and for its target to appear.
@@ -113,12 +124,22 @@ impl ClientConfig {
     }
 }
 
+/// A client configuration that cannot work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigError {
+    /// The target channel is empty or longer than [`MAX_CHANNEL`] bytes,
+    /// so no replay request could be sent.
+    #[error("the target channel is 1 to {MAX_CHANNEL} bytes")]
+    TargetChannel,
+}
+
 /// What the client and the stops of the replays it handed out share: the
 /// request stream, the stops not sent yet, and the correlation ids.
 struct Outbox<Q> {
     requests: Q,
-    /// Replay ids whose stop found no room yet.
-    stops: Vec<u64>,
+    /// Stops that found no room yet: the replay id, and the correlation id
+    /// each was given when queued.
+    stops: Vec<(u64, u64)>,
     client_id: u32,
     next: u32,
     buffer: Vec<u8>,
@@ -145,20 +166,23 @@ impl<Q: ControlRequests> Outbox<Q> {
         }
     }
 
-    /// Stops replay `replay_id`, now or once there is room.
+    /// Stops replay `replay_id`, now or once there is room. Its
+    /// correlation id is taken once, here; with none left the stop cannot
+    /// be sent, and the replay runs to its end.
     fn stop(&mut self, replay_id: u64) {
-        self.stops.push(replay_id);
+        let Some(correlation_id) = self.correlation() else {
+            return;
+        };
+        if self.stops.len() >= MAX_STOPS {
+            self.stops.remove(0);
+        }
+        self.stops.push((replay_id, correlation_id));
         self.flush_stops();
     }
 
-    /// Sends the stops that wait, while there is room.
+    /// Sends the stops that wait, in order, while there is room.
     fn flush_stops(&mut self) {
-        while let Some(&replay_id) = self.stops.first() {
-            let Some(correlation_id) = self.correlation() else {
-                // No id left to send them with.
-                self.stops.clear();
-                return;
-            };
+        while let Some(&(replay_id, correlation_id)) = self.stops.first() {
             let message = ControlMessage::StopReplay(control::StopReplay {
                 correlation_id,
                 replay_id,
@@ -202,6 +226,9 @@ struct Found {
     in_time: bool,
     /// One of those still records and has not reached `to`.
     behind: bool,
+    /// The lowest id of a recording of the source that starts at or
+    /// before `from`: where a list again begins.
+    first_in_time: Option<u64>,
 }
 
 /// Where a request stands.
@@ -238,6 +265,11 @@ struct Pending {
     /// Its first call, on the client's clock.
     since: u64,
     step: Step,
+    /// A list found the recording behind: past the deadline it is
+    /// `RecordingBehind`, even while a list again is unanswered.
+    behind: bool,
+    /// Where a list again begins.
+    relist_from: u64,
 }
 
 /// What a call ends with.
@@ -248,7 +280,7 @@ enum Outcome<T: TermBytes> {
 
 /// The Archive's client: a [`ReplayProvider`] over its control streams
 /// (see the module documentation).
-pub struct ArchiveClient<Q, R, S> {
+pub struct ArchiveClient<Q: ControlRequests + 'static, R: ControlResponses, S> {
     config: ClientConfig,
     outbox: Arc<Mutex<Outbox<Q>>>,
     responses: R,
@@ -261,7 +293,9 @@ pub struct ArchiveClient<Q, R, S> {
     answer: Vec<u8>,
 }
 
-impl<Q, R, S> core::fmt::Debug for ArchiveClient<Q, R, S> {
+impl<Q: ControlRequests + 'static, R: ControlResponses, S> core::fmt::Debug
+    for ArchiveClient<Q, R, S>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ArchiveClient")
             .field("config", &self.config)
@@ -273,21 +307,38 @@ impl<Q, R, S> core::fmt::Debug for ArchiveClient<Q, R, S> {
 impl<Q: ControlRequests + 'static, R: ControlResponses, S> ArchiveClient<Q, R, S> {
     /// A client sending on `requests`, reading `responses` and finding the
     /// targets through `targets`, on a monotonic clock.
-    pub fn new(config: ClientConfig, requests: Q, responses: R, targets: S) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::TargetChannel`] for a target channel no request can
+    /// carry.
+    pub fn new(
+        config: ClientConfig,
+        requests: Q,
+        responses: R,
+        targets: S,
+    ) -> Result<Self, ConfigError> {
         let epoch = Instant::now();
         let clock = move || u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
         Self::with_clock(config, requests, responses, targets, Box::new(clock))
     }
 
     /// [`ArchiveClient::new`] on `clock`, which tells nanoseconds.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveClient::new`].
     pub fn with_clock(
         config: ClientConfig,
         requests: Q,
         responses: R,
         targets: S,
         clock: Box<dyn FnMut() -> u64 + Send>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ConfigError> {
+        if !(1..=MAX_CHANNEL).contains(&config.target_channel.len()) {
+            return Err(ConfigError::TargetChannel);
+        }
+        Ok(Self {
             outbox: Arc::new(Mutex::new(Outbox {
                 requests,
                 stops: Vec::new(),
@@ -302,7 +353,28 @@ impl<Q: ControlRequests + 'static, R: ControlResponses, S> ArchiveClient<Q, R, S
             pending: None,
             orphans: Vec::new(),
             answer: vec![0; MAX_ANSWER],
+        })
+    }
+
+    /// The work a host gives the client while no replay is asked for: the
+    /// stops that wait are sent, and the answers there are read, which
+    /// stops a replay withdrawn before its answer came. While a replay is
+    /// asked for, [`ReplayProvider::replay`] does this itself.
+    pub fn duty(&mut self) {
+        lock(&self.outbox).flush_stops();
+        if self.pending.is_some() {
+            return;
         }
+        let mut buffer = std::mem::take(&mut self.answer);
+        for _ in 0..ANSWERS_PER_CALL {
+            let Some(length) = self.responses.next(&mut buffer) else {
+                break;
+            };
+            if let Some(Ok(message)) = buffer.get(..length).map(ControlMessage::decode) {
+                self.orphaned(&message);
+            }
+        }
+        self.answer = buffer;
     }
 
     /// Whether more than the deadline passed since `since`, at `now`.
@@ -392,7 +464,12 @@ impl<Q: ControlRequests + 'static, R: ControlResponses, S> ArchiveClient<Q, R, S
                     ReplayUnavailable::RecordingBehind,
                 ));
             }
-            Step::Behind { listed: now }
+            return Outcome::Waiting(Pending {
+                step: Step::Behind { listed: now },
+                behind: true,
+                relist_from: found.first_in_time.unwrap_or(0),
+                ..pending
+            });
         } else if found.any && !found.in_time {
             return Outcome::Done(ReplayStatus::Unavailable(ReplayUnavailable::RetentionShort));
         } else {
@@ -555,7 +632,7 @@ impl<Q: ControlRequests + 'static, R: ControlResponses, S> ArchiveClient<Q, R, S
                 ReplayUnavailable::RecordingBehind,
             )),
             Step::Behind { listed } if self.relisting(listed, now) => {
-                match self.list(0, Found::default()) {
+                match self.list(pending.relist_from, Found::default()) {
                     Some(step) => Outcome::Waiting(Pending {
                         step: self.send(&Pending { step, ..pending }),
                         ..pending
@@ -584,6 +661,10 @@ impl<Q: ControlRequests + 'static, R: ControlResponses, S> ArchiveClient<Q, R, S
                 }
                 Outcome::Waiting(pending)
             }
+            // A list again, unanswered when the recording was behind.
+            Step::Listing { .. } if expired && pending.behind => Outcome::Done(
+                ReplayStatus::Unavailable(ReplayUnavailable::RecordingBehind),
+            ),
             // No answer in time.
             Step::Listing { .. } | Step::Asking { .. } if expired => {
                 self.withdraw(pending);
@@ -625,6 +706,8 @@ where
                     length,
                     since: now,
                     step,
+                    behind: false,
+                    relist_from: 0,
                 }
             }
         };
@@ -641,6 +724,18 @@ where
         if let Some(pending) = self.pending.take() {
             self.withdraw(pending);
         }
+        self.duty();
+    }
+}
+
+impl<Q: ControlRequests + 'static, R: ControlResponses, S> Drop for ArchiveClient<Q, R, S> {
+    /// Withdraws the request pending and sends what can be sent: a replay
+    /// whose answer comes after the drop runs to its end.
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.withdraw(pending);
+        }
+        self.duty();
     }
 }
 
@@ -654,6 +749,8 @@ fn look_at(descriptor: &RecordingDescriptor<'_>, request: &ReplayRequest, found:
         return;
     }
     found.in_time = true;
+    let id = descriptor.recording_id;
+    found.first_in_time = Some(found.first_in_time.map_or(id, |first| first.min(id)));
     let (end, recording) = match descriptor.state {
         RecordingState::Recording { written, .. } => (written, true),
         RecordingState::Stopped(stop) => (stop.position, false),
