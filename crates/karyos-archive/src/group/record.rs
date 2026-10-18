@@ -60,7 +60,7 @@ pub const LIFECYCLE_EVENT: Template = template(5, 43, 12 + 43);
 /// `ExternalEvent`, template 6.
 pub const EXTERNAL_EVENT: Template = template(6, 20, 12 + 20 + 2 + 65_535);
 /// `OutcomeObservation`, template 11.
-pub const OUTCOME_OBSERVATION: Template = template(11, 41, 12 + 41);
+pub const OUTCOME_OBSERVATION: Template = template(11, 51, 12 + 51);
 /// `TimerObservation`, template 12.
 pub const TIMER_OBSERVATION: Template = template(12, 29, 12 + 29);
 /// `DeliveryObservation`, template 14.
@@ -654,6 +654,25 @@ pub enum Operation {
 /// it name the client's errors in a stable order.
 pub const MAX_ERROR_CODE: u16 = 21;
 
+/// Per `ClientError` code, the highest `sub` it takes: the count of its
+/// inner error's variants (or of the driver's refusal codes), 0 for a
+/// variant with no inner one (section 5.1 of the note).
+const MAX_SUB: [u16; 22] = [
+    0, 0, 0, 0, 0, 7, 0, 4, 0, 0, 0, 26, 0, 0, 6, 11, 0, 0, 16, 0, 6, 0,
+];
+
+/// Whether `sub` names a variant of `error`'s inner error: 1 to its count
+/// when it has one, else 0.
+fn sub_of(error: u16, sub: u16) -> bool {
+    MAX_SUB.get(usize::from(error)).is_some_and(|&max| {
+        if max == 0 {
+            sub == 0
+        } else {
+            (1..=max).contains(&sub)
+        }
+    })
+}
+
 /// An operation's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -685,14 +704,19 @@ pub enum Outcome {
         /// The position.
         position: u64,
     },
-    /// The call returned an error: its `ClientError` code, 1 to
-    /// [`MAX_ERROR_CODE`], and the one field the handler can see in it (a
-    /// message's length for a message too large), else 0.
+    /// The call returned an error, as section 5.1 of the note maps it: its
+    /// `ClientError` code, 1 to [`MAX_ERROR_CODE`]; `sub`, its inner
+    /// error's variant (or the driver's refusal code), else 0; and its
+    /// first two numeric fields, else 0.
     Failed {
         /// The error's code.
         error: u16,
-        /// Its detail.
+        /// Its inner variant.
+        sub: u16,
+        /// Its first numeric field.
         detail: u64,
+        /// Its second numeric field.
+        detail2: u64,
     },
 }
 
@@ -725,15 +749,16 @@ const fn returns(operation: Operation, outcome: u8) -> bool {
 impl OutcomeObservation {
     fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
         decoder.finish()?;
-        let operation = match block.u8(38)? {
+        let operation = match block.u8(48)? {
             1 => Operation::Offer,
             2 => Operation::Claim,
             3 => Operation::Commit,
             value => return Err(invalid_enum("operation", value)),
         };
-        let (position, detail, error) = (block.u64(8)?, block.u64(16)?, block.u16(36)?);
-        let lane_byte = block.u8(40)?;
-        let code = block.u8(39)?;
+        let (position, detail, detail2) = (block.u64(8)?, block.u64(16)?, block.u64(24)?);
+        let (error, sub) = (block.u16(44)?, block.u16(46)?);
+        let lane_byte = block.u8(50)?;
+        let code = block.u8(49)?;
         if !(1..=9).contains(&code) {
             return Err(invalid_enum("outcome", code));
         }
@@ -747,7 +772,7 @@ impl OutcomeObservation {
         if !positioned && lane_byte != 0 {
             return Err(out_of_range("lane"));
         }
-        if code != 9 && (error != 0 || detail != 0) {
+        if code != 9 && (error != 0 || sub != 0 || detail != 0 || detail2 != 0) {
             return Err(out_of_range("error"));
         }
         let outcome = match code {
@@ -766,13 +791,19 @@ impl OutcomeObservation {
             6 => Outcome::Gated,
             7 => Outcome::RateLimited,
             _ if error == 0 || error > MAX_ERROR_CODE => return Err(out_of_range("error")),
-            _ => Outcome::Failed { error, detail },
+            _ if !sub_of(error, sub) => return Err(out_of_range("sub")),
+            _ => Outcome::Failed {
+                error,
+                sub,
+                detail,
+                detail2,
+            },
         };
         Ok(Self {
             group_seq: id("group_seq", block.u64(0)?)?,
-            index: block.u32(24)?,
-            stream_id: block.i32(28)?,
-            session_id: block.i32(32)?,
+            index: block.u32(32)?,
+            stream_id: block.i32(36)?,
+            session_id: block.i32(40)?,
             operation,
             outcome,
         })
@@ -787,19 +818,28 @@ impl OutcomeObservation {
     /// to [`MAX_ERROR_CODE`].
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let mut encoder = Encoder::new(out, &OUTCOME_OBSERVATION)?;
-        let (outcome, lane, position, error, detail) = match self.outcome {
-            Outcome::Accepted { lane, position } => (1, lane.get(), position, 0, 0),
-            Outcome::BackPressured => (2, 0, 0, 0, 0),
-            Outcome::AdminAction => (3, 0, 0, 0, 0),
-            Outcome::NotConnected => (4, 0, 0, 0, 0),
-            Outcome::Closed => (5, 0, 0, 0, 0),
-            Outcome::Gated => (6, 0, 0, 0, 0),
-            Outcome::RateLimited => (7, 0, 0, 0, 0),
-            Outcome::Aborted { lane, position } => (8, lane.get(), position, 0, 0),
+        let none = (0u16, 0u16, 0u64, 0u64);
+        let (outcome, lane, position, (error, sub, detail, detail2)) = match self.outcome {
+            Outcome::Accepted { lane, position } => (1, lane.get(), position, none),
+            Outcome::BackPressured => (2, 0, 0, none),
+            Outcome::AdminAction => (3, 0, 0, none),
+            Outcome::NotConnected => (4, 0, 0, none),
+            Outcome::Closed => (5, 0, 0, none),
+            Outcome::Gated => (6, 0, 0, none),
+            Outcome::RateLimited => (7, 0, 0, none),
+            Outcome::Aborted { lane, position } => (8, lane.get(), position, none),
             Outcome::Failed { error, .. } if error == 0 || error > MAX_ERROR_CODE => {
                 return Err(out_of_range("error"));
             }
-            Outcome::Failed { error, detail } => (9, 0, 0, error, detail),
+            Outcome::Failed { error, sub, .. } if !sub_of(error, sub) => {
+                return Err(out_of_range("sub"));
+            }
+            Outcome::Failed {
+                error,
+                sub,
+                detail,
+                detail2,
+            } => (9, 0, 0, (error, sub, detail, detail2)),
         };
         if !returns(self.operation, outcome) {
             return Err(out_of_range("outcome"));
@@ -812,13 +852,15 @@ impl OutcomeObservation {
         encoder.u64(0, id("group_seq", self.group_seq)?)?;
         encoder.u64(8, position)?;
         encoder.u64(16, detail)?;
-        encoder.u32(24, self.index)?;
-        encoder.i32(28, self.stream_id)?;
-        encoder.i32(32, self.session_id)?;
-        encoder.u16(36, error)?;
-        encoder.u8(38, operation)?;
-        encoder.u8(39, outcome)?;
-        encoder.u8(40, lane)?;
+        encoder.u64(24, detail2)?;
+        encoder.u32(32, self.index)?;
+        encoder.i32(36, self.stream_id)?;
+        encoder.i32(40, self.session_id)?;
+        encoder.u16(44, error)?;
+        encoder.u16(46, sub)?;
+        encoder.u8(48, operation)?;
+        encoder.u8(49, outcome)?;
+        encoder.u8(50, lane)?;
         encoder.finish()
     }
 }
