@@ -245,3 +245,38 @@ fn a_recorded_stream_refuses_a_cutover() {
     drop(lease);
     assert!(driver.reconfigure_stream(handle, reconfiguration).is_ok());
 }
+
+/// A required recording of a stream starting at `initial_term_id` reads
+/// about four terms; returns the messages accepted and where it read to.
+fn record_four_terms(initial_term_id: u32) -> (usize, u64) {
+    let mut driver = EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+        initial_term_id: Some(initial_term_id),
+        ..crate::embedded::DriverConfig::default()
+    })
+    .unwrap();
+    let handle = driver.add_stream(stream()).unwrap();
+    let (mut reader, _lease) = driver
+        .recording_reader(handle, Role::Required)
+        .unwrap()
+        .into_parts();
+    let mut publication = driver.publication(handle).unwrap();
+    let most = 4 * usize::try_from(MIN_TERM_LENGTH).unwrap() / MESSAGE;
+    let mut accepted = 0;
+    let mut position = 0;
+    while accepted < most {
+        accepted += offer_until_refused(&mut driver, &mut publication, most - accepted);
+        position = drain(&mut reader);
+        driver.do_work().unwrap();
+    }
+    (accepted, position)
+}
+
+/// A required recording of a stream starting just below `u32::MAX` reads
+/// across the term id wrap (term ids MAX - 1, MAX, 0 and 1) exactly what
+/// it reads from a stream starting at 7 (SPEC §4, initial state).
+#[test]
+fn a_required_recording_reads_across_the_term_id_wrap() {
+    let wrapped = record_four_terms(u32::MAX - 1);
+    assert_eq!(wrapped, record_four_terms(7));
+    assert!(wrapped.1 > 3 * u64::from(MIN_TERM_LENGTH));
+}

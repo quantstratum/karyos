@@ -35,6 +35,16 @@ const OTHER: i32 = 44;
 const TARGET: i32 = 43;
 const INITIAL_TERM_ID: i32 = 7;
 
+/// A driver whose streams start at [`INITIAL_TERM_ID`]: each test replays
+/// into a target configured with it (the driver otherwise draws the id).
+fn pinned() -> EmbeddedDriver {
+    EmbeddedDriver::with_config(karyos_driver::DriverConfig {
+        initial_term_id: Some(INITIAL_TERM_ID.cast_unsigned()),
+        ..karyos_driver::DriverConfig::default()
+    })
+    .unwrap()
+}
+
 fn stream(stream_id: i32, term_length: u32) -> StreamConfig {
     StreamConfig {
         buffer: LogBufferConfig {
@@ -353,7 +363,7 @@ fn joined(
     after: u32,
     live_role: Role,
 ) -> (EmbeddedDriver, Recorded, ClientSubscription, u64) {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let mut recorded = Recorded::new(&mut driver, SOURCE);
     recorded.publish(&mut driver, before, 1000);
     let live = driver.subscribe(recorded.handle, live_role).unwrap();
@@ -491,7 +501,7 @@ fn a_replay_of_another_incarnation_is_an_epoch_change() {
 /// replay's there, and the merge fails, typed, instead of merging.
 #[test]
 fn a_replay_of_another_log_is_a_mismatch() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     // Two streams alike up to the cutover, then with other lengths.
     let mut replayed = Recorded::new(&mut driver, OTHER);
     let mut recorded = Recorded::new(&mut driver, SOURCE);
@@ -655,7 +665,7 @@ fn other_log(
     u64,
     PublicationIdentity,
 ) {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let mut replayed = Recorded::new(&mut driver, OTHER);
     let mut recorded = Recorded::new(&mut driver, SOURCE);
     replayed.publish(&mut driver, replayed_count, replayed_length);
@@ -751,7 +761,7 @@ fn a_replay_past_the_cutover_is_a_mismatch() {
 /// replay does not have, so the merge fails, typed.
 #[test]
 fn a_replay_in_other_terms_is_a_mismatch() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let mut replayed = Recorded::with_terms(&mut driver, OTHER, 2 * MIN_TERM_LENGTH);
     let mut recorded = Recorded::new(&mut driver, SOURCE);
     // 62 messages of 1056 bytes: the live stream's first term ends there,
@@ -818,7 +828,7 @@ fn term_padding_at_the_cutover_waits_for_the_next_term() {
 /// typed, and the replay stops.
 #[test]
 fn only_lane_zero_merges() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let recorded = Recorded::new(&mut driver, SOURCE);
     let lanes = driver
         .add_aggregate(karyos_driver::AggregateConfig {
