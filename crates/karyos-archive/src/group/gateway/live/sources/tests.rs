@@ -648,22 +648,38 @@ impl MessageSource for Images {
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
     ) -> Result<PollSummary, PollError> {
-        let count = self.images.len();
-        for offset in 0..count {
-            let index = (self.next + offset) % count;
-            let summary = self.images[index].poll_taking(&mut *handler, limit)?;
-            if summary.delivered > 0 {
-                self.next = (index + 1) % count;
-                return Ok(summary);
-            }
-        }
-        Ok(PollSummary::default())
+        self.poll_reporting(handler, limit)
+            .map(|(summary, _)| summary)
     }
 
     fn next_image_change(&mut self) -> Option<ImageChange> {
         self.changes.lock().unwrap().pop_front()
     }
+
+    fn fan_in(&self) -> bool {
+        true
+    }
+
+    fn poll_reporting(
+        &mut self,
+        handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        limit: MessageLimit,
+    ) -> Result<(PollSummary, Option<i32>), PollError> {
+        let count = self.images.len();
+        for offset in 0..count {
+            let index = (self.next + offset) % count;
+            let summary = self.images[index].poll_taking(&mut *handler, limit)?;
+            if summary != PollSummary::default() {
+                self.next = (index + 1) % count;
+                return Ok((summary, Some(SESSIONS[index])));
+            }
+        }
+        Ok((PollSummary::default(), None))
+    }
 }
+
+/// The fan-in's images' sessions, in order.
+const SESSIONS: [i32; 2] = [1, 3];
 
 struct Fanned {
     gateway: Gateway<Idle, Clocked>,
@@ -671,6 +687,7 @@ struct Fanned {
     disk: FaultDisk,
     publications: Vec<Publication<Arc<LogBuffer>>>,
     changes: Arc<std::sync::Mutex<std::collections::VecDeque<ImageChange>>>,
+    word: Arc<RecordingWord>,
     _conductors: Vec<Conductor<Arc<LogBuffer>>>,
 }
 
@@ -702,7 +719,7 @@ fn fanned(mode: Capture, ring_capacity: usize) -> Fanned {
     let mut gateway = Gateway::new(Idle, clock, sender, mode, 1, 1000, 8).unwrap();
     gateway.set_inline_threshold(64);
     let (mut images, mut publications, mut conductors) = (Vec::new(), Vec::new(), Vec::new());
-    for session in [1, 3] {
+    for session in SESSIONS {
         let buffer = log_of(session, 64 * 1024);
         let mut conductor = buffer.conductor_owned().unwrap();
         images.push(ClientSubscription::new(
@@ -717,8 +734,9 @@ fn fanned(mode: Capture, ring_capacity: usize) -> Fanned {
         next: 0,
         changes: Arc::clone(&changes),
     };
+    let word = Arc::new(RecordingWord::new());
     let _ = gateway
-        .add_subscription(Box::new(source), IDENTITY, Arc::new(RecordingWord::new()))
+        .add_subscription(Box::new(source), IDENTITY, Arc::clone(&word))
         .unwrap();
     Fanned {
         gateway,
@@ -726,6 +744,7 @@ fn fanned(mode: Capture, ring_capacity: usize) -> Fanned {
         disk,
         publications,
         changes,
+        word,
         _conductors: conductors,
     }
 }
@@ -781,7 +800,7 @@ fn image_changes_are_lifecycle_events_live_and_in_replay() {
             .unwrap();
     }
     let mut live = Vec::new();
-    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| live.push(seen(event).0);
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| live.push(seen(event));
     while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
     push(&rig, 10, 1, false);
     push(&rig, 12, 1, true);
@@ -789,18 +808,17 @@ fn image_changes_are_lifecycle_events_live_and_in_replay() {
         .append(b"c", AppendOptions::default())
         .unwrap();
     while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
-    assert_eq!(
-        live,
-        [
-            "available",
-            "available",
-            "message",
-            "message",
-            "unavailable",
-            "available",
-            "message"
-        ]
-    );
+    // One source, live and in replay: the fan-in's every image is it.
+    let expected = [
+        ("available", 0),
+        ("available", 0),
+        ("message", 0),
+        ("message", 0),
+        ("unavailable", 0),
+        ("available", 0),
+        ("message", 0),
+    ];
+    assert_eq!(live, expected);
     let bytes = records(rig.job, &rig.disk);
     let recorded: Vec<(&str, i32)> = decoded(&bytes)
         .into_iter()
@@ -833,7 +851,7 @@ fn image_changes_are_lifecycle_events_live_and_in_replay() {
             ("message", 1)
         ]
     );
-    // Replay: sources by stream and session, 0 for session 1, 1 for 3.
+    // Replay: the network stream's one entry takes every session.
     let mut journal = GroupJournal::recover(rig.disk.clone(), Path::new("/g"), 1, journal_config())
         .unwrap()
         .journal;
@@ -855,7 +873,8 @@ fn image_changes_are_lifecycle_events_live_and_in_replay() {
         cursor,
         &GatewayConfig {
             publications: &[],
-            subscriptions: &[(2, 1), (2, 3)],
+            subscriptions: &[(2, 1)],
+            network: &[2],
             conflated: &[],
             max_claim: 0,
             max_payload: 0,
@@ -867,18 +886,7 @@ fn image_changes_are_lifecycle_events_live_and_in_replay() {
     let mut replayed = Vec::new();
     let mut handler = |event: &Event<'_>, _: &mut dyn Effects| replayed.push(seen(event));
     while let Ok(Dispatched::Event { .. }) = replay.dispatch(&mut handler) {}
-    assert_eq!(
-        replayed,
-        [
-            ("available", 0),
-            ("available", 1),
-            ("message", 0),
-            ("message", 1),
-            ("unavailable", 0),
-            ("available", 0),
-            ("message", 0)
-        ]
-    );
+    assert_eq!(replayed, expected);
 }
 
 /// Strict capture without room refuses an image event: it stays held and
@@ -1224,4 +1232,81 @@ fn a_view_at_the_event_budget_is_accepted() {
         rig_budget().gateway.add_conflated(Box::new(over), 5, 1),
         Err(GatewayError::TooLarge(fits + 1))
     );
+}
+
+/// #445 review P1-a: the recording word names the source's own session's
+/// recording; a large message of another image is placed as without a
+/// word (inline), the source's own by reference.
+#[test]
+fn only_the_words_session_is_placed_by_reference() {
+    let mut rig = fanned(Capture::BestEffort, 1 << 16);
+    rig.word.set(7, 0);
+    for image in [0, 1] {
+        let _ = rig.publications[image]
+            .append(
+                &[u8::try_from(image).unwrap(); 100],
+                AppendOptions::default(),
+            )
+            .unwrap();
+    }
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(noop) {}
+    let bytes = records(rig.job, &rig.disk);
+    let placed: Vec<(i32, bool)> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Message(message) => Some((
+                message.session_id,
+                matches!(message.payload, Payload::Reference { .. }),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(placed, [(1, true), (3, false)]);
+}
+
+/// #445 review P2: a loss an image reports is recorded in that image's
+/// session.
+#[test]
+fn an_image_loss_is_in_its_session() {
+    let mut rig = fanned(Capture::Strict, 1 << 16);
+    let ClaimOutcome::Claimed(claim) = rig.publications[1]
+        .try_claim(40, AppendOptions::default())
+        .unwrap()
+    else {
+        panic!("not claimed");
+    };
+    claim.abort();
+    let _ = rig.publications[1]
+        .append(b"after", AppendOptions::default())
+        .unwrap();
+    let noop = &mut |_: &Event<'_>, _: &mut dyn Effects| {};
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(noop) {}
+    let bytes = records(rig.job, &rig.disk);
+    let losses: Vec<i32> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Loss(loss) => Some(loss.session_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(losses, [3]);
+}
+
+/// #445 review P1-b: a network subscription is its stream's only source.
+#[test]
+fn a_fan_in_is_its_streams_only_source() {
+    let mut rig = fanned(Capture::Strict, 1 << 16);
+    let buffer = log_of(5, 64 * 1024);
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let other = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+    let identity = SourceIdentity {
+        session_id: 5,
+        ..IDENTITY
+    };
+    assert!(matches!(
+        rig.gateway
+            .add_subscription(Box::new(other), identity, Arc::new(RecordingWord::new())),
+        Err(GatewayError::DuplicateSource { stream_id: 2, .. })
+    ));
 }

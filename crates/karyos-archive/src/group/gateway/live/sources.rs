@@ -122,24 +122,64 @@ pub trait MessageSource {
     fn next_image_change(&mut self) -> Option<ImageChange> {
         None
     }
+
+    /// Whether it takes every session of its stream: a network
+    /// subscription's images. It is then its stream's only source.
+    fn fan_in(&self) -> bool {
+        false
+    }
+
+    /// [`MessageSource::poll_taking`], with the session of the image whose
+    /// report the summary carries, when it names one.
+    ///
+    /// # Errors
+    ///
+    /// As [`MessageSource::poll_taking`].
+    #[expect(clippy::result_large_err, reason = "the client's own poll error")]
+    fn poll_reporting(
+        &mut self,
+        handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        limit: MessageLimit,
+    ) -> Result<(PollSummary, Option<i32>), PollError> {
+        self.poll_taking(handler, limit)
+            .map(|summary| (summary, None))
+    }
 }
 
 /// A network subscription's images, polled in turn: their messages carry
 /// each image's session, and their attaches and retirements are its
-/// image changes.
+/// image changes. A closed subscription is a failed poll with an empty
+/// summary, which the Gateway records as an end closed at 0 (#439's M13).
 impl<T: TermBytes> MessageSource for Subscription<T> {
     fn poll_taking(
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
     ) -> Result<PollSummary, PollError> {
+        self.poll_reporting(handler, limit)
+            .map(|(summary, _)| summary)
+    }
+
+    fn fan_in(&self) -> bool {
+        true
+    }
+
+    fn poll_reporting(
+        &mut self,
+        handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        limit: MessageLimit,
+    ) -> Result<(PollSummary, Option<i32>), PollError> {
         match Subscription::poll_taking(self, handler, limit) {
             // The image that reported more than deliveries: its report,
-            // with the deliveries over every image.
-            Ok(poll) => Ok(PollSummary {
-                delivered: poll.delivered,
-                ..poll.stopped.map(|stop| stop.summary).unwrap_or_default()
-            }),
+            // with the deliveries over every image, and its session.
+            Ok(poll) => {
+                let session = poll.stopped.and_then(|stop| stop.session_id);
+                let summary = PollSummary {
+                    delivered: poll.delivered,
+                    ..poll.stopped.map(|stop| stop.summary).unwrap_or_default()
+                };
+                Ok((summary, session))
+            }
             Err(SubscriptionError::Poll { error, .. }) => Err(error),
             Err(SubscriptionError::Closed(cause)) => Err(PollError {
                 summary: PollSummary::default(),
@@ -225,6 +265,8 @@ enum Held {
         from: u64,
         lost_to: u64,
         resume: u64,
+        /// The image's session, for a network subscription's.
+        session_id: Option<i32>,
     },
     Ended {
         position: u64,
@@ -241,6 +283,8 @@ enum Held {
 /// A message source added at configuration.
 pub(super) struct Source {
     source: Option<Box<dyn MessageSource + Send>>,
+    /// It takes every session of its stream.
+    fan_in: bool,
     identity: SourceIdentity,
     word: Arc<RecordingWord>,
     held: Option<Held>,
@@ -301,6 +345,7 @@ fn reported(summary: &PollSummary) -> Option<Held> {
             from: lost.from,
             lost_to: lost.lost_to,
             resume: lost.resume,
+            session_id: None,
         });
     }
     if let Some(skipped) = summary.skipped
@@ -311,6 +356,7 @@ fn reported(summary: &PollSummary) -> Option<Held> {
             from: skipped.position,
             lost_to: to,
             resume: to,
+            session_id: None,
         });
     }
     if let Some(aborted) = summary.aborted
@@ -321,6 +367,7 @@ fn reported(summary: &PollSummary) -> Option<Held> {
             from: aborted.position,
             lost_to: to,
             resume: to,
+            session_id: None,
         });
     }
     if let Some(lost) = summary.closed_by_overrun {
@@ -363,9 +410,13 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         identity: SourceIdentity,
         word: Arc<RecordingWord>,
     ) -> Result<SubscriptionId, GatewayError> {
+        // A network subscription takes every session of its stream: it is
+        // then the stream's only source, so replay maps it as one.
+        let fan_in = source.fan_in();
         if self.sources.iter().any(|slot| {
-            (slot.identity.stream_id, slot.identity.session_id)
-                == (identity.stream_id, identity.session_id)
+            let same_stream = slot.identity.stream_id == identity.stream_id;
+            let either_fans_in = fan_in || slot.fan_in;
+            same_stream && (either_fans_in || slot.identity.session_id == identity.session_id)
         }) {
             return Err(GatewayError::DuplicateSource {
                 stream_id: identity.stream_id,
@@ -375,6 +426,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let id = u16::try_from(self.sources.len()).map_err(|_| GatewayError::Ended)?;
         self.sources.push(Source {
             source: Some(source),
+            fan_in,
             identity,
             word,
             held: None,
@@ -601,7 +653,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let (identity, word) = (slot.identity, Arc::clone(&slot.word));
         let id = SubscriptionId(u16::try_from(index).unwrap_or(u16::MAX));
         let mut result = None;
-        let polled = source.poll_taking(
+        let polled = source.poll_reporting(
             &mut |bytes, info| {
                 let dispatched =
                     self.dispatch_message(id, identity, &word, bytes, info, now, handler);
@@ -619,7 +671,23 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             return result.map(Some);
         }
         let held = match polled {
-            Ok(summary) => reported(&summary),
+            // A loss is the stopped image's, in its session.
+            Ok((summary, session)) => reported(&summary).map(|held| match held {
+                Held::Loss {
+                    loss,
+                    from,
+                    lost_to,
+                    resume,
+                    ..
+                } => Held::Loss {
+                    loss,
+                    from,
+                    lost_to,
+                    resume,
+                    session_id: session,
+                },
+                other => other,
+            }),
             // A poll that failed ends the source as closed.
             Err(error) => Some(Held::Ended {
                 position: error.summary.closed.unwrap_or(0),
@@ -661,7 +729,9 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 from,
                 lost_to,
                 resume,
+                session_id,
             } => {
+                let session_id = session_id.unwrap_or(identity.session_id);
                 let first = |group_seq: u64, out: &mut [u8]| {
                     GroupRecord::Loss(LossEvent {
                         group_seq,
@@ -671,7 +741,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                         lost_to,
                         resume,
                         stream_id: identity.stream_id,
-                        session_id: identity.session_id,
+                        session_id,
                         lane: identity.lane,
                         loss,
                     })
@@ -762,10 +832,16 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let length32 =
             u32::try_from(length).map_err(|_| GatewayError::Refused(Refusal::TooLarge))?;
         let threshold = usize::try_from(self.inline_threshold).unwrap_or(usize::MAX);
+        // The word names the recording of the source's own stream, session
+        // and lane: another image of a network subscription is not in it,
+        // and is placed as without a word.
+        let recorded = info.session_id == identity.session_id;
         // The word is read once: the record and the decision agree.
         let payload = match word.read() {
             // A recording that started after the message does not hold it.
-            Some((recording_id, start)) if length > threshold && info.position >= start => {
+            Some((recording_id, start))
+                if recorded && length > threshold && info.position >= start =>
+            {
                 Payload::Reference {
                     recording_id,
                     length: length32,

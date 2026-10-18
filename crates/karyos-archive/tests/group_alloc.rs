@@ -293,6 +293,7 @@ fn a_replay_gateway_dispatches_without_allocating() {
         &GatewayConfig {
             publications: &publications,
             subscriptions: &subscriptions,
+            network: &[],
             conflated: &[],
             max_claim: 64,
             max_payload: 0,

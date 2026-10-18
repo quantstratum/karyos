@@ -359,6 +359,7 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
         &GatewayConfig {
             publications: &[],
             subscriptions: &[(STREAM, 1)],
+            network: &[],
             conflated: &[],
             max_claim: 64,
             max_payload: 4096,
