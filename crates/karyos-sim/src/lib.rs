@@ -14,10 +14,14 @@
 //! `tests/timed.rs`, over the scripted sockets of karyos-io's test hooks.
 //! Suspensions and drops are logical, inside one
 //! process: they are not evidence for real process pause, crash or restart,
-//! which belongs to IPC. The network, the backend ring models, the disk
-//! model, the Archive and the Cluster do not exist yet.
+//! which belongs to IPC. The multi-node host (C1) runs several message
+//! level nodes on skewed clocks over a faulty network (`cluster`, `net`);
+//! the backend ring models, the disk model and the Cluster do not exist
+//! yet.
 
 pub mod clock;
+pub mod cluster;
+pub mod net;
 pub mod oracle;
 pub mod payload;
 pub mod publisher;
