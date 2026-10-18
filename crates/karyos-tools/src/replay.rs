@@ -60,7 +60,9 @@ Usage: karyos-tools replay diff <left-dir> <left-group> <right-dir> <right-group
   --from-checkpoint <id>  compare from the event after the left journal's
                         checkpoint <id> and the right one's at its group_seq
                         (stores in <dir>/checkpoints; a replay capture has
-                        none, so it is not comparable)
+                        none, so it is not comparable). Ranges are recovered
+                        with the default reopen hold: the journal does not
+                        record the group's own yet
   -h, --help            print this text
 
 Exit status: 0 identical over the range; 1 diverged, the first difference
@@ -641,6 +643,9 @@ fn open<D: Disk + Clone>(
                 }
                 Err(failure) => return Err(context(&failure)),
             };
+            // Which ranges recover depends on the group's reopen hold,
+            // which the journal does not record yet: the default one, until
+            // its header carries it (a follow-up).
             let recovery = recover(&mut recovered, &Stored(&store), RECOVERY_CAPACITY)
                 .map_err(|failure| context(&failure))?;
             let mut snapshot =
