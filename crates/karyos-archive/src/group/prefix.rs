@@ -65,6 +65,16 @@ pub enum PrefixError {
     /// A `group_seq` or a position past `u64`.
     #[error("sequence or position exhausted")]
     Exhausted,
+    /// A reference unavailable record naming no event that waits on that
+    /// recording's frames: none by that `group_seq`, one whose payload is
+    /// not by reference to it, or one already marked.
+    #[error("no event {group_seq} waits on recording {recording_id}")]
+    NoReference {
+        /// The event named.
+        group_seq: u64,
+        /// The recording named.
+        recording_id: u64,
+    },
 }
 
 /// What one complete event still needs.
@@ -199,7 +209,7 @@ impl PrefixTracker {
             _ if !self.started => return Err(PrefixError::OutOfOrder),
             GroupRecord::Message(message) => {
                 let reference = match message.payload {
-                    Payload::Inline(_) => None,
+                    Payload::Inline(_) | Payload::Unavailable { .. } => None,
                     Payload::Reference { recording_id, .. } => Some((
                         recording_id,
                         message
@@ -214,6 +224,7 @@ impl PrefixTracker {
             GroupRecord::Timer(event) => self.open_event(event.group_seq, None)?,
             GroupRecord::Lifecycle(event) => self.open_event(event.group_seq, None)?,
             GroupRecord::External(event) => self.open_event(event.group_seq, None)?,
+            GroupRecord::Loss(event) => self.open_event(event.group_seq, None)?,
             GroupRecord::Outcome(_)
             | GroupRecord::TimerOperation(_)
             | GroupRecord::ExternalObservation(_)
@@ -251,7 +262,37 @@ impl PrefixTracker {
                 }
                 self.stopped = true;
             }
+            GroupRecord::Unavailable(unavailable) => {
+                if self.open.is_some() {
+                    return Err(PrefixError::OutOfOrder);
+                }
+                self.settle(unavailable.group_seq, unavailable.recording_id)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Event `seq`'s payload, by reference to `recording_id`, will never be
+    /// there: the event counts complete with its payload unavailable. After
+    /// the prefixes stopped, no event waits, and the mark changes nothing.
+    fn settle(&mut self, seq: u64, recording_id: u64) -> Result<(), PrefixError> {
+        if self.stopped {
+            return Ok(());
+        }
+        let waiting = self
+            .waiting
+            .iter_mut()
+            .find(|waiting| waiting.seq == seq)
+            .filter(|waiting| {
+                waiting
+                    .reference
+                    .is_some_and(|(recording, _)| recording == recording_id)
+            })
+            .ok_or(PrefixError::NoReference {
+                group_seq: seq,
+                recording_id,
+            })?;
+        waiting.reference = None;
         Ok(())
     }
 

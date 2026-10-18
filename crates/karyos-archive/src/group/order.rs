@@ -32,6 +32,12 @@ pub enum OrderRule {
     AfterIncomplete,
     /// A gap marker in a strict journal.
     StrictGap,
+    /// A reference unavailable record in a strict journal, or naming an
+    /// event that has not ended (A7d). That the event's payload is by
+    /// reference, and is named once, is the prefix tracker's check: it
+    /// holds the events waiting on their payloads, and this checker holds
+    /// a few words.
+    Unavailable,
     /// A `group_seq` or index past `u64` or `u32`.
     Exhausted,
     /// A role no decoded record has: a header whose first `group_seq` is
@@ -151,8 +157,17 @@ impl OrderCheck {
                 Ok(State::Between)
             }
             (State::Between, Role::Gap(_)) => Err(OrderRule::Sequence),
+            (State::Between, Role::Unavailable(0)) => Err(OrderRule::Invalid),
+            (State::Between, Role::Unavailable(seq))
+                if self.capture == Capture::Strict || seq >= self.next_seq =>
+            {
+                Err(OrderRule::Unavailable)
+            }
+            (State::Between, Role::Unavailable(_)) => Ok(State::Between),
             (State::Between, Role::Observation(..) | Role::End(_)) => Err(OrderRule::OutsideEvent),
-            (State::InEvent { .. }, Role::Event(_) | Role::Gap(_)) => Err(OrderRule::Nested),
+            (State::InEvent { .. }, Role::Event(_) | Role::Gap(_) | Role::Unavailable(_)) => {
+                Err(OrderRule::Nested)
+            }
             (State::InEvent { seq, index }, Role::Observation(of, at)) => {
                 if of != seq {
                     Err(OrderRule::OutsideEvent)

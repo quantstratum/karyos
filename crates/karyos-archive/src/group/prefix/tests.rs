@@ -22,7 +22,7 @@ use crate::fault::{FaultDisk, Survives};
 use crate::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
 use crate::group::record::{
     Capture, Clock, EventEnd, GapMarker, GapReason, JournalHeader, MAX_RECORD, MessageEvent,
-    TimerEvent,
+    ReferenceUnavailable, TimerEvent,
 };
 use crate::segment::SyncPolicy;
 
@@ -555,4 +555,185 @@ fn a_snapshot_keeps_durable_at_most_complete() {
     let (_, complete, durable) = view.snapshot();
     assert!(durable <= complete);
     assert_eq!((complete, durable), (1, 1));
+}
+
+fn unavailable(seq: u64, recording_id: u64) -> GroupRecord<'static> {
+    GroupRecord::Unavailable(ReferenceUnavailable {
+        group_seq: seq,
+        recording_id,
+    })
+}
+
+/// A7d: a reference its recording stopped before covering, marked
+/// unavailable, no longer holds the prefixes: the event counts complete
+/// with its payload unavailable, and the events after it follow.
+#[test]
+fn a_reference_marked_unavailable_lets_the_prefixes_go_on() {
+    let recordings = Recordings::default();
+    recordings.set(7, 32, 32);
+    let mut tracker = PrefixTracker::new(8);
+    let at = feed(
+        &mut tracker,
+        &[
+            GroupRecord::Header(header(1, Capture::BestEffort)),
+            message(1, None),
+            end(1, EndOutcome::Complete),
+            message(2, Some(7)),
+            end(2, EndOutcome::Complete),
+            message(3, None),
+            end(3, EndOutcome::Complete),
+        ],
+    );
+    // Recording 7 stopped at 32, short of event 2's frames.
+    assert_eq!(tracker.advance(at, at, &recordings), (1, 1));
+    tracker.record(&unavailable(2, 7), at + 100).unwrap();
+    assert_eq!(tracker.advance(at + 100, at + 100, &recordings), (3, 3));
+}
+
+/// A mark must name an event waiting on that recording's frames: not an
+/// inline one, not another recording, not twice, nor one already durable,
+/// nor from inside an event. After the prefixes stopped it changes
+/// nothing.
+#[test]
+fn a_mark_names_an_event_waiting_on_that_recording() {
+    let recordings = Recordings::default();
+    let journal = [
+        GroupRecord::Header(header(1, Capture::BestEffort)),
+        message(1, None),
+        end(1, EndOutcome::Complete),
+        message(2, Some(7)),
+        end(2, EndOutcome::Complete),
+    ];
+    let no_reference = |group_seq, recording_id| {
+        Err(PrefixError::NoReference {
+            group_seq,
+            recording_id,
+        })
+    };
+    for (seq, recording) in [(1, 7), (2, 8), (3, 7)] {
+        let mut tracker = PrefixTracker::new(8);
+        let at = feed(&mut tracker, &journal);
+        assert_eq!(
+            tracker.record(&unavailable(seq, recording), at + 100),
+            no_reference(seq, recording)
+        );
+    }
+    // Twice.
+    let mut tracker = PrefixTracker::new(8);
+    let at = feed(&mut tracker, &journal);
+    tracker.record(&unavailable(2, 7), at + 100).unwrap();
+    assert_eq!(
+        tracker.record(&unavailable(2, 7), at + 200),
+        no_reference(2, 7)
+    );
+    // Already durable, so no longer waiting.
+    let mut tracker = PrefixTracker::new(8);
+    let at = feed(&mut tracker, &journal);
+    recordings.set(7, 64, 64);
+    assert_eq!(tracker.advance(at, at, &recordings), (2, 2));
+    assert_eq!(
+        tracker.record(&unavailable(2, 7), at + 100),
+        no_reference(2, 7)
+    );
+    // Inside an event.
+    let mut tracker = PrefixTracker::new(8);
+    let at = feed(&mut tracker, &journal[..4]);
+    assert_eq!(
+        tracker.record(&unavailable(2, 7), at + 100),
+        Err(PrefixError::OutOfOrder)
+    );
+    // After a gap stopped the prefixes, no event waits, and a mark is
+    // taken as it is.
+    let mut tracker = PrefixTracker::new(8);
+    let at = feed(
+        &mut tracker,
+        &[
+            GroupRecord::Header(header(1, Capture::BestEffort)),
+            GroupRecord::Gap(GapMarker {
+                from_seq: 1,
+                to_seq: 1,
+                reason: GapReason::RingFull,
+            }),
+            message(2, Some(7)),
+            end(2, EndOutcome::Complete),
+        ],
+    );
+    tracker.record(&unavailable(2, 7), at + 100).unwrap();
+    assert!(tracker.stopped());
+}
+
+/// A recovered journal with a mark: recovery reads it like the running
+/// tracker, so the prefixes reach past the event it names.
+#[test]
+fn recovery_reads_a_mark() {
+    let recordings = Recordings::default();
+    recordings.set(7, 32, 32);
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let disk = FaultDisk::default();
+    let mut journal = GroupJournal::create(
+        disk.clone(),
+        Path::new("/g"),
+        &header(1, Capture::BestEffort),
+        config,
+    )
+    .unwrap();
+    for record in [
+        message(1, Some(7)),
+        end(1, EndOutcome::Complete),
+        message(2, None),
+        end(2, EndOutcome::Complete),
+        unavailable(1, 7),
+    ] {
+        journal.append(&encode(&record)).unwrap();
+    }
+    journal.close().unwrap();
+    let mut journal = GroupJournal::recover(
+        disk.after_crash(Survives::Synced),
+        Path::new("/g"),
+        1,
+        config,
+    )
+    .unwrap()
+    .journal;
+    let recovery = recover(&mut journal, &recordings, 8).unwrap();
+    assert_eq!(
+        (
+            recovery.tracker.complete_recording_seq(),
+            recovery.tracker.durable_group_seq()
+        ),
+        (2, 2)
+    );
+}
+
+/// A strict journal refuses a mark: its order rules hold none.
+#[test]
+fn a_strict_journal_refuses_a_mark() {
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let mut journal = GroupJournal::create(
+        FaultDisk::default(),
+        Path::new("/g"),
+        &header(1, Capture::Strict),
+        config,
+    )
+    .unwrap();
+    for record in [message(1, Some(7)), end(1, EndOutcome::Complete)] {
+        journal.append(&encode(&record)).unwrap();
+    }
+    let written = journal.written();
+    assert!(matches!(
+        journal.append(&encode(&unavailable(1, 7))),
+        Err(crate::group::journal::JournalError::Order(
+            crate::group::order::OrderError {
+                rule: crate::group::order::OrderRule::Unavailable,
+                ..
+            }
+        ))
+    ));
+    assert_eq!(journal.written(), written, "nothing written");
 }
