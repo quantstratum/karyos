@@ -846,3 +846,56 @@ fn a_frame_cut_by_its_entry_end_is_caught_before_delivery() {
         );
     }
 }
+
+/// A held step comes again, within a segment and across one.
+#[test]
+fn a_held_step_is_yielded_again() {
+    let (disk, first, _, end) = recorded();
+    let mut source = open_source(&disk, 0, end, Rate::Full, 4096);
+    let mut steps = Vec::new();
+    loop {
+        let step = seen(source.poll(0).unwrap());
+        source.hold().unwrap();
+        assert_eq!(seen(source.poll(0).unwrap()), step, "held");
+        let done = matches!(step, Seen::End(_));
+        steps.push(step);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(steps.len(), 5);
+    assert_eq!(steps[0], Seen::Frames(0, first));
+    // Across segments.
+    let disk = FaultDisk::default();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    let term = frames(&[512, 512], 0xC3);
+    let mut position = 0;
+    for _ in 0..4 {
+        position = store.append(position, &term).unwrap();
+    }
+    store.close().unwrap();
+    let mut source = open_source(&disk, 0, position, Rate::Full, 4096);
+    let mut starts = Vec::new();
+    loop {
+        match seen(source.poll(0).unwrap()) {
+            Seen::Frames(at, _) => {
+                source.hold().unwrap();
+                assert!(
+                    matches!(seen(source.poll(0).unwrap()), Seen::Frames(again, _) if again == at)
+                );
+                starts.push(at);
+            }
+            Seen::End(_) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(starts, [0, 1024, 2048, 3072]);
+}

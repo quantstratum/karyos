@@ -17,35 +17,61 @@
 //!   duty. A recording that ends (the seal, or a lap with `OnLap::Stop`) is
 //!   closed, then stopped in the catalog, and an event says so. A recorder
 //!   that fails is dropped, its recording left for the next start's settle.
+//! - **Replays.** After the recorders, the replays share one budget per
+//!   cycle, each in turn, so recording keeps priority. A replay is first
+//!   prepared, its range checked against the recording's index, and only
+//!   then given its target's sink.
+//! - **Caps.** Recordings and replays at once are capped; a start beyond
+//!   is refused and counted.
 //! - **Idle.** A cycle with nothing to do waits for a command up to the
 //!   idle interval, so an idle agent does not spin.
+//!
+//! A caller that must not block, such as the control server on the
+//! driver's thread, posts its commands and takes their answers later
+//! ([`Posted`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason};
+use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
 use crate::recorder::{Ended, FrameSource, Mode, Recorder, RecorderError};
+use crate::replay::{Rate, ReplayError, ReplaySource, Step};
 use crate::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 
 /// The agent's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentConfig {
-    /// Commands queued at most. A handle waits for each command's reply
-    /// before it sends another, so one is always enough; a send waits for
-    /// room.
+    /// Commands queued at most. A blocking call waits for room; a posted
+    /// command finds none as [`AgentError::Busy`].
     pub command_capacity: usize,
-    /// Events queued at most; a full queue drops the newest, counted by
-    /// [`ArchiveHandle::dropped_events`].
+    /// Recording events queued at most, and replay ends apart; a full
+    /// queue drops the newest, counted by [`ArchiveHandle::dropped_events`]
+    /// and [`ArchiveHandle::dropped_replay_ends`].
     pub event_capacity: usize,
-    /// The copy buffer of each recorder: at least the largest frame.
+    /// The copy buffer of each recorder and replay: at least the largest
+    /// frame.
     pub buffer: usize,
-    /// Bytes one recorder records at most per duty.
+    /// Bytes one recorder records, or one replay replays, at most per
+    /// cycle.
     pub budget: u64,
+    /// Bytes all replays replay at most per cycle, after the recorders;
+    /// each takes at most `budget` of it, in turn.
+    pub replay_budget: u64,
+    /// Recordings recorded at once at most.
+    pub max_recordings: usize,
+    /// Replays at once at most, prepared or running.
+    pub max_replays: usize,
+    /// How long a prepared replay waits for its sink. Past it the agent
+    /// drops it, so a sink never attached, its post lost or its server
+    /// gone, does not hold a replay's slot. Keep it above the time a host
+    /// takes to open a target: 0 drops every prepared replay on the
+    /// agent's next cycle, before any attach can find it.
+    pub prepared_timeout: Duration,
     /// How long an idle cycle waits for a command.
     pub idle: Duration,
 }
@@ -57,6 +83,10 @@ impl Default for AgentConfig {
             event_capacity: 256,
             buffer: 64 * 1024,
             budget: 1 << 20,
+            replay_budget: 1 << 20,
+            max_recordings: 64,
+            max_replays: 16,
+            prepared_timeout: Duration::from_secs(5),
             idle: Duration::from_millis(1),
         }
     }
@@ -76,6 +106,8 @@ pub struct StartRecording {
     pub policy: SyncPolicy,
     /// Required or async.
     pub mode: Mode,
+    /// The recorded stream's format, which a replay needs.
+    pub format: StreamFormat,
     /// The lane's reader, positioned at the recording's start.
     pub source: Box<dyn FrameSource + Send>,
 }
@@ -109,7 +141,134 @@ pub enum Event {
         id: u64,
         /// What failed.
         failure: Failure,
+        /// The position its store had written when it failed.
+        position: u64,
     },
+}
+
+/// A replay that ended by itself; its target was told with
+/// [`ReplaySink::finish`]. (One stopped by command reports nothing.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayEnded {
+    /// The replay.
+    pub id: u64,
+    /// Where it ended.
+    pub position: u64,
+    /// How.
+    pub outcome: ReplayOutcome,
+}
+
+/// Where a replay delivers what it reads: the host's replay target, such
+/// as a driver stream that keeps the recorded positions. Each call either
+/// takes the step whole (`Ok(true)`) or has no room for it yet
+/// (`Ok(false)`), in which case the same step comes again on a later duty.
+pub trait ReplaySink {
+    /// Whole frames at `position`, as the log held them.
+    ///
+    /// # Errors
+    ///
+    /// [`SinkClosed`] when the target is gone; the replay ends.
+    fn frames(&mut self, position: u64, bytes: &[u8]) -> Result<bool, SinkClosed>;
+
+    /// A padding or aborted block: its canonical record, covering `extent`
+    /// bytes from `position`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReplaySink::frames`].
+    fn fill(&mut self, position: u64, record: &[u8], extent: u32) -> Result<bool, SinkClosed>;
+
+    /// A range the recording lost.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReplaySink::frames`].
+    fn gap(&mut self, from: u64, to: u64) -> Result<bool, SinkClosed>;
+
+    /// The replay ended at `end`: `complete` when it reached its requested
+    /// end, else it was stopped or failed.
+    fn finish(&mut self, end: u64, complete: bool);
+}
+
+/// A replay target that is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the replay target is closed")]
+pub struct SinkClosed;
+
+/// A replay to start: a recording's range onto a host's target.
+pub struct StartReplay {
+    /// The recording.
+    pub recording_id: u64,
+    /// The first position, a frame boundary.
+    pub from: u64,
+    /// The end, at most the recording's end ([`ArchiveHandle::describe`]).
+    pub to: u64,
+    /// The pace.
+    pub rate: Rate,
+    /// The target.
+    pub sink: Box<dyn ReplaySink + Send>,
+}
+
+impl core::fmt::Debug for StartReplay {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StartReplay")
+            .field("recording_id", &self.recording_id)
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("rate", &self.rate)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A replay to prepare: a recording's range, checked against its index
+/// before any target exists ([`ArchiveHandle::post_prepare_replay`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrepareReplay {
+    /// The recording.
+    pub recording_id: u64,
+    /// The first position: a frame boundary at or after the recording's
+    /// start.
+    pub position: u64,
+    /// The bytes to replay; `u64::MAX` replays to the recording's end now.
+    pub length: u64,
+    /// The pace.
+    pub rate: Rate,
+}
+
+/// A prepared replay, waiting for its target's sink
+/// ([`ArchiveHandle::post_attach_replay`]); it counts toward
+/// [`AgentConfig::max_replays`] until it is attached or stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prepared {
+    /// The replay's id.
+    pub replay_id: u64,
+    /// The recording, as the catalog lists it.
+    pub recording: Recording,
+    /// The range: `[from, to)`.
+    pub from: u64,
+    /// Its end.
+    pub to: u64,
+}
+
+/// How a replay ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// It reached its requested end.
+    Complete,
+    /// Its recording could not be read, or its target closed.
+    Failed,
+}
+
+/// A recording as the catalog lists it, and where it ends now: its stop,
+/// or the position written for one that still records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Described {
+    /// The catalog's record.
+    pub recording: Recording,
+    /// Its end now.
+    pub end: u64,
+    /// It lost ranges: its stop's, or so far for one that records.
+    pub incomplete: bool,
 }
 
 /// What failed when a recording could not be stopped in the catalog.
@@ -139,12 +298,36 @@ pub enum AgentError {
         /// The id.
         id: u64,
     },
+    /// No recording or replay has this id.
+    #[error("no recording or replay {id}")]
+    Unknown {
+        /// The id.
+        id: u64,
+    },
+    /// A replay's range is not readable.
+    #[error(transparent)]
+    Replay(#[from] ReplayError),
     /// The recording failed ([`Event::Failed`]); the next start settles it.
     #[error("recording {id} failed")]
     RecordingFailed {
         /// The id.
         id: u64,
     },
+    /// As many recordings or replays as the configuration allows run
+    /// already; counted by [`ArchiveHandle::refused`].
+    #[error("at most {max} {what} at once")]
+    Full {
+        /// Recordings or replays.
+        what: &'static str,
+        /// The cap.
+        max: usize,
+    },
+    /// Every replay id was used.
+    #[error("replay ids are exhausted")]
+    IdsExhausted,
+    /// A posted command found the command queue full.
+    #[error("the agent's command queue is full")]
+    Busy,
     /// The agent's thread is gone.
     #[error("the agent stopped")]
     Gone,
@@ -159,7 +342,34 @@ enum Command {
     Start(Box<StartRecording>, Reply<u64>),
     Stop(u64, Reply<Ended>),
     List(Reply<Vec<Recording>>),
+    Snapshot {
+        from_id: u64,
+        max: usize,
+        reply: Reply<Vec<Described>>,
+    },
+    Describe(u64, Reply<Described>),
+    Prepare(PrepareReplay, Reply<Prepared>),
+    Attach {
+        id: u64,
+        from: u64,
+        sink: Box<dyn ReplaySink + Send>,
+        reply: Reply<u64>,
+    },
+    Replay(Box<StartReplay>, Reply<u64>),
+    StopReplay(u64, Reply<u64>),
     Shutdown(Reply<()>),
+}
+
+impl Command {
+    /// A command never served: a sink it carries is finished, incomplete,
+    /// so its target does not wait for a replay that will not come.
+    fn abandon(self) {
+        match self {
+            Self::Attach { from, mut sink, .. } => sink.finish(from, false),
+            Self::Replay(mut start, _) => start.sink.finish(start.from, false),
+            _ => {}
+        }
+    }
 }
 
 /// The host's handle on a running agent.
@@ -167,8 +377,24 @@ enum Command {
 pub struct ArchiveHandle {
     commands: SyncSender<Command>,
     events: Receiver<Event>,
-    dropped: Arc<AtomicU64>,
+    replay_ends: Receiver<ReplayEnded>,
+    counts: Arc<Counts>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// The agent's counters, each sticky at `u64::MAX` rather than wrapping.
+#[derive(Debug, Default)]
+struct Counts {
+    dropped_events: AtomicU64,
+    dropped_replay_ends: AtomicU64,
+    refused: AtomicU64,
+}
+
+/// Adds one to `counter`, sticky at `u64::MAX`.
+fn count(counter: &AtomicU64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_add(1)
+    });
 }
 
 impl core::fmt::Debug for Command {
@@ -177,7 +403,40 @@ impl core::fmt::Debug for Command {
             Self::Start(start, _) => f.debug_tuple("Start").field(start).finish(),
             Self::Stop(id, _) => f.debug_tuple("Stop").field(id).finish(),
             Self::List(_) => f.write_str("List"),
+            Self::Snapshot { from_id, max, .. } => f
+                .debug_struct("Snapshot")
+                .field("from_id", from_id)
+                .field("max", max)
+                .finish_non_exhaustive(),
+            Self::Describe(id, _) => f.debug_tuple("Describe").field(id).finish(),
+            Self::Prepare(prepare, _) => f.debug_tuple("Prepare").field(prepare).finish(),
+            Self::Attach { id, from, .. } => f
+                .debug_struct("Attach")
+                .field("id", id)
+                .field("from", from)
+                .finish_non_exhaustive(),
+            Self::Replay(start, _) => f.debug_tuple("Replay").field(start).finish(),
+            Self::StopReplay(id, _) => f.debug_tuple("StopReplay").field(id).finish(),
             Self::Shutdown(_) => f.write_str("Shutdown"),
+        }
+    }
+}
+
+/// An answer the agent sends later, to a command posted without waiting.
+#[derive(Debug)]
+pub struct Posted<T> {
+    answer: Receiver<Result<T, AgentError>>,
+}
+
+impl<T> Posted<T> {
+    /// The answer, once the agent sent it; `None` until then. It is
+    /// returned once: a later call finds [`AgentError::Gone`].
+    #[must_use]
+    pub fn try_answer(&self) -> Option<Result<T, AgentError>> {
+        match self.answer.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(AgentError::Gone)),
         }
     }
 }
@@ -195,22 +454,25 @@ impl ArchiveHandle {
         D::File: Send,
     {
         let (commands, inbox) = mpsc::sync_channel(config.command_capacity);
-        let (outbox, events) = mpsc::sync_channel(config.event_capacity);
+        let (events_in, events) = mpsc::sync_channel(config.event_capacity);
+        let (replay_ends_in, replay_ends) = mpsc::sync_channel(config.event_capacity);
         let (ready, started) = mpsc::sync_channel(1);
         let dir = dir.to_path_buf();
-        let dropped = Arc::new(AtomicU64::new(0));
-        let events_out = Outbox {
-            sender: outbox,
-            dropped: Arc::clone(&dropped),
+        let counts = Arc::new(Counts::default());
+        let outbox = Outbox {
+            events: events_in,
+            replay_ends: replay_ends_in,
+            counts: Arc::clone(&counts),
         };
         let thread = std::thread::Builder::new()
             .name("karyos-archive".to_owned())
-            .spawn(move || run(disk, dir, config, &inbox, &events_out, &ready))?;
+            .spawn(move || run(disk, dir, config, &inbox, &outbox, &ready))?;
         match started.recv() {
             Ok(Ok(())) => Ok(Self {
                 commands,
                 events,
-                dropped,
+                replay_ends,
+                counts,
                 thread: Some(thread),
             }),
             Ok(Err(error)) => {
@@ -232,14 +494,41 @@ impl ArchiveHandle {
         answer.recv().map_err(|_| AgentError::Gone)?
     }
 
+    /// Posts a command without waiting for room or for its answer.
+    fn post<T>(&self, make: impl FnOnce(Reply<T>) -> Command) -> Result<Posted<T>, AgentError> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        match self.commands.try_send(make(reply)) {
+            Ok(()) => Ok(Posted { answer }),
+            Err(TrySendError::Full(command)) => {
+                command.abandon();
+                Err(AgentError::Busy)
+            }
+            Err(TrySendError::Disconnected(command)) => {
+                command.abandon();
+                Err(AgentError::Gone)
+            }
+        }
+    }
+
     /// Starts a recording of `start.source` from its position; returns its
     /// id once its `Started` is durable and its store exists.
     ///
     /// # Errors
     ///
-    /// The catalog's and the store's errors, and [`AgentError::Gone`].
+    /// [`AgentError::Full`], the catalog's and the store's errors, and
+    /// [`AgentError::Gone`].
     pub fn start(&self, start: StartRecording) -> Result<u64, AgentError> {
         self.call(|reply| Command::Start(Box::new(start), reply))
+    }
+
+    /// [`ArchiveHandle::start`], posted.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Busy`] and [`AgentError::Gone`]; the answer carries
+    /// the rest.
+    pub fn post_start(&self, start: StartRecording) -> Result<Posted<u64>, AgentError> {
+        self.post(|reply| Command::Start(Box::new(start), reply))
     }
 
     /// Stops recording `id` where it is: its store is closed with
@@ -254,6 +543,15 @@ impl ArchiveHandle {
         self.call(|reply| Command::Stop(id, reply))
     }
 
+    /// [`ArchiveHandle::stop`], posted.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_stop(&self, id: u64) -> Result<Posted<Ended>, AgentError> {
+        self.post(|reply| Command::Stop(id, reply))
+    }
+
     /// The catalog's recordings, in id order.
     ///
     /// # Errors
@@ -263,22 +561,139 @@ impl ArchiveHandle {
         self.call(Command::List)
     }
 
-    /// The next event, if any.
+    /// Posts a snapshot of at most `max` recordings from id `from_id` on,
+    /// in id order, each with where it ends now, as
+    /// [`ArchiveHandle::describe`] tells it.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_list(
+        &self,
+        from_id: u64,
+        max: usize,
+    ) -> Result<Posted<Vec<Described>>, AgentError> {
+        self.post(|reply| Command::Snapshot {
+            from_id,
+            max,
+            reply,
+        })
+    }
+
+    /// Recording `id` as the catalog lists it, and where it ends now.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Unknown`] and [`AgentError::Gone`].
+    pub fn describe(&self, id: u64) -> Result<Described, AgentError> {
+        self.call(|reply| Command::Describe(id, reply))
+    }
+
+    /// Starts a replay of a recording's range onto `start.sink`; returns
+    /// its id. The recording is read, never changed; one that still
+    /// records is read up to `start.to`.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Unknown`], [`AgentError::Replay`] for a range that
+    /// cannot be read, [`AgentError::Full`] (its sink is then finished,
+    /// incomplete), and [`AgentError::Gone`].
+    pub fn replay(&self, start: StartReplay) -> Result<u64, AgentError> {
+        self.call(|reply| Command::Replay(Box::new(start), reply))
+    }
+
+    /// Posts the preparation of a replay: its range is checked against
+    /// the recording's index and its source opened, with no target yet.
+    /// Attach its sink with [`ArchiveHandle::post_attach_replay`], or stop
+    /// it with [`ArchiveHandle::post_stop_replay`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`]; the answer carries
+    /// [`AgentError::Unknown`], [`AgentError::Replay`] and
+    /// [`AgentError::Full`].
+    pub fn post_prepare_replay(
+        &self,
+        prepare: PrepareReplay,
+    ) -> Result<Posted<Prepared>, AgentError> {
+        self.post(|reply| Command::Prepare(prepare, reply))
+    }
+
+    /// Posts the target's sink of prepared replay `id`, whose range starts
+    /// at `from`: the replay runs. A sink the agent does not take is
+    /// finished, incomplete.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`]; the answer carries
+    /// [`AgentError::Unknown`].
+    pub fn post_attach_replay(
+        &self,
+        id: u64,
+        from: u64,
+        sink: Box<dyn ReplaySink + Send>,
+    ) -> Result<Posted<u64>, AgentError> {
+        self.post(|reply| Command::Attach {
+            id,
+            from,
+            sink,
+            reply,
+        })
+    }
+
+    /// Stops replay `id` where it is; returns that position. Its target is
+    /// finished, incomplete. A prepared replay is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Unknown`] and [`AgentError::Gone`].
+    pub fn stop_replay(&self, id: u64) -> Result<u64, AgentError> {
+        self.call(|reply| Command::StopReplay(id, reply))
+    }
+
+    /// [`ArchiveHandle::stop_replay`], posted.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_stop_replay(&self, id: u64) -> Result<Posted<u64>, AgentError> {
+        self.post(|reply| Command::StopReplay(id, reply))
+    }
+
+    /// The next recording event, if any.
     #[must_use]
     pub fn try_event(&self) -> Option<Event> {
         self.events.try_recv().ok()
     }
 
-    /// Events dropped because the event queue was full.
-    #[must_use]
-    pub fn dropped_events(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
-    }
-
-    /// The next event, waiting up to `timeout`.
+    /// The next recording event, waiting up to `timeout`.
     #[must_use]
     pub fn event(&self, timeout: Duration) -> Option<Event> {
         self.events.recv_timeout(timeout).ok()
+    }
+
+    /// The next replay that ended by itself, if any.
+    #[must_use]
+    pub fn try_replay_ended(&self) -> Option<ReplayEnded> {
+        self.replay_ends.try_recv().ok()
+    }
+
+    /// Recording events dropped because their queue was full.
+    #[must_use]
+    pub fn dropped_events(&self) -> u64 {
+        self.counts.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Replay ends dropped because their queue was full.
+    #[must_use]
+    pub fn dropped_replay_ends(&self) -> u64 {
+        self.counts.dropped_replay_ends.load(Ordering::Relaxed)
+    }
+
+    /// Starts and replays refused at a cap ([`AgentError::Full`]).
+    #[must_use]
+    pub fn refused(&self) -> u64 {
+        self.counts.refused.load(Ordering::Relaxed)
     }
 
     /// Stops every recording where it is (reason [`StopReason::Shutdown`])
@@ -306,23 +721,31 @@ impl Drop for ArchiveHandle {
     }
 }
 
-/// The agent's side of the event queue: a full queue drops the event and
+/// The agent's side of the event queues: a full queue drops the event and
 /// counts it.
 struct Outbox {
-    sender: SyncSender<Event>,
-    dropped: Arc<AtomicU64>,
+    events: SyncSender<Event>,
+    replay_ends: SyncSender<ReplayEnded>,
+    counts: Arc<Counts>,
 }
 
 impl Outbox {
     fn send(&self, event: Event) {
-        if self.sender.try_send(event).is_err() {
-            // Sticky at u64::MAX rather than wrapping.
-            let _ = self
-                .dropped
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |dropped| {
-                    dropped.checked_add(1)
-                });
+        if self.events.try_send(event).is_err() {
+            count(&self.counts.dropped_events);
         }
+    }
+
+    fn replay_ended(&self, ended: ReplayEnded) {
+        if self.replay_ends.try_send(ended).is_err() {
+            count(&self.counts.dropped_replay_ends);
+        }
+    }
+
+    /// A start or replay refused at a cap.
+    fn refused(&self, what: &'static str, max: usize) -> AgentError {
+        count(&self.counts.refused);
+        AgentError::Full { what, max }
     }
 }
 
@@ -353,6 +776,147 @@ impl FrameSource for Box<dyn FrameSource + Send> {
     }
 }
 
+/// A replay the agent runs.
+struct ActiveReplay<D: Disk> {
+    id: u64,
+    source: ReplaySource<D>,
+    sink: Box<dyn ReplaySink + Send>,
+    /// How it ended, once it did; it leaves the set at the cycle's end.
+    ended: Option<ReplayOutcome>,
+}
+
+/// A replay prepared, waiting for its sink.
+struct PreparedReplay<D: Disk> {
+    id: u64,
+    source: ReplaySource<D>,
+    /// When it was prepared, on the agent's clock.
+    at: u64,
+}
+
+/// The replays the agent runs or prepared, and the next id.
+struct Replays<D: Disk> {
+    active: Vec<ActiveReplay<D>>,
+    prepared: Vec<PreparedReplay<D>>,
+    next_id: u64,
+    /// The replay whose turn comes first next cycle.
+    turn: usize,
+}
+
+impl<D: Disk> Replays<D> {
+    /// Replays prepared or running.
+    fn len(&self) -> usize {
+        self.active.len() + self.prepared.len()
+    }
+
+    /// Drops the prepared replays older than `timeout`.
+    fn expire(&mut self, now: u64, timeout: Duration) {
+        let timeout = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        self.prepared
+            .retain(|prepared| now.checked_sub(prepared.at).is_none_or(|age| age < timeout));
+    }
+
+    /// A new replay id.
+    fn id(&mut self) -> Result<u64, AgentError> {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or(AgentError::IdsExhausted)?;
+        Ok(id)
+    }
+
+    /// Runs the replays in turn, each up to `budget` bytes, all together up
+    /// to `share`; returns whether any moved.
+    fn duty(&mut self, now: u64, budget: u64, share: u64, outbox: &Outbox) -> bool {
+        let count = self.active.len();
+        if count == 0 {
+            return false;
+        }
+        let first = self.turn % count;
+        self.turn = (first + 1) % count;
+        let mut worked = false;
+        let mut left = share;
+        for offset in 0..count {
+            if left == 0 {
+                break;
+            }
+            let Some(replay) = self.active.get_mut((first + offset) % count) else {
+                break;
+            };
+            let (moved, spent, ended) = run_replay(replay, now, budget.min(left));
+            worked |= moved || ended.is_some();
+            left -= spent.min(left);
+            replay.ended = ended;
+        }
+        self.active.retain_mut(|replay| {
+            let Some(outcome) = replay.ended else {
+                return true;
+            };
+            let position = replay.source.position();
+            replay
+                .sink
+                .finish(position, outcome == ReplayOutcome::Complete);
+            outbox.replay_ended(ReplayEnded {
+                id: replay.id,
+                position,
+                outcome,
+            });
+            false
+        });
+        worked
+    }
+}
+
+/// One replay's duty: steps into its sink until it waits, has no room,
+/// spends `budget` bytes or ends. Returns whether it moved, the bytes it
+/// spent, and how it ended if it did.
+fn run_replay<D: Disk>(
+    replay: &mut ActiveReplay<D>,
+    now: u64,
+    budget: u64,
+) -> (bool, u64, Option<ReplayOutcome>) {
+    let mut moved = false;
+    let mut spent = 0u64;
+    while spent < budget {
+        let before = replay.source.position();
+        let taken = match replay.source.poll(now) {
+            Ok(Step::Frames { position, bytes }) => replay.sink.frames(position, bytes),
+            Ok(Step::Fill {
+                position,
+                record,
+                extent,
+            }) => replay.sink.fill(position, record, extent),
+            Ok(Step::Gap { from, to }) => replay.sink.gap(from, to),
+            Ok(Step::Wait { .. }) => return (moved, spent, None),
+            Ok(Step::End { .. }) => return (moved, spent, Some(ReplayOutcome::Complete)),
+            Err(_) => return (moved, spent, Some(ReplayOutcome::Failed)),
+        };
+        match taken {
+            Ok(true) => {
+                moved = true;
+                // A source only moves forward.
+                let Some(step) = replay.source.position().checked_sub(before) else {
+                    return (moved, spent, Some(ReplayOutcome::Failed));
+                };
+                // `spent` is below `budget` here.
+                if step >= budget - spent {
+                    return (moved, budget, None);
+                }
+                spent += step;
+            }
+            // No room: the same step comes again on a later duty.
+            Ok(false) => {
+                let outcome = replay.source.hold().err().map(|_| ReplayOutcome::Failed);
+                return (moved, spent, outcome);
+            }
+            // Back to the step not taken, so the replay ends where its
+            // target stopped taking.
+            Err(SinkClosed) => {
+                let _ = replay.source.hold();
+                return (moved, spent, Some(ReplayOutcome::Failed));
+            }
+        }
+    }
+    (moved, spent, None)
+}
+
 /// The agent's thread.
 fn run<D>(
     disk: D,
@@ -380,10 +944,20 @@ fn run<D>(
     if ready.send(Ok(())).is_err() {
         return;
     }
-    let mut active: Vec<Active<D>> = Vec::new();
-    // Recordings whose store failed: open in the catalog until the next
-    // start settles them.
-    let mut failed: Vec<u64> = Vec::new();
+    let mut state = State {
+        disk,
+        dir,
+        config,
+        catalog,
+        active: Vec::new(),
+        failed: Vec::new(),
+        replays: Replays {
+            active: Vec::new(),
+            prepared: Vec::new(),
+            next_id: 1,
+            turn: 0,
+        },
+    };
     loop {
         let mut worked = false;
         loop {
@@ -393,64 +967,22 @@ fn run<D>(
                 Err(mpsc::TryRecvError::Disconnected) => return,
             };
             worked = true;
-            if serve(
-                command,
-                &disk,
-                &dir,
-                &config,
-                &mut catalog,
-                &mut active,
-                &mut failed,
-                now(),
-            ) {
+            if state.serve(command, outbox, now()) {
                 return;
             }
         }
-        // Each recording's duty; those that end or fail leave the set.
-        for mut recording in std::mem::take(&mut active) {
-            let event = match recording.recorder.duty(now()) {
-                Ok(duty) => {
-                    worked |= duty.recorded > 0;
-                    if duty.ended.is_none() {
-                        active.push(recording);
-                        continue;
-                    }
-                    // The reason it ended for (the seal, a lap).
-                    finish(recording, &mut catalog, StopReason::Normal, now())
-                }
-                Err(error) => {
-                    worked = true;
-                    match error.fail_kind() {
-                        // The store is whole: close it and stop the
-                        // recording, typed.
-                        Some(kind) => {
-                            finish(recording, &mut catalog, StopReason::Failed(kind), now())
-                        }
-                        None => Event::Failed {
-                            id: recording.id,
-                            failure: Failure::Store,
-                        },
-                    }
-                }
-            };
-            if let Event::Failed { id, .. } = event {
-                failed.push(id);
-            }
-            outbox.send(event);
-        }
+        // Right after the commands: an attach this cycle served still found
+        // its replay.
+        state.replays.expire(now(), config.prepared_timeout);
+        worked |= state.duty(outbox, now());
+        // After the recorders: they keep priority.
+        worked |= state
+            .replays
+            .duty(now(), config.budget, config.replay_budget, outbox);
         if !worked {
             match inbox.recv_timeout(config.idle) {
                 Ok(command) => {
-                    if serve(
-                        command,
-                        &disk,
-                        &dir,
-                        &config,
-                        &mut catalog,
-                        &mut active,
-                        &mut failed,
-                        now(),
-                    ) {
+                    if state.serve(command, outbox, now()) {
                         return;
                     }
                 }
@@ -458,6 +990,349 @@ fn run<D>(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+}
+
+/// What the agent's thread owns.
+struct State<D: Disk> {
+    disk: D,
+    dir: PathBuf,
+    config: AgentConfig,
+    catalog: Catalog<D>,
+    active: Vec<Active<D>>,
+    /// Recordings whose store failed: open in the catalog until the next
+    /// start settles them.
+    failed: Vec<u64>,
+    replays: Replays<D>,
+}
+
+impl<D: Disk + Clone> State<D> {
+    /// Each recording's duty; those that end or fail leave the set.
+    /// Returns whether any moved.
+    fn duty(&mut self, outbox: &Outbox, now: u64) -> bool {
+        let mut worked = false;
+        let mut index = 0;
+        while let Some(recording) = self.active.get_mut(index) {
+            let event = match recording.recorder.duty(now) {
+                Ok(duty) => {
+                    worked |= duty.recorded > 0;
+                    if duty.ended.is_none() {
+                        index += 1;
+                        continue;
+                    }
+                    // The reason it ended for (the seal, a lap).
+                    finish(
+                        self.active.swap_remove(index),
+                        &mut self.catalog,
+                        StopReason::Normal,
+                        now,
+                    )
+                }
+                Err(error) => {
+                    worked = true;
+                    let recording = self.active.swap_remove(index);
+                    match error.fail_kind() {
+                        // The store is whole: close it and stop the
+                        // recording, typed.
+                        Some(kind) => {
+                            finish(recording, &mut self.catalog, StopReason::Failed(kind), now)
+                        }
+                        None => Event::Failed {
+                            id: recording.id,
+                            failure: Failure::Store,
+                            position: recording.recorder.store().written(),
+                        },
+                    }
+                }
+            };
+            if let Event::Failed { id, .. } = event {
+                self.failed.push(id);
+            }
+            outbox.send(event);
+        }
+        worked
+    }
+
+    /// Serves one command; `true` when it was the shutdown.
+    fn serve(&mut self, command: Command, outbox: &Outbox, now: u64) -> bool {
+        match command {
+            Command::Start(start, reply) => {
+                let _ = reply.send(self.start_recording(*start, outbox, now));
+            }
+            Command::Stop(id, reply) => {
+                let result = match self.active.iter().position(|recording| recording.id == id) {
+                    Some(index) => {
+                        let recording = self.active.swap_remove(index);
+                        let result = stop(recording, &mut self.catalog, StopReason::Stopped, now);
+                        // A stop that failed leaves the recording to settle.
+                        if result.is_err() {
+                            self.failed.push(id);
+                        }
+                        result
+                    }
+                    None if self.failed.contains(&id) => Err(AgentError::RecordingFailed { id }),
+                    None => Err(AgentError::NotRecording { id }),
+                };
+                let _ = reply.send(result);
+            }
+            Command::List(reply) => {
+                let _ = reply.send(Ok(self.catalog.recordings().to_vec()));
+            }
+            Command::Snapshot {
+                from_id,
+                max,
+                reply,
+            } => {
+                let listed = self
+                    .catalog
+                    .recordings()
+                    .iter()
+                    .filter(|recording| recording.id >= from_id)
+                    .take(max)
+                    .map(|recording| described(recording, &self.active))
+                    .collect();
+                let _ = reply.send(Ok(listed));
+            }
+            Command::Describe(id, reply) => {
+                let result = self
+                    .catalog
+                    .get(id)
+                    .map(|recording| described(recording, &self.active))
+                    .ok_or(AgentError::Unknown { id });
+                let _ = reply.send(result);
+            }
+            Command::Prepare(prepare, reply) => {
+                let _ = reply.send(self.prepare_replay(prepare, outbox, now));
+            }
+            Command::Attach {
+                id,
+                from,
+                mut sink,
+                reply,
+            } => {
+                let result = match self.replays.prepared.iter().position(|p| p.id == id) {
+                    Some(index) => {
+                        let prepared = self.replays.prepared.swap_remove(index);
+                        self.replays.active.push(ActiveReplay {
+                            id,
+                            source: prepared.source,
+                            sink,
+                            ended: None,
+                        });
+                        Ok(id)
+                    }
+                    None => {
+                        sink.finish(from, false);
+                        Err(AgentError::Unknown { id })
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            Command::Replay(start, reply) => {
+                let _ = reply.send(self.start_replay(*start, outbox, now));
+            }
+            Command::StopReplay(id, reply) => {
+                let replays = &mut self.replays;
+                let result = if let Some(index) = replays.active.iter().position(|r| r.id == id) {
+                    let mut replay = replays.active.swap_remove(index);
+                    let position = replay.source.position();
+                    replay.sink.finish(position, false);
+                    Ok(position)
+                } else if let Some(index) = replays.prepared.iter().position(|p| p.id == id) {
+                    Ok(replays.prepared.swap_remove(index).source.position())
+                } else {
+                    Err(AgentError::Unknown { id })
+                };
+                let _ = reply.send(result);
+            }
+            Command::Shutdown(reply) => {
+                for mut replay in self.replays.active.drain(..) {
+                    let position = replay.source.position();
+                    replay.sink.finish(position, false);
+                }
+                self.replays.prepared.clear();
+                let mut first = Ok(());
+                for recording in self.active.drain(..) {
+                    if let Err(error) =
+                        stop(recording, &mut self.catalog, StopReason::Shutdown, now)
+                        && first.is_ok()
+                    {
+                        first = Err(error);
+                    }
+                }
+                let _ = reply.send(first);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn start_recording(
+        &mut self,
+        start: StartRecording,
+        outbox: &Outbox,
+        now: u64,
+    ) -> Result<u64, AgentError> {
+        if self.active.len() >= self.config.max_recordings {
+            return Err(outbox.refused("recordings", self.config.max_recordings));
+        }
+        let position = start.source.position();
+        let id = self.catalog.start(NewRecording {
+            stream_id: start.stream_id,
+            session_id: start.session_id,
+            channel: &start.channel,
+            start: position,
+            start_time_ns: now,
+            geometry: start.geometry,
+            policy: start.policy,
+            format: start.format,
+        })?;
+        let recorder = SegmentStore::create(
+            self.disk.clone(),
+            &self.dir,
+            id,
+            start.geometry,
+            start.policy,
+            position,
+        )
+        .map_err(AgentError::from)
+        .and_then(|store| {
+            Recorder::new(
+                store,
+                start.source,
+                start.mode,
+                self.config.buffer,
+                self.config.budget,
+            )
+            .map_err(AgentError::from)
+        });
+        match recorder {
+            Ok(recorder) => {
+                self.active.push(Active { id, recorder });
+                Ok(id)
+            }
+            Err(error) => {
+                // `Started` is durable and nothing was recorded: the
+                // recording stops empty, or is left for the next start to
+                // settle when even that fails.
+                if self
+                    .catalog
+                    .stop(id, position, now, StopReason::Empty, false)
+                    .is_err()
+                {
+                    self.failed.push(id);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Checks a replay's range and opens its source.
+    fn prepare_replay(
+        &mut self,
+        prepare: PrepareReplay,
+        outbox: &Outbox,
+        now: u64,
+    ) -> Result<Prepared, AgentError> {
+        let id = prepare.recording_id;
+        let recording = self.catalog.get(id).ok_or(AgentError::Unknown { id })?;
+        let described = described(recording, &self.active);
+        let from = prepare.position;
+        let to = if prepare.length == u64::MAX {
+            Some(described.end)
+        } else {
+            from.checked_add(prepare.length)
+        };
+        // The end is checked here, where the length is resolved; the
+        // source's open checks the start against what the store holds and
+        // that it is a frame boundary.
+        let Some(to) = to.filter(|to| from < *to && *to <= described.end) else {
+            return Err(AgentError::Replay(ReplayError::OutOfRange {
+                from,
+                to: to.unwrap_or(u64::MAX),
+            }));
+        };
+        if self.replays.len() >= self.config.max_replays {
+            return Err(outbox.refused("replays", self.config.max_replays));
+        }
+        let source = ReplaySource::open(
+            self.disk.clone(),
+            &self.dir,
+            id,
+            described.recording.geometry,
+            from,
+            to,
+            prepare.rate,
+            self.config.buffer,
+        )?;
+        let replay_id = self.replays.id()?;
+        self.replays.prepared.push(PreparedReplay {
+            id: replay_id,
+            source,
+            at: now,
+        });
+        Ok(Prepared {
+            replay_id,
+            recording: described.recording,
+            from,
+            to,
+        })
+    }
+
+    /// Prepares a replay and runs it into its sink; a sink not taken is
+    /// finished, incomplete.
+    fn start_replay(
+        &mut self,
+        mut start: StartReplay,
+        outbox: &Outbox,
+        now: u64,
+    ) -> Result<u64, AgentError> {
+        let from = start.from;
+        let prepared = start
+            .to
+            .checked_sub(from)
+            .ok_or(AgentError::Replay(ReplayError::OutOfRange {
+                from,
+                to: start.to,
+            }))
+            .and_then(|length| {
+                self.prepare_replay(
+                    PrepareReplay {
+                        recording_id: start.recording_id,
+                        position: from,
+                        length,
+                        rate: start.rate,
+                    },
+                    outbox,
+                    now,
+                )
+            });
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                start.sink.finish(from, false);
+                return Err(error);
+            }
+        };
+        let Some(index) = self
+            .replays
+            .prepared
+            .iter()
+            .position(|replay| replay.id == prepared.replay_id)
+        else {
+            start.sink.finish(from, false);
+            return Err(AgentError::Unknown {
+                id: prepared.replay_id,
+            });
+        };
+        let source = self.replays.prepared.swap_remove(index).source;
+        self.replays.active.push(ActiveReplay {
+            id: prepared.replay_id,
+            source,
+            sink: start.sink,
+            ended: None,
+        });
+        Ok(prepared.replay_id)
     }
 }
 
@@ -470,11 +1345,13 @@ fn finish<D: Disk>(
     now: u64,
 ) -> Event {
     let id = recording.id;
+    let position = recording.recorder.store().written();
     match stop(recording, catalog, reason, now) {
         Ok(ended) => Event::Ended { id, ended },
         Err(_) => Event::Failed {
             id,
             failure: Failure::Stop,
+            position,
         },
     }
 }
@@ -493,99 +1370,26 @@ fn stop<D: Disk>(
     Ok(ended)
 }
 
-/// Serves one command; `true` when it was the shutdown.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one command against the agent's state: its disk, catalog and recordings"
-)]
-fn serve<D: Disk + Clone>(
-    command: Command,
-    disk: &D,
-    dir: &Path,
-    config: &AgentConfig,
-    catalog: &mut Catalog<D>,
-    active: &mut Vec<Active<D>>,
-    failed: &mut Vec<u64>,
-    now: u64,
-) -> bool {
-    match command {
-        Command::Start(start, reply) => {
-            let result = start_recording(*start, disk, dir, config, catalog, active, now);
-            let _ = reply.send(result);
-            false
-        }
-        Command::Stop(id, reply) => {
-            let result = match active.iter().position(|recording| recording.id == id) {
-                Some(index) => {
-                    let result = stop(active.swap_remove(index), catalog, StopReason::Stopped, now);
-                    // A stop that failed leaves the recording to settle.
-                    if result.is_err() {
-                        failed.push(id);
-                    }
-                    result
-                }
-                None if failed.contains(&id) => Err(AgentError::RecordingFailed { id }),
-                None => Err(AgentError::NotRecording { id }),
-            };
-            let _ = reply.send(result);
-            false
-        }
-        Command::List(reply) => {
-            let _ = reply.send(Ok(catalog.recordings().to_vec()));
-            false
-        }
-        Command::Shutdown(reply) => {
-            let mut first = Ok(());
-            for recording in active.drain(..) {
-                if let Err(error) = stop(recording, catalog, StopReason::Shutdown, now)
-                    && first.is_ok()
-                {
-                    first = Err(error);
-                }
-            }
-            let _ = reply.send(first);
-            true
-        }
+/// `recording` and where it ends now.
+fn described<D: Disk>(recording: &Recording, active: &[Active<D>]) -> Described {
+    let (end, incomplete) = match recording.stop {
+        Some(stop) => (stop.position, stop.incomplete),
+        None => active
+            .iter()
+            .find(|active| active.id == recording.id)
+            .map_or((recording.start, false), |active| {
+                (
+                    active.recorder.store().written(),
+                    active.recorder.incomplete(),
+                )
+            }),
+    };
+    Described {
+        recording: recording.clone(),
+        end,
+        incomplete,
     }
 }
 
 #[cfg(test)]
 mod tests;
-
-fn start_recording<D: Disk + Clone>(
-    start: StartRecording,
-    disk: &D,
-    dir: &Path,
-    config: &AgentConfig,
-    catalog: &mut Catalog<D>,
-    active: &mut Vec<Active<D>>,
-    now: u64,
-) -> Result<u64, AgentError> {
-    let position = start.source.position();
-    let id = catalog.start(NewRecording {
-        stream_id: start.stream_id,
-        session_id: start.session_id,
-        channel: &start.channel,
-        start: position,
-        start_time_ns: now,
-        geometry: start.geometry,
-        policy: start.policy,
-    })?;
-    let store = SegmentStore::create(
-        disk.clone(),
-        dir,
-        id,
-        start.geometry,
-        start.policy,
-        position,
-    )?;
-    let recorder = Recorder::new(
-        store,
-        start.source,
-        start.mode,
-        config.buffer,
-        config.budget,
-    )?;
-    active.push(Active { id, recorder });
-    Ok(id)
-}

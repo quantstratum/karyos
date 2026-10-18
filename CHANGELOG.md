@@ -11,6 +11,76 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The Archive's client (phase 3, A6b-2).
+  `karyos_archive::client::ArchiveClient` is a `ReplayProvider` over the
+  Archive's control streams (`ControlRequests`, `ControlResponses`): asked
+  for a source's range, it lists the recordings, picks one of that
+  publication and incarnation that covers the range, asks for a replay of
+  exactly that range onto `ClientConfig::target_stream_id`, and hands out
+  the target's subscription, which the host's `ReplayTargets` finds at the
+  replay id's low 32 bits. It never blocks; a recording behind is listed
+  again until `ClientConfig::deadline`. No replay comes as `NoRecording`,
+  `RetentionShort`, `RecordingBehind` or `Refused`. A handed-out replay
+  stops by `StopReplay`, queued when the request stream has no room, and
+  a replay withdrawn before its answer is stopped when the answer comes:
+  `ArchiveClient::duty` does this while no replay is asked for, and a
+  cancel or a drop sends what it can. The constructors refuse a target
+  channel no request can carry (`ConfigError`).
+  `karyos_client` re-exports `PublicationIdentity`, which its merge API
+  names.
+- The Archive's `RecordingDescriptor` (control schema 1, A6b) carries
+  the recorded publication's identity (`source`, a `SourceIncarnation`)
+  and, while it records, the position written so far
+  (`RecordingState::Recording { written, .. }`): its block grows from 70
+  to 110 bytes, and a descriptor whose `written` lies below its start or
+  away from its stop is refused. A replay target's session id is the
+  replay id's low 32 bits (`server::replay_session_id`), and
+  `ArchiveHost::open_replay` takes the replay id. A prepared replay whose
+  sink never comes is dropped after `AgentConfig::prepared_timeout`, so
+  it no longer holds a replay's slot.
+- The live merge (phase 3, A6a; SPEC.md §8.2).
+  `karyos_client::LiveMerge` merges a `Replay` of a recording into the
+  live subscription of the same publication at an explicit cutover: the
+  live reader's position when the merge is made. Below it the replay's
+  messages are delivered, from it the live reader's; the replay's
+  duplicates are dropped by position, and the live reader's first message
+  must match the replay's there in position and length. Every
+  disagreement is a typed, final `MergeError`: an epoch change (another
+  publication or incarnation), a reader of another lane than 0, a replay
+  short of the cutover, a message or term padding across it, a replay or
+  live reader lapped. A required live reader keeps a first message that
+  disagrees pending, for `into_live`. A gap in the
+  recording below the cutover is reported as the replay's local gap. A
+  replay stops through its `ReplayStop` at the cutover, on failure and on
+  drop. `ReplayProvider`, which the Archive's client implements, hands out
+  replays without blocking (`ReplayStatus`, `ReplayUnavailable`).
+- The Archive is controlled over streams (phase 3, A5c).
+  `karyos_archive::server::ControlServer` reads A1's requests from a
+  `RequestSource`, serves them with the agent and answers on a
+  `ResponseSink`, one request at a time and only once the last one's
+  answers are out; a start is signalled with its request's correlation
+  id, a stop or failure with 0. It never blocks: it posts its commands
+  (`ArchiveHandle::post_start`, `post_stop`, `post_list`,
+  `post_prepare_replay`, `post_attach_replay`, `post_stop_replay`) and
+  answers when the agent's `Posted` answer arrives, in a later duty. What
+  touches the driver stays with the host behind `ArchiveHost`: a
+  recorded lane's reader, and a replay's target stream, opened only once
+  the agent prepared the replay and found its range readable. The agent
+  runs replays into the host's `ReplaySink`s, after its recorders and
+  within one shared budget per cycle (`AgentConfig::replay_budget`),
+  taking a step back (`ReplaySource::hold`) when a sink has no room, and
+  describes and stops them (`ArchiveHandle::describe`, `replay`,
+  `stop_replay`). Recordings and replays at once are capped
+  (`max_recordings`, `max_replays`; `AgentError::Full`, counted by
+  `ArchiveHandle::refused`), and so are the server's waiting signals
+  (`ServerConfig`, `dropped_signals`). A replay's end comes on its own
+  queue (`ArchiveHandle::try_replay_ended`), and `Event::Failed` carries
+  the position written. The catalog becomes version 3: a recording's
+  `Started` keeps the recorded stream's lane, initial term id and mtu
+  (nonzero), which its replays need, and the source's incarnation
+  (`SourceIncarnation`: the driver id, registration and incarnation of
+  the publication recorded), which a live merge matches
+  (`StreamFormat`).
 - A guarded network publication's outcome records come from its sender
   gate's submissions, not from the commit (guards-and-abort.md, "Trusted
   sockets in Phase 2"). A message is `Submitted` once a backend took
@@ -196,6 +266,46 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A removed routed publication sends each lane's EOS on every live path
+  (redundant paths; rp-w5b follow-up). A lane is drained once its first
+  sends reached its seal on every path that can send now; a path whose
+  TX half is detached, that is resetting or that left the live set
+  neither holds the drain nor gets the EOS, and one that returns during
+  the linger gets the repeats. The EOS counts as sent once one path
+  submitted it; a closed guard sends it on none. Routed removals no
+  longer linger without EOS.
+- A recording group's three prefixes (phase 3, A7c; SPEC §8.3).
+  `karyos_archive::group::prefix::PrefixTracker` tracks `delivered_seq`,
+  `complete_recording_seq` and `durable_group_seq`: an event is complete
+  once its records through its end are written, its end is complete and
+  the payload it names by reference is written in its recording, and
+  durable once all of those are durable. An incomplete event or a gap
+  stops both prefixes. Events not yet durable wait in a queue sized when
+  the tracker is made; one with no room is refused. A `PrefixView`
+  publishes the three values, each a wait-free load, and
+  `prefix::recover` recomputes them from a recovered journal. The
+  journal's `walk` now gives each record's end too.
+- A recording group's journal on disk (phase 3, A7b).
+  `karyos_archive::group::journal::GroupJournal` keeps a group's records
+  back to back in a segment store named by the group (written and durable
+  positions, sync policies, CRC-32C, torn-write recovery of A2). Every
+  record appended is decoded and checked against the order rules first,
+  so a refusal writes nothing. A record never spans two store writes: a
+  segment's end is padded (a fill, or zero bytes under 32), so recovery
+  always cuts between records; it then reads every record kept and
+  checks it again.
+- A recording group's journal records, schema 3 version 1 (phase 3,
+  A7a; SPEC §8.3, ADR-0024). `karyos_archive::group::record` holds the
+  journal header (group, first `group_seq`, inline threshold, capture
+  contract, clock provenance, strict or best-effort capture, the
+  caller's manifest), five event records (a message with its reserved
+  value, end of stream and trace extension, inline or by reference to a
+  required recording; conflated value; timer; lifecycle; external), four
+  observations (offer, claim and commit outcomes with the client error
+  code; timer create and cancel; external; delivery outcomes), the event
+  end and the gap marker, hand written on the
+  `karyos-codec` runtime as A1. `karyos_archive::group::order` checks a
+  journal's order rules with fixed state. Nothing allocates.
 - A segment store is truncated at the end of a write
   (`SegmentStore::truncate`; phase 3, for a recording group's recovery
   to its complete prefix, SPEC §8.3). Everything after the cut is
@@ -817,6 +927,31 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A removed network publication's sender closes its lane queues, its
+  repair queue and its route at its next duty (#354 review P3-6;
+  driver-network-agents.md §7: the sender drops its queues), on every
+  path of a routed one, instead of leaving them open until the endpoint
+  retires. A half the sender does not hold then, or one in another
+  epoch, dropped them already. Counted (`removed_closed`); items still
+  pending in a closing queue are returned and counted
+  (`removed_returned`), and a full close list, never expected, is
+  counted (`removed_unrecorded`).
+- The driver's loopback tests no longer pick a free port by binding a
+  socket, dropping it and binding the port again later, which another
+  process could take in between. A test's embedded subscription binds on
+  port 0 and its publication sends to the address the driver bound; a
+  publication with no receiver sends to a socket the test holds. A test
+  reads that address through `EmbeddedDriver::network_subscription_address`,
+  hidden and not part of the API. Client subscriptions by URI and
+  multicast groups still pick a port: a channel URI refuses port 0, and a
+  group's port is named before any bind.
+- A recording group's records hold only what their sources present
+  (#382 review P3s): a delivery outcome takes a receiver only on a
+  range-side kind and a lost count only on outcomes lost, as the outcome
+  ring does; a failure's details are 0 where its variant has no field,
+  and an absent `Option` is 0 in both. `record::EXTENSION` is tied to the
+  frame's extension length at compile time, and the segment store's
+  index header buffers use one named length.
 - The segment store's arithmetic is checked (SPEC §14): five
   saturating operations in the interval sync and in recovery's counts
   are checked ones. A clock that steps back still syncs nothing.

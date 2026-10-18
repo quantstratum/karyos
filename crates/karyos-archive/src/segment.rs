@@ -84,6 +84,9 @@ const MAGIC: u32 = u32::from_le_bytes(*b"KYSX");
 const VERSION: u32 = 2;
 /// The index header's length.
 const HEADER: u64 = 48;
+/// [`HEADER`] as a buffer length.
+const HEADER_BYTES: usize = 48;
+const _: () = assert!(HEADER == 48, "HEADER_BYTES is HEADER");
 /// An index entry's length.
 const ENTRY: u64 = 32;
 
@@ -476,8 +479,8 @@ struct Header {
 }
 
 impl Header {
-    fn encode(self) -> [u8; 48] {
-        let mut bytes = [0u8; 48];
+    fn encode(self) -> [u8; HEADER_BYTES] {
+        let mut bytes = [0u8; HEADER_BYTES];
         put(&mut bytes, 0, &MAGIC.to_le_bytes());
         put(&mut bytes, 4, &VERSION.to_le_bytes());
         put(&mut bytes, 8, &self.recording.to_le_bytes());
@@ -490,7 +493,7 @@ impl Header {
         bytes
     }
 
-    fn read(bytes: Option<&[u8; 48]>) -> HeaderRead {
+    fn read(bytes: Option<&[u8; HEADER_BYTES]>) -> HeaderRead {
         let Some(bytes) = bytes else {
             return HeaderRead::Missing;
         };
@@ -1113,7 +1116,7 @@ impl<D: Disk> SegmentStore<D> {
         let index = self
             .disk
             .open(&self.dir.join(index_name(self.recording, base)))?;
-        let mut header = [0u8; 48];
+        let mut header = [0u8; HEADER_BYTES];
         self.disk.read_at(&index, 0, &mut header)?;
         let HeaderRead::Valid(header) = Header::read(Some(&header)) else {
             return Err(SegmentError::BadHeader {
@@ -1450,7 +1453,7 @@ fn scan_segment<D: Disk>(
     };
     let read = match &index {
         Some(index) => {
-            let mut bytes = [0u8; 48];
+            let mut bytes = [0u8; HEADER_BYTES];
             match disk.read_at(index, 0, &mut bytes) {
                 Ok(()) => Header::read(Some(&bytes)),
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Header::read(None),

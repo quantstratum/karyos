@@ -15,7 +15,7 @@
 
 use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
 
-use crate::catalog::{Stop, StopReason};
+use crate::catalog::{SourceIncarnation, Stop, StopReason};
 use crate::recorder::{Mode, OnLap};
 use crate::segment::{Geometry, SyncPolicy};
 
@@ -60,7 +60,7 @@ pub const STOP_REPLAY: Template = template(5, 16, 12 + 16);
 /// `ControlResponse`, template 101.
 pub const CONTROL_RESPONSE: Template = template(101, 17, 12 + 17 + 2 + 256);
 /// `RecordingDescriptor`, template 102.
-pub const RECORDING_DESCRIPTOR: Template = template(102, 70, 12 + 70 + 2 + 1024);
+pub const RECORDING_DESCRIPTOR: Template = template(102, 110, 12 + 110 + 2 + 1024);
 /// `RecordingSignal`, template 103.
 pub const RECORDING_SIGNAL: Template = template(103, 27, 12 + 27);
 
@@ -486,6 +486,8 @@ impl<'a> ControlResponse<'a> {
 pub enum RecordingState {
     /// It still records.
     Recording {
+        /// The position written so far.
+        written: u64,
         /// It lost ranges so far (an async recording that lapped and
         /// resumed).
         incomplete: bool,
@@ -509,6 +511,8 @@ pub struct RecordingDescriptor<'a> {
     pub state: RecordingState,
     /// Its segment geometry.
     pub geometry: Geometry,
+    /// The publication recorded, which a live merge matches.
+    pub source: SourceIncarnation,
     /// The recorded stream.
     pub stream_id: i32,
     /// The recorded session.
@@ -519,15 +523,20 @@ pub struct RecordingDescriptor<'a> {
 
 impl<'a> RecordingDescriptor<'a> {
     fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
+        let start = block.u64(16)?;
         let stop_position = block.u64(24)?;
-        let stop_time_ns = block.u64(40)?;
-        let reason = block.u8(68)?;
-        let incomplete = block.bool("incomplete", 69)?;
+        let written = block.u64(32)?;
+        let stop_time_ns = block.u64(48)?;
+        let reason = block.u8(108)?;
+        let incomplete = block.bool("incomplete", 109)?;
         let state = match reason {
             0 if stop_position != u64::MAX || stop_time_ns != 0 => {
                 return Err(out_of_range("stop"));
             }
-            0 => RecordingState::Recording { incomplete },
+            0 => RecordingState::Recording {
+                written,
+                incomplete,
+            },
             code => RecordingState::Stopped(Stop {
                 position: stop_position,
                 time_ns: stop_time_ns,
@@ -535,8 +544,14 @@ impl<'a> RecordingDescriptor<'a> {
                 incomplete,
             }),
         };
-        let term_length = block.u32(56)?;
-        let geometry = Geometry::new(term_length, block.u64(48)?).map_err(|_| {
+        // Written from the start on, and up to the stop once stopped.
+        let stopped_elsewhere =
+            matches!(state, RecordingState::Stopped(stop) if stop.position != written);
+        if written < start || stopped_elsewhere {
+            return Err(out_of_range("written"));
+        }
+        let term_length = block.u32(96)?;
+        let geometry = Geometry::new(term_length, block.u64(56)?).map_err(|_| {
             out_of_range(if term_length == 0 {
                 "term_length"
             } else {
@@ -548,12 +563,17 @@ impl<'a> RecordingDescriptor<'a> {
         Ok(Self {
             correlation_id: block.u64(0)?,
             recording_id: id("recording_id", block.u64(8)?)?,
-            start: block.u64(16)?,
-            start_time_ns: block.u64(32)?,
+            start,
+            start_time_ns: block.u64(40)?,
             state,
             geometry,
-            stream_id: block.i32(60)?,
-            session_id: block.i32(64)?,
+            source: SourceIncarnation {
+                driver: [block.u64(64)?, block.u64(72)?],
+                registration: block.u64(80)?,
+                incarnation: block.u64(88)?,
+            },
+            stream_id: block.i32(100)?,
+            session_id: block.i32(104)?,
             channel,
         })
     }
@@ -563,31 +583,44 @@ impl<'a> RecordingDescriptor<'a> {
     /// # Errors
     ///
     /// [`CodecError::Truncated`], [`CodecError::ValueOutOfRange`] for a
-    /// recording id of 0, and [`CodecError::LengthOutOfRange`] for the
-    /// channel.
+    /// recording id of 0 and for a position written below the start, and
+    /// [`CodecError::LengthOutOfRange`] for the channel.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let mut encoder = Encoder::new(out, &RECORDING_DESCRIPTOR)?;
-        let (stop, time, reason, incomplete) = match self.state {
-            RecordingState::Recording { incomplete } => (u64::MAX, 0, 0, incomplete),
+        let (stop, written, time, reason, incomplete) = match self.state {
+            RecordingState::Recording {
+                written,
+                incomplete,
+            } => (u64::MAX, written, 0, 0, incomplete),
             RecordingState::Stopped(stop) => (
+                stop.position,
                 stop.position,
                 stop.time_ns,
                 stop.reason.code(),
                 stop.incomplete,
             ),
         };
+        // As the decoder refuses it.
+        if written < self.start {
+            return Err(out_of_range("written"));
+        }
         encoder.u64(0, self.correlation_id)?;
         encoder.u64(8, id("recording_id", self.recording_id)?)?;
         encoder.u64(16, self.start)?;
         encoder.u64(24, stop)?;
-        encoder.u64(32, self.start_time_ns)?;
-        encoder.u64(40, time)?;
-        encoder.u64(48, self.geometry.segment_length())?;
-        encoder.u32(56, self.geometry.term_length())?;
-        encoder.i32(60, self.stream_id)?;
-        encoder.i32(64, self.session_id)?;
-        encoder.u8(68, reason)?;
-        encoder.bool(69, incomplete)?;
+        encoder.u64(32, written)?;
+        encoder.u64(40, self.start_time_ns)?;
+        encoder.u64(48, time)?;
+        encoder.u64(56, self.geometry.segment_length())?;
+        encoder.u64(64, self.source.driver[0])?;
+        encoder.u64(72, self.source.driver[1])?;
+        encoder.u64(80, self.source.registration)?;
+        encoder.u64(88, self.source.incarnation)?;
+        encoder.u32(96, self.geometry.term_length())?;
+        encoder.i32(100, self.stream_id)?;
+        encoder.i32(104, self.session_id)?;
+        encoder.u8(108, reason)?;
+        encoder.bool(109, incomplete)?;
         encoder.bytes("channel", 1, MAX_CHANNEL, self.channel.as_bytes())?;
         encoder.finish()
     }

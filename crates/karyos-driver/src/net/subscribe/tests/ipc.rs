@@ -19,7 +19,7 @@ use karyos_sys::log_buffer::{Role, SealReason};
 use karyos_sys::sizing::{MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term_bytes::SharedTerms;
 
-use super::{BUDGET, aggregate, channel, driver, free_address};
+use super::{ANY_PORT, BUDGET, aggregate, channel, driver};
 use crate::admission::IpcConfig;
 use crate::agents::ThreadingMode;
 use crate::clock::SystemClock;
@@ -101,8 +101,8 @@ fn exposed<P: StreamTerms>(
     b: &mut IpcDriver,
     lanes: usize,
 ) -> (AggregateHandle, AggregateHandle, NetworkSubscription) {
-    let address = free_address();
-    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
+    let address = b.network_subscription_address(10).unwrap();
     let publication = a
         .add_network_publication(aggregate(10, 3, lanes), &channel(address))
         .unwrap();
