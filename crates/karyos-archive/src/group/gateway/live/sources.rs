@@ -29,6 +29,9 @@ use karyos_sys::frame::Lane;
 use karyos_sys::term_bytes::TermBytes;
 
 use super::{Gateway, Port};
+
+#[cfg(test)]
+mod tests;
 use crate::group::capture::Refusal;
 use crate::group::gateway::{Dispatched, Event, GatewayError, Handler, SubscriptionId, TimerId};
 use crate::group::record::Capture;
