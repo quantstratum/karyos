@@ -185,6 +185,14 @@ pub struct AgentConfig {
     /// EOS repeats of a removed publication's linger
     /// (driver-network-agents.md §7).
     pub path_heartbeat_interval: u64,
+    /// `sender_heartbeat_interval` in ns (default 100 ms; SPEC §6: idle
+    /// senders emit heartbeats): a lane of an established single-path
+    /// publication that sent no DATA for this long sends a header-only
+    /// DATA frame at its next position, and again every interval while
+    /// idle, so a receiver learns of a lost tail and NAKs it. At least 1
+    /// and at most half of `image_liveness_timeout`, this driver's own; a
+    /// remote receiver's liveness is that receiver's configuration.
+    pub sender_heartbeat_interval: u64,
     /// When a routed publication's path leaves the live set
     /// (redundant-paths.md section 7, RP-8): `path_lag_limit` (100 ms),
     /// `path_skip_ratio` in percent (50) and `path_skip_min_bytes` (64 KiB).
@@ -273,6 +281,7 @@ impl Default for AgentConfig {
             publications: 64,
             setup_interval: 100_000_000,
             path_heartbeat_interval: 100_000_000,
+            sender_heartbeat_interval: 100_000_000,
             path_policy: crate::agents::data::PathPolicy::default(),
             answer_rate: crate::sessions::send::AnswerRate::default(),
             control_capacity: 512,
@@ -321,6 +330,13 @@ impl AgentConfig {
         if self.path_heartbeat_interval == 0 {
             return Err(AgentError::InvalidConfig(
                 "path_heartbeat_interval must be at least 1",
+            ));
+        }
+        if self.sender_heartbeat_interval == 0
+            || self.sender_heartbeat_interval > self.image_liveness_timeout / 2
+        {
+            return Err(AgentError::InvalidConfig(
+                "sender_heartbeat_interval must be at least 1 and at most half of image_liveness_timeout",
             ));
         }
         let events = NonZeroUsize::new(self.event_capacity).ok_or(AgentError::InvalidConfig(

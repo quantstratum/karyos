@@ -284,6 +284,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     picked: Vec<(TraceExtension, u64)>,
     /// The redundant paths of a routed publication ([`Outbound::new_routed`]).
     routed: Option<Box<routed::Routed>>,
+    /// Per lane, since when it submitted no DATA nor heartbeat: its idle
+    /// heartbeat is due `sender_heartbeat_interval` later (SPEC §6).
+    idle_since: [Option<u64>; 4],
     /// Its removal linger, once removing (driver-network-agents.md §7).
     removal: Option<Box<removal::Removal>>,
 }
@@ -452,6 +455,7 @@ impl<T: StreamTerms> Outbound<T> {
                     .ok_or(OutboundError::Mtu)?,
             ),
             routed: None,
+            idle_since: [None; 4],
             removal: None,
         })
     }
@@ -1034,7 +1038,7 @@ impl<T: StreamTerms> Outbound<T> {
         }
         self.cancel_aborted(tx);
         self.handle_failure(tx, report.failure);
-        for track in &mut self.tracks {
+        for (track, idle) in self.tracks.iter_mut().zip(&mut self.idle_since) {
             if std::mem::take(&mut track.unsent) {
                 self.counters.bump(|c| &mut c.unsent, 1);
             }
@@ -1044,6 +1048,8 @@ impl<T: StreamTerms> Outbound<T> {
             if let Some(submitted) = track.submitted.take() {
                 self.counters.bump(|c| &mut c.submitted, 1);
                 track.high = track.high.max(submitted);
+                // DATA left: the lane's idle heartbeat waits again.
+                *idle = Some(now);
             }
         }
         self.advance_registered(consumption);
@@ -1695,6 +1701,7 @@ pub(crate) mod testing {
     }
 }
 
+mod heartbeat;
 mod removal;
 mod routed;
 

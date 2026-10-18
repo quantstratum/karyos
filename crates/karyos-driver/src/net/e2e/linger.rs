@@ -600,3 +600,38 @@ fn a_linger_above_sixty_seconds_is_refused() {
         Err(crate::error::DriverError::InvalidConfig)
     ));
 }
+
+/// A removed publication's lanes send only EOS through the linger, never
+/// an idle heartbeat (SPEC §6, G1): the linger outlasts several
+/// `sender_heartbeat_interval`s, yet `heartbeats_sent` stays where the
+/// removal found it while the EOS repeats; and the receiver, whose image
+/// ended at the EOS, solicits no new image. (The repeated EOS frames
+/// reach it unbound once its image ended; an EOS solicits nothing, where
+/// an unbound idle heartbeat would.)
+#[test]
+fn a_removed_publication_sends_only_eos_through_its_linger() {
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let linger = 6 * interval;
+    let (mut a, mut b, publication, mut reader) = pair(linger, 1);
+    offer_all(&mut a, &publication, 1, 4);
+    let mut seen = 0;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        seen == 4
+    });
+    let heartbeats = sender_counters(&a).heartbeats_sent;
+    a.remove_aggregate(&publication).unwrap();
+    let (terminal, ends, _) = read_to_end(&mut a, &mut b, &mut reader);
+    assert!(terminal.clean && closed_at_eos(ends[0]), "{ends:?}");
+    pump(&mut [&mut a, &mut b], |drivers| {
+        stream_state(drivers[0], &publication, 0) == StreamState::Freed
+    });
+    let sender = sender_counters(&a);
+    assert_eq!(sender.heartbeats_sent, heartbeats, "{sender:?}");
+    assert!(
+        sender.eos_sent >= 2,
+        "repeated through the linger: {sender:?}"
+    );
+    let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert_eq!(receiver.create_image, 1, "{receiver:?}");
+}

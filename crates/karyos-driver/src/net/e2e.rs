@@ -39,6 +39,7 @@ fn fast_agents() -> AgentConfig {
         sm_interval: 5 * MS,
         image_liveness_timeout: 100 * MS,
         idle_image_timeout: 100 * MS,
+        sender_heartbeat_interval: 20 * MS,
         ..AgentConfig::default()
     }
 }
@@ -2079,4 +2080,71 @@ fn a_receiver_failure_on_a_dedicated_runner_leaves_the_gates_deciding() {
     }
     assert_eq!((sent, seen), (4, 4), "sent after the failure");
     assert_eq!(kinds, [Kind::Submitted; 4]);
+}
+
+/// SPEC §6 (G1): a tail lost on the wire is revealed only by the idle
+/// sender's heartbeat. The last three DATA datagrams of a reliable lane
+/// are dropped at B's intake and the publisher goes idle: nothing else
+/// shows the hole, so the heartbeat at the lane's next position raises
+/// the image's mark, B NAKs the tail, the repair arrives, and every
+/// message is delivered, in order, with the image still live.
+#[test]
+fn an_idle_heartbeat_reveals_a_lost_tail() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    // The next three DATA datagrams, the whole tail, are lost.
+    b.net.as_mut().unwrap().drop_receiver_data(&[0, 1, 2]);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    for index in 0..3u32 {
+        let mut payload = [0u8; 1000];
+        payload[..4].copy_from_slice(&index.to_le_bytes());
+        assert!(matches!(
+            lane.offer(&payload).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    let mut seen = 0u32;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 3
+    });
+    let sender = a.net.as_ref().unwrap().sender_counters().unwrap();
+    let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert!(sender.heartbeats_sent >= 1, "{sender:?}");
+    assert!(receiver.naks >= 1, "{receiver:?}");
+    assert!(b.network_image(10, 3).is_some(), "the image is still live");
+}
+
+/// G2: a publication whose `initial_term_id` is just below `u32::MAX`
+/// (the test override) crosses the term id wrap: its messages arrive in
+/// order across it.
+#[test]
+fn a_publication_crosses_the_term_id_wrap() {
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.stream_defaults.initial_term_id = Some(u32::MAX - 1);
+    let mut a = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let mut b = driver(ThreadingMode::Shared);
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let lane = a.stream_ref(publication.lane(Lane::ZERO).unwrap()).unwrap();
+    assert_eq!(lane.config.initial_term_id.get(), u32::MAX - 1);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    // About four 64 KiB terms: term ids MAX - 1, MAX, 0 and 1.
+    exchange(&mut a, &mut b, &publication, &mut reader, 256);
 }

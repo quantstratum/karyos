@@ -1196,3 +1196,54 @@ fn a_network_close_aborts_what_the_gate_never_staged() {
     let aborted = (Kind::Aborted, REASON_DRIVER_SHUTDOWN);
     assert_eq!(records, [aborted, aborted]);
 }
+
+/// SPEC §4 (initial state) and §5: each network publication draws its
+/// `initial_term_id` on the control path, shared by its lanes, and its
+/// SETUP announces it. Two draws differ (a 2^-32 equality is retried
+/// once).
+#[test]
+fn network_publications_draw_their_initial_term_ids() {
+    let announced = |stream_id: i32| {
+        let mut driver = driver();
+        let socket = receiver();
+        let destination = Destination::Unicast(socket.local_addr().unwrap());
+        let handle = driver
+            .add_network_publication(aggregate(stream_id, 2), &channel(destination))
+            .unwrap();
+        let drawn: Vec<u32> = handle
+            .streams()
+            .map(|stream| {
+                driver
+                    .stream_ref(stream)
+                    .unwrap()
+                    .config
+                    .initial_term_id
+                    .get()
+            })
+            .collect();
+        assert_eq!(drawn.len(), 2);
+        assert_eq!(drawn[0], drawn[1], "every lane shares it");
+        let mut buffer = [0u8; 2048];
+        let mut announce = None;
+        until(&mut driver, |_| {
+            if let Ok(len) = socket.recv(&mut buffer)
+                && let Ok(Datagram::Control(Control::SetupAnnounce(found))) =
+                    classify(&buffer[..len])
+            {
+                announce = Some(found);
+            }
+            announce.is_some()
+        });
+        let announced = announce.unwrap().term.initial_term_id.cast_unsigned();
+        assert_eq!(announced, drawn[0], "SETUP carries it");
+        announced
+    };
+    let first = announced(10);
+    let second = announced(11);
+    let second = if second == first {
+        announced(12)
+    } else {
+        second
+    };
+    assert_ne!(first, second);
+}
