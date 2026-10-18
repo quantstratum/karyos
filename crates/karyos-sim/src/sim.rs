@@ -221,6 +221,19 @@ struct Sim<'s> {
     revoked_holding: usize,
 }
 
+/// The simulated driver's configuration. Its streams start at term id 7:
+/// a replay of a seed must not depend on a random first term id.
+fn driver_config() -> DriverConfig {
+    DriverConfig {
+        cutover_deadline: CUTOVER_DEADLINE,
+        max_retained_generations: 2,
+        heartbeat_interval: HEARTBEAT_INTERVAL,
+        client_liveness_timeout: CLIENT_TIMEOUT,
+        initial_term_id: Some(7),
+        ..DriverConfig::default()
+    }
+}
+
 /// Runs `scenario` with `seed`.
 ///
 /// # Errors
@@ -289,15 +302,7 @@ fn connect_reader(
 impl<'s> Sim<'s> {
     fn new(scenario: &'s Scenario, seed: u64) -> Result<Self, Failure> {
         let clock = SimClock::default();
-        let config = DriverConfig {
-            cutover_deadline: CUTOVER_DEADLINE,
-            max_retained_generations: 2,
-            heartbeat_interval: HEARTBEAT_INTERVAL,
-            client_liveness_timeout: CLIENT_TIMEOUT,
-            // A replay must not depend on a random first term id.
-            initial_term_id: Some(7),
-            ..DriverConfig::default()
-        };
+        let config = driver_config();
         let fail = |reason: String| Failure {
             scenario: scenario.name,
             seed,
@@ -1003,5 +1008,17 @@ impl<'s> Sim<'s> {
             revoked_holding: self.revoked_holding,
             digest: self.digest,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every simulated stream starts at term id 7, whatever the draw: the
+    /// driver's override pins it, so a seed replays the same positions.
+    #[test]
+    fn the_simulated_driver_pins_its_first_term_id() {
+        assert_eq!(driver_config().initial_term_id, Some(7));
     }
 }

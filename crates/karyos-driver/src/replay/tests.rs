@@ -946,3 +946,44 @@ fn counter(driver: &EmbeddedDriver, label: &str) -> u64 {
         })
         .unwrap()
 }
+
+/// A recording's format names every field of the lane it reads, not a
+/// default: lane 1 of a two-lane aggregate with a term of twice the
+/// minimum and an mtu of 2048 reports exactly those, and its drawn
+/// initial term id.
+#[test]
+fn a_recordings_format_names_its_lanes_geometry() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let term_length = MIN_TERM_LENGTH * 2;
+    let mtu = 2048;
+    let mut stream = source();
+    stream.buffer.term_length = TermLength::try_new(term_length).unwrap();
+    stream.buffer.mtu = mtu;
+    stream.buffer.max_reserved = term_length / 8;
+    let aggregate = driver
+        .add_aggregate(crate::embedded::AggregateConfig {
+            stream,
+            quanta: vec![u64::from(mtu) + 32; 2],
+        })
+        .unwrap();
+    let lane = Lane::try_new(1).unwrap();
+    let handle = aggregate.lane(lane).unwrap();
+    let recording = driver.recording_reader(handle, Role::Optional).unwrap();
+    let drawn = driver
+        .stream_ref(handle)
+        .unwrap()
+        .buffer
+        .config()
+        .initial_term_id
+        .get()
+        .cast_signed();
+    assert_eq!(
+        recording.format(),
+        crate::recording::RecordingFormat {
+            lane,
+            initial_term_id: drawn,
+            term_length,
+            mtu,
+        }
+    );
+}

@@ -1979,12 +1979,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Returns configuration and allocation errors; no stream is added on
     /// error, and the refusal is recorded in the error log.
     /// [`DriverError::Sys`] when the random source fails, before anything
-    /// is validated.
+    /// is validated; it is logged too.
     pub fn add_stream(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
         // The first term id, drawn on the control path before the stream
         // exists (SPEC §4, initial state); a failed draw refuses the add.
         let mut config = config;
-        config.buffer.initial_term_id = self.draw_initial_term_id(self.config.initial_term_id)?;
         let key = [
             u64::from(config.buffer.stream_id.cast_unsigned()),
             u64::from(config.buffer.session_id.cast_unsigned()),
@@ -1992,7 +1991,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // One lane, the configured one, with a quantum of the largest frame:
         // exactly today's stream.
         let lane = config.buffer.lane;
-        let added = largest_charge(&config)
+        let added = self
+            .draw_initial_term_id(self.config.initial_term_id)
+            .and_then(|drawn| {
+                config.buffer.initial_term_id = drawn;
+                largest_charge(&config)
+            })
             .and_then(|charge| self.add_aggregate_checked(config, &[lane], &[charge]))
             .and_then(|aggregate| aggregate.lane(lane).ok_or(DriverError::InvalidConfig));
         if let Err(error) = &added {
@@ -2023,11 +2027,28 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         &mut self,
         config: AggregateConfig,
     ) -> Result<AggregateHandle, DriverError> {
-        // As for a stream, one draw shared by every lane.
+        // As for a stream, one draw shared by every lane; a failed draw is
+        // logged as any other refusal.
         let mut config = config;
-        config.stream.buffer.initial_term_id =
-            self.draw_initial_term_id(self.config.initial_term_id)?;
-        self.add_aggregate_drawn(config)
+        match self.draw_initial_term_id(self.config.initial_term_id) {
+            Ok(drawn) => {
+                config.stream.buffer.initial_term_id = drawn;
+                self.add_aggregate_drawn(config)
+            }
+            Err(error) => {
+                let key = [
+                    u64::from(config.stream.buffer.stream_id.cast_unsigned()),
+                    u64::from(config.stream.buffer.session_id.cast_unsigned()),
+                ];
+                self.diagnostics.error(
+                    &mut self.counters,
+                    crate::diagnostics::ErrorCode::StreamConfigRejected,
+                    key,
+                    &error.to_string(),
+                );
+                Err(error)
+            }
+        }
     }
 
     /// [`EmbeddedDriver::add_aggregate`] with the `initial_term_id` already
