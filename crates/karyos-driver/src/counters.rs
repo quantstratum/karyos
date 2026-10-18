@@ -107,7 +107,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 58] = [
+const LABELS: [(u64, &str); 59] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -166,6 +166,7 @@ const LABELS: [(u64, &str); 58] = [
     (TYPE_EVENTS, "network trace journals refused"),
     (TYPE_EVENTS, "network trace journals unhooked"),
     (TYPE_EVENTS, "replay targets not retired"),
+    (TYPE_EVENTS, "overruns replayed"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -315,6 +316,9 @@ pub(crate) enum Event {
     /// Replay targets whose feed was dropped unfinished and whose retire
     /// then failed; such a target is no longer tracked.
     ReplayTargetsNotRetired,
+    /// Reported overruns that `replay` recovered from a recording, merging
+    /// back into the live stream. Last, so no other counter's id moves.
+    OverrunsReplayed,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -577,6 +581,7 @@ mod tests {
                 "network trace journals unhooked",
             ),
             (Event::ReplayTargetsNotRetired, "replay targets not retired"),
+            (Event::OverrunsReplayed, "overruns replayed"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

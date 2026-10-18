@@ -486,3 +486,153 @@ fn test_a_full_command_ring_delays_a_report_without_losing_it() {
     assert_eq!((records[0].from, records[0].to), (lost.from, lost.lost_to));
     assert_eq!(client.loss_reports_dropped(), 0);
 }
+
+/// A provider with no replay for any gap: the Archive refuses it.
+struct Refusing;
+
+impl karyos_client::ReplayProvider for Refusing {
+    fn replay(&mut self, _request: &karyos_client::ReplayRequest) -> karyos_client::ReplayStatus {
+        karyos_client::ReplayStatus::Unavailable(karyos_client::ReplayUnavailable::Refused)
+    }
+
+    fn cancel(&mut self) {}
+}
+
+/// A replay rejoin reports its overrun once, when it resolved, as `replay`
+/// with the provider's reason and the secondary's outcome; the wrapped
+/// subscription's own `rejoin at head` is not reported.
+#[test]
+fn test_a_replay_rejoin_reports_its_overrun_once_resolved() {
+    let (mut driver, stream, mut publication, mut client, subscription) =
+        setup(RejoinPolicy::RejoinAtHead);
+    let source = driver.trace_identity(stream).unwrap();
+    let mut rejoin = karyos_client::ReplayRejoin::new(
+        subscription,
+        source,
+        Box::new(Refusing),
+        Secondary::RejoinAtHead,
+    );
+    lap(&mut driver, &mut publication);
+    let first = rejoin.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    let lost = first.overrun.unwrap();
+    assert_eq!(first.rejoin, Some(RejoinOutcome::Replaying));
+    assert_eq!(client.loss_reports_queued(), 0);
+    let resolved = rejoin.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    assert_eq!(
+        resolved.rejoin,
+        Some(RejoinOutcome::ReplayFallback {
+            reason: ReplayFallbackReason::Refused,
+            secondary: SecondaryOutcome::ResumedAtHead,
+        })
+    );
+    assert_eq!(client.loss_reports_queued(), 1);
+    settle(&mut driver, &mut client);
+    let [record] = losses(&driver)[..] else {
+        panic!("expected exactly one loss record");
+    };
+    assert_eq!(
+        (
+            record.configured_policy,
+            record.applied_policy,
+            record.reason,
+            record.from,
+            record.to
+        ),
+        (4, 1, 5, lost.from, lost.lost_to)
+    );
+    assert_eq!(counter(&driver, "overruns rejoin at head"), 1);
+    assert_eq!(counter(&driver, "replay fallbacks"), 1);
+}
+
+/// A provider that never answers: the gap stays asked for.
+struct Pending;
+
+impl karyos_client::ReplayProvider for Pending {
+    fn replay(&mut self, _request: &karyos_client::ReplayRequest) -> karyos_client::ReplayStatus {
+        karyos_client::ReplayStatus::Pending
+    }
+
+    fn cancel(&mut self) {}
+}
+
+/// A live reader taken back from a replay rejoin has its own policy and
+/// loss reports again: its next overrun is closed by its `close` policy,
+/// and reported as such.
+#[test]
+fn test_a_reader_taken_back_reports_by_its_own_policy() {
+    let (mut driver, stream, mut publication, mut client, subscription) =
+        setup(RejoinPolicy::Close);
+    let source = driver.trace_identity(stream).unwrap();
+    let rejoin = karyos_client::ReplayRejoin::new(
+        subscription,
+        source,
+        Box::new(Refusing),
+        Secondary::RejoinAtHead,
+    );
+    let mut live = rejoin.into_live().unwrap();
+    lap(&mut driver, &mut publication);
+    let first = live.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    let lost = first.overrun.unwrap();
+    assert_eq!(first.rejoin, Some(RejoinOutcome::Closed));
+    settle(&mut driver, &mut client);
+    let [record] = losses(&driver)[..] else {
+        panic!("expected exactly one loss record");
+    };
+    assert_eq!(
+        (
+            record.configured_policy,
+            record.applied_policy,
+            record.reason,
+            record.from,
+            record.to
+        ),
+        (3, 4, 0, lost.from, lost.lost_to)
+    );
+}
+
+/// A gap given up while it is asked for is reported once, as `replay`
+/// withdrawn with the reader resumed at its resume: when the live reader
+/// is taken back, and when the rejoin is dropped.
+#[test]
+fn test_a_withdrawn_replay_rejoin_reports_its_overrun() {
+    for taken_back in [true, false] {
+        let (mut driver, stream, mut publication, mut client, subscription) =
+            setup(RejoinPolicy::RejoinAtHead);
+        let source = driver.trace_identity(stream).unwrap();
+        let mut rejoin = karyos_client::ReplayRejoin::new(
+            subscription,
+            source,
+            Box::new(Pending),
+            Secondary::RejoinAtHead,
+        );
+        lap(&mut driver, &mut publication);
+        let first = rejoin.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+        let lost = first.overrun.unwrap();
+        assert_eq!(first.rejoin, Some(RejoinOutcome::Replaying));
+        let asking = rejoin.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+        assert_eq!(asking.rejoin, None);
+        assert!(rejoin.is_recovering());
+        assert_eq!(client.loss_reports_queued(), 0);
+        if taken_back {
+            drop(rejoin.into_live());
+        } else {
+            drop(rejoin);
+        }
+        settle(&mut driver, &mut client);
+        let [record] = losses(&driver)[..] else {
+            panic!("expected exactly one loss record, taken back {taken_back}");
+        };
+        assert_eq!(
+            (
+                record.configured_policy,
+                record.applied_policy,
+                record.reason,
+                record.from,
+                record.to
+            ),
+            (4, 1, 7, lost.from, lost.lost_to),
+            "taken back {taken_back}"
+        );
+        assert_eq!(counter(&driver, "replay fallbacks"), 1);
+    }
+}

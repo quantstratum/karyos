@@ -200,16 +200,29 @@ pub enum SecondaryOutcome {
     Closed,
 }
 
-/// Why `replay` was not used. The values are fixed now, so they never
-/// change meaning when phase 3 adds Archive replay.
+/// Why `replay` was not used. The values are fixed: none ever changes
+/// meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayFallbackReason {
-    /// No Archive exists (phase 1).
+    /// No Archive exists: a plain [`RejoinPolicy::Replay`], which has no
+    /// replay provider ([`crate::merge::ReplayRejoin`] has one).
     NoArchive,
     /// No recording covers the gap (phase 3).
     NoRecording,
     /// The recording's retention does not reach the gap (phase 3).
     RetentionShort,
+    /// The recording had not reached the gap's end in time (phase 3).
+    RecordingBehind,
+    /// The Archive refused the replay (phase 3).
+    Refused,
+    /// The replay and the live stream did not merge (phase 3): the
+    /// merge's typed error is on the poll that failed.
+    MergeFailed,
+    /// The gap was given up before it resolved (phase 3): the
+    /// [`crate::merge::ReplayRejoin`] was dropped, or its live reader taken
+    /// back, while the gap was asked for or merging. Only a loss report
+    /// carries it, with the live reader resumed at its resume.
+    Withdrawn,
 }
 
 /// What the rejoin policy did after an overrun, reported with it.
@@ -230,6 +243,16 @@ pub enum RejoinOutcome {
         reason: ReplayFallbackReason,
         /// What the secondary policy did.
         secondary: SecondaryOutcome,
+    },
+    /// `replay` is recovering the gap from a recording
+    /// ([`crate::merge::ReplayRejoin`]): set with the overrun; a later
+    /// poll reports how it resolved, `Replayed` or `ReplayFallback`.
+    Replaying,
+    /// `replay` recovered the gap from a recording and merged back into
+    /// the live stream at `cutover`.
+    Replayed {
+        /// The cutover position.
+        cutover: u64,
     },
 }
 
@@ -507,6 +530,22 @@ impl<T: TermBytes> ClientSubscription<T> {
         self
     }
 
+    /// Takes the loss reporter, for a wrapper that reports the overruns
+    /// itself.
+    pub(crate) fn take_loss_reports(&mut self) -> Option<Box<LossReporter>> {
+        self.loss.take()
+    }
+
+    /// Gives back the loss reporter [`Self::take_loss_reports`] took.
+    pub(crate) fn restore_loss_reports(&mut self, loss: Option<Box<LossReporter>>) {
+        self.loss = loss;
+    }
+
+    /// Replaces the rejoin policy; returns the one it had.
+    pub(crate) fn replace_rejoin(&mut self, policy: RejoinPolicy) -> RejoinPolicy {
+        std::mem::replace(&mut self.rejoin, policy)
+    }
+
     /// The owner and registration, for a handle from a client conductor.
     #[must_use]
     pub fn origin(&self) -> Option<&Origin> {
@@ -729,7 +768,7 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// link closes for good and its offered successor is dropped, which
     /// detaches its cell, then the link, the stream lease and a remote
     /// grant's export are released; only the closure result stays.
-    fn close_by_overrun(&mut self, overrun: Overrun, outcome: RejoinOutcome) {
+    pub(crate) fn close_by_overrun(&mut self, overrun: Overrun, outcome: RejoinOutcome) {
         let position = self.position();
         drop(self.inner.take());
         if let Some(link) = self.link.take() {
@@ -864,7 +903,7 @@ impl<T: TermBytes> ClientSubscription<T> {
 }
 
 /// Runs `source` once for `overrun`; a panic counts as a failure.
-fn rebuild(source: &mut dyn SnapshotSource, overrun: &Overrun) -> SecondaryOutcome {
+pub(crate) fn rebuild(source: &mut dyn SnapshotSource, overrun: &Overrun) -> SecondaryOutcome {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.rebuild(overrun))) {
         Ok(Ok(())) => SecondaryOutcome::SnapshotRebuilt,
         Ok(Err(SnapshotFailed)) | Err(_) => SecondaryOutcome::SnapshotFailed,
