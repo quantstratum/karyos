@@ -14,10 +14,13 @@
 //! `tests/timed.rs`, over the scripted sockets of karyos-io's test hooks.
 //! Suspensions and drops are logical, inside one
 //! process: they are not evidence for real process pause, crash or restart,
-//! which belongs to IPC. The network, the backend ring models, the disk
-//! model, the Archive and the Cluster do not exist yet.
+//! which belongs to IPC. A linearizability checker over recorded
+//! histories ([`lin`], cluster-gap-analysis.md C3) is the Cluster's first
+//! piece. The network, the backend ring models, the disk model, the
+//! Archive and the Cluster do not exist yet.
 
 pub mod clock;
+pub mod lin;
 pub mod oracle;
 pub mod payload;
 pub mod publisher;
