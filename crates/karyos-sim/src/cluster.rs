@@ -31,7 +31,7 @@
 use std::fmt::Debug;
 
 use crate::clock::SimClock;
-use crate::net::{Delivery, LinkConfig, Net, NetOverflow, NodeId};
+use crate::net::{Delivery, LinkConfig, LinkConfigError, Net, NetOverflow, NodeId};
 use crate::rng::Rng;
 use crate::sim::Failure;
 
@@ -146,19 +146,23 @@ const FAILURE_TRACE: usize = 48;
 
 impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
     /// A run named `name` of `seed`, whose links start as `link`.
-    #[must_use]
-    pub fn new(name: &'static str, seed: u64, link: LinkConfig) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`LinkConfigError`] when `link` is invalid
+    /// ([`crate::net::validate`]).
+    pub fn new(name: &'static str, seed: u64, link: LinkConfig) -> Result<Self, LinkConfigError> {
+        Ok(Self {
             name,
             seed,
             scheduler: Rng::new(seed),
             base: SimClock::default(),
-            net: Net::new(link, Rng::new(fault_seed(seed))),
+            net: Net::new(link, Rng::new(fault_seed(seed)))?,
             nodes: Vec::new(),
             step: 0,
             trace: Vec::new(),
             digest: 0xCBF2_9CE4_8422_2325,
-        }
+        })
     }
 
     /// Adds `node` on a clock of `offset` and `drift_ppm`; returns its id,
@@ -351,6 +355,8 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
             .step
             .checked_add(1)
             .ok_or_else(|| self.failure("steps exhausted".into()))?;
+        // Link changes made between steps (configure, partitions) first.
+        self.absorb();
         self.base.advance(1);
         let now = self.base.get();
         for delivery in self.net.due(now) {
@@ -364,7 +370,8 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
             .collect();
         let mut ticked = Vec::with_capacity(order.len());
         while !order.is_empty() {
-            let pick = self.scheduler.below(order.len() as u64);
+            let len = u64::try_from(order.len()).map_err(|_| self.failure("nodes".into()))?;
+            let pick = self.scheduler.below(len);
             let index = usize::try_from(pick).map_err(|_| self.failure("pick".into()))?;
             if index < order.len() {
                 ticked.push(order.remove(index));

@@ -158,15 +158,54 @@ pub struct Net<M> {
     events: Vec<String>,
 }
 
+/// A link configuration the network refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkConfigError {
+    /// `min_delay` is above `max_delay`.
+    DelayRange,
+    /// A fault rate is above 1_000_000 ppm.
+    Rate,
+}
+
+/// Checks a link state's rates.
+fn validate_state(state: LinkState) -> Result<(), LinkConfigError> {
+    match state {
+        LinkState::Lossy(faults)
+            if [faults.loss_ppm, faults.reorder_ppm, faults.duplicate_ppm]
+                .iter()
+                .any(|rate| *rate > PPM) =>
+        {
+            Err(LinkConfigError::Rate)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Checks a link configuration: its delays and its state's rates.
+///
+/// # Errors
+///
+/// [`LinkConfigError`] for a delay range or a rate out of bounds.
+pub fn validate(config: LinkConfig) -> Result<(), LinkConfigError> {
+    if config.min_delay > config.max_delay {
+        return Err(LinkConfigError::DelayRange);
+    }
+    validate_state(config.state)
+}
+
 /// An arithmetic step of the network overflowed its integers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetOverflow;
 
 impl<M: Clone + Debug> Net<M> {
     /// A network whose links start as `default`, drawing from `rng`.
-    #[must_use]
-    pub fn new(default: LinkConfig, rng: Rng) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`LinkConfigError`] when `default` is invalid ([`validate`]).
+    pub fn new(default: LinkConfig, rng: Rng) -> Result<Self, LinkConfigError> {
+        validate(default)?;
+        Ok(Self {
             links: BTreeMap::new(),
             default,
             rng,
@@ -174,7 +213,7 @@ impl<M: Clone + Debug> Net<M> {
             next_order: 0,
             counters: NetCounters::default(),
             events: Vec::new(),
-        }
+        })
     }
 
     fn link(&mut self, from: NodeId, to: NodeId) -> &mut Link<M> {
@@ -188,21 +227,48 @@ impl<M: Clone + Debug> Net<M> {
 
     /// Configures the link from `from` to `to`; its state becomes the
     /// configured one.
-    pub fn configure(&mut self, from: NodeId, to: NodeId, config: LinkConfig) {
+    ///
+    /// # Errors
+    ///
+    /// [`LinkConfigError`] when `config` is invalid ([`validate`]); the
+    /// link is unchanged.
+    pub fn configure(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        config: LinkConfig,
+    ) -> Result<(), LinkConfigError> {
+        validate(config)?;
         let link = self.link(from, to);
         link.config = config;
         link.state = config.state;
+        self.events
+            .push(format!("link {from}->{to} configured {config:?}"));
+        Ok(())
     }
 
     /// Sets the link from `from` to `to` to `state`.
-    pub fn set_state(&mut self, from: NodeId, to: NodeId, state: LinkState) {
+    ///
+    /// # Errors
+    ///
+    /// [`LinkConfigError::Rate`] for a rate out of bounds; the link is
+    /// unchanged.
+    pub fn set_state(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        state: LinkState,
+    ) -> Result<(), LinkConfigError> {
+        validate_state(state)?;
         self.link(from, to).state = state;
         self.events.push(format!("link {from}->{to} {state:?}"));
+        Ok(())
     }
 
     /// Cuts one direction: from `from` to `to` only.
     pub fn cut(&mut self, from: NodeId, to: NodeId) {
-        self.set_state(from, to, LinkState::Down);
+        self.link(from, to).state = LinkState::Down;
+        self.events.push(format!("link {from}->{to} Down"));
     }
 
     /// Cuts every link between `node` and every other node of `nodes`,

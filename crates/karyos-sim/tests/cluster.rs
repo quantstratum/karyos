@@ -16,14 +16,14 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use karyos_sim::cluster::{ClusterSim, Echo, EchoNode};
-use karyos_sim::net::{LinkConfig, LinkFaults, LinkState, NetCounters, NodeId};
+use karyos_sim::net::{LinkConfig, LinkConfigError, LinkFaults, LinkState, NetCounters, NodeId};
 use karyos_sim::scenarios;
 
 type Sim = ClusterSim<EchoNode, Echo>;
 
 /// `count` silent nodes (no timer) on links of a fixed delay of 1.
 fn quiet(seed: u64, count: usize, link: LinkConfig) -> Sim {
-    let mut sim = Sim::new("cluster", seed, link);
+    let mut sim = Sim::new("cluster", seed, link).unwrap();
     for _ in 0..count {
         let _ = sim.add_node(EchoNode::new(0, Vec::new()), 0, 0).unwrap();
     }
@@ -67,7 +67,7 @@ fn ring(seed: u64) -> Sim {
         max_delay: 7,
         cap: 16,
     };
-    let mut sim = Sim::new("ring", seed, link);
+    let mut sim = Sim::new("ring", seed, link).unwrap();
     let _ = sim.add_node(EchoNode::new(5, vec![1, 2]), 0, 0).unwrap();
     let _ = sim
         .add_node(EchoNode::new(7, vec![2, 0]), 3, 20_000)
@@ -250,7 +250,7 @@ fn a_cut_can_be_one_way() {
 /// clock: exact, from its offset and drift.
 #[test]
 fn skewed_clocks_fire_timers_at_their_own_rates() {
-    let mut sim = Sim::new("clocks", 1, LinkConfig::default());
+    let mut sim = Sim::new("clocks", 1, LinkConfig::default()).unwrap();
     for (offset, drift) in [(0, 0), (0, 500_000), (0, -250_000), (25, 0), (0, 1_000)] {
         let _ = sim
             .add_node(EchoNode::new(10, Vec::new()), offset, drift)
@@ -266,6 +266,7 @@ fn skewed_clocks_fire_timers_at_their_own_rates() {
     assert_eq!(ticks, vec![100, 150, 75, 102, 100]);
     assert!(
         Sim::new("clocks", 1, LinkConfig::default())
+            .unwrap()
             .add_node(EchoNode::new(10, Vec::new()), 0, -1_000_000)
             .is_err()
     );
@@ -278,7 +279,7 @@ fn a_crashed_node_is_not_ticked_and_drops_what_is_due() {
         max_delay: 3,
         ..LinkConfig::default()
     };
-    let mut sim = Sim::new("crash", 1, link);
+    let mut sim = Sim::new("crash", 1, link).unwrap();
     let _ = sim.add_node(EchoNode::new(0, Vec::new()), 0, 0).unwrap();
     let _ = sim.add_node(EchoNode::new(10, Vec::new()), 0, 0).unwrap();
     sim.run_for(20).unwrap();
@@ -301,4 +302,59 @@ fn a_crashed_node_is_not_ticked_and_drops_what_is_due() {
     assert_eq!((node.restarts, node.received.len()), (1, 1));
     // Its timer catches up on its own clock.
     assert_eq!(node.ticks, 4);
+}
+
+/// A link configuration out of bounds is refused, with nothing changed:
+/// a delay range upside down, or a rate above one million ppm.
+#[test]
+fn an_invalid_link_configuration_is_refused() {
+    let upside_down = LinkConfig {
+        min_delay: 5,
+        max_delay: 4,
+        ..LinkConfig::default()
+    };
+    let too_lossy = lossy(LinkFaults {
+        loss_ppm: 1_000_001,
+        ..NONE
+    });
+    assert_eq!(
+        Sim::new("bad", 1, upside_down).err(),
+        Some(LinkConfigError::DelayRange)
+    );
+    assert_eq!(
+        Sim::new("bad", 1, too_lossy).err(),
+        Some(LinkConfigError::Rate)
+    );
+    let mut sim = quiet(1, 2, LinkConfig::default());
+    assert_eq!(
+        sim.net_mut().configure(0, 1, upside_down),
+        Err(LinkConfigError::DelayRange)
+    );
+    assert_eq!(
+        sim.net_mut().set_state(0, 1, too_lossy.state),
+        Err(LinkConfigError::Rate)
+    );
+    // Unchanged: a delay of 1, no loss.
+    pongs(&mut sim, 0, 1, 1);
+    sim.run_for(1).unwrap();
+    assert_eq!(received(&sim, 1), vec![(0, Echo::Pong(0), 1)]);
+}
+
+/// The trace alone tells two runs of one seed apart when only a scripted
+/// `configure` differs: the configuration reaches the trace.
+#[test]
+fn a_scripted_configure_reaches_the_trace() {
+    let run = |delay: u64| {
+        let mut sim = quiet(7, 2, LinkConfig::default());
+        let config = LinkConfig {
+            min_delay: delay,
+            max_delay: delay,
+            ..LinkConfig::default()
+        };
+        sim.net_mut().configure(0, 1, config).unwrap();
+        sim.run_for(1).unwrap();
+        bytes(&sim)
+    };
+    assert_eq!(run(3), run(3));
+    assert_ne!(run(3), run(4));
 }
