@@ -934,39 +934,25 @@ pub struct Recovery {
 /// `coverage`. When the queue is full at an event's end, the prefixes are
 /// advanced and the end taken again; an event that still finds no room,
 /// with `capacity` events waiting on their payloads, stops the feed there,
-/// so `capacity` should be at least the running tracker's.
+/// so `capacity` should be at least the running tracker's. The reopening
+/// window holds the events the journal's header records
+/// ([`JournalHeader::reopen_hold`](super::record::JournalHeader::reopen_hold),
+/// at least `capacity`), as the run's did: a range a checkpoint reopened
+/// is recovered as it ran, by any reader of the journal.
 ///
 /// # Errors
 ///
-/// The journal's read errors.
+/// The journal's read errors, and
+/// [`JournalError::InvalidConfig`](super::journal::JournalError::InvalidConfig)
+/// for a hold that cannot be allocated.
 pub fn recover<D: crate::disk::Disk>(
     journal: &mut super::journal::GroupJournal<D>,
     coverage: &impl Coverage,
     capacity: usize,
 ) -> Result<Recovery, super::journal::JournalError> {
-    recover_with_hold(journal, coverage, capacity, capacity)
-}
-
-/// [`recover`], with the reopening window sized to `hold` events
-/// ([`PrefixTracker::reserve_reopen_hold`], at least `capacity`) before
-/// the first record: the running tracker's, so a range a checkpoint
-/// reopened is recovered as it ran. Recover with the group's reopen
-/// hold (`GroupCheckpoints::reopen_hold`, or its default): a smaller one
-/// may let go of events the run held, a larger one may hold events the
-/// run let go.
-///
-/// # Errors
-///
-/// The journal's read errors, and [`JournalError::InvalidConfig`] for a
-/// hold that cannot be allocated.
-///
-/// [`JournalError::InvalidConfig`]: super::journal::JournalError::InvalidConfig
-pub fn recover_with_hold<D: crate::disk::Disk>(
-    journal: &mut super::journal::GroupJournal<D>,
-    coverage: &impl Coverage,
-    capacity: usize,
-    hold: usize,
-) -> Result<Recovery, super::journal::JournalError> {
+    // The reopening window is the header's (A9), as the run's was.
+    let hold = usize::try_from(journal.reopen_hold()?)
+        .map_err(|_| super::journal::JournalError::InvalidConfig)?;
     let mut tracker = PrefixTracker::new(capacity);
     tracker
         .reserve_reopen_hold(hold)

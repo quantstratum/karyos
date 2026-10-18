@@ -89,13 +89,14 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 1,
-                &Fields::new(24)
+                &Fields::new(32)
                     .u64(0, 7)
                     .u64(8, 1)
                     .u32(16, 4096)
                     .u16(20, 1)
                     .u8(22, 1)
                     .u8(23, 2)
+                    .u32(24, 256)
                     .0,
                 &[b"build 42"],
             ),
@@ -106,6 +107,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 contract_version: 1,
                 clock: Clock::HostMonotonic,
                 capture: Capture::BestEffort,
+                reopen_hold: 256,
                 manifest: b"build 42",
             }),
         ),
@@ -679,6 +681,7 @@ fn samples() -> Vec<GroupRecord<'static>> {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: Capture::Strict,
+        reopen_hold: 0,
         manifest: &[0xAB; MAX_MANIFEST],
     }));
     samples.push(GroupRecord::Message(MessageEvent {
@@ -1002,9 +1005,19 @@ fn every_invalid_field_is_refused() {
     assert_eq!(refused(&mutated(HEADER, 22, 0, 1)), invalid("clock", 0));
     assert_eq!(refused(&mutated(HEADER, 22, 2, 1)), invalid("clock", 2));
     assert_eq!(refused(&mutated(HEADER, 23, 3, 1)), invalid("capture", 3));
+    // The reopen hold up to MAX_REOPEN_HOLD; the reserved bytes zero.
+    assert_eq!(
+        refused(&mutated(HEADER, 24, u64::from(MAX_REOPEN_HOLD) + 1, 4)),
+        out_of_range("reopen_hold")
+    );
+    assert!(GroupRecord::decode(&mutated(HEADER, 24, u64::from(MAX_REOPEN_HOLD), 4)).is_ok());
+    assert_eq!(
+        refused(&mutated(HEADER, 28, 1, 4)),
+        out_of_range("reserved")
+    );
     let empty = vector(
         1,
-        &Fields::new(24)
+        &Fields::new(32)
             .u64(0, 1)
             .u64(8, 1)
             .u32(16, 1)
@@ -1213,6 +1226,7 @@ fn invalid_values_are_not_encoded() {
             contract_version: 1,
             clock: Clock::HostMonotonic,
             capture: Capture::Strict,
+            reopen_hold: 0,
             manifest: b"m",
         }),
         message(32, Payload::Inline(&[0; 1])),
@@ -1758,6 +1772,7 @@ fn an_unsupported_header_is_named() {
         contract_version: CONTRACT_VERSION,
         clock: Clock::HostMonotonic,
         capture: Capture::Strict,
+        reopen_hold: 0,
         manifest: b"m",
     });
     let mut bytes = vec![0u8; MAX_RECORD];

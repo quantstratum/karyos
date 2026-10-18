@@ -195,25 +195,8 @@ fn extent(payload: usize) -> Option<u64> {
 /// errors as [`CaptureSetup::Journal`].
 pub fn capture<D: Disk>(
     config: CaptureConfig,
-    journal: GroupJournal<D>,
-    coverage: &impl Coverage,
-) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
-    capture_with_hold(config, journal, coverage, None)
-}
-
-/// [`capture`], for a group that keeps checkpoints: its reopening window
-/// holds `reopen_hold` events, at least `in_flight`
-/// ([`CaptureJob::reserve_reopen_hold`]), in recovery as when running,
-/// so a restart recovers the prefixes the run had.
-///
-/// # Errors
-///
-/// [`capture`]'s.
-pub fn capture_with_hold<D: Disk>(
-    config: CaptureConfig,
     mut journal: GroupJournal<D>,
     coverage: &impl Coverage,
-    reopen_hold: Option<usize>,
 ) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
     let policy = journal.policy();
     let (ring, max_extent, in_flight) = check(config, policy).map_err(CaptureSetup::Config)?;
@@ -222,12 +205,11 @@ pub fn capture_with_hold<D: Disk>(
             max_event: config.max_event,
         })
     })?;
-    let hold = match reopen_hold {
-        Some(hold) => hold,
-        None => config.in_flight,
-    };
-    let recovery = prefix::recover_with_hold(&mut journal, coverage, config.in_flight, hold)
-        .map_err(CaptureSetup::Journal)?;
+    // The reopening window is the header's (A9): recovery and the running
+    // tracker take the same.
+    let reopen_hold = journal.reopen_hold().map_err(CaptureSetup::Journal)?;
+    let recovery =
+        prefix::recover(&mut journal, coverage, config.in_flight).map_err(CaptureSetup::Journal)?;
     if recovery.full {
         return Err(CaptureSetup::Config(CaptureError::RecoveryFull {
             capacity: config.in_flight,
@@ -296,7 +278,9 @@ pub fn capture_with_hold<D: Disk>(
         stop_notified: false,
     };
     let mut job = job;
-    if let Some(hold) = reopen_hold {
+    if reopen_hold != 0 {
+        let hold = usize::try_from(reopen_hold)
+            .map_err(|_| CaptureSetup::Config(CaptureError::InFlight))?;
         job.reserve_reopen_hold(hold)
             .map_err(CaptureSetup::Config)?;
     }

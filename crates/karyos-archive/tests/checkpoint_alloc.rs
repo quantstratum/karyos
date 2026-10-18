@@ -69,6 +69,7 @@ fn a_checkpoint_allocates_nothing_after_configuration() {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: Capture::Strict,
+        reopen_hold: 0,
         manifest: b"m",
     };
     let mut journal = GroupJournal::create(StdDisk, &journals, &header, config).unwrap();
@@ -139,6 +140,7 @@ fn replay_from_a_checkpoint_steps_without_allocating() {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: Capture::Strict,
+        reopen_hold: 0,
         manifest: b"m",
     };
     let mut journal = GroupJournal::create(StdDisk, &journals, &header, config).unwrap();
@@ -226,6 +228,7 @@ fn the_handoff_and_a_chunked_write_allocate_nothing() {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: Capture::Strict,
+        reopen_hold: 0,
         manifest: b"m",
     };
     let mut journal = GroupJournal::create(StdDisk, &journals, &header, config).unwrap();
@@ -294,6 +297,7 @@ fn the_reopen_hold_allocates_nothing_after_configuration() {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: Capture::BestEffort,
+        reopen_hold: 0,
         manifest: b"m",
     })];
     records.push(GroupRecord::Gap(GapMarker {

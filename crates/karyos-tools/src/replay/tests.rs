@@ -64,6 +64,7 @@ fn header(capture: Capture, manifest: &'static [u8]) -> JournalHeader<'static> {
         contract_version: CONTRACT_VERSION,
         clock: Clock::HostMonotonic,
         capture,
+        reopen_hold: 0,
         manifest,
     }
 }

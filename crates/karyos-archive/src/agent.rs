@@ -169,8 +169,12 @@ pub struct GroupCheckpoints {
     /// ([`PrefixTracker::failed_reopens`](crate::group::prefix::PrefixTracker::failed_reopens)).
     /// A hold below `in_flight` is taken as `in_flight`; one above
     /// [`MAX_REOPEN_HOLD`] is refused ([`AgentError::CheckpointConfig`]).
-    /// Recovery sizes its window so too. It must not shrink across
-    /// restarts of a group; it is recorded in the header in a follow-up.
+    /// It is fixed when the group is made and recorded in its journal's
+    /// header, which recovery and the running tracker both take. A
+    /// restart is refused when it names another hold, an `in_flight`
+    /// above the recorded hold, or checkpoints for a group made without
+    /// them. Raising a group's hold would take a record of the raise in
+    /// its journal; none exists yet.
     pub reopen_hold: Option<usize>,
 }
 
@@ -1604,6 +1608,25 @@ impl<D: Disk + Clone> State<D> {
         closed
     }
 
+    /// Checks a restart against the reopen hold its journal's header
+    /// records (A9): the hold is fixed per group. Refused
+    /// ([`AgentError::CheckpointConfig`]): checkpoints on a group made
+    /// without them, an explicit hold other than the recorded one, and an
+    /// `in_flight` above it (the clamp would raise the running window).
+    fn check_hold(start: &StartGroup, recorded: u32) -> Result<(), AgentError> {
+        let Some(checkpoints) = &start.checkpoints else {
+            return Ok(());
+        };
+        let recorded = usize::try_from(recorded).map_err(|_| AgentError::CheckpointConfig)?;
+        let differs = checkpoints
+            .reopen_hold
+            .is_some_and(|hold| hold.max(start.capture.in_flight) != recorded);
+        if recorded == 0 || differs || start.capture.in_flight > recorded {
+            return Err(AgentError::CheckpointConfig);
+        }
+        Ok(())
+    }
+
     /// Makes or recovers a group's journal and its capture path.
     fn start_group(
         &mut self,
@@ -1625,30 +1648,27 @@ impl<D: Disk + Clone> State<D> {
         {
             return Err(AgentError::CheckpointConfig);
         }
-        // The reopening window, sized before recovery so a restart
-        // recovers the prefixes the run had, and checked here, before the
-        // journal exists.
-        let hold = match &start.checkpoints {
-            None => None,
-            Some(GroupCheckpoints {
-                reopen_hold: Some(hold),
-                ..
-            }) => Some(*hold),
-            Some(GroupCheckpoints {
-                reopen_hold: None, ..
-            }) => Some(
-                start
-                    .capture
-                    .in_flight
-                    .checked_mul(4)
-                    .ok_or(AgentError::CheckpointConfig)?,
-            ),
+        // A new group's reopening window, recorded in its header (A9) and
+        // checked here, before the journal exists: configured, or four
+        // times `in_flight`, at least `in_flight`; 0 without checkpoints.
+        let new_hold = match &start.checkpoints {
+            None => 0,
+            Some(checkpoints) => {
+                let hold = match checkpoints.reopen_hold {
+                    Some(hold) => hold,
+                    None => start
+                        .capture
+                        .in_flight
+                        .checked_mul(4)
+                        .ok_or(AgentError::CheckpointConfig)?,
+                }
+                .max(start.capture.in_flight);
+                if hold > MAX_REOPEN_HOLD {
+                    return Err(AgentError::CheckpointConfig);
+                }
+                u32::try_from(hold).map_err(|_| AgentError::CheckpointConfig)?
+            }
         };
-        if let Some(hold) = hold
-            && (hold > MAX_REOPEN_HOLD || hold.checked_mul(3).is_none())
-        {
-            return Err(AgentError::CheckpointConfig);
-        }
         let checkpoint_dir = store_dir(&start.dir);
         let journal = match &start.new {
             Some(new) => GroupJournal::create(
@@ -1661,6 +1681,7 @@ impl<D: Disk + Clone> State<D> {
                     contract_version: CONTRACT_VERSION,
                     clock: Clock::HostMonotonic,
                     capture: new.capture,
+                    reopen_hold: new_hold,
                     manifest: &new.manifest,
                 },
                 start.journal,
@@ -1670,6 +1691,12 @@ impl<D: Disk + Clone> State<D> {
             }
         };
         let mut journal = journal;
+        if start.new.is_none() {
+            // A restart takes the header's window as recorded, before the
+            // store is touched: the hold is fixed per group.
+            let recorded = journal.reopen_hold()?;
+            Self::check_hold(&start, recorded)?;
+        }
         // The store beside the journal, made or recovered with it: a
         // recovered one is cut to what the journal's records name.
         let store = match &start.checkpoints {
@@ -1718,8 +1745,8 @@ impl<D: Disk + Clone> State<D> {
             recorded: &recorded,
             store: store.as_ref(),
         };
-        let (mut sender, job) = capture::capture_with_hold(start.capture, journal, &coverage, hold)
-            .map_err(|error| match error {
+        let (mut sender, job) =
+            capture::capture(start.capture, journal, &coverage).map_err(|error| match error {
                 CaptureSetup::Config(error) => AgentError::Capture(error),
                 CaptureSetup::Journal(error) => AgentError::Journal(error),
             })?;
