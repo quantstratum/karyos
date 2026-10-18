@@ -15,10 +15,17 @@
 //!   linearized, and the model's state) is explored once.
 //! - **Cost.** The worst case explores every configuration: up to `2^n`
 //!   sets of `n` operations times the model's reachable states, each
-//!   reached by up to `n!` orders before the memo cuts them. A concurrent
-//!   history is the expensive case; a sequential one is linear. The search
-//!   stops after [`Limit::max_configurations`] new configurations with
-//!   [`Verdict::Undecided`], never a guess.
+//!   reached by up to `n!` orders before the memo cuts them. Each
+//!   configuration is kept in the memo with its set, `n` bits, so time and
+//!   memory are O(configurations × n / 64): a sequential history of `n`
+//!   operations has `n` configurations, O(n² / 64) in all (16k operations
+//!   take about a quarter of a second; 100k would hold about 1.25 GB). A
+//!   concurrent history is the expensive case. One search stops after
+//!   [`Limit::max_configurations`] new configurations; [`check`] runs the
+//!   full history's search, then, for a history that is not linearizable,
+//!   up to `⌈log2(returns + 1)⌉` prefix searches, each with the same
+//!   limit. Only the full search's limit gives [`Verdict::Undecided`],
+//!   never a guess.
 //! - **Pending operations.** An invocation with no return took effect or
 //!   did not: it may be linearized anywhere after its invocation, with any
 //!   result, or left out.
@@ -28,7 +35,11 @@
 //!   being pending. Bisection finds it because non-linearizability is
 //!   monotone over such prefixes: a linearization of a longer prefix,
 //!   restricted to the operations of a shorter one (those still open there
-//!   pending), linearizes it.
+//!   pending), linearizes it. A prefix search can cost more than the full
+//!   one, since the operations open at the cut become pending; one that
+//!   reaches the limit stops the bisection, and the shortest prefix proven
+//!   so far is returned, marked not minimal. A decided verdict is never
+//!   turned into an undecided one.
 
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -80,23 +91,37 @@ pub enum HistoryError {
     ReturnWithoutInvoke {
         /// The client.
         client: u32,
+        /// The event's index in the history.
+        event: usize,
     },
     /// An invocation of a client whose last operation is open.
     InvokeWhileOpen {
         /// The client.
         client: u32,
+        /// The event's index in the history.
+        event: usize,
     },
+    /// The search's own bookkeeping broke: a bug, never a verdict on the
+    /// history.
+    Invariant,
 }
 
 impl std::fmt::Display for HistoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ReturnWithoutInvoke { client } => {
-                write!(f, "client {client} returned with no operation open")
+            Self::ReturnWithoutInvoke { client, event } => {
+                write!(
+                    f,
+                    "event {event}: client {client} returned with no operation open"
+                )
             }
-            Self::InvokeWhileOpen { client } => {
-                write!(f, "client {client} invoked with an operation open")
+            Self::InvokeWhileOpen { client, event } => {
+                write!(
+                    f,
+                    "event {event}: client {client} invoked with an operation open"
+                )
             }
+            Self::Invariant => write!(f, "the checker's bookkeeping broke"),
         }
     }
 }
@@ -155,7 +180,7 @@ impl<O: Clone, R: Clone> History<O, R> {
             if let Some(first) = returns.next() {
                 end = first;
             }
-        } else if let Some(at) = returns.nth(count - 1) {
+        } else if let Some(at) = count.checked_sub(1).and_then(|nth| returns.nth(nth)) {
             // Just after the return: `at` is below the length.
             end = at.checked_add(1).unwrap_or(end);
         }
@@ -185,6 +210,10 @@ pub struct Counterexample<O, R> {
     /// The shortest prefix, cut just after a return, that is not
     /// linearizable; the operations open in it are pending.
     pub prefix: History<O, R>,
+    /// Whether `prefix` is proven the shortest: false when a shorter
+    /// prefix's search reached the limit, and `prefix` is only the
+    /// shortest proven not linearizable.
+    pub minimal: bool,
 }
 
 /// What a check found.
@@ -196,9 +225,9 @@ pub enum Verdict<O, R> {
     Linearizable(Vec<usize>),
     /// No order does.
     NotLinearizable(Counterexample<O, R>),
-    /// The limit was reached first.
+    /// The full history's search reached the limit first.
     Undecided {
-        /// The configurations explored.
+        /// The configurations that search explored.
         explored: u64,
     },
 }
@@ -315,11 +344,14 @@ fn prepare<O: Clone, R: Clone>(
     let mut entries: Vec<Entry> = Vec::new();
     // Per client, its open operation's call entry.
     let mut open: Vec<(u32, usize)> = Vec::new();
-    for event in &history.events {
+    for (at_event, event) in history.events.iter().enumerate() {
         match event {
             Event::Invoke { client, op } => {
                 if open.iter().any(|(owner, _)| owner == client) {
-                    return Err(HistoryError::InvokeWhileOpen { client: *client });
+                    return Err(HistoryError::InvokeWhileOpen {
+                        client: *client,
+                        event: at_event,
+                    });
                 }
                 open.push((*client, entries.len()));
                 entries.push(Entry {
@@ -335,14 +367,16 @@ fn prepare<O: Clone, R: Clone>(
                 });
             }
             Event::Return { client, ret } => {
-                let at = open
-                    .iter()
-                    .position(|(owner, _)| owner == client)
-                    .ok_or(HistoryError::ReturnWithoutInvoke { client: *client })?;
+                let at = open.iter().position(|(owner, _)| owner == client).ok_or(
+                    HistoryError::ReturnWithoutInvoke {
+                        client: *client,
+                        event: at_event,
+                    },
+                )?;
                 let (_, call) = open.swap_remove(at);
                 let returned = entries.len();
                 let Some(entry) = entries.get_mut(call) else {
-                    return Err(HistoryError::ReturnWithoutInvoke { client: *client });
+                    return Err(HistoryError::Invariant);
                 };
                 entry.pair = Some(returned);
                 let op = entry.op;
@@ -399,11 +433,11 @@ fn search<M: Model>(
             return Ok(Search::Order(order));
         };
         let Some(entry) = list.get(at) else {
-            return Ok(Search::No);
+            return Err(HistoryError::Invariant);
         };
         if entry.call {
             let Some(operation) = operations.get(entry.op) else {
-                return Ok(Search::No);
+                return Err(HistoryError::Invariant);
             };
             let (next, ret) = model.step(&state, &operation.op);
             let answers = operation
@@ -439,7 +473,10 @@ fn search<M: Model>(
             let Some((call, before)) = stack.pop() else {
                 return Ok(Search::No);
             };
-            let op = list.get(call).map_or(0, |entry| entry.op);
+            let op = list
+                .get(call)
+                .map(|entry| entry.op)
+                .ok_or(HistoryError::Invariant)?;
             linearized.set(op, false);
             state = before;
             list.unlift(call);
@@ -464,18 +501,30 @@ pub fn check<M: Model>(
         Search::No => {
             // The shortest prefix cut after a return that is already not
             // linearizable: prefixes are monotone (see the module).
+            // `high` is always proven not linearizable; a prefix search
+            // that reaches the limit stops here with what is proven.
             let (mut low, mut high) = (0usize, history.returns());
+            let mut minimal = true;
             while low < high {
-                // Below `high`, so neither step overflows.
-                let middle = (high - low) / 2 + low;
+                let middle = high
+                    .checked_sub(low)
+                    .map(|span| span / 2)
+                    .and_then(|half| half.checked_add(low))
+                    .ok_or(HistoryError::Invariant)?;
                 match search(model, &history.up_to_return(middle), limit)? {
                     Search::No => high = middle,
-                    Search::Order(_) => low = middle + 1,
-                    Search::Undecided(explored) => return Ok(Verdict::Undecided { explored }),
+                    Search::Order(_) => {
+                        low = middle.checked_add(1).ok_or(HistoryError::Invariant)?;
+                    }
+                    Search::Undecided(_) => {
+                        minimal = false;
+                        break;
+                    }
                 }
             }
             Ok(Verdict::NotLinearizable(Counterexample {
                 prefix: history.up_to_return(high),
+                minimal,
             }))
         }
     }

@@ -190,27 +190,151 @@ fn the_counterexample_is_the_shortest_failing_prefix() {
     }
 }
 
-/// A wide concurrent history whose search the limit stops: undecided,
-/// never a guess.
+/// Concurrent increments all returning `n`: only an exhaustive search
+/// shows that `n` of them cannot all see `n`.
+fn crowded(n: u32) -> History<(), u64> {
+    let mut history = History::new();
+    for client in 0..n {
+        history.invoke(client, ());
+    }
+    for client in 0..n {
+        history.ret(client, u64::from(n));
+    }
+    history
+}
+
+/// A search the limit stops is undecided, never a guess: twelve
+/// concurrent writes, then a read of a value none wrote, which only an
+/// exhaustive search over the writes' orders refutes.
 #[test]
 fn the_limit_gives_undecided() {
     let mut history = History::new();
+    for client in 0..12u32 {
+        history.invoke(client, RegisterOp::Write(client + 1));
+    }
     for client in 0..12 {
-        history.invoke(client, ());
+        history.ret(client, None);
     }
-    // All return 12 but the last, which returns 0: not linearizable, and
-    // only an exhaustive search shows it.
-    for client in 0..11 {
-        history.ret(client, 12);
-    }
-    history.ret(11, 0);
+    history.invoke(12, RegisterOp::Read).ret(12, Some(99));
     let small = Limit {
         max_configurations: 50,
     };
-    assert!(matches!(
-        check(&Counter, &history, small).unwrap(),
+    assert_eq!(
+        check(&Register, &history, small).unwrap(),
         Verdict::Undecided { explored: 51 }
+    );
+    // With room it is decided.
+    assert!(matches!(
+        verdict(&Register, &history),
+        Verdict::NotLinearizable(_)
     ));
+}
+
+/// A decided verdict is never turned undecided: when a prefix's search
+/// reaches the limit (its open operations are pending, so it can cost
+/// more than the whole), the shortest proven prefix comes back, marked
+/// not minimal (the #417 review's probe).
+#[test]
+fn a_prefix_at_the_limit_keeps_the_verdict() {
+    let history = crowded(20);
+    let limit = Limit {
+        max_configurations: 1000,
+    };
+    let Verdict::NotLinearizable(counterexample) = check(&Counter, &history, limit).unwrap() else {
+        panic!("the full search decides it within the limit");
+    };
+    assert!(!counterexample.minimal);
+    assert!(matches!(
+        check(&Counter, &counterexample.prefix, limit).unwrap(),
+        Verdict::NotLinearizable(_)
+    ));
+    // With room, the prefix is minimal.
+    let Verdict::NotLinearizable(counterexample) = verdict(&Counter, &crowded(3)) else {
+        panic!("three increments cannot all return 3");
+    };
+    assert!(counterexample.minimal);
+}
+
+/// A register whose states all hash alike: the memo must tell them apart
+/// by equality, or it prunes a configuration it never explored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Colliding(u32);
+
+impl std::hash::Hash for Colliding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        0u8.hash(state);
+    }
+}
+
+struct CollidingRegister;
+
+impl Model for CollidingRegister {
+    type State = Colliding;
+    type Op = RegisterOp;
+    type Ret = Option<u32>;
+
+    fn init(&self) -> Colliding {
+        Colliding(0)
+    }
+
+    fn step(&self, state: &Colliding, op: &RegisterOp) -> (Colliding, Option<u32>) {
+        match op {
+            RegisterOp::Write(value) => (Colliding(*value), None),
+            RegisterOp::Read => (state.clone(), Some(state.0)),
+        }
+    }
+}
+
+#[test]
+fn states_that_hash_alike_are_told_apart() {
+    // Two concurrent writes, then a read of the first: the search tries
+    // write 1 then write 2 first (state 2), which fails the read, then the
+    // same set of operations in the other order (state 1).
+    let mut history = History::new();
+    history
+        .invoke(1, RegisterOp::Write(1))
+        .invoke(2, RegisterOp::Write(2))
+        .ret(1, None)
+        .ret(2, None)
+        .invoke(3, RegisterOp::Read)
+        .ret(3, Some(1));
+    assert_eq!(
+        verdict(&CollidingRegister, &history),
+        Verdict::Linearizable(vec![1, 0, 2])
+    );
+}
+
+/// Monotonicity with operations open at the cut: each prefix of a
+/// history whose operations overlap a cut is linearizable exactly up to
+/// the first failing one.
+#[test]
+fn prefixes_with_open_operations_are_monotone() {
+    let mut history = History::new();
+    history
+        .invoke(1, RegisterOp::Write(1))
+        .invoke(2, RegisterOp::Read)
+        .ret(2, Some(1))
+        // Write 1 is still open here: the read of 1 needs it taken.
+        .invoke(3, RegisterOp::Write(2))
+        .ret(1, None)
+        .invoke(2, RegisterOp::Read)
+        .ret(3, None)
+        .ret(2, Some(1))
+        // Write 2 returned before this read began.
+        .invoke(2, RegisterOp::Read)
+        .ret(2, Some(1));
+    let Verdict::NotLinearizable(counterexample) = verdict(&Register, &history) else {
+        panic!("a read of 1 after write 2 returned");
+    };
+    assert!(counterexample.minimal);
+    let shortest = counterexample.prefix.returns();
+    for count in 0..=history.returns() {
+        let linearizable = matches!(
+            verdict(&Register, &history.up_to_return(count)),
+            Verdict::Linearizable(_)
+        );
+        assert_eq!(linearizable, count < shortest, "prefix of {count} returns");
+    }
 }
 
 #[test]
@@ -219,12 +343,18 @@ fn a_history_that_is_not_well_formed_is_refused() {
     twice.invoke(1, ()).invoke(1, ());
     assert_eq!(
         check(&Counter, &twice, ENOUGH),
-        Err(HistoryError::InvokeWhileOpen { client: 1 })
+        Err(HistoryError::InvokeWhileOpen {
+            client: 1,
+            event: 1
+        })
     );
     let mut orphan: History<(), u64> = History::new();
     orphan.ret(2, 1);
     assert_eq!(
         check(&Counter, &orphan, ENOUGH),
-        Err(HistoryError::ReturnWithoutInvoke { client: 2 })
+        Err(HistoryError::ReturnWithoutInvoke {
+            client: 2,
+            event: 0
+        })
     );
 }
