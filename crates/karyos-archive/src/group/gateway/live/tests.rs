@@ -825,3 +825,125 @@ fn strict_room_is_checked_at_its_boundaries() {
         }))
     );
 }
+
+/// A Gateway over a fresh journal whose group keeps checkpoints of up to
+/// 16 bytes: its job, and the writer's end of the handoff.
+fn checkpointing() -> (
+    Gateway<Accepting, Clocked>,
+    CaptureJob<FaultDisk>,
+    crate::group::checkpoint::CheckpointInbox,
+) {
+    let disk = FaultDisk::default();
+    let journal = GroupJournal::create(
+        disk.clone(),
+        Path::new("/g"),
+        &header(Capture::Strict),
+        config(),
+    )
+    .unwrap();
+    let (mut sender, job) = capture(
+        CaptureConfig {
+            ring_capacity: 1 << 16,
+            max_event: 4096,
+            in_flight: 64,
+        },
+        journal,
+        &NoRecordings,
+    )
+    .unwrap();
+    let (handle, inbox) = crate::group::checkpoint::handoff(16);
+    sender.attach_checkpoints(handle);
+    let clock: Clocked = Box::new(|| 1);
+    let gateway = Gateway::new(
+        Accepting::default(),
+        clock,
+        sender,
+        Capture::Strict,
+        1,
+        4096,
+        8,
+    )
+    .unwrap();
+    (gateway, job, inbox)
+}
+
+/// A checkpoint names the last event dispatched, `next_seq - 1`, and none
+/// is taken before the first event.
+#[test]
+fn a_checkpoint_names_the_last_event_dispatched() {
+    let (mut gateway, _job, inbox) = checkpointing();
+    let mut written = false;
+    assert!(matches!(
+        gateway.checkpoint(9, |_| {
+            written = true;
+            1
+        }),
+        Err(CheckpointError::NothingDispatched)
+    ));
+    assert!(!written);
+    for _ in 0..2 {
+        gateway
+            .deliver_external(1, b"", &mut |_: &Event<'_>, _: &mut dyn Effects| {})
+            .unwrap();
+    }
+    gateway
+        .checkpoint(9, |bytes| {
+            bytes[..3].copy_from_slice(b"abc");
+            3
+        })
+        .unwrap();
+    let request = inbox.take().unwrap();
+    assert_eq!((request.group_seq, request.format), (2, 9));
+    assert_eq!(request.bytes(), b"abc");
+    assert_eq!(gateway.checkpoint_stats().taken, 1);
+    // The handle's own refusal: one in flight.
+    assert!(matches!(
+        gateway.checkpoint(9, |_| 1),
+        Err(CheckpointError::InFlight)
+    ));
+    assert!(gateway.last_checkpoint().is_none());
+    inbox.give_back(request, Err(CheckpointError::Stopped));
+    assert!(matches!(
+        gateway.last_checkpoint(),
+        Some(LastCheckpoint::Failed { group_seq: 2 })
+    ));
+}
+
+/// A group started without checkpoints refuses one, typed, and counts
+/// nothing.
+#[test]
+fn a_group_without_checkpoints_refuses_one() {
+    let (mut gateway, _job, _disk, _reads) = gateway(Capture::Strict, 1 << 16, 4096);
+    gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, _: &mut dyn Effects| {})
+        .unwrap();
+    assert!(matches!(
+        gateway.checkpoint(1, |_| 1),
+        Err(CheckpointError::NoCheckpoints)
+    ));
+    assert_eq!(gateway.checkpoint_stats(), CheckpointStats::default());
+    assert!(gateway.last_checkpoint().is_none());
+}
+
+/// Once the group stopped, a checkpoint is refused `Stopped` before the
+/// handle is reached: not `InFlight`, and `write` is not called.
+#[test]
+fn stopped_wins_over_the_handles_refusals() {
+    let (mut gateway, job, _inbox) = checkpointing();
+    gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, _: &mut dyn Effects| {})
+        .unwrap();
+    gateway.checkpoint(1, |_| 1).unwrap();
+    job.close().unwrap();
+    let mut written = false;
+    assert!(matches!(
+        gateway.checkpoint(1, |_| {
+            written = true;
+            1
+        }),
+        Err(CheckpointError::Stopped)
+    ));
+    assert!(!written);
+    // The handle was not reached: its in-flight refusal is not counted.
+    assert_eq!(gateway.checkpoint_stats().in_flight, 0);
+}

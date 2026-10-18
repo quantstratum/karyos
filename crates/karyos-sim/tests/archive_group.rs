@@ -24,7 +24,8 @@ use karyos_archive::disk::StdDisk;
 use karyos_archive::group::capture::CaptureConfig;
 use karyos_archive::group::gateway::live::{Gateway, Port, SourceIdentity};
 use karyos_archive::group::gateway::{
-    ClaimCommit, DeliveryOutcome, Dispatched, Effects, Event, GroupGateway, PublicationId, TimerId,
+    ClaimCommit, DeliveryOutcome, Dispatched, Effects, Event, GroupGateway, Handler, PublicationId,
+    TimerId,
 };
 use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
 use karyos_archive::group::record::{Capture, GroupRecord, Outcome, Payload};
@@ -288,4 +289,247 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
     for pair in messages.windows(2) {
         assert_eq!(pair[0].1 + u64::from(pair[0].2), pair[1].1);
     }
+}
+
+/// The application's state in the checkpoint test: the messages it saw
+/// and the sum of their payloads' first bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Tally {
+    count: u64,
+    sum: u64,
+}
+
+impl Tally {
+    fn write(self, out: &mut [u8]) -> usize {
+        out[..8].copy_from_slice(&self.count.to_le_bytes());
+        out[8..16].copy_from_slice(&self.sum.to_le_bytes());
+        16
+    }
+}
+
+impl Handler for Tally {
+    fn on_event(&mut self, event: &Event<'_>, _: &mut dyn Effects) {
+        if let Event::Message {
+            payload: karyos_archive::group::gateway::MessagePayload::Bytes(bytes),
+            ..
+        } = event
+        {
+            self.count += 1;
+            self.sum += u64::from(bytes[0]);
+        }
+    }
+
+    fn checkpoint(&mut self, out: &mut [u8]) -> Option<usize> {
+        Some(self.write(out))
+    }
+
+    fn restore(&mut self, state: &[u8]) -> bool {
+        let Ok(state) = <[u8; 16]>::try_from(state) else {
+            return false;
+        };
+        self.count = u64::from_le_bytes(state[..8].try_into().unwrap());
+        self.sum = u64::from_le_bytes(state[8..].try_into().unwrap());
+        true
+    }
+}
+
+/// A9: a strict group over a driver takes a checkpoint after event
+/// `AT`; replay opens at that checkpoint, the application restores its
+/// state from it, and the events after it bring the state to the live
+/// run's. A checkpoint naming any other event than the last dispatched
+/// leaves the replayed state off by one message.
+#[test]
+fn replay_from_a_checkpoint_reaches_the_live_state() {
+    use karyos_archive::agent::GroupCheckpoints;
+    use karyos_archive::group::checkpoint::{
+        CheckpointStore, LastCheckpoint, recorded_end, store_dir,
+    };
+    use karyos_archive::group::prefix::{CheckpointHeld, Coverage, recover};
+    use karyos_archive::group::record::MAX_RECORD;
+    use karyos_archive::group::replay::gateway::{GatewayConfig, ReplayGateway};
+    use karyos_archive::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
+
+    const AT: u64 = 12;
+    let dir = TempDir::new("checkpoint");
+    let groups = dir.path().join("groups");
+    std::fs::create_dir_all(store_dir(&groups)).unwrap();
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let archive = ArchiveHandle::spawn(StdDisk, dir.path(), AgentConfig::default()).unwrap();
+    let handle = driver.add_stream(stream()).unwrap();
+    let (reader, lease) = driver
+        .recording_reader(handle, Role::Required)
+        .unwrap()
+        .into_parts();
+    let _ = archive
+        .start(StartRecording {
+            stream_id: STREAM,
+            session_id: 1,
+            channel: b"karyos:ipc".to_vec(),
+            geometry: Geometry::new(MIN_TERM_LENGTH, 2 * u64::from(MIN_TERM_LENGTH)).unwrap(),
+            policy: SyncPolicy::Every { interval_ns: 0 },
+            mode: Mode::Required,
+            format: format(),
+            source: Box::new(Guarded::new(reader, lease)),
+        })
+        .unwrap();
+    let word = archive.recording_word(STREAM, 1).unwrap().unwrap();
+    let sender = archive
+        .start_group(StartGroup {
+            group_id: 1,
+            dir: groups.clone(),
+            new: Some(NewGroup {
+                first_group_seq: 1,
+                // Every payload inline: the replay needs no recording.
+                inline_threshold: 4096,
+                capture: Capture::Strict,
+                manifest: b"e2e".to_vec(),
+            }),
+            journal: JOURNAL,
+            capture: CaptureConfig {
+                ring_capacity: 1 << 16,
+                max_event: 4096,
+                in_flight: 64,
+            },
+            checkpoints: Some(GroupCheckpoints {
+                max_checkpoint: 64,
+                reopen_hold: None,
+            }),
+        })
+        .unwrap();
+    let waiter = sender.waiter();
+    let started = Instant::now();
+    let clock = move || u64::try_from(started.elapsed().as_nanos()).unwrap();
+    let mut gateway = Gateway::new(Inert, clock, sender, Capture::Strict, 1, 4096, 4).unwrap();
+    gateway.set_inline_threshold(4096);
+    let subscription = driver.subscribe(handle, Role::Required).unwrap();
+    let identity = SourceIdentity {
+        incarnation: 1,
+        stream_id: STREAM,
+        session_id: 1,
+        lane: Lane::ZERO,
+    };
+    let _ = gateway
+        .add_subscription(Box::new(subscription), identity, word)
+        .unwrap();
+    let mut publication = driver.publication(handle).unwrap();
+    let mut live = Tally::default();
+    let mut at_checkpoint = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut published = 0;
+    let mut dispatched = 0;
+    while dispatched < MESSAGES {
+        if published < MESSAGES {
+            match publication
+                .offer(&[u8::try_from(published + 1).unwrap(); 32])
+                .unwrap()
+            {
+                OfferOutcome::Accepted { .. } => published += 1,
+                OfferOutcome::BackPressured | OfferOutcome::AdminAction => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        driver.do_work().unwrap();
+        match gateway.dispatch(&mut live) {
+            Ok(Dispatched::Event { .. }) => dispatched += 1,
+            Ok(_) | Err(karyos_archive::group::gateway::GatewayError::Refused(_)) => {}
+            Err(error) => panic!("{error:?}"),
+        }
+        if dispatched == AT && at_checkpoint.is_none() {
+            gateway.checkpoint(1, |out| live.write(out)).unwrap();
+            at_checkpoint = Some(live);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the group never took every message"
+        );
+    }
+    let recorded = loop {
+        driver.do_work().unwrap();
+        match gateway.last_checkpoint() {
+            Some(LastCheckpoint::Recorded(record)) => break record,
+            Some(failed @ LastCheckpoint::Failed { .. }) => panic!("{failed:?}"),
+            None => assert!(Instant::now() < deadline, "the checkpoint never ended"),
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(recorded.group_seq, AT);
+    let durable = loop {
+        driver.do_work().unwrap();
+        match waiter.wait_durable(MESSAGES, Duration::from_millis(20)) {
+            Ok(durable) => break durable,
+            Err(_) => assert!(Instant::now() < deadline, "the group never became durable"),
+        }
+    };
+    assert_eq!(durable, MESSAGES);
+    archive.stop_group(1).unwrap();
+    drop(publication);
+    drop(gateway);
+    archive.shutdown().unwrap();
+
+    struct Held<'a>(&'a CheckpointStore<StdDisk>);
+    impl Coverage for Held<'_> {
+        fn positions(&self, _: u64) -> Option<(u64, u64)> {
+            None
+        }
+        fn ended(&self, _: u64) -> Option<u64> {
+            None
+        }
+        fn checkpoint(&self, position: u64, end: u64) -> CheckpointHeld {
+            self.0.holds(position, end)
+        }
+    }
+    let mut journal = GroupJournal::recover(StdDisk, &groups, 1, JOURNAL)
+        .unwrap()
+        .journal;
+    let end = recorded_end(&mut journal).unwrap();
+    let mut store =
+        CheckpointStore::recover(StdDisk, &store_dir(&groups), 1, JOURNAL, end).unwrap();
+    let recovery = recover(&mut journal, &Held(&store), 64).unwrap();
+    let mut snapshot = [0u8; 64];
+    let (cursor, record) = ReplayCursor::open_at_checkpoint(
+        journal,
+        &recovery,
+        &mut store,
+        recorded.checkpoint_id,
+        &ReplayConfig {
+            manifest: b"e2e",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 4 * MAX_RECORD,
+            records: 8,
+        },
+        &mut snapshot,
+    )
+    .unwrap();
+    // The application restores its state itself: replay hands it the
+    // snapshot.
+    let mut replayed = Tally::default();
+    assert!(replayed.restore(&snapshot[..usize::try_from(record.length).unwrap()]));
+    assert_eq!(Some(replayed), at_checkpoint);
+    let mut gateway = ReplayGateway::new(
+        cursor,
+        &GatewayConfig {
+            publications: &[],
+            subscriptions: &[(STREAM, 1)],
+            conflated: &[],
+            max_claim: 0,
+            max_payload: 0,
+            present_unavailable: false,
+        },
+        None,
+    )
+    .unwrap()
+    .with_state(64)
+    .unwrap();
+    let mut events = Vec::new();
+    loop {
+        match gateway.dispatch(&mut replayed).unwrap() {
+            Dispatched::Event { group_seq } => events.push(group_seq),
+            Dispatched::End => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(events, (AT + 1..=MESSAGES).collect::<Vec<_>>());
+    assert_eq!(replayed, live);
 }

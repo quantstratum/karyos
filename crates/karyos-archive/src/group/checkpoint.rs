@@ -77,6 +77,7 @@ const _: () = assert!(CHECKPOINT.max_length == RECORD_LENGTH_U32);
 
 /// Why a checkpoint was not taken or not written.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CheckpointError {
     /// Another checkpoint is with the writer.
     #[error("a checkpoint is in flight")]
@@ -107,6 +108,14 @@ pub enum CheckpointError {
     /// and its buffer comes back.
     #[error("the group stopped")]
     Stopped,
+    /// The group was started without checkpoints
+    /// (`StartGroup::checkpoints` was `None`).
+    #[error("the group keeps no checkpoints")]
+    NoCheckpoints,
+    /// No event has been dispatched yet, in this run or the journal's:
+    /// there is no state after an event to name.
+    #[error("no event was dispatched yet")]
+    NothingDispatched,
     /// No checkpoint is being written, or `advance` was given another
     /// request than `begin`.
     #[error("no checkpoint is being written for this request")]

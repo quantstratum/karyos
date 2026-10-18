@@ -367,6 +367,13 @@ impl CaptureSender {
         self.checkpoints.take()
     }
 
+    /// The last `group_seq` the journal holds or was sent, recorded or a
+    /// gap's: 0 while the group has none.
+    #[must_use]
+    pub(crate) const fn dispatched(&self) -> u64 {
+        self.dispatched
+    }
+
     /// Gives the sender the group's checkpoint handle.
     pub(crate) fn attach_checkpoints(&mut self, handle: super::checkpoint::CheckpointHandle) {
         self.checkpoints = Some(handle);
