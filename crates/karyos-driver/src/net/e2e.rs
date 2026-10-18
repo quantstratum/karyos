@@ -1986,6 +1986,193 @@ fn a_guard_close_on_a_trusted_channel_ends_the_remote_image_at_liveness() {
     );
 }
 
+/// SPEC.md §13 "Same position, different lanes", the outcomes half on a
+/// trusted channel: two lanes of one guarded network publication reach
+/// identical positions, then the guard closes. Every outcome record, on
+/// both lanes, names its own lane and its lane's positions: ten
+/// `Submitted` each at the same positions, then the three written before
+/// the close `Aborted` each, then `Ended`. The close acknowledgement names
+/// the same last position for both lanes, and the receiver gets each
+/// lane's own messages on that lane. `SESSION_ABORT_ACK`, the other half,
+/// is gated until a reviewed security profile exists (owner decision 5,
+/// ADR-0035).
+///
+/// Each lane's `Ended` comes only once its handle has seen the close: a
+/// lane's seal is positioned when its publication releases at the guard's
+/// seal, which its next offer (`Gated`) does. This is the local-stream
+/// design (guards-and-abort.md, Local streams), so the test offers once on
+/// each lane after the close.
+#[test]
+fn two_lanes_at_the_same_position_keep_their_own_outcomes_through_a_close() {
+    use karyos_sys::guard::Closed;
+    use karyos_sys::outcome_ring::Kind;
+
+    use crate::guard_ack::SenderAck;
+    use crate::guard_streams::REASON_GUARD_CLOSED;
+    use crate::net::NetworkGuard;
+
+    const LANES: u8 = 2;
+    const FRAME: u64 = 160;
+    let (mut a, mut b) = (
+        fast_driver(ThreadingMode::Shared),
+        fast_driver(ThreadingMode::Shared),
+    );
+    let guard = a.add_guard("same-position").unwrap();
+    assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
+    let _ = b
+        .add_network_subscription(10, &channel(ANY_PORT, true))
+        .unwrap();
+    let address = bound(&b, 10);
+    let mut config = aggregate(10, 3, usize::from(LANES));
+    // The sender's reservation and the guard's walker.
+    config.stream.buffer.spare_slots = 4;
+    let publication = a
+        .add_guarded_network_publication(
+            config,
+            &channel(address, true),
+            NetworkGuard {
+                guard,
+                messages: 4,
+                rate: None,
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Optional)
+        .unwrap();
+    let mut lanes: Vec<_> = (0..LANES)
+        .map(|lane| {
+            a.publication(publication.lane(Lane::try_new(lane).unwrap()).unwrap())
+                .unwrap()
+        })
+        .collect();
+    // The same 100-byte payload size on both lanes, so the same positions;
+    // each payload names its lane and its index.
+    let message = |lane: u8, index: u32| {
+        let mut payload = [0u8; 100];
+        payload[..4].copy_from_slice(&index.to_le_bytes());
+        payload[4] = lane;
+        payload
+    };
+    let mut records: [Vec<karyos_sys::outcome_ring::Record>; 2] = [Vec::new(), Vec::new()];
+    let mut sent = [0u32; 2];
+    let mut seen = [0u32; 2];
+    pump(&mut [&mut a, &mut b], |_| {
+        for (index, lane) in lanes.iter_mut().enumerate() {
+            let _ = lane
+                .poll_outcomes(64, |_, record| records[index].push(record))
+                .unwrap();
+            let number = u8::try_from(index).unwrap();
+            if sent[index] < 10
+                && matches!(
+                    lane.offer(&message(number, sent[index])).unwrap(),
+                    OfferOutcome::Accepted { .. }
+                )
+            {
+                sent[index] += 1;
+            }
+        }
+        let _ = reader.poll(
+            |bytes, lane, _| {
+                let lane = usize::from(lane.get());
+                assert_eq!(usize::from(bytes[4]), lane, "a message on another lane");
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen[lane], "lane {lane} in order");
+                seen[lane] += 1;
+            },
+            BUDGET,
+        );
+        seen == [10, 10] && records.iter().all(|lane| lane.len() == 10)
+    });
+    for (index, lane) in records.iter().enumerate() {
+        for (number, record) in (0u64..).zip(lane) {
+            assert_eq!(
+                (record.kind, usize::from(record.lane)),
+                (Kind::Submitted, index),
+                "{record:?}"
+            );
+            assert_eq!(
+                (record.start, record.end),
+                (number * FRAME, (number + 1) * FRAME)
+            );
+        }
+    }
+    // Three more on each lane, at the same positions, then the close
+    // before any cycle runs.
+    for (index, lane) in lanes.iter_mut().enumerate() {
+        let number = u8::try_from(index).unwrap();
+        for at in 10..13 {
+            assert!(matches!(
+                lane.offer(&message(number, at)).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ));
+        }
+    }
+    let Closed::Now { epoch } = a.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    // Each handle sees the close at its next offer and releases at the
+    // guard's seal, which the walker then reaches.
+    for (index, lane) in lanes.iter_mut().enumerate() {
+        let number = u8::try_from(index).unwrap();
+        assert_eq!(
+            lane.offer(&message(number, 13)).unwrap(),
+            OfferOutcome::Gated
+        );
+    }
+    let mut ended: [Vec<karyos_sys::outcome_ring::Record>; 2] = [Vec::new(), Vec::new()];
+    pump(&mut [&mut a, &mut b], |drivers| {
+        for (index, lane) in lanes.iter_mut().enumerate() {
+            let _ = lane
+                .poll_outcomes(64, |_, record| ended[index].push(record))
+                .unwrap();
+        }
+        drivers[0]
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .effective()
+            == Some(true)
+            && ended
+                .iter()
+                .all(|lane| lane.last().is_some_and(|record| record.kind == Kind::Ended))
+    });
+    for (index, lane) in ended.iter().enumerate() {
+        assert_eq!(lane.len(), 4, "lane {index}: {lane:?}");
+        for record in lane {
+            assert_eq!(usize::from(record.lane), index, "{record:?}");
+            assert_eq!(record.reason, REASON_GUARD_CLOSED, "{record:?}");
+        }
+        let aborted: Vec<_> = lane[..3]
+            .iter()
+            .map(|record| (record.kind, record.start, record.end))
+            .collect();
+        assert_eq!(
+            aborted,
+            (10..13)
+                .map(|at| (Kind::Aborted, at * FRAME, (at + 1) * FRAME))
+                .collect::<Vec<_>>(),
+            "lane {index}"
+        );
+        assert_eq!(lane[3].kind, Kind::Ended);
+    }
+    let ack = a.close_guard_ack(guard, epoch).unwrap();
+    let [(_, SenderAck::Applied { positions, .. })] = ack.senders[..] else {
+        panic!("{ack:?}");
+    };
+    assert_eq!(
+        positions[..usize::from(LANES)],
+        [10 * FRAME, 10 * FRAME],
+        "each lane's last position submitted"
+    );
+    let _ = reader.poll(|_, _, _| panic!("a message after the close"), BUDGET);
+    assert_eq!(seen, [10, 10]);
+}
+
 /// #381 review P1: on a dedicated runner a receiver failure leaves the
 /// sender's thread, and its gates, running. The driver must not end their
 /// lanes: a message the sender submits after the failure is recorded

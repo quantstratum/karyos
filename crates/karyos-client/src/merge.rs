@@ -747,18 +747,24 @@ enum Step {
 /// or the merge fails, the secondary policy applies to the gap and the
 /// poll reports [`RejoinOutcome::ReplayFallback`] with its reason; a
 /// merge's typed error is kept ([`ReplayRejoin::merge_failure`]). Each
-/// overrun is reported to the driver once, when it resolved.
+/// overrun is reported to the driver once, when it resolved. A gap given
+/// up before it resolved, when the rejoin is dropped or its live reader
+/// taken back ([`ReplayRejoin::into_live`]), is reported then, as
+/// [`ReplayFallbackReason::Withdrawn`] with the live reader resumed at
+/// its resume.
 ///
-/// While the gap is recovered the live reader is not polled: a required
-/// one holds its publisher back, and an optional one can be lapped, which
-/// fails the merge ([`MergeError::LiveOverrun`]) and applies the
-/// secondary policy. Only lane 0 of a single subscription is recovered
-/// (A6, Q6); another lane fails its merges.
+/// Only an optional reader is overrun. While its gap is recovered it is
+/// not polled, so it can be lapped again, which fails the merge
+/// ([`MergeError::LiveOverrun`]) and applies the secondary policy. Only
+/// lane 0 of a single subscription is recovered (A6, Q6); another lane
+/// fails its merges.
 pub struct ReplayRejoin<T: TermBytes = HeapTerms> {
     state: Rejoin<T>,
     source: PublicationIdentity,
     provider: Box<dyn ReplayProvider<T>>,
     secondary: Secondary,
+    /// The subscription's own rejoin policy, given back with it.
+    policy: Option<RejoinPolicy>,
     loss: Option<Box<LossReporter>>,
     lane: u8,
     failure: Option<MergeError>,
@@ -803,7 +809,8 @@ impl<T: TermBytes> ReplayRejoin<T> {
     /// Recovers `subscription`'s overruns, the subscription of publication
     /// `source`, from `provider`'s replays, falling back to `secondary`.
     /// The subscription's own rejoin policy becomes `RejoinAtHead`, and its
-    /// loss reports are made here instead.
+    /// loss reports are made here instead, until
+    /// [`ReplayRejoin::into_live`] gives both back.
     #[must_use]
     pub fn new(
         subscription: ClientSubscription<T>,
@@ -811,7 +818,8 @@ impl<T: TermBytes> ReplayRejoin<T> {
         provider: Box<dyn ReplayProvider<T>>,
         secondary: Secondary,
     ) -> Self {
-        let mut live = subscription.with_rejoin(RejoinPolicy::RejoinAtHead);
+        let mut live = subscription;
+        let policy = live.replace_rejoin(RejoinPolicy::RejoinAtHead);
         let loss = live.take_loss_reports();
         let lane = live.lane().map_or(0, Lane::get);
         Self {
@@ -819,6 +827,7 @@ impl<T: TermBytes> ReplayRejoin<T> {
             source,
             provider,
             secondary,
+            policy: Some(policy),
             loss,
             lane,
             failure: None,
@@ -839,20 +848,42 @@ impl<T: TermBytes> ReplayRejoin<T> {
         self.failure
     }
 
-    /// Gives the live reader back: a gap asked for is withdrawn, a replay
-    /// merging is stopped. `None` only after a panic between two states,
-    /// where no handler runs.
+    /// Gives the live reader back, with its own rejoin policy and loss
+    /// reports: a gap asked for is withdrawn, a replay merging is stopped,
+    /// and either is reported as withdrawn. `None` only after a panic
+    /// between two states, where no handler runs.
     #[must_use]
     pub fn into_live(mut self) -> Option<ClientSubscription<T>> {
-        match std::mem::replace(&mut self.state, Rejoin::Moving) {
-            Rejoin::Live(live) => Some(live),
-            Rejoin::Asking { live, .. } => {
-                self.provider.cancel();
-                Some(live)
-            }
-            Rejoin::Merging { merge, .. } => Some(merge.into_live()),
-            Rejoin::Moving => None,
+        let mut live = match self.withdraw() {
+            Rejoin::Live(live) => live,
+            Rejoin::Asking { live, .. } => live,
+            Rejoin::Merging { merge, .. } => merge.into_live(),
+            Rejoin::Moving => return None,
+        };
+        if let Some(policy) = self.policy.take() {
+            let _ = live.replace_rejoin(policy);
         }
+        live.restore_loss_reports(self.loss.take());
+        Some(live)
+    }
+
+    /// Takes the state out, giving up a gap not resolved: the provider's
+    /// request is withdrawn, and the overrun is reported as withdrawn,
+    /// the live reader resumed at its resume. A merging replay stops when
+    /// its merge drops.
+    fn withdraw(&mut self) -> Rejoin<T> {
+        let state = std::mem::replace(&mut self.state, Rejoin::Moving);
+        if let Rejoin::Asking { overrun, .. } | Rejoin::Merging { overrun, .. } = &state {
+            if matches!(state, Rejoin::Asking { .. }) {
+                self.provider.cancel();
+            }
+            let outcome = RejoinOutcome::ReplayFallback {
+                reason: ReplayFallbackReason::Withdrawn,
+                secondary: SecondaryOutcome::ResumedAtHead,
+            };
+            self.report(overrun, outcome);
+        }
+        state
     }
 
     /// Delivers up to `message_limit` messages to `handler`, as
@@ -1018,6 +1049,13 @@ impl<T: TermBytes> ReplayRejoin<T> {
         if let Some(loss) = &self.loss {
             loss.report_as(self.lane, overrun, RejoinPolicyCode::Replay, outcome);
         }
+    }
+}
+
+impl<T: TermBytes> Drop for ReplayRejoin<T> {
+    /// A gap not resolved is given up, and reported as withdrawn.
+    fn drop(&mut self) {
+        let _ = self.withdraw();
     }
 }
 

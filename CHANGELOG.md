@@ -20,12 +20,14 @@ release may break APIs, wire formats and shared-memory layouts.
   With no replay, or a merge that fails, the secondary policy applies and
   the poll reports `ReplayFallback` with the reason, which gains
   `RecordingBehind`, `Refused` and `MergeFailed`. Each overrun is
-  reported to the driver once, when it resolved: the loss report gains
-  the outcome code `Replayed` (5, with no reason) and the reasons 4 to 6,
-  in place under admission version 2, and the driver counts
-  `overruns replayed`. A plain `RejoinPolicy::Replay`, with no provider,
-  still falls back with `NoArchive`. `LiveMerge::is_settled` tells when a
-  merge is done.
+  reported to the driver once, when it resolved; a gap given up first,
+  when the rejoin is dropped or its live reader taken back
+  (`into_live`, which gives back the reader's own policy and loss
+  reports), is reported as `Withdrawn`. The loss report gains the outcome
+  code `Replayed` (5, with no reason) and the reasons 4 to 7, in place
+  under admission version 2, and the driver counts `overruns replayed`.
+  A plain `RejoinPolicy::Replay`, with no provider, still falls back with
+  `NoArchive`. `LiveMerge::is_settled` tells when a merge is done.
 - The Archive's client (phase 3, A6b-2).
   `karyos_archive::client::ArchiveClient` is a `ReplayProvider` over the
   Archive's control streams (`ControlRequests`, `ControlResponses`): asked

@@ -167,6 +167,7 @@ impl LossReporter {
                     ReplayFallbackReason::RecordingBehind => FallbackReasonCode::RecordingBehind,
                     ReplayFallbackReason::Refused => FallbackReasonCode::Refused,
                     ReplayFallbackReason::MergeFailed => FallbackReasonCode::MergeFailed,
+                    ReplayFallbackReason::Withdrawn => FallbackReasonCode::Withdrawn,
                 }),
             ),
         };
@@ -318,6 +319,10 @@ mod tests {
             (
                 ReplayFallbackReason::MergeFailed,
                 FallbackReasonCode::MergeFailed,
+            ),
+            (
+                ReplayFallbackReason::Withdrawn,
+                FallbackReasonCode::Withdrawn,
             ),
         ] {
             reporter.report_as(

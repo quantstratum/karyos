@@ -526,6 +526,10 @@ pub enum FallbackReasonCode {
     Refused = 5,
     /// The replay and the live stream did not merge (phase 3).
     MergeFailed = 6,
+    /// The gap was given up before it resolved: the rejoin was dropped,
+    /// or its live reader taken back, while the gap was asked for or
+    /// merging (phase 3).
+    Withdrawn = 7,
 }
 
 impl FallbackReasonCode {
@@ -537,6 +541,7 @@ impl FallbackReasonCode {
             4 => Self::RecordingBehind,
             5 => Self::Refused,
             6 => Self::MergeFailed,
+            7 => Self::Withdrawn,
             _ => return None,
         })
     }
@@ -3038,12 +3043,12 @@ mod tests {
             Command::decode(0x08, &bad[..length]),
             Err(CncError::Reserved { type_id: 0x08 })
         );
-        bad[67] = 7;
+        bad[67] = 8;
         assert_eq!(
             Command::decode(0x08, &bad[..length]),
             Err(CncError::Reserved { type_id: 0x08 })
         );
-        for reason in 1..=6 {
+        for reason in 1..=7 {
             bad[67] = reason;
             assert!(
                 Command::decode(0x08, &bad[..length]).is_ok(),
@@ -3682,6 +3687,7 @@ mod properties {
     fn loss() -> impl Strategy<Value = ReportedLoss> {
         use FallbackReasonCode::{
             MergeFailed, NoArchive, NoRecording, RecordingBehind, Refused, RetentionShort,
+            Withdrawn,
         };
         use RejoinOutcomeCode::{Closed, Replayed, ResumedAtHead, SnapshotFailed, SnapshotRebuilt};
         use RejoinPolicyCode::{Close, RejoinAtHead, Replay, Snapshot};
@@ -3699,6 +3705,7 @@ mod properties {
                     RecordingBehind,
                     Refused,
                     MergeFailed,
+                    Withdrawn,
                 ][..],
             ),
         )
