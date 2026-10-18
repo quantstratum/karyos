@@ -127,7 +127,8 @@ pub enum ReplayError {
         capacity: usize,
     },
     /// A cursor configuration with fewer than two records per event, or
-    /// a buffer that cannot be allocated.
+    /// a buffer (or the list of the events a reference unavailable names)
+    /// that cannot be allocated or counted.
     #[error("invalid cursor configuration")]
     InvalidConfig,
     /// The recovery stopped feeding the journal (`Recovery::full`): its
@@ -340,12 +341,14 @@ impl<D: Disk> ReplayCursor<D> {
             }
             _ => None,
         };
-        let mut count = 0usize;
+        let mut count = Some(0usize);
         let _ = journal.walk(header_end, |_, _, record| {
-            count = count.saturating_add(usize::from(names(record).is_some()));
-            true
+            if names(record).is_some() {
+                count = count.and_then(|count| count.checked_add(1));
+            }
+            count.is_some()
         })?;
-        let mut unavailable = allocate::<u64>(count)?;
+        let mut unavailable = allocate::<u64>(count.ok_or(ReplayError::InvalidConfig)?)?;
         let _ = journal.walk(header_end, |_, _, record| {
             if let Some(seq) = names(record)
                 && unavailable.len() < unavailable.capacity()
