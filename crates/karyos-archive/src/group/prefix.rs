@@ -936,7 +936,25 @@ pub fn recover<D: crate::disk::Disk>(
     coverage: &impl Coverage,
     capacity: usize,
 ) -> Result<Recovery, super::journal::JournalError> {
+    recover_with_hold(journal, coverage, capacity, capacity)
+}
+
+/// [`recover`], with the reopening window sized to `hold` events
+/// ([`PrefixTracker::reserve_reopen_hold`], at least `capacity`) before
+/// the first record: the running tracker's, so a range a checkpoint
+/// reopened is recovered as it ran.
+///
+/// # Errors
+///
+/// The journal's read errors.
+pub fn recover_with_hold<D: crate::disk::Disk>(
+    journal: &mut super::journal::GroupJournal<D>,
+    coverage: &impl Coverage,
+    capacity: usize,
+    hold: usize,
+) -> Result<Recovery, super::journal::JournalError> {
     let mut tracker = PrefixTracker::new(capacity);
+    tracker.reserve_reopen_hold(hold);
     let mut last_seen = 0u64;
     let mut full = false;
     let durable = journal.durable();

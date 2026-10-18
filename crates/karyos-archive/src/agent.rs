@@ -168,6 +168,8 @@ pub struct GroupCheckpoints {
     /// times the capture's `in_flight`. A best-effort group under traffic
     /// beyond it reopens at a later checkpoint, counted
     /// ([`PrefixTracker::failed_reopens`](crate::group::prefix::PrefixTracker::failed_reopens)).
+    /// A hold below `in_flight` is taken as `in_flight`. Recovery sizes
+    /// its window so too.
     pub reopen_hold: Option<usize>,
 }
 
@@ -1752,23 +1754,31 @@ impl<D: Disk + Clone> State<D> {
             recorded: &recorded,
             store: store.as_ref(),
         };
-        let (mut sender, job) =
-            capture::capture(start.capture, journal, &coverage).map_err(|error| match error {
+        // The reopening window, sized before recovery so a restart
+        // recovers the prefixes the run had.
+        let hold = match &start.checkpoints {
+            None => None,
+            Some(GroupCheckpoints {
+                reopen_hold: Some(hold),
+                ..
+            }) => Some(*hold),
+            Some(GroupCheckpoints {
+                reopen_hold: None, ..
+            }) => Some(
+                start
+                    .capture
+                    .in_flight
+                    .checked_mul(4)
+                    .ok_or(AgentError::CheckpointConfig)?,
+            ),
+        };
+        let (mut sender, job) = capture::capture_with_hold(start.capture, journal, &coverage, hold)
+            .map_err(|error| match error {
                 CaptureSetup::Config(error) => AgentError::Capture(error),
                 CaptureSetup::Journal(error) => AgentError::Journal(error),
             })?;
-        let mut job = job;
         let checkpoints = match (store, &start.checkpoints) {
             (Some(store), Some(config)) => {
-                let hold = match config.reopen_hold {
-                    Some(hold) => hold,
-                    None => start
-                        .capture
-                        .in_flight
-                        .checked_mul(4)
-                        .ok_or(AgentError::CheckpointConfig)?,
-                };
-                job.reserve_reopen_hold(hold).map_err(AgentError::Capture)?;
                 let writer = CheckpointWriter::new(store, job.journal())
                     .map_err(|error| AgentError::Checkpoint(Box::new(error)))?;
                 let (handle, inbox) = handoff(config.max_checkpoint);

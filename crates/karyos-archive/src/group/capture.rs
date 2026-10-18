@@ -195,8 +195,25 @@ fn extent(payload: usize) -> Option<u64> {
 /// errors as [`CaptureSetup::Journal`].
 pub fn capture<D: Disk>(
     config: CaptureConfig,
+    journal: GroupJournal<D>,
+    coverage: &impl Coverage,
+) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
+    capture_with_hold(config, journal, coverage, None)
+}
+
+/// [`capture`], for a group that keeps checkpoints: its reopening window
+/// holds `reopen_hold` events, at least `in_flight`
+/// ([`CaptureJob::reserve_reopen_hold`]), in recovery as when running,
+/// so a restart recovers the prefixes the run had.
+///
+/// # Errors
+///
+/// [`capture`]'s.
+pub fn capture_with_hold<D: Disk>(
+    config: CaptureConfig,
     mut journal: GroupJournal<D>,
     coverage: &impl Coverage,
+    reopen_hold: Option<usize>,
 ) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
     let policy = journal.policy();
     let (ring, max_extent, in_flight) = check(config, policy).map_err(CaptureSetup::Config)?;
@@ -205,8 +222,12 @@ pub fn capture<D: Disk>(
             max_event: config.max_event,
         })
     })?;
-    let recovery =
-        prefix::recover(&mut journal, coverage, config.in_flight).map_err(CaptureSetup::Journal)?;
+    let hold = match reopen_hold {
+        Some(hold) => hold,
+        None => config.in_flight,
+    };
+    let recovery = prefix::recover_with_hold(&mut journal, coverage, config.in_flight, hold)
+        .map_err(CaptureSetup::Journal)?;
     if recovery.full {
         return Err(CaptureSetup::Config(CaptureError::RecoveryFull {
             capacity: config.in_flight,
@@ -274,6 +295,11 @@ pub fn capture<D: Disk>(
         signalled_first: 0,
         stop_notified: false,
     };
+    let mut job = job;
+    if let Some(hold) = reopen_hold {
+        job.reserve_reopen_hold(hold)
+            .map_err(CaptureSetup::Config)?;
+    }
     Ok((sender, job))
 }
 

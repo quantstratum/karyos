@@ -263,3 +263,73 @@ fn the_handoff_and_a_chunked_write_allocate_nothing() {
     let _ = std::fs::remove_dir_all(&journals);
     let _ = std::fs::remove_dir_all(&checkpoints);
 }
+
+/// #426 re-check h2: the reopening window, sized at configuration, keeps
+/// the events a checkpoint write spans and opens the range over them
+/// without allocating.
+#[test]
+fn the_reopen_hold_allocates_nothing_after_configuration() {
+    use karyos_archive::group::prefix::{CheckpointHeld, Coverage, PrefixTracker};
+    use karyos_archive::group::record::{CheckpointRecord, GapMarker, GapReason};
+
+    struct Written;
+    impl Coverage for Written {
+        fn positions(&self, _: u64) -> Option<(u64, u64)> {
+            None
+        }
+        fn ended(&self, _: u64) -> Option<u64> {
+            None
+        }
+        fn checkpoint(&self, _: u64, _: u64) -> CheckpointHeld {
+            CheckpointHeld::Durable
+        }
+    }
+
+    let mut tracker = PrefixTracker::new(2);
+    tracker.reserve_reopen_hold(8);
+    let mut records = vec![GroupRecord::Header(JournalHeader {
+        group_id: 4,
+        first_group_seq: 1,
+        inline_threshold: 4096,
+        contract_version: 1,
+        clock: Clock::HostMonotonic,
+        capture: Capture::BestEffort,
+        manifest: b"m",
+    })];
+    records.push(GroupRecord::Gap(GapMarker {
+        from_seq: 1,
+        to_seq: 1,
+        reason: GapReason::RingFull,
+    }));
+    for seq in 2..=7u64 {
+        records.push(GroupRecord::Timer(TimerEvent {
+            group_seq: seq,
+            logical_time: seq,
+            timer_id: seq,
+        }));
+        records.push(GroupRecord::End(EventEnd {
+            group_seq: seq,
+            observations: 0,
+            outcome: EndOutcome::Complete,
+        }));
+    }
+    records.push(GroupRecord::Checkpoint(CheckpointRecord {
+        group_seq: 1,
+        checkpoint_id: 1,
+        position: 0,
+        length: 100,
+        crc32c: 0,
+        format: 7,
+    }));
+    let (prefix, allocations) = count(|| {
+        let mut at = 0u64;
+        for record in &records {
+            at += 64;
+            tracker.record(record, at).unwrap();
+        }
+        tracker.advance(at, at, &Written)
+    });
+    assert_eq!(prefix, (7, 7), "the range opens over the held events");
+    assert_eq!(tracker.failed_reopens(), 0);
+    assert_eq!(allocations, 0, "the hold allocated");
+}
