@@ -311,9 +311,14 @@ release may break APIs, wire formats and shared-memory layouts.
   refusals are typed. The job appends each message to the journal, feeds
   the tracker and advances the prefixes; `recording_ended` counts the
   references a stopped recording covers as covered, and marks the others
-  unavailable (best effort) or ends a strict group. A `GroupWaiter` waits
-  for durability off the event loop; the job only notifies it. A journal
-  failure fails the group.
+  unavailable (best effort) or ends a strict group; a reference that
+  reaches the job after its recording ended is settled when read
+  (`Coverage::ended`). A strict incomplete event ends the group. A
+  `GroupWaiter` waits for durability off the event loop; the job only
+  notifies it. A journal failure fails the group. `capture` refuses a
+  journal that never syncs (`SyncPolicy::None`), a recovery with more
+  events waiting than the tracker holds, and settings whose arithmetic
+  would overflow; under `PerSegment` the job syncs at the in-flight bound.
 - A recording group's records for the Gateway (phase 3, A7d-1a;
   `recording-group-gateway.md` section 10), in place under schema 3
   version 1. A message's payload can be unavailable (value 3): above

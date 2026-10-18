@@ -461,6 +461,11 @@ pub struct Recovery {
     /// events after the complete prefix, up to it, are outside the replay
     /// guarantee.
     pub last_seen: u64,
+    /// The feed stopped: an event found no room, with `capacity` events
+    /// waiting on their payloads (or a record was refused). The tracker
+    /// then holds only the journal's start, and cannot take the next
+    /// events.
+    pub full: bool,
 }
 
 /// Recomputes the prefixes of a recovered `journal`, every record of it
@@ -509,5 +514,9 @@ pub fn recover<D: crate::disk::Disk>(
     })?;
     let written = journal.written();
     let _ = tracker.advance(written, durable, coverage);
-    Ok(Recovery { tracker, last_seen })
+    Ok(Recovery {
+        tracker,
+        last_seen,
+        full,
+    })
 }

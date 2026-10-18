@@ -45,6 +45,7 @@ use super::journal::{GroupJournal, JournalError};
 use super::prefix::{self, Coverage, PrefixError, PrefixTracker, PrefixView};
 use super::record::{Capture, GroupRecord, ReferenceUnavailable, Role};
 use crate::disk::Disk;
+use crate::segment::SyncPolicy;
 
 #[cfg(test)]
 mod tests;
@@ -81,6 +82,17 @@ pub enum CaptureError {
     /// No event can be in flight.
     #[error("no event can be in flight")]
     InFlight,
+    /// The journal's sync policy is `None`, which never makes an event
+    /// durable on its own: the in-flight bound would hold for good.
+    #[error("a group's journal needs a sync policy")]
+    NoSync,
+    /// The recovered journal holds more events waiting on their payloads
+    /// than the tracker holds: its recovery stopped there.
+    #[error("the recovered journal needs room for more than {capacity} events in flight")]
+    RecoveryFull {
+        /// The tracker's capacity.
+        capacity: usize,
+    },
 }
 
 /// Why an event was not taken: the Gateway's refusals, typed so it can
@@ -157,12 +169,13 @@ impl Shared {
     }
 }
 
-/// A ring record's extent: its header and payload, aligned to 8 bytes.
-fn extent(payload: usize) -> u64 {
+/// A ring record's extent: its header and payload, aligned to 8 bytes;
+/// `None` past `u64`.
+fn extent(payload: usize) -> Option<u64> {
     u64::try_from(payload)
-        .unwrap_or(u64::MAX)
-        .saturating_add(RING_HEADER)
-        .next_multiple_of(8)
+        .ok()?
+        .checked_add(RING_HEADER)?
+        .checked_next_multiple_of(8)
 }
 
 /// Makes a group's capture path over `journal`, which holds at least its
@@ -178,15 +191,25 @@ pub fn capture<D: Disk>(
     mut journal: GroupJournal<D>,
     coverage: &impl Coverage,
 ) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
-    let ring = u64::try_from(config.ring_capacity).unwrap_or(u64::MAX);
-    let max_extent = extent(config.max_event);
+    let ring_error = CaptureSetup::Config(CaptureError::Ring {
+        max_event: config.max_event,
+    });
+    let (Ok(ring), Some(max_extent)) = (
+        u64::try_from(config.ring_capacity),
+        extent(config.max_event),
+    ) else {
+        return Err(ring_error);
+    };
     if !config.ring_capacity.is_power_of_two() || max_extent > ring / 8 {
-        return Err(CaptureSetup::Config(CaptureError::Ring {
-            max_event: config.max_event,
-        }));
+        return Err(ring_error);
     }
-    if config.in_flight == 0 {
-        return Err(CaptureSetup::Config(CaptureError::InFlight));
+    let in_flight = match u64::try_from(config.in_flight) {
+        Ok(0) | Err(_) => return Err(CaptureSetup::Config(CaptureError::InFlight)),
+        Ok(in_flight) => in_flight,
+    };
+    let policy = journal.policy();
+    if policy == SyncPolicy::None {
+        return Err(CaptureSetup::Config(CaptureError::NoSync));
     }
     let (producer, consumer) = command_ring(config.ring_capacity).map_err(|_| {
         CaptureSetup::Config(CaptureError::Ring {
@@ -195,6 +218,11 @@ pub fn capture<D: Disk>(
     })?;
     let recovery =
         prefix::recover(&mut journal, coverage, config.in_flight).map_err(CaptureSetup::Journal)?;
+    if recovery.full {
+        return Err(CaptureSetup::Config(CaptureError::RecoveryFull {
+            capacity: config.in_flight,
+        }));
+    }
     let mut tracker = recovery.tracker;
     // Every event the journal holds was delivered before it was sent.
     tracker.delivered(recovery.last_seen);
@@ -216,7 +244,7 @@ pub fn capture<D: Disk>(
         max_extent,
         tail: 0,
         dispatched,
-        in_flight: u64::try_from(config.in_flight).unwrap_or(u64::MAX),
+        in_flight,
     };
     let job = CaptureJob {
         consumer,
@@ -224,8 +252,11 @@ pub fn capture<D: Disk>(
         tracker,
         shared,
         capture,
+        sync_at_bound: policy == SyncPolicy::PerSegment,
+        in_flight,
         uncovered: Vec::with_capacity(config.in_flight),
         signalled: 0,
+        stop_notified: false,
     };
     Ok((sender, job))
 }
@@ -281,7 +312,11 @@ impl CaptureSender {
         self.room()?;
         if !self.shared.stopped.load(Ordering::Acquire) {
             let durable = self.shared.view.durable_group_seq();
-            if self.dispatched.saturating_sub(durable) >= self.in_flight {
+            if self
+                .dispatched
+                .checked_sub(durable)
+                .is_some_and(|in_flight| in_flight >= self.in_flight)
+            {
                 return Err(Refusal::InFlight);
             }
         }
@@ -302,11 +337,23 @@ impl CaptureSender {
             GroupState::Ended => return Err(Refusal::Ended),
         }
         let consumed = self.shared.consumed.load(Ordering::Acquire);
-        let used = self.tail.saturating_sub(consumed);
-        let free = self.capacity.saturating_sub(used);
-        let to_end = self.capacity - (self.tail & (self.capacity - 1));
+        // The job reads only what was written, so `consumed` is never past
+        // the tail, nor a capacity behind it.
+        let free = self
+            .tail
+            .checked_sub(consumed)
+            .and_then(|used| self.capacity.checked_sub(used))
+            .ok_or(Refusal::Failed)?;
+        let mask = self.capacity.checked_sub(1).ok_or(Refusal::Failed)?;
+        let to_end = self
+            .capacity
+            .checked_sub(self.tail & mask)
+            .ok_or(Refusal::Failed)?;
         let padding = if self.max_extent > to_end { to_end } else { 0 };
-        if padding + self.max_extent > free {
+        let needed = padding
+            .checked_add(self.max_extent)
+            .ok_or(Refusal::RingFull)?;
+        if needed > free {
             return Err(Refusal::RingFull);
         }
         Ok(())
@@ -325,17 +372,23 @@ impl CaptureSender {
         if records.len() > self.max_event {
             return Err(Refusal::TooLarge);
         }
+        let framed = extent(records.len()).ok_or(Refusal::TooLarge)?;
+        // A failure stores the state only: the event loop never takes the
+        // waiters' lock, and the job notifies them.
+        let fail = |shared: &Shared| {
+            shared.state.store(FAILED, Ordering::Release);
+            Refusal::Failed
+        };
         match self.producer.write(RECORDS, records) {
             Ok(start) => {
-                self.tail = start.saturating_add(extent(records.len()));
+                self.tail = start
+                    .checked_add(framed)
+                    .ok_or_else(|| fail(&self.shared))?;
                 self.dispatched = self.dispatched.max(last_seq);
                 Ok(())
             }
             Err(RingError::Full) => Err(Refusal::RingFull),
-            Err(_) => {
-                self.shared.set(FAILED);
-                Err(Refusal::Failed)
-            }
+            Err(_) => Err(fail(&self.shared)),
         }
     }
 
@@ -434,10 +487,17 @@ pub struct CaptureJob<D: Disk> {
     tracker: PrefixTracker,
     shared: Arc<Shared>,
     capture: Capture,
+    /// The journal syncs on its own only when a segment fills: sync it
+    /// when the in-flight bound is reached, or the group would wait for
+    /// good.
+    sync_at_bound: bool,
+    in_flight: u64,
     /// Events a recording that ended does not cover, sized to the tracker.
     uncovered: Vec<u64>,
     /// The `durable_group_seq` waiters were last notified of.
     signalled: u64,
+    /// The waiters were told the group stopped.
+    stop_notified: bool,
 }
 
 /// Why the job stopped recording.
@@ -473,6 +533,11 @@ impl<D: Disk> CaptureJob<D> {
         coverage: &impl Coverage,
     ) -> Result<bool, JobError> {
         if self.shared.state() != GroupState::Running {
+            // A failure the event loop stored is told to the waiters here.
+            if !self.stop_notified {
+                self.stop_notified = true;
+                self.shared.notify();
+            }
             return Ok(false);
         }
         let result = self.drain(now, budget, coverage);
@@ -494,9 +559,9 @@ impl<D: Disk> CaptureJob<D> {
                 break;
             };
             read = true;
-            let end = message
-                .position
-                .saturating_add(extent(message.payload.len()));
+            let end = extent(message.payload.len())
+                .and_then(|framed| message.position.checked_add(framed))
+                .ok_or(JobError::Ring)?;
             self.journal.append(message.payload)?;
             let written = self.journal.written();
             let mut records = message.payload;
@@ -508,17 +573,37 @@ impl<D: Disk> CaptureJob<D> {
                 // Only an end's and a header's positions count, and a
                 // message ends at the event's end.
                 self.tracker.record(&record, written)?;
-                if let Role::Event(seq) | Role::Uncaptured(seq) = record.role() {
-                    self.tracker.delivered(seq);
+                match record.role() {
+                    Role::Event(seq) | Role::Uncaptured(seq) => self.tracker.delivered(seq),
+                    // A gap's events were delivered, not captured.
+                    Role::Gap(gap) => self.tracker.delivered(gap.to_seq),
+                    _ => {}
                 }
                 records = rest;
             }
             self.shared.consumed.store(end, Ordering::Release);
         }
         let _ = self.journal.tick(now)?;
+        if self.sync_at_bound && self.at_bound() {
+            let _ = self.journal.sync()?;
+        }
         self.settle_ended(coverage)?;
         self.advance(coverage);
+        // A strict journal ends at an incomplete event: nothing more is
+        // taken.
+        if self.capture == Capture::Strict && self.tracker.stopped() {
+            self.shared.set(ENDED);
+        }
         Ok(read)
+    }
+
+    /// Whether as many events are delivered and not durable as the tracker
+    /// holds.
+    fn at_bound(&self) -> bool {
+        self.tracker
+            .delivered_seq()
+            .checked_sub(self.tracker.durable_group_seq())
+            .is_some_and(|in_flight| in_flight >= self.in_flight)
     }
 
     /// Settles the waiting references to recordings that already ended
@@ -536,7 +621,7 @@ impl<D: Disk> CaptureJob<D> {
             else {
                 break;
             };
-            self.settle(recording, durable)?;
+            self.settle(recording, durable, coverage)?;
         }
         Ok(())
     }
@@ -592,7 +677,7 @@ impl<D: Disk> CaptureJob<D> {
         if self.shared.state() != GroupState::Running {
             return Ok(());
         }
-        let result = self.settle(recording_id, durable);
+        let result = self.settle(recording_id, durable, coverage);
         if result.is_err() {
             self.shared.set(FAILED);
         }
@@ -602,12 +687,19 @@ impl<D: Disk> CaptureJob<D> {
 
     /// Settles the references to `recording_id`, which ended durable to
     /// `durable`: covered, marked, or the strict group ends.
-    fn settle(&mut self, recording_id: u64, durable: u64) -> Result<(), JobError> {
+    fn settle(
+        &mut self,
+        recording_id: u64,
+        durable: u64,
+        coverage: &impl Coverage,
+    ) -> Result<(), JobError> {
         let uncovered = &mut self.uncovered;
         uncovered.clear();
         self.tracker
             .recording_ended(recording_id, durable, |seq| uncovered.push(seq));
         if !self.uncovered.is_empty() && self.capture == Capture::Strict {
+            // The events before it that are covered count first.
+            self.advance(coverage);
             self.shared.set(ENDED);
             return Ok(());
         }

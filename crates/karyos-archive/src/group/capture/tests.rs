@@ -39,7 +39,11 @@ impl Coverage for Recordings {
     }
 }
 
-const NONE: SyncPolicy = SyncPolicy::None;
+/// A policy that syncs on its own only past the test's time: durability
+/// comes from the job's explicit syncs.
+const UNSYNCED: SyncPolicy = SyncPolicy::Every {
+    interval_ns: u64::MAX,
+};
 
 fn header(capture: Capture) -> JournalHeader<'static> {
     JournalHeader {
@@ -75,12 +79,23 @@ fn settings(ring_capacity: usize, max_event: usize, in_flight: usize) -> Capture
 /// Event `seq`'s records: a message of `length` inline bytes, or naming
 /// `recording`'s frames `[0, 64)`, then its end.
 fn event(seq: u64, length: usize, recording: Option<u64>) -> Vec<u8> {
+    event_at(seq, length, recording, 0, EndOutcome::Complete)
+}
+
+/// [`event`] at `position`, ending `outcome`.
+fn event_at(
+    seq: u64,
+    length: usize,
+    recording: Option<u64>,
+    position: u64,
+    outcome: EndOutcome,
+) -> Vec<u8> {
     let value = vec![0x5A; length];
     let message = GroupRecord::Message(MessageEvent {
         group_seq: seq,
         logical_time: seq,
         incarnation: 1,
-        position: 0,
+        position,
         extent: u32::try_from(length + 32)
             .unwrap()
             .next_multiple_of(32)
@@ -102,7 +117,7 @@ fn event(seq: u64, length: usize, recording: Option<u64>) -> Vec<u8> {
     let end = GroupRecord::End(EventEnd {
         group_seq: seq,
         observations: 0,
-        outcome: EndOutcome::Complete,
+        outcome,
     });
     let mut out = vec![0u8; MAX_RECORD];
     let mut bytes = Vec::new();
@@ -159,7 +174,7 @@ fn new(
 #[test]
 fn events_go_through_the_ring_into_the_journal_and_its_prefixes() {
     let none = Recordings::default();
-    let (mut sender, mut job) = new(Capture::Strict, NONE, settings(4096, 400, 8));
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
     let waiter = sender.waiter();
     for seq in 1..=3 {
         sender.admit().unwrap();
@@ -234,7 +249,7 @@ fn an_admitted_event_always_fits_the_ring() {
 #[test]
 fn events_in_flight_are_bounded_until_durable() {
     let none = Recordings::default();
-    let (mut sender, mut job) = new(Capture::Strict, NONE, settings(4096, 400, 2));
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 2));
     for seq in 1..=2 {
         sender.admit().unwrap();
         sender.send(&event(seq, 10, None), seq).unwrap();
@@ -256,7 +271,7 @@ fn events_in_flight_are_bounded_until_durable() {
 #[test]
 fn a_gap_needs_only_room_and_lifts_the_in_flight_bound() {
     let none = Recordings::default();
-    let (mut sender, mut job) = new(Capture::BestEffort, NONE, settings(4096, 400, 1));
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 1));
     sender.send(&event(1, 10, None), 1).unwrap();
     job.duty(0, 16, &none).unwrap();
     assert_eq!(sender.admit(), Err(Refusal::InFlight));
@@ -289,7 +304,7 @@ fn a_gap_needs_only_room_and_lifts_the_in_flight_bound() {
 fn a_recording_that_ends_settles_its_references() {
     let recordings = Recordings::default();
     let gone = Recordings::default();
-    let (mut sender, mut job) = new(Capture::BestEffort, NONE, settings(4096, 400, 8));
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 8));
     sender.send(&event(1, 10, Some(7)), 1).unwrap();
     sender.send(&event(2, 10, Some(8)), 2).unwrap();
     sender.send(&event(3, 10, None), 3).unwrap();
@@ -320,7 +335,7 @@ fn a_recording_that_ends_settles_its_references() {
 #[test]
 fn a_strict_group_ends_at_a_reference_never_covered() {
     let gone = Recordings::default();
-    let (mut sender, mut job) = new(Capture::Strict, NONE, settings(4096, 400, 8));
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
     let waiter = sender.waiter();
     sender.send(&event(1, 10, None), 1).unwrap();
     sender.send(&event(2, 10, Some(8)), 2).unwrap();
@@ -351,13 +366,13 @@ fn a_strict_group_ends_at_a_reference_never_covered() {
 fn a_failed_journal_fails_the_group() {
     let none = Recordings::default();
     let free = FaultDisk::default();
-    let journal_alone = journal(free.clone(), Capture::Strict, NONE);
+    let journal_alone = journal(free.clone(), Capture::Strict, UNSYNCED);
     let created = free.used();
     drop(journal_alone);
     let disk = FaultDisk::with_budget(created + 10);
     let (mut sender, mut job) = capture(
         settings(4096, 400, 8),
-        journal(disk, Capture::Strict, NONE),
+        journal(disk, Capture::Strict, UNSYNCED),
         &none,
     )
     .unwrap();
@@ -445,7 +460,7 @@ fn run(disk: &FaultDisk, coverage: &Recordings) -> u64 {
 
 #[test]
 fn a_waiter_times_out() {
-    let (sender, _job) = new(Capture::Strict, NONE, settings(4096, 400, 8));
+    let (sender, _job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
     assert_eq!(
         sender.waiter().wait_durable(1, Duration::from_millis(10)),
         Err(WaitError::Timeout { durable: 0 })
@@ -458,7 +473,7 @@ fn settings_that_cannot_work_are_refused() {
     let make = |settings| {
         capture(
             settings,
-            journal(FaultDisk::default(), Capture::Strict, NONE),
+            journal(FaultDisk::default(), Capture::Strict, UNSYNCED),
             &none,
         )
         .map(|_| ())
@@ -478,7 +493,7 @@ fn settings_that_cannot_work_are_refused() {
         make(settings(1024, 120, 0)),
         Err(CaptureSetup::Config(CaptureError::InFlight))
     ));
-    let (mut sender, _job) = new(Capture::Strict, NONE, settings(1024, 100, 8));
+    let (mut sender, _job) = new(Capture::Strict, UNSYNCED, settings(1024, 100, 8));
     assert_eq!(sender.send(&event(1, 100, None), 1), Err(Refusal::TooLarge));
 }
 
@@ -487,7 +502,7 @@ fn settings_that_cannot_work_are_refused() {
 #[test]
 fn a_waiter_on_another_thread_wakes_at_durability() {
     let none = Recordings::default();
-    let (mut sender, mut job) = new(Capture::Strict, NONE, settings(4096, 400, 8));
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
     let waiter = sender.waiter();
     let waiting = std::thread::spawn(move || {
         let start = std::time::Instant::now();
@@ -512,19 +527,19 @@ fn a_waiter_on_another_thread_wakes_at_durability() {
 #[test]
 fn the_framing_is_the_rings() {
     for (payload, framed) in [(0, 8), (1, 16), (7, 16), (8, 16), (9, 24), (120, 128)] {
-        assert_eq!(extent(payload), framed, "{payload}");
+        assert_eq!(extent(payload), Some(framed), "{payload}");
     }
     let (mut producer, mut consumer) = command_ring(4096).unwrap();
     let mut previous: Option<(u64, usize)> = None;
     for payload in 0..=100 {
         let start = producer.write(RECORDS, &vec![1u8; payload]).unwrap();
         if let Some((at, length)) = previous {
-            assert_eq!(start, at + extent(length), "after {length} bytes");
+            assert_eq!(start, at + extent(length).unwrap(), "after {length} bytes");
         }
         previous = Some((start, payload));
         let read = consumer.read().unwrap().unwrap();
         assert_eq!(read.position, start);
-        if start + extent(payload) > 4096 - 256 {
+        if start + extent(payload).unwrap() > 4096 - 256 {
             break;
         }
     }
@@ -535,7 +550,7 @@ fn the_framing_is_the_rings() {
 #[test]
 fn an_uncaptured_message_is_delivered() {
     let none = Recordings::default();
-    let (mut sender, mut job) = new(Capture::BestEffort, NONE, settings(4096, 400, 8));
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 8));
     let message = GroupRecord::Message(MessageEvent {
         group_seq: 1,
         logical_time: 1,
@@ -588,7 +603,7 @@ impl Coverage for Ended {
 #[test]
 fn a_reference_after_its_recording_ended_is_settled() {
     let ended = Ended([(7, 64), (8, 32)].into_iter().collect());
-    let (mut sender, mut job) = new(Capture::BestEffort, NONE, settings(4096, 400, 8));
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 8));
     sender.send(&event(1, 10, Some(7)), 1).unwrap();
     sender.send(&event(2, 10, Some(8)), 2).unwrap();
     job.duty(0, 16, &ended).unwrap();
@@ -598,8 +613,212 @@ fn a_reference_after_its_recording_ended_is_settled() {
         journal_events(&mut job.journal),
         [Role::Event(1), Role::Event(2), Role::Unavailable(2)]
     );
-    let (mut sender, mut job) = new(Capture::Strict, NONE, settings(4096, 400, 8));
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
     sender.send(&event(1, 10, Some(8)), 1).unwrap();
     job.duty(0, 16, &ended).unwrap();
     assert_eq!(job.state(), GroupState::Ended);
+}
+
+/// #408 review P1, the exact race: the event loop read the recording's id,
+/// the recording ended and was settled, then the event reached the job.
+/// It is settled when the job reads it: marked (best effort), or the
+/// strict group ends.
+#[test]
+fn a_reference_sent_before_its_recording_ended_and_read_after_is_settled() {
+    let ended = Ended([(8, 32)].into_iter().collect());
+    for capture_mode in [Capture::BestEffort, Capture::Strict] {
+        let (mut sender, mut job) = new(capture_mode, UNSYNCED, settings(4096, 400, 8));
+        sender.send(&event(1, 10, None), 1).unwrap();
+        job.duty(0, 16, &ended).unwrap();
+        // Recording 8 ends; nothing waiting refers to it yet.
+        job.recording_ended(8, 32, &ended).unwrap();
+        assert_eq!(job.state(), GroupState::Running);
+        sender.send(&event(2, 10, Some(8)), 2).unwrap();
+        job.duty(0, 16, &ended).unwrap();
+        job.sync(&ended).unwrap();
+        match capture_mode {
+            Capture::BestEffort => {
+                assert_eq!(sender.view().snapshot(), (2, 2, 2));
+                assert_eq!(
+                    journal_events(&mut job.journal),
+                    [Role::Event(1), Role::Event(2), Role::Unavailable(2)]
+                );
+            }
+            Capture::Strict => assert_eq!(job.state(), GroupState::Ended),
+        }
+    }
+}
+
+/// #408 review P3, mutants b2 and b3: the credit is exact at the
+/// boundary. A ring of 1024 bytes and events of exactly 128 framed bytes:
+/// full after eight; one drained frees exactly one event's room, which is
+/// admitted (not a byte too few); a smaller event then leaves the room
+/// eight bytes short of the padding and the largest event, refused (not a
+/// byte too many).
+#[test]
+fn the_credit_is_exact_at_the_boundary() {
+    let none = Recordings::default();
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(1024, 120, 1024));
+    // 108 bytes of records and 12 of payload: 120, framed 128.
+    let records = |seq| event(seq, 12, None);
+    assert_eq!(records(1).len(), 120);
+    for seq in 1..=8 {
+        sender.admit().unwrap();
+        sender.send(&records(seq), seq).unwrap();
+    }
+    assert_eq!(sender.admit(), Err(Refusal::RingFull));
+    assert!(job.duty(0, 1, &none).unwrap());
+    // Exactly 128 free at the ring's start: admitted.
+    sender.admit().unwrap();
+    sender.send(&records(9), 9).unwrap();
+    assert_eq!(sender.admit(), Err(Refusal::RingFull));
+    // Drain one more (128 free), then send a smaller event of 120 framed
+    // bytes (4 of payload): 8 free, 128 needed.
+    assert!(job.duty(0, 1, &none).unwrap());
+    let smaller = event(10, 4, None);
+    assert_eq!(smaller.len(), 112);
+    sender.admit().unwrap();
+    sender.send(&smaller, 10).unwrap();
+    assert_eq!(sender.admit(), Err(Refusal::RingFull), "8 bytes short");
+    // Two more drained: 264 free, to the end 128 at most: admitted again.
+    assert!(job.duty(0, 2, &none).unwrap());
+    sender.admit().unwrap();
+}
+
+/// #408 review P3, mutant e2: a waiter woken before its `group_seq` is
+/// durable waits on.
+#[test]
+fn a_waiter_woken_early_waits_on() {
+    let none = Recordings::default();
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
+    let waiter = sender.waiter();
+    let waiting = std::thread::spawn(move || waiter.wait_durable(2, Duration::from_secs(30)));
+    sender.send(&event(1, 10, None), 1).unwrap();
+    job.duty(0, 16, &none).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    // Event 1 durable: the waiter wakes, and waits on for 2.
+    job.sync(&none).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!waiting.is_finished(), "woke at 1 and returned");
+    sender.send(&event(2, 10, None), 2).unwrap();
+    job.duty(0, 16, &none).unwrap();
+    job.sync(&none).unwrap();
+    assert_eq!(waiting.join().unwrap(), Ok(2));
+}
+
+/// #408 review P2: a journal that never syncs on its own is refused, and
+/// one that syncs only at segment ends is synced by the job at the
+/// in-flight bound, so the group goes on.
+#[test]
+fn a_group_journal_syncs_at_its_in_flight_bound() {
+    let none = Recordings::default();
+    assert!(matches!(
+        capture(
+            settings(4096, 400, 2),
+            journal(FaultDisk::default(), Capture::Strict, SyncPolicy::None),
+            &none,
+        ),
+        Err(CaptureSetup::Config(CaptureError::NoSync))
+    ));
+    let (mut sender, mut job) = new(
+        Capture::Strict,
+        SyncPolicy::PerSegment,
+        settings(4096, 400, 2),
+    );
+    for seq in 1..=6 {
+        sender.admit().unwrap();
+        sender.send(&event(seq, 10, None), seq).unwrap();
+        job.duty(0, 16, &none).unwrap();
+    }
+    assert!(sender.view().durable_group_seq() >= 5);
+}
+
+/// #408 review P3: a strict group that ends at an uncovered reference
+/// first counts what is covered before it.
+#[test]
+fn a_strict_end_counts_what_is_covered_first() {
+    let gone = Recordings::default();
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
+    let waiter = sender.waiter();
+    sender
+        .send(&event_at(1, 10, Some(7), 0, EndOutcome::Complete), 1)
+        .unwrap();
+    sender
+        .send(&event_at(2, 10, Some(7), 64, EndOutcome::Complete), 2)
+        .unwrap();
+    job.duty(0, 16, &gone).unwrap();
+    job.sync(&gone).unwrap();
+    // Recording 7 ended at 64: event 1 is covered, event 2 is not.
+    job.recording_ended(7, 64, &gone).unwrap();
+    assert_eq!(job.state(), GroupState::Ended);
+    assert_eq!(waiter.wait_durable(1, Duration::ZERO), Ok(1));
+}
+
+/// #408 review P3: a strict journal ends at an incomplete event, so the
+/// group takes nothing more.
+#[test]
+fn a_strict_incomplete_end_ends_the_group() {
+    let none = Recordings::default();
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
+    sender
+        .send(&event_at(1, 10, None, 0, EndOutcome::Incomplete), 1)
+        .unwrap();
+    job.duty(0, 16, &none).unwrap();
+    assert_eq!(job.state(), GroupState::Ended);
+    assert_eq!(sender.admit(), Err(Refusal::Ended));
+}
+
+/// #408 review P3: a gap's events were delivered, not captured.
+#[test]
+fn a_gap_counts_its_events_delivered() {
+    let none = Recordings::default();
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 8));
+    sender.send(&gap(1, 3), 3).unwrap();
+    job.duty(0, 16, &none).unwrap();
+    assert_eq!(sender.view().delivered_seq(), 3);
+}
+
+/// #408 review P3: a recovered journal with more events waiting on their
+/// payloads than the tracker holds is refused, typed.
+#[test]
+fn a_recovery_with_no_room_is_refused() {
+    let none = Recordings::default();
+    let disk = FaultDisk::default();
+    let mut journal = journal(disk.clone(), Capture::Strict, SyncPolicy::PerSegment);
+    for seq in 1..=2 {
+        journal.append(&event(seq, 10, Some(7))).unwrap();
+    }
+    journal.close().unwrap();
+    let recovered = |capacity| {
+        let journal = GroupJournal::recover(
+            disk.after_crash(Survives::Synced),
+            Path::new("/g"),
+            1,
+            config(SyncPolicy::PerSegment),
+        )
+        .unwrap()
+        .journal;
+        capture(settings(4096, 400, capacity), journal, &none).map(|_| ())
+    };
+    assert!(matches!(
+        recovered(1),
+        Err(CaptureSetup::Config(CaptureError::RecoveryFull {
+            capacity: 1
+        }))
+    ));
+    assert!(recovered(2).is_ok());
+}
+
+/// #408 review P2: an event budget whose framing overflows is refused.
+#[test]
+fn an_event_budget_that_overflows_is_refused() {
+    let none = Recordings::default();
+    assert!(matches!(
+        capture(
+            settings(1024, usize::MAX, 8),
+            journal(FaultDisk::default(), Capture::Strict, UNSYNCED),
+            &none,
+        ),
+        Err(CaptureSetup::Config(CaptureError::Ring { .. }))
+    ));
 }
