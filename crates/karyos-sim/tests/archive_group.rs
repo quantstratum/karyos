@@ -421,7 +421,10 @@ fn driver_counter(cells: &[(usize, String, u64)], label: &str) -> Vec<u64> {
 /// the record, so nothing reaches the driver: every one of its counters
 /// (the output stream's head, limit and floor, its subscriber's
 /// position, the streams, leases, clients, commands and claims) reads as
-/// before the replay, and the output subscriber receives nothing.
+/// before the replay, and the output subscriber receives nothing. The
+/// cells that moved while recording (each stream's head and limit, the
+/// output subscriber's position among them) are checked one by one, so
+/// none passes by never moving.
 #[test]
 fn a_replayed_group_reaches_nothing_of_a_running_driver() {
     use karyos_archive::group::prefix::{Coverage, recover};
@@ -509,6 +512,12 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
         )
         .unwrap();
     let mut publication = driver.publication(input).unwrap();
+    // The cells as recording starts: the replay check compares the ones
+    // that move while recording, so none of them passes by never moving.
+    for _ in 0..10 {
+        driver.do_work().unwrap();
+    }
+    let at_start = driver_cells(&driver);
     // Live: the handler's effects reach the driver, two per message.
     let deadline = Instant::now() + Duration::from_secs(30);
     let (mut published, mut dispatched, mut answered) = (0, 0, 0u64);
@@ -547,7 +556,23 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
         driver.do_work().unwrap();
     }
     let before = driver_cells(&driver);
-    assert!(!driver_counter(&before, "stream head").is_empty());
+    let moved: Vec<&(usize, String, u64)> = before
+        .iter()
+        .filter(|cell| {
+            at_start
+                .iter()
+                .find(|start| start.0 == cell.0 && start.1 == cell.1)
+                .is_none_or(|start| start.2 != cell.2)
+        })
+        .collect();
+    // What the handler's offers and claims move: each stream's head and
+    // limit, and the output subscriber's position.
+    for label in ["stream head", "stream limit", "subscriber position"] {
+        assert!(
+            moved.iter().any(|(_, name, _)| name.starts_with(label)),
+            "no {label} cell moved while recording: {moved:?}"
+        );
+    }
     let mut journal = GroupJournal::recover(StdDisk, &groups, 1, JOURNAL)
         .unwrap()
         .journal;
@@ -602,6 +627,16 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
         driver_counter(&after, "stream head"),
         driver_counter(&before, "stream head")
     );
+    for (index, label, value) in &moved {
+        let now = after
+            .iter()
+            .find(|cell| cell.0 == *index && cell.1 == *label);
+        assert_eq!(
+            now.map(|cell| cell.2),
+            Some(*value),
+            "{label} moved during replay"
+        );
+    }
     assert_eq!(after, before, "the driver's counters moved during replay");
     drop(real);
 }
