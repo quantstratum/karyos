@@ -147,6 +147,9 @@ pub struct Case {
     pub schedule: Vec<(u64, Action)>,
     /// Steps to run.
     pub steps: u64,
+    /// Steps after the restarts that end the run, before the checks: see
+    /// [`QUIET`].
+    pub quiet: u64,
     /// What it expects of progress.
     pub progress: Progress,
 }
@@ -171,10 +174,23 @@ impl Case {
             drift_ppm: Vec::new(),
             schedule: Vec::new(),
             steps: 600,
+            quiet: QUIET,
             progress: Progress::Expected,
         }
     }
 }
+
+/// The quiet period: steps a run takes after restarting its crashed and
+/// stopped servers, before its final checks. Each restart reopens the log
+/// at once, so a lost or unopened log is already reported; the quiet
+/// period lets the restarted servers take part again (their positions,
+/// resent entries and re-applied commits, under the same checks), and
+/// lets what was in flight land, so a server is unverified only when its
+/// restart really fails. 100 steps are 25 of the reference's resend
+/// periods and twice the longest link delay the workloads set (50).
+/// Liveness and the servers' states are taken before the restarts, so
+/// the quiet period changes neither.
+pub const QUIET: u64 = 100;
 
 /// Why progress stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,15 +449,27 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         .map(|(_, server)| server.service().deduplicated())
         .try_fold(0u64, u64::checked_add)
         .ok_or(RunError::Count)?;
-    // Every crashed server restarts before the checks, so what it held
-    // durably is verified (`check::durable_kept`); a server whose log
-    // failed is up to the simulator, and is not restarted.
-    for &id in &peers {
-        match sim.restart(id) {
-            Ok(()) | Err(NodeError::AlreadyUp(_)) => {}
+    // Every server that is not up, crashed or stopped by a drive error,
+    // restarts before the checks, so what it held durably is verified
+    // (`check::durable_kept`); then the quiet period runs.
+    let stopped: Vec<NodeId> = peers
+        .iter()
+        .copied()
+        .filter(|id| {
+            sim.node(*id)
+                .and_then(Member::server)
+                .is_some_and(|server| !server.is_up())
+        })
+        .collect();
+    for id in stopped {
+        // A stopped server is up to the simulator: crash it first.
+        match sim.crash(id) {
+            Ok(()) | Err(NodeError::AlreadyDown(_)) => {}
             Err(error) => return Err(RunError::Node(error)),
         }
+        sim.restart(id).map_err(RunError::Node)?;
     }
+    sim.run_for(case.quiet).map_err(RunError::Sim)?;
     let recorded = recorder.borrow();
     Ok(Outcome {
         safety: check::all(&recorded.observations, &recorded.history, case.servers),

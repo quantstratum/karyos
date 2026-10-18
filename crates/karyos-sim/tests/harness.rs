@@ -760,3 +760,33 @@ fn responses_round_trip_in_canonical_bytes() {
     assert_eq!(Ret::decode(&[0, 1]), None);
     assert_eq!(Ret::decode(&[1, 9, 0, 0, 0]), None);
 }
+
+#[test]
+fn a_server_stopped_by_its_disk_is_verified_at_its_restart() {
+    // Node 2's disk crashes at an operation inside a duty: the drive
+    // error stops the node while it is up. Its entries stay unverified
+    // until a restart reopens its log.
+    for budget in [30, 45] {
+        for seed in scenarios::seeds() {
+            let disks = vec![SimDisk::new(), SimDisk::new(), SimDisk::with_budget(budget)];
+            let (mut sim, recorder, _) = fresh(seed, disks, appends(6));
+            sim.run_for(300).unwrap();
+            assert!(
+                count(&recorder, |o| matches!(
+                    o,
+                    Observation::OpenFailed { node: 2, .. }
+                )) > 0,
+                "budget {budget} seed {seed}: the disk did not stop node 2"
+            );
+            assert_eq!(
+                check::durable_kept(&recorder.borrow().observations),
+                Err(Violation::Unverified { node: 2 }),
+                "budget {budget} seed {seed}"
+            );
+            sim.crash(2).unwrap();
+            sim.restart(2).unwrap();
+            sim.run_for(100).unwrap();
+            all_checks(&recorder, 3);
+        }
+    }
+}

@@ -305,9 +305,11 @@ pub fn durable_majority_before_reply(
 
 /// A restarted server's reopened log holds every entry it held durably
 /// before the crash, and no server truncates an entry the cluster applied.
-/// A crashed server whose log then fails to open lost what it held; one
-/// still down at the end leaves what it held unverified, so a run should
-/// restart every crashed server before its checks.
+/// A server is down from its crash, or from a drive error that stopped it
+/// while up, to its next reopened log. A down server whose log then fails
+/// to open lost what it held; one still down at the end leaves what it
+/// held unverified, so a run should restart every crashed or stopped
+/// server before its checks.
 ///
 /// # Errors
 ///
@@ -330,6 +332,11 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
                         term: *term,
                     });
                 }
+            }
+            // A drive error stops a server that is up: what it held waits
+            // for its restart, as after a crash.
+            Observation::OpenFailed { node, .. } | Observation::Contract { node, .. } => {
+                let _ = down.insert(*node);
             }
             Observation::Applied { entry, .. } => {
                 let _ = applied.insert(entry.index, entry.term);
