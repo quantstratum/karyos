@@ -1723,6 +1723,7 @@ fn a_guard_closed_publication_ends_its_image_at_liveness() {
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
             rate: None,
+            frontier: Default::default(),
         }),
         ..Setup::default()
     });
@@ -4126,6 +4127,7 @@ fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
             rate: None,
+            frontier: Default::default(),
         }),
         ..Setup::default()
     });
@@ -4252,6 +4254,7 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
             rate: None,
+            frontier: Default::default(),
         }),
         ..Setup::default()
     });

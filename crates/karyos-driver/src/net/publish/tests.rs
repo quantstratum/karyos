@@ -1145,3 +1145,54 @@ fn a_reopened_guarded_network_publication_is_refused_a_fresh_incarnation() {
         Err(DriverError::NetworkReincarnation { .. })
     ));
 }
+
+/// Records plan v2: a network close supersedes a guarded publication's
+/// gate, which never runs again. What it never staged never left: each
+/// message is `Aborted` with `DRIVER_SHUTDOWN`, not `Submitted` at commit.
+#[test]
+fn a_network_close_aborts_what_the_gate_never_staged() {
+    use karyos_client::OfferOutcome;
+    use karyos_sys::outcome_ring::Kind;
+
+    use crate::guard_streams::REASON_DRIVER_SHUTDOWN;
+    use crate::net::NetworkGuard;
+
+    let mut driver = driver();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    // Spare slots for the sender's reservation and the guard's walker.
+    let mut config = aggregate(10, 1);
+    config.stream.buffer.spare_slots = 4;
+    let handle = driver
+        .add_guarded_network_publication(
+            config,
+            &channel(destination),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    let mut lane = driver
+        .publication(handle.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    for value in [b"a", b"b"] {
+        assert!(matches!(
+            lane.offer(value).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    // Before any sender cycle: the gate never staged them.
+    let _ = driver.close_network().unwrap();
+    let mut records = Vec::new();
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+        let _ = lane
+            .poll_outcomes(8, |_, record| records.push((record.kind, record.reason)))
+            .unwrap();
+    }
+    let aborted = (Kind::Aborted, REASON_DRIVER_SHUTDOWN);
+    assert_eq!(records, [aborted, aborted]);
+}

@@ -169,6 +169,7 @@ impl Fixture {
                         token,
                         length: u64::from(FRAME),
                         messages: 1,
+                        start: end - u64::from(FRAME),
                         end,
                     },
                 )

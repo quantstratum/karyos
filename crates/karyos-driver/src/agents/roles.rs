@@ -4626,6 +4626,11 @@ impl<T: StreamTerms> SenderRole<T> {
             .iter()
             .position(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
             .map(|index| self.publications.swap_remove(index));
+        // Drained or given up, its gate decides nothing more: the walker
+        // records what never left.
+        if let Some(outbound) = outbound.as_deref_mut() {
+            outbound.finish_removed();
+        }
         // Every path's SETUP side and bindings go with it.
         match outbound.as_deref() {
             Some(outbound) => {

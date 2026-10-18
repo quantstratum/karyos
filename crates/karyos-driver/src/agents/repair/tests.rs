@@ -427,6 +427,7 @@ fn a_guard_close_stops_every_submission() {
                 cell: Arc::clone(&cell),
                 epoch: 2,
                 rate: None,
+                frontier: Default::default(),
             },
             0,
         )
@@ -545,6 +546,7 @@ fn guarded(
                 cell: Arc::clone(&cell),
                 epoch: 2,
                 rate: None,
+                frontier: Default::default(),
             },
             0,
         )
@@ -643,6 +645,7 @@ fn guard_spec(
             cell: Arc::clone(&cell),
             epoch: 2,
             rate,
+            frontier: Default::default(),
         },
         cell,
     )
