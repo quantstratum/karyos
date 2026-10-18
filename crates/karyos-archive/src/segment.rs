@@ -32,6 +32,12 @@
 //!   equals `written` afterwards. A write the index does not cover was
 //!   never `written`, so a torn write is never read back. The data file is
 //!   shortened to `written`, so no stale byte past it lingers.
+//! - **Verification.** [`SegmentStore::verify`] reports what recovery
+//!   would do, as a [`RecoveryPlan`] (the kept segment and extent, the
+//!   cut, the segments removed and why), without changing anything: it
+//!   lists, opens for reading and reads. `recover` applies the same scan's
+//!   plan, so the two never disagree; a refusal is the same error from
+//!   both.
 //! - **Truncation.** [`SegmentStore::truncate`] cuts the recording at the
 //!   end of a write: it syncs everything, writes an invalid entry right
 //!   after the last write kept and syncs it (from then on recovery cuts
@@ -40,13 +46,16 @@
 //!   A crash inside recovers either as before or at the cut.
 //! - **Headers.** Only the last segment can be one being created, and
 //!   recovery removes it: its index header is missing, short or zeroed, or
-//!   torn (failing its CRC) with no data and no entry behind it. Creation
-//!   makes the header durable before any write, so a torn header with
-//!   data or entries behind it is corruption. Any other bad header is a
-//!   typed error that removes nothing: one missing or torn before the last
-//!   segment, a corrupt one, one of another format version, one naming
-//!   another recording or geometry, or one whose start is outside its
-//!   segment.
+//!   torn (failing its CRC) with no data and no entry behind it; or its
+//!   header is valid with no entry and no data file, since a crash can
+//!   keep the index's directory entry and lose the data file's (the
+//!   creation gap). Creation makes the header durable before any write, so
+//!   a torn header with data or entries behind it is corruption. Any other
+//!   bad header is a typed error that removes nothing: one missing or torn
+//!   before the last segment, a data file missing before the last segment
+//!   or under entries, a corrupt one, one of another format version, one
+//!   naming another recording or geometry, or one whose start is outside
+//!   its segment.
 //!
 //! - **Kinds.** An index entry covers data, a fill or a gap (byte 16 of
 //!   the entry; zero, data, in every entry of the first version). A fill
@@ -238,6 +247,65 @@ pub struct Cut {
     pub reason: CutReason,
 }
 
+/// Why recovery removes a segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// It lies after the cut: nothing continues the recording.
+    AfterCut,
+    /// The last segment, being created: its index header is missing or
+    /// torn, with no data and no entry behind it.
+    Creating,
+    /// The last segment, its creation cut short: a valid index header, no
+    /// entry, and no data file (its directory entry did not survive).
+    CreationGap,
+    /// It does not start where the previous segment ends.
+    NotContiguous,
+}
+
+/// A segment recovery removes, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedSegment {
+    /// The segment's base position.
+    pub base: u64,
+    /// Why it is removed.
+    pub reason: DropReason,
+}
+
+/// The newest segment recovery keeps, and the recording's extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeptSegment {
+    /// The segment's base position.
+    pub base: u64,
+    /// The recording's start.
+    pub start: u64,
+    /// The end of the last write kept: the store's `written` and
+    /// `durable` after recovery.
+    pub written: u64,
+    /// The index entries it keeps.
+    pub entries: u64,
+    /// The length its index is cut to, when the cut lies in it.
+    pub index_length: Option<u64>,
+    /// The length its data file is shortened to, when bytes lie past
+    /// `written`.
+    pub data_length: Option<u64>,
+}
+
+/// What recovery does to a recording, computed by
+/// [`SegmentStore::verify`] without changing anything, and applied by
+/// [`SegmentStore::recover`], which is built on the same scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPlan {
+    /// The segment kept as the newest; `None` when no segment has a valid
+    /// header, and recovery then removes every segment and returns
+    /// [`SegmentError::NotFound`].
+    pub kept: Option<KeptSegment>,
+    /// Where the recording is cut, if it is.
+    pub cut: Option<Cut>,
+    /// The segments removed, in order.
+    pub dropped: Vec<DroppedSegment>,
+    gaps: Vec<(u64, u64)>,
+}
+
 /// The segment store's errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SegmentError {
@@ -338,7 +406,8 @@ pub enum SegmentError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderProblem {
     /// Missing, short, zeroed or torn, before the last segment; or a data
-    /// file missing under its index.
+    /// file missing under its index, before the last segment or with
+    /// entries.
     Incomplete,
     /// Torn (failing its CRC) with data or entries behind it: written and
     /// made durable at creation, then damaged.
@@ -1311,13 +1380,16 @@ impl<D: Disk> SegmentStore<D> {
 
     /// Recovers recording `recording` in `dir` after a crash or a close:
     /// keeps every whole, checked write in order, cuts at the first that
-    /// is not, removes later segments, and makes what it kept durable.
+    /// is not, removes later segments, and makes what it kept durable. It
+    /// applies the plan [`SegmentStore::verify`] reports.
     ///
     /// # Errors
     ///
     /// [`SegmentError::NotFound`] when no segment has a valid header (the
-    /// recording's creation did not complete; its files are removed), and
-    /// the operating system's errors.
+    /// recording's creation did not complete; its files are removed),
+    /// [`SegmentError::BadHeader`] and the other refusals of
+    /// [`SegmentStore::verify`], which remove nothing, and the operating
+    /// system's errors.
     pub fn recover(
         mut disk: D,
         dir: &Path,
@@ -1325,58 +1397,25 @@ impl<D: Disk> SegmentStore<D> {
         geometry: Geometry,
         policy: SyncPolicy,
     ) -> Result<Recovered<D>, SegmentError> {
-        let bases = bases(recording, &disk.list(dir)?);
-        let mut scan = Scan {
-            start: None,
-            written: None,
-            cut: None,
-            kept: None,
-            dropped: 0,
-            gaps: Vec::new(),
-        };
-        let last = bases.last().copied();
-        for base in bases {
-            // After a cut nothing continues the recording.
-            if scan.cut.is_some() {
-                remove_segment(&mut disk, dir, recording, base)?;
-                scan.dropped = scan
-                    .dropped
-                    .checked_add(1)
-                    .ok_or(SegmentError::PositionOverflow)?;
-                continue;
-            }
-            let is_last = Some(base) == last;
-            match scan_segment(
-                &mut disk, dir, recording, geometry, base, is_last, &mut scan,
-            )? {
-                Some(kept) => {
-                    // The previous kept segment is finished; this one is the
-                    // newest.
-                    scan.kept = Some(kept);
-                }
-                None => {
-                    remove_segment(&mut disk, dir, recording, base)?;
-                    scan.dropped = scan
-                        .dropped
-                        .checked_add(1)
-                        .ok_or(SegmentError::PositionOverflow)?;
-                }
-            }
+        let (plan, files) = scan_recording(&mut disk, dir, recording, geometry, Access::Write)?;
+        if let (Some(kept), Some((_, index))) = (plan.kept, &files)
+            && let Some(length) = kept.index_length
+        {
+            disk.set_len(index, length)?;
         }
-        let (Some(start), Some(kept)) = (scan.start, scan.kept) else {
+        for dropped in &plan.dropped {
+            remove_segment(&mut disk, dir, recording, dropped.base)?;
+        }
+        let (Some(kept), Some((data, index))) = (plan.kept, files) else {
             return Err(SegmentError::NotFound { recording });
         };
-        let written = scan.written.unwrap_or(start);
         // What lies beyond the kept writes is never read; dropping it keeps
         // the file's length at its written end.
-        let length = written
-            .checked_sub(kept.base)
-            .ok_or(SegmentError::PositionOverflow)?;
-        if disk.len(&kept.data)? > length {
-            disk.set_len(&kept.data, length)?;
+        if let Some(length) = kept.data_length {
+            disk.set_len(&data, length)?;
         }
-        disk.sync(&kept.data)?;
-        disk.sync(&kept.index)?;
+        disk.sync(&data)?;
+        disk.sync(&index)?;
         disk.sync_dir(dir)?;
         let store = Self {
             disk,
@@ -1384,17 +1423,17 @@ impl<D: Disk> SegmentStore<D> {
             recording,
             geometry,
             policy,
-            start,
-            written,
-            durable: written,
+            start: kept.start,
+            written: kept.written,
+            durable: kept.written,
             current: Some(Open {
                 base: kept.base,
-                data: kept.data,
-                index: kept.index,
+                data,
+                index,
                 entries: kept.entries,
                 dirty: false,
             }),
-            gaps: scan.gaps,
+            gaps: plan.gaps,
             finished: Vec::new(),
             unsynced_behind: None,
             last_sync_ns: 0,
@@ -1406,10 +1445,111 @@ impl<D: Disk> SegmentStore<D> {
         };
         Ok(Recovered {
             store,
-            cut: scan.cut,
-            dropped_segments: scan.dropped,
+            cut: plan.cut,
+            dropped_segments: u32::try_from(plan.dropped.len())
+                .map_err(|_| SegmentError::PositionOverflow)?,
         })
     }
+
+    /// Reports what [`SegmentStore::recover`] would do to recording
+    /// `recording` in `dir`, changing nothing: it only lists the directory,
+    /// opens files for reading and reads them, so it runs on a read-only
+    /// directory too. `recover` applies the same scan, so the two agree.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`SegmentStore::recover`] other than
+    /// [`SegmentError::NotFound`], which is a plan with no kept segment,
+    /// and the operating system's errors.
+    pub fn verify(
+        mut disk: D,
+        dir: &Path,
+        recording: u64,
+        geometry: Geometry,
+    ) -> Result<RecoveryPlan, SegmentError> {
+        scan_recording(&mut disk, dir, recording, geometry, Access::Read).map(|(plan, _)| plan)
+    }
+}
+
+/// How a scan opens the files it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// For reading only: a verification.
+    Read,
+    /// For reading and writing: a recovery, which then applies the plan.
+    Write,
+}
+
+/// The kept segment's data and index files.
+type KeptFiles<D> = (<D as Disk>::File, <D as Disk>::File);
+
+/// Scans recording `recording`'s segments in order, changing nothing:
+/// the plan, and the kept segment's data and index files.
+fn scan_recording<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    recording: u64,
+    geometry: Geometry,
+    access: Access,
+) -> Result<(RecoveryPlan, Option<KeptFiles<D>>), SegmentError> {
+    let bases = bases(recording, &disk.list(dir)?);
+    let mut scan = Scan {
+        start: None,
+        written: None,
+        cut: None,
+        kept: None,
+        dropped: Vec::new(),
+        gaps: Vec::new(),
+    };
+    let last = bases.last().copied();
+    for base in bases {
+        // After a cut nothing continues the recording.
+        if scan.cut.is_some() {
+            scan.dropped.push(DroppedSegment {
+                base,
+                reason: DropReason::AfterCut,
+            });
+            continue;
+        }
+        let is_last = Some(base) == last;
+        match scan_segment(
+            disk, dir, recording, geometry, base, is_last, access, &mut scan,
+        )? {
+            // The previous kept segment is finished; this one is the newest.
+            Ok(kept) => scan.kept = Some(kept),
+            Err(reason) => scan.dropped.push(DroppedSegment { base, reason }),
+        }
+    }
+    let (kept, files) = match (scan.start, scan.kept) {
+        (Some(start), Some(kept)) => {
+            let written = scan.written.unwrap_or(start);
+            let length = written
+                .checked_sub(kept.base)
+                .ok_or(SegmentError::PositionOverflow)?;
+            let data_length = (disk.len(&kept.data)? > length).then_some(length);
+            (
+                Some(KeptSegment {
+                    base: kept.base,
+                    start,
+                    written,
+                    entries: kept.entries,
+                    index_length: kept.index_length,
+                    data_length,
+                }),
+                Some((kept.data, kept.index)),
+            )
+        }
+        _ => (None, None),
+    };
+    Ok((
+        RecoveryPlan {
+            kept,
+            cut: scan.cut,
+            dropped: scan.dropped,
+            gaps: scan.gaps,
+        },
+        files,
+    ))
 }
 
 /// A segment recovery keeps.
@@ -1419,6 +1559,8 @@ struct Kept<F> {
     data: F,
     index: F,
     entries: u64,
+    /// The length its index is cut to, when the cut lies in it.
+    index_length: Option<u64>,
 }
 
 /// Recovery's progress over the segments, in order.
@@ -1428,7 +1570,7 @@ struct Scan<F> {
     written: Option<u64>,
     cut: Option<Cut>,
     kept: Option<Kept<F>>,
-    dropped: u32,
+    dropped: Vec<DroppedSegment>,
     gaps: Vec<(u64, u64)>,
 }
 
@@ -1461,9 +1603,9 @@ fn remove_segment<D: Disk>(
     Ok(())
 }
 
-/// Scans the segment at `base`: `None` when it has no valid header (its
-/// creation did not complete), else the segment, with its index cut at
-/// the first entry that does not hold.
+/// Scans the segment at `base`, changing nothing: why it is removed, or
+/// the segment, with where its index is cut at the first entry that does
+/// not hold.
 #[allow(
     clippy::too_many_arguments,
     reason = "one segment of one recovery: its place and the scan's state"
@@ -1475,19 +1617,25 @@ fn scan_segment<D: Disk>(
     geometry: Geometry,
     base: u64,
     last: bool,
+    access: Access,
     scan: &mut Scan<D::File>,
-) -> Result<Option<Kept<D::File>>, SegmentError> {
+) -> Result<Result<Kept<D::File>, DropReason>, SegmentError> {
     let bad = |problem| SegmentError::BadHeader { base, problem };
     let data_path = dir.join(data_name(recording, base));
     let index_path = dir.join(index_name(recording, base));
-    // The data file is created before the index: an index alone is never a
-    // crash's leftover.
-    let data = match disk.open(&data_path) {
+    // The data file is created before the index, but a crash can keep the
+    // index's directory entry and lose the data file's: on the last
+    // segment with no entry, that is a creation cut short.
+    let open = |disk: &mut D, path: &Path| match access {
+        Access::Read => disk.open_read(path),
+        Access::Write => disk.open(path),
+    };
+    let data = match open(disk, &data_path) {
         Ok(data) => Some(data),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let index = match disk.open(&index_path) {
+    let index = match open(disk, &index_path) {
         Ok(index) => Some(index),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
@@ -1514,6 +1662,18 @@ fn scan_segment<D: Disk>(
     };
     let (header, data, index) = match (read, data, index) {
         (HeaderRead::Valid(header), Some(data), Some(index)) => (header, data, index),
+        // A creation cut short: the index's directory entry survived the
+        // crash, the data file's did not, and nothing was written. Only
+        // the last segment can be one; elsewhere the data file was lost.
+        (HeaderRead::Valid(_), None, Some(_)) if last && empty => {
+            if scan.start.is_some() && scan.written.is_some_and(|written| written != base) {
+                scan.cut = Some(Cut {
+                    position: scan.written.unwrap_or(base),
+                    reason: CutReason::NotContiguous,
+                });
+            }
+            return Ok(Err(DropReason::CreationGap));
+        }
         (HeaderRead::Valid(_), None, Some(_)) => return Err(bad(HeaderProblem::Incomplete)),
         (HeaderRead::Foreign, _, _) => return Err(bad(HeaderProblem::Foreign)),
         (HeaderRead::Torn, _, _) if !empty => return Err(bad(HeaderProblem::Corrupt)),
@@ -1528,7 +1688,7 @@ fn scan_segment<D: Disk>(
                     reason: CutReason::Header,
                 });
             }
-            return Ok(None);
+            return Ok(Err(DropReason::Creating));
         }
         _ => return Err(bad(HeaderProblem::Incomplete)),
     };
@@ -1560,7 +1720,7 @@ fn scan_segment<D: Disk>(
             position: next,
             reason: CutReason::NotContiguous,
         });
-        return Ok(None);
+        return Ok(Err(DropReason::NotContiguous));
     }
     let length = disk.len(&index)?;
     // An index shorter than its header holds no entry.
@@ -1638,19 +1798,20 @@ fn scan_segment<D: Disk>(
     if cut.is_none() && torn {
         cut = Some(CutReason::TornEntry);
     }
+    let mut index_length = None;
     if let Some(reason) = cut {
-        let keep = entry_offset(kept).ok_or(SegmentError::PositionOverflow)?;
-        disk.set_len(&index, keep)?;
+        index_length = Some(entry_offset(kept).ok_or(SegmentError::PositionOverflow)?);
         scan.cut = Some(Cut {
             position: expected_start,
             reason,
         });
     }
     scan.written = Some(expected_start);
-    Ok(Some(Kept {
+    Ok(Ok(Kept {
         base,
         data,
         index,
         entries: kept,
+        index_length,
     }))
 }

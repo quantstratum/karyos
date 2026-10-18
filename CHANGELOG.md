@@ -11,6 +11,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-archive` recovery gains a dry run: `SegmentStore::verify`
+  returns a `RecoveryPlan` (the kept segment as a `KeptSegment`, the
+  `Cut`, and each removed segment as a `DroppedSegment` with its
+  `DropReason`) and changes nothing on disk. `SegmentStore::recover`
+  applies the same scan's plan, so the two agree. A last segment with a
+  valid index header, no entry and no data file (its creation cut short
+  by a crash that kept only the index's directory entry) is now removed,
+  as `DropReason::CreationGap`, instead of refused with
+  `BadHeader { Incomplete }`; before the last segment it is still
+  refused.
 - A remote client's registrations are capped at `max_exports_per_client`,
   as its ledger's grants were before. Every add that makes a
   registration counts: `AddPublication`, `AddConcurrentPublication`,

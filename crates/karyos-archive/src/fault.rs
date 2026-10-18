@@ -51,6 +51,17 @@ pub(crate) enum Survives {
     TornData,
 }
 
+/// The bytes under each name, by view, and the units spent.
+type Files = BTreeMap<PathBuf, Option<(Vec<u8>, Vec<u8>)>>;
+
+/// What [`FaultDisk::snapshot`] saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    names: Files,
+    durable_names: Files,
+    used: u64,
+}
+
 /// A shared handle on the in-memory disk.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FaultDisk(Rc<RefCell<Fs>>);
@@ -79,6 +90,30 @@ impl FaultDisk {
     /// Whether the budget ran out.
     pub(crate) fn has_crashed(&self) -> bool {
         self.0.borrow().crashed
+    }
+
+    /// Everything the disk holds: both views of every name with its
+    /// bytes, as the process sees them and as synced, and the units
+    /// spent. Two equal snapshots mean nothing changed in between.
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        let fs = self.0.borrow();
+        let files = |names: &BTreeMap<PathBuf, usize>| {
+            names
+                .iter()
+                .map(|(path, &inode)| {
+                    let bytes = fs
+                        .inodes
+                        .get(inode)
+                        .map(|inode| (inode.data.clone(), inode.synced.clone()));
+                    (path.clone(), bytes)
+                })
+                .collect()
+        };
+        Snapshot {
+            names: files(&fs.names),
+            durable_names: files(&fs.durable_names),
+            used: fs.used,
+        }
     }
 
     /// The disk a restart finds after the crash, under `survives`.
