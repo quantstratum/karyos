@@ -25,6 +25,7 @@
     reason = "tests, as ADR-0007 allows"
 )]
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -57,6 +58,9 @@ const DATA: i32 = 42;
 const REQUESTS: i32 = 100;
 const RESPONSES: i32 = 101;
 const TARGET: i32 = 200;
+/// This client's correlation ids: its own id in the high 32 bits, so they
+/// never collide with another requester's (§7a).
+const CLIENT: u64 = 0xC1 << 32;
 const INITIAL_TERM_ID: u32 = 7;
 /// Two terms below the term id wrap: a recording of three terms crosses
 /// it.
@@ -144,7 +148,8 @@ impl ArchiveHost for Host {
             format: StreamFormat {
                 lane: buffer.lane,
                 initial_term_id: buffer.initial_term_id.get().cast_signed(),
-                mtu: buffer.mtu,
+                mtu: NonZeroU32::new(buffer.mtu)
+                    .ok_or_else(|| HostRefusal("an mtu of 0".to_owned()))?,
                 source: SourceIncarnation {
                     driver: identity.driver,
                     registration: identity.registration,
@@ -169,17 +174,22 @@ impl ArchiveHost for Host {
                 session_id: self.next_session,
                 term_length: recording.geometry.term_length(),
                 initial_term_id: recording.format.initial_term_id,
-                mtu: recording.format.mtu,
+                mtu: recording.format.mtu.get(),
                 join: from,
                 lane: recording.format.lane,
                 source_stream_id: recording.stream_id,
                 source_session_id: recording.session_id,
             })
             .map_err(|error| HostRefusal(error.to_string()))?;
-        let reader = self
-            .driver
-            .subscribe_aggregate(&handle, Role::Required)
-            .map_err(|error| HostRefusal(error.to_string()))?;
+        let reader = match self.driver.subscribe_aggregate(&handle, Role::Required) {
+            Ok(reader) => reader,
+            Err(error) => {
+                // Nothing was written, so ending the replay at `to` retires
+                // the target (ImageRetired) rather than leave it open.
+                let _ = self.driver.finish_replay(handle, feed, to);
+                return Err(HostRefusal(error.to_string()));
+            }
+        };
         self.targets.push(reader);
         Ok(Box::new(Sink {
             feed: Some(feed),
@@ -332,15 +342,22 @@ impl Rig {
         }
     }
 
-    /// The next `count` answers and signals, as bytes.
-    fn answers(&mut self, count: usize) -> Vec<Vec<u8>> {
+    /// The next `count` messages for the request `correlation_id`, as
+    /// bytes: as archive-control-codec.md §7a has a requester read the
+    /// shared response stream, it keeps its own answers and the signals for
+    /// every reader (correlation id 0), and skips the rest.
+    fn answers(&mut self, correlation_id: u64, count: usize) -> Vec<Vec<u8>> {
         let start = Instant::now();
         let mut answers = Vec::new();
         while answers.len() < count {
             assert!(start.elapsed() < Duration::from_secs(10), "no answer");
             self.cycle();
             let _ = self.client.responses.poll(
-                |bytes, _| answers.push(bytes.to_vec()),
+                |bytes, _| {
+                    if [correlation_id, 0].contains(&correlation(bytes)) {
+                        answers.push(bytes.to_vec());
+                    }
+                },
                 MessageLimit::new(16),
             );
         }
@@ -352,6 +369,19 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A response's correlation id.
+fn correlation(bytes: &[u8]) -> u64 {
+    match ControlMessage::decode(bytes).unwrap() {
+        ControlMessage::ControlResponse(ControlResponse { correlation_id, .. })
+        | ControlMessage::RecordingDescriptor(control::RecordingDescriptor {
+            correlation_id,
+            ..
+        })
+        | ControlMessage::RecordingSignal(RecordingSignal { correlation_id, .. }) => correlation_id,
+        other => panic!("not a response: {other:?}"),
     }
 }
 
@@ -431,7 +461,7 @@ fn made_and_replayed(initial_term_id: u32) {
     let mut publication = rig.driver().publication(data).unwrap();
 
     rig.request(&ControlMessage::StartRecording(control::StartRecording {
-        correlation_id: 1,
+        correlation_id: CLIENT + 1,
         stream_id: DATA,
         session_id: 1,
         mode: Mode::Required,
@@ -439,11 +469,11 @@ fn made_and_replayed(initial_term_id: u32) {
         segment_length: 0,
         channel: "karyos:ipc",
     }));
-    let answers = rig.answers(2);
+    let answers = rig.answers(CLIENT + 1, 2);
     let started = response(&answers[0]);
     assert_eq!(
         (started.correlation_id, started.code),
-        (1, ResponseCode::Ok)
+        (CLIENT + 1, ResponseCode::Ok)
     );
     let recording_id = started.id;
     assert_eq!(signal(&answers[1]).signal, Signal::Started);
@@ -471,10 +501,10 @@ fn made_and_replayed(initial_term_id: u32) {
     }
 
     rig.request(&ControlMessage::StopRecording(control::StopRecording {
-        correlation_id: 2,
+        correlation_id: CLIENT + 2,
         recording_id,
     }));
-    let answers = rig.answers(2);
+    let answers = rig.answers(CLIENT + 2, 2);
     assert_eq!(response(&answers[0]).code, ResponseCode::Ok);
     let stopped = signal(&answers[1]);
     assert!(matches!(
@@ -504,8 +534,8 @@ fn made_and_replayed(initial_term_id: u32) {
     expected.retain(|(position, _)| *position < end);
 
     // The whole recording.
-    rig.request(&replay(3, recording_id, 0, u64::MAX));
-    let answers = rig.answers(1);
+    rig.request(&replay(CLIENT + 3, recording_id, 0, u64::MAX));
+    let answers = rig.answers(CLIENT + 3, 1);
     assert_eq!(response(&answers[0]).code, ResponseCode::Ok);
     let (messages, lane_end, clean) = read_target(&mut rig);
     assert_eq!(messages.len(), expected.len());
@@ -521,8 +551,8 @@ fn made_and_replayed(initial_term_id: u32) {
 
     // The second term only: it starts and ends at term boundaries.
     let term = u64::from(MIN_TERM_LENGTH);
-    rig.request(&replay(4, recording_id, term, term));
-    let answers = rig.answers(1);
+    rig.request(&replay(CLIENT + 4, recording_id, term, term));
+    let answers = rig.answers(CLIENT + 4, 1);
     assert_eq!(response(&answers[0]).code, ResponseCode::Ok);
     let (messages, lane_end, clean) = read_target(&mut rig);
     assert!(!messages.is_empty());
@@ -546,8 +576,8 @@ fn made_and_replayed(initial_term_id: u32) {
     assert!(clean);
 
     // A range past the recording's end is refused.
-    rig.request(&replay(5, recording_id, 0, end + term));
-    let answers = rig.answers(1);
+    rig.request(&replay(CLIENT + 5, recording_id, 0, end + term));
+    let answers = rig.answers(CLIENT + 5, 1);
     assert_eq!(response(&answers[0]).code, ResponseCode::InvalidRequest);
     drop(witness);
     drop(publication);

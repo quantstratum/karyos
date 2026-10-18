@@ -168,7 +168,7 @@ pub struct StreamFormat {
     /// The stream's initial term id.
     pub initial_term_id: i32,
     /// The stream's mtu: its largest frame.
-    pub mtu: u32,
+    pub mtu: core::num::NonZeroU32,
     /// The source's incarnation, which a live merge matches (SPEC §8.2).
     pub source: SourceIncarnation,
 }
@@ -418,7 +418,7 @@ impl Record {
                 payload.bytes(&interval.to_le_bytes());
                 payload.bytes(&[recording.format.lane.get()]);
                 payload.bytes(&recording.format.initial_term_id.to_le_bytes());
-                payload.bytes(&recording.format.mtu.to_le_bytes());
+                payload.bytes(&recording.format.mtu.get().to_le_bytes());
                 let source = recording.format.source;
                 for word in [
                     source.driver[0],
@@ -476,7 +476,7 @@ impl Record {
                 let format = StreamFormat {
                     lane: Lane::try_new(input.u8()?).ok()?,
                     initial_term_id: input.i32()?,
-                    mtu: input.u32()?,
+                    mtu: core::num::NonZeroU32::new(input.u32()?)?,
                     source: SourceIncarnation {
                         driver: [input.u64()?, input.u64()?],
                         registration: input.u64()?,

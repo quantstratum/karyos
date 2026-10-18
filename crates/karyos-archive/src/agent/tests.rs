@@ -107,7 +107,7 @@ fn format() -> crate::catalog::StreamFormat {
     crate::catalog::StreamFormat {
         lane: karyos_sys::frame::Lane::ZERO,
         initial_term_id: 0,
-        mtu: 1408,
+        mtu: core::num::NonZeroU32::new(1408).unwrap(),
         source: crate::catalog::SourceIncarnation {
             driver: [1, 2],
             registration: 3,
@@ -351,11 +351,13 @@ fn a_failed_store_is_left_to_settle() {
     gate.store(true, Ordering::Release);
     let event = agent.event(Duration::from_secs(5)).unwrap();
     std::fs::rename(&moved, &dir).unwrap();
+    // The whole first segment was written before the roll failed.
     assert_eq!(
         event,
         Event::Failed {
             id,
-            failure: Failure::Store
+            failure: Failure::Store,
+            position: 8192,
         }
     );
     assert!(matches!(
@@ -542,6 +544,17 @@ fn sealed_recording(agent: &ArchiveHandle) -> (u64, Vec<u8>) {
     (id, all)
 }
 
+/// The next replay that ended, waiting up to five seconds.
+fn replay_ended(agent: &ArchiveHandle) -> ReplayEnded {
+    for _ in 0..5000 {
+        if let Some(ended) = agent.try_replay_ended() {
+            return ended;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("no replay ended");
+}
+
 fn replay_of(recording_id: u64, to: u64, sink: Sink) -> StartReplay {
     StartReplay {
         recording_id,
@@ -574,8 +587,8 @@ fn a_recording_replays_into_its_sink() {
             ))
             .unwrap();
         assert_eq!(
-            agent.event(Duration::from_secs(5)).unwrap(),
-            Event::ReplayEnded {
+            replay_ended(&agent),
+            ReplayEnded {
                 id,
                 position: end,
                 outcome: ReplayOutcome::Complete
@@ -616,6 +629,7 @@ fn a_replay_stops_by_command_or_when_its_sink_closes() {
         Err(AgentError::Unknown { .. })
     ));
     assert_eq!(agent.try_event(), None);
+    assert_eq!(agent.try_replay_ended(), None);
 
     let seen = Arc::default();
     let closed = Sink {
@@ -624,8 +638,8 @@ fn a_replay_stops_by_command_or_when_its_sink_closes() {
     };
     let id = agent.replay(replay_of(recording, end, closed)).unwrap();
     assert_eq!(
-        agent.event(Duration::from_secs(5)).unwrap(),
-        Event::ReplayEnded {
+        replay_ended(&agent),
+        ReplayEnded {
             id,
             position: 0,
             outcome: ReplayOutcome::Failed
@@ -685,5 +699,266 @@ fn replays_are_refused_described_and_shut_down() {
     agent.replay(replay_of(recording, end, sink)).unwrap();
     agent.shutdown().unwrap();
     assert_eq!(seen.lock().unwrap().finished, Some((0, false)));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A posted command's answer, waiting up to five seconds.
+fn answer<T>(posted: Result<Posted<T>, AgentError>) -> Result<T, AgentError> {
+    let posted = posted.unwrap();
+    for _ in 0..5000 {
+        if let Some(answer) = posted.try_answer() {
+            return answer;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("no answer");
+}
+
+/// #387 review P2: recordings and replays at once are capped. A start or a
+/// replay past the cap is refused, typed and counted, and a refused
+/// replay's sink is finished; a prepared replay counts.
+#[test]
+fn recordings_and_replays_are_capped() {
+    let dir = temp_dir("caps");
+    let config = AgentConfig {
+        max_recordings: 1,
+        max_replays: 1,
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    // Ended: no longer counted.
+    let (recording, all) = sealed_recording(&agent);
+    let end = all.len() as u64;
+    let open = agent.start(start(Chunks::default())).unwrap();
+    assert!(matches!(
+        agent.start(start(Chunks::default())),
+        Err(AgentError::Full {
+            what: "recordings",
+            max: 1
+        })
+    ));
+    assert_eq!(agent.refused(), 1);
+    // A replay that waits for room holds the one slot.
+    let seen = Arc::default();
+    let sink = Sink::new(&seen);
+    sink.open.store(false, Ordering::Release);
+    let running = agent.replay(replay_of(recording, end, sink)).unwrap();
+    let refused = Arc::default();
+    assert!(matches!(
+        agent.replay(replay_of(recording, end, Sink::new(&refused))),
+        Err(AgentError::Full {
+            what: "replays",
+            max: 1
+        })
+    ));
+    assert_eq!(refused.lock().unwrap().finished, Some((0, false)));
+    agent.stop_replay(running).unwrap();
+    let prepare = PrepareReplay {
+        recording_id: recording,
+        position: 0,
+        length: u64::MAX,
+        rate: Rate::Full,
+    };
+    answer(agent.post_prepare_replay(prepare)).unwrap();
+    assert!(matches!(
+        answer(agent.post_prepare_replay(prepare)),
+        Err(AgentError::Full { .. })
+    ));
+    assert_eq!(agent.refused(), 3);
+    agent.stop(open).unwrap();
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// #387 review P2: a replay is prepared before any target exists. Its range
+/// is checked against the recording's start, its end and its index; a
+/// prepared replay runs once its sink is attached, and is dropped when
+/// stopped, after which a sink attached to it is finished.
+#[test]
+fn a_replay_is_prepared_then_attached() {
+    let dir = temp_dir("prepare");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    let (recording, all) = sealed_recording(&agent);
+    let end = all.len() as u64;
+    let prepare = |recording_id, position, length| PrepareReplay {
+        recording_id,
+        position,
+        length,
+        rate: Rate::Full,
+    };
+    for (position, length) in [(32, 96), (0, end + 96), (end, u64::MAX), (0, 0)] {
+        let refused = answer(agent.post_prepare_replay(prepare(recording, position, length)));
+        assert!(
+            matches!(
+                refused,
+                Err(AgentError::Replay(
+                    ReplayError::NotAFrameBoundary { .. } | ReplayError::OutOfRange { .. }
+                ))
+            ),
+            "{position}, {length}: {refused:?}"
+        );
+    }
+    assert!(matches!(
+        answer(agent.post_prepare_replay(prepare(recording + 1, 0, 96))),
+        Err(AgentError::Unknown { .. })
+    ));
+    // A recording that starts at 192 has nothing below it.
+    let later = agent
+        .start(start(Chunks {
+            position: 192,
+            chunks: vec![frames(1, 9)].into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    assert!(matches!(
+        answer(agent.post_prepare_replay(prepare(later, 96, 192))),
+        Err(AgentError::Replay(ReplayError::OutOfRange { .. }))
+    ));
+    let prepared = answer(agent.post_prepare_replay(prepare(recording, 0, u64::MAX))).unwrap();
+    assert_eq!(
+        (prepared.recording.id, prepared.from, prepared.to),
+        (recording, 0, end)
+    );
+    let seen = Arc::default();
+    let id = answer(agent.post_attach_replay(prepared.replay_id, 0, Box::new(Sink::new(&seen))))
+        .unwrap();
+    assert_eq!(id, prepared.replay_id);
+    assert_eq!(
+        replay_ended(&agent),
+        ReplayEnded {
+            id,
+            position: end,
+            outcome: ReplayOutcome::Complete
+        }
+    );
+    assert_eq!(seen.lock().unwrap().bytes, all);
+    let prepared = answer(agent.post_prepare_replay(prepare(recording, 192, 192))).unwrap();
+    assert_eq!(prepared.to, 384);
+    assert_eq!(
+        answer(agent.post_stop_replay(prepared.replay_id)).unwrap(),
+        192
+    );
+    let seen = Arc::default();
+    assert!(matches!(
+        answer(agent.post_attach_replay(prepared.replay_id, 192, Box::new(Sink::new(&seen)))),
+        Err(AgentError::Unknown { .. })
+    ));
+    assert_eq!(seen.lock().unwrap().finished, Some((192, false)));
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A sink that logs its tag for each step it takes, once `open`.
+struct Tagged {
+    tag: char,
+    log: Arc<std::sync::Mutex<Vec<char>>>,
+    open: Arc<AtomicBool>,
+}
+
+impl Tagged {
+    fn take(&mut self) -> Result<bool, SinkClosed> {
+        if !self.open.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.log.lock().unwrap().push(self.tag);
+        Ok(true)
+    }
+}
+
+impl ReplaySink for Tagged {
+    fn frames(&mut self, _position: u64, _bytes: &[u8]) -> Result<bool, SinkClosed> {
+        self.take()
+    }
+
+    fn fill(&mut self, _position: u64, _record: &[u8], _extent: u32) -> Result<bool, SinkClosed> {
+        self.take()
+    }
+
+    fn gap(&mut self, _from: u64, _to: u64) -> Result<bool, SinkClosed> {
+        self.take()
+    }
+
+    fn finish(&mut self, _end: u64, _complete: bool) {}
+}
+
+/// #387 review P2: the replays share one budget per cycle, in turn. With
+/// room for one step a cycle, two replays alternate, step for step.
+#[test]
+fn replays_share_a_budget_in_turn() {
+    let dir = temp_dir("share");
+    let config = AgentConfig {
+        replay_budget: 1,
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    let (recording, all) = sealed_recording(&agent);
+    let end = all.len() as u64;
+    let log = Arc::default();
+    let open = Arc::new(AtomicBool::new(false));
+    for tag in ['a', 'b'] {
+        agent
+            .replay(StartReplay {
+                recording_id: recording,
+                from: 0,
+                to: end,
+                rate: Rate::Full,
+                sink: Box::new(Tagged {
+                    tag,
+                    log: Arc::clone(&log),
+                    open: Arc::clone(&open),
+                }),
+            })
+            .unwrap();
+    }
+    open.store(true, Ordering::Release);
+    replay_ended(&agent);
+    replay_ended(&agent);
+    let log = log.lock().unwrap();
+    // Three entries each, taken one a cycle, by turns while both have one
+    // left. The cycle the sinks open in may give the second replay the
+    // first step and its turn next, so the turns are counted from the
+    // second step.
+    assert_eq!(log.len(), 6);
+    let both = ['a', 'b']
+        .iter()
+        .map(|tag| log.iter().rposition(|taken| taken == tag).unwrap())
+        .min()
+        .unwrap();
+    assert!(
+        log[1..=both].windows(2).all(|pair| pair[0] != pair[1]),
+        "{log:?}"
+    );
+    drop(log);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// #387 review P3: a recording whose store cannot be created is stopped
+/// empty at its start, never left open; the next one records.
+#[test]
+fn a_recording_whose_store_cannot_be_created_stops_empty() {
+    let dir = temp_dir("store-create");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    // Recording 1's first segment name is taken.
+    let taken = dir.join(format!("{:016x}-{:016x}.seg", 1, 0));
+    std::fs::create_dir(&taken).unwrap();
+    assert!(matches!(
+        agent.start(start(Chunks::default())),
+        Err(AgentError::Segment(_))
+    ));
+    let stop = agent.recordings().unwrap()[0].stop.unwrap();
+    assert_eq!((stop.position, stop.reason), (0, StopReason::Empty));
+    assert!(matches!(
+        agent.stop(1),
+        Err(AgentError::NotRecording { id: 1 })
+    ));
+    std::fs::remove_dir(&taken).unwrap();
+    assert_eq!(agent.start(start(Chunks::default())).unwrap(), 2);
+    agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }

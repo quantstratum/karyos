@@ -16,16 +16,28 @@ release may break APIs, wire formats and shared-memory layouts.
   `RequestSource`, serves them with the agent and answers on a
   `ResponseSink`, one request at a time and only once the last one's
   answers are out; a start is signalled with its request's correlation
-  id, a stop or failure with 0. What touches the driver stays with the
-  host behind `ArchiveHost`: a recorded lane's reader, and a replay's
-  target stream. The agent runs replays into the host's `ReplaySink`s,
+  id, a stop or failure with 0. It never blocks: it posts its commands
+  (`ArchiveHandle::post_start`, `post_stop`, `post_list`,
+  `post_prepare_replay`, `post_attach_replay`, `post_stop_replay`) and
+  answers when the agent's `Posted` answer arrives, in a later duty. What
+  touches the driver stays with the host behind `ArchiveHost`: a
+  recorded lane's reader, and a replay's target stream, opened only once
+  the agent prepared the replay and found its range readable. The agent
+  runs replays into the host's `ReplaySink`s, after its recorders and
+  within one shared budget per cycle (`AgentConfig::replay_budget`),
   taking a step back (`ReplaySource::hold`) when a sink has no room, and
   describes and stops them (`ArchiveHandle::describe`, `replay`,
-  `stop_replay`). The catalog becomes version 3: a recording's `Started`
-  keeps the recorded stream's lane, initial term id and mtu, which its
-  replays need, and the source's incarnation (`SourceIncarnation`: the
-  driver id, registration and incarnation of the publication recorded),
-  which a live merge matches (`StreamFormat`).
+  `stop_replay`). Recordings and replays at once are capped
+  (`max_recordings`, `max_replays`; `AgentError::Full`, counted by
+  `ArchiveHandle::refused`), and so are the server's waiting signals
+  (`ServerConfig`, `dropped_signals`). A replay's end comes on its own
+  queue (`ArchiveHandle::try_replay_ended`), and `Event::Failed` carries
+  the position written. The catalog becomes version 3: a recording's
+  `Started` keeps the recorded stream's lane, initial term id and mtu
+  (nonzero), which its replays need, and the source's incarnation
+  (`SourceIncarnation`: the driver id, registration and incarnation of
+  the publication recorded), which a live merge matches
+  (`StreamFormat`).
 - A guarded network publication's outcome records come from its sender
   gate's submissions, not from the commit (guards-and-abort.md, "Trusted
   sockets in Phase 2"). A message is `Submitted` once a backend took

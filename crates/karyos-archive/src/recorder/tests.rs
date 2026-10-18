@@ -329,7 +329,7 @@ fn settles_at_every_crash_point(policy: SyncPolicy) {
             format: crate::catalog::StreamFormat {
                 lane: karyos_sys::frame::Lane::ZERO,
                 initial_term_id: 0,
-                mtu: 1408,
+                mtu: core::num::NonZeroU32::new(1408).unwrap(),
                 source: crate::catalog::SourceIncarnation {
                     driver: [1, 2],
                     registration: 3,

@@ -43,7 +43,7 @@ fn format() -> StreamFormat {
     StreamFormat {
         lane: karyos_sys::frame::Lane::ZERO,
         initial_term_id: -3,
-        mtu: 1408,
+        mtu: core::num::NonZeroU32::new(1408).unwrap(),
         source: crate::catalog::SourceIncarnation {
             driver: [1, 2],
             registration: 3,
@@ -653,7 +653,7 @@ fn an_unknown_stop_reason_is_corrupt() {
 }
 
 /// A recording's stream format survives a reopen, for its replays; a
-/// `Started` naming a lane no stream has is corrupt.
+/// `Started` naming a lane no stream has, or an mtu of 0, is corrupt.
 #[test]
 fn the_stream_format_is_kept() {
     let disk = FaultDisk::default();
@@ -663,7 +663,7 @@ fn the_stream_format_is_kept() {
     let format = StreamFormat {
         lane,
         initial_term_id: i32::MIN,
-        mtu: 9000,
+        mtu: core::num::NonZeroU32::new(9000).unwrap(),
         source: crate::catalog::SourceIncarnation {
             driver: [1, 2],
             registration: 3,
@@ -704,4 +704,9 @@ fn the_stream_format_is_kept() {
     assert!(Record::decode(STARTED, &payload).is_none());
     payload[lane_at - HEAD] = 3;
     assert!(Record::decode(STARTED, &payload).is_some());
+    // The initial term id (4) follows the lane, then the mtu.
+    let mtu_at = lane_at - HEAD + 1 + 4;
+    assert_eq!(payload[mtu_at..mtu_at + 4], 9000u32.to_le_bytes());
+    payload[mtu_at..mtu_at + 4].fill(0);
+    assert!(Record::decode(STARTED, &payload).is_none());
 }

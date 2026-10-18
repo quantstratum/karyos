@@ -76,7 +76,7 @@ fn format() -> StreamFormat {
     StreamFormat {
         lane: karyos_sys::frame::Lane::ZERO,
         initial_term_id: 7,
-        mtu: karyos_sys::sizing::DEFAULT_MTU,
+        mtu: core::num::NonZeroU32::new(karyos_sys::sizing::DEFAULT_MTU).unwrap(),
         source: karyos_archive::catalog::SourceIncarnation {
             driver: [1, 2],
             registration: 3,
@@ -247,7 +247,9 @@ fn seal_and_wait(
                 id: ended_id,
                 ended,
             }) if ended_id == id => return (ended, seal),
-            Some(Event::Failed { id, failure }) => panic!("recording {id} failed: {failure:?}"),
+            Some(Event::Failed { id, failure, .. }) => {
+                panic!("recording {id} failed: {failure:?}")
+            }
             _ => assert!(Instant::now() < deadline, "recording {id} never ended"),
         }
     }
