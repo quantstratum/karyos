@@ -1373,33 +1373,55 @@ fn an_agent_failure_mid_reincarnation_leaves_the_lane_sealed() {
     assert_eq!(driver.seal_reason(lane), Ok(Some(SealReason::GuardClosed)));
 }
 
-/// #396 review P2: a lane swapped to its next incarnation whose sender
-/// post was refused is `AwaitingSender`. A network close then leaves it
-/// refused, typed: no handle, so no offer is accepted and no `Submitted`
-/// record is written for a sender that will never read it.
-#[test]
-fn an_awaiting_sender_lane_is_refused_once_the_network_closed() {
-    const QUARANTINE: u64 = 50_000_000;
-    let mut driver = reincarnating_driver(QUARANTINE, 64);
-    let (_handle, _guard, _epoch, lane, _socket) = waiting_reincarnation(&mut driver);
-    driver.reincarnation_post_fault = true;
-    // Past the quarantine: the lanes are swapped, the post refused.
-    let mut refused = None;
-    until(&mut driver, |driver| match driver.publication(lane) {
-        Err(DriverError::QuarantinedAlias { .. }) => false,
-        other => {
-            refused = Some(other.map(drop));
-            true
-        }
+/// A reincarnation past its quarantine whose lanes are swapped
+/// (`AwaitingSender`) and whose sender add was refused: the receiver's
+/// ring is full, so its alias cannot be published.
+fn awaiting_sender(
+    driver: &mut EmbeddedDriver,
+) -> (AggregateHandle, crate::embedded::StreamHandle, UdpSocket) {
+    let (handle, _guard, _epoch, lane, socket) = waiting_reincarnation(driver);
+    until(driver, |driver| {
+        matches!(
+            driver
+                .net
+                .as_ref()
+                .unwrap()
+                .reincarnation(handle.registration()),
+            Ok(Some(crate::net::ReincarnationPhase::Ready {
+                swapped: false
+            }))
+        )
     });
-    assert_eq!(refused, Some(Err(DriverError::NetworkBusy)));
-    assert_eq!(driver.trace_identity(lane).unwrap().incarnation, 2);
+    while driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .receiver
+        .ping(1)
+        .is_ok()
+    {}
+    assert_eq!(
+        driver.publication(lane).map(drop),
+        Err(DriverError::NetworkBusy)
+    );
     assert_eq!(
         driver.stream_ref(lane).unwrap().network,
         crate::embedded::NetworkLane::AwaitingSender
     );
+    assert_eq!(driver.trace_identity(lane).unwrap().incarnation, 2);
+    (handle, lane, socket)
+}
+
+/// #396 review P2: a lane swapped to its next incarnation whose sender
+/// add was refused stays refused once the network closed: no handle, so
+/// no offer is accepted and no record written for a sender that will
+/// never read it.
+#[test]
+fn an_awaiting_sender_lane_is_refused_once_the_network_closed() {
+    let mut driver = reincarnating_driver(20_000_000, 64);
+    let (_handle, lane, _socket) = awaiting_sender(&mut driver);
     let _ = driver.close_network().unwrap();
-    driver.reincarnation_post_fault = false;
     for _ in 0..3 {
         let _ = driver.do_work().unwrap();
         assert_eq!(
@@ -1407,6 +1429,151 @@ fn an_awaiting_sender_lane_is_refused_once_the_network_closed() {
             Err(DriverError::NetworkUnavailable)
         );
     }
+}
+
+/// #396 re-check P2: an agent failure after the swap ends the
+/// reincarnation's record, so only the failed network refuses the lane,
+/// with the failure.
+#[test]
+fn an_awaiting_sender_lane_is_refused_once_an_agent_failed() {
+    let mut driver = reincarnating_driver(20_000_000, 64);
+    let (_handle, lane, _socket) = awaiting_sender(&mut driver);
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::Panic)
+        .unwrap();
+    assert!(matches!(
+        driver.do_work(),
+        Err(DriverError::NetworkAgent { .. })
+    ));
+    for _ in 0..3 {
+        let _ = driver.do_work();
+        let taken = driver.publication(lane).map(drop);
+        assert!(
+            matches!(taken, Err(DriverError::NetworkAgent { .. })),
+            "{taken:?}"
+        );
+    }
+}
+
+/// #396 re-check: a refused add after the swap is posted again by a later
+/// call once the ring has room, and the lane is sending.
+#[test]
+fn a_refused_add_after_the_swap_is_retried() {
+    let mut driver = reincarnating_driver(20_000_000, 64);
+    let (handle, lane, _socket) = awaiting_sender(&mut driver);
+    let mut taken = None;
+    until(&mut driver, |driver| match driver.publication(lane) {
+        Err(DriverError::NetworkBusy) => false,
+        other => {
+            taken = Some(other.map(drop));
+            true
+        }
+    });
+    assert_eq!(taken, Some(Ok(())));
+    assert_eq!(
+        driver.stream_ref(lane).unwrap().network,
+        crate::embedded::NetworkLane::Sending
+    );
+    let net = driver.net.as_ref().unwrap();
+    assert!(net.reincarnation(handle.registration()).unwrap().is_none());
+}
+
+/// #396 re-check: a closed or failed network refuses only lanes that
+/// would reincarnate: a network lane its guard never sealed still issues.
+#[test]
+fn a_live_network_lane_still_issues_after_a_close_or_a_failure() {
+    for fail in [false, true] {
+        let mut driver = reincarnating_driver(20_000_000, 64);
+        let socket = receiver();
+        let destination = Destination::Unicast(socket.local_addr().unwrap());
+        let handle = driver
+            .add_network_publication(aggregate(10, 1), &channel(destination))
+            .unwrap();
+        until(&mut driver, |driver| {
+            driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+        });
+        if fail {
+            driver
+                .net
+                .as_ref()
+                .unwrap()
+                .links()
+                .sender
+                .post(|_reply| crate::agents::AgentCommand::Panic)
+                .unwrap();
+            assert!(driver.do_work().is_err());
+        } else {
+            let _ = driver.close_network().unwrap();
+        }
+        let lane = handle.lane(Lane::ZERO).unwrap();
+        assert_eq!(driver.publication(lane).map(drop), Ok(()), "{fail}");
+    }
+}
+
+/// #396 re-check: a reincarnation's record and its extra endpoint hold
+/// end with the publication's removal, an agent failure or a close in
+/// the middle of the wait.
+#[test]
+fn a_reincarnation_ends_with_a_removal_a_failure_or_a_close() {
+    for how in 0..3 {
+        let mut driver = reincarnating_driver(10_000_000_000, 64);
+        let (handle, _guard, _epoch, _lane, _socket) = waiting_reincarnation(&mut driver);
+        let registration = handle.registration();
+        let net = driver.net.as_ref().unwrap();
+        assert!(net.reincarnation(registration).unwrap().is_some());
+        match how {
+            0 => {
+                driver.remove_aggregate(&handle).unwrap();
+                let net = driver.net.as_ref().unwrap();
+                assert!(net.reincarnation(registration).unwrap().is_none());
+                until(&mut driver, |driver| {
+                    driver.net.as_ref().unwrap().send_endpoints() == 0
+                });
+            }
+            1 => {
+                driver
+                    .net
+                    .as_ref()
+                    .unwrap()
+                    .links()
+                    .sender
+                    .post(|_reply| crate::agents::AgentCommand::Panic)
+                    .unwrap();
+                assert!(driver.do_work().is_err());
+                let net = driver.net.as_ref().unwrap();
+                assert!(net.reincarnation(registration).unwrap().is_none());
+            }
+            _ => {
+                let _ = driver.close_network().unwrap();
+                assert!(driver.net.is_none());
+            }
+        }
+    }
+}
+
+/// #396 re-check P3: a reincarnation's room is counted once while its
+/// old session is still being removed: the entry and the record are one
+/// publication, so another one is admitted beside it.
+#[test]
+fn a_reincarnating_publication_takes_its_room_once() {
+    let mut driver = reincarnating_driver(10_000_000_000, 2);
+    let (handle, _guard, _epoch, _lane, socket) = waiting_reincarnation(&mut driver);
+    // No duty since: the old session is still being removed.
+    assert!(
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .is_network_aggregate(handle.registration())
+    );
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let other = driver.add_network_publication(aggregate(11, 1), &channel(destination));
+    assert!(other.is_ok(), "{other:?}");
 }
 
 /// #396 review P2: the quarantine runs from the old session's removal,
@@ -1638,4 +1805,107 @@ fn network_publications_draw_their_initial_term_ids() {
         second
     };
     assert_ne!(first, second);
+}
+
+/// #396 re-check P3: a publication the sender refused cannot reincarnate:
+/// the call names the lane it was made on, not the aggregate's
+/// registration (lane 1 of two here).
+#[test]
+fn a_refused_publication_names_the_lane_it_cannot_reincarnate() {
+    use karyos_protocol::network::{Alias, Identity, TermParams};
+    use karyos_sys::guard::Closed;
+    use karyos_sys::log_buffer::SealReason;
+
+    use crate::net::NetworkGuard;
+
+    // The sender's one table entry is taken by a publication the
+    // conductor does not track, so the guarded add is refused.
+    let mut driver = reincarnating_driver(50_000_000, 1);
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let foreign = Alias {
+        session_id: 99,
+        stream_id: 99,
+    };
+    let endpoint = crate::agents::EndpointId(999);
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let (outbound, _log) = crate::agents::data::testing::outbound(
+        endpoint,
+        foreign,
+        socket.local_addr().unwrap(),
+        term,
+        1,
+        false,
+    );
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|reply| crate::agents::AgentCommand::AddPublication {
+            reply,
+            publication: crate::sessions::send::Publication {
+                endpoint,
+                alias: foreign,
+                identity: Identity {
+                    driver_id: [0, 0],
+                    registration_id: 999,
+                    incarnation: 1,
+                },
+                term,
+                lane_count: 1,
+            },
+            outbound,
+            guard: None,
+            roles: None,
+        })
+        .unwrap();
+    let guard = open_guard(&mut driver, "net");
+    let mut config = aggregate(10, 2);
+    config.stream.buffer.spare_slots = 4;
+    let handle = driver
+        .add_guarded_network_publication(
+            config,
+            &channel(destination),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Refused)
+    });
+    let lanes = [Lane::ZERO, Lane::try_new(1).unwrap()].map(|lane| handle.lane(lane).unwrap());
+    let publications = lanes.map(|lane| driver.publication(lane).unwrap());
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    drop(publications);
+    until(&mut driver, |driver| {
+        lanes
+            .iter()
+            .all(|lane| driver.seal_reason(*lane) == Ok(Some(SealReason::GuardClosed)))
+    });
+    let _ = driver.reopen_guard(guard, epoch, epoch).unwrap();
+    let mut refused = None;
+    until(&mut driver, |driver| match driver.publication(lanes[1]) {
+        Err(DriverError::GuardSealed { .. }) => false,
+        other => {
+            refused = Some(other.map(drop));
+            true
+        }
+    });
+    assert_eq!(
+        refused,
+        Some(Err(DriverError::UnknownStream {
+            stream: handle.registration() + 1
+        }))
+    );
 }

@@ -1416,12 +1416,22 @@ impl<T: StreamTerms> Network<T> {
         // Each path's alias takes room, held or stale. A queued alias of
         // one of its keys is superseded by the add below, so it takes none.
         // A reincarnating publication's paths keep their room, so its next
-        // incarnation's add is not refused for a full table.
+        // incarnation's add is not refused for a full table: counted once,
+        // by its old entry while that is still being removed.
         let held = self
             .publications
             .iter()
             .map(|entry| entry.paths().count())
-            .chain(others().map(|next| next.held.len()))
+            .chain(
+                others()
+                    .filter(|next| {
+                        !self
+                            .publications
+                            .iter()
+                            .any(|entry| entry.registration == next.registration)
+                    })
+                    .map(|next| next.held.len()),
+            )
             .try_fold(0usize, usize::checked_add);
         let stale_only = self
             .stale_aliases
