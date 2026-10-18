@@ -1011,3 +1011,1059 @@ fn a_prepared_replay_never_attached_expires() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+mod groups {
+    //! A7d-1c: recording groups the agent captures, their references
+    //! covered by the recordings it keeps, settled when a recording ends,
+    //! and recovered after a restart.
+
+    use super::*;
+    use crate::group::capture::{CaptureConfig, GroupState, Refusal};
+    use crate::group::journal::{JournalConfig, MIN_SEGMENT_LENGTH};
+    use crate::group::record::{
+        Capture, EndOutcome, EventEnd, GroupRecord, MAX_RECORD, MessageEvent, Payload,
+    };
+
+    const GROUP: u64 = 5;
+
+    fn chunks(bytes: usize, seal: bool, drained: &Arc<AtomicBool>) -> Chunks {
+        Chunks {
+            position: 0,
+            chunks: vec![vec![7u8; bytes]].into(),
+            seal,
+            fail: false,
+            gate: None,
+            drained: Arc::clone(drained),
+        }
+    }
+
+    fn start_group(dir: &Path, capture: Option<Capture>) -> StartGroup {
+        StartGroup {
+            group_id: GROUP,
+            dir: dir.to_path_buf(),
+            new: capture.map(|capture| NewGroup {
+                first_group_seq: 1,
+                inline_threshold: 4096,
+                capture,
+                manifest: b"m".to_vec(),
+            }),
+            journal: JournalConfig {
+                segment_length: MIN_SEGMENT_LENGTH,
+                policy: SyncPolicy::Every { interval_ns: 0 },
+            },
+            capture: CaptureConfig {
+                ring_capacity: 1 << 16,
+                max_event: 4096,
+                in_flight: 64,
+            },
+        }
+    }
+
+    /// Event `seq`: a message naming `recording`'s frames `[0, 64)`.
+    fn referencing(seq: u64, recording: u64) -> Vec<u8> {
+        let mut out = vec![0u8; MAX_RECORD];
+        let mut bytes = Vec::new();
+        for record in [
+            GroupRecord::Message(MessageEvent {
+                group_seq: seq,
+                logical_time: seq,
+                incarnation: 1,
+                position: 0,
+                extent: 64,
+                stream_id: 10,
+                session_id: 3,
+                lane: karyos_sys::frame::Lane::ZERO,
+                reserved_value: 0,
+                end_of_stream: false,
+                extension: None,
+                payload: Payload::Reference {
+                    recording_id: recording,
+                    length: 10,
+                },
+            }),
+            GroupRecord::End(EventEnd {
+                group_seq: seq,
+                observations: 0,
+                outcome: EndOutcome::Complete,
+            }),
+        ] {
+            let length = record.encode(&mut out).unwrap();
+            bytes.extend_from_slice(&out[..length]);
+        }
+        bytes
+    }
+
+    fn groups_dir(dir: &Path) -> PathBuf {
+        let groups = dir.join("groups");
+        std::fs::create_dir(&groups).unwrap();
+        groups
+    }
+
+    /// A group refers to a `required` recording's frames: complete once
+    /// written, durable once the recording's stop made them durable; and a
+    /// restarted agent recovers the group with the reference covered by
+    /// the stopped recording the catalog keeps as `required`.
+    #[test]
+    fn a_covered_reference_survives_a_restart() {
+        let dir = temp_dir("group-restart");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        sender.admit().unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        let waiter = sender.waiter();
+        // The recording's frames are written, not durable yet: the event
+        // is complete, not durable.
+        for _ in 0..5000 {
+            if sender.view().complete_recording_seq() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            (sender.view().snapshot(), sender.state()),
+            ((1, 1, 0), GroupState::Running)
+        );
+        // The stop closes the store, durable to 3000, which covers it.
+        assert_eq!(agent.stop(recording).unwrap().position, 3000);
+        assert_eq!(waiter.wait_durable(1, Duration::from_secs(5)), Ok(1));
+        agent.shutdown().unwrap();
+        assert_eq!(sender.state(), GroupState::Ended);
+        let restarted = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        assert!(restarted.recordings().unwrap()[0].required);
+        let recovered = restarted.start_group(start_group(&groups, None)).unwrap();
+        assert_eq!(recovered.view().snapshot(), (1, 1, 1));
+        restarted.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A reference its recording stops short of: a strict group ends, a
+    /// best-effort one marks it and goes on.
+    #[test]
+    fn a_recording_that_stops_short_settles_its_references() {
+        for capture in [Capture::Strict, Capture::BestEffort] {
+            let dir = temp_dir("group-short");
+            let groups = groups_dir(&dir);
+            let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+            let drained = Arc::new(AtomicBool::new(false));
+            let recording = agent.start(start(chunks(32, false, &drained))).unwrap();
+            wait(&drained);
+            let mut sender = agent
+                .start_group(start_group(&groups, Some(capture)))
+                .unwrap();
+            sender.send(&referencing(1, recording), 1).unwrap();
+            let waiter = sender.waiter();
+            assert_eq!(agent.stop(recording).unwrap().position, 32);
+            match capture {
+                Capture::Strict => {
+                    assert!(matches!(
+                        waiter.wait_durable(1, Duration::from_secs(5)),
+                        Err(crate::group::capture::WaitError::Stopped {
+                            state: GroupState::Ended,
+                            ..
+                        })
+                    ));
+                    assert_eq!(sender.admit(), Err(Refusal::Ended));
+                }
+                Capture::BestEffort => {
+                    assert_eq!(waiter.wait_durable(1, Duration::from_secs(5)), Ok(1));
+                    assert_eq!(sender.state(), GroupState::Running);
+                }
+            }
+            agent.shutdown().unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// An `async` recording vouches for nothing: the catalog keeps it as
+    /// `async`, a reference to it never completes while it records, and
+    /// its stop marks the reference unavailable whatever it wrote.
+    #[test]
+    fn an_async_recording_covers_no_reference() {
+        let dir = temp_dir("group-async");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent
+            .start(StartRecording {
+                mode: Mode::Async {
+                    on_lap: crate::recorder::OnLap::Resume,
+                },
+                ..start(chunks(3000, false, &drained))
+            })
+            .unwrap();
+        wait(&drained);
+        assert!(!agent.recordings().unwrap()[0].required);
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::BestEffort)))
+            .unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        for _ in 0..5000 {
+            if sender.view().delivered_seq() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Drained, and never complete: the recording vouches for nothing.
+        for _ in 0..200 {
+            assert_eq!(sender.view().snapshot(), (1, 0, 0));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        agent.stop(recording).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(1, Duration::from_secs(5)),
+            Ok(1)
+        );
+        agent.shutdown().unwrap();
+        // Marked, not covered: after a restart the event still completes,
+        // though the recording vouches for nothing.
+        let restarted = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let recovered = restarted.start_group(start_group(&groups, None)).unwrap();
+        assert_eq!(recovered.view().snapshot(), (1, 1, 1));
+        restarted.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A reference sent after its `async` recording ended is marked
+    /// unavailable, whatever the recording wrote: it vouches for nothing.
+    #[test]
+    fn a_late_reference_to_an_ended_async_recording_is_marked() {
+        let dir = temp_dir("group-late-async");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent
+            .start(StartRecording {
+                mode: Mode::Async {
+                    on_lap: crate::recorder::OnLap::Resume,
+                },
+                ..start(chunks(3000, false, &drained))
+            })
+            .unwrap();
+        wait(&drained);
+        agent.stop(recording).unwrap();
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::BestEffort)))
+            .unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(1, Duration::from_secs(5)),
+            Ok(1)
+        );
+        agent.shutdown().unwrap();
+        let restarted = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let recovered = restarted.start_group(start_group(&groups, None)).unwrap();
+        assert_eq!(recovered.view().snapshot(), (1, 1, 1), "marked");
+        restarted.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The operating system's files, failing every write and sync to a
+    /// recording's segments once `fail` is set; group journals, in their
+    /// own directory, and the catalog keep working.
+    #[derive(Debug, Clone)]
+    struct Failing {
+        fail: Arc<AtomicBool>,
+    }
+
+    #[derive(Debug)]
+    struct FailingFile {
+        file: std::fs::File,
+        segment: bool,
+    }
+
+    impl Failing {
+        fn check(&self, file: &FailingFile) -> std::io::Result<()> {
+            if file.segment && self.fail.load(Ordering::Acquire) {
+                Err(std::io::Error::other("failing"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn segment(path: &Path) -> bool {
+        path.extension().is_some_and(|extension| extension == "seg")
+            && !path.components().any(|part| part.as_os_str() == "groups")
+    }
+
+    impl Disk for Failing {
+        type File = FailingFile;
+
+        fn create(&mut self, path: &Path) -> std::io::Result<FailingFile> {
+            Ok(FailingFile {
+                file: StdDisk.create(path)?,
+                segment: segment(path),
+            })
+        }
+
+        fn open(&mut self, path: &Path) -> std::io::Result<FailingFile> {
+            Ok(FailingFile {
+                file: StdDisk.open(path)?,
+                segment: segment(path),
+            })
+        }
+
+        fn open_read(&mut self, path: &Path) -> std::io::Result<FailingFile> {
+            Ok(FailingFile {
+                file: StdDisk.open_read(path)?,
+                segment: segment(path),
+            })
+        }
+
+        fn write_at(
+            &mut self,
+            file: &FailingFile,
+            offset: u64,
+            bytes: &[u8],
+        ) -> std::io::Result<()> {
+            self.check(file)?;
+            StdDisk.write_at(&file.file, offset, bytes)
+        }
+
+        fn read_at(
+            &mut self,
+            file: &FailingFile,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> std::io::Result<()> {
+            StdDisk.read_at(&file.file, offset, buf)
+        }
+
+        fn len(&mut self, file: &FailingFile) -> std::io::Result<u64> {
+            StdDisk.len(&file.file)
+        }
+
+        fn set_len(&mut self, file: &FailingFile, len: u64) -> std::io::Result<()> {
+            self.check(file)?;
+            StdDisk.set_len(&file.file, len)
+        }
+
+        fn sync(&mut self, file: &FailingFile) -> std::io::Result<()> {
+            self.check(file)?;
+            StdDisk.sync(&file.file)
+        }
+
+        fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+            StdDisk.sync_dir(dir)
+        }
+
+        fn list(&mut self, dir: &Path) -> std::io::Result<Vec<String>> {
+            StdDisk.list(dir)
+        }
+
+        fn remove(&mut self, path: &Path) -> std::io::Result<()> {
+            StdDisk.remove(path)
+        }
+
+        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+            StdDisk.rename(from, to)
+        }
+    }
+
+    /// A stop whose close fails leaves no stop in the catalog: the agent
+    /// settles the groups' references by what was durable before it, here
+    /// nothing, so a strict group ends.
+    #[test]
+    fn a_failed_stop_settles_by_what_was_durable() {
+        let dir = temp_dir("group-failed-stop");
+        let groups = groups_dir(&dir);
+        let fail = Arc::new(AtomicBool::new(false));
+        let disk = Failing {
+            fail: Arc::clone(&fail),
+        };
+        let agent = ArchiveHandle::spawn(disk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        for _ in 0..5000 {
+            if sender.view().complete_recording_seq() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(sender.view().complete_recording_seq(), 1);
+        fail.store(true, Ordering::Release);
+        assert!(agent.stop(recording).is_err());
+        assert!(matches!(
+            sender.waiter().wait_durable(1, Duration::from_secs(5)),
+            Err(crate::group::capture::WaitError::Stopped {
+                state: GroupState::Ended,
+                ..
+            })
+        ));
+        drop(agent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A recording whose store fails while it records leaves no stop in
+    /// the catalog: the agent settles the groups' references by what was
+    /// durable before, here nothing, so a strict group ends.
+    #[test]
+    fn a_store_failure_settles_by_what_was_durable() {
+        let dir = temp_dir("group-store-failure");
+        let groups = groups_dir(&dir);
+        let fail = Arc::new(AtomicBool::new(false));
+        let disk = Failing {
+            fail: Arc::clone(&fail),
+        };
+        let agent = ArchiveHandle::spawn(disk, &dir, AgentConfig::default()).unwrap();
+        let gate = Arc::new(AtomicBool::new(false));
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent
+            .start(start(Chunks {
+                gate: Some(Arc::clone(&gate)),
+                ..chunks(3000, false, &drained)
+            }))
+            .unwrap();
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        for _ in 0..5000 {
+            if sender.view().delivered_seq() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The recording's first write fails.
+        fail.store(true, Ordering::Release);
+        gate.store(true, Ordering::Release);
+        assert!(matches!(
+            sender.waiter().wait_durable(1, Duration::from_secs(5)),
+            Err(crate::group::capture::WaitError::Stopped {
+                state: GroupState::Ended,
+                ..
+            })
+        ));
+        drop(agent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A source that hands out its chunks as they are released.
+    struct Released {
+        position: u64,
+        chunks: VecDeque<Vec<u8>>,
+        released: Arc<std::sync::atomic::AtomicUsize>,
+        read: usize,
+    }
+
+    impl FrameSource for Released {
+        fn position(&self) -> u64 {
+            self.position
+        }
+
+        fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
+            if self.read >= self.released.load(Ordering::Acquire) {
+                return Ok(Frames::Pending);
+            }
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Ok(Frames::Pending);
+            };
+            self.read += 1;
+            let position = self.position;
+            out[..chunk.len()].copy_from_slice(&chunk);
+            self.position += chunk.len() as u64;
+            Ok(Frames::Copied {
+                position,
+                len: chunk.len(),
+                next: self.position,
+            })
+        }
+
+        fn consumed(&mut self, _position: u64) -> Result<(), SourceError> {
+            Ok(())
+        }
+
+        fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+            self.position = to;
+            Ok(to)
+        }
+    }
+
+    /// An `async` recording whose store fails vouches for nothing, even
+    /// with its frames durable past a reference: a strict group ends.
+    #[test]
+    fn an_async_store_failure_covers_no_reference() {
+        let dir = temp_dir("group-async-failure");
+        let groups = groups_dir(&dir);
+        let fail = Arc::new(AtomicBool::new(false));
+        let disk = Failing {
+            fail: Arc::clone(&fail),
+        };
+        let agent = ArchiveHandle::spawn(disk, &dir, AgentConfig::default()).unwrap();
+        let released = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let recording = agent
+            .start(StartRecording {
+                mode: Mode::Async {
+                    on_lap: crate::recorder::OnLap::Resume,
+                },
+                policy: SyncPolicy::Every { interval_ns: 0 },
+                source: Box::new(Released {
+                    position: 0,
+                    chunks: vec![vec![7u8; 3000], vec![8u8; 3000]].into(),
+                    released: Arc::clone(&released),
+                    read: 0,
+                }),
+                ..start(chunks(0, false, &Arc::default()))
+            })
+            .unwrap();
+        // The first chunk is durable.
+        for _ in 0..5000 {
+            if agent.describe(recording).unwrap().end == 3000 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(agent.describe(recording).unwrap().end, 3000);
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        for _ in 0..5000 {
+            if sender.view().delivered_seq() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The second chunk's write fails.
+        fail.store(true, Ordering::Release);
+        released.store(2, Ordering::Release);
+        assert!(matches!(
+            sender.waiter().wait_durable(1, Duration::from_secs(5)),
+            Err(crate::group::capture::WaitError::Stopped {
+                state: GroupState::Ended,
+                ..
+            })
+        ));
+        drop(agent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A group is captured once, within the agent's bound, and stopped by
+    /// id: its journal closed and its sender then refusing.
+    #[test]
+    fn groups_start_once_and_stop_by_id() {
+        let dir = temp_dir("group-commands");
+        let groups = groups_dir(&dir);
+        let config = AgentConfig {
+            max_groups: 1,
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let sender = agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        assert!(matches!(
+            agent.start_group(start_group(&groups, Some(Capture::Strict))),
+            Err(AgentError::Full { what: "groups", .. })
+        ));
+        assert_eq!(agent.refused(), 1);
+        assert!(matches!(
+            agent.stop_group(GROUP + 1),
+            Err(AgentError::Unknown { .. })
+        ));
+        agent.stop_group(GROUP).unwrap();
+        assert_eq!(sender.admit(), Err(Refusal::Ended));
+        let config = AgentConfig::default();
+        drop(agent);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let _first = agent.start_group(start_group(&groups, None)).unwrap();
+        assert!(matches!(
+            agent.start_group(start_group(&groups, None)),
+            Err(AgentError::GroupCaptured { id: GROUP })
+        ));
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Settings that cannot work are refused before the journal exists,
+    /// so a retry with the same new group starts it.
+    #[test]
+    fn a_refused_group_start_leaves_no_journal() {
+        let dir = temp_dir("group-refused");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let mut refused = start_group(&groups, Some(Capture::Strict));
+        refused.capture.in_flight = 0;
+        assert!(matches!(
+            agent.start_group(refused),
+            Err(AgentError::Capture(CaptureError::InFlight))
+        ));
+        let mut unsynced = start_group(&groups, Some(Capture::Strict));
+        unsynced.journal.policy = SyncPolicy::None;
+        assert!(matches!(
+            agent.start_group(unsynced),
+            Err(AgentError::Capture(CaptureError::NoSync))
+        ));
+        agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A reference drained after its recording failed, past the frames
+    /// durable at the failure: marked in best effort, and a strict group
+    /// ends.
+    #[test]
+    fn a_late_uncovered_reference_to_a_failed_recording_is_settled() {
+        for capture in [Capture::BestEffort, Capture::Strict] {
+            let dir = temp_dir("probe-late-uncovered");
+            let groups = groups_dir(&dir);
+            let fail = Arc::new(AtomicBool::new(false));
+            let (agent, recording, released) = failing_required(&dir, &fail);
+            let mut sender = agent
+                .start_group(start_group(&groups, Some(capture)))
+                .unwrap();
+            fail.store(true, Ordering::Release);
+            released.store(2, Ordering::Release);
+            let event = agent.event(Duration::from_secs(5));
+            assert!(matches!(event, Some(Event::Failed { .. })), "{event:?}");
+            let mut out = vec![0u8; MAX_RECORD];
+            let mut bytes = Vec::new();
+            for record in [
+                GroupRecord::Message(MessageEvent {
+                    group_seq: 1,
+                    logical_time: 1,
+                    incarnation: 1,
+                    position: 3000,
+                    extent: 64,
+                    stream_id: 10,
+                    session_id: 3,
+                    lane: karyos_sys::frame::Lane::ZERO,
+                    reserved_value: 0,
+                    end_of_stream: false,
+                    extension: None,
+                    payload: Payload::Reference {
+                        recording_id: recording,
+                        length: 10,
+                    },
+                }),
+                GroupRecord::End(EventEnd {
+                    group_seq: 1,
+                    observations: 0,
+                    outcome: EndOutcome::Complete,
+                }),
+            ] {
+                let length = record.encode(&mut out).unwrap();
+                bytes.extend_from_slice(&out[..length]);
+            }
+            sender.send(&bytes, 1).unwrap();
+            let result = sender.waiter().wait_durable(1, Duration::from_secs(3));
+            match capture {
+                Capture::BestEffort => assert_eq!(result, Ok(1)),
+                Capture::Strict => assert!(matches!(
+                    result,
+                    Err(crate::group::capture::WaitError::Stopped {
+                        state: GroupState::Ended,
+                        ..
+                    })
+                )),
+            }
+            drop(agent);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// `stop_group` returns promptly while a best-effort sender, past its
+    /// in-flight bound, keeps sending: the sender is refused as closing.
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one scenario")]
+    fn stop_group_refuses_a_live_sender() {
+        let dir = temp_dir("probe-live-sender");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        agent.stop(recording).unwrap();
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::BestEffort)))
+            .unwrap();
+        // Event 1 ends incomplete: the best-effort prefixes stop, and the
+        // in-flight bound no longer holds the sender back.
+        let mut first = referencing(1, recording);
+        let mut out = vec![0u8; MAX_RECORD];
+        let end = GroupRecord::End(EventEnd {
+            group_seq: 1,
+            observations: 0,
+            outcome: EndOutcome::Incomplete,
+        });
+        let length = end.encode(&mut out).unwrap();
+        let complete_len = {
+            let complete = GroupRecord::End(EventEnd {
+                group_seq: 1,
+                observations: 0,
+                outcome: EndOutcome::Complete,
+            });
+            complete.encode(&mut vec![0u8; MAX_RECORD]).unwrap()
+        };
+        first.truncate(first.len() - complete_len);
+        first.extend_from_slice(&out[..length]);
+        sender.admit().unwrap();
+        sender.send(&first, 1).unwrap();
+        let halt = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let producer = {
+            let halt = Arc::clone(&halt);
+            let sent = Arc::clone(&sent);
+            std::thread::spawn(move || {
+                let mut seq = 2u64;
+                while !halt.load(Ordering::Acquire) {
+                    match sender.admit() {
+                        Ok(()) => {
+                            if let Err(refusal) = sender.send(&referencing(seq, recording), seq) {
+                                return Some(refusal);
+                            }
+                            sent.store(seq, Ordering::Release);
+                            seq += 1;
+                        }
+                        Err(refusal @ (Refusal::Ended | Refusal::Failed | Refusal::Closing)) => {
+                            return Some(refusal);
+                        }
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+                None
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let fired = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let halt = Arc::clone(&halt);
+            let fired = Arc::clone(&fired);
+            std::thread::spawn(move || {
+                // Stops the sender if the stop hangs; ends early once it
+                // returned.
+                for _ in 0..1500 {
+                    if halt.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !halt.swap(true, Ordering::AcqRel) {
+                    fired.store(true, Ordering::Release);
+                }
+            })
+        };
+        let begun = std::time::Instant::now();
+        let result = agent.stop_group(GROUP);
+        let took = begun.elapsed();
+        // The closed group refuses the sender, which then stops on its own.
+        let state = producer.join().unwrap();
+        halt.store(true, Ordering::Release);
+        watchdog.join().unwrap();
+        result.unwrap();
+        assert!(!fired.load(Ordering::Acquire), "took {took:?}");
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+        assert!(sent.load(Ordering::Acquire) > 1);
+        // Refused as closing, or as ended once the close was done.
+        assert!(
+            matches!(state, Some(Refusal::Closing | Refusal::Ended)),
+            "{state:?}"
+        );
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Failures arrive one after another, more than the recording cap,
+    /// while a group runs: each failed entry is dropped, when a start needs
+    /// its slot, once the group has read its ring empty after the failure,
+    /// so the cap's slots come back. A reference sent after the latest
+    /// failure settles by its durable frames; one to a reclaimed entry is
+    /// settled as uncovered, never left waiting.
+    #[test]
+    fn failed_entries_last_until_the_groups_have_read_past_them() {
+        let dir = temp_dir("group-many-failures");
+        let groups = groups_dir(&dir);
+        let fail = Arc::new(AtomicBool::new(false));
+        let disk = Failing {
+            fail: Arc::clone(&fail),
+        };
+        let config = AgentConfig {
+            max_recordings: 2,
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(disk, &dir, config).unwrap();
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::BestEffort)))
+            .unwrap();
+        let mut first = None;
+        let mut last = 0;
+        for round in 0..6 {
+            fail.store(false, Ordering::Release);
+            let released = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+            // A start can meet the slot of the previous failure until the
+            // group has read past it: retried, never refused for good.
+            let mut started = None;
+            for _ in 0..5000 {
+                match agent.start(StartRecording {
+                    policy: SyncPolicy::Every { interval_ns: 0 },
+                    source: Box::new(Released {
+                        position: 0,
+                        chunks: vec![vec![7u8; 3000], vec![8u8; 3000]].into(),
+                        released: Arc::clone(&released),
+                        read: 0,
+                    }),
+                    ..start(chunks(0, false, &Arc::default()))
+                }) {
+                    Ok(id) => {
+                        started = Some(id);
+                        break;
+                    }
+                    Err(AgentError::Full { .. }) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error:?}"),
+                }
+            }
+            last = started.unwrap_or_else(|| panic!("round {round}: refused for good"));
+            first.get_or_insert(last);
+            for _ in 0..5000 {
+                if agent.describe(last).unwrap().end == 3000 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            fail.store(true, Ordering::Release);
+            released.store(2, Ordering::Release);
+            let event = agent.event(Duration::from_secs(5));
+            assert!(matches!(event, Some(Event::Failed { .. })), "{event:?}");
+        }
+        // The latest failure's entry is kept: its durable frames cover.
+        sender.send(&referencing(1, last), 1).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(1, Duration::from_secs(5)),
+            Ok(1)
+        );
+        // The first one's was reclaimed: a reference that raced it covers
+        // nothing, and is marked rather than left waiting.
+        sender.send(&referencing(2, first.unwrap()), 2).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(2, Duration::from_secs(5)),
+            Ok(2)
+        );
+        assert_eq!(sender.state(), GroupState::Running);
+        drop(agent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn failing_required(
+        dir: &Path,
+        fail: &Arc<AtomicBool>,
+    ) -> (ArchiveHandle, u64, Arc<std::sync::atomic::AtomicUsize>) {
+        let disk = Failing {
+            fail: Arc::clone(fail),
+        };
+        let agent = ArchiveHandle::spawn(disk, dir, AgentConfig::default()).unwrap();
+        let released = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let recording = agent
+            .start(StartRecording {
+                policy: SyncPolicy::Every { interval_ns: 0 },
+                source: Box::new(Released {
+                    position: 0,
+                    chunks: vec![vec![7u8; 3000], vec![8u8; 3000]].into(),
+                    released: Arc::clone(&released),
+                    read: 0,
+                }),
+                ..start(chunks(0, false, &Arc::default()))
+            })
+            .unwrap();
+        for _ in 0..5000 {
+            if agent.describe(recording).unwrap().end == 3000 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        (agent, recording, released)
+    }
+
+    /// A reference drained after its `required` recording failed is
+    /// settled by the frames durable at the failure: covered, in each mode.
+    #[test]
+    fn a_late_reference_to_a_failed_recording_is_settled() {
+        for capture in [Capture::BestEffort, Capture::Strict] {
+            let dir = temp_dir("probe-late-failed");
+            let groups = groups_dir(&dir);
+            let fail = Arc::new(AtomicBool::new(false));
+            let (agent, recording, released) = failing_required(&dir, &fail);
+            let mut sender = agent
+                .start_group(start_group(&groups, Some(capture)))
+                .unwrap();
+            fail.store(true, Ordering::Release);
+            released.store(2, Ordering::Release);
+            let event = agent.event(Duration::from_secs(5));
+            assert!(matches!(event, Some(Event::Failed { .. })), "{event:?}");
+            // Sent before the failure was known, drained after it.
+            sender.send(&referencing(1, recording), 1).unwrap();
+            let result = sender.waiter().wait_durable(1, Duration::from_secs(5));
+            assert_eq!(result, Ok(1), "{capture:?}");
+            assert_eq!(sender.view().snapshot(), (1, 1, 1), "{capture:?}");
+            assert_eq!(sender.state(), GroupState::Running, "{capture:?}");
+            drop(agent);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// After a restart, a stopped `async` recording still vouches for
+    /// nothing: a strict group that referred to it stays ended.
+    #[test]
+    fn a_stopped_async_recording_covers_nothing_after_a_restart() {
+        let dir = temp_dir("probe-async-restart");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent
+            .start(StartRecording {
+                mode: Mode::Async {
+                    on_lap: crate::recorder::OnLap::Resume,
+                },
+                ..start(chunks(3000, false, &drained))
+            })
+            .unwrap();
+        wait(&drained);
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        agent.stop(recording).unwrap();
+        let live = sender.waiter().wait_durable(1, Duration::from_secs(5));
+        assert!(
+            matches!(
+                live,
+                Err(crate::group::capture::WaitError::Stopped {
+                    state: GroupState::Ended,
+                    ..
+                })
+            ),
+            "{live:?}"
+        );
+        agent.shutdown().unwrap();
+        let restarted = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let recovered = restarted.start_group(start_group(&groups, None)).unwrap();
+        let again = recovered.waiter().wait_durable(1, Duration::from_secs(2));
+        assert!(
+            matches!(
+                again,
+                Err(crate::group::capture::WaitError::Stopped {
+                    state: GroupState::Ended,
+                    ..
+                })
+            ),
+            "{again:?}"
+        );
+        restarted.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `required` recording fails with a waiting reference its durable
+    /// frames cover: settled covered, and the strict group runs on.
+    #[test]
+    fn a_failed_required_recording_covers_by_its_durable_frames() {
+        let dir = temp_dir("probe-failed-covers");
+        let groups = groups_dir(&dir);
+        let fail = Arc::new(AtomicBool::new(false));
+        let (agent, recording, released) = failing_required(&dir, &fail);
+        let mut start = start_group(&groups, Some(Capture::Strict));
+        start.journal.policy = SyncPolicy::PerSegment;
+        let mut sender = agent.start_group(start).unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        for _ in 0..5000 {
+            if sender.view().complete_recording_seq() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(sender.view().snapshot(), (1, 1, 0));
+        fail.store(true, Ordering::Release);
+        released.store(2, Ordering::Release);
+        let event = agent.event(Duration::from_secs(5));
+        assert!(matches!(event, Some(Event::Failed { .. })), "{event:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(sender.state(), GroupState::Running);
+        assert_eq!(sender.view().complete_recording_seq(), 1);
+        drop(agent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A store failure with frames written and not durable settles by the
+    /// durable ones, none here: a strict group ends.
+    #[test]
+    fn a_store_failure_settles_by_durable_not_written() {
+        let dir = temp_dir("probe-written");
+        let groups = groups_dir(&dir);
+        let fail = Arc::new(AtomicBool::new(false));
+        let disk = Failing {
+            fail: Arc::clone(&fail),
+        };
+        let agent = ArchiveHandle::spawn(disk, &dir, AgentConfig::default()).unwrap();
+        let released = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let recording = agent
+            .start(StartRecording {
+                source: Box::new(Released {
+                    position: 0,
+                    chunks: vec![vec![7u8; 3000], vec![8u8; 3000]].into(),
+                    released: Arc::clone(&released),
+                    read: 0,
+                }),
+                ..start(chunks(0, false, &Arc::default()))
+            })
+            .unwrap();
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        for _ in 0..5000 {
+            if sender.view().complete_recording_seq() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(sender.view().snapshot(), (1, 1, 0));
+        fail.store(true, Ordering::Release);
+        released.store(2, Ordering::Release);
+        let event = agent.event(Duration::from_secs(5));
+        assert!(matches!(event, Some(Event::Failed { .. })), "{event:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(sender.state(), GroupState::Ended);
+        drop(agent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An event sent right before `stop_group` is drained into the journal
+    /// before it closes.
+    #[test]
+    fn stop_group_drains_the_ring() {
+        for _ in 0..20 {
+            let dir = temp_dir("probe-stop-group");
+            let groups = groups_dir(&dir);
+            let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+            let drained = Arc::new(AtomicBool::new(false));
+            let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+            wait(&drained);
+            agent.stop(recording).unwrap();
+            let mut sender = agent
+                .start_group(start_group(&groups, Some(Capture::Strict)))
+                .unwrap();
+            sender.admit().unwrap();
+            sender.send(&referencing(1, recording), 1).unwrap();
+            agent.stop_group(GROUP).unwrap();
+            agent.shutdown().unwrap();
+            let restarted = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+            let recovered = restarted.start_group(start_group(&groups, None)).unwrap();
+            assert_eq!(recovered.view().snapshot(), (1, 1, 1));
+            restarted.shutdown().unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+}
