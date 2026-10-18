@@ -566,3 +566,40 @@ fn an_uncaptured_message_is_delivered() {
     job.sync(&none).unwrap();
     assert_eq!(sender.view().snapshot(), (1, 1, 1));
 }
+
+/// Recordings that ended: each with its durable end.
+#[derive(Default)]
+struct Ended(BTreeMap<u64, u64>);
+
+impl Coverage for Ended {
+    fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
+        self.0.get(&recording_id).map(|&end| (end, end))
+    }
+
+    fn ended(&self, recording_id: u64) -> Option<u64> {
+        self.0.get(&recording_id).copied()
+    }
+}
+
+/// A7d-1c: a reference that reaches the journal after its recording
+/// ended, sent before the stop and drained after it, is settled by the
+/// job: covered when the end reaches it; otherwise marked (best effort),
+/// or the strict group ends.
+#[test]
+fn a_reference_after_its_recording_ended_is_settled() {
+    let ended = Ended([(7, 64), (8, 32)].into_iter().collect());
+    let (mut sender, mut job) = new(Capture::BestEffort, NONE, settings(4096, 400, 8));
+    sender.send(&event(1, 10, Some(7)), 1).unwrap();
+    sender.send(&event(2, 10, Some(8)), 2).unwrap();
+    job.duty(0, 16, &ended).unwrap();
+    job.sync(&ended).unwrap();
+    assert_eq!(sender.view().snapshot(), (2, 2, 2));
+    assert_eq!(
+        journal_events(&mut job.journal),
+        [Role::Event(1), Role::Event(2), Role::Unavailable(2)]
+    );
+    let (mut sender, mut job) = new(Capture::Strict, NONE, settings(4096, 400, 8));
+    sender.send(&event(1, 10, Some(8)), 1).unwrap();
+    job.duty(0, 16, &ended).unwrap();
+    assert_eq!(job.state(), GroupState::Ended);
+}

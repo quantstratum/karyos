@@ -47,6 +47,16 @@ pub trait Coverage {
     /// Recording `recording_id`'s `(written, durable)` positions when it is
     /// a `required` recording this Archive keeps, else `None`.
     fn positions(&self, recording_id: u64) -> Option<(u64, u64)>;
+
+    /// The durable end of recording `recording_id` once it ended, which
+    /// will never cover more: its stop for a `required` recording, 0 for
+    /// any other (it vouches for nothing). `None` while it records, or for
+    /// a recording this Archive does not know. A7d-1c: a reference that
+    /// reaches the journal after its recording ended is settled by it.
+    fn ended(&self, recording_id: u64) -> Option<u64> {
+        let _ = recording_id;
+        None
+    }
 }
 
 /// Why the tracker refused a record.
@@ -284,8 +294,10 @@ impl PrefixTracker {
     /// recording held its frames after all, as one that recovers more after
     /// a crash than it reported before (`recording-group-gateway.md`
     /// section 7). One at or past the stop: no event is queued there, and
-    /// the prefixes cannot reach it. A `group_seq` inside the gap that
-    /// stopped them names no event, and is refused.
+    /// the prefixes cannot reach it; such a mark is taken unchecked,
+    /// since checking it would need to remember every event past the
+    /// stop, without bound. A `group_seq` inside the gap that stopped them
+    /// names no event, and is refused.
     fn settle(&mut self, seq: u64, recording_id: u64) -> Result<(), PrefixError> {
         let no_reference = PrefixError::NoReference {
             group_seq: seq,
@@ -338,6 +350,12 @@ impl PrefixTracker {
                 _ => {}
             }
         }
+    }
+
+    /// The recordings and frame ends the waiting events' payloads name, in
+    /// order: `(recording_id, end)`.
+    pub fn references(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.waiting.iter().filter_map(|waiting| waiting.reference)
     }
 
     /// Whether the queue has room for one more complete event: the strict

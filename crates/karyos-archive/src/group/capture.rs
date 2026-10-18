@@ -195,7 +195,9 @@ pub fn capture<D: Disk>(
     })?;
     let recovery =
         prefix::recover(&mut journal, coverage, config.in_flight).map_err(CaptureSetup::Journal)?;
-    let tracker = recovery.tracker;
+    let mut tracker = recovery.tracker;
+    // Every event the journal holds was delivered before it was sent.
+    tracker.delivered(recovery.last_seen);
     let shared = Arc::new(Shared {
         consumed: AtomicU64::new(0),
         state: AtomicU8::new(RUNNING),
@@ -514,8 +516,29 @@ impl<D: Disk> CaptureJob<D> {
             self.shared.consumed.store(end, Ordering::Release);
         }
         let _ = self.journal.tick(now)?;
+        self.settle_ended(coverage)?;
         self.advance(coverage);
         Ok(read)
+    }
+
+    /// Settles the waiting references to recordings that already ended
+    /// short of them: one can reach the journal after its recording's
+    /// stop was settled, sent before the stop and drained after it.
+    fn settle_ended(&mut self, coverage: &impl Coverage) -> Result<(), JobError> {
+        while self.shared.state() == GroupState::Running {
+            let Some((recording, durable)) =
+                self.tracker.references().find_map(|(recording, end)| {
+                    coverage
+                        .ended(recording)
+                        .filter(|&durable| end > durable)
+                        .map(|durable| (recording, durable))
+                })
+            else {
+                break;
+            };
+            self.settle(recording, durable)?;
+        }
+        Ok(())
     }
 
     /// Advances the prefixes, and notifies waiters when the durable one
@@ -569,6 +592,17 @@ impl<D: Disk> CaptureJob<D> {
         if self.shared.state() != GroupState::Running {
             return Ok(());
         }
+        let result = self.settle(recording_id, durable);
+        if result.is_err() {
+            self.shared.set(FAILED);
+        }
+        self.advance(coverage);
+        result
+    }
+
+    /// Settles the references to `recording_id`, which ended durable to
+    /// `durable`: covered, marked, or the strict group ends.
+    fn settle(&mut self, recording_id: u64, durable: u64) -> Result<(), JobError> {
         let uncovered = &mut self.uncovered;
         uncovered.clear();
         self.tracker
@@ -577,12 +611,7 @@ impl<D: Disk> CaptureJob<D> {
             self.shared.set(ENDED);
             return Ok(());
         }
-        let result = self.mark(recording_id);
-        if result.is_err() {
-            self.shared.set(FAILED);
-        }
-        self.advance(coverage);
-        result
+        self.mark(recording_id)
     }
 
     /// Appends a reference unavailable mark for each uncovered event.
