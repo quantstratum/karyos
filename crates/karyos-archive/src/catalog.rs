@@ -101,7 +101,9 @@ pub enum StopReason {
     /// A crash left it open before its segment store existed: it is empty.
     Empty,
     /// An async recording was lapped and stopped there (`on_lap = Stop`),
-    /// or lapped once more than its store records gaps.
+    /// or lapped once more than its store records gaps; or a recording's
+    /// source was fenced at a mapping cutover and the recording ended at
+    /// the seal (the agent's `fenced_recordings` tells the two apart).
     Lapped,
     /// A stop command stopped it.
     Stopped,

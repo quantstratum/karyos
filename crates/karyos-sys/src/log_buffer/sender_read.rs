@@ -771,6 +771,14 @@ impl<O: BufferOwner> SenderRead<O> {
         }
     }
 
+    /// Whether the publication is sealed for a mapping-generation cutover:
+    /// the stream continues in a successor mapping (Acquire). `false`
+    /// while active and for a final seal.
+    #[must_use]
+    pub fn sealed_with_successor(&self) -> bool {
+        self.subscription.buffer.sealed_with_successor()
+    }
+
     /// Records the backend's submission up to `position`: the registered
     /// position, which bounds the publisher and the retention floor, moves
     /// there. Only a block boundary this reader returned is accepted (see
