@@ -668,8 +668,12 @@ mod remote {
         }
         assert_eq!(reading.image_count(), 1);
         assert_eq!(reading.images_refused(), 0);
+        // The publisher goes: a remote client's network publication ends
+        // with its client (its registration ends with its grant), and the
+        // removal ends the image.
         drop(publication);
-        until(&mut [&mut subscriber, &mut publisher], || {
+        drop(publisher);
+        until(&mut [&mut subscriber], || {
             let _ = reading.poll(|_, _| {}, MessageLimit::new(16));
             reading.image_count() == 0
         });
