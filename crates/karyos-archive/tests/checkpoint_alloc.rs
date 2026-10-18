@@ -207,3 +207,59 @@ fn replay_from_a_checkpoint_steps_without_allocating() {
     let _ = std::fs::remove_dir_all(&journals);
     let _ = std::fs::remove_dir_all(&checkpoints);
 }
+
+/// A9-3: the handoff between the Gateway's and the Archive's ends moves
+/// the buffer both ways without allocating, the chunked write included.
+#[test]
+fn the_handoff_and_a_chunked_write_allocate_nothing() {
+    use karyos_archive::group::checkpoint::{LastCheckpoint, Progress, handoff};
+
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::None,
+    };
+    let (journals, checkpoints) = (dir("handoff-journals"), dir("handoff-checkpoints"));
+    let header = JournalHeader {
+        group_id: 5,
+        first_group_seq: 1,
+        inline_threshold: 4096,
+        contract_version: 1,
+        clock: Clock::HostMonotonic,
+        capture: Capture::Strict,
+        manifest: b"m",
+    };
+    let mut journal = GroupJournal::create(StdDisk, &journals, &header, config).unwrap();
+    let store = CheckpointStore::create(StdDisk, &checkpoints, 5, config).unwrap();
+    let mut writer = CheckpointWriter::new(store, &journal).unwrap();
+    let (mut handle, inbox) = handoff(4096);
+    let mut events = Vec::new();
+    for seq in 1..=4 {
+        event(seq, &mut events);
+    }
+    let _ = journal.append(&events).unwrap();
+    for seq in 1..=4u64 {
+        let (recorded, allocations) = count(|| {
+            handle
+                .checkpoint(seq, 1, |buffer| {
+                    buffer[..1000].fill(1);
+                    1000
+                })
+                .unwrap();
+            let request = inbox.take().unwrap();
+            writer.begin(&journal, &request).unwrap();
+            let record = loop {
+                match writer.advance(&mut journal, &request, 300).unwrap() {
+                    Progress::Writing { .. } => {}
+                    Progress::Recorded(record) => break record,
+                }
+            };
+            inbox.give_back(request, Ok(record));
+            handle.poll();
+            matches!(handle.last_checkpoint(), Some(LastCheckpoint::Recorded(_)))
+        });
+        assert!(recorded);
+        assert_eq!(allocations, 0, "checkpoint {seq}");
+    }
+    let _ = std::fs::remove_dir_all(&journals);
+    let _ = std::fs::remove_dir_all(&checkpoints);
+}

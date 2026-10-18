@@ -41,9 +41,10 @@ use std::time::{Duration, Instant};
 use karyos_codec::{CodecError, Envelope};
 use karyos_sys::command_ring::{RingConsumer, RingError, RingProducer, command_ring};
 
+use super::checkpoint::{CheckpointError, CheckpointRequest, CheckpointWriter, Progress};
 use super::journal::{GroupJournal, JournalError};
 use super::prefix::{self, Coverage, DurableFor, PrefixError, PrefixTracker, PrefixView};
-use super::record::{Capture, GroupRecord, ReferenceUnavailable, Role};
+use super::record::{Capture, CheckpointRecord, GroupRecord, ReferenceUnavailable, Role};
 use crate::disk::Disk;
 use crate::segment::SyncPolicy;
 
@@ -240,6 +241,7 @@ pub fn capture<D: Disk>(
         tail: 0,
         dispatched,
         in_flight,
+        checkpoints: None,
     };
     let uncovered = config
         .in_flight
@@ -342,9 +344,23 @@ pub struct CaptureSender {
     /// The last `group_seq` sent.
     dispatched: u64,
     in_flight: u64,
+    /// The group's checkpoint handle, when it keeps checkpoints (A9-3),
+    /// until the Gateway takes it.
+    checkpoints: Option<super::checkpoint::CheckpointHandle>,
 }
 
 impl CaptureSender {
+    /// The group's checkpoint handle, once: `None` for a group started
+    /// without checkpoints, or once taken.
+    pub fn take_checkpoints(&mut self) -> Option<super::checkpoint::CheckpointHandle> {
+        self.checkpoints.take()
+    }
+
+    /// Gives the sender the group's checkpoint handle.
+    pub(crate) fn attach_checkpoints(&mut self, handle: super::checkpoint::CheckpointHandle) {
+        self.checkpoints = Some(handle);
+    }
+
     /// Whether a whole event can be taken now: the group runs, the ring
     /// has room for the largest event with the padding a wrap would need,
     /// and fewer events are in flight than the tracker holds (until the
@@ -492,6 +508,13 @@ pub struct GroupWaiter {
 }
 
 impl GroupWaiter {
+    /// Whether event `seq` is durable now, as the prefixes answer per
+    /// event across ranges ([`PrefixView::durable_for`]).
+    #[must_use]
+    pub fn durable_for(&self, seq: u64) -> DurableFor {
+        self.shared.view.durable_for(seq)
+    }
+
     /// Waits until `durable_group_seq` reaches `seq`, the group fails or
     /// ends, or `timeout` passes; returns `durable_group_seq`.
     ///
@@ -571,6 +594,21 @@ pub struct CaptureJob<D: Disk> {
     emptied: u64,
 }
 
+/// How far [`CaptureJob::checkpoint`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointStep {
+    /// The journal does not hold the checkpoint's event yet, or is inside
+    /// an event: nothing was written.
+    NotReady,
+    /// Its bytes are written up to `written`.
+    Writing {
+        /// The bytes in the store so far.
+        written: usize,
+    },
+    /// Recorded.
+    Recorded(CheckpointRecord),
+}
+
 /// Why the job stopped recording.
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
@@ -646,7 +684,22 @@ impl<D: Disk> CaptureJob<D> {
                 let record = GroupRecord::decode(record)?;
                 // Only an end's and a header's positions count, and a
                 // message ends at the event's end.
-                self.tracker.record(&record, written)?;
+                match self.tracker.record(&record, written) {
+                    // Events sent while the prefixes were stopped can fill
+                    // the queue once a checkpoint reopens a range: the
+                    // journal is synced and the prefixes advanced, and the
+                    // record taken again, once; still full, the group fails.
+                    Err(PrefixError::Full { .. }) => {
+                        let _ = self.journal.sync()?;
+                        let _ = self.tracker.advance(
+                            self.journal.written(),
+                            self.journal.durable(),
+                            coverage,
+                        );
+                        self.tracker.record(&record, written)?;
+                    }
+                    taken => taken?,
+                }
                 match record.role() {
                     Role::Event(seq) | Role::Uncaptured(seq) => self.tracker.delivered(seq),
                     // A gap's events were delivered, not captured.
@@ -705,15 +758,60 @@ impl<D: Disk> CaptureJob<D> {
         Ok(())
     }
 
+    /// Writes the checkpoint `request` through `writer`, at most `budget`
+    /// of its bytes this call (A9-3): it begins once the journal holds the
+    /// event the checkpoint names and is between events, and its record,
+    /// appended once the bytes are synced, is fed to the prefixes, which
+    /// may open a range once advanced over the store's coverage
+    /// ([`CaptureJob::refresh`]).
+    ///
+    /// # Errors
+    ///
+    /// The writer's: the checkpoint is let go, the group goes on.
+    pub fn checkpoint(
+        &mut self,
+        writer: &mut CheckpointWriter<D>,
+        request: &CheckpointRequest,
+        budget: usize,
+    ) -> Result<CheckpointStep, CheckpointError> {
+        if !writer.writing() {
+            let order = self.journal.order();
+            if !order.at_boundary() || order.next_seq() <= request.group_seq {
+                return Ok(CheckpointStep::NotReady);
+            }
+            writer.begin(&self.journal, request)?;
+        }
+        match writer.advance(&mut self.journal, request, budget)? {
+            Progress::Writing { written } => Ok(CheckpointStep::Writing { written }),
+            Progress::Recorded(record) => {
+                let written = self.journal.written();
+                // The journal took it; the tracker's refusal would be
+                // its order disagreeing, which the journal checked.
+                let _ = self
+                    .tracker
+                    .record(&GroupRecord::Checkpoint(record), written);
+                Ok(CheckpointStep::Recorded(record))
+            }
+        }
+    }
+
+    /// Advances the prefixes over `coverage`, as a duty does: after a
+    /// checkpoint its caller records, with the coverage of its store.
+    pub fn refresh(&mut self, coverage: &impl Coverage) {
+        self.advance(coverage);
+    }
+
     /// Advances the prefixes, and notifies waiters when the durable one
     /// moved.
     fn advance(&mut self, coverage: &impl Coverage) {
         let (_, durable) =
             self.tracker
                 .advance(self.journal.written(), self.journal.durable(), coverage);
-        if self.tracker.stopped() {
-            self.shared.stopped.store(true, Ordering::Release);
-        }
+        // A checkpoint that opens a range lifts the stop (A9-3): the
+        // in-flight bound applies again.
+        self.shared
+            .stopped
+            .store(self.tracker.stopped(), Ordering::Release);
         let start = self.tracker.range().start.map(|start| start.group_seq);
         let first = self.tracker.first_range().map_or(0, |first| first.durable);
         if durable > self.signalled || start != self.signalled_start || first > self.signalled_first

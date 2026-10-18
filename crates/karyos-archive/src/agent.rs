@@ -55,10 +55,15 @@ use std::time::{Duration, Instant};
 use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
 use crate::group::capture::{
-    self, CaptureConfig, CaptureError, CaptureJob, CaptureSender, CaptureSetup, GroupState,
+    self, CaptureConfig, CaptureError, CaptureJob, CaptureSender, CaptureSetup, CheckpointStep,
+    GroupState,
+};
+use crate::group::checkpoint::{
+    CheckpointError, CheckpointInbox, CheckpointRequest, CheckpointStore, CheckpointWriter,
+    handoff, recorded_end,
 };
 use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
-use crate::group::prefix::Coverage;
+use crate::group::prefix::{CheckpointHeld, Coverage};
 use crate::group::record::{CONTRACT_VERSION, Capture, Clock, JournalHeader};
 use crate::recorder::{Ended, FrameSource, Mode, Recorder, RecorderError};
 use crate::replay::{Rate, ReplayError, ReplaySource, Step};
@@ -99,6 +104,10 @@ pub struct AgentConfig {
     pub max_groups: usize,
     /// Events one group's journal takes at most per cycle.
     pub group_budget: usize,
+    /// Checkpoint bytes one group writes at most per cycle: a large
+    /// snapshot is written over several, so it never stalls the
+    /// recorders and replays sharing the thread (A9-3).
+    pub checkpoint_budget: usize,
 }
 
 impl Default for AgentConfig {
@@ -115,6 +124,7 @@ impl Default for AgentConfig {
             idle: Duration::from_millis(1),
             max_groups: 16,
             group_budget: 64,
+            checkpoint_budget: 256 * 1024,
         }
     }
 }
@@ -138,6 +148,20 @@ pub struct StartGroup {
     pub journal: JournalConfig,
     /// The capture path's ring and bounds.
     pub capture: CaptureConfig,
+    /// The group's checkpoints (A9-3), or `None` for a group that keeps
+    /// none.
+    pub checkpoints: Option<GroupCheckpoints>,
+}
+
+/// Where a group's checkpoints live, and how large one may be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCheckpoints {
+    /// The directory of checkpoint stores, beside the group journals' and
+    /// not the same: a store is named by the group's id, as its journal
+    /// is. The host made it.
+    pub dir: PathBuf,
+    /// The largest snapshot, at least 1 byte: the Gateway's buffer.
+    pub max_checkpoint: usize,
 }
 
 /// A new group's journal header.
@@ -403,6 +427,9 @@ pub enum AgentError {
     /// A recording group's capture settings cannot work.
     #[error(transparent)]
     Capture(#[from] CaptureError),
+    /// A group's checkpoint writer could not start (A9-3).
+    #[error(transparent)]
+    Checkpoint(Box<CheckpointError>),
     /// A recording group of that id is already captured.
     #[error("group {id} is already captured")]
     GroupCaptured {
@@ -1144,14 +1171,72 @@ fn next_failure(failures: u64) -> u64 {
     failures.checked_add(1).unwrap_or(failures)
 }
 
+/// One group's checkpoint work this cycle: takes a request from the
+/// Gateway, writes at most `budget` of its bytes, and gives the buffer back
+/// once its write ended. Returns whether it worked.
+fn checkpoint_duty<D: Disk>(
+    job: &mut CaptureJob<D>,
+    checkpoints: &mut GroupWriter<D>,
+    budget: usize,
+) -> bool {
+    if checkpoints.current.is_none() {
+        checkpoints.current = checkpoints.inbox.take();
+    }
+    let Some(request) = checkpoints.current.as_ref() else {
+        return false;
+    };
+    let result = match job.checkpoint(&mut checkpoints.writer, request, budget) {
+        Ok(CheckpointStep::NotReady) => return false,
+        Ok(CheckpointStep::Writing { .. }) => return true,
+        Ok(CheckpointStep::Recorded(record)) => Ok(record),
+        Err(error) => Err(error),
+    };
+    if let Some(request) = checkpoints.current.take() {
+        checkpoints.inbox.give_back(request, result);
+    }
+    true
+}
+
 /// A recording group the agent captures.
 #[derive(Debug)]
 struct ActiveGroup<D: Disk> {
     id: u64,
     job: CaptureJob<D>,
+    /// Its checkpoints, when it keeps them.
+    checkpoints: Option<GroupWriter<D>>,
     /// The failures whose references this group has all read: its last
     /// duty that read the ring empty began after them.
     cleared: u64,
+}
+
+/// A group's checkpoint writer on the agent's thread (A9-3): the store,
+/// the handoff from the Gateway, and the request being written.
+#[derive(Debug)]
+struct GroupWriter<D: Disk> {
+    writer: CheckpointWriter<D>,
+    inbox: CheckpointInbox,
+    current: Option<CheckpointRequest>,
+}
+
+/// One group's coverage: the recordings, and its checkpoint store.
+struct GroupCoverage<'a, D: Disk> {
+    recorded: &'a Recorded<'a, D>,
+    store: Option<&'a CheckpointStore<D>>,
+}
+
+impl<D: Disk> Coverage for GroupCoverage<'_, D> {
+    fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
+        self.recorded.positions(recording_id)
+    }
+
+    fn ended(&self, recording_id: u64) -> Option<u64> {
+        self.recorded.ended(recording_id)
+    }
+
+    fn checkpoint(&self, position: u64, end: u64) -> CheckpointHeld {
+        self.store
+            .map_or(CheckpointHeld::Missing, |store| store.holds(position, end))
+    }
 }
 
 /// The recordings' frames as recording groups see them (A7d): an active
@@ -1464,9 +1549,27 @@ impl<D: Disk + Clone> State<D> {
             failed: &self.failed,
             catalog: &self.catalog,
         };
+        let coverage = GroupCoverage {
+            recorded: &recorded,
+            store: group.checkpoints.as_ref().map(|c| c.writer.store()),
+        };
         // A job that fails reports it through its sender's state, and
         // closes all the same.
-        let _ = group.job.drain_to_close(now, &recorded);
+        let _ = group.job.drain_to_close(now, &coverage);
+        // A checkpoint not recorded by the stop is not: its buffer goes
+        // back, and its bytes stay unnamed.
+        if let Some(mut checkpoints) = group.checkpoints {
+            if let Some(request) = checkpoints
+                .current
+                .take()
+                .or_else(|| checkpoints.inbox.take())
+            {
+                checkpoints
+                    .inbox
+                    .give_back(request, Err(CheckpointError::NotStarted));
+            }
+            let _ = checkpoints.writer.close()?;
+        }
         group.job.close().map_err(AgentError::from)
     }
 
@@ -1505,20 +1608,72 @@ impl<D: Disk + Clone> State<D> {
                 GroupJournal::recover(self.disk.clone(), &start.dir, id, start.journal)?.journal
             }
         };
+        let mut journal = journal;
+        // The store beside the journal, made or recovered with it: a
+        // recovered one is cut to what the journal's records name.
+        let store = match &start.checkpoints {
+            None => None,
+            Some(checkpoints) if start.new.is_some() => Some(CheckpointStore::create(
+                self.disk.clone(),
+                &checkpoints.dir,
+                id,
+                start.journal,
+            )?),
+            Some(checkpoints) => {
+                let end = recorded_end(&mut journal)?;
+                Some(
+                    match CheckpointStore::recover(
+                        self.disk.clone(),
+                        &checkpoints.dir,
+                        id,
+                        start.journal,
+                        end,
+                    ) {
+                        // A group whose checkpoints were never kept.
+                        Err(SegmentError::NotFound { .. }) if end == 0 => CheckpointStore::create(
+                            self.disk.clone(),
+                            &checkpoints.dir,
+                            id,
+                            start.journal,
+                        )?,
+                        recovered => recovered?,
+                    },
+                )
+            }
+        };
         let recorded = Recorded {
             active: &self.active,
             failed: &self.failed,
             catalog: &self.catalog,
         };
-        let (sender, job) =
-            capture::capture(start.capture, journal, &recorded).map_err(|error| match error {
+        let coverage = GroupCoverage {
+            recorded: &recorded,
+            store: store.as_ref(),
+        };
+        let (mut sender, job) =
+            capture::capture(start.capture, journal, &coverage).map_err(|error| match error {
                 CaptureSetup::Config(error) => AgentError::Capture(error),
                 CaptureSetup::Journal(error) => AgentError::Journal(error),
             })?;
+        let checkpoints = match (store, &start.checkpoints) {
+            (Some(store), Some(config)) => {
+                let writer = CheckpointWriter::new(store, job.journal())
+                    .map_err(|error| AgentError::Checkpoint(Box::new(error)))?;
+                let (handle, inbox) = handoff(config.max_checkpoint);
+                sender.attach_checkpoints(handle);
+                Some(GroupWriter {
+                    writer,
+                    inbox,
+                    current: None,
+                })
+            }
+            _ => None,
+        };
         // A new ring holds no reference to a recording that failed.
         self.groups.push(ActiveGroup {
             id,
             job,
+            checkpoints,
             cleared: self.failures,
         });
         Ok(sender)
@@ -1533,14 +1688,31 @@ impl<D: Disk + Clone> State<D> {
             catalog: &self.catalog,
         };
         let failures = self.failures;
+        let checkpoint_budget = self.config.checkpoint_budget;
         let mut worked = false;
         for group in &mut self.groups {
             let emptied = group.job.emptied();
+            let coverage = GroupCoverage {
+                recorded: &recorded,
+                store: group.checkpoints.as_ref().map(|c| c.writer.store()),
+            };
             // A job that fails reports it through its sender's state.
             worked |= group
                 .job
-                .duty(now, self.config.group_budget, &recorded)
+                .duty(now, self.config.group_budget, &coverage)
                 .unwrap_or(false);
+            if let Some(checkpoints) = group.checkpoints.as_mut()
+                && checkpoint_duty(&mut group.job, checkpoints, checkpoint_budget)
+            {
+                worked = true;
+                // A checkpoint just recorded may open a range: now, not at
+                // the next cycle.
+                let coverage = GroupCoverage {
+                    recorded: &recorded,
+                    store: Some(checkpoints.writer.store()),
+                };
+                group.job.refresh(&coverage);
+            }
             // A group that read its ring empty, or that reads nothing
             // more, holds no reference to an earlier failure.
             if group.job.emptied() != emptied || group.job.state() != GroupState::Running {

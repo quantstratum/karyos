@@ -981,3 +981,102 @@ fn a_waiter_on_a_let_go_event_is_woken_when_a_range_opens() {
         "woken at the deadline: {after:?}"
     );
 }
+
+/// A checkpoint record sent through the ring.
+fn checkpoint_message(group_seq: u64, id: u64) -> Vec<u8> {
+    use crate::group::record::CheckpointRecord;
+
+    let mut record = vec![0u8; 64];
+    let length = GroupRecord::Checkpoint(CheckpointRecord {
+        group_seq,
+        checkpoint_id: id,
+        position: 0,
+        length: 10,
+        crc32c: 0,
+        format: 7,
+    })
+    .encode(&mut record)
+    .unwrap();
+    record.truncate(length);
+    record
+}
+
+/// #414 wiring item, the coordinator's scenario (A9-3): in_flight 2, a
+/// gap, events 3 and 4, a checkpoint at 2 that opens a range holding them
+/// (the queue full), then event 5, sent while the stop still let it in.
+/// The tracker is full at 5's end: the job syncs, advances and takes it
+/// again, once, and the group goes on. Once the range opened, the stop is
+/// lifted, so the in-flight bound applies again.
+#[test]
+fn a_full_queue_after_a_range_opens_syncs_and_takes_the_event_again() {
+    let held = CheckpointsHeld;
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 2));
+    sender.send(&event(1, 10, None), 1).unwrap();
+    sender.send(&gap(2, 2), 2).unwrap();
+    job.duty(0, 16, &held).unwrap();
+    assert!(job.tracker().stopped());
+    sender.send(&event(3, 10, None), 3).unwrap();
+    sender.send(&event(4, 10, None), 4).unwrap();
+    sender.send(&checkpoint_message(2, 1), 4).unwrap();
+    job.duty(0, 16, &held).unwrap();
+    assert_eq!(job.tracker().range().start.unwrap().group_seq, 2);
+    assert!(!job.tracker().stopped());
+    // The stop is lifted: the in-flight bound applies again.
+    assert_eq!(sender.admit(), Err(Refusal::InFlight));
+    // Admitted under the stop, before the sender saw it lifted.
+    sender.send(&event(5, 10, None), 5).unwrap();
+    job.duty(0, 16, &held).unwrap();
+    assert_eq!(sender.state(), GroupState::Running);
+    job.sync(&held).unwrap();
+    assert_eq!(job.tracker().range().durable, 5);
+    assert_eq!(sender.view().durable_group_seq(), 5);
+}
+
+/// A9-3: the job writes a checkpoint only once its journal holds the
+/// event it names (the request may come before the ring is drained), at
+/// most the budget's bytes a call, and feeds the record to the prefixes.
+#[test]
+fn the_job_writes_a_checkpoint_once_its_event_is_journaled() {
+    use crate::group::checkpoint::{CheckpointSlot, CheckpointStore, CheckpointWriter};
+
+    let held = CheckpointsHeld;
+    let disk = FaultDisk::default();
+    let (mut sender, mut job) = capture(
+        settings(4096, 400, 8),
+        journal(disk.clone(), Capture::BestEffort, UNSYNCED),
+        &held,
+    )
+    .unwrap();
+    let store =
+        CheckpointStore::create(disk, Path::new("/checkpoints"), 1, config(UNSYNCED)).unwrap();
+    let mut writer = CheckpointWriter::new(store, job.journal()).unwrap();
+    let mut slot = CheckpointSlot::new(64);
+    let request = slot
+        .take(2, 7, |buffer| {
+            buffer[..10].copy_from_slice(b"0123456789");
+            10
+        })
+        .unwrap();
+    sender.send(&event(1, 10, None), 1).unwrap();
+    sender.send(&gap(2, 2), 2).unwrap();
+    // The ring is not drained: the journal does not hold event 2.
+    assert_eq!(
+        job.checkpoint(&mut writer, &request, 4).unwrap(),
+        CheckpointStep::NotReady
+    );
+    job.duty(0, 16, &held).unwrap();
+    assert_eq!(
+        job.checkpoint(&mut writer, &request, 4).unwrap(),
+        CheckpointStep::Writing { written: 4 }
+    );
+    assert_eq!(
+        job.checkpoint(&mut writer, &request, 4).unwrap(),
+        CheckpointStep::Writing { written: 8 }
+    );
+    assert!(matches!(
+        job.checkpoint(&mut writer, &request, 4).unwrap(),
+        CheckpointStep::Recorded(_)
+    ));
+    job.refresh(&held);
+    assert_eq!(job.tracker().range().start.unwrap().group_seq, 2);
+}
