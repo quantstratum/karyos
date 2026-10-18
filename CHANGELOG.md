@@ -11,6 +11,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A publication released through the client facade whose removal cannot
+  be sent (the command ring full, a handle another connection issued, a
+  closed link) is counted: `Client::publication_releases_failed`. The
+  handle is still dropped; in process that ends its lease, and for a
+  remote client the driver keeps the publication, with no EOS, until the
+  client ends. The doc-hidden `Connection::release_publication` returns
+  whether the removal was sent (#402 review P3).
 - The `replay` rejoin with an Archive (phase 3, A6c; SPEC.md §4).
   `karyos_client::ReplayRejoin` wraps a subscription: on an overrun the
   live reader rejoins at the head, the poll reports the overrun as

@@ -326,9 +326,16 @@ pub trait Connection: sealed::Sealed {
         lane: karyos_sys::frame::Lane,
     ) -> Result<u64, ConductorError>;
 
-    /// Releases a publication handle the facade will not hand out.
+    /// Releases a publication handle the facade will not hand out: asks
+    /// the driver to remove it, and returns whether that was sent. A
+    /// removal that cannot be sent now (the command ring full, a handle
+    /// this connection did not issue, a closed link) drops the handle
+    /// instead: in process that ends its lease; for a remote client it
+    /// detaches its export, and the driver keeps the publication, with no
+    /// EOS, until the client ends. The facade counts these
+    /// ([`Client::publication_releases_failed`]).
     #[doc(hidden)]
-    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>);
+    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) -> bool;
 
     #[doc(hidden)]
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError>;
@@ -392,9 +399,9 @@ impl Connection for ClientConductor {
         ClientConductor::add_publication_on_lane(self, stream, lane, false)
     }
 
-    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) {
+    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) -> bool {
         // A handle that cannot be removed now is dropped, ending its lease.
-        let _ = self.remove_publication(publication);
+        self.remove_publication(publication).is_ok()
     }
 
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError> {
@@ -483,10 +490,10 @@ impl Connection for crate::ipc::RemoteClient {
         crate::ipc::RemoteClient::add_publication_on_lane(self, stream, lane, false)
     }
 
-    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) {
+    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) -> bool {
         // A handle that cannot be removed now is dropped: it detaches its
         // export, and its registration ends with the client.
-        let _ = crate::ipc::RemoteClient::remove_publication(self, publication);
+        crate::ipc::RemoteClient::remove_publication(self, publication).is_ok()
     }
 
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError> {
@@ -535,7 +542,9 @@ impl Connection for crate::ipc::RemoteClient {
                 crate::conductor::Request::Publication { .. } => {
                     match self.take_publication(&fetchable) {
                         Ok(publication) => {
-                            self.release_publication(publication);
+                            // Released either way: removed, or dropped
+                            // until the client ends (`release_publication`).
+                            let _ = self.release_publication(publication);
                             true
                         }
                         Err(_) => false,
@@ -693,6 +702,8 @@ pub struct Client<C: Connection> {
     laps: u64,
     /// Late grants released after their request timed out.
     late_released: u64,
+    /// Publication handles released whose removal could not be sent.
+    releases_failed: u64,
     completions: Vec<Completion>,
     events: Vec<Event>,
 }
@@ -736,6 +747,7 @@ impl<C: Connection> Client<C> {
             events_dropped,
             laps,
             late_released: 0,
+            releases_failed: 0,
             completions: Vec::new(),
             events: Vec::new(),
         }
@@ -746,6 +758,16 @@ impl<C: Connection> Client<C> {
     #[must_use]
     pub fn late_grants_released(&self) -> u64 {
         self.late_released
+    }
+
+    /// Publication handles released ([`Client::remove_publication`], or a
+    /// lane given back when a publication was refused) whose removal could
+    /// not be sent: the handle was dropped instead, so the driver keeps the
+    /// publication until its lease ends (in process) or the client ends
+    /// (remote), with no EOS. Sticky at `u64::MAX`.
+    #[must_use]
+    pub fn publication_releases_failed(&self) -> u64 {
+        self.releases_failed
     }
 
     /// The exclusive publication of `stream_id` on the channel `uri`: a
@@ -814,7 +836,9 @@ impl<C: Connection> Client<C> {
                 Err(_) => ClientError::Unknown,
             };
             for publication in lanes {
-                self.connection.release_publication(publication);
+                if !self.connection.release_publication(publication) {
+                    bump(&mut self.releases_failed);
+                }
             }
             return Err(refused);
         }
@@ -859,7 +883,9 @@ impl<C: Connection> Client<C> {
     /// ```
     pub fn remove_publication(&mut self, publication: Publication<C::Terms>) {
         for lane in publication.into_lanes() {
-            self.connection.release_publication(lane);
+            if !self.connection.release_publication(lane) {
+                bump(&mut self.releases_failed);
+            }
         }
     }
 
