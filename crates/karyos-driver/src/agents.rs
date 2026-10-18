@@ -1111,6 +1111,17 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index).map(data::Outbound::counters)
     }
 
+    /// What the timed gate of its `index`-th publication counted (tests).
+    #[cfg(test)]
+    pub(crate) fn outbound_timed_counts(
+        &self,
+        index: usize,
+    ) -> Option<crate::timed_gate::TimedCounts> {
+        self.role
+            .outbound(index)
+            .and_then(data::Outbound::timed_counts)
+    }
+
     /// Reads NAKs again after [`SenderAgent::ignore_naks`] (tests).
     #[cfg(test)]
     #[cfg_attr(

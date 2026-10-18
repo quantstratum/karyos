@@ -290,6 +290,27 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Timed lanes over the network (P2.11 PR1, the software route;
+  timed-tx.md). `EmbeddedDriver::add_timed_network_publication` adds a
+  network publication whose lanes have a schedule ring: its sender holds
+  each message until its requested time, then sends it, one message per
+  datagram, and frees its schedule entry once it left, so the ring bounds
+  only messages outstanding. A plain network publication whose lanes have
+  a ring is timed with the default settings; before, its offers were
+  back-pressured for good after the ring's capacity, as nothing freed it.
+  Lateness, late sends and heads dropped by an unreliable reset are
+  counted; a guard close ends a head still waiting for its time. Refused
+  for now, typed (`DriverError::TimedNetworkUnsupported`): redundant
+  paths, reliable channels (PR1b), the `Tai` domain, cancel-on-deadline
+  and a `max_horizon` that, with one `sender_heartbeat_interval`, reaches
+  `image_liveness_timeout` (a lane holding only a head that far ahead
+  sends nothing, so its images would retire).
+  A lane's settings and counter cells are fixed from the add, also across
+  a guard reopen's fresh incarnation. Counts are per message, not per
+  fragment. The sender times heads on the host monotonic clock,
+  as `Monotonic` offers are timed; no time namespace is checked, as on the
+  local route. `TimedGate` keeps its API over a `TimedState`, which a
+  sender holds across cycles and gates through a `TimedView`.
 - The `replay` rejoin through the Archive end to end (phase 3, A6d):
   karyos-sim's `tests/archive_control.rs` wraps a lapped optional reader
   in a `ReplayRejoin` whose provider is the Archive's client, over the

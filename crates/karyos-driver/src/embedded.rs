@@ -2374,7 +2374,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Allocates a timed lane's counters once, when its first handle is
     /// prepared; nothing for a lane that is not timed.
-    fn ensure_timed_counters(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+    pub(crate) fn ensure_timed_counters(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<(), DriverError> {
         let found = self.stream_ref(stream)?;
         if found.buffer.schedule_ring().is_none() || found.timed_counters.is_some() {
             return Ok(());
@@ -2639,8 +2642,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // The buffer's configuration, which a network sender announces.
         found.config = plan.config;
         found.incarnation = plan.incarnation;
-        // A fresh incarnation has a fresh ring.
-        found.schedule_issued = false;
+        // A fresh incarnation has a fresh ring. A local lane takes new
+        // settings before its next handle; a network lane's are its
+        // sender's, fixed from the add: kept, with its counters, on every
+        // lane, so a reopen bypasses no refusal of the add.
+        if found.network == NetworkLane::Local {
+            found.schedule_issued = false;
+        }
         found.base = plan.base;
         found.members.clear();
         found.spare = None;
