@@ -1612,6 +1612,162 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A reference drained after its recording failed, past the frames
+    /// durable at the failure: marked in best effort, and a strict group
+    /// ends.
+    #[test]
+    fn a_late_uncovered_reference_to_a_failed_recording_is_settled() {
+        for capture in [Capture::BestEffort, Capture::Strict] {
+            let dir = temp_dir("probe-late-uncovered");
+            let groups = groups_dir(&dir);
+            let fail = Arc::new(AtomicBool::new(false));
+            let (agent, recording, released) = failing_required(&dir, &fail);
+            let mut sender = agent
+                .start_group(start_group(&groups, Some(capture)))
+                .unwrap();
+            fail.store(true, Ordering::Release);
+            released.store(2, Ordering::Release);
+            let event = agent.event(Duration::from_secs(5));
+            assert!(matches!(event, Some(Event::Failed { .. })), "{event:?}");
+            let mut out = vec![0u8; MAX_RECORD];
+            let mut bytes = Vec::new();
+            for record in [
+                GroupRecord::Message(MessageEvent {
+                    group_seq: 1,
+                    logical_time: 1,
+                    incarnation: 1,
+                    position: 3000,
+                    extent: 64,
+                    stream_id: 10,
+                    session_id: 3,
+                    lane: karyos_sys::frame::Lane::ZERO,
+                    reserved_value: 0,
+                    end_of_stream: false,
+                    extension: None,
+                    payload: Payload::Reference {
+                        recording_id: recording,
+                        length: 10,
+                    },
+                }),
+                GroupRecord::End(EventEnd {
+                    group_seq: 1,
+                    observations: 0,
+                    outcome: EndOutcome::Complete,
+                }),
+            ] {
+                let length = record.encode(&mut out).unwrap();
+                bytes.extend_from_slice(&out[..length]);
+            }
+            sender.send(&bytes, 1).unwrap();
+            let result = sender.waiter().wait_durable(1, Duration::from_secs(3));
+            match capture {
+                Capture::BestEffort => assert_eq!(result, Ok(1)),
+                Capture::Strict => assert!(matches!(
+                    result,
+                    Err(crate::group::capture::WaitError::Stopped {
+                        state: GroupState::Ended,
+                        ..
+                    })
+                )),
+            }
+            drop(agent);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// `stop_group` returns promptly while a best-effort sender, past its
+    /// in-flight bound, keeps sending: the sender is refused as closing.
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one scenario")]
+    fn stop_group_refuses_a_live_sender() {
+        let dir = temp_dir("probe-live-sender");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        agent.stop(recording).unwrap();
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::BestEffort)))
+            .unwrap();
+        // Event 1 ends incomplete: the best-effort prefixes stop, and the
+        // in-flight bound no longer holds the sender back.
+        let mut first = referencing(1, recording);
+        let mut out = vec![0u8; MAX_RECORD];
+        let end = GroupRecord::End(EventEnd {
+            group_seq: 1,
+            observations: 0,
+            outcome: EndOutcome::Incomplete,
+        });
+        let length = end.encode(&mut out).unwrap();
+        let complete_len = {
+            let complete = GroupRecord::End(EventEnd {
+                group_seq: 1,
+                observations: 0,
+                outcome: EndOutcome::Complete,
+            });
+            complete.encode(&mut vec![0u8; MAX_RECORD]).unwrap()
+        };
+        first.truncate(first.len() - complete_len);
+        first.extend_from_slice(&out[..length]);
+        sender.admit().unwrap();
+        sender.send(&first, 1).unwrap();
+        let halt = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let producer = {
+            let halt = Arc::clone(&halt);
+            let sent = Arc::clone(&sent);
+            std::thread::spawn(move || {
+                let mut seq = 2u64;
+                while !halt.load(Ordering::Acquire) {
+                    match sender.admit() {
+                        Ok(()) => {
+                            if let Err(refusal) = sender.send(&referencing(seq, recording), seq) {
+                                return Some(refusal);
+                            }
+                            sent.store(seq, Ordering::Release);
+                            seq += 1;
+                        }
+                        Err(refusal @ (Refusal::Ended | Refusal::Failed | Refusal::Closing)) => {
+                            return Some(refusal);
+                        }
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+                None
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let fired = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let halt = Arc::clone(&halt);
+            let fired = Arc::clone(&fired);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                if !halt.swap(true, Ordering::AcqRel) {
+                    fired.store(true, Ordering::Release);
+                }
+            })
+        };
+        let begun = std::time::Instant::now();
+        let result = agent.stop_group(GROUP);
+        let took = begun.elapsed();
+        halt.store(true, Ordering::Release);
+        let state = producer.join().unwrap();
+        watchdog.join().unwrap();
+        result.unwrap();
+        assert!(!fired.load(Ordering::Acquire), "took {took:?}");
+        assert!(took < Duration::from_secs(2), "took {took:?}");
+        assert!(sent.load(Ordering::Acquire) > 1);
+        // Refused as closing, or as ended once the close was done.
+        assert!(
+            matches!(state, Some(Refusal::Closing | Refusal::Ended)),
+            "{state:?}"
+        );
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn failing_required(
         dir: &Path,
         fail: &Arc<AtomicBool>,

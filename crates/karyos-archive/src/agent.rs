@@ -27,9 +27,11 @@
 //!   durable at the failure, which the agent keeps beside the failed
 //!   recording for references drained later. A strict group that ended
 //!   because its recording failed short comes back running after a
-//!   restart when the recording recovers frames that cover the reference:
-//!   nothing was delivered unrecorded, so the journal is whole. Stopping a
-//!   group drains its ring into the journal before it closes.
+//!   restart when the recording recovers frames that cover the reference.
+//!   Its journal holds every event up to the end; the events the Gateway
+//!   sent before it learned of the end are not journaled. Stopping a group
+//!   refuses its sender, then drains its ring into the journal, bounded by
+//!   the ring, before it closes.
 //! - **Caps.** Recordings, replays and groups at once are capped; a start
 //!   beyond is refused and counted.
 //! - **Idle.** A cycle with nothing to do waits for a command up to the
@@ -1046,7 +1048,7 @@ fn run<D>(
         config,
         catalog,
         active: Vec::new(),
-        failed: Vec::new(),
+        failed: Vec::with_capacity(FAILED_KEPT),
         replays: Replays {
             active: Vec::new(),
             prepared: Vec::new(),
@@ -1108,10 +1110,26 @@ struct State<D: Disk> {
 
 /// A recording that failed: no stop in the catalog, so the groups settle
 /// their references to it by `durable`, its frames durable at the failure.
+///
+/// The agent keeps the latest [`FAILED_KEPT`] of them; a reference drained
+/// after its recording's entry was dropped is not settled, since the
+/// event loop sends references only to recordings it saw recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Failed {
     id: u64,
     durable: u64,
+}
+
+/// The failed recordings the agent keeps, oldest dropped first: a bound,
+/// since coverage scans them for each reference.
+const FAILED_KEPT: usize = 64;
+
+/// Keeps `entry`, dropping the oldest past [`FAILED_KEPT`].
+fn keep_failed(failed: &mut Vec<Failed>, entry: Failed) {
+    if failed.len() >= FAILED_KEPT {
+        failed.remove(0);
+    }
+    failed.push(entry);
 }
 
 /// A recording group the agent captures.
@@ -1184,7 +1202,7 @@ fn fail_recording<D: Disk>(
     id: u64,
     durable: u64,
 ) {
-    failed.push(Failed { id, durable });
+    keep_failed(failed, Failed { id, durable });
     let required = catalog.get(id).is_some_and(|recording| recording.required);
     let durable = if required { durable } else { 0 };
     let recorded = Recorded {
@@ -1402,8 +1420,8 @@ impl<D: Disk + Clone> State<D> {
 
     /// Drains what the group's ring still holds into its journal, then
     /// closes it, synced: an event the sender wrote before the stop is
-    /// recorded, as strict capture promises. The ring is bounded, so the
-    /// drain is.
+    /// recorded. The sender is refused first, and the drain is bounded by
+    /// the ring, so a live sender cannot hold the agent here.
     fn close_group(&self, mut group: ActiveGroup<D>, now: u64) -> Result<u64, AgentError> {
         let recorded = Recorded {
             active: &self.active,
@@ -1412,7 +1430,7 @@ impl<D: Disk + Clone> State<D> {
         };
         // A job that fails reports it through its sender's state, and
         // closes all the same.
-        while let Ok(true) = group.job.duty(now, self.config.group_budget, &recorded) {}
+        let _ = group.job.drain_to_close(now, &recorded);
         group.job.close().map_err(AgentError::from)
     }
 
@@ -1539,10 +1557,13 @@ impl<D: Disk + Clone> State<D> {
                     .is_err()
                 {
                     // Nothing was recorded, and no group refers to it yet.
-                    self.failed.push(Failed {
-                        id,
-                        durable: position,
-                    });
+                    keep_failed(
+                        &mut self.failed,
+                        Failed {
+                            id,
+                            durable: position,
+                        },
+                    );
                 }
                 Err(error)
             }

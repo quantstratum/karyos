@@ -115,6 +115,10 @@ pub enum Refusal {
     /// never be covered.
     #[error("the group ended")]
     Ended,
+    /// The group is closing: what the ring holds is drained into the
+    /// journal, and nothing more is taken.
+    #[error("the group is closing")]
+    Closing,
 }
 
 /// Where a group stands.
@@ -142,6 +146,8 @@ struct Shared {
     /// The prefixes stopped at an incomplete event or a gap: no event is
     /// queued any more, so none is in flight.
     stopped: std::sync::atomic::AtomicBool,
+    /// The group is closing: the sender takes nothing more.
+    closing: std::sync::atomic::AtomicBool,
     view: Arc<PrefixView>,
     /// Held for no work: the job takes it before it notifies, so a waiter
     /// that checked under it is already waiting.
@@ -213,6 +219,7 @@ pub fn capture<D: Disk>(
         consumed: AtomicU64::new(0),
         state: AtomicU8::new(RUNNING),
         stopped: std::sync::atomic::AtomicBool::new(tracker.stopped()),
+        closing: std::sync::atomic::AtomicBool::new(false),
         view: tracker.view(),
         lock: Mutex::new(()),
         signal: Condvar::new(),
@@ -243,6 +250,7 @@ pub fn capture<D: Disk>(
         sync_at_bound: policy == SyncPolicy::PerSegment,
         in_flight,
         uncovered: Vec::with_capacity(config.in_flight),
+        capacity: config.ring_capacity,
         signalled: 0,
         stop_notified: false,
     };
@@ -361,6 +369,9 @@ impl CaptureSender {
             GroupState::Failed => return Err(Refusal::Failed),
             GroupState::Ended => return Err(Refusal::Ended),
         }
+        if self.shared.closing.load(Ordering::Acquire) {
+            return Err(Refusal::Closing);
+        }
         let consumed = self.shared.consumed.load(Ordering::Acquire);
         // The job reads only what was written, so `consumed` is never past
         // the tail, nor a capacity behind it.
@@ -398,6 +409,9 @@ impl CaptureSender {
             return Err(Refusal::TooLarge);
         }
         let framed = extent(records.len()).ok_or(Refusal::TooLarge)?;
+        if self.shared.closing.load(Ordering::Acquire) {
+            return Err(Refusal::Closing);
+        }
         // A failure stores the state only: the event loop never takes the
         // waiters' lock, and the job notifies them.
         let fail = |shared: &Shared| {
@@ -525,6 +539,8 @@ pub struct CaptureJob<D: Disk> {
     signalled: u64,
     /// The waiters were told the group stopped.
     stop_notified: bool,
+    /// The ring's capacity in bytes.
+    capacity: usize,
 }
 
 /// Why the job stopped recording.
@@ -773,6 +789,29 @@ impl<D: Disk> CaptureJob<D> {
     #[must_use]
     pub const fn journal(&self) -> &GroupJournal<D> {
         &self.journal
+    }
+
+    /// Drains what the ring holds into the journal before a close: the
+    /// sender is refused ([`Refusal::Closing`]) first, so a live sender
+    /// cannot keep the drain going, and the drain is bounded by what the
+    /// ring can hold. A pass reads every message the ring can hold, and a
+    /// second reads one a sender wrote while the first ran. A message
+    /// written later still, by a sender that checked before the close, is
+    /// not journaled.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError`]: the group is then failed.
+    pub fn drain_to_close(&mut self, now: u64, coverage: &impl Coverage) -> Result<(), JobError> {
+        self.shared.closing.store(true, Ordering::Release);
+        // Every message takes at least a ring header.
+        let most = self.capacity / usize::try_from(RING_HEADER).unwrap_or(usize::MAX).max(1);
+        for _ in 0..2 {
+            if !self.duty(now, most, coverage)? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Closes the journal (syncing it); the group records nothing more.

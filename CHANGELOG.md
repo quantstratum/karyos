@@ -329,19 +329,19 @@ release may break APIs, wire formats and shared-memory layouts.
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
 - The Archive's agent captures recording groups (phase 3, A7d-1c;
-  `recording-group-gateway.md` sections 7 and 9).
-  `ArchiveHandle::start_group` makes a group's journal (or recovers it)
-  in the host's group directory and returns its `CaptureSender`; the
-  agent serves the group's job after the recorders, and `stop_group`
-  drains its ring into the journal and closes it. Settings that cannot
-  work are refused before the journal is made, and a start past
-  `max_groups` is counted in `refused()`. A group's references are covered by the agent's recordings:
-  an active `required` recorder's written and durable positions, and a
-  stopped `required` recording's end, also after a restart. A recording
-  that fails, with no stop in the catalog, has its references settled by
-  its frames durable at the failure, also those drained after it. The catalog records each recording's mode in
-  its `Started` record (an optional last byte under version 3, covered by
-  the CRC; an entry without it reads back as `async`), and
+  `recording-group-gateway.md` sections 7 and 9). `ArchiveHandle::start_group`
+  makes a group's journal (or recovers it) in the host's group directory and
+  returns its `CaptureSender`; the agent serves the group's job after the
+  recorders, and `stop_group` refuses the group's sender, drains its ring into
+  the journal, bounded by the ring, and closes it. Settings that cannot work are
+  refused before the journal is made, and a start past `max_groups` is counted
+  in `refused()`. A group's references are covered by the agent's recordings: an
+  active `required` recorder's written and durable positions, and a stopped
+  `required` recording's end, also after a restart. A recording that fails, with
+  no stop in the catalog, has its references settled by its frames durable at
+  the failure, also those drained after it. The catalog records each recording's
+  mode in its `Started` record (an optional last byte under version 3, covered
+  by the CRC; an entry without it reads back as `async`), and
   `Recording::required` reports it. `AgentConfig` gains `max_groups` and
   `group_budget`.
 - A recording group's capture path (phase 3, A7d-1b;
