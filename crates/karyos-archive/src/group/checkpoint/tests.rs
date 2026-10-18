@@ -1105,6 +1105,7 @@ fn replay_from_start(
     loop {
         match cursor.step().unwrap() {
             Step::Event(event) => seen.push(event.group_seq()),
+            Step::Checkpoint(_) => {}
             Step::Stop(stop) => return (seen, stop),
         }
     }

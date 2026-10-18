@@ -691,3 +691,121 @@ fn an_incomplete_event_named_unavailable_is_not_presented() {
         Err(GatewayError::NotReproducible { group_seq: 1 })
     );
 }
+
+/// A handler whose state at a checkpoint is `state`.
+struct Stateful {
+    echo: Echo,
+    state: &'static [u8],
+}
+
+impl Handler for Stateful {
+    fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
+        self.echo.on_event(event, effects);
+    }
+
+    fn checkpoint(&mut self, out: &mut [u8]) -> Option<usize> {
+        out.get_mut(..self.state.len())?.copy_from_slice(self.state);
+        Some(self.state.len())
+    }
+}
+
+/// A9-2: at each recorded checkpoint the Gateway compares the handler's
+/// state in the dispatch of the event the checkpoint names. The same
+/// state is captured as a template 30 at `CAPTURE_POSITION`, right after
+/// the event; another state, or none, is a `state checkpoint`
+/// divergence at that event, its index the event's observation count.
+#[test]
+fn a_checkpoint_compares_the_handlers_state_in_its_events_dispatch() {
+    use crate::crc32c::crc32c;
+    use crate::group::record::{CAPTURE_POSITION, CheckpointRecord};
+
+    let recorded = CheckpointRecord {
+        group_seq: 1,
+        checkpoint_id: 1,
+        position: 0,
+        length: 5,
+        crc32c: crc32c(b"state"),
+        format: 7,
+    };
+    let mut records = offered().to_vec();
+    records.push(GroupRecord::Checkpoint(recorded));
+    records.extend([
+        GroupRecord::Timer(TimerEvent {
+            group_seq: 2,
+            logical_time: 20,
+            timer_id: 4,
+        }),
+        end(2, 0, EndOutcome::Complete),
+    ]);
+    let run = |state: &'static [u8], max_state: Option<usize>| {
+        let journal = CaptureJournal::create(
+            FaultDisk::default(),
+            Path::new("/c"),
+            &header(Capture::Strict),
+            b"replay",
+            CONFIG,
+        )
+        .unwrap();
+        let mut gateway = replaying(Capture::Strict, &records, false).with_capture(journal);
+        if let Some(max_state) = max_state {
+            gateway = gateway.with_state(max_state).unwrap();
+        }
+        let mut handler = Stateful {
+            echo: Echo::default(),
+            state,
+        };
+        let first = gateway.dispatch(&mut handler);
+        let rest = loop {
+            match gateway.dispatch(&mut handler) {
+                Ok(Dispatched::Event { .. }) => {}
+                stop => break stop,
+            }
+        };
+        let (_, journal) = gateway.into_parts();
+        let mut journal = journal.unwrap().into_journal();
+        let mut checkpoints = Vec::new();
+        let _ = journal
+            .walk(0, |_, _, record| {
+                if let GroupRecord::Checkpoint(checkpoint) = record {
+                    checkpoints.push(*checkpoint);
+                }
+                true
+            })
+            .unwrap();
+        (first, rest, checkpoints)
+    };
+    let (first, rest, checkpoints) = run(b"state", Some(64));
+    assert_eq!(first, Ok(Dispatched::Event { group_seq: 1 }));
+    assert_eq!(rest, Ok(Dispatched::End));
+    assert_eq!(
+        checkpoints,
+        [CheckpointRecord {
+            position: CAPTURE_POSITION,
+            ..recorded
+        }]
+    );
+    let diverged = |found| {
+        Err(GatewayError::Diverged(crate::group::gateway::Divergence {
+            group_seq: 1,
+            index: 1,
+            expected: 30,
+            found,
+        }))
+    };
+    let (first, rest, checkpoints) = run(b"other", Some(64));
+    assert_eq!(first, diverged(30));
+    assert_eq!(rest, diverged(30), "replay stays stopped");
+    assert!(checkpoints.is_empty());
+    // A buffer smaller than the recorded snapshot is the configuration's.
+    let (first, _, _) = run(b"state", None);
+    assert_eq!(
+        first,
+        Err(GatewayError::StateBuffer {
+            group_seq: 1,
+            length: 5
+        })
+    );
+    // A handler that gives no state diverges, found 0.
+    let (first, _, _) = run(&[0u8; 100], Some(64));
+    assert_eq!(first, diverged(0), "no state");
+}

@@ -14,6 +14,11 @@
 //! reference is compared as its reference, so the complete prefix is
 //! bounded only by incomplete events and gap markers. A payload not
 //! captured, or a reference unavailable, in the range is not comparable.
+//!
+//! Recorded checkpoints (A9-2, template 30) are not compared yet: the
+//! cursor gives them right after their events, and the diff passes over
+//! them. Their comparison, matched by `group_seq` with the `state
+//! checkpoint` kind, and `--from-checkpoint` follow (A8-2).
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -540,9 +545,20 @@ fn next_from<'c, D: Disk>(
     from: u64,
     side: &str,
 ) -> Result<Item<'c>, Report> {
+    // Checkpoints (A9-2) are not compared here yet: the diff by
+    // `group_seq` and the `state checkpoint` kind follow (A8-2). The due
+    // ones are taken without reading the next event.
+    loop {
+        match cursor.due_checkpoint() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(failure) => return Err(error(format!("{side} journal: {failure}"))),
+        }
+    }
     match cursor.step_from(from) {
         Ok(Step::Event(event)) => Ok(Item::Event(event)),
         Ok(Step::Stop(stop)) => Ok(Item::Stop(stop)),
+        Ok(Step::Checkpoint(_)) => Err(error(format!("{side} journal: checkpoints out of order"))),
         Err(failure) => Err(error(format!("{side} journal: {failure}"))),
     }
 }

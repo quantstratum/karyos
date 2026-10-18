@@ -194,6 +194,20 @@ pub struct DeliveryOutcome {
 pub trait Handler {
     /// Handles `event`, acting only through `effects`.
     fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects);
+
+    /// The application's state at a checkpoint, written into `out`: its
+    /// length, or `None` when it keeps none or `out` is too small (A9).
+    fn checkpoint(&mut self, out: &mut [u8]) -> Option<usize> {
+        let _ = out;
+        None
+    }
+
+    /// Restores the state a checkpoint holds; `false` when the bytes are
+    /// not this application's (A9).
+    fn restore(&mut self, state: &[u8]) -> bool {
+        let _ = state;
+        false
+    }
 }
 
 impl<F: FnMut(&Event<'_>, &mut dyn Effects)> Handler for F {
@@ -250,6 +264,16 @@ pub enum GatewayError {
     /// recording.
     #[error("external events are not delivered in replay")]
     ExternalInReplay,
+    /// Replay's state buffer ([`super::replay::gateway::ReplayGateway::with_state`])
+    /// is smaller than a recorded checkpoint's snapshot: its configuration,
+    /// not the handler's state.
+    #[error("checkpoint {group_seq}: a snapshot of {length} bytes, above the state buffer")]
+    StateBuffer {
+        /// The event the checkpoint follows.
+        group_seq: u64,
+        /// The recorded snapshot's length.
+        length: u64,
+    },
     /// A replay's handler diverged from its recording.
     #[error("replay diverged at group_seq {}, observation {}", .0.group_seq, .0.index)]
     Diverged(Divergence),

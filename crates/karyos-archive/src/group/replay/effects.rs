@@ -23,8 +23,8 @@ use super::{ReplayError, ReplayEvent};
 use crate::crc32c::crc32c;
 use crate::group::gateway::{self, ClaimCommit, DeliveryOutcome, Effects, PublicationId, TimerId};
 use crate::group::record::{
-    DeliveryObservation, DeliveryPoll, GroupRecord, Operation, Outcome, OutcomeObservation,
-    TimerAction, TimerObservation,
+    CHECKPOINT, DeliveryObservation, DeliveryPoll, GroupRecord, Operation, Outcome,
+    OutcomeObservation, TimerAction, TimerObservation,
 };
 
 #[cfg(test)]
@@ -159,6 +159,16 @@ pub enum DivergenceKind {
         /// The call.
         found: Call,
     },
+    /// The state at a recorded checkpoint differs (A9-2, `state
+    /// checkpoint`): its length or digest, or the handler gave none. The
+    /// index is the event's recorded observation count: the checkpoint
+    /// follows its end.
+    StateCheckpoint {
+        /// The recorded snapshot's length and digest.
+        recorded: (u64, u32),
+        /// The replay's, or `None` when the handler gave none.
+        found: Option<(u64, u32)>,
+    },
 }
 
 /// The first difference between a replayed handler and its recording.
@@ -206,6 +216,10 @@ impl From<Divergence> for gateway::Divergence {
             DivergenceKind::Extra { found } => (0, found.template()),
             DivergenceKind::Missing { expected } => (expected.template(), 0),
             DivergenceKind::Call { expected, found } => (expected.template(), found.template()),
+            DivergenceKind::StateCheckpoint { found, .. } => (
+                CHECKPOINT.template_id,
+                found.map_or(0, |_| CHECKPOINT.template_id),
+            ),
         };
         Self {
             group_seq: divergence.group_seq,

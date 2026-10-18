@@ -102,3 +102,108 @@ fn a_checkpoint_allocates_nothing_after_configuration() {
     let _ = std::fs::remove_dir_all(&journals);
     let _ = std::fs::remove_dir_all(&checkpoints);
 }
+
+/// A9-2: once opened at a checkpoint, a replay's steps allocate nothing,
+/// its checkpoint steps and the state compare included.
+#[test]
+fn replay_from_a_checkpoint_steps_without_allocating() {
+    use karyos_archive::group::checkpoint::recorded_end;
+    use karyos_archive::group::prefix::{CheckpointHeld, Coverage, recover};
+    use karyos_archive::group::record::MAX_RECORD;
+    use karyos_archive::group::replay::{
+        CursorConfig, ReplayConfig, ReplayCursor, Step, compare_state,
+    };
+
+    struct Held<'a>(&'a CheckpointStore<StdDisk>);
+    impl Coverage for Held<'_> {
+        fn positions(&self, _: u64) -> Option<(u64, u64)> {
+            None
+        }
+        fn ended(&self, _: u64) -> Option<u64> {
+            None
+        }
+        fn checkpoint(&self, position: u64, end: u64) -> CheckpointHeld {
+            self.0.holds(position, end)
+        }
+    }
+
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let (journals, checkpoints) = (dir("replay-journals"), dir("replay-checkpoints"));
+    let header = JournalHeader {
+        group_id: 4,
+        first_group_seq: 1,
+        inline_threshold: 4096,
+        contract_version: 1,
+        clock: Clock::HostMonotonic,
+        capture: Capture::Strict,
+        manifest: b"m",
+    };
+    let mut journal = GroupJournal::create(StdDisk, &journals, &header, config).unwrap();
+    let store = CheckpointStore::create(StdDisk, &checkpoints, 4, config).unwrap();
+    let mut writer = CheckpointWriter::new(store, &journal).unwrap();
+    let mut slot = CheckpointSlot::new(64);
+    for seq in 1..=8u64 {
+        let mut events = Vec::new();
+        event(seq, &mut events);
+        let _ = journal.append(&events).unwrap();
+        let request = slot
+            .take(seq, 1, |buffer| {
+                buffer[0] = u8::try_from(seq).unwrap();
+                1
+            })
+            .unwrap();
+        let result = writer.write(&mut journal, &request);
+        slot.returned(request, &result);
+        let _ = result.unwrap();
+    }
+    let _ = journal.close().unwrap();
+    let _ = writer.store_mut().sync().unwrap();
+    drop(writer);
+    let mut journal = GroupJournal::recover(StdDisk, &journals, 4, config)
+        .unwrap()
+        .journal;
+    let end = recorded_end(&mut journal).unwrap();
+    let mut store = CheckpointStore::recover(StdDisk, &checkpoints, 4, config, end).unwrap();
+    let recovery = recover(&mut journal, &Held(&store), 16).unwrap();
+    let mut snapshot = [0u8; 64];
+    let (mut cursor, _) = ReplayCursor::open_at_checkpoint(
+        journal,
+        &recovery,
+        &mut store,
+        2,
+        &ReplayConfig {
+            manifest: b"m",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 4 * MAX_RECORD,
+            records: 4,
+        },
+        &mut snapshot,
+    )
+    .unwrap();
+    let mut seen = (0u32, 0u32);
+    loop {
+        let (step, allocations) = count(|| match cursor.step().unwrap() {
+            Step::Event(_) => Some(true),
+            Step::Checkpoint(checkpoint) => {
+                let state = [u8::try_from(checkpoint.group_seq).unwrap()];
+                assert!(compare_state(&checkpoint, &state).is_ok());
+                Some(false)
+            }
+            Step::Stop(_) => None,
+        });
+        assert_eq!(allocations, 0, "a step allocated");
+        match step {
+            Some(true) => seen.0 += 1,
+            Some(false) => seen.1 += 1,
+            None => break,
+        }
+    }
+    assert_eq!(seen, (6, 6), "events 3 to 8, each with its checkpoint");
+    let _ = std::fs::remove_dir_all(&journals);
+    let _ = std::fs::remove_dir_all(&checkpoints);
+}

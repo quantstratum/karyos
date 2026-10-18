@@ -154,6 +154,8 @@ fn steps(cursor: &mut ReplayCursor<FaultDisk>) -> (Vec<(u64, bool)>, Stop) {
     loop {
         match cursor.step().unwrap() {
             Step::Event(event) => events.push((event.group_seq(), event.reference_unavailable())),
+            // These journals hold no checkpoint.
+            Step::Checkpoint(checkpoint) => panic!("a checkpoint: {checkpoint:?}"),
             Step::Stop(stop) => return (events, stop),
         }
     }
@@ -175,6 +177,7 @@ fn event<D: crate::disk::Disk>(cursor: &mut ReplayCursor<D>) -> (u64, Vec<Vec<u8
                 .collect(),
         ),
         Step::Stop(stop) => panic!("a stop: {stop:?}"),
+        Step::Checkpoint(checkpoint) => panic!("a checkpoint: {checkpoint:?}"),
     }
 }
 
@@ -182,6 +185,7 @@ fn stop(cursor: &mut ReplayCursor<FaultDisk>) -> Stop {
     match cursor.step().unwrap() {
         Step::Stop(stop) => stop,
         Step::Event(event) => panic!("event {}", event.group_seq()),
+        Step::Checkpoint(checkpoint) => panic!("a checkpoint: {checkpoint:?}"),
     }
 }
 
@@ -352,6 +356,7 @@ fn an_incomplete_event_stops_the_cursor() {
             assert_eq!(event.len(), 2);
         }
         Step::Stop(stop) => panic!("{stop:?}"),
+        Step::Checkpoint(checkpoint) => panic!("a checkpoint: {checkpoint:?}"),
     }
     assert_eq!(stop(&mut cursor), Stop::Incomplete { group_seq: 2 });
     assert_eq!(stop(&mut cursor), Stop::Incomplete { group_seq: 2 });

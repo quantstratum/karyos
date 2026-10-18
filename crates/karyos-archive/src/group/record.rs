@@ -86,6 +86,9 @@ pub const GAP_MARKER: Template = template(21, 17, 12 + 17);
 pub const REFERENCE_UNAVAILABLE: Template = template(22, 16, 12 + 16);
 /// `Checkpoint`, template 30.
 pub const CHECKPOINT: Template = template(30, 40, 12 + 40);
+/// A checkpoint record's `position` in a replay's capture: the replay's
+/// digest only, its bytes stored nowhere (A9-2).
+pub const CAPTURE_POSITION: u64 = u64::MAX;
 
 /// The longest record of any template.
 pub const MAX_RECORD: usize = 12 + 67 + 2 + 65_535 + 2 + 64;
@@ -1721,8 +1724,8 @@ pub struct CheckpointRecord {
     pub group_seq: u64,
     /// Never 0, increasing within the group.
     pub checkpoint_id: u64,
-    /// Where its range starts in the checkpoint store; [`u64::MAX`] in a
-    /// replay's capture, which stores nothing.
+    /// Where its range starts in the checkpoint store;
+    /// [`CAPTURE_POSITION`] in a replay's capture, which stores nothing.
     pub position: u64,
     /// The snapshot's bytes, at least 1.
     pub length: u64,
@@ -1737,7 +1740,7 @@ impl CheckpointRecord {
     /// capture.
     #[must_use]
     pub const fn end(&self) -> Option<u64> {
-        if self.position == u64::MAX {
+        if self.position == CAPTURE_POSITION {
             None
         } else {
             self.position.checked_add(self.length)
@@ -1750,7 +1753,7 @@ impl CheckpointRecord {
         if self.length == 0 {
             return Err(out_of_range("length"));
         }
-        if self.position != u64::MAX && self.end().is_none() {
+        if self.position != CAPTURE_POSITION && self.end().is_none() {
             return Err(out_of_range("position"));
         }
         Ok(())
