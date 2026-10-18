@@ -726,3 +726,19 @@ fn a_strict_refusal_ends_the_event_for_later_calls() {
         }))
     );
 }
+
+/// Timer 0 cannot be recorded: strict refuses its operations, and best
+/// effort performs them and ends the event incomplete.
+#[test]
+fn timer_zero_is_not_recorded() {
+    for mode in [Capture::Strict, Capture::BestEffort] {
+        let (mut gateway, _job, _disk, _) = gateway(mode, 1 << 16, 4096);
+        let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
+            effects.schedule(TimerId(0), 5);
+        };
+        gateway.deliver_external(1, b"", &mut handler).unwrap();
+        let performed = u32::from(mode == Capture::BestEffort);
+        assert_eq!(gateway.port().calls, performed, "{mode:?}");
+        assert_eq!(gateway.stats().incomplete, 1, "{mode:?}");
+    }
+}

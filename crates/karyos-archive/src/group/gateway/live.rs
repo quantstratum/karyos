@@ -606,6 +606,12 @@ impl<P: Port> Recording<'_, P> {
     }
 }
 
+/// A timer operation's observation length; timer 0 cannot be recorded
+/// (template 12's `timer_id` is never 0).
+fn recordable_timer(timer: TimerId) -> Option<usize> {
+    (timer.0 != 0).then_some(TIMER)
+}
+
 /// Whether `length` fits template 11's `length`.
 fn recordable(length: usize) -> Option<usize> {
     u32::try_from(length).ok().map(|_| OUTCOME)
@@ -739,7 +745,7 @@ impl<P: Port> Effects for Recording<'_, P> {
     }
 
     fn schedule(&mut self, timer: TimerId, deadline: u64) {
-        if !self.admit(Some(TIMER)) {
+        if !self.admit(recordable_timer(timer)) {
             return;
         }
         self.port.schedule(timer, deadline);
@@ -752,7 +758,7 @@ impl<P: Port> Effects for Recording<'_, P> {
     /// A cancel repeats the timer's pending deadline; one not pending
     /// records 0.
     fn cancel(&mut self, timer: TimerId) {
-        if !self.admit(Some(TIMER)) {
+        if !self.admit(recordable_timer(timer)) {
             return;
         }
         self.port.cancel(timer);

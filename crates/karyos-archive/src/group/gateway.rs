@@ -32,7 +32,9 @@ pub struct SubscriptionId(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConflatedId(pub u16);
 
-/// A slot in a Gateway's timer table.
+/// A slot in a Gateway's timer table, from 1: template 12 records no
+/// timer 0, so strict capture refuses its operations and best effort
+/// performs them unrecorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TimerId(pub u16);
 
@@ -141,7 +143,10 @@ pub trait Effects {
     ) -> ClaimCommit;
 
     /// Presents a guarded publication's next delivery outcomes, at most
-    /// `max`, to `each`. Returns how many it presented.
+    /// `max`, to `each`. Returns how many it presented. Strict capture
+    /// reserves room for `max` outcomes before it polls, so a `max` past
+    /// the event's remaining room is refused, presenting nothing: poll
+    /// with a `max` the event budget holds.
     fn poll_outcomes(
         &mut self,
         publication: PublicationId,
