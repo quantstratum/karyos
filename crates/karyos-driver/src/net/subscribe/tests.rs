@@ -1594,7 +1594,15 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         let _ = c.do_work().unwrap();
         b.network_images(10).len() == 2
     });
-    let [(oldest, _), (newest, _)] = b.network_images(10)[..] else {
+    // Oldest is the lowest aggregate registration, as `find_stream`
+    // takes it, whatever order the images are listed in.
+    let mut images: Vec<_> = b
+        .network_images(10)
+        .into_iter()
+        .map(|(image, _)| image)
+        .collect();
+    images.sort_by_key(crate::embedded::AggregateHandle::registration);
+    let [oldest, newest] = images[..] else {
         panic!("two images");
     };
     let local = b.add_aggregate(aggregate(20, 1, 1)).unwrap();
@@ -1605,8 +1613,11 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         .unwrap();
     let mut observer = b.broadcast.receiver();
     let (client, mut producer) = remote_client(&mut b);
-    let serve = |b: &mut EmbeddedDriver| {
+    // Both publishers stay driven, so neither image goes stale or misses
+    // a repair while the commands are served.
+    let serve = |a: &mut EmbeddedDriver, c: &mut EmbeddedDriver, b: &mut EmbeddedDriver| {
         for _ in 0..20 {
+            let _ = (a.do_work().unwrap(), c.do_work().unwrap());
             let _ = b.do_work().unwrap();
         }
     };
@@ -1616,12 +1627,26 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         lane: Lane::try_new(lane).unwrap(),
         role: SubscriberRole::Required,
     };
+    let live = |b: &EmbeddedDriver| {
+        let mut live: Vec<u64> = b
+            .network_images(10)
+            .iter()
+            .map(|(image, _)| image.registration())
+            .collect();
+        live.sort_unstable();
+        live
+    };
+    assert_eq!(
+        live(&b),
+        [oldest.registration(), newest.registration()],
+        "both images live before the commands"
+    );
     add_remote_subscription(&mut producer, 1, (10, 3), SubscriberRole::Required);
     write_command(
         &mut producer,
         image_subscription(2, newest.registration(), 0),
     );
-    serve(&mut b);
+    serve(&mut a, &mut c, &mut b);
     let streams: Vec<u64> = b
         .ledger(client)
         .unwrap()
@@ -1644,7 +1669,7 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
     for (sequence, image, lane) in refused {
         write_command(&mut producer, image_subscription(sequence, image, lane));
     }
-    serve(&mut b);
+    serve(&mut a, &mut c, &mut b);
     let mut events = b.broadcast.receiver();
     assert!(b.remove_network_subscription(subscription).unwrap());
     pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_none());
@@ -1669,7 +1694,7 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         &mut producer,
         image_subscription(6, oldest.registration(), 0),
     );
-    serve(&mut b);
+    serve(&mut a, &mut c, &mut b);
     assert_eq!(grants(&b, client), 2, "nothing more granted");
     let errors: Vec<(u64, ErrorCode, u64)> = responses(&mut observer)
         .into_iter()
