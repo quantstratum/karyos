@@ -193,7 +193,8 @@ impl PrefixTracker {
             GroupRecord::External(event) => self.open_event(event.group_seq, None)?,
             GroupRecord::Outcome(_)
             | GroupRecord::TimerOperation(_)
-            | GroupRecord::ExternalObservation(_) => {
+            | GroupRecord::ExternalObservation(_)
+            | GroupRecord::Delivery(_) => {
                 if self.open.is_none() {
                     return Err(PrefixError::OutOfOrder);
                 }

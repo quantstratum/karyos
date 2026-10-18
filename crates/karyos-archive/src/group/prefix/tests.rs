@@ -65,6 +65,9 @@ fn message(seq: u64, recording: Option<u64>) -> GroupRecord<'static> {
         stream_id: 1,
         session_id: 1,
         lane: Lane::ZERO,
+        reserved_value: 0,
+        end_of_stream: false,
+        extension: None,
         payload: match recording {
             Some(recording_id) => Payload::Reference {
                 recording_id,
