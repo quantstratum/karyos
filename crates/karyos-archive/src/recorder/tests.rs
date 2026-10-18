@@ -41,6 +41,11 @@ enum Script {
     Cutover,
     /// A cutover the source was fenced from, at its position.
     Fenced,
+    /// A cutover at its position, every read, for ever.
+    CutoverAgain,
+    /// A cutover, then a fence, at this position, wherever the source is.
+    CutoverAt(u64),
+    FencedAt(u64),
 }
 
 /// A source that plays a script from `position`.
@@ -118,6 +123,9 @@ impl FrameSource for Scripted {
                 Ok(Frames::Cutover { at: position })
             }
             Script::Fenced => Ok(Frames::Fenced { at: position }),
+            Script::CutoverAgain => Ok(Frames::Cutover { at: position }),
+            Script::CutoverAt(at) => Ok(Frames::Cutover { at }),
+            Script::FencedAt(at) => Ok(Frames::Fenced { at }),
             Script::Lost(length) => {
                 let _ = self.script.pop_front();
                 Ok(Frames::Lost {
@@ -630,6 +638,10 @@ fn a_recording_continues_across_a_cutover_it_follows() {
         },
         script,
     );
+    // The cutover ends its duty at the seal; the next one goes on.
+    let duty = recorder.duty(1).unwrap();
+    assert_eq!(duty.ended, None);
+    assert_eq!(recorder.store.written(), 30);
     let duty = recorder.duty(1).unwrap();
     assert_eq!(
         duty.ended,
@@ -667,8 +679,12 @@ fn a_fenced_recording_follows_its_lap_policy_from_the_seal() {
         script.clone(),
     );
     resumed.source.head = Some(70);
+    // The fence ends its duty; the next one records the successor.
     let duty = resumed.duty(1).unwrap();
     assert!(duty.fenced);
+    assert_eq!(duty.ended, None);
+    let duty = resumed.duty(1).unwrap();
+    assert!(!duty.fenced);
     assert_eq!(
         duty.ended,
         Some(Ended {
@@ -700,5 +716,49 @@ fn a_fenced_recording_follows_its_lap_policy_from_the_seal() {
         );
         assert!(stopped.source.resumed.is_empty());
         assert!(stopped.store.gaps().is_empty());
+    }
+}
+
+/// #444 review P2: a cutover ends its duty, so a source that repeats one
+/// at the same position never holds the recorder: each duty returns.
+#[test]
+fn a_repeated_cutover_never_holds_the_recorder() {
+    let script = vec![Script::Data(data(0, 30)), Script::CutoverAgain];
+    let mut recorder = recorder(
+        FaultDisk::default(),
+        Mode::Async {
+            on_lap: OnLap::Resume,
+        },
+        script,
+    );
+    for _ in 0..3 {
+        let duty = recorder.duty(1).unwrap();
+        assert_eq!(duty.ended, None);
+        assert!(!duty.fenced);
+    }
+    assert_eq!(recorder.store.written(), 30);
+}
+
+/// A cutover or a fence names the seal, which is the written position;
+/// any other is the source's error.
+#[test]
+fn a_cutover_or_a_fence_off_the_written_position_is_invalid() {
+    for script in [Script::CutoverAt(31), Script::FencedAt(29)] {
+        let mut recorder = recorder(
+            FaultDisk::default(),
+            Mode::Required,
+            vec![Script::Data(data(0, 30)), script],
+        );
+        assert!(
+            matches!(
+                recorder.duty(1),
+                Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+                    written: 30,
+                    ..
+                }))
+            ),
+            "{:?}",
+            recorder.duty(1)
+        );
     }
 }

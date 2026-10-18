@@ -15,6 +15,13 @@
 //!   lap it. The lost range is recorded as a gap, and the recording then
 //!   stops there ([`OnLap::Stop`]) or resumes at the source's lowest
 //!   retained position ([`OnLap::Resume`]), marked incomplete.
+//! - **Cutovers.** At a mapping cutover the source either follows the
+//!   successor ([`Frames::Cutover`]: the recording goes on at the seal,
+//!   with no gap) or was fenced ([`Frames::Fenced`]: the recording ends at
+//!   the seal, incomplete, with [`StopReason::Lapped`];
+//!   quantstratum-docs: karyos/design/mapping-generations.md,
+//!   "Recordings"). Each ends the duty, so a source repeating one cannot
+//!   hold the recorder's thread.
 //! - **Consumption.** The recorder tells the source what it consumed once
 //!   it is written to the store (not yet durable): durability follows the
 //!   store's policy, a separate axis (ADR-0023).
@@ -228,8 +235,9 @@ impl RecorderError {
 pub struct Ended {
     /// Its last position.
     pub position: u64,
-    /// Why: the seal (normal), a lap with `OnLap::Stop`, or how it was
-    /// closed (a command, the shutdown, a source failure).
+    /// Why: the seal (normal), a lap with `OnLap::Stop` or a fence at a
+    /// mapping cutover (lapped), or how it was closed (a command, the
+    /// shutdown, a source failure).
     pub reason: StopReason,
     /// Whether it lost a range.
     pub incomplete: bool,
@@ -388,7 +396,9 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                 }
                 Frames::Cutover { at } => {
                     // The successor continues the stream where the seal is:
-                    // nothing is lost, and the recording goes on.
+                    // nothing is lost, and the recording goes on, from the
+                    // next duty: a source that repeats the cutover at the
+                    // same position cannot hold this thread.
                     let written = self.store.written();
                     if at != written {
                         return Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
@@ -396,6 +406,7 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                             written,
                         }));
                     }
+                    break;
                 }
                 Frames::Fenced { at } => {
                     let written = self.store.written();
@@ -420,9 +431,10 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                         duty.ended = Some(self.end(at, StopReason::Lapped));
                         break;
                     }
-                    if !self.resume_after_lap(at)? {
-                        break;
-                    }
+                    // Resumed or not, the duty ends here: a source fenced again
+                    // at the same position cannot hold this thread.
+                    let _ = self.resume_after_lap(at)?;
+                    break;
                 }
                 Frames::Lost { from, to } => {
                     if to <= from {

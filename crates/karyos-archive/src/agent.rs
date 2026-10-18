@@ -849,9 +849,11 @@ impl ArchiveHandle {
         self.counts.refused.load(Ordering::Relaxed)
     }
 
-    /// Recordings whose source was fenced at a mapping cutover: each one
-    /// recorded a gap from the seal, or ended there (mapping-generations.md,
-    /// "Recordings"). It tells a cutover gap from a lap.
+    /// Duties that found a recording's source fenced at a mapping cutover
+    /// (mapping-generations.md, "Recordings"); a fenced recording ends
+    /// there, so this is once per recording. A duty that fails is not
+    /// counted. It tells a cutover end from a lap, which share
+    /// [`StopReason::Lapped`].
     #[must_use]
     pub fn fenced_recordings(&self) -> u64 {
         self.counts.fenced_recordings.load(Ordering::Relaxed)
