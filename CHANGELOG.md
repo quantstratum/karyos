@@ -902,6 +902,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- The driver's loopback tests no longer pick a free port by binding a
+  socket, dropping it and binding the port again later, which another
+  process could take in between. A test's embedded subscription binds on
+  port 0 and its publication sends to the address the driver bound; a
+  publication with no receiver sends to a socket the test holds. A test
+  reads that address through `EmbeddedDriver::network_subscription_address`,
+  hidden and not part of the API. Client subscriptions by URI and
+  multicast groups still pick a port: a channel URI refuses port 0, and a
+  group's port is named before any bind.
 - A recording group's records hold only what their sources present
   (#382 review P3s): a delivery outcome takes a receiver only on a
   range-side kind and a lost count only on outcomes lost, as the outcome
