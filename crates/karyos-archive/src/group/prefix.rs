@@ -310,6 +310,12 @@ pub struct PrefixTracker {
     /// The highest `group_seq` a full `candidates` let go: a range opened
     /// below it cannot advance, since what lies between is unknown.
     lost_through: u64,
+    /// How many events `candidates` holds past a stop: the reopening
+    /// window's own capacity ([`PrefixTracker::reserve_reopen_hold`]).
+    hold: usize,
+    /// Checkpoints that opened a range which stayed at them, `candidates`
+    /// having let go of events after them.
+    failed_reopens: u64,
     /// The checkpoint that opened the current range.
     start: Option<RangeStart>,
     /// A checkpoint past the stop whose bytes the coverage has not yet
@@ -346,6 +352,8 @@ impl PrefixTracker {
             stop: None,
             reopen_at: 0,
             candidates: VecDeque::with_capacity(capacity),
+            hold: capacity,
+            failed_reopens: 0,
             lost_through: 0,
             start: None,
             pending: None,
@@ -541,7 +549,7 @@ impl PrefixTracker {
 
     /// Keeps `candidate`, letting the oldest go when there is no room.
     fn candidate(&mut self, candidate: Candidate) {
-        if self.candidates.len() >= self.capacity
+        if self.candidates.len() >= self.hold
             && let Some(oldest) = self.candidates.pop_front()
         {
             self.lost_through = self.lost_through.max(oldest.behind_at());
@@ -588,6 +596,10 @@ impl PrefixTracker {
         if self.lost_through > seq {
             // What lies between is unknown: the range stays at the
             // checkpoint, and a later one may open the next.
+            // Past `u64` the count holds.
+            if let Some(failed) = self.failed_reopens.checked_add(1) {
+                self.failed_reopens = failed;
+            }
             self.stop = Some(after);
             self.reopen_at = after;
             return Ok(());
@@ -851,6 +863,41 @@ impl PrefixTracker {
         }
     }
 
+    /// Sizes the reopening window (A9-3): past a stop, `hold` events,
+    /// at least the tracker's capacity, are kept for a checkpoint that may
+    /// open a range, and the queue has room for them once it does. The
+    /// events expected while one checkpoint is written, under the Gateway
+    /// unbounded while stopped, are its measure. Allocates here, at
+    /// configuration, before any record.
+    ///
+    /// # Errors
+    ///
+    /// The allocation's failure, with the window unchanged.
+    pub fn reserve_reopen_hold(
+        &mut self,
+        hold: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        let hold = hold.max(self.capacity);
+        if let Some(more) = hold.checked_sub(self.candidates.len()) {
+            self.candidates.try_reserve_exact(more)?;
+        }
+        for queue in [&mut self.waiting, &mut self.settling] {
+            if let Some(more) = hold.checked_sub(queue.len()) {
+                queue.try_reserve_exact(more)?;
+            }
+        }
+        self.hold = hold;
+        Ok(())
+    }
+
+    /// Checkpoints that opened a range which stayed at them: events after
+    /// them were let go while it was written, beyond the reopening
+    /// window. A later checkpoint opens the range.
+    #[must_use]
+    pub const fn failed_reopens(&self) -> u64 {
+        self.failed_reopens
+    }
+
     /// The first range as it ended, once a checkpoint opened another:
     /// replay from the journal's start stops there.
     #[must_use]
@@ -897,7 +944,33 @@ pub fn recover<D: crate::disk::Disk>(
     coverage: &impl Coverage,
     capacity: usize,
 ) -> Result<Recovery, super::journal::JournalError> {
+    recover_with_hold(journal, coverage, capacity, capacity)
+}
+
+/// [`recover`], with the reopening window sized to `hold` events
+/// ([`PrefixTracker::reserve_reopen_hold`], at least `capacity`) before
+/// the first record: the running tracker's, so a range a checkpoint
+/// reopened is recovered as it ran. Recover with the group's reopen
+/// hold (`GroupCheckpoints::reopen_hold`, or its default): a smaller one
+/// may let go of events the run held, a larger one may hold events the
+/// run let go.
+///
+/// # Errors
+///
+/// The journal's read errors, and [`JournalError::InvalidConfig`] for a
+/// hold that cannot be allocated.
+///
+/// [`JournalError::InvalidConfig`]: super::journal::JournalError::InvalidConfig
+pub fn recover_with_hold<D: crate::disk::Disk>(
+    journal: &mut super::journal::GroupJournal<D>,
+    coverage: &impl Coverage,
+    capacity: usize,
+    hold: usize,
+) -> Result<Recovery, super::journal::JournalError> {
     let mut tracker = PrefixTracker::new(capacity);
+    tracker
+        .reserve_reopen_hold(hold)
+        .map_err(|_| super::journal::JournalError::InvalidConfig)?;
     let mut last_seen = 0u64;
     let mut full = false;
     let durable = journal.durable();

@@ -194,9 +194,12 @@ fn a_replay_cursor_steps_without_allocating() {
 #[test]
 fn a_replay_gateway_dispatches_without_allocating() {
     use karyos_archive::disk::StdDisk;
-    use karyos_archive::group::gateway::{Dispatched, Effects, Event, GroupGateway, PublicationId};
+    use karyos_archive::group::gateway::{
+        Dispatched, Effects, Event, GroupGateway, Handler, PublicationId,
+    };
     use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
     use karyos_archive::group::prefix::{Coverage, recover};
+    use karyos_archive::group::record::CheckpointRecord;
     use karyos_archive::group::replay::gateway::{GatewayConfig, ReplayGateway};
     use karyos_archive::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
     use karyos_archive::segment::SyncPolicy;
@@ -250,6 +253,17 @@ fn a_replay_gateway_dispatches_without_allocating() {
             let length = record.encode(&mut out).unwrap();
             let _ = journal.append(&out[..length]).unwrap();
         }
+        // A checkpoint of each event (A9-2), compared in its dispatch.
+        let checkpoint = GroupRecord::Checkpoint(CheckpointRecord {
+            group_seq: seq,
+            checkpoint_id: seq,
+            position: 0,
+            length: 5,
+            crc32c: karyos_archive::crc32c::crc32c(b"state"),
+            format: 1,
+        });
+        let length = checkpoint.encode(&mut out).unwrap();
+        let _ = journal.append(&out[..length]).unwrap();
     }
     let _ = journal.close().unwrap();
     let mut journal = GroupJournal::recover(StdDisk, &dir, header.group_id, config)
@@ -286,12 +300,23 @@ fn a_replay_gateway_dispatches_without_allocating() {
         },
         None,
     )
+    .unwrap()
+    .with_state(64)
     .unwrap();
-    let mut handler = |event: &Event<'_>, effects: &mut dyn Effects| {
-        if let Event::Message { payload, .. } = event {
-            let _ = effects.offer(PublicationId(0), payload);
+    struct Offers;
+    impl Handler for Offers {
+        fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
+            if let Event::Message { payload, .. } = event {
+                let _ = effects.offer(PublicationId(0), payload);
+            }
         }
-    };
+
+        fn checkpoint(&mut self, out: &mut [u8]) -> Option<usize> {
+            out.get_mut(..5)?.copy_from_slice(b"state");
+            Some(5)
+        }
+    }
+    let mut handler = Offers;
     let mut seen = 0u64;
     loop {
         let (dispatched, allocations) = count(|| gateway.dispatch(&mut handler));

@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
-use karyos_sim::disk::{SimDisk, Survives};
+use karyos_sim::disk::{Decision, SimDisk, Survives};
 
 const DIR: &str = "/archive";
 const RECORDING: u64 = 7;
@@ -74,6 +74,8 @@ struct Reported {
     durable: u64,
     /// A truncation was called, and whether it returned.
     truncate: Option<(u64, bool)>,
+    /// A step failed.
+    failed: bool,
 }
 
 fn run(disk: SimDisk, steps: &[Step]) -> Reported {
@@ -85,13 +87,17 @@ fn run(disk: SimDisk, steps: &[Step]) -> Reported {
         SyncPolicy::PerSegment,
         0,
     ) else {
-        return Reported::default();
+        return Reported {
+            failed: true,
+            ..Reported::default()
+        };
     };
     let (before, after) = intended(steps);
     let mut reported = Reported {
         created: true,
         durable: store.durable(),
         truncate: None,
+        failed: false,
     };
     let mut position = 0u64;
     for step in steps {
@@ -120,6 +126,7 @@ fn run(disk: SimDisk, steps: &[Step]) -> Reported {
         // A claim made before a failure must hold too.
         reported.durable = store.durable();
         if result.is_err() {
+            reported.failed = true;
             return reported;
         }
     }
@@ -212,8 +219,12 @@ fn crash_everywhere(steps: &[Step]) -> Vec<String> {
     let free = SimDisk::new();
     let clean = run(free.clone(), steps);
     // The clean run does what the workload says, its truncation included.
-    assert!(
-        clean.truncate.is_none_or(|(_, returned)| returned),
+    let truncation = steps.iter().find_map(|step| match *step {
+        Step::Truncate(to) => Some((to, true)),
+        _ => None,
+    });
+    assert_eq!(
+        clean.truncate, truncation,
         "a clean run's truncation failed: the position is not a write boundary"
     );
     // Every crash point is a real one: each workload makes more than 20
@@ -297,6 +308,16 @@ fn a_failed_flush_is_reported_and_recovers() {
                 disk
             };
             let reported = run(disk.clone(), &steps);
+            // A flush that failed is reported: the store returns its error.
+            let flush_failed = disk
+                .trace()
+                .contains(&Decision::FailedSync { sync: failing });
+            if flush_failed != reported.failed {
+                failures.push(format!(
+                    "optimistic {optimistic}, flush {failing}: failed {flush_failed}, reported {}",
+                    reported.failed
+                ));
+            }
             for survives in modes() {
                 if let Err(failure) = check(&disk, survives, reported, &steps) {
                     failures.push(format!(
