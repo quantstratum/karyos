@@ -34,11 +34,16 @@ use crate::link::{Export, Lease, Origin};
 use crate::loss::LossReporter;
 use crate::trace::DeliveryTrace;
 
-/// Metadata delivered with each message.
+/// Metadata delivered with each message. The client builds it; more
+/// fields may follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageInfo {
     /// Stream position of the message.
     pub position: u64,
+    /// The bytes the message takes in the stream, its frames and their
+    /// alignment: the next message starts at `position + extent`.
+    pub extent: u32,
     /// Reserved value of the first fragment.
     pub reserved_value: i64,
     /// End of stream.
@@ -595,7 +600,7 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// not acknowledged, so the next poll delivers it again. An optional
     /// or observer reader acknowledges on copy: what it declines is gone.
     #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
-    pub(crate) fn poll_taking<H>(
+    pub fn poll_taking<H>(
         &mut self,
         mut handler: H,
         message_limit: MessageLimit,
@@ -638,8 +643,16 @@ impl<T: TermBytes> ClientSubscription<T> {
                     reserved_value,
                     extension,
                 } => {
+                    // The read cursor is already past the message, by less
+                    // than a term; 0 would mark an impossible cursor.
+                    let extent = inner
+                        .position()
+                        .checked_sub(position)
+                        .and_then(|extent| u32::try_from(extent).ok())
+                        .unwrap_or(0);
                     let info = MessageInfo {
                         position: self.base + position,
+                        extent,
                         reserved_value,
                         end_of_stream,
                         extension,
@@ -936,6 +949,72 @@ mod tests {
             })
             .unwrap(),
         )
+    }
+
+    /// Each message's extent reaches the next message, a fragmented one
+    /// too, and the last one's reaches the acknowledged position.
+    #[test]
+    fn a_message_extent_reaches_the_next_message() {
+        let buffer = buffer();
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let mut subscription =
+            ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        let mut publication = buffer.publication_owned().unwrap().unwrap();
+        for payload in [&b"a"[..], &[7u8; 3000][..], &b"tail"[..]] {
+            let _ = publication
+                .append(payload, AppendOptions::default())
+                .unwrap();
+        }
+        let mut infos = Vec::new();
+        let summary = subscription
+            .poll(|_, info| infos.push(info), MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(summary.delivered, 3);
+        for pair in infos.windows(2) {
+            assert_eq!(
+                pair[0].position + u64::from(pair[0].extent),
+                pair[1].position
+            );
+        }
+        let last = infos[2];
+        assert_eq!(
+            last.position + u64::from(last.extent),
+            subscription.position()
+        );
+        // The fragmented message spans more than one frame.
+        assert!(infos[1].extent > 3000);
+    }
+
+    /// A required reader that declines a message stops the poll and gets
+    /// the same message again on the next one.
+    #[test]
+    fn a_declined_message_stays_pending() {
+        let buffer = buffer();
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let mut subscription =
+            ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        let mut publication = buffer.publication_owned().unwrap().unwrap();
+        let _ = publication
+            .append(b"one", AppendOptions::default())
+            .unwrap();
+        let start = subscription.position();
+        let summary = subscription
+            .poll_taking(|_, _| false, MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(summary.delivered, 0);
+        assert_eq!(subscription.position(), start);
+        let mut seen = Vec::new();
+        let summary = subscription
+            .poll_taking(
+                |bytes, _| {
+                    seen.push(bytes.to_vec());
+                    true
+                },
+                MessageLimit::new(8),
+            )
+            .unwrap();
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(seen, vec![b"one".to_vec()]);
     }
 
     /// DATA, ABORTED, DATA: the abort stops the poll after the first

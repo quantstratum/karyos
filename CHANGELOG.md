@@ -335,6 +335,13 @@ release may break APIs, wire formats and shared-memory layouts.
   the linger gets the repeats. The EOS counts as sent once one path
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
+- karyos-client's `MessageInfo` gains `extent`, the bytes the message takes in
+  the stream (the next message starts at `position + extent`), and is
+  `#[non_exhaustive]`, so later fields add without breaking; it was built only
+  by the client. `ClientSubscription::poll_taking` is public: a handler that
+  returns false declines the message, which stays pending for a required reader.
+  karyos-sys's `FrameReader::ready_end` gives a complete message's end. For the
+  recording group Gateway's sources (phase 3, A7d-2b).
 - The recording group Gateway (phase 3, A7d-2a; `recording-group-gateway.md`
   sections 3, 6 and 8). `karyos_archive::group::gateway` holds the
   `GroupGateway` trait that capture and replay share: `Event`, `Effects` (clock,
