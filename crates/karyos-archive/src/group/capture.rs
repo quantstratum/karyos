@@ -231,7 +231,18 @@ pub fn capture<D: Disk>(
     if capture == Capture::Strict && tracker_stopped {
         shared.state.store(ENDED, Ordering::Release);
     }
-    let dispatched = recovery.last_seen.max(tracker.durable_group_seq());
+    // What the journal holds was sent: through its last event or gap,
+    // the one before the next it takes (a gap's events count, since a
+    // checkpoint may name them; `last_seen` counts events only).
+    let taken = match journal.order().next_seq() {
+        0 => recovery.last_seen,
+        next => next
+            .checked_sub(1)
+            .ok_or(CaptureSetup::Journal(JournalError::InvalidConfig))?,
+    };
+    let dispatched = taken
+        .max(recovery.last_seen)
+        .max(tracker.durable_group_seq());
     let sender = CaptureSender {
         producer,
         shared: Arc::clone(&shared),
@@ -793,6 +804,22 @@ impl<D: Disk> CaptureJob<D> {
                 Ok(CheckpointStep::Recorded(record))
             }
         }
+    }
+
+    /// Sizes the reopening window, past a stop, to `hold` events
+    /// ([`PrefixTracker::reserve_reopen_hold`]), and the list of events a
+    /// recording leaves uncovered with it. At configuration only.
+    ///
+    /// # Errors
+    ///
+    /// [`CaptureError::InFlight`] for a hold whose bound passes `usize`.
+    pub fn reserve_reopen_hold(&mut self, hold: usize) -> Result<(), CaptureError> {
+        let bound = hold.checked_mul(3).ok_or(CaptureError::InFlight)?;
+        self.tracker.reserve_reopen_hold(hold);
+        if let Some(more) = bound.checked_sub(self.uncovered.len()) {
+            self.uncovered.reserve_exact(more);
+        }
+        Ok(())
     }
 
     /// Advances the prefixes over `coverage`, as a duty does: after a

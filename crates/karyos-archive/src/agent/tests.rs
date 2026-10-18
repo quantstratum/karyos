@@ -2076,7 +2076,7 @@ mod checkpoints {
 
     use super::*;
     use crate::group::capture::{CaptureConfig, GroupState, WaitError};
-    use crate::group::checkpoint::{LastCheckpoint, recorded_end};
+    use crate::group::checkpoint::{LastCheckpoint, recorded_end, store_dir};
     use crate::group::journal::{JournalConfig, MIN_SEGMENT_LENGTH};
     use crate::group::record::{
         Capture, EndOutcome, EventEnd, GapMarker, GapReason, GroupRecord, MAX_RECORD, TimerEvent,
@@ -2113,8 +2113,8 @@ mod checkpoints {
                 in_flight,
             },
             checkpoints: Some(GroupCheckpoints {
-                dir: dir.join("checkpoints"),
                 max_checkpoint: 300_000,
+                reopen_hold: None,
             }),
         }
     }
@@ -2122,7 +2122,7 @@ mod checkpoints {
     fn dirs(name: &str) -> PathBuf {
         let dir = temp_dir(name);
         std::fs::create_dir(dir.join("groups")).unwrap();
-        std::fs::create_dir(dir.join("checkpoints")).unwrap();
+        std::fs::create_dir(store_dir(&dir.join("groups"))).unwrap();
         dir
     }
 
@@ -2235,7 +2235,7 @@ mod checkpoints {
         let end = recorded_end(&mut journal).unwrap();
         let mut store = CheckpointStore::recover(
             StdDisk,
-            &dir.join("checkpoints"),
+            &store_dir(&dir.join("groups")),
             GROUP,
             journal_config(policy),
             end,
@@ -2297,6 +2297,272 @@ mod checkpoints {
         agent.stop_group(GROUP).unwrap();
         agent.shutdown().unwrap();
         assert_ne!(sender.state(), GroupState::Failed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn start_with(dir: &Path, capture: Option<Capture>, policy: SyncPolicy) -> StartGroup {
+        start(dir, capture, policy, 64)
+    }
+
+    /// #426 review P1, with recovery's coverage (mutant g): a restart
+    /// whose journal ends at a gap, then the checkpoint that reopens the
+    /// range. The sender counts the gap's events as sent, so it admits
+    /// events again; and a second restart recovers the range the
+    /// checkpoint opened, its store answering the coverage.
+    #[test]
+    fn a_restart_at_a_gap_reopens_through_a_checkpoint() {
+        let dir = dirs("checkpoint-gap-restart");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let mut sender = agent
+            .start_group(start_with(&dir, Some(Capture::BestEffort), policy))
+            .unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        sender.room().unwrap();
+        sender.send(&gap(2), 2).unwrap();
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let mut sender = agent.start_group(start_with(&dir, None, policy)).unwrap();
+        let mut handle = sender.take_checkpoints().unwrap();
+        handle
+            .checkpoint(2, 7, |buffer| {
+                buffer[..5].copy_from_slice(b"state");
+                5
+            })
+            .unwrap();
+        assert!(matches!(ended(&mut handle), LastCheckpoint::Recorded(_)));
+        // The range is open at 2, durable: the gap's events were sent.
+        for _ in 0..5000 {
+            if sender.view().durable_group_seq() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(sender.view().durable_group_seq(), 2);
+        sender.admit().unwrap();
+        sender.send(&event(3), 3).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(3, Duration::from_secs(10)),
+            Ok(3)
+        );
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let recovered = agent.start_group(start_with(&dir, None, policy)).unwrap();
+        assert_eq!(
+            recovered.view().durable_group_seq(),
+            3,
+            "the range recovered"
+        );
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #426 review P2 and P3: a checkpoint after the group stopped is
+    /// refused, typed, its buffer kept; one being written at the stop
+    /// comes back the same way. Written 1 byte a cycle, a 200 kB one is
+    /// still being written once taken (mutant a: the cycle's budget).
+    #[test]
+    fn a_checkpoint_at_or_after_the_stop_is_refused_with_its_buffer() {
+        let dir = dirs("checkpoint-stop");
+        let config = AgentConfig {
+            checkpoint_budget: 1,
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let mut sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        let mut handle = sender.take_checkpoints().unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        // The journal holds event 1: the write begins once taken.
+        for _ in 0..5000 {
+            if sender.view().complete_recording_seq() >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        handle
+            .checkpoint(1, 7, |buffer| {
+                buffer[..200_000].fill(3);
+                200_000
+            })
+            .unwrap();
+        for _ in 0..5000 {
+            if !handle.pending() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!handle.pending(), "taken");
+        agent.stop_group(GROUP).unwrap();
+        assert_eq!(
+            ended(&mut handle),
+            LastCheckpoint::Failed { group_seq: 1 },
+            "still being written at the stop"
+        );
+        assert!(matches!(
+            handle.checkpoint(1, 7, |_| 1),
+            Err(crate::group::checkpoint::CheckpointError::Stopped)
+        ));
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #426 review P3: a group that ends answers what it holds, typed, and
+    /// refuses what comes after.
+    #[test]
+    fn an_ended_group_refuses_its_checkpoints() {
+        let dir = dirs("checkpoint-ended");
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let mut sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        let mut handle = sender.take_checkpoints().unwrap();
+        sender.admit().unwrap();
+        sender
+            .send(
+                &encode(&[
+                    GroupRecord::Timer(TimerEvent {
+                        group_seq: 1,
+                        logical_time: 1,
+                        timer_id: 1,
+                    }),
+                    GroupRecord::End(EventEnd {
+                        group_seq: 1,
+                        observations: 0,
+                        outcome: EndOutcome::Incomplete,
+                    }),
+                ]),
+                1,
+            )
+            .unwrap();
+        for _ in 0..5000 {
+            if sender.state() == GroupState::Ended {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(sender.state(), GroupState::Ended);
+        let mut refused = false;
+        for _ in 0..5000 {
+            if matches!(
+                handle.checkpoint(1, 7, |_| 1),
+                Err(crate::group::checkpoint::CheckpointError::Stopped)
+            ) {
+                refused = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(refused, "{:?}", handle.last_checkpoint());
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #426 review P3: checkpoints of size 0, or an agent writing 0 bytes a
+    /// cycle, are refused before anything is made; the store's directory
+    /// is never the journals'.
+    #[test]
+    fn checkpoint_settings_that_cannot_work_are_refused() {
+        let dir = dirs("checkpoint-config");
+        assert_ne!(store_dir(&dir.join("groups")), dir.join("groups"));
+        let agent = ArchiveHandle::spawn(
+            StdDisk,
+            &dir,
+            AgentConfig {
+                checkpoint_budget: 0,
+                ..AgentConfig::default()
+            },
+        )
+        .unwrap();
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        assert!(matches!(
+            agent.start_group(start_with(&dir, Some(Capture::Strict), policy)),
+            Err(AgentError::CheckpointConfig)
+        ));
+        agent.shutdown().unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let mut zero = start_with(&dir, Some(Capture::Strict), policy);
+        zero.checkpoints.as_mut().unwrap().max_checkpoint = 0;
+        assert!(matches!(
+            agent.start_group(zero),
+            Err(AgentError::CheckpointConfig)
+        ));
+        assert!(
+            std::fs::read_dir(dir.join("groups"))
+                .unwrap()
+                .all(|entry| { entry.unwrap().file_type().unwrap().is_dir() }),
+            "no journal made"
+        );
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #426 review P3 (A9 section 2): a store gone while the journal's
+    /// records name checkpoints: the group starts, those ranges lost.
+    #[test]
+    fn a_missing_store_marks_its_checkpoints_lost() {
+        let dir = dirs("checkpoint-missing");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let mut sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        let mut handle = sender.take_checkpoints().unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        handle
+            .checkpoint(1, 7, |buffer| {
+                buffer[..5].copy_from_slice(b"state");
+                5
+            })
+            .unwrap();
+        let LastCheckpoint::Recorded(record) = ended(&mut handle) else {
+            panic!("not recorded");
+        };
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let stores = store_dir(&dir.join("groups"));
+        std::fs::remove_dir_all(&stores).unwrap();
+        std::fs::create_dir(&stores).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let mut recovered = agent.start_group(start_with(&dir, None, policy)).unwrap();
+        assert_eq!(recovered.state(), GroupState::Running);
+        // The next checkpoint goes past the lost range, never reusing it.
+        let mut handle = recovered.take_checkpoints().unwrap();
+        recovered.admit().unwrap();
+        recovered.send(&event(2), 2).unwrap();
+        handle
+            .checkpoint(2, 7, |buffer| {
+                buffer[..5].copy_from_slice(b"after");
+                5
+            })
+            .unwrap();
+        let LastCheckpoint::Recorded(next) = ended(&mut handle) else {
+            panic!("not recorded: {:?}", handle.last_checkpoint());
+        };
+        assert_eq!(next.position, record.end().unwrap());
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let mut journal =
+            GroupJournal::recover(StdDisk, &dir.join("groups"), GROUP, journal_config(policy))
+                .unwrap()
+                .journal;
+        let end = recorded_end(&mut journal).unwrap();
+        let store =
+            CheckpointStore::recover(StdDisk, &stores, GROUP, journal_config(policy), end).unwrap();
+        assert_eq!(
+            store.holds(record.position, record.end().unwrap()),
+            crate::group::prefix::CheckpointHeld::Lost
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

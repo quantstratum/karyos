@@ -310,6 +310,12 @@ pub struct PrefixTracker {
     /// The highest `group_seq` a full `candidates` let go: a range opened
     /// below it cannot advance, since what lies between is unknown.
     lost_through: u64,
+    /// How many events `candidates` holds past a stop: the reopening
+    /// window's own capacity ([`PrefixTracker::reserve_reopen_hold`]).
+    hold: usize,
+    /// Checkpoints that opened a range which stayed at them, `candidates`
+    /// having let go of events after them.
+    failed_reopens: u64,
     /// The checkpoint that opened the current range.
     start: Option<RangeStart>,
     /// A checkpoint past the stop whose bytes the coverage has not yet
@@ -346,6 +352,8 @@ impl PrefixTracker {
             stop: None,
             reopen_at: 0,
             candidates: VecDeque::with_capacity(capacity),
+            hold: capacity,
+            failed_reopens: 0,
             lost_through: 0,
             start: None,
             pending: None,
@@ -541,7 +549,7 @@ impl PrefixTracker {
 
     /// Keeps `candidate`, letting the oldest go when there is no room.
     fn candidate(&mut self, candidate: Candidate) {
-        if self.candidates.len() >= self.capacity
+        if self.candidates.len() >= self.hold
             && let Some(oldest) = self.candidates.pop_front()
         {
             self.lost_through = self.lost_through.max(oldest.behind_at());
@@ -588,6 +596,10 @@ impl PrefixTracker {
         if self.lost_through > seq {
             // What lies between is unknown: the range stays at the
             // checkpoint, and a later one may open the next.
+            // Past `u64` the count holds.
+            if let Some(failed) = self.failed_reopens.checked_add(1) {
+                self.failed_reopens = failed;
+            }
             self.stop = Some(after);
             self.reopen_at = after;
             return Ok(());
@@ -849,6 +861,33 @@ impl PrefixTracker {
             complete: self.complete,
             durable: self.durable,
         }
+    }
+
+    /// Sizes the reopening window (A9-3): past a stop, `hold` events,
+    /// at least the tracker's capacity, are kept for a checkpoint that may
+    /// open a range, and the queue has room for them once it does. The
+    /// events expected while one checkpoint is written, under the Gateway
+    /// unbounded while stopped, are its measure. Allocates here, at
+    /// configuration, before any record.
+    pub fn reserve_reopen_hold(&mut self, hold: usize) {
+        let hold = hold.max(self.capacity);
+        if let Some(more) = hold.checked_sub(self.candidates.len()) {
+            self.candidates.reserve_exact(more);
+        }
+        for queue in [&mut self.waiting, &mut self.settling] {
+            if let Some(more) = hold.checked_sub(queue.len()) {
+                queue.reserve_exact(more);
+            }
+        }
+        self.hold = hold;
+    }
+
+    /// Checkpoints that opened a range which stayed at them: events after
+    /// them were let go while it was written, beyond the reopening
+    /// window. A later checkpoint opens the range.
+    #[must_use]
+    pub const fn failed_reopens(&self) -> u64 {
+        self.failed_reopens
     }
 
     /// The first range as it ended, once a checkpoint opened another:

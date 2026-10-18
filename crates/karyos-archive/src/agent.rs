@@ -60,7 +60,7 @@ use crate::group::capture::{
 };
 use crate::group::checkpoint::{
     CheckpointError, CheckpointInbox, CheckpointRequest, CheckpointStore, CheckpointWriter,
-    handoff, recorded_end,
+    handoff, recorded_end, store_dir,
 };
 use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
 use crate::group::prefix::{CheckpointHeld, Coverage};
@@ -153,15 +153,21 @@ pub struct StartGroup {
     pub checkpoints: Option<GroupCheckpoints>,
 }
 
-/// Where a group's checkpoints live, and how large one may be.
+/// How a group's checkpoints are kept. Their store is in the journal
+/// directory's `checkpoints` subdirectory
+/// ([`store_dir`]), which the host
+/// made, as it made the journal directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupCheckpoints {
-    /// The directory of checkpoint stores, beside the group journals' and
-    /// not the same: a store is named by the group's id, as its journal
-    /// is. The host made it.
-    pub dir: PathBuf,
     /// The largest snapshot, at least 1 byte: the Gateway's buffer.
     pub max_checkpoint: usize,
+    /// The events a reopening checkpoint's range keeps while it is written
+    /// over several cycles: those expected to end during one checkpoint
+    /// write, with the Gateway unbounded while stopped. `None` is four
+    /// times the capture's `in_flight`. A best-effort group under traffic
+    /// beyond it reopens at a later checkpoint, counted
+    /// ([`PrefixTracker::failed_reopens`](crate::group::prefix::PrefixTracker::failed_reopens)).
+    pub reopen_hold: Option<usize>,
 }
 
 /// A new group's journal header.
@@ -427,6 +433,11 @@ pub enum AgentError {
     /// A recording group's capture settings cannot work.
     #[error(transparent)]
     Capture(#[from] CaptureError),
+    /// A group's checkpoints are configured so they cannot work: their
+    /// size, or the agent's budget per cycle, is 0. Nothing is made
+    /// (A9-3).
+    #[error("invalid checkpoint configuration")]
+    CheckpointConfig,
     /// A group's checkpoint writer could not start (A9-3).
     #[error(transparent)]
     Checkpoint(Box<CheckpointError>),
@@ -1179,6 +1190,17 @@ fn checkpoint_duty<D: Disk>(
     checkpoints: &mut GroupWriter<D>,
     budget: usize,
 ) -> bool {
+    // A failed or ended group writes nothing more: what waits is
+    // answered, and later requests refused.
+    if job.state() != GroupState::Running {
+        if let Some(request) = checkpoints.current.take() {
+            checkpoints
+                .inbox
+                .give_back(request, Err(CheckpointError::Stopped));
+        }
+        checkpoints.inbox.close();
+        return false;
+    }
     if checkpoints.current.is_none() {
         checkpoints.current = checkpoints.inbox.take();
     }
@@ -1558,19 +1580,20 @@ impl<D: Disk + Clone> State<D> {
         let _ = group.job.drain_to_close(now, &coverage);
         // A checkpoint not recorded by the stop is not: its buffer goes
         // back, and its bytes stay unnamed.
+        // Both close; the first error is reported.
+        let mut stored = Ok(());
         if let Some(mut checkpoints) = group.checkpoints {
-            if let Some(request) = checkpoints
-                .current
-                .take()
-                .or_else(|| checkpoints.inbox.take())
-            {
+            if let Some(request) = checkpoints.current.take() {
                 checkpoints
                     .inbox
-                    .give_back(request, Err(CheckpointError::NotStarted));
+                    .give_back(request, Err(CheckpointError::Stopped));
             }
-            let _ = checkpoints.writer.close()?;
+            checkpoints.inbox.close();
+            stored = checkpoints.writer.close().map(drop);
         }
-        group.job.close().map_err(AgentError::from)
+        let closed = group.job.close().map_err(AgentError::from);
+        stored?;
+        closed
     }
 
     /// Makes or recovers a group's journal and its capture path.
@@ -1589,6 +1612,12 @@ impl<D: Disk + Clone> State<D> {
         // Checked before the journal exists, so a refused start leaves
         // none behind.
         capture::validate(start.capture, start.journal.policy).map_err(AgentError::Capture)?;
+        if let Some(checkpoints) = &start.checkpoints
+            && (checkpoints.max_checkpoint == 0 || self.config.checkpoint_budget == 0)
+        {
+            return Err(AgentError::CheckpointConfig);
+        }
+        let checkpoint_dir = store_dir(&start.dir);
         let journal = match &start.new {
             Some(new) => GroupJournal::create(
                 self.disk.clone(),
@@ -1613,29 +1642,36 @@ impl<D: Disk + Clone> State<D> {
         // recovered one is cut to what the journal's records name.
         let store = match &start.checkpoints {
             None => None,
-            Some(checkpoints) if start.new.is_some() => Some(CheckpointStore::create(
+            Some(_) if start.new.is_some() => Some(CheckpointStore::create(
                 self.disk.clone(),
-                &checkpoints.dir,
+                &checkpoint_dir,
                 id,
                 start.journal,
             )?),
-            Some(checkpoints) => {
+            Some(_) => {
                 let end = recorded_end(&mut journal)?;
                 Some(
                     match CheckpointStore::recover(
                         self.disk.clone(),
-                        &checkpoints.dir,
+                        &checkpoint_dir,
                         id,
                         start.journal,
                         end,
                     ) {
-                        // A group whose checkpoints were never kept.
-                        Err(SegmentError::NotFound { .. }) if end == 0 => CheckpointStore::create(
-                            self.disk.clone(),
-                            &checkpoints.dir,
-                            id,
-                            start.journal,
-                        )?,
+                        // A missing store: a group whose checkpoints were
+                        // never kept, or one whose store is gone. The
+                        // ranges its journal's records name are then lost
+                        // (A9 section 2), and the group starts.
+                        Err(SegmentError::NotFound { .. }) => {
+                            let mut store = CheckpointStore::create(
+                                self.disk.clone(),
+                                &checkpoint_dir,
+                                id,
+                                start.journal,
+                            )?;
+                            store.mark_lost(end)?;
+                            store
+                        }
                         recovered => recovered?,
                     },
                 )
@@ -1655,8 +1691,18 @@ impl<D: Disk + Clone> State<D> {
                 CaptureSetup::Config(error) => AgentError::Capture(error),
                 CaptureSetup::Journal(error) => AgentError::Journal(error),
             })?;
+        let mut job = job;
         let checkpoints = match (store, &start.checkpoints) {
             (Some(store), Some(config)) => {
+                let hold = match config.reopen_hold {
+                    Some(hold) => hold,
+                    None => start
+                        .capture
+                        .in_flight
+                        .checked_mul(4)
+                        .ok_or(AgentError::CheckpointConfig)?,
+                };
+                job.reserve_reopen_hold(hold).map_err(AgentError::Capture)?;
                 let writer = CheckpointWriter::new(store, job.journal())
                     .map_err(|error| AgentError::Checkpoint(Box::new(error)))?;
                 let (handle, inbox) = handoff(config.max_checkpoint);

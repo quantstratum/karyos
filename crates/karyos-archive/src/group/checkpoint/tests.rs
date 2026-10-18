@@ -1368,3 +1368,34 @@ fn a_checkpoint_is_durable_before_its_record_under_no_policy() {
         Err(error) => panic!("{error}"),
     }
 }
+
+/// #426 review P2: the reopening window has its own capacity. With room
+/// for 2 events in flight, 6 end while the checkpoint is written: a hold
+/// of 8 keeps them all and the range opens over them; the default hold
+/// (the capacity) lets the first go, the range stays at the checkpoint,
+/// and the failed reopen is counted.
+#[test]
+fn the_reopen_hold_keeps_the_events_a_checkpoint_write_spans() {
+    let run = |hold: Option<usize>| {
+        let mut tracker = PrefixTracker::new(2);
+        if let Some(hold) = hold {
+            tracker.reserve_reopen_hold(hold);
+        }
+        let store = Store::default();
+        store.written.set(100);
+        store.durable.set(100);
+        let mut at = feed(
+            &mut tracker,
+            &encode(&GroupRecord::Header(header(Capture::BestEffort))),
+            0,
+        );
+        at = feed(&mut tracker, &gap(1, 1), at);
+        for seq in 2..=7 {
+            at = feed(&mut tracker, &event(seq, EndOutcome::Complete), at);
+        }
+        at = feed(&mut tracker, &checkpoint_record(1, 1, 0), at);
+        (tracker.advance(at, at, &store), tracker.failed_reopens())
+    };
+    assert_eq!(run(Some(8)), ((7, 7), 0), "fits");
+    assert_eq!(run(None), ((1, 1), 1), "overflows, counted");
+}

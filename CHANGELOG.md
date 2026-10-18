@@ -307,23 +307,30 @@ release may break APIs, wire formats and shared-memory layouts.
 ### Added
 
 - A group's checkpoints in the Archive agent (phase 3, A9-3).
-  `StartGroup::checkpoints` (`GroupCheckpoints`: a directory beside the
-  journals', and `max_checkpoint`) gives a group a checkpoint store, made
+  `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and
+  `reopen_hold`) gives a group a checkpoint store in its journal
+  directory's `checkpoints` subdirectory (`checkpoint::store_dir`), made
   or recovered with its journal, recovery cutting it to what the
-  journal's records name, and closed with the group. The group's sender
+  journal's records name, a missing one marking their ranges lost, and
+  closed with the group. Settings that cannot work are refused before
+  anything is made (`AgentError::CheckpointConfig`). The group's sender
   carries a `CheckpointHandle` (`CaptureSender::take_checkpoints`), the
   Gateway's end of a one-slot handoff that moves the buffer both ways
-  with no copy and no allocation. The agent writes a checkpoint once its
-  journal holds the event it names, in chunks of at most
-  `AgentConfig::checkpoint_budget` bytes a cycle, then syncs it and
-  records template 30, which the capture job's prefixes take
-  (`CaptureJob::checkpoint`). The production coverage answers
-  `Coverage::checkpoint` from the group's store. The capture job lifts
-  its stop once a checkpoint opens a range, so the in-flight bound
-  applies again; an event the tracker has no room for then is taken
-  again once, after a sync, and the group fails, typed, only if it is
-  still full. `GroupWaiter::durable_for` answers per event across
-  ranges.
+  with no copy and no allocation; once the group stops, fails or ends,
+  checkpoints are refused (`CheckpointError::Stopped`) with their buffer
+  kept. The agent writes a checkpoint once its journal holds the event
+  it names, in chunks of at most `AgentConfig::checkpoint_budget` bytes
+  a cycle, then syncs it and records template 30, which the capture
+  job's prefixes take (`CaptureJob::checkpoint`). The production
+  coverage answers `Coverage::checkpoint` from the group's store. The
+  capture job lifts its stop once a checkpoint opens a range, so the
+  in-flight bound applies again, and a restart counts a gap's events as
+  sent; an event the tracker has no room for then is taken again once,
+  after a sync, and the group fails, typed, only if it is still full.
+  The reopening window holds `reopen_hold` events (four times
+  `in_flight` by default), and a range that could not reopen over them
+  is counted (`PrefixTracker::failed_reopens`).
+  `GroupWaiter::durable_for` answers per event across ranges.
 
 - Replay with checkpoints (phase 3, A9-2; recording-group-checkpoints.md
   section 6). `ReplayCursor::open_at_checkpoint` reads a checkpoint's

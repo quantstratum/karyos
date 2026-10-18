@@ -55,6 +55,19 @@ use crate::segment::{Geometry, SegmentError, SegmentStore};
 #[cfg(test)]
 mod tests;
 
+/// The name of a group journal directory's subdirectory that holds the
+/// groups' checkpoint stores: a store is named by its group, as its
+/// journal is, so it cannot share the journals' directory.
+pub const CHECKPOINT_DIR: &str = "checkpoints";
+
+/// Where the checkpoint stores of the groups whose journals are in
+/// `journal_dir` live: `<journal_dir>/checkpoints`, found so by the
+/// Archive, by replay and by `replay diff --from-checkpoint`.
+#[must_use]
+pub fn store_dir(journal_dir: &Path) -> std::path::PathBuf {
+    journal_dir.join(CHECKPOINT_DIR)
+}
+
 /// The encoded length of a checkpoint record.
 const RECORD_LENGTH: usize = 12 + 40;
 /// The same, as the template declares it.
@@ -90,6 +103,10 @@ pub enum CheckpointError {
     /// names them. The store then fails until recovered.
     #[error(transparent)]
     Store(#[from] SegmentError),
+    /// The group stopped, failed or ended: the checkpoint is not written,
+    /// and its buffer comes back.
+    #[error("the group stopped")]
+    Stopped,
     /// No checkpoint is being written, or `advance` was given another
     /// request than `begin`.
     #[error("no checkpoint is being written for this request")]
@@ -184,6 +201,22 @@ impl<D: Disk> CheckpointStore<D> {
         } else {
             CheckpointHeld::Written
         }
+    }
+
+    /// Marks `[written, end)` lost, for a store recreated after it went
+    /// missing while its journal's records name ranges up to `end`: they
+    /// read as lost, never open their ranges, and are never reused.
+    ///
+    /// # Errors
+    ///
+    /// The store's errors.
+    pub fn mark_lost(&mut self, end: u64) -> Result<(), SegmentError> {
+        let written = self.store.written();
+        if end > written {
+            let _ = self.store.append_gap(written, end)?;
+            let _ = self.store.sync()?;
+        }
+        Ok(())
     }
 
     /// Reads `buf.len()` bytes at `position`.
@@ -650,6 +683,8 @@ impl<D: Disk> CheckpointWriter<D> {
 struct Handoff {
     request: Option<CheckpointRequest>,
     returned: Option<(CheckpointRequest, Result<CheckpointRecord, CheckpointError>)>,
+    /// The group stopped, failed or ended: nothing more is written.
+    closed: bool,
 }
 
 /// The one-slot handoff between the Gateway's thread and the Archive's,
@@ -709,7 +744,14 @@ impl CheckpointHandle {
     ) -> Result<(), CheckpointError> {
         self.poll();
         let request = self.slot.take(group_seq, format, write)?;
-        lock(&self.shared).request = Some(request);
+        let mut shared = lock(&self.shared);
+        if shared.closed {
+            drop(shared);
+            // The buffer stays here, the refusal counted as a failure.
+            self.slot.returned(request, &Err(CheckpointError::Stopped));
+            return Err(CheckpointError::Stopped);
+        }
+        shared.request = Some(request);
         Ok(())
     }
 
@@ -725,6 +767,13 @@ impl CheckpointHandle {
     /// A strict journal ended: every later checkpoint is refused.
     pub fn end(&mut self) {
         self.slot.end();
+    }
+
+    /// Whether a checkpoint handed over still waits for the writer to
+    /// take it.
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        lock(&self.shared).request.is_some()
     }
 
     /// How the last checkpoint the writer took ended.
@@ -745,6 +794,17 @@ impl CheckpointInbox {
     #[must_use]
     pub fn take(&self) -> Option<CheckpointRequest> {
         lock(&self.shared).request.take()
+    }
+
+    /// Closes the handoff: the group stopped, failed or ended. A request
+    /// still waiting goes back, [`CheckpointError::Stopped`], and every
+    /// later one is refused so.
+    pub fn close(&self) {
+        let mut shared = lock(&self.shared);
+        shared.closed = true;
+        if let Some(request) = shared.request.take() {
+            shared.returned = Some((request, Err(CheckpointError::Stopped)));
+        }
     }
 
     /// Gives `request`'s buffer back, with how its write ended.

@@ -1080,3 +1080,26 @@ fn the_job_writes_a_checkpoint_once_its_event_is_journaled() {
     job.refresh(&held);
     assert_eq!(job.tracker().range().start.unwrap().group_seq, 2);
 }
+
+/// #426 review (mutant e2): the retry after a full queue is once. With
+/// the queue still full after the sync (its events wait on a recording
+/// that never covers them), the group fails, typed, as before.
+#[test]
+fn a_queue_still_full_after_the_retry_fails_the_group() {
+    let held = CheckpointsHeld;
+    let (mut sender, mut job) = new(Capture::BestEffort, UNSYNCED, settings(4096, 400, 2));
+    sender.send(&event(1, 10, None), 1).unwrap();
+    sender.send(&gap(2, 2), 2).unwrap();
+    job.duty(0, 16, &held).unwrap();
+    sender.send(&event(3, 10, Some(7)), 3).unwrap();
+    sender.send(&event(4, 10, Some(7)), 4).unwrap();
+    sender.send(&checkpoint_message(2, 1), 4).unwrap();
+    job.duty(0, 16, &held).unwrap();
+    assert_eq!(job.tracker().range().start.unwrap().group_seq, 2);
+    sender.send(&event(5, 10, None), 5).unwrap();
+    assert!(matches!(
+        job.duty(0, 16, &held),
+        Err(JobError::Prefix(PrefixError::Full { .. }))
+    ));
+    assert_eq!(sender.state(), GroupState::Failed);
+}
