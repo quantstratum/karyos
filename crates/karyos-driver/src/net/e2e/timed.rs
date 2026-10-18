@@ -17,11 +17,12 @@ use super::{ANY_PORT, BUDGET, aggregate, bound, channel, driver, pump, shared};
 use crate::embedded::{AggregateHandle, EmbeddedDriver};
 
 /// A timed publication of one lane with a ring of `capacity` and the
-/// settings `options` on `a`, over an unreliable channel, and B's required
-/// reader of its image.
+/// settings `options` on `a`, over a channel `reliable` or not, and B's
+/// required reader of its image.
 fn timed_pair(
     capacity: u32,
     options: ScheduleOptions,
+    reliable: bool,
 ) -> (
     EmbeddedDriver,
     EmbeddedDriver,
@@ -33,13 +34,13 @@ fn timed_pair(
         driver(crate::agents::ThreadingMode::Shared),
     );
     let _ = b
-        .add_network_subscription(10, &channel(ANY_PORT, false))
+        .add_network_subscription(10, &channel(ANY_PORT, reliable))
         .unwrap();
     let address = bound(&b, 10);
     let mut config = aggregate(10, 3, 1);
     config.stream.buffer.schedule_capacity = capacity;
     let publication = a
-        .add_timed_network_publication(config, &channel(address, false), None, options)
+        .add_timed_network_publication(config, &channel(address, reliable), None, options)
         .unwrap();
     let mut image = None;
     pump(&mut [&mut a, &mut b], |drivers| {
@@ -58,7 +59,7 @@ fn timed_pair(
 /// `capacity` offers every one was back-pressured, for good.
 #[test]
 fn a_timed_network_lane_takes_more_offers_than_its_ring() {
-    let (mut a, mut b, publication, mut reader) = timed_pair(4, ScheduleOptions::default());
+    let (mut a, mut b, publication, mut reader) = timed_pair(4, ScheduleOptions::default(), false);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();
@@ -92,7 +93,7 @@ fn a_timed_network_lane_takes_more_offers_than_its_ring() {
 fn a_timed_network_message_is_not_sent_before_its_time() {
     const AHEAD: u64 = 150_000_000;
     const SLACK: Duration = Duration::from_secs(2);
-    let (mut a, mut b, publication, mut reader) = timed_pair(4, ScheduleOptions::default());
+    let (mut a, mut b, publication, mut reader) = timed_pair(4, ScheduleOptions::default(), false);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();
@@ -129,7 +130,7 @@ fn a_timed_network_message_is_not_sent_before_its_time() {
 /// and in the lane's counter cells.
 #[test]
 fn a_timed_lane_sends_one_message_per_datagram_and_counts_late_ones() {
-    let (mut a, mut b, publication, mut reader) = timed_pair(16, ScheduleOptions::default());
+    let (mut a, mut b, publication, mut reader) = timed_pair(16, ScheduleOptions::default(), false);
     let stream = publication.lane(Lane::ZERO).unwrap();
     let mut lane = a.publication(stream).unwrap();
     let now = karyos_sys::host_clock::host_monotonic_ns();
@@ -174,7 +175,7 @@ fn an_unreliable_reset_frees_the_ring_of_held_heads() {
         max_horizon: 120_000_000_000,
         ..ScheduleOptions::default()
     };
-    let (mut a, mut b, publication, _reader) = timed_pair(4, options);
+    let (mut a, mut b, publication, _reader) = timed_pair(4, options, false);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();
@@ -234,7 +235,7 @@ fn an_unreliable_reset_frees_the_ring_of_held_heads() {
 #[test]
 fn a_fragmented_timed_message_is_read_whole_at_its_time() {
     const AHEAD: u64 = 100_000_000;
-    let (mut a, mut b, publication, mut reader) = timed_pair(4, ScheduleOptions::default());
+    let (mut a, mut b, publication, mut reader) = timed_pair(4, ScheduleOptions::default(), false);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();
@@ -275,7 +276,7 @@ fn a_steady_timed_network_cycle_allocates_nothing() {
 
     let ((), made) = count(|| drop(std::hint::black_box(vec![0_u8; 8])));
     assert!(made > 0, "the counting allocator counts in this binary");
-    let (mut a, mut b, publication, mut reader) = timed_pair(64, ScheduleOptions::default());
+    let (mut a, mut b, publication, mut reader) = timed_pair(64, ScheduleOptions::default(), false);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();
@@ -401,4 +402,155 @@ fn a_guard_close_ends_a_timed_head_that_waits() {
     assert_eq!(seen, 0, "a held head left after the close");
     let counts = shared(&mut a).sender.outbound_timed_counts(0).unwrap();
     assert_eq!(counts.sent, 0, "{counts:?}");
+}
+
+/// P2.11 PR1b: a reliable timed lane frees a message's entry once the
+/// receivers acknowledged it (its registered position passed it), not when
+/// it is sent: the ring holds the unacknowledged window. A ring of 4 below
+/// that window back-pressures the offers, and recovers as the subscriber
+/// consumes, so 32 messages go through it, each read once and in order.
+#[test]
+fn a_reliable_timed_lane_holds_its_ring_until_acknowledged() {
+    let (mut a, mut b, publication, mut reader) = timed_pair(4, ScheduleOptions::default(), true);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen, mut pressured) = (0u32, 0u32, 0u32);
+    pump(&mut [&mut a, &mut b], |_| {
+        while sent < 32 {
+            let now = karyos_sys::host_clock::host_monotonic_ns();
+            match lane.offer_at(&sent.to_le_bytes(), now).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => {
+                    pressured += 1;
+                    break;
+                }
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 32
+    });
+    assert!(pressured > 0, "the ring held the window");
+    let agents = shared(&mut a);
+    assert_eq!(
+        agents.sender.outbound_counters(0).unwrap().schedule_faults,
+        0
+    );
+    let counts = agents.sender.outbound_timed_counts(0).unwrap();
+    assert_eq!((counts.sent, counts.rewound), (32, 0), "{counts:?}");
+}
+
+/// P2.11 PR1b: a reliable timed lane's endpoint reset rewinds it to its
+/// registered position. The messages above it are read again with their
+/// entries, which were held: resent at once, outside the late policy and
+/// counted `rewound`, never late; the subscriber reads each once, in
+/// order, and the schedule stays consistent (no fault).
+#[test]
+fn a_reliable_reset_resends_timed_messages_outside_the_policy() {
+    let (mut a, mut b, publication, mut reader) = timed_pair(16, ScheduleOptions::default(), true);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // The subscriber holds: nothing is acknowledged while 8 are sent.
+    let now = karyos_sys::host_clock::host_monotonic_ns();
+    for index in 0..8u32 {
+        assert!(matches!(
+            lane.offer_at(&index.to_le_bytes(), now).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    pump(&mut [&mut a, &mut b], |drivers| {
+        shared(drivers[0])
+            .sender
+            .outbound_timed_counts(0)
+            .unwrap()
+            .sent
+            == 8
+    });
+    let late = shared(&mut a)
+        .sender
+        .outbound_timed_counts(0)
+        .unwrap()
+        .late_sends;
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].net.as_ref().unwrap().reopened() >= 1
+    });
+    let mut seen = 0u32;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 8
+    });
+    let agents = shared(&mut a);
+    assert_eq!(
+        agents.sender.outbound_counters(0).unwrap().schedule_faults,
+        0
+    );
+    let counts = agents.sender.outbound_timed_counts(0).unwrap();
+    assert!(counts.rewound >= 1, "{counts:?}");
+    assert_eq!(counts.late_sends, late, "a resend is not late: {counts:?}");
+    assert_eq!(counts.dropped, 0, "{counts:?}");
+}
+
+/// P2.11 PR1b: a NAK repair of a reliable timed lane goes through the
+/// repair path, never the timed gate: it repeats data already sent. The
+/// lost datagram is repaired and every message is read once and in order,
+/// while the timed gate counts each message sent exactly once.
+#[test]
+fn a_repair_of_a_timed_lane_bypasses_the_timed_gate() {
+    let (mut a, mut b, publication, mut reader) = timed_pair(16, ScheduleOptions::default(), true);
+    // The receiver loses the second DATA datagram it sees.
+    b.net.as_mut().unwrap().drop_receiver_data(&[1]);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let now = karyos_sys::host_clock::host_monotonic_ns();
+    for index in 0..6u32 {
+        assert!(matches!(
+            lane.offer_at(&index.to_le_bytes(), now).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    let mut seen = 0u32;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 6
+    });
+    let repairs = a.net.as_ref().unwrap().sender_counters().unwrap().repairs;
+    assert!(repairs >= 1, "the loss was repaired");
+    let counts = shared(&mut a).sender.outbound_timed_counts(0).unwrap();
+    assert_eq!((counts.sent, counts.rewound), (6, 0), "{counts:?}");
 }

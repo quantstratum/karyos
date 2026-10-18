@@ -199,6 +199,10 @@ pub struct TimedCounts {
     /// Timed heads dropped unsent: returned by their queue, or forgotten
     /// at a reset that does not send them again (an unreliable lane).
     pub dropped: u64,
+    /// Messages a reliable lane's reset read again: resent at once, outside
+    /// the late policy, and not counted late (their lateness would measure
+    /// the reset, not the schedule).
+    pub rewound: u64,
     /// Lanes aborted for a missed deadline, once each.
     pub deadline_aborts: u64,
     /// The largest lateness of a submitted timed head, in the clock's
@@ -501,9 +505,10 @@ impl TimedState {
         Ok(())
     }
 
-    /// Forgets `lane`'s heads, which its queue's reset dropped unsent; each
-    /// timed one counts as dropped. Returns how many it forgot.
-    pub fn forget(&mut self, lane: usize) -> usize {
+    /// Forgets `lane`'s heads, which its queue's reset returned unsent;
+    /// with `dropped` (an unreliable lane, which sends none of them again)
+    /// each timed one counts as dropped. Returns how many it forgot.
+    pub fn forget(&mut self, lane: usize, dropped: bool) -> usize {
         let Some(state) = self.lanes.get_mut(lane) else {
             return 0;
         };
@@ -514,10 +519,17 @@ impl TimedState {
             .filter(|head| head.time.is_some())
             .count();
         state.heads.clear();
-        for _ in 0..timed {
-            bump(&mut self.counts.dropped, &mut self.counts.overflows);
+        if dropped {
+            for _ in 0..timed {
+                bump(&mut self.counts.dropped, &mut self.counts.overflows);
+            }
         }
         forgotten
+    }
+
+    /// Counts a message a reliable lane's reset read again.
+    pub fn count_rewound(&mut self) {
+        bump(&mut self.counts.rewound, &mut self.counts.overflows);
     }
 }
 

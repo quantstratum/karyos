@@ -499,7 +499,7 @@ struct ReadView<'a, T: StreamTerms> {
 }
 
 impl<T: StreamTerms> RepairRead for ReadView<'_, T> {
-    fn head(&mut self, lane: u8, from: u64) -> Result<Head, RepairReadError> {
+    fn head(&mut self, lane: u8, from: u64, end: Option<u64>) -> Result<Head, RepairReadError> {
         let index = usize::from(lane);
         if self.closed.get(index).copied().unwrap_or(false) {
             return Err(RepairReadError::Retry);
@@ -514,13 +514,22 @@ impl<T: StreamTerms> RepairRead for ReadView<'_, T> {
             return Err(RepairReadError::Retry);
         };
         scratch.staged = None;
+        // Only the frames the request covers: a datagram read past its end
+        // would repeat frames the receiver has.
+        let room = end
+            .and_then(|end| end.checked_sub(from))
+            .and_then(|room| usize::try_from(room).ok())
+            .map_or(scratch.bytes.len(), |room| room.min(scratch.bytes.len()));
+        let Some(out) = scratch.bytes.get_mut(..room) else {
+            return Err(RepairReadError::TooSmall);
+        };
         let (result, used) = reader.read_nak(
             from,
             NakRead {
                 bound,
                 loads: self.loads,
             },
-            &mut scratch.bytes,
+            out,
         );
         self.loads = match self.loads.checked_sub(used) {
             Some(left) => left,

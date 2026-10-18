@@ -159,3 +159,83 @@ fn a_ring_that_is_not_one_is_refused() {
         Some(ScheduleConsumerError::Ring(ScheduleError::Layout))
     );
 }
+
+/// A rewind to a message boundary reads the entries not released again,
+/// in order, each marked replayed; a message read after them is not.
+#[test]
+fn a_rewind_replays_the_unreleased_messages() {
+    use super::Scheduled;
+
+    let ring = ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    for (position, time) in [(0, 10), (64, 20), (128, 30)] {
+        push(&ring, &mut publisher, position, time);
+    }
+    for position in [0, 64] {
+        let _ = consumer.frame(&ring, data(position, true, true)).unwrap();
+    }
+    // The first left and was acknowledged: released. The second was read.
+    consumer.message_left(&ring).unwrap();
+    consumer.rewind();
+    assert_eq!(consumer.outstanding(), 0);
+    let again = consumer
+        .frame_scheduled(&ring, data(64, true, true))
+        .unwrap();
+    assert_eq!(
+        again,
+        Some(Scheduled {
+            time: 20,
+            replayed: true
+        })
+    );
+    let next = consumer
+        .frame_scheduled(&ring, data(128, true, true))
+        .unwrap();
+    assert_eq!(
+        next,
+        Some(Scheduled {
+            time: 30,
+            replayed: false
+        })
+    );
+}
+
+/// A rewind inside a message (a block boundary between its fragments):
+/// its next fragment takes the message's own entry, at `head`, below it;
+/// with none below, the term is corrupt.
+#[test]
+fn a_rewind_inside_a_message_resumes_it() {
+    use super::Scheduled;
+
+    let ring = ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    push(&ring, &mut publisher, 0, 10);
+    let _ = consumer.frame(&ring, data(0, true, false)).unwrap();
+    let _ = consumer.frame(&ring, data(1408, false, false)).unwrap();
+    consumer.rewind();
+    let resumed = consumer
+        .frame_scheduled(&ring, data(1408, false, false))
+        .unwrap();
+    assert_eq!(
+        resumed,
+        Some(Scheduled {
+            time: 10,
+            replayed: true
+        })
+    );
+    assert_eq!(consumer.frame(&ring, data(2816, false, true)), Ok(Some(10)));
+    consumer.message_left(&ring).unwrap();
+    assert_eq!(consumer.outstanding(), 0);
+    // An entry at or past the fragment is no message it continues.
+    let ring = super::tests::ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    push(&ring, &mut publisher, 4096, 10);
+    consumer.rewind();
+    assert!(matches!(
+        consumer.frame_scheduled(&ring, data(1408, false, true)),
+        Err(ScheduleConsumerError::CorruptTerm { .. })
+    ));
+}

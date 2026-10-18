@@ -277,8 +277,15 @@ release may break APIs, wire formats and shared-memory layouts.
   Lateness, late sends and heads dropped by an unreliable reset are
   counted; a guard close ends a head still waiting for its time. Refused
   for now, typed (`DriverError::TimedNetworkUnsupported`): redundant
-  paths, reliable channels (PR1b), the `Tai` domain and
-  cancel-on-deadline. The sender times heads on the host monotonic clock,
+  paths, the `Tai` domain and cancel-on-deadline. On a reliable channel
+  (PR1b) a message's schedule entry is held until the receivers
+  acknowledge it, so `schedule_capacity` must cover the unacknowledged
+  window (a smaller ring back-pressures offers until they consume); a
+  reset reads the held entries again with
+  `ScheduleReader::rewind_to_released`, and the messages it resends go at
+  once, outside the late policy, counted as rewound. A NAK repair reads
+  only the frames its request covers, as a timed lane sends one frame per
+  datagram. The sender times heads on the host monotonic clock,
   as `Monotonic` offers are timed; no time namespace is checked, as on the
   local route. `TimedGate` keeps its API over a `TimedState`, which a
   sender holds across cycles and gates through a `TimedView`.

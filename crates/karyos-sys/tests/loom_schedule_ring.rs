@@ -234,6 +234,14 @@ fn control_the_block_committed_before_its_entry() {
 /// messages wrap a ring of two. With `past_cursor`, the negative control
 /// releases one entry beyond what it read.
 fn read_ahead_model(past_cursor: bool) {
+    read_ahead_model_with(past_cursor, None);
+}
+
+/// The read-ahead model, with a rewind after each release when `rewind`
+/// is set (`Some(true)` rewinds past `head`, the control): a rewind to
+/// `head` reads again only entries still the ones written, whatever the
+/// publisher does meanwhile, because a slot not released is never reused.
+fn read_ahead_model_with(past_cursor: bool, rewind: Option<bool>) {
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(3);
     builder.check(move || {
@@ -250,6 +258,9 @@ fn read_ahead_model(past_cursor: bool) {
                 if past_cursor {
                     reader = reader.with_unchecked_release();
                 }
+                if rewind == Some(true) {
+                    reader = reader.with_rewind_past_head();
+                }
                 let mut read = 0;
                 while reader.released() < AHEAD {
                     // Read ahead while entries are there.
@@ -263,6 +274,12 @@ fn read_ahead_model(past_cursor: bool) {
                     let limit = reader.read() + u64::from(past_cursor);
                     if reader.released() < limit && reader.released() < AHEAD {
                         reader.release(&ring).unwrap();
+                        if rewind.is_some() {
+                            // A reliable sender's reset: read again from
+                            // the oldest entry not released.
+                            reader.rewind_to_released();
+                            read = reader.read();
+                        }
                     }
                     thread::yield_now();
                 }
@@ -290,4 +307,15 @@ fn reading_ahead_releases_in_order_across_a_wrap() {
 #[should_panic(expected = "Causality violation")]
 fn control_reading_ahead_with_a_release_past_the_cursor() {
     read_ahead_model(true);
+}
+
+#[test]
+fn a_rewind_reads_only_entries_never_reused() {
+    read_ahead_model_with(false, Some(false));
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn control_a_rewind_past_head() {
+    read_ahead_model_with(false, Some(true));
 }

@@ -1282,14 +1282,7 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         cancel_on_deadline: true,
         ..ScheduleOptions::default()
     };
-    let mut cases = vec![
-        (
-            channel(destination),
-            ScheduleOptions::default(),
-            Unsupported::Reliable,
-        ),
-        (unreliable.clone(), cancel, Unsupported::CancelOnDeadline),
-    ];
+    let mut cases = vec![(unreliable.clone(), cancel, Unsupported::CancelOnDeadline)];
     // The Tai domain is Linux only; elsewhere the schedule refuses it first.
     if cfg!(target_os = "linux") {
         cases.push((unreliable.clone(), tai, Unsupported::TaiDomain));
