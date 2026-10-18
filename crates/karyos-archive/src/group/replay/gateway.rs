@@ -36,6 +36,7 @@ use super::reference::{Frames, Recording, read_message};
 use super::{
     CaptureJournal, ReplayCursor, ReplayError, ReplayEvent, Step, Stop, allocate, compare_state,
 };
+use crate::crc32c::crc32c;
 use crate::disk::Disk;
 use crate::group::gateway::{
     ConflatedId, Dispatched, Event, GatewayError, GroupGateway, Handler, SubscriptionId, TimerId,
@@ -103,6 +104,8 @@ pub struct ReplayGateway<D: Disk> {
     observations: u32,
     /// Where replay stopped, returned again by every later dispatch.
     stopped: Option<Result<Dispatched, GatewayError>>,
+    /// A restore may still come: no dispatch and no restore yet.
+    restorable: bool,
 }
 
 impl<D: Disk> ReplayGateway<D> {
@@ -147,6 +150,7 @@ impl<D: Disk> ReplayGateway<D> {
             state: Vec::new(),
             observations: 0,
             stopped: None,
+            restorable: true,
         })
     }
 
@@ -211,27 +215,43 @@ impl<D: Disk> ReplayGateway<D> {
     }
 
     /// Hands checkpoint `record`'s snapshot to the handler's `restore`,
-    /// before the first dispatch of a replay from it (A9-2,
-    /// `recording-group-checkpoints.md` section 6): the cursor was opened
-    /// at `record` by [`ReplayCursor::open_at_checkpoint`], which checked
-    /// `snapshot` against the record.
+    /// once, before the first dispatch of a replay from it (A9-2,
+    /// `recording-group-checkpoints.md` section 6, whose
+    /// `from_checkpoint` is [`ReplayCursor::open_at_checkpoint`] then
+    /// this): `record` is the checkpoint the cursor was opened at, and
+    /// `snapshot` its bytes.
     ///
     /// # Errors
     ///
-    /// [`GatewayError::NotReproducible`] at the checkpoint's `group_seq`
-    /// when the handler refuses the bytes; replay stops there, and each
-    /// later dispatch returns the same.
+    /// Without calling the handler: the stop of a gateway already
+    /// stopped; [`GatewayError::RestoreOrder`] after a dispatch, for a
+    /// second restore, or for a checkpoint the cursor was not opened at;
+    /// [`GatewayError::CheckpointCorrupt`] for a snapshot whose length or
+    /// crc32c differs from `record`. [`GatewayError::NotReproducible`] at
+    /// the checkpoint's `group_seq` when the handler refuses the bytes.
+    /// Replay stops at each, and each later dispatch returns the same.
     pub fn restore(
         &mut self,
         record: &CheckpointRecord,
         snapshot: &[u8],
         handler: &mut dyn Handler,
     ) -> Result<(), GatewayError> {
-        if handler.restore(snapshot) {
-            return Ok(());
+        if let Some(Err(stopped)) = self.stopped {
+            return Err(stopped);
         }
-        let refused = GatewayError::NotReproducible {
-            group_seq: record.group_seq,
+        let group_seq = record.group_seq;
+        let refused = if !std::mem::replace(&mut self.restorable, false)
+            || self.cursor.opened_at() != Some(group_seq)
+        {
+            GatewayError::RestoreOrder { group_seq }
+        } else if u64::try_from(snapshot.len()).ok() != Some(record.length)
+            || crc32c(snapshot) != record.crc32c
+        {
+            GatewayError::CheckpointCorrupt { group_seq }
+        } else if handler.restore(snapshot) {
+            return Ok(());
+        } else {
+            GatewayError::NotReproducible { group_seq }
         };
         self.stopped = Some(Err(refused));
         Err(refused)
@@ -324,6 +344,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
         if let Some(stopped) = self.stopped {
             return stopped;
         }
+        self.restorable = false;
         let event = match self.cursor.step() {
             Ok(Step::Event(event)) => event,
             // Never: an event's checkpoints are compared in its own
