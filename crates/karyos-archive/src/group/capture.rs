@@ -463,7 +463,9 @@ impl GroupWaiter {
                 return Err(WaitError::Stopped { durable, state });
             }
             let left = deadline.map_or(Duration::MAX, |deadline| {
-                deadline.saturating_duration_since(Instant::now())
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO)
             });
             if left.is_zero() {
                 return Err(WaitError::Timeout { durable });
