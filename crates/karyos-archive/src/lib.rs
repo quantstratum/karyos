@@ -20,6 +20,7 @@ mod fault;
 pub mod group;
 pub mod recorder;
 pub mod segment;
+pub mod server;
 
 pub use segment::replay;
 pub mod source;
