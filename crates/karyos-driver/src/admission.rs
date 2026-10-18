@@ -108,8 +108,14 @@ pub struct IpcConfig {
     /// not drained it by then is retired.
     pub fetch_deadline: u64,
     /// Grants one client holds at once, in any state but ended
-    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Bounds); a
-    /// command beyond it is refused and reserves nothing.
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Bounds), and
+    /// registrations it holds at once: a command beyond either is refused
+    /// with `ResourcesUnavailable` and reserves nothing. Every add that
+    /// makes a registration counts (`AddPublication`,
+    /// `AddConcurrentPublication`, `AddSubscription`,
+    /// `AddImageSubscription` and a conflated view). A registration whose
+    /// last grant ended (detached, or ended unsent) is reclaimed, so it no
+    /// longer counts.
     pub max_exports_per_client: usize,
     /// Fetches of one client whose messages are still queued; a `Fetch`
     /// beyond it is refused with `LIMIT`.

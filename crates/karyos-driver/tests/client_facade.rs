@@ -693,6 +693,36 @@ mod remote {
         .unwrap()
     }
 
+    /// #420 review P1: a remote facade client that subscribes by
+    /// `karyos:ipc` and drops each subscription is never refused at the
+    /// export bound (16): each dropped handle detaches its grant, and the
+    /// driver reclaims the registration. Twenty cycles are all admitted,
+    /// and the client can still publish; a removed one is admitted too.
+    #[test]
+    fn subscribe_and_drop_cycles_are_never_refused_at_the_export_bound() {
+        let (_driver, dir) = ipc_driver("cycles");
+        let mut client = connect(&dir);
+        for cycle in 0..20 {
+            let subscription = client
+                .add_subscription("karyos:ipc", StreamId::new(3))
+                .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
+            drop(subscription);
+            // The Detach and the reclaim run on the driver's thread.
+            for _ in 0..20 {
+                let _ = client.poll();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let removed = client
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
+        client.remove_subscription(removed);
+        assert_eq!(client.subscription_releases_failed(), 0);
+        let _publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(3))
+            .unwrap();
+    }
+
     /// SPEC §10 remote: a client attaches by directory, publishes and
     /// subscribes by `karyos:ipc`, and reads what it offered.
     #[test]

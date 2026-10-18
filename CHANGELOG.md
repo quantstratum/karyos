@@ -11,6 +11,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A remote client's registrations are capped at `max_exports_per_client`,
+  as its ledger's grants were before. Every add that makes a
+  registration counts: `AddPublication`, `AddConcurrentPublication`,
+  `AddSubscription`, `AddImageSubscription` and a conflated view; past
+  the cap each is refused with `ResourcesUnavailable`, and the client
+  stays served. A remote registration whose last grant ended (detached,
+  or ended unsent) is reclaimed, so a client that only drops its handles
+  never reaches the cap that way; a later `RemoveSubscription` or
+  `RemovePublication` of a reclaimed registration answers
+  `UnknownRegistration`, which the client facade ignores.
+- `Client::remove_subscription` removes a subscription as
+  `Client::remove_publication` removes a publication: a `karyos:ipc` one
+  at the driver, a `karyos:udp` one with every image it reads. A removal
+  that cannot be sent drops the handle and is counted:
+  `Client::subscription_releases_failed`, as the facade counts every
+  image handle it lets go of whose removal could not be sent.
 - A publication released through the client facade whose removal cannot
   be sent (the command ring full, a handle another connection issued, a
   closed link) is counted: `Client::publication_releases_failed`. The
@@ -1078,6 +1094,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- An IPC driver no longer keeps the images a connected remote subscriber
+  read. A registration kept its stream from freeing, and a remote client
+  had no way to remove one, so every image it took stayed Retiring, with
+  its regions, descriptors and storage charge, until the client left. A
+  retiring stream now frees once no lease, remote grant or lingering
+  network publication holds it. An in-process registration whose
+  `Remove` is still queued stays until it is served, and the `Remove`
+  succeeds; a `ReportLoss` queued ahead of it is not a protocol
+  violation once the stream is freed (it is counted unverified). A remote
+  registration is reclaimed once its last grant ends. Stream ids and
+  registration ids are never reused, so neither names a later one. A
+  remote registration no longer keeps a replaced guarded incarnation by
+  itself: its grants do.
+  `RemoteClient::remove_subscription` removes a taken subscription, and
+  the client facade releases retired, dropped and late-granted image
+  handles with it (the doc-hidden `Connection::release_subscription`).
 - A removed network publication's sender closes its lane queues, its
   repair queue and its route at its next duty (#354 review P3-6;
   driver-network-agents.md §7: the sender drops its queues), on every

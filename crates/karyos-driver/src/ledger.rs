@@ -115,6 +115,11 @@ impl Ledger {
         self.grants.len() >= self.limit
     }
 
+    /// The most grants it holds at once, `max_exports_per_client`.
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
     /// Records a new grant.
     pub(crate) fn push(&mut self, grant: Grant) {
         self.grants.push(grant);
