@@ -2,20 +2,24 @@
 
 //! The Raft log of C4 (karyos-cluster) over C2's crashing disk
 //! (quantstratum-docs: karyos/design/cluster-gap-analysis.md §6, C4): the
-//! eight crash cases of the `log` module, each run once per disk operation
-//! with the disk crashing at that operation, then reopened under every
-//! survival mode of [`Survives`], with seeds from [`scenarios::seeds`].
+//! eight crash cases of the `log` module and three more truncations, each
+//! run once per disk operation with the disk crashing at that operation
+//! (and once after the last step), then reopened under every survival mode
+//! of [`Survives`]: `Synced` and `Everything` once, `Subset` and `Torn` once
+//! per seed of [`scenarios::seeds`]. The run without a crash must complete
+//! every step, so no case is cut short by a refusal of its own.
 //!
 //! The invariant, checked by [`check`] at every crash point:
 //!
 //! 1. every entry the log reported durable before the crash is present,
 //!    byte for byte, unless a truncation that removes it was in flight;
 //! 2. nothing is claimed that was not written: every entry present is one
-//!    the workload appended at that index, and the reopened log claims
-//!    no durable index past its last;
+//!    the workload appended at that index and no truncation removed, and
+//!    the reopened log claims no durable index past its last;
 //! 3. the term and vote are the last saved record or the one in flight,
 //!    never torn, so no vote is cast twice in a term;
-//! 4. the stored commit never exceeds the durable last index;
+//! 4. the stored commit is durable: every committed entry is present, as
+//!    the log reported it durable;
 //! 5. open never refuses a legitimate crash: it is `Ok`, a torn tail or a
 //!    crash's loss above the watermark cut at most. Crash points whose
 //!    recovery removes a segment its creation left without a data file
@@ -87,6 +91,8 @@ struct Model {
     saved: Option<HardState>,
     /// The one being saved when the run stopped.
     saving: Option<HardState>,
+    /// Every step ran and returned `Ok`.
+    completed: bool,
 }
 
 /// Runs `steps` on a log created on `disk`, until the end, a crash or a
@@ -135,6 +141,8 @@ fn run(disk: SimDisk, steps: &[Step]) -> Model {
                 model.truncating = None;
                 let _ = model.written.split_off(from);
                 let _ = model.durable.split_off(from);
+                // What it removed must not come back.
+                let _ = model.versions.split_off(from);
                 // What is kept is durable on return.
                 model.durable = model.written.clone();
             }
@@ -148,14 +156,41 @@ fn run(disk: SimDisk, steps: &[Step]) -> Model {
             }
         }
     }
+    model.completed = true;
     model
 }
 
-/// Which refusals at reopen a case allows.
+/// How a case is swept.
 #[derive(Debug, Clone, Copy)]
-struct Allowed {
-    /// `FirstIndex` while the creation was not complete.
-    first_index_before_create: bool,
+struct Sweep {
+    /// The disk's tear unit; `None` for its default sector.
+    sector: Option<u64>,
+    /// Seeds swept besides [`scenarios::seeds`], whatever it selects.
+    extra_seeds: &'static [u64],
+}
+
+impl Sweep {
+    const DEFAULT: Self = Self {
+        sector: None,
+        extra_seeds: &[],
+    };
+
+    /// `disk` with this sweep's tear unit.
+    fn disk(&self, disk: SimDisk) -> SimDisk {
+        match self.sector {
+            Some(sector) => disk.with_sector(sector),
+            None => disk,
+        }
+    }
+
+    /// The seeds swept, without repeats.
+    fn seeds(&self) -> Vec<u64> {
+        let mut seeds = scenarios::seeds();
+        seeds.extend(self.extra_seeds);
+        seeds.sort_unstable();
+        seeds.dedup();
+        seeds
+    }
 }
 
 thread_local! {
@@ -165,12 +200,7 @@ thread_local! {
 }
 
 /// The invariant: `Ok` when the reopened log keeps it, else what broke.
-fn check(
-    disk: &SimDisk,
-    survives: Survives,
-    model: &Model,
-    allowed: Allowed,
-) -> Result<(), String> {
+fn check(disk: &SimDisk, survives: Survives, model: &Model) -> Result<(), String> {
     let restarted = disk
         .after_crash(survives)
         .map_err(|error| error.to_string())?;
@@ -184,7 +214,7 @@ fn check(
     }
     let mut log = match RaftLog::open(restarted, Path::new(DIR), geometry()) {
         Ok(opened) => opened.log,
-        Err(LogError::FirstIndex) if allowed.first_index_before_create && !model.created => {
+        Err(LogError::FirstIndex) if !model.created => {
             return Ok(());
         }
         Err(error) => return Err(format!("open refused: {error}")),
@@ -231,30 +261,57 @@ fn check(
             model.saved, model.saving
         ));
     }
-    // 4. The commit is durable.
-    if let Some(commit) = state.and_then(|state| state.commit)
-        && last.is_none_or(|last| commit > last)
-    {
-        return Err(format!("commit {commit} above the last index {last:?}"));
+    // 4. The commit is durable: every committed entry is present, as the
+    // log reported it durable.
+    if let Some(commit) = state.and_then(|state| state.commit) {
+        let committed = log
+            .entries(1..commit + 1, u64::MAX)
+            .map_err(|e| e.to_string())?;
+        if committed.len() as u64 != commit {
+            return Err(format!("committed {commit}, but {} held", committed.len()));
+        }
+        for found in committed {
+            if model
+                .durable
+                .get(&found.index)
+                .is_some_and(|durable| *durable != found)
+            {
+                return Err(format!("committed entry {} changed", found.index));
+            }
+        }
     }
     Ok(())
 }
 
-/// The survival modes of one crash point, the seeded ones from `seed`.
-fn survivals(seed: u64) -> [Survives; 4] {
-    [
-        Survives::Synced,
-        Survives::Everything,
-        Survives::Subset { seed },
-        Survives::Torn { seed },
-    ]
+/// Checks `disk` under every survival mode: the deterministic ones once,
+/// the seeded ones once per seed (mixed with `point`, the crash point).
+fn check_all(
+    disk: &SimDisk,
+    model: &Model,
+    seeds: &[u64],
+    point: u64,
+    label: &dyn Fn(Survives) -> String,
+    failures: &mut Vec<String>,
+) {
+    let mut modes = vec![Survives::Synced, Survives::Everything];
+    for seed in seeds {
+        let mixed = Rng::new(seed ^ point.rotate_left(32)).next_u64();
+        modes.push(Survives::Subset { seed: mixed });
+        modes.push(Survives::Torn { seed: mixed });
+    }
+    for survives in modes {
+        if let Err(broken) = check(disk, survives, model) {
+            failures.push(format!("{}: {broken}", label(survives)));
+        }
+    }
 }
 
-/// Runs `steps` with a crash at every disk operation in turn, then with
-/// every flush failing in turn; checks the invariant under every survival
-/// mode. Returns the crash points and the failed flushes run.
-fn sweep(name: &str, steps: &[Step], allowed: Allowed) -> (u64, u64) {
-    let (points, flushes, failures) = sweep_all(name, steps, allowed);
+/// Runs `steps` with a crash at every disk operation in turn (and after
+/// the last), then with every flush failing in turn; checks the invariant
+/// under every survival mode. Returns the crash points and the failed
+/// flushes run.
+fn sweep(name: &str, steps: &[Step], how: Sweep) -> (u64, u64) {
+    let (points, flushes, failures) = sweep_all(name, steps, how);
     assert!(
         failures.is_empty(),
         "{} failures:\n{}",
@@ -272,61 +329,68 @@ fn crashed_at(disk: &SimDisk) -> &'static str {
             Decision::Crash { call, .. } => Some(*call),
             _ => None,
         })
-        .unwrap_or("?")
+        .unwrap_or("after the last step")
 }
 
 /// [`sweep`], returning every broken check instead of the first.
-fn sweep_all(name: &str, steps: &[Step], allowed: Allowed) -> (u64, u64, Vec<String>) {
+fn sweep_all(name: &str, steps: &[Step], how: Sweep) -> (u64, u64, Vec<String>) {
     let mut failures = Vec::new();
-    let whole = SimDisk::new();
-    let _ = run(whole.clone(), steps);
+    let seeds = how.seeds();
+    // The full run must complete: a step that fails for a logic reason
+    // would shorten every sweep below.
+    let whole = how.disk(SimDisk::new());
+    let model = run(whole.clone(), steps);
+    assert!(
+        model.completed,
+        "{name}: the run without a crash stopped early"
+    );
     let operations = whole.used();
-    let mut syncs = 0;
-    for seed in scenarios::seeds() {
-        let mut rng = Rng::new(seed);
-        for budget in 0..operations {
-            let disk = SimDisk::with_budget(budget);
-            let model = run(disk.clone(), steps);
+    for budget in 0..=operations {
+        let disk = how.disk(SimDisk::with_budget(budget));
+        let model = run(disk.clone(), steps);
+        if budget < operations {
             assert!(disk.has_crashed(), "{name}: budget {budget} did not crash");
-            for survives in survivals(rng.next_u64()) {
-                if let Err(broken) = check(&disk, survives, &model, allowed) {
-                    failures.push(format!(
-                        "{name}: crash at operation {} ({}) under {survives:?} (seed {seed}): {broken}",
-                        budget + 1,
-                        crashed_at(&disk)
-                    ));
-                }
-            }
+        } else {
+            assert!(
+                model.completed,
+                "{name}: the last crash point stopped early"
+            );
         }
-        // Each flush failing in turn, then a crash with what survives.
-        syncs = 0;
-        loop {
-            syncs += 1;
-            let disk = SimDisk::new().with_failed_syncs([syncs]);
-            let model = run(disk.clone(), steps);
-            let failed = disk
-                .trace()
-                .iter()
-                .any(|decision| matches!(decision, Decision::FailedSync { .. }));
-            if !failed {
-                syncs -= 1;
-                break;
-            }
-            for survives in survivals(rng.next_u64()) {
-                if let Err(broken) = check(&disk, survives, &model, allowed) {
-                    failures.push(format!(
-                        "{name}: flush {syncs} failed, under {survives:?} (seed {seed}): {broken}"
-                    ));
-                }
-            }
+        let label = |survives| {
+            format!(
+                "{name}: crash at operation {} ({}) under {survives:?}",
+                budget + 1,
+                crashed_at(&disk)
+            )
+        };
+        check_all(&disk, &model, &seeds, budget, &label, &mut failures);
+    }
+    // Each flush failing in turn, then a crash with what survives.
+    let mut syncs = 0;
+    loop {
+        let next = syncs + 1;
+        let disk = how.disk(SimDisk::new().with_failed_syncs([next]));
+        let model = run(disk.clone(), steps);
+        let failed = disk
+            .trace()
+            .iter()
+            .any(|decision| matches!(decision, Decision::FailedSync { .. }));
+        if !failed {
+            break;
         }
+        syncs = next;
+        let label = |survives| format!("{name}: flush {next} failed, under {survives:?}");
+        check_all(
+            &disk,
+            &model,
+            &seeds,
+            next.rotate_left(16),
+            &label,
+            &mut failures,
+        );
     }
     (operations, syncs, failures)
 }
-
-const STRICT: Allowed = Allowed {
-    first_index_before_create: true,
-};
 
 fn appends(range: std::ops::Range<u64>, term: u64, size: usize) -> Step {
     Step::Append(range.map(|index| entry(index, term, size)).collect())
@@ -351,7 +415,7 @@ fn case_1_an_append_spanning_segments() {
         appends(4..5, 1, 3000),
         Step::Sync,
     ];
-    let (points, flushes) = sweep("case 1", &steps, STRICT);
+    let (points, flushes) = sweep("case 1", &steps, Sweep::DEFAULT);
     println!(
         "case 1: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
         GAPS.with(std::cell::Cell::get)
@@ -367,7 +431,7 @@ fn case_2_a_crash_between_append_and_sync() {
         appends(4..7, 1, 200),
         appends(7..8, 2, 200),
     ];
-    let (points, flushes) = sweep("case 2", &steps, STRICT);
+    let (points, flushes) = sweep("case 2", &steps, Sweep::DEFAULT);
     println!(
         "case 2: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
         GAPS.with(std::cell::Cell::get)
@@ -385,7 +449,7 @@ fn case_3_every_step_of_truncate() {
         appends(3..5, 2, 900),
         Step::Sync,
     ];
-    let (points, flushes) = sweep("case 3", &steps, STRICT);
+    let (points, flushes) = sweep("case 3", &steps, Sweep::DEFAULT);
     println!(
         "case 3: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
         GAPS.with(std::cell::Cell::get)
@@ -403,24 +467,30 @@ fn case_4_every_step_of_a_hard_state_save() {
         state(2, Some(3), Some(1)),
         state(2, Some(3), Some(2)),
     ];
-    let (points, flushes) = sweep("case 4", &steps, STRICT);
+    let (points, flushes) = sweep("case 4", &steps, Sweep::DEFAULT);
     println!(
         "case 4: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
         GAPS.with(std::cell::Cell::get)
     );
 }
 
-/// Case 5: a record big enough to tear: the torn survival mode keeps a
-/// sector prefix of any write, the record's included, and a reordered
-/// writeback keeps a rename without its data.
+/// Case 5: a torn record. The hard state (44 bytes) and a watermark slot
+/// (32) fit in one 512-byte sector, so this case tears at 8-byte sectors:
+/// the torn survival mode keeps an 8-byte-aligned prefix of any write, the
+/// record's and the slot's included, and a reordered writeback keeps a
+/// rename without its data.
 #[test]
 fn case_5_a_torn_record() {
     let steps = [
+        appends(1..3, 1, 100),
+        Step::Sync,
         state(5, Some(1), None),
+        appends(3..4, 1, 100),
+        Step::Sync,
         state(6, None, None),
-        state(6, Some(2), None),
+        state(6, Some(2), Some(2)),
     ];
-    let (points, flushes) = sweep("case 5", &steps, STRICT);
+    let (points, flushes) = sweep("case 5", &steps, TORN_SMALL);
     println!(
         "case 5: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
         GAPS.with(std::cell::Cell::get)
@@ -439,7 +509,7 @@ fn case_6_a_failed_flush_of_the_log_or_the_hard_state() {
         Step::Sync,
         state(1, Some(1), Some(4)),
     ];
-    let (points, flushes) = sweep("case 6", &steps, STRICT);
+    let (points, flushes) = sweep("case 6", &steps, Sweep::DEFAULT);
     assert!(flushes > 0);
     println!(
         "case 6: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
@@ -460,18 +530,31 @@ fn case_7_a_reopened_commit_against_the_recovered_log() {
         state(1, None, Some(7)),
         appends(8..9, 2, 700),
     ];
-    let (points, flushes) = sweep("case 7", &steps, STRICT);
+    let (points, flushes) = sweep("case 7", &steps, Sweep::DEFAULT);
     println!(
         "case 7: {points} crash points, {flushes} failed flushes, {} creation gaps opened",
         GAPS.with(std::cell::Cell::get)
     );
 }
 
+/// Seeds whose survival draws hit a creation gap in case 8, swept whatever
+/// `KARYOS_SIM_SEED` selects, so its assertion does not depend on it.
+const CASE_8: Sweep = Sweep {
+    sector: None,
+    extra_seeds: &[1, 3],
+};
+
+/// Tears at 8-byte sectors, so a 44-byte record and a 32-byte slot tear.
+const TORN_SMALL: Sweep = Sweep {
+    sector: Some(8),
+    extra_seeds: &[],
+};
+
 /// Case 8: a crash inside `create`: the directory opens empty, or is
 /// refused for its missing first index while the creation never ended.
 #[test]
 fn case_8_a_crash_inside_create() {
-    let (points, flushes) = sweep("case 8", &[], STRICT);
+    let (points, flushes) = sweep("case 8", &[], CASE_8);
     assert!(
         GAPS.with(std::cell::Cell::get) > 0,
         "no crash point left a creation gap"
@@ -512,4 +595,67 @@ fn a_flip_below_the_watermark_is_refused() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// Case 3 again at 8-byte sectors: the watermark's slots tear too, so a
+/// torn newer slot must fall back to the older one.
+#[test]
+fn case_3_at_small_sectors() {
+    let steps = [
+        appends(1..6, 1, 900),
+        Step::Sync,
+        Step::Truncate(3),
+        appends(3..5, 2, 900),
+        Step::Sync,
+    ];
+    let (points, flushes) = sweep("case 3 small", &steps, TORN_SMALL);
+    println!("case 3 at 8-byte sectors: {points} crash points, {flushes} failed flushes");
+}
+
+/// Case 9: truncating entries never synced, then appending again.
+#[test]
+fn case_9_truncating_unsynced_entries() {
+    let steps = [
+        appends(1..3, 1, 600),
+        Step::Sync,
+        appends(3..7, 1, 600),
+        Step::Truncate(4),
+        appends(4..6, 2, 600),
+        Step::Sync,
+    ];
+    let (points, flushes) = sweep("case 9", &steps, Sweep::DEFAULT);
+    println!("case 9: {points} crash points, {flushes} failed flushes");
+}
+
+/// Case 10: truncating to the first index, emptying the log, then filling
+/// it again.
+#[test]
+fn case_10_truncating_to_the_first_index() {
+    let steps = [
+        appends(1..4, 1, 1500),
+        Step::Sync,
+        Step::Truncate(1),
+        appends(1..3, 2, 1500),
+        Step::Sync,
+    ];
+    let (points, flushes) = sweep("case 10", &steps, Sweep::DEFAULT);
+    println!("case 10: {points} crash points, {flushes} failed flushes");
+}
+
+/// Case 11: saves mixed with truncation: a commit, a truncation above it,
+/// a new vote carrying the commit, and a later commit.
+#[test]
+fn case_11_saves_mixed_with_truncation() {
+    let steps = [
+        appends(1..6, 1, 500),
+        Step::Sync,
+        state(1, Some(1), Some(2)),
+        Step::Truncate(4),
+        state(2, Some(2), Some(2)),
+        appends(4..6, 2, 500),
+        Step::Sync,
+        state(2, Some(2), Some(5)),
+    ];
+    let (points, flushes) = sweep("case 11", &steps, Sweep::DEFAULT);
+    println!("case 11: {points} crash points, {flushes} failed flushes");
 }
