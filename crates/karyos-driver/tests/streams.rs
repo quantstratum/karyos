@@ -158,8 +158,11 @@ fn foreign_handles_are_refused() {
     assert_eq!(first.stream_state(stream).unwrap(), StreamState::Active);
 }
 
+/// A registration does not keep its retiring stream: with its handle
+/// removed (no lease), the stream frees even while the `Remove` is still
+/// queued, and the `Remove` then succeeds on the registration it left.
 #[test]
-fn a_queued_remove_keeps_a_retiring_stream_until_served() {
+fn a_queued_remove_succeeds_after_its_stream_is_freed() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(stream_config(2)).unwrap();
     let mut client = driver.connect().unwrap();
@@ -173,15 +176,12 @@ fn a_queued_remove_keeps_a_retiring_stream_until_served() {
     };
     let remove = client.remove_subscription(subscription).unwrap();
     driver.remove_stream(stream).unwrap();
-    // This cycle frees nothing (the queued Remove keeps its registration),
-    // then serves the Remove.
+    // This cycle frees the stream, then serves the Remove.
     let _ = driver.do_work().unwrap();
-    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    assert_eq!(state(&driver, stream), StreamState::Freed);
     let done = drain(&mut client);
     assert_eq!(done[0].sequence, remove);
     assert!(matches!(done[0].outcome, Outcome::Succeeded));
-    let _ = driver.do_work().unwrap();
-    assert_eq!(state(&driver, stream), StreamState::Freed);
 }
 
 #[test]
@@ -311,8 +311,10 @@ fn a_held_entry_taken_after_retirement_still_frees_on_drop() {
     assert_eq!(state(&driver, stream), StreamState::Freed);
 }
 
+/// With zero leases a retiring stream frees at once, whatever `Remove` is
+/// still queued for it: the registration does not pin it.
 #[test]
-fn a_queued_remove_with_zero_leases_still_blocks_freeing() {
+fn a_queued_remove_with_zero_leases_does_not_block_freeing() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(stream_config(2)).unwrap();
     let mut client = driver.connect().unwrap();
@@ -325,10 +327,8 @@ fn a_queued_remove_with_zero_leases_still_blocks_freeing() {
     let _ = client.remove_publication(publication).unwrap();
     assert_eq!(driver.live_leases(stream).unwrap(), 0);
     driver.remove_stream(stream).unwrap();
-    // Leases are zero, but the queued Remove's registration remains until
-    // this cycle serves it, after the freeing check.
-    let _ = driver.do_work().unwrap();
-    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    // Leases are zero: the queued Remove's registration does not keep
+    // the stream.
     let _ = driver.do_work().unwrap();
     assert_eq!(state(&driver, stream), StreamState::Freed);
 }
@@ -505,8 +505,10 @@ fn an_unknown_remove_that_executed_leaves_nothing() {
     assert_eq!(state(&driver, stream), StreamState::Freed);
 }
 
+/// A `Remove` reported `Unknown` (its client lapped) but still queued: the
+/// stream frees without waiting for it, and the `Remove` is served later.
 #[test]
-fn an_unknown_remove_still_queued_keeps_its_registration_until_served() {
+fn an_unknown_remove_still_queued_does_not_keep_its_stream() {
     let mut driver = EmbeddedDriver::with_config(lapping_config()).unwrap();
     let stream = driver.add_stream(stream_config(2)).unwrap();
     let mut slow = driver.connect().unwrap();
@@ -532,9 +534,9 @@ fn an_unknown_remove_still_queued_keeps_its_registration_until_served() {
     // Every pending request, the Remove included, is Unknown...
     assert!(lapped.iter().any(|c| c.sequence == remove));
     assert!(lapped.iter().all(|c| matches!(c.outcome, Outcome::Unknown)));
-    // ...but the Remove is still queued: its registration keeps the stream.
-    assert_eq!(driver.live_leases(stream).unwrap(), 0);
-    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    // ...and the Remove is still queued, yet its registration does not
+    // keep the stream.
+    assert_eq!(state(&driver, stream), StreamState::Freed);
     for _ in 0..60 {
         let _ = driver.do_work().unwrap();
     }

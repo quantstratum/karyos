@@ -11,11 +11,14 @@
 //! which attach as tools, with their shared command line
 //! ([`args::parse_tool`]); and `karyos-trace` (`quantstratum-docs:
 //! karyos/design/trace-tool.md`), whose command line, mirror reader,
-//! output and run loop live in [`trace`].
+//! output and run loop live in [`trace`]; and `karyos-tools replay diff`
+//! (`quantstratum-docs: karyos/design/recording-group-replay.md` section
+//! 10), which compares two recording group journals ([`replay`]).
 
 pub mod args;
 pub mod daemon;
 pub mod errors;
 pub mod idle;
+pub mod replay;
 pub mod stat;
 pub mod trace;
