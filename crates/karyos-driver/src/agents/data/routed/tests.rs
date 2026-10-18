@@ -1758,7 +1758,9 @@ fn a_removed_routed_lane_sends_its_eos_on_every_path() {
 
 /// ACS 17249: a path whose TX half is detached, still holding its copies
 /// of the lane, neither holds the drain nor gets the EOS; the other path
-/// sends it.
+/// sends it. #391 review P3: once B is back, still holding its copies, no
+/// repeat goes anywhere, so B's EOS never precedes its DATA; once its
+/// copies have left, the next repeat reaches B too.
 #[test]
 fn a_detached_path_does_not_hold_the_eos() {
     let (mut outbound, mut halves, [observer_a, observer_b]) = sealed_routed(false);
@@ -1769,14 +1771,30 @@ fn a_detached_path_does_not_hold_the_eos() {
     assert_eq!(step.sent, 1, "{step:?}");
     assert_eq!(observer_a.send_calls(), calls.0 + 1);
     assert_eq!(observer_b.send_calls(), calls.1, "B is detached");
-    // B back, its copies sent: nothing was waiting on it.
+    // B back with its copies still held: past the cadence, no repeat on
+    // either path.
     halves.push(b_half);
+    let calls = (observer_a.send_calls(), observer_b.send_calls());
+    let step = outbound.serve_removal_routes(&mut halves, 110);
+    assert_eq!(step.sent, 0, "{step:?}");
+    assert_eq!(
+        (observer_a.send_calls(), observer_b.send_calls()),
+        calls,
+        "no repeat while B holds copies"
+    );
+    // B's copies leave; the next repeat reaches both paths.
     sent(&observer_b, 32);
-    for now in 11..20 {
+    for now in 111..120 {
         let _ = outbound
             .serve_routes(&mut halves, BUDGET, None, now)
             .unwrap();
     }
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    let calls = (observer_a.send_calls(), observer_b.send_calls());
+    let step = outbound.serve_removal_routes(&mut halves, 220);
+    assert_eq!(step.sent, 1, "{step:?}");
+    assert_eq!(observer_a.send_calls(), calls.0 + 1, "the repeat on A");
+    assert_eq!(observer_b.send_calls(), calls.1 + 1, "the repeat on B");
 }
 
 /// ACS 17249: a live path still holding its copies (its socket blocks)
