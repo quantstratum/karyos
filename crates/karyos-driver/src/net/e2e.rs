@@ -26,7 +26,7 @@ use karyos_sys::term_bytes::HeapTerms;
 
 use crate::agents::{AgentConfig, ThreadingMode};
 use crate::embedded::{
-    AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, StreamConfig,
+    AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, StreamConfig, StreamTerms,
 };
 use crate::net::NetworkConfig;
 
@@ -111,7 +111,7 @@ const ANY_PORT: SocketAddr = SocketAddr::new(LOOPBACK, 0);
 
 /// The address `driver`'s network subscription of `stream_id` is bound
 /// to.
-fn bound(driver: &EmbeddedDriver, stream_id: i32) -> SocketAddr {
+fn bound<T: StreamTerms>(driver: &EmbeddedDriver<T>, stream_id: i32) -> SocketAddr {
     driver.network_subscription_address(stream_id).unwrap()
 }
 
@@ -128,9 +128,9 @@ fn free_port() -> u16 {
 }
 
 /// Runs every driver until `done`, at most about four seconds.
-fn pump(
-    drivers: &mut [&mut EmbeddedDriver],
-    mut done: impl FnMut(&mut [&mut EmbeddedDriver]) -> bool,
+fn pump<T: StreamTerms>(
+    drivers: &mut [&mut EmbeddedDriver<T>],
+    mut done: impl FnMut(&mut [&mut EmbeddedDriver<T>]) -> bool,
 ) {
     for _ in 0..40_000 {
         for driver in drivers.iter_mut() {
@@ -154,9 +154,9 @@ const BUDGET: Budget = Budget {
 };
 
 /// A publication on `a` and B's subscription of it, with B's image found.
-fn connected(
-    a: &mut EmbeddedDriver,
-    b: &mut EmbeddedDriver,
+fn connected<T: StreamTerms>(
+    a: &mut EmbeddedDriver<T>,
+    b: &mut EmbeddedDriver<T>,
     reliable: bool,
     stream_id: i32,
 ) -> (AggregateHandle, AggregateHandle) {
@@ -177,11 +177,11 @@ fn connected(
 
 /// Offers `count` numbered messages on lane 0 of `publication` while
 /// reading `reader` on `b`, until every one arrived in order.
-fn exchange(
-    a: &mut EmbeddedDriver,
-    b: &mut EmbeddedDriver,
+fn exchange<T: StreamTerms>(
+    a: &mut EmbeddedDriver<T>,
+    b: &mut EmbeddedDriver<T>,
     publication: &AggregateHandle,
-    reader: &mut AggregateSubscription<HeapTerms>,
+    reader: &mut AggregateSubscription<T>,
     count: u32,
 ) {
     let mut lane = a
@@ -191,11 +191,11 @@ fn exchange(
 }
 
 /// [`exchange`] of the messages numbered `range` on `lane`.
-fn exchange_on(
-    a: &mut EmbeddedDriver,
-    b: &mut EmbeddedDriver,
-    lane: &mut karyos_client::ClientPublication<HeapTerms>,
-    reader: &mut AggregateSubscription<HeapTerms>,
+fn exchange_on<T: StreamTerms>(
+    a: &mut EmbeddedDriver<T>,
+    b: &mut EmbeddedDriver<T>,
+    lane: &mut karyos_client::ClientPublication<T>,
+    reader: &mut AggregateSubscription<T>,
     range: core::ops::Range<u32>,
 ) {
     exchange_from(a, b, lane, reader, range.start, range);
@@ -203,11 +203,11 @@ fn exchange_on(
 
 /// [`exchange_on`] whose messages from `range.start` up to `sent` were
 /// already offered.
-fn exchange_from(
-    a: &mut EmbeddedDriver,
-    b: &mut EmbeddedDriver,
-    lane: &mut karyos_client::ClientPublication<HeapTerms>,
-    reader: &mut AggregateSubscription<HeapTerms>,
+fn exchange_from<T: StreamTerms>(
+    a: &mut EmbeddedDriver<T>,
+    b: &mut EmbeddedDriver<T>,
+    lane: &mut karyos_client::ClientPublication<T>,
+    reader: &mut AggregateSubscription<T>,
     sent: u32,
     range: core::ops::Range<u32>,
 ) {
