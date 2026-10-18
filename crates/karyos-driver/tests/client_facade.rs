@@ -1271,7 +1271,7 @@ fn a_release_whose_removal_cannot_be_sent_is_counted() {
 /// Task 2 (A7d-3): a network subscription reports each image it attaches
 /// and retires, in order, with its attach id: a publication that goes and
 /// one that comes back are two images. Polling without draining keeps
-/// the latest `2 * max_images` changes and counts the ones dropped.
+/// the latest `3 * max_images` changes and counts the ones dropped.
 #[test]
 fn a_network_subscription_reports_its_image_changes() {
     for drain in [true, false] {
@@ -1316,13 +1316,21 @@ fn a_network_subscription_reports_its_image_changes() {
             take(&mut reading, &mut changes);
             reading.image_count() == 0
         });
-        let _two = second
+        let two = second
             .add_exclusive_publication(&uri, StreamId::new(11))
             .unwrap();
         until(&mut [&mut subscriber, &mut second], || {
             take(&mut reading, &mut changes);
             reading.image_count() == 1
         });
+        if !drain {
+            // A fourth change: one more than the queue holds.
+            drop(two);
+            until(&mut [&mut subscriber, &mut second], || {
+                take(&mut reading, &mut changes);
+                reading.image_count() == 0
+            });
+        }
         if drain {
             let seen: Vec<_> = changes.iter().map(|change| change.available).collect();
             assert_eq!(seen, [true, false, true]);
@@ -1330,13 +1338,13 @@ fn a_network_subscription_reports_its_image_changes() {
             assert_ne!(changes[1].image_id, changes[2].image_id, "a new image");
             assert_eq!(reading.image_changes_lost(), 0);
         } else {
-            // Room for two: the first attach was dropped, counted. Taken
-            // one at a time.
+            // Room for three: the first attach was dropped, counted.
+            // Taken one at a time.
             while let Some(change) = reading.next_image_change() {
                 changes.push(change);
             }
             let seen: Vec<_> = changes.iter().map(|change| change.available).collect();
-            assert_eq!(seen, [false, true]);
+            assert_eq!(seen, [false, true, false]);
             assert_eq!(reading.image_changes_lost(), 1);
         }
     }

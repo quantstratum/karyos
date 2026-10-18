@@ -241,8 +241,10 @@ impl ContextBuilder {
                 reason: "no image may be attached",
             });
         }
-        // A network subscription queues twice as many image changes.
-        if context.max_images.checked_mul(2).is_none() {
+        // A network subscription queues three times as many image
+        // changes: one adoption's retirements, arrivals and a close's
+        // drain.
+        if context.max_images.checked_mul(3).is_none() {
             return Err(ClientError::InvalidContext {
                 reason: "too many images to queue their changes",
             });
@@ -1047,7 +1049,7 @@ impl<C: Connection> Client<C> {
         let max_changes =
             self.context
                 .max_images
-                .checked_mul(2)
+                .checked_mul(3)
                 .ok_or(ClientError::InvalidContext {
                     reason: "too many images to queue their changes",
                 })?;
@@ -1064,6 +1066,7 @@ impl<C: Connection> Client<C> {
                     next: 0,
                     closed: None,
                     changes: std::collections::VecDeque::with_capacity(max_changes),
+                    max_changes,
                     changes_lost: 0,
                 }),
             }),
@@ -1370,9 +1373,13 @@ struct Images<T: TermBytes> {
     /// The image the next poll starts at.
     next: usize,
     closed: Option<ClientError>,
-    /// The image changes not yet drained, oldest first: room for
-    /// `2 * max_images`, which bounds one adoption. Full, the oldest goes.
+    /// The image changes not yet drained, oldest first, at most
+    /// `max_changes`. Full, the oldest goes.
     changes: std::collections::VecDeque<ImageChange>,
+    /// `3 * max_images`, which bounds one adoption: retirements, arrivals
+    /// and, with a close, every image left. The queue was reserved to it
+    /// (its capacity may be larger; this is the bound).
+    max_changes: usize,
     /// The changes dropped from a full queue.
     changes_lost: u64,
 }
@@ -1410,7 +1417,7 @@ impl<T: TermBytes> Subscription<T> {
     /// since the last call, and forgets them: a network subscription's
     /// images as it adopts them, each with its attach id. Nothing for a
     /// stream. It allocates nothing; changes beyond the queue's room
-    /// (twice [`Context::max_images`]) drop the oldest, counted by
+    /// (three times [`Context::max_images`]) drop the oldest, counted by
     /// [`Subscription::image_changes_lost`].
     pub fn image_changes(&mut self, each: &mut dyn FnMut(ImageChange)) {
         while let Some(change) = self.next_image_change() {
@@ -1538,14 +1545,15 @@ impl<T: TermBytes> Images<T> {
     /// allocates.
     fn change(
         changes: &mut std::collections::VecDeque<ImageChange>,
+        max: usize,
         lost: &mut u64,
         image: &Image<T>,
         available: bool,
     ) {
-        if changes.len() == changes.capacity() && changes.pop_front().is_some() {
+        if changes.len() >= max && changes.pop_front().is_some() {
             bump(lost);
         }
-        if changes.len() < changes.capacity() {
+        if changes.len() < max {
             changes.push_back(ImageChange {
                 image_id: image.id,
                 session_id: image.session_id,
@@ -1575,12 +1583,24 @@ impl<T: TermBytes> Images<T> {
         for id in state.retired.drain(..) {
             if let Some(index) = self.images.iter().position(|image| image.id == id) {
                 let image = self.images.remove(index);
-                Self::change(&mut self.changes, &mut self.changes_lost, &image, false);
+                Self::change(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    &image,
+                    false,
+                );
                 released.push(image.subscription);
             }
         }
         for image in &state.arrived {
-            Self::change(&mut self.changes, &mut self.changes_lost, image, true);
+            Self::change(
+                &mut self.changes,
+                self.max_changes,
+                &mut self.changes_lost,
+                image,
+                true,
+            );
         }
         self.images.append(&mut state.arrived);
         if self.closed.is_none() {
@@ -1589,7 +1609,13 @@ impl<T: TermBytes> Images<T> {
         drop(state);
         if self.closed.is_some() {
             for image in self.images.drain(..) {
-                Self::change(&mut self.changes, &mut self.changes_lost, &image, false);
+                Self::change(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    &image,
+                    false,
+                );
                 released.push(image.subscription);
             }
         }
@@ -1718,5 +1744,88 @@ impl<T: TermBytes> Images<T> {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    /// An image of attach id `id`, session `session`, over its own log.
+    fn image(id: u64, session: i32) -> Image<karyos_sys::term_bytes::HeapTerms> {
+        let buffer = Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 2,
+                max_subscribers: 2,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: session,
+                stream_id: 2,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            })
+            .unwrap(),
+        );
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        Image {
+            id,
+            session_id: session,
+            subscription,
+        }
+    }
+
+    /// #440 review F1: one adoption's worst case, every image retired, as
+    /// many arriving and a close draining them, is `3 * max_images`
+    /// changes: all are queued, none lost.
+    #[test]
+    fn one_adoption_queues_every_change() {
+        let max_images = 2;
+        let inbox = Arc::new(Inbox::new(max_images));
+        let mut images = Images {
+            registration: 1,
+            inbox: Arc::clone(&inbox),
+            released: Arc::new(Mutex::new(Vec::with_capacity(4 * max_images))),
+            images: Vec::with_capacity(max_images),
+            next: 0,
+            closed: None,
+            changes: std::collections::VecDeque::with_capacity(3 * max_images),
+            max_changes: 3 * max_images,
+            changes_lost: 0,
+        };
+        images.images.push(image(1, 1));
+        images.images.push(image(2, 2));
+        inbox.update(|state| {
+            state.retired.extend([1, 2]);
+            state.arrived.push(image(3, 3));
+            state.arrived.push(image(4, 4));
+            state.closed = Some(ClientError::EmptyMessage);
+        });
+        images.adopt();
+        let seen: Vec<(u64, bool)> = images
+            .changes
+            .iter()
+            .map(|change| (change.image_id, change.available))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (1, false),
+                (2, false),
+                (3, true),
+                (4, true),
+                (3, false),
+                (4, false)
+            ]
+        );
+        assert_eq!(images.changes_lost, 0);
     }
 }
