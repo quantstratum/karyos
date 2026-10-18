@@ -72,16 +72,33 @@ impl fmt::Display for HardStateProblem {
     }
 }
 
+/// `value` at `at` in `bytes`; nothing if it does not fit.
+fn put(bytes: &mut [u8; HARD_STATE_LEN], at: usize, value: &[u8]) {
+    if let Some(slot) = at
+        .checked_add(value.len())
+        .and_then(|end| bytes.get_mut(at..end))
+    {
+        slot.copy_from_slice(value);
+    }
+}
+
+/// The eight bytes at `at`, little endian.
+fn word(bytes: &[u8; HARD_STATE_LEN], at: usize) -> Option<u64> {
+    let end = at.checked_add(8)?;
+    Some(u64::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+/// The four bytes at `at`, little endian.
+fn half(bytes: &[u8; HARD_STATE_LEN], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    Some(u32::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
 impl HardState {
     /// The record of this state.
     #[must_use]
     pub fn encode(&self) -> [u8; HARD_STATE_LEN] {
         let mut bytes = [0u8; HARD_STATE_LEN];
-        let put = |bytes: &mut [u8; HARD_STATE_LEN], at: usize, value: &[u8]| {
-            if let Some(slot) = bytes.get_mut(at..at + value.len()) {
-                slot.copy_from_slice(value);
-            }
-        };
         put(&mut bytes, 0, &MAGIC);
         put(&mut bytes, 4, &VERSION.to_le_bytes());
         put(&mut bytes, 8, &self.current_term.to_le_bytes());
@@ -89,7 +106,9 @@ impl HardState {
         put(&mut bytes, 17, &self.voted_for.unwrap_or(0).to_le_bytes());
         put(&mut bytes, 25, &[u8::from(self.commit.is_some())]);
         put(&mut bytes, 26, &self.commit.unwrap_or(0).to_le_bytes());
-        let crc = crc32c(bytes.get(..40).unwrap_or(&[]));
+        let crc = bytes
+            .split_first_chunk::<40>()
+            .map_or(0, |(body, _)| crc32c(body));
         put(&mut bytes, 40, &crc.to_le_bytes());
         bytes
     }
@@ -104,25 +123,17 @@ impl HardState {
         let record: &[u8; HARD_STATE_LEN] = bytes
             .try_into()
             .map_err(|_| HardStateProblem::Length(bytes.len()))?;
-        let field = |at: usize| -> [u8; 8] {
-            let mut word = [0u8; 8];
-            if let Some(slice) = record.get(at..at + 8) {
-                word.copy_from_slice(slice);
-            }
-            word
-        };
-        let mut crc = [0u8; 4];
-        let mut version = [0u8; 4];
-        crc.copy_from_slice(record.get(40..44).unwrap_or(&[0; 4]));
-        version.copy_from_slice(record.get(4..8).unwrap_or(&[0; 4]));
-        if crc32c(record.get(..40).unwrap_or(&[])) != u32::from_le_bytes(crc) {
+        let (body, _) = record
+            .split_first_chunk::<40>()
+            .ok_or(HardStateProblem::Length(bytes.len()))?;
+        if half(record, 40) != Some(crc32c(body)) {
             return Err(HardStateProblem::Checksum);
         }
-        if record.get(..4) != Some(&MAGIC[..]) || u32::from_le_bytes(version) != VERSION {
+        if record.get(..4) != Some(&MAGIC[..]) || half(record, 4) != Some(VERSION) {
             return Err(HardStateProblem::Foreign);
         }
         let optional = |flag: usize, at: usize| -> Result<Option<u64>, HardStateProblem> {
-            let value = u64::from_le_bytes(field(at));
+            let value = word(record, at).ok_or(HardStateProblem::Malformed)?;
             match record.get(flag) {
                 Some(1) => Ok(Some(value)),
                 Some(0) if value == 0 => Ok(None),
@@ -136,7 +147,7 @@ impl HardState {
             return Err(HardStateProblem::Malformed);
         }
         Ok(Self {
-            current_term: u64::from_le_bytes(field(8)),
+            current_term: word(record, 8).ok_or(HardStateProblem::Malformed)?,
             voted_for: optional(16, 17)?,
             commit: optional(25, 26)?,
         })

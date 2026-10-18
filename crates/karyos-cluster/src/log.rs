@@ -7,23 +7,40 @@
 //! - **Frames.** Each entry is one A2 write, so every entry starts at a
 //!   write boundary and a suffix can be cut there: a 36-byte header
 //!   (magic `KRLE`, payload length, index, term, event time, CRC-32C of
-//!   the header's first 32 bytes and the payload), then the payload.
+//!   the header's first 32 bytes and the payload), then the payload. A2
+//!   splits a write only at a segment's end.
 //! - **Index.** The entry-to-byte index is kept in memory and rebuilt at
 //!   [`RaftLog::open`] from the frames: there is no index file.
-//! - **Positions.** `written` and `durable` are A2's, and their last
-//!   entries are [`RaftLog::last_index`] and [`RaftLog::durable_index`];
-//!   [`RaftLog::append`] advances only the first, [`RaftLog::sync`] the
-//!   second. Commit and applied indices are the caller's.
-//! - **Recovery.** [`RaftLog::open`] runs A2's recovery, which keeps every
-//!   whole, checked write, then walks the frames. A frame the recovered
-//!   bytes end inside (an entry whose later chunk was lost with its
-//!   segment) is the torn tail: the log is cut at its start. Any other
-//!   frame that is not the next one is refused, typed: a foreign magic, a
-//!   CRC failure, an index that does not follow, a term that goes back.
+//! - **Indices.** Any first index is valid, 0 included;
+//!   [`RaftLog::last_index`] is `None` while the log is empty.
+//! - **Positions** (SPEC §9, the five positions). `written` and `durable`
+//!   are A2's, and their last entries are [`RaftLog::last_index`] and
+//!   [`RaftLog::durable_index`]; [`RaftLog::append`] advances only the
+//!   first, [`RaftLog::sync`] the second. The received position is the
+//!   transport's: the log never holds an entry it was not given whole.
+//!   Commit and applied are the caller's (a stored commit is checked,
+//!   below).
+//! - **Recovery.** A crash tears at most the last write. [`RaftLog::open`]
+//!   loads the hard state first, then runs A2's recovery: a recovery that
+//!   drops any whole write but the last (bit rot, a lost segment) is
+//!   [`LogError::Corruption`]. It then walks the frames: the last write
+//!   may hold the first chunks of a frame whose later chunks were lost
+//!   with the next segment, and only that torn tail is cut, unless it holds
+//!   a committed entry. Any other frame that is not the next one is
+//!   [`LogError::Chain`]: a foreign magic, a CRC failure, a length past
+//!   the end, an index that does not follow, a term that goes back.
 //! - **Hard state.** [`HardState`] lives in its own file, replaced
-//!   atomically; a failed save poisons the log until it is reopened.
-//! - **First index.** Kept in its own file, written at creation, so an
-//!   emptied log keeps it. Purging a prefix waits for snapshots (C8).
+//!   atomically; its stored commit only moves forward and never past the
+//!   durable last index, and no committed entry is ever truncated.
+//! - **Poison.** Every failed write or sync (an append's segment roll, a
+//!   truncation's, a sync, a hard-state save) poisons the log: writes are
+//!   refused until it is reopened, and the index keeps only what A2 still
+//!   holds.
+//! - **First index.** Kept in its own file, written atomically before the
+//!   store at creation, so an emptied log keeps it and a creation cut
+//!   short is finished at open. Purging a prefix waits for snapshots (C8).
+//! - **Allocation.** An append encodes each frame into a new `Vec`; C5's
+//!   zero-allocation gate will need it reused.
 //!
 //! Crash cases for C2's simulated disk (not run here, since the Archive
 //! has no public faulty disk):
@@ -41,19 +58,22 @@
 //! 6. a failed flush of the log or of the hard state: the call fails, and
 //!    every later write is refused until the log is reopened;
 //! 7. a crash after a save whose commit was checked against the durable
-//!    index: the reopened commit is never above the recovered log.
+//!    index: the reopened commit is never above the recovered log;
+//! 8. a crash inside `create`: the reopened directory opens empty or is
+//!    created again.
 
 use std::fmt;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use karyos_archive::crc32c::crc32c;
+use karyos_archive::crc32c::{Crc32c, crc32c};
 use karyos_archive::disk::Disk;
 use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 
-use crate::file;
-use crate::hard_state::{HARD_STATE_FILE, HardState, HardStateProblem};
+use crate::a2;
+use crate::file::{self, Read};
+use crate::hard_state::{HARD_STATE_FILE, HARD_STATE_LEN, HardState, HardStateProblem};
 
 /// The A2 recording id of the log.
 pub const LOG_RECORDING: u64 = 1;
@@ -61,7 +81,11 @@ pub const LOG_RECORDING: u64 = 1;
 pub const FIRST_INDEX_FILE: &str = "first-index";
 /// A frame's header length.
 pub const FRAME_HEADER: usize = 36;
+/// [`FRAME_HEADER`] as a position.
+pub const FRAME_HEADER_LEN: u64 = 36;
 const MAGIC: [u8; 4] = *b"KRLE";
+/// The first-index record: the index, then its CRC-32C.
+const FIRST_LEN: usize = 12;
 
 /// One log entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,12 +115,21 @@ impl Entry {
         frame.extend_from_slice(&self.index.to_le_bytes());
         frame.extend_from_slice(&self.term.to_le_bytes());
         frame.extend_from_slice(&self.event_time.to_le_bytes());
-        let mut crc = karyos_archive::crc32c::Crc32c::new();
+        let mut crc = Crc32c::new();
         crc.update(&frame);
         crc.update(&self.payload);
         frame.extend_from_slice(&crc.finish().to_le_bytes());
         frame.extend_from_slice(&self.payload);
         Ok(frame)
+    }
+
+    /// Its encoded size: header and payload.
+    #[must_use]
+    pub fn encoded_len(&self) -> u64 {
+        u64::try_from(self.payload.len())
+            .ok()
+            .and_then(|length| length.checked_add(FRAME_HEADER_LEN))
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -111,22 +144,26 @@ struct Header {
 
 impl Header {
     fn decode(bytes: &[u8; FRAME_HEADER]) -> Option<Self> {
-        let word = |at: usize| -> Option<u64> {
-            Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
-        };
-        let half = |at: usize| -> Option<u32> {
-            Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-        };
-        if bytes.get(..4) != Some(&MAGIC[..]) {
-            return None;
-        }
-        Some(Self {
-            length: half(4)?,
-            index: word(8)?,
-            term: word(16)?,
-            event_time: word(24)?,
-            crc: half(32)?,
+        let (magic, rest) = bytes.split_first_chunk::<4>()?;
+        let (length, rest) = rest.split_first_chunk::<4>()?;
+        let (index, rest) = rest.split_first_chunk::<8>()?;
+        let (term, rest) = rest.split_first_chunk::<8>()?;
+        let (event_time, rest) = rest.split_first_chunk::<8>()?;
+        let (crc, _) = rest.split_first_chunk::<4>()?;
+        (*magic == MAGIC).then(|| Self {
+            length: u32::from_le_bytes(*length),
+            index: u64::from_le_bytes(*index),
+            term: u64::from_le_bytes(*term),
+            event_time: u64::from_le_bytes(*event_time),
+            crc: u32::from_le_bytes(*crc),
         })
+    }
+
+    /// The frame's end, from its start.
+    fn end(&self, start: u64) -> Option<u64> {
+        start
+            .checked_add(FRAME_HEADER_LEN)?
+            .checked_add(u64::from(self.length))
     }
 }
 
@@ -149,7 +186,7 @@ pub enum LogError {
         /// The entry's term.
         got: u64,
     },
-    /// A payload over `u32::MAX` bytes.
+    /// A payload over `u32::MAX` bytes, or an index past `u64::MAX`.
     TooLarge {
         /// The entry's index.
         index: u64,
@@ -160,8 +197,8 @@ pub enum LogError {
         index: u64,
         /// The first index.
         first: u64,
-        /// The last index.
-        last: u64,
+        /// The last index, if any.
+        last: Option<u64>,
     },
     /// Purging a prefix waits for snapshots (C8).
     PurgeUnsupported,
@@ -173,6 +210,13 @@ pub enum LogError {
         /// The stored commit.
         commit: u64,
     },
+    /// A torn tail at recovery that would remove a committed entry.
+    TornBelowCommit {
+        /// The torn entry's index.
+        index: u64,
+        /// The stored commit.
+        commit: u64,
+    },
     /// A frame found at recovery that does not continue the chain.
     Chain {
         /// The frame's position.
@@ -180,6 +224,8 @@ pub enum LogError {
         /// What is wrong.
         problem: ChainProblem,
     },
+    /// A2's recovery dropped whole writes past the last one.
+    Corruption(Corruption),
     /// The first-index file is missing or not one this version wrote.
     FirstIndex,
     /// The hard-state record is refused.
@@ -188,11 +234,18 @@ pub enum LogError {
     CommitBeyondDurable {
         /// The commit asked for.
         commit: u64,
-        /// The durable last index.
-        durable: u64,
+        /// The durable last index, if any.
+        durable: Option<u64>,
     },
-    /// A log sync or a hard-state save failed earlier: writes are refused
-    /// until the log is reopened.
+    /// A save whose commit is below the stored one, or none after one.
+    CommitBack {
+        /// The stored commit.
+        stored: u64,
+        /// The commit asked for.
+        got: Option<u64>,
+    },
+    /// A write or a sync failed earlier: writes are refused until the log
+    /// is reopened.
     Poisoned,
     /// The segment store's error.
     Store(SegmentError),
@@ -207,6 +260,8 @@ pub enum ChainProblem {
     Foreign,
     /// Its CRC does not match.
     Checksum,
+    /// It runs past the log's end, and is not the torn last write.
+    PastEnd,
     /// Its index is not the next one.
     Index {
         /// The next index.
@@ -223,6 +278,24 @@ pub enum ChainProblem {
     },
 }
 
+/// What A2's recovery lost beyond a torn last write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corruption {
+    /// It cut at `cut`, below the start of the last whole write.
+    Dropped {
+        /// Where A2 cut the log.
+        cut: u64,
+        /// The start of the last whole write before the recovery.
+        last_write: u64,
+    },
+    /// A segment's index header is bad before the last segment: a segment
+    /// was lost or damaged.
+    Segment {
+        /// The segment's base.
+        base: u64,
+    },
+}
+
 impl fmt::Display for LogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -235,29 +308,36 @@ impl fmt::Display for LogError {
                     "entry {index} has term {got}, below the last term {last}"
                 )
             }
-            Self::TooLarge { index } => write!(f, "entry {index}'s payload is too large"),
+            Self::TooLarge { index } => write!(f, "entry {index} is too large"),
             Self::OutOfRange { index, first, last } => {
-                write!(f, "index {index} is outside [{first}, {last} + 1]")
-            }
-            Self::PurgeUnsupported => f.write_str("purging a prefix waits for snapshots"),
-            Self::TruncateBelowCommit { from, commit } => {
                 write!(
                     f,
-                    "truncating from {from} would remove committed entries up to {commit}"
+                    "index {index} is outside the log from {first} to {last:?}"
                 )
             }
+            Self::PurgeUnsupported => f.write_str("purging a prefix waits for snapshots"),
+            Self::TruncateBelowCommit { from, commit } => write!(
+                f,
+                "truncating from {from} would remove committed entries up to {commit}"
+            ),
+            Self::TornBelowCommit { index, commit } => write!(
+                f,
+                "the torn entry {index} is at or below the stored commit {commit}"
+            ),
             Self::Chain { position, problem } => {
                 write!(f, "the frame at {position} breaks the chain: {problem:?}")
             }
+            Self::Corruption(corruption) => write!(f, "the log is corrupt: {corruption:?}"),
             Self::FirstIndex => f.write_str("the first-index file is missing or invalid"),
             Self::HardState(problem) => write!(f, "the hard state is refused: {problem}"),
-            Self::CommitBeyondDurable { commit, durable } => {
-                write!(
-                    f,
-                    "commit {commit} is above the durable last index {durable}"
-                )
+            Self::CommitBeyondDurable { commit, durable } => write!(
+                f,
+                "commit {commit} is above the durable last index {durable:?}"
+            ),
+            Self::CommitBack { stored, got } => {
+                write!(f, "commit {got:?} would go back from the stored {stored}")
             }
-            Self::Poisoned => f.write_str("a sync or a save failed: reopen the log"),
+            Self::Poisoned => f.write_str("a write or a sync failed: reopen the log"),
             Self::Store(error) => write!(f, "segment store: {error}"),
             Self::Io(error) => write!(f, "disk: {error}"),
         }
@@ -296,33 +376,59 @@ pub struct RaftLog<D: Disk + Clone> {
 pub struct Opened<D: Disk + Clone> {
     /// The log.
     pub log: RaftLog<D>,
-    /// The position recovery cut a torn tail at, if it did.
+    /// The position a torn tail was cut at, by A2 or by the frame walk, if
+    /// one was.
     pub cut: Option<u64>,
 }
 
-fn encode_first(first: u64) -> [u8; 12] {
-    let mut bytes = [0u8; 12];
-    bytes[..8].copy_from_slice(&first.to_le_bytes());
-    bytes[8..].copy_from_slice(&crc32c(&first.to_le_bytes()).to_le_bytes());
+fn encode_first(first: u64) -> [u8; FIRST_LEN] {
+    let mut bytes = [0u8; FIRST_LEN];
+    let (index, crc) = bytes.split_at_mut(8);
+    index.copy_from_slice(&first.to_le_bytes());
+    crc.copy_from_slice(&crc32c(&first.to_le_bytes()).to_le_bytes());
     bytes
 }
 
 fn decode_first(bytes: &[u8]) -> Option<u64> {
-    let first = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
-    let crc = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
-    (bytes.len() == 12 && crc == crc32c(&first.to_le_bytes())).then_some(first)
+    let record: &[u8; FIRST_LEN] = bytes.try_into().ok()?;
+    let (index, crc) = record.split_first_chunk::<8>()?;
+    let crc: [u8; 4] = crc.try_into().ok()?;
+    (u32::from_le_bytes(crc) == crc32c(index)).then(|| u64::from_le_bytes(*index))
+}
+
+/// A2's store files of the log, if any are in `dir`.
+fn store_exists<D: Disk>(disk: &mut D, dir: &Path) -> io::Result<bool> {
+    let prefix = format!("{LOG_RECORDING:016x}-");
+    Ok(disk.list(dir)?.iter().any(|name| name.starts_with(&prefix)))
 }
 
 impl<D: Disk + Clone> RaftLog<D> {
     /// Creates an empty log in `dir`, whose first entry will be
-    /// `first_index`.
+    /// `first_index`. The first-index file is written atomically before
+    /// the store, so a crash inside leaves a directory [`RaftLog::open`]
+    /// finishes, or one this creates again.
     ///
     /// # Errors
     ///
-    /// The store's errors ([`SegmentError::Exists`] when a log is there),
-    /// and the disk's.
+    /// The store's errors ([`SegmentError::Exists`] when a log is there,
+    /// changing nothing), and the disk's.
     pub fn create(
         mut disk: D,
+        dir: &Path,
+        geometry: Geometry,
+        first_index: u64,
+    ) -> Result<Self, LogError> {
+        if store_exists(&mut disk, dir)? {
+            return Err(LogError::Store(SegmentError::Exists {
+                recording: LOG_RECORDING,
+            }));
+        }
+        file::replace(&mut disk, dir, FIRST_INDEX_FILE, &encode_first(first_index))?;
+        Self::create_store(disk, dir, geometry, first_index)
+    }
+
+    fn create_store(
+        disk: D,
         dir: &Path,
         geometry: Geometry,
         first_index: u64,
@@ -335,7 +441,6 @@ impl<D: Disk + Clone> RaftLog<D> {
             SyncPolicy::PerSegment,
             0,
         )?;
-        file::replace(&mut disk, dir, FIRST_INDEX_FILE, &encode_first(first_index))?;
         Ok(Self {
             store,
             disk,
@@ -347,74 +452,110 @@ impl<D: Disk + Clone> RaftLog<D> {
         })
     }
 
-    /// Opens the log in `dir` after a crash or a close: recovers the store,
-    /// rebuilds the index from the frames, cuts a torn tail, and loads the
-    /// hard state.
+    /// Opens the log in `dir` after a crash or a close: loads the hard
+    /// state, recovers the store, rebuilds the index from the frames and
+    /// cuts a torn tail. A creation cut short after its first-index file
+    /// is finished here, as an empty log.
     ///
     /// # Errors
     ///
-    /// [`LogError::Chain`] for a frame that does not continue the chain,
     /// [`LogError::FirstIndex`], [`LogError::HardState`] for a refused
-    /// record, [`LogError::CommitBeyondDurable`] for a stored commit above
-    /// the recovered log, and the store's and the disk's errors.
+    /// record, [`LogError::Corruption`] when A2's recovery dropped more
+    /// than a torn last write, [`LogError::Chain`] for a frame that does
+    /// not continue the chain, [`LogError::TornBelowCommit`] and
+    /// [`LogError::CommitBeyondDurable`] for a stored commit the recovered
+    /// log does not hold, and the store's and the disk's errors.
     pub fn open(mut disk: D, dir: &Path, geometry: Geometry) -> Result<Opened<D>, LogError> {
-        let first_index = file::read(&mut disk, dir, FIRST_INDEX_FILE)?
-            .as_deref()
-            .and_then(decode_first)
-            .ok_or(LogError::FirstIndex)?;
-        let recovered = SegmentStore::recover(
+        let first_index = match file::read(&mut disk, dir, FIRST_INDEX_FILE, FIRST_LEN)? {
+            Read::Bytes(bytes) => decode_first(&bytes),
+            Read::Missing | Read::TooLong(_) => None,
+        }
+        .ok_or(LogError::FirstIndex)?;
+        let hard_state = match file::read(&mut disk, dir, HARD_STATE_FILE, HARD_STATE_LEN)? {
+            Read::Missing => None,
+            Read::Bytes(bytes) => Some(HardState::decode(&bytes).map_err(LogError::HardState)?),
+            Read::TooLong(length) => {
+                let length = usize::try_from(length).unwrap_or(usize::MAX);
+                return Err(LogError::HardState(HardStateProblem::Length(length)));
+            }
+        };
+        if !store_exists(&mut disk, dir)? {
+            // A creation that stopped after its first-index file.
+            let log = Self::create_store(disk, dir, geometry, first_index)?;
+            return Ok(Opened { log, cut: None });
+        }
+        let last_write = a2::last_write_start(&mut disk, dir, LOG_RECORDING)?;
+        let recovered = match SegmentStore::recover(
             disk.clone(),
             dir,
             LOG_RECORDING,
             geometry,
             SyncPolicy::PerSegment,
-        )?;
+        ) {
+            Ok(recovered) => recovered,
+            Err(SegmentError::BadHeader { base, .. }) => {
+                return Err(LogError::Corruption(Corruption::Segment { base }));
+            }
+            Err(error) => return Err(LogError::Store(error)),
+        };
+        let written = recovered.store.written();
+        if let Some(last_write) = last_write.filter(|last| *last > written) {
+            return Err(LogError::Corruption(Corruption::Dropped {
+                cut: written,
+                last_write,
+            }));
+        }
         let mut log = Self {
             store: recovered.store,
             disk,
             dir: dir.to_path_buf(),
             first_index,
             entries: Vec::new(),
-            hard_state: None,
+            hard_state,
             poisoned: false,
         };
-        let cut = log.rebuild()?;
-        log.hard_state = match file::read(&mut log.disk, dir, HARD_STATE_FILE)? {
-            Some(bytes) => Some(HardState::decode(&bytes).map_err(LogError::HardState)?),
-            None => None,
-        };
+        let torn = log.rebuild(geometry)?;
         if let Some(commit) = log.hard_state.and_then(|state| state.commit) {
             log.check_commit(commit)?;
         }
-        Ok(Opened { log, cut })
+        Ok(Opened {
+            log,
+            cut: torn.or(recovered.cut.map(|cut| cut.position)),
+        })
     }
 
     /// Walks the frames from the start; returns where a torn tail was cut.
-    fn rebuild(&mut self) -> Result<Option<u64>, LogError> {
+    fn rebuild(&mut self, geometry: Geometry) -> Result<Option<u64>, LogError> {
         let written = self.store.written();
         let mut position = self.store.start();
         let mut next = self.first_index;
-        let mut last_term = 0;
+        let mut last_term = None;
         while position < written {
-            let mut header = [0u8; FRAME_HEADER];
-            let header_end = position.checked_add(FRAME_HEADER as u64);
-            if header_end.is_none_or(|end| end > written) {
-                return self.cut_tail(position);
-            }
-            self.store.read(position, &mut header)?;
             let chain = |problem| LogError::Chain { position, problem };
-            let frame = Header::decode(&header).ok_or_else(|| chain(ChainProblem::Foreign))?;
-            let end = header_end
-                .and_then(|end| end.checked_add(u64::from(frame.length)))
-                .ok_or_else(|| chain(ChainProblem::Checksum))?;
-            if end > written {
-                return self.cut_tail(position);
+            let header_end = position
+                .checked_add(FRAME_HEADER_LEN)
+                .ok_or_else(|| chain(ChainProblem::PastEnd))?;
+            if header_end > written {
+                return self.cut_tail(position, next, geometry);
             }
-            let mut payload = vec![0u8; usize::try_from(frame.length).unwrap_or(0)];
-            let payload_at = header_end.unwrap_or(position);
-            self.store.read(payload_at, &mut payload)?;
-            let mut crc = karyos_archive::crc32c::Crc32c::new();
-            crc.update(header.get(..32).unwrap_or(&[]));
+            let mut header = [0u8; FRAME_HEADER];
+            self.store.read(position, &mut header)?;
+            let frame = Header::decode(&header).ok_or_else(|| chain(ChainProblem::Foreign))?;
+            let end = frame
+                .end(position)
+                .ok_or_else(|| chain(ChainProblem::PastEnd))?;
+            if end > written {
+                return self.cut_tail(position, next, geometry);
+            }
+            let length = usize::try_from(frame.length).map_err(|_| chain(ChainProblem::PastEnd))?;
+            let mut payload = vec![0u8; length];
+            self.store.read(header_end, &mut payload)?;
+            let mut crc = Crc32c::new();
+            crc.update(
+                header
+                    .split_first_chunk::<32>()
+                    .map_or(&[][..], |(head, _)| head),
+            );
             crc.update(&payload);
             if crc.finish() != frame.crc {
                 return Err(chain(ChainProblem::Checksum));
@@ -425,26 +566,49 @@ impl<D: Disk + Clone> RaftLog<D> {
                     got: frame.index,
                 }));
             }
-            if frame.term < last_term {
+            if let Some(last) = last_term.filter(|last| frame.term < *last) {
                 return Err(chain(ChainProblem::TermBack {
-                    last: last_term,
+                    last,
                     got: frame.term,
                 }));
             }
             self.entries.push((position, frame.term));
-            last_term = frame.term;
-            next = next.checked_add(1).ok_or_else(|| {
-                chain(ChainProblem::Index {
-                    expected: next,
-                    got: frame.index,
-                })
-            })?;
+            last_term = Some(frame.term);
+            next = next
+                .checked_add(1)
+                .ok_or(LogError::TooLarge { index: next })?;
             position = end;
         }
         Ok(None)
     }
 
-    fn cut_tail(&mut self, position: u64) -> Result<Option<u64>, LogError> {
+    /// Cuts the torn frame of entry `index` at `position`, if it is the
+    /// last write and that write ends at a segment's end (A2 splits a
+    /// write only there), and if it holds no committed entry.
+    fn cut_tail(
+        &mut self,
+        position: u64,
+        index: u64,
+        geometry: Geometry,
+    ) -> Result<Option<u64>, LogError> {
+        let last_write = a2::last_write_start(&mut self.disk, &self.dir, LOG_RECORDING)?;
+        let at_segment_end = self
+            .store
+            .written()
+            .is_multiple_of(geometry.segment_length());
+        if last_write != Some(position) || !at_segment_end {
+            return Err(LogError::Chain {
+                position,
+                problem: ChainProblem::PastEnd,
+            });
+        }
+        if let Some(commit) = self
+            .hard_state
+            .and_then(|state| state.commit)
+            .filter(|commit| index <= *commit)
+        {
+            return Err(LogError::TornBelowCommit { index, commit });
+        }
         self.store.truncate(position)?;
         Ok(Some(position))
     }
@@ -455,34 +619,39 @@ impl<D: Disk + Clone> RaftLog<D> {
         self.first_index
     }
 
-    /// The last index written, or `first_index - 1` when empty.
+    /// The last index written, or `None` while the log is empty.
     #[must_use]
-    pub fn last_index(&self) -> u64 {
+    pub fn last_index(&self) -> Option<u64> {
         self.index_of(self.entries.len())
     }
 
-    /// The index of the `count`th entry from the first, or the one before
-    /// the first for 0.
-    fn index_of(&self, count: usize) -> u64 {
-        let count = u64::try_from(count).unwrap_or(u64::MAX);
-        self.first_index
-            .checked_add(count)
-            .and_then(|next| next.checked_sub(1))
-            .unwrap_or(0)
+    /// The index the next append starts at.
+    #[must_use]
+    pub fn next_index(&self) -> u64 {
+        self.last_index()
+            .map_or(Some(self.first_index), |last| last.checked_add(1))
+            .unwrap_or(u64::MAX)
     }
 
-    /// The last index whose whole frame is durable.
+    /// The index of the last of the first `count` entries; `None` for 0.
+    fn index_of(&self, count: usize) -> Option<u64> {
+        let count = u64::try_from(count).ok()?.checked_sub(1)?;
+        self.first_index.checked_add(count)
+    }
+
+    /// The last index whose whole frame is durable, or `None`.
     #[must_use]
-    pub fn durable_index(&self) -> u64 {
+    pub fn durable_index(&self) -> Option<u64> {
         let durable = self.store.durable();
-        let ends = self.entries.iter().skip(1).map(|(start, _)| *start);
-        let kept = self
-            .entries
-            .iter()
-            .zip(ends.chain(std::iter::once(self.store.written())))
-            .take_while(|(_, end)| *end <= durable)
-            .count();
-        self.index_of(kept)
+        let count = if self.store.written() <= durable {
+            self.entries.len()
+        } else {
+            // Entry `k` ends where `k + 1` starts: those before the first
+            // entry starting past `durable`, but the last of them.
+            let starting = self.entries.partition_point(|(start, _)| *start <= durable);
+            if starting == 0 { 0 } else { starting - 1 }
+        };
+        self.index_of(count)
     }
 
     /// A2's written position: the end of the last frame.
@@ -516,7 +685,26 @@ impl<D: Disk + Clone> RaftLog<D> {
         Ok(())
     }
 
-    /// Appends `entries`, each starting right after the last index and not
+    /// Poisons the log on an error of the store, keeping in the index only
+    /// the frames A2 still holds whole.
+    fn poison_on<T>(&mut self, result: Result<T, SegmentError>) -> Result<T, LogError> {
+        if result.is_err() {
+            self.poisoned = true;
+            let written = self.store.written();
+            let ends: Vec<u64> = self
+                .entries
+                .iter()
+                .skip(1)
+                .map(|(start, _)| *start)
+                .chain(std::iter::once(written))
+                .collect();
+            let kept = ends.iter().take_while(|end| **end <= written).count();
+            self.entries.truncate(kept);
+        }
+        result.map_err(LogError::Store)
+    }
+
+    /// Appends `entries`, each starting at [`RaftLog::next_index`] and not
     /// lowering the term; returns the last index written. Not durable
     /// until [`RaftLog::sync`].
     ///
@@ -524,14 +712,12 @@ impl<D: Disk + Clone> RaftLog<D> {
     ///
     /// [`LogError::NotNext`], [`LogError::TermBack`] and
     /// [`LogError::TooLarge`], checked for every entry before anything is
-    /// written; [`LogError::Poisoned`]; the store's errors.
-    pub fn append(&mut self, entries: &[Entry]) -> Result<u64, LogError> {
+    /// written; [`LogError::Poisoned`]; the store's errors (a segment
+    /// roll's sync included), which poison the log.
+    pub fn append(&mut self, entries: &[Entry]) -> Result<Option<u64>, LogError> {
         self.check_writable()?;
-        let mut expected = self.last_index().checked_add(1).ok_or(LogError::NotNext {
-            expected: u64::MAX,
-            got: u64::MAX,
-        })?;
-        let mut last = self.entries.last().map_or(0, |(_, term)| *term);
+        let mut expected = self.next_index();
+        let mut last = self.entries.last().map(|(_, term)| *term);
         let mut frames = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.index != expected {
@@ -540,7 +726,7 @@ impl<D: Disk + Clone> RaftLog<D> {
                     got: entry.index,
                 });
             }
-            if entry.term < last {
+            if let Some(last) = last.filter(|last| entry.term < *last) {
                 return Err(LogError::TermBack {
                     index: entry.index,
                     last,
@@ -548,14 +734,15 @@ impl<D: Disk + Clone> RaftLog<D> {
                 });
             }
             frames.push((entry.term, entry.frame()?));
-            last = entry.term;
+            last = Some(entry.term);
             expected = expected
                 .checked_add(1)
                 .ok_or(LogError::TooLarge { index: entry.index })?;
         }
         for (term, frame) in frames {
             let position = self.store.written();
-            self.store.append(position, &frame)?;
+            let appended = self.store.append(position, &frame);
+            self.poison_on(appended)?;
             self.entries.push((position, term));
         }
         Ok(self.last_index())
@@ -565,15 +752,11 @@ impl<D: Disk + Clone> RaftLog<D> {
     ///
     /// # Errors
     ///
-    /// [`LogError::Poisoned`]; the store's errors, which poison the log:
-    /// every later write is refused with [`LogError::Poisoned`] until it is
-    /// reopened.
-    pub fn sync(&mut self) -> Result<u64, LogError> {
+    /// [`LogError::Poisoned`]; the store's errors, which poison the log.
+    pub fn sync(&mut self) -> Result<Option<u64>, LogError> {
         self.check_writable()?;
-        if let Err(error) = self.store.sync() {
-            self.poisoned = true;
-            return Err(LogError::Store(error));
-        }
+        let synced = self.store.sync();
+        self.poison_on(synced)?;
         Ok(self.durable_index())
     }
 
@@ -585,35 +768,32 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// [`LogError::OutOfRange`] outside `[first_index, last_index + 1]`
     /// and [`LogError::TruncateBelowCommit`] at or below the stored
     /// commit, which change nothing; [`LogError::Poisoned`]; the store's
-    /// errors.
+    /// errors, which poison the log.
     pub fn truncate_suffix(&mut self, from_index: u64) -> Result<(), LogError> {
         self.check_writable()?;
-        if let Some(commit) = self.hard_state.and_then(|state| state.commit)
-            && from_index <= commit
+        if let Some(commit) = self
+            .hard_state
+            .and_then(|state| state.commit)
+            .filter(|commit| from_index <= *commit)
         {
             return Err(LogError::TruncateBelowCommit {
                 from: from_index,
                 commit,
             });
         }
-        let out = LogError::OutOfRange {
+        let out = || LogError::OutOfRange {
             index: from_index,
             first: self.first_index,
             last: self.last_index(),
         };
-        let slot = self.slot(from_index).ok_or(out)?;
+        let slot = self.slot(from_index).ok_or_else(out)?;
         let position = match self.entries.get(slot) {
             Some((position, _)) => *position,
             None if slot == self.entries.len() => return Ok(()),
-            None => {
-                return Err(LogError::OutOfRange {
-                    index: from_index,
-                    first: self.first_index,
-                    last: self.last_index(),
-                });
-            }
+            None => return Err(out()),
         };
-        self.store.truncate(position)?;
+        let truncated = self.store.truncate(position);
+        self.poison_on(truncated)?;
         self.entries.truncate(slot);
         Ok(())
     }
@@ -628,12 +808,14 @@ impl<D: Disk + Clone> RaftLog<D> {
     }
 
     /// The entries of `range` the log holds, in order, stopping before the
-    /// one that would take the payloads past `max_bytes`; the first is
-    /// returned whatever its size, so a range is never refused.
+    /// one that would take their encoded size ([`Entry::encoded_len`]) past
+    /// `max_bytes`; the first is returned whatever its size, so a range is
+    /// never refused.
     ///
     /// # Errors
     ///
-    /// The store's errors.
+    /// The store's errors, and [`LogError::Chain`] for a frame that no
+    /// longer reads as one.
     pub fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, LogError> {
         let mut found = Vec::new();
         let mut bytes = 0u64;
@@ -642,20 +824,28 @@ impl<D: Disk + Clone> RaftLog<D> {
             else {
                 break;
             };
-            let mut header = [0u8; FRAME_HEADER];
-            self.store.read(position, &mut header)?;
-            let frame = Header::decode(&header).ok_or(LogError::Chain {
+            let foreign = LogError::Chain {
                 position,
                 problem: ChainProblem::Foreign,
-            })?;
-            // Past `max_bytes` (or past `u64`), only the first is kept.
-            let total = bytes.checked_add(u64::from(frame.length));
-            let Some(total) = total.filter(|total| found.is_empty() || *total <= max_bytes) else {
+            };
+            let mut header = [0u8; FRAME_HEADER];
+            self.store.read(position, &mut header)?;
+            let frame = Header::decode(&header).ok_or(foreign)?;
+            let encoded = u64::from(frame.length)
+                .checked_add(FRAME_HEADER_LEN)
+                .and_then(|size| bytes.checked_add(size));
+            let Some(total) = encoded.filter(|total| found.is_empty() || *total <= max_bytes)
+            else {
                 break;
             };
-            let mut payload = vec![0u8; usize::try_from(frame.length).unwrap_or(0)];
+            let past = LogError::Chain {
+                position,
+                problem: ChainProblem::PastEnd,
+            };
+            let length = usize::try_from(frame.length).map_err(|_| past)?;
+            let mut payload = vec![0u8; length];
             let at = position
-                .checked_add(FRAME_HEADER as u64)
+                .checked_add(FRAME_HEADER_LEN)
                 .ok_or(LogError::Store(SegmentError::PositionOverflow))?;
             self.store.read(at, &mut payload)?;
             found.push(Entry {
@@ -677,21 +867,32 @@ impl<D: Disk + Clone> RaftLog<D> {
 
     fn check_commit(&self, commit: u64) -> Result<(), LogError> {
         let durable = self.durable_index();
-        if commit > durable {
+        if durable.is_none_or(|durable| commit > durable) {
             return Err(LogError::CommitBeyondDurable { commit, durable });
         }
         Ok(())
     }
 
-    /// Saves `state` durably: returns only after its sync. A failure
-    /// poisons the log, which refuses every write until reopened.
+    /// Saves `state` durably: returns only after its sync. The stored
+    /// commit only moves forward: a vote saved without a new commit must
+    /// carry the stored one ([`RaftLog::hard_state`]). A failure poisons
+    /// the log, which refuses every write until reopened.
     ///
     /// # Errors
     ///
-    /// [`LogError::CommitBeyondDurable`], which changes nothing;
-    /// [`LogError::Poisoned`]; the disk's errors, which poison.
+    /// [`LogError::CommitBack`] and [`LogError::CommitBeyondDurable`],
+    /// which change nothing; [`LogError::Poisoned`]; the disk's errors,
+    /// which poison.
     pub fn save_hard_state(&mut self, state: HardState) -> Result<(), LogError> {
         self.check_writable()?;
+        if let Some(stored) = self.hard_state.and_then(|stored| stored.commit)
+            && state.commit.is_none_or(|commit| commit < stored)
+        {
+            return Err(LogError::CommitBack {
+                stored,
+                got: state.commit,
+            });
+        }
         if let Some(commit) = state.commit {
             self.check_commit(commit)?;
         }

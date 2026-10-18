@@ -9,9 +9,10 @@
 //! store ([`log`], [`hard_state`]). The consensus core, the service
 //! container, snapshots and guards do not exist yet.
 
+mod a2;
 mod file;
 pub mod hard_state;
 pub mod log;
 
 pub use hard_state::HardState;
-pub use log::{ChainProblem, Entry, LogError, Opened, RaftLog};
+pub use log::{ChainProblem, Corruption, Entry, LogError, Opened, RaftLog};

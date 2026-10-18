@@ -34,20 +34,38 @@ pub(crate) fn replace<D: Disk>(
     disk.sync_dir(dir)
 }
 
-/// The bytes of `dir/name`, or `None` when there is no such file.
+/// A record file as read.
+#[derive(Debug)]
+pub(crate) enum Read {
+    /// No such file.
+    Missing,
+    /// Its bytes: no more than the record's length.
+    Bytes(Vec<u8>),
+    /// Longer than the record: its length, nothing read.
+    TooLong(u64),
+}
+
+/// The bytes of `dir/name`, read only up to `record` bytes.
 ///
 /// # Errors
 ///
 /// The disk's error other than a missing file.
-pub(crate) fn read<D: Disk>(disk: &mut D, dir: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
-    let file = match disk.open(&dir.join(name)) {
+pub(crate) fn read<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    name: &str,
+    record: usize,
+) -> io::Result<Read> {
+    let file = match disk.open_read(&dir.join(name)) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Read::Missing),
         Err(error) => return Err(error),
     };
-    let length = usize::try_from(disk.len(&file)?)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record too long"))?;
-    let mut bytes = vec![0u8; length];
+    let length = disk.len(&file)?;
+    let Some(fits) = usize::try_from(length).ok().filter(|fits| *fits <= record) else {
+        return Ok(Read::TooLong(length));
+    };
+    let mut bytes = vec![0u8; fits];
     disk.read_at(&file, 0, &mut bytes)?;
-    Ok(Some(bytes))
+    Ok(Read::Bytes(bytes))
 }
