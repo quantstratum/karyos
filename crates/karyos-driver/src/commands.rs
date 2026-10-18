@@ -30,7 +30,11 @@
 //! named stream, is a protocol violation: nothing is recorded and the
 //! client is retired as faulty. A live subscription of the sender gives a
 //! verified record; one that has already ended gives a record flagged
-//! unverified, counted in `loss reports unverified`. Every record counts
+//! unverified, counted in `loss reports unverified`. Once the named
+//! stream is freed, an incarnation above 0 can no longer be checked
+//! unless the sender's subscription still bounds it, so such a report is
+//! unverified too, whether its registration was removed or reclaimed at
+//! its last `Detach` in the same cycle. Every record counts
 //! once under the policy actually applied (`overruns rejoin at head`,
 //! `overruns snapshot` whether the source rebuilt or failed, `overruns
 //! close`), and a `replay` fallback also in `replay fallbacks`.
@@ -803,8 +807,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // An incarnation the driver cannot verify: 0, or above the lane's
         // current one. Once the lane's stream is freed, the bound is the
         // incarnation of the client's own subscription on it, if it still
-        // has one (a `ReportLoss` queued ahead of its `Remove`), else the
-        // first, the only one a freed stream is known to have had.
+        // has one (a `ReportLoss` queued ahead of its `Remove`); with none
+        // (removed, or reclaimed at its last `Detach`) there is no bound
+        // left to check, and the report is recorded unverified.
         let lane_incarnation = self
             .streams
             .iter()
@@ -822,7 +827,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                                 && r.kind == Kind::Subscription
                                 && !self.streams.iter().any(|s| s.id == r.stream)
                         })
-                        .map_or(crate::embedded::FIRST_INCARNATION, |r| r.incarnation)
+                        .map_or(u64::MAX, |r| r.incarnation)
                 },
                 |s| s.incarnation,
             );
@@ -2855,7 +2860,9 @@ mod tests {
                 sequence,
                 stream: KEY,
                 lane: Lane::ZERO,
-                role: SubscriberRole::Optional,
+                // Required: a guarded stream's walker holds the slot credit
+                // an optional reader would need.
+                role: SubscriberRole::Required,
             },
         );
         let _ = driver.do_work().unwrap();
@@ -4675,11 +4682,161 @@ mod tests {
         assert_eq!(counter(&driver, "clients faulty"), 0);
     }
 
+    /// Reincarnates the guarded `stream` once (a close, a reopen and a
+    /// fresh handle, dropped), so its current incarnation is 2.
+    fn reincarnated(driver: &mut EmbeddedDriver, stream: StreamHandle) {
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        // The stream needs a reader to accept the offer the seal is placed
+        // after; it goes with the old incarnation.
+        let reader = driver
+            .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+            .unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        assert!(matches!(
+            publication.offer(b"x").unwrap(),
+            karyos_client::OfferOutcome::Accepted { .. }
+        ));
+        let _ = driver.close_guard(guard, 2).unwrap();
+        drop(publication);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+        drop(driver.publication(stream).unwrap());
+        drop(reader);
+        assert_eq!(driver.streams[0].incarnation, 2);
+    }
+
+    /// A report on incarnation 2 of `stream_registration`'s lane 0.
+    fn reported_on(
+        driver: &EmbeddedDriver,
+        stream_registration: u64,
+        subscription: u64,
+    ) -> ReportedLoss {
+        ReportedLoss {
+            stream_registration,
+            incarnation: 2,
+            ..reported(driver, subscription)
+        }
+    }
+
+    /// Serves `loss` from `client` in the cycle that frees the stream, and
+    /// returns whether the client is still served.
+    fn served_after_free(
+        driver: &mut EmbeddedDriver,
+        stream: StreamHandle,
+        producer: &mut RingProducer,
+        client: u64,
+        loss: ReportedLoss,
+    ) -> bool {
+        driver.remove_stream(stream).unwrap();
+        write(producer, Command::ReportLoss { sequence: 9, loss });
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            driver.stream_state(stream).unwrap(),
+            crate::embedded::StreamState::Freed
+        );
+        driver
+            .clients
+            .iter()
+            .any(|slot| slot.id == client && slot.serving())
+    }
+
+    /// #420 re-check: the remote order. A remote subscriber of incarnation
+    /// 2 detaches its last grant; in one cycle the driver reclaims its
+    /// registration, frees the stream and then serves its `ReportLoss`,
+    /// with no registration left to bound it: recorded unverified, the
+    /// client kept.
+    #[test]
+    fn a_remote_loss_report_after_reclaim_and_free_is_unverified() {
+        let (mut driver, stream) = driver_with_stream();
+        reincarnated(&mut driver, stream);
+        let stream_registration = driver.streams[0].id;
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let subscription = detached_subscription(&mut driver, &mut producer, client, 1);
+        let loss = reported_on(&driver, stream_registration, subscription);
+        assert!(served_after_free(
+            &mut driver,
+            stream,
+            &mut producer,
+            client,
+            loss
+        ));
+        assert!(driver.registrations.is_empty(), "reclaimed");
+        assert_eq!(counter(&driver, "clients faulty"), 0);
+        assert_eq!(counter(&driver, "loss reports unverified"), 1);
+        assert_eq!(losses(&driver).len(), 1);
+    }
+
+    /// #420 re-check: the in-process order. The subscription is removed,
+    /// the stream frees, then the report on incarnation 2 is served:
+    /// recorded unverified, the client kept.
+    #[test]
+    fn an_in_process_loss_report_after_remove_and_free_is_unverified() {
+        let (mut driver, stream) = driver_with_stream();
+        reincarnated(&mut driver, stream);
+        let stream_registration = driver.streams[0].id;
+        let (client, mut producer, subscription) = reporting_client(&mut driver);
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 2,
+                registration: subscription,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert!(driver.registrations.is_empty(), "removed");
+        let loss = reported_on(&driver, stream_registration, subscription);
+        assert!(served_after_free(
+            &mut driver,
+            stream,
+            &mut producer,
+            client,
+            loss
+        ));
+        assert_eq!(counter(&driver, "clients faulty"), 0);
+        assert_eq!(counter(&driver, "loss reports unverified"), 1);
+        assert_eq!(losses(&driver).len(), 1);
+    }
+
+    /// The refusals stand on a freed stream too: incarnation 0 and a stream
+    /// registration never issued retire the client, recording nothing.
+    #[test]
+    fn a_loss_report_after_free_still_refuses_what_was_never_issued() {
+        type Case = fn(&mut ReportedLoss, u64);
+        let cases: [(&str, Case); 3] = [
+            ("incarnation 0", |loss, _| loss.incarnation = 0),
+            ("stream never issued", |loss, next| {
+                loss.stream_registration = next;
+            }),
+            ("subscription never issued", |loss, _| {
+                loss.subscription = u64::MAX;
+            }),
+        ];
+        for (name, case) in cases {
+            let (mut driver, stream) = driver_with_stream();
+            reincarnated(&mut driver, stream);
+            let stream_registration = driver.streams[0].id;
+            let (client, mut producer) = remote_client(&mut driver, 4);
+            let subscription = detached_subscription(&mut driver, &mut producer, client, 1);
+            let mut loss = reported_on(&driver, stream_registration, subscription);
+            case(&mut loss, driver.next_stream);
+            assert!(
+                !served_after_free(&mut driver, stream, &mut producer, client, loss),
+                "{name}"
+            );
+            assert_eq!(counter(&driver, "clients faulty"), 1, "{name}");
+            assert_eq!(counter(&driver, "loss reports unverified"), 0, "{name}");
+            assert_eq!(losses(&driver), Vec::new(), "{name}");
+        }
+    }
+
     #[test]
     fn a_loss_report_of_a_foreign_or_never_issued_identity_is_a_violation() {
         type Case = fn(&mut ReportedLoss, u64);
-        let cases: [(&str, Case); 9] = [
+        let cases: [(&str, Case); 10] = [
             ("another driver instance", |loss, _| loss.driver[1] ^= 1),
+            ("incarnation 0", |loss, _| loss.incarnation = 0),
             ("subscription 0", |loss, _| loss.subscription = 0),
             ("subscription never issued", |loss, next| {
                 loss.subscription = next;
