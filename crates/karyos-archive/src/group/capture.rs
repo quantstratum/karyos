@@ -243,7 +243,7 @@ pub fn capture<D: Disk>(
     };
     let uncovered = config
         .in_flight
-        .checked_mul(2)
+        .checked_mul(3)
         .ok_or(CaptureSetup::Config(CaptureError::InFlight))?;
     let job = CaptureJob {
         consumer,
@@ -257,6 +257,7 @@ pub fn capture<D: Disk>(
         capacity: config.ring_capacity,
         emptied: 0,
         signalled: 0,
+        signalled_start: None,
         stop_notified: false,
     };
     Ok((sender, job))
@@ -293,8 +294,9 @@ fn check(config: CaptureConfig, policy: SyncPolicy) -> Result<(u64, u64, u64), C
         Ok(in_flight) => in_flight,
     };
     // The events a recording that ended may leave uncovered: the tracker's
-    // queue and, past a stop, the events a checkpoint may yet take.
-    if config.in_flight.checked_mul(2).is_none() {
+    // queue, the first range's events still settling, and, past a stop,
+    // the events a checkpoint may yet take.
+    if config.in_flight.checked_mul(3).is_none() {
         return Err(CaptureError::InFlight);
     }
     if policy == SyncPolicy::None {
@@ -555,6 +557,9 @@ pub struct CaptureJob<D: Disk> {
     uncovered: Vec<u64>,
     /// The `durable_group_seq` waiters were last notified of.
     signalled: u64,
+    /// The range start waiters were last notified of: a waiter on an
+    /// event a new range let go must hear of it.
+    signalled_start: Option<u64>,
     /// The waiters were told the group stopped.
     stop_notified: bool,
     /// The ring's capacity in bytes.
@@ -706,8 +711,10 @@ impl<D: Disk> CaptureJob<D> {
         if self.tracker.stopped() {
             self.shared.stopped.store(true, Ordering::Release);
         }
-        if durable > self.signalled {
+        let start = self.tracker.range().start.map(|start| start.group_seq);
+        if durable > self.signalled || start != self.signalled_start {
             self.signalled = durable;
+            self.signalled_start = start;
             self.shared.notify();
         }
     }

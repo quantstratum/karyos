@@ -1061,10 +1061,12 @@ fn a_store_failure_leaves_no_record() {
         journal,
         slot: CheckpointSlot::new(300_000),
     };
-    assert!(matches!(
-        group.checkpoint(1, &snapshot(1, 200_000)),
-        Err(CheckpointError::Store(_))
-    ));
+    // The append's own error, not a later call's on a failed store.
+    let result = group.checkpoint(1, &snapshot(1, 200_000));
+    assert!(
+        matches!(result, Err(CheckpointError::Store(ref error)) if !matches!(error, SegmentError::Failed)),
+        "{result:?}"
+    );
     assert_eq!(group.journal.order().records(), records, "no record");
     assert!(group.records().is_empty());
     assert_eq!(
@@ -1177,5 +1179,82 @@ fn replay_from_the_start_skips_checkpoints_and_stops_at_the_first_range() {
                 "{stop:?}"
             );
         }
+    }
+}
+
+/// #414 re-check P2 2: the first range's events still waiting when a
+/// checkpoint opens another keep settling into its frozen values. Event 1
+/// is complete, not yet durable, when the range opens; once the journal
+/// is durable past it, the first range's durable value follows, and a
+/// wait for event 1 is reached.
+#[test]
+fn the_first_range_keeps_settling_after_a_range_opens() {
+    let mut tracker = PrefixTracker::new(8);
+    let view = tracker.view();
+    let store = Store::default();
+    store.written.set(100);
+    store.durable.set(100);
+    let mut at = feed(
+        &mut tracker,
+        &encode(&GroupRecord::Header(header(Capture::BestEffort))),
+        0,
+    );
+    let header_end = at;
+    at = feed(&mut tracker, &event(1, EndOutcome::Complete), at);
+    let event_end = at;
+    at = feed(&mut tracker, &gap(2, 2), at);
+    at = feed(&mut tracker, &checkpoint_record(2, 1, 0), at);
+    // Written to the record's end, durable only to the header.
+    assert_eq!(tracker.advance(at, header_end, &store), (2, 0));
+    assert_eq!(tracker.first_range().unwrap().durable, 0);
+    assert_eq!(view.durable_for(1), DurableFor::Never(0));
+    // Durable past event 1, not yet past the record.
+    let _ = tracker.advance(at, event_end, &store);
+    let first = tracker.first_range().unwrap();
+    assert_eq!((first.complete, first.durable), (1, 1));
+    assert_eq!(view.durable_for(1), DurableFor::Reached(1));
+    assert_eq!(view.durable_for(2), DurableFor::Never(1));
+    assert_eq!(tracker.advance(at, at, &store), (2, 2));
+}
+
+/// #414 re-check P2 4: under `SyncPolicy::None`, a 200 kB checkpoint
+/// crossing a segment is durable before its record, or refused with no
+/// record: never recorded with its bytes short of durable.
+#[test]
+fn a_checkpoint_is_durable_before_its_record_under_no_policy() {
+    let disk = FaultDisk::default();
+    let journal = GroupJournal::create(
+        disk.clone(),
+        Path::new(JOURNALS),
+        &header(Capture::Strict),
+        config(SyncPolicy::None),
+    )
+    .unwrap();
+    let store = CheckpointStore::create(
+        disk.clone(),
+        Path::new(CHECKPOINTS),
+        GROUP,
+        config(SyncPolicy::None),
+    )
+    .unwrap();
+    let mut group = Group {
+        writer: CheckpointWriter::new(store, &journal).unwrap(),
+        journal,
+        slot: CheckpointSlot::new(300_000),
+    };
+    let _ = group
+        .journal
+        .append(&event(1, EndOutcome::Complete))
+        .unwrap();
+    match group.checkpoint(1, &snapshot(4, 200_000)) {
+        Ok(record) => assert_eq!(
+            group
+                .writer
+                .store()
+                .holds(record.position, record.end().unwrap()),
+            CheckpointHeld::Durable
+        ),
+        Err(CheckpointError::NotDurable { .. }) => assert!(group.records().is_empty()),
+        Err(error) => panic!("{error}"),
     }
 }

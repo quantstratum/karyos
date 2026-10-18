@@ -90,6 +90,17 @@ pub enum CheckpointError {
     /// names them. The store then fails until recovered.
     #[error(transparent)]
     Store(#[from] SegmentError),
+    /// The store's sync left the bytes short of durable (`durable`, below
+    /// their `end`): no record is appended. Under `SyncPolicy::None`,
+    /// which capture refuses for a journal, a checkpoint crossing a
+    /// segment ends so.
+    #[error("the checkpoint's bytes are durable to {durable}, not {end}")]
+    NotDurable {
+        /// The store's durable position after the sync.
+        durable: u64,
+        /// The checkpoint's end.
+        end: u64,
+    },
     /// The journal failed to take the record after the bytes were
     /// written: they stay unnamed until recovery cuts them.
     #[error(transparent)]
@@ -485,9 +496,12 @@ impl<D: Disk> CheckpointWriter<D> {
             ordinal: journal.order().records(),
             rule: super::order::OrderRule::Exhausted,
         })?;
-        let _ = self.store.store.append(record.position, bytes)?;
+        let end = self.store.store.append(record.position, bytes)?;
         // Durable before its record: a kept record never names lost bytes.
-        let _ = self.store.store.sync()?;
+        let durable = self.store.store.sync()?;
+        if durable < end {
+            return Err(CheckpointError::NotDurable { durable, end });
+        }
         let _ = journal.append(self.record.get(..encoded).unwrap_or_default())?;
         self.next_id = next_id;
         Ok(record)

@@ -225,7 +225,9 @@ impl PrefixView {
         self.complete.load(Ordering::Acquire)
     }
 
-    /// `durable_group_seq`.
+    /// `durable_group_seq`: the current range's. Across a checkpoint that
+    /// opened another range it says nothing of the events before it; a
+    /// wait for one event uses [`PrefixView::durable_for`].
     #[must_use]
     pub fn durable_group_seq(&self) -> u64 {
         self.durable.load(Ordering::Acquire)
@@ -256,7 +258,8 @@ impl PrefixView {
         }
     }
 
-    /// `(delivered_seq, complete_recording_seq, durable_group_seq)` read so
+    /// `(delivered_seq, complete_recording_seq, durable_group_seq)`, the
+    /// current range's values (see [`PrefixView::durable_group_seq`]), read so
     /// that durable is never above complete: durable first, then complete
     /// (each published value is at least the one before, and complete is
     /// published before durable). Three separate reads may see a newer
@@ -306,8 +309,13 @@ pub struct PrefixTracker {
     /// The checkpoint opening the current range, until it is durable: the
     /// range's events wait behind it.
     opening: Option<Waiting>,
-    /// The first range as it ended.
+    /// The first range: its values once a checkpoint opened another, which
+    /// keep following the events it still waits on (`settling`).
     first: Option<FirstRange>,
+    /// The first range's events still waiting when a checkpoint opened
+    /// another: they settle as before, into `first`, never into the new
+    /// range.
+    settling: VecDeque<Waiting>,
     view: Arc<PrefixView>,
 }
 
@@ -334,6 +342,7 @@ impl PrefixTracker {
             pending: None,
             opening: None,
             first: None,
+            settling: VecDeque::with_capacity(capacity),
             view: Arc::new(PrefixView::default()),
         }
     }
@@ -489,6 +498,7 @@ impl PrefixTracker {
         if let Some(waiting) = self
             .waiting
             .iter_mut()
+            .chain(self.settling.iter_mut())
             .chain(candidates)
             .find(|waiting| waiting.seq == seq)
         {
@@ -530,10 +540,10 @@ impl PrefixTracker {
     }
 
     /// The checkpoint `checkpoint`, whose record ends at `journal_end`,
-    /// opens a range past the stop. The range it stops is frozen as it
-    /// ended (the first one only is kept, for replay from the start, and
-    /// for [`PrefixView::durable_for`]); the events it waits on are let go,
-    /// never claimed by the new range. The range starts at the checkpoint,
+    /// opens a range past the stop. The first range's values are kept, for
+    /// replay from the start and for [`PrefixView::durable_for`], and the
+    /// events it still waits on keep settling into them; a later range's
+    /// are let go. Neither is ever claimed by the new range. The range starts at the checkpoint,
     /// then takes the events after it that ended before its record, up to
     /// the next stop.
     fn open_range(
@@ -550,6 +560,9 @@ impl PrefixTracker {
                 complete_end: self.complete_end,
                 durable: self.durable,
             });
+            // `settling` is empty: the first range's waiting events move
+            // there, and `waiting` is left empty, with its room.
+            std::mem::swap(&mut self.waiting, &mut self.settling);
         }
         self.waiting.clear();
         self.opening = Some(Waiting {
@@ -612,7 +625,12 @@ impl PrefixTracker {
                 Candidate::Event(waiting) => Some(waiting),
                 Candidate::Stop { .. } => None,
             });
-        for waiting in self.waiting.iter_mut().chain(candidates) {
+        for waiting in self
+            .waiting
+            .iter_mut()
+            .chain(self.settling.iter_mut())
+            .chain(candidates)
+        {
             match waiting.reference {
                 Some((recording, end)) if recording == recording_id => {
                     if end <= durable {
@@ -639,6 +657,7 @@ impl PrefixTracker {
             });
         self.waiting
             .iter()
+            .chain(self.settling.iter())
             .filter_map(|waiting| waiting.reference)
             .chain(candidates)
     }
@@ -693,6 +712,30 @@ impl PrefixTracker {
                     })
             }
         };
+        // The first range's events still settling, into its values.
+        if let Some(first) = self.first.as_mut() {
+            while let Some(front) = self.settling.front().copied() {
+                if front.journal_end > durable || !covered(&front, true) {
+                    break;
+                }
+                first.durable = front.seq;
+                if front.seq > first.complete {
+                    first.complete = front.seq;
+                    first.complete_end = front.journal_end;
+                }
+                let _ = self.settling.pop_front();
+            }
+            for waiting in &self.settling {
+                if waiting.seq <= first.complete {
+                    continue;
+                }
+                if waiting.journal_end > written || !covered(waiting, false) {
+                    break;
+                }
+                first.complete = waiting.seq;
+                first.complete_end = waiting.journal_end;
+            }
+        }
         // A range's opening checkpoint first: its events wait behind it.
         if let Some(opening) = self.opening {
             if opening.journal_end <= durable && covered(&opening, true) {
