@@ -172,7 +172,7 @@ fn a_replay_cursor_steps_without_allocating() {
     loop {
         let (step, allocations) = count(|| match cursor.step().unwrap() {
             Step::Event(event) => Some(event.group_seq()),
-            Step::Stop(_) => None,
+            Step::Checkpoint(_) | Step::Stop(_) => None,
         });
         assert_eq!(allocations, 0, "a step allocated");
         match step {

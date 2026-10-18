@@ -290,6 +290,25 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Replay with checkpoints (phase 3, A9-2; recording-group-checkpoints.md
+  section 6). `ReplayCursor::open_at_checkpoint` reads a checkpoint's
+  snapshot into the caller's buffer, checks its length and CRC-32C
+  (`ReplayError::CheckpointCorrupt` otherwise, also for a lost one in a
+  range it opened), and replays the events after its `group_seq` to the
+  end of its range's complete prefix. One unknown, past that prefix, in
+  a middle range (interim), or lost after a stop it never opened is
+  refused (`UnknownCheckpoint`, `NotInPrefix`), as is a short buffer.
+  The cursor gives each recorded checkpoint of the range right after its
+  event (`Step::Checkpoint`); `compare_state` compares the replay's
+  state there by length and digest and gives the capture's record at
+  `CAPTURE_POSITION`. `ReplayGateway` does it in the event's own
+  dispatch through the handler's new `checkpoint` hook
+  (`ReplayGateway::with_state`); a difference, or no state, is a
+  `DivergenceKind::StateCheckpoint` divergence, its index the event's
+  observation count. `Handler` gains `checkpoint` and `restore`, with
+  default bodies; `CaptureJournal::create_from` starts a capture after a
+  checkpoint. Steps allocate nothing.
+
 - Checkpoints of a recording group, the store and the record (phase 3,
   A9-1; recording-group-checkpoints.md sections 2 to 5). Each group has
   a `CheckpointStore` beside its journal, with the journal's sync policy.

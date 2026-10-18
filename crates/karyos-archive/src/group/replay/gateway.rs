@@ -31,15 +31,17 @@
 
 use std::path::PathBuf;
 
-use super::effects::ReplayEffects;
+use super::effects::{Divergence as StateDivergence, DivergenceKind, ReplayEffects};
 use super::reference::{Frames, Recording, read_message};
-use super::{CaptureJournal, ReplayCursor, ReplayError, ReplayEvent, Step, Stop, allocate};
+use super::{
+    CaptureJournal, ReplayCursor, ReplayError, ReplayEvent, Step, Stop, allocate, compare_state,
+};
 use crate::disk::Disk;
 use crate::group::gateway::{
     ConflatedId, Dispatched, Event, GatewayError, GroupGateway, Handler, SubscriptionId, TimerId,
 };
 use crate::group::journal::JournalError;
-use crate::group::record::{EndOutcome, EventEnd, GroupRecord, Payload};
+use crate::group::record::{CheckpointRecord, EndOutcome, EventEnd, GroupRecord, Payload};
 use crate::segment::Geometry;
 
 #[cfg(test)]
@@ -94,6 +96,11 @@ pub struct ReplayGateway<D: Disk> {
     present_unavailable: bool,
     /// Where what the handler did is written.
     capture: Option<CaptureJournal<D>>,
+    /// The handler's state at a checkpoint, written for the compare.
+    state: Vec<u8>,
+    /// The recorded observations of the event last dispatched: a state
+    /// divergence's index.
+    observations: u32,
     /// Where replay stopped, returned again by every later dispatch.
     stopped: Option<Result<Dispatched, GatewayError>>,
 }
@@ -137,8 +144,62 @@ impl<D: Disk> ReplayGateway<D> {
             payload: zeroed(config.max_payload)?,
             present_unavailable: config.present_unavailable,
             capture: None,
+            state: Vec::new(),
+            observations: 0,
             stopped: None,
         })
+    }
+
+    /// Compares the handler's state at each recorded checkpoint (A9-2):
+    /// it writes it into a buffer of `max_state` bytes, allocated here.
+    /// Without one, a recorded checkpoint finds no state and diverges.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayError::InvalidConfig`] for a buffer that cannot be
+    /// allocated.
+    pub fn with_state(mut self, max_state: usize) -> Result<Self, ReplayError> {
+        let mut state = allocate(max_state)?;
+        state.resize(max_state, 0);
+        self.state = state;
+        Ok(self)
+    }
+
+    /// The handler's state at `recorded`, compared, and the capture's
+    /// record written: a difference, or no state, is a divergence of kind
+    /// `state checkpoint`.
+    fn check_state(
+        &mut self,
+        recorded: &CheckpointRecord,
+        handler: &mut dyn Handler,
+    ) -> Result<(), GatewayError> {
+        let diverged = |found| {
+            GatewayError::Diverged(
+                StateDivergence {
+                    group_seq: recorded.group_seq,
+                    index: self.observations,
+                    kind: DivergenceKind::StateCheckpoint {
+                        recorded: (recorded.length, recorded.crc32c),
+                        found,
+                    },
+                }
+                .into(),
+            )
+        };
+        let state = handler
+            .checkpoint(&mut self.state)
+            .and_then(|length| self.state.get(..length));
+        let Some(state) = state else {
+            return Err(diverged(None));
+        };
+        let capture = compare_state(recorded, state)
+            .map_err(|divergence| diverged(Some((divergence.length, divergence.crc32c))))?;
+        if let Some(journal) = self.capture.as_mut()
+            && journal.append(&GroupRecord::Checkpoint(capture)).is_err()
+        {
+            return Err(GatewayError::Ended);
+        }
+        Ok(())
     }
 
     /// Writes what the handler does to `capture` (section 9): a journal
@@ -230,6 +291,13 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
         }
         let event = match self.cursor.step() {
             Ok(Step::Event(event)) => event,
+            // A checkpoint not yet compared: compared, then the next event.
+            Ok(Step::Checkpoint(recorded)) => {
+                if let Err(error) = self.check_state(&recorded, handler) {
+                    return self.stop(Err(error));
+                }
+                return self.dispatch(handler);
+            }
             Ok(Step::Stop(Stop::EndOfPrefix { .. })) => return self.stop(Ok(Dispatched::End)),
             Ok(Step::Stop(Stop::Gap(gap))) => {
                 return self.stop(Err(GatewayError::NotReproducible {
@@ -245,6 +313,14 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
         };
         let group_seq = event.group_seq();
         let incomplete = event.incomplete();
+        // Records 1 to len - 2: the observations.
+        let Some(observations) = event
+            .len()
+            .checked_sub(2)
+            .and_then(|observations| u32::try_from(observations).ok())
+        else {
+            return self.stop(Err(GatewayError::Ended));
+        };
         let not_reproducible = Err(GatewayError::NotReproducible { group_seq });
         let Some(Ok(first)) = event.record(0) else {
             return self.stop(Err(GatewayError::Ended));
@@ -350,6 +426,19 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
         // cannot claim what the handler did past them.
         if incomplete {
             return self.stop(not_reproducible);
+        }
+        // The checkpoints of this event, in its own dispatch.
+        self.observations = observations;
+        loop {
+            match self.cursor.due_checkpoint() {
+                Ok(None) => break,
+                Ok(Some(recorded)) => {
+                    if let Err(error) = self.check_state(&recorded, handler) {
+                        return self.stop(Err(error));
+                    }
+                }
+                Err(_) => return self.stop(Err(GatewayError::Ended)),
+            }
         }
         Ok(Dispatched::Event { group_seq })
     }
