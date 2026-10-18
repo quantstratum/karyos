@@ -20,15 +20,23 @@
 //!   transport's: the log never holds an entry it was not given whole.
 //!   Commit and applied are the caller's (a stored commit is checked,
 //!   below).
-//! - **Recovery.** A crash tears at most the last write. [`RaftLog::open`]
-//!   loads the hard state first, then runs A2's recovery: a recovery that
-//!   drops any whole write but the last (bit rot, a lost segment) is
-//!   [`LogError::Corruption`]. It then walks the frames: the last write
-//!   may hold the first chunks of a frame whose later chunks were lost
-//!   with the next segment, and only that torn tail is cut, unless it holds
-//!   a committed entry. Any other frame that is not the next one is
+//! - **Watermark.** [`RaftLog::sync`] records the durable last index it
+//!   reports in a two-slot file ([`crate::mark`]), after A2's sync and
+//!   before it returns, and a truncation lowers it before A2 cuts.
+//!   [`RaftLog::durable_index`] never passes it.
+//! - **Recovery.** A crash may lose any number of writes past the last
+//!   sync, in any order; what a sync reported durable it must not lose.
+//!   [`RaftLog::open`] loads the hard state and the watermark first, then
+//!   runs A2's recovery and walks the frames. A log that ends below the
+//!   watermark is [`LogError::Corruption`]; anything lost above it is a
+//!   crash's loss, reported in [`Opened::cut`]. The last write may hold
+//!   the first chunks of a frame whose later chunks were lost with the
+//!   next segment: that torn tail is cut, unless it is committed or below
+//!   the watermark. Any other frame that is not the next one is
 //!   [`LogError::Chain`]: a foreign magic, a CRC failure, a length past
-//!   the end, an index that does not follow, a term that goes back.
+//!   the end, an index that does not follow, a term that goes back. (A2's
+//!   recovery runs before the decision; once A2 has a verifying mode, the
+//!   decision moves before any cut.)
 //! - **Hard state.** [`HardState`] lives in its own file, replaced
 //!   atomically; its stored commit only moves forward and never past the
 //!   durable last index, and no committed entry is ever truncated.
@@ -61,6 +69,8 @@
 //!    index: the reopened commit is never above the recovered log;
 //! 8. a crash inside `create`: the reopened directory opens empty or is
 //!    created again.
+//! 9. a crash inside a watermark update, in a sync or a truncation: the
+//!    older slot holds, and no reported durable entry is lost.
 
 use std::fmt;
 use std::io;
@@ -71,9 +81,9 @@ use karyos_archive::crc32c::{Crc32c, crc32c};
 use karyos_archive::disk::Disk;
 use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 
-use crate::a2;
 use crate::file::{self, Read};
 use crate::hard_state::{HARD_STATE_FILE, HARD_STATE_LEN, HardState, HardStateProblem};
+use crate::mark::{self, MARK_FILE, MARK_LEN, Slot};
 
 /// The A2 recording id of the log.
 pub const LOG_RECORDING: u64 = 1;
@@ -84,6 +94,22 @@ pub const FRAME_HEADER: usize = 36;
 /// [`FRAME_HEADER`] as a position.
 pub const FRAME_HEADER_LEN: u64 = 36;
 const MAGIC: [u8; 4] = *b"KRLE";
+/// An unset watermark, in slot 0: before any entry was reported durable.
+const UNSET: (usize, Slot) = (
+    0,
+    Slot {
+        sequence: 0,
+        durable: None,
+    },
+);
+/// A new watermark file's mark: slot 0, sequence 1, unset.
+const CREATED: (usize, Slot) = (
+    0,
+    Slot {
+        sequence: 1,
+        durable: None,
+    },
+);
 /// The first-index record: the index, then its CRC-32C.
 const FIRST_LEN: usize = 12;
 
@@ -224,7 +250,7 @@ pub enum LogError {
         /// What is wrong.
         problem: ChainProblem,
     },
-    /// A2's recovery dropped whole writes past the last one.
+    /// A recovery would lose entries reported durable.
     Corruption(Corruption),
     /// The first-index file is missing or not one this version wrote.
     FirstIndex,
@@ -278,18 +304,19 @@ pub enum ChainProblem {
     },
 }
 
-/// What A2's recovery lost beyond a torn last write.
+/// What a recovery would lose that was reported durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Corruption {
-    /// It cut at `cut`, below the start of the last whole write.
-    Dropped {
-        /// Where A2 cut the log.
-        cut: u64,
-        /// The start of the last whole write before the recovery.
-        last_write: u64,
+    /// The recovered log ends below the durable watermark ([`crate::mark`]):
+    /// entries [`RaftLog::sync`] reported durable are gone.
+    BelowMark {
+        /// The recovered last index, if any.
+        last: Option<u64>,
+        /// The watermark.
+        mark: u64,
     },
-    /// A segment's index header is bad before the last segment: a segment
-    /// was lost or damaged.
+    /// A segment's index header is bad where A2 cannot take it for one
+    /// being created: a segment was lost or damaged.
     Segment {
         /// The segment's base.
         base: u64,
@@ -369,6 +396,10 @@ pub struct RaftLog<D: Disk + Clone> {
     entries: Vec<(u64, u64)>,
     hard_state: Option<HardState>,
     poisoned: bool,
+    /// The watermark's file, its newest slot and the mark it holds.
+    mark_file: D::File,
+    mark_slot: usize,
+    mark: Slot,
 }
 
 /// What [`RaftLog::open`] found.
@@ -423,8 +454,9 @@ impl<D: Disk + Clone> RaftLog<D> {
                 recording: LOG_RECORDING,
             }));
         }
+        let mark_file = mark::create(&mut disk, dir)?;
         file::replace(&mut disk, dir, FIRST_INDEX_FILE, &encode_first(first_index))?;
-        Self::create_store(disk, dir, geometry, first_index)
+        Self::create_store(disk, dir, geometry, first_index, mark_file, CREATED)
     }
 
     fn create_store(
@@ -432,6 +464,8 @@ impl<D: Disk + Clone> RaftLog<D> {
         dir: &Path,
         geometry: Geometry,
         first_index: u64,
+        mark_file: D::File,
+        (mark_slot, mark): (usize, Slot),
     ) -> Result<Self, LogError> {
         let store = SegmentStore::create(
             disk.clone(),
@@ -449,6 +483,9 @@ impl<D: Disk + Clone> RaftLog<D> {
             entries: Vec::new(),
             hard_state: None,
             poisoned: false,
+            mark_file,
+            mark_slot,
+            mark,
         })
     }
 
@@ -460,8 +497,8 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// # Errors
     ///
     /// [`LogError::FirstIndex`], [`LogError::HardState`] for a refused
-    /// record, [`LogError::Corruption`] when A2's recovery dropped more
-    /// than a torn last write, [`LogError::Chain`] for a frame that does
+    /// record, [`LogError::Corruption`] when the recovered log ends below
+    /// the watermark or a segment is lost, [`LogError::Chain`] for a frame that does
     /// not continue the chain, [`LogError::TornBelowCommit`] and
     /// [`LogError::CommitBeyondDurable`] for a stored commit the recovered
     /// log does not hold, and the store's and the disk's errors.
@@ -479,12 +516,28 @@ impl<D: Disk + Clone> RaftLog<D> {
                 return Err(LogError::HardState(HardStateProblem::Length(length)));
             }
         };
+        // The newest valid slot; none (missing, torn or foreign) is an
+        // unset mark, the conservative choice.
+        let (mark_file, (mark_slot, mark)) = match file::read(&mut disk, dir, MARK_FILE, MARK_LEN)?
+        {
+            Read::Bytes(bytes) => (
+                disk.open(&dir.join(MARK_FILE))?,
+                mark::newest(&bytes).unwrap_or(UNSET),
+            ),
+            Read::Missing | Read::TooLong(_) => (mark::create(&mut disk, dir)?, CREATED),
+        };
         if !store_exists(&mut disk, dir)? {
             // A creation that stopped after its first-index file.
-            let log = Self::create_store(disk, dir, geometry, first_index)?;
+            let log = Self::create_store(
+                disk,
+                dir,
+                geometry,
+                first_index,
+                mark_file,
+                (mark_slot, mark),
+            )?;
             return Ok(Opened { log, cut: None });
         }
-        let last_write = a2::last_write_start(&mut disk, dir, LOG_RECORDING)?;
         let recovered = match SegmentStore::recover(
             disk.clone(),
             dir,
@@ -496,15 +549,21 @@ impl<D: Disk + Clone> RaftLog<D> {
             Err(SegmentError::BadHeader { base, .. }) => {
                 return Err(LogError::Corruption(Corruption::Segment { base }));
             }
+            // A creation that stopped inside the store's own creation: A2
+            // removed its files.
+            Err(SegmentError::NotFound { .. }) => {
+                let log = Self::create_store(
+                    disk,
+                    dir,
+                    geometry,
+                    first_index,
+                    mark_file,
+                    (mark_slot, mark),
+                )?;
+                return Ok(Opened { log, cut: None });
+            }
             Err(error) => return Err(LogError::Store(error)),
         };
-        let written = recovered.store.written();
-        if let Some(last_write) = last_write.filter(|last| *last > written) {
-            return Err(LogError::Corruption(Corruption::Dropped {
-                cut: written,
-                last_write,
-            }));
-        }
         let mut log = Self {
             store: recovered.store,
             disk,
@@ -513,11 +572,17 @@ impl<D: Disk + Clone> RaftLog<D> {
             entries: Vec::new(),
             hard_state,
             poisoned: false,
+            mark_file,
+            mark_slot,
+            mark,
         };
         let torn = log.rebuild(geometry)?;
+        log.check_mark(log.last_index())?;
         if let Some(commit) = log.hard_state.and_then(|state| state.commit) {
             log.check_commit(commit)?;
         }
+        // A2's recovery made everything kept durable: the mark follows.
+        log.write_mark(log.last_index())?;
         Ok(Opened {
             log,
             cut: torn.or(recovered.cut.map(|cut| cut.position)),
@@ -582,21 +647,20 @@ impl<D: Disk + Clone> RaftLog<D> {
         Ok(None)
     }
 
-    /// Cuts the torn frame of entry `index` at `position`, if it is the
-    /// last write and that write ends at a segment's end (A2 splits a
-    /// write only there), and if it holds no committed entry.
+    /// Cuts the torn frame of entry `index` at `position`, if the log ends
+    /// at a segment's end (A2 splits a write only there) and the entry is
+    /// neither committed nor below the watermark.
     fn cut_tail(
         &mut self,
         position: u64,
         index: u64,
         geometry: Geometry,
     ) -> Result<Option<u64>, LogError> {
-        let last_write = a2::last_write_start(&mut self.disk, &self.dir, LOG_RECORDING)?;
         let at_segment_end = self
             .store
             .written()
             .is_multiple_of(geometry.segment_length());
-        if last_write != Some(position) || !at_segment_end {
+        if !at_segment_end {
             return Err(LogError::Chain {
                 position,
                 problem: ChainProblem::PastEnd,
@@ -609,6 +673,8 @@ impl<D: Disk + Clone> RaftLog<D> {
         {
             return Err(LogError::TornBelowCommit { index, commit });
         }
+        // A torn entry was never reported durable.
+        self.check_mark(index.checked_sub(1).filter(|_| index > self.first_index))?;
         self.store.truncate(position)?;
         Ok(Some(position))
     }
@@ -642,6 +708,17 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// The last index whose whole frame is durable, or `None`.
     #[must_use]
     pub fn durable_index(&self) -> Option<u64> {
+        // Never past the watermark: a segment roll's sync makes A2's
+        // durable run ahead of what a sync reported.
+        let stored = self.stored_durable_index();
+        match (stored, self.mark.durable) {
+            (Some(stored), Some(mark)) => Some(stored.min(mark)),
+            _ => None,
+        }
+    }
+
+    /// The last index A2 holds durable.
+    fn stored_durable_index(&self) -> Option<u64> {
         let durable = self.store.durable();
         let count = if self.store.written() <= durable {
             self.entries.len()
@@ -748,7 +825,11 @@ impl<D: Disk + Clone> RaftLog<D> {
         Ok(self.last_index())
     }
 
-    /// Makes every written entry durable; returns the durable last index.
+    /// Makes every written entry durable, then records it in the durable
+    /// watermark ([`crate::mark`]); returns the durable last index. A
+    /// follower acknowledges entries as persisted (the caller's
+    /// persistence callback) only after this returns: recovery refuses to
+    /// lose anything the watermark covers.
     ///
     /// # Errors
     ///
@@ -757,7 +838,51 @@ impl<D: Disk + Clone> RaftLog<D> {
         self.check_writable()?;
         let synced = self.store.sync();
         self.poison_on(synced)?;
+        self.write_mark(self.stored_durable_index())?;
         Ok(self.durable_index())
+    }
+
+    /// The watermark, the last index a sync reported durable.
+    #[must_use]
+    pub fn mark(&self) -> Option<u64> {
+        self.mark.durable
+    }
+
+    /// Refuses a recovered or cut log ending at `last`, below the mark.
+    fn check_mark(&self, last: Option<u64>) -> Result<(), LogError> {
+        match self.mark.durable {
+            Some(mark) if last.is_none_or(|last| last < mark) => {
+                Err(LogError::Corruption(Corruption::BelowMark { last, mark }))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Records `durable` as the mark: in the older slot, with the next
+    /// sequence, then synced. Nothing to do when it is the mark already. A
+    /// failure poisons the log.
+    fn write_mark(&mut self, durable: Option<u64>) -> Result<(), LogError> {
+        if durable == self.mark.durable {
+            return Ok(());
+        }
+        let sequence = self
+            .mark
+            .sequence
+            .checked_add(1)
+            .ok_or(LogError::Poisoned)?;
+        let slot = Slot { sequence, durable };
+        let at = 1 - self.mark_slot.min(1);
+        match mark::write(&mut self.disk, &self.mark_file, at, slot) {
+            Ok(()) => {
+                self.mark = slot;
+                self.mark_slot = at;
+                Ok(())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(LogError::Io(error))
+            }
+        }
     }
 
     /// Removes entry `from_index` and every later one; appends restart at
@@ -792,10 +917,23 @@ impl<D: Disk + Clone> RaftLog<D> {
             None if slot == self.entries.len() => return Ok(()),
             None => return Err(out()),
         };
+        // The mark comes down first: a crash after A2's cut then finds it at
+        // or below the cut.
+        let kept = from_index
+            .checked_sub(1)
+            .filter(|_| from_index > self.first_index);
+        if self
+            .mark
+            .durable
+            .is_some_and(|mark| kept.is_none_or(|kept| mark > kept))
+        {
+            self.write_mark(kept)?;
+        }
         let truncated = self.store.truncate(position);
         self.poison_on(truncated)?;
         self.entries.truncate(slot);
-        Ok(())
+        // What is kept is durable now: the mark follows it up.
+        self.write_mark(self.stored_durable_index())
     }
 
     /// Purging a prefix waits for snapshots (C8).

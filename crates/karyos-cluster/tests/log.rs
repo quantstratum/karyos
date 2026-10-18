@@ -23,6 +23,7 @@ use karyos_archive::disk::{Disk, StdDisk};
 use karyos_archive::segment::{Geometry, SegmentStore, SyncPolicy};
 use karyos_cluster::hard_state::{HARD_STATE_FILE, HARD_STATE_LEN, HardStateProblem};
 use karyos_cluster::log::{FIRST_INDEX_FILE, FRAME_HEADER, LOG_RECORDING};
+use karyos_cluster::mark::{MARK_FILE, MARK_LEN, SLOT_LEN, Slot, newest};
 use karyos_cluster::{ChainProblem, Corruption, Entry, HardState, LogError, RaftLog};
 
 /// A test's directory, removed when it ends.
@@ -631,9 +632,10 @@ fn spanning(name: &str) -> (TempDir, u64) {
     let dir = TempDir::new(name);
     let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
     log.append(&[entry(1, 1, &[1; 3000])]).unwrap();
-    let second = log.written();
-    log.append(&[entry(2, 1, &[2; 3000])]).unwrap();
     log.sync().unwrap();
+    let second = log.written();
+    // Never synced: a crash may tear it.
+    log.append(&[entry(2, 1, &[2; 3000])]).unwrap();
     (dir, second)
 }
 
@@ -710,8 +712,8 @@ fn a_length_past_the_end_mid_chain_is_refused() {
     );
 }
 
-/// A bit flip in a middle segment: A2's recovery cuts there and drops the
-/// later segments, which is more than a torn last write: Corruption.
+/// A bit flip in a middle segment of a synced log: A2's recovery cuts
+/// there, below the watermark: Corruption.
 #[test]
 fn a_flip_in_a_middle_segment_is_corruption() {
     let dir = TempDir::new("flip-middle");
@@ -727,16 +729,18 @@ fn a_flip_in_a_middle_segment_is_corruption() {
     bytes[100] ^= 1;
     std::fs::write(&segment, &bytes).unwrap();
     match RaftLog::open(StdDisk, &dir.0, small()) {
-        Err(LogError::Corruption(Corruption::Dropped { cut, last_write })) => {
-            assert_eq!(cut, 4096);
-            assert!(last_write > cut, "{last_write}");
-        }
+        Err(LogError::Corruption(corruption)) => assert_eq!(
+            corruption,
+            Corruption::BelowMark {
+                last: Some(2),
+                mark: 8
+            }
+        ),
         other => panic!("{other:?}"),
     }
 }
 
-/// A flip inside one segment, with writes after it in the same segment:
-/// Corruption too, not a cut.
+/// A flip inside one segment of a synced log: below the watermark too.
 #[test]
 fn a_flip_mid_segment_is_corruption() {
     let dir = TempDir::new("flip-mid");
@@ -751,12 +755,14 @@ fn a_flip_mid_segment_is_corruption() {
     std::fs::write(&segment, &bytes).unwrap();
     assert!(matches!(
         RaftLog::open(StdDisk, &dir.0, geometry()),
-        Err(LogError::Corruption(Corruption::Dropped { cut, .. })) if cut == second
+        Err(LogError::Corruption(Corruption::BelowMark {
+            last: Some(1),
+            mark: 5
+        }))
     ));
 }
 
-/// A lost middle segment: A2 recovers up to it and drops the segments
-/// after it, which hold whole writes: Corruption.
+/// A lost middle segment: A2 recovers up to it, below the watermark.
 #[test]
 fn a_lost_segment_is_corruption() {
     let dir = TempDir::new("lost-segment");
@@ -772,9 +778,9 @@ fn a_lost_segment_is_corruption() {
     match RaftLog::open(StdDisk, &dir.0, small()) {
         Err(LogError::Corruption(corruption)) => assert_eq!(
             corruption,
-            Corruption::Dropped {
-                cut: 4096,
-                last_write: 14_336
+            Corruption::BelowMark {
+                last: Some(2),
+                mark: 8
             }
         ),
         other => panic!("{other:?}"),
@@ -1043,4 +1049,132 @@ fn a_damaged_segment_header_is_corruption() {
         RaftLog::open(StdDisk, &dir.0, small()),
         Err(LogError::Corruption(Corruption::Segment { base: 4096 }))
     ));
+}
+
+/// Each sync records its durable index in the watermark, alternating
+/// slots; a torn newest slot falls back to the older one, which is still
+/// safe.
+#[test]
+fn the_watermark_follows_syncs_and_survives_a_torn_slot() {
+    let dir = TempDir::new("mark");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    assert_eq!(log.mark(), None);
+    log.append(&entries(1..3, 1)).unwrap();
+    assert_eq!(log.mark(), None, "an append records nothing");
+    log.sync().unwrap();
+    assert_eq!(log.mark(), Some(2));
+    log.append(&entries(3..5, 1)).unwrap();
+    log.sync().unwrap();
+    assert_eq!(log.mark(), Some(4));
+    drop(log);
+    let path = dir.0.join(MARK_FILE);
+    let bytes = std::fs::read(&path).unwrap();
+    let (newest, slot) = newest(&bytes).unwrap();
+    assert_eq!(slot.durable, Some(4));
+    // Tear the newest slot: the older one, 2, is the mark.
+    let mut torn = bytes.clone();
+    torn[newest * SLOT_LEN + 5] ^= 1;
+    std::fs::write(&path, &torn).unwrap();
+    let log = open(StdDisk, &dir.0, geometry());
+    // Reopened, the mark follows the recovered log.
+    assert_eq!((log.last_index(), log.mark()), (Some(4), Some(4)));
+}
+
+/// With no valid slot, the mark is unset, the conservative choice: a cut
+/// a full mark would refuse is taken for a crash's loss.
+#[test]
+fn no_valid_watermark_slot_accepts_any_cut() {
+    let dir = TempDir::new("no-mark");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    let batch: Vec<Entry> = (1..=8)
+        .map(|index| entry(index, 1, &[index as u8; 2012]))
+        .collect();
+    log.append(&batch).unwrap();
+    log.sync().unwrap();
+    drop(log);
+    std::fs::write(dir.0.join(MARK_FILE), [0xA5u8; MARK_LEN]).unwrap();
+    let segment = data_file(&dir.0, 4096);
+    let mut bytes = std::fs::read(&segment).unwrap();
+    bytes[100] ^= 1;
+    std::fs::write(&segment, &bytes).unwrap();
+    let opened = RaftLog::open(StdDisk, &dir.0, small()).unwrap();
+    assert_eq!(opened.cut, Some(4096));
+    assert_eq!(
+        (opened.log.last_index(), opened.log.mark()),
+        (Some(2), Some(2))
+    );
+    // A missing file is the same, and is created again.
+    drop(opened);
+    std::fs::remove_file(dir.0.join(MARK_FILE)).unwrap();
+    let log = open(StdDisk, &dir.0, small());
+    assert_eq!(log.mark(), Some(2));
+    assert!(dir.0.join(MARK_FILE).exists());
+}
+
+/// A segment roll syncs A2 ahead of the mark: the durable index reported
+/// stays at the mark until a sync records it.
+#[test]
+fn the_durable_index_never_passes_the_watermark() {
+    let dir = TempDir::new("mark-cap");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    log.append(&[entry(1, 1, &[0; 3000])]).unwrap();
+    assert_eq!(log.sync().unwrap(), Some(1));
+    let synced = log.durable();
+    let batch: Vec<Entry> = (2..=5).map(|index| entry(index, 1, &[0; 3000])).collect();
+    log.append(&batch).unwrap();
+    assert!(
+        log.durable() > synced,
+        "the rolls synced A2's finished segments"
+    );
+    assert_eq!(log.durable_index(), Some(1));
+    assert_eq!(log.sync().unwrap(), Some(5));
+}
+
+/// A truncation brings the mark down to what it keeps, and a reopen finds
+/// it there.
+#[test]
+fn a_truncation_lowers_the_watermark() {
+    let dir = TempDir::new("mark-truncate");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..6, 1)).unwrap();
+    log.sync().unwrap();
+    log.truncate_suffix(3).unwrap();
+    assert_eq!(log.mark(), Some(2));
+    log.truncate_suffix(1).unwrap();
+    assert_eq!((log.mark(), log.durable_index()), (None, None));
+    drop(log);
+    let log = open(StdDisk, &dir.0, geometry());
+    assert_eq!((log.last_index(), log.mark()), (None, None));
+}
+
+#[test]
+fn watermark_slots_round_trip_and_refuse_damage() {
+    for durable in [None, Some(0), Some(u64::MAX)] {
+        let slot = Slot {
+            sequence: 9,
+            durable,
+        };
+        assert_eq!(Slot::decode(&slot.encode()), Some(slot));
+    }
+    let mut flag = Slot {
+        sequence: 1,
+        durable: None,
+    }
+    .encode();
+    flag[12] = 2;
+    let crc = crc32c(&flag[..28]);
+    flag[28..].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(Slot::decode(&flag), None);
+    // Two valid slots: the higher sequence wins, whichever slot it is in.
+    let older = Slot {
+        sequence: 3,
+        durable: Some(1),
+    };
+    let newer = Slot {
+        sequence: 4,
+        durable: Some(2),
+    };
+    let both = [newer.encode(), older.encode()].concat();
+    assert_eq!(newest(&both), Some((0, newer)));
+    assert_eq!(newest(&[0u8; MARK_LEN]), None);
 }
