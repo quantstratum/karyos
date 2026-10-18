@@ -3368,6 +3368,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.counters
     }
 
+    /// Retired images whose `StorageReclaimed` this receiver handled, still
+    /// in quarantine (tests).
+    #[cfg(test)]
+    pub(crate) fn reclaimed_tombstones(&self) -> usize {
+        self.sessions.reclaimed_tombstones()
+    }
+
     fn count(&mut self, field: fn(&mut ReceiverCounters) -> &mut u64) {
         let mut overflowed = self.counters.overflowed;
         bump(field(&mut self.counters), &mut overflowed);
