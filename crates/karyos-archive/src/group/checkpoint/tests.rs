@@ -1379,7 +1379,7 @@ fn the_reopen_hold_keeps_the_events_a_checkpoint_write_spans() {
     let run = |hold: Option<usize>| {
         let mut tracker = PrefixTracker::new(2);
         if let Some(hold) = hold {
-            tracker.reserve_reopen_hold(hold);
+            tracker.reserve_reopen_hold(hold).unwrap();
         }
         let store = Store::default();
         store.written.set(100);
@@ -1398,4 +1398,28 @@ fn the_reopen_hold_keeps_the_events_a_checkpoint_write_spans() {
     };
     assert_eq!(run(Some(8)), ((7, 7), 0), "fits");
     assert_eq!(run(None), ((1, 1), 1), "overflows, counted");
+}
+
+/// #426 re-check h5: a hold below the tracker's capacity is taken as the
+/// capacity. With room for 2 in flight and a hold of 1, the 2 events
+/// that end while the checkpoint is written are both kept.
+#[test]
+fn a_hold_below_the_capacity_is_the_capacity() {
+    let mut tracker = PrefixTracker::new(2);
+    tracker.reserve_reopen_hold(1).unwrap();
+    let store = Store::default();
+    store.written.set(100);
+    store.durable.set(100);
+    let mut at = feed(
+        &mut tracker,
+        &encode(&GroupRecord::Header(header(Capture::BestEffort))),
+        0,
+    );
+    at = feed(&mut tracker, &gap(1, 1), at);
+    for seq in 2..=3 {
+        at = feed(&mut tracker, &event(seq, EndOutcome::Complete), at);
+    }
+    at = feed(&mut tracker, &checkpoint_record(1, 1, 0), at);
+    assert_eq!(tracker.advance(at, at, &store), (3, 3));
+    assert_eq!(tracker.failed_reopens(), 0);
 }

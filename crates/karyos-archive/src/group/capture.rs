@@ -838,12 +838,17 @@ impl<D: Disk> CaptureJob<D> {
     ///
     /// # Errors
     ///
-    /// [`CaptureError::InFlight`] for a hold whose bound passes `usize`.
+    /// [`CaptureError::InFlight`] for a hold whose bound passes `usize`, or
+    /// that cannot be allocated.
     pub fn reserve_reopen_hold(&mut self, hold: usize) -> Result<(), CaptureError> {
         let bound = hold.checked_mul(3).ok_or(CaptureError::InFlight)?;
-        self.tracker.reserve_reopen_hold(hold);
+        self.tracker
+            .reserve_reopen_hold(hold)
+            .map_err(|_| CaptureError::InFlight)?;
         if let Some(more) = bound.checked_sub(self.uncovered.len()) {
-            self.uncovered.reserve_exact(more);
+            self.uncovered
+                .try_reserve_exact(more)
+                .map_err(|_| CaptureError::InFlight)?;
         }
         Ok(())
     }

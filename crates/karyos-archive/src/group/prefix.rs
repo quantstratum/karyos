@@ -869,17 +869,25 @@ impl PrefixTracker {
     /// events expected while one checkpoint is written, under the Gateway
     /// unbounded while stopped, are its measure. Allocates here, at
     /// configuration, before any record.
-    pub fn reserve_reopen_hold(&mut self, hold: usize) {
+    ///
+    /// # Errors
+    ///
+    /// The allocation's failure, with the window unchanged.
+    pub fn reserve_reopen_hold(
+        &mut self,
+        hold: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
         let hold = hold.max(self.capacity);
         if let Some(more) = hold.checked_sub(self.candidates.len()) {
-            self.candidates.reserve_exact(more);
+            self.candidates.try_reserve_exact(more)?;
         }
         for queue in [&mut self.waiting, &mut self.settling] {
             if let Some(more) = hold.checked_sub(queue.len()) {
-                queue.reserve_exact(more);
+                queue.try_reserve_exact(more)?;
             }
         }
         self.hold = hold;
+        Ok(())
     }
 
     /// Checkpoints that opened a range which stayed at them: events after
@@ -949,7 +957,10 @@ pub fn recover<D: crate::disk::Disk>(
 ///
 /// # Errors
 ///
-/// The journal's read errors.
+/// The journal's read errors, and [`JournalError::InvalidConfig`] for a
+/// hold that cannot be allocated.
+///
+/// [`JournalError::InvalidConfig`]: super::journal::JournalError::InvalidConfig
 pub fn recover_with_hold<D: crate::disk::Disk>(
     journal: &mut super::journal::GroupJournal<D>,
     coverage: &impl Coverage,
@@ -957,7 +968,9 @@ pub fn recover_with_hold<D: crate::disk::Disk>(
     hold: usize,
 ) -> Result<Recovery, super::journal::JournalError> {
     let mut tracker = PrefixTracker::new(capacity);
-    tracker.reserve_reopen_hold(hold);
+    tracker
+        .reserve_reopen_hold(hold)
+        .map_err(|_| super::journal::JournalError::InvalidConfig)?;
     let mut last_seen = 0u64;
     let mut full = false;
     let durable = journal.durable();

@@ -167,10 +167,16 @@ pub struct GroupCheckpoints {
     /// times the capture's `in_flight`. A best-effort group under traffic
     /// beyond it reopens at a later checkpoint, counted
     /// ([`PrefixTracker::failed_reopens`](crate::group::prefix::PrefixTracker::failed_reopens)).
-    /// A hold below `in_flight` is taken as `in_flight`. Recovery sizes
-    /// its window so too.
+    /// A hold below `in_flight` is taken as `in_flight`; one above
+    /// [`MAX_REOPEN_HOLD`] is refused ([`AgentError::CheckpointConfig`]).
+    /// Recovery sizes its window so too. It must not shrink across
+    /// restarts of a group; it is recorded in the header in a follow-up.
     pub reopen_hold: Option<usize>,
 }
+
+/// The largest reopen hold a group takes, in events: the window's three
+/// queues are allocated to it when the group starts.
+pub const MAX_REOPEN_HOLD: usize = 1 << 20;
 
 /// A new group's journal header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,8 +442,8 @@ pub enum AgentError {
     #[error(transparent)]
     Capture(#[from] CaptureError),
     /// A group's checkpoints are configured so they cannot work: their
-    /// size, or the agent's budget per cycle, is 0. Nothing is made
-    /// (A9-3).
+    /// size, or the agent's budget per cycle, is 0, or the reopen hold is
+    /// above [`MAX_REOPEN_HOLD`]. Nothing is made (A9-3).
     #[error("invalid checkpoint configuration")]
     CheckpointConfig,
     /// A group's checkpoint writer could not start (A9-3).
@@ -1619,6 +1625,30 @@ impl<D: Disk + Clone> State<D> {
         {
             return Err(AgentError::CheckpointConfig);
         }
+        // The reopening window, sized before recovery so a restart
+        // recovers the prefixes the run had, and checked here, before the
+        // journal exists.
+        let hold = match &start.checkpoints {
+            None => None,
+            Some(GroupCheckpoints {
+                reopen_hold: Some(hold),
+                ..
+            }) => Some(*hold),
+            Some(GroupCheckpoints {
+                reopen_hold: None, ..
+            }) => Some(
+                start
+                    .capture
+                    .in_flight
+                    .checked_mul(4)
+                    .ok_or(AgentError::CheckpointConfig)?,
+            ),
+        };
+        if let Some(hold) = hold
+            && (hold > MAX_REOPEN_HOLD || hold.checked_mul(3).is_none())
+        {
+            return Err(AgentError::CheckpointConfig);
+        }
         let checkpoint_dir = store_dir(&start.dir);
         let journal = match &start.new {
             Some(new) => GroupJournal::create(
@@ -1687,24 +1717,6 @@ impl<D: Disk + Clone> State<D> {
         let coverage = GroupCoverage {
             recorded: &recorded,
             store: store.as_ref(),
-        };
-        // The reopening window, sized before recovery so a restart
-        // recovers the prefixes the run had.
-        let hold = match &start.checkpoints {
-            None => None,
-            Some(GroupCheckpoints {
-                reopen_hold: Some(hold),
-                ..
-            }) => Some(*hold),
-            Some(GroupCheckpoints {
-                reopen_hold: None, ..
-            }) => Some(
-                start
-                    .capture
-                    .in_flight
-                    .checked_mul(4)
-                    .ok_or(AgentError::CheckpointConfig)?,
-            ),
         };
         let (mut sender, job) = capture::capture_with_hold(start.capture, journal, &coverage, hold)
             .map_err(|error| match error {

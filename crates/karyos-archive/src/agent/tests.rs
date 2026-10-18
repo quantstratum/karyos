@@ -2377,6 +2377,47 @@ mod checkpoints {
         }
     }
 
+    /// #426 re-check P2: a reopen hold too large to allocate is refused,
+    /// typed, before the journal exists; the agent keeps running and
+    /// starts the group with a hold it can take.
+    #[test]
+    fn an_oversized_reopen_hold_is_refused_and_the_agent_survives() {
+        let dir = dirs("checkpoint-hold-oversized");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        for hold in [usize::MAX, MAX_REOPEN_HOLD + 1] {
+            let start = StartGroup {
+                checkpoints: Some(GroupCheckpoints {
+                    max_checkpoint: 64,
+                    reopen_hold: Some(hold),
+                }),
+                ..start_with(&dir, Some(Capture::BestEffort), policy)
+            };
+            assert!(
+                matches!(agent.start_group(start), Err(AgentError::CheckpointConfig)),
+                "{hold}"
+            );
+        }
+        // No journal was made: the directory holds the stores' only.
+        let made: Vec<_> = std::fs::read_dir(dir.join("groups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(made.len(), 1, "{made:?}");
+        let start = StartGroup {
+            checkpoints: Some(GroupCheckpoints {
+                max_checkpoint: 64,
+                reopen_hold: Some(MAX_REOPEN_HOLD),
+            }),
+            ..start_with(&dir, Some(Capture::BestEffort), policy)
+        };
+        let sender = agent.start_group(start).unwrap();
+        assert_eq!(sender.state(), GroupState::Running);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// #426 re-check f: a best-effort group whose missing store held the
     /// checkpoint that reopened its range (event 1, gap 2, checkpoint 2,
     /// event 3) starts with that range lost: durable stays at 1, and the
