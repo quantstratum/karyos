@@ -105,3 +105,25 @@ fn a_merge_poll_does_not_allocate() {
     assert_eq!(seen, (0..30).collect::<Vec<_>>());
     assert_eq!(cutovers, 1);
 }
+
+/// A provider's reason is the fallback's reason, one for one.
+#[test]
+fn a_provider_reason_is_the_fallback_reason() {
+    for (unavailable, reason) in [
+        (
+            ReplayUnavailable::NoRecording,
+            ReplayFallbackReason::NoRecording,
+        ),
+        (
+            ReplayUnavailable::RetentionShort,
+            ReplayFallbackReason::RetentionShort,
+        ),
+        (
+            ReplayUnavailable::RecordingBehind,
+            ReplayFallbackReason::RecordingBehind,
+        ),
+        (ReplayUnavailable::Refused, ReplayFallbackReason::Refused),
+    ] {
+        assert_eq!(ReplayFallbackReason::from(unavailable), reason);
+    }
+}

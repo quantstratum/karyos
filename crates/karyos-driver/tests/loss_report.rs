@@ -486,3 +486,60 @@ fn test_a_full_command_ring_delays_a_report_without_losing_it() {
     assert_eq!((records[0].from, records[0].to), (lost.from, lost.lost_to));
     assert_eq!(client.loss_reports_dropped(), 0);
 }
+
+/// A provider with no replay for any gap: the Archive refuses it.
+struct Refusing;
+
+impl karyos_client::ReplayProvider for Refusing {
+    fn replay(&mut self, _request: &karyos_client::ReplayRequest) -> karyos_client::ReplayStatus {
+        karyos_client::ReplayStatus::Unavailable(karyos_client::ReplayUnavailable::Refused)
+    }
+
+    fn cancel(&mut self) {}
+}
+
+/// A replay rejoin reports its overrun once, when it resolved, as `replay`
+/// with the provider's reason and the secondary's outcome; the wrapped
+/// subscription's own `rejoin at head` is not reported.
+#[test]
+fn test_a_replay_rejoin_reports_its_overrun_once_resolved() {
+    let (mut driver, stream, mut publication, mut client, subscription) =
+        setup(RejoinPolicy::RejoinAtHead);
+    let source = driver.trace_identity(stream).unwrap();
+    let mut rejoin = karyos_client::ReplayRejoin::new(
+        subscription,
+        source,
+        Box::new(Refusing),
+        Secondary::RejoinAtHead,
+    );
+    lap(&mut driver, &mut publication);
+    let first = rejoin.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    let lost = first.overrun.unwrap();
+    assert_eq!(first.rejoin, Some(RejoinOutcome::Replaying));
+    assert_eq!(client.loss_reports_queued(), 0);
+    let resolved = rejoin.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    assert_eq!(
+        resolved.rejoin,
+        Some(RejoinOutcome::ReplayFallback {
+            reason: ReplayFallbackReason::Refused,
+            secondary: SecondaryOutcome::ResumedAtHead,
+        })
+    );
+    assert_eq!(client.loss_reports_queued(), 1);
+    settle(&mut driver, &mut client);
+    let [record] = losses(&driver)[..] else {
+        panic!("expected exactly one loss record");
+    };
+    assert_eq!(
+        (
+            record.configured_policy,
+            record.applied_policy,
+            record.reason,
+            record.from,
+            record.to
+        ),
+        (4, 1, 5, lost.from, lost.lost_to)
+    );
+    assert_eq!(counter(&driver, "overruns rejoin at head"), 1);
+    assert_eq!(counter(&driver, "replay fallbacks"), 1);
+}
