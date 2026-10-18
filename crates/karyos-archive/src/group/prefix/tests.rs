@@ -21,8 +21,8 @@ use super::*;
 use crate::fault::{FaultDisk, Survives};
 use crate::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
 use crate::group::record::{
-    Capture, Clock, EventEnd, GapMarker, GapReason, JournalHeader, MAX_RECORD, MessageEvent,
-    ReferenceUnavailable, TimerEvent,
+    Capture, Clock, EventEnd, GapMarker, GapReason, JournalHeader, Loss, LossEvent, MAX_RECORD,
+    MessageEvent, OverrunOutcome, ReferenceUnavailable, TimerEvent,
 };
 use crate::segment::SyncPolicy;
 
@@ -591,9 +591,9 @@ fn a_reference_marked_unavailable_lets_the_prefixes_go_on() {
 }
 
 /// A mark must name an event waiting on that recording's frames: not an
-/// inline one, not another recording, not twice, nor one already durable,
-/// nor from inside an event. After the prefixes stopped it changes
-/// nothing.
+/// inline one, not another recording, not twice, nor from inside an
+/// event. One already durable, or past where the prefixes stopped, is a
+/// no-op.
 #[test]
 fn a_mark_names_an_event_waiting_on_that_recording() {
     let recordings = Recordings::default();
@@ -626,15 +626,14 @@ fn a_mark_names_an_event_waiting_on_that_recording() {
         tracker.record(&unavailable(2, 7), at + 200),
         no_reference(2, 7)
     );
-    // Already durable, so no longer waiting.
+    // Already durable, so no longer waiting: the recording held its
+    // frames after all, and the mark is a no-op (#405 review P2).
     let mut tracker = PrefixTracker::new(8);
     let at = feed(&mut tracker, &journal);
     recordings.set(7, 64, 64);
     assert_eq!(tracker.advance(at, at, &recordings), (2, 2));
-    assert_eq!(
-        tracker.record(&unavailable(2, 7), at + 100),
-        no_reference(2, 7)
-    );
+    tracker.record(&unavailable(2, 7), at + 100).unwrap();
+    assert_eq!(tracker.advance(at + 100, at + 100, &recordings), (2, 2));
     // Inside an event.
     let mut tracker = PrefixTracker::new(8);
     let at = feed(&mut tracker, &journal[..4]);
@@ -660,6 +659,11 @@ fn a_mark_names_an_event_waiting_on_that_recording() {
     );
     tracker.record(&unavailable(2, 7), at + 100).unwrap();
     assert!(tracker.stopped());
+    // Inside the gap that stopped them, a mark names no event.
+    assert_eq!(
+        tracker.record(&unavailable(1, 7), at + 200),
+        no_reference(1, 7)
+    );
 }
 
 /// A recovered journal with a mark: recovery reads it like the running
@@ -736,4 +740,159 @@ fn a_strict_journal_refuses_a_mark() {
         ))
     ));
     assert_eq!(journal.written(), written, "nothing written");
+}
+
+/// #405 review P1: a mark for an event queued before the prefixes stopped
+/// still settles it, after an incomplete event and after a gap, live and
+/// in recovery; the events queued before the stop then complete.
+#[test]
+fn a_mark_settles_an_event_queued_before_a_stop() {
+    let none = Recordings::default();
+    let stops = [
+        vec![message(2, None), end(2, EndOutcome::Incomplete)],
+        vec![GroupRecord::Gap(GapMarker {
+            from_seq: 2,
+            to_seq: 2,
+            reason: GapReason::RingFull,
+        })],
+    ];
+    for stop in stops {
+        let mut records = vec![message(1, Some(7)), end(1, EndOutcome::Complete)];
+        records.extend(stop.iter().copied());
+        records.push(unavailable(1, 7));
+        // Live.
+        let mut tracker = PrefixTracker::new(8);
+        let mut fed = vec![GroupRecord::Header(header(1, Capture::BestEffort))];
+        fed.extend(records.iter().copied());
+        let at = feed(&mut tracker, &fed);
+        assert!(tracker.stopped());
+        assert_eq!(tracker.advance(at, at, &none), (1, 1), "{stop:?}");
+        // In recovery.
+        let config = JournalConfig {
+            segment_length: MIN_SEGMENT_LENGTH,
+            policy: SyncPolicy::PerSegment,
+        };
+        let disk = FaultDisk::default();
+        let mut journal = GroupJournal::create(
+            disk.clone(),
+            Path::new("/g"),
+            &header(1, Capture::BestEffort),
+            config,
+        )
+        .unwrap();
+        for record in &records {
+            journal.append(&encode(record)).unwrap();
+        }
+        journal.close().unwrap();
+        let mut journal = GroupJournal::recover(
+            disk.after_crash(Survives::Synced),
+            Path::new("/g"),
+            1,
+            config,
+        )
+        .unwrap()
+        .journal;
+        let recovery = recover(&mut journal, &none, 8).unwrap();
+        assert_eq!(
+            (
+                recovery.tracker.complete_recording_seq(),
+                recovery.tracker.durable_group_seq()
+            ),
+            (1, 1),
+            "{stop:?}"
+        );
+    }
+}
+
+/// #405 review P2: a recording that recovers more after a crash than it
+/// reported live covers the event its mark names; the event is durable
+/// before the mark, which is then a no-op, and recovery reads on.
+#[test]
+fn a_mark_for_an_event_already_durable_is_a_no_op() {
+    let recovered = Recordings::default();
+    recovered.set(7, 64, 64);
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let disk = FaultDisk::default();
+    let mut journal = GroupJournal::create(
+        disk.clone(),
+        Path::new("/g"),
+        &header(1, Capture::BestEffort),
+        config,
+    )
+    .unwrap();
+    for record in [
+        message(1, Some(7)),
+        end(1, EndOutcome::Complete),
+        unavailable(1, 7),
+        message(2, None),
+        end(2, EndOutcome::Complete),
+    ] {
+        journal.append(&encode(&record)).unwrap();
+    }
+    journal.close().unwrap();
+    let mut journal = GroupJournal::recover(
+        disk.after_crash(Survives::Synced),
+        Path::new("/g"),
+        1,
+        config,
+    )
+    .unwrap()
+    .journal;
+    let recovery = recover(&mut journal, &recovered, 8).unwrap();
+    assert_eq!(
+        (
+            recovery.tracker.complete_recording_seq(),
+            recovery.tracker.durable_group_seq()
+        ),
+        (2, 2)
+    );
+}
+
+/// #405 review P3: a loss event is an event like the others, and a
+/// payload not captured waits on no recording.
+#[test]
+fn a_loss_event_and_an_uncaptured_payload_complete_alone() {
+    let none = Recordings::default();
+    let mut tracker = PrefixTracker::new(8);
+    let at = feed(
+        &mut tracker,
+        &[
+            GroupRecord::Header(header(1, Capture::BestEffort)),
+            GroupRecord::Loss(LossEvent {
+                group_seq: 1,
+                logical_time: 1,
+                incarnation: 1,
+                from: 0,
+                lost_to: 64,
+                resume: 128,
+                stream_id: 1,
+                session_id: 1,
+                lane: Lane::ZERO,
+                loss: Loss::Overrun {
+                    outcome: OverrunOutcome::ResumedAtHead,
+                    fallback: None,
+                },
+            }),
+            end(1, EndOutcome::Complete),
+            GroupRecord::Message(MessageEvent {
+                group_seq: 2,
+                logical_time: 2,
+                incarnation: 1,
+                position: 0,
+                extent: 70_048,
+                stream_id: 1,
+                session_id: 1,
+                lane: Lane::ZERO,
+                reserved_value: 0,
+                end_of_stream: false,
+                extension: None,
+                payload: Payload::Unavailable { length: 70_000 },
+            }),
+            end(2, EndOutcome::Complete),
+        ],
+    );
+    assert_eq!(tracker.advance(at, at, &none), (2, 2));
 }

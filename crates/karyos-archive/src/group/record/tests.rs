@@ -1254,7 +1254,7 @@ fn every_record_knows_its_role() {
             Role::Observation(8, 0),
             Role::Event(10),
             Role::Event(11),
-            Role::Event(12),
+            Role::Uncaptured(12),
             Role::Unavailable(2),
         ]
     );
@@ -1585,4 +1585,74 @@ fn invalid_a7d_values_are_not_encoded() {
             "{record:?}"
         );
     }
+}
+
+/// #405 review P3: each loss code against its table, written out as
+/// literals: a swapped code fails here, whatever the round trips say.
+#[test]
+fn loss_codes_follow_the_tables() {
+    let loss = |loss| {
+        encoded(&GroupRecord::Loss(LossEvent {
+            group_seq: 1,
+            logical_time: 0,
+            incarnation: 0,
+            from: 0,
+            lost_to: 0,
+            resume: 0,
+            stream_id: 0,
+            session_id: 0,
+            lane: lane(0),
+            loss,
+        }))
+    };
+    let codes = |bytes: Vec<u8>| (bytes[12 + 57], bytes[12 + 58], bytes[12 + 59]);
+    let overruns = [
+        (OverrunOutcome::ResumedAtHead, 1),
+        (OverrunOutcome::SnapshotRebuilt, 2),
+        (OverrunOutcome::SnapshotFailed, 3),
+        (OverrunOutcome::Closed, 4),
+        (OverrunOutcome::Replayed, 5),
+        (OverrunOutcome::Replaying, 6),
+    ];
+    for (outcome, code) in overruns {
+        let bytes = loss(Loss::Overrun {
+            outcome,
+            fallback: None,
+        });
+        assert_eq!(codes(bytes), (1, code, 0), "{outcome:?}");
+    }
+    let fallbacks = [
+        (FallbackReason::NoArchive, 1),
+        (FallbackReason::NoRecording, 2),
+        (FallbackReason::RetentionShort, 3),
+        (FallbackReason::RecordingBehind, 4),
+        (FallbackReason::Refused, 5),
+        (FallbackReason::MergeFailed, 6),
+        (FallbackReason::Withdrawn, 7),
+    ];
+    for (reason, code) in fallbacks {
+        let bytes = loss(Loss::Overrun {
+            outcome: OverrunOutcome::Closed,
+            fallback: Some(reason),
+        });
+        assert_eq!(codes(bytes), (1, 4, code), "{reason:?}");
+    }
+    let skips = [
+        (SkipReason::MessageTooLarge, 1),
+        (SkipReason::MissingEnd, 2),
+        (SkipReason::Interrupted, 3),
+        (SkipReason::Orphan, 4),
+        (SkipReason::JoinedMidMessage, 5),
+        (SkipReason::AfterLoss, 6),
+        (SkipReason::LocalGap(LocalGapReason::ReorderExpired), 7),
+        (SkipReason::LocalGap(LocalGapReason::RangeUnavailable), 8),
+    ];
+    for (reason, code) in skips {
+        assert_eq!(
+            codes(loss(Loss::Skipped(reason))),
+            (2, 0, code),
+            "{reason:?}"
+        );
+    }
+    assert_eq!(codes(loss(Loss::Aborted)), (3, 0, 0));
 }

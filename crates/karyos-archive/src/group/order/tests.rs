@@ -277,6 +277,32 @@ fn a_reference_unavailable_names_an_ended_event_of_a_best_effort_journal() {
             OrderRule::AfterIncomplete,
         ),
         (vec![], Role::Unavailable(1), OrderRule::Header),
+        // #405 review P3: below the first event.
+        (
+            vec![
+                header(Capture::BestEffort, 5),
+                Role::Event(5),
+                complete(5, 0),
+            ],
+            Role::Unavailable(4),
+            OrderRule::Unavailable,
+        ),
+        // An uncaptured payload in a strict journal, and nested.
+        (
+            vec![header(Capture::Strict, 1)],
+            Role::Uncaptured(1),
+            OrderRule::Unavailable,
+        ),
+        (
+            vec![header(Capture::BestEffort, 1), Role::Event(1)],
+            Role::Uncaptured(2),
+            OrderRule::Nested,
+        ),
+        (
+            vec![header(Capture::BestEffort, 1)],
+            Role::Uncaptured(2),
+            OrderRule::Sequence,
+        ),
     ];
     for (before, role, rule) in cases {
         let mut checker = check(&before).unwrap();
@@ -291,4 +317,19 @@ fn a_reference_unavailable_names_an_ended_event_of_a_best_effort_journal() {
         );
         assert_eq!(checker, kept, "the checker stays as it was");
     }
+}
+
+/// A best-effort journal holds an uncaptured payload as an event.
+#[test]
+fn a_best_effort_journal_holds_an_uncaptured_payload() {
+    let checker = check(&[
+        header(Capture::BestEffort, 1),
+        Role::Uncaptured(1),
+        Role::Observation(1, 0),
+        complete(1, 1),
+        Role::Event(2),
+        complete(2, 0),
+    ])
+    .unwrap();
+    assert_eq!(checker.next_seq(), 3);
 }

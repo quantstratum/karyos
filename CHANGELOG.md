@@ -303,9 +303,11 @@ release may break APIs, wire formats and shared-memory layouts.
   `resume`. A `ReferenceUnavailable` (template 22) marks, in a
   best-effort journal, an ended event whose referenced recording stopped
   before covering it: the order rules take it between events, naming an
-  event that ended, and refuse it in a strict journal; the prefix tracker
-  takes it only for an event waiting on that recording, and counts the
-  event complete.
+  event that ended at or after the first, and refuse it, and payload 3,
+  in a strict journal. The prefix tracker settles a waiting event that
+  references that recording, also after the prefixes stopped, and counts
+  it complete; a mark for an event already durable, or at or past the
+  stop, is a no-op, and one inside the stopping gap is refused.
 - A recording group's three prefixes (phase 3, A7c; SPEC §8.3).
   `karyos_archive::group::prefix::PrefixTracker` tracks `delivered_seq`,
   `complete_recording_seq` and `durable_group_seq`: an event is complete
