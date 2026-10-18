@@ -17,8 +17,10 @@
 //!
 //! A new mark goes into the older slot, with the next sequence, then the
 //! file is synced: a torn write leaves the other slot, an older mark, which
-//! is still safe. The newest valid slot is the mark; with none valid, the
-//! mark is unset (the first index minus one), the conservative choice.
+//! is still safe. The newest valid slot is the mark. Creation writes the
+//! file durably before the log's first-index file, so a log whose
+//! watermark has no valid slot is damaged, and its open refuses with
+//! `LogError::Mark`.
 
 use std::io;
 use std::path::Path;

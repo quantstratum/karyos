@@ -519,7 +519,7 @@ fn a_failed_flush_poisons_until_reopened() {
     assert!(matches!(log.sync(), Err(LogError::Poisoned)));
     drop(log);
     let mut log = open(disk.clone(), &dir.0, geometry());
-    let next = log.next_index();
+    let next = log.next_index().unwrap();
     log.append(&entries(next..next + 1, 1)).unwrap();
     log.sync().unwrap();
 }
@@ -890,7 +890,7 @@ fn logs_start_at_zero_or_one() {
         let log = RaftLog::create(StdDisk, &dir.0, geometry(), first).unwrap();
         assert_eq!(
             (log.last_index(), log.next_index(), log.term(first)),
-            (None, first, None)
+            (None, Some(first), None)
         );
         drop(log);
         let mut log = open(StdDisk, &dir.0, geometry());
@@ -1045,7 +1045,7 @@ fn a_creation_cut_short_is_finished() {
     // A log there: create refuses and changes nothing.
     assert!(matches!(
         RaftLog::create(StdDisk, &dir.0, geometry(), 9),
-        Err(LogError::Store(_))
+        Err(LogError::Exists)
     ));
     assert_eq!(open(StdDisk, &dir.0, geometry()).first_index(), 5);
 }
@@ -1184,4 +1184,236 @@ fn watermark_slots_round_trip_and_refuse_damage() {
     let both = [newer.encode(), older.encode()].concat();
     assert_eq!(newest(&both), Some((0, newer)));
     assert_eq!(newest(&[0u8; MARK_LEN]), None);
+}
+
+/// A disk that panics on any change: a refused open must write nothing.
+#[derive(Debug, Clone, Copy, Default)]
+struct NoWrite;
+
+impl Disk for NoWrite {
+    type File = std::fs::File;
+
+    fn create(&mut self, path: &Path) -> io::Result<Self::File> {
+        panic!("create {path:?} during a refused open")
+    }
+
+    fn open(&mut self, path: &Path) -> io::Result<Self::File> {
+        StdDisk.open(path)
+    }
+
+    fn open_read(&mut self, path: &Path) -> io::Result<Self::File> {
+        StdDisk.open_read(path)
+    }
+
+    fn write_at(&mut self, _: &Self::File, offset: u64, _: &[u8]) -> io::Result<()> {
+        panic!("write_at {offset} during a refused open")
+    }
+
+    fn read_at(&mut self, file: &Self::File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        StdDisk.read_at(file, offset, buf)
+    }
+
+    fn len(&mut self, file: &Self::File) -> io::Result<u64> {
+        StdDisk.len(file)
+    }
+
+    fn set_len(&mut self, _: &Self::File, len: u64) -> io::Result<()> {
+        panic!("set_len {len} during a refused open")
+    }
+
+    fn sync(&mut self, file: &Self::File) -> io::Result<()> {
+        StdDisk.sync(file)
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
+        StdDisk.sync_dir(dir)
+    }
+
+    fn list(&mut self, dir: &Path) -> io::Result<Vec<String>> {
+        StdDisk.list(dir)
+    }
+
+    fn remove(&mut self, path: &Path) -> io::Result<()> {
+        panic!("remove {path:?} during a refused open")
+    }
+
+    fn rename(&mut self, from: &Path, _: &Path) -> io::Result<()> {
+        panic!("rename {from:?} during a refused open")
+    }
+}
+
+/// An empty log that voted, whose only segment's index header was torn
+/// in its creation: the open takes A2's creation-cut-short path, and keeps
+/// the stored term and vote, so no second vote in that term is possible.
+#[test]
+fn a_creation_cut_short_keeps_the_term_and_vote() {
+    let dir = TempDir::new("kept-none-vote");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    let vote = HardState {
+        current_term: 5,
+        voted_for: Some(2),
+        commit: None,
+    };
+    log.save_hard_state(vote).unwrap();
+    drop(log);
+    std::fs::write(index_file(&dir.0, 0), [0u8; 48]).unwrap();
+    let opened = RaftLog::open(StdDisk, &dir.0, geometry()).unwrap();
+    assert_eq!(opened.log.hard_state(), Some(vote));
+    assert_eq!(opened.log.last_index(), None);
+    drop(opened);
+    // A stored commit there is above the (empty) log: refused, unwritten.
+    std::fs::write(index_file(&dir.0, 0), [0u8; 48]).unwrap();
+    let committed = HardState {
+        commit: Some(1),
+        ..vote
+    };
+    std::fs::write(dir.0.join(HARD_STATE_FILE), committed.encode()).unwrap();
+    let before = listing(&dir.0);
+    assert!(matches!(
+        RaftLog::open(NoWrite, &dir.0, geometry()),
+        Err(LogError::CommitBeyondDurable {
+            commit: 1,
+            durable: None
+        })
+    ));
+    assert_eq!(listing(&dir.0), before);
+}
+
+/// A sync whose A2 part fails never advances the watermark, in memory or
+/// on disk, and poisons the log.
+#[test]
+fn a_failed_store_sync_leaves_the_watermark() {
+    for skip in 0..2 {
+        let dir = TempDir::new(&format!("mark-a2-fail-{skip}"));
+        let disk = FlakyDisk::default();
+        let mut log = RaftLog::create(disk.clone(), &dir.0, geometry(), 1).unwrap();
+        log.append(&entries(1..3, 1)).unwrap();
+        log.sync().unwrap();
+        log.append(&entries(3..5, 1)).unwrap();
+        // The first `skip` syncs succeed, then A2's data or index sync
+        // fails.
+        disk.fail_after(skip);
+        let result = log.sync();
+        disk.fail.store(false, Ordering::Relaxed);
+        assert!(matches!(result, Err(LogError::Store(_))), "{result:?}");
+        assert_eq!(log.mark(), Some(2), "skip {skip}: in memory");
+        let (_, slot) = newest(&std::fs::read(dir.0.join(MARK_FILE)).unwrap()).unwrap();
+        assert_eq!(slot.durable, Some(2), "skip {skip}: on disk");
+        assert!(matches!(
+            log.append(&entries(5..6, 1)),
+            Err(LogError::Poisoned)
+        ));
+    }
+}
+
+/// A failed sync of the watermark itself, in a sync or in a truncation's
+/// lowering, poisons the log; the truncation cuts nothing.
+#[test]
+fn a_failed_watermark_sync_poisons() {
+    let dir = TempDir::new("mark-fail");
+    let disk = FlakyDisk::default();
+    let mut log = RaftLog::create(disk.clone(), &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..2, 1)).unwrap();
+    // A2's data and index syncs pass; the mark's fails.
+    disk.fail_after(2);
+    let result = log.sync();
+    disk.fail.store(false, Ordering::Relaxed);
+    assert!(matches!(result, Err(LogError::Io(_))), "{result:?}");
+    assert!(matches!(
+        log.append(&entries(2..3, 1)),
+        Err(LogError::Poisoned)
+    ));
+    assert!(matches!(log.sync(), Err(LogError::Poisoned)));
+    let dir = TempDir::new("mark-fail-truncate");
+    let disk = FlakyDisk::default();
+    let mut log = RaftLog::create(disk.clone(), &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..3, 1)).unwrap();
+    log.sync().unwrap();
+    disk.fail_after(0);
+    let result = log.truncate_suffix(2);
+    disk.fail.store(false, Ordering::Relaxed);
+    assert!(matches!(result, Err(LogError::Io(_))), "{result:?}");
+    assert!(matches!(
+        log.append(&entries(3..4, 1)),
+        Err(LogError::Poisoned)
+    ));
+    assert_eq!(log.last_index(), Some(2), "nothing cut");
+}
+
+/// A newest slot torn in its index field fails its CRC: the older slot is
+/// the mark, and the open is accepted instead of refused below a bogus
+/// mark of 4 + 2^56.
+#[test]
+fn a_torn_newest_slot_falls_back_to_the_older() {
+    let dir = TempDir::new("slot-fallback");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..3, 1)).unwrap();
+    log.sync().unwrap();
+    log.append(&entries(3..5, 1)).unwrap();
+    log.sync().unwrap();
+    drop(log);
+    let path = dir.0.join(MARK_FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let (at, slot) = newest(&bytes).unwrap();
+    assert_eq!(slot.durable, Some(4));
+    bytes[at * SLOT_LEN + 20] ^= 1;
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(newest(&bytes).unwrap().1.durable, Some(2));
+    let opened = RaftLog::open(StdDisk, &dir.0, geometry()).unwrap();
+    assert_eq!(opened.log.last_index(), Some(4));
+}
+
+/// `create` over what is left of a log (its store lost, its first index,
+/// watermark and hard state kept) is refused with nothing changed: the
+/// loss stays for `open` to refuse.
+#[test]
+fn create_over_a_lost_store_is_refused() {
+    let dir = TempDir::new("recreate");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    log.append(&entries(1..3, 5)).unwrap();
+    log.sync().unwrap();
+    log.save_hard_state(HardState {
+        current_term: 5,
+        voted_for: Some(2),
+        commit: Some(1),
+    })
+    .unwrap();
+    drop(log);
+    for name in std::fs::read_dir(&dir.0).unwrap() {
+        let path = name.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext == "seg" || ext == "idx")
+        {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let before = listing(&dir.0);
+    assert!(matches!(
+        RaftLog::create(StdDisk, &dir.0, geometry(), 1),
+        Err(LogError::Exists)
+    ));
+    assert_eq!(listing(&dir.0), before);
+    assert!(matches!(
+        RaftLog::open(NoWrite, &dir.0, geometry()),
+        Err(LogError::Corruption(Corruption::BelowMark {
+            last: None,
+            mark: 2
+        }))
+    ));
+    // Only a mark left (a creation stopped before its first-index file):
+    // create may run again.
+    let dir = TempDir::new("recreate-mark");
+    drop(RaftLog::create(StdDisk, &dir.0, geometry(), 7).unwrap());
+    for (name, _) in listing(&dir.0) {
+        if name != MARK_FILE {
+            std::fs::remove_file(dir.0.join(name)).unwrap();
+        }
+    }
+    assert_eq!(
+        RaftLog::create(StdDisk, &dir.0, geometry(), 7)
+            .unwrap()
+            .first_index(),
+        7
+    );
 }
