@@ -153,9 +153,11 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
     /// The group's checkpoint handle, taken from the sender: `None` for a
     /// group started without checkpoints.
     checkpoints: Option<CheckpointHandle>,
-    /// A checkpoint names an event at or above it: the first this Gateway
-    /// takes when the journal held none, 1 otherwise.
+    /// A checkpoint names an event at or above it: the group's first, as
+    /// its journal header names it.
     first_checkpoint: u64,
+    /// The `group_seq` of the last checkpoint handed over, 0 for none.
+    last_taken: u64,
 }
 
 /// Why a Gateway could not be configured.
@@ -205,11 +207,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         }
         let mut sender = sender;
         let checkpoints = sender.take_checkpoints();
-        let first_checkpoint = if sender.dispatched() == 0 {
-            next_seq
-        } else {
-            1
-        };
+        let first_checkpoint = sender.first_group_seq();
         Ok(Self {
             port,
             clock,
@@ -228,6 +226,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             observation_budget: u32::MAX,
             checkpoints,
             first_checkpoint,
+            last_taken: 0,
         })
     }
 
@@ -240,21 +239,26 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     ///
     /// # Errors
     ///
-    /// - [`CheckpointError::Stopped`] once the group stopped, failed or
-    ///   ended, checked before anything else: `write` is not called.
+    /// In this order, `write` called only when none applies:
+    ///
+    /// - [`CheckpointError::Stopped`] once the group stopped, failed,
+    ///   ended or is closing.
     /// - [`CheckpointError::NoCheckpoints`] for a group started without
     ///   checkpoints.
     /// - [`CheckpointError::NothingDispatched`] before the group's first
     ///   event.
-    /// - [`CheckpointError::InFlight`], [`CheckpointError::TooLarge`],
-    ///   [`CheckpointError::Empty`] and [`CheckpointError::Ended`] from
-    ///   the handle, counted in [`Gateway::checkpoint_stats`].
+    /// - [`CheckpointError::Repeated`] for the `group_seq` of the last
+    ///   checkpoint taken, unless its write failed.
+    /// - From the handle, counted in [`Gateway::checkpoint_stats`]:
+    ///   [`CheckpointError::Ended`] once a strict journal ended at an
+    ///   incomplete event, then [`CheckpointError::InFlight`],
+    ///   [`CheckpointError::TooLarge`] and [`CheckpointError::Empty`].
     pub fn checkpoint(
         &mut self,
         format: u32,
         write: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<(), CheckpointError> {
-        if self.sender.state() != GroupState::Running {
+        if self.sender.state() != GroupState::Running || self.sender.closing() {
             return Err(CheckpointError::Stopped);
         }
         let Some(handle) = self.checkpoints.as_mut() else {
@@ -265,7 +269,19 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             .checked_sub(1)
             .filter(|seq| *seq != 0 && *seq >= self.first_checkpoint)
             .ok_or(CheckpointError::NothingDispatched)?;
-        handle.checkpoint(group_seq, format, write)
+        if group_seq == self.last_taken {
+            handle.poll();
+            let failed = matches!(
+                handle.last_checkpoint(),
+                Some(LastCheckpoint::Failed { group_seq: seq }) if seq == group_seq
+            );
+            if !failed {
+                return Err(CheckpointError::Repeated { group_seq });
+            }
+        }
+        handle.checkpoint(group_seq, format, write)?;
+        self.last_taken = group_seq;
+        Ok(())
     }
 
     /// How the last checkpoint the writer took ended: `None` before the
@@ -465,6 +481,13 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             .ok_or(GatewayError::Ended)?;
         if incomplete {
             self.stats.bump(|stats| &mut stats.incomplete);
+            // A strict journal ends at an incomplete event: no checkpoint
+            // can open another range.
+            if self.capture == Capture::Strict
+                && let Some(handle) = self.checkpoints.as_mut()
+            {
+                handle.end();
+            }
         }
         // Admitted, so the ring has room: a refusal here is a failed group.
         self.sender

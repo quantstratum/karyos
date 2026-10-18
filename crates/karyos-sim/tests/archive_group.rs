@@ -308,7 +308,7 @@ impl Tally {
 }
 
 impl Handler for Tally {
-    fn on_event(&mut self, event: &Event<'_>, _: &mut dyn Effects) {
+    fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
         if let Event::Message {
             payload: karyos_archive::group::gateway::MessagePayload::Bytes(bytes),
             ..
@@ -316,6 +316,8 @@ impl Handler for Tally {
         {
             self.count += 1;
             self.sum += u64::from(bytes[0]);
+            // One observation per message, for replay to compare.
+            let _ = effects.offer(PublicationId(0), &self.count.to_le_bytes());
         }
     }
 
@@ -350,6 +352,9 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
     use karyos_archive::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
 
     const AT: u64 = 12;
+    // A second checkpoint, which replay from the first compares.
+    const SECOND: u64 = 18;
+    let mut second = false;
     let dir = TempDir::new("checkpoint");
     let groups = dir.path().join("groups");
     std::fs::create_dir_all(store_dir(&groups)).unwrap();
@@ -438,21 +443,37 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
             gateway.checkpoint(1, |out| live.write(out)).unwrap();
             at_checkpoint = Some(live);
         }
+        if dispatched == SECOND && !second {
+            // The first is recorded before the second is taken: one in
+            // flight.
+            while !matches!(gateway.last_checkpoint(), Some(LastCheckpoint::Recorded(_))) {
+                driver.do_work().unwrap();
+                assert!(
+                    Instant::now() < deadline,
+                    "the first checkpoint never ended"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            gateway.checkpoint(1, |out| live.write(out)).unwrap();
+            second = true;
+        }
         assert!(
             Instant::now() < deadline,
             "the group never took every message"
         );
     }
-    let recorded = loop {
+    let last = loop {
         driver.do_work().unwrap();
         match gateway.last_checkpoint() {
-            Some(LastCheckpoint::Recorded(record)) => break record,
+            Some(LastCheckpoint::Recorded(record)) if record.group_seq == SECOND => break record,
             Some(failed @ LastCheckpoint::Failed { .. }) => panic!("{failed:?}"),
-            None => assert!(Instant::now() < deadline, "the checkpoint never ended"),
+            _ => assert!(Instant::now() < deadline, "the checkpoint never ended"),
         }
         std::thread::sleep(Duration::from_millis(1));
     };
-    assert_eq!(recorded.group_seq, AT);
+    // Ids run from 1: the first checkpoint is 1, the second 2.
+    assert_eq!(last.checkpoint_id, 2);
+    let first_id = 1;
     let durable = loop {
         driver.do_work().unwrap();
         match waiter.wait_durable(MESSAGES, Duration::from_millis(20)) {
@@ -490,7 +511,7 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
         journal,
         &recovery,
         &mut store,
-        recorded.checkpoint_id,
+        first_id,
         &ReplayConfig {
             manifest: b"e2e",
             accept_manifest: false,
@@ -505,12 +526,16 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
     // The application restores its state itself: replay hands it the
     // snapshot.
     let mut replayed = Tally::default();
+    assert_eq!(
+        record.group_seq, AT,
+        "the first checkpoint names event {AT}"
+    );
     assert!(replayed.restore(&snapshot[..usize::try_from(record.length).unwrap()]));
     assert_eq!(Some(replayed), at_checkpoint);
     let mut gateway = ReplayGateway::new(
         cursor,
         &GatewayConfig {
-            publications: &[],
+            publications: &[(0, 0)],
             subscriptions: &[(STREAM, 1)],
             conflated: &[],
             max_claim: 0,

@@ -833,18 +833,37 @@ fn checkpointing() -> (
     CaptureJob<FaultDisk>,
     crate::group::checkpoint::CheckpointInbox,
 ) {
+    let (gateway, job, inbox, _) = checkpointing_with(Capture::Strict, 1 << 16, 1);
+    (gateway, job, inbox)
+}
+
+/// [`checkpointing`] in `mode`, over a ring of `ring` bytes, the group's
+/// first event `first`; with the disk.
+fn checkpointing_with(
+    mode: Capture,
+    ring: usize,
+    first: u64,
+) -> (
+    Gateway<Accepting, Clocked>,
+    CaptureJob<FaultDisk>,
+    crate::group::checkpoint::CheckpointInbox,
+    FaultDisk,
+) {
     let disk = FaultDisk::default();
     let journal = GroupJournal::create(
         disk.clone(),
         Path::new("/g"),
-        &header(Capture::Strict),
+        &JournalHeader {
+            first_group_seq: first,
+            ..header(mode)
+        },
         config(),
     )
     .unwrap();
     let (mut sender, job) = capture(
         CaptureConfig {
-            ring_capacity: 1 << 16,
-            max_event: 4096,
+            ring_capacity: ring,
+            max_event: 1000,
             in_flight: 64,
         },
         journal,
@@ -854,17 +873,12 @@ fn checkpointing() -> (
     let (handle, inbox) = crate::group::checkpoint::handoff(16);
     sender.attach_checkpoints(handle);
     let clock: Clocked = Box::new(|| 1);
-    let gateway = Gateway::new(
-        Accepting::default(),
-        clock,
-        sender,
-        Capture::Strict,
-        1,
-        4096,
-        8,
-    )
-    .unwrap();
-    (gateway, job, inbox)
+    let gateway = Gateway::new(Accepting::default(), clock, sender, mode, first, 1000, 8).unwrap();
+    (gateway, job, inbox, disk)
+}
+
+fn noop() -> impl FnMut(&Event<'_>, &mut dyn Effects) {
+    |_: &Event<'_>, _: &mut dyn Effects| {}
 }
 
 /// A checkpoint names the last event dispatched, `next_seq - 1`, and none
@@ -896,7 +910,15 @@ fn a_checkpoint_names_the_last_event_dispatched() {
     assert_eq!((request.group_seq, request.format), (2, 9));
     assert_eq!(request.bytes(), b"abc");
     assert_eq!(gateway.checkpoint_stats().taken, 1);
-    // The handle's own refusal: one in flight.
+    // The same event again: refused up front.
+    assert!(matches!(
+        gateway.checkpoint(9, |_| 1),
+        Err(CheckpointError::Repeated { group_seq: 2 })
+    ));
+    // The handle's own refusal, after another event: one in flight.
+    gateway
+        .deliver_external(1, b"", &mut |_: &Event<'_>, _: &mut dyn Effects| {})
+        .unwrap();
     assert!(matches!(
         gateway.checkpoint(9, |_| 1),
         Err(CheckpointError::InFlight)
@@ -946,4 +968,209 @@ fn stopped_wins_over_the_handles_refusals() {
     assert!(!written);
     // The handle was not reached: its in-flight refusal is not counted.
     assert_eq!(gateway.checkpoint_stats().in_flight, 0);
+}
+
+/// #433 review P2: a strict journal that ended at an incomplete event
+/// refuses a checkpoint `Ended`, counted, before the handle's other
+/// refusals.
+#[test]
+fn a_strict_incomplete_event_ends_the_checkpoints() {
+    let (mut gateway, _job, _inbox) = checkpointing();
+    gateway.set_observation_budget(0);
+    let _ = gateway.deliver_external(1, b"", &mut |_: &Event<'_>, effects: &mut dyn Effects| {
+        let _ = effects.offer(PublicationId(1), b"x");
+    });
+    assert_eq!(gateway.stats().incomplete, 1);
+    let mut written = false;
+    assert!(matches!(
+        gateway.checkpoint(1, |_| {
+            written = true;
+            1
+        }),
+        Err(CheckpointError::Ended)
+    ));
+    assert!(!written);
+    assert_eq!(gateway.checkpoint_stats().ended, 1);
+}
+
+/// #433 review P2: best effort, the last event delivered uncaptured with
+/// its gap still pending. The checkpoint names it (`next_seq - 1`, not
+/// the last event sent); the writer waits until the journal holds it,
+/// then records it at that `group_seq`.
+#[test]
+fn a_checkpoint_after_an_uncaptured_event_names_it() {
+    use crate::group::capture::CheckpointStep;
+    use crate::group::checkpoint::{CheckpointStore, CheckpointWriter};
+
+    let (mut gateway, mut job, inbox, disk) =
+        checkpointing_with(Capture::BestEffort, SMALL_RING, 1);
+    // The last event `fill` delivered, `taken + 1`, ran uncaptured.
+    let taken = fill(&mut gateway);
+    assert_eq!(gateway.next_seq(), taken + 2);
+    assert_eq!(gateway.stats().uncaptured, 1);
+    gateway.checkpoint(1, |_| 1).unwrap();
+    let request = inbox.take().unwrap();
+    assert_eq!(request.group_seq, taken + 1);
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    let store = CheckpointStore::create(disk, Path::new("/c"), 1, config()).unwrap();
+    let mut writer = CheckpointWriter::new(store, job.journal()).unwrap();
+    assert!(matches!(
+        job.checkpoint(&mut writer, &request, 1 << 20),
+        Ok(CheckpointStep::NotReady)
+    ));
+    // The next event writes the gap first, then itself.
+    assert_eq!(
+        gateway.deliver_external(1, b"y", &mut noop()),
+        Ok(Dispatched::Event {
+            group_seq: taken + 2
+        })
+    );
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    let recorded = loop {
+        match job.checkpoint(&mut writer, &request, 1 << 20).unwrap() {
+            CheckpointStep::Recorded(record) => break record,
+            CheckpointStep::Writing { .. } => {}
+            CheckpointStep::NotReady => panic!("not ready once the journal holds it"),
+        }
+    };
+    assert_eq!(recorded.group_seq, taken + 1);
+}
+
+/// #433 review P3: a group whose first event is 5 takes no checkpoint
+/// before it, then names 5.
+#[test]
+fn the_first_checkpoint_follows_the_first_event() {
+    let (mut gateway, _job, inbox, _) = checkpointing_with(Capture::Strict, 1 << 16, 5);
+    assert!(matches!(
+        gateway.checkpoint(1, |_| 1),
+        Err(CheckpointError::NothingDispatched)
+    ));
+    gateway.deliver_external(1, b"", &mut noop()).unwrap();
+    gateway.checkpoint(1, |_| 1).unwrap();
+    assert_eq!(inbox.take().unwrap().group_seq, 5);
+}
+
+/// #433 review P3: over a journal that holds events, a new Gateway takes
+/// a checkpoint before its own first event, naming the journal's last.
+#[test]
+fn a_reopened_journal_checkpoints_its_last_event() {
+    let disk = FaultDisk::default();
+    let journal = GroupJournal::create(
+        disk.clone(),
+        Path::new("/g"),
+        &header(Capture::Strict),
+        config(),
+    )
+    .unwrap();
+    let settings = CaptureConfig {
+        ring_capacity: 1 << 16,
+        max_event: 1000,
+        in_flight: 64,
+    };
+    let (sender, mut job) = capture(settings, journal, &NoRecordings).unwrap();
+    let clock: Clocked = Box::new(|| 1);
+    let mut gateway = Gateway::new(
+        Accepting::default(),
+        clock,
+        sender,
+        Capture::Strict,
+        1,
+        1000,
+        8,
+    )
+    .unwrap();
+    for _ in 0..3 {
+        gateway.deliver_external(1, b"", &mut noop()).unwrap();
+    }
+    while job.duty(0, 1024, &NoRecordings).unwrap() {}
+    drop(gateway);
+    job.close().unwrap();
+    let journal = GroupJournal::recover(disk, Path::new("/g"), 1, config())
+        .unwrap()
+        .journal;
+    let (mut sender, _job) = capture(settings, journal, &NoRecordings).unwrap();
+    let (handle, inbox) = crate::group::checkpoint::handoff(16);
+    sender.attach_checkpoints(handle);
+    let clock: Clocked = Box::new(|| 1);
+    let mut gateway = Gateway::new(
+        Accepting::default(),
+        clock,
+        sender,
+        Capture::Strict,
+        4,
+        1000,
+        8,
+    )
+    .unwrap();
+    gateway.checkpoint(1, |_| 1).unwrap();
+    assert_eq!(inbox.take().unwrap().group_seq, 3);
+}
+
+/// #433 review P3: the refusals' order. A stopped group without
+/// checkpoints is `Stopped`; one running without them and without an
+/// event is `NoCheckpoints`; before any event the handle's refusals are
+/// not reached, nothing counted.
+#[test]
+fn the_refusals_come_in_order() {
+    let (mut gateway, job, _disk, _reads) = gateway(Capture::Strict, 1 << 16, 4096);
+    assert!(matches!(
+        gateway.checkpoint(1, |_| 1),
+        Err(CheckpointError::NoCheckpoints)
+    ));
+    job.close().unwrap();
+    assert!(matches!(
+        gateway.checkpoint(1, |_| 1),
+        Err(CheckpointError::Stopped)
+    ));
+    let (mut gateway, _job, _inbox) = checkpointing();
+    // Empty would be the handle's refusal: not reached.
+    assert!(matches!(
+        gateway.checkpoint(1, |_| 0),
+        Err(CheckpointError::NothingDispatched)
+    ));
+    assert_eq!(gateway.checkpoint_stats(), CheckpointStats::default());
+}
+
+/// #433 review P3: a second checkpoint at the same `group_seq` is refused
+/// up front while the first is recorded or being written; after a failed
+/// write it may be taken again.
+#[test]
+fn a_repeated_checkpoint_is_refused() {
+    let (mut gateway, _job, inbox) = checkpointing();
+    gateway.deliver_external(1, b"", &mut noop()).unwrap();
+    gateway.checkpoint(1, |_| 1).unwrap();
+    let mut written = false;
+    assert!(matches!(
+        gateway.checkpoint(1, |_| {
+            written = true;
+            1
+        }),
+        Err(CheckpointError::Repeated { group_seq: 1 })
+    ));
+    assert!(!written);
+    // Not counted as in flight: refused before the handle.
+    assert_eq!(gateway.checkpoint_stats().in_flight, 0);
+    let request = inbox.take().unwrap();
+    inbox.give_back(request, Err(CheckpointError::Stopped));
+    gateway.checkpoint(1, |_| 1).unwrap();
+    assert_eq!(inbox.take().unwrap().group_seq, 1);
+}
+
+/// #433 review P3: in the drain before a close the group still runs, but
+/// a checkpoint is refused `Stopped`, `write` not called.
+#[test]
+fn a_closing_group_takes_no_checkpoint() {
+    let (mut gateway, mut job, _inbox) = checkpointing();
+    gateway.deliver_external(1, b"", &mut noop()).unwrap();
+    job.drain_to_close(0, &NoRecordings).unwrap();
+    assert_eq!(gateway.sender().state(), GroupState::Running);
+    let mut written = false;
+    assert!(matches!(
+        gateway.checkpoint(1, |_| {
+            written = true;
+            1
+        }),
+        Err(CheckpointError::Stopped)
+    ));
+    assert!(!written);
 }

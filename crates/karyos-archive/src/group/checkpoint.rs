@@ -116,6 +116,13 @@ pub enum CheckpointError {
     /// there is no state after an event to name.
     #[error("no event was dispatched yet")]
     NothingDispatched,
+    /// A checkpoint at this `group_seq` was taken already, and is recorded
+    /// or being written: no event ran since.
+    #[error("a checkpoint at group_seq {group_seq} was taken already")]
+    Repeated {
+        /// The event both name.
+        group_seq: u64,
+    },
     /// No checkpoint is being written, or `advance` was given another
     /// request than `begin`.
     #[error("no checkpoint is being written for this request")]
