@@ -6,12 +6,12 @@
 //! messages over a [`Net`]. It stands beside the single-driver [`crate::sim`],
 //! which it leaves unchanged.
 //!
-//! **Generators.** The run's seed drives two SplitMix64 streams: the
-//! scheduler's, `Rng::new(seed)`, which orders the nodes' ticks, and the
-//! network's, `Rng::new(fault_seed(seed))`, which draws every fault (see
-//! [`crate::net`] for its order). A fault draw therefore never reshuffles
-//! the nodes, and a scripted partition changes only the draws of the
-//! messages it drops.
+//! **Generators.** The run's seed drives the scheduler's SplitMix64
+//! stream, `Rng::new(seed)`, which only orders the nodes' ticks, and the
+//! network's fault seed, [`fault_seed`]: each link draws from its own
+//! stream of it ([`crate::net::link_seed`], and [`crate::net`] for the
+//! draw order). A fault draw never reshuffles the nodes, and a scripted
+//! cut changes no other link's draws.
 //!
 //! **A step**, at each base time unit: the base clock advances by one;
 //! every message due is delivered, in the network's order, to a node that
@@ -24,11 +24,12 @@
 //! it decide what it keeps. What a crash loses from storage is C2's disk
 //! model.
 //!
-//! **The trace** holds every step's events, every draw with its value,
-//! and is digested as the single-driver simulator's is, so a seed
-//! reproduces it byte for byte.
+//! **The trace** holds the setup (the links' default configuration, each
+//! node's clock), every link change, crash and restart in the order made,
+//! and every step's events with each draw's value. It is digested as the
+//! single-driver simulator's is, so a seed reproduces it byte for byte.
 
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 
 use crate::clock::SimClock;
 use crate::net::{Delivery, LinkConfig, LinkConfigError, Net, NetOverflow, NodeId};
@@ -59,9 +60,71 @@ pub struct NodeClock {
     drift_ppm: i64,
 }
 
-/// A clock's time does not fit in `u64`, or its rate is not positive.
+/// A node clock refused or overflowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClockError;
+pub enum ClockError {
+    /// A drift of `-1_000_000` ppm or less: the clock would stop or run
+    /// backwards.
+    Drift {
+        /// The drift asked for.
+        drift_ppm: i64,
+    },
+    /// The node's time does not fit in `u64`.
+    Overflow {
+        /// The base time.
+        base: u64,
+        /// The clock's offset.
+        offset: u64,
+        /// The clock's drift.
+        drift_ppm: i64,
+    },
+}
+
+impl fmt::Display for ClockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Drift { drift_ppm } => {
+                write!(f, "a drift of {drift_ppm} ppm would stop the clock")
+            }
+            Self::Overflow {
+                base,
+                offset,
+                drift_ppm,
+            } => write!(
+                f,
+                "base time {base} with offset {offset} and drift {drift_ppm} ppm overflows"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClockError {}
+
+/// A crash or a restart the host refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeError {
+    /// No node has this id.
+    Unknown(NodeId),
+    /// The node is up: it cannot restart.
+    AlreadyUp(NodeId),
+    /// The node is down: it cannot crash again.
+    AlreadyDown(NodeId),
+    /// The node's clock overflowed.
+    Clock(NodeId, ClockError),
+}
+
+impl fmt::Display for NodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(id) => write!(f, "no node {id}"),
+            Self::AlreadyUp(id) => write!(f, "node {id} is up"),
+            Self::AlreadyDown(id) => write!(f, "node {id} is down"),
+            Self::Clock(id, error) => write!(f, "node {id}'s clock: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for NodeError {}
 
 impl NodeClock {
     /// A view of `base` starting at `offset`, running `drift_ppm` parts
@@ -73,7 +136,7 @@ impl NodeClock {
     /// would stop or run backwards.
     pub fn new(base: SimClock, offset: u64, drift_ppm: i64) -> Result<Self, ClockError> {
         if i128::from(drift_ppm) <= -PPM {
-            return Err(ClockError);
+            return Err(ClockError::Drift { drift_ppm });
         }
         Ok(Self {
             base,
@@ -88,18 +151,21 @@ impl NodeClock {
     ///
     /// [`ClockError`] when it does not fit in `u64`.
     pub fn now(&self) -> Result<u64, ClockError> {
+        let base = self.base.get();
+        let overflow = ClockError::Overflow {
+            base,
+            offset: self.offset,
+            drift_ppm: self.drift_ppm,
+        };
         let rate = PPM
             .checked_add(i128::from(self.drift_ppm))
-            .ok_or(ClockError)?;
-        let scaled = i128::from(self.base.get())
+            .ok_or(overflow)?;
+        let local = i128::from(base)
             .checked_mul(rate)
-            .ok_or(ClockError)?
-            .checked_div(PPM)
-            .ok_or(ClockError)?;
-        let local = scaled
-            .checked_add(i128::from(self.offset))
-            .ok_or(ClockError)?;
-        u64::try_from(local).map_err(|_| ClockError)
+            .and_then(|scaled| scaled.checked_div(PPM))
+            .and_then(|scaled| scaled.checked_add(i128::from(self.offset)))
+            .ok_or(overflow)?;
+        u64::try_from(local).map_err(|_| overflow)
     }
 }
 
@@ -152,17 +218,20 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
     /// [`LinkConfigError`] when `link` is invalid
     /// ([`crate::net::validate`]).
     pub fn new(name: &'static str, seed: u64, link: LinkConfig) -> Result<Self, LinkConfigError> {
-        Ok(Self {
+        let mut sim = Self {
             name,
             seed,
             scheduler: Rng::new(seed),
             base: SimClock::default(),
-            net: Net::new(link, Rng::new(fault_seed(seed)))?,
+            net: Net::new(link, fault_seed(seed))?,
             nodes: Vec::new(),
             step: 0,
             trace: Vec::new(),
             digest: 0xCBF2_9CE4_8422_2325,
-        })
+        };
+        // The links' default configuration.
+        sim.absorb();
+        Ok(sim)
     }
 
     /// Adds `node` on a clock of `offset` and `drift_ppm`; returns its id,
@@ -173,14 +242,18 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
     /// The clock's refusal, and a failure when the ids run out.
     pub fn add_node(&mut self, node: N, offset: u64, drift_ppm: i64) -> Result<NodeId, Failure> {
         let clock = NodeClock::new(self.base.clone(), offset, drift_ppm)
-            .map_err(|_| self.failure(format!("clock drift {drift_ppm} ppm")))?;
+            .map_err(|error| self.failure(format!("a node's clock: {error}")))?;
         let id = NodeId::try_from(self.nodes.len())
-            .map_err(|_| self.failure("node ids exhausted".into()))?;
+            .map_err(|_| self.failure(format!("node ids exhausted at {}", self.nodes.len())))?;
         self.nodes.push(Slot {
             node,
             clock,
             up: true,
         });
+        self.absorb();
+        self.note(format!(
+            "node {id} added: offset {offset}, drift {drift_ppm} ppm"
+        ));
         Ok(id)
     }
 
@@ -257,6 +330,7 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
     fn note(&mut self, event: String) {
         for byte in event.bytes().chain(self.step.to_le_bytes()) {
             self.digest ^= u64::from(byte);
+            // FNV-1a: the multiplication wraps by definition of the hash.
             self.digest = self.digest.wrapping_mul(0x0000_0100_0000_01B3);
         }
         self.trace
@@ -270,16 +344,21 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
         }
     }
 
-    fn overflow(&self, _: NetOverflow) -> Failure {
-        self.failure("network arithmetic overflowed".into())
+    fn overflow(&self, error: NetOverflow) -> Failure {
+        self.failure(format!("network at t={}: {error}", self.base.get()))
     }
 
     fn local(&self, id: NodeId) -> Result<u64, Failure> {
+        self.local_time(id)
+            .map_err(|error| self.failure(error.to_string()))
+    }
+
+    fn local_time(&self, id: NodeId) -> Result<u64, NodeError> {
         self.slot(id)
-            .ok_or_else(|| self.failure(format!("no node {id}")))?
+            .ok_or(NodeError::Unknown(id))?
             .clock
             .now()
-            .map_err(|_| self.failure(format!("node {id}'s clock overflowed")))
+            .map_err(|error| NodeError::Clock(id, error))
     }
 
     /// Sends what `from` put in `out`.
@@ -300,6 +379,7 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
     ///
     /// A failure when the network's arithmetic overflows.
     pub fn send(&mut self, from: NodeId, to: NodeId, message: M) -> Result<u64, Failure> {
+        self.absorb();
         let id = self
             .net
             .send(from, to, message, self.base.get())
@@ -309,25 +389,38 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
     }
 
     /// Crashes `id`: no ticks, and messages due at it are dropped.
-    pub fn crash(&mut self, id: NodeId) {
-        if let Some(slot) = self.slot_mut(id) {
-            slot.up = false;
-            slot.node.crash();
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Unknown`] and [`NodeError::AlreadyDown`]; nothing
+    /// changes.
+    pub fn crash(&mut self, id: NodeId) -> Result<(), NodeError> {
+        let slot = self.slot_mut(id).ok_or(NodeError::Unknown(id))?;
+        if !slot.up {
+            return Err(NodeError::AlreadyDown(id));
         }
+        slot.up = false;
+        slot.node.crash();
+        self.absorb();
         self.note(format!("node {id} crashed"));
+        Ok(())
     }
 
     /// Restarts `id`.
     ///
     /// # Errors
     ///
-    /// A failure when its clock overflows.
-    pub fn restart(&mut self, id: NodeId) -> Result<(), Failure> {
-        let now = self.local(id)?;
-        if let Some(slot) = self.slot_mut(id) {
-            slot.up = true;
-            slot.node.restart(now);
+    /// [`NodeError::Unknown`], [`NodeError::AlreadyUp`] and its clock's
+    /// overflow; nothing changes.
+    pub fn restart(&mut self, id: NodeId) -> Result<(), NodeError> {
+        let now = self.local_time(id)?;
+        let slot = self.slot_mut(id).ok_or(NodeError::Unknown(id))?;
+        if slot.up {
+            return Err(NodeError::AlreadyUp(id));
         }
+        slot.up = true;
+        slot.node.restart(now);
+        self.absorb();
         self.note(format!("node {id} restarted at {now}"));
         Ok(())
     }
@@ -359,7 +452,9 @@ impl<N: Node<M>, M: Clone + Debug> ClusterSim<N, M> {
         self.absorb();
         self.base.advance(1);
         let now = self.base.get();
-        for delivery in self.net.due(now) {
+        let due = self.net.due(now).map_err(|error| self.overflow(error))?;
+        self.absorb();
+        for delivery in due {
             self.deliver(delivery, now)?;
         }
         // The tick order: a draw per position, from the scheduler only.
@@ -448,12 +543,19 @@ impl EchoNode {
     }
 }
 
+/// Timer firings an [`EchoNode`] catches up in one tick; later ones wait
+/// for its next ticks.
+pub const CATCH_UP: u64 = 16;
+
 impl Node<Echo> for EchoNode {
     fn tick(&mut self, now: u64, out: &mut Outbox<Echo>) {
         if self.period == 0 {
             return;
         }
-        while self.next <= now {
+        for _ in 0..CATCH_UP {
+            if self.next > now {
+                return;
+            }
             let (Some(ticks), Some(next)) = (
                 self.ticks.checked_add(1),
                 self.next.checked_add(self.period),
