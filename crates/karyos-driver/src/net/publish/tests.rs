@@ -1909,3 +1909,59 @@ fn a_refused_publication_names_the_lane_it_cannot_reincarnate() {
         }))
     );
 }
+
+/// #396 review P3: a reincarnated network publication draws a fresh
+/// `initial_term_id`, as any announced publication does (SPEC §4, initial
+/// state): incarnation 2's SETUP announces the new draw, not incarnation
+/// 1's. A test pin still wins: pinned, both incarnations take it.
+#[test]
+fn a_reincarnation_draws_its_own_initial_term_id() {
+    for pinned in [None, Some(77)] {
+        let mut driver = match pinned {
+            None => reincarnating_driver(20_000_000, 64),
+            Some(pin) => {
+                let mut network = NetworkConfig {
+                    threading: ThreadingMode::Shared,
+                    ..NetworkConfig::default()
+                };
+                network.agents.sessions.alias_quarantine = 20_000_000;
+                network.stream_defaults.initial_term_id = Some(pin);
+                EmbeddedDriver::with_config(DriverConfig {
+                    network: Some(network),
+                    ..DriverConfig::default()
+                })
+                .unwrap()
+            }
+        };
+        let (_handle, _guard, _epoch, lane, socket) = waiting_reincarnation(&mut driver);
+        let first = driver.stream_ref(lane).unwrap().config.initial_term_id;
+        let mut taken = None;
+        until(&mut driver, |driver| match driver.publication(lane) {
+            Err(DriverError::QuarantinedAlias { .. }) => false,
+            other => {
+                taken = Some(other.map(drop));
+                true
+            }
+        });
+        assert_eq!(taken, Some(Ok(())));
+        let second = driver.stream_ref(lane).unwrap().config.initial_term_id;
+        let mut buffer = [0u8; 2048];
+        let mut announced = None;
+        until(&mut driver, |_| {
+            if let Ok(len) = socket.recv(&mut buffer)
+                && let Ok(Datagram::Control(Control::SetupAnnounce(found))) =
+                    classify(&buffer[..len])
+                && found.identity.incarnation == 2
+            {
+                announced = Some(found.term.initial_term_id);
+            }
+            announced.is_some()
+        });
+        assert_eq!(announced, Some(second.get().cast_signed()));
+        match pinned {
+            // Two draws of 32 bits collide once in 2^32.
+            None => assert_ne!(first, second),
+            Some(pin) => assert_eq!((first.get(), second.get()), (pin, pin)),
+        }
+    }
+}
