@@ -224,8 +224,9 @@ pub enum Dispatched {
 pub struct Divergence {
     /// The event.
     pub group_seq: u64,
-    /// The observation's index within it, or the recorded count for an
-    /// event that ended with fewer observations.
+    /// The observation's index within it: the first that differs, the
+    /// first the handler did not make, or, for a call past the recorded
+    /// observations, their count.
     pub index: u32,
     /// What the recording holds there, as its template id (0 for none).
     pub expected: u16,
