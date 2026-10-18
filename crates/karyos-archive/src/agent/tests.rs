@@ -971,7 +971,7 @@ fn a_prepared_replay_never_attached_expires() {
     let dir = temp_dir("expire");
     let config = AgentConfig {
         max_replays: 1,
-        prepared_timeout: Duration::from_millis(50),
+        prepared_timeout: Duration::from_millis(200),
         ..AgentConfig::default()
     };
     let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
@@ -987,8 +987,20 @@ fn a_prepared_replay_never_attached_expires() {
         answer(agent.post_prepare_replay(prepare)),
         Err(AgentError::Full { .. })
     ));
-    std::thread::sleep(Duration::from_millis(200));
-    let again = answer(agent.post_prepare_replay(prepare)).unwrap();
+    // Refused while the lost one holds the slot, then taken once it
+    // expired: at most five seconds.
+    let begun = std::time::Instant::now();
+    let again = loop {
+        match answer(agent.post_prepare_replay(prepare)) {
+            Ok(again) => break again,
+            Err(AgentError::Full { .. }) => {
+                assert!(begun.elapsed() < Duration::from_secs(5), "never expired");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    };
+    assert!(begun.elapsed() >= Duration::from_millis(100));
     assert_ne!(again.replay_id, lost.replay_id);
     let seen = Arc::default();
     assert!(matches!(
