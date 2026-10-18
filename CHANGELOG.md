@@ -283,6 +283,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The `replay` rejoin through the Archive end to end (phase 3, A6d):
+  karyos-sim's `tests/archive_control.rs` wraps a lapped optional reader
+  in a `ReplayRejoin` whose provider is the Archive's client, over the
+  control streams, with the sim host as its `ReplayTargets`. The gap is
+  replayed from the recording and merged back into the live stream at
+  the resume, every message once, in order, byte-exact. A recording
+  lapped before it was read reports its gap as the replay's local gap and
+  merges what follows; a stream with no recording falls back with
+  `NoRecording`.
 - A removed routed publication sends each lane's EOS on every live path
   (redundant paths; rp-w5b follow-up). A lane is drained once its first
   sends reached its seal on every path that can send now; a path whose
@@ -317,9 +326,11 @@ release may break APIs, wire formats and shared-memory layouts.
   `resume`. A `ReferenceUnavailable` (template 22) marks, in a
   best-effort journal, an ended event whose referenced recording stopped
   before covering it: the order rules take it between events, naming an
-  event that ended, and refuse it in a strict journal; the prefix tracker
-  takes it only for an event waiting on that recording, and counts the
-  event complete.
+  event that ended at or after the first, and refuse it, and payload 3,
+  in a strict journal. The prefix tracker settles a waiting event that
+  references that recording, also after the prefixes stopped, and counts
+  it complete; a mark for an event already durable, or at or past the
+  stop, is a no-op, and one inside the stopping gap is refused.
 - A recording group's three prefixes (phase 3, A7c; SPEC §8.3).
   `karyos_archive::group::prefix::PrefixTracker` tracks `delivered_seq`,
   `complete_recording_seq` and `durable_group_seq`: an event is complete
@@ -1015,7 +1026,9 @@ release may break APIs, wire formats and shared-memory layouts.
   reports the wait, and `DriverError::NetworkReincarnation` is gone. A
   network close or an agent failure before the next incarnation is
   added refuses its lanes (`NetworkUnavailable`, `NetworkAgent`) and
-  leaves them sealed: they never reincarnate locally.
+  leaves them sealed: they never reincarnate locally. Each incarnation
+  draws its own `initial_term_id` before it is announced (SPEC §4,
+  initial state), shared by its lanes; a test pin still wins.
 - The network keeps one time base in every threading mode. In
   `ThreadingMode::Shared` the agents' cycles took the driver's injectable
   clock while their role clocks read `host_monotonic_ns`. On Linux every

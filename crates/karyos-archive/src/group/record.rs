@@ -13,10 +13,10 @@
 //! A best-effort group marks the events it could not capture with a
 //! [`GapMarker`], and a reference its recording will never cover with a
 //! [`ReferenceUnavailable`] (A7d, `recording-group-gateway.md` section
-//! 10). As in A1,
-//! each record is a plain value whose variable field borrows the decoded
-//! input; [`GroupRecord::decode`] validates a whole record before any value
-//! exists, and `encode` writes into the caller's buffer. Nothing allocates.
+//! 10). As in A1, each record is a plain value whose variable field
+//! borrows the decoded input; [`GroupRecord::decode`] validates a whole
+//! record before any value exists, and `encode` writes into the caller's
+//! buffer. Nothing allocates.
 
 use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
 use karyos_sys::frame::{FRAME_ALIGNMENT, Lane};
@@ -1639,6 +1639,9 @@ pub enum Role {
     },
     /// An event's first record, with its `group_seq`.
     Event(u64),
+    /// A message event whose payload was not captured (payload 3), with
+    /// its `group_seq`: an event, which only a best-effort journal holds.
+    Uncaptured(u64),
     /// An observation, with its `group_seq` and index.
     Observation(u64, u32),
     /// An event's end.
@@ -1735,6 +1738,11 @@ impl<'a> GroupRecord<'a> {
                 capture: header.capture,
                 first_group_seq: header.first_group_seq,
             },
+            Self::Message(MessageEvent {
+                group_seq,
+                payload: Payload::Unavailable { .. },
+                ..
+            }) => Role::Uncaptured(*group_seq),
             Self::Message(MessageEvent { group_seq, .. })
             | Self::Conflated(ConflatedEvent { group_seq, .. })
             | Self::Timer(TimerEvent { group_seq, .. })

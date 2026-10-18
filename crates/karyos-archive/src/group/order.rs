@@ -32,11 +32,12 @@ pub enum OrderRule {
     AfterIncomplete,
     /// A gap marker in a strict journal.
     StrictGap,
-    /// A reference unavailable record in a strict journal, or naming an
-    /// event that has not ended (A7d). That the event's payload is by
-    /// reference, and is named once, is the prefix tracker's check: it
-    /// holds the events waiting on their payloads, and this checker holds
-    /// a few words.
+    /// An uncaptured payload (payload 3) or a reference unavailable record
+    /// in a strict journal, or a reference unavailable record naming an
+    /// event before the first or not ended (A7d). That the event's payload
+    /// is by reference, and is named once, is the prefix tracker's check:
+    /// it holds the events waiting on their payloads, and this checker
+    /// holds a few words.
     Unavailable,
     /// A `group_seq` or index past `u64` or `u32`.
     Exhausted,
@@ -74,6 +75,7 @@ enum State {
 pub struct OrderCheck {
     state: State,
     capture: Capture,
+    first_seq: u64,
     next_seq: u64,
     ordinal: u64,
 }
@@ -91,6 +93,7 @@ impl OrderCheck {
         Self {
             state: State::Start,
             capture: Capture::Strict,
+            first_seq: 0,
             next_seq: 0,
             ordinal: 0,
         }
@@ -137,15 +140,19 @@ impl OrderCheck {
                 },
             ) => {
                 self.capture = capture;
+                self.first_seq = first_group_seq;
                 self.next_seq = first_group_seq;
                 Ok(State::Between)
             }
             (State::Start, _) | (_, Role::Header { .. }) => Err(OrderRule::Header),
             (State::Ended, _) => Err(OrderRule::AfterIncomplete),
-            (State::Between, Role::Event(seq)) if seq == self.next_seq => {
+            (State::Between, Role::Uncaptured(_)) if self.capture == Capture::Strict => {
+                Err(OrderRule::Unavailable)
+            }
+            (State::Between, Role::Event(seq) | Role::Uncaptured(seq)) if seq == self.next_seq => {
                 Ok(State::InEvent { seq, index: 0 })
             }
-            (State::Between, Role::Event(_)) => Err(OrderRule::Sequence),
+            (State::Between, Role::Event(_) | Role::Uncaptured(_)) => Err(OrderRule::Sequence),
             (State::Between, Role::Gap(gap)) if gap.to_seq < gap.from_seq => {
                 Err(OrderRule::Invalid)
             }
@@ -159,15 +166,18 @@ impl OrderCheck {
             (State::Between, Role::Gap(_)) => Err(OrderRule::Sequence),
             (State::Between, Role::Unavailable(0)) => Err(OrderRule::Invalid),
             (State::Between, Role::Unavailable(seq))
-                if self.capture == Capture::Strict || seq >= self.next_seq =>
+                if self.capture == Capture::Strict
+                    || seq >= self.next_seq
+                    || seq < self.first_seq =>
             {
                 Err(OrderRule::Unavailable)
             }
             (State::Between, Role::Unavailable(_)) => Ok(State::Between),
             (State::Between, Role::Observation(..) | Role::End(_)) => Err(OrderRule::OutsideEvent),
-            (State::InEvent { .. }, Role::Event(_) | Role::Gap(_) | Role::Unavailable(_)) => {
-                Err(OrderRule::Nested)
-            }
+            (
+                State::InEvent { .. },
+                Role::Event(_) | Role::Uncaptured(_) | Role::Gap(_) | Role::Unavailable(_),
+            ) => Err(OrderRule::Nested),
             (State::InEvent { seq, index }, Role::Observation(of, at)) => {
                 if of != seq {
                     Err(OrderRule::OutsideEvent)
