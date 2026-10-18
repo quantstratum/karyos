@@ -211,6 +211,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A recording group's journal records, schema 3 version 1 (phase 3,
+  A7a; SPEC §8.3, ADR-0024). `karyos_archive::group::record` holds the
+  journal header (group, first `group_seq`, inline threshold, capture
+  contract, clock provenance, strict or best-effort capture, the
+  caller's manifest), five event records (a message with its reserved
+  value, end of stream and trace extension, inline or by reference to a
+  required recording; conflated value; timer; lifecycle; external), four
+  observations (offer, claim and commit outcomes with the client error
+  code; timer create and cancel; external; delivery outcomes), the event
+  end and the gap marker, hand written on the
+  `karyos-codec` runtime as A1. `karyos_archive::group::order` checks a
+  journal's order rules with fixed state. Nothing allocates.
 - A segment store is truncated at the end of a write
   (`SegmentStore::truncate`; phase 3, for a recording group's recovery
   to its complete prefix, SPEC §8.3). Everything after the cut is
