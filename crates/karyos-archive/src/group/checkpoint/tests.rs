@@ -994,7 +994,9 @@ fn a_reopened_range_does_not_claim_old_events_durable() {
     assert_eq!(tracker.advance(at, at, &store), (2, 2));
     let first_range = tracker.first_range().unwrap();
     assert_eq!((first_range.complete, first_range.durable), (0, 0));
-    assert_eq!(view.durable_for(1), DurableFor::Never(0));
+    // Event 1 still settles in the first range (its recording may yet
+    // cover it): pending there, never claimed by the new range.
+    assert_eq!(view.durable_for(1), DurableFor::Pending(0));
     assert_eq!(view.durable_for(2), DurableFor::Never(0));
     at = feed(&mut tracker, &event(3, EndOutcome::Complete), at);
     let _ = tracker.advance(at, at, &store);
@@ -1207,7 +1209,9 @@ fn the_first_range_keeps_settling_after_a_range_opens() {
     // Written to the record's end, durable only to the header.
     assert_eq!(tracker.advance(at, header_end, &store), (2, 0));
     assert_eq!(tracker.first_range().unwrap().durable, 0);
-    assert_eq!(view.durable_for(1), DurableFor::Never(0));
+    // Still settling: not yet, rather than never.
+    assert_eq!(view.durable_for(1), DurableFor::Pending(0));
+    assert_eq!(view.durable_for(2), DurableFor::Never(0));
     // Durable past event 1, not yet past the record.
     let _ = tracker.advance(at, event_end, &store);
     let first = tracker.first_range().unwrap();

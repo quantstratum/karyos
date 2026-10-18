@@ -258,6 +258,7 @@ pub fn capture<D: Disk>(
         emptied: 0,
         signalled: 0,
         signalled_start: None,
+        signalled_first: 0,
         stop_notified: false,
     };
     Ok((sender, job))
@@ -560,6 +561,8 @@ pub struct CaptureJob<D: Disk> {
     /// The range start waiters were last notified of: a waiter on an
     /// event a new range let go must hear of it.
     signalled_start: Option<u64>,
+    /// The first range's durable value waiters were last notified of.
+    signalled_first: u64,
     /// The waiters were told the group stopped.
     stop_notified: bool,
     /// The ring's capacity in bytes.
@@ -712,9 +715,12 @@ impl<D: Disk> CaptureJob<D> {
             self.shared.stopped.store(true, Ordering::Release);
         }
         let start = self.tracker.range().start.map(|start| start.group_seq);
-        if durable > self.signalled || start != self.signalled_start {
+        let first = self.tracker.first_range().map_or(0, |first| first.durable);
+        if durable > self.signalled || start != self.signalled_start || first > self.signalled_first
+        {
             self.signalled = durable;
             self.signalled_start = start;
+            self.signalled_first = first;
             self.shared.notify();
         }
     }

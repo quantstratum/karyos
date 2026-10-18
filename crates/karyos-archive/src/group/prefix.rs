@@ -194,9 +194,12 @@ pub struct PrefixView {
     /// The `group_seq` of the checkpoint that opened the current range; 0
     /// in the journal's first range.
     range_start: AtomicU64,
-    /// The first range's final `durable_group_seq`, once a checkpoint
-    /// opened another.
+    /// The first range's `durable_group_seq`, once a checkpoint opened
+    /// another.
     first_durable: AtomicU64,
+    /// The highest `group_seq` of the first range's events still
+    /// settling, 0 with none: up to it, an event may yet be durable.
+    first_settling: AtomicU64,
 }
 
 /// Whether an event is durable, as [`PrefixView::durable_for`] answers.
@@ -205,10 +208,11 @@ pub enum DurableFor {
     /// It is: the `durable_group_seq` that covers it.
     Reached(u64),
     /// It never will be: an event before the current range that the first
-    /// range's final durable prefix does not cover. The value is that
-    /// prefix.
+    /// range's durable prefix does not cover and that is not still
+    /// settling. The value is that prefix.
     Never(u64),
-    /// Not yet: the current range's `durable_group_seq`.
+    /// Not yet: the current range's `durable_group_seq`, or, for an event
+    /// of the first range still settling, the first range's.
     Pending(u64),
 }
 
@@ -244,9 +248,14 @@ impl PrefixView {
         let durable = self.durable.load(Ordering::Acquire);
         let start = self.range_start.load(Ordering::Acquire);
         if start != 0 && seq <= start {
+            // Settling before durable: an emptied queue's last value is
+            // seen with it.
+            let settling = self.first_settling.load(Ordering::Acquire);
             let first = self.first_durable.load(Ordering::Acquire);
             return if seq <= first {
                 DurableFor::Reached(first)
+            } else if seq <= settling {
+                DurableFor::Pending(first)
             } else {
                 DurableFor::Never(first)
             };
@@ -792,9 +801,11 @@ impl PrefixTracker {
     fn publish(&self) {
         // The range's start before its values (PrefixView::durable_for).
         if let (Some(first), Some(start)) = (self.first, self.start) {
+            let settling = self.settling.back().map_or(0, |waiting| waiting.seq);
             self.view
                 .first_durable
                 .store(first.durable, Ordering::Release);
+            self.view.first_settling.store(settling, Ordering::Release);
             self.view
                 .range_start
                 .store(start.group_seq, Ordering::Release);
