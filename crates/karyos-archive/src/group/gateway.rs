@@ -14,6 +14,8 @@
 
 use thiserror::Error;
 
+use super::capture::Refusal;
+
 use karyos_sys::frame::Lane;
 
 use super::record::{EXTENSION, Freshness, LifecycleKind, Loss, Outcome};
@@ -130,7 +132,7 @@ pub trait Effects {
     /// reserved. `write` gets exactly `length` bytes. No other effect can run
     /// between them: the client's claim borrows its publication until it
     /// is committed. Under replay `write` gets a scratch slice, whose
-    /// digest is checked when it returns true.
+    /// digest is checked at its commit or abort.
     fn claim(
         &mut self,
         publication: PublicationId,
@@ -165,6 +167,10 @@ pub trait Effects {
 pub struct DeliveryOutcome {
     /// The ring's kind code.
     pub kind: u8,
+    /// The publication incarnation.
+    pub incarnation: u64,
+    /// The lost count, for outcomes lost.
+    pub lost: u64,
     /// The lane.
     pub lane: Lane,
     /// The receiver index, for range kinds; else 0.
@@ -230,6 +236,10 @@ pub enum GatewayError {
     /// journal failed.
     #[error("the recording group ended")]
     Ended,
+    /// Strict capture could not record the event, so it was not taken:
+    /// its reason, counted in the Gateway's statistics.
+    #[error("the event was refused: {0}")]
+    Refused(Refusal),
     /// `deliver_external` under replay: external inputs come from the
     /// recording.
     #[error("external events are not delivered in replay")]
@@ -266,6 +276,8 @@ pub trait GroupGateway {
         handler: &mut dyn Handler,
     ) -> Result<Dispatched, GatewayError>;
 }
+
+pub mod live;
 
 #[cfg(test)]
 mod tests {
