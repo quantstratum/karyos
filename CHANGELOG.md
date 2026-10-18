@@ -949,7 +949,10 @@ release may break APIs, wire formats and shared-memory layouts.
   SETUP and its guard gate registered again; the send endpoints stay
   held between incarnations. Remote receivers are assumed to use the
   same `alias_quarantine`. `NetworkPublicationState::Reincarnating`
-  reports the wait, and `DriverError::NetworkReincarnation` is gone.
+  reports the wait, and `DriverError::NetworkReincarnation` is gone. A
+  network close or an agent failure before the next incarnation is
+  added refuses its lanes (`NetworkUnavailable`, `NetworkAgent`) and
+  leaves them sealed: they never reincarnate locally.
 - The network keeps one time base in every threading mode. In
   `ThreadingMode::Shared` the agents' cycles took the driver's injectable
   clock while their role clocks read `host_monotonic_ns`. On Linux every
