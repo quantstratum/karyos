@@ -796,6 +796,16 @@ fn a_checkpoint_compares_the_handlers_state_in_its_events_dispatch() {
     assert_eq!(first, diverged(30));
     assert_eq!(rest, diverged(30), "replay stays stopped");
     assert!(checkpoints.is_empty());
+    // A buffer smaller than the recorded snapshot is the configuration's.
     let (first, _, _) = run(b"state", None);
-    assert_eq!(first, diverged(0), "no state buffer: no state");
+    assert_eq!(
+        first,
+        Err(GatewayError::StateBuffer {
+            group_seq: 1,
+            length: 5
+        })
+    );
+    // A handler that gives no state diverges, found 0.
+    let (first, _, _) = run(&[0u8; 100], Some(64));
+    assert_eq!(first, diverged(0), "no state");
 }

@@ -305,7 +305,10 @@ release may break APIs, wire formats and shared-memory layouts.
   dispatch through the handler's new `checkpoint` hook
   (`ReplayGateway::with_state`); a difference, or no state, is a
   `DivergenceKind::StateCheckpoint` divergence, its index the event's
-  observation count. `Handler` gains `checkpoint` and `restore`, with
+  observation count, and a snapshot above the buffer is
+  `GatewayError::StateBuffer`. `ReplayCursor::step_from` skips the
+  checkpoints below its start; the diff does not compare checkpoints
+  yet. `Handler` gains `checkpoint` and `restore`, with
   default bodies; `CaptureJournal::create_from` starts a capture after a
   checkpoint. Steps allocate nothing.
 

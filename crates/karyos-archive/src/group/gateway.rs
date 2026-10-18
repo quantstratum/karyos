@@ -264,6 +264,16 @@ pub enum GatewayError {
     /// recording.
     #[error("external events are not delivered in replay")]
     ExternalInReplay,
+    /// Replay's state buffer ([`super::replay::gateway::ReplayGateway::with_state`])
+    /// is smaller than a recorded checkpoint's snapshot: its configuration,
+    /// not the handler's state.
+    #[error("checkpoint {group_seq}: a snapshot of {length} bytes, above the state buffer")]
+    StateBuffer {
+        /// The event the checkpoint follows.
+        group_seq: u64,
+        /// The recorded snapshot's length.
+        length: u64,
+    },
     /// A replay's handler diverged from its recording.
     #[error("replay diverged at group_seq {}, observation {}", .0.group_seq, .0.index)]
     Diverged(Divergence),

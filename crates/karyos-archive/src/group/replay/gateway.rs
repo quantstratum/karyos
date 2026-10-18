@@ -186,6 +186,14 @@ impl<D: Disk> ReplayGateway<D> {
                 .into(),
             )
         };
+        // A recorded snapshot larger than the buffer is the replay's
+        // configuration, not the handler's state.
+        if usize::try_from(recorded.length).map_or(true, |length| length > self.state.len()) {
+            return Err(GatewayError::StateBuffer {
+                group_seq: recorded.group_seq,
+                length: recorded.length,
+            });
+        }
         let state = handler
             .checkpoint(&mut self.state)
             .and_then(|length| self.state.get(..length));
@@ -291,13 +299,10 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
         }
         let event = match self.cursor.step() {
             Ok(Step::Event(event)) => event,
-            // A checkpoint not yet compared: compared, then the next event.
-            Ok(Step::Checkpoint(recorded)) => {
-                if let Err(error) = self.check_state(&recorded, handler) {
-                    return self.stop(Err(error));
-                }
-                return self.dispatch(handler);
-            }
+            // Never: an event's checkpoints are compared in its own
+            // dispatch, and one opened at a checkpoint gives none before
+            // its first event.
+            Ok(Step::Checkpoint(_)) => return self.stop(Err(GatewayError::Ended)),
             Ok(Step::Stop(Stop::EndOfPrefix { .. })) => return self.stop(Ok(Dispatched::End)),
             Ok(Step::Stop(Stop::Gap(gap))) => {
                 return self.stop(Err(GatewayError::NotReproducible {

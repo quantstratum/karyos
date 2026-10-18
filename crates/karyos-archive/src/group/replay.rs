@@ -407,7 +407,9 @@ pub(crate) fn allocate<T>(capacity: usize) -> Result<Vec<T>, ReplayError> {
     Ok(vec)
 }
 
-/// The events of a recovered journal's complete prefix, in order.
+/// The events of a recovered journal's complete prefix, in order: the
+/// first range's from the journal's start, or a range's from a checkpoint
+/// in it, each recorded checkpoint given right after its event.
 ///
 /// It allocates only when opened: the buffer, and the events a reference
 /// unavailable names. Each [`ReplayCursor::step`] reads one
@@ -735,8 +737,19 @@ impl<D: Disk> ReplayCursor<D> {
             let mut first = None;
             let mut done = None;
             let mut failed = None;
+            let mut past = false;
+            let (complete_seq, incomplete) = (self.complete_seq, self.incomplete);
             let _ = self.journal.walk(self.position, |position, end, record| {
                 if spans.is_empty() {
+                    // An event past the prefix is not read: the stop is
+                    // found from it, whatever its size.
+                    if let Role::Event(seq) | Role::Uncaptured(seq) = record.role()
+                        && seq > complete_seq
+                        && incomplete != Some(seq)
+                    {
+                        past = true;
+                        return false;
+                    }
                     match record.role() {
                         // Not events: a reference unavailable, and a
                         // checkpoint (A9), which A9-2 replays against.
@@ -796,6 +809,11 @@ impl<D: Disk> ReplayCursor<D> {
                 }
                 true
             })?;
+            if past {
+                self.spans.clear();
+                self.complete_end = self.position;
+                continue;
+            }
             if let Some(error) = failed {
                 self.spans.clear();
                 return Err(error);
@@ -803,15 +821,6 @@ impl<D: Disk> ReplayCursor<D> {
             match (done, first) {
                 // A reference unavailable or a checkpoint record: skipped.
                 (Some((end, false)), _) => self.position = end,
-                // Past the range's complete prefix, though before its end
-                // position (a checkpoint's record that opened the range
-                // lags it): the prefix ends here, and its stop is found
-                // from this event on.
-                (Some(_), Some(group_seq))
-                    if group_seq > self.complete_seq && self.incomplete != Some(group_seq) =>
-                {
-                    self.complete_end = self.position;
-                }
                 (Some((end, true)), Some(group_seq)) if end <= self.complete_end => {
                     self.position = end;
                     self.last_seq = group_seq;

@@ -632,3 +632,114 @@ fn replay_from_the_current_range_stops_at_its_gap() {
         Some(Seen::Stop(Stop::Gap(GapMarker { from_seq: 4, .. })))
     ));
 }
+
+/// #422 re-check P3: an event past the range's prefix is never read, so
+/// one larger than the cursor's buffer (5 records, the room 4), whose
+/// payload waits on a recording that never covers it, still gives the
+/// stop, not a buffer error.
+#[test]
+fn an_oversized_event_past_the_prefix_gives_the_stop() {
+    use crate::group::record::{MessageEvent, Payload, TimerAction, TimerObservation};
+
+    let mut big = encode(&GroupRecord::Message(MessageEvent {
+        group_seq: 4,
+        logical_time: 4,
+        incarnation: 1,
+        position: 0,
+        extent: 64,
+        stream_id: 1,
+        session_id: 1,
+        lane: karyos_sys::frame::Lane::ZERO,
+        reserved_value: 0,
+        end_of_stream: false,
+        extension: None,
+        payload: Payload::Reference {
+            recording_id: 7,
+            length: 10,
+        },
+    }));
+    for index in 0..3 {
+        big.extend(encode(&GroupRecord::TimerOperation(TimerObservation {
+            group_seq: 4,
+            index,
+            timer_id: 9,
+            deadline: 10,
+            action: TimerAction::Create,
+        })));
+    }
+    big.extend(encode(&GroupRecord::End(EventEnd {
+        group_seq: 4,
+        observations: 3,
+        outcome: EndOutcome::Complete,
+    })));
+    let recorded = Recorded::new(
+        Capture::BestEffort,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Records(gap(2, 2)),
+            Write::Records(event(3, EndOutcome::Complete)),
+            Write::Records(big),
+            Write::Checkpoint(3, b"state at 3"),
+        ],
+    );
+    let (_, from) = recorded.replay_from_checkpoint(1).unwrap();
+    assert_eq!(kinds(&from), ["EndOfPrefix { complete_recording_seq: 3 }"]);
+}
+
+/// #422 re-check P3: a capture from a checkpoint starts after it.
+#[test]
+fn a_capture_from_a_checkpoint_starts_after_it() {
+    let mut capture = CaptureJournal::create_from(
+        FaultDisk::default(),
+        Path::new("/capture"),
+        &header(Capture::Strict),
+        b"replay",
+        3,
+        config(),
+    )
+    .unwrap();
+    // Event 3 is the first; event 1 is refused.
+    let records = [
+        GroupRecord::Timer(TimerEvent {
+            group_seq: 1,
+            logical_time: 1,
+            timer_id: 1,
+        }),
+        GroupRecord::Timer(TimerEvent {
+            group_seq: 3,
+            logical_time: 3,
+            timer_id: 3,
+        }),
+    ];
+    assert!(capture.append(&records[0]).is_err());
+    let _ = capture.append(&records[1]).unwrap();
+}
+
+/// #422 re-check: `step_from` skips the checkpoints of the events it
+/// skips, and gives those at or past its start after their events.
+#[test]
+fn step_from_skips_checkpoints_below_its_start() {
+    let recorded = Recorded::new(
+        Capture::Strict,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Checkpoint(1, b"state at 1"),
+            Write::Records(event(2, EndOutcome::Complete)),
+            Write::Records(event(3, EndOutcome::Complete)),
+            Write::Checkpoint(3, b"state at 3"),
+        ],
+    );
+    let store = recorded.store();
+    let recovery = recorded.recovery(&store);
+    let mut cursor =
+        ReplayCursor::open(recorded.journal(), &recovery, &replay_config(), ROOM).unwrap();
+    let mut seen = Vec::new();
+    loop {
+        match cursor.step_from(3).unwrap() {
+            Step::Event(event) => seen.push(format!("e{}", event.group_seq())),
+            Step::Checkpoint(checkpoint) => seen.push(format!("c{}", checkpoint.group_seq)),
+            Step::Stop(_) => break,
+        }
+    }
+    assert_eq!(seen, ["e3", "c3"]);
+}
