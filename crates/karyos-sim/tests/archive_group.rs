@@ -410,3 +410,375 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
         );
     }
 }
+
+/// The output stream the isolation test's handler acts on.
+const OUT: i32 = 43;
+
+/// The real output publication, shared by the live port and the test,
+/// which keeps it open through the replay.
+type Shared = std::sync::Arc<std::sync::Mutex<karyos_client::ClientPublication>>;
+
+/// The live Gateway's port over the driver's real output publication.
+struct DriverPort(Shared);
+
+/// A client offer's outcome as the group records it.
+fn recorded(outcome: OfferOutcome) -> Outcome {
+    match outcome {
+        OfferOutcome::Accepted { lane, position } => Outcome::Accepted { lane, position },
+        OfferOutcome::BackPressured => Outcome::BackPressured,
+        OfferOutcome::AdminAction => Outcome::AdminAction,
+        OfferOutcome::NotConnected => Outcome::NotConnected,
+        other => panic!("{other:?}"),
+    }
+}
+
+impl Port for DriverPort {
+    fn publication(&self, _: PublicationId) -> (i32, i32) {
+        (OUT, 1)
+    }
+    fn offer(&mut self, _: PublicationId, payload: &[u8]) -> Outcome {
+        recorded(self.0.lock().unwrap().offer(payload).unwrap())
+    }
+    fn claim(
+        &mut self,
+        _: PublicationId,
+        length: usize,
+        write: &mut dyn FnMut(&mut [u8]) -> bool,
+    ) -> ClaimCommit {
+        use karyos_client::{ClaimOutcome, CommitOutcome};
+        let mut publication = self.0.lock().unwrap();
+        match publication
+            .try_claim(u32::try_from(length).unwrap())
+            .unwrap()
+        {
+            ClaimOutcome::Claimed(mut claim) => {
+                let (lane, position) = (claim.lane(), claim.position());
+                if write(claim.payload()) {
+                    let commit = match claim.commit() {
+                        CommitOutcome::Accepted { lane, position } => {
+                            Outcome::Accepted { lane, position }
+                        }
+                        CommitOutcome::Aborted { lane, position } => {
+                            Outcome::Aborted { lane, position }
+                        }
+                    };
+                    ClaimCommit {
+                        claim: Outcome::Accepted { lane, position },
+                        commit: Some(commit),
+                    }
+                } else {
+                    claim.abort();
+                    ClaimCommit {
+                        claim: Outcome::Accepted { lane, position },
+                        commit: Some(Outcome::Aborted { lane, position }),
+                    }
+                }
+            }
+            ClaimOutcome::BackPressured => ClaimCommit {
+                claim: Outcome::BackPressured,
+                commit: None,
+            },
+            ClaimOutcome::AdminAction => ClaimCommit {
+                claim: Outcome::AdminAction,
+                commit: None,
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+    fn poll_outcomes(
+        &mut self,
+        _: PublicationId,
+        _: u32,
+        _: &mut dyn FnMut(&DeliveryOutcome),
+    ) -> u32 {
+        0
+    }
+    fn schedule(&mut self, _: TimerId, _: u64) {}
+    fn cancel(&mut self, _: TimerId) {}
+}
+
+/// The handler of the isolation test: every message is answered by one
+/// offer and one claimed, committed message on the output publication.
+fn answer(event: &Event<'_>, effects: &mut dyn Effects) {
+    if let Event::Message { position, .. } = event {
+        let _ = effects.offer(PublicationId(0), &position.to_le_bytes());
+        let _ = effects.claim(PublicationId(0), 8, &mut |bytes| {
+            bytes.copy_from_slice(&position.to_le_bytes());
+            true
+        });
+    }
+}
+
+/// What the driver's counters show of its streams, positions and
+/// clients: every cell but the sampling pass's own epoch and time.
+fn driver_cells(driver: &EmbeddedDriver) -> Vec<(usize, String, u64)> {
+    use karyos_sys::counters::CellRead;
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .filter_map(|index| match reader.read(index) {
+            CellRead::Allocated {
+                metadata, value, ..
+            } => {
+                let label = String::from_utf8_lossy(metadata.label()).into_owned();
+                (!label.starts_with("positions ")).then_some((index, label, value))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The value of the driver's counter `label`.
+fn driver_counter(cells: &[(usize, String, u64)], label: &str) -> Vec<u64> {
+    cells
+        .iter()
+        .filter(|(_, name, _)| name.starts_with(label))
+        .map(|(_, _, value)| *value)
+        .collect()
+}
+
+/// Isolation of external effects (SPEC §15, phase 3; the phase 3 gate
+/// status, gap 5): a group whose handler offers and claims on a driver's
+/// publication is recorded live, then replayed from its first event over
+/// the same driver, running. Replay answers every offer and claim from
+/// the record, so nothing reaches the driver: every one of its counters
+/// (the output stream's head, limit and floor, its subscriber's
+/// position, the streams, leases, clients, commands and claims) reads as
+/// before the replay, and the output subscriber receives nothing. The
+/// cells that moved while recording (each stream's head and limit, the
+/// output subscriber's position among them) are checked one by one, so
+/// none passes by never moving.
+#[test]
+fn a_replayed_group_reaches_nothing_of_a_running_driver() {
+    use karyos_archive::group::prefix::{Coverage, recover};
+    use karyos_archive::group::record::MAX_RECORD;
+    use karyos_archive::group::replay::gateway::{GatewayConfig, ReplayGateway};
+    use karyos_archive::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
+    use karyos_client::MessageLimit;
+
+    /// Every payload is inline: no recording vouches for a reference.
+    struct Inline;
+    impl Coverage for Inline {
+        fn positions(&self, _: u64) -> Option<(u64, u64)> {
+            None
+        }
+        fn ended(&self, _: u64) -> Option<u64> {
+            None
+        }
+    }
+
+    let dir = TempDir::new("isolation");
+    let groups = dir.path().join("groups");
+    std::fs::create_dir_all(&groups).unwrap();
+    // Positions sampled every cycle (every 1 ns), so an offer shows at
+    // once.
+    let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
+        position_sample_interval: 1,
+        ..karyos_driver::DriverConfig::default()
+    })
+    .unwrap();
+    let archive = ArchiveHandle::spawn(StdDisk, dir.path(), AgentConfig::default()).unwrap();
+    let input = driver.add_stream(stream()).unwrap();
+    let output = driver
+        .add_stream(StreamConfig {
+            buffer: LogBufferConfig {
+                stream_id: OUT,
+                ..stream().buffer
+            },
+            ..stream()
+        })
+        .unwrap();
+    let sender = archive
+        .start_group(StartGroup {
+            group_id: 1,
+            dir: groups.clone(),
+            new: Some(NewGroup {
+                first_group_seq: 1,
+                // Inline: the input is not recorded, so nothing is by
+                // reference.
+                inline_threshold: 4096,
+                capture: Capture::Strict,
+                manifest: b"iso".to_vec(),
+            }),
+            journal: JOURNAL,
+            capture: CaptureConfig {
+                ring_capacity: 1 << 16,
+                max_event: 4096,
+                in_flight: 64,
+            },
+            checkpoints: None,
+        })
+        .unwrap();
+    let waiter = sender.waiter();
+    let started = Instant::now();
+    let clock = move || u64::try_from(started.elapsed().as_nanos()).unwrap();
+    // Open through the replay: a replay that reached it would publish.
+    let real: Shared =
+        std::sync::Arc::new(std::sync::Mutex::new(driver.publication(output).unwrap()));
+    let port = DriverPort(std::sync::Arc::clone(&real));
+    let mut gateway = Gateway::new(port, clock, sender, Capture::Strict, 1, 4096, 4).unwrap();
+    let mut out_reader = driver.subscribe(output, Role::Required).unwrap();
+    let identity = SourceIdentity {
+        incarnation: 1,
+        stream_id: STREAM,
+        session_id: 1,
+        lane: Lane::ZERO,
+    };
+    let word = archive
+        .recording_word(STREAM, 1, Lane::ZERO)
+        .unwrap()
+        .unwrap_or_default();
+    let _ = gateway
+        .add_subscription(
+            Box::new(driver.subscribe(input, Role::Required).unwrap()),
+            identity,
+            word,
+        )
+        .unwrap();
+    let mut publication = driver.publication(input).unwrap();
+    // The cells as recording starts: the replay check compares the ones
+    // that move while recording, so none of them passes by never moving.
+    for _ in 0..10 {
+        driver.do_work().unwrap();
+    }
+    let at_start = driver_cells(&driver);
+    // Live: the handler's effects reach the driver, two per message.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut published, mut dispatched, mut answered) = (0, 0, 0u64);
+    let mut handler = answer;
+    while dispatched < MESSAGES || answered < 2 * MESSAGES {
+        if published < MESSAGES
+            && let OfferOutcome::Accepted { .. } = publication.offer(&payload(published)).unwrap()
+        {
+            published += 1;
+        }
+        driver.do_work().unwrap();
+        if let Ok(Dispatched::Event { .. }) = gateway.dispatch(&mut handler) {
+            dispatched += 1;
+        }
+        let _ = out_reader
+            .poll(|_, _| answered += 1, MessageLimit::new(16))
+            .unwrap();
+        assert!(Instant::now() < deadline, "live: {dispatched} {answered}");
+    }
+    let durable = loop {
+        driver.do_work().unwrap();
+        match waiter.wait_durable(MESSAGES, Duration::from_millis(20)) {
+            Ok(durable) => break durable,
+            Err(_) => assert!(Instant::now() < deadline, "never durable"),
+        }
+    };
+    assert_eq!(durable, MESSAGES);
+    archive.stop_group(1).unwrap();
+    drop(publication);
+    drop(gateway);
+    archive.shutdown().unwrap();
+
+    // Replay over the same driver, running: the output stream and its
+    // subscriber stay; the driver settles first so its cells are stable.
+    for _ in 0..100 {
+        driver.do_work().unwrap();
+    }
+    let before = driver_cells(&driver);
+    let moved: Vec<&(usize, String, u64)> = before
+        .iter()
+        .filter(|cell| {
+            at_start
+                .iter()
+                .find(|start| start.0 == cell.0 && start.1 == cell.1)
+                .is_none_or(|start| start.2 != cell.2)
+        })
+        .collect();
+    // What the handler's offers and claims move: each stream's head and
+    // limit, and the output subscriber's position.
+    for label in ["stream head", "stream limit", "subscriber position"] {
+        assert!(
+            moved.iter().any(|(_, name, _)| name.starts_with(label)),
+            "no {label} cell moved while recording: {moved:?}"
+        );
+    }
+    // Exactly: one offer and one claim of 8 bytes per message, each a
+    // 64-byte frame (its 32-byte header and payload, aligned), on the
+    // output stream from 0; its subscriber read them all.
+    let answers = 2 * MESSAGES * 64;
+    let from_zero = |label: &str| {
+        moved.iter().any(|(index, name, value)| {
+            name.starts_with(label)
+                && *value == answers
+                && at_start
+                    .iter()
+                    .any(|start| start.0 == *index && start.2 == 0)
+        })
+    };
+    assert!(from_zero("stream head"), "output head: {moved:?}");
+    assert!(from_zero("subscriber position"), "output reader: {moved:?}");
+    // `commands served` counts CnC commands; every call here is the
+    // embedded driver's own, so it reads 0 throughout, and the full
+    // comparison below holds it there.
+    assert_eq!(driver_counter(&before, "commands served"), [0]);
+    let mut journal = GroupJournal::recover(StdDisk, &groups, 1, JOURNAL)
+        .unwrap()
+        .journal;
+    let recovery = recover(&mut journal, &Inline, 64).unwrap();
+    let cursor = ReplayCursor::open(
+        journal,
+        &recovery,
+        &ReplayConfig {
+            manifest: b"iso",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 8 * MAX_RECORD,
+            records: 8,
+        },
+    )
+    .unwrap();
+    let mut replay = ReplayGateway::new(
+        cursor,
+        &GatewayConfig {
+            publications: &[(OUT, 1)],
+            subscriptions: &[(STREAM, 1)],
+            conflated: &[],
+            max_claim: 8,
+            max_payload: 4096,
+            present_unavailable: false,
+        },
+        None,
+    )
+    .unwrap();
+    let mut replayed = 0u64;
+    loop {
+        driver.do_work().unwrap();
+        match replay.dispatch(&mut handler) {
+            Ok(Dispatched::Event { .. }) => replayed += 1,
+            Ok(Dispatched::End) => break,
+            other => panic!("replay: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "replay never ended");
+    }
+    assert_eq!(replayed, MESSAGES);
+    for _ in 0..100 {
+        driver.do_work().unwrap();
+    }
+    let mut extra = 0u64;
+    let _ = out_reader
+        .poll(|_, _| extra += 1, MessageLimit::new(64))
+        .unwrap();
+    assert_eq!(extra, 0, "replay published on the driver");
+    let after = driver_cells(&driver);
+    assert_eq!(
+        driver_counter(&after, "stream head"),
+        driver_counter(&before, "stream head")
+    );
+    for (index, label, value) in &moved {
+        let now = after
+            .iter()
+            .find(|cell| cell.0 == *index && cell.1 == *label);
+        assert_eq!(
+            now.map(|cell| cell.2),
+            Some(*value),
+            "{label} moved during replay"
+        );
+    }
+    assert_eq!(after, before, "the driver's counters moved during replay");
+    drop(real);
+}
