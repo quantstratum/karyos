@@ -849,6 +849,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A recording group's records hold only what their sources present
+  (#382 review P3s): a delivery outcome takes a receiver only on a
+  range-side kind and a lost count only on outcomes lost, as the outcome
+  ring does; a failure's details are 0 where its variant has no field,
+  and an absent `Option` is 0 in both. `record::EXTENSION` is tied to the
+  frame's extension length at compile time, and the segment store's
+  index header buffers use one named length.
 - The segment store's arithmetic is checked (SPEC §14): five
   saturating operations in the interval sync and in recovery's counts
   are checked ones. A clock that steps back still syncs nothing.

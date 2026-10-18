@@ -638,13 +638,15 @@ fn samples() -> Vec<GroupRecord<'static>> {
             session_id: 1,
             kind,
             lane: lane(3),
-            receiver: u16::MAX,
+            // As the ring writes them: a receiver on range-side kinds, a
+            // lost count on outcomes lost only.
+            receiver: if kind >= 16 { u16::MAX } else { 0 },
             incarnation: u64::MAX,
             start: 1,
             end: 2,
             epoch: 3,
             reason: u64::MAX,
-            lost: 4,
+            lost: if kind == 19 { 4 } else { 0 },
         }));
     }
     samples.push(GroupRecord::TimerOperation(TimerObservation {
@@ -1153,4 +1155,84 @@ proptest! {
         let _ = GroupRecord::decode(&vector(id, block, &[]));
         let _ = GroupRecord::decode(&vector(id, block, &[&value, &value]));
     }
+}
+
+/// #382 review P3: a delivery record holds only what the ring presents: a
+/// receiver on a range-side kind, a lost count on outcomes lost.
+#[test]
+fn a_delivery_holds_only_what_the_ring_writes() {
+    // Kind 1 (submitted) with a receiver, or with a lost count.
+    assert_eq!(
+        refused(&mutated(DELIVERY, 68, 1, 2)),
+        CodecError::ValueOutOfRange { field: "receiver" }
+    );
+    assert_eq!(
+        refused(&mutated(DELIVERY, 48, 1, 8)),
+        CodecError::ValueOutOfRange { field: "lost" }
+    );
+    // A range (16) takes a receiver; only outcomes lost (19) a count.
+    let mut range = mutated(DELIVERY, 70, 16, 1);
+    range[12 + 68..12 + 70].copy_from_slice(&3u16.to_le_bytes());
+    assert!(GroupRecord::decode(&range).is_ok());
+    range[12 + 48] = 1;
+    assert_eq!(
+        refused(&range),
+        CodecError::ValueOutOfRange { field: "lost" }
+    );
+}
+
+/// #382 review P3: a field a variant does not have is 0 (the note's 5.1
+/// table), and an `Option`'s flag is 0 or 1, its value 0 when absent.
+#[test]
+fn a_failure_holds_only_its_variants_fields() {
+    let detail = CodecError::ValueOutOfRange { field: "detail" };
+    let failure = |error: u16, sub: u16, first: u64, second: u64| {
+        vector(
+            11,
+            &Fields::new(51)
+                .u64(0, 1)
+                .u64(16, first)
+                .u64(24, second)
+                .i32(36, 1)
+                .i32(40, 1)
+                .u16(44, error)
+                .u16(46, sub)
+                .u8(48, 1)
+                .u8(49, 9)
+                .0,
+            &[],
+        )
+    };
+    // EmptyMessage has no field; PositionsExhausted one; MessageTooLarge two.
+    assert_eq!(refused(&failure(2, 0, 5, 0)), detail);
+    assert_eq!(refused(&failure(3, 0, 5, 6)), detail);
+    assert!(GroupRecord::decode(&failure(3, 0, 5, 0)).is_ok());
+    assert!(GroupRecord::decode(&failure(1, 0, 5, 6)).is_ok());
+    // Inner variants: Conflation::Closed none, Sys::Protocol none,
+    // Conductor::InvalidChannel one.
+    assert_eq!(refused(&failure(5, 5, 1, 0)), detail);
+    assert_eq!(refused(&failure(11, 14, 1, 0)), detail);
+    assert_eq!(refused(&failure(15, 10, 1, 2)), detail);
+    // An Option: ViewClosed::ImageRetired and Attach::IncompatibleVersion.
+    assert_eq!(refused(&failure(20, 4, 0, 2)), detail);
+    assert_eq!(refused(&failure(20, 4, 7, 0)), detail);
+    assert_eq!(refused(&failure(14, 2, 7, 0)), detail);
+    assert!(GroupRecord::decode(&failure(14, 2, 7, 1)).is_ok());
+    assert!(GroupRecord::decode(&failure(14, 2, 0, 0)).is_ok());
+    // The encoder refuses the same.
+    let mut out = vec![0u8; MAX_RECORD];
+    let record = GroupRecord::Outcome(OutcomeObservation {
+        group_seq: 1,
+        index: 0,
+        stream_id: 1,
+        session_id: 1,
+        operation: Operation::Offer,
+        outcome: Outcome::Failed {
+            error: 2,
+            sub: 0,
+            detail: 5,
+            detail2: 0,
+        },
+    });
+    assert_eq!(record.encode(&mut out), Err(detail));
 }
