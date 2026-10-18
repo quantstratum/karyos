@@ -18,7 +18,9 @@ release may break APIs, wire formats and shared-memory layouts.
   to 110 bytes, and a descriptor whose `written` lies below its start or
   away from its stop is refused. A replay target's session id is the
   replay id's low 32 bits (`server::replay_session_id`), and
-  `ArchiveHost::open_replay` takes the replay id.
+  `ArchiveHost::open_replay` takes the replay id. A prepared replay whose
+  sink never comes is dropped after `AgentConfig::prepared_timeout`, so
+  it no longer holds a replay's slot.
 - The Archive is controlled over streams (phase 3, A5c).
   `karyos_archive::server::ControlServer` reads A1's requests from a
   `RequestSource`, serves them with the agent and answers on a

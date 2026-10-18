@@ -962,3 +962,40 @@ fn a_recording_whose_store_cannot_be_created_stops_empty() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// #387 re-check P3-1: a prepared replay whose sink never comes, its
+/// attach or stop lost, is dropped after the timeout: its slot is free
+/// again, and a late attach finds it gone and finishes its sink.
+#[test]
+fn a_prepared_replay_never_attached_expires() {
+    let dir = temp_dir("expire");
+    let config = AgentConfig {
+        max_replays: 1,
+        prepared_timeout: Duration::from_millis(50),
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    let (recording, _) = sealed_recording(&agent);
+    let prepare = PrepareReplay {
+        recording_id: recording,
+        position: 0,
+        length: u64::MAX,
+        rate: Rate::Full,
+    };
+    let lost = answer(agent.post_prepare_replay(prepare)).unwrap();
+    assert!(matches!(
+        answer(agent.post_prepare_replay(prepare)),
+        Err(AgentError::Full { .. })
+    ));
+    std::thread::sleep(Duration::from_millis(200));
+    let again = answer(agent.post_prepare_replay(prepare)).unwrap();
+    assert_ne!(again.replay_id, lost.replay_id);
+    let seen = Arc::default();
+    assert!(matches!(
+        answer(agent.post_attach_replay(lost.replay_id, 0, Box::new(Sink::new(&seen)))),
+        Err(AgentError::Unknown { .. })
+    ));
+    assert_eq!(seen.lock().unwrap().finished, Some((0, false)));
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -770,6 +770,9 @@ fn the_server_never_waits_for_the_agent() {
     let mut rig = Rig::new("never-blocks", host);
     rig.request(&start(1));
     rig.sent(2);
+    // Dropped before the rig: a failed assertion opens the gate, so the
+    // rig's shutdown does not wait on a read the gate holds.
+    let _open = OpenOnDrop(Arc::clone(&gate));
     gate.store(false, Ordering::Release);
     // Let the agent's thread reach the read and block there.
     std::thread::sleep(Duration::from_millis(50));
@@ -788,6 +791,15 @@ fn the_server_never_waits_for_the_agent() {
     let sent = rig.sent(4);
     assert_eq!(response(&sent[2]).correlation_id, 2);
     rig.finish();
+}
+
+/// Opens a gate when dropped.
+struct OpenOnDrop(Arc<AtomicBool>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// The longest answer is a descriptor with the longest channel.
