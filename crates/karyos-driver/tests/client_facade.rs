@@ -612,12 +612,14 @@ mod remote {
     /// IPC drivers, a remote client publishes by `karyos:udp` and another
     /// subscribes by it; the subscriber reads the exact sequence from the
     /// image, whose lanes it fetched as regions, and drops the image once
-    /// its publication goes.
+    /// the publisher removes its publication: the removal ends the image at
+    /// its EOS while the publisher stays connected.
     #[test]
     fn a_remote_udp_publication_reaches_a_remote_udp_subscription() {
         let (_a, a_dir) = ipc_network_driver("udp-pub", 500_000_000);
-        // The receiver retires an image half a second after its sender goes.
-        let (_b, b_dir) = ipc_network_driver("udp-sub", 500_000_000);
+        // A minute: within the wait below, the image can end only at its
+        // EOS, never at its liveness timeout.
+        let (_b, b_dir) = ipc_network_driver("udp-sub", 60_000_000_000);
         let mut publisher = connect(&a_dir);
         let mut subscriber = connect(&b_dir);
         let port = port();
@@ -668,15 +670,67 @@ mod remote {
         }
         assert_eq!(reading.image_count(), 1);
         assert_eq!(reading.images_refused(), 0);
-        // The publisher goes: a remote client's network publication ends
-        // with its client (its registration ends with its grant), and the
-        // removal ends the image.
-        drop(publication);
-        drop(publisher);
-        until(&mut [&mut subscriber], || {
+        // The publication goes, its client stays: the driver removes the
+        // network publication the client created by URI, which ends the
+        // image at its EOS.
+        publisher.remove_publication(publication);
+        until(&mut [&mut subscriber, &mut publisher], || {
             let _ = reading.poll(|_, _| {}, MessageLimit::new(16));
             reading.image_count() == 0
         });
+        // Still served.
+        let _ = publisher
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
+    }
+
+    /// Releasing a remote client's `karyos:ipc` publication removes only its
+    /// registration: the stream stays, and a subscription of it reads every
+    /// message offered before the release.
+    #[test]
+    fn a_released_remote_ipc_publication_leaves_its_stream() {
+        let (_driver, dir) = ipc_driver("ipc-release");
+        let mut client = connect(&dir);
+        let mut reading = client
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(3))
+            .unwrap();
+        let mut sent = 0u32;
+        let start = Instant::now();
+        while sent < 16 {
+            assert!(start.elapsed() < Duration::from_secs(20), "sent {sent}");
+            let _ = client.poll();
+            match publication.offer(&sent.to_le_bytes()) {
+                Ok(_) => sent += 1,
+                Err(
+                    OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected,
+                ) => std::thread::sleep(Duration::from_micros(100)),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        client.remove_publication(publication);
+        let mut seen = 0u32;
+        let start = Instant::now();
+        while seen < sent {
+            assert!(start.elapsed() < Duration::from_secs(20), "seen {seen}");
+            let _ = client.poll();
+            let _ = reading
+                .poll(
+                    |bytes, _| {
+                        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                        seen += 1;
+                    },
+                    MessageLimit::new(8),
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        // The stream is still there, and the client still served.
+        let _ = client
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
     }
 
     /// `connect` needs the driver's directory.

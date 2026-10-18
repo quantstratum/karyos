@@ -484,8 +484,9 @@ impl Connection for crate::ipc::RemoteClient {
     }
 
     fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) {
-        // Dropped: the handle detaches its export and ends its registration.
-        drop(publication);
+        // A handle that cannot be removed now is dropped: it detaches its
+        // export, and its registration ends with the client.
+        let _ = crate::ipc::RemoteClient::remove_publication(self, publication);
     }
 
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError> {
