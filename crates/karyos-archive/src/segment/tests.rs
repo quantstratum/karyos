@@ -26,6 +26,70 @@ fn geometry() -> Geometry {
     Geometry::new(64, 128).unwrap()
 }
 
+/// Recovers through [`SegmentStore::recover`], checking it against
+/// [`SegmentStore::verify`] first: verify leaves every byte, name and
+/// sync of the disk as it was, and recover then does exactly what its
+/// plan said, or refuses with the same error and changes nothing.
+fn recover_checked(
+    disk: FaultDisk,
+    dir: &Path,
+    recording: u64,
+    geometry: Geometry,
+    policy: SyncPolicy,
+) -> Result<Recovered<FaultDisk>, SegmentError> {
+    let before = disk.snapshot();
+    let plan = SegmentStore::verify(disk.clone(), dir, recording, geometry);
+    assert_eq!(disk.snapshot(), before, "verify changed the disk");
+    let recovered = SegmentStore::recover(disk.clone(), dir, recording, geometry, policy);
+    let mut probe = disk.clone();
+    let exists = |probe: &mut FaultDisk, name: String| probe.open(&dir.join(name)).is_ok();
+    match (&plan, &recovered) {
+        (Ok(plan), Ok(recovered)) => {
+            let kept = plan.kept.expect("a kept segment");
+            assert_eq!(plan.cut, recovered.cut);
+            assert_eq!(
+                plan.dropped.len(),
+                usize::try_from(recovered.dropped_segments).unwrap()
+            );
+            assert_eq!(
+                (kept.start, kept.written, kept.written),
+                (
+                    recovered.store.start(),
+                    recovered.store.written(),
+                    recovered.store.durable()
+                )
+            );
+            let data = probe
+                .open(&dir.join(data_name(recording, kept.base)))
+                .unwrap();
+            let index = probe
+                .open(&dir.join(index_name(recording, kept.base)))
+                .unwrap();
+            assert!(probe.len(&data).unwrap() <= kept.written - kept.base);
+            // The kept index ends at its last kept entry, cut or not.
+            let entries_end = entry_offset(kept.entries).unwrap();
+            assert_eq!(probe.len(&index).unwrap(), entries_end);
+            assert!(kept.index_length.is_none_or(|length| length == entries_end));
+        }
+        (Ok(plan), Err(SegmentError::NotFound { .. })) => assert!(plan.kept.is_none()),
+        (Err(planned), Err(refused)) => {
+            assert_eq!(planned.to_string(), refused.to_string());
+            assert_eq!(disk.snapshot(), before, "a refusal changed the disk");
+        }
+        (plan, recovered) => panic!(
+            "verify {plan:?} disagrees with recover {:?}",
+            recovered.as_ref().map(|recovered| recovered.cut)
+        ),
+    }
+    if let Ok(plan) = &plan {
+        for dropped in &plan.dropped {
+            assert!(!exists(&mut probe, data_name(recording, dropped.base)));
+            assert!(!exists(&mut probe, index_name(recording, dropped.base)));
+        }
+    }
+    recovered
+}
+
 /// The recorded stream: byte `i` of the recording.
 fn stream(length: usize) -> Vec<u8> {
     (0..length)
@@ -125,7 +189,7 @@ fn check(
 ) -> Result<(), String> {
     let disk = crashed.after_crash(survives);
     let dir = Path::new(DIR);
-    let recovered = match SegmentStore::recover(disk, dir, RECORDING, geometry(), policy) {
+    let recovered = match recover_checked(disk, dir, RECORDING, geometry(), policy) {
         Ok(recovered) => recovered,
         Err(SegmentError::NotFound { .. }) if !reported.created => return Ok(()),
         Err(error) => return Err(format!("recovery failed: {error}")),
@@ -262,7 +326,7 @@ fn a_crash_mid_roll_keeps_the_previous_segment() {
         if !disk.has_crashed() {
             continue;
         }
-        let recovered = SegmentStore::recover(
+        let recovered = recover_checked(
             disk.after_crash(Survives::Synced),
             Path::new(DIR),
             RECORDING,
@@ -300,7 +364,7 @@ fn an_empty_last_segment_recovers() {
     store.roll(128).unwrap();
     assert_eq!(store.close().unwrap(), 128);
     let recovered =
-        SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::PerSegment).unwrap();
+        recover_checked(disk, dir, RECORDING, geometry(), SyncPolicy::PerSegment).unwrap();
     assert_eq!(recovered.cut, None);
     assert_eq!(recovered.store.written(), 128);
 }
@@ -315,7 +379,7 @@ fn a_torn_entry_is_cut_and_reported() {
     // The last write is the second entry: stop 5 bytes into it.
     let disk = FaultDisk::with_budget(used - 27);
     let _ = run(disk.clone(), &steps, SyncPolicy::None, 0, false);
-    let recovered = SegmentStore::recover(
+    let recovered = recover_checked(
         disk.after_crash(Survives::Everything),
         Path::new(DIR),
         RECORDING,
@@ -547,7 +611,7 @@ fn a_geometry_mismatch_is_refused_and_removes_nothing() {
     let before = raw.list(dir).unwrap().len();
     let other = Geometry::new(64, 256).unwrap();
     assert!(matches!(
-        SegmentStore::recover(disk.clone(), dir, RECORDING, other, SyncPolicy::PerSegment),
+        recover_checked(disk.clone(), dir, RECORDING, other, SyncPolicy::PerSegment),
         Err(SegmentError::BadHeader {
             problem: HeaderProblem::Mismatch,
             ..
@@ -556,7 +620,7 @@ fn a_geometry_mismatch_is_refused_and_removes_nothing() {
     assert_eq!(raw.list(dir).unwrap().len(), before, "nothing removed");
     // With its own geometry it recovers whole.
     let recovered =
-        SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::PerSegment).unwrap();
+        recover_checked(disk, dir, RECORDING, geometry(), SyncPolicy::PerSegment).unwrap();
     assert_eq!(recovered.store.written(), 300);
 }
 
@@ -588,7 +652,7 @@ fn bad_headers_are_typed_errors() {
         store.close().unwrap();
     };
     let recover = |disk: &FaultDisk| {
-        SegmentStore::recover(
+        recover_checked(
             disk.clone(),
             Path::new(DIR),
             RECORDING,
@@ -782,6 +846,103 @@ fn bad_headers_are_typed_errors() {
     assert_eq!(recovered.dropped_segments, 1);
 }
 
+/// The creation gap: a last segment with a valid index header, no entry
+/// and no data file is a creation cut short (the data file's directory
+/// entry did not survive the crash, the index's did). Recovery removes it,
+/// as `verify` reports first, and the recording ends where the previous
+/// segment does.
+#[test]
+fn a_last_segment_without_its_data_file_is_a_creation_cut_short() {
+    let disk = FaultDisk::default();
+    {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(256)).unwrap();
+        store.roll(256).unwrap();
+        store.close().unwrap();
+    }
+    let mut raw = disk.clone();
+    raw.remove(&Path::new(DIR).join(data_name(RECORDING, 256)))
+        .unwrap();
+    let plan = SegmentStore::verify(disk.clone(), Path::new(DIR), RECORDING, geometry()).unwrap();
+    assert_eq!(
+        plan.dropped,
+        [DroppedSegment {
+            base: 256,
+            reason: DropReason::CreationGap
+        }]
+    );
+    assert_eq!(plan.cut, None);
+    assert_eq!(
+        plan.kept.map(|kept| (kept.base, kept.written)),
+        Some((128, 256))
+    );
+    let recovered = recover_checked(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    assert_eq!(recovered.store.written(), 256);
+    assert_eq!(recovered.dropped_segments, 1);
+    assert!(
+        raw.open(&Path::new(DIR).join(index_name(RECORDING, 256)))
+            .is_err()
+    );
+}
+
+/// The same state before the last segment is never a creation: a middle
+/// segment with a valid header, no entry and no data file lost its data
+/// file, and recovery refuses it and removes nothing.
+#[test]
+fn a_middle_segment_without_its_data_file_is_refused() {
+    let disk = FaultDisk::default();
+    {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(384)).unwrap();
+        store.close().unwrap();
+    }
+    let mut raw = disk.clone();
+    raw.remove(&Path::new(DIR).join(data_name(RECORDING, 128)))
+        .unwrap();
+    let index = raw
+        .open(&Path::new(DIR).join(index_name(RECORDING, 128)))
+        .unwrap();
+    raw.set_len(&index, HEADER).unwrap();
+    let before = disk.snapshot();
+    assert!(matches!(
+        recover_checked(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+        ),
+        Err(SegmentError::BadHeader {
+            base: 128,
+            problem: HeaderProblem::Incomplete
+        })
+    ));
+    assert_eq!(disk.snapshot(), before);
+}
+
 /// #339 review P2: the interval policy does not sync at a roll; its next
 /// tick syncs the finished segment and the open one.
 #[test]
@@ -880,7 +1041,7 @@ fn a_torn_range_under_a_valid_entry_is_cut() {
             raw.write_at(&data, 50, &[0xEE; 4]).unwrap();
         }
         let recovered =
-            SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::None).unwrap();
+            recover_checked(disk, dir, RECORDING, geometry(), SyncPolicy::None).unwrap();
         assert_eq!(
             recovered.cut,
             Some(Cut {
@@ -1000,7 +1161,7 @@ fn check_pieces(
     pieces: &[Piece],
     start: u64,
 ) -> Result<(), String> {
-    let recovered = match SegmentStore::recover(
+    let recovered = match recover_checked(
         crashed.after_crash(survives),
         Path::new(DIR),
         RECORDING,
@@ -1186,7 +1347,7 @@ fn an_unknown_entry_kind_is_refused() {
     let index = raw.open(&dir.join(index_name(RECORDING, 0))).unwrap();
     raw.write_at(&index, HEADER + ENTRY, &bytes).unwrap();
     assert!(matches!(
-        SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::None),
+        recover_checked(disk, dir, RECORDING, geometry(), SyncPolicy::None),
         Err(SegmentError::UnknownEntryKind {
             position: 10,
             kind: 9
@@ -1217,7 +1378,7 @@ fn a_fill_whose_extent_is_not_in_the_file_is_cut() {
     let data = raw.open(&dir.join(data_name(RECORDING, 0))).unwrap();
     raw.set_len(&data, 10 + 40).unwrap();
     let recovered =
-        SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::PerSegment).unwrap();
+        recover_checked(disk, dir, RECORDING, geometry(), SyncPolicy::PerSegment).unwrap();
     assert_eq!(recovered.store.written(), 10);
     assert_eq!(
         recovered.cut,
@@ -1290,7 +1451,7 @@ fn an_index_with_too_many_gaps_is_refused() {
     raw.write_at(&index, HEADER + entries * ENTRY, &entry.encode())
         .unwrap();
     assert!(matches!(
-        SegmentStore::recover(disk, dir, RECORDING, geometry, SyncPolicy::None),
+        recover_checked(disk, dir, RECORDING, geometry, SyncPolicy::None),
         Err(SegmentError::TooManyGaps)
     ));
 }
@@ -1361,7 +1522,7 @@ fn a_truncation_holds_once_it_returns() {
         Err(SegmentError::OutOfRange { .. })
     ));
     for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
-        let recovered = SegmentStore::recover(
+        let recovered = recover_checked(
             disk.after_crash(survives),
             dir,
             RECORDING,
