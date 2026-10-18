@@ -1968,6 +1968,28 @@ pub(crate) mod testing {
         )
     }
 
+    /// [`outbound_timed`] over a reliable channel.
+    pub(crate) fn outbound_timed_reliable(
+        endpoint: EndpointId,
+        alias: Alias,
+        destination: SocketAddr,
+        term: TermParams,
+        capacity: u32,
+    ) -> (Box<Outbound>, TestLog) {
+        build(
+            endpoint,
+            alias,
+            destination,
+            term,
+            1,
+            true,
+            0,
+            None,
+            None,
+            capacity,
+        )
+    }
+
     /// [`outbound`], with `before` 1000-byte messages appended on each lane
     /// before its reader subscribes: the reader joins above 0.
     pub(crate) fn outbound_joined(
