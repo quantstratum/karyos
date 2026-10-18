@@ -1922,8 +1922,6 @@ pub(crate) mod testing {
         outbound_joined(endpoint, alias, destination, term, lanes, reliable, 0)
     }
 
-    /// [`outbound`], with `before` 1000-byte messages appended on each lane
-    /// before its reader subscribes: the reader joins above 0.
     /// [`outbound`] of one lane with a schedule ring of `capacity`.
     pub(crate) fn outbound_timed(
         endpoint: EndpointId,
@@ -1946,6 +1944,8 @@ pub(crate) mod testing {
         )
     }
 
+    /// [`outbound`], with `before` 1000-byte messages appended on each lane
+    /// before its reader subscribes: the reader joins above 0.
     pub(crate) fn outbound_joined(
         endpoint: EndpointId,
         alias: Alias,
