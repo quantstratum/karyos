@@ -215,6 +215,8 @@ struct Feeding {
     /// A range sealed as a gap in place of the runs it covers.
     gap: Option<(u64, u64)>,
     end: u64,
+    /// The runs from here on wait.
+    hold: Option<u64>,
 }
 
 impl Feeding {
@@ -225,6 +227,9 @@ impl Feeding {
             return;
         };
         while let Some(run) = self.runs.front() {
+            if self.hold.is_some_and(|hold| run.position() >= hold) {
+                return;
+            }
             if let Some((from, to)) = self.gap.filter(|(from, _)| run.position() == *from) {
                 if !feed.gap(from, to).unwrap() {
                     return;
@@ -260,7 +265,7 @@ fn replay_of(
     gap: Option<(u64, u64)>,
     source: PublicationIdentity,
     stops: &Stops,
-) -> (Replay, Feeding) {
+) -> (Box<Replay>, Feeding) {
     replay_from(driver, recorded, stream_id, 0..end, gap, source, stops)
 }
 
@@ -273,7 +278,7 @@ fn replay_from(
     gap: Option<(u64, u64)>,
     source: PublicationIdentity,
     stops: &Stops,
-) -> (Replay, Feeding) {
+) -> (Box<Replay>, Feeding) {
     let (handle, feed, reader) = target(driver, stream_id, recorded.term_length, range.start);
     let end = range.end;
     let runs = recorded
@@ -284,13 +289,14 @@ fn replay_from(
         .collect();
     let replay = Replay::new(reader, source).with_stop(Box::new(stops.clone()));
     (
-        replay,
+        Box::new(replay),
         Feeding {
             handle: Some(handle),
             feed: Some(feed),
             runs,
             gap,
             end,
+            hold: None,
         },
     )
 }
@@ -516,6 +522,19 @@ fn a_replay_of_another_log_is_a_mismatch() {
         .collect();
     assert_eq!(sequences, (0..30).collect::<Vec<_>>());
     assert_eq!(stops.count(), 1);
+    // The required live reader declined its first message: it is still
+    // at the cutover, and delivers it next.
+    let mut live = merge.into_live();
+    assert_eq!(live.position(), cutover);
+    let mut first = None;
+    live.poll(
+        |bytes, info| {
+            first.get_or_insert((sequence(bytes), info.position, bytes.len()));
+        },
+        MessageLimit::new(1),
+    )
+    .unwrap();
+    assert_eq!(first, Some((30, cutover, 2000)));
 }
 
 /// A gap in the recording below the cutover is reported as the replay's
@@ -668,7 +687,9 @@ fn a_replay_message_across_the_cutover_is_a_mismatch() {
             cutover,
         })
     );
-    assert_eq!(merged.messages.len(), 15);
+    // The fifteenth would end past the cutover even unfragmented: it is
+    // not delivered.
+    assert_eq!(merged.messages.len(), 14);
 }
 
 /// Term padding in the replay over the cutover belongs to another log: the
@@ -756,4 +777,138 @@ fn a_replay_in_other_terms_is_a_mismatch() {
         })
     );
     assert_eq!(merged.messages.len(), 62);
+}
+
+/// Term padding at the cutover, with the replay's next term written later:
+/// the replay steps over the padding and waits there, and the merge cuts
+/// over once the next term's first message comes, checked against the
+/// live reader's.
+#[test]
+fn term_padding_at_the_cutover_waits_for_the_next_term() {
+    // 62 messages of 1056 bytes: the first term ends in padding from the
+    // live reader's join at 65_472.
+    let (mut driver, recorded, live, cutover) = joined(62, 5, Role::Required);
+    assert_eq!(cutover, 65_472);
+    let source = driver.trace_identity(recorded.handle).unwrap();
+    let stops = Stops::default();
+    let end = recorded.end();
+    let (replay, mut feeding) =
+        replay_of(&mut driver, &recorded, SOURCE, end, None, source, &stops);
+    feeding.hold = Some(u64::from(MIN_TERM_LENGTH));
+    let mut merge = LiveMerge::new(live, source, replay);
+    let waiting = run(&mut driver, &mut merge, &mut feeding, 63);
+    assert_eq!(waiting.failure, None);
+    assert_eq!(waiting.messages.len(), 62);
+    assert!(!merge.is_live());
+    feeding.hold = None;
+    let rest = run(&mut driver, &mut merge, &mut feeding, 5);
+    assert_eq!(rest.failure, None);
+    let sequences: Vec<u32> = rest
+        .messages
+        .iter()
+        .map(|(sequence, ..)| *sequence)
+        .collect();
+    assert_eq!(sequences, (62..67).collect::<Vec<_>>());
+    assert_eq!(rest.messages[0].1, u64::from(MIN_TERM_LENGTH));
+    let cutovers: Vec<u64> = rest.polls.iter().filter_map(|poll| poll.cutover).collect();
+    assert_eq!(cutovers, [cutover]);
+}
+
+/// A live reader of another lane than 0 does not merge: the merge fails,
+/// typed, and the replay stops.
+#[test]
+fn only_lane_zero_merges() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let recorded = Recorded::new(&mut driver, SOURCE);
+    let lanes = driver
+        .add_aggregate(karyos_driver::AggregateConfig {
+            stream: stream(OTHER, MIN_TERM_LENGTH),
+            quanta: vec![u64::from(karyos_sys::sizing::align_frame(DEFAULT_MTU).unwrap()); 3],
+        })
+        .unwrap();
+    let lane = Lane::try_new(2).unwrap();
+    let live = driver
+        .subscribe(lanes.lane(lane).unwrap(), Role::Required)
+        .unwrap();
+    let source = driver.trace_identity(lanes.lane(lane).unwrap()).unwrap();
+    let stops = Stops::default();
+    let (replay, mut feeding) = replay_of(&mut driver, &recorded, SOURCE, 0, None, source, &stops);
+    let mut merge = LiveMerge::new(live, source, replay);
+    assert_eq!(stops.count(), 1);
+    let merged = run(&mut driver, &mut merge, &mut feeding, 1);
+    assert_eq!(
+        merged.failure,
+        Some(MergeError::Lane {
+            live: Some(lane),
+            replay: Some(Lane::ZERO),
+        })
+    );
+}
+
+/// A poll with a limit of 0 does nothing: not at the cutover, where the
+/// replay's next frame would be looked at, nor once live, where the live
+/// reader's first message would be checked and delivered.
+#[test]
+fn a_limit_of_zero_does_nothing() {
+    let (mut driver, recorded, live, cutover) = joined(10, 5, Role::Required);
+    let source = driver.trace_identity(recorded.handle).unwrap();
+    let stops = Stops::default();
+    let end = recorded.end();
+    let (replay, mut feeding) =
+        replay_of(&mut driver, &recorded, SOURCE, end, None, source, &stops);
+    // The replay waits at the cutover for what follows it.
+    feeding.hold = Some(cutover);
+    let mut merge = LiveMerge::new(live, source, replay);
+    let below = run(&mut driver, &mut merge, &mut feeding, 11);
+    assert_eq!(below.messages.len(), 10);
+    assert!(!merge.is_live());
+    feeding.hold = None;
+    for _ in 0..50 {
+        feeding.step(&mut driver);
+        driver.do_work().unwrap();
+    }
+    let zero = |merge: &mut LiveMerge| {
+        merge
+            .poll(|_, _| panic!("delivered"), MessageLimit::new(0))
+            .unwrap()
+    };
+    assert_eq!(zero(&mut merge), MergePoll::default());
+    assert!(!merge.is_live());
+    // Cut over, with the live reader's first message still to check.
+    let cut = merge
+        .poll(|_, _| panic!("delivered"), MessageLimit::new(1))
+        .unwrap();
+    assert_eq!(cut.cutover, Some(cutover));
+    assert_eq!(zero(&mut merge), MergePoll::default());
+    let first = merge
+        .poll(
+            |_, info| assert_eq!(info.position, cutover),
+            MessageLimit::new(1),
+        )
+        .unwrap();
+    assert_eq!(first.summary.delivered, 1);
+}
+
+/// A fragmented replay message that runs across the cutover, though one
+/// frame of it would not, is found once delivered: then the merge fails,
+/// typed.
+#[test]
+fn a_fragmented_message_across_the_cutover_is_a_mismatch() {
+    // 1500 bytes take two frames, 1568 bytes; one frame would end at
+    // 1536, the live stream's cutover after three 512-byte frames.
+    let (mut driver, replayed, live, cutover, source) = other_log(5, 1500, 3, 480);
+    assert_eq!(cutover, 1536);
+    let stops = Stops::default();
+    let end = replayed.end();
+    let (replay, mut feeding) = replay_of(&mut driver, &replayed, OTHER, end, None, source, &stops);
+    let mut merge = LiveMerge::new(live, source, replay);
+    let merged = run(&mut driver, &mut merge, &mut feeding, 5);
+    assert_eq!(
+        merged.failure,
+        Some(MergeError::Mismatch {
+            position: 0,
+            cutover,
+        })
+    );
+    assert_eq!(merged.messages.len(), 1);
 }

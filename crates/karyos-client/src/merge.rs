@@ -9,13 +9,15 @@
 //! replay and the live stream are the same log: the merge deduplicates by
 //! position. The cutover `P` is the live reader's position when the merge
 //! is made. Below `P` the replay's messages are delivered; at and past `P`
-//! the live reader's, and the replay's are duplicates, dropped. The merge
-//! switches only at `P` exactly: a replay that ends below it, or that
-//! steps over it inside a frame, is a typed [`MergeError`], never merged
-//! over. So is a replay of another publication or incarnation (an epoch
-//! change), and a live reader lapped while the replay ran. A gap in the
+//! the live reader's, and the replay's are duplicates, dropped. Positions
+//! are in bytes of the stream. The merge switches only at `P` exactly: a
+//! replay that ends below it, or that steps over it inside a frame, is a
+//! typed [`MergeError`], never merged over. So is a replay of another
+//! publication or incarnation (an epoch change), a reader of another lane
+//! than 0, and a live reader lapped while the replay ran. A gap in the
 //! recording below `P` is reported as the replay's local gap, and the merge
-//! goes on.
+//! goes on. The merge never learns where the replay starts: it delivers
+//! whatever the replay holds below `P`.
 //!
 //! The live reader is not polled while the replay delivers below `P`. A
 //! required live reader therefore holds its publisher back for the
@@ -26,7 +28,9 @@
 //! know the Archive (SPEC.md §14): a [`ReplayProvider`] hands it replays.
 
 use karyos_protocol::trace_hook::PublicationIdentity;
+use karyos_sys::frame::{HEADER_LENGTH, Lane};
 use karyos_sys::log_buffer::{SealReason, SkipReason};
+use karyos_sys::sizing::align_frame;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::error::ClientError;
@@ -38,7 +42,8 @@ use crate::subscription::{
 /// the merge fails or gives its live reader back, or when it is dropped.
 /// Stopping a replay that already ended is harmless.
 pub trait ReplayStop: Send {
-    /// Stops the replay.
+    /// Stops the replay. It runs on the polling thread and must not block:
+    /// it posts the stop, or queues it.
     fn stop(&mut self);
 }
 
@@ -70,6 +75,7 @@ impl<T: TermBytes> Replay<T> {
     }
 
     /// The publication the recording is of.
+    #[inline]
     #[must_use]
     pub fn source(&self) -> &PublicationIdentity {
         &self.source
@@ -95,14 +101,16 @@ impl<T: TermBytes> Drop for Replay<T> {
 }
 
 /// A replay a [`ReplayProvider`] is asked for: lane 0 of a recording of
-/// `source`, over `[from, to)`.
+/// `source`, over `[from, to)`, in bytes of the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayRequest {
     /// The live stream's publication: the recording must be of it.
     pub source: PublicationIdentity,
     /// The first position replayed.
     pub from: u64,
-    /// The position the replay must reach: the merge's cutover.
+    /// The position the replay must reach: the merge's cutover, the live
+    /// reader's position when the merge is made, with no poll of it in
+    /// between.
     pub to: u64,
 }
 
@@ -170,13 +178,26 @@ pub enum MergeError {
     },
     /// The replay and the live stream disagree at `position`: a message
     /// or a frame runs across the cutover, or the replay's message at the
-    /// cutover is not the live stream's. They are not the same log.
+    /// cutover is not the live stream's. They are not the same log. When
+    /// the live reader's first message disagrees, it is at `position`: a
+    /// required live reader keeps it pending, so
+    /// [`LiveMerge::into_live`] delivers it again; an optional or observer
+    /// one acknowledged it on copy, so it is gone.
     #[error("the replay and the live stream disagree at {position} (cutover at {cutover})")]
     Mismatch {
         /// Where.
         position: u64,
         /// The cutover.
         cutover: u64,
+    },
+    /// The live reader or the replay reads another lane than 0, the only
+    /// one merged (A6, Q6); `None` for a reader its rejoin policy closed.
+    #[error("the live reader reads lane {live:?} and the replay {replay:?}: only lane 0 merges")]
+    Lane {
+        /// The live reader's lane.
+        live: Option<Lane>,
+        /// The replay's lane.
+        replay: Option<Lane>,
     },
     /// The replay's reader was lapped.
     #[error("the replay was lapped: {0:?}")]
@@ -240,9 +261,13 @@ enum State<T: TermBytes> {
 }
 
 /// What one replay poll of one message found.
+#[derive(Clone, Copy)]
 enum Event {
     /// A message below the cutover, delivered.
     Delivered(u64),
+    /// A message below the cutover that runs past it even unfragmented,
+    /// not delivered.
+    Across(u64),
     /// A message at or past the cutover, not delivered: its position and
     /// length.
     Duplicate(u64, usize),
@@ -258,6 +283,9 @@ enum Event {
 pub struct LiveMerge<T: TermBytes = HeapTerms> {
     live: ClientSubscription<T>,
     cutover: u64,
+    /// Where the replay looks at its frame at the cutover: the cutover, or
+    /// the next term's start once it stepped over term padding there.
+    reach: u64,
     state: State<T>,
 }
 
@@ -279,16 +307,24 @@ impl<T: TermBytes> core::fmt::Debug for LiveMerge<T> {
 impl<T: TermBytes> LiveMerge<T> {
     /// Merges `replay` into `live`, the subscription of publication
     /// `source`, at the live reader's position now. A replay of another
-    /// source fails the merge with [`MergeError::EpochChanged`], and stops.
+    /// source fails the merge with [`MergeError::EpochChanged`], and a
+    /// reader of another lane than 0 with [`MergeError::Lane`]; the replay
+    /// then stops.
     #[must_use]
     pub fn new(
         live: ClientSubscription<T>,
         source: PublicationIdentity,
-        replay: Replay<T>,
+        replay: Box<Replay<T>>,
     ) -> Self {
         let cutover = live.position();
-        let state = if replay.source == source {
-            State::Replaying(Box::new(replay))
+        let lanes = (live.lane(), replay.subscription.lane());
+        let state = if lanes != (Some(Lane::ZERO), Some(Lane::ZERO)) {
+            State::Failed(MergeError::Lane {
+                live: lanes.0,
+                replay: lanes.1,
+            })
+        } else if replay.source == source {
+            State::Replaying(replay)
         } else {
             State::Failed(MergeError::EpochChanged {
                 replay: replay.source,
@@ -298,23 +334,27 @@ impl<T: TermBytes> LiveMerge<T> {
         Self {
             live,
             cutover,
+            reach: cutover,
             state,
         }
     }
 
-    /// The cutover position.
+    /// The cutover position, in bytes of the stream.
+    #[inline]
     #[must_use]
     pub fn cutover(&self) -> u64 {
         self.cutover
     }
 
     /// Whether the merge switched to the live reader.
+    #[inline]
     #[must_use]
     pub fn is_live(&self) -> bool {
         matches!(self.state, State::Live { .. })
     }
 
     /// The final failure, if the merge failed.
+    #[inline]
     #[must_use]
     pub fn failure(&self) -> Option<MergeError> {
         match self.state {
@@ -324,22 +364,28 @@ impl<T: TermBytes> LiveMerge<T> {
     }
 
     /// Gives the live reader back, stopping the replay if it still runs.
+    /// It is where the merge left it: at the cutover until the merge
+    /// switched, except after a [`MergeError::Mismatch`] on an optional
+    /// live reader's first message, which it acknowledged.
     #[must_use]
     pub fn into_live(self) -> ClientSubscription<T> {
         self.live
     }
 
     /// Delivers up to `message_limit` messages to `handler`: the replay's
-    /// below the cutover, then the live reader's. A poll stops at the
-    /// replay's first report (a skipped range or an aborted block below
-    /// the cutover) and at the cutover itself; after it, the live reader is
-    /// polled as [`ClientSubscription::poll`] polls.
+    /// below the cutover, then the live reader's. A limit of 0 does
+    /// nothing. A poll stops at the replay's first report (a skipped range
+    /// or an aborted block below the cutover) and at the cutover itself;
+    /// after it, the live reader is polled as [`ClientSubscription::poll`]
+    /// polls.
     ///
     /// # Errors
     ///
     /// Returns [`MergeFailed`] carrying what was delivered before the
-    /// failure. A replay message that runs past the cutover was delivered
-    /// before the [`MergeError::Mismatch`] it causes was found.
+    /// failure. A replay message that runs past the cutover is not
+    /// delivered when it would even unfragmented; a fragmented one is
+    /// found only once delivered, before the [`MergeError::Mismatch`] it
+    /// causes.
     #[expect(
         clippy::result_large_err,
         reason = "the error carries the poll by value so a failed merge reports its progress, as ClientSubscription::poll does"
@@ -353,6 +399,9 @@ impl<T: TermBytes> LiveMerge<T> {
         H: FnMut(&[u8], MessageInfo),
     {
         let mut poll = MergePoll::default();
+        if message_limit.get() == 0 {
+            return Ok(poll);
+        }
         let failure = match self.state {
             State::Failed(cause) => Some(cause),
             State::Replaying(_) => self.replay(&mut handler, message_limit, &mut poll).err(),
@@ -386,15 +435,16 @@ impl<T: TermBytes> LiveMerge<T> {
         // As the subscription's own bound: at most one more poll than
         // messages, and one to look at the cutover.
         for _ in 0..=limit {
+            let reach = self.reach;
             let State::Replaying(replay) = &mut self.state else {
                 break;
             };
-            // Past the cutover only if the replay started there: `step`
-            // finds it.
+            // Past the cutover only where it looks at the cutover, or if
+            // the replay started past it, which `step` finds.
             let before = replay.subscription.position();
             // At the cutover, the replay's next frame is looked at, for the
             // live reader's first message to be checked against it.
-            let at = before == cutover;
+            let at = before == reach;
             if !at && poll.summary.delivered == limit {
                 break;
             }
@@ -404,6 +454,11 @@ impl<T: TermBytes> LiveMerge<T> {
             } else {
                 Self::step(before, event, after, cutover, poll)?
             };
+            if matches!(step, Step::Stop) && matches!(event, Event::Nothing) && after > cutover {
+                // Term padding at the cutover, stepped over: its message
+                // is at the next term's start, not written yet.
+                self.reach = after;
+            }
             let expect = match step {
                 Step::Next => continue,
                 Step::Stop => return Ok(()),
@@ -429,7 +484,7 @@ impl<T: TermBytes> LiveMerge<T> {
             // Not written yet: it comes.
             Event::Nothing => Step::Stop,
             // Nothing below the cutover is left.
-            Event::Delivered(position) => {
+            Event::Delivered(position) | Event::Across(position) => {
                 return Err(MergeError::Mismatch { position, cutover });
             }
             Event::Skipped(_) | Event::Aborted(_) | Event::Closed(..) => Step::Cutover(None),
@@ -447,7 +502,9 @@ impl<T: TermBytes> LiveMerge<T> {
     ) -> Result<Step, MergeError> {
         let mismatch = |position| MergeError::Mismatch { position, cutover };
         let start = match event {
-            Event::Delivered(position) | Event::Duplicate(position, _) => position,
+            Event::Delivered(position)
+            | Event::Across(position)
+            | Event::Duplicate(position, _) => position,
             Event::Skipped(skipped) => skipped.position,
             Event::Aborted(aborted) => aborted.position,
             Event::Closed(position, _) => position,
@@ -463,10 +520,13 @@ impl<T: TermBytes> LiveMerge<T> {
             return Self::at_cutover(event, cutover);
         }
         match event {
+            // Not delivered: it would run past the cutover.
+            Event::Across(position) => return Err(mismatch(position)),
             Event::Delivered(position) => {
                 poll.summary.delivered += 1;
                 if after > cutover {
-                    // Delivered already: found once it ended.
+                    // A fragmented message, delivered already: found once
+                    // it ended.
                     return Err(mismatch(position));
                 }
             }
@@ -478,7 +538,9 @@ impl<T: TermBytes> LiveMerge<T> {
                 if after > cutover && !gap {
                     return Err(mismatch(skipped.position));
                 }
-                let extent = u32::try_from(cutover - skipped.position)
+                let extent = cutover
+                    .checked_sub(skipped.position)
+                    .and_then(|below| u32::try_from(below).ok())
                     .map_or(skipped.extent, |below| below.min(skipped.extent));
                 poll.summary.skipped = Some(Skipped { extent, ..skipped });
             }
@@ -524,12 +586,16 @@ impl<T: TermBytes> LiveMerge<T> {
             .subscription
             .poll(
                 |bytes, info| {
-                    if info.position < cutover {
-                        handler(bytes, info);
-                        seen = Some(Event::Delivered(info.position));
+                    seen = Some(if info.position >= cutover {
+                        Event::Duplicate(info.position, bytes.len())
+                    } else if shortest_end(info.position, bytes.len())
+                        .is_none_or(|end| end > cutover)
+                    {
+                        Event::Across(info.position)
                     } else {
-                        seen = Some(Event::Duplicate(info.position, bytes.len()));
-                    }
+                        handler(bytes, info);
+                        Event::Delivered(info.position)
+                    });
                 },
                 MessageLimit::new(1),
             )
@@ -555,7 +621,8 @@ impl<T: TermBytes> LiveMerge<T> {
     }
 
     /// Polls the live reader into `poll`, checking its first message
-    /// against the replay's at the cutover; returns the failure, if any.
+    /// against the replay's at the cutover before delivering it; returns
+    /// the failure, if any.
     fn live<H>(
         &mut self,
         handler: &mut H,
@@ -577,17 +644,20 @@ impl<T: TermBytes> LiveMerge<T> {
         };
         let mut mismatch = None;
         let mut delivered = 0;
-        let polled = self.live.poll(
+        let polled = self.live.poll_taking(
             |bytes, info| {
-                if let Some((position, length)) = expect.take()
+                if let Some((position, length)) = *expect
                     && (info.position != position || bytes.len() != length)
                 {
+                    // Declined: a required reader keeps it pending.
                     mismatch = Some(info.position);
-                    return;
+                    return false;
                 }
+                *expect = None;
                 *first = false;
                 delivered += 1;
                 handler(bytes, info);
+                true
             },
             limit,
         );
@@ -622,6 +692,16 @@ impl<T: TermBytes> LiveMerge<T> {
     }
 }
 
+/// The least position a message of `length` bytes at `position` can end
+/// at: one frame, unfragmented. `None` past the representable.
+fn shortest_end(position: u64, length: usize) -> Option<u64> {
+    let frame = u32::try_from(length)
+        .ok()
+        .and_then(|length| length.checked_add(HEADER_LENGTH))
+        .and_then(|length| align_frame(length).ok())?;
+    position.checked_add(u64::from(frame))
+}
+
 /// What to do after one replay event.
 enum Step {
     /// Poll the replay again.
@@ -632,3 +712,6 @@ enum Step {
     /// one, if any.
     Cutover(Option<(u64, usize)>),
 }
+
+#[cfg(test)]
+mod tests;

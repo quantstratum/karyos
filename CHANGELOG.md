@@ -19,8 +19,10 @@ release may break APIs, wire formats and shared-memory layouts.
   duplicates are dropped by position, and the live reader's first message
   must match the replay's there in position and length. Every
   disagreement is a typed, final `MergeError`: an epoch change (another
-  publication or incarnation), a replay short of the cutover, a message
-  or term padding across it, a replay or live reader lapped. A gap in the
+  publication or incarnation), a reader of another lane than 0, a replay
+  short of the cutover, a message or term padding across it, a replay or
+  live reader lapped. A required live reader keeps a first message that
+  disagrees pending, for `into_live`. A gap in the
   recording below the cutover is reported as the replay's local gap. A
   replay stops through its `ReplayStop` at the cutover, on failure and on
   drop. `ReplayProvider`, which the Archive's client implements, hands out
