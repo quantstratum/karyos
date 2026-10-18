@@ -36,6 +36,7 @@ fn new_recording(stream_id: i32, channel: &[u8]) -> NewRecording<'_> {
         geometry: geometry(),
         policy: SyncPolicy::PerSegment,
         format: format(),
+        required: false,
     }
 }
 
@@ -226,6 +227,7 @@ fn a_torn_record_is_cut() {
         geometry: geometry(),
         policy: SyncPolicy::PerSegment,
         format: format(),
+        required: false,
         stop: None,
     })
     .encode()
@@ -275,6 +277,7 @@ fn three_started() -> (FaultDisk, [u64; 3]) {
             geometry: geometry(),
             policy: SyncPolicy::PerSegment,
             format: format(),
+            required: false,
             stop: None,
         })
         .encode()
@@ -693,6 +696,7 @@ fn the_stream_format_is_kept() {
         geometry: geometry(),
         policy: SyncPolicy::PerSegment,
         format,
+        required: false,
         stop: None,
     })
     .encode()
@@ -709,4 +713,73 @@ fn the_stream_format_is_kept() {
     assert_eq!(payload[mtu_at..mtu_at + 4], 9000u32.to_le_bytes());
     payload[mtu_at..mtu_at + 4].fill(0);
     assert!(Record::decode(STARTED, &payload).is_none());
+}
+
+/// A7d-1c: a recording's mode is kept: `required` or `async`, read back
+/// after a reopen.
+#[test]
+fn a_recording_keeps_its_mode() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut catalog = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    let channel = channel_of(1);
+    let required = catalog
+        .start(NewRecording {
+            required: true,
+            ..new_recording(1, &channel)
+        })
+        .unwrap();
+    let asynchronous = catalog.start(new_recording(2, &channel)).unwrap();
+    drop(catalog);
+    let reopened = Catalog::open(disk, dir).unwrap().catalog;
+    assert!(reopened.get(required).unwrap().required);
+    assert!(!reopened.get(asynchronous).unwrap().required);
+}
+
+/// The mode is the `Started` record's last payload byte, under the CRC: a
+/// record written before it, without the byte, reads back as `async`; a
+/// byte that is no mode is refused; and the CRC covers the byte.
+#[test]
+fn a_started_record_without_its_mode_reads_back_async() {
+    let recording = Recording {
+        id: 3,
+        stream_id: 1,
+        session_id: 7,
+        channel: channel_of(1),
+        start: 0,
+        start_time_ns: 5,
+        geometry: geometry(),
+        policy: SyncPolicy::PerSegment,
+        format: format(),
+        required: true,
+        stop: None,
+    };
+    let record = Record::Started(recording.clone()).encode().unwrap();
+    let (body, crc) = record.split_at(record.len() - TAIL);
+    let payload = &body[HEAD..];
+    // The mode byte is last, and the CRC covers it.
+    assert_eq!(payload.last(), Some(&MODE_REQUIRED));
+    assert_eq!(crc, crc32c(body).to_le_bytes());
+    let mut flipped = body.to_vec();
+    *flipped.last_mut().unwrap() = MODE_ASYNC;
+    assert_ne!(crc, crc32c(&flipped).to_le_bytes());
+    // Without the byte: async.
+    let older = &payload[..payload.len() - 1];
+    assert_eq!(
+        Record::decode(STARTED, older),
+        Some(Record::Started(Recording {
+            required: false,
+            ..recording.clone()
+        }))
+    );
+    // A byte that is no mode, or one too many.
+    for bad in [&[0u8][..], &[3], &[MODE_REQUIRED, 0]] {
+        let mut longer = older.to_vec();
+        longer.extend_from_slice(bad);
+        assert_eq!(Record::decode(STARTED, &longer), None, "{bad:?}");
+    }
+    assert_eq!(
+        Record::decode(STARTED, payload),
+        Some(Record::Started(recording))
+    );
 }

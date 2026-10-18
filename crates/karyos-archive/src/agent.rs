@@ -39,6 +39,12 @@ use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
+use crate::group::capture::{
+    self, CaptureConfig, CaptureError, CaptureJob, CaptureSender, CaptureSetup,
+};
+use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
+use crate::group::prefix::Coverage;
+use crate::group::record::{CONTRACT_VERSION, Capture, Clock, JournalHeader};
 use crate::recorder::{Ended, FrameSource, Mode, Recorder, RecorderError};
 use crate::replay::{Rate, ReplayError, ReplaySource, Step};
 use crate::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
@@ -74,6 +80,10 @@ pub struct AgentConfig {
     pub prepared_timeout: Duration,
     /// How long an idle cycle waits for a command.
     pub idle: Duration,
+    /// Recording groups captured at once at most (A7d).
+    pub max_groups: usize,
+    /// Events one group's journal takes at most per cycle.
+    pub group_budget: usize,
 }
 
 impl Default for AgentConfig {
@@ -88,8 +98,45 @@ impl Default for AgentConfig {
             max_replays: 16,
             prepared_timeout: Duration::from_secs(5),
             idle: Duration::from_millis(1),
+            max_groups: 16,
+            group_budget: 64,
         }
     }
+}
+
+/// A recording group to capture (A7d; `quantstratum-docs:
+/// karyos/design/recording-group-gateway.md` section 9): its journal, made
+/// new or recovered, and its capture path. The agent serves the group's
+/// job in its cycle, after the recorders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartGroup {
+    /// The group, never 0.
+    pub group_id: u64,
+    /// The directory of group journals, which the host made: it holds
+    /// group journals only.
+    pub dir: PathBuf,
+    /// A new group's journal header; `None` recovers the group's journal
+    /// from `dir`, its prefixes recomputed over the recordings this Archive
+    /// keeps.
+    pub new: Option<NewGroup>,
+    /// The journal's segments and sync policy.
+    pub journal: JournalConfig,
+    /// The capture path's ring and bounds.
+    pub capture: CaptureConfig,
+}
+
+/// A new group's journal header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewGroup {
+    /// The first event's `group_seq`, never 0.
+    pub first_group_seq: u64,
+    /// The payload size above which a `required` source's payload is
+    /// stored by reference.
+    pub inline_threshold: u32,
+    /// Strict or best effort.
+    pub capture: Capture,
+    /// The caller's identity of what ran, 1 to 4096 bytes.
+    pub manifest: Vec<u8>,
 }
 
 /// A recording to start, with its source.
@@ -331,6 +378,18 @@ pub enum AgentError {
     /// The agent's thread is gone.
     #[error("the agent stopped")]
     Gone,
+    /// A recording group's journal could not be made, recovered or closed.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    /// A recording group's capture settings cannot work.
+    #[error(transparent)]
+    Capture(#[from] CaptureError),
+    /// A recording group of that id is already captured.
+    #[error("group {id} is already captured")]
+    GroupCaptured {
+        /// The group.
+        id: u64,
+    },
     /// The thread could not be spawned.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -357,6 +416,8 @@ enum Command {
     },
     Replay(Box<StartReplay>, Reply<u64>),
     StopReplay(u64, Reply<u64>),
+    StartGroup(Box<StartGroup>, Reply<CaptureSender>),
+    StopGroup(u64, Reply<u64>),
     Shutdown(Reply<()>),
 }
 
@@ -417,6 +478,8 @@ impl core::fmt::Debug for Command {
                 .finish_non_exhaustive(),
             Self::Replay(start, _) => f.debug_tuple("Replay").field(start).finish(),
             Self::StopReplay(id, _) => f.debug_tuple("StopReplay").field(id).finish(),
+            Self::StartGroup(start, _) => f.debug_tuple("StartGroup").field(start).finish(),
+            Self::StopGroup(id, _) => f.debug_tuple("StopGroup").field(id).finish(),
             Self::Shutdown(_) => f.write_str("Shutdown"),
         }
     }
@@ -550,6 +613,30 @@ impl ArchiveHandle {
     /// As [`ArchiveHandle::post_start`].
     pub fn post_stop(&self, id: u64) -> Result<Posted<Ended>, AgentError> {
         self.post(|reply| Command::Stop(id, reply))
+    }
+
+    /// Starts capturing a recording group: its journal is made, or
+    /// recovered, and its job served in the agent's cycle; returns the
+    /// sender the event loop's Gateway writes through.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Full`], [`AgentError::GroupCaptured`],
+    /// [`AgentError::Capture`], [`AgentError::Journal`] and
+    /// [`AgentError::Gone`].
+    pub fn start_group(&self, start: StartGroup) -> Result<CaptureSender, AgentError> {
+        self.call(|reply| Command::StartGroup(Box::new(start), reply))
+    }
+
+    /// Stops capturing group `id`: its journal is closed, synced; returns
+    /// the journal's durable position. The group's sender then refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Unknown`], [`AgentError::Journal`] and
+    /// [`AgentError::Gone`].
+    pub fn stop_group(&self, id: u64) -> Result<u64, AgentError> {
+        self.call(|reply| Command::StopGroup(id, reply))
     }
 
     /// The catalog's recordings, in id order.
@@ -957,6 +1044,7 @@ fn run<D>(
             next_id: 1,
             turn: 0,
         },
+        groups: Vec::new(),
     };
     loop {
         let mut worked = false;
@@ -975,6 +1063,8 @@ fn run<D>(
         // its replay.
         state.replays.expire(now(), config.prepared_timeout);
         worked |= state.duty(outbox, now());
+        // After the recorders, whose positions cover the groups' payloads.
+        worked |= state.group_duty(now());
         // After the recorders: they keep priority.
         worked |= state
             .replays
@@ -1004,6 +1094,66 @@ struct State<D: Disk> {
     /// start settles them.
     failed: Vec<u64>,
     replays: Replays<D>,
+    groups: Vec<ActiveGroup<D>>,
+}
+
+/// A recording group the agent captures.
+#[derive(Debug)]
+struct ActiveGroup<D: Disk> {
+    id: u64,
+    job: CaptureJob<D>,
+}
+
+/// The recordings' frames as recording groups see them (A7d): an active
+/// `required` recorder's written and durable positions, and a stopped
+/// `required` recording's end, which its close made durable. An `async`
+/// recording, or one the catalog does not know as `required` (an entry
+/// from before the mode was recorded), answers nothing.
+struct Recorded<'a, D: Disk> {
+    active: &'a [Active<D>],
+    catalog: &'a Catalog<D>,
+}
+
+impl<D: Disk> Coverage for Recorded<'_, D> {
+    fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
+        let recording = self.catalog.get(recording_id)?;
+        if !recording.required {
+            return None;
+        }
+        if let Some(active) = self.active.iter().find(|active| active.id == recording_id) {
+            let store = active.recorder.store();
+            return Some((store.written(), store.durable()));
+        }
+        recording.stop.map(|stop| (stop.position, stop.position))
+    }
+
+    fn ended(&self, recording_id: u64) -> Option<u64> {
+        let recording = self.catalog.get(recording_id)?;
+        let stop = recording.stop?;
+        Some(if recording.required { stop.position } else { 0 })
+    }
+}
+
+/// Settles every group's references to recording `id`, which failed with
+/// its frames durable to `durable` and no stop in the catalog (a recording
+/// that stopped is settled by the groups' duty, through
+/// [`Coverage::ended`]). Only a `required` recording vouches for its
+/// frames: a reference to any other covers nothing.
+fn settle_groups<D: Disk>(
+    groups: &mut [ActiveGroup<D>],
+    active: &[Active<D>],
+    catalog: &Catalog<D>,
+    id: u64,
+    durable: u64,
+) {
+    let required = catalog.get(id).is_some_and(|recording| recording.required);
+    let durable = if required { durable } else { 0 };
+    let recorded = Recorded { active, catalog };
+    for group in groups {
+        // A mark that cannot be written fails the group, which its sender
+        // then reports; nothing else is to be done here.
+        let _ = group.job.recording_ended(id, durable, &recorded);
+    }
 }
 
 impl<D: Disk + Clone> State<D> {
@@ -1013,6 +1163,8 @@ impl<D: Disk + Clone> State<D> {
         let mut worked = false;
         let mut index = 0;
         while let Some(recording) = self.active.get_mut(index) {
+            // What was durable before a close that may fail.
+            let durable = recording.recorder.store().durable();
             let event = match recording.recorder.duty(now) {
                 Ok(duty) => {
                     worked |= duty.recorded > 0;
@@ -1048,6 +1200,11 @@ impl<D: Disk + Clone> State<D> {
             if let Event::Failed { id, .. } = event {
                 self.failed.push(id);
             }
+            // A recording that ended is settled by the groups' duty, from
+            // its stop in the catalog; one that failed has none there.
+            if let Event::Failed { id, .. } = event {
+                settle_groups(&mut self.groups, &self.active, &self.catalog, id, durable);
+            }
             outbox.send(event);
         }
         worked
@@ -1063,10 +1220,22 @@ impl<D: Disk + Clone> State<D> {
                 let result = match self.active.iter().position(|recording| recording.id == id) {
                     Some(index) => {
                         let recording = self.active.swap_remove(index);
+                        let durable = recording.recorder.store().durable();
                         let result = stop(recording, &mut self.catalog, StopReason::Stopped, now);
                         // A stop that failed leaves the recording to settle.
                         if result.is_err() {
                             self.failed.push(id);
+                        }
+                        // A stop that failed has none in the catalog to
+                        // settle the groups' references by.
+                        if result.is_err() {
+                            settle_groups(
+                                &mut self.groups,
+                                &self.active,
+                                &self.catalog,
+                                id,
+                                durable,
+                            );
                         }
                         result
                     }
@@ -1145,7 +1314,25 @@ impl<D: Disk + Clone> State<D> {
                 };
                 let _ = reply.send(result);
             }
+            Command::StartGroup(start, reply) => {
+                let _ = reply.send(self.start_group(*start));
+            }
+            Command::StopGroup(id, reply) => {
+                let result = match self.groups.iter().position(|group| group.id == id) {
+                    Some(index) => self
+                        .groups
+                        .swap_remove(index)
+                        .job
+                        .close()
+                        .map_err(AgentError::from),
+                    None => Err(AgentError::Unknown { id }),
+                };
+                let _ = reply.send(result);
+            }
             Command::Shutdown(reply) => {
+                for group in self.groups.drain(..) {
+                    let _ = group.job.close();
+                }
                 for mut replay in self.replays.active.drain(..) {
                     let position = replay.source.position();
                     replay.sink.finish(position, false);
@@ -1167,6 +1354,68 @@ impl<D: Disk + Clone> State<D> {
         false
     }
 
+    /// Makes or recovers a group's journal and its capture path.
+    fn start_group(&mut self, start: StartGroup) -> Result<CaptureSender, AgentError> {
+        if self.groups.len() >= self.config.max_groups {
+            return Err(AgentError::Full {
+                what: "groups",
+                max: self.config.max_groups,
+            });
+        }
+        let id = start.group_id;
+        if self.groups.iter().any(|group| group.id == id) {
+            return Err(AgentError::GroupCaptured { id });
+        }
+        let journal = match &start.new {
+            Some(new) => GroupJournal::create(
+                self.disk.clone(),
+                &start.dir,
+                &JournalHeader {
+                    group_id: id,
+                    first_group_seq: new.first_group_seq,
+                    inline_threshold: new.inline_threshold,
+                    contract_version: CONTRACT_VERSION,
+                    clock: Clock::HostMonotonic,
+                    capture: new.capture,
+                    manifest: &new.manifest,
+                },
+                start.journal,
+            )?,
+            None => {
+                GroupJournal::recover(self.disk.clone(), &start.dir, id, start.journal)?.journal
+            }
+        };
+        let recorded = Recorded {
+            active: &self.active,
+            catalog: &self.catalog,
+        };
+        let (sender, job) =
+            capture::capture(start.capture, journal, &recorded).map_err(|error| match error {
+                CaptureSetup::Config(error) => AgentError::Capture(error),
+                CaptureSetup::Journal(error) => AgentError::Journal(error),
+            })?;
+        self.groups.push(ActiveGroup { id, job });
+        Ok(sender)
+    }
+
+    /// Each group's job: drains its ring into its journal and advances its
+    /// prefixes over the recordings. Returns whether any read.
+    fn group_duty(&mut self, now: u64) -> bool {
+        let recorded = Recorded {
+            active: &self.active,
+            catalog: &self.catalog,
+        };
+        let mut worked = false;
+        for group in &mut self.groups {
+            // A job that fails reports it through its sender's state.
+            worked |= group
+                .job
+                .duty(now, self.config.group_budget, &recorded)
+                .unwrap_or(false);
+        }
+        worked
+    }
+
     fn start_recording(
         &mut self,
         start: StartRecording,
@@ -1186,6 +1435,7 @@ impl<D: Disk + Clone> State<D> {
             geometry: start.geometry,
             policy: start.policy,
             format: start.format,
+            required: matches!(start.mode, Mode::Required),
         })?;
         let recorder = SegmentStore::create(
             self.disk.clone(),

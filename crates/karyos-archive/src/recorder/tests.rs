@@ -336,6 +336,7 @@ fn settles_at_every_crash_point(policy: SyncPolicy) {
                     incarnation: 1,
                 },
             },
+            required: false,
         }) else {
             return 0;
         };
