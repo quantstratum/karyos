@@ -679,3 +679,89 @@ fn test_a_loss_report_after_its_stream_is_freed_does_not_retire_the_client() {
     assert_eq!(counter(&driver, "loss reports unverified"), 1);
     assert_eq!(driver.clients(), 1, "the client is still served");
 }
+
+/// #420 review P2: the same as a report served after its stream was freed,
+/// for a subscription of a later incarnation. A guarded stream is closed
+/// and reopened into incarnation 2, the client subscribes to it and is
+/// overrun, the stream is freed, and the report on incarnation 2 is served
+/// before the `Remove`: it is counted unverified and the client is kept.
+#[test]
+fn test_a_loss_report_on_a_later_incarnation_of_a_freed_stream_does_not_retire_the_client() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    // The guard's walker holds a spare-slot credit for the stream's life.
+    let mut guarded = config();
+    guarded.buffer.spare_slots = 6;
+    let stream = driver.add_stream(guarded).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    driver.guard_stream(stream, guard, 4, None).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut first = driver.publication(stream).unwrap();
+    assert!(matches!(
+        first.offer(b"one").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert!(driver.close_guard(guard, 2).is_ok());
+    assert_eq!(first.offer(b"two").unwrap(), OfferOutcome::Gated);
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    let _ = first.poll_outcomes(64, |_, _| {}).unwrap();
+    drop(first);
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let mut publication = driver.publication(stream).unwrap();
+    assert_eq!(driver.trace_identity(stream).unwrap().incarnation, 2);
+    let mut client = driver.connect().unwrap();
+    let _ = client
+        .add_subscription_on_lane(KEY, LANE, SubscriberRole::Optional)
+        .unwrap();
+    let _ = driver.do_work().unwrap();
+    let mut handle = None;
+    let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+        Outcome::Subscription(subscription) => handle = Some(subscription),
+        other => panic!("unexpected {other:?}"),
+    });
+    let mut subscription = handle.unwrap().with_rejoin(RejoinPolicy::RejoinAtHead);
+    // A guarded handle frees its reservations as its outcomes are read.
+    for _ in 0..300 {
+        for _ in 0..10_000 {
+            let _ = publication.poll_outcomes(64, |_, _| {}).unwrap();
+            if let OfferOutcome::Accepted { .. } = publication.offer(&[7u8; 512]).unwrap() {
+                break;
+            }
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    let summary = subscription.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    assert!(summary.overrun.is_some());
+    assert_eq!(client.loss_reports_queued(), 1);
+    drop(publication);
+    let _ = client.poll(usize::MAX, |completion| {
+        panic!("unexpected completion {completion:?}");
+    });
+    assert_eq!(client.loss_reports_queued(), 0);
+    let remove = client.remove_subscription(subscription).unwrap();
+    driver.remove_stream(stream).unwrap();
+    let _ = driver.do_work().unwrap();
+    assert_eq!(
+        driver.stream_state(stream).unwrap(),
+        karyos_driver::StreamState::Freed
+    );
+    let mut done = Vec::new();
+    for _ in 0..10 {
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        if !done.is_empty() {
+            break;
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].sequence, remove);
+    assert!(matches!(done[0].outcome, Outcome::Succeeded));
+    assert_eq!(counter(&driver, "clients faulty"), 0);
+    assert_eq!(counter(&driver, "loss reports unverified"), 1);
+    assert_eq!(driver.clients(), 1, "the client is still served");
+    let records = losses(&driver);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].incarnation, 2);
+}

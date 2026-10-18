@@ -583,8 +583,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// - an in-process one whose capability was dropped without `remove`;
     ///   one whose handle was dropped by `remove` stays until its queued
     ///   `Remove` is served (or its client is retired);
-    /// - a remote one with no grant left in its client's ledger, journal
-    ///   grants included: its last grant was detached, or ended unsent.
+    /// - a remote one with no stream grant left in its client's ledger:
+    ///   its last grant was detached, or ended unsent. A journal grant
+    ///   never keeps one, since its registration word is a journal number.
     ///   It can never get another, since a successor grant is reserved
     ///   only from a grant still in the ledger
     ///   (`open_remote_successors`), and registration ids are never reused.
@@ -602,10 +603,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .find(|slot| slot.id == registration.client)
                 .and_then(|slot| slot.ledger.as_ref())
                 .is_none_or(|ledger| {
-                    ledger
-                        .grants()
-                        .iter()
-                        .any(|grant| grant.registration == registration.id)
+                    ledger.grants().iter().any(|grant| {
+                        // A journal grant's registration word is its
+                        // journal number, another id space.
+                        !matches!(grant.participant, Participant::Journal { .. })
+                            && grant.registration == registration.id
+                    })
                 })
         });
         let swept = before - self.registrations.len();
@@ -797,9 +800,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err("loss report of another driver instance; the client is retired");
         }
         let issued = |id: u64, next: u64| id != 0 && id < next;
-        // An incarnation the driver cannot verify: 0, above the lane's
-        // current one, or, once the lane's stream is freed, any but the
-        // first (the only one a freed stream is known to have had).
+        // An incarnation the driver cannot verify: 0, or above the lane's
+        // current one. Once the lane's stream is freed, the bound is the
+        // incarnation of the client's own subscription on it, if it still
+        // has one (a `ReportLoss` queued ahead of its `Remove`), else the
+        // first, the only one a freed stream is known to have had.
         let lane_incarnation = self
             .streams
             .iter()
@@ -807,7 +812,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 s.aggregate.registration == loss.stream_registration
                     && s.config.lane.get() == loss.lane
             })
-            .map_or(crate::embedded::FIRST_INCARNATION, |s| s.incarnation);
+            .map_or_else(
+                || {
+                    self.registrations
+                        .iter()
+                        .find(|r| {
+                            r.id == loss.subscription
+                                && r.client == client
+                                && r.kind == Kind::Subscription
+                                && !self.streams.iter().any(|s| s.id == r.stream)
+                        })
+                        .map_or(crate::embedded::FIRST_INCARNATION, |r| r.incarnation)
+                },
+                |s| s.incarnation,
+            );
         let never = loss.incarnation == 0 || loss.incarnation > lane_incarnation;
         if !issued(loss.stream_registration, self.next_stream)
             || never
@@ -2932,6 +2950,37 @@ mod tests {
         }
         assert_eq!(ledger(&driver, client).len(), 1);
         assert_eq!(driver.registrations.len(), 1, "its grant keeps it");
+    }
+
+    /// A journal grant whose journal number equals a registration's id does
+    /// not keep that registration: the two are different id spaces.
+    #[test]
+    fn a_journal_grant_with_a_colliding_number_keeps_no_registration() {
+        let (mut driver, _stream) = driver_with_stream();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let registration = detached_subscription(&mut driver, &mut producer, client, 1);
+        let export = driver.next_export;
+        remote_ledger(&mut driver, client).push(Grant {
+            export,
+            registration,
+            key: 0,
+            stream: 0,
+            participant: Participant::Journal {
+                journal: registration,
+            },
+            state: GrantState::Held,
+            sent: false,
+            generation: 0,
+            incarnation: 0,
+            fence_at: None,
+            fenced: false,
+        });
+        let _ = driver.do_work().unwrap();
+        assert!(
+            driver.registrations.is_empty(),
+            "the journal grant does not keep it"
+        );
+        assert_eq!(ledger(&driver, client).len(), 1, "the journal grant stays");
     }
 
     /// A reclaimed registration's id is never reused, nor its stream's: a
