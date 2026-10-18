@@ -907,6 +907,10 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// fails, as a walker short of a spare slot does.
     #[cfg(test)]
     pub(crate) guard_lane_fault: Option<usize>,
+    /// Test only: a reincarnation's sender post, after its lanes are
+    /// swapped, is refused as a full ring would refuse it.
+    #[cfg(test)]
+    pub(crate) reincarnation_post_fault: bool,
     /// The network agents and their tables, when configured.
     pub(crate) net: Option<crate::net::Network<T>>,
     /// What clients created by channel URI, owned by their registrations
@@ -1266,6 +1270,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
             #[cfg(test)]
             guard_lane_fault: None,
+            #[cfg(test)]
+            reincarnation_post_fault: false,
             // Validated above: the product fits.
             net_owned: Vec::with_capacity(config.network.map_or(0, |network| {
                 crate::net::client::owned_capacity(&network, config.max_clients).unwrap_or(0)
@@ -2675,6 +2681,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let incarnation = incarnation.incarnation;
         // A refused add leaves the lanes swapped: a later call posts the
         // sender again, and nothing is issued meanwhile.
+        #[cfg(test)]
+        if self.reincarnation_post_fault {
+            return Err(DriverError::NetworkBusy);
+        }
         self.attach_sender(&handle, channel, incarnation, true)?;
         if let Some(net) = self.net.as_mut() {
             let _ = net.end_reincarnation(registration);

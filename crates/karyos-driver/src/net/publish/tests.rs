@@ -1373,6 +1373,42 @@ fn an_agent_failure_mid_reincarnation_leaves_the_lane_sealed() {
     assert_eq!(driver.seal_reason(lane), Ok(Some(SealReason::GuardClosed)));
 }
 
+/// #396 review P2: a lane swapped to its next incarnation whose sender
+/// post was refused is `AwaitingSender`. A network close then leaves it
+/// refused, typed: no handle, so no offer is accepted and no `Submitted`
+/// record is written for a sender that will never read it.
+#[test]
+fn an_awaiting_sender_lane_is_refused_once_the_network_closed() {
+    const QUARANTINE: u64 = 50_000_000;
+    let mut driver = reincarnating_driver(QUARANTINE, 64);
+    let (_handle, _guard, _epoch, lane, _socket) = waiting_reincarnation(&mut driver);
+    driver.reincarnation_post_fault = true;
+    // Past the quarantine: the lanes are swapped, the post refused.
+    let mut refused = None;
+    until(&mut driver, |driver| match driver.publication(lane) {
+        Err(DriverError::QuarantinedAlias { .. }) => false,
+        other => {
+            refused = Some(other.map(drop));
+            true
+        }
+    });
+    assert_eq!(refused, Some(Err(DriverError::NetworkBusy)));
+    assert_eq!(driver.trace_identity(lane).unwrap().incarnation, 2);
+    assert_eq!(
+        driver.stream_ref(lane).unwrap().network,
+        crate::embedded::NetworkLane::AwaitingSender
+    );
+    let _ = driver.close_network().unwrap();
+    driver.reincarnation_post_fault = false;
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            driver.publication(lane).map(drop),
+            Err(DriverError::NetworkUnavailable)
+        );
+    }
+}
+
 /// #396 review P2: the quarantine runs from the old session's removal,
 /// not from when it was posted. The removal is held back (no duty runs
 /// for longer than the quarantine), so the swap still waits a full
