@@ -7,16 +7,21 @@
 //!
 //! A journal opens with a [`JournalHeader`]. Each event is one event
 //! record ([`MessageEvent`], [`ConflatedEvent`], [`TimerEvent`],
-//! [`LifecycleEvent`], [`ExternalEvent`]), then the handler's observations
-//! in order ([`OutcomeObservation`], [`TimerObservation`],
-//! [`ExternalObservation`]), then its [`EventEnd`]. A best-effort group
-//! marks the events it could not capture with a [`GapMarker`]. As in A1,
-//! each record is a plain value whose variable field borrows the decoded
-//! input; [`GroupRecord::decode`] validates a whole record before any value
-//! exists, and `encode` writes into the caller's buffer. Nothing allocates.
+//! [`LifecycleEvent`], [`ExternalEvent`], [`LossEvent`]), then the
+//! handler's observations in order ([`OutcomeObservation`],
+//! [`TimerObservation`], [`ExternalObservation`]), then its [`EventEnd`].
+//! A best-effort group marks the events it could not capture with a
+//! [`GapMarker`], and a reference its recording will never cover with a
+//! [`ReferenceUnavailable`] (A7d, `recording-group-gateway.md` section
+//! 10). As in A1, each record is a plain value whose variable field
+//! borrows the decoded input; [`GroupRecord::decode`] validates a whole
+//! record before any value exists, and `encode` writes into the caller's
+//! buffer. Nothing allocates.
 
 use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
 use karyos_sys::frame::{FRAME_ALIGNMENT, Lane};
+use karyos_sys::local_gap::GapReason as LocalGapReason;
+use karyos_sys::log_buffer::SkipReason;
 
 #[cfg(test)]
 mod tests;
@@ -59,6 +64,8 @@ pub const TIMER_EVENT: Template = template(4, 24, 12 + 24);
 pub const LIFECYCLE_EVENT: Template = template(5, 43, 12 + 43);
 /// `ExternalEvent`, template 6.
 pub const EXTERNAL_EVENT: Template = template(6, 20, 12 + 20 + 2 + 65_535);
+/// `LossEvent`, template 7.
+pub const LOSS_EVENT: Template = template(7, 60, 12 + 60);
 /// `OutcomeObservation`, template 11.
 pub const OUTCOME_OBSERVATION: Template = template(11, 51, 12 + 51);
 /// `TimerObservation`, template 12.
@@ -71,6 +78,8 @@ pub const EXTERNAL_OBSERVATION: Template = template(13, 16, 12 + 16 + 2 + 65_535
 pub const EVENT_END: Template = template(20, 13, 12 + 13);
 /// `GapMarker`, template 21.
 pub const GAP_MARKER: Template = template(21, 17, 12 + 17);
+/// `ReferenceUnavailable`, template 22.
+pub const REFERENCE_UNAVAILABLE: Template = template(22, 16, 12 + 16);
 
 /// The longest record of any template.
 pub const MAX_RECORD: usize = 12 + 67 + 2 + 65_535 + 2 + 64;
@@ -220,6 +229,22 @@ pub enum Payload<'a> {
         /// The payload's length.
         length: u32,
     },
+    /// Not captured: a payload above [`MAX_INLINE`] of a source this
+    /// Archive does not record as `required`. Its length, with the event's
+    /// position and extent, lets replay report it.
+    Unavailable {
+        /// The payload's length, above [`MAX_INLINE`].
+        length: u32,
+    },
+}
+
+/// An unavailable payload's length: above [`MAX_INLINE`].
+fn unavailable(length: u32) -> Result<u32, CodecError> {
+    if usize::try_from(length).is_ok_and(|length| length > MAX_INLINE) {
+        Ok(length)
+    } else {
+        Err(out_of_range("length"))
+    }
 }
 
 /// A message delivered from a stream.
@@ -313,6 +338,18 @@ impl<'a> MessageEvent<'a> {
                 recording_id: id("recording_id", recording_id)?,
                 length,
             },
+            3 if recording_id != 0 => return Err(out_of_range("recording_id")),
+            3 if !value.is_empty() => {
+                return Err(CodecError::LengthOutOfRange {
+                    field: "value",
+                    length: value.len(),
+                    min: 0,
+                    max: 0,
+                });
+            }
+            3 => Payload::Unavailable {
+                length: unavailable(length)?,
+            },
             value => return Err(invalid_enum("payload", value)),
         };
         Ok(Self {
@@ -356,6 +393,7 @@ impl<'a> MessageEvent<'a> {
                 recording_id,
                 length,
             } => (id("recording_id", recording_id)?, length, 2, &[][..]),
+            Payload::Unavailable { length } => (0, unavailable(length)?, 3, &[][..]),
         };
         let mut flags = 0;
         if self.end_of_stream {
@@ -598,6 +636,263 @@ impl LifecycleEvent {
         encoder.u8(40, kind)?;
         encoder.u8(41, self.lane.get())?;
         encoder.u8(42, reason)?;
+        encoder.finish()
+    }
+}
+
+/// How a rejoin policy resolved an overrun, as the handler was told: the
+/// loss report's applied outcomes, and `replaying` for a
+/// `ReplayRejoin` still recovering the gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrunOutcome {
+    /// Delivery went on at `resume`.
+    ResumedAtHead,
+    /// A snapshot rebuilt the state up to `resume`.
+    SnapshotRebuilt,
+    /// The snapshot failed, and the subscription closed.
+    SnapshotFailed,
+    /// The subscription closed.
+    Closed,
+    /// The gap was replayed from a recording and merged at `resume`.
+    Replayed,
+    /// The gap is being recovered from a recording.
+    Replaying,
+}
+
+/// Why `replay` fell back to its secondary policy: the loss report's
+/// reason codes, 1 to 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// No Archive.
+    NoArchive,
+    /// No recording covers the gap.
+    NoRecording,
+    /// The recording's retention does not reach the gap.
+    RetentionShort,
+    /// The recording had not reached the gap's end in time.
+    RecordingBehind,
+    /// The Archive refused the replay.
+    Refused,
+    /// The replay and the live stream did not merge.
+    MergeFailed,
+    /// The gap was given up before it resolved.
+    Withdrawn,
+}
+
+/// What a source reported instead of a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loss {
+    /// The reader was overrun, and its rejoin policy did `outcome`; a
+    /// `replay` that fell back names its reason.
+    Overrun {
+        /// What the policy did.
+        outcome: OverrunOutcome,
+        /// Why `replay` fell back, if it did: only with an outcome of the
+        /// secondary policy (resumed, rebuilt, failed or closed).
+        fallback: Option<FallbackReason>,
+    },
+    /// A range was skipped.
+    Skipped(SkipReason),
+    /// An aborted block.
+    Aborted,
+}
+
+/// A loss on a message source, delivered to the handler as an event of
+/// its own (`recording-group-gateway.md` sections 5 and 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LossEvent {
+    /// The event's sequence in its group, never 0.
+    pub group_seq: u64,
+    /// When it was dispatched.
+    pub logical_time: u64,
+    /// The publication incarnation.
+    pub incarnation: u64,
+    /// An overrun's first position not delivered; a skip's or an abort's
+    /// position.
+    pub from: u64,
+    /// An overrun's end known lost; a skip's or an abort's end.
+    pub lost_to: u64,
+    /// Where delivery resumed; for a skip or an abort, its end. A replayed
+    /// overrun's cutover.
+    pub resume: u64,
+    /// The stream.
+    pub stream_id: i32,
+    /// The session.
+    pub session_id: i32,
+    /// The lane.
+    pub lane: Lane,
+    /// What was lost, and how it resolved.
+    pub loss: Loss,
+}
+
+impl OverrunOutcome {
+    const fn code(self) -> u8 {
+        match self {
+            Self::ResumedAtHead => 1,
+            Self::SnapshotRebuilt => 2,
+            Self::SnapshotFailed => 3,
+            Self::Closed => 4,
+            Self::Replayed => 5,
+            Self::Replaying => 6,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, CodecError> {
+        Ok(match code {
+            1 => Self::ResumedAtHead,
+            2 => Self::SnapshotRebuilt,
+            3 => Self::SnapshotFailed,
+            4 => Self::Closed,
+            5 => Self::Replayed,
+            6 => Self::Replaying,
+            value => return Err(invalid_enum("outcome", value)),
+        })
+    }
+
+    /// Whether the secondary policy did it, so a fallback may name why.
+    const fn is_secondary(self) -> bool {
+        matches!(
+            self,
+            Self::ResumedAtHead | Self::SnapshotRebuilt | Self::SnapshotFailed | Self::Closed
+        )
+    }
+}
+
+impl FallbackReason {
+    const fn code(self) -> u8 {
+        match self {
+            Self::NoArchive => 1,
+            Self::NoRecording => 2,
+            Self::RetentionShort => 3,
+            Self::RecordingBehind => 4,
+            Self::Refused => 5,
+            Self::MergeFailed => 6,
+            Self::Withdrawn => 7,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Option<Self>, CodecError> {
+        Ok(Some(match code {
+            0 => return Ok(None),
+            1 => Self::NoArchive,
+            2 => Self::NoRecording,
+            3 => Self::RetentionShort,
+            4 => Self::RecordingBehind,
+            5 => Self::Refused,
+            6 => Self::MergeFailed,
+            7 => Self::Withdrawn,
+            value => return Err(invalid_enum("reason", value)),
+        }))
+    }
+}
+
+/// A skip's reason code: 1 to 6 for the reasons in their declaration
+/// order, then 7 and 8 for a local gap whose reason is 1 or 2.
+const fn skip_code(reason: SkipReason) -> u8 {
+    match reason {
+        SkipReason::MessageTooLarge => 1,
+        SkipReason::MissingEnd => 2,
+        SkipReason::Interrupted => 3,
+        SkipReason::Orphan => 4,
+        SkipReason::JoinedMidMessage => 5,
+        SkipReason::AfterLoss => 6,
+        SkipReason::LocalGap(LocalGapReason::ReorderExpired) => 7,
+        SkipReason::LocalGap(LocalGapReason::RangeUnavailable) => 8,
+    }
+}
+
+fn skip_reason(code: u8) -> Result<SkipReason, CodecError> {
+    Ok(match code {
+        1 => SkipReason::MessageTooLarge,
+        2 => SkipReason::MissingEnd,
+        3 => SkipReason::Interrupted,
+        4 => SkipReason::Orphan,
+        5 => SkipReason::JoinedMidMessage,
+        6 => SkipReason::AfterLoss,
+        7 => SkipReason::LocalGap(LocalGapReason::ReorderExpired),
+        8 => SkipReason::LocalGap(LocalGapReason::RangeUnavailable),
+        value => return Err(invalid_enum("reason", value)),
+    })
+}
+
+impl LossEvent {
+    /// The positions' rule: `from <= lost_to <= resume`, and a skip's or an
+    /// abort's `lost_to` is its `resume`.
+    fn positions(&self) -> Result<(), CodecError> {
+        if self.from > self.lost_to {
+            return Err(out_of_range("lost_to"));
+        }
+        let ranged = matches!(self.loss, Loss::Skipped(_) | Loss::Aborted);
+        if self.lost_to > self.resume || (ranged && self.lost_to != self.resume) {
+            return Err(out_of_range("resume"));
+        }
+        Ok(())
+    }
+
+    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+        decoder.finish()?;
+        let (outcome, reason) = (block.u8(58)?, block.u8(59)?);
+        let loss = match block.u8(57)? {
+            1 => {
+                let outcome = OverrunOutcome::from_code(outcome)?;
+                let fallback = FallbackReason::from_code(reason)?;
+                if fallback.is_some() && !outcome.is_secondary() {
+                    return Err(out_of_range("reason"));
+                }
+                Loss::Overrun { outcome, fallback }
+            }
+            2 | 3 if outcome != 0 => return Err(out_of_range("outcome")),
+            2 => Loss::Skipped(skip_reason(reason)?),
+            3 if reason != 0 => return Err(out_of_range("reason")),
+            3 => Loss::Aborted,
+            value => return Err(invalid_enum("kind", value)),
+        };
+        let event = Self {
+            group_seq: id("group_seq", block.u64(0)?)?,
+            logical_time: block.u64(8)?,
+            incarnation: block.u64(16)?,
+            from: block.u64(24)?,
+            lost_to: block.u64(32)?,
+            resume: block.u64(40)?,
+            stream_id: block.i32(48)?,
+            session_id: block.i32(52)?,
+            lane: lane(block.u8(56)?)?,
+            loss,
+        };
+        event.positions()?;
+        Ok(event)
+    }
+
+    /// Encodes into `out`; returns the record's length.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &LOSS_EVENT)?;
+        self.positions()?;
+        let (kind, outcome, reason) = match self.loss {
+            Loss::Overrun { outcome, fallback } => {
+                if fallback.is_some() && !outcome.is_secondary() {
+                    return Err(out_of_range("reason"));
+                }
+                (1, outcome.code(), fallback.map_or(0, FallbackReason::code))
+            }
+            Loss::Skipped(reason) => (2, 0, skip_code(reason)),
+            Loss::Aborted => (3, 0, 0),
+        };
+        encoder.u64(0, id("group_seq", self.group_seq)?)?;
+        encoder.u64(8, self.logical_time)?;
+        encoder.u64(16, self.incarnation)?;
+        encoder.u64(24, self.from)?;
+        encoder.u64(32, self.lost_to)?;
+        encoder.u64(40, self.resume)?;
+        encoder.i32(48, self.stream_id)?;
+        encoder.i32(52, self.session_id)?;
+        encoder.u8(56, self.lane.get())?;
+        encoder.u8(57, kind)?;
+        encoder.u8(58, outcome)?;
+        encoder.u8(59, reason)?;
         encoder.finish()
     }
 }
@@ -1265,6 +1560,40 @@ impl GapMarker {
     }
 }
 
+/// A best-effort group's mark of an event whose payload is by reference to
+/// a recording that stopped or failed before it covered the frames: the
+/// payload will never be there, so the event counts complete with its
+/// payload unavailable (`recording-group-gateway.md` section 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceUnavailable {
+    /// The event, already ended, never 0.
+    pub group_seq: u64,
+    /// The recording its payload names, never 0.
+    pub recording_id: u64,
+}
+
+impl ReferenceUnavailable {
+    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+        decoder.finish()?;
+        Ok(Self {
+            group_seq: id("group_seq", block.u64(0)?)?,
+            recording_id: id("recording_id", block.u64(8)?)?,
+        })
+    }
+
+    /// Encodes into `out`; returns the record's length.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &REFERENCE_UNAVAILABLE)?;
+        encoder.u64(0, id("group_seq", self.group_seq)?)?;
+        encoder.u64(8, id("recording_id", self.recording_id)?)?;
+        encoder.finish()
+    }
+}
+
 /// Any record of schema 3, version 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupRecord<'a> {
@@ -1280,6 +1609,8 @@ pub enum GroupRecord<'a> {
     Lifecycle(LifecycleEvent),
     /// Template 6.
     External(ExternalEvent<'a>),
+    /// Template 7.
+    Loss(LossEvent),
     /// Template 11.
     Outcome(OutcomeObservation),
     /// Template 12.
@@ -1292,6 +1623,8 @@ pub enum GroupRecord<'a> {
     End(EventEnd),
     /// Template 21.
     Gap(GapMarker),
+    /// Template 22.
+    Unavailable(ReferenceUnavailable),
 }
 
 /// What a record is within its journal, for the order rules.
@@ -1306,12 +1639,17 @@ pub enum Role {
     },
     /// An event's first record, with its `group_seq`.
     Event(u64),
+    /// A message event whose payload was not captured (payload 3), with
+    /// its `group_seq`: an event, which only a best-effort journal holds.
+    Uncaptured(u64),
     /// An observation, with its `group_seq` and index.
     Observation(u64, u32),
     /// An event's end.
     End(EventEnd),
     /// A gap marker.
     Gap(GapMarker),
+    /// A reference unavailable, naming its event's `group_seq`.
+    Unavailable(u64),
 }
 
 impl<'a> GroupRecord<'a> {
@@ -1339,12 +1677,14 @@ impl<'a> GroupRecord<'a> {
             4 => &TIMER_EVENT,
             5 => &LIFECYCLE_EVENT,
             6 => &EXTERNAL_EVENT,
+            7 => &LOSS_EVENT,
             11 => &OUTCOME_OBSERVATION,
             12 => &TIMER_OBSERVATION,
             13 => &EXTERNAL_OBSERVATION,
             14 => &DELIVERY_OBSERVATION,
             20 => &EVENT_END,
             21 => &GAP_MARKER,
+            22 => &REFERENCE_UNAVAILABLE,
             _ => return Err(unsupported),
         };
         let (block, decoder) = Decoder::new(buf, template)?;
@@ -1355,12 +1695,14 @@ impl<'a> GroupRecord<'a> {
             4 => Self::Timer(TimerEvent::decode(block, decoder)?),
             5 => Self::Lifecycle(LifecycleEvent::decode(block, decoder)?),
             6 => Self::External(ExternalEvent::decode(block, decoder)?),
+            7 => Self::Loss(LossEvent::decode(block, decoder)?),
             11 => Self::Outcome(OutcomeObservation::decode(block, decoder)?),
             12 => Self::TimerOperation(TimerObservation::decode(block, decoder)?),
             13 => Self::ExternalObservation(ExternalObservation::decode(block, decoder)?),
             14 => Self::Delivery(DeliveryObservation::decode(block, decoder)?),
             20 => Self::End(EventEnd::decode(block, decoder)?),
-            _ => Self::Gap(GapMarker::decode(block, decoder)?),
+            21 => Self::Gap(GapMarker::decode(block, decoder)?),
+            _ => Self::Unavailable(ReferenceUnavailable::decode(block, decoder)?),
         })
     }
 
@@ -1377,12 +1719,14 @@ impl<'a> GroupRecord<'a> {
             Self::Timer(record) => record.encode(out),
             Self::Lifecycle(record) => record.encode(out),
             Self::External(record) => record.encode(out),
+            Self::Loss(record) => record.encode(out),
             Self::Outcome(record) => record.encode(out),
             Self::TimerOperation(record) => record.encode(out),
             Self::ExternalObservation(record) => record.encode(out),
             Self::Delivery(record) => record.encode(out),
             Self::End(record) => record.encode(out),
             Self::Gap(record) => record.encode(out),
+            Self::Unavailable(record) => record.encode(out),
         }
     }
 
@@ -1394,11 +1738,17 @@ impl<'a> GroupRecord<'a> {
                 capture: header.capture,
                 first_group_seq: header.first_group_seq,
             },
+            Self::Message(MessageEvent {
+                group_seq,
+                payload: Payload::Unavailable { .. },
+                ..
+            }) => Role::Uncaptured(*group_seq),
             Self::Message(MessageEvent { group_seq, .. })
             | Self::Conflated(ConflatedEvent { group_seq, .. })
             | Self::Timer(TimerEvent { group_seq, .. })
             | Self::Lifecycle(LifecycleEvent { group_seq, .. })
-            | Self::External(ExternalEvent { group_seq, .. }) => Role::Event(*group_seq),
+            | Self::External(ExternalEvent { group_seq, .. })
+            | Self::Loss(LossEvent { group_seq, .. }) => Role::Event(*group_seq),
             Self::Outcome(OutcomeObservation {
                 group_seq, index, ..
             })
@@ -1413,6 +1763,7 @@ impl<'a> GroupRecord<'a> {
             }) => Role::Observation(*group_seq, *index),
             Self::End(end) => Role::End(*end),
             Self::Gap(gap) => Role::Gap(*gap),
+            Self::Unavailable(unavailable) => Role::Unavailable(unavailable.group_seq),
         }
     }
 }

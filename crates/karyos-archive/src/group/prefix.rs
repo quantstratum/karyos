@@ -65,6 +65,16 @@ pub enum PrefixError {
     /// A `group_seq` or a position past `u64`.
     #[error("sequence or position exhausted")]
     Exhausted,
+    /// A reference unavailable record naming no event that waits on that
+    /// recording's frames: none by that `group_seq`, one whose payload is
+    /// not by reference to it, or one already marked.
+    #[error("no event {group_seq} waits on recording {recording_id}")]
+    NoReference {
+        /// The event named.
+        group_seq: u64,
+        /// The recording named.
+        recording_id: u64,
+    },
 }
 
 /// What one complete event still needs.
@@ -135,8 +145,10 @@ pub struct PrefixTracker {
     durable: u64,
     /// The journal position after the complete prefix's last record.
     complete_end: u64,
-    /// An incomplete event or a gap stopped the prefixes.
-    stopped: bool,
+    /// Where an incomplete event or a gap stopped the prefixes: the first
+    /// event not queued (the incomplete one, or the one after the gap),
+    /// and no later one is either.
+    stop: Option<u64>,
     view: Arc<PrefixView>,
 }
 
@@ -155,7 +167,7 @@ impl PrefixTracker {
             complete: 0,
             durable: 0,
             complete_end: 0,
-            stopped: false,
+            stop: None,
             view: Arc::new(PrefixView::default()),
         }
     }
@@ -199,7 +211,7 @@ impl PrefixTracker {
             _ if !self.started => return Err(PrefixError::OutOfOrder),
             GroupRecord::Message(message) => {
                 let reference = match message.payload {
-                    Payload::Inline(_) => None,
+                    Payload::Inline(_) | Payload::Unavailable { .. } => None,
                     Payload::Reference { recording_id, .. } => Some((
                         recording_id,
                         message
@@ -214,6 +226,7 @@ impl PrefixTracker {
             GroupRecord::Timer(event) => self.open_event(event.group_seq, None)?,
             GroupRecord::Lifecycle(event) => self.open_event(event.group_seq, None)?,
             GroupRecord::External(event) => self.open_event(event.group_seq, None)?,
+            GroupRecord::Loss(event) => self.open_event(event.group_seq, None)?,
             GroupRecord::Outcome(_)
             | GroupRecord::TimerOperation(_)
             | GroupRecord::ExternalObservation(_)
@@ -230,8 +243,8 @@ impl PrefixTracker {
                     return Err(PrefixError::OutOfOrder);
                 }
                 if end.outcome == EndOutcome::Incomplete {
-                    self.stopped = true;
-                } else if !self.stopped {
+                    let _ = self.stop.get_or_insert(seq);
+                } else if self.stop.is_none() {
                     if self.waiting.len() >= self.capacity {
                         return Err(PrefixError::Full {
                             capacity: self.capacity,
@@ -245,14 +258,53 @@ impl PrefixTracker {
                 }
                 self.open = None;
             }
-            GroupRecord::Gap(_) => {
+            GroupRecord::Gap(gap) => {
                 if self.open.is_some() {
                     return Err(PrefixError::OutOfOrder);
                 }
-                self.stopped = true;
+                let after = gap.to_seq.checked_add(1).ok_or(PrefixError::Exhausted)?;
+                let _ = self.stop.get_or_insert(after);
+            }
+            GroupRecord::Unavailable(unavailable) => {
+                if self.open.is_some() {
+                    return Err(PrefixError::OutOfOrder);
+                }
+                self.settle(unavailable.group_seq, unavailable.recording_id)?;
             }
         }
         Ok(())
+    }
+
+    /// Event `seq`'s payload, by reference to `recording_id`, will never be
+    /// there: the event counts complete with its payload unavailable.
+    ///
+    /// A waiting event is always settled, also after the prefixes stopped:
+    /// the events queued before the stop still complete. An event not
+    /// waiting is taken as it is in two cases. One already durable: the
+    /// recording held its frames after all, as one that recovers more after
+    /// a crash than it reported before (`recording-group-gateway.md`
+    /// section 7). One at or past the stop: no event is queued there, and
+    /// the prefixes cannot reach it. A `group_seq` inside the gap that
+    /// stopped them names no event, and is refused.
+    fn settle(&mut self, seq: u64, recording_id: u64) -> Result<(), PrefixError> {
+        let no_reference = PrefixError::NoReference {
+            group_seq: seq,
+            recording_id,
+        };
+        if let Some(waiting) = self.waiting.iter_mut().find(|waiting| waiting.seq == seq) {
+            return match waiting.reference {
+                Some((recording, _)) if recording == recording_id => {
+                    waiting.reference = None;
+                    Ok(())
+                }
+                _ => Err(no_reference),
+            };
+        }
+        if seq <= self.durable || self.stop.is_some_and(|stop| seq >= stop) {
+            Ok(())
+        } else {
+            Err(no_reference)
+        }
     }
 
     fn open_event(&mut self, seq: u64, reference: Option<(u64, u64)>) -> Result<(), PrefixError> {
@@ -352,7 +404,7 @@ impl PrefixTracker {
     /// Whether an incomplete event or a gap stopped the prefixes.
     #[must_use]
     pub const fn stopped(&self) -> bool {
-        self.stopped
+        self.stop.is_some()
     }
 }
 
@@ -388,7 +440,9 @@ pub fn recover<D: crate::disk::Disk>(
     let mut full = false;
     let durable = journal.durable();
     journal.walk(0, |_, end, record| {
-        if let super::record::Role::Event(seq) = record.role() {
+        if let super::record::Role::Event(seq) | super::record::Role::Uncaptured(seq) =
+            record.role()
+        {
             last_seen = seq;
         }
         if full {

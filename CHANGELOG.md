@@ -11,6 +11,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A publication released through the client facade whose removal cannot
+  be sent (the command ring full, a handle another connection issued, a
+  closed link) is counted: `Client::publication_releases_failed`. The
+  handle is still dropped; in process that ends its lease, and for a
+  remote client the driver keeps the publication, with no EOS, until the
+  client ends. The doc-hidden `Connection::release_publication` returns
+  whether the removal was sent (#402 review P3).
 - The `replay` rejoin with an Archive (phase 3, A6c; SPEC.md §4).
   `karyos_client::ReplayRejoin` wraps a subscription: on an overrun the
   live reader rejoins at the head, the poll reports the overrun as
@@ -328,6 +335,23 @@ release may break APIs, wire formats and shared-memory layouts.
   the linger gets the repeats. The EOS counts as sent once one path
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
+- A recording group's records for the Gateway (phase 3, A7d-1a;
+  `recording-group-gateway.md` section 10), in place under schema 3
+  version 1. A message's payload can be unavailable (value 3): above
+  `MAX_INLINE`, from a source this Archive does not record as
+  `required`, with its length, position and extent and no value. A
+  `LossEvent` (template 7) is an event for what a source reported instead
+  of a message: an overrun with its rejoin outcome (replaying and
+  replayed among them, and a `replay` fallback's reason), a skipped range
+  with its reason, or an aborted block, with `from`, `lost_to` and
+  `resume`. A `ReferenceUnavailable` (template 22) marks, in a
+  best-effort journal, an ended event whose referenced recording stopped
+  before covering it: the order rules take it between events, naming an
+  event that ended at or after the first, and refuse it, and payload 3,
+  in a strict journal. The prefix tracker settles a waiting event that
+  references that recording, also after the prefixes stopped, and counts
+  it complete; a mark for an event already durable, or at or past the
+  stop, is a no-op, and one inside the stopping gap is refused.
 - A recording group's three prefixes (phase 3, A7c; SPEC §8.3).
   `karyos_archive::group::prefix::PrefixTracker` tracks `delivered_seq`,
   `complete_recording_seq` and `durable_group_seq`: an event is complete

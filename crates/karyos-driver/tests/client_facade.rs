@@ -1078,3 +1078,29 @@ fn a_named_lane_count_is_taken_exactly() {
     });
     assert_eq!(publication.unwrap().lane_count(), 2);
 }
+
+/// A publication released whose removal cannot be sent is dropped and
+/// counted (#402 review P3): client B releasing client A's publication
+/// gets `ForeignHandle` from its own connection, so B counts one failed
+/// release; A's release of its own publication is sent and counts none.
+#[test]
+fn a_release_whose_removal_cannot_be_sent_is_counted() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let _ = driver.add_stream(heap_stream(5)).unwrap();
+    let _ = driver.add_stream(heap_stream(6)).unwrap();
+    let mut a = Client::with_conductor(driver.connect().unwrap(), context());
+    let mut b = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let foreign = a
+            .add_exclusive_publication("karyos:ipc", StreamId::new(5))
+            .unwrap();
+        b.remove_publication(foreign);
+        assert_eq!(b.publication_releases_failed(), 1);
+        assert_eq!(a.publication_releases_failed(), 0);
+        let own = a
+            .add_exclusive_publication("karyos:ipc", StreamId::new(6))
+            .unwrap();
+        a.remove_publication(own);
+        assert_eq!(a.publication_releases_failed(), 0);
+    });
+}

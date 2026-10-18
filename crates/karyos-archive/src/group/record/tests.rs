@@ -446,6 +446,118 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 },
             }),
         ),
+        // A7d: an overrun that `replay` resolved by falling back, the merge
+        // failed; a skipped local gap; a payload not captured; a reference
+        // its recording will never cover.
+        (
+            vector(
+                7,
+                &Fields::new(60)
+                    .u64(0, 10)
+                    .u64(8, 10_000)
+                    .u64(16, 2)
+                    .u64(24, 4096)
+                    .u64(32, 8192)
+                    .u64(40, 12_288)
+                    .i32(48, 10)
+                    .i32(52, 3)
+                    .u8(56, 0)
+                    .u8(57, 1)
+                    .u8(58, 1)
+                    .u8(59, 6)
+                    .0,
+                &[],
+            ),
+            GroupRecord::Loss(LossEvent {
+                group_seq: 10,
+                logical_time: 10_000,
+                incarnation: 2,
+                from: 4096,
+                lost_to: 8192,
+                resume: 12_288,
+                stream_id: 10,
+                session_id: 3,
+                lane: lane(0),
+                loss: Loss::Overrun {
+                    outcome: OverrunOutcome::ResumedAtHead,
+                    fallback: Some(FallbackReason::MergeFailed),
+                },
+            }),
+        ),
+        (
+            vector(
+                7,
+                &Fields::new(60)
+                    .u64(0, 11)
+                    .u64(8, 11_000)
+                    .u64(16, 2)
+                    .u64(24, 12_288)
+                    .u64(32, 12_544)
+                    .u64(40, 12_544)
+                    .i32(48, 10)
+                    .i32(52, 3)
+                    .u8(56, 1)
+                    .u8(57, 2)
+                    .u8(58, 0)
+                    .u8(59, 8)
+                    .0,
+                &[],
+            ),
+            GroupRecord::Loss(LossEvent {
+                group_seq: 11,
+                logical_time: 11_000,
+                incarnation: 2,
+                from: 12_288,
+                lost_to: 12_544,
+                resume: 12_544,
+                stream_id: 10,
+                session_id: 3,
+                lane: lane(1),
+                loss: Loss::Skipped(SkipReason::LocalGap(LocalGapReason::RangeUnavailable)),
+            }),
+        ),
+        (
+            vector(
+                2,
+                &Fields::new(67)
+                    .u64(0, 12)
+                    .u64(8, 12_000)
+                    .u64(16, 2)
+                    .u64(24, 16_384)
+                    .u64(32, 0)
+                    .i64(40, 0)
+                    .u32(48, 70_000)
+                    .u32(52, 72_000)
+                    .i32(56, 10)
+                    .i32(60, 3)
+                    .u8(64, 0)
+                    .u8(65, 3)
+                    .u8(66, 0)
+                    .0,
+                &[b"", b""],
+            ),
+            GroupRecord::Message(MessageEvent {
+                group_seq: 12,
+                logical_time: 12_000,
+                incarnation: 2,
+                position: 16_384,
+                extent: 72_000,
+                stream_id: 10,
+                session_id: 3,
+                lane: lane(0),
+                reserved_value: 0,
+                end_of_stream: false,
+                extension: None,
+                payload: Payload::Unavailable { length: 70_000 },
+            }),
+        ),
+        (
+            vector(22, &Fields::new(16).u64(0, 2).u64(8, 9).0, &[]),
+            GroupRecord::Unavailable(ReferenceUnavailable {
+                group_seq: 2,
+                recording_id: 9,
+            }),
+        ),
     ]
 }
 
@@ -668,6 +780,63 @@ fn samples() -> Vec<GroupRecord<'static>> {
             reason,
         }));
     }
+    let loss = |loss| {
+        GroupRecord::Loss(LossEvent {
+            group_seq: u64::MAX,
+            logical_time: u64::MAX,
+            incarnation: u64::MAX,
+            from: 0,
+            lost_to: u64::MAX,
+            resume: u64::MAX,
+            stream_id: i32::MIN,
+            session_id: i32::MAX,
+            lane: lane(3),
+            loss,
+        })
+    };
+    let reasons = [
+        None,
+        Some(FallbackReason::NoArchive),
+        Some(FallbackReason::NoRecording),
+        Some(FallbackReason::RetentionShort),
+        Some(FallbackReason::RecordingBehind),
+        Some(FallbackReason::Refused),
+        Some(FallbackReason::MergeFailed),
+        Some(FallbackReason::Withdrawn),
+    ];
+    for outcome in [
+        OverrunOutcome::ResumedAtHead,
+        OverrunOutcome::SnapshotRebuilt,
+        OverrunOutcome::SnapshotFailed,
+        OverrunOutcome::Closed,
+    ] {
+        for fallback in reasons {
+            samples.push(loss(Loss::Overrun { outcome, fallback }));
+        }
+    }
+    for outcome in [OverrunOutcome::Replayed, OverrunOutcome::Replaying] {
+        samples.push(loss(Loss::Overrun {
+            outcome,
+            fallback: None,
+        }));
+    }
+    for reason in [
+        SkipReason::MessageTooLarge,
+        SkipReason::MissingEnd,
+        SkipReason::Interrupted,
+        SkipReason::Orphan,
+        SkipReason::JoinedMidMessage,
+        SkipReason::AfterLoss,
+        SkipReason::LocalGap(LocalGapReason::ReorderExpired),
+        SkipReason::LocalGap(LocalGapReason::RangeUnavailable),
+    ] {
+        samples.push(loss(Loss::Skipped(reason)));
+    }
+    samples.push(loss(Loss::Aborted));
+    samples.push(GroupRecord::Unavailable(ReferenceUnavailable {
+        group_seq: u64::MAX,
+        recording_id: u64::MAX,
+    }));
     samples
 }
 
@@ -707,7 +876,7 @@ fn every_truncation_is_refused() {
 #[test]
 fn unsupported_tuples_are_refused() {
     let (bytes, _) = goldens().remove(0);
-    for (at, value) in [(0, 1u16), (0, 2), (2, 7), (2, 15), (2, 30), (4, 2)] {
+    for (at, value) in [(0, 1u16), (0, 2), (2, 8), (2, 15), (2, 23), (2, 30), (4, 2)] {
         let mut mutated = bytes.clone();
         mutated[at..at + 2].copy_from_slice(&value.to_le_bytes());
         assert!(
@@ -747,6 +916,10 @@ const DELIVERY: usize = 11;
 const END: usize = 12;
 const GAP: usize = 13;
 const NESTED: usize = 14;
+const OVERRUN: usize = 15;
+const SKIPPED: usize = 16;
+const UNCAPTURED: usize = 17;
+const UNAVAILABLE: usize = 18;
 
 #[test]
 #[allow(clippy::too_many_lines, reason = "one case per rule")]
@@ -798,7 +971,7 @@ fn every_invalid_field_is_refused() {
     );
     assert_eq!(refused(&mutated(INLINE, 64, 4, 1)), out_of_range("lane"));
     assert_eq!(refused(&mutated(INLINE, 65, 0, 1)), invalid("payload", 0));
-    assert_eq!(refused(&mutated(INLINE, 65, 3, 1)), invalid("payload", 3));
+    assert_eq!(refused(&mutated(INLINE, 65, 4, 1)), invalid("payload", 4));
     assert_eq!(refused(&mutated(INLINE, 66, 4, 1)), out_of_range("flags"));
     // An inline payload naming a recording, or not of its length.
     assert_eq!(
@@ -1079,6 +1252,10 @@ fn every_record_knows_its_role() {
                 reason: GapReason::RingFull
             }),
             Role::Observation(8, 0),
+            Role::Event(10),
+            Role::Event(11),
+            Role::Uncaptured(12),
+            Role::Unavailable(2),
         ]
     );
 }
@@ -1106,7 +1283,7 @@ proptest! {
         };
         let length = match payload {
             Payload::Inline(value) => u32::try_from(value.len()).unwrap(),
-            Payload::Reference { length, .. } => length,
+            Payload::Reference { length, .. } | Payload::Unavailable { length } => length,
         };
         let extent = (u64::from(length) + 32)
             .next_multiple_of(32)
@@ -1138,7 +1315,7 @@ proptest! {
 
     #[test]
     fn arbitrary_blocks_of_every_template_never_panic(
-        template in 0usize..12,
+        template in 0usize..14,
         block in proptest::collection::vec(any::<u8>(), 72),
         value in proptest::collection::vec(any::<u8>(), 0..16),
     ) {
@@ -1146,7 +1323,7 @@ proptest! {
             JOURNAL_HEADER, MESSAGE_EVENT, CONFLATED_EVENT, TIMER_EVENT,
             LIFECYCLE_EVENT, EXTERNAL_EVENT, OUTCOME_OBSERVATION,
             TIMER_OBSERVATION, EXTERNAL_OBSERVATION, DELIVERY_OBSERVATION,
-            EVENT_END, GAP_MARKER,
+            EVENT_END, GAP_MARKER, LOSS_EVENT, REFERENCE_UNAVAILABLE,
         ];
         let template = templates[template];
         let block = &block[..usize::from(template.block_length)];
@@ -1235,4 +1412,247 @@ fn a_failure_holds_only_its_variants_fields() {
         },
     });
     assert_eq!(record.encode(&mut out), Err(detail));
+}
+
+/// The A7d records' fields (`recording-group-gateway.md` section 10): a
+/// loss event's kind, outcome, reason and positions, an unavailable
+/// payload, and a reference unavailable's identifiers.
+#[test]
+fn every_invalid_a7d_field_is_refused() {
+    let out_of_range = |field| CodecError::ValueOutOfRange { field };
+    let invalid = |field, value| CodecError::InvalidEnum { field, value };
+    // An overrun.
+    assert_eq!(
+        refused(&mutated(OVERRUN, 0, 0, 8)),
+        out_of_range("group_seq")
+    );
+    assert_eq!(refused(&mutated(OVERRUN, 56, 4, 1)), out_of_range("lane"));
+    for kind in [0u64, 4] {
+        assert_eq!(
+            refused(&mutated(OVERRUN, 57, kind, 1)),
+            invalid("kind", kind)
+        );
+    }
+    for outcome in [0u64, 7] {
+        assert_eq!(
+            refused(&mutated(OVERRUN, 58, outcome, 1)),
+            invalid("outcome", outcome)
+        );
+    }
+    assert_eq!(refused(&mutated(OVERRUN, 59, 8, 1)), invalid("reason", 8));
+    // A replayed or replaying overrun did not fall back.
+    for outcome in [5u64, 6] {
+        assert_eq!(
+            refused(&mutated(OVERRUN, 58, outcome, 1)),
+            out_of_range("reason")
+        );
+    }
+    assert_eq!(
+        refused(&mutated(OVERRUN, 24, 8193, 8)),
+        out_of_range("lost_to")
+    );
+    assert_eq!(
+        refused(&mutated(OVERRUN, 40, 8191, 8)),
+        out_of_range("resume")
+    );
+    // A skip: no outcome, a listed reason, and its end as its resume.
+    assert_eq!(
+        refused(&mutated(SKIPPED, 58, 1, 1)),
+        out_of_range("outcome")
+    );
+    for reason in [0u64, 9] {
+        assert_eq!(
+            refused(&mutated(SKIPPED, 59, reason, 1)),
+            invalid("reason", reason)
+        );
+    }
+    assert_eq!(
+        refused(&mutated(SKIPPED, 40, 12_800, 8)),
+        out_of_range("resume")
+    );
+    // An abort: neither outcome nor reason.
+    assert_eq!(refused(&mutated(SKIPPED, 57, 3, 1)), out_of_range("reason"));
+    let mut aborted = mutated(SKIPPED, 57, 3, 1);
+    aborted[12 + 59] = 0;
+    assert!(matches!(
+        GroupRecord::decode(&aborted).unwrap(),
+        GroupRecord::Loss(LossEvent {
+            loss: Loss::Aborted,
+            ..
+        })
+    ));
+    aborted[12 + 58] = 1;
+    assert_eq!(refused(&aborted), out_of_range("outcome"));
+    // An unavailable payload: no recording, no value, above MAX_INLINE.
+    assert_eq!(
+        refused(&mutated(UNCAPTURED, 32, 5, 8)),
+        out_of_range("recording_id")
+    );
+    assert_eq!(
+        refused(&mutated(UNCAPTURED, 48, 65_535, 4)),
+        out_of_range("length")
+    );
+    let (bytes, _) = goldens().remove(UNCAPTURED);
+    let valued = vector(2, &bytes[12..12 + 67], &[b"x", b""]);
+    assert!(matches!(
+        refused(&valued),
+        CodecError::LengthOutOfRange { field: "value", .. }
+    ));
+    // A reference unavailable.
+    assert_eq!(
+        refused(&mutated(UNAVAILABLE, 0, 0, 8)),
+        out_of_range("group_seq")
+    );
+    assert_eq!(
+        refused(&mutated(UNAVAILABLE, 8, 0, 8)),
+        out_of_range("recording_id")
+    );
+}
+
+#[test]
+fn invalid_a7d_values_are_not_encoded() {
+    let mut out = vec![0u8; MAX_RECORD];
+    let loss = |from, lost_to, resume, loss| {
+        GroupRecord::Loss(LossEvent {
+            group_seq: 1,
+            logical_time: 0,
+            incarnation: 0,
+            from,
+            lost_to,
+            resume,
+            stream_id: 0,
+            session_id: 0,
+            lane: lane(0),
+            loss,
+        })
+    };
+    let resumed = Loss::Overrun {
+        outcome: OverrunOutcome::ResumedAtHead,
+        fallback: None,
+    };
+    let cases = [
+        (loss(2, 1, 3, resumed), "lost_to"),
+        (loss(1, 3, 2, resumed), "resume"),
+        (loss(1, 2, 3, Loss::Aborted), "resume"),
+        (
+            loss(
+                1,
+                2,
+                3,
+                Loss::Overrun {
+                    outcome: OverrunOutcome::Replayed,
+                    fallback: Some(FallbackReason::Refused),
+                },
+            ),
+            "reason",
+        ),
+        (
+            GroupRecord::Message(MessageEvent {
+                group_seq: 1,
+                logical_time: 0,
+                incarnation: 0,
+                position: 0,
+                extent: 160,
+                stream_id: 0,
+                session_id: 0,
+                lane: lane(0),
+                reserved_value: 0,
+                end_of_stream: false,
+                extension: None,
+                payload: Payload::Unavailable { length: 100 },
+            }),
+            "length",
+        ),
+        (
+            GroupRecord::Unavailable(ReferenceUnavailable {
+                group_seq: 0,
+                recording_id: 9,
+            }),
+            "group_seq",
+        ),
+        (
+            GroupRecord::Unavailable(ReferenceUnavailable {
+                group_seq: 2,
+                recording_id: 0,
+            }),
+            "recording_id",
+        ),
+    ];
+    for (record, field) in cases {
+        assert_eq!(
+            record.encode(&mut out),
+            Err(CodecError::ValueOutOfRange { field }),
+            "{record:?}"
+        );
+    }
+}
+
+/// #405 review P3: each loss code against its table, written out as
+/// literals: a swapped code fails here, whatever the round trips say.
+#[test]
+fn loss_codes_follow_the_tables() {
+    let loss = |loss| {
+        encoded(&GroupRecord::Loss(LossEvent {
+            group_seq: 1,
+            logical_time: 0,
+            incarnation: 0,
+            from: 0,
+            lost_to: 0,
+            resume: 0,
+            stream_id: 0,
+            session_id: 0,
+            lane: lane(0),
+            loss,
+        }))
+    };
+    let codes = |bytes: Vec<u8>| (bytes[12 + 57], bytes[12 + 58], bytes[12 + 59]);
+    let overruns = [
+        (OverrunOutcome::ResumedAtHead, 1),
+        (OverrunOutcome::SnapshotRebuilt, 2),
+        (OverrunOutcome::SnapshotFailed, 3),
+        (OverrunOutcome::Closed, 4),
+        (OverrunOutcome::Replayed, 5),
+        (OverrunOutcome::Replaying, 6),
+    ];
+    for (outcome, code) in overruns {
+        let bytes = loss(Loss::Overrun {
+            outcome,
+            fallback: None,
+        });
+        assert_eq!(codes(bytes), (1, code, 0), "{outcome:?}");
+    }
+    let fallbacks = [
+        (FallbackReason::NoArchive, 1),
+        (FallbackReason::NoRecording, 2),
+        (FallbackReason::RetentionShort, 3),
+        (FallbackReason::RecordingBehind, 4),
+        (FallbackReason::Refused, 5),
+        (FallbackReason::MergeFailed, 6),
+        (FallbackReason::Withdrawn, 7),
+    ];
+    for (reason, code) in fallbacks {
+        let bytes = loss(Loss::Overrun {
+            outcome: OverrunOutcome::Closed,
+            fallback: Some(reason),
+        });
+        assert_eq!(codes(bytes), (1, 4, code), "{reason:?}");
+    }
+    let skips = [
+        (SkipReason::MessageTooLarge, 1),
+        (SkipReason::MissingEnd, 2),
+        (SkipReason::Interrupted, 3),
+        (SkipReason::Orphan, 4),
+        (SkipReason::JoinedMidMessage, 5),
+        (SkipReason::AfterLoss, 6),
+        (SkipReason::LocalGap(LocalGapReason::ReorderExpired), 7),
+        (SkipReason::LocalGap(LocalGapReason::RangeUnavailable), 8),
+    ];
+    for (reason, code) in skips {
+        assert_eq!(
+            codes(loss(Loss::Skipped(reason))),
+            (2, 0, code),
+            "{reason:?}"
+        );
+    }
+    assert_eq!(codes(loss(Loss::Aborted)), (3, 0, 0));
 }
