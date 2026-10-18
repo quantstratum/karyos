@@ -195,9 +195,10 @@ fn a_rewind_replays_the_unreleased_messages() {
     for position in [0, 64] {
         let _ = consumer.frame(&ring, data(position, true, true)).unwrap();
     }
-    // The first left and was acknowledged: released. The second was read.
+    // The first left and was acknowledged: released. The second left
+    // and waits for its acknowledgement.
     consumer.message_left(&ring).unwrap();
-    consumer.rewind();
+    consumer.rewind(1).unwrap();
     assert_eq!(consumer.outstanding(), 0);
     let again = consumer
         .frame_scheduled(&ring, data(64, true, true))
@@ -234,7 +235,8 @@ fn a_rewind_inside_a_message_resumes_it() {
     push(&ring, &mut publisher, 0, 10);
     let _ = consumer.frame(&ring, data(0, true, false)).unwrap();
     let _ = consumer.frame(&ring, data(1408, false, false)).unwrap();
-    consumer.rewind();
+    // Its first fragments left.
+    consumer.rewind(1).unwrap();
     let resumed = consumer
         .frame_scheduled(&ring, data(1408, false, false))
         .unwrap();
@@ -253,9 +255,40 @@ fn a_rewind_inside_a_message_resumes_it() {
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
     let mut consumer = ScheduleConsumer::new(&ring).unwrap();
     push(&ring, &mut publisher, 4096, 10);
-    consumer.rewind();
+    consumer.rewind(0).unwrap();
     assert!(matches!(
         consumer.frame_scheduled(&ring, data(1408, false, true)),
         Err(ScheduleConsumerError::CorruptTerm { .. })
     ));
+}
+
+/// A rewind resends at once only the messages that left: one read and held
+/// for its time keeps it, and a rewind naming more sent messages than are
+/// outstanding is refused.
+#[test]
+fn a_rewind_replays_only_the_messages_sent() {
+    use super::Scheduled;
+
+    let ring = ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    for (position, time) in [(0, 10), (64, 20), (128, 30)] {
+        push(&ring, &mut publisher, position, time);
+    }
+    for position in [0, 64, 128] {
+        let _ = consumer.frame(&ring, data(position, true, true)).unwrap();
+    }
+    assert!(matches!(
+        consumer.rewind(4),
+        Err(ScheduleConsumerError::CorruptTerm { .. })
+    ));
+    // The first left; the other two were read and held.
+    consumer.rewind(1).unwrap();
+    let expected = [(0, 10, true), (64, 20, false), (128, 30, false)];
+    for (position, time, replayed) in expected {
+        assert_eq!(
+            consumer.frame_scheduled(&ring, data(position, true, true)),
+            Ok(Some(Scheduled { time, replayed }))
+        );
+    }
 }

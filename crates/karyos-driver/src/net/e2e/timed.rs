@@ -558,6 +558,74 @@ fn a_reliable_reset_resends_timed_messages_outside_the_policy() {
     assert_clean(&mut a);
 }
 
+/// P2.11 PR1b (REVIEWER-01's P1 on #412): a reliable reset resends at
+/// once only the messages that left. Two due messages are sent and wait
+/// for their acknowledgement; two more are staged and held for a time
+/// ahead. After the reset the held ones still wait for their time, and
+/// only the sent ones count as rewound.
+#[test]
+fn a_reliable_reset_keeps_the_time_of_heads_never_sent() {
+    let options = ScheduleOptions {
+        max_horizon: 5_000_000_000,
+        ..ScheduleOptions::default()
+    };
+    let (mut a, mut b, publication, mut reader) = timed_pair(8, options, true);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let now = karyos_sys::host_clock::host_monotonic_ns();
+    let ahead = now + 1_500_000_000;
+    for (index, time) in [(0u32, now), (1, now), (2, ahead), (3, ahead)] {
+        assert!(matches!(
+            lane.offer_at(&index.to_le_bytes(), time).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let agents = shared(drivers[0]);
+        let sent = agents.sender.outbound_timed_counts(0).unwrap().sent;
+        sent == 2 && agents.sender.outbound_counters(0).unwrap().staged == 4
+    });
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].net.as_ref().unwrap().reopened() >= 1
+    });
+    let mut early = Vec::new();
+    let mut seen = 0u32;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                let read_at = karyos_sys::host_clock::host_monotonic_ns();
+                if index >= 2 && read_at < ahead {
+                    early.push((index, ahead - read_at));
+                }
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 4
+    });
+    assert!(early.is_empty(), "read before their time: {early:?}");
+    let counts = shared(&mut a).sender.outbound_timed_counts(0).unwrap();
+    assert!(counts.rewound <= 2, "only sent messages resend: {counts:?}");
+    assert_eq!(counts.dropped, 0, "{counts:?}");
+    assert_clean(&mut a);
+}
+
 /// P2.11 PR1b: a NAK repair of a reliable timed lane goes through the
 /// repair path, never the timed gate: it repeats data already sent. The
 /// lost datagram is repaired and every message is read once and in order,

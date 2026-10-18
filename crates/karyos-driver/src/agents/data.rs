@@ -170,6 +170,8 @@ impl LaneGate for DataGate<'_> {
         // message_left): sent or maybe sent, at the position its message
         // ends, which a reliable lane releases once acknowledged; returned
         // unsent, which an unreliable lane never sends again.
+        let sent = matches!(how, Left::Submitted | Left::Unknown);
+        track.started = !ends && (sent || track.started);
         if ends {
             match (how, left_at) {
                 (Left::Submitted | Left::Unknown, Some(end))
@@ -218,6 +220,10 @@ struct LaneTrack {
     left_ends: VecDeque<u64>,
     /// Timed messages whose last fragment was returned unsent this call.
     returned_ends: u32,
+    /// A fragment of the timed message being sent left (submitted, or of
+    /// unknown exposure) and its last fragment has not: a reliable reset
+    /// counts that message as sent.
+    started: bool,
 }
 
 /// A timed publication's schedule (`quantstratum-docs:
@@ -506,6 +512,7 @@ impl<T: StreamTerms> Outbound<T> {
                 ends: VecDeque::with_capacity(bound),
                 left_ends: VecDeque::with_capacity(bound),
                 returned_ends: 0,
+                started: false,
             })
             .collect();
         Ok(Self {
@@ -1048,18 +1055,34 @@ impl<T: StreamTerms> Outbound<T> {
         // them is done, and each is counted dropped. A reliable one reads
         // again from its registered position, below which every entry is
         // released, so its consumer rewinds to its oldest entry not
-        // released, and nothing is done or dropped.
+        // released, and nothing is done or dropped. Only the messages that
+        // left (in whole, or in part) are resent at once; the ones only
+        // read keep their time.
         let rewinding = self.opened.is_some() && self.reliable;
         if let Some(timed) = self.timed.as_deref_mut() {
             for (lane, track) in self.tracks.iter_mut().enumerate() {
                 let _ = timed.state.forget(lane, !rewinding);
                 if rewinding {
                     track.ends.clear();
-                    if let Some(unacknowledged) = timed.unacknowledged.get_mut(lane) {
-                        unacknowledged.clear();
-                    }
+                    let unacknowledged = timed
+                        .unacknowledged
+                        .get_mut(lane)
+                        .map_or(0, |unacknowledged| {
+                            let sent = unacknowledged.len();
+                            unacknowledged.clear();
+                            sent
+                        });
+                    let sent = unacknowledged
+                        .checked_add(track.left_ends.len())
+                        .and_then(|sent| sent.checked_add(usize::from(track.started)));
+                    track.left_ends.clear();
+                    track.returned_ends = 0;
+                    track.started = false;
                     if let Some(Some(consumer)) = timed.consumers.get_mut(lane) {
-                        consumer.rewind();
+                        let rewound = sent.map(|sent| consumer.rewind(sent));
+                        if !matches!(rewound, Some(Ok(()))) {
+                            self.counters.bump(|c| &mut c.schedule_faults, 1);
+                        }
                     }
                     continue;
                 }

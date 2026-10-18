@@ -109,15 +109,39 @@ impl ScheduleConsumer {
     /// A reliable lane's log was rewound to a position no message of an
     /// entry not yet released lies below (the registered position, up to
     /// which entries are released): every entry not released is read
-    /// again, in order, and their messages are marked replayed. A position
+    /// again, in order. The oldest `sent` of them, whose messages were
+    /// sent (or may have been) in whole or in part, are marked replayed;
+    /// the later ones were only read, and keep their time. A position
     /// inside a message resumes it at its next fragment.
-    pub fn rewind(&mut self) {
-        self.replay_to = self.replay_to.max(self.reader.read());
+    ///
+    /// # Errors
+    ///
+    /// [`ScheduleConsumerError::CorruptTerm`] when `sent` is above the
+    /// entries outstanding, or they above the entries read; nothing
+    /// changes.
+    pub fn rewind(&mut self, sent: usize) -> Result<(), ScheduleConsumerError> {
+        let corrupt = ScheduleConsumerError::CorruptTerm {
+            position: 0,
+            reason: "a rewind past the entries outstanding",
+        };
+        if sent > self.outstanding.len() {
+            return Err(corrupt);
+        }
+        let outstanding = u64::try_from(self.outstanding.len()).map_err(|_| corrupt)?;
+        let sent = u64::try_from(sent).map_err(|_| corrupt)?;
+        let replay_to = self
+            .reader
+            .read()
+            .checked_sub(outstanding)
+            .and_then(|released| released.checked_add(sent))
+            .ok_or(corrupt)?;
+        self.replay_to = self.replay_to.max(replay_to);
         self.reader.rewind_to_released();
         self.outstanding.clear();
         self.current = None;
         self.current_replayed = false;
         self.resuming = true;
+        Ok(())
     }
 
     /// [`Self::frame`], with whether the message was read before the last
