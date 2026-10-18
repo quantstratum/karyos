@@ -521,6 +521,8 @@ fn a_gap_inside_an_event_or_an_observation_outside_one_is_refused() {
         stream_id: 1,
         session_id: 1,
         operation: Operation::Offer,
+        length: 0,
+        crc32c: 0,
         outcome: Outcome::BackPressured,
     });
     let mut tracker = PrefixTracker::new(2);
