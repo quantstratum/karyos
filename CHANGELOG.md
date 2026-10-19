@@ -408,6 +408,16 @@ release may break APIs, wire formats and shared-memory layouts.
   connections (`server::MAX_ACCEPTS`). The guard pending-acknowledgement
   rule follows M4b.
 
+- The management agent's trace latency window (phase 5, M6c;
+  quantstratum-docs: `karyos/design/agent-trace-window.md`). Per driver, a
+  follower of the trace mirror pairs each `Publish` with its
+  `SubscriberPoll`s and keeps per publication lane the observed latencies
+  of the last window of the agent's time (`DriverView::latencies`,
+  `LaneLatency` with p50, p90, p99, p99.9 and max as intervals), under the
+  trace report's automatic calibration rule; never trace verdicts. Journals,
+  pending messages, polls and lanes are bounded by `WindowConfig`, and what
+  a bound refuses, ages out or the mirror overwrites is counted
+  (`TraceCounts`). karyos-agent now depends on karyos-trace (owner item 52).
 - The management agent's local API v1 (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M7; owner item 51
   interims, no new dependency). `karyos_agent::json` writes API v1 by hand

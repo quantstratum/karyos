@@ -20,10 +20,17 @@
 //!   [`json`] writes them as JSON, by hand (owner item 51, interim 3), and
 //!   `server` serves them on a local Unix socket to the uids of a role
 //!   table (interims 1 and 2; M7).
-//! - **Not yet.** Trace latency histograms over a bounded window (M6c)
-//!   and an endpoint's capability gauges read as one group (M6b).
-//! - **Crate graph** (owner item 52): it depends on `karyos-client` and
-//!   `karyos-sys`; neither the driver nor the client depends on it.
+//! - **Trace latencies** (M6c): per publication lane, the observed
+//!   latencies between `Publish` and `SubscriberPoll` within a bounded
+//!   window of the agent's time, from a follower of the driver's trace
+//!   mirror whose memory is bounded by [`WindowConfig`]; never trace
+//!   verdicts (quantstratum-docs: karyos/design/agent-trace-window.md).
+//! - **Not yet.** An endpoint's capability gauges read as one group in
+//!   the view (M6b's `karyos_client::capabilities` reads them), and the
+//!   trace latencies in the JSON encoding.
+//! - **Crate graph** (owner item 52): it depends on `karyos-client`,
+//!   `karyos-sys` and `karyos-trace`; neither the driver nor the client
+//!   depends on it.
 //!
 //! The attach is Linux only, as the tool attach is; [`api`] builds
 //! everywhere.
@@ -44,6 +51,13 @@ pub mod json;
     allow(dead_code, reason = "the attach that uses it is Linux only")
 )]
 mod model;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the attach that uses it is Linux only")
+)]
+mod trace_window;
+
+pub use trace_window::WindowConfig;
 
 #[cfg(target_os = "linux")]
 mod agent;

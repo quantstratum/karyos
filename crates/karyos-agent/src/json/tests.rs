@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::api::API_VERSION;
+use crate::api::{API_VERSION, TraceCounts};
 
 /// One view with every type and every `DriverState` variant, `None` and
 /// `Some` alike.
@@ -95,6 +95,8 @@ fn every_field() -> AgentView {
             delivered: 2,
             overwritten: 0,
         },
+        latencies: Vec::new(),
+        trace: TraceCounts::default(),
         alerts: vec![
             Alert {
                 kind: AlertKind::Lag,
@@ -125,6 +127,8 @@ fn every_field() -> AgentView {
         errors: Feed::default(),
         losses: Feed::default(),
         guards: Feed::default(),
+        latencies: Vec::new(),
+        trace: TraceCounts::default(),
         alerts: Vec::new(),
     };
     let closed = DriverView {
