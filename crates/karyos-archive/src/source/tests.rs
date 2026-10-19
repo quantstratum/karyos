@@ -512,3 +512,66 @@ fn a_fenced_following_source_rejoins_at_the_head_past_a_gap() {
         assert_eq!(after, published[4..]);
     }
 }
+
+/// #455 review nit: a rejoin answered `Waiting`, then `Refused`, leaves
+/// the source at its seal, where its recording ends: the reader dropped
+/// while waiting has no position of its own, and the base of its mapping
+/// is not the seal. A later read is the same fence.
+#[test]
+fn a_refused_rejoin_leaves_the_source_at_its_seal() {
+    use std::sync::Arc;
+
+    use karyos_client::GenerationLink;
+
+    use crate::source::{Following, Rejoin};
+
+    let old = Arc::new(LogBuffer::new(config()).unwrap());
+    let mut conductor = old.conductor_owned().unwrap();
+    let reader =
+        SenderRead::for_recording(conductor.subscribe_as(Role::Optional, true, 1).unwrap(), 3)
+            .unwrap();
+    let link = GenerationLink::new();
+    let mut publication = old.publication().unwrap().unwrap();
+    for sequence in 0..4 {
+        let _ = publication
+            .append(&message(sequence, 900), AppendOptions::default())
+            .unwrap();
+    }
+    drop(publication);
+    conductor.seal_for_cutover().unwrap();
+    let _ = link.fence();
+    let seal = 4 * 960;
+    let mut asked = 0u32;
+    let hook = Box::new(move || {
+        asked += 1;
+        if asked == 1 {
+            Rejoin::Waiting
+        } else {
+            Rejoin::Refused
+        }
+    });
+    let mut source = Following::rejoining(reader, link, 0, hook);
+    let mut out = vec![0u8; 1 << 16];
+    let mut fenced = None;
+    for _ in 0..16 {
+        let _ = conductor.duty_cycle().unwrap();
+        match FrameSource::read(&mut source, &mut out).unwrap() {
+            Frames::Copied { next, .. } | Frames::Fill { next, .. } => {
+                FrameSource::consumed(&mut source, next).unwrap();
+            }
+            Frames::Fenced { at } => {
+                fenced = Some(at);
+                break;
+            }
+            Frames::Pending => assert_eq!(FrameSource::position(&source), seal),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(fenced, Some(seal));
+    assert_eq!(FrameSource::position(&source), seal);
+    assert_eq!(
+        FrameSource::read(&mut source, &mut out).unwrap(),
+        Frames::Fenced { at: seal }
+    );
+    assert_eq!(FrameSource::position(&source), seal);
+}
