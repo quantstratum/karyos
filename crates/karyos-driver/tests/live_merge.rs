@@ -1079,11 +1079,7 @@ fn overrun_asked(
     assert!(seen.is_empty());
     assert_eq!(
         provider.0.lock().unwrap().requests.last(),
-        Some(&ReplayRequest {
-            source,
-            from: overrun.from,
-            to: overrun.resume,
-        })
+        Some(&ReplayRequest::new(source, overrun.from, overrun.resume))
     );
     overrun
 }
