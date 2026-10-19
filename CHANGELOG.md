@@ -399,11 +399,13 @@ release may break APIs, wire formats and shared-memory layouts.
   under the coordinator's ruling recorded in `cnc-primitives.md`).
   `karyos_driver::spin::SpinMeter` measures per spin run, two host clock
   reads a run and never on the wake path, flushing every 1024 spins for a
-  loop that spins without end, into a driver-wide cell it alone writes:
-  `conductor spin time` (taken by the loop that drives `do_work` with
-  `EmbeddedDriver::take_spin_meter`; `karyosd`'s `BackoffIdle` reports it),
-  and per agent loop `sender spin time` and `receiver spin time`
-  (Dedicated) or `network spin time` (SharedNetwork).
+  loop that spins without end, into one driver-wide cell per idle loop:
+  `conductor spin time`, a fixed counter the driver keeps and copies from
+  the meter's shared word at each duty cycle (the meter goes to the loop
+  that drives `do_work` with `EmbeddedDriver::take_spin_meter`; `karyosd`'s
+  `BackoffIdle` reports it), and per agent loop `sender spin time` and
+  `receiver spin time` (Dedicated) or `network spin time` (SharedNetwork),
+  keyed cells their meters own and alone write.
   `IdleStrategy::attach_spin_meter` hands a loop its meter; the default
   `YieldThenSleep` never spins and reports 0. `BackoffIdle` is no longer
   `Clone`.

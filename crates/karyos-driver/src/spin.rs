@@ -16,10 +16,30 @@
 //!   that found work, so it never delays a wake-up. A strategy that spins
 //!   without end flushes every [`FLUSH_SPINS`] spins, one more read.
 //! - **Cells.** One driver-wide type-3 cell per idle loop, allocated when
-//!   the driver is created; its loop's [`SpinMeter`] is its only writer and
-//!   stores its own checked total with a plain store.
+//!   the driver is created. An agent loop's meter owns its keyed cell and
+//!   is its only writer, with a plain store of its checked total. The
+//!   conductor loop's cell is one of the fixed counters, which the driver
+//!   keeps: that meter stores its total into a word the driver shares
+//!   with it, and the conductor copies the word into the cell at each duty
+//!   cycle, on the thread that drives it. Dropping that meter leaves the
+//!   fixed cell where it is.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_sys::counters::Counter;
+
+/// Where a meter stores its total.
+#[derive(Debug, Default)]
+enum Sink {
+    /// Nowhere (a meter without a cell).
+    #[default]
+    None,
+    /// A keyed cell the meter owns.
+    Cell(Counter),
+    /// A word the driver shares and copies into a fixed cell it keeps.
+    Shared(Arc<AtomicU64>),
+}
 
 /// Spins after which a run still going is measured and stored.
 pub const FLUSH_SPINS: u32 = 1024;
@@ -27,7 +47,7 @@ pub const FLUSH_SPINS: u32 = 1024;
 /// One idle loop's spin time and its cell.
 #[derive(Debug, Default)]
 pub struct SpinMeter {
-    cell: Option<Counter>,
+    sink: Sink,
     total: u64,
     /// When the current spin run started, if one is going.
     started: Option<u64>,
@@ -36,10 +56,19 @@ pub struct SpinMeter {
 }
 
 impl SpinMeter {
-    /// A meter storing into `cell`.
+    /// A meter storing into `cell`, which it owns.
     pub(crate) fn new(cell: Option<Counter>) -> Self {
         Self {
-            cell,
+            sink: cell.map_or(Sink::None, Sink::Cell),
+            ..Self::default()
+        }
+    }
+
+    /// A meter storing into `word`, which the driver copies into a cell it
+    /// keeps.
+    pub(crate) fn shared(word: Arc<AtomicU64>) -> Self {
+        Self {
+            sink: Sink::Shared(word),
             ..Self::default()
         }
     }
@@ -85,8 +114,12 @@ impl SpinMeter {
             && let Some(total) = self.total.checked_add(elapsed)
         {
             self.total = total;
-            if let Some(cell) = &self.cell {
-                cell.set(total);
+            match &self.sink {
+                Sink::None => {}
+                Sink::Cell(cell) => cell.set(total),
+                // The conductor reads it on the same thread, in its next
+                // duty cycle.
+                Sink::Shared(word) => word.store(total, Ordering::Relaxed),
             }
         }
         self.started = going_on.then_some(now);

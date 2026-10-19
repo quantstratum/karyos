@@ -125,8 +125,10 @@ mod tests {
         assert_eq!((idle.spins, idle.yields), (0, 0));
     }
 
-    /// The value of the driver's `conductor spin time`.
-    fn spin_time(driver: &karyos_driver::EmbeddedDriver) -> u64 {
+    /// The value of the driver's `conductor spin time`, after a duty cycle
+    /// copied the meter's total into it.
+    fn spin_time(driver: &mut karyos_driver::EmbeddedDriver) -> u64 {
+        let _ = driver.do_work().unwrap();
         let reader = driver.counters();
         (0..reader.capacity())
             .find_map(|index| match reader.read(index) {
@@ -155,13 +157,13 @@ mod tests {
         }
         // Past the 1024-spin flushes, the run so far is stored; the rest
         // counts at the end of the run.
-        let flushed = spin_time(&driver);
+        let flushed = spin_time(&mut driver);
         assert!(flushed > 0);
         idle.idle(1);
-        let ended = spin_time(&driver);
+        let ended = spin_time(&mut driver);
         assert!(ended >= flushed);
         idle.idle(1);
-        assert_eq!(spin_time(&driver), ended, "no run, nothing added");
+        assert_eq!(spin_time(&mut driver), ended, "no run, nothing added");
 
         let mut driver = karyos_driver::EmbeddedDriver::new().unwrap();
         let mut idle = BackoffIdle::new(0, 10, Duration::from_micros(1), Duration::from_micros(2))
@@ -170,7 +172,7 @@ mod tests {
             idle.idle(0);
         }
         idle.idle(1);
-        assert_eq!(spin_time(&driver), 0);
+        assert_eq!(spin_time(&mut driver), 0);
     }
 
     #[test]

@@ -930,8 +930,11 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) net: Option<crate::net::Network<T>>,
     /// Each guard's word gauge (M4).
     guard_cells: crate::guards::GuardCells,
-    /// The conductor loop's spin meter until its loop takes it (M5).
-    spin_meter: Option<crate::spin::SpinMeter>,
+    /// The word the conductor loop's spin meter stores into (M5), copied
+    /// into the fixed `conductor spin time` cell at each duty cycle, and
+    /// whether the meter was handed out.
+    spin_word: Arc<std::sync::atomic::AtomicU64>,
+    spin_taken: bool,
     /// Each network endpoint's capability gauges (M3).
     capabilities: crate::capabilities::CapabilityCells,
     /// What clients created by channel URI, owned by their registrations
@@ -1285,7 +1288,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map(|network| network_cells(&mut counters, network.threading));
         // The conductor loop's spin meter (M5), for whoever drives
         // `do_work`.
-        let spin_meter = crate::spin::SpinMeter::new(counters.take_conductor_spin());
+        let spin_word = Arc::new(std::sync::atomic::AtomicU64::new(0));
         counters.set(Event::DriverPid, u64::from(std::process::id()));
         counters.set(
             Event::DriverStartedAt,
@@ -1336,7 +1339,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 guard_ring,
             ),
             guard_cells: crate::guards::GuardCells::default(),
-            spin_meter: Some(spin_meter),
+            spin_word,
+            spin_taken: false,
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
             #[cfg(test)]
             guard_lane_fault: None,
@@ -2016,7 +2020,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// (`conductor spin time`, M5), once: that loop's idle strategy is its
     /// only writer (`crate::spin`). `None` once taken.
     pub fn take_spin_meter(&mut self) -> Option<crate::spin::SpinMeter> {
-        self.spin_meter.take()
+        if self.spin_taken {
+            return None;
+        }
+        self.spin_taken = true;
+        Some(crate::spin::SpinMeter::shared(Arc::clone(&self.spin_word)))
     }
 
     /// The tools' guard audit ring (M4), as a tool reads it: every
@@ -3136,6 +3144,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         add_work(&self.counters, &mut work, &mut first_error, mirrored);
         self.update_stream_gauges();
         self.guard_cells.sync(&self.guards, &mut self.counters);
+        // The conductor loop's spin time, stored by its meter on this thread.
+        self.counters
+            .set_conductor_spin(self.spin_word.load(std::sync::atomic::Ordering::Relaxed));
         self.sample_positions();
         match first_error {
             Some(error) => Err(error),

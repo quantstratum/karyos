@@ -377,8 +377,9 @@ pub(crate) struct DriverCounters {
     manager: CountersManager,
     reader: CountersReader,
     counters: Vec<Counter>,
-    /// The conductor loop's spin time cell until its meter takes it.
-    spin: Option<Counter>,
+    /// The conductor loop's spin time cell: fixed, kept here, written from
+    /// the meter's shared word (`crate::spin`).
+    spin: Counter,
 }
 
 impl DriverCounters {
@@ -431,13 +432,13 @@ impl DriverCounters {
             manager,
             reader,
             counters,
-            spin: Some(spin),
+            spin,
         })
     }
 
-    /// The conductor loop's spin time cell, once (`crate::spin`).
-    pub(crate) fn take_conductor_spin(&mut self) -> Option<Counter> {
-        self.spin.take()
+    /// Sets the conductor loop's spin time (`crate::spin`).
+    pub(crate) fn set_conductor_spin(&self, value: u64) {
+        self.spin.set(value);
     }
 
     /// Allocates a keyed counter outside the fixed set (inside a sampling
