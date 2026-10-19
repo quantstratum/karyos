@@ -321,6 +321,26 @@ fn a_joint_commit_needs_both_majorities() {
         check::quorum_of_voters(&record),
         Err(Violation::QuorumOfVoters { holding: 2, .. })
     ));
+    // A reply then is short of the outgoing majority too: one of three.
+    let mut replied = record.clone();
+    replied.push(Observation::Reply {
+        node: 0,
+        client: 9,
+        index: 1,
+        term: 1,
+    });
+    assert!(matches!(
+        check::durable_majority_before_reply(&replied, 5),
+        Err(Violation::ReplyBeforeDurableMajority {
+            durable: 1,
+            servers: 3,
+            ..
+        })
+    ));
+    // One more outgoing voter holding it makes both majorities.
+    replied.insert(3, persisted(1, vec![(1, 1)]));
+    assert_eq!(check::durable_majority_before_reply(&replied, 5), Ok(()));
+    assert_eq!(check::quorum_of_voters(&replied), Ok(()));
 }
 
 #[test]

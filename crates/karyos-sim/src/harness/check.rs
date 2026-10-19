@@ -331,15 +331,28 @@ impl DurableLogs {
     }
 }
 
+/// The set of `configuration` that lacks a durable majority holding entry
+/// `index` of `term`: its voters (also when there are none), else its
+/// outgoing voters under joint consensus; `None` when both hold it.
+fn short_of_majority<'a>(
+    logs: &DurableLogs,
+    configuration: &'a Configuration,
+    index: u64,
+    term: u64,
+) -> Option<&'a [NodeId]> {
+    let majority =
+        |members: &[NodeId]| logs.holding_among(members, index, term) > members.len() / 2;
+    if configuration.voters.is_empty() || !majority(&configuration.voters) {
+        return Some(&configuration.voters);
+    }
+    (!configuration.outgoing.is_empty() && !majority(&configuration.outgoing))
+        .then_some(configuration.outgoing.as_slice())
+}
+
 /// Whether a durable majority of `configuration`'s voters, and of its
 /// outgoing voters under joint consensus, holds entry `index` of `term`.
 fn voters_hold(logs: &DurableLogs, configuration: &Configuration, index: u64, term: u64) -> bool {
-    let majority = |members: &[NodeId]| {
-        members.is_empty() || logs.holding_among(members, index, term) > members.len() / 2
-    };
-    !configuration.voters.is_empty()
-        && majority(&configuration.voters)
-        && majority(&configuration.outgoing)
+    short_of_majority(logs, configuration, index, term).is_none()
 }
 
 /// Each server's configuration, from its last [`Observation::Configuration`].
@@ -388,12 +401,15 @@ pub fn durable_majority_before_reply(
             term,
         } = observation
         {
+            // Under a configuration, the set short of its majority: the
+            // voters, or the outgoing voters under joint consensus.
             let (durable, servers) = match configurations.of(*node) {
-                Some(configuration) if !voters_hold(&logs, configuration, *index, *term) => (
-                    logs.holding_among(&configuration.voters, *index, *term),
-                    configuration.voters.len(),
-                ),
-                Some(_) => continue,
+                Some(configuration) => {
+                    match short_of_majority(&logs, configuration, *index, *term) {
+                        Some(short) => (logs.holding_among(short, *index, *term), short.len()),
+                        None => continue,
+                    }
+                }
                 None => (logs.holding(*index, *term), servers),
             };
             if durable <= servers / 2 {
