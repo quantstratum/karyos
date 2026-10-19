@@ -214,3 +214,103 @@ fn a_damaged_manifest_is_refused() {
         Err(SnapshotError::Manifest)
     ));
 }
+
+#[test]
+fn a_reader_streams_sections_in_small_reads_and_skips_unread_bytes() {
+    let dir = TempDir::new("stream");
+    let mut store = open(dir.path());
+    // The sessions section spans several write chunks.
+    let large = bytes(5, 3 * karyos_cluster::snapshot::WRITE_CHUNK + 17);
+    let (small, service) = (bytes(4, 40), bytes(6, 100));
+    let info = store
+        .write(
+            50,
+            2,
+            &[
+                Section::new(SectionKind::Consensus, 1, &small),
+                Section::new(SectionKind::Sessions, 3, &large),
+                Section::new(SectionKind::Service, 9, &service),
+            ],
+        )
+        .unwrap();
+    let mut reader = store.reader(&info).unwrap();
+    // Read the first section 7 bytes at a time.
+    let header = reader.next_section().unwrap().unwrap();
+    assert_eq!(
+        (header.kind, header.version, header.length),
+        (SectionKind::Consensus, 1, 40)
+    );
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 7];
+    loop {
+        let read = reader.read(&mut chunk).unwrap();
+        if read == 0 {
+            break;
+        }
+        got.extend_from_slice(&chunk[..read]);
+    }
+    assert_eq!(got, small);
+    // Skip the large one unread; read the last.
+    let header = reader.next_section().unwrap().unwrap();
+    assert_eq!(header.length, u64::try_from(large.len()).unwrap());
+    let header = reader.next_section().unwrap().unwrap();
+    assert_eq!(header.kind, SectionKind::Service);
+    let mut last = vec![0u8; 100];
+    assert_eq!(reader.read(&mut last).unwrap(), 100);
+    assert_eq!(last, service);
+    assert_eq!(reader.read(&mut last).unwrap(), 0);
+    // The end checks the digest.
+    assert!(reader.next_section().unwrap().is_none());
+    assert!(reader.next_section().unwrap().is_none());
+    // The whole read agrees.
+    let all = store.read(&info).unwrap();
+    assert_eq!(all[1].bytes, large);
+    store.verify(&info).unwrap();
+}
+
+#[test]
+fn a_digest_mismatch_is_reported_at_the_end() {
+    let dir = TempDir::new("digest");
+    let mut store = open(dir.path());
+    let payload = bytes(1, 100);
+    let info = store
+        .write(10, 1, &[Section::new(SectionKind::Service, 1, &payload)])
+        .unwrap();
+    // The same store under a forged digest: every write is whole, only the
+    // digest is wrong.
+    let mut forged = info;
+    forged.digest ^= 1;
+    let mut reader = store.reader(&forged).unwrap();
+    let _ = reader.next_section().unwrap().unwrap();
+    assert!(matches!(
+        reader.next_section(),
+        Err(SnapshotError::Damaged { .. })
+    ));
+    assert!(matches!(
+        store.verify(&forged),
+        Err(SnapshotError::Damaged { .. })
+    ));
+}
+
+/// A section's bytes go to A2 in writes of at most `WRITE_CHUNK`, so the
+/// scan of A2's recovery, which reads each write whole, stays bounded.
+#[test]
+fn a_large_section_is_written_in_bounded_chunks() {
+    use karyos_cluster::snapshot::WRITE_CHUNK;
+
+    let dir = TempDir::new("chunks");
+    // 1 MiB segments: only the chunking splits the section's writes.
+    let geometry = Geometry::new(65_536, 1 << 20).unwrap();
+    let mut store = SnapshotStore::open(StdDisk, dir.path(), geometry, SnapshotConfig::default())
+        .unwrap()
+        .store;
+    let large = bytes(3, 4 * WRITE_CHUNK + 1);
+    let info = store
+        .write(1, 1, &[Section::new(SectionKind::Service, 1, &large)])
+        .unwrap();
+    // One index entry of 32 bytes per write, after a 48-byte header: the
+    // section header and five chunks.
+    let index = dir.path().join(format!("{:016x}-{:016x}.idx", info.id, 0));
+    let entries = (std::fs::metadata(index).unwrap().len() - 48) / 32;
+    assert_eq!(entries, 6);
+}
