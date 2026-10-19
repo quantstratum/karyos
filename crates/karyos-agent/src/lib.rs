@@ -5,7 +5,7 @@
 //!
 //! - **What it is.** A library the `karyos-agent` binary (M7) and the
 //!   exporter (M8) build on. It attaches to each configured driver as a
-//!   tool ([`karyos_client::tool::attach_tool`]), maps the CnC read-only
+//!   tool (`karyos_client::tool::attach_tool`), maps the CnC read-only
 //!   and never touches the data path; each attach counts against the
 //!   driver's `max_tools`.
 //! - **The model.** Per driver: its instance and whether it is attached,
