@@ -187,10 +187,7 @@ fn a_timed_lane_sends_one_message_per_datagram_and_counts_late_ones() {
 #[test]
 fn an_unreliable_reset_frees_the_ring_of_held_heads() {
     // Held 4 s ahead: within a 5 s horizon, below the 10 s liveness.
-    let options = ScheduleOptions {
-        max_horizon: 5_000_000_000,
-        ..ScheduleOptions::default()
-    };
+    let options = ScheduleOptions::default().with_max_horizon(5_000_000_000);
     let (mut a, mut b, publication, _reader) = timed_pair(4, options, false);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
@@ -630,10 +627,7 @@ fn a_reliable_reset_resends_timed_messages_outside_the_policy() {
 /// only the sent ones count as rewound.
 #[test]
 fn a_reliable_reset_keeps_the_time_of_heads_never_sent() {
-    let options = ScheduleOptions {
-        max_horizon: 5_000_000_000,
-        ..ScheduleOptions::default()
-    };
+    let options = ScheduleOptions::default().with_max_horizon(5_000_000_000);
     let (mut a, mut b, publication, mut reader) = timed_pair(8, options, true);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())

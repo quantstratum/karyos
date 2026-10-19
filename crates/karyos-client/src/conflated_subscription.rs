@@ -72,6 +72,7 @@ impl<'a> ConflatedValue<'a> {
 /// publishes an empty interval: it marks no value stale, and only ends the
 /// view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ViewClosed {
     /// The receive owner's seal waited past its bound for the feeder's
     /// acknowledgement.
@@ -143,6 +144,7 @@ pub const CONFLATION_BUDGETS_EXHAUSTED: &str = "conflation budgets exhausted";
 
 /// A view's reader-side counts since it was created.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReaderCounts {
     /// Served keys whose value was already delivered (`PollReport::skipped`
     /// summed over every poll).

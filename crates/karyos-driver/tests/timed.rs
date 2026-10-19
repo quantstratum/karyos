@@ -96,13 +96,7 @@ fn a_timed_lane_takes_timed_offers_in_order() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let handle = stream(&mut driver, 4);
     driver
-        .schedule_stream(
-            handle,
-            ScheduleOptions {
-                max_horizon: SECOND,
-                ..ScheduleOptions::default()
-            },
-        )
+        .schedule_stream(handle, ScheduleOptions::default().with_max_horizon(SECOND))
         .unwrap();
     let mut publication = driver.publication(handle).unwrap();
     assert_eq!(
@@ -173,10 +167,7 @@ fn the_schedule_is_set_before_any_handle() {
             let handle = stream(&mut driver, 4);
             driver.schedule_stream(
                 handle,
-                ScheduleOptions {
-                    domain: ClockDomain::Tai,
-                    ..ScheduleOptions::default()
-                },
+                ScheduleOptions::default().with_domain(ClockDomain::Tai),
             )
         };
         assert!(matches!(
@@ -236,13 +227,7 @@ fn a_zero_horizon_is_refused() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let handle = stream(&mut driver, 4);
     assert!(matches!(
-        driver.schedule_stream(
-            handle,
-            ScheduleOptions {
-                max_horizon: 0,
-                ..ScheduleOptions::default()
-            },
-        ),
+        driver.schedule_stream(handle, ScheduleOptions::default().with_max_horizon(0),),
         Err(DriverError::Client(ClientError::InvalidSchedule { .. }))
     ));
 }
@@ -310,10 +295,7 @@ fn timed_offers_are_counted_against_the_injected_clock() {
     driver
         .schedule_stream_with_clock(
             handle,
-            ScheduleOptions {
-                max_horizon: 100,
-                ..ScheduleOptions::default()
-            },
+            ScheduleOptions::default().with_max_horizon(100),
             clock,
         )
         .unwrap();
@@ -365,10 +347,7 @@ fn an_unavailable_clock_refuses_the_offer() {
         driver
             .schedule_stream_with_clock(
                 handle,
-                ScheduleOptions {
-                    max_horizon,
-                    ..ScheduleOptions::default()
-                },
+                ScheduleOptions::default().with_max_horizon(max_horizon),
                 ScheduleClock::new(|| CLOCK_UNAVAILABLE),
             )
             .unwrap();

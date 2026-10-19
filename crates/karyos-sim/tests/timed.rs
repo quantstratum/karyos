@@ -336,12 +336,11 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
     driver
         .schedule_stream_with_clock(
             handle,
-            ScheduleOptions {
-                domain: ClockDomain::Monotonic,
-                max_horizon: HORIZON,
-                lateness_tolerance: TOLERANCE,
-                cancel_on_deadline: scenario.cancel_on_deadline,
-            },
+            ScheduleOptions::default()
+                .with_domain(ClockDomain::Monotonic)
+                .with_max_horizon(HORIZON)
+                .with_lateness_tolerance(TOLERANCE)
+                .with_cancel_on_deadline(scenario.cancel_on_deadline),
             ScheduleClock::new(move || virtual_clock.get()),
         )
         .map_err(|error| setup(format!("{error:?}")))?;

@@ -202,3 +202,132 @@ fn a_gateway_allocates_nothing_per_event() {
     let _ = job.close().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Reports a fixed sequence of poll summaries, then nothing: allocates
+/// nothing.
+struct Reports {
+    summaries: [Option<karyos_client::PollSummary>; 4],
+    next: usize,
+}
+
+impl karyos_archive::group::gateway::live::MessageSource for Reports {
+    fn poll_taking(
+        &mut self,
+        _: &mut dyn FnMut(&[u8], karyos_client::MessageInfo) -> bool,
+        _: karyos_client::MessageLimit,
+    ) -> Result<karyos_client::PollSummary, karyos_client::PollError> {
+        let summary = self
+            .summaries
+            .get_mut(self.next)
+            .and_then(Option::take)
+            .unwrap_or_default();
+        self.next += 1;
+        Ok(summary)
+    }
+}
+
+/// An overrun, a skip, an abort, an end and a conflated value each
+/// dispatch without allocating.
+#[test]
+fn reports_and_values_dispatch_without_allocating() {
+    use karyos_client::{Aborted, Overrun, PollSummary, RejoinOutcome, Skipped};
+    let dir = std::env::temp_dir().join(format!(
+        "karyos-gateway-alloc-reports-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let header = JournalHeader {
+        group_id: 1,
+        first_group_seq: 1,
+        inline_threshold: 64,
+        contract_version: 1,
+        clock: Clock::HostMonotonic,
+        capture: Capture::Strict,
+        reopen_hold: 0,
+        manifest: b"m",
+    };
+    let config = JournalConfig {
+        segment_length: MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let journal = GroupJournal::create(StdDisk, &dir, &header, config).unwrap();
+    let (sender, mut job) = capture(
+        CaptureConfig {
+            ring_capacity: 1 << 16,
+            max_event: 4096,
+            in_flight: 64,
+        },
+        journal,
+        &Nothing,
+    )
+    .unwrap();
+    let mut gateway = Gateway::new(Accepting, || 10, sender, Capture::Strict, 1, 4096, 8).unwrap();
+    let reports = Reports {
+        summaries: [
+            Some(PollSummary {
+                overrun: Some(Overrun {
+                    from: 64,
+                    lost_to: 128,
+                    resume: 192,
+                }),
+                rejoin: Some(RejoinOutcome::ResumedAtHead),
+                ..Default::default()
+            }),
+            Some(PollSummary {
+                skipped: Some(Skipped {
+                    position: 192,
+                    extent: 32,
+                    reason: karyos_sys::log_buffer::SkipReason::MissingEnd,
+                }),
+                ..Default::default()
+            }),
+            Some(PollSummary {
+                aborted: Some(Aborted {
+                    position: 224,
+                    extent: 32,
+                }),
+                ..Default::default()
+            }),
+            Some(PollSummary {
+                closed: Some(256),
+                ..Default::default()
+            }),
+        ],
+        next: 0,
+    };
+    let identity = SourceIdentity {
+        incarnation: 1,
+        stream_id: 2,
+        session_id: 1,
+        lane: Lane::ZERO,
+    };
+    let _ = gateway
+        .add_subscription(Box::new(reports), identity, Arc::new(RecordingWord::new()))
+        .unwrap();
+    let writer = karyos_sys::conflation::conflation(4, 64, 4096).unwrap();
+    let view = karyos_client::ConflatedSubscription::new(
+        writer.reader(),
+        karyos_sys::conflation::Budget {
+            keys: 4,
+            retries: 4,
+        },
+    );
+    let mut writer = writer;
+    let _ = gateway.add_conflated(Box::new(view), 5, 1).unwrap();
+    writer.write(1, b"value").unwrap();
+    let mut handler = |_: &Event<'_>, _: &mut dyn Effects| {};
+    let mut events = 0;
+    for _ in 0..8 {
+        let (dispatched, allocations) = count(|| gateway.dispatch(&mut handler));
+        assert_eq!(allocations, 0, "a dispatch allocated: {dispatched:?}");
+        if matches!(dispatched, Ok(Dispatched::Event { .. })) {
+            events += 1;
+        }
+        while job.duty(0, 64, &Nothing).unwrap() {}
+    }
+    // The overrun, the skip, the abort, the end and the value.
+    assert_eq!(events, 5);
+    let _ = job.close().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

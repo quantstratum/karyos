@@ -118,6 +118,8 @@ impl SimPublisher for ClientPublication {
                 | OfferOutcome::RateLimited => Attempt::Retry,
                 // No guard in the simulator: a gate seal ends the publication.
                 OfferOutcome::Closed | OfferOutcome::Gated => Attempt::Closed,
+                // A later outcome the simulator does not know: it stops.
+                _ => Attempt::Closed,
             },
         )
     }
@@ -131,6 +133,8 @@ impl SimPublisher for ClientPublication {
             | ClaimOutcome::NotConnected
             | ClaimOutcome::RateLimited => Claimed::Outcome(Attempt::Retry),
             ClaimOutcome::Closed | ClaimOutcome::Gated => Claimed::Outcome(Attempt::Closed),
+            // A later outcome the simulator does not know: it stops.
+            _ => Claimed::Outcome(Attempt::Closed),
         })
     }
 }
@@ -145,6 +149,8 @@ impl SimPublisher for ClientConcurrentPublication {
                 | ConcurrentOfferOutcome::AdminAction
                 | ConcurrentOfferOutcome::NotConnected => Attempt::Retry,
                 ConcurrentOfferOutcome::Closed => Attempt::Closed,
+                // A later outcome the simulator does not know: it stops.
+                _ => Attempt::Closed,
             },
         )
     }
@@ -159,6 +165,8 @@ impl SimPublisher for ClientConcurrentPublication {
             | ConcurrentClaimOutcome::AdminAction
             | ConcurrentClaimOutcome::NotConnected => Claimed::Outcome(Attempt::Retry),
             ConcurrentClaimOutcome::Closed => Claimed::Outcome(Attempt::Closed),
+            // A later outcome the simulator does not know: it stops.
+            _ => Claimed::Outcome(Attempt::Closed),
         })
     }
 }

@@ -43,8 +43,8 @@ use crate::group::gateway::{
 use crate::group::record::Capture;
 use crate::group::record::{
     CONFLATED_EVENT, ConflatedEvent, EXTENSION, EndReason, FallbackReason, Freshness, GroupRecord,
-    LifecycleEvent, LifecycleKind, Loss, LossEvent, MAX_INLINE, MessageEvent, OverrunOutcome,
-    Payload, TimerEvent,
+    LifecycleEvent, LifecycleKind, Loss, LossEvent, MAX_INLINE, MESSAGE_EVENT, MessageEvent,
+    OverrunOutcome, Payload, TimerEvent,
 };
 
 /// A message source's identity, recorded with each of its events.
@@ -192,6 +192,12 @@ impl<T: TermBytes> MessageSource for Subscription<T> {
             Err(SubscriptionError::Closed(cause)) => Err(PollError {
                 summary: PollSummary::default(),
                 cause,
+            }),
+            // A failure this crate does not know yet: the source ends, as
+            // when it is closed.
+            Err(_) => Err(PollError {
+                summary: PollSummary::default(),
+                cause: ClientError::Unknown,
             }),
         }
     }
@@ -346,6 +352,15 @@ fn overrun(outcome: RejoinOutcome) -> (OverrunOutcome, Option<FallbackReason>) {
             }),
         ),
     }
+}
+
+/// A message record's length with an inline payload of `inline` bytes
+/// (0 for a reference or an unavailable payload) and, if `extension`, a
+/// trace extension: its header, block, payload and extension, each
+/// variable field behind its 2-byte length.
+pub(super) fn message_size(inline: usize, extension: bool) -> Option<usize> {
+    let extension = if extension { EXTENSION } else { 0 };
+    (12 + usize::from(MESSAGE_EVENT.block_length) + 2 + 2 + extension).checked_add(inline)
 }
 
 /// What a poll that delivered no message reported, as an event to hold.
@@ -697,10 +712,14 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let mut result = None;
         let polled = source.poll_reporting(
             &mut |bytes, info| {
+                self.delivered = false;
                 let dispatched =
                     self.dispatch_message(id, identity, &word, bytes, info, now, handler);
-                // Strict declines what it refused: it stays pending.
-                let taken = !matches!(dispatched, Err(GatewayError::Refused(_)));
+                // Taken once the handler saw it, whatever the dispatch then
+                // returns: a send that fails after it (the group closing)
+                // must not deliver it again. A refusal or an end before the
+                // handler leaves it pending for a required reader.
+                let taken = self.delivered || dispatched.is_ok();
                 result = Some(dispatched);
                 taken
             },
@@ -917,12 +936,13 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         };
         // Whether the record fits the event buffer with its end: an inline
         // payload under `MAX_INLINE` can still exceed the event budget.
-        let fits = self
-            .buffer
-            .len()
-            .checked_sub(super::END)
-            .and_then(|limit| self.buffer.get_mut(..limit))
-            .is_some_and(|room| record(self.next_seq, placement, room).is_ok());
+        let inline = match placement {
+            Payload::Inline(bytes) => bytes.len(),
+            Payload::Reference { .. } | Payload::Unavailable { .. } => 0,
+        };
+        let fits = message_size(inline, info.extension.is_some())
+            .and_then(|size| size.checked_add(super::END))
+            .is_some_and(|size| size <= self.buffer.len());
         // Best effort records an unavailable payload above `MAX_INLINE`
         // (the record's rule); one under it that does not fit is refused
         // into the pending gap, delivered unrecorded and counted.
