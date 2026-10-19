@@ -288,7 +288,7 @@ fn a_replay_gateway_dispatches_without_allocating() {
     let GroupRecord::Message(message) = records[1] else {
         panic!("no message");
     };
-    let subscriptions = [(message.stream_id, message.session_id)];
+    let subscriptions = [(message.stream_id, message.session_id, message.lane)];
     let mut gateway = ReplayGateway::new(
         cursor,
         &GatewayConfig {

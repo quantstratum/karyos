@@ -54,6 +54,8 @@ pub struct MessageInfo {
     /// The session of the image it came from: a network subscription's
     /// images differ in it.
     pub session_id: i32,
+    /// The lane of the image it came from.
+    pub lane: Lane,
 }
 
 impl MessageInfo {
@@ -661,6 +663,7 @@ impl<T: TermBytes> ClientSubscription<T> {
                         end_of_stream,
                         extension,
                         session_id: inner.buffer().config().session_id,
+                        lane: inner.buffer().lane(),
                     };
                     if let Some(trace) = &mut self.trace {
                         let decoded = info.trace();
