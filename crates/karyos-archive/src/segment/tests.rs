@@ -1913,3 +1913,303 @@ fn a_plan_counts_the_entries_it_drops() {
     assert_eq!(plan.cut.map(|cut| cut.position), Some(10));
     assert_eq!(dropped(&disk), 3);
 }
+
+// Prefix purge (C8b): the floor record, then the segments below it.
+
+/// A recording of `length` bytes from 0, synced: segments of 128 bytes.
+fn purgeable(disk: FaultDisk, length: usize) -> SegmentStore<FaultDisk> {
+    let mut store = SegmentStore::create(
+        disk,
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    let bytes = stream(length);
+    let mut at = 0;
+    for chunk in bytes.chunks(40) {
+        at = store.append(at, chunk).unwrap();
+    }
+    let _ = store.sync().unwrap();
+    store
+}
+
+#[test]
+fn a_purge_drops_whole_leading_segments() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    // Position 300 lies in the segment at 256.
+    assert_eq!(store.purge_before(300).unwrap(), 300);
+    assert_eq!(store.start(), 300);
+    let mut out = [0u8; 10];
+    assert!(matches!(
+        store.read(290, &mut out),
+        Err(SegmentError::OutOfRange { .. })
+    ));
+    store.read(300, &mut out).unwrap();
+    assert_eq!(out.as_slice(), &stream(500)[300..310]);
+    // Only the segments from 256 on remain.
+    let mut probe = disk.clone();
+    assert_eq!(
+        bases(RECORDING, &probe.list(Path::new(DIR)).unwrap()),
+        vec![256, 384]
+    );
+    // The recording recovers at the floor and goes on.
+    drop(store);
+    let recovered = recover_checked(
+        disk,
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    let mut store = recovered.store;
+    assert_eq!((store.start(), store.written()), (300, 500));
+    assert_eq!(store.append(500, &[1, 2, 3]).unwrap(), 503);
+}
+
+#[test]
+fn a_purge_inside_the_first_segment_moves_only_the_start() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    assert_eq!(store.purge_before(0).unwrap(), 0);
+    assert_eq!(store.purge_before(100).unwrap(), 100);
+    assert_eq!(store.purge_before(100).unwrap(), 100);
+    assert_eq!(store.start(), 100);
+    let mut probe = disk.clone();
+    assert_eq!(
+        bases(RECORDING, &probe.list(Path::new(DIR)).unwrap()),
+        vec![0, 128, 256, 384]
+    );
+    drop(store);
+    let recovered = recover_checked(
+        disk,
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    assert_eq!(recovered.store.start(), 100);
+}
+
+#[test]
+fn a_purge_outside_the_durable_range_is_refused() {
+    let mut store = purgeable(FaultDisk::default(), 500);
+    let _ = store.append(500, &[0; 5]).unwrap();
+    // 504 is written, not durable.
+    assert_eq!(store.durable(), 500);
+    assert!(matches!(
+        store.purge_before(504),
+        Err(SegmentError::InvalidPurge { .. })
+    ));
+    let _ = store.purge_before(300).unwrap();
+    assert!(matches!(
+        store.purge_before(200),
+        Err(SegmentError::InvalidPurge { .. })
+    ));
+    // A refusal does not fail the store.
+    assert_eq!(store.append(505, &[1]).unwrap(), 506);
+}
+
+#[test]
+fn a_purge_to_a_segment_not_created_yet_is_refused() {
+    // Exactly two segments, synced: the third is not created yet.
+    let mut store = purgeable(FaultDisk::default(), 256);
+    assert_eq!(store.written(), 256);
+    assert!(matches!(
+        store.purge_before(256),
+        Err(SegmentError::InvalidPurge { .. })
+    ));
+}
+
+#[test]
+fn a_floor_whose_segment_is_missing_is_refused() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    let _ = store.purge_before(300).unwrap();
+    drop(store);
+    let mut probe = disk.clone();
+    remove_segment(&mut probe, Path::new(DIR), RECORDING, 256).unwrap();
+    assert!(matches!(
+        SegmentStore::verify(disk, Path::new(DIR), RECORDING, geometry()),
+        Err(SegmentError::FloorMissing { floor: 300 })
+    ));
+}
+
+#[test]
+fn a_damaged_floor_is_refused() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    let _ = store.purge_before(300).unwrap();
+    drop(store);
+    let mut probe = disk.clone();
+    let path = Path::new(DIR).join(floor_name(RECORDING));
+    let file = probe.open(&path).unwrap();
+    probe.write_at(&file, 12, &[0xFF]).unwrap();
+    assert!(matches!(
+        SegmentStore::verify(disk, Path::new(DIR), RECORDING, geometry()),
+        Err(SegmentError::FloorDamaged {
+            recording: RECORDING
+        })
+    ));
+}
+
+#[test]
+fn a_new_recording_removes_a_stale_floor() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    let _ = store.purge_before(300).unwrap();
+    drop(store);
+    let mut probe = disk.clone();
+    for base in [256, 384] {
+        remove_segment(&mut probe, Path::new(DIR), RECORDING, base).unwrap();
+    }
+    let store = purgeable(disk.clone(), 200);
+    drop(store);
+    let recovered = recover_checked(
+        disk,
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    assert_eq!(
+        (recovered.store.start(), recovered.store.written()),
+        (0, 200)
+    );
+}
+
+/// The purge's crash cases: a crash at every disk operation of a purge,
+/// under every crash model, recovers as before it or at the floor, and
+/// every byte from the recovered start reads back.
+#[test]
+fn every_crash_point_of_a_purge_recovers_before_or_at_the_floor() {
+    let free = FaultDisk::default();
+    let before = purgeable(free.clone(), 500);
+    drop(before);
+    let set_up = free.used();
+    let mut store = SegmentStore::recover(
+        free.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap()
+    .store;
+    let _ = store.purge_before(300).unwrap();
+    let total = free.used();
+    let bytes = stream(500);
+    let mut failures = Vec::new();
+    for budget in set_up..=total {
+        let disk = FaultDisk::with_budget(budget);
+        let store = purgeable(disk.clone(), 500);
+        drop(store);
+        if let Ok(recovered) = SegmentStore::recover(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+        ) {
+            let mut store = recovered.store;
+            let _ = store.purge_before(300);
+        }
+        for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
+            let restarted = disk.after_crash(survives);
+            match recover_checked(
+                restarted,
+                Path::new(DIR),
+                RECORDING,
+                geometry(),
+                SyncPolicy::PerSegment,
+            ) {
+                Ok(recovered) => {
+                    let mut store = recovered.store;
+                    let start = store.start();
+                    if !(start == 0 || start == 300) || store.written() != 500 {
+                        failures.push(format!(
+                            "budget {budget}, {survives:?}: [{start}, {})",
+                            store.written()
+                        ));
+                        continue;
+                    }
+                    let length = usize::try_from(500 - start).unwrap();
+                    let mut out = vec![0u8; length];
+                    store.read(start, &mut out).unwrap();
+                    if out.as_slice() != &bytes[usize::try_from(start).unwrap()..] {
+                        failures.push(format!("budget {budget}, {survives:?}: bytes differ"));
+                    }
+                }
+                Err(error) => failures.push(format!("budget {budget}, {survives:?}: {error}")),
+            }
+        }
+    }
+    assert!(
+        total > set_up + 4,
+        "the purge took {} operations",
+        total - set_up
+    );
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A purge into a segment, then damage below the floor in that segment:
+/// recovery cuts there, below the floor, and refuses rather than start the
+/// recording past what it holds (REVIEWER-02's P2 on #465).
+#[test]
+fn a_cut_below_the_floor_is_refused() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    let _ = store.purge_before(300).unwrap();
+    drop(store);
+    // A byte of the write at [280, 320), below the floor at 300.
+    let mut probe = disk.clone();
+    let data = probe
+        .open(&Path::new(DIR).join(data_name(RECORDING, 256)))
+        .unwrap();
+    probe.write_at(&data, 30, &[0xFF]).unwrap();
+    assert!(matches!(
+        SegmentStore::verify(disk.clone(), Path::new(DIR), RECORDING, geometry()),
+        Err(SegmentError::FloorMissing { floor: 300 })
+    ));
+    assert!(matches!(
+        SegmentStore::recover(
+            disk,
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment
+        ),
+        Err(SegmentError::FloorMissing { floor: 300 })
+    ));
+}
+
+/// A purge's floor record a crash left before its rename: recovery
+/// removes it, and the recording is as before the purge.
+#[test]
+fn a_leftover_floor_temporary_is_removed_at_recovery() {
+    let disk = FaultDisk::default();
+    let store = purgeable(disk.clone(), 500);
+    drop(store);
+    let mut probe = disk.clone();
+    let temporary = Path::new(DIR).join(format!("{}.tmp", floor_name(RECORDING)));
+    let file = probe.create(&temporary).unwrap();
+    probe
+        .write_at(&file, 0, &encode_floor(RECORDING, 300))
+        .unwrap();
+    let recovered = recover_checked(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    assert_eq!(recovered.store.start(), 0);
+    assert!(probe.open(&temporary).is_err());
+}

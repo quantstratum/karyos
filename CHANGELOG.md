@@ -394,6 +394,27 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Streaming snapshot reads in karyos-cluster (C8a follow-up, REVIEWER-02's
+  review of #463). `SnapshotStore::reader` returns a `SnapshotReader` that
+  hands out sections (`SectionHeader`) and their bytes in the caller's
+  buffer, checking the digest at the end; `SnapshotStore::verify` streams
+  the same check, and `open` uses it instead of loading each snapshot whole.
+  A section's bytes go to A2 in writes of at most `WRITE_CHUNK` (64 KiB), so
+  A2's recovery scan of a snapshot is bounded too.
+
+- Prefix purge of the Raft log (phase 4, C8b). A2's
+  `SegmentStore::purge_before` moves a recording's start forward to a write
+  boundary and removes the whole segments below it. The new start, the
+  floor, is replaced atomically in `<recording>.floor` before anything is
+  removed, and recovery starts the recording at the floor
+  (`DropReason::Purged`; `SegmentError::InvalidPurge`, `FloorDamaged`,
+  `FloorMissing`). karyos-cluster's `RaftLog::purge_prefix(below)` now
+  purges committed entries and returns the new first index, instead of
+  `LogError::PurgeUnsupported` (replaced by `PurgeBeyondCommit`). If a
+  crash leaves the first-index file stale, `RaftLog::open` follows the first
+  frame. karyos-sim's `tests/purge_crash.rs` crashes the disk at every
+  operation of two purges and fails every flush.
+
 - `karyos-ffi`, the C ABI crate (SPEC.md §10.2; ADR-0053, ADR-0067;
   quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, batch F1). It
   builds `libkaryos_ffi` as a shared, a static and a Rust library, with a
