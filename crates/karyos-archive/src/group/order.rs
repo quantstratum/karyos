@@ -15,6 +15,7 @@ mod tests;
 
 /// The rule a record broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OrderRule {
     /// The first record is not the header, or a later one is.
     Header,
@@ -60,6 +61,7 @@ pub enum OrderRule {
 /// A record that broke an order rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("journal record {ordinal} breaks the order rule {rule:?}")]
+#[non_exhaustive]
 pub struct OrderError {
     /// The record's ordinal in the journal, from 0.
     pub ordinal: u64,

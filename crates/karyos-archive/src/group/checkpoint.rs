@@ -353,6 +353,7 @@ impl CheckpointRequest {
 
 /// What the Gateway counts of its checkpoints.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CheckpointStats {
     /// Handed to the writer.
     pub taken: u64,
@@ -383,6 +384,7 @@ impl CheckpointStats {
 
 /// How the last checkpoint the writer took ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LastCheckpoint {
     /// Recorded.
     Recorded(CheckpointRecord),
@@ -518,6 +520,7 @@ pub struct CheckpointWriter<D: Disk> {
 
 /// How far [`CheckpointWriter::advance`] got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Progress {
     /// Its bytes are written up to `written`; the record waits for the
     /// rest.

@@ -168,6 +168,7 @@ impl Geometry {
 
 /// When the store syncs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SyncPolicy {
     /// Never on its own; `durable` advances only by an explicit sync.
     None,
@@ -225,6 +226,7 @@ pub const MAX_GAPS: usize = 1024;
 
 /// Why recovery cut a recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CutReason {
     /// An index entry was only partly written.
     TornEntry,
@@ -240,6 +242,7 @@ pub enum CutReason {
 
 /// Where recovery cut a recording, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Cut {
     /// The position the recording now ends at.
     pub position: u64,
@@ -249,6 +252,7 @@ pub struct Cut {
 
 /// Why recovery removes a segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DropReason {
     /// It lies after the cut: nothing continues the recording.
     AfterCut,
@@ -264,6 +268,7 @@ pub enum DropReason {
 
 /// A segment recovery removes, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DroppedSegment {
     /// The segment's base position.
     pub base: u64,
@@ -273,6 +278,7 @@ pub struct DroppedSegment {
 
 /// The newest segment recovery keeps, and the recording's extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeptSegment {
     /// The segment's base position.
     pub base: u64,
@@ -311,6 +317,7 @@ pub struct RecoveryPlan {
 
 /// The segment store's errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SegmentError {
     /// The geometry is invalid.
     #[error("invalid segment geometry")]
@@ -407,6 +414,7 @@ pub enum SegmentError {
 
 /// What is wrong with an index header recovery refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HeaderProblem {
     /// Missing, short, zeroed or torn, before the last segment; or a data
     /// file missing under its index, before the last segment or with
@@ -438,6 +446,7 @@ enum HeaderRead {
 
 /// A recovered store.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Recovered<D: Disk> {
     /// The store, open for appends at its written position.
     pub store: SegmentStore<D>,

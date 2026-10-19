@@ -89,6 +89,7 @@ pub trait ReplayTargets<T: TermBytes = HeapTerms>: Send {
 
 /// The client's settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// This client's id, the high 32 bits of its correlation ids, unique
     /// among the Archive's requesters (archive-control-codec.md §7a), and
@@ -126,6 +127,7 @@ impl ClientConfig {
 
 /// A client configuration that cannot work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The target channel is empty or longer than [`MAX_CHANNEL`] bytes,
     /// so no replay request could be sent.

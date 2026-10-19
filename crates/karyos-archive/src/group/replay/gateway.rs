@@ -54,6 +54,7 @@ mod tests;
 /// the capture, each by the integer id the handler names, as
 /// `(stream_id, session_id)`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct GatewayConfig<'a> {
     /// By publication id.
     pub publications: &'a [(i32, i32)],
@@ -79,8 +80,81 @@ pub struct GatewayConfig<'a> {
     pub present_unavailable: bool,
 }
 
+impl<'a> GatewayConfig<'a> {
+    /// No publication, subscription or view, no claim or payload room,
+    /// unavailable payloads not presented: each `with_*` sets one.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            publications: &[],
+            subscriptions: &[],
+            network: &[],
+            conflated: &[],
+            max_claim: 0,
+            max_payload: 0,
+            present_unavailable: false,
+        }
+    }
+
+    /// The publications, by id.
+    #[must_use]
+    pub const fn with_publications(mut self, publications: &'a [(i32, i32)]) -> Self {
+        self.publications = publications;
+        self
+    }
+
+    /// The subscriptions, by id.
+    #[must_use]
+    pub const fn with_subscriptions(mut self, subscriptions: &'a [(i32, i32, Lane)]) -> Self {
+        self.subscriptions = subscriptions;
+        self
+    }
+
+    /// The network subscriptions' streams.
+    #[must_use]
+    pub const fn with_network(mut self, network: &'a [i32]) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// The conflated views, by id.
+    #[must_use]
+    pub const fn with_conflated(mut self, conflated: &'a [(i32, i32)]) -> Self {
+        self.conflated = conflated;
+        self
+    }
+
+    /// The largest claim the handler makes.
+    #[must_use]
+    pub const fn with_max_claim(mut self, max_claim: usize) -> Self {
+        self.max_claim = max_claim;
+        self
+    }
+
+    /// The largest payload by reference.
+    #[must_use]
+    pub const fn with_max_payload(mut self, max_payload: usize) -> Self {
+        self.max_payload = max_payload;
+        self
+    }
+
+    /// Presents a payload replay cannot give as empty.
+    #[must_use]
+    pub const fn with_present_unavailable(mut self, present: bool) -> Self {
+        self.present_unavailable = present;
+        self
+    }
+}
+
+impl Default for GatewayConfig<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The Archive that holds the recordings payloads by reference name.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Archive<D: Disk> {
     /// Its disk.
     pub disk: D,
@@ -88,6 +162,18 @@ pub struct Archive<D: Disk> {
     pub dir: PathBuf,
     /// The recordings it holds, as `(recording_id, geometry)`.
     pub recordings: Vec<(u64, Geometry)>,
+}
+
+impl<D: Disk> Archive<D> {
+    /// The Archive on `disk` in `dir`, holding `recordings`.
+    #[must_use]
+    pub const fn new(disk: D, dir: PathBuf, recordings: Vec<(u64, Geometry)>) -> Self {
+        Self {
+            disk,
+            dir,
+            recordings,
+        }
+    }
 }
 
 /// The replay Gateway.

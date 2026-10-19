@@ -165,6 +165,7 @@ pub struct JournalHeader<'a> {
 /// A journal header this build cannot take, as its bytes name it: not a
 /// corrupt record, a journal of another contract or clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnsupportedHeader {
     /// Another capture contract.
     Contract {

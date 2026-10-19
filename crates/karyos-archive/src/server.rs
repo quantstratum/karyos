@@ -93,6 +93,7 @@ pub trait ArchiveHost {
 }
 
 /// A recorded lane the host opened.
+#[non_exhaustive]
 pub struct HostRecording {
     /// Its reader, positioned at the recording's start.
     pub source: Box<dyn FrameSource + Send>,
@@ -100,6 +101,23 @@ pub struct HostRecording {
     pub term_length: u32,
     /// The recorded stream's format, kept in the catalog for its replays.
     pub format: StreamFormat,
+}
+
+impl HostRecording {
+    /// A recording the host hands over: its source, term length and
+    /// format.
+    #[must_use]
+    pub fn new(
+        source: Box<dyn FrameSource + Send>,
+        term_length: u32,
+        format: StreamFormat,
+    ) -> Self {
+        Self {
+            source,
+            term_length,
+            format,
+        }
+    }
 }
 
 impl core::fmt::Debug for HostRecording {
@@ -133,6 +151,7 @@ pub trait ResponseSink {
 
 /// The server's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServerConfig {
     /// Signals waiting for room on the response stream at most; one more is
     /// dropped and counted ([`ControlServer::dropped_signals`]). A

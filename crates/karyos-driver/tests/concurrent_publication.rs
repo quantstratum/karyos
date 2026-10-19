@@ -178,13 +178,7 @@ fn a_claim_held_past_its_deadline_is_aborted_and_readers_move_on() {
             MessageLimit::new(1),
         )
         .unwrap();
-    assert_eq!(
-        summary.aborted,
-        Some(Aborted {
-            position,
-            extent: 64
-        })
-    );
+    assert_eq!(summary.aborted, Some(Aborted::new(position, 64)));
     assert_eq!(read_all(&mut subscription), vec![b"after".to_vec()]);
 }
 

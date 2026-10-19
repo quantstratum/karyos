@@ -62,12 +62,12 @@ impl Port for Accepting {
     ) -> ClaimCommit {
         let mut bytes = [0u8; 16];
         let commit = write(&mut bytes);
-        ClaimCommit {
-            claim: Outcome::Accepted {
+        ClaimCommit::new(
+            Outcome::Accepted {
                 lane: Lane::ZERO,
                 position: 0,
             },
-            commit: Some(if commit {
+            Some(if commit {
                 Outcome::Accepted {
                     lane: Lane::ZERO,
                     position: 0,
@@ -78,7 +78,7 @@ impl Port for Accepting {
                     position: 0,
                 }
             }),
-        }
+        )
     }
     fn poll_outcomes(
         &mut self,
@@ -107,21 +107,10 @@ fn a_gateway_allocates_nothing_per_event() {
         reopen_hold: 0,
         manifest: b"m",
     };
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::PerSegment);
     let journal = GroupJournal::create(StdDisk, &dir, &header, config).unwrap();
-    let (sender, mut job) = capture(
-        CaptureConfig {
-            ring_capacity: 1 << 16,
-            max_event: 4096,
-            in_flight: 64,
-        },
-        journal,
-        &Nothing,
-    )
-    .unwrap();
+    let (sender, mut job) =
+        capture(CaptureConfig::new(1 << 16, 4096, 64), journal, &Nothing).unwrap();
     let mut clock = 0u64;
     let mut gateway = Gateway::new(
         Accepting,
@@ -158,12 +147,7 @@ fn a_gateway_allocates_nothing_per_event() {
     let mut publication = buffer.publication_owned().unwrap().unwrap();
     let word = Arc::new(RecordingWord::new());
     word.set(9, 0);
-    let identity = SourceIdentity {
-        incarnation: 1,
-        stream_id: 2,
-        session_id: 1,
-        lane: Lane::ZERO,
-    };
+    let identity = SourceIdentity::new(1, 2, 1, Lane::ZERO);
     let _ = gateway
         .add_subscription(Box::new(subscription), identity, word)
         .unwrap();
@@ -247,61 +231,42 @@ fn reports_and_values_dispatch_without_allocating() {
         reopen_hold: 0,
         manifest: b"m",
     };
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::PerSegment);
     let journal = GroupJournal::create(StdDisk, &dir, &header, config).unwrap();
-    let (sender, mut job) = capture(
-        CaptureConfig {
-            ring_capacity: 1 << 16,
-            max_event: 4096,
-            in_flight: 64,
-        },
-        journal,
-        &Nothing,
-    )
-    .unwrap();
+    let (sender, mut job) =
+        capture(CaptureConfig::new(1 << 16, 4096, 64), journal, &Nothing).unwrap();
     let mut gateway = Gateway::new(Accepting, || 10, sender, Capture::Strict, 1, 4096, 8).unwrap();
     let reports = Reports {
         summaries: [
-            Some(PollSummary {
-                overrun: Some(Overrun {
-                    from: 64,
-                    lost_to: 128,
-                    resume: 192,
-                }),
-                rejoin: Some(RejoinOutcome::ResumedAtHead),
-                ..Default::default()
+            Some({
+                let mut value = PollSummary::default();
+                value.overrun = Some(Overrun::new(64, 128, 192));
+                value.rejoin = Some(RejoinOutcome::ResumedAtHead);
+                value
             }),
-            Some(PollSummary {
-                skipped: Some(Skipped {
-                    position: 192,
-                    extent: 32,
-                    reason: karyos_sys::log_buffer::SkipReason::MissingEnd,
-                }),
-                ..Default::default()
+            Some({
+                let mut value = PollSummary::default();
+                value.skipped = Some(Skipped::new(
+                    192,
+                    32,
+                    karyos_sys::log_buffer::SkipReason::MissingEnd,
+                ));
+                value
             }),
-            Some(PollSummary {
-                aborted: Some(Aborted {
-                    position: 224,
-                    extent: 32,
-                }),
-                ..Default::default()
+            Some({
+                let mut value = PollSummary::default();
+                value.aborted = Some(Aborted::new(224, 32));
+                value
             }),
-            Some(PollSummary {
-                closed: Some(256),
-                ..Default::default()
+            Some({
+                let mut value = PollSummary::default();
+                value.closed = Some(256);
+                value
             }),
         ],
         next: 0,
     };
-    let identity = SourceIdentity {
-        incarnation: 1,
-        stream_id: 2,
-        session_id: 1,
-        lane: Lane::ZERO,
-    };
+    let identity = SourceIdentity::new(1, 2, 1, Lane::ZERO);
     let _ = gateway
         .add_subscription(Box::new(reports), identity, Arc::new(RecordingWord::new()))
         .unwrap();

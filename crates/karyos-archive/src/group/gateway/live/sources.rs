@@ -49,6 +49,7 @@ use crate::group::record::{
 
 /// A message source's identity, recorded with each of its events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SourceIdentity {
     /// The publication incarnation.
     pub incarnation: u64,
@@ -58,6 +59,20 @@ pub struct SourceIdentity {
     pub session_id: i32,
     /// The lane.
     pub lane: Lane,
+}
+
+impl SourceIdentity {
+    /// A source of publication incarnation `incarnation`, stream
+    /// `stream_id`, session `session_id`, on `lane`.
+    #[must_use]
+    pub const fn new(incarnation: u64, stream_id: i32, session_id: i32, lane: Lane) -> Self {
+        Self {
+            incarnation,
+            stream_id,
+            session_id,
+            lane,
+        }
+    }
 }
 
 /// The `required` recording of a source this Archive keeps, shared with
@@ -182,23 +197,17 @@ impl<T: TermBytes> MessageSource for Subscription<T> {
             // with the deliveries over every image, and its session.
             Ok(poll) => {
                 let session = poll.stopped.and_then(|stop| stop.session_id.zip(stop.lane));
-                let summary = PollSummary {
-                    delivered: poll.delivered,
-                    ..poll.stopped.map(|stop| stop.summary).unwrap_or_default()
-                };
+                let mut summary = poll.stopped.map(|stop| stop.summary).unwrap_or_default();
+                summary.delivered = poll.delivered;
                 Ok((summary, session))
             }
             Err(SubscriptionError::Poll { error, .. }) => Err(error),
-            Err(SubscriptionError::Closed(cause)) => Err(PollError {
-                summary: PollSummary::default(),
-                cause,
-            }),
+            Err(SubscriptionError::Closed(cause)) => {
+                Err(PollError::new(PollSummary::default(), cause))
+            }
             // A failure this crate does not know yet: the source ends, as
             // when it is closed.
-            Err(_) => Err(PollError {
-                summary: PollSummary::default(),
-                cause: ClientError::Unknown,
-            }),
+            Err(_) => Err(PollError::new(PollSummary::default(), ClientError::Unknown)),
         }
     }
 
@@ -321,15 +330,28 @@ impl core::fmt::Debug for Source {
     }
 }
 
-/// The record's overrun outcome and fallback reason for a rejoin outcome.
-fn overrun(outcome: RejoinOutcome) -> (OverrunOutcome, Option<FallbackReason>) {
+/// The record's overrun outcome and fallback reason for a rejoin outcome;
+/// `None` for one the client added that has no record code yet: it is
+/// refused, never recorded under another's code.
+fn overrun(outcome: RejoinOutcome) -> Option<(OverrunOutcome, Option<FallbackReason>)> {
     let secondary = |outcome| match outcome {
-        SecondaryOutcome::ResumedAtHead => OverrunOutcome::ResumedAtHead,
-        SecondaryOutcome::SnapshotRebuilt => OverrunOutcome::SnapshotRebuilt,
-        SecondaryOutcome::SnapshotFailed => OverrunOutcome::SnapshotFailed,
-        SecondaryOutcome::Closed => OverrunOutcome::Closed,
+        SecondaryOutcome::ResumedAtHead => Some(OverrunOutcome::ResumedAtHead),
+        SecondaryOutcome::SnapshotRebuilt => Some(OverrunOutcome::SnapshotRebuilt),
+        SecondaryOutcome::SnapshotFailed => Some(OverrunOutcome::SnapshotFailed),
+        SecondaryOutcome::Closed => Some(OverrunOutcome::Closed),
+        _ => None,
     };
-    match outcome {
+    let fallback = |reason| match reason {
+        ReplayFallbackReason::NoArchive => Some(FallbackReason::NoArchive),
+        ReplayFallbackReason::NoRecording => Some(FallbackReason::NoRecording),
+        ReplayFallbackReason::RetentionShort => Some(FallbackReason::RetentionShort),
+        ReplayFallbackReason::RecordingBehind => Some(FallbackReason::RecordingBehind),
+        ReplayFallbackReason::Refused => Some(FallbackReason::Refused),
+        ReplayFallbackReason::MergeFailed => Some(FallbackReason::MergeFailed),
+        ReplayFallbackReason::Withdrawn => Some(FallbackReason::Withdrawn),
+        _ => None,
+    };
+    Some(match outcome {
         RejoinOutcome::ResumedAtHead => (OverrunOutcome::ResumedAtHead, None),
         RejoinOutcome::SnapshotRebuilt => (OverrunOutcome::SnapshotRebuilt, None),
         RejoinOutcome::SnapshotFailed => (OverrunOutcome::SnapshotFailed, None),
@@ -339,19 +361,9 @@ fn overrun(outcome: RejoinOutcome) -> (OverrunOutcome, Option<FallbackReason>) {
         RejoinOutcome::ReplayFallback {
             reason,
             secondary: then,
-        } => (
-            secondary(then),
-            Some(match reason {
-                ReplayFallbackReason::NoArchive => FallbackReason::NoArchive,
-                ReplayFallbackReason::NoRecording => FallbackReason::NoRecording,
-                ReplayFallbackReason::RetentionShort => FallbackReason::RetentionShort,
-                ReplayFallbackReason::RecordingBehind => FallbackReason::RecordingBehind,
-                ReplayFallbackReason::Refused => FallbackReason::Refused,
-                ReplayFallbackReason::MergeFailed => FallbackReason::MergeFailed,
-                ReplayFallbackReason::Withdrawn => FallbackReason::Withdrawn,
-            }),
-        ),
-    }
+        } => (secondary(then)?, Some(fallback(reason)?)),
+        _ => return None,
+    })
 }
 
 /// A message record's length with an inline payload of `inline` bytes
@@ -364,61 +376,66 @@ pub(super) fn message_size(inline: usize, extension: bool) -> Option<usize> {
 }
 
 /// What a poll that delivered no message reported, as an event to hold.
-fn reported(summary: &PollSummary) -> Option<Held> {
+///
+/// # Errors
+///
+/// [`GatewayError::UnknownOutcome`] for a rejoin outcome this build has no
+/// record code for.
+fn reported(summary: &PollSummary) -> Result<Option<Held>, GatewayError> {
     let end = |position: u64, extent: u32| position.checked_add(u64::from(extent));
     if let (Some(lost), Some(outcome)) = (summary.overrun, summary.rejoin) {
-        let (outcome, fallback) = overrun(outcome);
-        return Some(Held::Loss {
+        let (outcome, fallback) = overrun(outcome).ok_or(GatewayError::UnknownOutcome)?;
+        return Ok(Some(Held::Loss {
             loss: Loss::Overrun { outcome, fallback },
             from: lost.from,
             lost_to: lost.lost_to,
             resume: lost.resume,
             image: None,
-        });
+        }));
     }
     if let Some(skipped) = summary.skipped
         && let Some(to) = end(skipped.position, skipped.extent)
     {
-        return Some(Held::Loss {
+        return Ok(Some(Held::Loss {
             loss: Loss::Skipped(skipped.reason),
             from: skipped.position,
             lost_to: to,
             resume: to,
             image: None,
-        });
+        }));
     }
     if let Some(aborted) = summary.aborted
         && let Some(to) = end(aborted.position, aborted.extent)
     {
-        return Some(Held::Loss {
+        return Ok(Some(Held::Loss {
             loss: Loss::Aborted,
             from: aborted.position,
             lost_to: to,
             resume: to,
             image: None,
-        });
+        }));
     }
     if let Some(lost) = summary.closed_by_overrun {
-        return Some(Held::Ended {
+        return Ok(Some(Held::Ended {
             position: lost.resume,
             reason: EndReason::Overrun,
-        });
+        }));
     }
     if let Some(position) = summary.revoked {
-        return Some(Held::Ended {
+        return Ok(Some(Held::Ended {
             position,
             reason: EndReason::Revoked,
-        });
+        }));
     }
     // A seal with no cause is the stream's end; one with a cause (the
     // stream removed, a required participant lost, ...) closed it.
-    summary.closed.map(|position| Held::Ended {
+    Ok(summary.closed.map(|position| Held::Ended {
         position,
         reason: match summary.close_reason {
             None | Some(SealReason::Unspecified) => EndReason::EndOfStream,
             Some(_) => EndReason::Closed,
         },
-    })
+    }))
 }
 
 impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
@@ -733,7 +750,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         }
         let held = match polled {
             // A loss is the stopped image's, in its session.
-            Ok((summary, session)) => reported(&summary).map(|held| match held {
+            Ok((summary, session)) => reported(&summary)?.map(|held| match held {
                 Held::Loss {
                     loss,
                     from,

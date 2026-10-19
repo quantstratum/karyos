@@ -511,10 +511,7 @@ fn open<D: Disk + Clone>(
         .ok_or_else(|| context(&"no journal"))?;
     let segment_length = u32::try_from(geometry.segment_length())
         .map_err(|_| context(&"a segment longer than a journal's"))?;
-    let journal_config = JournalConfig {
-        segment_length,
-        policy: SyncPolicy::PerSegment,
-    };
+    let journal_config = JournalConfig::new(segment_length, SyncPolicy::PerSegment);
     let mut recovered = match GroupJournal::recover(
         disk,
         &journal.dir,
@@ -534,6 +531,7 @@ fn open<D: Disk + Clone>(
                     }
                     UnsupportedHeader::Clock { found } =>
                         format!("a clock this build does not know ({found})"),
+                    _ => "a header this build does not know".to_string(),
                 }
             )));
         }
@@ -588,14 +586,8 @@ fn open<D: Disk + Clone>(
         })
         .map_err(|failure| context(&failure))?;
     let (manifest, first) = header.ok_or_else(|| context(&"no header"))?;
-    let config = ReplayConfig {
-        manifest: &manifest,
-        accept_manifest: false,
-    };
-    let room = CursorConfig {
-        bytes: largest.max(1),
-        records: most.max(2),
-    };
+    let config = ReplayConfig::new(&manifest);
+    let room = CursorConfig::new(largest.max(1), most.max(2));
     let opened = match at {
         At::Start => {
             let recovery = recover(&mut recovered, &Records, RECOVERY_CAPACITY)
@@ -801,6 +793,9 @@ fn next_from<'c, D: Disk>(
             "{side} journal: checkpoint {} out of order",
             checkpoint.checkpoint_id
         ))),
+        Ok(_) => Err(error(format!(
+            "{side} journal: a step this build does not know"
+        ))),
         Err(failure) => Err(error(format!("{side} journal: {failure}"))),
     }
 }
@@ -987,6 +982,7 @@ fn stopped(stop: Stop, side: &str) -> String {
             "the range is past the {side} journal's complete prefix, which ends at \
              group_seq {complete_recording_seq}"
         ),
+        _ => format!("{side} journal: a stop this build does not know"),
     }
 }
 
@@ -998,6 +994,9 @@ fn first_missing(stop: &Stop) -> Option<u64> {
         Stop::EndOfPrefix {
             complete_recording_seq,
         } => complete_recording_seq.checked_add(1),
+        // A stop this build does not know leaves out everything: the range
+        // is never compared past it.
+        _ => Some(0),
     }
 }
 

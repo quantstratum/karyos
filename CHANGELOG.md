@@ -26,11 +26,25 @@ release may break APIs, wire formats and shared-memory layouts.
   `ConflatedLimits`). A match outside the crate needs a wildcard arm, and a
   struct is built from `Default`: `ScheduleOptions` gains `with_domain`,
   `with_max_horizon`, `with_lateness_tolerance` and `with_cancel_on_deadline`.
-  The types the Archive's Gateway builds or matches (`PollSummary`,
-  `PollError`, the loss reports, `RejoinOutcome`, `SecondaryOutcome`,
-  `ReplayFallbackReason`) follow with karyos-archive's change;
   `ScheduleCounters` and `link::Capability` stay as they are, closed driver
   contracts.
+- `karyos-client`: `PollSummary`, `PollError`, `Overrun`, `Skipped`,
+  `Aborted`, `RejoinOutcome`, `SecondaryOutcome` and `ReplayFallbackReason`
+  are `#[non_exhaustive]`. `PollError::new`, `Overrun::new`, `Skipped::new`
+  and `Aborted::new` build them; `PollSummary` is built from `Default`.
+- `karyos-archive`'s public enums and report structs are
+  `#[non_exhaustive]`, as the public API audit lists them (owner note item
+  41's `ControlMessage`, `GroupRecord` and `Role` aside). The inputs gain
+  constructors and are `#[non_exhaustive]` too: `StartGroup::new` (with
+  `with_new` and `with_checkpoints`), `NewGroup::new`,
+  `GroupCheckpoints::new` (with `with_reopen_hold`), `StartRecording::new`,
+  `StartReplay::new`, `PrepareReplay::new`, `HostRecording::new`,
+  `CaptureConfig::new`, `JournalConfig::new`, `ClaimCommit::new`,
+  `SourceIdentity::new`, `CursorConfig::new`, `ReplayConfig::new` (with
+  `accepting_manifest`), `GatewayConfig::new` (with a `with_*` per field),
+  `replay::gateway::Archive::new` and `replay::reference::Recording::new`.
+  A rejoin outcome the Gateway has no record code for is refused
+  (`GatewayError::UnknownOutcome`), never recorded under another's code.
 - `karyos-client`: `ReplayRequest`, `link::Owner` and `link::HandOverEntry`
   are `#[non_exhaustive]`, built through constructors: `ReplayRequest::new`,
   `Owner::new` and `HandOverEntry::new` (`with_generation` and

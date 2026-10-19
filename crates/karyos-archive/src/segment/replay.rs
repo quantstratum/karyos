@@ -66,6 +66,7 @@ const PPM_UNIT: u64 = 1_000_000;
 
 /// The pace of a replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Rate {
     /// As fast as the caller polls.
     Full,

@@ -256,6 +256,7 @@ pub struct NewRecording<'a> {
 
 /// The catalog's errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CatalogError {
     /// A channel longer than [`MAX_CHANNEL`].
     #[error("channel of {length} bytes, at most {MAX_CHANNEL}")]
@@ -319,6 +320,7 @@ pub enum CatalogError {
 
 /// An opened catalog and what opening it repaired.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Opened<D: Disk> {
     /// The catalog.
     pub catalog: Catalog<D>,
@@ -330,6 +332,7 @@ pub struct Opened<D: Disk> {
 
 /// A recording [`Catalog::settle`] stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Settled {
     /// The recording.
     pub id: u64,

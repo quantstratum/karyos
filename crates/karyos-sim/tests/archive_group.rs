@@ -87,10 +87,7 @@ impl Port for Inert {
         _: usize,
         _: &mut dyn FnMut(&mut [u8]) -> bool,
     ) -> ClaimCommit {
-        ClaimCommit {
-            claim: Outcome::BackPressured,
-            commit: None,
-        }
+        ClaimCommit::new(Outcome::BackPressured, None)
     }
     fn poll_outcomes(
         &mut self,
@@ -118,10 +115,8 @@ impl Coverage for All {
 
 const STREAM: i32 = 42;
 const MESSAGES: u64 = 24;
-const JOURNAL: JournalConfig = JournalConfig {
-    segment_length: MIN_SEGMENT_LENGTH,
-    policy: SyncPolicy::Every { interval_ns: 0 },
-};
+const JOURNAL: JournalConfig =
+    JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::Every { interval_ns: 0 });
 
 fn stream() -> StreamConfig {
     StreamConfig {
@@ -181,16 +176,16 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
         .unwrap()
         .into_parts();
     let recording = archive
-        .start(StartRecording {
-            stream_id: STREAM,
-            session_id: 1,
-            channel: b"karyos:ipc".to_vec(),
-            geometry: Geometry::new(MIN_TERM_LENGTH, 2 * u64::from(MIN_TERM_LENGTH)).unwrap(),
-            policy: SyncPolicy::Every { interval_ns: 0 },
-            mode: Mode::Required,
-            format: format(),
-            source: Box::new(Guarded::new(reader, lease)),
-        })
+        .start(StartRecording::new(
+            STREAM,
+            1,
+            b"karyos:ipc".to_vec(),
+            Geometry::new(MIN_TERM_LENGTH, 2 * u64::from(MIN_TERM_LENGTH)).unwrap(),
+            SyncPolicy::Every { interval_ns: 0 },
+            Mode::Required,
+            format(),
+            Box::new(Guarded::new(reader, lease)),
+        ))
         .unwrap();
     let word = archive
         .recording_word(STREAM, 1, Lane::ZERO)
@@ -198,22 +193,15 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
         .unwrap();
     assert_eq!(word.read().map(|(id, _)| id), Some(recording));
     let sender = archive
-        .start_group(StartGroup {
-            group_id: 1,
-            dir: groups.clone(),
-            new: Some(NewGroup {
-                first_group_seq: 1,
-                inline_threshold: 64,
-                capture: Capture::Strict,
-                manifest: b"e2e".to_vec(),
-            }),
-            journal: JOURNAL,
-            capture: CaptureConfig {
-                ring_capacity: 1 << 16,
-                max_event: 4096,
-                in_flight: 64,
-            },
-            checkpoints: None,
+        .start_group({
+            let mut value = StartGroup::new(
+                1,
+                groups.clone(),
+                JOURNAL,
+                CaptureConfig::new(1 << 16, 4096, 64),
+            );
+            value.new = Some(NewGroup::new(1, 64, Capture::Strict, b"e2e".to_vec()));
+            value
         })
         .unwrap();
     let waiter = sender.waiter();
@@ -222,12 +210,7 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
     let mut gateway = Gateway::new(Inert, clock, sender, Capture::Strict, 1, 4096, 4).unwrap();
     gateway.set_inline_threshold(64);
     let subscription = driver.subscribe(handle, Role::Required).unwrap();
-    let identity = SourceIdentity {
-        incarnation: 1,
-        stream_id: STREAM,
-        session_id: 1,
-        lane: Lane::ZERO,
-    };
+    let identity = SourceIdentity::new(1, STREAM, 1, Lane::ZERO);
     let _ = gateway
         .add_subscription(Box::new(subscription), identity, word)
         .unwrap();
@@ -345,35 +328,24 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
     let cursor = ReplayCursor::open(
         journal,
         &recovery,
-        &ReplayConfig {
-            manifest: b"e2e",
-            accept_manifest: false,
-        },
-        CursorConfig {
-            bytes: 1 << 16,
-            records: 64,
-        },
+        &ReplayConfig::new(b"e2e"),
+        CursorConfig::new(1 << 16, 64),
     )
     .unwrap();
     let mut replay = ReplayGateway::new(
         cursor,
-        &GatewayConfig {
-            publications: &[],
-            subscriptions: &[(STREAM, 1, Lane::ZERO)],
-            network: &[],
-            conflated: &[],
-            max_claim: 64,
-            max_payload: 4096,
-            present_unavailable: false,
-        },
-        Some(Archive {
-            disk: StdDisk,
-            dir: dir.path().to_path_buf(),
-            recordings: vec![(
+        &GatewayConfig::new()
+            .with_subscriptions(&[(STREAM, 1, Lane::ZERO)])
+            .with_max_claim(64)
+            .with_max_payload(4096),
+        Some(Archive::new(
+            StdDisk,
+            dir.path().to_path_buf(),
+            vec![(
                 recording,
                 Geometry::new(MIN_TERM_LENGTH, 2 * u64::from(MIN_TERM_LENGTH)).unwrap(),
             )],
-        }),
+        )),
     )
     .unwrap();
     let mut replayed = Vec::new();
@@ -464,26 +436,17 @@ impl Port for DriverPort {
                             Outcome::Aborted { lane, position }
                         }
                     };
-                    ClaimCommit {
-                        claim: Outcome::Accepted { lane, position },
-                        commit: Some(commit),
-                    }
+                    ClaimCommit::new(Outcome::Accepted { lane, position }, Some(commit))
                 } else {
                     claim.abort();
-                    ClaimCommit {
-                        claim: Outcome::Accepted { lane, position },
-                        commit: Some(Outcome::Aborted { lane, position }),
-                    }
+                    ClaimCommit::new(
+                        Outcome::Accepted { lane, position },
+                        Some(Outcome::Aborted { lane, position }),
+                    )
                 }
             }
-            ClaimOutcome::BackPressured => ClaimCommit {
-                claim: Outcome::BackPressured,
-                commit: None,
-            },
-            ClaimOutcome::AdminAction => ClaimCommit {
-                claim: Outcome::AdminAction,
-                commit: None,
-            },
+            ClaimOutcome::BackPressured => ClaimCommit::new(Outcome::BackPressured, None),
+            ClaimOutcome::AdminAction => ClaimCommit::new(Outcome::AdminAction, None),
             other => panic!("{other:?}"),
         }
     }
@@ -590,24 +553,15 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
         })
         .unwrap();
     let sender = archive
-        .start_group(StartGroup {
-            group_id: 1,
-            dir: groups.clone(),
-            new: Some(NewGroup {
-                first_group_seq: 1,
-                // Inline: the input is not recorded, so nothing is by
-                // reference.
-                inline_threshold: 4096,
-                capture: Capture::Strict,
-                manifest: b"iso".to_vec(),
-            }),
-            journal: JOURNAL,
-            capture: CaptureConfig {
-                ring_capacity: 1 << 16,
-                max_event: 4096,
-                in_flight: 64,
-            },
-            checkpoints: None,
+        .start_group({
+            let mut value = StartGroup::new(
+                1,
+                groups.clone(),
+                JOURNAL,
+                CaptureConfig::new(1 << 16, 4096, 64),
+            );
+            value.new = Some(NewGroup::new(1, 4096, Capture::Strict, b"iso".to_vec()));
+            value
         })
         .unwrap();
     let waiter = sender.waiter();
@@ -619,12 +573,7 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
     let port = DriverPort(std::sync::Arc::clone(&real));
     let mut gateway = Gateway::new(port, clock, sender, Capture::Strict, 1, 4096, 4).unwrap();
     let mut out_reader = driver.subscribe(output, Role::Required).unwrap();
-    let identity = SourceIdentity {
-        incarnation: 1,
-        stream_id: STREAM,
-        session_id: 1,
-        lane: Lane::ZERO,
-    };
+    let identity = SourceIdentity::new(1, STREAM, 1, Lane::ZERO);
     let word = archive
         .recording_word(STREAM, 1, Lane::ZERO)
         .unwrap()
@@ -724,27 +673,17 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
     let cursor = ReplayCursor::open(
         journal,
         &recovery,
-        &ReplayConfig {
-            manifest: b"iso",
-            accept_manifest: false,
-        },
-        CursorConfig {
-            bytes: 8 * MAX_RECORD,
-            records: 8,
-        },
+        &ReplayConfig::new(b"iso"),
+        CursorConfig::new(8 * MAX_RECORD, 8),
     )
     .unwrap();
     let mut replay = ReplayGateway::new(
         cursor,
-        &GatewayConfig {
-            publications: &[(OUT, 1)],
-            subscriptions: &[(STREAM, 1, Lane::ZERO)],
-            network: &[],
-            conflated: &[],
-            max_claim: 8,
-            max_payload: 4096,
-            present_unavailable: false,
-        },
+        &GatewayConfig::new()
+            .with_publications(&[(OUT, 1)])
+            .with_subscriptions(&[(STREAM, 1, Lane::ZERO)])
+            .with_max_claim(8)
+            .with_max_payload(4096),
         None,
     )
     .unwrap();
@@ -861,42 +800,32 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
         .unwrap()
         .into_parts();
     let _ = archive
-        .start(StartRecording {
-            stream_id: STREAM,
-            session_id: 1,
-            channel: b"karyos:ipc".to_vec(),
-            geometry: Geometry::new(MIN_TERM_LENGTH, 2 * u64::from(MIN_TERM_LENGTH)).unwrap(),
-            policy: SyncPolicy::Every { interval_ns: 0 },
-            mode: Mode::Required,
-            format: format(),
-            source: Box::new(Guarded::new(reader, lease)),
-        })
+        .start(StartRecording::new(
+            STREAM,
+            1,
+            b"karyos:ipc".to_vec(),
+            Geometry::new(MIN_TERM_LENGTH, 2 * u64::from(MIN_TERM_LENGTH)).unwrap(),
+            SyncPolicy::Every { interval_ns: 0 },
+            Mode::Required,
+            format(),
+            Box::new(Guarded::new(reader, lease)),
+        ))
         .unwrap();
     let word = archive
         .recording_word(STREAM, 1, Lane::ZERO)
         .unwrap()
         .unwrap();
     let sender = archive
-        .start_group(StartGroup {
-            group_id: 1,
-            dir: groups.clone(),
-            new: Some(NewGroup {
-                first_group_seq: 1,
-                // Every payload inline: the replay needs no recording.
-                inline_threshold: 4096,
-                capture: Capture::Strict,
-                manifest: b"e2e".to_vec(),
-            }),
-            journal: JOURNAL,
-            capture: CaptureConfig {
-                ring_capacity: 1 << 16,
-                max_event: 4096,
-                in_flight: 64,
-            },
-            checkpoints: Some(GroupCheckpoints {
-                max_checkpoint: 64,
-                reopen_hold: None,
-            }),
+        .start_group({
+            let mut value = StartGroup::new(
+                1,
+                groups.clone(),
+                JOURNAL,
+                CaptureConfig::new(1 << 16, 4096, 64),
+            );
+            value.new = Some(NewGroup::new(1, 4096, Capture::Strict, b"e2e".to_vec()));
+            value.checkpoints = Some(GroupCheckpoints::new(64));
+            value
         })
         .unwrap();
     let waiter = sender.waiter();
@@ -905,12 +834,7 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
     let mut gateway = Gateway::new(Inert, clock, sender, Capture::Strict, 1, 4096, 4).unwrap();
     gateway.set_inline_threshold(4096);
     let subscription = driver.subscribe(handle, Role::Required).unwrap();
-    let identity = SourceIdentity {
-        incarnation: 1,
-        stream_id: STREAM,
-        session_id: 1,
-        lane: Lane::ZERO,
-    };
+    let identity = SourceIdentity::new(1, STREAM, 1, Lane::ZERO);
     let _ = gateway
         .add_subscription(Box::new(subscription), identity, word)
         .unwrap();
@@ -1011,14 +935,8 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
         &[],
         &mut store,
         first_id,
-        &ReplayConfig {
-            manifest: b"e2e",
-            accept_manifest: false,
-        },
-        CursorConfig {
-            bytes: 4 * MAX_RECORD,
-            records: 8,
-        },
+        &ReplayConfig::new(b"e2e"),
+        CursorConfig::new(4 * MAX_RECORD, 8),
         &mut snapshot,
     )
     .unwrap();
@@ -1029,15 +947,9 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
     );
     let mut gateway = ReplayGateway::new(
         cursor,
-        &GatewayConfig {
-            publications: &[(0, 0)],
-            subscriptions: &[(STREAM, 1, Lane::ZERO)],
-            network: &[],
-            conflated: &[],
-            max_claim: 0,
-            max_payload: 0,
-            present_unavailable: false,
-        },
+        &GatewayConfig::new()
+            .with_publications(&[(0, 0)])
+            .with_subscriptions(&[(STREAM, 1, Lane::ZERO)]),
         None,
     )
     .unwrap()

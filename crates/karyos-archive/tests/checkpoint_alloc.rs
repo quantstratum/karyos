@@ -57,10 +57,7 @@ fn event(seq: u64, out: &mut Vec<u8>) {
 
 #[test]
 fn a_checkpoint_allocates_nothing_after_configuration() {
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::None,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::None);
     let (journals, checkpoints) = (dir("journals"), dir("checkpoints"));
     let header = JournalHeader {
         group_id: 3,
@@ -128,10 +125,7 @@ fn replay_from_a_checkpoint_steps_without_allocating() {
         }
     }
 
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::PerSegment);
     let (journals, checkpoints) = (dir("replay-journals"), dir("replay-checkpoints"));
     let header = JournalHeader {
         group_id: 4,
@@ -177,14 +171,8 @@ fn replay_from_a_checkpoint_steps_without_allocating() {
         &[],
         &mut store,
         2,
-        &ReplayConfig {
-            manifest: b"m",
-            accept_manifest: false,
-        },
-        CursorConfig {
-            bytes: 4 * MAX_RECORD,
-            records: 4,
-        },
+        &ReplayConfig::new(b"m"),
+        CursorConfig::new(4 * MAX_RECORD, 4),
         &mut snapshot,
     )
     .unwrap();
@@ -197,7 +185,7 @@ fn replay_from_a_checkpoint_steps_without_allocating() {
                 assert!(compare_state(&checkpoint, &state).is_ok());
                 Some(false)
             }
-            Step::Stop(_) => None,
+            _ => None,
         });
         assert_eq!(allocations, 0, "a step allocated");
         match step {
@@ -217,10 +205,7 @@ fn replay_from_a_checkpoint_steps_without_allocating() {
 fn the_handoff_and_a_chunked_write_allocate_nothing() {
     use karyos_archive::group::checkpoint::{LastCheckpoint, Progress, handoff};
 
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::None,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::None);
     let (journals, checkpoints) = (dir("handoff-journals"), dir("handoff-checkpoints"));
     let header = JournalHeader {
         group_id: 5,
@@ -255,6 +240,7 @@ fn the_handoff_and_a_chunked_write_allocate_nothing() {
                 match writer.advance(&mut journal, &request, 300).unwrap() {
                     Progress::Writing { .. } => {}
                     Progress::Recorded(record) => break record,
+                    other => panic!("{other:?}"),
                 }
             };
             inbox.give_back(request, Ok(record));

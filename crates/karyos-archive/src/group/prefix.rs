@@ -75,6 +75,7 @@ pub trait Coverage {
 
 /// What a checkpoint store holds of a checkpoint's range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CheckpointHeld {
     /// Not written yet.
     Missing,
@@ -89,6 +90,7 @@ pub enum CheckpointHeld {
 
 /// Why the tracker refused a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PrefixError {
     /// The queue of events not yet durable is full.
     #[error("{capacity} events wait to be durable")]
@@ -152,6 +154,7 @@ impl Candidate {
 
 /// The checkpoint that opened a range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RangeStart {
     /// Its id.
     pub checkpoint_id: u64,
@@ -162,6 +165,7 @@ pub struct RangeStart {
 /// The range the tracker follows (`recording-group-checkpoints.md`
 /// section 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Range {
     /// The checkpoint that opened it; `None` for the journal's first.
     pub start: Option<RangeStart>,
@@ -175,6 +179,7 @@ pub struct Range {
 /// The journal's first range as it ended, frozen when a checkpoint opened
 /// another: replay from the journal's start stops there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FirstRange {
     /// Its final `complete_recording_seq`.
     pub complete: u64,
@@ -204,6 +209,7 @@ pub struct PrefixView {
 
 /// Whether an event is durable, as [`PrefixView::durable_for`] answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DurableFor {
     /// It is: the `durable_group_seq` that covers it.
     Reached(u64),
@@ -939,6 +945,7 @@ impl PrefixTracker {
 
 /// A journal's prefixes after a restart.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Recovery {
     /// The tracker, with the complete and durable prefixes of what the
     /// journal kept.

@@ -176,13 +176,7 @@ fn a_backlog_of_claims_drains_by_commit_or_deadline_before_the_end() {
         .poll(|bytes, _| assert_eq!(bytes, b"kept"), MessageLimit::new(8))
         .unwrap();
     assert_eq!(first.delivered, 1);
-    assert_eq!(
-        first.aborted,
-        Some(Aborted {
-            position: expired_at,
-            extent: 64,
-        })
-    );
+    assert_eq!(first.aborted, Some(Aborted::new(expired_at, 64)));
     let (seen, end) = read(&mut subscription);
     assert!(seen.is_empty());
     assert_eq!(end.closed, Some(position));
