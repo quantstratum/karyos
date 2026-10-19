@@ -1527,3 +1527,58 @@ fn a_range_end_on_one_side_only_is_a_difference() {
         "{report:?}"
     );
 }
+
+/// #448 review P2: with `--to` past a middle range's end, the gap that
+/// ends it lies inside the range asked for: not comparable (code 2), as
+/// section 7 says, even when only one journal stops there (without
+/// `--to` that is the `end` kind).
+#[test]
+fn a_middle_range_gap_before_to_is_not_comparable() {
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    write_ranges(
+        &left,
+        &[
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, true),
+            (5, false),
+            (6, true),
+        ],
+        &[2, 5],
+    );
+    write_ranges(
+        &right,
+        &[
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, true),
+            (5, true),
+            (6, true),
+        ],
+        &[2, 5],
+    );
+    let report = diff(&DiffArgs {
+        left: Journal {
+            dir: left.clone(),
+            group: 1,
+        },
+        right: Journal {
+            dir: right.clone(),
+            group: 1,
+        },
+        from: None,
+        to: Some(6),
+        json: false,
+        accept_manifest: false,
+        from_checkpoint: Some(1),
+    });
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    assert!(
+        report.text().contains("a gap marker from group_seq 5"),
+        "{}",
+        report.text()
+    );
+}

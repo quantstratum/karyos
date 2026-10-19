@@ -764,7 +764,7 @@ pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
             from,
             to: args.to,
             explicit_from: args.from.is_some(),
-            to_range_end: left.checkpoint.is_some() && args.to.is_none(),
+            to_range_end: left.checkpoint.is_some(),
         },
     )
 }
@@ -1010,10 +1010,12 @@ struct Range {
     /// left out is past it. The default `--from` is the journals' own
     /// first event, so an empty journal there is the `end` kind instead.
     explicit_from: bool,
-    /// From a checkpoint without `--to`: the range the checkpoint opened
-    /// is compared to its end, and the stop that ends it (a gap or an
-    /// incomplete event, for a middle range) ends the comparison as the
-    /// end of a complete prefix does. Both sides must end there.
+    /// From a checkpoint: the range the checkpoint opened is compared to
+    /// its end, and the stop that ends it (a gap or an incomplete event,
+    /// for a middle range) ends the comparison as the end of a complete
+    /// prefix does. Both sides must end there. A `--to` past that stop
+    /// still makes it not comparable: the stops' own checks against `to`
+    /// say so.
     to_range_end: bool,
 }
 
