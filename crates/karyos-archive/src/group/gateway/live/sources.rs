@@ -750,7 +750,20 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         }
         let held = match polled {
             // A loss is the stopped image's, in its session.
-            Ok((summary, session)) => reported(&summary)?.map(|held| match held {
+            Ok((summary, session)) => match reported(&summary) {
+                Ok(held) => held,
+                // The poll consumed an overrun this build has no record
+                // code for: the source ends there as closed, never with a
+                // silent gap after it, and a strict journal ends with it.
+                Err(_) => {
+                    self.incomplete_next |= self.capture == Capture::Strict;
+                    summary.overrun.map(|lost| Held::Ended {
+                        position: lost.from,
+                        reason: EndReason::Closed,
+                    })
+                }
+            }
+            .map(|held| match held {
                 Held::Loss {
                     loss,
                     from,
