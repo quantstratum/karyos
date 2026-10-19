@@ -1075,9 +1075,13 @@ fn a_second_source_of_a_stream_session_and_lane_is_refused() {
             lane: Lane::ZERO,
         })
     );
-    let other = ClientSubscription::new(rig.conductor.subscribe(Role::Required).unwrap());
+    // Another lane: a lane-1 buffer of the same stream and session.
+    let lane_one = Lane::try_new(1).unwrap();
+    let buffer = log_of(1, lane_one, 64 * 1024);
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let other = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
     let other_lane = SourceIdentity {
-        lane: Lane::try_new(1).unwrap(),
+        lane: lane_one,
         ..IDENTITY
     };
     assert!(
@@ -1085,6 +1089,7 @@ fn a_second_source_of_a_stream_session_and_lane_is_refused() {
             .add_subscription(Box::new(other), other_lane, Arc::new(RecordingWord::new()))
             .is_ok()
     );
+    drop(conductor);
 }
 
 /// Strict capture reads an optional or observer source only when it can
@@ -1633,4 +1638,32 @@ fn a_fan_in_image_is_recorded_on_its_lane() {
         })
         .collect();
     assert_eq!(lanes, [("lifecycle", 1), ("message", 1)]);
+}
+
+/// #450 review P2: a source added under an identity naming another lane
+/// than the one it reads is refused, typed: its messages would be
+/// recorded on its own lane and replayed as another source's.
+#[test]
+fn a_source_under_another_lane_is_refused() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let lane_one = Lane::try_new(1).unwrap();
+    // A lane-0 buffer of the same stream and session, named lane 1.
+    let buffer = log_of(1, Lane::ZERO, 64 * 1024);
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let second = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+    assert_eq!(
+        rig.gateway.add_subscription(
+            Box::new(second),
+            SourceIdentity {
+                lane: lane_one,
+                ..IDENTITY
+            },
+            Arc::new(RecordingWord::new()),
+        ),
+        Err(GatewayError::WrongLane {
+            named: lane_one,
+            read: Lane::ZERO,
+        })
+    );
+    drop(conductor);
 }

@@ -336,6 +336,16 @@ pub enum GatewayError {
         /// The lane.
         lane: karyos_sys::frame::Lane,
     },
+    /// A source added under an identity whose lane is not the one it
+    /// reads: its messages would be recorded, and replayed, under another
+    /// source's key.
+    #[error("the identity names lane {named:?}, the source reads lane {read:?}")]
+    WrongLane {
+        /// The identity's lane.
+        named: karyos_sys::frame::Lane,
+        /// The source's.
+        read: karyos_sys::frame::Lane,
+    },
 }
 
 /// The trait both the live Gateway and `ReplayGateway` implement.

@@ -764,7 +764,8 @@ impl<T: TermBytes> ClientSubscription<T> {
 
     /// The lane read; `None` once the rejoin policy closed the
     /// subscription.
-    pub(crate) fn lane(&self) -> Option<Lane> {
+    #[must_use]
+    pub fn lane(&self) -> Option<Lane> {
         self.inner.as_ref().map(|inner| inner.buffer().lane())
     }
 

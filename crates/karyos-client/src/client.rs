@@ -1207,8 +1207,15 @@ impl<C: Connection> Client<C> {
         match self.connection.subscription(completion.outcome) {
             Ok(subscription) => {
                 slot.attached = true;
-                // A subscription just attached is open: its lane is there.
-                let lane = subscription.lane().unwrap_or(karyos_sys::frame::Lane::ZERO);
+                // A subscription just attached is open, so it names its
+                // lane; one that does not is refused as a failed attach,
+                // never given a lane it does not read.
+                let Some(lane) = subscription.lane() else {
+                    let _ = self.connection.release_subscription(subscription);
+                    network.slots.retain(|slot| slot.id != attach.sequence);
+                    inbox.update(|state| bump(&mut state.refused));
+                    return;
+                };
                 let image = Image {
                     id: slot.id,
                     session_id: slot.session_id,

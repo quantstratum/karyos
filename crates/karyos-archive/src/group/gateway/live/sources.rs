@@ -129,6 +129,14 @@ pub trait MessageSource {
         false
     }
 
+    /// The lane it reads, when it reads one: the Gateway refuses an
+    /// identity that names another. `None` for a source of several lanes
+    /// (a network subscription, each message naming its own) or one that
+    /// does not say.
+    fn lane(&self) -> Option<Lane> {
+        None
+    }
+
     /// [`MessageSource::poll_taking`], with the session and lane of the
     /// image whose report the summary carries, when it names one.
     ///
@@ -200,6 +208,10 @@ impl<T: TermBytes> MessageSource for ClientSubscription<T> {
         limit: MessageLimit,
     ) -> Result<PollSummary, PollError> {
         ClientSubscription::poll_taking(self, handler, limit)
+    }
+
+    fn lane(&self) -> Option<Lane> {
+        ClientSubscription::lane(self)
     }
 }
 
@@ -405,12 +417,24 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     /// [`GatewayError::DuplicateSource`] for a second source of the same
     /// stream, session and lane, or one alongside a network subscription
     /// of its stream: replay tells sources apart by those.
+    /// [`GatewayError::WrongLane`] for an identity whose lane is not the
+    /// one the source reads.
     pub fn add_subscription(
         &mut self,
         source: Box<dyn MessageSource + Send>,
         identity: SourceIdentity,
         word: Arc<RecordingWord>,
     ) -> Result<SubscriptionId, GatewayError> {
+        // The identity names the lane the source reads: one that names
+        // another would record its messages under the wrong key.
+        if let Some(lane) = source.lane()
+            && lane != identity.lane
+        {
+            return Err(GatewayError::WrongLane {
+                named: identity.lane,
+                read: lane,
+            });
+        }
         // A network subscription takes every session of its stream: it is
         // then the stream's only source, so replay maps it as one.
         let fan_in = source.fan_in();
