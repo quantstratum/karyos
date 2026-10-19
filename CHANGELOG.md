@@ -394,6 +394,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Prefix purge of the Raft log (phase 4, C8b). A2's
+  `SegmentStore::purge_before` moves a recording's start forward to a write
+  boundary and removes the whole segments below it. The new start, the
+  floor, is replaced atomically in `<recording>.floor` before anything is
+  removed, and recovery starts the recording at the floor
+  (`DropReason::Purged`; `SegmentError::InvalidPurge`, `FloorDamaged`,
+  `FloorMissing`). karyos-cluster's `RaftLog::purge_prefix(below)` now
+  purges committed entries and returns the new first index, instead of
+  `LogError::PurgeUnsupported` (replaced by `PurgeBeyondCommit`). If a
+  crash leaves the first-index file stale, `RaftLog::open` follows the first
+  frame. karyos-sim's `tests/purge_crash.rs` crashes the disk at every
+  operation of two purges and fails every flush.
+
 - Snapshots in karyos-cluster (phase 4, C8a; quantstratum-docs:
   `karyos/design/cluster-dedup-and-snapshots.md` §3). `snapshot::SnapshotStore`
   writes a snapshot as typed sections (`SectionKind`: consensus, sessions,
