@@ -104,6 +104,7 @@ fn a_gateway_allocates_nothing_per_event() {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: Capture::Strict,
+        reopen_hold: 0,
         manifest: b"m",
     };
     let config = JournalConfig {

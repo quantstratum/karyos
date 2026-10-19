@@ -50,6 +50,7 @@ fn header(capture: Capture) -> JournalHeader<'static> {
         contract_version: CONTRACT_VERSION,
         clock: CLOCK,
         capture,
+        reopen_hold: 0,
         manifest: MANIFEST,
     }
 }

@@ -1863,3 +1863,53 @@ fn open_verified_opens_only_for_reading_and_reads_what_recover_keeps() {
     recovered.read(0, &mut kept).unwrap();
     assert_eq!(seen, kept);
 }
+
+/// #437: a plan counts the index entries it drops past its cut, a torn
+/// one too: none when nothing is cut, one for a torn last entry, and
+/// every later whole entry when an earlier write's data fails.
+#[test]
+fn a_plan_counts_the_entries_it_drops() {
+    let dir = Path::new(DIR);
+    let dropped = |disk: &FaultDisk| {
+        SegmentStore::verify(disk.clone(), dir, RECORDING, geometry())
+            .unwrap()
+            .kept
+            .unwrap()
+            .dropped_entries
+    };
+    let written = |disk: &FaultDisk| {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            dir,
+            RECORDING,
+            geometry(),
+            SyncPolicy::None,
+            0,
+        )
+        .unwrap();
+        for at in [0u64, 10, 20, 30] {
+            let start = usize::try_from(at).unwrap();
+            store.append(at, &stream(40)[start..start + 10]).unwrap();
+        }
+    };
+    // Nothing cut.
+    let disk = FaultDisk::default();
+    written(&disk);
+    assert_eq!(dropped(&disk), 0);
+    // A torn last entry: one.
+    let free = FaultDisk::default();
+    let steps = [Step::Append(40), Step::Append(40)];
+    let _ = run(free.clone(), &steps, SyncPolicy::None, 0, false);
+    let disk = FaultDisk::with_budget(free.used() - 27);
+    let _ = run(disk.clone(), &steps, SyncPolicy::None, 0, false);
+    assert_eq!(dropped(&disk.after_crash(Survives::Everything)), 1);
+    // The second write's data fails: it and the two after it, three.
+    let disk = FaultDisk::default();
+    written(&disk);
+    let mut raw = disk.clone();
+    let data = raw.open(&dir.join(data_name(RECORDING, 0))).unwrap();
+    raw.write_at(&data, 12, &[0xEE; 2]).unwrap();
+    let plan = SegmentStore::verify(disk.clone(), dir, RECORDING, geometry()).unwrap();
+    assert_eq!(plan.cut.map(|cut| cut.position), Some(10));
+    assert_eq!(dropped(&disk), 3);
+}

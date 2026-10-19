@@ -30,6 +30,7 @@ fn journal() -> [GroupRecord<'static>; 5] {
             contract_version: 1,
             clock: Clock::HostMonotonic,
             capture: Capture::Strict,
+            reopen_hold: 0,
             manifest: b"build",
         }),
         GroupRecord::Message(MessageEvent {

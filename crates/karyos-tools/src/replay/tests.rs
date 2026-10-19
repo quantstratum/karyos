@@ -64,6 +64,7 @@ fn header(capture: Capture, manifest: &'static [u8]) -> JournalHeader<'static> {
         contract_version: CONTRACT_VERSION,
         clock: Clock::HostMonotonic,
         capture,
+        reopen_hold: 0,
         manifest,
     }
 }
@@ -1249,6 +1250,81 @@ fn an_empty_checkpoint_directory_is_not_comparable() {
     assert!(
         matches!(&report, Report::NotComparable { reason } if reason.contains("store is not there")),
         "{report:?}"
+    );
+}
+
+/// #437 review P2: `--from-checkpoint` recovers with the hold the
+/// journal's header records, not the reader's capacity. A best-effort
+/// run: event 1, a gap at 2, then events 3 to 8 written while the
+/// checkpoint at 2 was, its record after them. Recorded with a hold of 8,
+/// the range opens over the six events; with a hold of 2 the run let
+/// them go, and so does the diff.
+#[test]
+fn from_checkpoint_takes_the_recorded_hold() {
+    use karyos_archive::group::checkpoint::{CheckpointSlot, CheckpointStore, CheckpointWriter};
+
+    let write = |dir: &Path, hold: u32| {
+        let header = JournalHeader {
+            reopen_hold: hold,
+            ..header(Capture::BestEffort, b"m")
+        };
+        let config = JournalConfig {
+            segment_length: karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
+            policy: SyncPolicy::PerSegment,
+        };
+        let mut journal = GroupJournal::create(StdDisk, dir, &header, config).unwrap();
+        let store_dir = dir.join(CHECKPOINTS);
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store = CheckpointStore::create(StdDisk, &store_dir, 1, config).unwrap();
+        let mut writer = CheckpointWriter::new(store, &journal).unwrap();
+        let mut records = timers(1, 1);
+        records.push(GroupRecord::Gap(GapMarker {
+            from_seq: 2,
+            to_seq: 2,
+            reason: GapReason::RingFull,
+        }));
+        records.extend(timers(3, 6));
+        let mut out = vec![0u8; MAX_RECORD];
+        for record in &records {
+            let length = record.encode(&mut out).unwrap();
+            let _ = journal.append(&out[..length]).unwrap();
+        }
+        let mut slot = CheckpointSlot::new(64);
+        let request = slot
+            .take(2, 1, |buffer| {
+                buffer[..5].copy_from_slice(b"state");
+                5
+            })
+            .unwrap();
+        let written = writer.write(&mut journal, &request);
+        slot.returned(request, &written);
+        let _ = written.unwrap();
+        let _ = journal.close().unwrap();
+    };
+    let mut reports = Vec::new();
+    for hold in [8, 2] {
+        let scratch = Scratch::new();
+        let (left, right) = (scratch.side("left"), scratch.side("right"));
+        write(&left, hold);
+        write(&right, hold);
+        reports.push(diff_from_checkpoint(&left, &right, 1));
+    }
+    assert_eq!(
+        reports[0],
+        Report::Identical {
+            from: 3,
+            to: Some(8),
+            events: 6
+        }
+    );
+    // The range stays at the checkpoint: nothing after it to compare.
+    assert_eq!(
+        reports[1],
+        Report::Identical {
+            from: 3,
+            to: None,
+            events: 0
+        }
     );
 }
 

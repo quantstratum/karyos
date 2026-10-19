@@ -39,6 +39,8 @@ pub const CONTRACT_VERSION: u16 = 1;
 pub const MAX_INLINE: usize = 65_535;
 /// The longest manifest, in bytes.
 pub const MAX_MANIFEST: usize = 4096;
+/// The largest reopen hold a journal header records, in events (A9).
+pub const MAX_REOPEN_HOLD: u32 = 1 << 16;
 /// The default inline threshold, in bytes.
 pub const DEFAULT_INLINE_THRESHOLD: u32 = 4096;
 
@@ -55,7 +57,7 @@ const fn template(template_id: u16, block_length: u16, max_length: u32) -> Templ
 // Maximum lengths: the 12-byte envelope, the block, and the variable
 // field's 2-byte length prefix and largest value.
 /// `JournalHeader`, template 1.
-pub const JOURNAL_HEADER: Template = template(1, 24, 12 + 24 + 2 + 4096);
+pub const JOURNAL_HEADER: Template = template(1, 32, 12 + 32 + 2 + 4096);
 /// `MessageEvent`, template 2.
 pub const MESSAGE_EVENT: Template = template(2, 67, 12 + 67 + 2 + 65_535 + 2 + 64);
 /// `ConflatedEvent`, template 3.
@@ -151,6 +153,10 @@ pub struct JournalHeader<'a> {
     pub clock: Clock,
     /// Strict or best effort.
     pub capture: Capture,
+    /// The events the reopening window holds (A9): fixed when the group
+    /// is made, at most [`MAX_REOPEN_HOLD`]; 0 for a group without
+    /// checkpoints. Recovery and the running tracker both take it.
+    pub reopen_hold: u32,
     /// The caller's identity of what ran, opaque: 1 to [`MAX_MANIFEST`]
     /// bytes.
     pub manifest: &'a [u8],
@@ -215,6 +221,13 @@ impl<'a> JournalHeader<'a> {
             2 => Capture::BestEffort,
             value => return Err(invalid_enum("capture", value)),
         };
+        let reopen_hold = block.u32(24)?;
+        if reopen_hold > MAX_REOPEN_HOLD {
+            return Err(out_of_range("reopen_hold"));
+        }
+        if block.u32(28)? != 0 {
+            return Err(out_of_range("reserved"));
+        }
         let manifest = decoder.bytes("manifest", 1, MAX_MANIFEST)?;
         decoder.finish()?;
         Ok(Self {
@@ -224,6 +237,7 @@ impl<'a> JournalHeader<'a> {
             contract_version,
             clock,
             capture,
+            reopen_hold,
             manifest,
         })
     }
@@ -258,6 +272,11 @@ impl<'a> JournalHeader<'a> {
         encoder.u16(20, self.contract_version)?;
         encoder.u8(22, clock)?;
         encoder.u8(23, capture)?;
+        if self.reopen_hold > MAX_REOPEN_HOLD {
+            return Err(out_of_range("reopen_hold"));
+        }
+        encoder.u32(24, self.reopen_hold)?;
+        encoder.u32(28, 0)?;
         encoder.bytes("manifest", 1, MAX_MANIFEST, self.manifest)?;
         encoder.finish()
     }

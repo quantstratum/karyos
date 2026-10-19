@@ -106,6 +106,7 @@ fn header(capture: Capture) -> JournalHeader<'static> {
         contract_version: CONTRACT_VERSION,
         clock: Clock::HostMonotonic,
         capture,
+        reopen_hold: 0,
         manifest: b"m",
     }
 }
@@ -585,6 +586,7 @@ fn the_capture_holds_what_the_handler_did() {
     let (stop, written) = captured(Capture::Strict, &records, &mut Echo::default());
     assert_eq!(stop, Ok(Dispatched::End));
     let mut wanted = vec![encoded(&GroupRecord::Header(JournalHeader {
+        reopen_hold: 0,
         manifest: b"replay",
         ..header(Capture::Strict)
     }))];
