@@ -454,6 +454,15 @@ release may break APIs, wire formats and shared-memory layouts.
   denied in the crate and expected only on `mod abi` and in the tests'
   `support::abi`; `make lint-sync` checks that, the clippy set, and that no
   profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- The C ABI conformance suite beside `karyos-ffi` (ADR-0067; batch F6), in
+  the interim format 1 of `crates/karyos-ffi/conformance/FORMAT.md` until
+  the owner chooses one (item 46): line-based `.kcs` scenarios (`call` and
+  `expect` steps, status names read from the header, variables, an `abi`
+  version that a runner checks against `karyos_abi_version`), and
+  `index.txt`, which maps the §13 C ABI rows to scenarios or to the batch
+  that brings them. The Rust runner (`tests/conformance.rs`) runs every
+  scenario through the exported symbols and checks the map. First
+  scenarios: the ABI version, null out-parameters and status texts.
 - `karyos_protocol::cnc::ErrorCode::code` is public: the wire value of a
   refusal code, which the C ABI reports as a detail.
 - Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:
