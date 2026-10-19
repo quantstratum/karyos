@@ -34,7 +34,7 @@ use karyos_sys::counters::{Counter, CounterKeys, KIND_GUARD};
 use karyos_sys::diag::{GuardAudit, GuardAuditRecord};
 use karyos_sys::guard::{self, Closed, GuardError, GuardState};
 
-use crate::counters::{DriverCounters, TYPE_GAUGE};
+use crate::counters::{DriverCounters, Event, TYPE_GAUGE};
 use crate::error::DriverError;
 
 /// The longest guard name, in bytes.
@@ -168,6 +168,10 @@ pub(crate) struct Guards {
     overwritten: u64,
     /// The tools' copy of every record (M4).
     ring: GuardAudit,
+    /// Records the ring took overwriting an older one, or dropped once its
+    /// sequences were exhausted.
+    ring_overwritten: u64,
+    ring_dropped: u64,
 }
 
 impl Guards {
@@ -181,6 +185,8 @@ impl Guards {
             audit_capacity,
             overwritten: 0,
             ring,
+            ring_overwritten: 0,
+            ring_dropped: 0,
         }
     }
 
@@ -418,9 +424,9 @@ impl Guards {
             AuditOutcome::Reopened => (3, 0),
             AuditOutcome::Refused(code) => (4, u16::try_from(code.code()).unwrap_or(u16::MAX)),
         };
-        // A ring whose sequences are exhausted keeps what it has; the
-        // driver's own audit below still records.
-        let _ = self.ring.record(&GuardAuditRecord {
+        // A ring whose sequences are exhausted keeps what it has and counts
+        // the record dropped; the driver's own audit below still records.
+        let appended = self.ring.record(&GuardAuditRecord {
             time: karyos_sys::host_clock::host_monotonic_ns(),
             driver_time: time,
             guard,
@@ -432,6 +438,18 @@ impl Guards {
             outcome: outcome_code,
             refusal,
         });
+        let count = match appended {
+            Some(appended) if appended.overwrote.is_some() => Some(&mut self.ring_overwritten),
+            Some(_) => None,
+            None => Some(&mut self.ring_dropped),
+        };
+        // Checked, never wrapped (SPEC.md section 14): at its end the
+        // count keeps its value.
+        if let Some(count) = count
+            && let Some(next) = count.checked_add(1)
+        {
+            *count = next;
+        }
         if self.audit_capacity == 0 {
             // Checked, never wrapped (SPEC.md section 14): at its end the
             // count keeps its value.
@@ -492,6 +510,15 @@ pub(crate) struct GuardCells {
     cells: Vec<(u64, Option<Counter>, u64, bool)>,
     /// Syncs left before refused allocations are tried again.
     retry_in: u32,
+    /// The ring's overwritten and dropped records already counted.
+    ring_counted: (u64, u64),
+}
+
+impl Guards {
+    /// The guard audit ring's records overwritten and dropped so far.
+    pub(crate) fn ring_losses(&self) -> (u64, u64) {
+        (self.ring_overwritten, self.ring_dropped)
+    }
 }
 
 /// Syncs between two retries of a refused guard gauge allocation.
@@ -543,6 +570,16 @@ impl GuardCells {
         if refused {
             self.retry_in = GUARD_CELL_RETRY;
         }
+        // The ring's losses since the last sync, into the driver's events.
+        let (overwritten, dropped) = guards.ring_losses();
+        let (counted_overwritten, counted_dropped) = self.ring_counted;
+        if let Some(delta) = overwritten.checked_sub(counted_overwritten) {
+            counters.add(Event::GuardAuditOverwritten, delta);
+        }
+        if let Some(delta) = dropped.checked_sub(counted_dropped) {
+            counters.add(Event::GuardAuditDropped, delta);
+        }
+        self.ring_counted = (overwritten, dropped);
     }
 }
 

@@ -409,6 +409,17 @@ release may break APIs, wire formats and shared-memory layouts.
   UID=ROLE`, `--refresh-ms`). The API compatibility test pins API v1's
   JSON field for field.
 
+- Consistent reads of an endpoint's capability gauges (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M6b): the conductor
+  writes each endpoint's gauges inside a sampling pass on a new `capability
+  pass` cell (same keys; odd while it writes, even after, with the
+  `begin_pass`/`end_pass` fences), and `karyos_client::capabilities::
+  endpoint_capabilities` reads each group with `read_pass`, for tools and
+  the management agent alike, marking it inconsistent when every attempt
+  overlapped a write. The guard audit
+  ring's losses are counted: `guard audit records overwritten` and `guard
+  audit records dropped` (sequences exhausted).
+
 - The management agent's core, `karyos-agent` (phase 5, M6a; ADR-0055;
   quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`).
   `Agent` attaches to each configured driver as a tool, counting against its
@@ -533,6 +544,16 @@ release may break APIs, wire formats and shared-memory layouts.
   denied in the crate and expected only on `mod abi` and in the tests'
   `support::abi`; `make lint-sync` checks that, the clippy set, and that no
   profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- `karyos-ffi` clients (batch F2): `karyos_client_options_init`,
+  `karyos_client_connect`, `karyos_client_poll` and `karyos_client_close`,
+  with the sized `karyos_client_options` (copied, nothing consumed) and
+  `karyos_detail` structs. A driver that refuses the client's protocol
+  version, or admits it at another, answers `KARYOS_E_INCOMPATIBLE_DRIVER`
+  with the driver's version in the detail when it named one; tested on
+  Linux against a fake driver, and a real one for the admitted path. The
+  client tests also run over an embedded driver's conductor, under Miri
+  and on macOS, where connect answers the new `KARYOS_E_UNSUPPORTED`. The
+  header check now covers structs.
 - The C ABI conformance suite beside `karyos-ffi` (ADR-0067; batch F6), in
   the interim format 1 of `crates/karyos-ffi/conformance/FORMAT.md` until
   the owner chooses one (item 46): line-based `.kcs` scenarios (`call` and

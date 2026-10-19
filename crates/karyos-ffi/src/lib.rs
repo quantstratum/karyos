@@ -8,9 +8,9 @@
 //! expected only in the boundary module `abi`, which turns each pointer and
 //! length into a checked safe value before the safe modules see it.
 //!
-//! Built so far (F1): the ABI version, the status codes and their text, the
-//! bounded handle tables and the panic boundary. Objects come with F2
-//! onward.
+//! Built so far: the ABI version, the status codes and their text, the
+//! bounded handle tables and the panic boundary (F1); clients (F2).
+//! Publications and subscriptions come with F3 and F4.
 
 #![deny(unsafe_code)]
 
@@ -19,8 +19,12 @@
     reason = "the C ABI boundary: exported symbols and raw pointer arguments (ADR-0053)"
 )]
 mod abi;
+mod api;
 mod boundary;
-#[expect(dead_code, reason = "the handle kinds get their tables from F2 on")]
+#[expect(
+    dead_code,
+    reason = "the other handle kinds get their tables from F3 on"
+)]
 mod handles;
 #[cfg_attr(
     not(test),
