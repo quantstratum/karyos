@@ -8,11 +8,15 @@ use std::time::Duration;
 /// What `karyos-agent` prints for a bad command line.
 pub const USAGE: &str = "\
 usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
---role UID=ROLE [--role UID=ROLE]... [--refresh-ms MS]
+--role UID=ROLE [--role UID=ROLE]... [--refresh-ms MS] [--lag-bytes N] \
+[--lag-refreshes N] [--loss-quiet N]
 
 Serves API v1 (JSON) on DIR/agent.sock to the uids given a role (viewer,
 operator, risk-officer, administrator), reading each driver's CnC as a
-tool every MS milliseconds (default 1000). Linux only.
+tool every MS milliseconds (default 1000). A uid takes one role. Alerts:
+a subscriber lagging N bytes or more (default 8 MiB) for N consecutive
+refreshes (default 3); losses, cleared after N quiet refreshes (default
+10). Linux only.
 
 A request is one line: KARYOS-AGENT 1 view
 ";
@@ -32,6 +36,8 @@ pub struct Args {
     pub roles: Vec<(u32, String)>,
     /// How often the agent reads the drivers.
     pub refresh: Duration,
+    /// The alert rules.
+    pub alerts: crate::alerts::AlertRules,
 }
 
 /// Parses `args` (without the program name); `None` for anything this
@@ -42,6 +48,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
     let mut drivers = Vec::new();
     let mut roles = Vec::new();
     let mut refresh = DEFAULT_REFRESH;
+    let mut alerts = crate::alerts::AlertRules::default();
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
@@ -56,7 +63,12 @@ pub fn parse(args: &[String]) -> Option<Args> {
                 ) {
                     return None;
                 }
-                roles.push((uid.parse().ok()?, role.to_owned()));
+                let uid: u32 = uid.parse().ok()?;
+                // One role per uid: a second is a mistake to refuse.
+                if roles.iter().any(|(taken, _)| *taken == uid) {
+                    return None;
+                }
+                roles.push((uid, role.to_owned()));
             }
             "--refresh-ms" => {
                 let millis: u64 = value.parse().ok()?;
@@ -64,6 +76,13 @@ pub fn parse(args: &[String]) -> Option<Args> {
                     return None;
                 }
                 refresh = Duration::from_millis(millis);
+            }
+            "--lag-bytes" => alerts = alerts.with_lag_bytes(value.parse().ok()?),
+            "--lag-refreshes" => {
+                alerts = alerts.with_lag_refreshes(value.parse().ok().filter(|n| *n > 0)?);
+            }
+            "--loss-quiet" => {
+                alerts = alerts.with_loss_quiet(value.parse().ok().filter(|n| *n > 0)?);
             }
             _ => return None,
         }
@@ -76,6 +95,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
         drivers,
         roles,
         refresh,
+        alerts,
     })
 }
 
@@ -93,7 +113,8 @@ mod tests {
     fn a_full_command_line_parses() {
         let parsed = parse(&args(
             "--api-dir /run/agent --driver /run/a --driver /run/b \
-             --role 1000=viewer --role 0=administrator --refresh-ms 250",
+             --role 1000=viewer --role 0=administrator --refresh-ms 250 \
+             --lag-bytes 4096 --lag-refreshes 5 --loss-quiet 7",
         ))
         .unwrap();
         assert_eq!(parsed.api_dir, PathBuf::from("/run/agent"));
@@ -103,6 +124,13 @@ mod tests {
             [(1000, "viewer".to_owned()), (0, "administrator".to_owned())]
         );
         assert_eq!(parsed.refresh, Duration::from_millis(250));
+        assert_eq!(
+            parsed.alerts,
+            crate::alerts::AlertRules::default()
+                .with_lag_bytes(4096)
+                .with_lag_refreshes(5)
+                .with_loss_quiet(7)
+        );
     }
 
     #[test]
@@ -119,6 +147,10 @@ mod tests {
             "--api-dir /a --api-dir /b --driver /d --role 1=viewer",
             "--api-dir /a --driver /d --role 1=viewer --bogus x",
             "--api-dir /a --driver /d --role 1=viewer --driver",
+            "--api-dir /a --driver /d --role 1=viewer --role 1=operator",
+            "--api-dir /a --driver /d --role 1=viewer --lag-refreshes 0",
+            "--api-dir /a --driver /d --role 1=viewer --loss-quiet 0",
+            "--api-dir /a --driver /d --role 1=viewer --lag-bytes -1",
         ] {
             assert_eq!(parse(&args(line)), None, "{line}");
         }

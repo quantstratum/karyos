@@ -44,7 +44,7 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut agent = Agent::new(AgentConfig::new(args.drivers));
+    let mut agent = Agent::new(AgentConfig::new(args.drivers).with_alerts(args.alerts));
     // Between refreshes the socket is polled every 10 ms.
     let tick = Duration::from_millis(10).min(args.refresh);
     loop {
