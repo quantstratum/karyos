@@ -1173,7 +1173,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut driver_id = [0u64; 2];
         karyos_sys::random::fill_u64s(&mut driver_id)?;
         #[cfg(target_os = "linux")]
-        let (broadcast, counters, client_counters, admission, diagnostics, mirror) = match ipc {
+        let (broadcast, mut counters, client_counters, admission, diagnostics, mirror) = match ipc {
             Some(ipc) => {
                 // Fail fast: the image lanes of a network are regions too.
                 if let Some(network) = &config.network {
@@ -1234,7 +1234,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ),
         };
         #[cfg(not(target_os = "linux"))]
-        let (broadcast, counters, client_counters, diagnostics, mirror) = {
+        let (broadcast, mut counters, client_counters, diagnostics, mirror) = {
             let _ = ipc;
             (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
@@ -1250,6 +1250,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
             return Err(DriverError::InvalidConfig);
         }
+        // The network agents' cells, allocated before any agent starts.
+        let network_cells = config
+            .network
+            .as_ref()
+            .map(|_| network_cells(&mut counters));
         counters.set(Event::DriverPid, u64::from(std::process::id()));
         counters.set(
             Event::DriverStartedAt,
@@ -1307,7 +1312,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             net: config
                 .network
                 .as_ref()
-                .map(crate::net::Network::start)
+                .zip(network_cells)
+                .map(|(network, cells)| crate::net::Network::start(network, cells))
                 .transpose()?,
         })
     }
@@ -4006,6 +4012,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // memory is spent on a network that stops.
         let mut lanes = crate::agents::images::LaneSource::closing();
         let mut shutdown = net.close(&mut lanes);
+        for cell in net.take_cells() {
+            self.counters.free(cell);
+        }
         // The closed network released every tracked guard sender: none of
         // them stays in a close acknowledgement.
         shutdown.guard_senders_released = self.deregister_released_guards();
@@ -4173,6 +4182,28 @@ fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), Dri
 }
 
 /// One conductor duty cycle, its work added.
+/// The network agents' driver-wide CnC cells (`quantstratum-docs:
+/// karyos/design/management-agent-gap-analysis.md`, M2), in
+/// [`crate::agents::SENDER_CELLS`] and [`crate::agents::RECEIVER_CELLS`]
+/// order; a cell the region has no room for is `None`, counted in
+/// `counters unavailable`.
+fn network_cells(
+    counters: &mut DriverCounters,
+) -> (crate::agents::AgentCells, crate::agents::AgentCells) {
+    let mut allocate = |labels: &[&str]| {
+        crate::agents::AgentCells::new(
+            labels
+                .iter()
+                .map(|label| counters.allocate_keyed(TYPE_EVENTS, label, CounterKeys::DRIVER))
+                .collect(),
+        )
+    };
+    (
+        allocate(&crate::agents::SENDER_CELLS),
+        allocate(&crate::agents::RECEIVER_CELLS),
+    )
+}
+
 fn duty<T: TermBytes>(
     counters: &DriverCounters,
     work: &mut u32,
