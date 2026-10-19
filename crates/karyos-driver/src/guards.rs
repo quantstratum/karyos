@@ -16,14 +16,25 @@
 //!   one record before its response or return. Capture never delays or
 //!   refuses a close: a full ring overwrites its oldest record and counts
 //!   the overwritten records.
+//! - **Tools (M4, `quantstratum-docs:
+//!   karyos/design/management-agent-gap-analysis.md`).** Each record is
+//!   also appended to the guard audit ring of `karyos_sys::diag`, a
+//!   driver-only region a tool receives read-only, with the host
+//!   `CLOCK_MONOTONIC` time beside the driver clock's. Each guard's word is
+//!   a gauge labelled with the guard's name, participant kind
+//!   `KIND_GUARD` and the guard id in `key2`, which [`GuardCells`] brings
+//!   in line at every conductor duty cycle.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use karyos_client::HeapWords;
 use karyos_protocol::cnc::ErrorCode;
+use karyos_sys::counters::{Counter, CounterKeys, KIND_GUARD};
+use karyos_sys::diag::{GuardAudit, GuardAuditRecord};
 use karyos_sys::guard::{self, Closed, GuardError, GuardState};
 
+use crate::counters::{DriverCounters, TYPE_GAUGE};
 use crate::error::DriverError;
 
 /// The longest guard name, in bytes.
@@ -155,10 +166,12 @@ pub(crate) struct Guards {
     audit: VecDeque<AuditRecord>,
     audit_capacity: usize,
     overwritten: u64,
+    /// The tools' copy of every record (M4).
+    ring: GuardAudit,
 }
 
 impl Guards {
-    pub(crate) fn new(driver: u64, max: usize, audit_capacity: usize) -> Self {
+    pub(crate) fn new(driver: u64, max: usize, audit_capacity: usize, ring: GuardAudit) -> Self {
         Self {
             driver,
             max,
@@ -167,7 +180,27 @@ impl Guards {
             audit: VecDeque::with_capacity(audit_capacity),
             audit_capacity,
             overwritten: 0,
+            ring,
         }
+    }
+
+    /// The guard audit ring's shared region, for tools; `None` on the
+    /// heap.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn region(&self) -> Option<&karyos_sys::ipc::Region> {
+        self.ring.region()
+    }
+
+    /// A reader of the tools' guard audit ring.
+    pub(crate) fn ring_reader(&self) -> karyos_sys::diag::GuardAuditReader {
+        self.ring.reader()
+    }
+
+    /// Each guard's id, name and current word.
+    fn words(&self) -> impl Iterator<Item = (u64, &str, u64)> + '_ {
+        self.entries
+            .iter()
+            .map(|entry| (entry.id, entry.name.as_str(), Self::raw(entry)))
     }
 
     /// Adds a guard, created closed at epoch 1.
@@ -375,6 +408,30 @@ impl Guards {
         requester: Requester,
         outcome: AuditOutcome,
     ) {
+        let (requester_kind, requester_id) = match requester {
+            Requester::InProcess => (0, 0),
+            Requester::Client(client) => (1, client),
+        };
+        let (outcome_code, refusal) = match outcome {
+            AuditOutcome::Closed => (1, 0),
+            AuditOutcome::AlreadyClosed => (2, 0),
+            AuditOutcome::Reopened => (3, 0),
+            AuditOutcome::Refused(code) => (4, u16::try_from(code.code()).unwrap_or(u16::MAX)),
+        };
+        // A ring whose sequences are exhausted keeps what it has; the
+        // driver's own audit below still records.
+        let _ = self.ring.record(&GuardAuditRecord {
+            time: karyos_sys::host_clock::host_monotonic_ns(),
+            driver_time: time,
+            guard,
+            before,
+            after,
+            operation,
+            requester_kind,
+            requester: requester_id,
+            outcome: outcome_code,
+            refusal,
+        });
         if self.audit_capacity == 0 {
             // Checked, never wrapped (SPEC.md section 14): at its end the
             // count keeps its value.
@@ -422,6 +479,54 @@ impl Guards {
     }
 }
 
+/// Each guard's word as a gauge for tools (M4): labelled with the guard's
+/// name, keyed by participant kind [`KIND_GUARD`] and the guard id. Guards
+/// are never removed, so a gauge lives as long as the driver; one the
+/// region has no room for is retried at each sync, counted once in
+/// `counters unavailable`.
+#[derive(Debug, Default)]
+pub(crate) struct GuardCells {
+    /// Per guard in registry order: its id, its gauge, the word last
+    /// stored, and whether a refused allocation was counted.
+    cells: Vec<(u64, Option<Counter>, u64, bool)>,
+}
+
+impl GuardCells {
+    /// Brings the gauges in line with `guards` (control path, each
+    /// conductor duty cycle): a new guard gets its gauge, a changed word
+    /// is stored.
+    pub(crate) fn sync(&mut self, guards: &Guards, counters: &mut DriverCounters) {
+        for (index, (id, name, word)) in guards.words().enumerate() {
+            if self.cells.get(index).is_none() {
+                self.cells.push((id, None, 0, false));
+            }
+            let Some((_, cell, stored, counted)) = self.cells.get_mut(index) else {
+                continue;
+            };
+            if cell.is_none() {
+                let keys = CounterKeys {
+                    kind: KIND_GUARD,
+                    participant: id,
+                    ..CounterKeys::DRIVER
+                };
+                *cell = if *counted {
+                    counters.retry_keyed(TYPE_GAUGE, name, keys)
+                } else {
+                    counters.allocate_keyed(TYPE_GAUGE, name, keys)
+                };
+                *counted = true;
+                *stored = 0;
+            }
+            if let Some(cell) = cell
+                && *stored != word
+            {
+                cell.set(word);
+                *stored = word;
+            }
+        }
+    }
+}
+
 /// The control code of a refused transition.
 pub(crate) fn refused(error: &DriverError) -> AuditOutcome {
     AuditOutcome::Refused(error_code(error))
@@ -444,7 +549,7 @@ mod tests {
 
     #[test]
     fn guards_are_named_closed_and_audited() {
-        let mut guards = Guards::new(7, 2, 3);
+        let mut guards = Guards::new(7, 2, 3, karyos_sys::diag::guard_audit(4).unwrap());
         let orders = guards.add("orders").unwrap();
         assert_eq!(orders.id(), 1);
         assert_eq!(guards.find("orders"), Some(orders));
@@ -524,7 +629,7 @@ mod tests {
 
     #[test]
     fn a_close_is_recorded_even_without_audit_room() {
-        let mut guards = Guards::new(1, 1, 0);
+        let mut guards = Guards::new(1, 1, 0, karyos_sys::diag::guard_audit(4).unwrap());
         let guard = guards.add("g").unwrap();
         assert_eq!(
             guards.close(guard, 1, Requester::InProcess, 0),

@@ -394,6 +394,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Guards for tools and the management agent (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M4). Every guard
+  transition, refusals included, is also appended to a guard audit ring
+  (`karyos_sys::diag::GuardAudit`, `GuardAuditRecord`, 16-word records with
+  host `CLOCK_MONOTONIC` and driver times, guard, words before and after,
+  operation id, requester and outcome), a driver-only region of the new
+  kind `GuardAudit` (code 11 on both sides) that a tool receives as the
+  sixth `ToolAdmitted` record, in place under admission version 2
+  (unreleased); `RemoteTool::guard_audit` and
+  `EmbeddedDriver::guard_audit_ring` read it. Each guard's word is a gauge
+  labelled with its name, keyed by the new participant kind `KIND_GUARD`
+  (5) and the guard id. `ErrorCode::code` is public.
 - Each network endpoint's effective capabilities in the CnC, for tools and
   the management agent (SPEC §16.8; quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M3): one gauge per

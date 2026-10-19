@@ -21,6 +21,10 @@ use crate::sync::{AtomicU64, Ordering};
 pub const ERROR_RECORD_WORDS: usize = 32;
 /// Words per loss record: one stride.
 pub const LOSS_RECORD_WORDS: usize = 16;
+/// Words per guard audit record: one stride.
+pub const GUARD_AUDIT_RECORD_WORDS: usize = 16;
+/// Default guard audit capacity in records.
+pub const DEFAULT_GUARD_AUDIT_RECORDS: usize = 256;
 /// Bytes of an error record's message.
 pub const MESSAGE_BYTES: usize = 192;
 /// Default error log capacity in records.
@@ -614,6 +618,182 @@ impl LossReportReader {
     }
 }
 
+/// One guard transition, refusals included (`quantstratum-docs:
+/// karyos/design/management-agent-gap-analysis.md`, M4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuardAuditRecord {
+    /// Host time (`CLOCK_MONOTONIC` nanoseconds), the tools' clock domain.
+    pub time: u64,
+    /// The driver clock's time, as the driver's own audit holds it.
+    pub driver_time: u64,
+    /// The guard id the requester named, known or not.
+    pub guard: u64,
+    /// The guard word before; 0 for an unknown guard.
+    pub before: u64,
+    /// The guard word after.
+    pub after: u64,
+    /// The requester's operation id.
+    pub operation: u64,
+    /// Who asked: 0 the in-process caller, 1 an admitted client.
+    pub requester_kind: u8,
+    /// The client id for a client, else 0.
+    pub requester: u64,
+    /// What happened: 1 closed, 2 already closed, 3 reopened, 4 refused.
+    pub outcome: u8,
+    /// The control error code of a refusal, else 0.
+    pub refusal: u16,
+}
+
+impl GuardAuditRecord {
+    fn encode(&self) -> [u64; GUARD_AUDIT_RECORD_WORDS - FIELDS] {
+        [
+            self.time,
+            self.driver_time,
+            self.guard,
+            self.before,
+            self.after,
+            self.operation,
+            u64::from(self.requester_kind)
+                | u64::from(self.outcome) << 8
+                | u64::from(self.refusal) << 16,
+            self.requester,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+    }
+
+    fn decode(fields: &[u64]) -> Self {
+        let field = |index: usize| fields.get(index).copied().unwrap_or(0);
+        let [requester_kind, outcome, refusal_low, refusal_high, ..] = field(6).to_le_bytes();
+        Self {
+            time: field(0),
+            driver_time: field(1),
+            guard: field(2),
+            before: field(3),
+            after: field(4),
+            operation: field(5),
+            requester_kind,
+            outcome,
+            refusal: u16::from_le_bytes([refusal_low, refusal_high]),
+            requester: field(7),
+        }
+    }
+}
+
+/// The guard audit ring's writer: the driver conductor's.
+#[derive(Debug)]
+pub struct GuardAudit {
+    store: Arc<Store>,
+}
+
+impl GuardAudit {
+    fn new(store: Store, capacity: usize) -> Result<Self, SysError> {
+        if RingWriter::create(store.words(), capacity, GUARD_AUDIT_RECORD_WORDS).is_none() {
+            return Err(SysError::InvalidRegion { address: 0, len: 0 });
+        }
+        Ok(Self {
+            store: Arc::new(store),
+        })
+    }
+
+    /// Appends `record`, overwriting the oldest when full; `None` once the
+    /// sequences are exhausted.
+    pub fn record(&mut self, record: &GuardAuditRecord) -> Option<Appended> {
+        RingWriter::resume(self.store.words(), GUARD_AUDIT_RECORD_WORDS)?.append(&record.encode())
+    }
+
+    /// A reader of this ring.
+    #[must_use]
+    pub fn reader(&self) -> GuardAuditReader {
+        GuardAuditReader {
+            store: Arc::clone(&self.store),
+        }
+    }
+
+    /// The shared region, to pass its descriptor; `None` on the heap.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn region(&self) -> Option<&crate::ipc::Region> {
+        match &*self.store {
+            Store::Mapped(region) => Some(region),
+            _ => None,
+        }
+    }
+}
+
+/// Creates a guard audit ring of `capacity` records on the heap.
+///
+/// # Errors
+///
+/// [`SysError::InvalidRegion`] for a zero or oversized capacity.
+pub fn guard_audit(capacity: usize) -> Result<GuardAudit, SysError> {
+    let (store, capacity) = heap_store(capacity, GUARD_AUDIT_RECORD_WORDS)?;
+    GuardAudit::new(store, capacity)
+}
+
+/// Creates a guard audit ring in a new driver-only shared region.
+///
+/// # Errors
+///
+/// As [`guard_audit`], and the errors of [`crate::ipc::Region::create_driver_only`].
+#[cfg(target_os = "linux")]
+pub fn guard_audit_in(
+    instance: u128,
+    region: u64,
+    capacity: usize,
+) -> Result<GuardAudit, SysError> {
+    let store = region_store(
+        instance,
+        region,
+        crate::ipc::RegionKind::GuardAudit,
+        capacity,
+        GUARD_AUDIT_RECORD_WORDS,
+    )?;
+    GuardAudit::new(store, capacity)
+}
+
+/// A reader of a guard audit ring.
+#[derive(Debug, Clone)]
+pub struct GuardAuditReader {
+    store: Arc<Store>,
+}
+
+impl GuardAuditReader {
+    /// A reader of a guard audit region mapped read-only (a tool).
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::InvalidRegion`] for another kind, layout or size.
+    #[cfg(target_os = "linux")]
+    pub fn attach_read_only(region: crate::ipc::ReadOnlyRegion) -> Result<Self, SysError> {
+        Ok(Self {
+            store: Arc::new(read_only_store(
+                region,
+                crate::ipc::RegionKind::GuardAudit,
+                GUARD_AUDIT_RECORD_WORDS,
+            )?),
+        })
+    }
+
+    /// Scans from `cursor` (see [`crate::diag_ring::scan`]), delivering
+    /// each retained record in order with its sequence.
+    pub fn scan(&self, cursor: &mut u64, mut deliver: impl FnMut(u64, GuardAuditRecord)) -> Scan {
+        let Some(reader) =
+            RingReader::new(|index| self.store.load(index), GUARD_AUDIT_RECORD_WORDS)
+        else {
+            return empty_scan();
+        };
+        let mut buffer = [0u64; GUARD_AUDIT_RECORD_WORDS - FIELDS];
+        scan(&reader, cursor, &mut buffer, |seq, fields| {
+            deliver(seq, GuardAuditRecord::decode(fields));
+        })
+    }
+}
+
 #[cfg(test)]
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
@@ -629,6 +809,35 @@ mod tests {
         let mut records = Vec::new();
         let scan = log.reader().scan(cursor, |record| records.push(record));
         (scan, records)
+    }
+
+    /// A guard audit record reads back whole, oldest first, and a full ring
+    /// overwrites its oldest record and reports it.
+    #[test]
+    fn guard_audit_records_round_trip_and_overwrite() {
+        let mut ring = guard_audit(2).unwrap();
+        let record = |guard| GuardAuditRecord {
+            time: 10,
+            driver_time: 20,
+            guard,
+            before: 1,
+            after: 3,
+            operation: 99,
+            requester_kind: 1,
+            requester: 7,
+            outcome: 4,
+            refusal: u16::MAX,
+        };
+        for guard in 1..=3 {
+            assert!(ring.record(&record(guard)).is_some());
+        }
+        let mut cursor = 0;
+        let mut read = Vec::new();
+        let scan = ring
+            .reader()
+            .scan(&mut cursor, |seq, record| read.push((seq, record)));
+        assert_eq!(read, [(1, record(2)), (2, record(3))]);
+        assert_eq!(scan.overwritten, 1);
     }
 
     #[test]

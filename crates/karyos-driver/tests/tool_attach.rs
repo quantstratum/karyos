@@ -2,7 +2,7 @@
 
 //! Tool attach (Linux; `quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, Tool attach, Owner decision
-//! Q7 and Tests, "Tool attach (Linux)"): a tool receives exactly the five
+//! Q7 and Tests, "Tool attach (Linux)"): a tool receives exactly the six
 //! diagnostic regions (the trace mirror of `quantstratum-docs:
 //! karyos/design/trace-journal-region.md` is the fifth), read-only (A1), and nothing that lets it act as a
 //! client; a driver-only region a client receives cannot be mapped
@@ -211,16 +211,16 @@ fn hello_rejections(driver: &IpcDriver, code: u64) -> u64 {
     occurrences
 }
 
-/// A tool receives exactly the five diagnostic regions, each once, without
+/// A tool receives exactly the six diagnostic regions, each once, without
 /// a capability, under the driver's instance, and nothing after them; it
 /// takes no client slot. Every descriptor it received is read-only (A1):
 /// the kernel refuses a shared writable mapping of it and write access
 /// added by `mprotect`, with `EACCES`, whether the region is driver-only
 /// or shared with clients.
 #[test]
-fn a_tool_receives_the_five_diagnostic_regions_read_only() {
+fn a_tool_receives_the_six_diagnostic_regions_read_only() {
     let _serial = serial();
-    let dir = dir("five");
+    let dir = dir("six");
     let mut driver = driver(&dir, 4);
     let (socket, instance, records, fds) = raw_tool(&mut driver, &dir);
     assert_eq!(Some(instance), driver.instance());
@@ -232,7 +232,8 @@ fn a_tool_receives_the_five_diagnostic_regions_read_only() {
             WireKind::ClientCounters,
             WireKind::ErrorLog,
             WireKind::LossReport,
-            WireKind::TraceMirror
+            WireKind::TraceMirror,
+            WireKind::GuardAudit
         ]
     );
     assert!(
@@ -458,9 +459,46 @@ fn a_tool_reads_the_driver_pid_and_its_duty_time() {
     assert!(after > served);
 }
 
+/// A tool reads the guard audit ring and each guard's word gauge
+/// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+/// M4): a close made through the driver reaches its read-only mapping.
+#[test]
+fn a_tool_reads_guard_transitions_and_words() {
+    let _serial = serial();
+    let dir = dir("guards");
+    let mut driver = driver(&dir, 4);
+    let guard = driver.add_guard("kill switch").unwrap();
+    let tool = attach_serving(&mut driver, &dir).unwrap();
+    let _ = driver.reopen_guard(guard, 1, 7).unwrap();
+    let _ = driver.close_guard(guard, 8).unwrap();
+    let _ = driver.do_work().unwrap();
+    let mut cursor = 0;
+    let mut records = Vec::new();
+    let _ = tool
+        .guard_audit()
+        .scan(&mut cursor, |_, record| records.push(record));
+    let seen: Vec<(u64, u64, u8)> = records
+        .iter()
+        .map(|record| (record.guard, record.operation, record.outcome))
+        .collect();
+    assert_eq!(seen, [(guard.id(), 7, 3), (guard.id(), 8, 1)]);
+    let reader = tool.counters();
+    let word = (0..reader.capacity()).find_map(|index| match reader.read(index) {
+        karyos_sys::counters::CellRead::Allocated {
+            metadata, value, ..
+        } if metadata.keys.kind == karyos_sys::counters::KIND_GUARD
+            && metadata.keys.participant == guard.id() =>
+        {
+            Some((metadata.label().to_vec(), value))
+        }
+        _ => None,
+    });
+    assert_eq!(word, Some((b"kill switch".to_vec(), records[1].after)));
+}
+
 // ---- Rollback against a fake driver ----
 
-/// The five diagnostic regions of a fake driver, made by the same
+/// The six diagnostic regions of a fake driver, made by the same
 /// constructors as the driver's.
 struct Fake {
     instance: u128,
@@ -476,6 +514,7 @@ struct Fake {
     errors: karyos_sys::diag::ErrorLog,
     losses: karyos_sys::diag::LossReport,
     mirror: karyos_sys::trace_mirror::TraceMirror,
+    guards: karyos_sys::diag::GuardAudit,
 }
 
 impl Fake {
@@ -487,20 +526,22 @@ impl Fake {
             errors: karyos_sys::diag::error_log_in(instance, 4, 8, 1).unwrap(),
             losses: karyos_sys::diag::loss_report_in(instance, 5, 8).unwrap(),
             mirror: karyos_sys::trace_mirror::trace_mirror_in(instance, 6, 2, 1, 4).unwrap(),
+            guards: karyos_sys::diag::guard_audit_in(instance, 7, 4).unwrap(),
         }
     }
 
-    fn regions(&self) -> [&Region; 5] {
+    fn regions(&self) -> [&Region; 6] {
         [
             self.counters.1.region().unwrap(),
             self.client.1.region().unwrap(),
             self.errors.region().unwrap(),
             self.losses.region().unwrap(),
             self.mirror.region().unwrap(),
+            self.guards.region().unwrap(),
         ]
     }
 
-    /// The wire records of its regions, exports 1 to 5.
+    /// The wire records of its regions, exports 1 to 6.
     fn records(&self) -> Vec<Record> {
         (1u64..)
             .zip(self.regions())
@@ -630,9 +671,12 @@ fn a_tool_attaches_to_a_fake_driver_and_releases_everything_on_drop() {
     assert_eq!(tool.counters().capacity(), 4);
     assert_eq!(tool.client_counters().capacity(), 4);
     assert_eq!(tool.trace_mirror().entries(), 2);
+    let mut cursor = 0;
+    let scan = tool.guard_audit().scan(&mut cursor, |_, _| {});
+    assert_eq!((scan.delivered, scan.overwritten), (0, 0));
     // The fake closed its end once its script ran.
     assert!(tool.driver_closed().unwrap());
-    assert_eq!(region_mappings(), before.1 + 5);
+    assert_eq!(region_mappings(), before.1 + 6);
     drop(tool);
     assert_eq!((descriptors(), region_mappings()), before);
 }
@@ -654,20 +698,20 @@ fn a_bad_tool_bootstrap_rolls_back_with_every_descriptor_closed() {
     };
     let cases: Vec<Case<'_>> = vec![
         (
-            "a missing region: the connection closes after four",
+            "a missing region: the connection closes after five",
             Box::new(move |socket, fake| {
                 admitted(socket, fake.instance, fake.records());
-                full(socket, fake, 4);
+                full(socket, fake, 5);
             }),
             |error| matches!(error, AttachError::Protocol),
         ),
         (
-            "a missing kind: four records, no trace mirror",
+            "a missing kind: five records, no guard audit",
             Box::new(move |socket, fake| {
                 let mut records = fake.records();
                 records.pop();
                 admitted(socket, fake.instance, records);
-                full(socket, fake, 4);
+                full(socket, fake, 5);
             }),
             |error| matches!(error, AttachError::Protocol),
         ),
@@ -703,22 +747,22 @@ fn a_bad_tool_bootstrap_rolls_back_with_every_descriptor_closed() {
                 let mut records = fake.records();
                 records[3].kind = WireKind::CommandRing;
                 admitted(socket, fake.instance, records);
-                full(socket, fake, 5);
+                full(socket, fake, 6);
             }),
             |error| matches!(error, AttachError::Protocol),
         ),
         (
-            "an unexpected sixth record",
+            "an unexpected seventh record",
             Box::new(move |socket, fake| {
                 let mut records = fake.records();
                 records.push(Record {
-                    export: 6,
+                    export: 7,
                     kind: WireKind::Broadcast,
                     ..records[0]
                 });
                 admitted(socket, fake.instance, records);
-                full(socket, fake, 5);
-                region(socket, 5, fake.regions()[0]);
+                full(socket, fake, 6);
+                region(socket, 6, fake.regions()[0]);
             }),
             |error| matches!(error, AttachError::Protocol),
         ),
@@ -726,7 +770,7 @@ fn a_bad_tool_bootstrap_rolls_back_with_every_descriptor_closed() {
             "a wrong instance in ToolAdmitted",
             Box::new(move |socket, fake| {
                 admitted(socket, fake.instance + 1, fake.records());
-                full(socket, fake, 5);
+                full(socket, fake, 6);
             }),
             |error| matches!(error, AttachError::Sys(_)),
         ),
@@ -792,7 +836,7 @@ fn a_bad_tool_bootstrap_rolls_back_with_every_descriptor_closed() {
                     },
                     None,
                 );
-                full(socket, fake, 5);
+                full(socket, fake, 6);
             }),
             |error| {
                 matches!(
@@ -816,7 +860,7 @@ fn a_bad_tool_bootstrap_rolls_back_with_every_descriptor_closed() {
                     },
                     None,
                 );
-                full(socket, fake, 5);
+                full(socket, fake, 6);
             }),
             |error| matches!(error, AttachError::Protocol),
         ),
