@@ -1008,6 +1008,7 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
     let (cursor, record) = ReplayCursor::open_at_checkpoint(
         journal,
         &recovery,
+        &[],
         &mut store,
         first_id,
         &ReplayConfig {
