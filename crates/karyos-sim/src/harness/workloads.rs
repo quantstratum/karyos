@@ -32,6 +32,7 @@ use super::node::{
     Shared, TestService, Wire,
 };
 use super::reference;
+use super::standby::{ExternalLease, FeedFault, Fencing};
 use crate::cluster::{ClusterSim, NodeError};
 use crate::disk::{SimDisk, Survives};
 use crate::lin::{self, Event, History, Verdict};
@@ -109,6 +110,15 @@ pub enum Action {
     /// An operator's membership change, sent to every server that is up;
     /// a core that does not lead refuses it.
     Change(Change),
+    /// The primary's leader stops reaching the arbiter: its lease is no
+    /// longer renewed ([`Case::lease`]).
+    CutArbiter,
+    /// The operator stops every primary server and confirms it.
+    OperatorStop,
+    /// Promotes the standby once `Fencing` is verified, sending clients to
+    /// its leader (but those of [`Case::stay_on_primary`]); refused, and
+    /// recorded so, when it is not.
+    Promote(Fencing),
 }
 
 /// What a case expects of progress.
@@ -165,6 +175,17 @@ pub struct Case {
     pub progress: Progress,
     /// The promotion lag [`check::learner_caught_up`] holds a leader to.
     pub promotion_lag: u64,
+    /// Standby servers, ids after the spares, fed by the primary (phase 5,
+    /// P5-S2); 0 for none.
+    pub standby: usize,
+    /// The primary's lease, in ticks, when it fences by lease.
+    pub lease: Option<u64>,
+    /// Ticks the arbiter waits past a lease's end for the clocks' skew.
+    pub lease_margin: u64,
+    /// Faults on the feed, each on one send of its primary index.
+    pub feed_faults: Vec<(u64, FeedFault)>,
+    /// Clients, by index, that stay on the primary after a promotion.
+    pub stay_on_primary: Vec<usize>,
 }
 
 impl Case {
@@ -191,6 +212,11 @@ impl Case {
             progress: Progress::Expected,
             spares: 0,
             promotion_lag: reference::PROMOTION_LAG,
+            standby: 0,
+            lease: None,
+            lease_margin: 0,
+            feed_faults: Vec::new(),
+            stay_on_primary: Vec::new(),
         }
     }
 }
@@ -238,6 +264,8 @@ pub struct Outcome {
     pub states: Vec<(NodeId, Option<u64>, u64)>,
     /// Retried commands the up servers answered from deduplication.
     pub deduplicated: u64,
+    /// Whether a standby was promoted: the states are the standby's.
+    pub promoted: bool,
 }
 
 /// A case its run did not pass.
@@ -351,7 +379,16 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         .ok()
         .and_then(|spares| servers.checked_add(spares))
         .ok_or(RunError::Count)?;
-    let everyone: Vec<NodeId> = (0..spares).collect();
+    let standby_end = u32::try_from(case.standby)
+        .ok()
+        .and_then(|standby| spares.checked_add(standby))
+        .ok_or(RunError::Count)?;
+    let primary: Vec<NodeId> = (0..spares).collect();
+    let standby: Vec<NodeId> = (spares..standby_end).collect();
+    let everyone: Vec<NodeId> = (0..standby_end).collect();
+    let lease = case
+        .lease
+        .map(|duration| Rc::new(RefCell::new(ExternalLease::new(duration))));
     let first_failing = if case.failing_flushes.is_empty() {
         None
     } else {
@@ -370,22 +407,34 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             let last = first.checked_add(FAILING).ok_or(RunError::Count)?;
             disk = disk.with_failed_syncs(first..last);
         }
-        let server = ServerNode::<C>::new(
+        let in_standby = standby.contains(&id);
+        let group = if in_standby { &standby } else { &peers };
+        let mut server = ServerNode::<C>::new(
             id,
-            peers.clone(),
+            group.clone(),
             disk,
             per_server(case.survives, id),
             geometry,
             Rc::clone(&recorder),
         )
         .map_err(RunError::Log)?;
+        if in_standby {
+            server = server.as_standby(primary.clone());
+        } else {
+            if !standby.is_empty() {
+                server = server.with_feed(standby.clone(), &case.feed_faults);
+            }
+            if let Some(lease) = &lease {
+                server = server.with_lease(Rc::clone(lease));
+            }
+        }
         let index = usize::try_from(id).map_err(|_| RunError::Count)?;
         let drift = case.drift_ppm.get(index).copied().unwrap_or(0);
         let _ = sim
             .add_node(Member::Server(Box::new(server)), 0, drift)
             .map_err(RunError::Sim)?;
         // A spare waits down, its log empty, for its join.
-        if id >= servers {
+        if id >= servers && !in_standby {
             sim.crash(id).map_err(RunError::Node)?;
         }
     }
@@ -394,7 +443,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     for index in 0..case.clients {
         let id = u32::try_from(index)
             .ok()
-            .and_then(|index| spares.checked_add(index))
+            .and_then(|index| standby_end.checked_add(index))
             .ok_or(RunError::Count)?;
         let client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
             .with_retry_after(case.retry_after);
@@ -408,12 +457,12 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     let changes = case
         .schedule
         .iter()
-        .any(|(_, action)| matches!(action, Action::Change(_)));
+        .any(|(_, action)| matches!(action, Action::Change(_) | Action::Promote(_)));
     let mut operator = None;
     if changes {
         let id = u32::try_from(case.clients)
             .ok()
-            .and_then(|count| spares.checked_add(count))
+            .and_then(|count| standby_end.checked_add(count))
             .ok_or(RunError::Count)?;
         let node = ClientNode::new(id, leader, Vec::new(), Rc::clone(&recorder));
         operator = Some(
@@ -438,7 +487,9 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                 .map_err(RunError::Link)?;
         }
     }
-    let mut joined: Vec<NodeId> = peers.clone();
+    let mut joined: Vec<NodeId> = peers.iter().chain(&standby).copied().collect();
+    let mut stopped = false;
+    let mut promoted = false;
     let mut schedule = case.schedule.clone();
     schedule.sort_by_key(|(step, _)| *step);
     let mut done = 0u64;
@@ -458,6 +509,65 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                 sim.restart(id).map_err(RunError::Node)?;
                 if !joined.contains(&id) {
                     joined.push(id);
+                }
+            }
+            Action::CutArbiter => {
+                if let Some(lease) = &lease {
+                    lease.borrow_mut().renewing = false;
+                }
+            }
+            Action::OperatorStop => {
+                for &id in &primary {
+                    match sim.crash(id) {
+                        Ok(()) | Err(NodeError::AlreadyDown(_)) => {}
+                        Err(error) => return Err(RunError::Node(error)),
+                    }
+                }
+                stopped = true;
+            }
+            Action::Promote(fencing) => {
+                // Present: this case schedules a promotion.
+                let operator = operator.ok_or(RunError::Count)?;
+                let fenced = match fencing {
+                    Fencing::OperatorStop => stopped,
+                    Fencing::Lease => lease.as_ref().is_some_and(|lease| {
+                        lease.borrow().expired_at(sim.now(), case.lease_margin)
+                    }),
+                };
+                let observation = if fenced {
+                    Observation::Fenced { fencing }
+                } else {
+                    Observation::PromotionRefused { fencing }
+                };
+                recorder.borrow_mut().observations.push(observation);
+                if fenced {
+                    promoted = true;
+                    let unknown: Vec<(NodeId, u64)> = clients
+                        .iter()
+                        .filter_map(|id| {
+                            let open = sim.node(*id).and_then(Member::client)?.open()?;
+                            Some((*id, open))
+                        })
+                        .collect();
+                    for &id in &standby {
+                        let _ = sim
+                            .send(
+                                operator,
+                                id,
+                                Wire::Promote {
+                                    unknown: unknown.clone(),
+                                },
+                            )
+                            .map_err(RunError::Sim)?;
+                    }
+                    let server = standby.first().copied().ok_or(RunError::Count)?;
+                    for (index, &client) in clients.iter().enumerate() {
+                        if !case.stay_on_primary.contains(&index) {
+                            let _ = sim
+                                .send(operator, client, Wire::Redirect { server })
+                                .map_err(RunError::Sim)?;
+                        }
+                    }
                 }
             }
             Action::Change(change) => {
@@ -489,7 +599,13 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                 .is_some_and(|client| !client.done())
         })
         .count();
-    let up: Vec<(NodeId, &ServerNode<C>)> = joined
+    // The group that serves at the end: the standby once promoted.
+    let acting: Vec<NodeId> = joined
+        .iter()
+        .copied()
+        .filter(|id| standby.contains(id) == promoted)
+        .collect();
+    let up: Vec<(NodeId, &ServerNode<C>)> = acting
         .iter()
         .filter_map(|id| Some((*id, sim.node(*id).and_then(Member::server)?)))
         .filter(|(_, server)| server.is_up())
@@ -536,8 +652,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     sim.run_for(case.quiet).map_err(RunError::Sim)?;
     let recorded = recorder.borrow();
     Ok(Outcome {
-        safety: check::all(&recorded.observations, &recorded.history, case.servers)
-            .and_then(|()| check::membership(&recorded.observations, case.promotion_lag)),
+        safety: safety(case, &recorded, &primary, &standby),
         liveness,
         observations: recorded.observations.clone(),
         history: recorded.history.clone(),
@@ -545,7 +660,31 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         digest: sim.digest(),
         states,
         deduplicated,
+        promoted,
     })
+}
+
+/// The safety checks of a run: every check over all of it, or with a
+/// standby, each group's on its own observations, the history across the
+/// promotion, and the standby's checks.
+fn safety(
+    case: &Case,
+    recorded: &Recorder,
+    primary: &[NodeId],
+    standby: &[NodeId],
+) -> Result<(), Violation> {
+    let observations = &recorded.observations;
+    if standby.is_empty() {
+        check::all(observations, &recorded.history, case.servers)?;
+    } else {
+        check::group(&check::of_servers(observations, primary), case.servers)?;
+        check::group(&check::of_servers(observations, standby), case.standby)?;
+        // The standby's checks name a violation C3 would only see as a
+        // history it cannot linearize, or one it gives up on.
+        check::standby(observations, standby)?;
+        check::linearizable(&check::across_promotion(&recorded.history, observations))?;
+    }
+    check::membership(observations, case.promotion_lag)
 }
 
 /// The pass predicate of W1, W3, W4 and W6: every safety check holds,
@@ -580,7 +719,10 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
     }
     // Where every client finished, the state is the register the
     // clients' linearized appends make, each once.
+    // Across a promotion, the old generation's unknown outcomes may or
+    // may not be in the state: the history's checks stand for it.
     if gap.is_none()
+        && !outcome.promoted
         && let Some(state) = first
     {
         let expected = linearized_digest(&outcome.history)?;

@@ -28,6 +28,14 @@
 //!   ([`Observation::Change`]) and every configuration the core reports
 //!   ([`Observation::Configuration`]). A core with static membership
 //!   reports none.
+//! - **A standby** (phase 5, P5-S2; [`super::standby`]): a primary server
+//!   with a feed sends its committed entries to the standby's servers
+//!   while its core leads; a standby server whose core leads verifies and
+//!   proposes them, and its service applies them with effects disabled
+//!   until a promotion. A primary server with a lease takes a command and
+//!   releases a reply only while it holds the lease on its own clock. Every
+//!   reply carries its server's generation, and a client rejects a lower
+//!   one once it has seen a higher one.
 //!
 //! [`ClusterSim`]: crate::cluster::ClusterSim
 
@@ -42,6 +50,10 @@ use karyos_cluster::{Entry, LogError, RaftLog};
 use super::core::{
     Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, LogView, Release,
     Step, drive,
+};
+use super::standby::{
+    self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
+    FeedRefusal, Fencing, PromotionReport,
 };
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
@@ -297,6 +309,8 @@ pub enum Observation {
         index: u64,
         /// The entry's term.
         term: u64,
+        /// The server's generation.
+        generation: u64,
     },
     /// A server crashed: its positions are gone until its restart.
     Crashed {
@@ -351,6 +365,52 @@ pub enum Observation {
         client: NodeId,
         /// The entry's index.
         index: u64,
+        /// The answering server's generation.
+        generation: u64,
+    },
+    /// A client rejected an answer of a generation below one it has seen.
+    StaleGeneration {
+        /// The client.
+        client: NodeId,
+        /// The answer's generation.
+        generation: u64,
+    },
+    /// A standby server refused a feed entry, and the rest of its send.
+    FeedRefused {
+        /// The server.
+        node: NodeId,
+        /// The primary's index of the entry.
+        index: u64,
+        /// Why.
+        reason: FeedRefusal,
+    },
+    /// A standby server's service applied a primary entry from the feed.
+    FeedApplied {
+        /// The server.
+        node: NodeId,
+        /// The primary's index.
+        index: u64,
+        /// The primary's term.
+        term: u64,
+        /// The payload.
+        payload: Vec<u8>,
+    },
+    /// The harness verified the fencing a promotion asks for.
+    Fenced {
+        /// How.
+        fencing: Fencing,
+    },
+    /// The harness refused a promotion: its fencing is not verified.
+    PromotionRefused {
+        /// The fencing it asked for.
+        fencing: Fencing,
+    },
+    /// A standby server whose core leads was promoted.
+    Promoted {
+        /// The server.
+        node: NodeId,
+        /// What it reports.
+        report: PromotionReport,
     },
     /// A server's positions after a duty.
     Positions {
@@ -480,6 +540,8 @@ pub enum Wire<M> {
         bytes: Vec<u8>,
         /// The entry's index.
         index: u64,
+        /// The server's generation.
+        generation: u64,
     },
     /// A server cannot take the request.
     Refused {
@@ -489,6 +551,58 @@ pub enum Wire<M> {
     /// An operator's membership change, which the server's core takes or
     /// refuses ([`Observation::Change`]); nothing answers it.
     Change(Change),
+    /// The primary's committed entries after the standby's verified
+    /// position, and its commit.
+    Feed {
+        /// The entries, consecutive unless a fault left one out.
+        entries: Vec<FeedEntry>,
+        /// The term of the entry before the first, `None` before the log's
+        /// first index.
+        prev_term: Option<u64>,
+        /// The primary leader's commit index.
+        commit: Option<u64>,
+    },
+    /// The standby's verified position, to the primary.
+    FeedAck {
+        /// The last primary index its service applied.
+        verified: Option<u64>,
+    },
+    /// The harness promotes the standby, the old primary fenced.
+    Promote {
+        /// The requests known to be in flight, by client and sequence.
+        unknown: Vec<(NodeId, u64)>,
+    },
+    /// The harness sends a client to another server.
+    Redirect {
+        /// The server.
+        server: NodeId,
+    },
+}
+
+/// A primary server's feed to the standby.
+#[derive(Debug, Clone)]
+struct FeedOut {
+    /// The standby's servers.
+    to: Vec<NodeId>,
+    /// The standby's verified position, as acknowledged.
+    acked: Option<u64>,
+    /// Faults still to apply, one send each, by index.
+    faults: BTreeMap<u64, FeedFault>,
+}
+
+/// A standby server's state.
+#[derive(Debug, Clone, Default)]
+struct StandbyIn {
+    /// The primary's servers, which acknowledgements go to.
+    primary: Vec<NodeId>,
+    /// The last primary index the service applied, and its term.
+    verified: Option<(u64, u64)>,
+    /// The last primary index proposed, and its term.
+    proposed: Option<(u64, u64)>,
+    /// The last primary commit learnt from the feed.
+    learnt: Option<u64>,
+    /// Promoted: it takes requests and replies.
+    promoted: bool,
 }
 
 /// A server: a core over C4's log on its own disk, and the test service.
@@ -508,6 +622,16 @@ pub struct ServerNode<C: ConsensusCore> {
     /// Why the disk cannot come back, when its crash could not be taken.
     lost: Option<String>,
     recorder: Shared,
+    /// Its generation: [`FIRST_GENERATION`], one more after a promotion.
+    generation: u64,
+    /// Its clock at its last tick or delivery.
+    now: u64,
+    /// The feed to a standby, for a primary server.
+    feed: Option<FeedOut>,
+    /// The lease it holds to act, for a primary server.
+    lease: Option<Rc<RefCell<ExternalLease>>>,
+    /// The standby state, for a standby server.
+    standby: Option<StandbyIn>,
 }
 
 impl<C: ConsensusCore> ServerNode<C> {
@@ -542,6 +666,11 @@ impl<C: ConsensusCore> ServerNode<C> {
             configuration: None,
             lost: None,
             recorder,
+            generation: FIRST_GENERATION,
+            now: 0,
+            feed: None,
+            lease: None,
+            standby: None,
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
@@ -573,9 +702,60 @@ impl<C: ConsensusCore> ServerNode<C> {
             configuration: None,
             lost: None,
             recorder,
+            generation: FIRST_GENERATION,
+            now: 0,
+            feed: None,
+            lease: None,
+            standby: None,
         };
         server.start();
         server
+    }
+
+    /// Feeds its committed entries to the standby servers `to` while its
+    /// core leads, applying each of `faults` to one send of its index.
+    #[must_use]
+    pub fn with_feed(mut self, to: Vec<NodeId>, faults: &[(u64, FeedFault)]) -> Self {
+        self.feed = Some(FeedOut {
+            to,
+            acked: None,
+            faults: faults.iter().copied().collect(),
+        });
+        self
+    }
+
+    /// Takes a command and releases a reply only while it holds `lease`,
+    /// which it renews while its core leads.
+    #[must_use]
+    pub fn with_lease(mut self, lease: Rc<RefCell<ExternalLease>>) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    /// A standby server, fed by the servers `primary`.
+    #[must_use]
+    pub fn as_standby(mut self, primary: Vec<NodeId>) -> Self {
+        self.standby = Some(StandbyIn {
+            primary,
+            ..StandbyIn::default()
+        });
+        self
+    }
+
+    /// Its generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether it takes requests: not a standby that waits for its
+    /// promotion, and not a lease holder past its lease.
+    fn acts(&self) -> bool {
+        self.standby.as_ref().is_none_or(|standby| standby.promoted)
+            && self
+                .lease
+                .as_ref()
+                .is_none_or(|lease| lease.borrow().held_at(self.now))
     }
 
     /// Whether it is up: its log open and its core running.
@@ -651,17 +831,53 @@ impl<C: ConsensusCore> ServerNode<C> {
             self.observe(observation);
             return;
         }
+        let acts = self.acts();
+        let verified_before = self.standby.as_ref().and_then(|standby| standby.verified);
         for (entry, applying) in applied {
-            let answer = self.service.apply(&entry);
+            // A standby's service applies the primary entry an entry
+            // wraps, once.
+            let mut served = entry.clone();
+            if let Some(standby) = self.standby.as_mut()
+                && let Some((index, term, payload)) = standby::unwrap(&entry.payload)
+            {
+                if standby
+                    .verified
+                    .is_none_or(|(verified, _)| index > verified)
+                {
+                    standby.verified = Some((index, term));
+                    if standby
+                        .proposed
+                        .is_none_or(|(proposed, _)| index > proposed)
+                    {
+                        standby.proposed = Some((index, term));
+                    }
+                    served.payload = payload.to_vec();
+                    recorder
+                        .borrow_mut()
+                        .observations
+                        .push(Observation::FeedApplied {
+                            node,
+                            index,
+                            term,
+                            payload: payload.to_vec(),
+                        });
+                } else {
+                    // Applied before: the service only moves its position.
+                    served.payload = Vec::new();
+                }
+            }
+            let answer = self.service.apply(&served);
             let response = answer.as_ref().map(|(_, ret)| ret.canonical());
             if let Some((command, ret)) = answer
                 && self.pending.remove(&(command.client, command.sequence))
+                && acts
             {
                 self.observe(Observation::Reply {
                     node,
                     client: command.client,
                     index: entry.index,
                     term: entry.term,
+                    generation: self.generation,
                 });
                 out.push((
                     command.client,
@@ -669,6 +885,7 @@ impl<C: ConsensusCore> ServerNode<C> {
                         sequence: command.sequence,
                         bytes: ret.canonical(),
                         index: entry.index,
+                        generation: self.generation,
                     },
                 ));
             }
@@ -678,6 +895,16 @@ impl<C: ConsensusCore> ServerNode<C> {
                 applying,
                 response,
             });
+        }
+        // A standby's leader acknowledges a verified position that moved.
+        if let Some(standby) = &self.standby
+            && standby.verified != verified_before
+            && core.leads()
+        {
+            let verified = standby.verified.map(|(index, _)| index);
+            for &to in &standby.primary {
+                out.push((to, Wire::FeedAck { verified }));
+            }
         }
         if let Some(configuration) = core.configuration()
             && self.configuration.as_ref() != Some(&configuration)
@@ -764,6 +991,11 @@ impl<C: ConsensusCore> ServerNode<C> {
         // baseline, not a new commit.
         self.service = TestService::default();
         self.commit = core.committed();
+        // A standby rebuilds its verified position as its service does.
+        if let Some(standby) = self.standby.as_mut() {
+            standby.verified = None;
+            standby.proposed = None;
+        }
         // Recorded at every start, so a check compares it with the log.
         if let Some(configuration) = core.configuration() {
             let entry_term = configuration.index.and_then(|index| log.term(index));
@@ -776,8 +1008,22 @@ impl<C: ConsensusCore> ServerNode<C> {
 
 impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     fn tick(&mut self, now: u64, out: &mut Outbox<Wire<C::Message>>) {
+        self.now = now;
         if let Some((core, log)) = self.running.as_mut() {
             core.tick(now, &mut LogView::new(log));
+            if core.leads() {
+                if let Some(lease) = &self.lease {
+                    let mut lease = lease.borrow_mut();
+                    if lease.renewing {
+                        lease.renewed_at = Some(now);
+                    }
+                }
+                if let Some(feed) = self.feed.as_mut()
+                    && now.is_multiple_of(FEED_PERIOD)
+                {
+                    send_feed(feed, core.committed(), log, out);
+                }
+            }
         }
         self.duty(out);
     }
@@ -786,15 +1032,23 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
         &mut self,
         from: NodeId,
         message: Wire<C::Message>,
-        _now: u64,
+        now: u64,
         out: &mut Outbox<Wire<C::Message>>,
     ) {
+        self.now = now;
+        let acts = self.acts();
         let Some((core, log)) = self.running.as_mut() else {
             return;
         };
         let mut view = LogView::new(log);
         match message {
             Wire::Core(message) => core.step(from, message, &mut view),
+            Wire::Request(command) if !acts => out.push((
+                command.client,
+                Wire::Refused {
+                    sequence: command.sequence,
+                },
+            )),
             Wire::Request(command) => {
                 let key = (command.client, command.sequence);
                 match core.propose(command.encode(), &mut view) {
@@ -820,7 +1074,57 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                         result,
                     });
             }
-            Wire::Response { .. } | Wire::Refused { .. } => {}
+            Wire::Feed {
+                entries,
+                prev_term,
+                commit,
+            } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                {
+                    let refused = take_feed(standby, core, &mut view, &entries, prev_term, commit);
+                    if let Some((index, reason)) = refused {
+                        self.recorder
+                            .borrow_mut()
+                            .observations
+                            .push(Observation::FeedRefused {
+                                node: self.id,
+                                index,
+                                reason,
+                            });
+                    }
+                }
+            }
+            Wire::FeedAck { verified } => {
+                if let Some(feed) = self.feed.as_mut() {
+                    feed.acked = feed.acked.max(verified);
+                }
+            }
+            Wire::Promote { unknown } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                {
+                    standby.promoted = true;
+                    self.generation = self.generation.saturating_add(1);
+                    if core.leads() {
+                        let report = PromotionReport {
+                            generation: self.generation,
+                            verified: standby.verified.map(|(index, _)| index),
+                            learnt_commit: standby.learnt,
+                            unknown,
+                        };
+                        self.recorder
+                            .borrow_mut()
+                            .observations
+                            .push(Observation::Promoted {
+                                node: self.id,
+                                report,
+                            });
+                    }
+                }
+            }
+            Wire::Response { .. } | Wire::Refused { .. } | Wire::Redirect { .. } => {}
         }
         self.duty(out);
     }
@@ -840,6 +1144,104 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     fn restart(&mut self, _now: u64) {
         self.start();
     }
+}
+
+/// Sends `feed` the committed entries after its acknowledged position, up
+/// to `commit`, from `log`, with the commit; a failed read sends none.
+fn send_feed<M>(
+    feed: &mut FeedOut,
+    commit: Option<u64>,
+    log: &mut RaftLog<SimDisk>,
+    out: &mut Outbox<Wire<M>>,
+) {
+    let from = feed
+        .acked
+        .map_or(Some(log.first_index()), |acked| acked.checked_add(1));
+    let entries = match (from, commit.and_then(|commit| commit.checked_add(1))) {
+        (Some(from), Some(end)) if from < end => {
+            log.entries(from..end, FEED_BATCH_BYTES).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let prev_term = entries
+        .first()
+        .and_then(|first| first.index.checked_sub(1))
+        .and_then(|before| log.term(before));
+    let mut sent = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let checksum = standby::checksum(entry.index, entry.term, &entry.payload);
+        let mut fed = FeedEntry {
+            index: entry.index,
+            term: entry.term,
+            checksum,
+            payload: entry.payload,
+        };
+        match feed.faults.remove(&fed.index) {
+            Some(FeedFault::Skip) => continue,
+            Some(FeedFault::Corrupt) => {
+                if let Some(first) = fed.payload.first_mut() {
+                    *first ^= 0xFF;
+                }
+            }
+            Some(FeedFault::Term) => fed.term = fed.term.saturating_add(1),
+            None => {}
+        }
+        sent.push(fed);
+    }
+    for &to in &feed.to {
+        out.push((
+            to,
+            Wire::Feed {
+                entries: sent.clone(),
+                prev_term,
+                commit,
+            },
+        ));
+    }
+}
+
+/// Takes a feed send at a standby whose core leads: checks each entry
+/// after the last one proposed by log matching and checksum, and proposes
+/// what passes. Returns the first refused entry and why.
+fn take_feed<C: ConsensusCore>(
+    standby: &mut StandbyIn,
+    core: &mut C,
+    view: &mut LogView<'_>,
+    entries: &[FeedEntry],
+    prev_term: Option<u64>,
+    commit: Option<u64>,
+) -> Option<(u64, FeedRefusal)> {
+    standby.learnt = standby.learnt.max(commit);
+    let mut previous = prev_term;
+    for entry in entries {
+        let last = standby.proposed;
+        if last.is_some_and(|(index, _)| entry.index <= index) {
+            previous = Some(entry.term);
+            continue;
+        }
+        let expected = last.map_or(Some(standby::PRIMARY_FIRST_INDEX), |(index, _)| {
+            index.checked_add(1)
+        });
+        let refusal = if Some(entry.index) != expected {
+            Some(FeedRefusal::Gap)
+        } else if previous != last.map(|(_, term)| term) {
+            Some(FeedRefusal::Term)
+        } else if standby::checksum(entry.index, entry.term, &entry.payload) != entry.checksum {
+            Some(FeedRefusal::Checksum)
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            return Some((entry.index, reason));
+        }
+        let wrapped = standby::wrap(entry.index, entry.term, &entry.payload);
+        if core.propose(wrapped, view).is_err() {
+            return None;
+        }
+        standby.proposed = Some((entry.index, entry.term));
+        previous = Some(entry.term);
+    }
+    None
 }
 
 /// Ticks a client waits for an answer before it sends its request
@@ -862,6 +1264,8 @@ pub struct ClientNode {
     /// The open request was refused: send it again now.
     refused: bool,
     recorder: Shared,
+    /// The highest generation it has seen, 0 before the first answer.
+    generation: u64,
 }
 
 impl ClientNode {
@@ -877,7 +1281,14 @@ impl ClientNode {
             retry_after: RETRY_AFTER,
             refused: false,
             recorder,
+            generation: 0,
         }
+    }
+
+    /// Its open request's sequence number, if one waits for its answer.
+    #[must_use]
+    pub fn open(&self) -> Option<u64> {
+        self.open.as_ref().map(|(command, _)| command.sequence)
     }
 
     /// Sends an unanswered request again after `ticks`.
@@ -935,10 +1346,20 @@ impl<M> Node<Wire<M>> for ClientNode {
     fn deliver(&mut self, _from: NodeId, message: Wire<M>, _now: u64, _out: &mut Outbox<Wire<M>>) {
         let open = self.open.as_ref().map(|(command, _)| command.sequence);
         match message {
+            Wire::Response { generation, .. } if generation < self.generation => {
+                self.recorder
+                    .borrow_mut()
+                    .observations
+                    .push(Observation::StaleGeneration {
+                        client: self.id,
+                        generation,
+                    });
+            }
             Wire::Response {
                 sequence,
                 bytes,
                 index,
+                generation,
             } if open == Some(sequence) => {
                 // Bytes that do not decode are no answer: the retry asks
                 // again.
@@ -946,14 +1367,21 @@ impl<M> Node<Wire<M>> for ClientNode {
                     return;
                 };
                 self.open = None;
+                self.generation = generation;
                 let mut recorder = self.recorder.borrow_mut();
                 let _ = recorder.history.ret(self.id, ret);
                 recorder.observations.push(Observation::Success {
                     client: self.id,
                     index,
+                    generation,
                 });
             }
             Wire::Refused { sequence } if open == Some(sequence) => self.refused = true,
+            Wire::Redirect { server } => {
+                self.server = server;
+                // An open request goes to the new server at once.
+                self.refused = self.open.is_some();
+            }
             _ => {}
         }
     }

@@ -43,7 +43,9 @@ use super::core::{
 };
 use crate::net::NodeId;
 
-/// The fixed leader.
+/// The fixed leader of a group whose servers are numbered from 0. A group
+/// is led by the lowest id of its bootstrap peers, so a standby group
+/// (phase 5, P5-S2) has its own.
 pub const LEADER: NodeId = 0;
 /// Its only term.
 pub const TERM: u64 = 1;
@@ -116,6 +118,8 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub struct Reference {
     id: NodeId,
+    /// The fixed leader: the lowest id of the bootstrap peers.
+    leader: NodeId,
     /// The bootstrap voters, ascending.
     peers: Vec<NodeId>,
     /// The configurations in the log, written or not, ascending.
@@ -140,7 +144,7 @@ pub struct Reference {
 
 impl Reference {
     fn leading(&self) -> bool {
-        self.id == LEADER
+        self.id == self.leader
     }
 
     fn last(&self, log: &LogView<'_>) -> Option<u64> {
@@ -251,8 +255,10 @@ impl ConsensusCore for Reference {
         let stored = log.hard_state();
         let mut peers = peers.to_vec();
         peers.sort_unstable();
+        let leader = peers.first().copied().unwrap_or(id);
         Self {
             id,
+            leader,
             peers,
             configs,
             unpersisted: Vec::new(),
@@ -272,13 +278,13 @@ impl ConsensusCore for Reference {
     fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
         if !self.leading() {
             return Err(NotLeader {
-                leader: Some(LEADER),
+                leader: Some(self.leader),
             });
         }
         // The last index is u64::MAX: the log takes no more.
         let Some(index) = self.next(log) else {
             return Err(NotLeader {
-                leader: Some(LEADER),
+                leader: Some(self.leader),
             });
         };
         self.unpersisted.push(Entry {
@@ -326,7 +332,8 @@ impl ConsensusCore for Reference {
                 }
                 // Released only once `drive` made these entries durable.
                 let index = self.last(log);
-                self.after_persist.push((LEADER, Message::Ack { index }));
+                self.after_persist
+                    .push((self.leader, Message::Ack { index }));
             }
             Message::Ack { index } if self.leading() => {
                 let known = self.acked.entry(from).or_insert(None);
@@ -423,7 +430,7 @@ impl ConsensusCore for Reference {
         }
         let hard_state = self.dirty.then_some(HardState {
             current_term: TERM,
-            voted_for: Some(u64::from(LEADER)),
+            voted_for: Some(u64::from(self.leader)),
             commit: self.commit,
         });
         if self.messages.is_empty()
@@ -492,7 +499,7 @@ impl ConsensusCore for Reference {
     ) -> Result<(), ChangeRefused> {
         if !self.leading() {
             return Err(ChangeRefused::NotLeader(NotLeader {
-                leader: Some(LEADER),
+                leader: Some(self.leader),
             }));
         }
         // One change at a time: the last one must be committed.

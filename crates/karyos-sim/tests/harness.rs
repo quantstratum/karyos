@@ -432,6 +432,7 @@ fn a_reply_before_a_durable_majority_is_caught() {
         client: 3,
         index: 1,
         term: 2,
+        generation: 1,
     };
     // Three servers: when the leader replies, only it holds entry 1 of
     // term 2; server 1 holds a stale entry 1 of term 1, which does not
