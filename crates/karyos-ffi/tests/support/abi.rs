@@ -12,9 +12,74 @@
 
 use core::ffi::{CStr, c_char};
 
+/// `karyos_client_options`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ClientOptions {
+    pub size: u32,
+    pub idle_strategy: u32,
+    pub dir: *const c_char,
+    pub idle_sleep_ns: u64,
+    pub timeout_ns: u64,
+    pub max_pending: u32,
+    pub max_images: u32,
+}
+
+/// `karyos_detail`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Detail {
+    pub size: u32,
+    pub reserved: u32,
+    pub code: u64,
+    pub value: u64,
+}
+
 unsafe extern "C" {
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
+    fn karyos_client_options_init(options: *mut ClientOptions) -> i32;
+    fn karyos_client_connect(
+        options: *const ClientOptions,
+        client: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
+    fn karyos_client_poll(client: u64, served: *mut u32) -> i32;
+    safe fn karyos_client_close(client: u64) -> i32;
+}
+
+/// `karyos_client_connect` to the driver in `dir`, with the defaults
+/// otherwise: the status, the handle and the detail.
+pub fn client_connect(dir: &CStr) -> (i32, u64, Detail) {
+    let mut options = core::mem::MaybeUninit::<ClientOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `ClientOptions`.
+    let status = unsafe { karyos_client_options_init(options.as_mut_ptr()) };
+    assert_eq!(status, 0);
+    // SAFETY: `karyos_client_options_init` wrote every field.
+    let mut options = unsafe { options.assume_init() };
+    options.dir = dir.as_ptr();
+    options.timeout_ns = 5_000_000_000;
+    let mut client = 0;
+    let mut detail = Detail {
+        size: u32::try_from(size_of::<Detail>()).unwrap_or(u32::MAX),
+        ..Detail::default()
+    };
+    // SAFETY: live, aligned pointers; `dir` outlives the call.
+    let status = unsafe { karyos_client_connect(&options, &mut client, &mut detail) };
+    (status, client, detail)
+}
+
+/// `karyos_client_poll`: the status and `served`.
+pub fn client_poll(client: u64) -> (i32, u32) {
+    let mut served = u32::MAX;
+    // SAFETY: a live, aligned `u32`.
+    let status = unsafe { karyos_client_poll(client, &mut served) };
+    (status, served)
+}
+
+/// `karyos_client_close`.
+pub fn client_close(client: u64) -> i32 {
+    karyos_client_close(client)
 }
 
 /// `karyos_abi_version` with valid out-parameters: the status and the

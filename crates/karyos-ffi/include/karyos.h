@@ -39,6 +39,14 @@ extern "C" {
 /** No handle names an object with this value. */
 #define KARYOS_NULL_HANDLE 0
 
+/** The most clients open at once. */
+#define KARYOS_MAX_CLIENTS 64
+
+/** Idle strategies of a control call's wait (karyos_client_options). */
+#define KARYOS_IDLE_BUSY_SPIN 0
+#define KARYOS_IDLE_YIELD 1
+#define KARYOS_IDLE_SLEEP 2
+
 /*
  * Status codes. 0 is success; 1-99 data-path outcomes, 100-199 usage,
  * 200-299 lifecycle, 300-399 resource and driver, 400-499 compatibility,
@@ -83,6 +91,8 @@ extern "C" {
 #define KARYOS_E_BUSY 109
 /** conflation error */
 #define KARYOS_E_CONFLATION 110
+/** not supported on this platform */
+#define KARYOS_E_UNSUPPORTED 111
 /** closed */
 #define KARYOS_E_CLOSED 200
 /** the subscription was closed by its rejoin policy */
@@ -123,6 +133,41 @@ extern "C" {
 #define KARYOS_E_INTERNAL 500
 
 /**
+ * What a failed control call adds to its status. The caller sets size to
+ * sizeof(karyos_detail); a smaller size, or a null pointer, receives
+ * nothing. Untouched on success.
+ */
+typedef struct karyos_detail {
+    uint32_t size;
+    uint32_t reserved;
+    /* A code the status defines, such as the driver's refusal code. */
+    uint64_t code;
+    /* A value the status defines, such as a length, a version or errno. */
+    uint64_t value;
+} karyos_detail;
+
+/**
+ * A client's options, copied by karyos_client_connect. Fill it with
+ * karyos_client_options_init, which sets size and the defaults, then set
+ * dir. Zero timeout_ns, max_pending or max_images are invalid.
+ */
+typedef struct karyos_client_options {
+    uint32_t size;
+    /* KARYOS_IDLE_BUSY_SPIN, KARYOS_IDLE_YIELD or KARYOS_IDLE_SLEEP. */
+    uint32_t idle_strategy;
+    /* The driver's directory, NUL-terminated UTF-8. */
+    const char *dir;
+    /* The sleep of KARYOS_IDLE_SLEEP, in nanoseconds. */
+    uint64_t idle_sleep_ns;
+    /* The longest wait of a control call, in nanoseconds. */
+    uint64_t timeout_ns;
+    /* The most requests in flight. */
+    uint32_t max_pending;
+    /* The most images a network subscription attaches. */
+    uint32_t max_images;
+} karyos_client_options;
+
+/**
  * Writes the ABI version this library implements. Returns KARYOS_OK, or
  * KARYOS_E_INVALID_ARGUMENT with nothing written when a pointer is null or
  * misaligned.
@@ -134,6 +179,36 @@ int32_t karyos_abi_version(uint32_t *major, uint32_t *minor, uint32_t *patch);
  * Never freed.
  */
 const char *karyos_status_message(int32_t status);
+
+/**
+ * Fills options with the defaults and its size. KARYOS_E_INVALID_ARGUMENT
+ * for a null or misaligned pointer.
+ */
+int32_t karyos_client_options_init(karyos_client_options *options);
+
+/**
+ * Attaches a client to the driver whose admission socket is in
+ * options->dir and writes its handle. The options are copied; a failed
+ * connect opens nothing and fills detail (may be null).
+ * KARYOS_E_INCOMPATIBLE_DRIVER carries the driver's protocol version in
+ * detail->value when it admitted the client at another one, 0 when it
+ * refused it. KARYOS_E_UNSUPPORTED where no cross-process client exists
+ * (not Linux).
+ */
+int32_t karyos_client_connect(const karyos_client_options *options,
+                              uint64_t *client, karyos_detail *detail);
+
+/**
+ * Serves the client once without waiting; writes 1 to served when
+ * anything was served, else 0. Call it regularly.
+ */
+int32_t karyos_client_poll(uint64_t client, uint32_t *served);
+
+/**
+ * Closes the client; the driver releases what it granted it. Nothing is
+ * closed when the handle is in use (KARYOS_E_BUSY, KARYOS_E_REENTRANT).
+ */
+int32_t karyos_client_close(uint64_t client);
 
 #ifdef __cplusplus
 }
