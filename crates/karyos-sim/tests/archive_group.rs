@@ -1031,6 +1031,7 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
         &GatewayConfig {
             publications: &[(0, 0)],
             subscriptions: &[(STREAM, 1)],
+            network: &[],
             conflated: &[],
             max_claim: 0,
             max_payload: 0,
