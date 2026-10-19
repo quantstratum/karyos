@@ -367,3 +367,148 @@ fn a_seal_for_a_cutover_fences_the_recording_where_a_final_seal_ends_it() {
         assert_eq!(messages, published, "cutover {cutover}");
     }
 }
+
+/// Gap 6, option B: a `Following` source of an `async` recording that
+/// resumes after a lap, fenced at a cutover, asks its hook to rejoin.
+/// While the host has not answered, the recording waits. Answered, it
+/// rejoins the successor at its head: the messages published there before
+/// the rejoin are a plain gap, and the ones after it are recorded. A
+/// refused rejoin ends the recording at the seal, as a fence does.
+#[test]
+fn a_fenced_following_source_rejoins_at_the_head_past_a_gap() {
+    use std::sync::{Arc, Mutex};
+
+    use karyos_client::GenerationLink;
+
+    use crate::recorder::Ended;
+    use crate::source::{Following, Rejoin};
+
+    for refused in [false, true] {
+        // The predecessor: four messages, then a seal for a cutover the
+        // reader is fenced from.
+        let old = Arc::new(LogBuffer::new(config()).unwrap());
+        let mut old_conductor = old.conductor_owned().unwrap();
+        let reader = SenderRead::for_recording(
+            old_conductor.subscribe_as(Role::Optional, true, 1).unwrap(),
+            3,
+        )
+        .unwrap();
+        let link = GenerationLink::new();
+        let mut published = Vec::new();
+        let mut publication = old.publication().unwrap().unwrap();
+        for sequence in 0..4 {
+            let data = message(sequence, 900);
+            let _ = publication.append(&data, AppendOptions::default()).unwrap();
+            published.push(data);
+        }
+        drop(publication);
+        old_conductor.seal_for_cutover().unwrap();
+        let _ = link.fence();
+        let seal = 4 * 960;
+
+        // The successor, based at the seal: two messages published before
+        // the rejoin are lost, and the rejoined reader starts at the head.
+        let new = Arc::new(LogBuffer::new(config()).unwrap());
+        let mut new_conductor = new.conductor_owned().unwrap();
+        let mut successor = Some(new.publication().unwrap().unwrap());
+        for sequence in 10..12 {
+            let _ = successor
+                .as_mut()
+                .unwrap()
+                .append(&message(sequence, 900), AppendOptions::default())
+                .unwrap();
+        }
+        let answers = Arc::new(Mutex::new(0u32));
+        let asked = Arc::clone(&answers);
+        let mut joined = Some((
+            SenderRead::for_recording(
+                new_conductor.subscribe_as(Role::Optional, true, 2).unwrap(),
+                3,
+            )
+            .unwrap(),
+            GenerationLink::new(),
+        ));
+        let hook = Box::new(move || {
+            let mut asked = asked.lock().unwrap();
+            *asked += 1;
+            if *asked == 1 {
+                return Rejoin::Waiting;
+            }
+            if refused {
+                return Rejoin::Refused;
+            }
+            let (reader, link) = joined.take().unwrap();
+            Rejoin::Joined {
+                reader,
+                link,
+                base: seal,
+                guard: Box::new(()),
+            }
+        });
+        let mut recorder = Recorder::new(
+            store(0),
+            Following::rejoining(reader, link, 0, hook),
+            Mode::Async {
+                on_lap: OnLap::Resume,
+            },
+            1 << 16,
+            1 << 20,
+        )
+        .unwrap();
+        let mut rejoined = 0;
+        let mut ended = None;
+        for _ in 0..12 {
+            let _ = old_conductor.duty_cycle().unwrap();
+            let _ = new_conductor.duty_cycle().unwrap();
+            let duty = recorder.duty(0).unwrap();
+            if duty.rejoined {
+                rejoined += 1;
+                // After the rejoin, two more messages, then the end.
+                let mut publication = successor.take().unwrap();
+                for sequence in 20..22 {
+                    let data = message(sequence, 900);
+                    let _ = publication.append(&data, AppendOptions::default()).unwrap();
+                    published.push(data);
+                }
+                drop(publication);
+                new_conductor.seal().unwrap();
+            }
+            if let Some(end) = duty.ended {
+                ended = Some(end);
+                break;
+            }
+        }
+        let ended = ended.expect("the recording never ended");
+        // The hook was asked again after it waited.
+        assert!(*answers.lock().unwrap() >= 2);
+        if refused {
+            assert_eq!(rejoined, 0);
+            assert_eq!(
+                ended,
+                Ended {
+                    position: seal,
+                    reason: StopReason::Lapped,
+                    incomplete: true
+                }
+            );
+            assert!(recorder.store().gaps().is_empty());
+            continue;
+        }
+        assert_eq!(rejoined, 1);
+        let head = seal + 2 * 960;
+        let end = head + 2 * 960;
+        assert_eq!(
+            ended,
+            Ended {
+                position: end,
+                reason: StopReason::Normal,
+                incomplete: true
+            }
+        );
+        assert_eq!(recorder.store().gaps(), [(seal, head)]);
+        let (before, _) = walk(recorder.store_mut(), 0, seal);
+        let (after, _) = walk(recorder.store_mut(), head, end);
+        assert_eq!(before, published[..4]);
+        assert_eq!(after, published[4..]);
+    }
+}

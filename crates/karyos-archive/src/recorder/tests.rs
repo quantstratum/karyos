@@ -46,6 +46,10 @@ enum Script {
     /// A cutover, then a fence, at this position, wherever the source is.
     CutoverAt(u64),
     FencedAt(u64),
+    /// Fenced at its position, then rejoined this many bytes later.
+    Rejoined(u64),
+    /// A rejoin from this seal to this position, wherever the source is.
+    RejoinedAt(u64, u64),
 }
 
 /// A source that plays a script from `position`.
@@ -126,6 +130,19 @@ impl FrameSource for Scripted {
             Script::CutoverAgain => Ok(Frames::Cutover { at: position }),
             Script::CutoverAt(at) => Ok(Frames::Cutover { at }),
             Script::FencedAt(at) => Ok(Frames::Fenced { at }),
+            Script::Rejoined(gap) => {
+                let _ = self.script.pop_front();
+                self.position = position + gap;
+                Ok(Frames::Rejoined {
+                    from: position,
+                    to: self.position,
+                })
+            }
+            Script::RejoinedAt(from, to) => {
+                let _ = self.script.pop_front();
+                self.position = to;
+                Ok(Frames::Rejoined { from, to })
+            }
             Script::Lost(length) => {
                 let _ = self.script.pop_front();
                 Ok(Frames::Lost {
@@ -695,6 +712,95 @@ fn a_fenced_recording_ends_at_the_seal_whatever_its_lap_policy() {
         assert!(fenced.source.resumed.is_empty());
         assert!(fenced.store.gaps().is_empty());
     }
+}
+
+/// Gap 6, option B: an `async` recording that resumes after a lap,
+/// fenced at a cutover, rejoins the stream at its head. The bytes between
+/// the seal and the head are a plain gap, the recording is incomplete, and
+/// it goes on to its final seal. A rejoin exactly at the seal leaves no
+/// gap.
+#[test]
+fn a_fenced_resuming_recording_rejoins_past_a_gap() {
+    for gap in [40u64, 0] {
+        let script = vec![
+            Script::Data(data(0, 30)),
+            Script::Rejoined(gap),
+            Script::Data(data(30 + gap as usize, 20)),
+            Script::Sealed,
+        ];
+        let mut rejoined = recorder(
+            FaultDisk::default(),
+            Mode::Async {
+                on_lap: OnLap::Resume,
+            },
+            script,
+        );
+        let duty = rejoined.duty(1).unwrap();
+        assert!(duty.fenced && duty.rejoined);
+        assert_eq!(
+            duty.ended,
+            Some(Ended {
+                position: 50 + gap,
+                reason: StopReason::Normal,
+                incomplete: true
+            }),
+            "gap {gap}"
+        );
+        // The source is already at the head: nothing is resumed.
+        assert!(rejoined.source.resumed.is_empty());
+        let gaps: &[(u64, u64)] = if gap > 0 { &[(30, 70)] } else { &[] };
+        assert_eq!(rejoined.store.gaps(), gaps);
+        assert_eq!(rejoined.store.written(), 50 + gap);
+    }
+}
+
+/// Only an `async` recording that resumes after a lap rejoins, and only at
+/// or after its seal, at the written position: anything else is a source
+/// that broke its contract.
+#[test]
+fn a_rejoin_only_an_async_resuming_recording_may_take_is_invalid() {
+    for mode in [
+        Mode::Async {
+            on_lap: OnLap::Stop,
+        },
+        Mode::Required,
+    ] {
+        let mut recorder = recorder(
+            FaultDisk::default(),
+            mode,
+            vec![Script::Data(data(0, 30)), Script::Rejoined(40)],
+        );
+        assert!(matches!(
+            recorder.duty(1),
+            Err(RecorderError::Invalid(Invalid::Rejoin { from: 30, to: 70 }))
+        ));
+    }
+    let resume = Mode::Async {
+        on_lap: OnLap::Resume,
+    };
+    // Back past the seal.
+    let mut back = recorder(
+        FaultDisk::default(),
+        resume,
+        vec![Script::Data(data(0, 30)), Script::RejoinedAt(30, 10)],
+    );
+    assert!(matches!(
+        back.duty(1),
+        Err(RecorderError::Invalid(Invalid::Rejoin { from: 30, to: 10 }))
+    ));
+    // A seal away from the written position.
+    let mut away = recorder(
+        FaultDisk::default(),
+        resume,
+        vec![Script::Data(data(0, 30)), Script::RejoinedAt(20, 60)],
+    );
+    assert!(matches!(
+        away.duty(1),
+        Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+            at: 20,
+            written: 30
+        }))
+    ));
 }
 
 /// #444 review P2: a cutover ends its duty, so a source that repeats one

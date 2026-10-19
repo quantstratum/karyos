@@ -23,7 +23,7 @@ use karyos_archive::catalog::StopReason;
 use karyos_archive::disk::StdDisk;
 use karyos_archive::recorder::{Mode, OnLap, Recorder};
 use karyos_archive::segment::{Geometry, SegmentStore, SyncPolicy};
-use karyos_archive::source::Following;
+use karyos_archive::source::{Following, Rejoin};
 use karyos_client::OfferOutcome;
 use karyos_driver::{
     DriverConfig, EmbeddedDriver, MonotonicClock, Reconfiguration, StreamConfig, StreamHandle,
@@ -392,5 +392,171 @@ fn the_agent_records_across_a_cutover_through_its_documented_wiring() {
     for (offset, &position) in positions.iter().enumerate() {
         let index = before + u64::try_from(offset).unwrap();
         assert_eq!(recorded_in(dir.path(), id, position), payload(index));
+    }
+}
+
+/// The driver's `stream leases live` gauge.
+fn leases_live(driver: &EmbeddedDriver) -> u64 {
+    use karyos_sys::counters::CellRead;
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .find_map(|index| match reader.read(index) {
+            CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == b"stream leases live" => Some(value),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// Gap 6, option B: an `async` recording that resumes after a lap, paused
+/// past the cutover deadline, is fenced without delaying the cutover. It
+/// then rejoins the stream at its head, as a new optional member the host
+/// admits on the driver's thread, answering through a channel as a host
+/// whose Archive runs elsewhere would. What the writer published on the
+/// successor before the rejoin is a plain gap; what it published after is
+/// recorded, every byte at its stream position. The rejoined member's
+/// lease is the recording's guard, released when the recording is
+/// dropped.
+#[test]
+fn a_fenced_async_recording_rejoins_at_the_head_past_a_gap() {
+    use std::sync::mpsc;
+
+    let dir = TempDir::new("rejoin");
+    let (mut driver, clock) = driver();
+    let stream = stream(&mut driver);
+    let (reader, link, base, lease) = driver
+        .recording_reader(stream, Role::Optional)
+        .unwrap()
+        .into_following_parts();
+    // The first member's lease lives as long as the test's driver.
+    std::mem::forget(lease);
+    let (ask, asked) = mpsc::channel::<()>();
+    let (answer, answers) = mpsc::channel::<Rejoin>();
+    let mut requested = false;
+    let hook = Box::new(move || {
+        if !requested {
+            requested = true;
+            let _ = ask.send(());
+        }
+        match answers.try_recv() {
+            Ok(answer) => answer,
+            Err(mpsc::TryRecvError::Empty) => Rejoin::Waiting,
+            Err(mpsc::TryRecvError::Disconnected) => Rejoin::Refused,
+        }
+    });
+    let store = SegmentStore::create(
+        StdDisk,
+        dir.path(),
+        1,
+        geometry(),
+        SyncPolicy::PerSegment,
+        base,
+    )
+    .unwrap();
+    let mut recorder = Recorder::new(
+        store,
+        Following::rejoining(reader, link, base, hook),
+        Mode::Async {
+            on_lap: OnLap::Resume,
+        },
+        1 << 16,
+        1 << 20,
+    )
+    .unwrap();
+    let mut writer = Some(driver.publication(stream).unwrap());
+    let before = 4u64;
+    for index in 0..before {
+        let _ = publish(&mut driver, writer.as_mut().unwrap(), index);
+    }
+    let _ = driver.reconfigure_stream(stream, larger()).unwrap();
+    // The writer moves while the recording is paused: the cutover opens
+    // without it, and the deadline fences it.
+    let seal = publish(&mut driver, writer.as_mut().unwrap(), before);
+    assert_eq!(seal, driver.generations(stream).unwrap()[0].seal.unwrap());
+    clock.set(DEADLINE);
+    let _ = driver.do_work().unwrap();
+    // Two more on the successor before the rejoin: lost, with the first.
+    for index in before + 1..before + 3 {
+        let _ = publish(&mut driver, writer.as_mut().unwrap(), index);
+    }
+    let head = seal + 3 * FRAME;
+    let _ = driver.do_work().unwrap();
+    let leases = leases_live(&driver);
+    let mut rejoined = 0;
+    let mut fenced = 0;
+    let mut after = Vec::new();
+    let mut ended = None;
+    for _ in 0..64 {
+        let duty = recorder.duty(0).unwrap();
+        fenced += u32::from(duty.fenced);
+        if duty.rejoined {
+            rejoined += 1;
+            let _ = driver.do_work().unwrap();
+            assert_eq!(leases_live(&driver), leases + 1);
+            // Published after the rejoin: recorded.
+            let mut last = writer.take().unwrap();
+            for index in before + 3..before + 5 {
+                after.push((publish(&mut driver, &mut last, index), index));
+            }
+            // The end: the writer leaves and the stream is removed.
+            drop(last);
+            driver.remove_stream(stream).unwrap();
+        }
+        // The host answers a rejoin on the driver's thread, late: while
+        // the source waits, it holds no reader, so the driver reclaims
+        // the retained predecessor before the answer.
+        if asked.try_recv().is_ok() {
+            for _ in 0..8 {
+                assert!(recorder.duty(0).unwrap().ended.is_none());
+                let _ = driver.do_work().unwrap();
+            }
+            assert_eq!(
+                driver.generations(stream).unwrap().len(),
+                1,
+                "the fenced predecessor is still retained while waiting"
+            );
+            let (reader, link, base, lease) = driver
+                .recording_reader(stream, Role::Optional)
+                .unwrap()
+                .into_following_parts();
+            answer
+                .send(Rejoin::Joined {
+                    reader,
+                    link,
+                    base,
+                    guard: Box::new(lease),
+                })
+                .unwrap();
+        }
+        let _ = driver.do_work().unwrap();
+        if duty.ended.is_some() {
+            ended = duty.ended;
+            break;
+        }
+    }
+    assert_eq!((fenced, rejoined), (1, 1));
+    let end = head + 2 * FRAME;
+    assert_eq!(
+        ended,
+        Some(Ended {
+            position: end,
+            reason: StopReason::Normal,
+            incomplete: true
+        })
+    );
+    assert_eq!(recorder.store().gaps(), [(seal, head)]);
+    drop(recorder);
+    let _ = driver.do_work().unwrap();
+    // The rejoined member's lease went with the recording, and the
+    // writer's with the writer: no pin. The first member's lease is the
+    // one the test forgot.
+    assert_eq!(leases_live(&driver), leases - 1);
+    for index in 0..before {
+        assert_eq!(recorded(dir.path(), index * FRAME), payload(index));
+    }
+    for (position, index) in after {
+        assert!(position >= head);
+        assert_eq!(recorded(dir.path(), position), payload(index));
     }
 }

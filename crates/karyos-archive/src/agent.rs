@@ -707,6 +707,7 @@ struct Counts {
     dropped_replay_ends: AtomicU64,
     refused: AtomicU64,
     fenced_recordings: AtomicU64,
+    rejoined_recordings: AtomicU64,
 }
 
 /// Adds one to `counter`, sticky at `u64::MAX`.
@@ -1078,13 +1079,22 @@ impl ArchiveHandle {
     }
 
     /// Duties that found a recording's source fenced at a mapping cutover
-    /// (mapping-generations.md, "Recordings"); a fenced recording ends
-    /// there, so this is once per recording. A duty that fails is not
-    /// counted. It tells a cutover end from a lap, which share
-    /// [`StopReason::Lapped`].
+    /// (mapping-generations.md, "Recordings"): once per fence. A fenced
+    /// recording ends there, or, `async` and resuming after a lap, rejoins
+    /// the stream at its head ([`ArchiveHandle::rejoined_recordings`]). A
+    /// duty that fails is not counted. It tells a cutover end from a lap,
+    /// which share [`StopReason::Lapped`].
     #[must_use]
     pub fn fenced_recordings(&self) -> u64 {
         self.counts.fenced_recordings.load(Ordering::Relaxed)
+    }
+
+    /// Fenced recordings that rejoined their stream at its head, as a new
+    /// optional member, and went on past a gap (mapping-generations.md,
+    /// "Recordings"). A duty that fails is not counted.
+    #[must_use]
+    pub fn rejoined_recordings(&self) -> u64 {
+        self.counts.rejoined_recordings.load(Ordering::Relaxed)
     }
 
     /// Stops every recording where it is (reason [`StopReason::Shutdown`])
@@ -1136,6 +1146,11 @@ impl Outbox {
     /// A recording's source fenced at a cutover.
     fn fenced(&self) {
         count(&self.counts.fenced_recordings);
+    }
+
+    /// A fenced recording's source rejoined its stream.
+    fn rejoined(&self) {
+        count(&self.counts.rejoined_recordings);
     }
 
     /// A start or replay refused at a cap.
@@ -1645,6 +1660,9 @@ impl<D: Disk + Clone> State<D> {
                     worked |= duty.recorded > 0;
                     if duty.fenced {
                         outbox.fenced();
+                    }
+                    if duty.rejoined {
+                        outbox.rejoined();
                     }
                     if duty.ended.is_none() {
                         index += 1;

@@ -152,11 +152,67 @@ impl<O: BufferOwner> FrameSource for SenderRead<O> {
 /// [`Frames::Cutover`] at the seal, and the next read is the successor's.
 /// While the successor is not offered yet it is [`Frames::Pending`]; a
 /// fenced reader gets [`Frames::Fenced`] at the seal.
-#[derive(Debug)]
 pub struct Following<T: TermBytes = HeapTerms> {
-    reader: SenderRead<Arc<LogBuffer<T>>>,
+    /// The member's reader; none while a fenced reader waits for its
+    /// rejoin, so its predecessor mapping is not kept retained.
+    reader: Option<SenderRead<Arc<LogBuffer<T>>>>,
     link: Arc<GenerationLink<T>>,
     base: u64,
+    /// How a fenced reader asks for a new member at the head.
+    rejoin: Option<Box<RejoinHook<T>>>,
+    /// The seal the reader was fenced at, while its rejoin is answered:
+    /// the source's position, with no reader.
+    fenced: Option<u64>,
+    /// What keeps the rejoined member's stream: dropped with the source,
+    /// after the reader, or when a later rejoin replaces it.
+    guard: Option<Box<dyn Send>>,
+}
+
+/// A host's answer to a fenced reader that asks to rejoin its stream.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "made once per rejoin, a control-path event, and moved once to the source; boxing the member would only add an allocation"
+)]
+pub enum Rejoin<T: TermBytes = HeapTerms> {
+    /// Not answered yet: the reader asks again on a later read.
+    Waiting,
+    /// A new optional member of the stream's current generation, admitted
+    /// at its head: its reader, the link it follows, the stream position
+    /// its mapping starts at, and what keeps its stream (the driver's
+    /// lease, which the Archive does not know).
+    Joined {
+        /// The new member's reader.
+        reader: SenderRead<Arc<LogBuffer<T>>>,
+        /// The link it follows at the next cutover.
+        link: Arc<GenerationLink<T>>,
+        /// The stream position its mapping starts at.
+        base: u64,
+        /// What keeps its stream.
+        guard: Box<dyn Send>,
+    },
+    /// The stream cannot be rejoined (removed, retiring): the recording
+    /// ends at the seal, as a fenced recording without a hook does.
+    Refused,
+}
+
+/// How a host answers a fenced reader's request to rejoin: asked on each
+/// read until it answers [`Rejoin::Joined`] or [`Rejoin::Refused`]. It
+/// runs on the Archive's thread, inside a recording's duty, so it must
+/// return at once and never block: a host whose driver runs elsewhere
+/// sends the request through a channel and answers [`Rejoin::Waiting`]
+/// until a non-blocking receive (`try_recv`) has the member.
+pub type RejoinHook<T> = dyn FnMut() -> Rejoin<T> + Send;
+
+impl<T: TermBytes> std::fmt::Debug for Following<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Following")
+            .field("reader", &self.reader)
+            .field("link", &self.link)
+            .field("base", &self.base)
+            .field("rejoins", &self.rejoin.is_some())
+            .field("fenced", &self.fenced)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: TermBytes> Following<T> {
@@ -167,7 +223,77 @@ impl<T: TermBytes> Following<T> {
         link: Arc<GenerationLink<T>>,
         base: u64,
     ) -> Self {
-        Self { reader, link, base }
+        Self {
+            reader: Some(reader),
+            link,
+            base,
+            rejoin: None,
+            fenced: None,
+            guard: None,
+        }
+    }
+
+    /// As [`Following::new`], for an `async` recording that resumes after
+    /// a lap: fenced at a cutover, the reader asks `hook` for a new
+    /// member at the stream's head and reads on from there, with
+    /// [`Frames::Rejoined`] for the gap (mapping-generations.md,
+    /// "Recordings"). Only such a recording takes a hook; the recorder
+    /// refuses a rejoin for any other.
+    pub fn rejoining(
+        reader: SenderRead<Arc<LogBuffer<T>>>,
+        link: Arc<GenerationLink<T>>,
+        base: u64,
+        hook: Box<RejoinHook<T>>,
+    ) -> Self {
+        Self {
+            rejoin: Some(hook),
+            ..Self::new(reader, link, base)
+        }
+    }
+
+    /// The reader was fenced at `at`: a rejoin, while the host has not
+    /// answered, or the end.
+    fn after_fence(&mut self, at: u64) -> Result<Frames, SourceError> {
+        let Some(hook) = self.rejoin.as_mut() else {
+            return Ok(Frames::Fenced { at });
+        };
+        match hook() {
+            Rejoin::Waiting => {
+                // Only the seal is needed to rejoin: the fenced reader is
+                // dropped now, so its predecessor mapping can be reclaimed
+                // however long the host takes to answer.
+                self.fenced = Some(at);
+                self.reader = None;
+                Ok(Frames::Pending)
+            }
+            Rejoin::Refused => {
+                self.fenced = None;
+                self.rejoin = None;
+                Ok(Frames::Fenced { at })
+            }
+            Rejoin::Joined {
+                reader,
+                link,
+                base,
+                guard,
+            } => {
+                let to = base
+                    .checked_add(reader.position())
+                    .ok_or(SourceError::Invariant)?;
+                // A member of a later generation starts at or after the
+                // seal its predecessor was fenced at.
+                if to < at {
+                    return Err(SourceError::Invariant);
+                }
+                self.reader = Some(reader);
+                self.link = link;
+                self.base = base;
+                // The old reader is dropped first, then the old guard.
+                self.guard = Some(guard);
+                self.fenced = None;
+                Ok(Frames::Rejoined { from: at, to })
+            }
+        }
     }
 
     /// The stream position of the reader's local `position`.
@@ -187,15 +313,24 @@ impl<T: TermBytes> Following<T> {
 
 impl<T: TermBytes> FrameSource for Following<T> {
     fn position(&self) -> u64 {
+        let Some(reader) = self.reader.as_ref() else {
+            // Fenced and waiting: the seal, the written position.
+            return self.fenced.unwrap_or(self.base);
+        };
         // The link refuses a base whose mapping could pass `2^63`, so the
         // sum is below it; the fallback is never taken.
-        let position = self.base.checked_add(self.reader.position());
+        let position = self.base.checked_add(reader.position());
         debug_assert!(position.is_some(), "a mapping past 2^63");
         position.unwrap_or(u64::MAX)
     }
 
     fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
-        Ok(match self.reader.read(out)? {
+        // Fenced and waiting for the host: ask again.
+        if let Some(at) = self.fenced {
+            return self.after_fence(at);
+        }
+        let reader = self.reader.as_mut().ok_or(SourceError::Invariant)?;
+        Ok(match reader.read(out)? {
             Frames::Copied {
                 position,
                 len,
@@ -210,6 +345,8 @@ impl<T: TermBytes> FrameSource for Following<T> {
                 next: self.stream(next)?,
             },
             Frames::Pending => Frames::Pending,
+            // A bare reader has no hook: only this source rejoins.
+            Frames::Rejoined { .. } => return Err(SourceError::Invariant),
             Frames::Sealed { at } => Frames::Sealed {
                 at: self.stream(at)?,
             },
@@ -230,12 +367,12 @@ impl<T: TermBytes> FrameSource for Following<T> {
                         if base != at {
                             return Err(SourceError::Invariant);
                         }
-                        self.reader = *reader;
+                        self.reader = Some(*reader);
                         self.base = base;
                         Frames::Cutover { at }
                     }
                     Next::Wait => Frames::Pending,
-                    Next::End => Frames::Fenced { at },
+                    Next::End => return self.after_fence(at),
                     // The driver offers a recording only a recording cell.
                     _ => return Err(SourceError::Invariant),
                 }
@@ -244,13 +381,23 @@ impl<T: TermBytes> FrameSource for Following<T> {
     }
 
     fn consumed(&mut self, position: u64) -> Result<(), SourceError> {
-        let position = self.local(position)?;
-        self.reader.consumed(position)
+        let Some(reader) = self.reader.as_mut() else {
+            // Fenced and waiting: everything up to the seal was consumed.
+            return match self.fenced {
+                Some(at) if position <= at => Ok(()),
+                _ => Err(SourceError::Invariant),
+            };
+        };
+        let position = position
+            .checked_sub(self.base)
+            .ok_or(SourceError::Invariant)?;
+        reader.consumed(position)
     }
 
     fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
         let to = self.local(to)?;
-        let resumed = self.reader.resume(to)?;
+        let reader = self.reader.as_mut().ok_or(SourceError::Invariant)?;
+        let resumed = reader.resume(to)?;
         self.stream(resumed)
     }
 }

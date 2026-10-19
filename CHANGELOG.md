@@ -49,6 +49,23 @@ release may break APIs, wire formats and shared-memory layouts.
   are `#[non_exhaustive]`, built through constructors: `ReplayRequest::new`,
   `Owner::new` and `HandOverEntry::new` (`with_generation` and
   `with_publication` add its optional parts).
+- A fenced `async` recording that resumes after a lap rejoins its stream
+  at the head (mapping-generations.md, "Recordings", option B). The host
+  gives `source::Following::rejoining(reader, link, base, hook)` a
+  `RejoinHook`: fenced, the source asks it for a new optional member of
+  the current generation, admitted at its head with
+  `recording_reader(stream, Role::Optional)`, and answered
+  `Rejoin::Joined` (the reader, its link, its base and the lease, kept as
+  the source's guard), `Rejoin::Waiting` or `Rejoin::Refused`. The hook
+  runs on the Archive's thread, so a host whose driver runs elsewhere
+  answers through a channel. The recorder reads the new
+  `Frames::Rejoined { from, to }`, records the plain gap `[from, to)`,
+  marks the recording incomplete and goes on; `Duty::rejoined` reports it
+  and `ArchiveHandle::rejoined_recordings` counts it, beside
+  `fenced_recordings`. A refused rejoin, a source without a hook, `stop`
+  and `required` recordings end at the seal, `Lapped`, as before; a
+  rejoin anywhere else is `Invalid::Rejoin`. No driver API or segment
+  format change.
 - Recordings follow a mapping cutover (mapping-generations.md,
   "Recordings"). The driver makes a recording reader a member of the
   stream's cutovers: `recording_reader` registers it with a
