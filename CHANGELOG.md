@@ -394,6 +394,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Snapshots in karyos-cluster (phase 4, C8a; quantstratum-docs:
+  `karyos/design/cluster-dedup-and-snapshots.md` §3). `snapshot::SnapshotStore`
+  writes a snapshot as typed sections (`SectionKind`: consensus, sessions,
+  timers, guards, service; each with a version) into its own segment store,
+  syncs it, and only then publishes it by replacing the manifest
+  (`snapshot-manifest`: id, index, term, length, CRC-32C digest). It keeps
+  the newest `SnapshotConfig::keep` and removes the others' files.
+  `SnapshotConfig::log_floor` gives the first log index to keep with the
+  catch-up allowance, and `due` the entry and byte trigger. Recovery removes
+  every store the manifest does not name and reports a published snapshot
+  that no longer reads whole. The defaults (keep 2, a 1 GiB allowance, 1 Mi
+  entries, 256 MiB) are the proposal's interim values until the owner
+  decides (item 37). karyos-sim's `tests/snapshot_crash.rs` crashes the
+  disk at every operation and fails every flush.
 - The driver's CnC counters for tools and the management agent
   (quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`, M1
   and M2). M1: `driver pid` (in the driver's own pid namespace), `driver
