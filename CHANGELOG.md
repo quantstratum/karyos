@@ -394,6 +394,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The session table in snapshots (phase 4, C7/C8 glue).
+  `SessionTable::encode` writes the table as a snapshot's sessions section
+  (`dedup::SESSIONS_VERSION`), and `SessionTable::decode` rebuilds it, with
+  the log time, the last registration's index (`registered`) and every live
+  session's slot, client, epoch, activity, window and retained replies;
+  decoding checks every bound (`DecodeError`). A decoded table answers
+  every later entry as the encoded one and encodes to the same bytes.
+  karyos-sim's `tests/dedup.rs` snapshots a replica through C8a's store on
+  the simulated disk, crashes a third of the writes, rebuilds the replica
+  from what survived plus the log, and checks it under C3.
 - Guards for tools and the management agent (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M4). Every guard
   transition, refusals included, is also appended to a guard audit ring
