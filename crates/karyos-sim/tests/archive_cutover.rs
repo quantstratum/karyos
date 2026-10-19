@@ -537,13 +537,10 @@ fn a_fenced_async_recording_rejoins_at_the_head_past_a_gap() {
     }
     assert_eq!((fenced, rejoined), (1, 1));
     let end = head + 2 * FRAME;
+    let ended = ended.unwrap();
     assert_eq!(
-        ended,
-        Some(Ended {
-            position: end,
-            reason: StopReason::Normal,
-            incomplete: true
-        })
+        (ended.position, ended.reason, ended.incomplete),
+        (end, StopReason::Normal, true)
     );
     assert_eq!(recorder.store().gaps(), [(seal, head)]);
     drop(recorder);
