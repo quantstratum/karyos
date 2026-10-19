@@ -189,7 +189,7 @@ pub enum ReplayError {
         checkpoint_id: u64,
     },
     /// The checkpoint lies outside a replayable range's complete prefix:
-    /// past it, or in a middle range. Replay never starts outside the
+    /// past it, in its range's gap. Replay never starts outside the
     /// guarantee.
     #[error("checkpoint {checkpoint_id} is outside a replayable prefix")]
     NotInPrefix {
@@ -481,14 +481,12 @@ impl<D: Disk> ReplayCursor<D> {
     /// `length` and `crc32c`, for the caller's `restore`; the cursor then
     /// gives the events after its `group_seq`, up to the end of the range
     /// it lies in, and stops there as replay from the start does. The
-    /// checkpoint must lie in the first range or in the current one, at or
-    /// before its complete prefix: a middle range is not replayable yet.
+    /// checkpoint must lie in a range, at or before its complete prefix:
+    /// the first, the current, or one of the middle `ranges`
+    /// ([`super::prefix::recover_ranges`]; without them, a middle range's
+    /// checkpoint is refused).
     /// Returns the cursor and the checkpoint's record; the snapshot is
     /// `snapshot[..length]`.
-    ///
-    /// Recover with the group's reopen hold
-    /// ([`super::prefix::recover_with_hold`]): with another, a range a
-    /// checkpoint reopened may be recovered otherwise than it ran.
     ///
     /// # Errors
     ///
@@ -500,6 +498,7 @@ impl<D: Disk> ReplayCursor<D> {
     pub fn open_at_checkpoint(
         mut journal: GroupJournal<D>,
         recovery: &Recovery,
+        ranges: &[super::prefix::ClosedRange],
         store: &mut CheckpointStore<D>,
         checkpoint_id: u64,
         config: &ReplayConfig<'_>,
@@ -520,9 +519,19 @@ impl<D: Disk> ReplayCursor<D> {
         let seq = checkpoint.group_seq;
         let tracker = &recovery.tracker;
         let current = (tracker.complete_recording_seq(), tracker.complete_end());
+        // A middle range: from its opening checkpoint to its complete
+        // prefix.
+        let middle = ranges
+            .iter()
+            .find(|range| seq >= range.start.group_seq && seq <= range.complete)
+            .map(|range| (range.complete, range.complete_end));
         let range = match (tracker.first_range(), tracker.range().start) {
             (Some(first), Some(_)) if seq <= first.complete => (first.complete, first.complete_end),
-            (Some(_), Some(start)) if seq >= start.group_seq && seq <= current.0 => current,
+            (Some(_), Some(start)) => match middle {
+                Some(range) => range,
+                None if seq >= start.group_seq && seq <= current.0 => current,
+                None => return Err(ReplayError::NotInPrefix { checkpoint_id }),
+            },
             // Only one range: the journal's first.
             (None, _) if seq <= current.0 => current,
             _ => return Err(ReplayError::NotInPrefix { checkpoint_id }),
@@ -956,6 +965,7 @@ impl<D: Disk> CaptureJournal<D> {
         config: JournalConfig,
     ) -> Result<Self, JournalError> {
         let header = JournalHeader {
+            reopen_hold: 0,
             manifest,
             ..*header
         };

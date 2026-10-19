@@ -50,6 +50,7 @@ fn header(capture: Capture) -> JournalHeader<'static> {
         contract_version: CONTRACT_VERSION,
         clock: CLOCK,
         capture,
+        reopen_hold: 0,
         manifest: MANIFEST,
     }
 }
@@ -191,11 +192,13 @@ impl Recorded {
     /// The snapshot and the steps from checkpoint `id`.
     fn replay_from_checkpoint(&self, id: u64) -> Result<(Vec<u8>, Vec<Seen>), ReplayError> {
         let mut store = self.store();
-        let recovery = self.recovery(&store);
+        let (recovery, ranges) =
+            crate::group::prefix::recover_ranges(&mut self.journal(), &Held(&store), 8).unwrap();
         let mut snapshot = vec![0u8; 4096];
         let (cursor, record) = ReplayCursor::open_at_checkpoint(
             self.journal(),
             &recovery,
+            &ranges,
             &mut store,
             id,
             &replay_config(),
@@ -373,6 +376,7 @@ fn a_corrupt_or_unknown_checkpoint_is_not_comparable() {
         ReplayCursor::open_at_checkpoint(
             recorded.journal(),
             &recovery,
+            &[],
             &mut store,
             1,
             &replay_config(),
@@ -431,6 +435,7 @@ fn a_corrupt_or_unknown_checkpoint_is_not_comparable() {
         ReplayCursor::open_at_checkpoint(
             lost.journal(),
             &recovery,
+            &[],
             &mut store,
             1,
             &replay_config(),
@@ -452,10 +457,10 @@ fn a_corrupt_or_unknown_checkpoint_is_not_comparable() {
             Write::Records(event(4, EndOutcome::Complete)),
         ],
     );
-    assert!(matches!(
-        ranges.replay_from_checkpoint(1),
-        Err(ReplayError::NotInPrefix { checkpoint_id: 1 })
-    ));
+    // A8 middle ranges: range 2 replays from its checkpoint, to its
+    // incomplete event.
+    let (_, middle) = ranges.replay_from_checkpoint(1).unwrap();
+    assert_eq!(kinds(&middle), ["e3", "Incomplete { group_seq: 3 }"]);
     let (_, last) = ranges.replay_from_checkpoint(2).unwrap();
     assert_eq!(
         kinds(&last),
@@ -522,6 +527,7 @@ fn replay_from_a_checkpoint_stops_at_the_range_end_before_its_record() {
     let (mut cursor, _) = ReplayCursor::open_at_checkpoint(
         recorded.journal(),
         &recovery,
+        &[],
         &mut store,
         1,
         &replay_config(),
@@ -775,6 +781,7 @@ impl Recorded {
         let (cursor, record) = ReplayCursor::open_at_checkpoint(
             self.journal(),
             &recovery,
+            &[],
             &mut store,
             id,
             &replay_config(),
@@ -788,6 +795,7 @@ impl Recorded {
             &GatewayConfig {
                 publications: &[],
                 subscriptions: &[],
+                network: &[],
                 conflated: &[],
                 max_claim: 64,
                 max_payload: 256,
@@ -937,4 +945,165 @@ fn a_replay_opened_at_a_checkpoint_dispatches_only_after_its_restore() {
         Err(GatewayError::RestoreOrder { group_seq: 1 })
     );
     assert_eq!(gateway.dispatch(&mut seen), end);
+}
+
+/// A8 middle ranges (A9 section 6): a best-effort journal of three
+/// ranges, two gaps between. Replay from the middle range's checkpoint
+/// gives its events and stops at the next gap; from a later checkpoint
+/// in that range, the events after it; from the current range's, its
+/// own. Without the derived ranges, the middle one is refused.
+#[test]
+fn a_middle_range_replays_from_its_checkpoint() {
+    let recorded = Recorded::new(
+        Capture::BestEffort,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Records(gap(2, 2)),
+            Write::Checkpoint(2, b"A"),
+            Write::Records(event(3, EndOutcome::Complete)),
+            Write::Checkpoint(3, b"A3"),
+            Write::Records(event(4, EndOutcome::Complete)),
+            Write::Records(gap(5, 5)),
+            Write::Checkpoint(5, b"B"),
+            Write::Records(event(6, EndOutcome::Complete)),
+            Write::Records(event(7, EndOutcome::Complete)),
+        ],
+    );
+    let stop_at = |seen: &[Seen]| match seen.last() {
+        Some(Seen::Stop(Stop::Gap(GapMarker { from_seq, .. }))) => Some(*from_seq),
+        _ => None,
+    };
+    let (snapshot, middle) = recorded.replay_from_checkpoint(1).unwrap();
+    assert_eq!(snapshot, b"A");
+    assert_eq!(kinds(&middle)[..3], ["e3", "c3#2", "e4"]);
+    assert_eq!(stop_at(&middle), Some(5), "{:?}", kinds(&middle));
+    let (_, later) = recorded.replay_from_checkpoint(2).unwrap();
+    assert_eq!(kinds(&later)[..1], ["e4"]);
+    assert_eq!(stop_at(&later), Some(5));
+    let (_, current) = recorded.replay_from_checkpoint(3).unwrap();
+    assert_eq!(
+        kinds(&current),
+        ["e6", "e7", "EndOfPrefix { complete_recording_seq: 7 }"]
+    );
+    // Without the derived ranges, the middle range is not replayable.
+    let mut store = recorded.store();
+    let recovery = recorded.recovery(&store);
+    let mut snapshot = vec![0u8; 64];
+    assert!(matches!(
+        ReplayCursor::open_at_checkpoint(
+            recorded.journal(),
+            &recovery,
+            &[],
+            &mut store,
+            1,
+            &replay_config(),
+            ROOM,
+            &mut snapshot,
+        ),
+        Err(ReplayError::NotInPrefix { checkpoint_id: 1 })
+    ));
+}
+
+/// A middle range whose complete prefix ends at its opening checkpoint:
+/// the next gap comes right after it. Replay from it gives no event.
+#[test]
+fn an_empty_middle_range_replays_nothing() {
+    let recorded = Recorded::new(
+        Capture::BestEffort,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Records(gap(2, 2)),
+            Write::Checkpoint(2, b"A"),
+            Write::Records(gap(3, 3)),
+            Write::Checkpoint(3, b"B"),
+            Write::Records(event(4, EndOutcome::Complete)),
+        ],
+    );
+    let (_, middle) = recorded.replay_from_checkpoint(1).unwrap();
+    assert!(
+        matches!(
+            middle[..],
+            [Seen::Stop(Stop::Gap(GapMarker { from_seq: 3, .. }))]
+        ),
+        "{:?}",
+        kinds(&middle)
+    );
+}
+
+/// Several middle ranges: each replays its own event from its own
+/// checkpoint, none off by one.
+#[test]
+fn several_middle_ranges_each_replay_their_own() {
+    let mut writes = vec![Write::Records(event(1, EndOutcome::Complete))];
+    // Ranges opened at 2, 4, 6, 8: each holds one event, then a gap.
+    for opener in [2u64, 4, 6, 8] {
+        writes.push(Write::Records(gap(opener, opener)));
+        writes.push(Write::Checkpoint(opener, b"s"));
+        writes.push(Write::Records(event(opener + 1, EndOutcome::Complete)));
+    }
+    let recorded = Recorded::new(Capture::BestEffort, &writes);
+    for (id, opener) in [(1u64, 2u64), (2, 4), (3, 6)] {
+        let (_, seen) = recorded.replay_from_checkpoint(id).unwrap();
+        let events: Vec<_> = kinds(&seen)
+            .into_iter()
+            .filter(|kind| kind.starts_with('e') && !kind.starts_with("End"))
+            .collect();
+        assert_eq!(events, [format!("e{}", opener + 1)], "checkpoint {id}");
+        assert!(
+            matches!(seen.last(), Some(Seen::Stop(Stop::Gap(GapMarker { from_seq, .. }))) if *from_seq == opener + 2),
+            "checkpoint {id}: {:?}",
+            kinds(&seen)
+        );
+    }
+    let (_, last) = recorded.replay_from_checkpoint(4).unwrap();
+    assert_eq!(
+        kinds(&last),
+        ["e9", "EndOfPrefix { complete_recording_seq: 9 }"]
+    );
+}
+
+/// A8 middle ranges, #437 decision (1): recovery advances after each
+/// checkpoint record, as the run's job advances between records. A
+/// checkpoint B recorded after a gap while A is still pending: the run
+/// opens A's range before B takes over, and so does recovery. A tracker
+/// fed record by record, advancing after each (the run), and recovery
+/// agree on the current range, and recovery derives A's range.
+#[test]
+fn recovery_opens_a_range_as_the_run_does() {
+    use crate::group::prefix::{PrefixTracker, recover_ranges};
+
+    let recorded = Recorded::new(
+        Capture::BestEffort,
+        &[
+            Write::Records(event(1, EndOutcome::Complete)),
+            Write::Records(gap(2, 2)),
+            Write::Checkpoint(2, b"A"),
+            Write::Records(gap(3, 3)),
+            Write::Checkpoint(3, b"B"),
+            Write::Records(event(4, EndOutcome::Complete)),
+        ],
+    );
+    let store = recorded.store();
+    // The run: every record, then an advance.
+    let mut run = PrefixTracker::new(8);
+    let mut journal = recorded.journal();
+    let written = journal.written();
+    journal
+        .walk(0, |_, end, record| {
+            run.record(record, end).unwrap();
+            let _ = run.advance(end, end, &Held(&store));
+            true
+        })
+        .unwrap();
+    let _ = run.advance(written, written, &Held(&store));
+    let (recovery, ranges) = recover_ranges(&mut recorded.journal(), &Held(&store), 8).unwrap();
+    assert_eq!(recovery.tracker.range(), run.range());
+    assert_eq!(
+        ranges
+            .iter()
+            .map(|range| range.start.group_seq)
+            .collect::<Vec<_>>(),
+        [2],
+        "A's range, between the two stops"
+    );
 }

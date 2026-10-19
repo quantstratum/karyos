@@ -334,7 +334,35 @@ pub struct PrefixTracker {
     view: Arc<PrefixView>,
 }
 
+/// Makes room in `queue` for `hold` entries in all, fallibly.
+fn hold_room<T>(
+    queue: &mut VecDeque<T>,
+    hold: usize,
+) -> Result<(), std::collections::TryReserveError> {
+    if let Some(more) = hold.checked_sub(queue.len()) {
+        queue.try_reserve_exact(more)?;
+    }
+    Ok(())
+}
+
 impl PrefixTracker {
+    /// [`PrefixTracker::new`], allocating fallibly: the configured bound
+    /// may be one the host cannot hold.
+    ///
+    /// # Errors
+    ///
+    /// The allocation's failure.
+    pub fn try_new(capacity: usize) -> Result<Self, std::collections::TryReserveError> {
+        let mut tracker = Self::new(1);
+        let capacity = capacity.max(1);
+        hold_room(&mut tracker.waiting, capacity)?;
+        hold_room(&mut tracker.candidates, capacity)?;
+        hold_room(&mut tracker.settling, capacity)?;
+        tracker.capacity = capacity;
+        tracker.hold = capacity;
+        Ok(tracker)
+    }
+
     /// A tracker with room for `capacity` events written and not yet
     /// durable, at least 1.
     #[must_use]
@@ -863,12 +891,13 @@ impl PrefixTracker {
         }
     }
 
-    /// Sizes the reopening window (A9-3): past a stop, `hold` events,
-    /// at least the tracker's capacity, are kept for a checkpoint that may
-    /// open a range, and the queue has room for them once it does. The
-    /// events expected while one checkpoint is written, under the Gateway
-    /// unbounded while stopped, are its measure. Allocates here, at
-    /// configuration, before any record.
+    /// Sizes the reopening window (A9-3): past a stop, exactly `hold`
+    /// events (the tracker's capacity for a hold of 0) are kept for a
+    /// checkpoint that may open a range, and the queues have room for
+    /// them once it does, at least the capacity. The events expected
+    /// while one checkpoint is written, under the Gateway unbounded while
+    /// stopped, are its measure. Allocates here, at configuration, before
+    /// any record.
     ///
     /// # Errors
     ///
@@ -877,15 +906,11 @@ impl PrefixTracker {
         &mut self,
         hold: usize,
     ) -> Result<(), std::collections::TryReserveError> {
-        let hold = hold.max(self.capacity);
-        if let Some(more) = hold.checked_sub(self.candidates.len()) {
-            self.candidates.try_reserve_exact(more)?;
-        }
-        for queue in [&mut self.waiting, &mut self.settling] {
-            if let Some(more) = hold.checked_sub(queue.len()) {
-                queue.try_reserve_exact(more)?;
-            }
-        }
+        let hold = if hold == 0 { self.capacity } else { hold };
+        let room = hold.max(self.capacity);
+        hold_room(&mut self.candidates, room)?;
+        hold_room(&mut self.waiting, room)?;
+        hold_room(&mut self.settling, room)?;
         self.hold = hold;
         Ok(())
     }
@@ -934,46 +959,107 @@ pub struct Recovery {
 /// `coverage`. When the queue is full at an event's end, the prefixes are
 /// advanced and the end taken again; an event that still finds no room,
 /// with `capacity` events waiting on their payloads, stops the feed there,
-/// so `capacity` should be at least the running tracker's.
+/// so `capacity` should be at least the running tracker's. The reopening
+/// window holds the events the journal's header records
+/// ([`JournalHeader::reopen_hold`](super::record::JournalHeader::reopen_hold),
+/// at least `capacity`), as the run's did: a range a checkpoint reopened
+/// is recovered as it ran, by any reader of the journal.
 ///
 /// # Errors
 ///
-/// The journal's read errors.
+/// The journal's read errors, and
+/// [`JournalError::Allocation`](super::journal::JournalError::Allocation)
+/// for a tracker or a hold that cannot be allocated.
 pub fn recover<D: crate::disk::Disk>(
     journal: &mut super::journal::GroupJournal<D>,
     coverage: &impl Coverage,
     capacity: usize,
 ) -> Result<Recovery, super::journal::JournalError> {
-    recover_with_hold(journal, coverage, capacity, capacity)
+    recover_with(journal, coverage, capacity, |_| Ok(()))
 }
 
-/// [`recover`], with the reopening window sized to `hold` events
-/// ([`PrefixTracker::reserve_reopen_hold`], at least `capacity`) before
-/// the first record: the running tracker's, so a range a checkpoint
-/// reopened is recovered as it ran. Recover with the group's reopen
-/// hold (`GroupCheckpoints::reopen_hold`, or its default): a smaller one
-/// may let go of events the run held, a larger one may hold events the
-/// run let go.
+/// [`recover`], with every range a later checkpoint closed, in journal
+/// order: the journal's first range is [`PrefixTracker::first_range`],
+/// the current one [`PrefixTracker::range`], and those between are the
+/// list (A9 section 6, replay from a middle range). A recovered journal
+/// is durable throughout, so each keeps its complete prefix only. The
+/// list is allocated here, from what the journal holds.
 ///
 /// # Errors
 ///
-/// The journal's read errors, and [`JournalError::InvalidConfig`] for a
-/// hold that cannot be allocated.
-///
-/// [`JournalError::InvalidConfig`]: super::journal::JournalError::InvalidConfig
-pub fn recover_with_hold<D: crate::disk::Disk>(
+/// [`recover`]'s, and
+/// [`JournalError::Allocation`](super::journal::JournalError::Allocation)
+/// for a list that cannot be allocated.
+pub fn recover_ranges<D: crate::disk::Disk>(
     journal: &mut super::journal::GroupJournal<D>,
     coverage: &impl Coverage,
     capacity: usize,
-    hold: usize,
+) -> Result<(Recovery, Vec<ClosedRange>), super::journal::JournalError> {
+    let mut closed = Vec::new();
+    let recovery = recover_with(journal, coverage, capacity, |range| {
+        closed
+            .try_reserve(1)
+            .map_err(|_| super::journal::JournalError::Allocation)?;
+        closed.push(range);
+        Ok(())
+    })?;
+    Ok((recovery, closed))
+}
+
+/// A range between two others, as recovery leaves it: from its opening
+/// checkpoint to its complete prefix's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedRange {
+    /// The checkpoint that opened it.
+    pub start: RangeStart,
+    /// Its final `complete_recording_seq`; after recovery its durable
+    /// prefix is the same.
+    pub complete: u64,
+    /// The journal position after its last complete event.
+    pub complete_end: u64,
+}
+
+/// [`recover`], calling `closed` with each middle range as a later
+/// checkpoint closes it.
+fn recover_with<D: crate::disk::Disk>(
+    journal: &mut super::journal::GroupJournal<D>,
+    coverage: &impl Coverage,
+    capacity: usize,
+    mut closed: impl FnMut(ClosedRange) -> Result<(), super::journal::JournalError>,
 ) -> Result<Recovery, super::journal::JournalError> {
-    let mut tracker = PrefixTracker::new(capacity);
-    tracker
-        .reserve_reopen_hold(hold)
-        .map_err(|_| super::journal::JournalError::InvalidConfig)?;
+    // The reopening window is exactly the header's (A9), as the run's
+    // was, whatever `capacity` the reader gives: that sizes the queues.
+    let allocation = |_| super::journal::JournalError::Allocation;
+    // A journal without a header holds no event: no window.
+    let recorded = journal.reopen_hold()?.unwrap_or(0);
+    let hold = usize::try_from(recorded).map_err(|_| super::journal::JournalError::Allocation)?;
+    let mut tracker = PrefixTracker::try_new(capacity).map_err(allocation)?;
+    tracker.reserve_reopen_hold(hold).map_err(allocation)?;
     let mut last_seen = 0u64;
     let mut full = false;
     let durable = journal.durable();
+    // The current range as last seen: when another opens, it is closed.
+    let mut current = (tracker.range().start, 0u64, 0u64);
+    let mut failed = None;
+    let mut watch = |tracker: &PrefixTracker| {
+        let start = tracker.range().start;
+        if start != current.0
+            && let Some(previous) = current.0
+            && failed.is_none()
+            && let Err(error) = closed(ClosedRange {
+                start: previous,
+                complete: current.1,
+                complete_end: current.2,
+            })
+        {
+            failed = Some(error);
+        }
+        current = (
+            start,
+            tracker.complete_recording_seq(),
+            tracker.complete_end(),
+        );
+    };
     journal.walk(0, |_, end, record| {
         if let super::record::Role::Event(seq) | super::record::Role::Uncaptured(seq) =
             record.role()
@@ -994,13 +1080,21 @@ pub fn recover_with_hold<D: crate::disk::Disk>(
             full = true;
             return true;
         }
-        if matches!(record, GroupRecord::End(_)) {
+        // After an event's end, and after a checkpoint record: the run
+        // advances between records, so a checkpoint opens its range
+        // before a later one can take its place.
+        if matches!(record, GroupRecord::End(_) | GroupRecord::Checkpoint(_)) {
             let _ = tracker.advance(end, durable.min(end), coverage);
         }
+        watch(&tracker);
         true
     })?;
     let written = journal.written();
     let _ = tracker.advance(written, durable, coverage);
+    watch(&tracker);
+    if let Some(error) = failed {
+        return Err(error);
+    }
     Ok(Recovery {
         tracker,
         last_seen,

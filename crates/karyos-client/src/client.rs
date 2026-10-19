@@ -294,8 +294,29 @@ pub struct ImageChange {
     pub image_id: u64,
     /// Its session.
     pub session_id: i32,
+    /// Its lane.
+    pub lane: karyos_sys::frame::Lane,
     /// Attached (`true`) or retired (`false`).
     pub available: bool,
+}
+
+impl ImageChange {
+    /// A change of image `image_id` of session `session_id` on `lane`:
+    /// for sources other than a client's, and tests.
+    #[must_use]
+    pub const fn new(
+        image_id: u64,
+        session_id: i32,
+        lane: karyos_sys::frame::Lane,
+        available: bool,
+    ) -> Self {
+        Self {
+            image_id,
+            session_id,
+            lane,
+            available,
+        }
+    }
 }
 
 /// An image's poll that reported more than deliveries.
@@ -304,6 +325,8 @@ pub struct ImageChange {
 pub struct ImageStop {
     /// The image's session id, for a network subscription.
     pub session_id: Option<i32>,
+    /// The image's lane, for a network subscription.
+    pub lane: Option<karyos_sys::frame::Lane>,
     /// Its poll's summary.
     pub summary: PollSummary,
 }
@@ -690,6 +713,8 @@ struct InboxState<T: TermBytes> {
 struct Image<T: TermBytes> {
     id: u64,
     session_id: i32,
+    /// Its lane, read when it was attached.
+    lane: karyos_sys::frame::Lane,
     subscription: ClientSubscription<T>,
 }
 
@@ -1186,9 +1211,19 @@ impl<C: Connection> Client<C> {
         match self.connection.subscription(completion.outcome) {
             Ok(subscription) => {
                 slot.attached = true;
+                // A subscription just attached is open, so it names its
+                // lane; one that does not is refused as a failed attach,
+                // never given a lane it does not read.
+                let Some(lane) = subscription.lane() else {
+                    let _ = self.connection.release_subscription(subscription);
+                    network.slots.retain(|slot| slot.id != attach.sequence);
+                    inbox.update(|state| bump(&mut state.refused));
+                    return;
+                };
                 let image = Image {
                     id: slot.id,
                     session_id: slot.session_id,
+                    lane,
                     subscription,
                 };
                 inbox.update(|state| state.arrived.push(image));
@@ -1465,6 +1500,7 @@ impl<T: TermBytes> Subscription<T> {
                     delivered: summary.delivered,
                     stopped: stopped(&summary).then_some(ImageStop {
                         session_id: None,
+                        lane: None,
                         summary,
                     }),
                 }),
@@ -1504,6 +1540,7 @@ impl<T: TermBytes> Subscription<T> {
                     delivered: summary.delivered,
                     stopped: stopped(&summary).then_some(ImageStop {
                         session_id: None,
+                        lane: None,
                         summary,
                     }),
                 }),
@@ -1548,6 +1585,7 @@ impl<T: TermBytes> Images<T> {
             changes.push_back(ImageChange {
                 image_id: image.id,
                 session_id: image.session_id,
+                lane: image.lane,
                 available,
             });
         }
@@ -1694,6 +1732,7 @@ impl<T: TermBytes> Images<T> {
             };
             let Some(Image {
                 session_id,
+                lane,
                 subscription: image,
                 ..
             }) = self.images.get_mut(index)
@@ -1713,6 +1752,7 @@ impl<T: TermBytes> Images<T> {
                     if result.stopped.is_none() && stopped(&summary) {
                         result.stopped = Some(ImageStop {
                             session_id: Some(*session_id),
+                            lane: Some(*lane),
                             summary,
                         });
                     }
@@ -1770,6 +1810,7 @@ mod tests {
         Image {
             id,
             session_id: session,
+            lane: Lane::ZERO,
             subscription,
         }
     }

@@ -323,14 +323,28 @@ pub enum GatewayError {
     /// An external value over `MAX_INLINE` under strict capture.
     #[error("value too large: {0} bytes")]
     TooLarge(usize),
-    /// A second source of the same stream and session: replay names a
-    /// source by its stream and session, so each pair is added once.
-    #[error("stream {stream_id} session {session_id} already has a source")]
+    /// A second source of the same stream, session and lane, or of a
+    /// network subscription's stream: replay names a source by its
+    /// stream, session and lane (a network subscription by its stream),
+    /// so each is added once.
+    #[error("stream {stream_id} session {session_id} lane {lane:?} already has a source")]
     DuplicateSource {
         /// The stream.
         stream_id: i32,
         /// The session.
         session_id: i32,
+        /// The lane.
+        lane: karyos_sys::frame::Lane,
+    },
+    /// A source added under an identity whose lane is not the one it
+    /// reads: its messages would be recorded, and replayed, under another
+    /// source's key.
+    #[error("the identity names lane {named:?}, the source reads lane {read:?}")]
+    WrongLane {
+        /// The identity's lane.
+        named: karyos_sys::frame::Lane,
+        /// The source's.
+        read: karyos_sys::frame::Lane,
     },
 }
 

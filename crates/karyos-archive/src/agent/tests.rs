@@ -2443,6 +2443,455 @@ mod checkpoints {
         out
     }
 
+    /// A group whose checkpoints keep `hold` events, `in_flight` events
+    /// in flight.
+    fn holding(
+        dir: &Path,
+        capture: Option<Capture>,
+        in_flight: usize,
+        hold: Option<usize>,
+    ) -> StartGroup {
+        StartGroup {
+            checkpoints: Some(GroupCheckpoints {
+                max_checkpoint: 300_000,
+                reopen_hold: hold,
+            }),
+            ..start(
+                dir,
+                capture,
+                SyncPolicy::Every { interval_ns: 0 },
+                in_flight,
+            )
+        }
+    }
+
+    /// The shrink scenario of the #426 re-check: a best-effort group with
+    /// room for 2 in flight and a hold of 8; event 1, gap 2, a checkpoint
+    /// at 2 written 1 byte a cycle while events 3 to 8 end. The range
+    /// opens over them: durable to 8. Returns the directory.
+    fn reopened_over_six(name: &str) -> PathBuf {
+        let dir = dirs(name);
+        let slow = AgentConfig {
+            checkpoint_budget: 1,
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, slow).unwrap();
+        let mut sender = agent
+            .start_group(holding(&dir, Some(Capture::BestEffort), 2, Some(8)))
+            .unwrap();
+        let mut handle = sender.take_checkpoints().unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        sender.room().unwrap();
+        sender.send(&gap(2), 2).unwrap();
+        handle
+            .checkpoint(2, 7, |buffer| {
+                buffer[..20_000].fill(5);
+                20_000
+            })
+            .unwrap();
+        for seq in 3..=8 {
+            admitted(&sender);
+            sender.send(&event(seq), seq).unwrap();
+        }
+        assert!(matches!(ended(&mut handle), LastCheckpoint::Recorded(_)));
+        assert_eq!(
+            sender.waiter().wait_durable(8, Duration::from_secs(10)),
+            Ok(8)
+        );
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        dir
+    }
+
+    /// Every file under `dir` with its length.
+    fn files(dir: &Path) -> Vec<(PathBuf, u64)> {
+        let mut files: Vec<_> = walk(dir)
+            .into_iter()
+            .map(|path| {
+                let length = std::fs::metadata(dir.join(&path)).unwrap().len();
+                (path, length)
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A9-5: the reopen hold is the journal header's, fixed per group. A
+    /// restart with the same settings, with no hold named, or with a
+    /// lower `in_flight` recovers the range at 8; one naming a smaller or
+    /// larger hold, or an `in_flight` above the recorded hold, is
+    /// refused, typed, and writes nothing.
+    #[test]
+    fn a_restart_takes_the_recorded_hold() {
+        let dir = reopened_over_six("checkpoint-hold-recorded");
+        let refused = |start: StartGroup, what: &str| {
+            let before = files(&dir);
+            let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+            assert!(
+                matches!(agent.start_group(start), Err(AgentError::CheckpointConfig)),
+                "{what}"
+            );
+            agent.shutdown().unwrap();
+            assert_eq!(files(&dir), before, "{what}: something was written");
+        };
+        refused(holding(&dir, None, 2, Some(4)), "a smaller hold");
+        refused(holding(&dir, None, 2, Some(16)), "a larger hold");
+        refused(holding(&dir, None, 9, None), "in_flight above the hold");
+        refused(
+            StartGroup {
+                checkpoints: None,
+                ..holding(&dir, None, 2, None)
+            },
+            "checkpoints off",
+        );
+        for (what, start) in [
+            ("the same settings", holding(&dir, None, 2, Some(8))),
+            ("no hold named", holding(&dir, None, 2, None)),
+            ("a lower in_flight", holding(&dir, None, 1, None)),
+            // The effective window, max(4, 8), is the recorded 8.
+            ("a hold below in_flight", holding(&dir, None, 8, Some(4))),
+        ] {
+            let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+            let recovered = agent.start_group(start).unwrap();
+            assert_eq!(recovered.view().durable_group_seq(), 8, "{what}");
+            agent.stop_group(GROUP).unwrap();
+            agent.shutdown().unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 review P3: a journal whose header was never written. A restart
+    /// is refused, typed, before the store is touched; started as new, the
+    /// group writes its header into it and runs.
+    #[test]
+    fn a_headerless_journal_is_started_as_new() {
+        let dir = dirs("checkpoint-headerless");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let config = journal_config(policy);
+        let geometry =
+            crate::segment::Geometry::new(config.segment_length, u64::from(config.segment_length))
+                .unwrap();
+        let store = crate::segment::SegmentStore::create(
+            StdDisk,
+            &dir.join("groups"),
+            GROUP,
+            geometry,
+            policy,
+            0,
+        )
+        .unwrap();
+        drop(store);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let before = files(&dir);
+        assert!(matches!(
+            agent.start_group(start_with(&dir, None, policy)),
+            Err(AgentError::NoHeader { id: GROUP })
+        ));
+        assert_eq!(files(&dir), before, "the store was touched");
+        let mut sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        assert_eq!(sender.state(), GroupState::Running);
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(1, Duration::from_secs(10)),
+            Ok(1)
+        );
+        agent.stop_group(GROUP).unwrap();
+        // Its header now there, starting it as new again is refused.
+        assert!(
+            agent
+                .start_group(start_with(&dir, Some(Capture::Strict), policy))
+                .is_err()
+        );
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A journal of group `GROUP` in `dir` whose header was never written.
+    fn headerless(dir: &Path, policy: SyncPolicy) {
+        let config = journal_config(policy);
+        let geometry =
+            crate::segment::Geometry::new(config.segment_length, u64::from(config.segment_length))
+                .unwrap();
+        drop(
+            crate::segment::SegmentStore::create(
+                StdDisk,
+                &dir.join("groups"),
+                GROUP,
+                geometry,
+                policy,
+                0,
+            )
+            .unwrap(),
+        );
+    }
+
+    /// #437 re-check t1: the crash after the journal and the store were
+    /// made, before the header: started as new, the empty store is opened
+    /// as a restart opens one, and the group runs; restarted, it recovers.
+    #[test]
+    fn a_takeover_opens_the_store_the_crash_left() {
+        let dir = dirs("checkpoint-takeover-store");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        headerless(&dir, policy);
+        drop(
+            crate::group::checkpoint::CheckpointStore::create(
+                StdDisk,
+                &store_dir(&dir.join("groups")),
+                GROUP,
+                journal_config(policy),
+            )
+            .unwrap(),
+        );
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let mut sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        assert_eq!(
+            sender.waiter().wait_durable(1, Duration::from_secs(10)),
+            Ok(1)
+        );
+        agent.stop_group(GROUP).unwrap();
+        let restarted = agent.start_group(start_with(&dir, None, policy)).unwrap();
+        assert_eq!(restarted.view().durable_group_seq(), 1);
+        agent.stop_group(GROUP).unwrap();
+        // Mtake: a journal with its header is not taken over.
+        assert!(matches!(
+            agent.start_group(start_with(&dir, Some(Capture::Strict), policy)),
+            Err(AgentError::Journal(JournalError::Segment(
+                SegmentError::Exists { .. }
+            )))
+        ));
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 re-check Morder: the header is written only once the store is
+    /// open. A takeover whose store cannot be opened leaves the journal
+    /// as it was, headerless, and fails.
+    #[test]
+    fn a_takeover_whose_store_fails_writes_no_header() {
+        let dir = dirs("checkpoint-takeover-store-fails");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        headerless(&dir, policy);
+        // The store's directory is a file: the store cannot be opened.
+        let stores = store_dir(&dir.join("groups"));
+        std::fs::remove_dir_all(&stores).unwrap();
+        std::fs::write(&stores, b"not a directory").unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let before = files(&dir);
+        assert!(
+            agent
+                .start_group(start_with(&dir, Some(Capture::Strict), policy))
+                .is_err()
+        );
+        assert_eq!(files(&dir), before, "the journal changed");
+        agent.shutdown().unwrap();
+        let plan =
+            GroupJournal::verify(StdDisk, &dir.join("groups"), GROUP, journal_config(policy))
+                .unwrap();
+        assert_eq!(
+            plan.kept.map(|kept| kept.written),
+            Some(0),
+            "still headerless"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 re-check t2: a journal durable to 8 whose header is damaged:
+    /// recovery cuts it all. Neither a restart nor a new start takes it;
+    /// both are refused as a cut header, and nothing is written.
+    #[test]
+    fn a_cut_header_is_refused_both_ways() {
+        let dir = reopened_over_six("checkpoint-header-cut");
+        let segment = walk(&dir)
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+            .unwrap();
+        let path = dir.join(segment);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Inside the header record, past its frame: its checksum fails.
+        bytes[40] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        // Every refusal, the first too, leaves the journal byte for byte
+        // as it was: nothing is cut, and the operator may copy it.
+        let before = std::fs::read(&path).unwrap();
+        let tree = files(&dir);
+        for start in [
+            holding(&dir, None, 2, Some(8)),
+            holding(&dir, Some(Capture::BestEffort), 2, Some(8)),
+            holding(&dir, None, 2, Some(8)),
+        ] {
+            let refused = agent.start_group(start);
+            assert!(
+                matches!(refused, Err(AgentError::HeaderCut { id: GROUP, .. })),
+                "{refused:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "the journal changed");
+            assert_eq!(files(&dir), tree, "a refusal wrote");
+        }
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 re-check: a crash while the header was written tears that one
+    /// write, with nothing after it. A restart finds no header (typed);
+    /// a new start takes the journal over, as never written.
+    #[test]
+    fn a_torn_header_alone_is_taken_over() {
+        let dir = dirs("checkpoint-torn-header");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let header = crate::group::record::JournalHeader {
+            group_id: GROUP,
+            first_group_seq: 1,
+            inline_threshold: 4096,
+            contract_version: crate::group::record::CONTRACT_VERSION,
+            clock: crate::group::record::Clock::HostMonotonic,
+            capture: Capture::Strict,
+            reopen_hold: 0,
+            manifest: b"m",
+        };
+        let journal = GroupJournal::create(
+            StdDisk,
+            &dir.join("groups"),
+            &header,
+            journal_config(policy),
+        )
+        .unwrap();
+        let _ = journal.close().unwrap();
+        let segment = walk(&dir)
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+            .unwrap();
+        let path = dir.join(segment);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[20] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        assert!(matches!(
+            agent.start_group(start_with(&dir, None, policy)),
+            Err(AgentError::NoHeader { id: GROUP })
+        ));
+        let sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        assert_eq!(sender.state(), GroupState::Running);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 review M6: a hold below `in_flight` is recorded as `in_flight`.
+    #[test]
+    fn a_hold_below_in_flight_is_recorded_as_in_flight() {
+        let dir = dirs("checkpoint-hold-recorded-in-flight");
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let sender = agent
+            .start_group(holding(&dir, Some(Capture::Strict), 4, Some(1)))
+            .unwrap();
+        drop(sender);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let mut journal =
+            GroupJournal::recover(StdDisk, &dir.join("groups"), GROUP, journal_config(policy))
+                .unwrap()
+                .journal;
+        assert_eq!(journal.reopen_hold().unwrap(), Some(4));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #437 review P3: the default hold is computed only when the group is
+    /// made: a restart naming no hold, with an `in_flight` whose default
+    /// would pass the cap, takes the recorded hold.
+    #[test]
+    fn a_restart_computes_no_default_hold() {
+        let dir = dirs("checkpoint-hold-no-default");
+        let in_flight = MAX_REOPEN_HOLD / 4 + 1;
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let sender = agent
+            .start_group(holding(
+                &dir,
+                Some(Capture::Strict),
+                in_flight,
+                Some(MAX_REOPEN_HOLD),
+            ))
+            .unwrap();
+        drop(sender);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let recovered = agent
+            .start_group(holding(&dir, None, in_flight, None))
+            .unwrap();
+        assert_eq!(recovered.state(), GroupState::Running);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A9-5: a group made without checkpoints records a hold of 0, and a
+    /// restart with checkpoints is refused, typed.
+    #[test]
+    fn checkpoints_cannot_be_turned_on_at_a_restart() {
+        let dir = dirs("checkpoint-hold-off-on");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let without = StartGroup {
+            checkpoints: None,
+            ..start_with(&dir, Some(Capture::Strict), policy)
+        };
+        let mut sender = agent.start_group(without).unwrap();
+        sender.admit().unwrap();
+        sender.send(&event(1), 1).unwrap();
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        assert!(matches!(
+            agent.start_group(start_with(&dir, None, policy)),
+            Err(AgentError::CheckpointConfig)
+        ));
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #426 re-check P2 (pre-existing): an `in_flight` above
+    /// `MAX_IN_FLIGHT` is refused, typed, and the agent keeps running.
+    #[test]
+    fn a_huge_in_flight_is_refused_and_the_agent_survives() {
+        let dir = dirs("checkpoint-huge-in-flight");
+        let policy = SyncPolicy::Every { interval_ns: 0 };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        for in_flight in [1 << 60, crate::group::capture::MAX_IN_FLIGHT + 1] {
+            let huge = StartGroup {
+                checkpoints: None,
+                ..start(&dir, Some(Capture::Strict), policy, in_flight)
+            };
+            assert!(
+                matches!(
+                    agent.start_group(huge),
+                    Err(AgentError::Capture(
+                        crate::group::capture::CaptureError::InFlight
+                    ))
+                ),
+                "{in_flight}"
+            );
+        }
+        let sender = agent
+            .start_group(start_with(&dir, Some(Capture::Strict), policy))
+            .unwrap();
+        assert_eq!(sender.state(), GroupState::Running);
+        agent.stop_group(GROUP).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// #426 re-check P2: a reopen hold too large to allocate is refused,
     /// typed, before the journal exists; the agent keeps running and
     /// starts the group with a hold it can take.

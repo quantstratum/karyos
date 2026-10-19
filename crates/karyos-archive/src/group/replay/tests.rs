@@ -55,6 +55,7 @@ fn header(capture: Capture) -> JournalHeader<'static> {
         contract_version: CONTRACT_VERSION,
         clock: Clock::HostMonotonic,
         capture,
+        reopen_hold: 0,
         manifest: MANIFEST,
     }
 }
@@ -602,6 +603,7 @@ fn a_capture_journal_takes_what_the_replay_gives() {
         .unwrap();
     // The capture's header names the replaying caller's manifest.
     let mut wanted = vec![encode(&GroupRecord::Header(JournalHeader {
+        reopen_hold: 0,
         manifest: b"build 2",
         ..header
     }))];
