@@ -232,3 +232,27 @@ fn a_repeated_error_is_shown_with_its_current_count() {
     // One record, delivered once, nothing lost.
     assert_eq!((errors.delivered, errors.overwritten), (1, 0));
 }
+
+/// M8: the exporter renders an attached driver's view, its own pid cell
+/// among the driver counters as a gauge, and the attach as a gauge of 1.
+#[test]
+fn the_exporter_renders_an_attached_driver() {
+    let _serial = serial();
+    let dir = dir("exporter");
+    let mut driver = driver(&dir, DriverConfig::default(), 4);
+    sampled(&mut driver);
+    let mut agent = agent(&[&dir]);
+    refresh_serving(&mut driver, &mut agent);
+    let text = karyos_agent::exporter::render(&agent.view());
+    let driver_label = format!("driver=\"{}\"", dir.display());
+    assert!(
+        text.contains(&format!("karyos_driver_attached{{{driver_label}}} 1\n")),
+        "{text}"
+    );
+    assert!(text.contains("# TYPE karyos_events_total counter\n"));
+    let pid = format!(
+        "karyos_gauge{{{driver_label},source=\"driver\",name=\"driver pid\",stream=\"0\",lane=\"0\",kind=\"0\",participant=\"0\"}} {}\n",
+        std::process::id()
+    );
+    assert!(text.contains(&pid), "{text}");
+}
