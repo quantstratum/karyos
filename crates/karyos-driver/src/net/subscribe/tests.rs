@@ -1569,6 +1569,25 @@ fn responses(
     out
 }
 
+/// Every message the driver broadcast that `observer` has not read, as
+/// text: responses and events (a closed image's `PublicationClosed`).
+fn broadcast(observer: &mut karyos_sys::broadcast::BroadcastReceiver) -> Vec<String> {
+    let mut out = Vec::new();
+    while let karyos_sys::broadcast::Received::Message {
+        type_id, payload, ..
+    } = observer.receive()
+    {
+        if let Ok(response) = karyos_protocol::cnc::Response::decode(type_id, payload) {
+            out.push(format!("{response:?}"));
+        } else if let Ok(event) = karyos_protocol::cnc::Event::decode(type_id, payload) {
+            out.push(format!("{event:?}"));
+        } else {
+            out.push(format!("type {type_id:#x}"));
+        }
+    }
+    out
+}
+
 /// Binding commands to images (`quantstratum-docs:
 /// karyos/design/per-source-images.md`, D2-2 and D2-3): with two images
 /// of one alias, `AddSubscription` by the alias grants the oldest and
@@ -1654,12 +1673,17 @@ fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
         .iter()
         .map(|grant| grant.stream)
         .collect();
+    // What the driver said while the commands ran (a closed image names
+    // its reason there) and the images still live: if the alias missed the
+    // oldest, these say why (the test has failed so, rarely, under load).
+    let said = broadcast(&mut observer);
     assert_eq!(
         streams,
         [oldest.registration(), newest.registration()],
-        "the alias reaches the oldest, the registration its image"
+        "the alias reaches the oldest, the registration its image; live after the \
+         commands: {:?}; the driver said: {said:?}",
+        live(&b)
     );
-    let _ = responses(&mut observer);
     // None of these is an image's live lane.
     let refused = [
         (3, local.registration(), 0),
