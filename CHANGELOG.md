@@ -394,6 +394,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The Prometheus exporter (phase 5, M8; ADR-0055; SPEC.md §11
+  `karyos-exporter`; owner item 51, interim 4). `karyos_agent::exporter`
+  renders an `AgentView` in the Prometheus text format (0.0.4): the CnC
+  cells by type (events and spin time as counters, gauges, positions and
+  timestamps as gauges), lane positions, headroom and subscriber lag, ring
+  read and overwrite counts, error occurrences by code, and the trace
+  window's latency quantile bounds and counts. It answers `GET /metrics`
+  only, on a loopback address only, at most 16 connections per poll, with
+  100 ms I/O timeouts. The `karyos-exporter` binary, in karyos-agent, runs
+  it as its own process: `--listen ADDRESS:PORT --driver DIR...
+  [--refresh-ms MS]`; a non-loopback address is refused. No TLS, no
+  authentication and no new dependency. It exports M9's alerts as
+  `karyos_alerts_firing` per driver and each alert's `karyos_alert_value`
+  and `karyos_alert_since_ns`, and takes one of each driver's tool slots
+  while attached.
+
 - Alerts in the management agent (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M9). `AlertRules`
   (`AgentConfig::with_alerts`; `karyos-agent --lag-bytes --lag-refreshes
