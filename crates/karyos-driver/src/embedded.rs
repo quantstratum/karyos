@@ -1250,6 +1250,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
             return Err(DriverError::InvalidConfig);
         }
+        counters.set(Event::DriverPid, u64::from(std::process::id()));
+        counters.set(
+            Event::DriverStartedAt,
+            karyos_sys::host_clock::host_monotonic_ns(),
+        );
         let id = NEXT_DRIVER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| DriverError::DriverIdsExhausted)?;
@@ -1479,9 +1484,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Runs a positions sampling pass when `position_sample_interval` has
-    /// elapsed (`quantstratum-docs: karyos/design/observability-and-tools.md`).
+    /// elapsed (`quantstratum-docs: karyos/design/observability-and-tools.md`),
+    /// then records `now` as the end of this duty cycle.
     fn sample_positions(&mut self) {
         let now = karyos_sys::host_clock::host_monotonic_ns();
+        self.counters.set(Event::ConductorDutyAt, now);
         if self
             .positions
             .due(now, self.config.position_sample_interval)
