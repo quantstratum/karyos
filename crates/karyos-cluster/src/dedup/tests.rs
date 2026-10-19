@@ -369,3 +369,127 @@ fn replicas_applying_the_same_entries_hold_the_same_table() {
     }
     assert_eq!(replicas[0], replicas[1]);
 }
+
+// The sessions section (C7/C8 glue).
+
+/// A table after registrations, replies (one too large), an
+/// acknowledgement, a close and an expiry.
+fn worked() -> SessionTable {
+    let mut table = table();
+    table.register(7, 1, 0).unwrap();
+    table.register(8, 2, 0).unwrap();
+    table.register(9, 3, 0).unwrap();
+    run(&mut table, Request::new(7, 1, 0, 0), 1, b"a");
+    run(&mut table, Request::new(7, 1, 1, 0), 2, b"bb");
+    let _ = table.request(Request::new(7, 1, 2, 1), 3, |_| None);
+    run(&mut table, Request::new(8, 2, 0, 0), 4, b"cc");
+    assert!(table.close(8, 2, 5));
+    run(&mut table, Request::new(7, 1, 3, 1), 95, b"d");
+    // A retry at 101 renews client 7 and expires client 9 (active at 0).
+    run(&mut table, Request::new(7, 1, 3, 1), 101, b"x");
+    assert_eq!(table.live_sessions(), 1);
+    table
+}
+
+#[test]
+fn a_decoded_table_encodes_the_same() {
+    let table = worked();
+    let bytes = table.encode();
+    let decoded = SessionTable::decode(&bytes).unwrap();
+    assert_eq!(decoded.encode(), bytes);
+    assert_eq!(decoded.config(), table.config());
+    assert_eq!(decoded.log_time(), 101);
+    // Client 7's window, [1, 4): two replies and one too large.
+    let mut probe = SessionTable::decode(&bytes).unwrap();
+    for (sequence, expected) in [
+        (1, Outcome::Retained(b"bb")),
+        (2, Outcome::ReplyTooLarge),
+        (3, Outcome::Retained(b"d")),
+        (0, Outcome::Duplicate),
+    ] {
+        let (outcome, runs) = run(&mut probe, Request::new(7, 1, sequence, 1), 102, b"no");
+        assert_eq!((outcome, runs), (expected, 0), "{sequence}");
+    }
+    assert_eq!(decoded.live_sessions(), table.live_sessions());
+    // An empty table too.
+    let empty = SessionTable::new(small()).unwrap();
+    assert_eq!(
+        SessionTable::decode(&empty.encode()).unwrap().encode(),
+        empty.encode()
+    );
+}
+
+#[test]
+fn a_decoded_table_answers_as_the_live_one() {
+    let mut live = worked();
+    let mut decoded = SessionTable::decode(&live.encode()).unwrap();
+    // The last registration's index travels: a later one must pass it.
+    assert_eq!(
+        decoded.register(5, 3, 121),
+        Err(RegisterError::NotAfter { index: 3, last: 3 })
+    );
+    let _ = live.register(5, 3, 121);
+    let requests = [
+        (Request::new(7, 1, 1, 1), 121),
+        (Request::new(7, 1, 2, 1), 122),
+        (Request::new(7, 1, 3, 1), 123),
+        (Request::new(7, 1, 0, 0), 124),
+        (Request::new(7, 1, 4, 2), 125),
+        (Request::new(8, 2, 0, 0), 126),
+        (Request::new(9, 3, 0, 0), 127),
+    ];
+    for (request, time) in requests {
+        let (expected, ran) = run(&mut live, request, time, b"new");
+        let (got, ran_too) = run(&mut decoded, request, time, b"new");
+        assert_eq!((got, ran_too), (expected, ran), "{request:?}");
+    }
+    for (client, index) in [(10, 20), (11, 21)] {
+        assert_eq!(
+            decoded.register(client, index, 130),
+            live.register(client, index, 130)
+        );
+    }
+    assert_eq!(decoded.encode(), live.encode());
+}
+
+#[test]
+fn a_damaged_section_is_refused() {
+    let bytes = worked().encode();
+    for length in 0..bytes.len() {
+        assert!(SessionTable::decode(&bytes[..length]).is_err(), "{length}");
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert_eq!(SessionTable::decode(&longer), Err(DecodeError::Format));
+    let mut magic = bytes.clone();
+    magic[0] ^= 1;
+    assert_eq!(SessionTable::decode(&magic), Err(DecodeError::Format));
+}
+
+#[test]
+fn a_session_outside_the_bounds_is_refused() {
+    let mut table = table();
+    table.register(7, 1, 0).unwrap();
+    run(&mut table, Request::new(7, 1, 0, 0), 1, b"a");
+    let bytes = table.encode();
+    // The header is 49 bytes; the session's slot follows.
+    let slot_at = 49;
+    let mut far = bytes.clone();
+    far[slot_at..slot_at + 4].copy_from_slice(&9u32.to_le_bytes());
+    assert_eq!(
+        SessionTable::decode(&far),
+        Err(DecodeError::Session { slot: 9 })
+    );
+    // A window wider than the configuration: next past base + 3.
+    let next_at = slot_at + 4 + 8 * 4;
+    let mut wide = bytes.clone();
+    wide[next_at..next_at + 8].copy_from_slice(&9u64.to_le_bytes());
+    assert!(SessionTable::decode(&wide).is_err());
+    // A configuration of zero sessions.
+    let mut zero = bytes;
+    zero[8..12].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        SessionTable::decode(&zero),
+        Err(DecodeError::Config(ConfigError::Zero("sessions")))
+    );
+}

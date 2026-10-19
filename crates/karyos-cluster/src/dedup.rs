@@ -56,10 +56,55 @@
 //!   table returns its configuration at registration, so a client learns
 //!   the bounds it is held to.
 //!
-//! Snapshots (C8) carry the table; its encoding comes with them.
+//! - **Snapshots** (C8). [`SessionTable::encode`] writes the table as a
+//!   snapshot's sessions section ([`SESSIONS_VERSION`]), and
+//!   [`SessionTable::decode`] rebuilds it: the configuration, the log time,
+//!   the last registration's index, and every session live at the log time
+//!   with its slot, client, epoch, activity, window and retained replies.
+//!   A decoded table answers every later entry as the encoded one would,
+//!   and encodes to the same bytes. Little endian:
+//!
+//! | Field | Bytes |
+//! | --- | --- |
+//! | magic `KRDT`, version | 4, 4 |
+//! | sessions, window, response bytes, ttl | 4, 4, 4, 8 |
+//! | log time | 8 |
+//! | last registration: 1 and its index, or 0 and 0 | 1, 8 |
+//! | live sessions | 4 |
+//! | per session: slot, client, epoch, activity, base, next | 4, 8 × 5 |
+//! | per retained sequence from base to next: 1 and its length and bytes, or 2 for a reply too large | 1, 4, length |
+//!
+//! Decoding checks every bound: a slot past the table, a window past
+//! [`DedupConfig::window`], a reply past [`DedupConfig::response_bytes`],
+//! two sessions in one slot, a session not live at the log time, or bytes
+//! left over are [`DecodeError`].
 
 #[cfg(test)]
 mod tests;
+
+/// The sessions section's version.
+pub const SESSIONS_VERSION: u64 = 1;
+const SESSIONS_MAGIC: [u8; 4] = *b"KRDT";
+/// The encoding's own version, inside the section.
+const ENCODING_VERSION: u32 = 1;
+
+/// A sessions section that does not decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DecodeError {
+    /// Not this version's bytes, or bytes cut short or left over.
+    #[error("not a sessions section of this version")]
+    Format,
+    /// Its configuration cannot be held.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    /// A session breaks the table's bounds.
+    #[error("session at slot {slot} breaks the table's bounds")]
+    Session {
+        /// Its slot.
+        slot: u32,
+    },
+}
 
 /// The proposed sessions bound (design D3; interim, owner item 37).
 pub const DEFAULT_SESSIONS: u32 = 1024;
@@ -453,6 +498,146 @@ impl SessionTable {
         }
     }
 
+    /// The table as a snapshot's sessions section (see the module).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let (now, ttl) = (self.now, self.config.ttl);
+        let live: Vec<(usize, &Session)> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| alive(session, now, ttl))
+            .collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(&SESSIONS_MAGIC);
+        out.extend_from_slice(&ENCODING_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.config.sessions.to_le_bytes());
+        out.extend_from_slice(&self.config.window.to_le_bytes());
+        out.extend_from_slice(&self.config.response_bytes.to_le_bytes());
+        out.extend_from_slice(&self.config.ttl.to_le_bytes());
+        out.extend_from_slice(&self.now.to_le_bytes());
+        out.push(u8::from(self.registered.is_some()));
+        out.extend_from_slice(&self.registered.unwrap_or(0).to_le_bytes());
+        let count = u32::try_from(live.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for (slot, session) in live {
+            out.extend_from_slice(&u32::try_from(slot).unwrap_or(u32::MAX).to_le_bytes());
+            for field in [
+                session.client,
+                session.epoch,
+                session.activity,
+                session.base,
+                session.next,
+            ] {
+                out.extend_from_slice(&field.to_le_bytes());
+            }
+            let mut sequence = session.base;
+            while sequence < session.next {
+                match self.slot(slot, sequence) {
+                    Some((Stored::Reply(length), at)) => {
+                        out.push(1);
+                        out.extend_from_slice(&length.to_le_bytes());
+                        out.extend_from_slice(self.reply(at, length).unwrap_or_default());
+                    }
+                    _ => out.push(2),
+                }
+                let Some(after) = sequence.checked_add(1) else {
+                    break;
+                };
+                sequence = after;
+            }
+        }
+        out
+    }
+
+    /// The table a sessions section holds, allocated whole as
+    /// [`SessionTable::new`] does.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for bytes that are not a section this version
+    /// wrote, a configuration the table cannot hold, or a session outside
+    /// its bounds.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut input = Input(bytes);
+        if input.array::<4>()? != SESSIONS_MAGIC
+            || u32::from_le_bytes(input.array()?) != ENCODING_VERSION
+        {
+            return Err(DecodeError::Format);
+        }
+        let config = DedupConfig {
+            sessions: u32::from_le_bytes(input.array()?),
+            window: u32::from_le_bytes(input.array()?),
+            response_bytes: u32::from_le_bytes(input.array()?),
+            ttl: u64::from_le_bytes(input.array()?),
+        };
+        let mut table = Self::new(config)?;
+        table.now = u64::from_le_bytes(input.array()?);
+        let [flag] = input.array::<1>()?;
+        let registered = u64::from_le_bytes(input.array()?);
+        table.registered = match (flag, registered) {
+            (0, 0) => None,
+            (1, index) => Some(index),
+            _ => return Err(DecodeError::Format),
+        };
+        let count = u32::from_le_bytes(input.array()?);
+        let capacity = table.reply_capacity();
+        for _ in 0..count {
+            let slot = u32::from_le_bytes(input.array()?);
+            let broken = DecodeError::Session { slot };
+            let index = usize::try_from(slot).map_err(|_| broken)?;
+            let [client, epoch, activity, base, next] =
+                [(); 5].map(|()| input.array().map(u64::from_le_bytes));
+            let session = Session {
+                live: true,
+                client: client?,
+                epoch: epoch?,
+                activity: activity?,
+                base: base?,
+                next: next?,
+            };
+            let held = session.next.checked_sub(session.base).ok_or(broken)?;
+            if held > u64::from(config.window)
+                || !alive(&session, table.now, config.ttl)
+                || table.sessions.get(index).is_none_or(|taken| taken.live)
+            {
+                return Err(broken);
+            }
+            let mut sequence = session.base;
+            while sequence < session.next {
+                let (_, at) = table.slot(index, sequence).ok_or(broken)?;
+                let entry = table.stored_index(index, sequence).ok_or(broken)?;
+                let [kind] = input.array::<1>()?;
+                let value = match kind {
+                    1 => {
+                        let length = u32::from_le_bytes(input.array()?);
+                        let size = usize::try_from(length).map_err(|_| broken)?;
+                        if size > capacity {
+                            return Err(broken);
+                        }
+                        let bytes = input.take(size)?;
+                        let end = at.checked_add(size).ok_or(broken)?;
+                        table
+                            .replies
+                            .get_mut(at..end)
+                            .ok_or(broken)?
+                            .copy_from_slice(bytes);
+                        Stored::Reply(length)
+                    }
+                    2 => Stored::TooLarge,
+                    _ => return Err(DecodeError::Format),
+                };
+                *table.stored.get_mut(entry).ok_or(broken)? = value;
+                sequence = sequence.checked_add(1).ok_or(broken)?;
+            }
+            *table.sessions.get_mut(index).ok_or(broken)? = session;
+        }
+        if !input.0.is_empty() {
+            return Err(DecodeError::Format);
+        }
+        Ok(table)
+    }
+
     /// Moves log time to `event_time` if it is later.
     fn advance(&mut self, event_time: u64) {
         self.now = self.now.max(event_time);
@@ -489,6 +674,26 @@ impl SessionTable {
     fn reply(&self, at: usize, length: u32) -> Option<&[u8]> {
         let end = at.checked_add(usize::try_from(length).ok()?)?;
         self.replies.get(at..end)
+    }
+}
+
+/// Bytes being decoded.
+struct Input<'a>(&'a [u8]);
+
+impl<'a> Input<'a> {
+    fn take(&mut self, length: usize) -> Result<&'a [u8], DecodeError> {
+        if length > self.0.len() {
+            return Err(DecodeError::Format);
+        }
+        let (head, rest) = self.0.split_at(length);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        let (head, rest) = self.0.split_first_chunk::<N>().ok_or(DecodeError::Format)?;
+        self.0 = rest;
+        Ok(*head)
     }
 }
 
