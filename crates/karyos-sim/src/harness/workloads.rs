@@ -535,7 +535,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                     }),
                 };
                 let observation = if fenced {
-                    Observation::Fenced { fencing }
+                    let lease_end = match fencing {
+                        Fencing::Lease => lease.as_ref().and_then(|lease| lease.borrow().end()),
+                        Fencing::OperatorStop => None,
+                    };
+                    Observation::Fenced { fencing, lease_end }
                 } else {
                     Observation::PromotionRefused { fencing }
                 };

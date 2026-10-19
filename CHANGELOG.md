@@ -457,7 +457,9 @@ release may break APIs, wire formats and shared-memory layouts.
   a lower one. The reference fixture's leader is the lowest of its
   bootstrap peers, so a standby leads itself. New checks: `check::group`
   per group of servers, `check::standby` (no standby reply before a
-  promotion, no old-generation reply after it, every fed entry the
+  promotion, no primary reply at or after the fencing point (the lease's
+  end on the holder's clock, recorded with `Fenced`, or the operator's
+  stop), no old-generation reply after it, every fed entry the
   primary's, the verified prefix applied, the gap report bounded, no client
   going back a generation) and `check::across_promotion`, which leaves an
   old-generation answer above the verified position pending for C3.

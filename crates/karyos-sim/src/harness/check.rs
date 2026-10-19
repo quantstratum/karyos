@@ -24,7 +24,7 @@ use karyos_cluster::Entry;
 
 use super::core::{Applying, Change, Configuration, Release, Step};
 use super::node::{Breach, Observation, Op, Positions, Ret, ServiceModel};
-use super::standby::PromotionReport;
+use super::standby::{Fencing, PromotionReport};
 use crate::lin::{self, Event, History, HistoryError, Limit, Verdict};
 use crate::net::NodeId;
 
@@ -182,6 +182,16 @@ pub enum Violation {
     StandbyEffect {
         /// The server.
         node: NodeId,
+    },
+    /// A primary server released a reply at or after the fencing point:
+    /// its lease's end on its own clock, or after the operator's stop.
+    ReplyAfterFencing {
+        /// The server.
+        node: NodeId,
+        /// Its clock at the release.
+        at: u64,
+        /// The lease's end, for a lease.
+        lease_end: Option<u64>,
     },
     /// A server of an older generation replied after a promotion, past
     /// the fencing point.
@@ -885,6 +895,8 @@ pub fn of_servers(observations: &[Observation], nodes: &[NodeId]) -> Vec<Observa
 /// A standby's checks (P5-S2), its servers `standby`, every other server
 /// a primary one:
 ///
+/// - no primary server replies at or after the fencing point: its
+///   lease's end on its own clock, or the operator's stop;
 /// - no standby server replies before a promotion;
 /// - after a promotion, no server of an older generation replies;
 /// - every primary entry a standby applied is the one a primary server
@@ -913,14 +925,40 @@ pub fn standby(observations: &[Observation], standby: &[NodeId]) -> Result<(), V
             _ => {}
         }
     }
+    // A lease's fencing point is known only at the promotion, after the
+    // replies it bounds: take it first.
+    let lease_end = observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::Fenced {
+                lease_end: Some(end),
+                ..
+            } => Some(*end),
+            _ => None,
+        });
+    let mut stopped = false;
     let mut promoted: Option<u64> = None;
     let mut fed: BTreeMap<NodeId, BTreeSet<u64>> = BTreeMap::new();
     let mut accepted: BTreeMap<NodeId, u64> = BTreeMap::new();
     for observation in observations {
         match observation {
+            Observation::Fenced {
+                fencing: Fencing::OperatorStop,
+                ..
+            } => stopped = true,
             Observation::Reply {
-                node, generation, ..
+                node,
+                generation,
+                at,
+                ..
             } => {
+                if !standby.contains(node) && (stopped || lease_end.is_some_and(|end| *at >= end)) {
+                    return Err(Violation::ReplyAfterFencing {
+                        node: *node,
+                        at: *at,
+                        lease_end,
+                    });
+                }
                 if promoted.is_none() && standby.contains(node) {
                     return Err(Violation::StandbyEffect { node: *node });
                 }
@@ -949,6 +987,8 @@ pub fn standby(observations: &[Observation], standby: &[NodeId]) -> Result<(), V
                 let _ = fed.entry(*node).or_default().insert(*index);
             }
             Observation::Promoted { node, report } => {
+                // From the primary's first index: once snapshots purge a
+                // prefix (C8), the floor becomes the snapshot's index.
                 if let Some(verified) = report.verified {
                     let applied = fed.get(node);
                     if let Some(index) = (super::standby::PRIMARY_FIRST_INDEX..=verified)
@@ -1046,6 +1086,8 @@ pub fn across_promotion(
                 *count = count.saturating_add(1);
                 if lost {
                     let _ = alias.insert(*client, fresh);
+                    // Fresh ids start above every client's and grow by
+                    // one per unknown outcome, far below u32::MAX.
                     fresh = fresh.saturating_add(1);
                 } else {
                     let id = alias.get(client).copied().unwrap_or(*client);

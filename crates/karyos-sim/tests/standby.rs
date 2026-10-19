@@ -146,9 +146,13 @@ fn s2_an_operator_stop_then_a_promotion() {
         assert_eq!(node, STANDBY[0]);
         assert_eq!(report.generation, 2);
         assert!(report.verified <= report.learnt_commit);
-        assert!(outcome.observations.contains(&Observation::Fenced {
-            fencing: Fencing::OperatorStop
-        }));
+        assert!(outcome.observations.iter().any(|observation| matches!(
+            observation,
+            Observation::Fenced {
+                fencing: Fencing::OperatorStop,
+                lease_end: None
+            }
+        )));
         // The clients finished on the standby, in generation 2.
         assert!(
             outcome.observations.iter().any(|observation| matches!(
@@ -172,9 +176,13 @@ fn s3_a_lease_expiry_then_a_promotion_with_the_old_primary_alive() {
         );
         let (_, report) = promoted(&outcome).unwrap();
         assert_eq!(report.generation, 2, "seed {seed:#x}");
-        assert!(outcome.observations.contains(&Observation::Fenced {
-            fencing: Fencing::Lease
-        }));
+        assert!(outcome.observations.iter().any(|observation| matches!(
+            observation,
+            Observation::Fenced {
+                fencing: Fencing::Lease,
+                lease_end: Some(_)
+            }
+        )));
     }
 }
 
@@ -274,12 +282,17 @@ fn s7_a_restarted_standby_resumes_from_its_verified_position() {
 // Hand-built records: each standby check catches its violation.
 
 fn reply(node: NodeId, generation: u64) -> Observation {
+    reply_at(node, generation, 0)
+}
+
+fn reply_at(node: NodeId, generation: u64, at: u64) -> Observation {
     Observation::Reply {
         node,
         client: 9,
         index: 1,
         term: 1,
         generation,
+        at,
     }
 }
 
@@ -362,6 +375,50 @@ fn an_old_generation_reply_after_a_promotion_is_caught() {
         })
     );
     assert_eq!(check::standby(&record[..3], &STANDBY), Ok(()));
+}
+
+#[test]
+fn a_reply_at_or_after_the_fencing_point_is_caught() {
+    // The lease ended at 52 on the holder's clock; the promotion came
+    // later. A reply at 52 broke the lease, one at 51 did not.
+    let fenced = Observation::Fenced {
+        fencing: Fencing::Lease,
+        lease_end: Some(52),
+    };
+    let record = [
+        commit(0, 1),
+        reply_at(0, 1, 52),
+        fenced.clone(),
+        promotion(None, Some(1)),
+    ];
+    assert_eq!(
+        check::standby(&record, &STANDBY),
+        Err(Violation::ReplyAfterFencing {
+            node: 0,
+            at: 52,
+            lease_end: Some(52)
+        })
+    );
+    let before = [
+        commit(0, 1),
+        reply_at(0, 1, 51),
+        fenced,
+        promotion(None, Some(1)),
+    ];
+    assert_eq!(check::standby(&before, &STANDBY), Ok(()));
+    // After an operator stop, no primary reply at all.
+    let stopped = [
+        commit(0, 1),
+        Observation::Fenced {
+            fencing: Fencing::OperatorStop,
+            lease_end: None,
+        },
+        reply_at(0, 1, 0),
+    ];
+    assert!(matches!(
+        check::standby(&stopped, &STANDBY),
+        Err(Violation::ReplyAfterFencing { node: 0, .. })
+    ));
 }
 
 #[test]

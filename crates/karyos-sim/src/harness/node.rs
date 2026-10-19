@@ -311,6 +311,8 @@ pub enum Observation {
         term: u64,
         /// The server's generation.
         generation: u64,
+        /// The server's clock at the release.
+        at: u64,
     },
     /// A server crashed: its positions are gone until its restart.
     Crashed {
@@ -399,6 +401,9 @@ pub enum Observation {
     Fenced {
         /// How.
         fencing: Fencing,
+        /// For a lease, the end of the last one the holder renewed, on
+        /// the holder's clock: its fencing point.
+        lease_end: Option<u64>,
     },
     /// The harness refused a promotion: its fencing is not verified.
     PromotionRefused {
@@ -878,6 +883,7 @@ impl<C: ConsensusCore> ServerNode<C> {
                     index: entry.index,
                     term: entry.term,
                     generation: self.generation,
+                    at: self.now,
                 });
                 out.push((
                     command.client,

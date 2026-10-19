@@ -111,7 +111,10 @@ pub fn unwrap(bytes: &[u8]) -> Option<(u64, u64, &[u8])> {
 pub enum FeedFault {
     /// The payload's first byte flipped; the checksum is the original's.
     Corrupt,
-    /// The term raised by one; the checksum is the original's.
+    /// The term raised by one; the checksum is the original's. The
+    /// checksum covers the term, so the standby refuses it as
+    /// [`FeedRefusal::Checksum`]; [`FeedRefusal::Term`] is for a sender
+    /// whose own log diverged, which these scenarios do not build.
     Term,
     /// The entry left out of the send; the later ones still sent.
     Skip,
@@ -152,12 +155,19 @@ impl ExternalLease {
         }
     }
 
-    /// Whether the holder may act at `now`, on its own clock.
+    /// Whether the holder may act at `now`, on its own clock: before
+    /// [`ExternalLease::end`].
     #[must_use]
     pub fn held_at(&self, now: u64) -> bool {
-        self.renewed_at
-            .and_then(|at| at.checked_add(self.duration))
-            .is_some_and(|until| now < until)
+        self.end().is_some_and(|until| now < until)
+    }
+
+    /// The end of the last renewal, on the holder's clock: the fencing
+    /// point, from which the holder neither takes a command nor releases
+    /// a reply.
+    #[must_use]
+    pub fn end(&self) -> Option<u64> {
+        self.renewed_at.and_then(|at| at.checked_add(self.duration))
     }
 
     /// Whether the arbiter sees it expired at `now` on the base clock,
@@ -194,7 +204,9 @@ pub struct PromotionReport {
     /// interval is at least from `verified` to it.
     pub learnt_commit: Option<u64>,
     /// The requests known to be in flight, by client and sequence: their
-    /// outcome is unknown.
+    /// outcome is unknown. The harness stands in for the clients and
+    /// gateways that would report them (SPEC.md §9) and hands the list to
+    /// the standby, which echoes it; no check derives it.
     pub unknown: Vec<(NodeId, u64)>,
 }
 
