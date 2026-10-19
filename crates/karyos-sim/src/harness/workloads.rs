@@ -26,7 +26,7 @@ use karyos_archive::segment::{Geometry, SegmentError};
 use karyos_cluster::LogError;
 
 use super::check::{self, Violation};
-use super::core::ConsensusCore;
+use super::core::{Change, ConsensusCore};
 use super::node::{
     ClientNode, Member, Observation, Op, RETRY_AFTER, Recorder, Ret, ServerNode, ServiceModel,
     Shared, TestService, Wire,
@@ -102,6 +102,13 @@ pub enum Action {
     },
     /// Restores every link.
     Heal,
+    /// Starts a spare server ([`Case::spares`]) with an empty log, the
+    /// initial servers as its bootstrap peers: a member only once a
+    /// configuration entry makes it one.
+    Join(NodeId),
+    /// An operator's membership change, sent to every server that is up;
+    /// a core that does not lead refuses it.
+    Change(Change),
 }
 
 /// What a case expects of progress.
@@ -119,9 +126,13 @@ pub enum Progress {
 pub struct Case {
     /// Its name, for reports.
     pub name: String,
-    /// Servers, ids from 0.
+    /// Servers, ids from 0: the bootstrap voters.
     pub servers: usize,
-    /// Clients, ids after the servers, each sending to the leader.
+    /// Spare servers, ids after the servers: down, with empty disks, until
+    /// an [`Action::Join`] starts them.
+    pub spares: usize,
+    /// Clients, ids after the spares, each sending to the leader; the
+    /// operator that sends [`Action::Change`] follows them.
     pub clients: usize,
     /// Operations per client: appends, and a final read by client 0.
     pub operations: usize,
@@ -152,6 +163,8 @@ pub struct Case {
     pub quiet: u64,
     /// What it expects of progress.
     pub progress: Progress,
+    /// The promotion lag [`check::learner_caught_up`] holds a leader to.
+    pub promotion_lag: u64,
 }
 
 impl Case {
@@ -176,6 +189,8 @@ impl Case {
             steps: 600,
             quiet: QUIET,
             progress: Progress::Expected,
+            spares: 0,
+            promotion_lag: reference::PROMOTION_LAG,
         }
     }
 }
@@ -332,6 +347,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         ClusterSim::new("harness", seed, LinkConfig::default()).map_err(RunError::Link)?;
     let servers = u32::try_from(case.servers).map_err(|_| RunError::Count)?;
     let peers: Vec<NodeId> = (0..servers).collect();
+    let spares = u32::try_from(case.spares)
+        .ok()
+        .and_then(|spares| servers.checked_add(spares))
+        .ok_or(RunError::Count)?;
+    let everyone: Vec<NodeId> = (0..spares).collect();
     let first_failing = if case.failing_flushes.is_empty() {
         None
     } else {
@@ -342,7 +362,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                 .ok_or(RunError::Count)?,
         )
     };
-    for &id in &peers {
+    for &id in &everyone {
         let mut disk = SimDisk::new();
         if let Some(first) = first_failing
             && case.failing_flushes.contains(&id)
@@ -364,13 +384,17 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         let _ = sim
             .add_node(Member::Server(Box::new(server)), 0, drift)
             .map_err(RunError::Sim)?;
+        // A spare waits down, its log empty, for its join.
+        if id >= servers {
+            sim.crash(id).map_err(RunError::Node)?;
+        }
     }
     let leader = peers.first().copied().ok_or(RunError::Count)?;
     let mut clients = Vec::new();
     for index in 0..case.clients {
         let id = u32::try_from(index)
             .ok()
-            .and_then(|index| servers.checked_add(index))
+            .and_then(|index| spares.checked_add(index))
             .ok_or(RunError::Count)?;
         let client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
             .with_retry_after(case.retry_after);
@@ -379,8 +403,26 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .map_err(RunError::Sim)?;
         clients.push(added);
     }
-    for &from in &peers {
-        for &to in peers.iter().filter(|to| **to != from) {
+    // The operator, a client with no script, only where a change is
+    // scheduled, so a phase 4 case runs the nodes it always did.
+    let changes = case
+        .schedule
+        .iter()
+        .any(|(_, action)| matches!(action, Action::Change(_)));
+    let mut operator = None;
+    if changes {
+        let id = u32::try_from(case.clients)
+            .ok()
+            .and_then(|count| spares.checked_add(count))
+            .ok_or(RunError::Count)?;
+        let node = ClientNode::new(id, leader, Vec::new(), Rc::clone(&recorder));
+        operator = Some(
+            sim.add_node(Member::Client(node), 0, 0)
+                .map_err(RunError::Sim)?,
+        );
+    }
+    for &from in &everyone {
+        for &to in everyone.iter().filter(|to| **to != from) {
             sim.net_mut()
                 .configure(from, to, case.server_links)
                 .map_err(RunError::Link)?;
@@ -390,12 +432,13 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             max_delay: case.reply_delay,
             ..LinkConfig::default()
         };
-        for &client in &clients {
+        for &client in clients.iter().chain(&operator) {
             sim.net_mut()
                 .configure(from, client, replies)
                 .map_err(RunError::Link)?;
         }
     }
+    let mut joined: Vec<NodeId> = peers.clone();
     let mut schedule = case.schedule.clone();
     schedule.sort_by_key(|(step, _)| *step);
     let mut done = 0u64;
@@ -407,10 +450,31 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         match action {
             Action::Crash(id) => sim.crash(id).map_err(RunError::Node)?,
             Action::Restart(id) => sim.restart(id).map_err(RunError::Node)?,
-            Action::Isolate(id) => sim.net_mut().isolate(id, &peers),
+            Action::Isolate(id) => sim.net_mut().isolate(id, &everyone),
             Action::Cut { from, to } => sim.net_mut().cut(from, to),
             Action::Split { left, right } => sim.net_mut().split(&left, &right),
             Action::Heal => sim.net_mut().heal(),
+            Action::Join(id) => {
+                sim.restart(id).map_err(RunError::Node)?;
+                if !joined.contains(&id) {
+                    joined.push(id);
+                }
+            }
+            Action::Change(change) => {
+                // Present: this case schedules a change.
+                let operator = operator.ok_or(RunError::Count)?;
+                for &id in &everyone {
+                    if sim
+                        .node(id)
+                        .and_then(Member::server)
+                        .is_some_and(ServerNode::is_up)
+                    {
+                        let _ = sim
+                            .send(operator, id, Wire::Change(change))
+                            .map_err(RunError::Sim)?;
+                    }
+                }
+            }
         }
     }
     if let Some(steps) = case.steps.checked_sub(done).filter(|steps| *steps > 0) {
@@ -425,7 +489,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                 .is_some_and(|client| !client.done())
         })
         .count();
-    let up: Vec<(NodeId, &ServerNode<C>)> = peers
+    let up: Vec<(NodeId, &ServerNode<C>)> = joined
         .iter()
         .filter_map(|id| Some((*id, sim.node(*id).and_then(Member::server)?)))
         .filter(|(_, server)| server.is_up())
@@ -452,7 +516,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     // Every server that is not up, crashed or stopped by a drive error,
     // restarts before the checks, so what it held durably is verified
     // (`check::durable_kept`); then the quiet period runs.
-    let stopped: Vec<NodeId> = peers
+    let stopped: Vec<NodeId> = joined
         .iter()
         .copied()
         .filter(|id| {
@@ -472,7 +536,8 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     sim.run_for(case.quiet).map_err(RunError::Sim)?;
     let recorded = recorder.borrow();
     Ok(Outcome {
-        safety: check::all(&recorded.observations, &recorded.history, case.servers),
+        safety: check::all(&recorded.observations, &recorded.history, case.servers)
+            .and_then(|()| check::membership(&recorded.observations, case.promotion_lag)),
         liveness,
         observations: recorded.observations.clone(),
         history: recorded.history.clone(),

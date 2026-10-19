@@ -30,6 +30,13 @@
 //! apply completes when [`drive`] has applied a Ready's `committed`: the
 //! next [`ConsensusCore::ready`] call implies it.
 //!
+//! **Membership** (phase 5, ADR-0054; quantstratum-docs:
+//! karyos/design/phase-5-cluster-scenarios.md, H1). A core that changes
+//! its membership reports its [`Configuration`] and takes [`Change`]s
+//! through two provided methods; their defaults describe static
+//! membership, so a phase 4 core implements neither. The harness never
+//! decodes a configuration entry: it asks the core.
+//!
 //! **The log.** Every call gets a [`LogView`], a read-only view of C4's
 //! log (entries, terms, indices, the hard state), as raft-rs's `Storage`
 //! and openraft's log reader would read it; only [`drive`] writes the log.
@@ -192,6 +199,79 @@ pub trait ConsensusCore: Sized {
 
     /// The core's commit index.
     fn committed(&self) -> Option<u64>;
+
+    /// The configuration the core acts under, for a core that changes its
+    /// membership (phase 5, ADR-0054); `None`, the default, for one with
+    /// static membership.
+    fn configuration(&self) -> Option<Configuration> {
+        None
+    }
+
+    /// Proposes one membership change.
+    ///
+    /// # Errors
+    ///
+    /// [`ChangeRefused`]; [`ChangeRefused::Unsupported`], the default, for
+    /// a core with static membership.
+    fn propose_change(
+        &mut self,
+        change: Change,
+        log: &mut LogView<'_>,
+    ) -> Result<(), ChangeRefused> {
+        let _ = (change, log);
+        Err(ChangeRefused::Unsupported)
+    }
+}
+
+/// The membership a core acts under: the latest configuration in its log,
+/// committed or not (Raft's rule), or the bootstrap one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Configuration {
+    /// The index of the entry that set it; `None` for the bootstrap
+    /// configuration, the `peers` given to [`ConsensusCore::recover`].
+    pub index: Option<u64>,
+    /// The voting members, ascending.
+    pub voters: Vec<NodeId>,
+    /// Under joint consensus, the outgoing voters while a change runs: a
+    /// commit needs a majority of both sets. Empty otherwise.
+    pub outgoing: Vec<NodeId>,
+    /// The non-voting members, ascending: they replicate the log and never
+    /// count toward a quorum.
+    pub learners: Vec<NodeId>,
+}
+
+/// One membership change (ADR-0054: a new member joins as a learner and is
+/// promoted once it has caught up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// Adds a non-voting member.
+    AddLearner(NodeId),
+    /// Makes a learner a voter.
+    Promote(NodeId),
+    /// Removes a member.
+    Remove(NodeId),
+}
+
+/// Why a core refused a membership change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeRefused {
+    /// The core does not lead.
+    NotLeader(NotLeader),
+    /// An earlier change is not committed yet, or the leader has not yet
+    /// committed an entry of its term (the single-server errata).
+    InProgress,
+    /// The learner is further behind the leader's commit than the core's
+    /// promotion lag.
+    Lagging {
+        /// Entries it is behind.
+        behind: u64,
+    },
+    /// The change does not apply to the current configuration: adding a
+    /// member, promoting a voter, removing a stranger, or a change the
+    /// core cannot make.
+    Invalid,
+    /// The core's membership is static.
+    Unsupported,
 }
 
 /// What [`drive`] reports, in the order it happened.
