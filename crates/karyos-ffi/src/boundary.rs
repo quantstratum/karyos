@@ -16,8 +16,19 @@ pub(crate) fn guard(body: impl FnOnce() -> Status) -> i32 {
     // through its handle, whose slot the panic poisoned.
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(status) => status.code(),
-        Err(_) => Status::Internal.code(),
+        Err(payload) => {
+            forget_payload(payload);
+            Status::Internal.code()
+        }
     }
+}
+
+/// Forgets a panic's payload: dropping it could panic in turn (a payload
+/// whose `Drop` panics), and that unwind would leave an `extern "C"`
+/// function and abort the process. The payload leaks; a panic is already
+/// a poisoned handle.
+pub(crate) fn forget_payload(payload: Box<dyn core::any::Any + Send>) {
+    core::mem::forget(payload);
 }
 
 #[cfg(test)]
@@ -29,6 +40,17 @@ mod tests {
         assert_eq!(guard(|| Status::Busy), Status::Busy.code());
         assert_eq!(
             guard(|| std::panic::resume_unwind(Box::new("in a call"))),
+            Status::Internal.code()
+        );
+        // A payload whose drop panics is never dropped.
+        struct PanicsOnDrop;
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                std::panic::resume_unwind(Box::new("in drop"));
+            }
+        }
+        assert_eq!(
+            guard(|| std::panic::resume_unwind(Box::new(PanicsOnDrop))),
             Status::Internal.code()
         );
     }

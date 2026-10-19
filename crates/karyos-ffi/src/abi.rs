@@ -9,7 +9,7 @@
 use core::ffi::c_char;
 use std::panic::catch_unwind;
 
-use crate::boundary::guard;
+use crate::boundary::{forget_payload, guard};
 use crate::status::{Status, UNKNOWN_CODE};
 
 /// The ABI version's major number (`KARYOS_ABI_VERSION_MAJOR`).
@@ -61,7 +61,11 @@ pub unsafe extern "C" fn karyos_abi_version(
 /// fixed text.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_status_message(status: i32) -> *const c_char {
-    catch_unwind(|| Status::from_code(status).map_or(UNKNOWN_CODE, Status::message))
-        .unwrap_or(UNKNOWN_CODE)
-        .as_ptr()
+    match catch_unwind(|| Status::from_code(status).map_or(UNKNOWN_CODE, Status::message)) {
+        Ok(text) => text.as_ptr(),
+        Err(payload) => {
+            forget_payload(payload);
+            UNKNOWN_CODE.as_ptr()
+        }
+    }
 }

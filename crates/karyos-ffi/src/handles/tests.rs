@@ -151,3 +151,45 @@ fn a_capacity_above_the_index_range_is_clamped() {
     assert_eq!(table.insert(1), Err(Status::HandlesExhausted));
     assert_eq!(MAX_CAPACITY, 1 << INDEX_BITS);
 }
+
+#[test]
+fn a_stale_close_leaves_the_poison_of_the_live_handle() {
+    let table = Table::new(Kind::Client, 1);
+    let stale = table.insert(1_u32).unwrap();
+    table.remove(stale).unwrap();
+    let live = table.insert(2_u32).unwrap();
+    assert_eq!(stale.index(), live.index());
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        table
+            .with(live, |_| std::panic::resume_unwind(Box::new("in a call")))
+            .unwrap();
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(table.with(live, |value| *value), Err(Status::Internal));
+    // The stale handle is closed, poisoned slot or not.
+    assert_eq!(table.with(stale, |value| *value), Err(Status::Closed));
+    assert_eq!(table.remove(stale), Err(Status::Closed));
+    assert_eq!(table.with(live, |value| *value), Err(Status::Internal));
+    assert_eq!(table.remove(live), Ok(2));
+}
+
+#[test]
+fn a_create_waits_out_a_stale_use_of_its_free_slot() {
+    let table = Arc::new(Table::new(Kind::Client, 1));
+    let stale = table.insert(1_u32).unwrap();
+    table.remove(stale).unwrap();
+    let inserted = {
+        // Held as a use of the stale handle holds it to compare
+        // generations.
+        let _comparing = table.slots[0].entry.lock().unwrap();
+        let table = Arc::clone(&table);
+        let inserting = std::thread::spawn(move || table.insert(2_u32));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        inserting
+    };
+    let live = inserted.join().unwrap().unwrap();
+    assert_eq!(table.with(live, |value| *value), Ok(2));
+    table.remove(live).unwrap();
+    // The slot went back to the free list: capacity is intact.
+    assert!(table.insert(3_u32).is_ok());
+}
