@@ -406,6 +406,12 @@ release may break APIs, wire formats and shared-memory layouts.
   them, and `karyos_client::groups::read_groups` reads any such group
   (`capabilities` now uses it).
 
+- API v1's JSON carries each driver's trace window (M6c): `latencies`, one
+  object per lane with `p50`, `p90`, `p99`, `p999` and `max` as `null` or
+  `{"low","high"}` bounds, and `trace`, the window's counts. They come
+  after `guards` and before `alerts`, in `DriverView`'s declaration order
+  (quantstratum-docs: `karyos/design/agent-api-v1.md`).
+
 - The Prometheus exporter (phase 5, M8; ADR-0055; SPEC.md §11
   `karyos-exporter`; owner item 51, interim 4). `karyos_agent::exporter`
   renders an `AgentView` in the Prometheus text format (0.0.4): the CnC
