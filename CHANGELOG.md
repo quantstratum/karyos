@@ -518,6 +518,16 @@ release may break APIs, wire formats and shared-memory layouts.
   denied in the crate and expected only on `mod abi` and in the tests'
   `support::abi`; `make lint-sync` checks that, the clippy set, and that no
   profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- `karyos-ffi` clients (batch F2): `karyos_client_options_init`,
+  `karyos_client_connect`, `karyos_client_poll` and `karyos_client_close`,
+  with the sized `karyos_client_options` (copied, nothing consumed) and
+  `karyos_detail` structs. A driver that refuses the client's protocol
+  version, or admits it at another, answers `KARYOS_E_INCOMPATIBLE_DRIVER`
+  with the driver's version in the detail when it named one; tested on
+  Linux against a fake driver, and a real one for the admitted path. The
+  client tests also run over an embedded driver's conductor, under Miri
+  and on macOS, where connect answers the new `KARYOS_E_UNSUPPORTED`. The
+  header check now covers structs.
 - The C ABI conformance suite beside `karyos-ffi` (ADR-0067; batch F6), in
   the interim format 1 of `crates/karyos-ffi/conformance/FORMAT.md` until
   the owner chooses one (item 46): line-based `.kcs` scenarios (`call` and
