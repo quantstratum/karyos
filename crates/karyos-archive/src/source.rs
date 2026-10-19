@@ -267,7 +267,10 @@ impl<T: TermBytes> Following<T> {
                 Ok(Frames::Pending)
             }
             Rejoin::Refused => {
-                self.fenced = None;
+                // The seal stays the source's position: a reader dropped
+                // while waiting has none of its own, and a later read is
+                // the same fence.
+                self.fenced = Some(at);
                 self.rejoin = None;
                 Ok(Frames::Fenced { at })
             }
