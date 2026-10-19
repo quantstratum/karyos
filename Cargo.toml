@@ -16,6 +16,7 @@ members = [
     "crates/karyos-sim",
     "crates/karyos",
     "crates/karyos-tools",
+    "crates/karyos-ffi",
     "crates/karyos-bench",
 ]
 

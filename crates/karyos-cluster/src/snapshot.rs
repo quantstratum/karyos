@@ -28,8 +28,8 @@
 //!   leaves snapshot k complete. [`SnapshotConfig::log_floor`] gives the
 //!   first log index to keep: the oldest kept snapshot's next index,
 //!   lowered to retain up to [`SnapshotConfig::allowance`] log bytes below
-//!   it for a slow follower. The log cannot purge a prefix yet
-//!   (`RaftLog::purge_prefix` waits for A2 to drop leading segments).
+//!   it for a slow follower; [`crate::RaftLog::purge_prefix`] then purges
+//!   the log below it (C8b).
 //! - **When** (design S2). [`SnapshotConfig::due`] after `every_entries`
 //!   entries or `every_bytes` log bytes since the last snapshot, never by
 //!   time, so a seed gives the same snapshot points.

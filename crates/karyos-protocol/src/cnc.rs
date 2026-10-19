@@ -884,7 +884,9 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    const fn code(self) -> u64 {
+    /// The code's wire value, as the `Refused` completion carries it.
+    #[must_use]
+    pub const fn code(self) -> u64 {
         match self {
             Self::PublicationTaken => 1,
             Self::UnknownStream => 2,

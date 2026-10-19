@@ -407,6 +407,35 @@ release may break APIs, wire formats and shared-memory layouts.
   epoch) and `capability missing` (opens and reopens refused for a
   required capability) count degradations.
 
+- Prefix purge of the Raft log (phase 4, C8b). A2's
+  `SegmentStore::purge_before` moves a recording's start forward to a write
+  boundary and removes the whole segments below it. The new start, the
+  floor, is replaced atomically in `<recording>.floor` before anything is
+  removed, and recovery starts the recording at the floor
+  (`DropReason::Purged`; `SegmentError::InvalidPurge`, `FloorDamaged`,
+  `FloorMissing`). karyos-cluster's `RaftLog::purge_prefix(below)` now
+  purges committed entries and returns the new first index, instead of
+  `LogError::PurgeUnsupported` (replaced by `PurgeBeyondCommit`). If a
+  crash leaves the first-index file stale, `RaftLog::open` follows the first
+  frame. karyos-sim's `tests/purge_crash.rs` crashes the disk at every
+  operation of two purges and fails every flush.
+
+- `karyos-ffi`, the C ABI crate (SPEC.md §10.2; ADR-0053, ADR-0067;
+  quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, batch F1). It
+  builds `libkaryos_ffi` as a shared, a static and a Rust library, with a
+  hand-written `include/karyos.h` that a test checks against the Rust source
+  until `cbindgen` is admitted. F1 exports `karyos_abi_version` (ABI 0.1.0)
+  and `karyos_status_message`, and defines the status codes, grouped by
+  range and mapped from the client's Rust errors, the bounded tables of
+  generation-tagged handles (a per-slot `try_lock`, so a call never blocks:
+  `KARYOS_E_BUSY` from another thread, `KARYOS_E_REENTRANT` from the same
+  one, `KARYOS_E_INTERNAL` after a panic poisoned the slot; a slot whose
+  generation cannot grow is retired) and the panic boundary. `unsafe` is
+  denied in the crate and expected only on `mod abi` and in the tests'
+  `support::abi`; `make lint-sync` checks that, the clippy set, and that no
+  profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- `karyos_protocol::cnc::ErrorCode::code` is public: the wire value of a
+  refusal code, which the C ABI reports as a detail.
 - Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:
   `karyos/design/cluster-dedup-and-snapshots.md` §2). `dedup::SessionTable`
   is the replicated session table, driven only by applied entries: a
@@ -447,6 +476,27 @@ release may break APIs, wire formats and shared-memory layouts.
   received`, `datagrams dropped by backend`, `invalid frames received`,
   `status messages sent` and `images retired at timeout`. Closing the
   network frees them.
+
+- karyos-sim harness: phase 5 membership scenarios, batch P5-S1
+  (quantstratum-docs: `karyos/design/phase-5-cluster-scenarios.md`;
+  ADR-0054). `ConsensusCore` gains two provided methods,
+  `configuration()` and `propose_change()`, whose defaults describe static
+  membership, so a phase 4 core implements neither; `Configuration`,
+  `Change` and `ChangeRefused` describe them. Servers record
+  `Observation::Configuration` at each start and after each change, and
+  `Observation::Change` for an operator's change. Cases gain `spares`
+  (servers that wait down until `Action::Join`), `Action::Change` (sent by an
+  operator node to every server that is up) and `promotion_lag`. The
+  reference fixture changes its membership with its fixed leader: one change
+  at a time, configuration entries that take effect when appended,
+  promotion within `PROMOTION_LAG`, a commit on a majority of the voters
+  alone, and the configuration rebuilt from the log at a restart. New checks
+  `quorum_of_voters`, `configuration_from_log` and `learner_caught_up` run
+  with every case (`check::membership`), and the reply check counts the
+  voters of a server that reports a configuration. Scenarios M1 (add and
+  promote, with a split that a core counting its learner would commit
+  through), M5 (a lagging learner refused, then promoted) and M8 (a restart
+  under an uncommitted configuration) run on the reference.
 
 - A group's checkpoints in the Archive agent (phase 3, A9-3).
   `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and
