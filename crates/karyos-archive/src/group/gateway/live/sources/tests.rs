@@ -139,6 +139,7 @@ fn rig_as(
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: mode,
+        reopen_hold: 0,
         manifest: b"m",
     };
     let config = JournalConfig {
@@ -763,6 +764,7 @@ fn fanned(mode: Capture, ring_capacity: usize) -> Fanned {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: mode,
+        reopen_hold: 0,
         manifest: b"m",
     };
     let journal =
