@@ -288,6 +288,9 @@ pub struct KeptSegment {
     /// The length its data file is shortened to, when bytes lie past
     /// `written`.
     pub data_length: Option<u64>,
+    /// The index entries past the cut, a torn one counted: the writes
+    /// recovery drops from this segment.
+    pub dropped_entries: u64,
 }
 
 /// What recovery does to a recording, computed by
@@ -1596,6 +1599,16 @@ fn scan_recording<D: Disk>(
                 .checked_sub(kept.base)
                 .ok_or(SegmentError::PositionOverflow)?;
             let data_length = (disk.len(&kept.data)? > length).then_some(length);
+            // Every entry the index file holds, a torn last one too.
+            let held = disk
+                .len(&kept.index)?
+                .checked_sub(HEADER)
+                .and_then(|bytes| bytes.checked_add(ENTRY - 1))
+                .map_or(0, |bytes| bytes / ENTRY);
+            // The kept entries are among those the file holds.
+            let dropped_entries = held
+                .checked_sub(kept.entries)
+                .ok_or(SegmentError::PositionOverflow)?;
             (
                 Some(KeptSegment {
                     base: kept.base,
@@ -1604,6 +1617,7 @@ fn scan_recording<D: Disk>(
                     entries: kept.entries,
                     index_length: kept.index_length,
                     data_length,
+                    dropped_entries,
                 }),
                 Some((kept.data, kept.index)),
             )

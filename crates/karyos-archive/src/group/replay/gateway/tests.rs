@@ -35,7 +35,7 @@ const CONFIG: JournalConfig = JournalConfig {
 };
 /// Subscription 0 is stream 10, session 3; publication 0 is stream 20,
 /// session 5.
-const SUBSCRIPTIONS: [(i32, i32); 1] = [(10, 3)];
+const SUBSCRIPTIONS: [(i32, i32, Lane); 1] = [(10, 3, Lane::ZERO)];
 const PUBLICATIONS: [(i32, i32); 1] = [(20, 5)];
 
 /// Only recording 7, written and durable to 4096.
@@ -106,6 +106,7 @@ fn header(capture: Capture) -> JournalHeader<'static> {
         contract_version: CONTRACT_VERSION,
         clock: Clock::HostMonotonic,
         capture,
+        reopen_hold: 0,
         manifest: b"m",
     }
 }
@@ -156,6 +157,7 @@ fn replaying_from(
         &GatewayConfig {
             publications: &PUBLICATIONS,
             subscriptions: &SUBSCRIPTIONS,
+            network: &[],
             conflated: &[],
             max_claim: 64,
             max_payload: 256,
@@ -584,6 +586,7 @@ fn the_capture_holds_what_the_handler_did() {
     let (stop, written) = captured(Capture::Strict, &records, &mut Echo::default());
     assert_eq!(stop, Ok(Dispatched::End));
     let mut wanted = vec![encoded(&GroupRecord::Header(JournalHeader {
+        reopen_hold: 0,
         manifest: b"replay",
         ..header(Capture::Strict)
     }))];
@@ -666,13 +669,17 @@ fn a_duplicate_source_is_refused_at_configuration() {
     let gateway = || replaying(Capture::Strict, &offered(), false).into_parts().0;
     for (publications, subscriptions) in [
         (&[(20, 5), (20, 5)][..], &SUBSCRIPTIONS[..]),
-        (&PUBLICATIONS[..], &[(10, 3), (10, 3)][..]),
+        (
+            &PUBLICATIONS[..],
+            &[(10, 3, Lane::ZERO), (10, 3, Lane::ZERO)][..],
+        ),
     ] {
         let refused = ReplayGateway::new(
             gateway(),
             &GatewayConfig {
                 publications,
                 subscriptions,
+                network: &[],
                 conflated: &[],
                 max_claim: 64,
                 max_payload: 256,
