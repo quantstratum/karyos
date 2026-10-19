@@ -15,6 +15,7 @@ use crate::api::{
     Sample,
 };
 use crate::model::{self, Cell, Follower};
+use crate::trace_window::{TraceWindow, WindowConfig};
 
 /// Attempts at a consistent sampling pass before the values are reported
 /// as mixed, as `karyos-stat` makes.
@@ -36,6 +37,8 @@ pub struct AgentConfig {
     /// Records kept per diagnostic ring and driver; older ones are dropped
     /// from the view, still counted as delivered.
     pub history: usize,
+    /// The trace latency window's bounds.
+    pub trace: WindowConfig,
 }
 
 impl AgentConfig {
@@ -46,7 +49,15 @@ impl AgentConfig {
             drivers,
             attach_timeout: DEFAULT_ATTACH_TIMEOUT,
             history: DEFAULT_HISTORY,
+            trace: WindowConfig::default(),
         }
+    }
+
+    /// With the trace latency window `trace`.
+    #[must_use]
+    pub fn with_trace_window(mut self, trace: WindowConfig) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// With `attach_timeout` for each message of an attach.
@@ -76,6 +87,7 @@ struct Driver {
     errors: Follower<ErrorEntry>,
     losses: Follower<LossEntry>,
     guards: Follower<GuardEntry>,
+    trace: Option<TraceWindow>,
 }
 
 /// The agent. Each driver it is attached to counts one tool against the
@@ -106,6 +118,7 @@ impl Agent {
                 errors: Follower::new(config.history),
                 losses: Follower::new(config.history),
                 guards: Follower::new(config.history),
+                trace: None,
             })
             .collect();
         Self { config, drivers }
@@ -115,9 +128,9 @@ impl Agent {
     /// is, and notes those that exited. A driver it cannot attach to is
     /// reported unavailable with the reason; nothing here fails the agent.
     pub fn refresh(&mut self) {
-        let timeout = self.config.attach_timeout;
+        let (timeout, trace) = (self.config.attach_timeout, self.config.trace);
         for driver in &mut self.drivers {
-            driver.refresh(timeout);
+            driver.refresh(timeout, trace);
         }
     }
 
@@ -132,7 +145,7 @@ impl Agent {
 }
 
 impl Driver {
-    fn refresh(&mut self, timeout: Duration) {
+    fn refresh(&mut self, timeout: Duration, trace: WindowConfig) {
         if self.tool.is_none() {
             match attach_tool(&self.dir, timeout) {
                 Ok(tool) => {
@@ -141,6 +154,7 @@ impl Driver {
                         self.errors.restart();
                         self.losses.restart();
                         self.guards.restart();
+                        self.trace = Some(TraceWindow::new(trace, driver_id(tool.instance())));
                     }
                     self.instance = Some(tool.instance());
                     self.state = DriverState::Attached;
@@ -168,6 +182,9 @@ impl Driver {
             .map(|(metadata, value)| model::counter(metadata, *value))
             .collect();
         read_rings(tool, &mut self.errors, &mut self.losses, &mut self.guards);
+        if let Some(window) = self.trace.as_mut() {
+            window.scan(tool.trace_mirror(), host_monotonic_ns());
+        }
         match tool.driver_closed() {
             Ok(false) => {}
             Ok(true) => {
@@ -184,6 +201,11 @@ impl Driver {
     }
 
     fn view(&self) -> DriverView {
+        let (latencies, trace) = self
+            .trace
+            .as_ref()
+            .map(|window| window.view(host_monotonic_ns()))
+            .unwrap_or_default();
         DriverView {
             dir: self.dir.clone(),
             state: self.state.clone(),
@@ -193,8 +215,18 @@ impl Driver {
             errors: self.errors.feed(),
             losses: self.losses.feed(),
             guards: self.guards.feed(),
+            latencies,
+            trace,
         }
     }
+}
+
+/// The `driver_id` words of a driver instance id, as the trace records
+/// carry them.
+fn driver_id(instance: u128) -> [u64; 2] {
+    let [high, low] = [instance >> 64, instance & u128::from(u64::MAX)]
+        .map(|half| u64::try_from(half).unwrap_or(0));
+    [high, low]
 }
 
 /// Every allocated cell of `reader`.
