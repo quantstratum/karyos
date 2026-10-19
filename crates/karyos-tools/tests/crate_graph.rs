@@ -63,3 +63,29 @@ fn neither_the_driver_nor_the_client_depends_on_karyos_trace() {
             .any(|line| line.starts_with("karyos-trace "))
     );
 }
+
+/// The management agent (owner item 52; quantstratum-docs:
+/// karyos/design/management-agent-gap-analysis.md, M6): the driver and
+/// the client never depend on it, and it depends on neither the driver nor
+/// the tools.
+#[test]
+fn the_agent_stays_outside_the_driver_and_the_client() {
+    for package in ["karyos-driver", "karyos-client"] {
+        let tree = dependencies(package);
+        assert!(
+            !tree.lines().any(|line| line.starts_with("karyos-agent ")),
+            "{package} depends on karyos-agent:\n{tree}"
+        );
+    }
+    let agent = dependencies("karyos-agent");
+    assert!(
+        agent.lines().any(|line| line.starts_with("karyos-client ")),
+        "{agent}"
+    );
+    for crate_name in ["karyos-driver ", "karyos-tools "] {
+        assert!(
+            !agent.lines().any(|line| line.starts_with(crate_name)),
+            "karyos-agent depends on {crate_name}:\n{agent}"
+        );
+    }
+}

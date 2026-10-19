@@ -18,6 +18,7 @@ members = [
     "crates/karyos-tools",
     "crates/karyos-ffi",
     "crates/karyos-bench",
+    "crates/karyos-agent",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ karyos-sim = { path = "crates/karyos-sim", version = "0.1.0-alpha.1" }
 karyos = { path = "crates/karyos", version = "0.1.0-alpha.1" }
 karyos-tools = { path = "crates/karyos-tools", version = "0.1.0-alpha.1" }
 karyos-bench = { path = "crates/karyos-bench", version = "0.1.0-alpha.1" }
+karyos-agent = { path = "crates/karyos-agent", version = "0.1.0-alpha.1" }
 
 # External dependencies; each admission is recorded in deps/dependencies.md.
 loom = { version = "0.7.2", default-features = false }
