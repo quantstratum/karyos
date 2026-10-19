@@ -1,0 +1,9 @@
+# The library states its ABI version before any other call, so a binding
+# can refuse a different major (SPEC.md §13, C ABI boundary).
+format 1
+id abi.version
+abi 0.1
+covers "abi version"
+
+call karyos_abi_version
+expect KARYOS_OK major=0 minor=1 patch=0

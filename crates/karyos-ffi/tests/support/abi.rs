@@ -119,6 +119,39 @@ pub fn abi_version_misaligned_major() -> (i32, [u32; 2]) {
     (status, written)
 }
 
+/// `karyos_abi_version` with the out-parameters marked in `null` passed as
+/// null: the status, and each value written (`None` for a null or
+/// untouched one).
+pub fn abi_version_with(null: [bool; 3]) -> (i32, [Option<u32>; 3]) {
+    let mut values = [u32::MAX; 3];
+    let [major, minor, patch] = &mut values;
+    let pointer = |value: &mut u32, null: bool| {
+        if null {
+            core::ptr::null_mut()
+        } else {
+            core::ptr::from_mut(value)
+        }
+    };
+    let [major_null, minor_null, patch_null] = null;
+    let (major, minor, patch) = (
+        pointer(major, major_null),
+        pointer(minor, minor_null),
+        pointer(patch, patch_null),
+    );
+    // SAFETY: each pointer is null or a live, aligned, writable `u32`.
+    let status = unsafe { karyos_abi_version(major, minor, patch) };
+    let written = |value: u32, null: bool| (!null && value != u32::MAX).then_some(value);
+    let [major, minor, patch] = values;
+    (
+        status,
+        [
+            written(major, major_null),
+            written(minor, minor_null),
+            written(patch, patch_null),
+        ],
+    )
+}
+
 /// `karyos_status_message` as a string.
 pub fn status_message(status: i32) -> String {
     let text = karyos_status_message(status);
