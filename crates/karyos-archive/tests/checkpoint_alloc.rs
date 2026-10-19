@@ -174,6 +174,7 @@ fn replay_from_a_checkpoint_steps_without_allocating() {
     let (mut cursor, _) = ReplayCursor::open_at_checkpoint(
         journal,
         &recovery,
+        &[],
         &mut store,
         2,
         &ReplayConfig {

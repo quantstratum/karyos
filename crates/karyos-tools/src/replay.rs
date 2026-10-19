@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use karyos_archive::disk::{Disk, ReadOnly};
 use karyos_archive::group::checkpoint::{CheckpointStore, recorded_end};
 use karyos_archive::group::journal::{GroupJournal, JournalConfig, JournalError};
-use karyos_archive::group::prefix::{CheckpointHeld, Coverage, recover};
+use karyos_archive::group::prefix::{CheckpointHeld, Coverage, recover, recover_ranges};
 use karyos_archive::group::record::{
     CONTRACT_VERSION, CheckpointRecord, GroupRecord, Operation, Payload, Role, UnsupportedHeader,
 };
@@ -645,9 +645,11 @@ fn open<D: Disk + Clone>(
             };
             // Which ranges recover depends on the group's reopen hold:
             // recovery takes the header's (A9-5); RECOVERY_CAPACITY only
-            // sizes the tracker's queues.
-            let recovery = recover(&mut recovered, &Stored(&store), RECOVERY_CAPACITY)
-                .map_err(|failure| context(&failure))?;
+            // sizes the tracker's queues. Every range is derived, a middle
+            // one too.
+            let (recovery, ranges) =
+                recover_ranges(&mut recovered, &Stored(&store), RECOVERY_CAPACITY)
+                    .map_err(|failure| context(&failure))?;
             // A checkpoint the store does not hold is not comparable, before
             // its snapshot's buffer is reserved.
             if let Some(found) = found
@@ -665,6 +667,7 @@ fn open<D: Disk + Clone>(
             ReplayCursor::open_at_checkpoint(
                 recovered,
                 &recovery,
+                &ranges,
                 &mut store,
                 checkpoint_id,
                 &config,
@@ -728,6 +731,7 @@ pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
                 from: 0,
                 to: None,
                 explicit_from: false,
+                to_range_end: false,
             };
             if let Some(report) =
                 compare_checkpoints(&[left_checkpoint], &[right_checkpoint], range)
@@ -760,6 +764,7 @@ pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
             from,
             to: args.to,
             explicit_from: args.from.is_some(),
+            to_range_end: left.checkpoint.is_some() && args.to.is_none(),
         },
     )
 }
@@ -1005,6 +1010,11 @@ struct Range {
     /// left out is past it. The default `--from` is the journals' own
     /// first event, so an empty journal there is the `end` kind instead.
     explicit_from: bool,
+    /// From a checkpoint without `--to`: the range the checkpoint opened
+    /// is compared to its end, and the stop that ends it (a gap or an
+    /// incomplete event, for a middle range) ends the comparison as the
+    /// end of a complete prefix does. Both sides must end there.
+    to_range_end: bool,
 }
 
 impl Range {
@@ -1076,7 +1086,8 @@ fn compare<L: Disk, R: Disk>(
         // A gap or an incomplete event inside the range is not comparable,
         // the left side first.
         let inside = |stop: &Stop| {
-            !matches!(stop, Stop::EndOfPrefix { .. })
+            !range.to_range_end
+                && !matches!(stop, Stop::EndOfPrefix { .. })
                 && first_missing(stop).is_some_and(|seq| to.is_none_or(|to| seq <= to))
         };
         for (stopped_side, name) in [(&left_side, "left"), (&right_side, "right")] {

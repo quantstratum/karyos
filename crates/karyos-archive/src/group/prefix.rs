@@ -975,6 +975,58 @@ pub fn recover<D: crate::disk::Disk>(
     coverage: &impl Coverage,
     capacity: usize,
 ) -> Result<Recovery, super::journal::JournalError> {
+    recover_with(journal, coverage, capacity, |_| Ok(()))
+}
+
+/// [`recover`], with every range a later checkpoint closed, in journal
+/// order: the journal's first range is [`PrefixTracker::first_range`],
+/// the current one [`PrefixTracker::range`], and those between are the
+/// list (A9 section 6, replay from a middle range). A recovered journal
+/// is durable throughout, so each keeps its complete prefix only. The
+/// list is allocated here, from what the journal holds.
+///
+/// # Errors
+///
+/// [`recover`]'s, and
+/// [`JournalError::Allocation`](super::journal::JournalError::Allocation)
+/// for a list that cannot be allocated.
+pub fn recover_ranges<D: crate::disk::Disk>(
+    journal: &mut super::journal::GroupJournal<D>,
+    coverage: &impl Coverage,
+    capacity: usize,
+) -> Result<(Recovery, Vec<ClosedRange>), super::journal::JournalError> {
+    let mut closed = Vec::new();
+    let recovery = recover_with(journal, coverage, capacity, |range| {
+        closed
+            .try_reserve(1)
+            .map_err(|_| super::journal::JournalError::Allocation)?;
+        closed.push(range);
+        Ok(())
+    })?;
+    Ok((recovery, closed))
+}
+
+/// A range between two others, as recovery leaves it: from its opening
+/// checkpoint to its complete prefix's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedRange {
+    /// The checkpoint that opened it.
+    pub start: RangeStart,
+    /// Its final `complete_recording_seq`; after recovery its durable
+    /// prefix is the same.
+    pub complete: u64,
+    /// The journal position after its last complete event.
+    pub complete_end: u64,
+}
+
+/// [`recover`], calling `closed` with each middle range as a later
+/// checkpoint closes it.
+fn recover_with<D: crate::disk::Disk>(
+    journal: &mut super::journal::GroupJournal<D>,
+    coverage: &impl Coverage,
+    capacity: usize,
+    mut closed: impl FnMut(ClosedRange) -> Result<(), super::journal::JournalError>,
+) -> Result<Recovery, super::journal::JournalError> {
     // The reopening window is exactly the header's (A9), as the run's
     // was, whatever `capacity` the reader gives: that sizes the queues.
     let allocation = |_| super::journal::JournalError::Allocation;
@@ -986,6 +1038,28 @@ pub fn recover<D: crate::disk::Disk>(
     let mut last_seen = 0u64;
     let mut full = false;
     let durable = journal.durable();
+    // The current range as last seen: when another opens, it is closed.
+    let mut current = (tracker.range().start, 0u64, 0u64);
+    let mut failed = None;
+    let mut watch = |tracker: &PrefixTracker| {
+        let start = tracker.range().start;
+        if start != current.0
+            && let Some(previous) = current.0
+            && failed.is_none()
+            && let Err(error) = closed(ClosedRange {
+                start: previous,
+                complete: current.1,
+                complete_end: current.2,
+            })
+        {
+            failed = Some(error);
+        }
+        current = (
+            start,
+            tracker.complete_recording_seq(),
+            tracker.complete_end(),
+        );
+    };
     journal.walk(0, |_, end, record| {
         if let super::record::Role::Event(seq) | super::record::Role::Uncaptured(seq) =
             record.role()
@@ -1006,13 +1080,21 @@ pub fn recover<D: crate::disk::Disk>(
             full = true;
             return true;
         }
-        if matches!(record, GroupRecord::End(_)) {
+        // After an event's end, and after a checkpoint record: the run
+        // advances between records, so a checkpoint opens its range
+        // before a later one can take its place.
+        if matches!(record, GroupRecord::End(_) | GroupRecord::Checkpoint(_)) {
             let _ = tracker.advance(end, durable.min(end), coverage);
         }
+        watch(&tracker);
         true
     })?;
     let written = journal.written();
     let _ = tracker.advance(written, durable, coverage);
+    watch(&tracker);
+    if let Some(error) = failed {
+        return Err(error);
+    }
     Ok(Recovery {
         tracker,
         last_seen,
