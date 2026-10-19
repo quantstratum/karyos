@@ -4181,7 +4181,6 @@ fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), Dri
     Ok(())
 }
 
-/// One conductor duty cycle, its work added.
 /// The network agents' driver-wide CnC cells (`quantstratum-docs:
 /// karyos/design/management-agent-gap-analysis.md`, M2), in
 /// [`crate::agents::SENDER_CELLS`] and [`crate::agents::RECEIVER_CELLS`]
@@ -4204,6 +4203,7 @@ fn network_cells(
     )
 }
 
+/// One conductor duty cycle, its work added.
 fn duty<T: TermBytes>(
     counters: &DriverCounters,
     work: &mut u32,
