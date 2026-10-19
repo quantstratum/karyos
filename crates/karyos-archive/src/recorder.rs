@@ -21,7 +21,10 @@
 //!   the seal, incomplete, with [`StopReason::Lapped`];
 //!   quantstratum-docs: karyos/design/mapping-generations.md,
 //!   "Recordings"). Each ends the duty, so a source repeating one cannot
-//!   hold the recorder's thread.
+//!   hold the recorder's thread. An `async` recording that resumes after
+//!   a lap may instead rejoin the stream at its head
+//!   ([`Frames::Rejoined`]): the range from the seal to the head is a
+//!   plain gap, and the recording goes on, incomplete.
 //! - **Consumption.** The recorder tells the source what it consumed once
 //!   it is written to the store (not yet durable): durability follows the
 //!   store's policy, a separate axis (ADR-0023).
@@ -71,10 +74,22 @@ pub enum Frames {
     },
     /// The publication was sealed at `at` for a cutover, and the source
     /// cannot follow it: it was fenced at the cutover deadline. The
-    /// recording ends at `at`, incomplete, whatever its lap policy.
+    /// recording ends at `at`, incomplete, whatever its lap policy, unless
+    /// its source rejoins the stream ([`Frames::Rejoined`]).
     Fenced {
         /// The seal position.
         at: u64,
+    },
+    /// The publication was sealed at `from` for a cutover, the source was
+    /// fenced there, and it rejoined the stream's current generation at
+    /// its head `to`, as a new optional member (mapping-generations.md,
+    /// "Recordings"): `[from, to)` is lost, and the next read starts at
+    /// `to`. Only an `async` recording that resumes after a lap rejoins.
+    Rejoined {
+        /// The seal position, where the source was fenced.
+        from: u64,
+        /// Where the source rejoined: the head, at or after the seal.
+        to: u64,
     },
     /// The source was lapped: `[from, to)` is lost, and `to` is the lowest
     /// position still retained.
@@ -213,6 +228,14 @@ pub enum Invalid {
         /// Its end, not above its start.
         to: u64,
     },
+    /// A rejoin for a recording that does not resume after a lap, or one
+    /// that rejoins before its seal.
+    Rejoin {
+        /// The seal.
+        from: u64,
+        /// Where the source rejoined.
+        to: u64,
+    },
 }
 
 impl RecorderError {
@@ -253,6 +276,9 @@ pub struct Duty {
     /// The source was fenced at a cutover in this duty: what the Archive
     /// counts, so a cutover gap is told from a lap.
     pub fenced: bool,
+    /// The fenced source rejoined the stream at its head in this duty, and
+    /// the recording went on past a gap.
+    pub rejoined: bool,
 }
 
 /// The recorder of one stream lane into one recording.
@@ -424,6 +450,38 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                     self.incomplete = true;
                     duty.ended = Some(self.end(at, StopReason::Lapped));
                     break;
+                }
+                Frames::Rejoined { from, to } => {
+                    let written = self.store.written();
+                    if from != written {
+                        return Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+                            at: from,
+                            written,
+                        }));
+                    }
+                    if to < from
+                        || !matches!(
+                            self.mode,
+                            Mode::Async {
+                                on_lap: OnLap::Resume
+                            }
+                        )
+                    {
+                        return Err(RecorderError::Invalid(Invalid::Rejoin { from, to }));
+                    }
+                    duty.fenced = true;
+                    duty.rejoined = true;
+                    // Fenced at the seal, the source joined the current
+                    // generation at its head: what was published between
+                    // is lost, a plain gap, and the recording goes on.
+                    self.incomplete = true;
+                    if to > from {
+                        if !self.store.gap_fits() {
+                            duty.ended = Some(self.end(from, StopReason::Lapped));
+                            break;
+                        }
+                        self.store.append_gap(from, to)?;
+                    }
                 }
                 Frames::Lost { from, to } => {
                     if to <= from {
