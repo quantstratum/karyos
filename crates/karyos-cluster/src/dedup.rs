@@ -76,8 +76,9 @@
 //!
 //! Decoding checks every bound: a slot past the table, a window past
 //! [`DedupConfig::window`], a reply past [`DedupConfig::response_bytes`],
-//! two sessions in one slot, a session not live at the log time, or bytes
-//! left over are [`DecodeError`].
+//! two sessions in one slot or under one client and epoch, a session not
+//! live at the log time or active after it, an epoch past the last
+//! registration, or bytes left over are [`DecodeError`].
 
 #[cfg(test)]
 mod tests;
@@ -535,11 +536,21 @@ impl SessionTable {
             while sequence < session.next {
                 match self.slot(slot, sequence) {
                     Some((Stored::Reply(length), at)) => {
+                        let reply = self.reply(at, length);
+                        debug_assert!(reply.is_some(), "a retained reply is within its slot");
                         out.push(1);
                         out.extend_from_slice(&length.to_le_bytes());
-                        out.extend_from_slice(self.reply(at, length).unwrap_or_default());
+                        out.extend_from_slice(reply.unwrap_or_default());
                     }
-                    _ => out.push(2),
+                    stored => {
+                        // Every sequence in the window holds a reply or a
+                        // reply too large.
+                        debug_assert!(
+                            matches!(stored, Some((Stored::TooLarge, _))),
+                            "{stored:?} in a window"
+                        );
+                        out.push(2);
+                    }
                 }
                 let Some(after) = sequence.checked_add(1) else {
                     break;
@@ -597,9 +608,16 @@ impl SessionTable {
                 next: next?,
             };
             let held = session.next.checked_sub(session.base).ok_or(broken)?;
+            // An epoch is a registration's index, and a session is active
+            // no later than the log time.
             if held > u64::from(config.window)
                 || !alive(&session, table.now, config.ttl)
+                || session.activity > table.now
+                || table.registered.is_none_or(|last| session.epoch > last)
                 || table.sessions.get(index).is_none_or(|taken| taken.live)
+                || table.sessions.iter().any(|other| {
+                    other.live && (other.client, other.epoch) == (session.client, session.epoch)
+                })
             {
                 return Err(broken);
             }

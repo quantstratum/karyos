@@ -493,3 +493,69 @@ fn a_session_outside_the_bounds_is_refused() {
         Err(DecodeError::Config(ConfigError::Zero("sessions")))
     );
 }
+
+/// Two sessions at times about 150: client 7 in slot 0 with a full
+/// window of three replies, client 8 in slot 1 with none. The encoding:
+/// a 49-byte header, then each session's 44 bytes (slot, client, epoch,
+/// activity, base, next), then client 7's three entries of 7 bytes.
+fn full_window() -> Vec<u8> {
+    let mut table = table();
+    table.register(7, 1, 150).unwrap();
+    table.register(8, 2, 150).unwrap();
+    for (sequence, reply) in [(0, b"aa"), (1, b"bb"), (2, b"cc")] {
+        run(&mut table, Request::new(7, 1, sequence, 0), 151, reply);
+    }
+    table.encode()
+}
+
+const FIRST: usize = 49;
+const SECOND: usize = FIRST + 44 + 3 * 7;
+
+fn changed(at: usize, bytes: &[u8]) -> Vec<u8> {
+    let mut encoded = full_window();
+    encoded[at..at + bytes.len()].copy_from_slice(bytes);
+    encoded
+}
+
+/// REVIEWER-02's P2 on #471: a valid encoding with one field changed is
+/// refused with the session's slot, each bound at its first value past it.
+#[test]
+fn each_session_bound_is_refused_at_its_edge() {
+    let valid = full_window();
+    assert!(SessionTable::decode(&valid).is_ok());
+    let session = |slot| Err(DecodeError::Session { slot });
+    // A window of K + 1: next one past base + 3, with a fourth entry, so
+    // the bytes are whole and only the bound refuses them.
+    let mut wide = changed(FIRST + 36, &4u64.to_le_bytes());
+    let fourth = [1, 2, 0, 0, 0, b'd', b'd'];
+    let _ = wide.splice(SECOND..SECOND, fourth);
+    assert_eq!(SessionTable::decode(&wide), session(0));
+    // A reply of R + 1 bytes, its bytes all there.
+    let mut long = changed(FIRST + 45, &9u32.to_le_bytes());
+    let _ = long.splice(FIRST + 51..FIRST + 51, [b'x'; 7]);
+    assert_eq!(SessionTable::decode(&long), session(0));
+    // Activity 0 with the log time at 151: expired.
+    assert_eq!(
+        SessionTable::decode(&changed(FIRST + 20, &0u64.to_le_bytes())),
+        session(0)
+    );
+    // Activity after the log time.
+    assert_eq!(
+        SessionTable::decode(&changed(FIRST + 20, &152u64.to_le_bytes())),
+        session(0)
+    );
+    // The second session in the first one's slot.
+    assert_eq!(
+        SessionTable::decode(&changed(SECOND, &0u32.to_le_bytes())),
+        session(0)
+    );
+    // The second session under the first one's client and epoch.
+    let mut twin = changed(SECOND + 4, &7u64.to_le_bytes());
+    twin[SECOND + 12..SECOND + 20].copy_from_slice(&1u64.to_le_bytes());
+    assert_eq!(SessionTable::decode(&twin), session(1));
+    // An epoch past the last registration (2).
+    assert_eq!(
+        SessionTable::decode(&changed(SECOND + 12, &3u64.to_le_bytes())),
+        session(1)
+    );
+}
