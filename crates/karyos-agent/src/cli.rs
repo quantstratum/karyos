@@ -124,3 +124,100 @@ mod tests {
         }
     }
 }
+
+/// What `karyos-exporter` prints for a bad command line.
+pub const EXPORTER_USAGE: &str = "\
+usage: karyos-exporter --listen ADDRESS:PORT --driver DIR [--driver DIR]... \
+[--refresh-ms MS]
+
+Serves the agent's view of each driver in the Prometheus text format on
+http://ADDRESS:PORT/metrics, reading each driver's CnC as a tool every MS
+milliseconds (default 1000). ADDRESS must be a loopback address (127.0.0.1
+or ::1): the exporter has no TLS and no authentication. Linux only.
+";
+
+/// A parsed `karyos-exporter` command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExporterArgs {
+    /// The loopback address to listen on.
+    pub listen: std::net::SocketAddr,
+    /// The drivers' admission socket directories.
+    pub drivers: Vec<PathBuf>,
+    /// How often the agent reads the drivers.
+    pub refresh: Duration,
+}
+
+/// Parses `karyos-exporter`'s `args` (without the program name); `None`
+/// for anything its usage does not describe, a non-loopback address
+/// included.
+#[must_use]
+pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
+    let mut listen = None;
+    let mut drivers = Vec::new();
+    let mut refresh = DEFAULT_REFRESH;
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let value = args.next()?;
+        match flag.as_str() {
+            "--listen" if listen.is_none() => {
+                let address: std::net::SocketAddr = value.parse().ok()?;
+                if !address.ip().is_loopback() {
+                    return None;
+                }
+                listen = Some(address);
+            }
+            "--driver" => drivers.push(PathBuf::from(value)),
+            "--refresh-ms" => {
+                let millis: u64 = value.parse().ok()?;
+                if millis == 0 {
+                    return None;
+                }
+                refresh = Duration::from_millis(millis);
+            }
+            _ => return None,
+        }
+    }
+    if drivers.is_empty() {
+        return None;
+    }
+    Some(ExporterArgs {
+        listen: listen?,
+        drivers,
+        refresh,
+    })
+}
+
+#[cfg(test)]
+mod exporter_tests {
+    use super::*;
+
+    fn args(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn the_exporter_listens_on_loopback_only() {
+        let parsed = parse_exporter(&args(
+            "--listen 127.0.0.1:9464 --driver /d --driver /e --refresh-ms 250",
+        ))
+        .unwrap();
+        assert_eq!(parsed.listen, "127.0.0.1:9464".parse().unwrap());
+        assert_eq!(parsed.drivers.len(), 2);
+        assert_eq!(parsed.refresh, Duration::from_millis(250));
+        assert!(parse_exporter(&args("--listen [::1]:9464 --driver /d")).is_some());
+        for refused in [
+            "--listen 0.0.0.0:9464 --driver /d",
+            "--listen 192.168.1.2:9464 --driver /d",
+            "--listen [::]:9464 --driver /d",
+            "--listen localhost:9464 --driver /d",
+            "--listen 127.0.0.1:9464",
+            "--driver /d",
+            "--listen 127.0.0.1:1 --listen 127.0.0.1:2 --driver /d",
+            "--listen 127.0.0.1:1 --driver /d --refresh-ms 0",
+            "--listen 127.0.0.1:1 --driver /d --role 1=viewer",
+        ] {
+            assert_eq!(parse_exporter(&args(refused)), None, "{refused}");
+        }
+    }
+}
