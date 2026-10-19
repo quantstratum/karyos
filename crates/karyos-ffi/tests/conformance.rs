@@ -4,7 +4,10 @@
 //! `conformance/` (interim format 1, `conformance/FORMAT.md`; SPEC.md
 //! §10.2, §13; quantstratum-docs: karyos/design/ffi-gap-analysis.md, F6).
 //! It runs every scenario through the exported symbols, as a binding's
-//! runner does through its own API, and checks the coverage map.
+//! runner does through its own API, and checks the coverage map. Miri
+//! skips it: it reads the suite's files, which Miri's isolation forbids,
+//! and its calls go through `support::abi`, which `tests/abi.rs` runs
+//! under Miri.
 
 // Test helpers outside `#[test]` functions.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
@@ -391,6 +394,10 @@ fn index() -> BTreeMap<String, Option<Vec<String>>> {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads the suite's files, which Miri's isolation forbids"
+)]
 fn every_scenario_passes_at_the_library_abi_version() {
     let statuses = statuses();
     let (status, [major, minor, _]) = abi::abi_version_with([false; 3]);
@@ -408,6 +415,10 @@ fn every_scenario_passes_at_the_library_abi_version() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads the suite's files, which Miri's isolation forbids"
+)]
 fn the_index_maps_every_scenario_and_every_id_exists() {
     let scenarios = scenarios();
     let mut ids = BTreeSet::new();
@@ -448,6 +459,10 @@ fn the_index_maps_every_scenario_and_every_id_exists() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads the suite's files, which Miri's isolation forbids"
+)]
 fn the_parser_refuses_what_the_format_does_not_allow() {
     let at = "test";
     assert_eq!(
@@ -482,6 +497,10 @@ fn the_parser_refuses_what_the_format_does_not_allow() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads the suite's files, which Miri's isolation forbids"
+)]
 fn a_scenario_of_another_major_or_a_newer_minor_is_skipped() {
     let statuses = statuses();
     let step = Step {
