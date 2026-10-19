@@ -7,8 +7,8 @@
 //! to the Archive's agent, which reads it through its `FrameSource`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use karyos_client::GenerationLink;
 use karyos_client::link::{Lease, LeaseEnd};
 use karyos_sys::SysError;
 use karyos_sys::frame::Lane;
@@ -18,19 +18,28 @@ use karyos_sys::term_bytes::HeapTerms;
 use crate::agents::data::LaneReader;
 use crate::embedded::{EmbeddedDriver, StreamHandle};
 use crate::error::DriverError;
+use crate::generations::MemberKind;
 
 /// A recording's reader of a stream, with the lease that keeps the stream:
 /// a removed stream is freed only once the lease is dropped, so its
-/// conductor positions the seal the reader ends at; and while the lease
-/// lives, the stream refuses a cutover ([`DriverError::RecordingCutover`]).
-/// Take the parts with [`RecordingReader::into_parts`] and keep the lease
-/// for as long as the reader (the Archive's `Guarded` source drops the
-/// reader first).
+/// conductor positions the seal the reader ends at. The reader is a member
+/// of the stream's cutovers (mapping-generations.md, "Recordings"): its
+/// [`GenerationLink`] is offered a successor recording cell when a
+/// cutover opens, and the reader's mapping starts at stream position
+/// [`RecordingReader::base`]. Take the parts with
+/// [`RecordingReader::into_following_parts`], which keeps the link, and
+/// keep the lease for as long as the reader (the Archive's `Guarded`
+/// source drops the reader first): the Archive's `source::Following` over
+/// the reader, the link and the base follows each cutover. A reader taken
+/// alone ([`RecordingReader::into_parts`]) has no link, so a cutover
+/// fences it and the recording ends at the seal.
 #[derive(Debug)]
 pub struct RecordingReader {
     reader: LaneReader,
     lease: RecordingLease,
     format: RecordingFormat,
+    link: Arc<GenerationLink>,
+    base: u64,
 }
 
 /// The recorded lane's format: what a host records with the recording, as
@@ -56,26 +65,42 @@ impl RecordingReader {
         self.format
     }
 
-    /// The reader and the stream's lease.
+    /// The reader's generation link: what offers it a successor at a
+    /// cutover.
+    #[must_use]
+    pub fn link(&self) -> &Arc<GenerationLink> {
+        &self.link
+    }
+
+    /// The stream position where the reader's mapping starts: its local
+    /// positions plus this are stream positions.
+    #[must_use]
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// The reader and the stream's lease, without the link: a cutover
+    /// fences such a reader, and its recording ends at the seal. To follow
+    /// cutovers, take [`RecordingReader::into_following_parts`].
     #[must_use]
     pub fn into_parts(self) -> (LaneReader, RecordingLease) {
         (self.reader, self.lease)
     }
+
+    /// The reader, its generation link, the base of its mapping and the
+    /// stream's lease: what the Archive's `source::Following` takes
+    /// (`Following::new(reader, link, base)`), kept with the lease in a
+    /// `Guarded` source, so the recording follows each cutover.
+    #[must_use]
+    pub fn into_following_parts(self) -> (LaneReader, Arc<GenerationLink>, u64, RecordingLease) {
+        (self.reader, self.link, self.base, self.lease)
+    }
 }
 
-/// A recording's hold on its stream: the stream's lease, and its count of
-/// recording readers, released on drop.
+/// A recording's hold on its stream: the stream's lease, released on drop.
 #[derive(Debug)]
 pub struct RecordingLease {
     _lease: Lease,
-    recordings: Arc<AtomicU64>,
-}
-
-impl Drop for RecordingLease {
-    fn drop(&mut self) {
-        // Release: the driver's cutover check reads it with Acquire.
-        self.recordings.fetch_sub(1, Ordering::Release);
-    }
 }
 
 impl EmbeddedDriver<HeapTerms> {
@@ -123,20 +148,24 @@ impl EmbeddedDriver<HeapTerms> {
         let subscription = target
             .conductor
             .subscribe_as(role, role == Role::Required, occupant)?;
+        let cell = subscription.cell();
         let reader = SenderRead::for_recording(subscription, DEFAULT_CORRUPT_RETRIES)?;
-        let lease = Lease::acquire(&target.leases, &Arc::new(LeaseEnd::default()));
-        // One reader per lease; the count cannot reach u64::MAX.
-        target.recordings.fetch_add(1, Ordering::Release);
         let lease = RecordingLease {
-            _lease: lease,
-            recordings: Arc::clone(&target.recordings),
+            _lease: Lease::acquire(&target.leases, &Arc::new(LeaseEnd::default())),
         };
+        let (link, base) = target.join(MemberKind::Recording {
+            role,
+            cell,
+            occupant,
+        });
         self.next_export = next;
         self.update_stream_gauges();
         Ok(RecordingReader {
             reader,
             lease,
             format,
+            link,
+            base,
         })
     }
 }

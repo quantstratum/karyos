@@ -2,9 +2,11 @@
 
 //! The Archive recording a driver's streams end to end (quantstratum-docs:
 //! karyos/design/archive-gap-analysis.md, A4c). The host wiring of §4: the
-//! driver hands out a lane's reader and the lease that keeps its stream
-//! (`recording_reader`), the host passes both to the Archive's agent as a
-//! `Guarded` source, and the agent records it on its own thread.
+//! driver hands out a lane's reader, its generation link and the lease
+//! that keeps its stream (`recording_reader`, `into_following_parts`), the
+//! host passes them to the Archive's agent as a `Guarded` source over a
+//! `Following` reader, which follows the stream's cutovers, and the agent
+//! records it on its own thread.
 //!
 //! - A required recording of fragmented messages, an aborted claim and a
 //!   term end: the segments hold every block where the log does,
@@ -31,7 +33,7 @@ use karyos_archive::catalog::{StopReason, StreamFormat};
 use karyos_archive::disk::StdDisk;
 use karyos_archive::recorder::{FrameSource, Frames, Mode, OnLap, SourceError};
 use karyos_archive::segment::{Geometry, SegmentStore, SyncPolicy};
-use karyos_archive::source::Guarded;
+use karyos_archive::source::{Following, Guarded};
 use karyos_client::{ClaimOutcome, ClientPublication, OfferOutcome};
 use karyos_driver::embedded::{EmbeddedDriver, StreamConfig, StreamHandle};
 use karyos_sys::frame::Lane;
@@ -267,10 +269,10 @@ fn the_archive_records_driver_streams_end_to_end() {
         .recording_reader(required, Role::Required)
         .unwrap()
         .into_parts();
-    let (reader, lease) = driver
+    let (reader, link, base, lease) = driver
         .recording_reader(required, Role::Required)
         .unwrap()
-        .into_parts();
+        .into_following_parts();
     let first = archive
         .start(StartRecording {
             stream_id: 42,
@@ -280,7 +282,7 @@ fn the_archive_records_driver_streams_end_to_end() {
             policy: SyncPolicy::PerSegment,
             mode: Mode::Required,
             format: format(),
-            source: Box::new(Guarded::new(reader, lease)),
+            source: Box::new(Guarded::new(Following::new(reader, link, base), lease)),
         })
         .unwrap();
     let mut publication = driver.publication(required).unwrap();
@@ -331,10 +333,10 @@ fn the_archive_records_driver_streams_end_to_end() {
 
     // An async recording whose reader is lapped before the agent reads it.
     let lapped = driver.add_stream(stream(43)).unwrap();
-    let (reader, lease) = driver
+    let (reader, link, base, lease) = driver
         .recording_reader(lapped, Role::Optional)
         .unwrap()
-        .into_parts();
+        .into_following_parts();
     let mut publication = driver.publication(lapped).unwrap();
     let resumed = Arc::new(AtomicU64::new(u64::MAX));
     for i in 0..5 * TERM / 1000 {
@@ -356,7 +358,7 @@ fn the_archive_records_driver_streams_end_to_end() {
             },
             format: format(),
             source: Box::new(Watched {
-                source: Guarded::new(reader, lease),
+                source: Guarded::new(Following::new(reader, link, base), lease),
                 resumed: Arc::clone(&resumed),
             }),
         })

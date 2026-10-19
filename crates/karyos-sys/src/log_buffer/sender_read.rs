@@ -771,6 +771,12 @@ impl<O: BufferOwner> SenderRead<O> {
         }
     }
 
+    /// The buffer this reader reads.
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer<O::Terms> {
+        self.subscription.buffer()
+    }
+
     /// Whether the publication is sealed for a mapping-generation cutover:
     /// the stream continues in a successor mapping (Acquire). `false`
     /// while active and for a final seal.
