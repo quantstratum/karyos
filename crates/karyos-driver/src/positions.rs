@@ -562,7 +562,7 @@ mod tests {
     /// at its last value, and the pass counts one counter overflow.
     #[test]
     fn a_position_that_does_not_fit_keeps_its_cell_and_counts_an_overflow() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _reader = driver.subscribe(handle, Role::Required).unwrap();
         let mut writer = driver.publication(handle).unwrap();
@@ -592,9 +592,28 @@ mod tests {
         assert!(positions.due(1_100, 100));
     }
 
+    /// The liveness cells (management-agent-gap-analysis.md, M1): the pid
+    /// and start time are set at creation, and the duty time is 0 until
+    /// the first duty cycle, then moves with each one, never back.
+    #[test]
+    fn the_driver_records_its_pid_start_and_duty_time() {
+        let mut driver = driver(FIXED_COUNTERS + 5);
+        assert_eq!(fixed(&driver, "driver pid"), u64::from(std::process::id()));
+        let started = fixed(&driver, "driver started at");
+        assert_ne!(started, 0);
+        assert_eq!(fixed(&driver, "conductor duty at"), 0);
+        let _ = driver.do_work().unwrap();
+        let first = fixed(&driver, "conductor duty at");
+        assert!(first >= started);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = driver.do_work().unwrap();
+        assert!(fixed(&driver, "conductor duty at") > first);
+        assert_eq!(fixed(&driver, "driver started at"), started);
+    }
+
     #[test]
     fn a_pass_samples_the_conductor_readings() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _reader = driver.subscribe(handle, Role::Required).unwrap();
         let mut writer = driver.publication(handle).unwrap();
@@ -652,7 +671,7 @@ mod tests {
 
     #[test]
     fn positions_continue_across_a_mapping_cutover() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let mut writer = driver.publication(handle).unwrap();
         let _ = writer.offer(b"one").unwrap();
@@ -687,7 +706,7 @@ mod tests {
 
     #[test]
     fn a_subscriber_that_has_not_moved_reports_its_predecessor_position() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let mut reader = driver.subscribe(handle, Role::Required).unwrap();
         let mut writer = driver.publication(handle).unwrap();
@@ -739,7 +758,7 @@ mod tests {
     /// predecessor cell only, not the successor cell reserved for it.
     #[test]
     fn a_recording_that_has_not_moved_reports_its_predecessor_position() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _recording = driver.recording_reader(handle, Role::Optional).unwrap();
         let mut writer = driver.publication(handle).unwrap();
@@ -773,7 +792,7 @@ mod tests {
 
     #[test]
     fn membership_changes_only_inside_a_pass() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _ = driver.do_work().unwrap();
         let epoch = fixed(&driver, "positions epoch");
@@ -840,7 +859,7 @@ mod tests {
 
     #[test]
     fn dropping_the_driver_releases_cells_in_a_final_pass() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _reader = driver.subscribe(handle, Role::Optional).unwrap();
         let _ = driver.do_work().unwrap();
@@ -909,7 +928,7 @@ mod tests {
 
     #[test]
     fn cells_carry_the_stream_lane() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let mut config = stream_config(2);
         config.buffer.lane = Lane::try_new(3).unwrap();
         let handle = driver.add_stream(config).unwrap();
@@ -927,7 +946,7 @@ mod tests {
         assert_eq!(next_epochs(u64::MAX - 1), (u64::MAX, 2));
         // An odd epoch is never stored, but the wrap from it skips 0 too.
         assert_eq!(next_epochs(u64::MAX), (1, 2));
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         driver.positions.set_epoch(u64::MAX - 1);
         let _ = driver.do_work().unwrap();
         assert_eq!(fixed(&driver, "positions epoch"), 2);
@@ -935,7 +954,7 @@ mod tests {
 
     #[test]
     fn cells_are_released_with_the_subscriber_and_the_stream() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let reader = driver.subscribe(handle, Role::Optional).unwrap();
         let _ = driver.do_work().unwrap();
@@ -1000,7 +1019,7 @@ mod tests {
     /// its label.
     #[test]
     fn readers_of_a_replaced_incarnation_are_sampled() {
-        let mut driver = driver(64);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let guard = driver.add_guard("orders").unwrap();
         driver.guard_stream(handle, guard, 4, None).unwrap();
