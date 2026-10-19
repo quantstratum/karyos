@@ -152,11 +152,7 @@ impl Agent {
     pub fn view(&self) -> AgentView {
         AgentView {
             version: API_VERSION,
-            drivers: self
-                .drivers
-                .iter()
-                .map(|driver| driver.view(&self.config.alerts))
-                .collect(),
+            drivers: self.drivers.iter().map(Driver::view).collect(),
         }
     }
 }
@@ -186,6 +182,9 @@ impl Driver {
                             reason: error.to_string(),
                         };
                     }
+                    // Nothing read: its lag alerts clear, a quiet refresh
+                    // for its loss alert (M9).
+                    self.alerts.detached(rules);
                     return;
                 }
             }
@@ -227,7 +226,7 @@ impl Driver {
         }
     }
 
-    fn view(&self, rules: &AlertRules) -> DriverView {
+    fn view(&self) -> DriverView {
         let (latencies, trace) = self
             .trace
             .as_ref()
@@ -244,7 +243,7 @@ impl Driver {
             guards: self.guards.feed(),
             latencies,
             trace,
-            alerts: self.alerts.firing(rules),
+            alerts: self.alerts.firing(),
         }
     }
 }

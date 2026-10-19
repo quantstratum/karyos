@@ -8,13 +8,14 @@
 //! - **Lag.** A subscriber whose lag is at or above
 //!   [`AlertRules::lag_bytes`] in [`AlertRules::lag_refreshes`]
 //!   consecutive consistent samples fires; one consistent sample below the
-//!   bound, or the subscriber gone, clears it. A sample whose values may
-//!   mix passes changes nothing, either way.
+//!   bound, or the subscriber gone, clears it, and so does a refresh that
+//!   reads nothing (the driver closed or cannot be attached). A sample
+//!   whose values may mix passes changes nothing, either way.
 //! - **Loss.** A refresh whose loss report grew (records read or
 //!   overwritten unread: both are unrecoverable losses) fires the driver's
 //!   loss alert, which counts the records; [`AlertRules::loss_quiet`]
-//!   refreshes without a new one clear it. A new driver instance starts
-//!   the count over.
+//!   refreshes without a new one clear it, a refresh that reads nothing
+//!   included. A new driver instance starts the count over.
 //!
 //! An alert carries the host time of the refresh at which it began firing.
 
@@ -79,7 +80,8 @@ impl AlertRules {
 #[derive(Debug, Clone, Copy)]
 struct Lagging {
     samples: u32,
-    since: u64,
+    /// The time it began firing, once its samples reached the rule's.
+    since: Option<u64>,
     lag: u64,
 }
 
@@ -102,6 +104,18 @@ pub(crate) struct Alerts {
 }
 
 impl Alerts {
+    /// A refresh that read nothing: the driver closed or cannot be
+    /// attached (IMPLEMENT's F1 on #477). Its subscribers are gone, so
+    /// every lag alert clears; no loss was reported, so it is a quiet
+    /// refresh for the loss alert.
+    pub(crate) fn detached(&mut self, rules: &AlertRules) {
+        self.lagging.clear();
+        self.losing = self.losing.and_then(|losing| {
+            let quiet = losing.quiet.checked_add(1).unwrap_or(losing.quiet);
+            (quiet < rules.loss_quiet.max(1)).then_some(Losing { quiet, ..losing })
+        });
+    }
+
     /// A new driver instance: its rings start over, so the loss baseline
     /// does; a loss alert firing stays until it clears.
     pub(crate) fn restart(&mut self) {
@@ -128,18 +142,19 @@ impl Alerts {
                         .and_then(|lag| u64::try_from(lag).ok())
                         .filter(|lag| *lag >= rules.lag_bytes);
                     if let Some(lag) = lag {
-                        let state = match self.lagging.get(&key) {
-                            Some(state) => Lagging {
-                                // Checked: at its end the count keeps its value.
-                                samples: state.samples.checked_add(1).unwrap_or(state.samples),
-                                since: state.since,
-                                lag,
-                            },
-                            None => Lagging {
-                                samples: 1,
-                                since: now,
-                                lag,
-                            },
+                        // Checked: at its end the count keeps its value.
+                        let samples = self.lagging.get(&key).map_or(1, |state| {
+                            state.samples.checked_add(1).unwrap_or(state.samples)
+                        });
+                        let since = self
+                            .lagging
+                            .get(&key)
+                            .and_then(|state| state.since)
+                            .or((samples >= rules.lag_refreshes.max(1)).then_some(now));
+                        let state = Lagging {
+                            samples,
+                            since,
+                            lag,
                         };
                         let _ = seen.insert(key, state);
                     }
@@ -172,18 +187,19 @@ impl Alerts {
     }
 
     /// The alerts firing.
-    pub(crate) fn firing(&self, rules: &AlertRules) -> Vec<Alert> {
+    pub(crate) fn firing(&self) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self
             .lagging
             .iter()
-            .filter(|(_, state)| state.samples >= rules.lag_refreshes.max(1))
-            .map(|(&(stream, lane, participant), state)| Alert {
-                kind: AlertKind::Lag,
-                stream,
-                lane,
-                participant,
-                value: state.lag,
-                since: state.since,
+            .filter_map(|(&(stream, lane, participant), state)| {
+                Some(Alert {
+                    kind: AlertKind::Lag,
+                    stream,
+                    lane,
+                    participant,
+                    value: state.lag,
+                    since: state.since?,
+                })
             })
             .collect();
         if let Some(losing) = self.losing {
