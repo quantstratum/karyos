@@ -404,6 +404,21 @@ release may break APIs, wire formats and shared-memory layouts.
   pending messages, polls and lanes are bounded by `WindowConfig`, and what
   a bound refuses, ages out or the mirror overwrites is counted
   (`TraceCounts`). karyos-agent now depends on karyos-trace (owner item 52).
+- The management agent's local API v1 (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M7; owner item 51
+  interims, no new dependency). `karyos_agent::json` writes API v1 by hand
+  (fields under their Rust names in declaration order, exact integers, the
+  instance as 32 hex digits, `null` for none); `karyos_agent::server`
+  serves it on `<api-dir>/agent.sock` (a private `0700` directory, the
+  socket `0600`; a stale socket replaced, a live one never) to the uids of
+  a role table (`Role`: viewer, operator, risk officer, administrator),
+  checking the peer's uid (`SO_PEERCRED`). One request line per connection,
+  `KARYOS-AGENT 1 view`, one JSON answer; another version is answered with
+  the versions supported, a uid without a role `not authorized`. The
+  `karyos-agent` binary runs it (`--api-dir`, `--driver`, `--role
+  UID=ROLE`, `--refresh-ms`). The API compatibility test pins API v1's
+  JSON field for field.
+
 - Consistent reads of an endpoint's capability gauges (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M6b): the conductor
   writes each endpoint's gauges inside a sampling pass on a new `capability
