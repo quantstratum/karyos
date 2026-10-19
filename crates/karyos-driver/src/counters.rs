@@ -67,6 +67,12 @@
 //! | `driver pid` | gauge | the driver process's id in its own pid namespace, set at creation; a tool in another namespace knows it by another number |
 //! | `driver started at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds when the driver was created |
 //! | `conductor duty at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds of the last duty cycle, read at its end with the positions pass; 0 before the first |
+//! | `capability fallback` | event | endpoint capabilities on a fallback, once per endpoint epoch (SPEC §16.8) |
+//! | `capability missing` | event | endpoint opens and reopens refused for a required capability (SPEC §16.8) |
+//!
+//! With a network, each endpoint's effective capabilities are gauges keyed
+//! by participant kind endpoint and its instance id (`crate::capabilities`,
+//! M3), written by the conductor.
 //!
 //! With a network, the agents' system counters are driver-wide event
 //! cells (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
@@ -123,7 +129,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 62] = [
+const LABELS: [(u64, &str); 64] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -186,6 +192,8 @@ const LABELS: [(u64, &str); 62] = [
     (TYPE_GAUGE, "driver pid"),
     (TYPE_TIMESTAMP, "driver started at"),
     (TYPE_TIMESTAMP, "conductor duty at"),
+    (TYPE_EVENTS, "capability fallback"),
+    (TYPE_EVENTS, "capability missing"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -348,8 +356,14 @@ pub(crate) enum Event {
     DriverStartedAt,
     /// Host `CLOCK_MONOTONIC` nanoseconds of the last duty cycle, read at
     /// its end with the positions pass, 0 before the first: a tool's age
-    /// of it grows while the conductor stalls. Last, so no other counter's id moves.
+    /// of it grows while the conductor stalls.
     ConductorDutyAt,
+    /// Endpoint capabilities running on a fallback, once per endpoint
+    /// epoch (SPEC §16.8; `crate::capabilities`).
+    CapabilityFallback,
+    /// Endpoint opens and reopens refused because a required capability
+    /// was not active (SPEC §16.8). Last, so no other counter's id moves.
+    CapabilityMissing,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -616,6 +630,8 @@ mod tests {
             (Event::DriverPid, "driver pid"),
             (Event::DriverStartedAt, "driver started at"),
             (Event::ConductorDutyAt, "conductor duty at"),
+            (Event::CapabilityFallback, "capability fallback"),
+            (Event::CapabilityMissing, "capability missing"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

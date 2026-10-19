@@ -394,6 +394,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Each network endpoint's effective capabilities in the CnC, for tools and
+  the management agent (SPEC §16.8; quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M3): one gauge per
+  capability field (`capability epoch`, platform, copy mode, queue
+  assignment, max datagram, observation points, clock granularity, each
+  capability's state with its reason and detail, and the effective buffer
+  sizes), keyed by the new participant kind `KIND_ENDPOINT` (4) and the
+  endpoint's instance id, rewritten at each reopen and freed when the
+  endpoint leaves or the network closes. The driver-wide events
+  `capability fallback` (capabilities on a fallback, once per endpoint
+  epoch) and `capability missing` (opens and reopens refused for a
+  required capability) count degradations.
 - The driver's CnC counters for tools and the management agent
   (quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`, M1
   and M2). M1: `driver pid` (in the driver's own pid namespace), `driver
