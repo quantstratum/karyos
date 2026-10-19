@@ -44,6 +44,22 @@
 //!   there and removes every later segment unread), then shortens the
 //!   data file, removes the later segments and drops the invalid entry.
 //!   A crash inside recovers either as before or at the cut.
+//! - **Purge.** [`SegmentStore::purge_before`] moves the recording's start
+//!   forward to a write boundary, for a log that compacts its prefix, and
+//!   drops the whole segments below the new start's. The new start, the
+//!   floor, is replaced atomically in its own file, `<recording>.floor`
+//!   (written, synced, renamed, its directory synced), before any segment
+//!   is removed; then the segments below the floor's are removed, lowest
+//!   first, and the directory synced. Recovery drops every segment below
+//!   the floor's and starts the recording at the floor, so a crash inside
+//!   a purge recovers as before it (the floor not replaced yet) or at the
+//!   floor (a removal cut short leaves only segments below it). The bytes
+//!   of the floor's segment below the floor stay in its file, never read
+//!   back, though recovery still checks them as it walks the segment: a
+//!   cut there leaves the floor past the written position. A floor whose
+//!   segment is missing, or past the written position, is refused, never
+//!   skipped. A floor's temporary file left by a crash is removed at
+//!   recovery.
 //! - **Headers.** Only the last segment can be one being created, and
 //!   recovery removes it: its index header is missing, short or zeroed, or
 //!   torn (failing its CRC) with no data and no entry behind it; or its
@@ -98,6 +114,11 @@ const HEADER_BYTES: usize = 48;
 const _: () = assert!(HEADER == 48, "HEADER_BYTES is HEADER");
 /// An index entry's length.
 const ENTRY: u64 = 32;
+/// "KYSF", the floor record's magic.
+const FLOOR_MAGIC: [u8; 4] = *b"KYSF";
+/// The floor record: magic, reserved, recording, the floor (the
+/// recording's start), CRC-32C of the first 24 bytes.
+const FLOOR_LEN: usize = 28;
 
 /// Finished segments the interval policy keeps open for its next tick; a
 /// roll past this many syncs them inline, so a store that is never ticked
@@ -264,6 +285,9 @@ pub enum DropReason {
     CreationGap,
     /// It does not start where the previous segment ends.
     NotContiguous,
+    /// It lies below the recording's floor: a purge removed it, or was
+    /// removing it when it stopped.
+    Purged,
 }
 
 /// A segment recovery removes, and why.
@@ -406,6 +430,31 @@ pub enum SegmentError {
         base: u64,
         /// What is wrong.
         problem: HeaderProblem,
+    },
+    /// A purge to a position that is not in `[start, durable]`, or in a
+    /// segment not created yet: nothing changed.
+    #[error("cannot purge before {position}: outside [{start}, {durable}]")]
+    InvalidPurge {
+        /// The position asked.
+        position: u64,
+        /// The recording's first position.
+        start: u64,
+        /// The durable position.
+        durable: u64,
+    },
+    /// The recording's floor record is not one this version wrote whole,
+    /// or names another recording.
+    #[error("the floor record of recording {recording} is damaged")]
+    FloorDamaged {
+        /// The recording.
+        recording: u64,
+    },
+    /// The recording's floor lies in a segment that is missing, or past
+    /// the written position: what remains cannot start the recording.
+    #[error("the recording's floor {floor} is not held")]
+    FloorMissing {
+        /// The floor.
+        floor: u64,
     },
     /// The operating system's error.
     #[error(transparent)]
@@ -675,6 +724,60 @@ fn index_name(recording: u64, base: u64) -> String {
     format!("{recording:016x}-{base:016x}.idx")
 }
 
+fn floor_name(recording: u64) -> String {
+    format!("{recording:016x}.floor")
+}
+
+fn encode_floor(recording: u64, floor: u64) -> [u8; FLOOR_LEN] {
+    let mut bytes = [0u8; FLOOR_LEN];
+    let (body, crc) = bytes.split_at_mut(24);
+    let (magic, rest) = body.split_at_mut(4);
+    magic.copy_from_slice(&FLOOR_MAGIC);
+    let (_, rest) = rest.split_at_mut(4);
+    let (id, rest) = rest.split_at_mut(8);
+    id.copy_from_slice(&recording.to_le_bytes());
+    rest.copy_from_slice(&floor.to_le_bytes());
+    let sum = crc32c(body);
+    crc.copy_from_slice(&sum.to_le_bytes());
+    bytes
+}
+
+/// The floor in `bytes`, if they are a whole record of `recording`.
+fn decode_floor(recording: u64, bytes: &[u8]) -> Option<u64> {
+    let bytes: &[u8; FLOOR_LEN] = bytes.try_into().ok()?;
+    let (body, crc) = bytes.split_first_chunk::<24>()?;
+    let crc: [u8; 4] = crc.try_into().ok()?;
+    if u32::from_le_bytes(crc) != crc32c(body) {
+        return None;
+    }
+    let (magic, rest) = body.split_first_chunk::<4>()?;
+    let (reserved, rest) = rest.split_first_chunk::<4>()?;
+    let (id, rest) = rest.split_first_chunk::<8>()?;
+    let floor: [u8; 8] = rest.try_into().ok()?;
+    (*magic == FLOOR_MAGIC && *reserved == [0; 4] && u64::from_le_bytes(*id) == recording)
+        .then_some(u64::from_le_bytes(floor))
+}
+
+/// The floor of `recording` in `dir`: `None` when it was never purged.
+fn read_floor<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    recording: u64,
+) -> Result<Option<u64>, SegmentError> {
+    let file = match disk.open_read(&dir.join(floor_name(recording))) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let damaged = SegmentError::FloorDamaged { recording };
+    if disk.len(&file)? != u64::try_from(FLOOR_LEN).map_err(|_| SegmentError::PositionOverflow)? {
+        return Err(damaged);
+    }
+    let mut bytes = [0u8; FLOOR_LEN];
+    disk.read_at(&file, 0, &mut bytes)?;
+    decode_floor(recording, &bytes).map(Some).ok_or(damaged)
+}
+
 /// The segment bases of `recording` among `names`, in order.
 fn bases(recording: u64, names: &[String]) -> Vec<u64> {
     let prefix = format!("{recording:016x}-");
@@ -718,6 +821,13 @@ impl<D: Disk> SegmentStore<D> {
     ) -> Result<Self, SegmentError> {
         if !bases(recording, &disk.list(dir)?).is_empty() {
             return Err(SegmentError::Exists { recording });
+        }
+        // A floor left by an earlier recording of this id, whose segments
+        // are gone: it would drop the new one's first segments.
+        match disk.remove(&dir.join(floor_name(recording))) {
+            Ok(()) => disk.sync_dir(dir)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let mut store = Self {
             disk,
@@ -1182,6 +1292,81 @@ impl<D: Disk> SegmentStore<D> {
         Ok(())
     }
 
+    /// Moves the recording's start to `position`, a write boundary, and
+    /// drops the whole segments below the one holding it; returns the new
+    /// start, or the start, unchanged, when `position` is not past it.
+    /// What is dropped is gone, and the new start durable, on return; see
+    /// the module's purge for the crash cases.
+    ///
+    /// `position` must lie in `[start, durable]`, so nothing purged is
+    /// unsynced, in a segment already created. It must be the start of a
+    /// write (the caller's frames start there); the store does not check
+    /// it, and a recording that starts inside a write reads that write's
+    /// tail first.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::InvalidPurge`], which changes nothing;
+    /// [`SegmentError::Failed`] after an earlier failure; the operating
+    /// system's errors, after which the store fails until recovered.
+    pub fn purge_before(&mut self, position: u64) -> Result<u64, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        let refused = SegmentError::InvalidPurge {
+            position,
+            start: self.start,
+            durable: self.durable,
+        };
+        if position < self.start || position > self.durable {
+            return Err(refused);
+        }
+        if position == self.start {
+            return Ok(self.start);
+        }
+        let floor_base = self.geometry.base_of(position);
+        // The floor's segment must exist: at the written position's end of
+        // a segment, the next one is not created yet.
+        if self
+            .current
+            .as_ref()
+            .is_none_or(|open| floor_base > open.base)
+        {
+            return Err(refused);
+        }
+        self.failed = true;
+        let temporary = self.dir.join(format!("{}.tmp", floor_name(self.recording)));
+        let file = self.disk.create(&temporary)?;
+        self.disk
+            .write_at(&file, 0, &encode_floor(self.recording, position))?;
+        self.disk.sync(&file)?;
+        drop(file);
+        self.disk
+            .rename(&temporary, &self.dir.join(floor_name(self.recording)))?;
+        self.disk.sync_dir(&self.dir)?;
+        // Lowest first: a removal cut short leaves only segments below the
+        // floor's, which recovery drops.
+        let mut base = self.geometry.base_of(self.start);
+        let removing = base < floor_base;
+        while base < floor_base {
+            remove_segment(&mut self.disk, &self.dir, self.recording, base)?;
+            base = base
+                .checked_add(self.geometry.segment_length)
+                .ok_or(SegmentError::PositionOverflow)?;
+        }
+        if removing {
+            self.disk.sync_dir(&self.dir)?;
+        }
+        self.start = position;
+        self.finished.retain(|open| open.base >= floor_base);
+        self.gaps.retain(|(_, to)| *to > position);
+        if let Some(first) = self.gaps.first_mut() {
+            first.0 = first.0.max(position);
+        }
+        self.failed = false;
+        Ok(position)
+    }
+
     /// Truncates the recording to `position`, the end of a write (or the
     /// start): everything after it is removed, on disk and in the store,
     /// and what is kept is durable on return. Returns the durable
@@ -1410,6 +1595,14 @@ impl<D: Disk> SegmentStore<D> {
         policy: SyncPolicy,
     ) -> Result<Recovered<D>, SegmentError> {
         let (plan, files) = scan_recording(&mut disk, dir, recording, geometry, Access::Write)?;
+        // A purge's floor record not renamed yet: the purge never began.
+        // Only where there is one: a recovery that writes nothing else runs
+        // on a read-only directory too.
+        let temporary = format!("{}.tmp", floor_name(recording));
+        if disk.list(dir)?.contains(&temporary) {
+            disk.remove(&dir.join(temporary))?;
+            disk.sync_dir(dir)?;
+        }
         if let (Some(kept), Some((_, index))) = (plan.kept, &files)
             && let Some(length) = kept.index_length
         {
@@ -1573,6 +1766,7 @@ fn scan_recording<D: Disk>(
     geometry: Geometry,
     access: Access,
 ) -> Result<(RecoveryPlan, Option<KeptFiles<D>>), SegmentError> {
+    let floor = read_floor(disk, dir, recording)?;
     let bases = bases(recording, &disk.list(dir)?);
     let mut scan = Scan {
         start: None,
@@ -1583,7 +1777,22 @@ fn scan_recording<D: Disk>(
         gaps: Vec::new(),
     };
     let last = bases.last().copied();
+    // Every segment from the floor's on is the recording; the floor's own
+    // segment must be there to start it.
+    let floor_base = floor.map(|floor| geometry.base_of(floor));
+    if let (Some(floor), Some(floor_base)) = (floor, floor_base)
+        && !bases.contains(&floor_base)
+    {
+        return Err(SegmentError::FloorMissing { floor });
+    }
     for base in bases {
+        if floor_base.is_some_and(|floor_base| base < floor_base) {
+            scan.dropped.push(DroppedSegment {
+                base,
+                reason: DropReason::Purged,
+            });
+            continue;
+        }
         // After a cut nothing continues the recording.
         if scan.cut.is_some() {
             scan.dropped.push(DroppedSegment {
@@ -1601,7 +1810,21 @@ fn scan_recording<D: Disk>(
             Err(reason) => scan.dropped.push(DroppedSegment { base, reason }),
         }
     }
-    let (kept, files) = match (scan.start, scan.kept) {
+    // A purged recording starts at its floor, inside the floor's segment.
+    let start = match (scan.start, floor) {
+        (Some(start), Some(floor)) if floor > start => {
+            if scan.written.is_none_or(|written| floor > written) {
+                return Err(SegmentError::FloorMissing { floor });
+            }
+            scan.gaps.retain(|(_, to)| *to > floor);
+            if let Some(first) = scan.gaps.first_mut() {
+                first.0 = first.0.max(floor);
+            }
+            Some(floor)
+        }
+        (start, _) => start,
+    };
+    let (kept, files) = match (start, scan.kept) {
         (Some(start), Some(kept)) => {
             let written = scan.written.unwrap_or(start);
             let length = written
