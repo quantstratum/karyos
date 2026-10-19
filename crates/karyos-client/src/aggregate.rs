@@ -128,6 +128,8 @@ pub struct AggregatePoll {
 /// One lane: its frame reader and the subscription state around it.
 struct LaneState<T: TermBytes> {
     lane: Lane,
+    /// The stream's session, for each message's info.
+    session_id: i32,
     reader: Option<FrameReader<Arc<LogBuffer<T>>>>,
     rejoin: RejoinPolicy,
     link: Option<Arc<GenerationLink<T>>>,
@@ -156,8 +158,13 @@ impl<T: TermBytes> LaneState<T> {
             lease,
             export,
         } = subscription.into_lane_parts();
+        // No mapping, no message: the session is then never read.
+        let session_id = inner
+            .as_ref()
+            .map_or(0, |inner| inner.buffer().config().session_id);
         Self {
             lane,
+            session_id,
             reader: inner.map(FrameReader::new),
             rejoin,
             link,
@@ -220,13 +227,21 @@ impl<T: TermBytes> LaneState<T> {
         };
         let base = self.base;
         let lane = self.lane;
+        let session_id = self.session_id;
         let mut taken = None;
+        let end = reader.ready_end();
         let delivered = reader.take(|bytes, info| {
+            let extent = end
+                .and_then(|end| end.checked_sub(info.position))
+                .and_then(|extent| u32::try_from(extent).ok())
+                .unwrap_or(0);
             let info = MessageInfo {
                 position: base + info.position,
+                extent,
                 reserved_value: info.reserved_value,
                 end_of_stream: info.end_of_stream,
                 extension: info.extension,
+                session_id,
             };
             taken = Some(info);
             handler(bytes, lane, info);

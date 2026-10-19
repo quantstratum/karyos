@@ -15,6 +15,13 @@
 //!   lap it. The lost range is recorded as a gap, and the recording then
 //!   stops there ([`OnLap::Stop`]) or resumes at the source's lowest
 //!   retained position ([`OnLap::Resume`]), marked incomplete.
+//! - **Cutovers.** At a mapping cutover the source either follows the
+//!   successor ([`Frames::Cutover`]: the recording goes on at the seal,
+//!   with no gap) or was fenced ([`Frames::Fenced`]: the recording ends at
+//!   the seal, incomplete, with [`StopReason::Lapped`];
+//!   quantstratum-docs: karyos/design/mapping-generations.md,
+//!   "Recordings"). Each ends the duty, so a source repeating one cannot
+//!   hold the recorder's thread.
 //! - **Consumption.** The recorder tells the source what it consumed once
 //!   it is written to the store (not yet durable): durability follows the
 //!   store's policy, a separate axis (ADR-0023).
@@ -52,6 +59,20 @@ pub enum Frames {
     Pending,
     /// The publication is sealed at `at`: nothing follows.
     Sealed {
+        /// The seal position.
+        at: u64,
+    },
+    /// The publication was sealed at `at` for a cutover, and the source
+    /// moved to its successor: the stream goes on at `at`, the
+    /// successor's base (mapping-generations.md, "Recordings").
+    Cutover {
+        /// The seal position, where the successor's positions start.
+        at: u64,
+    },
+    /// The publication was sealed at `at` for a cutover, and the source
+    /// cannot follow it: it was fenced at the cutover deadline. The
+    /// recording follows its lap policy from `at`.
+    Fenced {
         /// The seal position.
         at: u64,
     },
@@ -214,8 +235,9 @@ impl RecorderError {
 pub struct Ended {
     /// Its last position.
     pub position: u64,
-    /// Why: the seal (normal), a lap with `OnLap::Stop`, or how it was
-    /// closed (a command, the shutdown, a source failure).
+    /// Why: the seal (normal), a lap with `OnLap::Stop` or a fence at a
+    /// mapping cutover (lapped), or how it was closed (a command, the
+    /// shutdown, a source failure).
     pub reason: StopReason,
     /// Whether it lost a range.
     pub incomplete: bool,
@@ -228,6 +250,9 @@ pub struct Duty {
     pub recorded: u64,
     /// The recording ended in this duty.
     pub ended: Option<Ended>,
+    /// The source was fenced at a cutover in this duty: what the Archive
+    /// counts, so a cutover gap is told from a lap.
+    pub fenced: bool,
 }
 
 /// The recorder of one stream lane into one recording.
@@ -367,6 +392,48 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                         }));
                     }
                     duty.ended = Some(self.end(at, StopReason::Normal));
+                    break;
+                }
+                Frames::Cutover { at } => {
+                    // The successor continues the stream where the seal is:
+                    // nothing is lost, and the recording goes on, from the
+                    // next duty: a source that repeats the cutover at the
+                    // same position cannot hold this thread.
+                    let written = self.store.written();
+                    if at != written {
+                        return Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+                            at,
+                            written,
+                        }));
+                    }
+                    break;
+                }
+                Frames::Fenced { at } => {
+                    let written = self.store.written();
+                    if at != written {
+                        return Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+                            at,
+                            written,
+                        }));
+                    }
+                    duty.fenced = true;
+                    self.incomplete = true;
+                    // Resuming joins the successor at its head, a gap from
+                    // the seal; a recording that stops, or a required one,
+                    // ends at the seal, which it recorded whole.
+                    let resume = matches!(
+                        self.mode,
+                        Mode::Async {
+                            on_lap: OnLap::Resume
+                        }
+                    );
+                    if !resume || !self.store.gap_fits() {
+                        duty.ended = Some(self.end(at, StopReason::Lapped));
+                        break;
+                    }
+                    // Resumed or not, the duty ends here: a source fenced again
+                    // at the same position cannot hold this thread.
+                    let _ = self.resume_after_lap(at)?;
                     break;
                 }
                 Frames::Lost { from, to } => {

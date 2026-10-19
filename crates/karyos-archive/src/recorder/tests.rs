@@ -37,6 +37,15 @@ enum Script {
     SealedAt(u64),
     /// The source is lapped: this many bytes are lost.
     Lost(u64),
+    /// A cutover the source follows, at its position.
+    Cutover,
+    /// A cutover the source was fenced from, at its position.
+    Fenced,
+    /// A cutover at its position, every read, for ever.
+    CutoverAgain,
+    /// A cutover, then a fence, at this position, wherever the source is.
+    CutoverAt(u64),
+    FencedAt(u64),
 }
 
 /// A source that plays a script from `position`.
@@ -48,6 +57,9 @@ struct Scripted {
     resumed: Vec<u64>,
     /// Resumes answered `Busy` before one succeeds.
     busy: u32,
+    /// Where a resume lands, past its floor: the head; the floor when
+    /// `None`.
+    head: Option<u64>,
 }
 
 impl Scripted {
@@ -58,6 +70,7 @@ impl Scripted {
             consumed: position,
             resumed: Vec::new(),
             busy: 0,
+            head: None,
         }
     }
 }
@@ -105,6 +118,14 @@ impl FrameSource for Scripted {
             }
             Script::Sealed => Ok(Frames::Sealed { at: position }),
             Script::SealedAt(at) => Ok(Frames::Sealed { at }),
+            Script::Cutover => {
+                let _ = self.script.pop_front();
+                Ok(Frames::Cutover { at: position })
+            }
+            Script::Fenced => Ok(Frames::Fenced { at: position }),
+            Script::CutoverAgain => Ok(Frames::Cutover { at: position }),
+            Script::CutoverAt(at) => Ok(Frames::Cutover { at }),
+            Script::FencedAt(at) => Ok(Frames::Fenced { at }),
             Script::Lost(length) => {
                 let _ = self.script.pop_front();
                 Ok(Frames::Lost {
@@ -129,8 +150,12 @@ impl FrameSource for Scripted {
             return Err(SourceError::Busy);
         }
         self.resumed.push(to);
-        self.position = to;
-        Ok(to)
+        // A fenced source resumes past the cutover: its script goes on.
+        if matches!(self.script.front(), Some(Script::Fenced)) {
+            let _ = self.script.pop_front();
+        }
+        self.position = self.head.unwrap_or(to).max(to);
+        Ok(self.position)
     }
 }
 
@@ -592,4 +617,148 @@ fn a_duty_stamps_its_writes_with_its_time() {
         replay.poll(1).unwrap(),
         crate::replay::Step::Wait { until_ns: 1200 }
     );
+}
+
+/// Gap 6 (SPEC §13 "Cutover with backlog"): a source that follows a
+/// cutover at the seal position goes on at the successor's base, the same
+/// position. The recording continues with no gap and ends normally at the
+/// final seal, every byte in order.
+#[test]
+fn a_recording_continues_across_a_cutover_it_follows() {
+    let script = vec![
+        Script::Data(data(0, 30)),
+        Script::Cutover,
+        Script::Data(data(30, 20)),
+        Script::Sealed,
+    ];
+    let mut recorder = recorder(
+        FaultDisk::default(),
+        Mode::Async {
+            on_lap: OnLap::Resume,
+        },
+        script,
+    );
+    // The cutover ends its duty at the seal; the next one goes on.
+    let duty = recorder.duty(1).unwrap();
+    assert_eq!(duty.ended, None);
+    assert_eq!(recorder.store.written(), 30);
+    let duty = recorder.duty(1).unwrap();
+    assert_eq!(
+        duty.ended,
+        Some(Ended {
+            position: 50,
+            reason: StopReason::Normal,
+            incomplete: false
+        })
+    );
+    assert!(!duty.fenced);
+    assert!(recorder.store.gaps().is_empty());
+    assert!(recorder.source.resumed.is_empty());
+    let mut read = vec![0u8; 50];
+    recorder.store.read(0, &mut read).unwrap();
+    assert_eq!(read, data(0, 50));
+}
+
+/// A source fenced at a cutover follows the lap policy from the seal:
+/// with `Resume` it joins the successor at its head, the range between is
+/// a gap and the recording is incomplete; with `Stop`, and for a required
+/// recording, it ends at the seal, incomplete. Each duty reports it.
+#[test]
+fn a_fenced_recording_follows_its_lap_policy_from_the_seal() {
+    let script = vec![
+        Script::Data(data(0, 30)),
+        Script::Fenced,
+        Script::Data(data(70, 20)),
+        Script::Sealed,
+    ];
+    let mut resumed = recorder(
+        FaultDisk::default(),
+        Mode::Async {
+            on_lap: OnLap::Resume,
+        },
+        script.clone(),
+    );
+    resumed.source.head = Some(70);
+    // The fence ends its duty; the next one records the successor.
+    let duty = resumed.duty(1).unwrap();
+    assert!(duty.fenced);
+    assert_eq!(duty.ended, None);
+    let duty = resumed.duty(1).unwrap();
+    assert!(!duty.fenced);
+    assert_eq!(
+        duty.ended,
+        Some(Ended {
+            position: 90,
+            reason: StopReason::Normal,
+            incomplete: true
+        })
+    );
+    assert_eq!(resumed.source.resumed, [30]);
+    assert_eq!(resumed.store.gaps(), [(30, 70)]);
+
+    for mode in [
+        Mode::Async {
+            on_lap: OnLap::Stop,
+        },
+        Mode::Required,
+    ] {
+        let mut stopped = recorder(FaultDisk::default(), mode, script.clone());
+        let duty = stopped.duty(1).unwrap();
+        assert!(duty.fenced);
+        assert_eq!(
+            duty.ended,
+            Some(Ended {
+                position: 30,
+                reason: StopReason::Lapped,
+                incomplete: true
+            }),
+            "{mode:?}"
+        );
+        assert!(stopped.source.resumed.is_empty());
+        assert!(stopped.store.gaps().is_empty());
+    }
+}
+
+/// #444 review P2: a cutover ends its duty, so a source that repeats one
+/// at the same position never holds the recorder: each duty returns.
+#[test]
+fn a_repeated_cutover_never_holds_the_recorder() {
+    let script = vec![Script::Data(data(0, 30)), Script::CutoverAgain];
+    let mut recorder = recorder(
+        FaultDisk::default(),
+        Mode::Async {
+            on_lap: OnLap::Resume,
+        },
+        script,
+    );
+    for _ in 0..3 {
+        let duty = recorder.duty(1).unwrap();
+        assert_eq!(duty.ended, None);
+        assert!(!duty.fenced);
+    }
+    assert_eq!(recorder.store.written(), 30);
+}
+
+/// A cutover or a fence names the seal, which is the written position;
+/// any other is the source's error.
+#[test]
+fn a_cutover_or_a_fence_off_the_written_position_is_invalid() {
+    for script in [Script::CutoverAt(31), Script::FencedAt(29)] {
+        let mut recorder = recorder(
+            FaultDisk::default(),
+            Mode::Required,
+            vec![Script::Data(data(0, 30)), script],
+        );
+        assert!(
+            matches!(
+                recorder.duty(1),
+                Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+                    written: 30,
+                    ..
+                }))
+            ),
+            "{:?}",
+            recorder.duty(1)
+        );
+    }
 }

@@ -789,6 +789,7 @@ impl Recorded {
             &GatewayConfig {
                 publications: &[],
                 subscriptions: &[],
+                network: &[],
                 conflated: &[],
                 max_claim: 64,
                 max_payload: 256,

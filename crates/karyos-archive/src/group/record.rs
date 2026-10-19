@@ -638,8 +638,8 @@ pub struct LifecycleEvent {
     pub logical_time: u64,
     /// The publication incarnation.
     pub incarnation: u64,
-    /// The position on `lane` the event names (where the image joined or
-    /// ended), or 0 when it names none.
+    /// The position on `lane` the event names (where the stream ended), or
+    /// 0 when it names none: image events carry no position.
     pub position: u64,
     /// The stream.
     pub stream_id: i32,

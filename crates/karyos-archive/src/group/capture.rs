@@ -237,7 +237,8 @@ pub fn capture<D: Disk>(
         lock: Mutex::new(()),
         signal: Condvar::new(),
     });
-    let capture = journal_capture(&mut journal).map_err(CaptureSetup::Journal)?;
+    let (capture, first_group_seq) =
+        journal_capture(&mut journal).map_err(CaptureSetup::Journal)?;
     // A recovered strict journal that ended at an incomplete event takes
     // nothing more.
     if capture == Capture::Strict && tracker_stopped {
@@ -265,6 +266,7 @@ pub fn capture<D: Disk>(
         dispatched,
         in_flight,
         checkpoints: None,
+        first_group_seq,
     };
     let bound = config
         .in_flight
@@ -353,15 +355,19 @@ pub enum CaptureSetup {
 }
 
 /// The journal's capture mode, from its header.
-fn journal_capture<D: Disk>(journal: &mut GroupJournal<D>) -> Result<Capture, JournalError> {
-    let mut capture = Capture::Strict;
+fn journal_capture<D: Disk>(journal: &mut GroupJournal<D>) -> Result<(Capture, u64), JournalError> {
+    let mut found = (Capture::Strict, 1);
     journal.walk(0, |_, _, record| {
-        if let Role::Header { capture: mode, .. } = record.role() {
-            capture = mode;
+        if let Role::Header {
+            capture,
+            first_group_seq,
+        } = record.role()
+        {
+            found = (capture, first_group_seq);
         }
         false
     })?;
-    Ok(capture)
+    Ok(found)
 }
 
 /// The event loop's end: it admits events and sends their records.
@@ -380,13 +386,21 @@ pub struct CaptureSender {
     /// The group's checkpoint handle, when it keeps checkpoints (A9-3),
     /// until the Gateway takes it.
     checkpoints: Option<super::checkpoint::CheckpointHandle>,
+    /// The journal header's first event.
+    first_group_seq: u64,
 }
 
 impl CaptureSender {
     /// The group's checkpoint handle, once: `None` for a group started
     /// without checkpoints, or once taken.
-    pub fn take_checkpoints(&mut self) -> Option<super::checkpoint::CheckpointHandle> {
+    pub(crate) fn take_checkpoints(&mut self) -> Option<super::checkpoint::CheckpointHandle> {
         self.checkpoints.take()
+    }
+
+    /// The group's first event, as its journal header names it.
+    #[must_use]
+    pub(crate) const fn first_group_seq(&self) -> u64 {
+        self.first_group_seq
     }
 
     /// Gives the sender the group's checkpoint handle.
@@ -503,6 +517,12 @@ impl CaptureSender {
     #[must_use]
     pub fn state(&self) -> GroupState {
         self.shared.state()
+    }
+
+    /// Whether the group is closing: the sender takes nothing more.
+    #[must_use]
+    pub(crate) fn closing(&self) -> bool {
+        self.shared.closing.load(Ordering::Acquire)
     }
 
     /// A waiter for durability, for threads other than the event loop's.

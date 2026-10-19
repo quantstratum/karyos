@@ -22,6 +22,7 @@ use karyos_sys::log_buffer::{
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
+use crate::catalog::StopReason;
 use crate::fault::FaultDisk;
 use crate::recorder::{FrameSource, Frames, Mode, OnLap, Recorder};
 use crate::segment::{Geometry, SegmentStore, SyncPolicy};
@@ -302,4 +303,68 @@ fn a_copy_buffer_off_the_stride_still_records() {
             next: 960
         }
     );
+}
+
+/// Gap 6: a lane sealed for a cutover is a seal with a successor. A
+/// recording's reader has no link to follow it yet, so the source is
+/// fenced there: the recording ends at the seal, incomplete, where a final
+/// seal ends it normally.
+#[test]
+fn a_seal_for_a_cutover_fences_the_recording_where_a_final_seal_ends_it() {
+    for cutover in [false, true] {
+        let buffer = LogBuffer::new(config()).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let source =
+            SenderRead::for_recording(conductor.subscribe_as(Role::Optional, true, 1).unwrap(), 3)
+                .unwrap();
+        let mut recorder = Recorder::new(
+            store(0),
+            source,
+            Mode::Async {
+                on_lap: OnLap::Stop,
+            },
+            1 << 16,
+            1 << 20,
+        )
+        .unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let mut published = Vec::new();
+        for sequence in 0..4 {
+            let data = message(sequence, 900);
+            assert!(matches!(
+                publication.append(&data, AppendOptions::default()).unwrap(),
+                AppendOutcome::Appended { .. }
+            ));
+            published.push(data);
+        }
+        drop(publication);
+        if cutover {
+            conductor.seal_for_cutover().unwrap();
+        } else {
+            conductor.seal().unwrap();
+        }
+        let mut ended = None;
+        for _ in 0..8 {
+            let _ = conductor.duty_cycle().unwrap();
+            let duty = recorder.duty(0).unwrap();
+            assert_eq!(duty.fenced, cutover && duty.ended.is_some());
+            if let Some(end) = duty.ended {
+                ended = Some(end);
+                break;
+            }
+        }
+        let ended = ended.expect("the recording never ended");
+        let written = recorder.store().written();
+        assert_eq!(ended.position, written);
+        assert_eq!(
+            (ended.reason, ended.incomplete),
+            if cutover {
+                (StopReason::Lapped, true)
+            } else {
+                (StopReason::Normal, false)
+            }
+        );
+        let (messages, _) = walk(recorder.store_mut(), 0, written);
+        assert_eq!(messages, published, "cutover {cutover}");
+    }
 }

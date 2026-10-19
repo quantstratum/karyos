@@ -196,7 +196,7 @@ fn a_replay_cursor_steps_without_allocating() {
 fn a_replay_gateway_dispatches_without_allocating() {
     use karyos_archive::disk::StdDisk;
     use karyos_archive::group::gateway::{
-        Dispatched, Effects, Event, GroupGateway, Handler, PublicationId,
+        Dispatched, Effects, Event, GroupGateway, Handler, MessagePayload, PublicationId,
     };
     use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
     use karyos_archive::group::prefix::{Coverage, recover};
@@ -294,6 +294,7 @@ fn a_replay_gateway_dispatches_without_allocating() {
         &GatewayConfig {
             publications: &publications,
             subscriptions: &subscriptions,
+            network: &[],
             conflated: &[],
             max_claim: 64,
             max_payload: 0,
@@ -307,7 +308,11 @@ fn a_replay_gateway_dispatches_without_allocating() {
     struct Offers;
     impl Handler for Offers {
         fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
-            if let Event::Message { payload, .. } = event {
+            if let Event::Message {
+                payload: MessagePayload::Bytes(payload),
+                ..
+            } = event
+            {
                 let _ = effects.offer(PublicationId(0), payload);
             }
         }
