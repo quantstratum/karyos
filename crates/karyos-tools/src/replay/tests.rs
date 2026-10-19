@@ -1155,8 +1155,7 @@ fn from_checkpoint_matches_the_right_journal_by_group_seq() {
 /// #430 P3: the prefix is recovered with the store as it holds the
 /// checkpoints. A gap, an intact checkpoint A, a second gap, then a lost
 /// checkpoint B: B opens no range, so A's range is the current one and
-/// replays, to the second gap; were B taken as held, A's range would be
-/// a middle one, not replayable.
+/// replays, to the second gap; B itself, lost, is not comparable.
 #[test]
 fn a_lost_checkpoint_opens_no_range() {
     let gap = |seq| {
@@ -1186,11 +1185,15 @@ fn a_lost_checkpoint_opens_no_range() {
         bytes[last] ^= 0x01;
         std::fs::write(&data, &bytes).unwrap();
     }
-    // A's range replays up to the second gap, in the range compared.
+    // A's range replays up to the second gap, its end: compared to it.
     let report = diff_from_checkpoint(&dirs[0], &dirs[1], 1);
-    assert!(
-        matches!(&report, Report::NotComparable { reason } if reason.contains("a gap marker from group_seq 5")),
-        "{report:?}"
+    assert_eq!(
+        report,
+        Report::Identical {
+            from: 4,
+            to: Some(4),
+            events: 1
+        }
     );
     // B itself, lost, opens no range: not comparable.
     let report = diff_from_checkpoint(&dirs[0], &dirs[1], 2);
@@ -1389,4 +1392,193 @@ fn a_record_whose_digest_differs_from_intact_bytes_is_corrupt() {
     let report = diff_from_checkpoint(&left, &right, 1);
     assert_eq!(report.exit_code(), 2, "{report:?}");
     assert!(report.text().contains("corrupt"), "{}", report.text());
+}
+
+/// Writes a best-effort journal of `events` (each `Some(seq)` a timer
+/// event, each `None` at `seq` a gap), with a checkpoint after each
+/// `group_seq` in `checkpoints`, its record right after that one.
+fn write_ranges(dir: &Path, steps: &[(u64, bool)], checkpoints: &[u64]) {
+    use karyos_archive::group::checkpoint::{CheckpointSlot, CheckpointStore, CheckpointWriter};
+
+    let header = header(Capture::BestEffort, b"m");
+    let config = JournalConfig {
+        segment_length: karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
+        policy: SyncPolicy::PerSegment,
+    };
+    let mut journal = GroupJournal::create(StdDisk, dir, &header, config).unwrap();
+    let store_dir = dir.join(CHECKPOINTS);
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let store = CheckpointStore::create(StdDisk, &store_dir, 1, config).unwrap();
+    let mut writer = CheckpointWriter::new(store, &journal).unwrap();
+    let mut slot = CheckpointSlot::new(64);
+    let mut out = vec![0u8; MAX_RECORD];
+    for &(seq, event) in steps {
+        let records = if event {
+            timers(seq, 1)
+        } else {
+            vec![GroupRecord::Gap(GapMarker {
+                from_seq: seq,
+                to_seq: seq,
+                reason: GapReason::RingFull,
+            })]
+        };
+        for record in &records {
+            let length = record.encode(&mut out).unwrap();
+            let _ = journal.append(&out[..length]).unwrap();
+        }
+        if checkpoints.contains(&seq) {
+            let request = slot
+                .take(seq, 1, |buffer| {
+                    buffer[0] = u8::try_from(seq).unwrap();
+                    1
+                })
+                .unwrap();
+            let written = writer.write(&mut journal, &request);
+            slot.returned(request, &written);
+            let _ = written.unwrap();
+        }
+    }
+    let _ = journal.close().unwrap();
+}
+
+/// A8 middle ranges: `--from-checkpoint` at a middle range's checkpoint
+/// compares that range, to its end before the next gap; an empty middle
+/// range, its prefix ending at its checkpoint, compares nothing.
+#[test]
+fn from_checkpoint_compares_a_middle_range() {
+    // 1, gap 2 (checkpoint 1 at 2), 3, 4, gap 5 (checkpoint 2 at 5), 6.
+    let steps = [
+        (1, true),
+        (2, false),
+        (3, true),
+        (4, true),
+        (5, false),
+        (6, true),
+    ];
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    write_ranges(&left, &steps, &[2, 5]);
+    write_ranges(&right, &steps, &[2, 5]);
+    assert_eq!(
+        diff_from_checkpoint(&left, &right, 1),
+        Report::Identical {
+            from: 3,
+            to: Some(4),
+            events: 2
+        }
+    );
+    // 1, gap 2 (checkpoint 1 at 2), gap 3 (checkpoint 2 at 3), 4.
+    let steps = [(1, true), (2, false), (3, false), (4, true)];
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    write_ranges(&left, &steps, &[2, 3]);
+    write_ranges(&right, &steps, &[2, 3]);
+    let report = diff_from_checkpoint(&left, &right, 1);
+    assert!(
+        matches!(report, Report::Identical { events: 0, .. }),
+        "{report:?}"
+    );
+}
+
+/// A8 middle ranges, #437 decision: the stop that ends the opened range
+/// ends the comparison only when both sides stop there. One side's range
+/// ends at a gap where the other's goes on: the `end` kind, at that
+/// event.
+#[test]
+fn a_range_end_on_one_side_only_is_a_difference() {
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    // Left: 1, gap 2 (checkpoint 1), 3, 4, gap 5 (checkpoint 2), 6.
+    write_ranges(
+        &left,
+        &[
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, true),
+            (5, false),
+            (6, true),
+        ],
+        &[2, 5],
+    );
+    // Right: the same, but event 5 where the left had its gap.
+    write_ranges(
+        &right,
+        &[
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, true),
+            (5, true),
+            (6, true),
+        ],
+        &[2, 5],
+    );
+    let report = diff_from_checkpoint(&left, &right, 1);
+    assert!(
+        matches!(
+            report,
+            Report::Diverged {
+                group_seq: 5,
+                kind: Kind::End,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+}
+
+/// #448 review P2: with `--to` past a middle range's end, the gap that
+/// ends it lies inside the range asked for: not comparable (code 2), as
+/// section 7 says, even when only one journal stops there (without
+/// `--to` that is the `end` kind).
+#[test]
+fn a_middle_range_gap_before_to_is_not_comparable() {
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    write_ranges(
+        &left,
+        &[
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, true),
+            (5, false),
+            (6, true),
+        ],
+        &[2, 5],
+    );
+    write_ranges(
+        &right,
+        &[
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, true),
+            (5, true),
+            (6, true),
+        ],
+        &[2, 5],
+    );
+    let report = diff(&DiffArgs {
+        left: Journal {
+            dir: left.clone(),
+            group: 1,
+        },
+        right: Journal {
+            dir: right.clone(),
+            group: 1,
+        },
+        from: None,
+        to: Some(6),
+        json: false,
+        accept_manifest: false,
+        from_checkpoint: Some(1),
+    });
+    assert_eq!(report.exit_code(), 2, "{report:?}");
+    assert!(
+        report.text().contains("a gap marker from group_seq 5"),
+        "{}",
+        report.text()
+    );
 }
