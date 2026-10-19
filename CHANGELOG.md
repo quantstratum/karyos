@@ -394,6 +394,21 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Snapshots in karyos-cluster (phase 4, C8a; quantstratum-docs:
+  `karyos/design/cluster-dedup-and-snapshots.md` §3). `snapshot::SnapshotStore`
+  writes a snapshot as typed sections (`SectionKind`: consensus, sessions,
+  timers, guards, service; each with a version) into its own segment store,
+  syncs it, and only then publishes it by replacing the manifest
+  (`snapshot-manifest`: id, index, term, length, CRC-32C digest). It keeps
+  the newest `SnapshotConfig::keep` and removes the others' files.
+  `SnapshotConfig::log_floor` gives the first log index to keep with the
+  catch-up allowance, and `due` the entry and byte trigger. Recovery removes
+  every store the manifest does not name and reports a published snapshot
+  that no longer reads whole. The defaults (keep 2, a 1 GiB allowance, 1 Mi
+  entries, 256 MiB) are the proposal's interim values until the owner
+  decides (item 37). karyos-sim's `tests/snapshot_crash.rs` crashes the
+  disk at every operation and fails every flush.
+
 - A group's checkpoints in the Archive agent (phase 3, A9-3).
   `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and
   `reopen_hold`) gives a group a checkpoint store in its journal
