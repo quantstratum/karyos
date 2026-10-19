@@ -66,6 +66,7 @@ timing-build-check:
 
 miri:
 	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-sys --lib --locked
+	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-ffi --locked
 
 build-release:
 	RUSTFLAGS="-D warnings" $(CARGO) build --workspace --release --locked

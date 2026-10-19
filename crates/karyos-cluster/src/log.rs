@@ -50,7 +50,14 @@
 //!   holds.
 //! - **First index.** Kept in its own file, written atomically before the
 //!   store at creation, so an emptied log keeps it and a creation cut
-//!   short is finished at open. Purging a prefix waits for snapshots (C8).
+//!   short is finished at open. A prefix purge rewrites it after A2's
+//!   floor (below).
+//! - **Purge** (C8b). [`RaftLog::purge_prefix`] drops committed entries
+//!   below an index: A2 moves the recording's start to the first kept
+//!   frame, publishing it in its floor record, and removes the whole
+//!   segments below; then the first-index file is replaced. A crash
+//!   between the two leaves the file below the first frame, and
+//!   [`RaftLog::open`] takes the first frame's index, then rewrites it.
 //! - **Allocation.** An append encodes each frame into a new `Vec`; C5's
 //!   zero-allocation gate will need it reused.
 //!
@@ -225,9 +232,15 @@ pub enum LogError {
         /// The last index, if any.
         last: Option<u64>,
     },
-    /// Purging a prefix waits for snapshots (C8).
-    #[error("purging a prefix waits for snapshots")]
-    PurgeUnsupported,
+    /// A prefix purge past the stored commit: only committed entries,
+    /// which a snapshot covers, are purged.
+    #[error("purging below {below} would remove entries past the commit {commit:?}")]
+    PurgeBeyondCommit {
+        /// The first index asked to keep.
+        below: u64,
+        /// The stored commit.
+        commit: Option<u64>,
+    },
     /// A truncation that would remove an entry at or below the stored
     /// commit: committed entries are never removed.
     #[error("truncating from {from} would remove committed entries up to {commit}")]
@@ -537,6 +550,22 @@ impl<D: Disk + Clone> RaftLog<D> {
             )?;
             return Ok(Opened { log, cut: None });
         };
+        // A store that starts past 0 was purged (C8b). A2's floor is
+        // published before the first-index file follows it, so a crash
+        // between them leaves the file below the first frame: the first
+        // frame's index is the log's, rewritten once the open succeeds.
+        let stored_first = first_index;
+        let first_index = if kept.start > 0 && kept.written > kept.start {
+            let mut reader = RawReader::new(&mut disk, dir, geometry);
+            let mut header = [0u8; FRAME_HEADER];
+            reader.read(kept.start, &mut header)?;
+            Header::decode(&header)
+                .map(|frame| frame.index)
+                .filter(|index| *index > first_index)
+                .unwrap_or(first_index)
+        } else {
+            first_index
+        };
         let walk = {
             let mut reader = RawReader::new(&mut disk, dir, geometry);
             walk(&mut reader, kept.start, kept.written, first_index, geometry)?
@@ -587,6 +616,14 @@ impl<D: Disk + Clone> RaftLog<D> {
             mark_slot,
             mark,
         };
+        if first_index != stored_first {
+            file::replace(
+                &mut log.disk,
+                dir,
+                FIRST_INDEX_FILE,
+                &encode_first(first_index),
+            )?;
+        }
         // What recovery kept is durable: the mark follows it.
         log.write_mark(log.last_index())?;
         Ok(Opened {
@@ -847,13 +884,61 @@ impl<D: Disk + Clone> RaftLog<D> {
         self.write_mark(self.stored_durable_index())
     }
 
-    /// Purging a prefix waits for snapshots (C8).
+    /// Purges the entries below `below` and returns the new first index:
+    /// `below`, or the last index when `below` is past it (the log keeps
+    /// at least its last entry, so its next index stays known), or the
+    /// first index when `below` is not past it (C8b). A2 moves the
+    /// recording's start to the first kept frame and removes the whole
+    /// segments below it; the bytes of purged entries in the first kept
+    /// segment stay in its file, unread. Durable on return.
+    ///
+    /// A2 publishes the purge by its floor record before it removes a
+    /// segment, then the first-index file follows; a crash between them
+    /// leaves a first-index file below the first frame, and
+    /// [`RaftLog::open`] takes the first frame's index and rewrites it.
     ///
     /// # Errors
     ///
-    /// Always [`LogError::PurgeUnsupported`].
-    pub fn purge_prefix(&mut self, _below: u64) -> Result<(), LogError> {
-        Err(LogError::PurgeUnsupported)
+    /// [`LogError::PurgeBeyondCommit`] for `below` past the stored commit
+    /// plus one, which changes nothing; [`LogError::Poisoned`]; the store's
+    /// and the disk's errors, which poison the log.
+    pub fn purge_prefix(&mut self, below: u64) -> Result<u64, LogError> {
+        self.check_writable()?;
+        let commit = self.hard_state.and_then(|state| state.commit);
+        if commit
+            .and_then(|commit| commit.checked_add(1))
+            .is_none_or(|limit| below > limit)
+        {
+            return Err(LogError::PurgeBeyondCommit { below, commit });
+        }
+        let Some(last_slot) = self.entries.len().checked_sub(1) else {
+            return Ok(self.first_index);
+        };
+        let kept = self.slot(below).unwrap_or(0).min(last_slot);
+        if kept == 0 {
+            return Ok(self.first_index);
+        }
+        let Some((position, _)) = self.entries.get(kept).copied() else {
+            return Ok(self.first_index);
+        };
+        let first = u64::try_from(kept)
+            .ok()
+            .and_then(|kept| self.first_index.checked_add(kept))
+            .ok_or(LogError::TooLarge { index: below })?;
+        let purged = self.store.purge_before(position);
+        let _ = self.poison_on(purged)?;
+        if let Err(error) = file::replace(
+            &mut self.disk,
+            &self.dir,
+            FIRST_INDEX_FILE,
+            &encode_first(first),
+        ) {
+            self.poisoned = true;
+            return Err(LogError::Io(error));
+        }
+        let _ = self.entries.drain(..kept);
+        self.first_index = first;
+        Ok(first)
     }
 
     /// The entries of `range` the log holds, in order, stopping before the

@@ -231,9 +231,13 @@ fn out_of_order_appends_are_refused_before_anything_is_written() {
         })
     ));
     assert_eq!((log.written(), log.last_index()), (written, Some(2)));
+    // Nothing is committed: no purge.
     assert!(matches!(
         log.purge_prefix(2),
-        Err(LogError::PurgeUnsupported)
+        Err(LogError::PurgeBeyondCommit {
+            below: 2,
+            commit: None
+        })
     ));
 }
 
@@ -1573,4 +1577,99 @@ fn store_and_io_errors_are_transparent() {
         karyos_archive::segment::SegmentError::Failed.to_string()
     );
     assert!(LogError::Exists.source().is_none());
+}
+
+// Prefix purge (C8b).
+
+/// A log of 40 entries of 300 bytes at 4 KiB segments, synced and
+/// committed through `commit`.
+fn purge_log(dir: &Path, commit: u64) -> RaftLog<StdDisk> {
+    let mut log = RaftLog::create(StdDisk, dir, small(), 1).unwrap();
+    let batch: Vec<Entry> = (1..=40).map(|index| entry(index, 1, &[7; 300])).collect();
+    let _ = log.append(&batch).unwrap();
+    let _ = log.sync().unwrap();
+    log.save_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: Some(commit),
+    })
+    .unwrap();
+    log
+}
+
+#[test]
+fn a_purge_removes_whole_segments_below_the_kept_entries() {
+    let dir = TempDir::new("purge");
+    let mut log = purge_log(&dir.0, 40);
+    let first = log.purge_prefix(30).unwrap();
+    assert_eq!(first, 30);
+    assert_eq!(log.first_index(), first);
+    assert_eq!(log.last_index(), Some(40));
+    assert!(log.term(first - 1).is_none());
+    let kept = log.entries(first..41, u64::MAX).unwrap();
+    assert_eq!(kept.first().map(|entry| entry.index), Some(first));
+    assert_eq!(kept.len(), usize::try_from(41 - first).unwrap());
+    // Reopened, it is the same log, and it goes on.
+    drop(log);
+    let mut log = open(StdDisk, &dir.0, small());
+    assert_eq!((log.first_index(), log.last_index()), (first, Some(40)));
+    let _ = log.append(&[entry(41, 1, b"next")]).unwrap();
+    // Past the last index, the last entry is kept.
+    let _ = log.sync().unwrap();
+    log.save_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: Some(41),
+    })
+    .unwrap();
+    assert_eq!(log.purge_prefix(42).unwrap(), 41);
+    assert_eq!((log.first_index(), log.last_index()), (41, Some(41)));
+    drop(log);
+    let log = open(StdDisk, &dir.0, small());
+    assert_eq!((log.first_index(), log.last_index()), (41, Some(41)));
+}
+
+#[test]
+fn a_purge_past_the_commit_is_refused() {
+    let dir = TempDir::new("purge-commit");
+    let mut log = purge_log(&dir.0, 10);
+    assert!(matches!(
+        log.purge_prefix(12),
+        Err(LogError::PurgeBeyondCommit {
+            below: 12,
+            commit: Some(10)
+        })
+    ));
+    // Up to the commit plus one is allowed.
+    let first = log.purge_prefix(11).unwrap();
+    assert_eq!(first, 11);
+    assert_eq!(log.last_index(), Some(40));
+}
+
+#[test]
+fn a_purge_not_past_the_first_index_changes_nothing() {
+    let dir = TempDir::new("purge-none");
+    let mut log = purge_log(&dir.0, 40);
+    assert_eq!(log.purge_prefix(0).unwrap(), 1);
+    assert_eq!(log.purge_prefix(1).unwrap(), 1);
+    assert_eq!(log.purge_prefix(10).unwrap(), 10);
+    assert_eq!(log.purge_prefix(5).unwrap(), 10);
+    assert_eq!(log.first_index(), 10);
+}
+
+/// A crash after A2's floor and before the first-index file: open takes
+/// the first frame's index and rewrites the file.
+#[test]
+fn open_follows_a_purge_whose_first_index_file_is_stale() {
+    let dir = TempDir::new("purge-stale");
+    let mut log = purge_log(&dir.0, 40);
+    let stale = std::fs::read(dir.0.join(FIRST_INDEX_FILE)).unwrap();
+    let first = log.purge_prefix(30).unwrap();
+    drop(log);
+    std::fs::write(dir.0.join(FIRST_INDEX_FILE), &stale).unwrap();
+    let log = open(StdDisk, &dir.0, small());
+    assert_eq!(log.first_index(), first);
+    drop(log);
+    assert_ne!(std::fs::read(dir.0.join(FIRST_INDEX_FILE)).unwrap(), stale);
+    assert_eq!(open(StdDisk, &dir.0, small()).first_index(), first);
 }
