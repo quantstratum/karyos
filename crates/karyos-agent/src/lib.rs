@@ -18,10 +18,16 @@
 //!   reports what it lost).
 //! - **API v1.** [`api`] defines what the agent reports, as Rust types; no
 //!   transport and no encoding yet (M7, owner items 1 and 3).
-//! - **Not yet.** Trace latency histograms over a bounded window (M6c)
-//!   and an endpoint's capability gauges read as one group (M6b).
-//! - **Crate graph** (owner item 52): it depends on `karyos-client` and
-//!   `karyos-sys`; neither the driver nor the client depends on it.
+//! - **Trace latencies** (M6c): per publication lane, the observed
+//!   latencies between `Publish` and `SubscriberPoll` within a bounded
+//!   window of the agent's time, from a follower of the driver's trace
+//!   mirror whose memory is bounded by [`WindowConfig`]; never trace
+//!   verdicts (quantstratum-docs: karyos/design/agent-trace-window.md).
+//! - **Not yet.** An endpoint's capability gauges read as one group
+//!   (M6b).
+//! - **Crate graph** (owner item 52): it depends on `karyos-client`,
+//!   `karyos-sys` and `karyos-trace`; neither the driver nor the client
+//!   depends on it.
 //!
 //! The attach is Linux only, as the tool attach is; [`api`] builds
 //! everywhere.
@@ -32,6 +38,13 @@ pub mod api;
     allow(dead_code, reason = "the attach that uses it is Linux only")
 )]
 mod model;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the attach that uses it is Linux only")
+)]
+mod trace_window;
+
+pub use trace_window::WindowConfig;
 
 #[cfg(target_os = "linux")]
 mod agent;

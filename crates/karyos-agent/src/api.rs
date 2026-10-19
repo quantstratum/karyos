@@ -41,6 +41,11 @@ pub struct DriverView {
     pub losses: Feed<LossEntry>,
     /// The guard audit ring's records the agent followed.
     pub guards: Feed<GuardEntry>,
+    /// Per publication lane, the observed latencies within the trace
+    /// window (M6c): never trace verdicts.
+    pub latencies: Vec<LaneLatency>,
+    /// What the trace window counted.
+    pub trace: TraceCounts,
 }
 
 /// Whether the agent is attached to a driver.
@@ -231,4 +236,74 @@ pub struct GuardEntry {
     pub outcome: u8,
     /// The control error code of a refusal, else 0.
     pub refusal: u16,
+}
+
+/// One publication lane's latencies within the trace window: the pairs of
+/// a message's `Publish` and each of its `SubscriberPoll`s the mirror
+/// delivered, in nanoseconds. Not a trace verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LaneLatency {
+    /// The publication's stream registration.
+    pub stream: u64,
+    /// Its incarnation.
+    pub incarnation: u64,
+    /// The lane.
+    pub lane: u8,
+    /// Pairs with a latency interval.
+    pub available: u64,
+    /// Pairs whose clocks share no source: no interval.
+    pub unavailable: u64,
+    /// A count overflowed: the quantiles answer nothing.
+    pub incomplete: bool,
+    /// The median.
+    pub p50: Option<QuantileBounds>,
+    /// The 90th percentile.
+    pub p90: Option<QuantileBounds>,
+    /// The 99th percentile.
+    pub p99: Option<QuantileBounds>,
+    /// The 99.9th percentile.
+    pub p999: Option<QuantileBounds>,
+    /// The maximum.
+    pub max: Option<QuantileBounds>,
+}
+
+/// Where a quantile lies: `[low, high]` nanoseconds; `None` is an
+/// unbounded side (past the histogram's range).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QuantileBounds {
+    /// Lower bound.
+    pub low: Option<i64>,
+    /// Upper bound.
+    pub high: Option<i64>,
+}
+
+/// What the trace window counted for one driver (since the agent's attach
+/// to its instance), or holds now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct TraceCounts {
+    /// Records scanned.
+    pub records: u64,
+    /// Records whose payload is not a trace record.
+    pub malformed: u64,
+    /// Records of a journal the agent never saw in the table.
+    pub unknown_journal: u64,
+    /// Records of network journals or points, not matched in this version.
+    pub network_ignored: u64,
+    /// Journals past the bound, whose records are not matched.
+    pub journals_dropped: u64,
+    /// Messages refused at the pending bound.
+    pub pending_dropped: u64,
+    /// Polls past the bound of one message.
+    pub polls_dropped: u64,
+    /// Pairs of lanes past the bound.
+    pub lanes_dropped: u64,
+    /// Messages that aged out of the window unmatched.
+    pub aged_out: u64,
+    /// Mirror records overwritten before the agent read them.
+    pub mirror_overwritten: u64,
+    /// Messages pending now.
+    pub pending: u64,
 }
