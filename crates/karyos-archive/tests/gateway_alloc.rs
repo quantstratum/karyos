@@ -244,6 +244,7 @@ fn reports_and_values_dispatch_without_allocating() {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture: Capture::Strict,
+        reopen_hold: 0,
         manifest: b"m",
     };
     let config = JournalConfig {

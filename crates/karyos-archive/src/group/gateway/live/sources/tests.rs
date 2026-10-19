@@ -1798,3 +1798,59 @@ fn the_message_size_is_the_records() {
         assert_eq!(message_size(inline, extension.is_some()), Some(encoded));
     }
 }
+
+/// Best effort, the group closed while the handler runs (a concurrent
+/// stop): the event cannot be sent, but the handler saw the message, so it
+/// is taken and never delivered again (REVIEWER-01's probe, #447).
+#[test]
+fn a_close_during_a_dispatch_delivers_once() {
+    let rig = rig(Capture::BestEffort, 1 << 16, 4096, 64 * 1024);
+    let Rig {
+        mut gateway,
+        job,
+        mut publication,
+        ..
+    } = rig;
+    let _ = publication
+        .append(b"only", karyos_sys::log_buffer::AppendOptions::default())
+        .unwrap();
+    let job = std::cell::RefCell::new(job);
+    let mut seen = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| {
+        if let Event::Message { position, .. } = event {
+            seen.push(*position);
+            job.borrow_mut().drain_to_close(0, &NoRecordings).unwrap();
+        }
+    };
+    let mut outcomes = Vec::new();
+    for _ in 0..4 {
+        outcomes.push(gateway.dispatch(&mut handler));
+    }
+    drop(handler);
+    assert_eq!(seen.len(), 1, "{seen:?}; {outcomes:?}");
+    assert_eq!(outcomes[0], Err(GatewayError::Ended));
+}
+
+/// A message whose record and end exactly fill the event buffer fits, and
+/// strict capture records it; one byte less ends the journal at it.
+#[test]
+fn a_message_that_exactly_fills_the_buffer_fits() {
+    let payload = 600;
+    let exact = message_size(payload, false).unwrap() + crate::group::gateway::live::END;
+    for (max_event, delivered) in [(exact, true), (exact - 1, false)] {
+        let mut rig = rig(Capture::Strict, 1 << 16, max_event, 64 * 1024);
+        append(&mut rig, &vec![3u8; payload]);
+        let mut message = None;
+        let result = rig
+            .gateway
+            .dispatch(&mut |event: &Event<'_>, _: &mut dyn Effects| {
+                message = Some(matches!(event, Event::Message { .. }));
+            });
+        assert_eq!(
+            result,
+            Ok(Dispatched::Event { group_seq: 1 }),
+            "{max_event}"
+        );
+        assert_eq!(message, Some(delivered), "{max_event}");
+    }
+}

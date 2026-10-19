@@ -706,13 +706,14 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let mut result = None;
         let polled = source.poll_reporting(
             &mut |bytes, info| {
+                self.delivered = false;
                 let dispatched =
                     self.dispatch_message(id, identity, &word, bytes, info, now, handler);
-                // Strict declines what it refused: it stays pending.
-                // Taken once delivered or recorded: an error before that
-                // (refused, or the group already ended) leaves it pending
-                // for a required reader.
-                let taken = dispatched.is_ok();
+                // Taken once the handler saw it, whatever the dispatch then
+                // returns: a send that fails after it (the group closing)
+                // must not deliver it again. A refusal or an end before the
+                // handler leaves it pending for a required reader.
+                let taken = self.delivered || dispatched.is_ok();
                 result = Some(dispatched);
                 taken
             },
