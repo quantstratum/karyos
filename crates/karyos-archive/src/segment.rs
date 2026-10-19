@@ -1596,10 +1596,12 @@ impl<D: Disk> SegmentStore<D> {
     ) -> Result<Recovered<D>, SegmentError> {
         let (plan, files) = scan_recording(&mut disk, dir, recording, geometry, Access::Write)?;
         // A purge's floor record not renamed yet: the purge never began.
-        match disk.remove(&dir.join(format!("{}.tmp", floor_name(recording)))) {
-            Ok(()) => disk.sync_dir(dir)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        // Only where there is one: a recovery that writes nothing else runs
+        // on a read-only directory too.
+        let temporary = format!("{}.tmp", floor_name(recording));
+        if disk.list(dir)?.contains(&temporary) {
+            disk.remove(&dir.join(temporary))?;
+            disk.sync_dir(dir)?;
         }
         if let (Some(kept), Some((_, index))) = (plan.kept, &files)
             && let Some(length) = kept.index_length

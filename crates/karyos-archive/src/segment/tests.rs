@@ -2188,3 +2188,28 @@ fn a_cut_below_the_floor_is_refused() {
         Err(SegmentError::FloorMissing { floor: 300 })
     ));
 }
+
+/// A purge's floor record a crash left before its rename: recovery
+/// removes it, and the recording is as before the purge.
+#[test]
+fn a_leftover_floor_temporary_is_removed_at_recovery() {
+    let disk = FaultDisk::default();
+    let store = purgeable(disk.clone(), 500);
+    drop(store);
+    let mut probe = disk.clone();
+    let temporary = Path::new(DIR).join(format!("{}.tmp", floor_name(RECORDING)));
+    let file = probe.create(&temporary).unwrap();
+    probe
+        .write_at(&file, 0, &encode_floor(RECORDING, 300))
+        .unwrap();
+    let recovered = recover_checked(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    assert_eq!(recovered.store.start(), 0);
+    assert!(probe.open(&temporary).is_err());
+}
