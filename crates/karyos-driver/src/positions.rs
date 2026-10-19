@@ -1019,7 +1019,8 @@ mod tests {
     /// its label.
     #[test]
     fn readers_of_a_replaced_incarnation_are_sampled() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        // Five spare cells, and one for the guard's word gauge (M4).
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let guard = driver.add_guard("orders").unwrap();
         driver.guard_stream(handle, guard, 4, None).unwrap();

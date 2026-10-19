@@ -43,8 +43,8 @@
 //! `max_tools` tool connections, also while the driver is terminal, so
 //! that its diagnostics stay readable. A tool gets no client slot, command
 //! ring or capability: it is answered `ToolAdmitted` with the records of the
-//! five diagnostic regions (driver counters, client counters, error log,
-//! loss report, trace mirror), then one `Region` per record, in record
+//! six diagnostic regions (driver counters, client counters, error log,
+//! loss report, trace mirror, guard audit), then one `Region` per record, in record
 //! order, each with the region's descriptor reopened read-only (owner
 //! decision Q7, A1). The
 //! connection stays open after this bootstrap, so the tool notices the
@@ -85,8 +85,9 @@ const BOOTSTRAP_REGIONS: u64 = 4;
 /// Messages of the bootstrap: `Admitted` and one `Region` per CnC record.
 const BOOTSTRAP_MESSAGES: usize = 1 + BOOTSTRAP_REGIONS as usize;
 /// Diagnostic regions granted to a tool: the driver counters, the client
-/// counters, the error log, the loss report and the trace mirror.
-const TOOL_REGIONS: u64 = 5;
+/// counters, the error log, the loss report, the trace mirror and the
+/// guard audit ring.
+const TOOL_REGIONS: u64 = 6;
 /// A small default for [`IpcConfig::max_tools`].
 pub const DEFAULT_MAX_TOOLS: usize = 4;
 
@@ -744,7 +745,7 @@ impl<T: StreamTerms> Admission<T> {
         }
     }
 
-    /// Builds a tool's bootstrap: `ToolAdmitted` with the five diagnostic
+    /// Builds a tool's bootstrap: `ToolAdmitted` with the six diagnostic
     /// records, then one `Region` per record with a read-only descriptor
     /// (A1). Export ids come from the driver's checked counter, so no id is
     /// ever given twice, although no ledger charges a tool's grants.
@@ -755,6 +756,7 @@ impl<T: StreamTerms> Admission<T> {
             driver.diagnostics.error_region()?,
             driver.diagnostics.loss_region()?,
             driver.trace_journals.region()?,
+            driver.guards.region()?,
         ];
         let mut next_export = driver.next_export;
         let first_export = Self::take_ids(&mut next_export, TOOL_REGIONS)?;

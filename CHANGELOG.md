@@ -404,6 +404,38 @@ release may break APIs, wire formats and shared-memory layouts.
   karyos-sim's `tests/dedup.rs` snapshots a replica through C8a's store on
   the simulated disk, crashes a third of the writes, rebuilds the replica
   from what survived plus the log, and checks it under C3.
+- Guards for tools and the management agent (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M4). Every guard
+  transition, refusals included, is also appended to a guard audit ring
+  (`karyos_sys::diag::GuardAudit`, `GuardAuditRecord`, 16-word records with
+  host `CLOCK_MONOTONIC` and driver times, guard, words before and after,
+  operation id, requester and outcome), a driver-only region of the new
+  kind `GuardAudit` (code 11 on both sides) that a tool receives as the
+  sixth `ToolAdmitted` record, in place under admission version 2
+  (unreleased); `RemoteTool::guard_audit` and
+  `EmbeddedDriver::guard_audit_ring` read it. Each guard's word is a gauge
+  labelled with its name, keyed by the new participant kind `KIND_GUARD`
+  (5) and the guard id.
+- Each network endpoint's effective capabilities in the CnC, for tools and
+  the management agent (SPEC §16.8; quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M3): one gauge per
+  capability field (`capability epoch`, platform, copy mode, queue
+  assignment, max datagram, observation points, clock granularity, each
+  capability's state with its reason and detail, and the effective buffer
+  sizes), keyed by the new participant kind `KIND_ENDPOINT` (4) and the
+  endpoint's instance id, rewritten at each reopen and freed when the
+  endpoint leaves or the network closes. The driver-wide events
+  `capability fallback` (capabilities on a fallback, once per endpoint
+  epoch) and `capability missing` (opens and reopens refused for a
+  required capability) count degradations.
+
+- Streaming snapshot reads in karyos-cluster (C8a follow-up, REVIEWER-02's
+  review of #463). `SnapshotStore::reader` returns a `SnapshotReader` that
+  hands out sections (`SectionHeader`) and their bytes in the caller's
+  buffer, checking the digest at the end; `SnapshotStore::verify` streams
+  the same check, and `open` uses it instead of loading each snapshot whole.
+  A section's bytes go to A2 in writes of at most `WRITE_CHUNK` (64 KiB), so
+  A2's recovery scan of a snapshot is bounded too.
 
 - Prefix purge of the Raft log (phase 4, C8b). A2's
   `SegmentStore::purge_before` moves a recording's start forward to a write
@@ -432,6 +464,15 @@ release may break APIs, wire formats and shared-memory layouts.
   denied in the crate and expected only on `mod abi` and in the tests'
   `support::abi`; `make lint-sync` checks that, the clippy set, and that no
   profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- The C ABI conformance suite beside `karyos-ffi` (ADR-0067; batch F6), in
+  the interim format 1 of `crates/karyos-ffi/conformance/FORMAT.md` until
+  the owner chooses one (item 46): line-based `.kcs` scenarios (`call` and
+  `expect` steps, status names read from the header, variables, an `abi`
+  version that a runner checks against `karyos_abi_version`), and
+  `index.txt`, which maps the §13 C ABI rows to scenarios or to the batch
+  that brings them. The Rust runner (`tests/conformance.rs`) runs every
+  scenario through the exported symbols and checks the map. First
+  scenarios: the ABI version, null out-parameters and status texts.
 - `karyos_protocol::cnc::ErrorCode::code` is public: the wire value of a
   refusal code, which the C ABI reports as a detail.
 - Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:
