@@ -394,6 +394,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Streaming snapshot reads in karyos-cluster (C8a follow-up, REVIEWER-02's
+  review of #463). `SnapshotStore::reader` returns a `SnapshotReader` that
+  hands out sections (`SectionHeader`) and their bytes in the caller's
+  buffer, checking the digest at the end; `SnapshotStore::verify` streams
+  the same check, and `open` uses it instead of loading each snapshot whole.
+  A section's bytes go to A2 in writes of at most `WRITE_CHUNK` (64 KiB), so
+  A2's recovery scan of a snapshot is bounded too.
+
 - Prefix purge of the Raft log (phase 4, C8b). A2's
   `SegmentStore::purge_before` moves a recording's start forward to a write
   boundary and removes the whole segments below it. The new start, the
