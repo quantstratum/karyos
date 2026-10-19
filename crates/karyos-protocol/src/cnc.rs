@@ -884,7 +884,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// The code on the wire, as `Error` and the guard audit carry it.
+    /// The code's wire value, as the `Refused` completion carries it.
     #[must_use]
     pub const fn code(self) -> u64 {
         match self {
