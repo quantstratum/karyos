@@ -39,6 +39,12 @@
 //!   was durable before its publish; one that no longer reads whole, or
 //!   whose digest fails, is reported damaged and not used. A manifest that
 //!   fails its CRC is refused.
+//! - **Reads.** [`SnapshotStore::reader`] streams a snapshot section by
+//!   section into the caller's buffer, and [`SnapshotStore::open`] and
+//!   [`SnapshotStore::verify`] check one the same way: a section's bytes
+//!   go to A2 in writes of at most [`WRITE_CHUNK`], so the memory a check
+//!   holds is that and a fixed buffer, whatever the snapshot's size.
+//!   [`SnapshotStore::read`] loads every section at once, for small ones.
 //! - **Poison.** A failed write, sync, publish or purge poisons the store:
 //!   it refuses writes until it is reopened, which finds what was
 //!   published.
@@ -84,6 +90,11 @@ pub const DEFAULT_EVERY_ENTRIES: u64 = 1 << 20;
 pub const DEFAULT_EVERY_BYTES: u64 = 256 << 20;
 
 const SECTION_MAGIC: [u8; 4] = *b"KRSN";
+/// The largest single write of a section's bytes: what a scan of the
+/// snapshot (A2's recovery checks, [`SnapshotReader`]) holds at once.
+pub const WRITE_CHUNK: usize = 64 * 1024;
+/// The reader's buffer for bytes it checks without handing them out.
+const SKIP_BUFFER: usize = 4096;
 const MANIFEST_MAGIC: [u8; 4] = *b"KRSM";
 const MANIFEST_VERSION: u32 = 1;
 /// Magic, version, count, reserved.
@@ -402,8 +413,8 @@ impl<D: Disk + Clone> SnapshotStore<D> {
         let mut kept = Vec::new();
         let mut damaged = Vec::new();
         for info in &named {
-            match read_sections(disk.clone(), dir, geometry, info) {
-                Ok(_) => kept.push(*info),
+            match verify_snapshot(disk.clone(), dir, geometry, info) {
+                Ok(()) => kept.push(*info),
                 Err(SnapshotError::Io(error)) => return Err(SnapshotError::Io(error)),
                 Err(_) => damaged.push(*info),
             }
@@ -513,14 +524,56 @@ impl<D: Disk + Clone> SnapshotStore<D> {
     }
 
     /// The sections of `info`, a kept snapshot, checked against its length
-    /// and digest.
+    /// and digest, every section's bytes in memory at once: for small
+    /// snapshots and tests. [`SnapshotStore::reader`] streams them.
     ///
     /// # Errors
     ///
     /// [`SnapshotError::Damaged`] for bytes that do not read back whole,
     /// and the store's and the disk's errors.
     pub fn read(&self, info: &SnapshotInfo) -> Result<Vec<SectionRead>, SnapshotError> {
-        read_sections(self.disk.clone(), &self.dir, self.geometry, info)
+        let mut reader = self.reader(info)?;
+        let mut sections = Vec::new();
+        while let Some(header) = reader.next_section()? {
+            let length = usize::try_from(header.length).map_err(|_| reader.damaged())?;
+            let mut bytes = vec![0u8; length];
+            let mut filled = 0;
+            while let Some(rest) = bytes.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+                let read = reader.read(rest)?;
+                if read == 0 {
+                    return Err(reader.damaged());
+                }
+                filled = filled.checked_add(read).ok_or_else(|| reader.damaged())?;
+            }
+            sections.push(SectionRead {
+                kind: header.kind,
+                version: header.version,
+                bytes,
+            });
+        }
+        Ok(sections)
+    }
+
+    /// A reader of `info`'s sections, in order and in chunks, holding no
+    /// more than a fixed buffer and A2's scan of one write
+    /// ([`WRITE_CHUNK`]).
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Damaged`] for a store that does not hold the
+    /// snapshot's length, and the store's and the disk's errors.
+    pub fn reader(&self, info: &SnapshotInfo) -> Result<SnapshotReader<D>, SnapshotError> {
+        SnapshotReader::open(self.disk.clone(), &self.dir, self.geometry, info)
+    }
+
+    /// Checks `info` whole, its sections' framing and its digest, streaming
+    /// it: what [`SnapshotStore::open`] runs on each kept snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Damaged`], and the store's and the disk's errors.
+    pub fn verify(&self, info: &SnapshotInfo) -> Result<(), SnapshotError> {
+        verify_snapshot(self.disk.clone(), &self.dir, self.geometry, info)
     }
 
     /// Writes `sections` into a new store `id`, synced and closed; their
@@ -544,9 +597,11 @@ impl<D: Disk + Clone> SnapshotStore<D> {
             let header = section_header(section)?;
             digest.update(&header);
             at = store.append(at, &header)?;
-            if !section.bytes.is_empty() {
-                digest.update(section.bytes);
-                at = store.append(at, section.bytes)?;
+            // In chunks: A2 checks each write whole at recovery, so a write
+            // bounds the memory a scan of the snapshot needs.
+            for chunk in section.bytes.chunks(WRITE_CHUNK) {
+                digest.update(chunk);
+                at = store.append(at, chunk)?;
             }
         }
         let _ = store.close_synced()?;
@@ -568,36 +623,123 @@ fn section_header(section: &Section<'_>) -> Result<[u8; SECTION_HEADER], Snapsho
     Ok(header)
 }
 
-/// The sections of snapshot `info` in `dir`, checked against its length
-/// and digest.
-fn read_sections<D: Disk>(
-    disk: D,
-    dir: &Path,
-    geometry: Geometry,
-    info: &SnapshotInfo,
-) -> Result<Vec<SectionRead>, SnapshotError> {
-    let damaged = || SnapshotError::Damaged { id: info.id };
-    let mut store =
-        match SegmentStore::open_verified(disk, dir, info.id, geometry, SyncPolicy::None) {
-            Ok(store) => store,
-            Err(SegmentError::Io(error)) => return Err(SnapshotError::Io(error)),
-            Err(_) => return Err(damaged()),
-        };
-    if store.start() != 0 || store.written() != info.length || !store.gaps().is_empty() {
-        return Err(damaged());
+/// A section's header, as a reader meets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SectionHeader {
+    /// Its type.
+    pub kind: SectionKind,
+    /// Its version.
+    pub version: u64,
+    /// Its bytes.
+    pub length: u64,
+}
+
+/// A snapshot read section by section, in chunks
+/// ([`SnapshotStore::reader`]).
+///
+/// [`SnapshotReader::next_section`] moves to the next section, checking
+/// what the caller left of the current one; [`SnapshotReader::read`] hands
+/// out the current section's bytes. A2 checked every write's CRC when the
+/// store opened; the snapshot's digest covers every byte, so it is known
+/// only at the end: `next_section` returns `None` only once it matched,
+/// and a caller must treat what it read as unverified until then.
+#[derive(Debug)]
+pub struct SnapshotReader<D: Disk> {
+    store: SegmentStore<D>,
+    id: u64,
+    length: u64,
+    expected: u32,
+    digest: Crc32c,
+    /// The next position to read.
+    at: u64,
+    /// The current section's end.
+    section_end: u64,
+    finished: bool,
+}
+
+impl<D: Disk> SnapshotReader<D> {
+    fn open(
+        disk: D,
+        dir: &Path,
+        geometry: Geometry,
+        info: &SnapshotInfo,
+    ) -> Result<Self, SnapshotError> {
+        let damaged = SnapshotError::Damaged { id: info.id };
+        let store =
+            match SegmentStore::open_verified(disk, dir, info.id, geometry, SyncPolicy::None) {
+                Ok(store) => store,
+                Err(SegmentError::Io(error)) => return Err(SnapshotError::Io(error)),
+                Err(_) => return Err(damaged),
+            };
+        if store.start() != 0 || store.written() != info.length || !store.gaps().is_empty() {
+            return Err(damaged);
+        }
+        Ok(Self {
+            store,
+            id: info.id,
+            length: info.length,
+            expected: info.digest,
+            digest: Crc32c::new(),
+            at: 0,
+            section_end: 0,
+            finished: false,
+        })
     }
-    let length = usize::try_from(info.length).map_err(|_| damaged())?;
-    let mut bytes = vec![0u8; length];
-    store.read(0, &mut bytes).map_err(|_| damaged())?;
-    if crc32c(&bytes) != info.digest {
-        return Err(damaged());
+
+    fn damaged(&self) -> SnapshotError {
+        SnapshotError::Damaged { id: self.id }
     }
-    let mut sections = Vec::new();
-    let mut rest = bytes.as_slice();
-    while !rest.is_empty() {
-        let (header, body) = rest
-            .split_first_chunk::<SECTION_HEADER>()
-            .ok_or_else(damaged)?;
+
+    /// Reads `buf` whole at the current position, into the digest.
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), SnapshotError> {
+        let length = u64::try_from(buf.len()).map_err(|_| self.damaged())?;
+        let end = self.at.checked_add(length).ok_or_else(|| self.damaged())?;
+        if end > self.length {
+            return Err(self.damaged());
+        }
+        if let Err(error) = self.store.read(self.at, buf) {
+            return Err(match error {
+                SegmentError::Io(error) => SnapshotError::Io(error),
+                _ => self.damaged(),
+            });
+        }
+        self.digest.update(buf);
+        self.at = end;
+        Ok(())
+    }
+
+    /// The next section's header, after checking what is left of the
+    /// current one; `None` at the end, once the digest matched.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Damaged`] for a header, a length or a digest that
+    /// does not hold, and the store's and the disk's errors.
+    pub fn next_section(&mut self) -> Result<Option<SectionHeader>, SnapshotError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let mut skip = [0u8; SKIP_BUFFER];
+        while self.at < self.section_end {
+            let left = self
+                .section_end
+                .checked_sub(self.at)
+                .ok_or_else(|| self.damaged())?;
+            let take = usize::try_from(left).map_or(SKIP_BUFFER, |left| left.min(SKIP_BUFFER));
+            let chunk = skip.get_mut(..take).ok_or_else(|| self.damaged())?;
+            self.fill(chunk)?;
+        }
+        if self.at == self.length {
+            if self.digest.finish() != self.expected {
+                return Err(self.damaged());
+            }
+            self.finished = true;
+            return Ok(None);
+        }
+        let mut header = [0u8; SECTION_HEADER];
+        self.fill(&mut header)?;
+        let damaged = || SnapshotError::Damaged { id: self.id };
         let (magic, fields) = header.split_first_chunk::<4>().ok_or_else(damaged)?;
         let (kind, fields) = fields.split_first_chunk::<4>().ok_or_else(damaged)?;
         let (version, fields) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
@@ -606,16 +748,48 @@ fn read_sections<D: Disk>(
             return Err(damaged());
         }
         let kind = SectionKind::from_code(u32::from_le_bytes(*kind)).ok_or_else(damaged)?;
-        let length = usize::try_from(u64::from_le_bytes(*length)).map_err(|_| damaged())?;
-        let section = body.get(..length).ok_or_else(damaged)?;
-        sections.push(SectionRead {
+        let length = u64::from_le_bytes(*length);
+        let end = self
+            .at
+            .checked_add(length)
+            .filter(|end| *end <= self.length)
+            .ok_or_else(damaged)?;
+        self.section_end = end;
+        Ok(Some(SectionHeader {
             kind,
             version: u64::from_le_bytes(*version),
-            bytes: section.to_vec(),
-        });
-        rest = body.get(length..).ok_or_else(damaged)?;
+            length,
+        }))
     }
-    Ok(sections)
+
+    /// Reads up to `buf.len()` bytes of the current section; 0 at its end.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Damaged`] for bytes that do not read back, and the
+    /// store's and the disk's errors.
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, SnapshotError> {
+        let left = self
+            .section_end
+            .checked_sub(self.at)
+            .ok_or_else(|| self.damaged())?;
+        let take = usize::try_from(left).map_or(buf.len(), |left| left.min(buf.len()));
+        let chunk = buf.get_mut(..take).ok_or_else(|| self.damaged())?;
+        self.fill(chunk)?;
+        Ok(take)
+    }
+}
+
+/// Checks snapshot `info` in `dir` whole, streaming it.
+fn verify_snapshot<D: Disk>(
+    disk: D,
+    dir: &Path,
+    geometry: Geometry,
+    info: &SnapshotInfo,
+) -> Result<(), SnapshotError> {
+    let mut reader = SnapshotReader::open(disk, dir, geometry, info)?;
+    while reader.next_section()?.is_some() {}
+    Ok(())
 }
 
 /// The manifest's bytes.
