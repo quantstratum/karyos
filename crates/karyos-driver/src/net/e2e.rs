@@ -469,6 +469,8 @@ fn endpoint_capabilities_reach_the_cnc() {
         };
         assert_ne!(cells[0].0, 0, "keyed by the endpoint's instance");
         assert_eq!(value("capability epoch"), 1);
+        // Written in one pass: the pass cell is even, one pass done (M6b).
+        assert_eq!(value("capability pass"), 2);
         let platform = if cfg!(target_os = "linux") { 1 } else { 2 };
         assert_eq!(value("capability platform"), platform);
         // The baseline observes receives in user space, actively.

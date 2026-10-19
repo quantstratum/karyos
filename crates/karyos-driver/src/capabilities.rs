@@ -22,6 +22,14 @@
 //!   capability was not active. Unrequested capabilities the platform
 //!   lacks are reported in their gauges and counted in neither.
 //!
+//! - **One read.** An endpoint's gauges are written together, inside a
+//!   sampling pass on its `capability pass` cell ([`PASS_LABEL`], same
+//!   keys): odd while the conductor writes them, even after, with the
+//!   Release fences of `begin_pass` and `end_pass`. A reader takes them as
+//!   one with `karyos_sys::counters::read_pass` over that cell
+//!   (management-agent-gap-analysis.md, M6b; `karyos-tools`'
+//!   `capabilities` reads them so).
+//!
 //! Allocation happens only when an endpoint appears; a steady duty cycle
 //! compares epochs and writes nothing.
 
@@ -31,6 +39,9 @@ use karyos_sys::counters::{Counter, CounterKeys, KIND_ENDPOINT};
 
 use crate::agents::EndpointId;
 use crate::counters::{DriverCounters, Event, TYPE_GAUGE};
+
+/// The label of an endpoint's pass cell, its gauges' seqlock epoch.
+pub(crate) const PASS_LABEL: &str = "capability pass";
 
 /// An endpoint's capability gauges, in [`values`] order.
 pub(crate) const LABELS: [&str; 20] = [
@@ -161,6 +172,9 @@ struct EndpointCells {
     id: EndpointId,
     /// The capability epoch the cells show.
     epoch: u32,
+    /// The pass cell and its last even value.
+    pass: Option<Counter>,
+    passes: u64,
     cells: Vec<Option<Counter>>,
     /// Seen in the current sync.
     seen: bool,
@@ -193,7 +207,7 @@ impl CapabilityCells {
                     cells.seen = true;
                     if cells.epoch != epoch {
                         cells.epoch = epoch;
-                        write(counters, &cells.cells, snapshot);
+                        cells.write(counters, snapshot);
                     }
                 }
                 None => {
@@ -202,17 +216,20 @@ impl CapabilityCells {
                         participant: u64::from(id.0),
                         ..CounterKeys::DRIVER
                     };
+                    let pass = counters.allocate_keyed(TYPE_GAUGE, PASS_LABEL, keys);
                     let cells = LABELS
                         .iter()
                         .map(|label| counters.allocate_keyed(TYPE_GAUGE, label, keys))
                         .collect();
-                    let cells = EndpointCells {
+                    let mut cells = EndpointCells {
                         id,
                         epoch,
+                        pass,
+                        passes: 0,
                         cells,
                         seen: true,
                     };
-                    write(counters, &cells.cells, snapshot);
+                    cells.write(counters, snapshot);
                     self.endpoints.push(cells);
                 }
             }
@@ -223,7 +240,7 @@ impl CapabilityCells {
                 index += 1;
             } else {
                 let gone = self.endpoints.swap_remove(index);
-                free(counters, gone.cells);
+                gone.free(counters);
             }
         }
         if let Some(delta) = missing.checked_sub(self.missing).filter(|delta| *delta > 0) {
@@ -235,27 +252,45 @@ impl CapabilityCells {
     /// Frees every endpoint's cells (the network closed).
     pub(crate) fn close(&mut self, counters: &mut DriverCounters) {
         for endpoint in self.endpoints.drain(..) {
-            free(counters, endpoint.cells);
+            endpoint.free(counters);
         }
     }
 }
 
-/// Writes `snapshot` into `cells` and counts its fallbacks.
-fn write(counters: &DriverCounters, cells: &[Option<Counter>], snapshot: &CapabilitySnapshot) {
-    for (cell, value) in cells.iter().zip(values(snapshot)) {
-        if let Some(cell) = cell {
-            cell.set(value);
+impl EndpointCells {
+    /// Writes `snapshot` into the gauges inside one pass (module
+    /// documentation, One read) and counts its fallbacks.
+    fn write(&mut self, counters: &DriverCounters, snapshot: &CapabilitySnapshot) {
+        // Checked: 2^63 passes of one endpoint never come; at the end the
+        // gauges are written without a pass.
+        let odd = self.passes.checked_add(1);
+        let even = odd.and_then(|odd| odd.checked_add(1));
+        if let (Some(pass), Some(odd)) = (&self.pass, odd) {
+            pass.begin_pass(odd);
+        }
+        for (cell, value) in self.cells.iter().zip(values(snapshot)) {
+            if let Some(cell) = cell {
+                cell.set(value);
+            }
+        }
+        if let (Some(pass), Some(even)) = (&self.pass, even) {
+            pass.end_pass(even);
+            self.passes = even;
+        }
+        let fallbacks = fallbacks(snapshot);
+        if fallbacks > 0 {
+            counters.add(Event::CapabilityFallback, fallbacks);
         }
     }
-    let fallbacks = fallbacks(snapshot);
-    if fallbacks > 0 {
-        counters.add(Event::CapabilityFallback, fallbacks);
-    }
-}
 
-fn free(counters: &mut DriverCounters, cells: Vec<Option<Counter>>) {
-    for cell in cells.into_iter().flatten() {
-        counters.free(cell);
+    fn free(self, counters: &mut DriverCounters) {
+        for cell in self
+            .pass
+            .into_iter()
+            .chain(self.cells.into_iter().flatten())
+        {
+            counters.free(cell);
+        }
     }
 }
 
