@@ -153,12 +153,15 @@ impl<O: BufferOwner> FrameSource for SenderRead<O> {
 /// While the successor is not offered yet it is [`Frames::Pending`]; a
 /// fenced reader gets [`Frames::Fenced`] at the seal.
 pub struct Following<T: TermBytes = HeapTerms> {
-    reader: SenderRead<Arc<LogBuffer<T>>>,
+    /// The member's reader; none while a fenced reader waits for its
+    /// rejoin, so its predecessor mapping is not kept retained.
+    reader: Option<SenderRead<Arc<LogBuffer<T>>>>,
     link: Arc<GenerationLink<T>>,
     base: u64,
     /// How a fenced reader asks for a new member at the head.
     rejoin: Option<Box<RejoinHook<T>>>,
-    /// The seal the reader was fenced at, while its rejoin is answered.
+    /// The seal the reader was fenced at, while its rejoin is answered:
+    /// the source's position, with no reader.
     fenced: Option<u64>,
     /// What keeps the rejoined member's stream: dropped with the source,
     /// after the reader, or when a later rejoin replaces it.
@@ -194,8 +197,10 @@ pub enum Rejoin<T: TermBytes = HeapTerms> {
 
 /// How a host answers a fenced reader's request to rejoin: asked on each
 /// read until it answers [`Rejoin::Joined`] or [`Rejoin::Refused`]. It
-/// runs on the Archive's thread, so a host whose driver runs elsewhere
-/// answers through a channel.
+/// runs on the Archive's thread, inside a recording's duty, so it must
+/// return at once and never block: a host whose driver runs elsewhere
+/// sends the request through a channel and answers [`Rejoin::Waiting`]
+/// until a non-blocking receive (`try_recv`) has the member.
 pub type RejoinHook<T> = dyn FnMut() -> Rejoin<T> + Send;
 
 impl<T: TermBytes> std::fmt::Debug for Following<T> {
@@ -219,7 +224,7 @@ impl<T: TermBytes> Following<T> {
         base: u64,
     ) -> Self {
         Self {
-            reader,
+            reader: Some(reader),
             link,
             base,
             rejoin: None,
@@ -254,7 +259,11 @@ impl<T: TermBytes> Following<T> {
         };
         match hook() {
             Rejoin::Waiting => {
+                // Only the seal is needed to rejoin: the fenced reader is
+                // dropped now, so its predecessor mapping can be reclaimed
+                // however long the host takes to answer.
                 self.fenced = Some(at);
+                self.reader = None;
                 Ok(Frames::Pending)
             }
             Rejoin::Refused => {
@@ -276,7 +285,7 @@ impl<T: TermBytes> Following<T> {
                 if to < at {
                     return Err(SourceError::Invariant);
                 }
-                self.reader = reader;
+                self.reader = Some(reader);
                 self.link = link;
                 self.base = base;
                 // The old reader is dropped first, then the old guard.
@@ -304,9 +313,13 @@ impl<T: TermBytes> Following<T> {
 
 impl<T: TermBytes> FrameSource for Following<T> {
     fn position(&self) -> u64 {
+        let Some(reader) = self.reader.as_ref() else {
+            // Fenced and waiting: the seal, the written position.
+            return self.fenced.unwrap_or(self.base);
+        };
         // The link refuses a base whose mapping could pass `2^63`, so the
         // sum is below it; the fallback is never taken.
-        let position = self.base.checked_add(self.reader.position());
+        let position = self.base.checked_add(reader.position());
         debug_assert!(position.is_some(), "a mapping past 2^63");
         position.unwrap_or(u64::MAX)
     }
@@ -316,7 +329,8 @@ impl<T: TermBytes> FrameSource for Following<T> {
         if let Some(at) = self.fenced {
             return self.after_fence(at);
         }
-        Ok(match self.reader.read(out)? {
+        let reader = self.reader.as_mut().ok_or(SourceError::Invariant)?;
+        Ok(match reader.read(out)? {
             Frames::Copied {
                 position,
                 len,
@@ -353,7 +367,7 @@ impl<T: TermBytes> FrameSource for Following<T> {
                         if base != at {
                             return Err(SourceError::Invariant);
                         }
-                        self.reader = *reader;
+                        self.reader = Some(*reader);
                         self.base = base;
                         Frames::Cutover { at }
                     }
@@ -367,13 +381,23 @@ impl<T: TermBytes> FrameSource for Following<T> {
     }
 
     fn consumed(&mut self, position: u64) -> Result<(), SourceError> {
-        let position = self.local(position)?;
-        self.reader.consumed(position)
+        let Some(reader) = self.reader.as_mut() else {
+            // Fenced and waiting: everything up to the seal was consumed.
+            return match self.fenced {
+                Some(at) if position <= at => Ok(()),
+                _ => Err(SourceError::Invariant),
+            };
+        };
+        let position = position
+            .checked_sub(self.base)
+            .ok_or(SourceError::Invariant)?;
+        reader.consumed(position)
     }
 
     fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
         let to = self.local(to)?;
-        let resumed = self.reader.resume(to)?;
+        let reader = self.reader.as_mut().ok_or(SourceError::Invariant)?;
+        let resumed = reader.resume(to)?;
         self.stream(resumed)
     }
 }

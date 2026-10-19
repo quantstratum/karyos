@@ -506,8 +506,19 @@ fn a_fenced_async_recording_rejoins_at_the_head_past_a_gap() {
             drop(last);
             driver.remove_stream(stream).unwrap();
         }
-        // The host answers a rejoin on the driver's thread.
+        // The host answers a rejoin on the driver's thread, late: while
+        // the source waits, it holds no reader, so the driver reclaims
+        // the retained predecessor before the answer.
         if asked.try_recv().is_ok() {
+            for _ in 0..8 {
+                assert!(recorder.duty(0).unwrap().ended.is_none());
+                let _ = driver.do_work().unwrap();
+            }
+            assert_eq!(
+                driver.generations(stream).unwrap().len(),
+                1,
+                "the fenced predecessor is still retained while waiting"
+            );
             let (reader, link, base, lease) = driver
                 .recording_reader(stream, Role::Optional)
                 .unwrap()
