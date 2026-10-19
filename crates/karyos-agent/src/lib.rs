@@ -16,8 +16,10 @@
 //!   the guard audit ring, each with its cursor, the newest records up to
 //!   a bound, and the records delivered and overwritten (a lapped cursor
 //!   reports what it lost).
-//! - **API v1.** [`api`] defines what the agent reports, as Rust types; no
-//!   transport and no encoding yet (M7, owner items 1 and 3).
+//! - **API v1.** [`api`] defines what the agent reports, as Rust types;
+//!   [`json`] writes them as JSON, by hand (owner item 51, interim 3), and
+//!   `server` serves them on a local Unix socket to the uids of a role
+//!   table (interims 1 and 2; M7).
 //! - **Not yet.** Trace latency histograms over a bounded window (M6c)
 //!   and an endpoint's capability gauges read as one group (M6b).
 //! - **Crate graph** (owner item 52): it depends on `karyos-client` and
@@ -27,6 +29,8 @@
 //! everywhere.
 
 pub mod api;
+pub mod cli;
+pub mod json;
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "the attach that uses it is Linux only")
@@ -35,6 +39,8 @@ mod model;
 
 #[cfg(target_os = "linux")]
 mod agent;
+#[cfg(target_os = "linux")]
+pub mod server;
 
 #[cfg(target_os = "linux")]
 pub use agent::{Agent, AgentConfig, DEFAULT_ATTACH_TIMEOUT, DEFAULT_HISTORY};
