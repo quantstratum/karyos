@@ -1,0 +1,16 @@
+# The §13 contract rows of the C ABI (SPEC.md §13, "C ABI boundary" and
+# "Binding conformance") and the scenarios that cover them. One row per
+# line: the row's name, then `:`, then the scenario ids that cover it, or
+# `pending` and the batch of quantstratum-docs:
+# karyos/design/ffi-gap-analysis.md that brings them.
+
+abi version: abi.version
+typed status codes: abi.version.null status.text
+use after close: pending F2
+double close: pending F2
+older protocol version refused at admission: pending F2
+reentrant poll: pending F4
+bounded poll stops on callback failure: pending F4
+kept fragment pointer never refers to a shared mapping: pending F4
+panic poisons the handle and does not unwind: pending F5
+older minor ABI client against a newer library: pending the ABI manifest test of the first released header

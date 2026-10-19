@@ -7,6 +7,7 @@
 use karyos_ffi as _;
 
 mod support {
+    #[allow(dead_code, reason = "each test binary calls a part of the ABI")]
     pub mod abi;
 }
 

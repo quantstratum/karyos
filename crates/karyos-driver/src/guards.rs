@@ -481,21 +481,36 @@ impl Guards {
 
 /// Each guard's word as a gauge for tools (M4): labelled with the guard's
 /// name, keyed by participant kind [`KIND_GUARD`] and the guard id. Guards
-/// are never removed, so a gauge lives as long as the driver; one the
-/// region has no room for is retried at each sync, counted once in
-/// `counters unavailable`.
+/// are never removed, so a gauge lives as long as the driver. One the
+/// region has no room for is counted once in `counters unavailable` and
+/// retried every [`GUARD_CELL_RETRY`] syncs, so a full region is not
+/// scanned at every duty cycle.
 #[derive(Debug, Default)]
 pub(crate) struct GuardCells {
     /// Per guard in registry order: its id, its gauge, the word last
     /// stored, and whether a refused allocation was counted.
     cells: Vec<(u64, Option<Counter>, u64, bool)>,
+    /// Syncs left before refused allocations are tried again.
+    retry_in: u32,
 }
+
+/// Syncs between two retries of a refused guard gauge allocation.
+pub(crate) const GUARD_CELL_RETRY: u32 = 1024;
 
 impl GuardCells {
     /// Brings the gauges in line with `guards` (control path, each
     /// conductor duty cycle): a new guard gets its gauge, a changed word
     /// is stored.
     pub(crate) fn sync(&mut self, guards: &Guards, counters: &mut DriverCounters) {
+        // A refused allocation is retried only when the countdown ends.
+        let retry = match self.retry_in.checked_sub(1) {
+            Some(left) => {
+                self.retry_in = left;
+                false
+            }
+            None => true,
+        };
+        let mut refused = false;
         for (index, (id, name, word)) in guards.words().enumerate() {
             if self.cells.get(index).is_none() {
                 self.cells.push((id, None, 0, false));
@@ -503,7 +518,7 @@ impl GuardCells {
             let Some((_, cell, stored, counted)) = self.cells.get_mut(index) else {
                 continue;
             };
-            if cell.is_none() {
+            if cell.is_none() && (retry || !*counted) {
                 let keys = CounterKeys {
                     kind: KIND_GUARD,
                     participant: id,
@@ -516,6 +531,7 @@ impl GuardCells {
                 };
                 *counted = true;
                 *stored = 0;
+                refused |= cell.is_none();
             }
             if let Some(cell) = cell
                 && *stored != word
@@ -523,6 +539,9 @@ impl GuardCells {
                 cell.set(word);
                 *stored = word;
             }
+        }
+        if refused {
+            self.retry_in = GUARD_CELL_RETRY;
         }
     }
 }
@@ -637,5 +656,44 @@ mod tests {
         );
         assert_eq!(guards.audit().overwritten, 1);
         assert!(guards.audit().records.is_empty());
+    }
+
+    /// A guard gauge the full region refused is counted once and tried
+    /// again only every `GUARD_CELL_RETRY` syncs, not at every duty cycle;
+    /// it appears once room is made and the countdown ends.
+    #[test]
+    fn a_refused_guard_gauge_is_retried_every_nth_sync() {
+        use crate::counters::{Event, FIXED_COUNTERS};
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 1).unwrap();
+        let mut guards = Guards::new(1, 2, 2, karyos_sys::diag::guard_audit(2).unwrap());
+        let _ = guards.add("kill").unwrap();
+        // The one spare cell is taken.
+        let taken = counters
+            .allocate_keyed(TYPE_GAUGE, "taken", CounterKeys::DRIVER)
+            .unwrap();
+        let mut cells = GuardCells::default();
+        cells.sync(&guards, &mut counters);
+        assert_eq!(counters.value(Event::CountersUnavailable), 1);
+        let gauges = |counters: &DriverCounters| {
+            let reader = counters.reader();
+            (0..reader.capacity())
+                .filter(|&index| {
+                    matches!(
+                        reader.read(index),
+                        karyos_sys::counters::CellRead::Allocated { metadata, .. }
+                            if metadata.keys.kind == KIND_GUARD
+                    )
+                })
+                .count()
+        };
+        counters.free(taken);
+        for _ in 0..GUARD_CELL_RETRY {
+            cells.sync(&guards, &mut counters);
+            assert_eq!(gauges(&counters), 0, "retried before the countdown ended");
+        }
+        cells.sync(&guards, &mut counters);
+        assert_eq!(gauges(&counters), 1);
+        // Counted once: the retries add nothing.
+        assert_eq!(counters.value(Event::CountersUnavailable), 1);
     }
 }
