@@ -408,6 +408,17 @@ release may break APIs, wire formats and shared-memory layouts.
   entries, 256 MiB) are the proposal's interim values until the owner
   decides (item 37). karyos-sim's `tests/snapshot_crash.rs` crashes the
   disk at every operation and fails every flush.
+- The driver's CnC counters for tools and the management agent
+  (quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`, M1
+  and M2). M1: `driver pid` (in the driver's own pid namespace), `driver
+  started at` and `conductor duty at` (host `CLOCK_MONOTONIC`). M2: the
+  network agents' system counters as driver-wide event cells, each written
+  only by its agent at the end of its duty cycle in every threading mode:
+  `network controls sent`, `network control send failures`, `naks
+  received`, `status messages received`, `heartbeats sent`, `datagrams
+  received`, `datagrams dropped by backend`, `invalid frames received`,
+  `status messages sent` and `images retired at timeout`. Closing the
+  network frees them.
 
 - A group's checkpoints in the Archive agent (phase 3, A9-3).
   `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and

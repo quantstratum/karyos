@@ -58,9 +58,11 @@ use crate::sessions::send::Publication;
 
 use crate::agents::endpoints::Endpoints;
 use crate::agents::images::{ImageEvent, ImageTable, ImageTemplate, LaneSource};
+use karyos_sys::counters::Counter;
+
 use crate::agents::{
-    AgentConfig, AgentError, AgentKind, AgentLinks, AgentRunner, LateAgent, NetworkAgents,
-    ThreadingMode, YieldThenSleep, guarded, network_agents_over,
+    AgentCells, AgentConfig, AgentError, AgentKind, AgentLinks, AgentRunner, LateAgent,
+    NetworkAgents, ThreadingMode, YieldThenSleep, guarded, network_agents_over,
 };
 use crate::embedded::StreamTerms;
 use crate::error::DriverError;
@@ -598,6 +600,9 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// What the conflated views of network images did
     /// (conflated-network-images.md).
     views: NetworkViewCounters,
+    /// The agents' CnC cells, taken back at the close for the conductor to
+    /// free (M2).
+    cells: Vec<Counter>,
     /// Conflated views built from now on are not attached (tests).
     #[cfg(test)]
     defer_view_attach: bool,
@@ -612,7 +617,10 @@ impl<T: StreamTerms> Network<T> {
     /// [`DriverError::InvalidConfig`] for an agent configuration the agents
     /// refuse or a `publication_linger` above [`MAX_PUBLICATION_LINGER`];
     /// [`DriverError::NetworkStart`] when a thread cannot start.
-    pub(crate) fn start(config: &NetworkConfig) -> Result<Self, DriverError>
+    pub(crate) fn start(
+        config: &NetworkConfig,
+        cells: (AgentCells, AgentCells),
+    ) -> Result<Self, DriverError>
     where
         T: 'static,
     {
@@ -620,8 +628,10 @@ impl<T: StreamTerms> Network<T> {
             return Err(DriverError::InvalidConfig);
         }
         control_group::validate(&config.nak_control_groups)?;
-        let (agents, links) = network_agents_over::<OsSocket, T>(config.agents)
+        let (mut agents, links) = network_agents_over::<OsSocket, T>(config.agents)
             .map_err(|_| DriverError::InvalidConfig)?;
+        // Each agent writes its own cells from its first cycle (M2).
+        agents.attach_cells(cells.0, cells.1);
         let agents = match config.threading {
             ThreadingMode::Shared => Agents::Shared(Box::new(agents)),
             mode => Agents::Threads(
@@ -673,6 +683,7 @@ impl<T: StreamTerms> Network<T> {
             paths_refused: 0,
             path_failures: 0,
             views: NetworkViewCounters::default(),
+            cells: Vec::new(),
             #[cfg(test)]
             defer_view_attach: false,
         })
@@ -2026,6 +2037,7 @@ impl<T: StreamTerms> Network<T> {
             Agents::Closed => None,
         };
         if let Some(mut agents) = agents {
+            self.cells = agents.take_cells();
             shutdown.agents_stopped = agents.is_stopped();
             shutdown.endpoints_retired = self.endpoints.reclaim(&self.links, &mut agents, |_| {});
         }
@@ -2041,6 +2053,12 @@ impl<T: StreamTerms> Network<T> {
         self.release_guard_senders(!sender_late);
         self.end_reincarnations();
         shutdown
+    }
+
+    /// The agents' CnC cells taken back at the close, for the conductor to
+    /// free; an agent that did not come back keeps its cells.
+    pub(crate) fn take_cells(&mut self) -> Vec<Counter> {
+        core::mem::take(&mut self.cells)
     }
 
     /// Moves the guard sender of every tracked publication to the released
