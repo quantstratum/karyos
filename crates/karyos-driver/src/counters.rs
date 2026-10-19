@@ -69,6 +69,8 @@
 //! | `conductor duty at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds of the last duty cycle, read at its end with the positions pass; 0 before the first |
 //! | `capability fallback` | event | endpoint capabilities on a fallback, once per endpoint epoch (SPEC §16.8) |
 //! | `capability missing` | event | endpoint opens and reopens refused for a required capability (SPEC §16.8) |
+//! | `guard audit records overwritten` | event | guard audit ring records overwritten by newer ones |
+//! | `guard audit records dropped` | event | guard audit ring records dropped once its sequences were exhausted |
 //!
 //! With a network, each endpoint's effective capabilities are gauges keyed
 //! by participant kind endpoint and its instance id (`crate::capabilities`,
@@ -132,7 +134,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 64] = [
+const LABELS: [(u64, &str); 66] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -197,6 +199,8 @@ const LABELS: [(u64, &str); 64] = [
     (TYPE_TIMESTAMP, "conductor duty at"),
     (TYPE_EVENTS, "capability fallback"),
     (TYPE_EVENTS, "capability missing"),
+    (TYPE_EVENTS, "guard audit records overwritten"),
+    (TYPE_EVENTS, "guard audit records dropped"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -367,8 +371,13 @@ pub(crate) enum Event {
     /// epoch (SPEC §16.8; `crate::capabilities`).
     CapabilityFallback,
     /// Endpoint opens and reopens refused because a required capability
-    /// was not active (SPEC §16.8). Last, so no other counter's id moves.
+    /// was not active (SPEC §16.8).
     CapabilityMissing,
+    /// Guard audit ring records overwritten by newer ones (M4).
+    GuardAuditOverwritten,
+    /// Guard audit ring records dropped once its sequences were exhausted
+    /// (M4). Last, so no other counter's id moves.
+    GuardAuditDropped,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -649,6 +658,11 @@ mod tests {
             (Event::ConductorDutyAt, "conductor duty at"),
             (Event::CapabilityFallback, "capability fallback"),
             (Event::CapabilityMissing, "capability missing"),
+            (
+                Event::GuardAuditOverwritten,
+                "guard audit records overwritten",
+            ),
+            (Event::GuardAuditDropped, "guard audit records dropped"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();
