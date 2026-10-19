@@ -165,6 +165,10 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
     /// The next event's effects start incomplete: an event delivered so
     /// that its record ends the strict journal, every call refused.
     incomplete_next: bool,
+    /// The handler ran on the event being dispatched: a source's message
+    /// is then taken whatever the dispatch returns, so a later error (the
+    /// group closing as it is sent) does not deliver it twice.
+    delivered: bool,
 }
 
 /// Why a Gateway could not be configured.
@@ -190,6 +194,14 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     /// whose next event is `next_seq`. Its event buffer is `max_event`
     /// bytes, the sender's own bound; its timer table holds `timers`
     /// timers, ids below it.
+    ///
+    /// A message whose record does not fit `max_event` cannot be recorded:
+    /// strict capture ends the journal at it, and best effort delivers it
+    /// in a gap (above `MAX_INLINE`, its payload recorded unavailable). To
+    /// record every inline payload of a source with no recording to
+    /// reference, `max_event` needs at least 147 + `MAX_INLINE` + the end
+    /// record (12 + its block): a message head with a trace extension, the
+    /// largest inline payload and its end.
     ///
     /// # Errors
     ///
@@ -239,6 +251,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             last_taken: 0,
             ended: false,
             incomplete_next: false,
+            delivered: false,
         })
     }
 
@@ -474,6 +487,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             deadlines: &mut self.deadlines,
             budget: self.observation_budget,
         };
+        self.delivered = true;
         handler.on_event(event, &mut effects);
         let (length, index, incomplete) = (effects.length, effects.index, effects.incomplete);
         let end = GroupRecord::End(EventEnd {
@@ -574,6 +588,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             deadlines: &mut self.deadlines,
             budget: self.observation_budget,
         };
+        self.delivered = true;
         handler.on_event(event, &mut effects);
     }
 }
