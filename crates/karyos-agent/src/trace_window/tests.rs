@@ -25,8 +25,8 @@ fn window(max_pending: usize) -> TraceWindow {
             .with_bounds(8, max_pending, 4, 4),
         [1, 2],
     );
-    window.journal(PUBLISHER, Some(HOST));
-    window.journal(SUBSCRIBER, Some(HOST));
+    window.journal(PUBLISHER, Some(HOST), 0);
+    window.journal(SUBSCRIBER, Some(HOST), 0);
     window
 }
 
@@ -104,10 +104,13 @@ fn clocks_that_share_no_source_give_an_unavailable_pair() {
     let mut window = window(8);
     window.journals.insert(
         SUBSCRIBER,
-        Some(JournalClock {
-            provenance: ClockProvenance::HostMonotonic,
-            same_namespace: false,
-        }),
+        (
+            Some(JournalClock {
+                provenance: ClockProvenance::HostMonotonic,
+                same_namespace: false,
+            }),
+            0,
+        ),
     );
     window.observe(PUBLISHER, &record(Point::Publish, 0, 1000), 1);
     window.observe(SUBSCRIBER, &record(Point::SubscriberPoll, 0, 1500), 1);
@@ -136,7 +139,7 @@ fn every_bound_counts_what_it_refuses() {
             counts.records,
             counts.pending_dropped,
             counts.unknown_journal,
-            counts.network_ignored,
+            counts.points_ignored,
             counts.pending
         ),
         (4, 1, 1, 1, 1)
@@ -167,6 +170,65 @@ fn the_window_forgets_pairs_older_than_it() {
     // At 65 slice 0 has left the window; at 95 slice 3 too.
     assert_eq!(lane(&window, 65).available, 1);
     assert!(window.view(95).0.is_empty());
+}
+
+/// DESIGN's P2-1 on #475: journals opened and closed in turn, more than
+/// the bound over the run, are all matched: a journal leaves the map one
+/// window after it left the table.
+#[test]
+fn journals_past_the_bound_over_a_run_are_forgotten_not_refused() {
+    let mut window = window(8);
+    window.age(100);
+    for journal in 0..20u64 {
+        let now = 100 * (journal + 2);
+        window.journal(1000 + journal, Some(HOST), now);
+        window.journal(2000 + journal, Some(HOST), now);
+        window.observe(1000 + journal, &record(Point::Publish, journal, 1000), now);
+        window.observe(
+            2000 + journal,
+            &record(Point::SubscriberPoll, journal, 1500),
+            now,
+        );
+        window.age(now + 1);
+    }
+    let (_, counts) = window.view(2100);
+    assert_eq!(
+        (counts.journals_dropped, counts.unknown_journal),
+        (0, 0),
+        "{counts:?}"
+    );
+    assert!(window.journals.len() <= 8);
+}
+
+/// DESIGN's P2-2 on #475: successive incarnations, more lanes than the
+/// bound over the run, each get their histogram: a lane leaves the map one
+/// window after its last pair.
+#[test]
+fn lanes_past_the_bound_over_a_run_are_forgotten_not_refused() {
+    let mut window = window(8);
+    for incarnation in 1..=10u64 {
+        let now = 100 * incarnation;
+        window.journal(PUBLISHER, Some(HOST), now);
+        window.journal(SUBSCRIBER, Some(HOST), now);
+        let mut publish = record(Point::Publish, 0, 1000);
+        let mut poll = record(Point::SubscriberPoll, 0, 1500);
+        publish.publication.incarnation = incarnation;
+        poll.publication.incarnation = incarnation;
+        window.observe(PUBLISHER, &publish, now);
+        window.observe(SUBSCRIBER, &poll, now);
+        assert_eq!(lane(&window, now).incarnation, incarnation);
+        window.age(now + 99);
+    }
+    assert_eq!(window.view(1000).1.lanes_dropped, 0);
+    assert!(window.lanes.len() <= 4);
+}
+
+#[test]
+fn a_second_publish_of_a_message_is_counted() {
+    let mut window = window(8);
+    window.observe(PUBLISHER, &record(Point::Publish, 0, 1000), 1);
+    window.observe(PUBLISHER, &record(Point::Publish, 0, 1100), 1);
+    assert_eq!(window.view(1).1.duplicates, 1);
 }
 
 mod mirror {

@@ -290,8 +290,13 @@ pub struct TraceCounts {
     pub malformed: u64,
     /// Records of a journal the agent never saw in the table.
     pub unknown_journal: u64,
-    /// Records of network journals or points, not matched in this version.
+    /// Records of network journals, not matched in this version.
     pub network_ignored: u64,
+    /// Records of other points (packet-level stamps) in publisher and
+    /// subscriber journals, not matched.
+    pub points_ignored: u64,
+    /// A second `Publish` of a message already filed: ignored.
+    pub duplicates: u64,
     /// Journals past the bound, whose records are not matched.
     pub journals_dropped: u64,
     /// Messages refused at the pending bound.

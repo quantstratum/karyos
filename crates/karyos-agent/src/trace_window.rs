@@ -18,7 +18,14 @@
 //!   clocks, or two host monotonic clocks whose journals are both in the
 //!   driver's time namespace, with equal epochs share their source, and the
 //!   pair is calibrated with offset 0, drift 0 and the two observations'
-//!   uncertainties. Any other pair is recorded as unavailable.
+//!   uncertainties. The report uses each journal's largest uncertainty
+//!   instead; they agree for clocks of constant uncertainty, as every
+//!   monotonic clock's is, and the pair's own is never wider. Any other
+//!   pair is recorded as unavailable.
+//! - **Forgetting.** A journal leaves the map one window after it left the
+//!   table (journal numbers are never reused), and a lane one window after
+//!   its last pair (a new incarnation is a new lane), so the bounds hold for
+//!   a run of any length.
 //! - **The window.** The agent's time is cut into `slices` slices of
 //!   `window / slices`; a pair is recorded in the slice of the scan that
 //!   made it, and the reported histogram merges the slices of the last
@@ -162,8 +169,9 @@ pub(crate) struct TraceWindow {
     config: WindowConfig,
     driver: [u64; 2],
     cursor: u64,
-    /// The clock of each tracked journal; `None` for a network journal.
-    journals: BTreeMap<u64, Option<JournalClock>>,
+    /// Each tracked journal: its clock (`None` for a network journal) and
+    /// the agent's time of the last scan that saw it in the table.
+    journals: BTreeMap<u64, (Option<JournalClock>, u64)>,
     pending: BTreeMap<Key, Pending>,
     lanes: BTreeMap<(u64, u64, u8), Slices>,
     counts: TraceCounts,
@@ -192,7 +200,7 @@ impl TraceWindow {
                     provenance: ClockProvenance::from_word(entry.provenance),
                     same_namespace: entry.time_namespace == TimeNamespace::Same,
                 });
-                self.journal(entry.journal, clock);
+                self.journal(entry.journal, clock, now);
             }
         }
         let mut cursor = self.cursor;
@@ -215,16 +223,18 @@ impl TraceWindow {
         self.age(now);
     }
 
-    /// Notes a journal's clock, `None` for a network journal.
-    fn journal(&mut self, journal: u64, clock: Option<JournalClock>) {
-        if self.journals.contains_key(&journal) {
+    /// Notes a journal's clock, `None` for a network journal, seen in the
+    /// table at the agent's time `now`.
+    fn journal(&mut self, journal: u64, clock: Option<JournalClock>, now: u64) {
+        if let Some((_, seen)) = self.journals.get_mut(&journal) {
+            *seen = now;
             return;
         }
         if self.journals.len() >= self.config.max_journals {
             count(&mut self.counts.journals_dropped, 1);
             return;
         }
-        let _ = self.journals.insert(journal, clock);
+        let _ = self.journals.insert(journal, (clock, now));
     }
 
     /// Files one record of `journal` at the agent's time `now`.
@@ -232,13 +242,13 @@ impl TraceWindow {
         count(&mut self.counts.records, 1);
         let clock = match self.journals.get(&journal) {
             None => return count(&mut self.counts.unknown_journal, 1),
-            Some(None) => return count(&mut self.counts.network_ignored, 1),
-            Some(Some(clock)) => *clock,
+            Some((None, _)) => return count(&mut self.counts.network_ignored, 1),
+            Some((Some(clock), _)) => *clock,
         };
         let poll = match record.point {
             Point::Publish => false,
             Point::SubscriberPoll => true,
-            _ => return count(&mut self.counts.network_ignored, 1),
+            _ => return count(&mut self.counts.points_ignored, 1),
         };
         let seen = Seen {
             clock,
@@ -277,6 +287,8 @@ impl TraceWindow {
         } else if pending.publish.is_none() {
             pending.publish = Some(seen);
             pairs.extend(pending.polls.drain(..).map(|poll| (seen, poll)));
+        } else {
+            count(&mut self.counts.duplicates, 1);
         }
         let lane = (key.0, key.1, key.2);
         for (publish, poll) in pairs {
@@ -319,9 +331,21 @@ impl TraceWindow {
         }
     }
 
-    /// Ages out pending keys older than the window.
+    /// Ages out what is older than the window: pending keys, journals no
+    /// longer in the table (their numbers are never reused, so a map that
+    /// kept them would fill for good), and lanes whose newest slice left
+    /// the window (a new incarnation is a new lane).
     fn age(&mut self, now: u64) {
         let window = self.config.window;
+        self.journals
+            .retain(|_, (_, seen)| now.checked_sub(*seen).is_none_or(|age| age < window));
+        let slice = now.checked_div(self.config.slice()).unwrap_or(0);
+        let slices = self.config.slices.max(1);
+        self.lanes.retain(|_, lane| {
+            lane.slices
+                .back()
+                .is_some_and(|(number, _)| number.checked_add(slices).is_none_or(|end| end > slice))
+        });
         let mut aged = 0;
         self.pending.retain(|_, pending| {
             let keep = now
