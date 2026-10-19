@@ -2157,3 +2157,34 @@ fn every_crash_point_of_a_purge_recovers_before_or_at_the_floor() {
     );
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// A purge into a segment, then damage below the floor in that segment:
+/// recovery cuts there, below the floor, and refuses rather than start the
+/// recording past what it holds (REVIEWER-02's P2 on #465).
+#[test]
+fn a_cut_below_the_floor_is_refused() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    let _ = store.purge_before(300).unwrap();
+    drop(store);
+    // A byte of the write at [280, 320), below the floor at 300.
+    let mut probe = disk.clone();
+    let data = probe
+        .open(&Path::new(DIR).join(data_name(RECORDING, 256)))
+        .unwrap();
+    probe.write_at(&data, 30, &[0xFF]).unwrap();
+    assert!(matches!(
+        SegmentStore::verify(disk.clone(), Path::new(DIR), RECORDING, geometry()),
+        Err(SegmentError::FloorMissing { floor: 300 })
+    ));
+    assert!(matches!(
+        SegmentStore::recover(
+            disk,
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment
+        ),
+        Err(SegmentError::FloorMissing { floor: 300 })
+    ));
+}

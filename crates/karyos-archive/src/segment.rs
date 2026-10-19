@@ -54,9 +54,12 @@
 //!   the floor's and starts the recording at the floor, so a crash inside
 //!   a purge recovers as before it (the floor not replaced yet) or at the
 //!   floor (a removal cut short leaves only segments below it). The bytes
-//!   of the floor's segment below the floor stay in its file, unread. A
-//!   floor whose segment is missing, or past the written position, is
-//!   refused, never skipped.
+//!   of the floor's segment below the floor stay in its file, never read
+//!   back, though recovery still checks them as it walks the segment: a
+//!   cut there leaves the floor past the written position. A floor whose
+//!   segment is missing, or past the written position, is refused, never
+//!   skipped. A floor's temporary file left by a crash is removed at
+//!   recovery.
 //! - **Headers.** Only the last segment can be one being created, and
 //!   recovery removes it: its index header is missing, short or zeroed, or
 //!   torn (failing its CRC) with no data and no entry behind it; or its
@@ -1592,6 +1595,12 @@ impl<D: Disk> SegmentStore<D> {
         policy: SyncPolicy,
     ) -> Result<Recovered<D>, SegmentError> {
         let (plan, files) = scan_recording(&mut disk, dir, recording, geometry, Access::Write)?;
+        // A purge's floor record not renamed yet: the purge never began.
+        match disk.remove(&dir.join(format!("{}.tmp", floor_name(recording)))) {
+            Ok(()) => disk.sync_dir(dir)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         if let (Some(kept), Some((_, index))) = (plan.kept, &files)
             && let Some(length) = kept.index_length
         {
