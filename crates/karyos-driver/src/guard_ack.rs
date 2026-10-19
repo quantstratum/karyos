@@ -24,6 +24,9 @@ use karyos_sys::applied_epoch::{Applied, AppliedEpoch};
 use karyos_sys::frame::Lane;
 use karyos_sys::guard::{GuardError, GuardState};
 
+use karyos_sys::counters::{Counter, CounterKeys, KIND_GUARD};
+
+use crate::counters::{DriverCounters, TYPE_GAUGE};
 use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::guards::GuardHandle;
@@ -133,6 +136,46 @@ impl GuardSenders {
             next: 1,
         }
     }
+
+    /// The senders of `guard`'s close at `epoch`, counted as
+    /// [`EmbeddedDriver::close_guard_ack`] reports them, without
+    /// allocating (M4b): applied with nothing in flight, applied with work
+    /// in flight, pending, and pending past the timeout (`overdue`).
+    pub(crate) fn counts(&self, guard: GuardHandle, epoch: u64, overdue: bool) -> AckCounts {
+        let mut counts = AckCounts::default();
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| entry.guard == guard && entry.registered < epoch)
+        {
+            let slot = match read(&entry.cell) {
+                Some(applied) if applied.epoch >= epoch && applied.in_flight == 0 => {
+                    &mut counts.applied
+                }
+                Some(applied) if applied.epoch >= epoch => &mut counts.in_flight,
+                _ if overdue => &mut counts.overdue,
+                _ => &mut counts.pending,
+            };
+            // At most `max_guard_senders`: never past `u64`.
+            if let Some(next) = slot.checked_add(1) {
+                *slot = next;
+            }
+        }
+        counts
+    }
+}
+
+/// A close's senders by acknowledgement state (M4b): the gauges tools read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AckCounts {
+    /// Applied, nothing in flight: the close is effective there.
+    pub(crate) applied: u64,
+    /// Applied, with work still in flight.
+    pub(crate) in_flight: u64,
+    /// Not applied yet, within the timeout.
+    pub(crate) pending: u64,
+    /// Not applied past `guard_ack_timeout`: still pending, overdue.
+    pub(crate) overdue: u64,
 }
 
 /// One whole read of `cell` within [`ACK_READ_ATTEMPTS`].
@@ -255,6 +298,170 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
 fn not_closed(expected: u64, current: GuardState) -> DriverError {
     DriverError::Guard(GuardError::NotClosedAt { expected, current })
+}
+
+/// The labels of a guard's acknowledgement gauges, in [`AckCells`] order
+/// (M4b): the close epoch they count (0 while no close is in effect), then
+/// its senders applied, applied with work in flight, pending and overdue.
+pub(crate) const ACK_LABELS: [&str; 5] = [
+    "guard ack epoch",
+    "guard senders applied",
+    "guard senders in flight",
+    "guard senders pending",
+    "guard senders overdue",
+];
+
+/// The label of a guard's acknowledgement pass cell: the gauges are
+/// written inside a sampling pass on it, so a tool reads them as one.
+pub(crate) const ACK_PASS_LABEL: &str = "guard ack pass";
+
+/// One guard's acknowledgement gauges.
+#[derive(Debug)]
+struct AckCells {
+    id: u64,
+    /// Whether an allocation was tried (a refusal counts once).
+    tried: bool,
+    pass: Option<Counter>,
+    /// The last even pass value.
+    passes: u64,
+    cells: Vec<Option<Counter>>,
+    stored: [u64; 5],
+}
+
+/// Each guard's close acknowledgement as gauges for tools (M4b), keyed by
+/// participant kind `KIND_GUARD` and the guard id, beside its word gauge.
+/// While a guard is closed by a close (epoch 3 or later, odd), the gauges
+/// count its registered senders as [`EmbeddedDriver::close_guard_ack`]
+/// would report them, recomputed at every conductor duty cycle without
+/// allocating, since a pending sender becomes overdue with time alone.
+/// They are written inside a pass on the guard's `guard ack pass` cell,
+/// and only when a value changed. The driver clock is read only while
+/// such a close exists. The six cells are allocated together or not at
+/// all; a refusal is counted once and retried every
+/// [`crate::guards::GUARD_CELL_RETRY`] syncs.
+#[derive(Debug, Default)]
+pub(crate) struct GuardAckCells {
+    guards: Vec<AckCells>,
+    retry_in: u32,
+}
+
+impl GuardAckCells {
+    /// Brings the gauges in line (control path, each duty cycle); `now`
+    /// reads the driver clock, `timeout` is `guard_ack_timeout`.
+    pub(crate) fn sync(
+        &mut self,
+        guards: &crate::guards::Guards,
+        senders: &GuardSenders,
+        counters: &mut DriverCounters,
+        now: &mut dyn FnMut() -> u64,
+        timeout: u64,
+    ) {
+        let retry = match self.retry_in.checked_sub(1) {
+            Some(left) => {
+                self.retry_in = left;
+                false
+            }
+            None => true,
+        };
+        let mut refused = false;
+        let mut clock: Option<u64> = None;
+        for (index, id) in guards.ids().enumerate() {
+            if self.guards.get(index).is_none() {
+                self.guards.push(AckCells {
+                    id,
+                    tried: false,
+                    pass: None,
+                    passes: 0,
+                    cells: Vec::new(),
+                    stored: [0; 5],
+                });
+            }
+            let Some(entry) = self.guards.get_mut(index) else {
+                continue;
+            };
+            if entry.pass.is_none() && (retry || !entry.tried) {
+                let keys = CounterKeys {
+                    kind: KIND_GUARD,
+                    participant: entry.id,
+                    ..CounterKeys::DRIVER
+                };
+                let mut allocate = |label: &str| {
+                    if entry.tried {
+                        counters.retry_keyed(TYPE_GAUGE, label, keys)
+                    } else {
+                        counters.allocate_keyed(TYPE_GAUGE, label, keys)
+                    }
+                };
+                let pass = allocate(ACK_PASS_LABEL);
+                let cells: Vec<Option<Counter>> = match &pass {
+                    Some(_) => ACK_LABELS.iter().map(|label| allocate(label)).collect(),
+                    None => Vec::new(),
+                };
+                entry.tried = true;
+                // All or nothing: a group a reader cannot trust is not left
+                // half allocated.
+                if pass.is_some() && cells.iter().all(Option::is_some) {
+                    entry.pass = pass;
+                    entry.cells = cells;
+                    entry.stored = [0; 5];
+                } else {
+                    for cell in pass.into_iter().chain(cells.into_iter().flatten()) {
+                        counters.free(cell);
+                    }
+                    refused = true;
+                }
+            }
+            let Some(pass) = &entry.pass else {
+                continue;
+            };
+            let values = guards
+                .by_id(entry.id)
+                .and_then(|handle| {
+                    let state = guards.state(handle).ok()?;
+                    // Epoch 1 is the guard's creation, not a close.
+                    if state.open || state.epoch < 3 {
+                        return None;
+                    }
+                    let closed_at = guards.closed_since(handle, state.epoch).ok()?;
+                    let now = *clock.get_or_insert_with(&mut *now);
+                    let overdue = closed_at
+                        .and_then(|at| now.checked_sub(at))
+                        .is_some_and(|elapsed| elapsed >= timeout);
+                    let counts = senders.counts(handle, state.epoch, overdue);
+                    Some([
+                        state.epoch,
+                        counts.applied,
+                        counts.in_flight,
+                        counts.pending,
+                        counts.overdue,
+                    ])
+                })
+                .unwrap_or([0; 5]);
+            if values == entry.stored {
+                continue;
+            }
+            // Checked: 2^63 changes of one guard's counts never come; at
+            // the end the gauges are written without a pass.
+            let odd = entry.passes.checked_add(1);
+            let even = odd.and_then(|odd| odd.checked_add(1));
+            if let Some(odd) = odd {
+                pass.begin_pass(odd);
+            }
+            for (cell, value) in entry.cells.iter().zip(values) {
+                if let Some(cell) = cell {
+                    cell.set(value);
+                }
+            }
+            if let Some(even) = even {
+                pass.end_pass(even);
+                entry.passes = even;
+            }
+            entry.stored = values;
+        }
+        if refused {
+            self.retry_in = crate::guards::GUARD_CELL_RETRY;
+        }
+    }
 }
 
 #[cfg(test)]

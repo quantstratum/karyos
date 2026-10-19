@@ -304,3 +304,82 @@ fn a_sender_id_belongs_to_its_driver() {
     driver.deregister_guard_sender(mine).unwrap();
     other.deregister_guard_sender(id).unwrap();
 }
+
+/// The guard's acknowledgement gauges (M4b), as a tool reads them: label
+/// to value, and the pass cell's value.
+fn ack_gauges(driver: &EmbeddedDriver, guard: GuardHandle) -> (Vec<(String, u64)>, u64) {
+    use karyos_sys::counters::{CellRead, KIND_GUARD};
+    let reader = driver.counters();
+    let mut gauges = Vec::new();
+    let mut pass = None;
+    for index in 0..reader.capacity() {
+        if let CellRead::Allocated {
+            metadata, value, ..
+        } = reader.read(index)
+            && metadata.keys.kind == KIND_GUARD
+            && metadata.keys.participant == guard.id()
+        {
+            let label = String::from_utf8(metadata.label().to_vec()).unwrap();
+            if label == ACK_PASS_LABEL {
+                pass = Some(value);
+            } else if ACK_LABELS.contains(&label.as_str()) {
+                gauges.push((label, value));
+            }
+        }
+    }
+    (gauges, pass.unwrap())
+}
+
+fn values(gauges: &[(String, u64)]) -> [u64; 5] {
+    let mut out = [0; 5];
+    for (slot, label) in out.iter_mut().zip(ACK_LABELS) {
+        *slot = gauges
+            .iter()
+            .find(|(name, _)| name == label)
+            .map(|(_, value)| *value)
+            .unwrap();
+    }
+    out
+}
+
+/// M4b: a close's senders reach the CnC by state, recomputed at each duty
+/// cycle: pending, then overdue as the clock passes the timeout, then
+/// applied with work in flight and applied; a reopen clears the gauges.
+/// Each change is one pass; an unchanged cycle writes nothing.
+#[test]
+fn a_close_acknowledgement_reaches_the_cnc() {
+    let (mut driver, guard, now) = driver(DriverConfig::default());
+    let (_first, cell) = driver.register_guard_sender(guard).unwrap();
+    let (_second, _never) = driver.register_guard_sender(guard).unwrap();
+    let _ = driver.do_work().unwrap();
+    // Open: no close in effect.
+    let (gauges, pass) = ack_gauges(&driver, guard);
+    assert_eq!((values(&gauges), pass), ([0; 5], 0));
+    now.store(10, Ordering::Relaxed);
+    assert_eq!(driver.close_guard(guard, 1), Ok(Closed::Now { epoch: 3 }));
+    let _ = driver.do_work().unwrap();
+    let (gauges, pass) = ack_gauges(&driver, guard);
+    assert_eq!((values(&gauges), pass), ([3, 0, 0, 2, 0], 2));
+    // Nothing changed: no pass.
+    let _ = driver.do_work().unwrap();
+    assert_eq!(ack_gauges(&driver, guard).1, 2);
+    // Past the timeout, both are overdue; one then applies with work in
+    // flight, then drains.
+    now.store(10 + SECOND, Ordering::Relaxed);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(values(&ack_gauges(&driver, guard).0), [3, 0, 0, 0, 2]);
+    cell.publish(applied(3, 4));
+    let _ = driver.do_work().unwrap();
+    assert_eq!(values(&ack_gauges(&driver, guard).0), [3, 0, 1, 0, 1]);
+    cell.publish(applied(3, 0));
+    let _ = driver.do_work().unwrap();
+    let (gauges, pass) = ack_gauges(&driver, guard);
+    assert_eq!((values(&gauges), pass), ([3, 1, 0, 0, 1], 8));
+    // The counts agree with close_guard_ack's report.
+    let ack = driver.close_guard_ack(guard, 3).unwrap();
+    assert_eq!(ack.senders.len(), 2);
+    // A reopen ends the close: the gauges clear.
+    assert_eq!(driver.reopen_guard(guard, 3, 2), Ok(4));
+    let _ = driver.do_work().unwrap();
+    assert_eq!(values(&ack_gauges(&driver, guard).0), [0; 5]);
+}

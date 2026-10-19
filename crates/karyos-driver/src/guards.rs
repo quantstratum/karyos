@@ -202,6 +202,11 @@ impl Guards {
         self.ring.reader()
     }
 
+    /// Each guard's id, in registry order.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.iter().map(|entry| entry.id)
+    }
+
     /// Each guard's id, name and current word.
     fn words(&self) -> impl Iterator<Item = (u64, &str, u64)> + '_ {
         self.entries

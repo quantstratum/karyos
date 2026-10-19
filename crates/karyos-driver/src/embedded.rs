@@ -930,6 +930,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) net: Option<crate::net::Network<T>>,
     /// Each guard's word gauge (M4).
     guard_cells: crate::guards::GuardCells,
+    /// Each guard's close acknowledgement gauges (M4b).
+    guard_ack_cells: crate::guard_ack::GuardAckCells,
     /// The word the conductor loop's spin meter stores into (M5), copied
     /// into the fixed `conductor spin time` cell at each duty cycle, and
     /// whether the meter was handed out.
@@ -1339,6 +1341,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 guard_ring,
             ),
             guard_cells: crate::guards::GuardCells::default(),
+            guard_ack_cells: crate::guard_ack::GuardAckCells::default(),
             spin_word,
             spin_taken: false,
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
@@ -3144,6 +3147,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         add_work(&self.counters, &mut work, &mut first_error, mirrored);
         self.update_stream_gauges();
         self.guard_cells.sync(&self.guards, &mut self.counters);
+        // The close acknowledgements of closed guards (M4b).
+        let clock = &mut self.clock;
+        self.guard_ack_cells.sync(
+            &self.guards,
+            &self.guard_senders,
+            &mut self.counters,
+            &mut || clock.now(),
+            self.config.guard_ack_timeout,
+        );
         // The conductor loop's spin time, stored by its meter on this thread.
         self.counters
             .set_conductor_spin(self.spin_word.load(std::sync::atomic::Ordering::Relaxed));
