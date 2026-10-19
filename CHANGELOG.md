@@ -394,6 +394,21 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The management agent's local API v1 (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M7; owner item 51
+  interims, no new dependency). `karyos_agent::json` writes API v1 by hand
+  (fields under their Rust names in declaration order, exact integers, the
+  instance as 32 hex digits, `null` for none); `karyos_agent::server`
+  serves it on `<api-dir>/agent.sock` (a private `0700` directory, the
+  socket `0600`; a stale socket replaced, a live one never) to the uids of
+  a role table (`Role`: viewer, operator, risk officer, administrator),
+  checking the peer's uid (`SO_PEERCRED`). One request line per connection,
+  `KARYOS-AGENT 1 view`, one JSON answer; another version is answered with
+  the versions supported, a uid without a role `not authorized`. The
+  `karyos-agent` binary runs it (`--api-dir`, `--driver`, `--role
+  UID=ROLE`, `--refresh-ms`). The API compatibility test pins API v1's
+  JSON field for field.
+
 - The management agent's core, `karyos-agent` (phase 5, M6a; ADR-0055;
   quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`).
   `Agent` attaches to each configured driver as a tool, counting against its
