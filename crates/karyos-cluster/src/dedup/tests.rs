@@ -54,7 +54,6 @@ fn owned(outcome: Outcome<'_>) -> Outcome<'static> {
         Outcome::Duplicate => Outcome::Duplicate,
         Outcome::ReplyTooLarge => Outcome::ReplyTooLarge,
         Outcome::SessionExpired => Outcome::SessionExpired,
-        Outcome::StaleEpoch => Outcome::StaleEpoch,
         Outcome::WindowFull => Outcome::WindowFull,
         Outcome::OutOfOrder { expected } => Outcome::OutOfOrder { expected },
         Outcome::Applied(_) | Outcome::Retained(_) => unreachable!(),
@@ -108,7 +107,13 @@ fn a_zero_bound_or_an_overflow_is_refused() {
 #[test]
 fn registration_advertises_the_bounds() {
     let mut table = table();
-    assert_eq!(table.register(7, 1, 10), Ok(small()));
+    assert_eq!(
+        table.register(7, 1, 10),
+        Ok(Registered {
+            epoch: 1,
+            config: small()
+        })
+    );
     assert_eq!(table.live_sessions(), 1);
 }
 
@@ -219,7 +224,7 @@ fn any_entry_advances_log_time_and_it_never_goes_back() {
     let mut table = table();
     table.register(7, 1, 0).unwrap();
     // Another client's entry at 100 expires client 7 (last active at 0).
-    table.register(8, 1, 100).unwrap();
+    table.register(8, 2, 100).unwrap();
     // A new leader's clock behind: log time stays at 100.
     let (outcome, _) = run(&mut table, Request::new(7, 1, 0, 0), 20, b"x");
     assert_eq!(outcome, Outcome::SessionExpired);
@@ -240,51 +245,90 @@ fn a_duplicate_or_retained_request_renews_the_session() {
 #[test]
 fn a_full_table_refuses_and_never_evicts_a_live_session() {
     let mut table = table();
+    // Client c registers at index c + 1, its epoch.
     for client in 0..4 {
-        table.register(client, 1, 0).unwrap();
+        table.register(client, client + 1, 0).unwrap();
     }
     assert_eq!(
-        table.register(9, 1, 10),
+        table.register(9, 5, 10),
         Err(RegisterError::SessionsExhausted)
     );
     for client in 0..4 {
-        let (outcome, _) = run(&mut table, Request::new(client, 1, 0, 0), 10, b"r");
+        let (outcome, _) = run(&mut table, Request::new(client, client + 1, 0, 0), 10, b"r");
         assert_eq!(outcome, Outcome::Applied(b"r"));
     }
     // An expired session's slot is free again.
     for client in 1..4 {
-        run(&mut table, Request::new(client, 1, 1, 0), 60, b"r");
+        run(&mut table, Request::new(client, client + 1, 1, 0), 60, b"r");
     }
-    assert_eq!(table.register(9, 1, 110), Ok(small()));
+    assert_eq!(table.register(9, 6, 110).map(|done| done.epoch), Ok(6));
     let (outcome, _) = run(&mut table, Request::new(0, 1, 0, 0), 110, b"x");
     assert_eq!(outcome, Outcome::SessionExpired);
 }
 
 #[test]
-fn epochs_replace_forward_and_refuse_backward() {
+fn registrations_follow_log_order() {
     let mut table = table();
-    table.register(7, 2, 0).unwrap();
-    run(&mut table, Request::new(7, 2, 0, 0), 1, b"a");
-    assert_eq!(
-        table.register(7, 1, 2),
-        Err(RegisterError::StaleEpoch { current: 2 })
-    );
-    let (outcome, _) = run(&mut table, Request::new(7, 1, 0, 0), 3, b"x");
-    assert_eq!(outcome, Outcome::StaleEpoch);
-    // A retried registration of the live epoch keeps its replies.
-    assert_eq!(table.register(7, 2, 4), Ok(small()));
-    let (outcome, _) = run(&mut table, Request::new(7, 2, 0, 0), 5, b"x");
-    assert_eq!(outcome, Outcome::Retained(b"a"));
-    // A request of an epoch not registered yet.
-    let (outcome, _) = run(&mut table, Request::new(7, 3, 0, 0), 6, b"x");
-    assert_eq!(outcome, Outcome::SessionExpired);
-    // A newer epoch starts afresh, in the same slot.
-    assert_eq!(table.register(7, 3, 7), Ok(small()));
+    table.register(7, 5, 0).unwrap();
+    for index in [3, 5] {
+        assert_eq!(
+            table.register(8, index, 0),
+            Err(RegisterError::NotAfter { index, last: 5 })
+        );
+    }
     assert_eq!(table.live_sessions(), 1);
-    let (outcome, runs) = run(&mut table, Request::new(7, 3, 0, 0), 8, b"b");
+}
+
+#[test]
+fn each_registration_opens_its_own_session() {
+    let mut table = table();
+    table.register(7, 1, 0).unwrap();
+    run(&mut table, Request::new(7, 1, 0, 0), 1, b"a");
+    // A duplicate of the registration, applied later: another session,
+    // under its own epoch; the first keeps its replies.
+    assert_eq!(table.register(7, 2, 2).map(|done| done.epoch), Ok(2));
+    assert_eq!(table.live_sessions(), 2);
+    let (outcome, _) = run(&mut table, Request::new(7, 1, 0, 0), 3, b"x");
+    assert_eq!(outcome, Outcome::Retained(b"a"));
+    let (outcome, runs) = run(&mut table, Request::new(7, 2, 0, 0), 4, b"b");
     assert_eq!((outcome, runs), (Outcome::Applied(b"b"), 1));
-    let (outcome, _) = run(&mut table, Request::new(7, 2, 0, 0), 9, b"x");
-    assert_eq!(outcome, Outcome::StaleEpoch);
+    // An epoch never registered.
+    let (outcome, _) = run(&mut table, Request::new(7, 9, 0, 0), 5, b"x");
+    assert_eq!(outcome, Outcome::SessionExpired);
+}
+
+/// REVIEWER-02's F1 on #458: a late duplicate of a registration, applied
+/// after its session expired, must not revive it, so a late duplicate of
+/// its first request never runs again.
+#[test]
+fn a_late_duplicate_registration_never_revives_an_expired_session() {
+    let mut table = table();
+    let epoch = table.register(7, 1, 0).unwrap().epoch;
+    let (outcome, runs) = run(&mut table, Request::new(7, epoch, 0, 0), 1, b"a");
+    assert_eq!((outcome, runs), (Outcome::Applied(b"a"), 1));
+    // The duplicate registration, past the TTL: a new session, epoch 2.
+    assert_eq!(table.register(7, 2, 500).map(|done| done.epoch), Ok(2));
+    let (outcome, runs) = run(&mut table, Request::new(7, epoch, 0, 0), 501, b"x");
+    assert_eq!((outcome, runs), (Outcome::SessionExpired, 0));
+}
+
+/// REVIEWER-02's F2 on #458: a stale request carrying an older lowest
+/// unanswered never moves the base back.
+#[test]
+fn a_stale_acknowledgement_never_moves_the_base_back() {
+    let mut table = table();
+    table.register(7, 1, 0).unwrap();
+    for (sequence, reply) in [(0, b"a"), (1, b"b"), (2, b"c")] {
+        run(&mut table, Request::new(7, 1, sequence, 0), 1, reply);
+    }
+    // The client saw replies 0 and 1; sequence 3 takes sequence 0's slot.
+    let (outcome, _) = run(&mut table, Request::new(7, 1, 3, 2), 2, b"d");
+    assert_eq!(outcome, Outcome::Applied(b"d"));
+    // A late duplicate of request 0, with its old acknowledgement.
+    let (outcome, runs) = run(&mut table, Request::new(7, 1, 0, 0), 3, b"x");
+    assert_eq!((outcome, runs), (Outcome::Duplicate, 0));
+    let (outcome, _) = run(&mut table, Request::new(7, 1, 0, 0), 4, b"x");
+    assert_eq!(outcome, Outcome::Duplicate);
 }
 
 #[test]
@@ -301,6 +345,7 @@ fn a_closed_session_frees_its_slot() {
 
 #[test]
 fn replicas_applying_the_same_entries_hold_the_same_table() {
+    // Client 7 holds epoch 1, client 8 epoch 2.
     let entries = [
         (7, 0, 0, 1),
         (8, 0, 0, 2),
@@ -311,9 +356,15 @@ fn replicas_applying_the_same_entries_hold_the_same_table() {
     let mut replicas = [table(), table()];
     for replica in &mut replicas {
         replica.register(7, 1, 0).unwrap();
-        replica.register(8, 1, 0).unwrap();
+        replica.register(8, 2, 0).unwrap();
         for (client, sequence, seen, time) in entries {
-            run(replica, Request::new(client, 1, sequence, seen), time, b"r");
+            let epoch = if client == 7 { 1 } else { 2 };
+            run(
+                replica,
+                Request::new(client, epoch, sequence, seen),
+                time,
+                b"r",
+            );
         }
     }
     assert_eq!(replicas[0], replicas[1]);

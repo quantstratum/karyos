@@ -5,12 +5,19 @@
 //! table of client sessions driven only by applied log entries, so every
 //! replica that applies the same entries holds the same table.
 //!
-//! - **Sessions.** A client registers under a stable identity and an
-//!   epoch. The table holds at most [`DedupConfig::sessions`] live
-//!   sessions; a registration that finds no free slot is refused
-//!   ([`RegisterError::SessionsExhausted`]), and a live session is never
-//!   evicted. A registration with a newer epoch replaces the client's
-//!   session; an older one is refused ([`RegisterError::StaleEpoch`]).
+//! - **Sessions.** A client registers under its stable identity, and the
+//!   session's epoch is the registering entry's log index (the Raft
+//!   dissertation's §6.3): [`SessionTable::register`] returns it, and the
+//!   client's requests carry it. Every registration entry opens a new
+//!   session, so a late duplicate of a registration opens another session
+//!   under a later epoch and never revives an expired or closed one: an
+//!   epoch is used once, and a request of an epoch whose session is gone
+//!   is refused for good. The table holds at most
+//!   [`DedupConfig::sessions`] live sessions, a client possibly several (a
+//!   duplicate registration's session expires unused); a registration that
+//!   finds no free slot is refused ([`RegisterError::SessionsExhausted`]),
+//!   and a live session is never evicted. Registrations must come in
+//!   increasing log order ([`RegisterError::NotAfter`]).
 //! - **Window** (design D1(b)). Each request carries its sequence and the
 //!   lowest sequence the client has not yet seen answered. The session
 //!   keeps the replies from that sequence up to its highest applied one,
@@ -36,8 +43,7 @@
 //!   looked up or a slot is sought, which gives the same answers as
 //!   checking every session at every entry. An expired session's slot is
 //!   free; its requests get [`Outcome::SessionExpired`], and the client
-//!   registers again under a new epoch. A client must never reuse an
-//!   epoch: the table forgets an expired one.
+//!   registers again, which gives it a new epoch.
 //! - **Activity.** Every request of a live session, retained and duplicate
 //!   ones included, and every registration renew it. An idle client keeps
 //!   its session with a no-op request at least every `ttl / 2`.
@@ -141,12 +147,25 @@ pub enum RegisterError {
     /// Every slot holds a live session.
     #[error("every session slot is live")]
     SessionsExhausted,
-    /// The client's live session has a newer epoch.
-    #[error("the live session's epoch {current} is newer")]
-    StaleEpoch {
-        /// The live session's epoch.
-        current: u64,
+    /// The registration's log index is not past the previous one's: the
+    /// entries are not applied in log order.
+    #[error("registration at index {index}, not past {last}")]
+    NotAfter {
+        /// The registration's index.
+        index: u64,
+        /// The previous registration's.
+        last: u64,
     },
+}
+
+/// A session opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Registered {
+    /// The session's epoch: the registering entry's log index.
+    pub epoch: u64,
+    /// The bounds the session is held to.
+    pub config: DedupConfig,
 }
 
 /// A request as the log carries it.
@@ -155,7 +174,7 @@ pub enum RegisterError {
 pub struct Request {
     /// The client's stable identity.
     pub client: u64,
-    /// The epoch it registered under.
+    /// Its session's epoch, as [`SessionTable::register`] returned it.
     pub epoch: u64,
     /// The request's sequence.
     pub sequence: u64,
@@ -193,12 +212,9 @@ pub enum Outcome<'a> {
     /// [`DedupConfig::response_bytes`].
     ReplyTooLarge,
     /// No live session holds this client and epoch: it expired, was
-    /// closed, was never registered, or its registration is not applied
-    /// yet. The client registers again under a new epoch; it must not
-    /// assume the request was deduplicated.
+    /// closed, or was never opened. The client registers again, under a
+    /// new epoch; it must not assume the request was deduplicated.
     SessionExpired,
-    /// The client's live session has a newer epoch.
-    StaleEpoch,
     /// The window holds [`DedupConfig::window`] unacknowledged replies.
     WindowFull,
     /// The sequence is past the next one the session expects.
@@ -237,6 +253,8 @@ pub struct SessionTable {
     config: DedupConfig,
     /// The highest event time applied.
     now: u64,
+    /// The last registration's log index.
+    registered: Option<u64>,
     sessions: Vec<Session>,
     /// `window` per session.
     stored: Vec<Stored>,
@@ -272,6 +290,7 @@ impl SessionTable {
         Ok(Self {
             config,
             now: 0,
+            registered: None,
             sessions: vec![Session::default(); sessions],
             stored: vec![Stored::Empty; slots],
             replies: vec![0; reply_bytes],
@@ -301,70 +320,59 @@ impl SessionTable {
             .count()
     }
 
-    /// Applies a registration of `client` under `epoch`, in an entry of
-    /// event time `event_time`, and returns the bounds the session is held
-    /// to. A registration of the live epoch again (a retried one) renews
-    /// it; a newer epoch replaces the client's session, whose replies are
-    /// gone.
+    /// Applies a registration of `client` in the entry at log index
+    /// `index`, of event time `event_time`: opens a session whose epoch is
+    /// `index`, and returns it with the bounds it is held to.
     ///
     /// # Errors
     ///
-    /// [`RegisterError`] for no free slot or an older epoch.
+    /// [`RegisterError::SessionsExhausted`] for no free slot, and
+    /// [`RegisterError::NotAfter`] for an index not past the previous
+    /// registration's; neither opens a session.
     pub fn register(
         &mut self,
         client: u64,
-        epoch: u64,
+        index: u64,
         event_time: u64,
-    ) -> Result<DedupConfig, RegisterError> {
+    ) -> Result<Registered, RegisterError> {
+        if let Some(last) = self.registered.filter(|last| index <= *last) {
+            return Err(RegisterError::NotAfter { index, last });
+        }
         self.advance(event_time);
+        self.registered = Some(index);
         let (now, ttl) = (self.now, self.config.ttl);
-        let slot = match self.find(client) {
-            Some(slot) => {
-                let current = self.sessions.get(slot).map_or(0, |session| session.epoch);
-                if epoch < current {
-                    return Err(RegisterError::StaleEpoch { current });
-                }
-                if epoch == current {
-                    if let Some(session) = self.sessions.get_mut(slot) {
-                        session.activity = now;
-                    }
-                    return Ok(self.config);
-                }
-                slot
-            }
-            None => self
-                .sessions
-                .iter()
-                .position(|session| !alive(session, now, ttl))
-                .ok_or(RegisterError::SessionsExhausted)?,
-        };
+        let slot = self
+            .sessions
+            .iter()
+            .position(|session| !alive(session, now, ttl))
+            .ok_or(RegisterError::SessionsExhausted)?;
         if let Some(session) = self.sessions.get_mut(slot) {
             *session = Session {
                 live: true,
                 client,
-                epoch,
+                epoch: index,
                 activity: now,
                 base: 0,
                 next: 0,
             };
         }
-        Ok(self.config)
+        Ok(Registered {
+            epoch: index,
+            config: self.config,
+        })
     }
 
-    /// Applies a close of `client`'s session under `epoch`, freeing its
-    /// slot; `false` if no live session holds them.
+    /// Applies a close of `client`'s session `epoch`, freeing its slot;
+    /// `false` if no live session holds them.
     pub fn close(&mut self, client: u64, epoch: u64, event_time: u64) -> bool {
         self.advance(event_time);
-        let Some(slot) = self.find(client) else {
+        let Some(slot) = self.find(client, epoch) else {
             return false;
         };
-        match self.sessions.get_mut(slot) {
-            Some(session) if session.epoch == epoch => {
-                session.live = false;
-                true
-            }
-            _ => false,
+        if let Some(session) = self.sessions.get_mut(slot) {
+            session.live = false;
         }
+        true
     }
 
     /// Applies `request`, in an entry of event time `event_time`. A new
@@ -377,7 +385,7 @@ impl SessionTable {
         F: FnOnce(&mut [u8]) -> Option<usize>,
     {
         self.advance(event_time);
-        let Some(slot) = self.find(request.client) else {
+        let Some(slot) = self.find(request.client, request.epoch) else {
             return Outcome::SessionExpired;
         };
         let now = self.now;
@@ -385,14 +393,9 @@ impl SessionTable {
         let Some(session) = self.sessions.get_mut(slot) else {
             return Outcome::SessionExpired;
         };
-        if request.epoch < session.epoch {
-            return Outcome::StaleEpoch;
-        }
-        if request.epoch > session.epoch {
-            return Outcome::SessionExpired;
-        }
         session.activity = now;
-        // The client has seen every reply below its lowest unanswered.
+        // The client has seen every reply below its lowest unanswered. The
+        // base never goes back: a late duplicate carries an older one.
         session.base = request
             .lowest_unanswered
             .max(session.base)
@@ -455,12 +458,12 @@ impl SessionTable {
         self.now = self.now.max(event_time);
     }
 
-    /// The slot of `client`'s live session.
-    fn find(&self, client: u64) -> Option<usize> {
+    /// The slot of `client`'s live session `epoch`.
+    fn find(&self, client: u64, epoch: u64) -> Option<usize> {
         let (now, ttl) = (self.now, self.config.ttl);
-        self.sessions
-            .iter()
-            .position(|session| session.client == client && alive(session, now, ttl))
+        self.sessions.iter().position(|session| {
+            session.client == client && session.epoch == epoch && alive(session, now, ttl)
+        })
     }
 
     fn reply_capacity(&self) -> usize {

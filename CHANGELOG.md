@@ -401,11 +401,14 @@ release may break APIs, wire formats and shared-memory layouts.
   unanswered sequence; `Outcome::Applied`, `Retained`, `Duplicate`,
   `WindowFull`, `OutOfOrder`, `ReplyTooLarge`), sessions refused when the
   table is full and never evicted (`RegisterError::SessionsExhausted`),
-  epochs (`StaleEpoch`), and expiry by log time (`SessionExpired`). All
+  session epochs assigned by the registering entry's log index
+  (`Registered`), so a late duplicate never revives a session, and expiry
+  by log time (`SessionExpired`). All
   memory is allocated at `SessionTable::new`. `DedupConfig`'s defaults
   (1024 sessions, 64 replies, 8 KiB, 60 s) are the proposal's interim
   values until the owner decides (item 37). karyos-sim's `tests/dedup.rs`
-  checks retried, duplicated and expiring requests with C3's checker.
+  checks retried, duplicated, late and expiring requests with C3's
+  checker.
 
 - A group's checkpoints in the Archive agent (phase 3, A9-3).
   `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and
