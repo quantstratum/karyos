@@ -236,3 +236,30 @@ fn every_failed_flush_poisons_and_recovers() {
     assert!(flush > 10, "only {flush} flushes");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A failed flush poisons the store: a later write on the same store is
+/// refused, until a reopen (REVIEWER-02's P2 on #463).
+#[test]
+fn a_failed_write_poisons_the_store_until_reopened() {
+    use karyos_cluster::snapshot::SnapshotError;
+
+    let disk = SimDisk::new().with_failed_syncs([1]);
+    let mut store = SnapshotStore::open(disk.clone(), Path::new(DIR), geometry(), config())
+        .unwrap()
+        .store;
+    assert!(!write(&mut store, 10));
+    let held = sections(20);
+    let sections: Vec<Section<'_>> = held
+        .iter()
+        .map(|(kind, version, bytes)| Section::new(*kind, *version, bytes))
+        .collect();
+    assert!(matches!(
+        store.write(20, 1, &sections),
+        Err(SnapshotError::Failed)
+    ));
+    // A reopen clears it.
+    let mut reopened = SnapshotStore::open(disk, Path::new(DIR), geometry(), config())
+        .unwrap()
+        .store;
+    assert!(write(&mut reopened, 20));
+}
