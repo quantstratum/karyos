@@ -394,6 +394,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:
+  `karyos/design/cluster-dedup-and-snapshots.md` §2). `dedup::SessionTable`
+  is the replicated session table, driven only by applied entries: a
+  bounded window of replies per session (`Request` with its lowest
+  unanswered sequence; `Outcome::Applied`, `Retained`, `Duplicate`,
+  `WindowFull`, `OutOfOrder`, `ReplyTooLarge`), sessions refused when the
+  table is full and never evicted (`RegisterError::SessionsExhausted`),
+  epochs (`StaleEpoch`), and expiry by log time (`SessionExpired`). All
+  memory is allocated at `SessionTable::new`. `DedupConfig`'s defaults
+  (1024 sessions, 64 replies, 8 KiB, 60 s) are the proposal's interim
+  values until the owner decides (item 37). karyos-sim's `tests/dedup.rs`
+  checks retried, duplicated and expiring requests with C3's checker.
+
 - A group's checkpoints in the Archive agent (phase 3, A9-3).
   `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and
   `reopen_hold`) gives a group a checkpoint store in its journal
