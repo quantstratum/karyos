@@ -22,7 +22,7 @@
 //!   driver-only region a tool receives read-only, with the host
 //!   `CLOCK_MONOTONIC` time beside the driver clock's. Each guard's word is
 //!   a gauge labelled with the guard's name, participant kind
-//!   `KIND_GUARD` and the guard id in `key2`, which [`GuardCells`] brings
+//!   `KIND_GUARD` and the guard id in `key2`, which `GuardCells` brings
 //!   in line at every conductor duty cycle.
 
 use std::collections::VecDeque;

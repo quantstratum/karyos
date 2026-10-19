@@ -1175,11 +1175,11 @@ mod tests {
             assert_eq!(wire.to_sys(), sys);
             assert_eq!(RegionKind::from_sys(sys), wire);
         }
-        for code in 1..=10 {
+        for code in 1..=11 {
             let wire = RegionKind::from_code(code).unwrap();
             assert_eq!(RegionKind::from_sys(wire.to_sys()), wire);
         }
-        assert_eq!(RegionKind::from_code(11), None);
+        assert_eq!(RegionKind::from_code(12), None);
     }
 
     /// The protocol version is 2 (ACS 13677): the trace journal kinds.
