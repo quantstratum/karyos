@@ -59,6 +59,7 @@ use karyos_io::sockets::ops::SocketOps;
 use ring::{PostError, Reservation, RingReceiver, RingSender};
 
 use crate::embedded::StreamTerms;
+use karyos_sys::counters::Counter;
 use karyos_sys::term_bytes::HeapTerms;
 
 /// Which network agent.
@@ -1035,12 +1036,98 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
     }
 }
 
+/// The sender's system counters in the CnC, in [`AgentCells`] order
+/// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+/// M2): controls sent and not sent, NAKs and SMs received, idle
+/// heartbeats sent.
+pub(crate) const SENDER_CELLS: [&str; 5] = [
+    "network controls sent",
+    "network control send failures",
+    "naks received",
+    "status messages received",
+    "heartbeats sent",
+];
+
+/// The receiver's system counters in the CnC, in [`AgentCells`] order:
+/// datagrams read, dropped by the backend and not decoded, SMs sent, and
+/// images retired at their liveness timeout.
+pub(crate) const RECEIVER_CELLS: [&str; 5] = [
+    "datagrams received",
+    "datagrams dropped by backend",
+    "invalid frames received",
+    "status messages sent",
+    "images retired at timeout",
+];
+
+fn sender_values(counters: &roles::SenderCounters) -> [u64; SENDER_CELLS.len()] {
+    [
+        counters.sent,
+        counters.send_failures,
+        counters.naks,
+        counters.sm_accepted,
+        counters.heartbeats_sent,
+    ]
+}
+
+fn receiver_values(counters: &roles::ReceiverCounters) -> [u64; RECEIVER_CELLS.len()] {
+    [
+        counters.datagrams,
+        counters.backend_drops,
+        counters.decode_errors,
+        counters.sm_sent,
+        counters.images_retired,
+    ]
+}
+
+/// One agent's system counters in the CnC (`quantstratum-docs:
+/// karyos/design/management-agent-gap-analysis.md`, M2): driver-wide
+/// cells the conductor allocates when the network starts and hands to the
+/// agent. The agent is each cell's only writer: at the end of every duty
+/// cycle it stores its own checked count with a plain store, never a
+/// shared read-modify-write, so the cells read the same in every threading
+/// mode. A cell the region had no room for is `None` and is skipped. The
+/// conductor takes the cells back from a stopped agent and frees them; an
+/// agent that never comes back keeps its cells pending release.
+#[derive(Debug, Default)]
+pub struct AgentCells {
+    cells: Vec<Option<Counter>>,
+    /// The values last stored, so an unchanged count is not stored again.
+    stored: Vec<u64>,
+}
+
+impl AgentCells {
+    /// Cells in the agent's label order.
+    pub(crate) fn new(cells: Vec<Option<Counter>>) -> Self {
+        let stored = vec![0; cells.len()];
+        Self { cells, stored }
+    }
+
+    /// Stores each count that changed into its cell.
+    fn publish(&mut self, values: &[u64]) {
+        for ((cell, stored), &value) in self.cells.iter().zip(&mut self.stored).zip(values) {
+            if *stored != value {
+                if let Some(cell) = cell {
+                    cell.set(value);
+                }
+                *stored = value;
+            }
+        }
+    }
+
+    /// Hands every cell back, for the conductor to free.
+    fn take(&mut self) -> impl Iterator<Item = Counter> + '_ {
+        self.stored.clear();
+        self.cells.drain(..).flatten()
+    }
+}
+
 /// The sender agent (`driver-network-agents.md` §3.1). This phase serves
 /// conductor commands only.
 #[derive(Debug)]
 pub struct SenderAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
     core: AgentCore<O, T>,
     role: roles::SenderRole<T>,
+    cells: AgentCells,
 }
 
 /// The receiver agent (`driver-network-agents.md` §3.2). This phase
@@ -1050,6 +1137,7 @@ pub struct ReceiverAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
     core: AgentCore<O, T>,
     role: roles::ReceiverRole<T>,
     sessions: chain::SessionEnd<T>,
+    cells: AgentCells,
 }
 
 impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
@@ -1151,13 +1239,20 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.core.take_halves()
     }
 
-    /// One duty cycle at `now` (driver clock, ns); returns its work count.
+    /// One duty cycle at `now` (driver clock, ns), then its system
+    /// counters into their CnC cells; returns its work count.
     ///
     /// # Errors
     ///
     /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
-        let Self { core, role } = self;
+        let result = self.duty(now);
+        self.cells.publish(&sender_values(&self.role.counters()));
+        result
+    }
+
+    fn duty(&mut self, now: u64) -> Result<u32, AgentError> {
+        let Self { core, role, .. } = self;
         let served = core.serve_commands(&mut |command| role.command(command))?;
         if core.stopped {
             return Ok(served);
@@ -1212,16 +1307,24 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
         self.core.take_halves()
     }
 
-    /// One duty cycle at `now` (driver clock, ns); returns its work count.
+    /// One duty cycle at `now` (driver clock, ns), then its system
+    /// counters into their CnC cells; returns its work count.
     ///
     /// # Errors
     ///
     /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
+        let result = self.duty(now);
+        self.cells.publish(&receiver_values(&self.role.counters()));
+        result
+    }
+
+    fn duty(&mut self, now: u64) -> Result<u32, AgentError> {
         let Self {
             core,
             role,
             sessions,
+            ..
         } = self;
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
         // Session commands before conductor commands, and both before
@@ -1295,6 +1398,23 @@ pub struct NetworkAgents<O: SocketOps, T: StreamTerms = HeapTerms> {
 }
 
 impl<O: SocketOps, T: StreamTerms> NetworkAgents<O, T> {
+    /// Hands each agent its CnC cells (control path, before the agents
+    /// start), in [`SENDER_CELLS`] and [`RECEIVER_CELLS`] order.
+    pub(crate) fn attach_cells(&mut self, sender: AgentCells, receiver: AgentCells) {
+        self.sender.cells = sender;
+        self.receiver.cells = receiver;
+    }
+
+    /// Takes both agents' cells back (after a stop), for the conductor to
+    /// free.
+    pub(crate) fn take_cells(&mut self) -> Vec<Counter> {
+        self.sender
+            .cells
+            .take()
+            .chain(self.receiver.cells.take())
+            .collect()
+    }
+
     /// One iteration: the receiver's duty cycle, then the sender's.
     ///
     /// # Errors
@@ -1487,11 +1607,13 @@ pub fn network_agents_over<O: SocketOps, T: StreamTerms>(
             sender: SenderAgent {
                 core: sender_core,
                 role: sender_role,
+                cells: AgentCells::default(),
             },
             receiver: ReceiverAgent {
                 core: receiver_core,
                 role: receiver_role,
                 sessions: session_end,
+                cells: AgentCells::default(),
             },
         },
         AgentLinks {

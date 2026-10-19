@@ -64,9 +64,22 @@
 //! | `trace mirror overwritten` | event | trace mirror ring records overwritten (mirror loss, never journal loss) |
 //! | `trace journals open` | gauge | client trace journals whose writer may still append |
 //! | `trace journal faults` | event | client trace journals the driver stopped draining for a protocol violation |
-//! | `driver pid` | gauge | the driver process's id, set at creation |
+//! | `driver pid` | gauge | the driver process's id in its own pid namespace, set at creation; a tool in another namespace knows it by another number |
 //! | `driver started at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds when the driver was created |
 //! | `conductor duty at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds of the last duty cycle, read at its end with the positions pass; 0 before the first |
+//!
+//! With a network, the agents' system counters are driver-wide event
+//! cells (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+//! M2), allocated when the driver is created, before any agent starts.
+//! Each is written only by the agent that counts it, with a plain store of
+//! its own checked count at the end of its duty cycle, in every threading
+//! mode; the conductor frees them when the network closes and the agents
+//! come back. Sender: `network controls sent`, `network control send
+//! failures`, `naks received`, `status messages received`, `heartbeats
+//! sent`. Receiver: `datagrams received`, `datagrams dropped by backend`,
+//! `invalid frames received`, `status messages sent`, `images retired at
+//! timeout`. When no cell is free one is not allocated and `counters
+//! unavailable` counts it.
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! "Per-stream positions") are allocated, set and released only inside a
@@ -325,7 +338,9 @@ pub(crate) enum Event {
     /// Reported overruns that `replay` recovered from a recording, merging
     /// back into the live stream.
     OverrunsReplayed,
-    /// The driver process's id, so a tool can tell which process it reads
+    /// The driver process's id in the driver's own pid namespace (a tool
+    /// in another namespace knows the process by another number), so a
+    /// tool can tell which process it reads
     /// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
     /// M1).
     DriverPid,
