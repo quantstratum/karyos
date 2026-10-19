@@ -11,6 +11,12 @@
 //! three checks: [`quorum_of_voters`], [`configuration_from_log`] and
 //! [`learner_caught_up`]. A core with static membership reports none, and
 //! they pass at once.
+//!
+//! **A standby** (phase 5, P5-S2): [`group`] checks each group of servers
+//! on its own observations ([`of_servers`]), [`standby`] adds the checks
+//! of the feed, the fencing and the promotion, and [`across_promotion`]
+//! gives the history C3 checks: an answer of the old generation above the
+//! promoted standby's verified position is an unknown outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,7 +24,8 @@ use karyos_cluster::Entry;
 
 use super::core::{Applying, Change, Configuration, Release, Step};
 use super::node::{Breach, Observation, Op, Positions, Ret, ServiceModel};
-use crate::lin::{self, History, HistoryError, Limit, Verdict};
+use super::standby::{Fencing, PromotionReport};
+use crate::lin::{self, Event, History, HistoryError, Limit, Verdict};
 use crate::net::NodeId;
 
 /// A property a run broke.
@@ -169,6 +176,66 @@ pub enum Violation {
         index: u64,
         /// The entry's term.
         term: u64,
+    },
+    /// A standby server replied before any promotion: its effects were
+    /// not disabled.
+    StandbyEffect {
+        /// The server.
+        node: NodeId,
+    },
+    /// A primary server released a reply at or after the fencing point:
+    /// its lease's end on its own clock, or after the operator's stop.
+    ReplyAfterFencing {
+        /// The server.
+        node: NodeId,
+        /// Its clock at the release.
+        at: u64,
+        /// The lease's end, for a lease.
+        lease_end: Option<u64>,
+    },
+    /// A server of an older generation replied after a promotion, past
+    /// the fencing point.
+    OldGenerationReply {
+        /// The server.
+        node: NodeId,
+        /// Its generation.
+        generation: u64,
+    },
+    /// A standby applied a primary entry other than the one the primary
+    /// applied at that index.
+    FeedMismatch {
+        /// The standby server.
+        node: NodeId,
+        /// The primary's index.
+        index: u64,
+    },
+    /// A promoted standby reported a verified position whose entries it
+    /// did not all apply.
+    VerifiedLost {
+        /// The server.
+        node: NodeId,
+        /// The first primary index missing.
+        index: u64,
+    },
+    /// A promoted standby's report overstates what it learnt: a commit
+    /// beyond the primary's, or a verified position beyond it.
+    GapMisreported {
+        /// The server.
+        node: NodeId,
+        /// What it reported.
+        report: Box<PromotionReport>,
+        /// The highest commit the primary's servers reached.
+        primary_commit: Option<u64>,
+    },
+    /// A client accepted an answer of a generation below one it had
+    /// accepted.
+    GenerationBack {
+        /// The client.
+        client: NodeId,
+        /// The answer's generation.
+        generation: u64,
+        /// The highest it had accepted.
+        seen: u64,
     },
     /// A leader promoted a learner further behind its commit than the lag.
     LearnerBehind {
@@ -399,6 +466,7 @@ pub fn durable_majority_before_reply(
             client,
             index,
             term,
+            ..
         } = observation
         {
             // Under a configuration, the set short of its majority: the
@@ -789,6 +857,265 @@ pub fn membership(observations: &[Observation], lag: u64) -> Result<(), Violatio
     learner_caught_up(observations, lag)
 }
 
+/// The server an observation is of, if it is one of a server.
+fn server_of(observation: &Observation) -> Option<NodeId> {
+    match observation {
+        Observation::Drive { node, .. }
+        | Observation::Released { node, .. }
+        | Observation::Reply { node, .. }
+        | Observation::Crashed { node }
+        | Observation::Recovered { node, .. }
+        | Observation::Contract { node, .. }
+        | Observation::Commit { node, .. }
+        | Observation::Applied { node, .. }
+        | Observation::Positions { node, .. }
+        | Observation::OpenFailed { node, .. }
+        | Observation::Configuration { node, .. }
+        | Observation::Change { node, .. }
+        | Observation::FeedRefused { node, .. }
+        | Observation::FeedApplied { node, .. }
+        | Observation::Promoted { node, .. } => Some(*node),
+        Observation::Success { .. }
+        | Observation::StaleGeneration { .. }
+        | Observation::Fenced { .. }
+        | Observation::PromotionRefused { .. } => None,
+    }
+}
+
+/// The observations of the servers `nodes`, in order: one group's.
+#[must_use]
+pub fn of_servers(observations: &[Observation], nodes: &[NodeId]) -> Vec<Observation> {
+    observations
+        .iter()
+        .filter(|observation| server_of(observation).is_some_and(|node| nodes.contains(&node)))
+        .cloned()
+        .collect()
+}
+
+/// A standby's checks (P5-S2), its servers `standby`, every other server
+/// a primary one:
+///
+/// - no primary server replies at or after the fencing point: its
+///   lease's end on its own clock, or the operator's stop;
+/// - no standby server replies before a promotion;
+/// - after a promotion, no server of an older generation replies;
+/// - every primary entry a standby applied is the one a primary server
+///   applied at that index;
+/// - a promoted standby applied every primary entry up to the verified
+///   position it reports, and reports a learnt commit no higher than the
+///   primary's servers reached, and a verified position no higher than
+///   it;
+/// - no client accepts an answer of a lower generation than one it
+///   accepted.
+///
+/// # Errors
+///
+/// The first [`Violation`].
+pub fn standby(observations: &[Observation], standby: &[NodeId]) -> Result<(), Violation> {
+    let mut primary_applied: BTreeMap<u64, (u64, &[u8])> = BTreeMap::new();
+    let mut primary_commit: Option<u64> = None;
+    for observation in observations {
+        match observation {
+            Observation::Applied { node, entry, .. } if !standby.contains(node) => {
+                let _ = primary_applied.insert(entry.index, (entry.term, &entry.payload));
+            }
+            Observation::Commit { node, index, .. } if !standby.contains(node) => {
+                primary_commit = primary_commit.max(Some(*index));
+            }
+            _ => {}
+        }
+    }
+    // A lease's fencing point is known only at the promotion, after the
+    // replies it bounds: take it first.
+    let lease_end = observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::Fenced {
+                lease_end: Some(end),
+                ..
+            } => Some(*end),
+            _ => None,
+        });
+    let mut stopped = false;
+    let mut promoted: Option<u64> = None;
+    let mut fed: BTreeMap<NodeId, BTreeSet<u64>> = BTreeMap::new();
+    let mut accepted: BTreeMap<NodeId, u64> = BTreeMap::new();
+    for observation in observations {
+        match observation {
+            Observation::Fenced {
+                fencing: Fencing::OperatorStop,
+                ..
+            } => stopped = true,
+            Observation::Reply {
+                node,
+                generation,
+                at,
+                ..
+            } => {
+                if !standby.contains(node) && (stopped || lease_end.is_some_and(|end| *at >= end)) {
+                    return Err(Violation::ReplyAfterFencing {
+                        node: *node,
+                        at: *at,
+                        lease_end,
+                    });
+                }
+                if promoted.is_none() && standby.contains(node) {
+                    return Err(Violation::StandbyEffect { node: *node });
+                }
+                if promoted.is_some_and(|newest| *generation < newest) {
+                    return Err(Violation::OldGenerationReply {
+                        node: *node,
+                        generation: *generation,
+                    });
+                }
+            }
+            Observation::FeedApplied {
+                node,
+                index,
+                term,
+                payload,
+            } => {
+                if primary_applied
+                    .get(index)
+                    .is_some_and(|(at, bytes)| (at, *bytes) != (term, payload.as_slice()))
+                {
+                    return Err(Violation::FeedMismatch {
+                        node: *node,
+                        index: *index,
+                    });
+                }
+                let _ = fed.entry(*node).or_default().insert(*index);
+            }
+            Observation::Promoted { node, report } => {
+                // From the primary's first index: once snapshots purge a
+                // prefix (C8), the floor becomes the snapshot's index.
+                if let Some(verified) = report.verified {
+                    let applied = fed.get(node);
+                    if let Some(index) = (super::standby::PRIMARY_FIRST_INDEX..=verified)
+                        .find(|index| !applied.is_some_and(|set| set.contains(index)))
+                    {
+                        return Err(Violation::VerifiedLost { node: *node, index });
+                    }
+                }
+                // Every feed send carries a commit at least as high as its
+                // entries, so the learnt commit bounds the verified position.
+                if report.learnt_commit > primary_commit || report.verified > report.learnt_commit {
+                    return Err(Violation::GapMisreported {
+                        node: *node,
+                        report: Box::new(report.clone()),
+                        primary_commit,
+                    });
+                }
+                promoted = promoted.max(Some(report.generation));
+            }
+            Observation::Success {
+                client, generation, ..
+            } => {
+                let seen = accepted.entry(*client).or_insert(0);
+                if *generation < *seen {
+                    return Err(Violation::GenerationBack {
+                        client: *client,
+                        generation: *generation,
+                        seen: *seen,
+                    });
+                }
+                *seen = *generation;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The clients' `history` across a promotion (SPEC.md §9): an answer of a
+/// generation below the first promoted standby's, for a primary index
+/// above its verified position, is an unknown outcome. Its return is left
+/// out, so the operation is pending, and the client's later operations
+/// carry a fresh client id. Without a promotion, `history` as it is.
+#[must_use]
+pub fn across_promotion(
+    history: &History<Op, Ret>,
+    observations: &[Observation],
+) -> History<Op, Ret> {
+    let Some(report) = observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::Promoted { report, .. } => Some(report),
+            _ => None,
+        })
+    else {
+        return history.clone();
+    };
+    // Per client, whether each of its successes, in order, is unknown.
+    let mut unknown: BTreeMap<NodeId, Vec<bool>> = BTreeMap::new();
+    for observation in observations {
+        if let Observation::Success {
+            client,
+            index,
+            generation,
+        } = observation
+        {
+            let lost = *generation < report.generation && Some(*index) > report.verified;
+            unknown.entry(*client).or_default().push(lost);
+        }
+    }
+    let mut fresh = history
+        .events()
+        .iter()
+        .map(|event| match event {
+            Event::Invoke { client, .. } | Event::Return { client, .. } => *client,
+        })
+        .max()
+        .map_or(0, |last| last.saturating_add(1));
+    let mut alias: BTreeMap<NodeId, NodeId> = BTreeMap::new();
+    let mut returned: BTreeMap<NodeId, usize> = BTreeMap::new();
+    let mut rewritten = History::new();
+    for event in history.events() {
+        match event {
+            Event::Invoke { client, op } => {
+                let id = alias.get(client).copied().unwrap_or(*client);
+                let _ = rewritten.invoke(id, op.clone());
+            }
+            Event::Return { client, ret } => {
+                let count = returned.entry(*client).or_insert(0);
+                let lost = unknown
+                    .get(client)
+                    .and_then(|flags| flags.get(*count))
+                    .copied()
+                    .unwrap_or(false);
+                *count = count.saturating_add(1);
+                if lost {
+                    let _ = alias.insert(*client, fresh);
+                    // Fresh ids start above every client's and grow by
+                    // one per unknown outcome, far below u32::MAX.
+                    fresh = fresh.saturating_add(1);
+                } else {
+                    let id = alias.get(client).copied().unwrap_or(*client);
+                    let _ = rewritten.ret(id, ret.clone());
+                }
+            }
+        }
+    }
+    rewritten
+}
+
+/// Every check of one group of `servers` servers but linearizability.
+///
+/// # Errors
+///
+/// The first [`Violation`].
+pub fn group(observations: &[Observation], servers: usize) -> Result<(), Violation> {
+    no_contract_breach(observations)?;
+    released_after_persistence(observations)?;
+    durable_majority_before_reply(observations, servers)?;
+    durable_kept(observations)?;
+    applied_durable(observations)?;
+    committed_prefixes_agree(observations)?;
+    responses_agree(observations)?;
+    no_old_term_direct_commit(observations)?;
+    positions_ordered(observations)
+}
+
 /// Every check of a run with `servers` servers.
 ///
 /// # Errors
@@ -799,14 +1126,6 @@ pub fn all(
     history: &History<Op, Ret>,
     servers: usize,
 ) -> Result<(), Violation> {
-    no_contract_breach(observations)?;
-    released_after_persistence(observations)?;
-    durable_majority_before_reply(observations, servers)?;
-    durable_kept(observations)?;
-    applied_durable(observations)?;
-    committed_prefixes_agree(observations)?;
-    responses_agree(observations)?;
-    no_old_term_direct_commit(observations)?;
-    positions_ordered(observations)?;
+    group(observations, servers)?;
     linearizable(history)
 }
