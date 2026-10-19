@@ -10,6 +10,7 @@ use karyos_client::tool::{RemoteTool, attach_tool};
 use karyos_sys::counters::{CellRead, CountersReader, PassRead, read_pass};
 use karyos_sys::host_clock::host_monotonic_ns;
 
+use crate::alerts::{AlertRules, Alerts};
 use crate::api::{
     API_VERSION, AgentView, Counter, DriverState, DriverView, ErrorEntry, GuardEntry, LossEntry,
     Sample,
@@ -36,6 +37,8 @@ pub struct AgentConfig {
     /// Records kept per diagnostic ring and driver; older ones are dropped
     /// from the view, still counted as delivered.
     pub history: usize,
+    /// The alert rules (M9).
+    pub alerts: AlertRules,
 }
 
 impl AgentConfig {
@@ -46,6 +49,7 @@ impl AgentConfig {
             drivers,
             attach_timeout: DEFAULT_ATTACH_TIMEOUT,
             history: DEFAULT_HISTORY,
+            alerts: AlertRules::default(),
         }
     }
 
@@ -62,6 +66,13 @@ impl AgentConfig {
         self.history = history;
         self
     }
+
+    /// With `alerts` as the alert rules.
+    #[must_use]
+    pub fn with_alerts(mut self, alerts: AlertRules) -> Self {
+        self.alerts = alerts;
+        self
+    }
 }
 
 /// One watched driver.
@@ -76,6 +87,7 @@ struct Driver {
     errors: Follower<ErrorEntry>,
     losses: Follower<LossEntry>,
     guards: Follower<GuardEntry>,
+    alerts: Alerts,
 }
 
 /// The agent. Each driver it is attached to counts one tool against the
@@ -106,6 +118,7 @@ impl Agent {
                 errors: Follower::new(config.history),
                 losses: Follower::new(config.history),
                 guards: Follower::new(config.history),
+                alerts: Alerts::default(),
             })
             .collect();
         Self { config, drivers }
@@ -117,7 +130,7 @@ impl Agent {
     pub fn refresh(&mut self) {
         let timeout = self.config.attach_timeout;
         for driver in &mut self.drivers {
-            driver.refresh(timeout);
+            driver.refresh(timeout, &self.config.alerts);
         }
     }
 
@@ -126,13 +139,17 @@ impl Agent {
     pub fn view(&self) -> AgentView {
         AgentView {
             version: API_VERSION,
-            drivers: self.drivers.iter().map(Driver::view).collect(),
+            drivers: self
+                .drivers
+                .iter()
+                .map(|driver| driver.view(&self.config.alerts))
+                .collect(),
         }
     }
 }
 
 impl Driver {
-    fn refresh(&mut self, timeout: Duration) {
+    fn refresh(&mut self, timeout: Duration, rules: &AlertRules) {
         if self.tool.is_none() {
             match attach_tool(&self.dir, timeout) {
                 Ok(tool) => {
@@ -141,6 +158,7 @@ impl Driver {
                         self.errors.restart();
                         self.losses.restart();
                         self.guards.restart();
+                        self.alerts.restart();
                     }
                     self.instance = Some(tool.instance());
                     self.state = DriverState::Attached;
@@ -168,6 +186,15 @@ impl Driver {
             .map(|(metadata, value)| model::counter(metadata, *value))
             .collect();
         read_rings(tool, &mut self.errors, &mut self.losses, &mut self.guards);
+        // The rules see what this refresh read (M9).
+        let losses = self.losses.feed();
+        let reported = losses.delivered.checked_add(losses.overwritten);
+        self.alerts.update(
+            rules,
+            self.sample.as_ref(),
+            reported.unwrap_or(losses.delivered),
+            host_monotonic_ns(),
+        );
         match tool.driver_closed() {
             Ok(false) => {}
             Ok(true) => {
@@ -183,7 +210,7 @@ impl Driver {
         }
     }
 
-    fn view(&self) -> DriverView {
+    fn view(&self, rules: &AlertRules) -> DriverView {
         DriverView {
             dir: self.dir.clone(),
             state: self.state.clone(),
@@ -193,6 +220,7 @@ impl Driver {
             errors: self.errors.feed(),
             losses: self.losses.feed(),
             guards: self.guards.feed(),
+            alerts: self.alerts.firing(rules),
         }
     }
 }

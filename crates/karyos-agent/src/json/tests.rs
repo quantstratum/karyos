@@ -95,6 +95,24 @@ fn every_field() -> AgentView {
             delivered: 2,
             overwritten: 0,
         },
+        alerts: vec![
+            Alert {
+                kind: AlertKind::Lag,
+                stream: 3,
+                lane: 1,
+                participant: 5,
+                value: 1024,
+                since: 50,
+            },
+            Alert {
+                kind: AlertKind::Loss,
+                stream: 0,
+                lane: 0,
+                participant: 0,
+                value: 15,
+                since: 60,
+            },
+        ],
     };
     let unavailable = DriverView {
         dir: PathBuf::from("/run/karyos/b"),
@@ -107,6 +125,7 @@ fn every_field() -> AgentView {
         errors: Feed::default(),
         losses: Feed::default(),
         guards: Feed::default(),
+        alerts: Vec::new(),
     };
     let closed = DriverView {
         dir: PathBuf::from("/run/karyos/c"),
@@ -121,7 +140,8 @@ fn every_field() -> AgentView {
 
 /// API v1's JSON, field for field. This is the compatibility contract
 /// (ADR-0055 Validation): a field renamed, removed, retyped or moved fails
-/// here, and needs API v2. A field added to v1 is appended to this text.
+/// here, and needs API v2. A field added to v1 is appended to this text:
+/// `alerts` (M9) was, at the end of each driver.
 const V1: &str = concat!(
     r#"{"version":1,"drivers":["#,
     r#"{"dir":"/run/karyos/a","state":{"state":"attached"},"#,
@@ -133,11 +153,12 @@ const V1: &str = concat!(
     r#""client_counters":[{"label":"streams active","type_id":2,"stream":0,"lane":0,"kind":0,"participant":0,"value":18446744073709551615}],"#,
     r#""errors":{"records":[{"seq":0,"first":10,"last":20,"occurrences":3,"code":4,"source":1,"key":[2,1],"message":"stream \"2\" rejected\n\ttwice\u0001"}],"delivered":1,"overwritten":0},"#,
     r#""losses":{"records":[{"seq":7,"time":30,"kind":1,"reason":2,"lane":0,"stream_id":9,"stream_registration":3,"from":100,"to":200,"participant":5,"client":6}],"delivered":8,"overwritten":7},"#,
-    r#""guards":{"records":[{"seq":1,"time":40,"guard":1,"before":2,"after":3,"operation":42,"requester_kind":1,"requester":6,"outcome":4,"refusal":9}],"delivered":2,"overwritten":0}},"#,
+    r#""guards":{"records":[{"seq":1,"time":40,"guard":1,"before":2,"after":3,"operation":42,"requester_kind":1,"requester":6,"outcome":4,"refusal":9}],"delivered":2,"overwritten":0},"#,
+    r#""alerts":[{"kind":"lag","stream":3,"lane":1,"participant":5,"value":1024,"since":50},{"kind":"loss","stream":0,"lane":0,"participant":0,"value":15,"since":60}]},"#,
     r#"{"dir":"/run/karyos/b","state":{"state":"unavailable","reason":"no socket"},"instance":null,"sample":null,"client_counters":[],"#,
-    r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0}},"#,
+    r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0},"alerts":[]},"#,
     r#"{"dir":"/run/karyos/c","state":{"state":"closed"},"instance":null,"sample":null,"client_counters":[],"#,
-    r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0}}"#,
+    r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0},"alerts":[]}"#,
     r#"]}"#,
 );
 

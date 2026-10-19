@@ -394,6 +394,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Alerts in the management agent (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M9). `AlertRules`
+  (`AgentConfig::with_alerts`; `karyos-agent --lag-bytes --lag-refreshes
+  --loss-quiet`) are evaluated at every refresh: a subscriber lagging
+  `lag_bytes` or more over `lag_refreshes` consecutive consistent samples
+  (8 MiB and 3 by default; a mixed sample changes nothing), and a loss
+  report that grew (read or overwritten), cleared after `loss_quiet`
+  refreshes without a new loss (10). `DriverView::alerts` (`Alert`,
+  `AlertKind::{Lag, Loss}`) lists those firing, with the time each began;
+  API v1's JSON appends `alerts` to each driver. The agent's command line
+  refuses a uid given two roles, and one poll serves at most 16
+  connections (`server::MAX_ACCEPTS`). The guard pending-acknowledgement
+  rule follows M4b.
+
 - The management agent's local API v1 (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M7; owner item 51
   interims, no new dependency). `karyos_agent::json` writes API v1 by hand

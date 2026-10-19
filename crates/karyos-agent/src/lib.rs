@@ -28,6 +28,14 @@
 //! The attach is Linux only, as the tool attach is; [`api`] builds
 //! everywhere.
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "the attach that evaluates the rules is Linux only"
+    )
+)]
+pub mod alerts;
 pub mod api;
 pub mod cli;
 pub mod json;

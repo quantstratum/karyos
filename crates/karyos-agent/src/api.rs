@@ -41,6 +41,39 @@ pub struct DriverView {
     pub losses: Feed<LossEntry>,
     /// The guard audit ring's records the agent followed.
     pub guards: Feed<GuardEntry>,
+    /// The alerts firing for this driver (M9).
+    pub alerts: Vec<Alert>,
+}
+
+/// What an alert watches (SPEC §11, alerting; management-agent-gap-analysis.md,
+/// M9). Guard pending acknowledgement comes with M4b, replication lag and
+/// clock divergence with the Cluster and the Archive's retention work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AlertKind {
+    /// A subscriber's lag stayed at or above the rule's bound.
+    Lag,
+    /// The driver reported unrecoverable losses (its loss report grew).
+    Loss,
+}
+
+/// One alert firing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Alert {
+    /// What it watches.
+    pub kind: AlertKind,
+    /// The stream registration (`Lag`); 0 for a driver-wide alert.
+    pub stream: u64,
+    /// The lane (`Lag`).
+    pub lane: u8,
+    /// The subscriber's registration (`Lag`); 0 when none.
+    pub participant: u64,
+    /// `Lag`: the lag in bytes at the last consistent sample. `Loss`: the
+    /// loss records reported since it began firing, read or overwritten.
+    pub value: u64,
+    /// Host `CLOCK_MONOTONIC` nanoseconds of the refresh it began firing.
+    pub since: u64,
 }
 
 /// Whether the agent is attached to a driver.
