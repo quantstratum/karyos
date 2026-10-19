@@ -16,14 +16,25 @@
 //!   one record before its response or return. Capture never delays or
 //!   refuses a close: a full ring overwrites its oldest record and counts
 //!   the overwritten records.
+//! - **Tools (M4, `quantstratum-docs:
+//!   karyos/design/management-agent-gap-analysis.md`).** Each record is
+//!   also appended to the guard audit ring of `karyos_sys::diag`, a
+//!   driver-only region a tool receives read-only, with the host
+//!   `CLOCK_MONOTONIC` time beside the driver clock's. Each guard's word is
+//!   a gauge labelled with the guard's name, participant kind
+//!   `KIND_GUARD` and the guard id in `key2`, which `GuardCells` brings
+//!   in line at every conductor duty cycle.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use karyos_client::HeapWords;
 use karyos_protocol::cnc::ErrorCode;
+use karyos_sys::counters::{Counter, CounterKeys, KIND_GUARD};
+use karyos_sys::diag::{GuardAudit, GuardAuditRecord};
 use karyos_sys::guard::{self, Closed, GuardError, GuardState};
 
+use crate::counters::{DriverCounters, TYPE_GAUGE};
 use crate::error::DriverError;
 
 /// The longest guard name, in bytes.
@@ -155,10 +166,12 @@ pub(crate) struct Guards {
     audit: VecDeque<AuditRecord>,
     audit_capacity: usize,
     overwritten: u64,
+    /// The tools' copy of every record (M4).
+    ring: GuardAudit,
 }
 
 impl Guards {
-    pub(crate) fn new(driver: u64, max: usize, audit_capacity: usize) -> Self {
+    pub(crate) fn new(driver: u64, max: usize, audit_capacity: usize, ring: GuardAudit) -> Self {
         Self {
             driver,
             max,
@@ -167,7 +180,27 @@ impl Guards {
             audit: VecDeque::with_capacity(audit_capacity),
             audit_capacity,
             overwritten: 0,
+            ring,
         }
+    }
+
+    /// The guard audit ring's shared region, for tools; `None` on the
+    /// heap.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn region(&self) -> Option<&karyos_sys::ipc::Region> {
+        self.ring.region()
+    }
+
+    /// A reader of the tools' guard audit ring.
+    pub(crate) fn ring_reader(&self) -> karyos_sys::diag::GuardAuditReader {
+        self.ring.reader()
+    }
+
+    /// Each guard's id, name and current word.
+    fn words(&self) -> impl Iterator<Item = (u64, &str, u64)> + '_ {
+        self.entries
+            .iter()
+            .map(|entry| (entry.id, entry.name.as_str(), Self::raw(entry)))
     }
 
     /// Adds a guard, created closed at epoch 1.
@@ -375,6 +408,30 @@ impl Guards {
         requester: Requester,
         outcome: AuditOutcome,
     ) {
+        let (requester_kind, requester_id) = match requester {
+            Requester::InProcess => (0, 0),
+            Requester::Client(client) => (1, client),
+        };
+        let (outcome_code, refusal) = match outcome {
+            AuditOutcome::Closed => (1, 0),
+            AuditOutcome::AlreadyClosed => (2, 0),
+            AuditOutcome::Reopened => (3, 0),
+            AuditOutcome::Refused(code) => (4, u16::try_from(code.code()).unwrap_or(u16::MAX)),
+        };
+        // A ring whose sequences are exhausted keeps what it has; the
+        // driver's own audit below still records.
+        let _ = self.ring.record(&GuardAuditRecord {
+            time: karyos_sys::host_clock::host_monotonic_ns(),
+            driver_time: time,
+            guard,
+            before,
+            after,
+            operation,
+            requester_kind,
+            requester: requester_id,
+            outcome: outcome_code,
+            refusal,
+        });
         if self.audit_capacity == 0 {
             // Checked, never wrapped (SPEC.md section 14): at its end the
             // count keeps its value.
@@ -422,6 +479,73 @@ impl Guards {
     }
 }
 
+/// Each guard's word as a gauge for tools (M4): labelled with the guard's
+/// name, keyed by participant kind [`KIND_GUARD`] and the guard id. Guards
+/// are never removed, so a gauge lives as long as the driver. One the
+/// region has no room for is counted once in `counters unavailable` and
+/// retried every [`GUARD_CELL_RETRY`] syncs, so a full region is not
+/// scanned at every duty cycle.
+#[derive(Debug, Default)]
+pub(crate) struct GuardCells {
+    /// Per guard in registry order: its id, its gauge, the word last
+    /// stored, and whether a refused allocation was counted.
+    cells: Vec<(u64, Option<Counter>, u64, bool)>,
+    /// Syncs left before refused allocations are tried again.
+    retry_in: u32,
+}
+
+/// Syncs between two retries of a refused guard gauge allocation.
+pub(crate) const GUARD_CELL_RETRY: u32 = 1024;
+
+impl GuardCells {
+    /// Brings the gauges in line with `guards` (control path, each
+    /// conductor duty cycle): a new guard gets its gauge, a changed word
+    /// is stored.
+    pub(crate) fn sync(&mut self, guards: &Guards, counters: &mut DriverCounters) {
+        // A refused allocation is retried only when the countdown ends.
+        let retry = match self.retry_in.checked_sub(1) {
+            Some(left) => {
+                self.retry_in = left;
+                false
+            }
+            None => true,
+        };
+        let mut refused = false;
+        for (index, (id, name, word)) in guards.words().enumerate() {
+            if self.cells.get(index).is_none() {
+                self.cells.push((id, None, 0, false));
+            }
+            let Some((_, cell, stored, counted)) = self.cells.get_mut(index) else {
+                continue;
+            };
+            if cell.is_none() && (retry || !*counted) {
+                let keys = CounterKeys {
+                    kind: KIND_GUARD,
+                    participant: id,
+                    ..CounterKeys::DRIVER
+                };
+                *cell = if *counted {
+                    counters.retry_keyed(TYPE_GAUGE, name, keys)
+                } else {
+                    counters.allocate_keyed(TYPE_GAUGE, name, keys)
+                };
+                *counted = true;
+                *stored = 0;
+                refused |= cell.is_none();
+            }
+            if let Some(cell) = cell
+                && *stored != word
+            {
+                cell.set(word);
+                *stored = word;
+            }
+        }
+        if refused {
+            self.retry_in = GUARD_CELL_RETRY;
+        }
+    }
+}
+
 /// The control code of a refused transition.
 pub(crate) fn refused(error: &DriverError) -> AuditOutcome {
     AuditOutcome::Refused(error_code(error))
@@ -444,7 +568,7 @@ mod tests {
 
     #[test]
     fn guards_are_named_closed_and_audited() {
-        let mut guards = Guards::new(7, 2, 3);
+        let mut guards = Guards::new(7, 2, 3, karyos_sys::diag::guard_audit(4).unwrap());
         let orders = guards.add("orders").unwrap();
         assert_eq!(orders.id(), 1);
         assert_eq!(guards.find("orders"), Some(orders));
@@ -524,7 +648,7 @@ mod tests {
 
     #[test]
     fn a_close_is_recorded_even_without_audit_room() {
-        let mut guards = Guards::new(1, 1, 0);
+        let mut guards = Guards::new(1, 1, 0, karyos_sys::diag::guard_audit(4).unwrap());
         let guard = guards.add("g").unwrap();
         assert_eq!(
             guards.close(guard, 1, Requester::InProcess, 0),
@@ -532,5 +656,44 @@ mod tests {
         );
         assert_eq!(guards.audit().overwritten, 1);
         assert!(guards.audit().records.is_empty());
+    }
+
+    /// A guard gauge the full region refused is counted once and tried
+    /// again only every `GUARD_CELL_RETRY` syncs, not at every duty cycle;
+    /// it appears once room is made and the countdown ends.
+    #[test]
+    fn a_refused_guard_gauge_is_retried_every_nth_sync() {
+        use crate::counters::{Event, FIXED_COUNTERS};
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 1).unwrap();
+        let mut guards = Guards::new(1, 2, 2, karyos_sys::diag::guard_audit(2).unwrap());
+        let _ = guards.add("kill").unwrap();
+        // The one spare cell is taken.
+        let taken = counters
+            .allocate_keyed(TYPE_GAUGE, "taken", CounterKeys::DRIVER)
+            .unwrap();
+        let mut cells = GuardCells::default();
+        cells.sync(&guards, &mut counters);
+        assert_eq!(counters.value(Event::CountersUnavailable), 1);
+        let gauges = |counters: &DriverCounters| {
+            let reader = counters.reader();
+            (0..reader.capacity())
+                .filter(|&index| {
+                    matches!(
+                        reader.read(index),
+                        karyos_sys::counters::CellRead::Allocated { metadata, .. }
+                            if metadata.keys.kind == KIND_GUARD
+                    )
+                })
+                .count()
+        };
+        counters.free(taken);
+        for _ in 0..GUARD_CELL_RETRY {
+            cells.sync(&guards, &mut counters);
+            assert_eq!(gauges(&counters), 0, "retried before the countdown ended");
+        }
+        cells.sync(&guards, &mut counters);
+        assert_eq!(gauges(&counters), 1);
+        // Counted once: the retries add nothing.
+        assert_eq!(counters.value(Event::CountersUnavailable), 1);
     }
 }

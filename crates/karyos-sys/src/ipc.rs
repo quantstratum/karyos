@@ -108,6 +108,10 @@ pub enum RegionKind {
     /// A conflation table (driver only): the slots and the update journal
     /// of one conflated stream, which views map read-only.
     ConflationTable,
+    /// The guard audit ring (driver only): every guard transition, for
+    /// tools (`quantstratum-docs:
+    /// karyos/design/management-agent-gap-analysis.md`, M4).
+    GuardAudit,
 }
 
 impl RegionKind {
@@ -123,6 +127,7 @@ impl RegionKind {
             Self::ClientCounters => 8,
             Self::TraceMirror => 9,
             Self::ConflationTable => 10,
+            Self::GuardAudit => 11,
         }
     }
 }

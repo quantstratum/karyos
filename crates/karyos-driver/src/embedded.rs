@@ -928,6 +928,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) guard_lane_fault: Option<usize>,
     /// The network agents and their tables, when configured.
     pub(crate) net: Option<crate::net::Network<T>>,
+    /// Each guard's word gauge (M4).
+    guard_cells: crate::guards::GuardCells,
     /// Each network endpoint's capability gauges (M3).
     capabilities: crate::capabilities::CapabilityCells,
     /// What clients created by channel URI, owned by their registrations
@@ -1175,66 +1177,68 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut driver_id = [0u64; 2];
         karyos_sys::random::fill_u64s(&mut driver_id)?;
         #[cfg(target_os = "linux")]
-        let (broadcast, mut counters, client_counters, admission, diagnostics, mirror) = match ipc {
-            Some(ipc) => {
-                // Fail fast: the image lanes of a network are regions too.
-                if let Some(network) = &config.network {
-                    crate::admission::check_descriptors(
-                        crate::admission::descriptors_needed(&config, network),
-                        karyos_sys::ipc::descriptor_limits(),
+        let (broadcast, mut counters, client_counters, mut admission, diagnostics, mirror) =
+            match ipc {
+                Some(ipc) => {
+                    // Fail fast: the image lanes of a network are regions too.
+                    if let Some(network) = &config.network {
+                        crate::admission::check_descriptors(
+                            crate::admission::descriptors_needed(&config, network),
+                            karyos_sys::ipc::descriptor_limits(),
+                        )?;
+                    }
+                    let instance = crate::admission::instance_of(driver_id);
+                    let mut admission = crate::admission::Admission::new(ipc, instance)?;
+                    let broadcast = BroadcastTransmitter::create_in(
+                        instance,
+                        crate::admission::BROADCAST_REGION,
+                        config.broadcast_capacity,
+                    )
+                    .map_err(|_| DriverError::InvalidConfig)?;
+                    let counters = DriverCounters::new_in(
+                        instance,
+                        crate::admission::COUNTERS_REGION,
+                        config.counters_capacity,
                     )?;
+                    let diagnostics =
+                        crate::diagnostics::Diagnostics::new_in(&mut admission, &config)?;
+                    let (_, region) = admission.next_region()?;
+                    let client_counters = ClientCounters::new_in(
+                        instance,
+                        region,
+                        config.client_counters_capacity,
+                        config.max_counters_per_client,
+                    )?;
+                    let (_, region) = admission.next_region()?;
+                    let mirror = karyos_sys::trace_mirror::trace_mirror_in(
+                        instance,
+                        region,
+                        config.max_trace_journals,
+                        config.trace_recycle_log_entries,
+                        config.trace_mirror_records,
+                    )
+                    .map_err(|_| DriverError::InvalidConfig)?;
+                    (
+                        broadcast,
+                        counters,
+                        client_counters,
+                        Some(admission),
+                        diagnostics,
+                        mirror,
+                    )
                 }
-                let instance = crate::admission::instance_of(driver_id);
-                let mut admission = crate::admission::Admission::new(ipc, instance)?;
-                let broadcast = BroadcastTransmitter::create_in(
-                    instance,
-                    crate::admission::BROADCAST_REGION,
-                    config.broadcast_capacity,
-                )
-                .map_err(|_| DriverError::InvalidConfig)?;
-                let counters = DriverCounters::new_in(
-                    instance,
-                    crate::admission::COUNTERS_REGION,
-                    config.counters_capacity,
-                )?;
-                let diagnostics = crate::diagnostics::Diagnostics::new_in(&mut admission, &config)?;
-                let (_, region) = admission.next_region()?;
-                let client_counters = ClientCounters::new_in(
-                    instance,
-                    region,
-                    config.client_counters_capacity,
-                    config.max_counters_per_client,
-                )?;
-                let (_, region) = admission.next_region()?;
-                let mirror = karyos_sys::trace_mirror::trace_mirror_in(
-                    instance,
-                    region,
-                    config.max_trace_journals,
-                    config.trace_recycle_log_entries,
-                    config.trace_mirror_records,
-                )
-                .map_err(|_| DriverError::InvalidConfig)?;
-                (
-                    broadcast,
-                    counters,
-                    client_counters,
-                    Some(admission),
-                    diagnostics,
-                    mirror,
-                )
-            }
-            None => (
-                broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
-                DriverCounters::with_capacity(config.counters_capacity)?,
-                ClientCounters::new(
-                    config.client_counters_capacity,
-                    config.max_counters_per_client,
-                )?,
-                None,
-                crate::diagnostics::Diagnostics::new(&config)?,
-                heap_mirror(&config)?,
-            ),
-        };
+                None => (
+                    broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
+                    DriverCounters::with_capacity(config.counters_capacity)?,
+                    ClientCounters::new(
+                        config.client_counters_capacity,
+                        config.max_counters_per_client,
+                    )?,
+                    None,
+                    crate::diagnostics::Diagnostics::new(&config)?,
+                    heap_mirror(&config)?,
+                ),
+            };
         #[cfg(not(target_os = "linux"))]
         let (broadcast, mut counters, client_counters, diagnostics, mirror) = {
             let _ = ipc;
@@ -1252,6 +1256,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
             return Err(DriverError::InvalidConfig);
         }
+        // The tools' guard audit ring (M4): a driver-only region in IPC
+        // mode. It holds at least one record, so a driver that keeps no
+        // audit of its own still shows its latest transition.
+        let audit_records = config.guard_audit_records.max(1);
+        #[cfg(target_os = "linux")]
+        let guard_ring = match admission.as_mut() {
+            Some(admission) => {
+                let (_, region) = admission.next_region()?;
+                karyos_sys::diag::guard_audit_in(
+                    crate::admission::instance_of(driver_id),
+                    region,
+                    audit_records,
+                )
+            }
+            None => karyos_sys::diag::guard_audit(audit_records),
+        }
+        .map_err(|_| DriverError::InvalidConfig)?;
+        #[cfg(not(target_os = "linux"))]
+        let guard_ring =
+            karyos_sys::diag::guard_audit(audit_records).map_err(|_| DriverError::InvalidConfig)?;
         // The network agents' cells, allocated before any agent starts.
         let network_cells = config
             .network
@@ -1300,7 +1324,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 config.trace_drain_budget,
             ),
             network: crate::network_journals::NetworkTracing::new(config.max_trace_journals),
-            guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
+            guards: crate::guards::Guards::new(
+                id,
+                config.max_guards,
+                config.guard_audit_records,
+                guard_ring,
+            ),
+            guard_cells: crate::guards::GuardCells::default(),
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
             #[cfg(test)]
             guard_lane_fault: None,
@@ -1974,6 +2004,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     #[must_use]
     pub fn guard_audit(&self) -> crate::guards::Audit {
         self.guards.audit()
+    }
+
+    /// The tools' guard audit ring (M4), as a tool reads it: every
+    /// transition with host and driver times.
+    #[must_use]
+    pub fn guard_audit_ring(&self) -> karyos_sys::diag::GuardAuditReader {
+        self.guards.ring_reader()
     }
 
     /// Creates a stream (control path: allocates its log buffer). Its
@@ -3085,6 +3122,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .drain(&mut self.diagnostics, &mut self.counters);
         add_work(&self.counters, &mut work, &mut first_error, mirrored);
         self.update_stream_gauges();
+        self.guard_cells.sync(&self.guards, &mut self.counters);
         self.sample_positions();
         match first_error {
             Some(error) => Err(error),
