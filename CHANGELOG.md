@@ -394,6 +394,21 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:
+  `karyos/design/cluster-dedup-and-snapshots.md` §2). `dedup::SessionTable`
+  is the replicated session table, driven only by applied entries: a
+  bounded window of replies per session (`Request` with its lowest
+  unanswered sequence; `Outcome::Applied`, `Retained`, `Duplicate`,
+  `WindowFull`, `OutOfOrder`, `ReplyTooLarge`), sessions refused when the
+  table is full and never evicted (`RegisterError::SessionsExhausted`),
+  session epochs assigned by the registering entry's log index
+  (`Registered`), so a late duplicate never revives a session, and expiry
+  by log time (`SessionExpired`). All
+  memory is allocated at `SessionTable::new`. `DedupConfig`'s defaults
+  (1024 sessions, 64 replies, 8 KiB, 60 s) are the proposal's interim
+  values until the owner decides (item 37). karyos-sim's `tests/dedup.rs`
+  checks retried, duplicated, late and expiring requests with C3's
+  checker.
 - Snapshots in karyos-cluster (phase 4, C8a; quantstratum-docs:
   `karyos/design/cluster-dedup-and-snapshots.md` §3). `snapshot::SnapshotStore`
   writes a snapshot as typed sections (`SectionKind`: consensus, sessions,
