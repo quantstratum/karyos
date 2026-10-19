@@ -394,6 +394,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- karyos-archive's recording lister (phase 5, M11; quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`):
+  `client::list::RecordingLister` reads the whole catalog over the control
+  streams, page by page, never blocking. A full page asks for the next one
+  from the id after its last; the listing ends at a short page or a
+  refusal. It keeps at most `ListerConfig::max_recordings` and counts the
+  rest; answers to other requesters are skipped. The management agent's
+  catalog view builds on it.
+
 - The management agent's trace latency window (phase 5, M6c;
   quantstratum-docs: `karyos/design/agent-trace-window.md`). Per driver, a
   follower of the trace mirror pairs each `Publish` with its
