@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The harness skeleton (quantstratum-docs:
-//! karyos/design/cluster-gap-analysis.md §6, C5), with a test-only core
-//! that has a fixed leader and no elections, and reads its log through
-//! the harness's read-only view:
+//! karyos/design/cluster-gap-analysis.md §6, C5), with the reference core
+//! (`harness::reference`: a fixed leader and no elections, reading its log
+//! through the harness's read-only view):
 //!
 //! - a healthy run passes every check, also with slow replies to the
 //!   client (a leader that commits on a minority fails it);
@@ -21,7 +21,6 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -31,8 +30,8 @@ use karyos_sim::cluster::ClusterSim;
 use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::check::{self, Violation};
 use karyos_sim::harness::core::{
-    ConsensusCore, DriveError, LogView, MAX_READIES, NotLeader, Persisted, Ready, Release, Step,
-    drive,
+    Applying, ConsensusCore, DriveError, LogView, MAX_READIES, NotLeader, Persisted, Ready,
+    Release, Step, drive,
 };
 use karyos_sim::harness::node::{
     Breach, ClientNode, LOG_DIR, Member, Observation, Op, Positions, Recorder, Ret, ServerNode,
@@ -42,282 +41,7 @@ use karyos_sim::lin::History;
 use karyos_sim::net::{LinkConfig, NodeId};
 use karyos_sim::scenarios;
 
-/// The fixed leader.
-const LEADER: NodeId = 0;
-/// Its only term.
-const TERM: u64 = 1;
-/// Ticks between the leader's resends.
-const RESEND: u64 = 4;
-/// Frame bytes per append message at most.
-const BATCH_BYTES: u64 = 16 * 1024;
-
-#[derive(Debug, Clone, PartialEq)]
-enum Msg {
-    /// The leader's entries from some index, and its commit index.
-    Append {
-        entries: Vec<Entry>,
-        commit: Option<u64>,
-    },
-    /// A follower holds every entry up to `index` durably.
-    Ack { index: Option<u64> },
-}
-
-/// A fixed leader replicating to followers: commit on a durable majority.
-/// It keeps only what is not written yet; the rest it reads from the log.
-struct Fixed {
-    id: NodeId,
-    peers: Vec<NodeId>,
-    /// Entries not yet handed to the node to persist.
-    unpersisted: Vec<Entry>,
-    /// The first index to remove before they are written.
-    truncate: Option<u64>,
-    /// The leader's view of each server's durable index.
-    acked: BTreeMap<NodeId, Option<u64>>,
-    commit: Option<u64>,
-    /// The hard state needs saving.
-    dirty: bool,
-    /// The last index handed out to apply.
-    handed: Option<u64>,
-    messages: Vec<(NodeId, Msg)>,
-    after_persist: Vec<(NodeId, Msg)>,
-    waiting: bool,
-    /// The last index, written or not, after the last call.
-    received: Option<u64>,
-}
-
-impl Fixed {
-    fn leading(&self) -> bool {
-        self.id == LEADER
-    }
-
-    fn last(&self, log: &LogView<'_>) -> Option<u64> {
-        if let Some(entry) = self.unpersisted.last() {
-            return Some(entry.index);
-        }
-        match self.truncate {
-            Some(from) => from
-                .checked_sub(1)
-                .filter(|last| *last >= log.first_index()),
-            None => log.last_index(),
-        }
-    }
-
-    fn next(&self, log: &LogView<'_>) -> u64 {
-        self.last(log).map_or(log.first_index(), |last| last + 1)
-    }
-
-    fn term_at(&self, log: &LogView<'_>, index: u64) -> Option<u64> {
-        if let Some(entry) = self.unpersisted.iter().find(|entry| entry.index == index) {
-            return Some(entry.term);
-        }
-        if self.truncate.is_some_and(|from| index >= from) {
-            return None;
-        }
-        log.term(index)
-    }
-
-    fn recompute_commit(&mut self, log: &LogView<'_>) {
-        let mut durable: Vec<Option<u64>> = self.acked.values().copied().collect();
-        durable.sort_unstable_by(|a, b| b.cmp(a));
-        let majority = self.peers.len() / 2;
-        let candidate = durable.get(majority).copied().flatten();
-        if candidate > self.commit
-            && let Some(index) = candidate
-            && self.term_at(log, index) == Some(TERM)
-        {
-            self.commit = candidate;
-            self.dirty = true;
-        }
-    }
-
-    fn settle(&mut self, log: &LogView<'_>) {
-        self.received = self.last(log);
-    }
-}
-
-impl ConsensusCore for Fixed {
-    type Message = Msg;
-
-    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
-        let mut acked: BTreeMap<NodeId, Option<u64>> =
-            peers.iter().map(|peer| (*peer, None)).collect();
-        let _ = acked.insert(id, log.durable_index());
-        let stored = log.hard_state();
-        Self {
-            id,
-            peers: peers.to_vec(),
-            unpersisted: Vec::new(),
-            truncate: None,
-            acked,
-            commit: stored.and_then(|state| state.commit),
-            // The vote for the fixed leader is saved at the first Ready.
-            dirty: stored.is_none(),
-            handed: None,
-            messages: Vec::new(),
-            after_persist: Vec::new(),
-            waiting: false,
-            received: log.last_index(),
-        }
-    }
-
-    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
-        if !self.leading() {
-            return Err(NotLeader {
-                leader: Some(LEADER),
-            });
-        }
-        let index = self.next(log);
-        self.unpersisted.push(Entry {
-            index,
-            term: TERM,
-            event_time: 0,
-            payload: command,
-        });
-        self.settle(log);
-        Ok(())
-    }
-
-    fn step(&mut self, from: NodeId, message: Msg, log: &mut LogView<'_>) {
-        match message {
-            Msg::Append { entries, commit } if !self.leading() => {
-                for entry in entries {
-                    let next = self.next(log);
-                    if entry.index < next {
-                        if self.term_at(log, entry.index) == Some(entry.term) {
-                            continue;
-                        }
-                        // A stale entry of another term: remove it and
-                        // everything after it.
-                        self.unpersisted.retain(|kept| kept.index < entry.index);
-                        if self.unpersisted.is_empty() {
-                            self.truncate =
-                                Some(self.truncate.map_or(entry.index, |t| t.min(entry.index)));
-                        }
-                        self.unpersisted.push(entry);
-                    } else if entry.index == next {
-                        self.unpersisted.push(entry);
-                    } else {
-                        break;
-                    }
-                }
-                let commit = commit.min(self.last(log)).max(self.commit);
-                if commit > self.commit {
-                    self.commit = commit;
-                    self.dirty = true;
-                }
-                // Released only once `drive` made these entries durable.
-                let index = self.last(log);
-                self.after_persist.push((LEADER, Msg::Ack { index }));
-            }
-            Msg::Ack { index } if self.leading() => {
-                let known = self.acked.entry(from).or_insert(None);
-                *known = index.max(*known);
-                self.recompute_commit(log);
-            }
-            Msg::Append { .. } | Msg::Ack { .. } => {}
-        }
-        self.settle(log);
-    }
-
-    fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
-        if !self.leading() || !now.is_multiple_of(RESEND) {
-            return;
-        }
-        let Some(end) = log.last_index().map(|last| last + 1) else {
-            return;
-        };
-        for peer in self.peers.clone() {
-            if peer == self.id {
-                continue;
-            }
-            let from = self
-                .acked
-                .get(&peer)
-                .copied()
-                .flatten()
-                .map_or(log.first_index(), |index| index + 1);
-            let entries = if from < end {
-                // A failed read sends none; the next resend retries.
-                log.entries(from..end, BATCH_BYTES).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            self.messages.push((
-                peer,
-                Msg::Append {
-                    entries,
-                    commit: self.commit,
-                },
-            ));
-        }
-    }
-
-    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Msg>> {
-        if self.waiting {
-            return None;
-        }
-        // Committed entries are applied once durable here.
-        let start = self.handed.map_or(log.first_index(), |handed| handed + 1);
-        let end = self.commit.min(log.durable_index()).map(|last| last + 1);
-        let committed = match end {
-            // A failed read applies none; the next Ready retries.
-            Some(end) if start < end => log.entries(start..end, u64::MAX).unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        let hard_state = self.dirty.then_some(HardState {
-            current_term: TERM,
-            voted_for: Some(u64::from(LEADER)),
-            commit: self.commit,
-        });
-        if self.messages.is_empty()
-            && self.unpersisted.is_empty()
-            && self.truncate.is_none()
-            && hard_state.is_none()
-            && self.after_persist.is_empty()
-            && committed.is_empty()
-        {
-            return None;
-        }
-        if let Some(last) = committed.last() {
-            self.handed = Some(last.index);
-        }
-        self.dirty = false;
-        self.waiting = true;
-        Some(Ready {
-            messages: std::mem::take(&mut self.messages),
-            truncate_from: self.truncate.take(),
-            entries: std::mem::take(&mut self.unpersisted),
-            hard_state,
-            after_persist: std::mem::take(&mut self.after_persist),
-            committed,
-        })
-    }
-
-    fn advance(&mut self, persisted: Persisted, log: &mut LogView<'_>) {
-        self.waiting = false;
-        let _ = self.acked.insert(self.id, persisted.durable);
-        if self.leading() {
-            self.recompute_commit(log);
-        }
-        self.settle(log);
-    }
-
-    fn term(&self) -> u64 {
-        TERM
-    }
-
-    fn leads(&self) -> bool {
-        self.leading()
-    }
-
-    fn received(&self) -> Option<u64> {
-        self.received
-    }
-
-    fn committed(&self) -> Option<u64> {
-        self.commit
-    }
-}
+use karyos_sim::harness::reference::{LEADER, Message as Msg, Reference as Fixed};
 
 type Sim = ClusterSim<Member<Fixed>, Wire<Msg>>;
 
@@ -605,6 +329,20 @@ fn entry(index: u64, term: u64, payload: u8) -> Entry {
     }
 }
 
+/// `entry` applied by `node` once durable.
+fn applied(node: NodeId, entry: Entry) -> Observation {
+    let applying = Applying {
+        durable: Some(entry.index),
+        logged_term: Some(entry.term),
+    };
+    Observation::Applied {
+        node,
+        entry,
+        applying,
+        response: None,
+    }
+}
+
 fn positions(durable: Option<u64>) -> Positions {
     Positions {
         received: Some(1),
@@ -654,22 +392,10 @@ fn a_history_that_is_not_linearizable_is_caught() {
 #[test]
 fn divergent_committed_prefixes_are_caught() {
     let observations = vec![
-        Observation::Applied {
-            node: 0,
-            entry: entry(1, 1, 1),
-        },
-        Observation::Applied {
-            node: 1,
-            entry: entry(1, 1, 1),
-        },
-        Observation::Applied {
-            node: 1,
-            entry: entry(2, 1, 2),
-        },
-        Observation::Applied {
-            node: 0,
-            entry: entry(2, 1, 3),
-        },
+        applied(0, entry(1, 1, 1)),
+        applied(1, entry(1, 1, 1)),
+        applied(1, entry(2, 1, 2)),
+        applied(0, entry(2, 1, 3)),
     ];
     check::committed_prefixes_agree(&observations[..3]).unwrap();
     assert_eq!(
@@ -861,10 +587,7 @@ fn lost_durable_entries_are_caught() {
     // Truncating an entry the cluster applied.
     let truncated = vec![
         persisted(1, None, vec![(1, 1), (2, 1)]),
-        Observation::Applied {
-            node: 0,
-            entry: entry(2, 1, 9),
-        },
+        applied(0, entry(2, 1, 9)),
         persisted(1, Some(2), vec![(2, 3)]),
     ];
     assert_eq!(
@@ -937,7 +660,7 @@ fn drive_stops_at_its_work_budget() {
         &mut core,
         &mut log,
         &mut |_, (), _| sent += 1,
-        &mut |_| {},
+        &mut |_, _| {},
         &mut |_| {},
     );
     assert!(
@@ -971,4 +694,99 @@ fn drive_stops_at_its_work_budget() {
             ..
         })
     ));
+}
+
+#[test]
+fn an_entry_applied_before_it_is_durable_is_caught() {
+    check::applied_durable(&[applied(1, entry(2, 1, 0))]).unwrap();
+    for applying in [
+        Applying {
+            durable: Some(1),
+            logged_term: Some(1),
+        },
+        Applying {
+            durable: Some(2),
+            logged_term: None,
+        },
+    ] {
+        let early = Observation::Applied {
+            node: 1,
+            entry: entry(2, 1, 0),
+            applying,
+            response: None,
+        };
+        assert_eq!(
+            check::applied_durable(&[early]),
+            Err(Violation::AppliedNotDurable {
+                node: 1,
+                index: 2,
+                applying,
+            })
+        );
+    }
+}
+
+#[test]
+fn divergent_responses_are_caught() {
+    let answered = |node, bytes: Vec<u8>| Observation::Applied {
+        node,
+        entry: entry(1, 1, 0),
+        applying: Applying {
+            durable: Some(1),
+            logged_term: Some(1),
+        },
+        response: Some(bytes),
+    };
+    check::responses_agree(&[answered(0, vec![0, 1]), answered(1, vec![0, 1])]).unwrap();
+    assert_eq!(
+        check::responses_agree(&[answered(0, vec![0, 1]), answered(1, vec![0, 2])]),
+        Err(Violation::DivergentResponse {
+            index: 1,
+            first: 0,
+            second: 1,
+        })
+    );
+}
+
+#[test]
+fn responses_round_trip_in_canonical_bytes() {
+    for ret in [
+        Ret::Appended(7),
+        Ret::Values(Vec::new()),
+        Ret::Values(vec![vec![1, 2], Vec::new(), vec![3]]),
+    ] {
+        assert_eq!(Ret::decode(&ret.canonical()), Some(ret));
+    }
+    assert_eq!(Ret::decode(&[0, 1]), None);
+    assert_eq!(Ret::decode(&[1, 9, 0, 0, 0]), None);
+}
+
+#[test]
+fn a_server_stopped_by_its_disk_is_verified_at_its_restart() {
+    // Node 2's disk crashes at an operation inside a duty: the drive
+    // error stops the node while it is up. Its entries stay unverified
+    // until a restart reopens its log.
+    for budget in [30, 45] {
+        for seed in scenarios::seeds() {
+            let disks = vec![SimDisk::new(), SimDisk::new(), SimDisk::with_budget(budget)];
+            let (mut sim, recorder, _) = fresh(seed, disks, appends(6));
+            sim.run_for(300).unwrap();
+            assert!(
+                count(&recorder, |o| matches!(
+                    o,
+                    Observation::OpenFailed { node: 2, .. }
+                )) > 0,
+                "budget {budget} seed {seed}: the disk did not stop node 2"
+            );
+            assert_eq!(
+                check::durable_kept(&recorder.borrow().observations),
+                Err(Violation::Unverified { node: 2 }),
+                "budget {budget} seed {seed}"
+            );
+            sim.crash(2).unwrap();
+            sim.restart(2).unwrap();
+            sim.run_for(100).unwrap();
+            all_checks(&recorder, 3);
+        }
+    }
 }

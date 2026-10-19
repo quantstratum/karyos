@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use karyos_cluster::Entry;
 
-use super::core::{Release, Step};
+use super::core::{Applying, Release, Step};
 use super::node::{Breach, Observation, Op, Positions, Ret, ServiceModel};
 use crate::lin::{self, History, HistoryError, Limit, Verdict};
 use crate::net::NodeId;
@@ -104,6 +104,24 @@ pub enum Violation {
         /// The server.
         node: NodeId,
     },
+    /// A server applied an entry its log did not hold durably.
+    AppliedNotDurable {
+        /// The server.
+        node: NodeId,
+        /// The entry's index.
+        index: u64,
+        /// What the log held then.
+        applying: Applying,
+    },
+    /// Two servers answered the entry at one index differently.
+    DivergentResponse {
+        /// The index.
+        index: u64,
+        /// One server.
+        first: NodeId,
+        /// The other.
+        second: NodeId,
+    },
     /// A server truncated an entry the cluster had applied.
     CommittedTruncated {
         /// The server.
@@ -143,7 +161,7 @@ pub fn linearizable(history: &History<Op, Ret>) -> Result<(), Violation> {
 pub fn committed_prefixes_agree(observations: &[Observation]) -> Result<(), Violation> {
     let mut applied: BTreeMap<u64, (NodeId, Entry)> = BTreeMap::new();
     for observation in observations {
-        let Observation::Applied { node, entry } = observation else {
+        let Observation::Applied { node, entry, .. } = observation else {
             continue;
         };
         match applied.get(&entry.index) {
@@ -287,9 +305,11 @@ pub fn durable_majority_before_reply(
 
 /// A restarted server's reopened log holds every entry it held durably
 /// before the crash, and no server truncates an entry the cluster applied.
-/// A crashed server whose log then fails to open lost what it held; one
-/// still down at the end leaves what it held unverified, so a run should
-/// restart every crashed server before its checks.
+/// A server is down from its crash, or from a drive error that stopped it
+/// while up, to its next reopened log. A down server whose log then fails
+/// to open lost what it held; one still down at the end leaves what it
+/// held unverified, so a run should restart every crashed or stopped
+/// server before its checks.
 ///
 /// # Errors
 ///
@@ -312,6 +332,11 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
                         term: *term,
                     });
                 }
+            }
+            // A drive error stops a server that is up: what it held waits
+            // for its restart, as after a crash.
+            Observation::OpenFailed { node, .. } | Observation::Contract { node, .. } => {
+                let _ = down.insert(*node);
             }
             Observation::Applied { entry, .. } => {
                 let _ = applied.insert(entry.index, entry.term);
@@ -343,6 +368,67 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
     for node in down {
         if logs.logs.get(&node).is_some_and(|log| !log.is_empty()) {
             return Err(Violation::Unverified { node });
+        }
+    }
+    Ok(())
+}
+
+/// Every server applies only an entry its own log holds durably, the same
+/// term at its index.
+///
+/// # Errors
+///
+/// [`Violation::AppliedNotDurable`].
+pub fn applied_durable(observations: &[Observation]) -> Result<(), Violation> {
+    for observation in observations {
+        if let Observation::Applied {
+            node,
+            entry,
+            applying,
+            ..
+        } = observation
+            && !(applying.durable >= Some(entry.index) && applying.logged_term == Some(entry.term))
+        {
+            return Err(Violation::AppliedNotDurable {
+                node: *node,
+                index: entry.index,
+                applying: *applying,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Every server that applied the entry at an index answered it in the
+/// same canonical response bytes.
+///
+/// # Errors
+///
+/// [`Violation::DivergentResponse`].
+pub fn responses_agree(observations: &[Observation]) -> Result<(), Violation> {
+    let mut responses: BTreeMap<u64, (NodeId, &Option<Vec<u8>>)> = BTreeMap::new();
+    for observation in observations {
+        let Observation::Applied {
+            node,
+            entry,
+            response,
+            ..
+        } = observation
+        else {
+            continue;
+        };
+        match responses.get(&entry.index) {
+            Some((first, seen)) if *seen != response => {
+                return Err(Violation::DivergentResponse {
+                    index: entry.index,
+                    first: *first,
+                    second: *node,
+                });
+            }
+            Some(_) => {}
+            None => {
+                let _ = responses.insert(entry.index, (*node, response));
+            }
         }
     }
     Ok(())
@@ -443,7 +529,9 @@ pub fn all(
     released_after_persistence(observations)?;
     durable_majority_before_reply(observations, servers)?;
     durable_kept(observations)?;
+    applied_durable(observations)?;
     committed_prefixes_agree(observations)?;
+    responses_agree(observations)?;
     no_old_term_direct_commit(observations)?;
     positions_ordered(observations)?;
     linearizable(history)
