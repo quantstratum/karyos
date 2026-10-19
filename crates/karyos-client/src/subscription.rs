@@ -115,6 +115,7 @@ impl MessageLimit {
 
 /// A lost range reported by an optional subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Overrun {
     /// First position not delivered.
     pub from: u64,
@@ -122,6 +123,18 @@ pub struct Overrun {
     pub lost_to: u64,
     /// Position delivery resumed from.
     pub resume: u64,
+}
+
+impl Overrun {
+    /// The range `[from, lost_to)` lost, the reader resuming at `resume`.
+    #[must_use]
+    pub const fn new(from: u64, lost_to: u64, resume: u64) -> Self {
+        Self {
+            from,
+            lost_to,
+            resume,
+        }
+    }
 }
 
 /// The application's rebuild of its state after an overrun
@@ -202,6 +215,7 @@ impl core::fmt::Debug for Secondary {
 
 /// What a non-replay policy did after an overrun.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SecondaryOutcome {
     /// Delivery continues at `resume`.
     ResumedAtHead,
@@ -217,6 +231,7 @@ pub enum SecondaryOutcome {
 /// Why `replay` was not used. The values are fixed: none ever changes
 /// meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReplayFallbackReason {
     /// No Archive exists: a plain [`RejoinPolicy::Replay`], which has no
     /// replay provider ([`crate::merge::ReplayRejoin`] has one).
@@ -241,6 +256,7 @@ pub enum ReplayFallbackReason {
 
 /// What the rejoin policy did after an overrun, reported with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RejoinOutcome {
     /// Delivery continues at `resume`.
     ResumedAtHead,
@@ -300,6 +316,7 @@ impl From<SecondaryOutcome> for RejoinOutcome {
 /// An aborted block the poll skipped: the claim that reserved it never
 /// committed, so its extent carries no message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Aborted {
     /// Stream position of the block.
     pub position: u64,
@@ -307,9 +324,18 @@ pub struct Aborted {
     pub extent: u32,
 }
 
+impl Aborted {
+    /// The aborted block at `position`, of `extent` bytes.
+    #[must_use]
+    pub const fn new(position: u64, extent: u32) -> Self {
+        Self { position, extent }
+    }
+}
+
 /// A range of an image skipped because it delivers no message
 /// (`quantstratum-docs: karyos/design/receive-publication.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Skipped {
     /// Stream position of the range.
     pub position: u64,
@@ -319,10 +345,23 @@ pub struct Skipped {
     pub reason: SkipReason,
 }
 
+impl Skipped {
+    /// The range at `position`, of `extent` bytes, skipped for `reason`.
+    #[must_use]
+    pub const fn new(position: u64, extent: u32, reason: SkipReason) -> Self {
+        Self {
+            position,
+            extent,
+            reason,
+        }
+    }
+}
+
 /// What one poll did. A poll stops at the first overrun or aborted block,
 /// so no loss or abort report is ever overwritten or hidden behind later
 /// deliveries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct PollSummary {
     /// Messages delivered to the handler (and acknowledged) before the poll
     /// stopped.
@@ -357,11 +396,20 @@ pub struct PollSummary {
 /// the deliveries that were handled and acknowledged before `cause`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("poll failed after {} deliveries: {cause}", summary.delivered)]
+#[non_exhaustive]
 pub struct PollError {
     /// Progress made before the failure.
     pub summary: PollSummary,
     /// The failure.
     pub cause: ClientError,
+}
+
+impl PollError {
+    /// A poll that failed with `cause` after the progress in `summary`.
+    #[must_use]
+    pub const fn new(summary: PollSummary, cause: ClientError) -> Self {
+        Self { summary, cause }
+    }
 }
 
 /// A subscription on one stream.

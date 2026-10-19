@@ -40,6 +40,7 @@ pub struct TimerId(pub u16);
 
 /// The event a dispatch delivers to the handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event<'a> {
     /// A subscription's message.
     Message {
@@ -114,6 +115,7 @@ pub enum Event<'a> {
 
 /// A message's payload as the handler gets it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MessagePayload<'a> {
     /// The payload's bytes.
     Bytes(&'a [u8]),
@@ -127,12 +129,21 @@ pub enum MessagePayload<'a> {
 /// What a scoped [`Effects::claim`] did: the claim's outcome, and the
 /// commit's (or abort's) when the claim reserved bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClaimCommit {
     /// The claim's outcome, as the client returned it.
     pub claim: Outcome,
     /// The commit's outcome, or `Aborted` when `write` returned false;
     /// `None` when the claim reserved nothing.
     pub commit: Option<Outcome>,
+}
+
+impl ClaimCommit {
+    /// A claim's outcome and its commit's (or abort's), if it reserved.
+    #[must_use]
+    pub const fn new(claim: Outcome, commit: Option<Outcome>) -> Self {
+        Self { claim, commit }
+    }
 }
 
 /// The handler's only way to act during an event. Each call but
@@ -188,6 +199,7 @@ pub trait Effects {
 
 /// A delivery outcome as the outcome ring presented it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeliveryOutcome {
     /// The ring's kind code.
     pub kind: u8,
@@ -237,6 +249,7 @@ impl<F: FnMut(&Event<'_>, &mut dyn Effects)> Handler for F {
 
 /// What a dispatch did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Dispatched {
     /// An event ran, as `group_seq`.
     Event {
@@ -254,6 +267,7 @@ pub enum Dispatched {
 
 /// Where a replay first differed from its recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Divergence {
     /// The event.
     pub group_seq: u64,
@@ -270,6 +284,7 @@ pub struct Divergence {
 
 /// Why a Gateway call failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum GatewayError {
     /// The group ended: strict capture could not record an event, or its
     /// journal failed.
@@ -346,6 +361,11 @@ pub enum GatewayError {
         /// The source's.
         read: karyos_sys::frame::Lane,
     },
+    /// A source reported a rejoin outcome this build has no record code
+    /// for (a client newer than the Archive's record format): the loss is
+    /// not recorded under another outcome's code.
+    #[error("a rejoin outcome with no record code")]
+    UnknownOutcome,
 }
 
 /// The trait both the live Gateway and `ReplayGateway` implement.

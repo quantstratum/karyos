@@ -86,6 +86,7 @@ pub trait Port {
 /// The Gateway's refusals and uncaptured events, each counted by its own
 /// reason.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GatewayStats {
     /// Events refused because the ring was full.
     pub ring_full: u64,
@@ -173,6 +174,7 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
 
 /// Why a Gateway could not be configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The event buffer cannot hold an event's first record and its end.
     #[error("an event buffer of {0} bytes is too small")]

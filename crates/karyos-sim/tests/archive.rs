@@ -274,16 +274,16 @@ fn the_archive_records_driver_streams_end_to_end() {
         .unwrap()
         .into_following_parts();
     let first = archive
-        .start(StartRecording {
-            stream_id: 42,
-            session_id: 1,
-            channel: b"karyos:ipc".to_vec(),
-            geometry: geometry(),
-            policy: SyncPolicy::PerSegment,
-            mode: Mode::Required,
-            format: format(),
-            source: Box::new(Guarded::new(Following::new(reader, link, base), lease)),
-        })
+        .start(StartRecording::new(
+            42,
+            1,
+            b"karyos:ipc".to_vec(),
+            geometry(),
+            SyncPolicy::PerSegment,
+            Mode::Required,
+            format(),
+            Box::new(Guarded::new(Following::new(reader, link, base), lease)),
+        ))
         .unwrap();
     let mut publication = driver.publication(required).unwrap();
     let mut blocks = Vec::new();
@@ -347,21 +347,21 @@ fn the_archive_records_driver_streams_end_to_end() {
         );
     }
     let second = archive
-        .start(StartRecording {
-            stream_id: 43,
-            session_id: 1,
-            channel: b"karyos:ipc".to_vec(),
-            geometry: geometry(),
-            policy: SyncPolicy::PerSegment,
-            mode: Mode::Async {
+        .start(StartRecording::new(
+            43,
+            1,
+            b"karyos:ipc".to_vec(),
+            geometry(),
+            SyncPolicy::PerSegment,
+            Mode::Async {
                 on_lap: OnLap::Resume,
             },
-            format: format(),
-            source: Box::new(Watched {
+            format(),
+            Box::new(Watched {
                 source: Guarded::new(Following::new(reader, link, base), lease),
                 resumed: Arc::clone(&resumed),
             }),
-        })
+        ))
         .unwrap();
     // What follows the rejoin is recorded.
     let deadline = Instant::now() + Duration::from_secs(30);

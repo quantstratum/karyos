@@ -25,6 +25,7 @@ mod tests;
 
 /// Where a recording's frames are read from.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Recording<'a> {
     /// The Archive directory that holds it.
     pub dir: &'a Path,
@@ -34,8 +35,21 @@ pub struct Recording<'a> {
     pub geometry: Geometry,
 }
 
+impl<'a> Recording<'a> {
+    /// Recording `recording_id` in `dir`, of `geometry`.
+    #[must_use]
+    pub const fn new(dir: &'a Path, recording_id: u64, geometry: Geometry) -> Self {
+        Self {
+            dir,
+            recording_id,
+            geometry,
+        }
+    }
+}
+
 /// The frames of one message, as recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Frames {
     /// The first frame's position.
     pub position: u64,

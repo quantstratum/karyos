@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_archive::catalog::StopReason;
 use karyos_archive::disk::StdDisk;
-use karyos_archive::recorder::{Ended, Mode, OnLap, Recorder};
+use karyos_archive::recorder::{Mode, OnLap, Recorder};
 use karyos_archive::segment::{Geometry, SegmentStore, SyncPolicy};
 use karyos_archive::source::Following;
 use karyos_client::OfferOutcome;
@@ -272,13 +272,10 @@ fn a_paused_recording_is_fenced_without_delaying_the_cutover() {
         }
     }
     assert!(fenced);
+    let ended = ended.unwrap();
     assert_eq!(
-        ended,
-        Some(Ended {
-            position: seal,
-            reason: StopReason::Lapped,
-            incomplete: true
-        })
+        (ended.position, ended.reason, ended.incomplete),
+        (seal, StopReason::Lapped, true)
     );
     drop(recorder);
     for index in 0..before {
@@ -344,16 +341,16 @@ fn the_agent_records_across_a_cutover_through_its_documented_wiring() {
         .into_following_parts();
     let archive = ArchiveHandle::spawn(StdDisk, dir.path(), AgentConfig::default()).unwrap();
     let id = archive
-        .start(StartRecording {
-            stream_id: 11,
-            session_id: 1,
-            channel: b"karyos:ipc".to_vec(),
-            geometry: geometry(),
-            policy: SyncPolicy::PerSegment,
-            mode: Mode::Async {
+        .start(StartRecording::new(
+            11,
+            1,
+            b"karyos:ipc".to_vec(),
+            geometry(),
+            SyncPolicy::PerSegment,
+            Mode::Async {
                 on_lap: OnLap::Resume,
             },
-            format: StreamFormat {
+            StreamFormat {
                 lane: Lane::ZERO,
                 initial_term_id: 7,
                 mtu: core::num::NonZeroU32::new(DEFAULT_MTU).unwrap(),
@@ -363,8 +360,8 @@ fn the_agent_records_across_a_cutover_through_its_documented_wiring() {
                     incarnation: 1,
                 },
             },
-            source: Box::new(Guarded::new(Following::new(reader, link, base), lease)),
-        })
+            Box::new(Guarded::new(Following::new(reader, link, base), lease)),
+        ))
         .unwrap();
     let mut writer = driver.publication(stream).unwrap();
     let before = 6u64;

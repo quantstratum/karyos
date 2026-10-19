@@ -74,6 +74,7 @@ use crate::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 
 /// The agent's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AgentConfig {
     /// Commands queued at most. A blocking call waits for room; a posted
     /// command finds none as [`AgentError::Busy`].
@@ -137,6 +138,7 @@ impl Default for AgentConfig {
 /// new or recovered, and its capture path. The agent serves the group's
 /// job in its cycle, after the recorders.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StartGroup {
     /// The group, never 0.
     pub group_id: u64,
@@ -156,11 +158,48 @@ pub struct StartGroup {
     pub checkpoints: Option<GroupCheckpoints>,
 }
 
+impl StartGroup {
+    /// Starts group `group_id` from its journal in `dir`: a restart, with
+    /// no checkpoints ([`StartGroup::with_new`] makes the group,
+    /// [`StartGroup::with_checkpoints`] keeps checkpoints).
+    #[must_use]
+    pub const fn new(
+        group_id: u64,
+        dir: PathBuf,
+        journal: JournalConfig,
+        capture: CaptureConfig,
+    ) -> Self {
+        Self {
+            group_id,
+            dir,
+            new: None,
+            journal,
+            capture,
+            checkpoints: None,
+        }
+    }
+
+    /// Makes the group, with this header.
+    #[must_use]
+    pub fn with_new(mut self, new: NewGroup) -> Self {
+        self.new = Some(new);
+        self
+    }
+
+    /// Keeps checkpoints.
+    #[must_use]
+    pub const fn with_checkpoints(mut self, checkpoints: GroupCheckpoints) -> Self {
+        self.checkpoints = Some(checkpoints);
+        self
+    }
+}
+
 /// How a group's checkpoints are kept. Their store is in the journal
 /// directory's `checkpoints` subdirectory
 /// ([`store_dir`]), which the host
 /// made, as it made the journal directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GroupCheckpoints {
     /// The largest snapshot, at least 1 byte: the Gateway's buffer.
     pub max_checkpoint: usize,
@@ -183,6 +222,25 @@ pub struct GroupCheckpoints {
     pub reopen_hold: Option<usize>,
 }
 
+impl GroupCheckpoints {
+    /// Checkpoints of up to `max_checkpoint` bytes, the reopen hold the
+    /// default ([`GroupCheckpoints::with_reopen_hold`] sets it).
+    #[must_use]
+    pub const fn new(max_checkpoint: usize) -> Self {
+        Self {
+            max_checkpoint,
+            reopen_hold: None,
+        }
+    }
+
+    /// The reopen hold, in events.
+    #[must_use]
+    pub const fn with_reopen_hold(mut self, hold: usize) -> Self {
+        self.reopen_hold = Some(hold);
+        self
+    }
+}
+
 /// The largest reopening window a group takes, in events: its hold, or
 /// its `in_flight` when larger. The window's three queues are allocated
 /// to it when the group starts, about 216 bytes an event, about 14 MiB at
@@ -196,6 +254,7 @@ const _: () =
 
 /// A new group's journal header.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NewGroup {
     /// The first event's `group_seq`, never 0.
     pub first_group_seq: u64,
@@ -208,7 +267,27 @@ pub struct NewGroup {
     pub manifest: Vec<u8>,
 }
 
+impl NewGroup {
+    /// A new group's header: its first event, inline threshold, capture
+    /// mode and manifest.
+    #[must_use]
+    pub const fn new(
+        first_group_seq: u64,
+        inline_threshold: u32,
+        capture: Capture,
+        manifest: Vec<u8>,
+    ) -> Self {
+        Self {
+            first_group_seq,
+            inline_threshold,
+            capture,
+            manifest,
+        }
+    }
+}
+
 /// A recording to start, with its source.
+#[non_exhaustive]
 pub struct StartRecording {
     /// The recorded stream.
     pub stream_id: i32,
@@ -228,6 +307,34 @@ pub struct StartRecording {
     pub source: Box<dyn FrameSource + Send>,
 }
 
+impl StartRecording {
+    /// Records stream `stream_id`, session `session_id`, on `channel`,
+    /// from `source`.
+    #[must_use]
+    #[allow(clippy::too_many_arguments, reason = "every field is required")]
+    pub fn new(
+        stream_id: i32,
+        session_id: i32,
+        channel: Vec<u8>,
+        geometry: Geometry,
+        policy: SyncPolicy,
+        mode: Mode,
+        format: StreamFormat,
+        source: Box<dyn FrameSource + Send>,
+    ) -> Self {
+        Self {
+            stream_id,
+            session_id,
+            channel,
+            geometry,
+            policy,
+            mode,
+            format,
+            source,
+        }
+    }
+}
+
 impl core::fmt::Debug for StartRecording {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("StartRecording")
@@ -240,6 +347,7 @@ impl core::fmt::Debug for StartRecording {
 
 /// What the agent reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A recording ended and is stopped in the catalog.
     Ended {
@@ -265,6 +373,7 @@ pub enum Event {
 /// A replay that ended by itself; its target was told with
 /// [`ReplaySink::finish`]. (One stopped by command reports nothing.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplayEnded {
     /// The replay.
     pub id: u64,
@@ -312,6 +421,7 @@ pub trait ReplaySink {
 pub struct SinkClosed;
 
 /// A replay to start: a recording's range onto a host's target.
+#[non_exhaustive]
 pub struct StartReplay {
     /// The recording.
     pub recording_id: u64,
@@ -323,6 +433,26 @@ pub struct StartReplay {
     pub rate: Rate,
     /// The target.
     pub sink: Box<dyn ReplaySink + Send>,
+}
+
+impl StartReplay {
+    /// Replays `recording_id` over `[from, to)` at `rate` into `sink`.
+    #[must_use]
+    pub fn new(
+        recording_id: u64,
+        from: u64,
+        to: u64,
+        rate: Rate,
+        sink: Box<dyn ReplaySink + Send>,
+    ) -> Self {
+        Self {
+            recording_id,
+            from,
+            to,
+            rate,
+            sink,
+        }
+    }
 }
 
 impl core::fmt::Debug for StartReplay {
@@ -339,6 +469,7 @@ impl core::fmt::Debug for StartReplay {
 /// A replay to prepare: a recording's range, checked against its index
 /// before any target exists ([`ArchiveHandle::post_prepare_replay`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrepareReplay {
     /// The recording.
     pub recording_id: u64,
@@ -351,10 +482,25 @@ pub struct PrepareReplay {
     pub rate: Rate,
 }
 
+impl PrepareReplay {
+    /// A replay of `length` bytes of `recording_id` from `position`, at
+    /// `rate`.
+    #[must_use]
+    pub const fn new(recording_id: u64, position: u64, length: u64, rate: Rate) -> Self {
+        Self {
+            recording_id,
+            position,
+            length,
+            rate,
+        }
+    }
+}
+
 /// A prepared replay, waiting for its target's sink
 /// ([`ArchiveHandle::post_attach_replay`]); it counts toward
 /// [`AgentConfig::max_replays`] until it is attached or stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Prepared {
     /// The replay's id.
     pub replay_id: u64,
@@ -368,6 +514,7 @@ pub struct Prepared {
 
 /// How a replay ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReplayOutcome {
     /// It reached its requested end.
     Complete,
@@ -378,6 +525,7 @@ pub enum ReplayOutcome {
 /// A recording as the catalog lists it, and where it ends now: its stop,
 /// or the position written for one that still records.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Described {
     /// The catalog's record.
     pub recording: Recording,
@@ -389,6 +537,7 @@ pub struct Described {
 
 /// What failed when a recording could not be stopped in the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Failure {
     /// Its segment store, while recording.
     Store,
@@ -398,6 +547,7 @@ pub enum Failure {
 
 /// The agent's errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AgentError {
     /// The agent's count of failed recordings, or of recordings it holds,
     /// would pass its range: the start is refused.

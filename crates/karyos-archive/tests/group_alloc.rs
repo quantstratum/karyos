@@ -123,10 +123,7 @@ fn a_replay_cursor_steps_without_allocating() {
     let dir = std::env::temp_dir().join(format!("karyos-replay-alloc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::PerSegment);
     let records = journal();
     let GroupRecord::Header(header) = records[0] else {
         panic!("no header");
@@ -160,20 +157,14 @@ fn a_replay_cursor_steps_without_allocating() {
         .unwrap()
         .journal;
     let recovery = recover(&mut journal, &Nothing, 8).unwrap();
-    let replay = ReplayConfig {
-        manifest: header.manifest,
-        accept_manifest: false,
-    };
-    let room = CursorConfig {
-        bytes: 4096,
-        records: 8,
-    };
+    let replay = ReplayConfig::new(header.manifest);
+    let room = CursorConfig::new(4096, 8);
     let mut cursor = ReplayCursor::open(journal, &recovery, &replay, room).unwrap();
     let mut seen = 0u64;
     loop {
         let (step, allocations) = count(|| match cursor.step().unwrap() {
             Step::Event(event) => Some(event.group_seq()),
-            Step::Checkpoint(_) | Step::Stop(_) => None,
+            _ => None,
         });
         assert_eq!(allocations, 0, "a step allocated");
         match step {
@@ -221,10 +212,7 @@ fn a_replay_gateway_dispatches_without_allocating() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::PerSegment);
     let records = journal();
     let GroupRecord::Header(header) = records[0] else {
         panic!("no header");
@@ -271,14 +259,8 @@ fn a_replay_gateway_dispatches_without_allocating() {
         .unwrap()
         .journal;
     let recovery = recover(&mut journal, &Nothing, 8).unwrap();
-    let replay = ReplayConfig {
-        manifest: header.manifest,
-        accept_manifest: false,
-    };
-    let room = CursorConfig {
-        bytes: 4096,
-        records: 8,
-    };
+    let replay = ReplayConfig::new(header.manifest);
+    let room = CursorConfig::new(4096, 8);
     let cursor = ReplayCursor::open(journal, &recovery, &replay, room).unwrap();
     // The recorded offer is publication 0's: stream 20, session 1.
     let GroupRecord::Outcome(offer) = records[2] else {
@@ -291,15 +273,10 @@ fn a_replay_gateway_dispatches_without_allocating() {
     let subscriptions = [(message.stream_id, message.session_id, message.lane)];
     let mut gateway = ReplayGateway::new(
         cursor,
-        &GatewayConfig {
-            publications: &publications,
-            subscriptions: &subscriptions,
-            network: &[],
-            conflated: &[],
-            max_claim: 64,
-            max_payload: 0,
-            present_unavailable: false,
-        },
+        &GatewayConfig::new()
+            .with_publications(&publications)
+            .with_subscriptions(&subscriptions)
+            .with_max_claim(64),
         None,
     )
     .unwrap()

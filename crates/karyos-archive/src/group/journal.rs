@@ -52,11 +52,23 @@ pub const MIN_SEGMENT_LENGTH: u32 = 128 << 10;
 
 /// How a journal is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JournalConfig {
     /// Each segment's length: [`MIN_SEGMENT_LENGTH`] or more.
     pub segment_length: u32,
     /// When the store syncs.
     pub policy: SyncPolicy,
+}
+
+impl JournalConfig {
+    /// Segments of `segment_length` bytes, synced by `policy`.
+    #[must_use]
+    pub const fn new(segment_length: u32, policy: SyncPolicy) -> Self {
+        Self {
+            segment_length,
+            policy,
+        }
+    }
 }
 
 impl Default for JournalConfig {
@@ -80,6 +92,7 @@ impl JournalConfig {
 
 /// A journal's errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum JournalError {
     /// The configuration is invalid.
     #[error("invalid journal configuration")]
@@ -125,6 +138,7 @@ pub enum JournalError {
 
 /// A recovered journal.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct RecoveredJournal<D: Disk> {
     /// The journal, open for appends after its last record.
     pub journal: GroupJournal<D>,

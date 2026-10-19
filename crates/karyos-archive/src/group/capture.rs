@@ -64,6 +64,7 @@ pub const MAX_IN_FLIGHT: usize = 1 << 16;
 
 /// A capture path's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaptureConfig {
     /// The ring's capacity in bytes: a power of two, at least eight times
     /// the largest event's framed extent.
@@ -76,8 +77,22 @@ pub struct CaptureConfig {
     pub in_flight: usize,
 }
 
+impl CaptureConfig {
+    /// A ring of `ring_capacity` bytes, events of at most `max_event`
+    /// bytes, `in_flight` events written and not yet durable.
+    #[must_use]
+    pub const fn new(ring_capacity: usize, max_event: usize, in_flight: usize) -> Self {
+        Self {
+            ring_capacity,
+            max_event,
+            in_flight,
+        }
+    }
+}
+
 /// A capture path that cannot be made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CaptureError {
     /// The ring's capacity is not a power of two of at least 1024 bytes,
     /// or a whole event does not fit an eighth of it.
@@ -105,6 +120,7 @@ pub enum CaptureError {
 /// Why an event was not taken: the Gateway's refusals, typed so it can
 /// count them (A7d-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Refusal {
     /// The ring has no room for a whole event.
     #[error("the ring is full")]
@@ -130,6 +146,7 @@ pub enum Refusal {
 
 /// Where a group stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GroupState {
     /// Recording.
     Running,
@@ -345,6 +362,7 @@ fn check(config: CaptureConfig, policy: SyncPolicy) -> Result<(u64, u64, u64), C
 
 /// Why [`capture`] could not make a group's capture path.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CaptureSetup {
     /// Settings that cannot work.
     #[error(transparent)]
@@ -536,6 +554,7 @@ impl CaptureSender {
 
 /// Why a wait ended without its `group_seq` durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum WaitError {
     /// The deadline passed; `durable` is how far the group got.
     #[error("not durable by the deadline (durable to {durable})")]
@@ -649,6 +668,7 @@ pub struct CaptureJob<D: Disk> {
 
 /// How far [`CaptureJob::checkpoint`] got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CheckpointStep {
     /// The journal does not hold the checkpoint's event yet, or is inside
     /// an event: nothing was written.
@@ -664,6 +684,7 @@ pub enum CheckpointStep {
 
 /// Why the job stopped recording.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum JobError {
     /// The journal refused or failed a write.
     #[error(transparent)]

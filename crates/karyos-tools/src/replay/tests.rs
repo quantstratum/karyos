@@ -70,10 +70,7 @@ fn header(capture: Capture, manifest: &'static [u8]) -> JournalHeader<'static> {
 }
 
 fn write(dir: &Path, header: &JournalHeader<'_>, records: &[GroupRecord<'_>]) {
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::PerSegment);
     let mut journal = GroupJournal::create(StdDisk, dir, header, config).unwrap();
     let mut out = vec![0u8; MAX_RECORD];
     for record in records {
@@ -769,10 +766,10 @@ fn write_with_checkpoints(
 ) {
     use karyos_archive::group::checkpoint::{CheckpointSlot, CheckpointStore, CheckpointWriter};
 
-    let config = JournalConfig {
-        segment_length: karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(
+        karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
+        SyncPolicy::PerSegment,
+    );
     let mut journal = GroupJournal::create(StdDisk, dir, header, config).unwrap();
     let store_dir = dir.join(CHECKPOINTS);
     std::fs::create_dir_all(&store_dir).unwrap();
@@ -1218,10 +1215,7 @@ fn a_store_marked_lost_by_recovery_is_not_comparable() {
     let file = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
     file.set_len(std::fs::metadata(&data).unwrap().len() - 4)
         .unwrap();
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::PerSegment);
     let mut journal = GroupJournal::recover(StdDisk, &right, 1, config)
         .unwrap()
         .journal;
@@ -1271,10 +1265,10 @@ fn from_checkpoint_takes_the_recorded_hold() {
             reopen_hold: hold,
             ..header(Capture::BestEffort, b"m")
         };
-        let config = JournalConfig {
-            segment_length: karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
-            policy: SyncPolicy::PerSegment,
-        };
+        let config = JournalConfig::new(
+            karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
+            SyncPolicy::PerSegment,
+        );
         let mut journal = GroupJournal::create(StdDisk, dir, &header, config).unwrap();
         let store_dir = dir.join(CHECKPOINTS);
         std::fs::create_dir_all(&store_dir).unwrap();
@@ -1348,10 +1342,7 @@ fn a_record_whose_digest_differs_from_intact_bytes_is_corrupt() {
     write_with_checkpoints(&left, &header, &events, at_two);
     // The store's bytes, written for a journal whose record is right.
     write_with_checkpoints(&source, &header, &events, at_two);
-    let config = JournalConfig {
-        segment_length: MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::PerSegment);
     let mut journal = GroupJournal::recover(StdDisk, &source, 1, config)
         .unwrap()
         .journal;
@@ -1401,10 +1392,10 @@ fn write_ranges(dir: &Path, steps: &[(u64, bool)], checkpoints: &[u64]) {
     use karyos_archive::group::checkpoint::{CheckpointSlot, CheckpointStore, CheckpointWriter};
 
     let header = header(Capture::BestEffort, b"m");
-    let config = JournalConfig {
-        segment_length: karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
-        policy: SyncPolicy::PerSegment,
-    };
+    let config = JournalConfig::new(
+        karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
+        SyncPolicy::PerSegment,
+    );
     let mut journal = GroupJournal::create(StdDisk, dir, &header, config).unwrap();
     let store_dir = dir.join(CHECKPOINTS);
     std::fs::create_dir_all(&store_dir).unwrap();

@@ -110,13 +110,7 @@ fn a_held_claim_is_aborted_at_exactly_its_deadline() {
     let summary = subscription
         .poll(|_, _| panic!("nothing to deliver"), MessageLimit::new(4))
         .unwrap();
-    assert_eq!(
-        summary.aborted,
-        Some(Aborted {
-            position,
-            extent: 64
-        })
-    );
+    assert_eq!(summary.aborted, Some(Aborted::new(position, 64)));
 }
 
 #[test]

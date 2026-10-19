@@ -61,6 +61,7 @@ const CLOCK: Clock = Clock::HostMonotonic;
 /// clock are this build's, never the caller's: another contract is not
 /// comparable, with no override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplayConfig<'a> {
     /// The caller's identity of what replays: the recorded manifest must
     /// be the same bytes, unless `accept_manifest`.
@@ -70,8 +71,28 @@ pub struct ReplayConfig<'a> {
     pub accept_manifest: bool,
 }
 
+impl<'a> ReplayConfig<'a> {
+    /// The manifest replay expects; a different one is refused
+    /// ([`ReplayConfig::accepting_manifest`] accepts it).
+    #[must_use]
+    pub const fn new(manifest: &'a [u8]) -> Self {
+        Self {
+            manifest,
+            accept_manifest: false,
+        }
+    }
+
+    /// Accepts a journal whose manifest differs.
+    #[must_use]
+    pub const fn accepting_manifest(mut self) -> Self {
+        self.accept_manifest = true;
+        self
+    }
+}
+
 /// How a journal's header differs from what the replay expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum HeaderMismatch {
     /// Another capture contract.
     #[error("captured under contract {found}, replaying {expected}")]
@@ -125,6 +146,7 @@ pub fn check_header(
 
 /// A replay's errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReplayError {
     /// The journal holds no header.
     #[error("the journal holds no header")]
@@ -224,6 +246,7 @@ pub enum ReplayError {
     "state checkpoint at {group_seq}: {length} bytes, crc {crc32c:#x}; \
      recorded {recorded_length}, {recorded_crc32c:#x}"
 )]
+#[non_exhaustive]
 pub struct StateDivergence {
     /// The event the state follows.
     pub group_seq: u64,
@@ -271,6 +294,7 @@ pub fn compare_state(
 
 /// Why a cursor gives no event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Stop {
     /// The prefix ends at a gap marker: the events it names were not
     /// captured.
@@ -291,6 +315,7 @@ pub enum Stop {
 /// What [`ReplayCursor::step`] gives: once it gives a stop, it gives the
 /// same stop on every later call.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Step<'c> {
     /// The next event of the complete prefix.
     Event(ReplayEvent<'c>),
@@ -391,12 +416,21 @@ impl<'c> ReplayEvent<'c> {
 
 /// The room a cursor's buffer has for one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CursorConfig {
     /// Bytes for one event's records: at least [`MAX_RECORD`] times
     /// `records` holds any event of that many records.
     pub bytes: usize,
     /// Records in one event, its first and its end included: at least 2.
     pub records: usize,
+}
+
+impl CursorConfig {
+    /// Room for an event of `bytes` bytes and `records` records.
+    #[must_use]
+    pub const fn new(bytes: usize, records: usize) -> Self {
+        Self { bytes, records }
+    }
 }
 
 /// One allocation of `capacity` elements, or [`ReplayError::InvalidConfig`].

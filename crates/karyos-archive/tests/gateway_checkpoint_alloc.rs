@@ -41,10 +41,7 @@ impl Port for Inert {
         _: usize,
         _: &mut dyn FnMut(&mut [u8]) -> bool,
     ) -> ClaimCommit {
-        ClaimCommit {
-            claim: Outcome::BackPressured,
-            commit: None,
-        }
+        ClaimCommit::new(Outcome::BackPressured, None)
     }
     fn poll_outcomes(
         &mut self,
@@ -69,28 +66,16 @@ fn the_gateway_checkpoint_path_allocates_nothing() {
     std::fs::create_dir_all(store_dir(&groups)).unwrap();
     let archive = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
     let sender = archive
-        .start_group(StartGroup {
-            group_id: 1,
-            dir: groups.clone(),
-            new: Some(NewGroup {
-                first_group_seq: 1,
-                inline_threshold: 4096,
-                capture: Capture::Strict,
-                manifest: b"probe".to_vec(),
-            }),
-            journal: JournalConfig {
-                segment_length: MIN_SEGMENT_LENGTH,
-                policy: SyncPolicy::Every { interval_ns: 0 },
-            },
-            capture: CaptureConfig {
-                ring_capacity: 1 << 16,
-                max_event: 4096,
-                in_flight: 64,
-            },
-            checkpoints: Some(GroupCheckpoints {
-                max_checkpoint: 64,
-                reopen_hold: None,
-            }),
+        .start_group({
+            let mut value = StartGroup::new(
+                1,
+                groups.clone(),
+                JournalConfig::new(MIN_SEGMENT_LENGTH, SyncPolicy::Every { interval_ns: 0 }),
+                CaptureConfig::new(1 << 16, 4096, 64),
+            );
+            value.new = Some(NewGroup::new(1, 4096, Capture::Strict, b"probe".to_vec()));
+            value.checkpoints = Some(GroupCheckpoints::new(64));
+            value
         })
         .unwrap();
     let mut gateway = Gateway::new(Inert, || 1u64, sender, Capture::Strict, 1, 4096, 4).unwrap();

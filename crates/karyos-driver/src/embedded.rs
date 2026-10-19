@@ -3320,10 +3320,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // on).
             #[cfg(test)]
             let polled = if fail_poll {
-                Err(karyos_client::subscription::PollError {
-                    summary: karyos_client::subscription::PollSummary::default(),
-                    cause: karyos_client::ClientError::ClosedByOverrun,
-                })
+                Err(karyos_client::subscription::PollError::new(
+                    karyos_client::subscription::PollSummary::default(),
+                    karyos_client::ClientError::ClosedByOverrun,
+                ))
             } else {
                 polled
             };

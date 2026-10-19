@@ -31,12 +31,10 @@ fn claim_through_the_facade(publication: &mut ClientPublication) -> Option<Commi
 
 #[test]
 fn poll_and_abort_types_are_reachable() {
-    let summary = PollSummary {
-        aborted: Some(Aborted {
-            position: 0,
-            extent: 64,
-        }),
-        ..PollSummary::default()
+    let summary = {
+        let mut value = PollSummary::default();
+        value.aborted = Some(Aborted::new(0, 64));
+        value
     };
     assert_eq!(summary.aborted.map(|aborted| aborted.extent), Some(64));
 }

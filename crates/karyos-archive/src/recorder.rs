@@ -35,6 +35,7 @@ use crate::segment::{FILL_RECORD, SegmentError, SegmentStore};
 
 /// What a [`FrameSource`] read produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Frames {
     /// Whole committed frames, `len` bytes from `position`, copied into
     /// the read's buffer; the next read starts at `next`.
@@ -88,6 +89,7 @@ pub enum Frames {
 
 /// Why a source cannot read on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SourceError {
     /// The source's participant was revoked.
     #[error("the source was revoked")]
@@ -163,6 +165,7 @@ pub enum Mode {
 
 /// The recorder's errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RecorderError {
     /// The store failed.
     #[error(transparent)]
@@ -193,6 +196,7 @@ pub enum RecorderError {
 
 /// What a source returned that it never may.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Invalid {
     /// A seal away from the written position.
     SealNotAtWritten {
@@ -232,6 +236,7 @@ impl RecorderError {
 
 /// Why a recording ended, and where.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Ended {
     /// Its last position.
     pub position: u64,
@@ -245,6 +250,7 @@ pub struct Ended {
 
 /// What one duty did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Duty {
     /// Bytes of the stream recorded (data, fills and gaps).
     pub recorded: u64,

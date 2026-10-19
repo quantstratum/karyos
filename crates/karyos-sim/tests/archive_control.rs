@@ -195,10 +195,10 @@ impl ArchiveHost for Host {
         };
         let format = recording.format();
         let (reader, lease) = recording.into_parts();
-        Ok(HostRecording {
-            source: Box::new(Guarded::new(reader, lease)),
-            term_length: format.term_length,
-            format: StreamFormat {
+        Ok(HostRecording::new(
+            Box::new(Guarded::new(reader, lease)),
+            format.term_length,
+            StreamFormat {
                 lane: format.lane,
                 initial_term_id: format.initial_term_id,
                 mtu: NonZeroU32::new(format.mtu)
@@ -209,7 +209,7 @@ impl ArchiveHost for Host {
                     incarnation: identity.incarnation,
                 },
             },
-        })
+        ))
     }
 
     fn open_replay(
@@ -496,10 +496,8 @@ impl Rig {
             requests,
             responses,
         } = self.client.take().unwrap();
-        let config = ClientConfig {
-            deadline: Duration::from_secs(10),
-            ..ClientConfig::new(ARCHIVE_CLIENT, REPLAYS)
-        };
+        let mut config = ClientConfig::new(ARCHIVE_CLIENT, REPLAYS);
+        config.deadline = Duration::from_secs(10);
         let replays = self.server.host().replays.clone();
         ArchiveClient::new(config, Writing(requests), Reading(responses), replays).unwrap()
     }

@@ -32,6 +32,7 @@ mod tests;
 
 /// A call the handler made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Call {
     /// `offer`.
     Offer {
@@ -88,6 +89,7 @@ pub enum Call {
 
 /// The recorded observation a call was checked against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Recorded {
     /// An operation's outcome (template 11).
     Outcome {
@@ -139,6 +141,7 @@ pub enum Recorded {
 
 /// How a replayed handler differed from its recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DivergenceKind {
     /// A call past the event's recorded observations.
     Extra {
@@ -173,6 +176,7 @@ pub enum DivergenceKind {
 
 /// The first difference between a replayed handler and its recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Divergence {
     /// The event.
     pub group_seq: u64,

@@ -66,6 +66,7 @@ const PPM_UNIT: u64 = 1_000_000;
 
 /// The pace of a replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Rate {
     /// As fast as the caller polls.
     Full,
@@ -81,6 +82,7 @@ pub enum Rate {
 
 /// A replay's error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReplayError {
     /// The store's files failed to read, or their header is not this
     /// recording's (a version 1 index is foreign).
@@ -154,6 +156,7 @@ enum Next {
 
 /// What a poll yields.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Step<'a> {
     /// Whole frames at `position`, as the log held them.
     Frames {

@@ -1175,14 +1175,11 @@ fn scripted_losses(summary: karyos_client::PollSummary) -> Vec<(u64, u64, u64, L
 /// its rejoin outcome.
 #[test]
 fn an_overrun_is_a_loss_event_with_its_positions() {
-    let summary = karyos_client::PollSummary {
-        overrun: Some(karyos_client::Overrun {
-            from: 100,
-            lost_to: 200,
-            resume: 300,
-        }),
-        rejoin: Some(RejoinOutcome::ResumedAtHead),
-        ..Default::default()
+    let summary = {
+        let mut value = karyos_client::PollSummary::default();
+        value.overrun = Some(karyos_client::Overrun::new(100, 200, 300));
+        value.rejoin = Some(RejoinOutcome::ResumedAtHead);
+        value
     };
     assert_eq!(
         scripted_losses(summary),
@@ -1202,13 +1199,14 @@ fn an_overrun_is_a_loss_event_with_its_positions() {
 /// delivery resumes, with its reason.
 #[test]
 fn a_skipped_range_is_a_loss_event() {
-    let summary = karyos_client::PollSummary {
-        skipped: Some(karyos_client::Skipped {
-            position: 64,
-            extent: 32,
-            reason: karyos_sys::log_buffer::SkipReason::MissingEnd,
-        }),
-        ..Default::default()
+    let summary = {
+        let mut value = karyos_client::PollSummary::default();
+        value.skipped = Some(karyos_client::Skipped::new(
+            64,
+            32,
+            karyos_sys::log_buffer::SkipReason::MissingEnd,
+        ));
+        value
     };
     assert_eq!(
         scripted_losses(summary),
@@ -1268,10 +1266,11 @@ fn a_seal_reason_names_the_end() {
         ),
     ] {
         let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
-        let summary = karyos_client::PollSummary {
-            closed: Some(640),
-            close_reason: reason,
-            ..Default::default()
+        let summary = {
+            let mut value = karyos_client::PollSummary::default();
+            value.closed = Some(640);
+            value.close_reason = reason;
+            value
         };
         let _ = rig
             .gateway
@@ -1678,10 +1677,10 @@ impl MessageSource for Failing {
         _: MessageLimit,
     ) -> Result<karyos_client::PollSummary, karyos_client::PollError> {
         let _ = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Err(karyos_client::PollError {
-            summary: karyos_client::PollSummary::default(),
-            cause: karyos_client::ClientError::OutcomesLost,
-        })
+        Err(karyos_client::PollError::new(
+            karyos_client::PollSummary::default(),
+            karyos_client::ClientError::OutcomesLost,
+        ))
     }
 }
 
