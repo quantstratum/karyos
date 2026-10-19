@@ -60,6 +60,11 @@ pub struct GatewayConfig<'a> {
     /// and session, as a client's subscription does, so the lane is not
     /// part of its key; each pair is named once.
     pub subscriptions: &'a [(i32, i32)],
+    /// The streams of `subscriptions` that are network subscriptions: the
+    /// entry of such a stream takes every session, as the live source
+    /// took every image, which was then its stream's only source. Each is
+    /// named once in `subscriptions`.
+    pub network: &'a [i32],
     /// By conflated view id.
     pub conflated: &'a [(i32, i32)],
     /// The largest claim the handler makes, for the scratch claim.
@@ -91,6 +96,8 @@ pub struct ReplayGateway<D: Disk> {
     cursor: ReplayCursor<D>,
     publications: Vec<(i32, i32)>,
     subscriptions: Vec<(i32, i32)>,
+    /// The network subscriptions' streams.
+    network: Vec<i32>,
     conflated: Vec<(i32, i32)>,
     scratch: Vec<u8>,
     archive: Option<Archive<D>>,
@@ -143,6 +150,23 @@ impl<D: Disk> ReplayGateway<D> {
             cursor,
             publications: copied(config.publications)?,
             subscriptions: copied(config.subscriptions)?,
+            network: {
+                // Each network stream is one entry of the table.
+                let once = config.network.iter().all(|stream| {
+                    config
+                        .subscriptions
+                        .iter()
+                        .filter(|(entry, _)| entry == stream)
+                        .count()
+                        == 1
+                });
+                if !once {
+                    return Err(ReplayError::InvalidConfig);
+                }
+                let mut network = allocate(config.network.len())?;
+                network.extend_from_slice(config.network);
+                network
+            },
             conflated: copied(config.conflated)?,
             scratch: zeroed(config.max_claim)?,
             archive,
@@ -292,6 +316,23 @@ impl<D: Disk> ReplayGateway<D> {
 }
 
 /// The id of `(stream_id, session_id)` in `table`.
+/// A subscription's id: its stream and session, or its stream alone for
+/// a network subscription's.
+fn subscription_of(
+    table: &[(i32, i32)],
+    network: &[i32],
+    stream_id: i32,
+    session_id: i32,
+) -> Option<u16> {
+    if network.contains(&stream_id) {
+        return table
+            .iter()
+            .position(|&(stream, _)| stream == stream_id)
+            .and_then(|index| u16::try_from(index).ok());
+    }
+    id_of(table, stream_id, session_id)
+}
+
 fn id_of(table: &[(i32, i32)], stream_id: i32, session_id: i32) -> Option<u16> {
     table
         .iter()
@@ -431,7 +472,12 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                 match (
                     payload,
                     length,
-                    id_of(&self.subscriptions, message.stream_id, message.session_id),
+                    subscription_of(
+                        &self.subscriptions,
+                        &self.network,
+                        message.stream_id,
+                        message.session_id,
+                    ),
                 ) {
                     (Some(payload), Some(length), Some(source)) => Some(Event::Message {
                         source: SubscriptionId(source),
@@ -462,8 +508,9 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                         timer: TimerId(timer),
                     })
             }
-            GroupRecord::Lifecycle(lifecycle) => id_of(
+            GroupRecord::Lifecycle(lifecycle) => subscription_of(
                 &self.subscriptions,
+                &self.network,
                 lifecycle.stream_id,
                 lifecycle.session_id,
             )
@@ -475,14 +522,19 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                 kind: external.kind,
                 value: external.value,
             }),
-            GroupRecord::Loss(loss) => id_of(&self.subscriptions, loss.stream_id, loss.session_id)
-                .map(|source| Event::Loss {
-                    source: SubscriptionId(source),
-                    loss: loss.loss,
-                    from: loss.from,
-                    lost_to: loss.lost_to,
-                    resume: loss.resume,
-                }),
+            GroupRecord::Loss(loss) => subscription_of(
+                &self.subscriptions,
+                &self.network,
+                loss.stream_id,
+                loss.session_id,
+            )
+            .map(|source| Event::Loss {
+                source: SubscriptionId(source),
+                loss: loss.loss,
+                from: loss.from,
+                lost_to: loss.lost_to,
+                resume: loss.resume,
+            }),
             _ => None,
         };
         let Some(presented) = presented else {

@@ -156,6 +156,7 @@ fn replaying_from(
         &GatewayConfig {
             publications: &PUBLICATIONS,
             subscriptions: &SUBSCRIPTIONS,
+            network: &[],
             conflated: &[],
             max_claim: 64,
             max_payload: 256,
@@ -673,6 +674,7 @@ fn a_duplicate_source_is_refused_at_configuration() {
             &GatewayConfig {
                 publications,
                 subscriptions,
+                network: &[],
                 conflated: &[],
                 max_claim: 64,
                 max_payload: 256,
