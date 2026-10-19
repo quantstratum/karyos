@@ -481,6 +481,58 @@ fn endpoint_capabilities_reach_the_cnc() {
     }
 }
 
+/// M5 (`crate::spin`): each agent idle loop has its type-3 spin cell for
+/// its threading mode, and the default `YieldThenSleep`, which never
+/// spins, reports 0 through traffic. Shared mode's loop is the
+/// conductor's, so its agents have none.
+#[test]
+fn yield_then_sleep_agents_report_no_spin_time() {
+    let spin_cells = |driver: &EmbeddedDriver| {
+        let reader = driver.counters();
+        let mut cells: Vec<(String, u64)> = (0..reader.capacity())
+            .filter_map(|index| match reader.read(index) {
+                karyos_sys::counters::CellRead::Allocated {
+                    metadata, value, ..
+                } if metadata.type_id == crate::counters::TYPE_SPIN_TIME => {
+                    Some((String::from_utf8(metadata.label().to_vec()).unwrap(), value))
+                }
+                _ => None,
+            })
+            .collect();
+        cells.sort();
+        cells
+    };
+    for (mode, labels) in [
+        (ThreadingMode::Shared, &["conductor spin time"][..]),
+        (
+            ThreadingMode::Dedicated,
+            &[
+                "conductor spin time",
+                "receiver spin time",
+                "sender spin time",
+            ][..],
+        ),
+        (
+            ThreadingMode::SharedNetwork,
+            &["conductor spin time", "network spin time"][..],
+        ),
+    ] {
+        let (mut a, mut b) = (driver(mode), driver(mode));
+        let (publication, image) = connected(&mut a, &mut b, true, 10);
+        let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+        exchange(&mut a, &mut b, &publication, &mut reader, 64);
+        for driver in [&a, &b] {
+            let cells = spin_cells(driver);
+            let names: Vec<&str> = cells.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(names, labels, "{mode:?}");
+            assert!(
+                cells.iter().all(|(_, value)| *value == 0),
+                "{mode:?}: {cells:?}"
+            );
+        }
+    }
+}
+
 /// E5: in steady state, a network cycle on either side allocates nothing.
 #[test]
 fn a_steady_network_cycle_allocates_nothing() {

@@ -94,3 +94,45 @@ fn transitions_reach_the_ring_and_words_their_gauges() {
     // Nothing new: a later scan delivers nothing.
     assert!(ring(&driver, &mut cursor).is_empty());
 }
+
+/// DESIGN's repro on #470: the conductor loop's spin meter taken and
+/// dropped leaves the fixed `conductor spin time` cell in place, so a
+/// later keyed allocation (a guard's gauge) never takes a fixed index.
+#[test]
+fn a_dropped_spin_meter_keeps_the_fixed_cells_in_place() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let fixed = |driver: &EmbeddedDriver| {
+        let reader = driver.counters();
+        (0..reader.capacity())
+            .filter_map(|index| match reader.read(index) {
+                CellRead::Allocated { metadata, .. } if metadata.keys.kind == 0 => {
+                    Some((index, String::from_utf8(metadata.label().to_vec()).unwrap()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = fixed(&driver);
+    assert!(
+        before
+            .iter()
+            .any(|(_, label)| label == "conductor spin time")
+    );
+    drop(driver.take_spin_meter().unwrap());
+    let _ = driver.add_guard("kill switch").unwrap();
+    let _ = driver.do_work().unwrap();
+    assert_eq!(fixed(&driver), before, "a fixed cell moved or was released");
+    let gauges = guard_gauges(&driver);
+    assert_eq!(gauges.len(), 1);
+    // The guard's gauge took a cell past every fixed one.
+    let reader = driver.counters();
+    let guard_index = (0..reader.capacity())
+        .find(|&index| {
+            matches!(
+                reader.read(index),
+                CellRead::Allocated { metadata, .. } if metadata.keys.kind == KIND_GUARD
+            )
+        })
+        .unwrap();
+    assert!(before.iter().all(|(index, _)| *index < guard_index));
+}
