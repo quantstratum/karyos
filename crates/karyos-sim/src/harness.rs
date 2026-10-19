@@ -20,10 +20,13 @@
 //! - [`membership`]: the phase 5 membership scenarios a fixed leader can
 //!   run (quantstratum-docs: karyos/design/phase-5-cluster-scenarios.md,
 //!   P5-S1).
+//! - [`standby`]: a standby cluster, its feed, fencing and promotion
+//!   (the same document, P5-S2).
 
 pub mod check;
 pub mod core;
 pub mod membership;
 pub mod node;
 pub mod reference;
+pub mod standby;
 pub mod workloads;

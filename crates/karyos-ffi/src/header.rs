@@ -6,9 +6,11 @@
 //! the same C types, the same status codes and the same ABI version.
 //!
 //! It reads both files as text and covers the constructs the ABI uses: one
-//! `#define NAME VALUE` per constant, prototypes without function pointer
-//! parameters, and `extern "C" fn` items in `abi.rs` whose parameter types
-//! the table in [`c_type`] knows. Anything else fails the test.
+//! `#define NAME VALUE` per constant, `typedef struct` declarations with one
+//! field per statement, prototypes without function pointer parameters,
+//! and the `extern "C" fn` items and `pub struct` items of `abi.rs` whose
+//! types the tables in [`c_type`] and [`c_struct`] know. Anything else
+//! fails the test.
 
 use std::collections::BTreeMap;
 
@@ -21,6 +23,18 @@ const ABI: &str = include_str!("abi.rs");
 /// A function's C return type and parameter types.
 type Signature = (String, Vec<String>);
 
+/// A struct's fields: names and C types, in order.
+type Fields = Vec<(String, String)>;
+
+/// The C name of a struct of `abi.rs`.
+fn c_struct(rust: &str) -> &'static str {
+    match rust {
+        "ClientOptions" => "karyos_client_options",
+        "Detail" => "karyos_detail",
+        other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
+    }
+}
+
 /// The C type of a Rust type the boundary uses.
 fn c_type(rust: &str) -> String {
     let c = match rust.trim() {
@@ -32,6 +46,9 @@ fn c_type(rust: &str) -> String {
         "*mut u64" => "uint64_t *",
         "*const u8" => "const uint8_t *",
         "*const c_char" => "const char *",
+        "*const ClientOptions" => "const karyos_client_options *",
+        "*mut ClientOptions" => "karyos_client_options *",
+        "*mut Detail" => "karyos_detail *",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -76,9 +93,66 @@ fn header_defines() -> BTreeMap<String, i64> {
         .collect()
 }
 
+/// The header's code without comments and without its struct
+/// declarations, and the structs it declares.
+fn header_structs() -> (String, BTreeMap<String, Fields>) {
+    let mut code = header_code();
+    let mut structs = BTreeMap::new();
+    while let Some(start) = code.find("typedef struct ") {
+        let open = start + code[start..].find('{').expect("a struct body");
+        let close = open + code[open..].find('}').expect("a struct body");
+        let end = close + code[close..].find(';').expect("a typedef name");
+        let name = code[close + 1..end].trim().to_owned();
+        assert_eq!(
+            code[start + "typedef struct ".len()..open].trim(),
+            name,
+            "the struct tag and the typedef name differ"
+        );
+        let fields = code[open + 1..close]
+            .split(';')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(|field| {
+                let (c, name) = split_name(field);
+                (name, c)
+            })
+            .collect();
+        structs.insert(name, fields);
+        code.replace_range(start..=end, "");
+    }
+    (code, structs)
+}
+
+/// The `pub struct` items of `abi.rs`, with their C names and types.
+fn rust_structs() -> BTreeMap<String, Fields> {
+    let mut structs = BTreeMap::new();
+    let mut rest = ABI;
+    while let Some(at) = rest.find("\npub struct ") {
+        rest = &rest[at + "\npub struct ".len()..];
+        let open = rest.find('{').expect("a struct body");
+        let close = rest.find("\n}").expect("a struct body");
+        let name = c_struct(rest[..open].trim()).to_owned();
+        let fields = rest[open + 1..close]
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("pub "))
+            .map(|field| {
+                let (name, rust) = field
+                    .trim_end_matches(',')
+                    .split_once(':')
+                    .expect("name: type");
+                (name.trim().to_owned(), c_type(rust))
+            })
+            .collect();
+        structs.insert(name, fields);
+    }
+    structs
+}
+
 /// The header's prototypes.
 fn header_functions() -> BTreeMap<String, Signature> {
-    let code: String = header_code()
+    let code: String = header_structs()
+        .0
         .lines()
         .map(str::trim)
         .filter(|line| !line.starts_with('#') && *line != "extern \"C\" {" && *line != "}")
@@ -145,6 +219,13 @@ fn the_header_declares_every_exported_function_with_its_types() {
 }
 
 #[test]
+fn the_header_declares_every_struct_with_its_fields() {
+    let rust = rust_structs();
+    assert!(rust.contains_key("karyos_detail"));
+    assert_eq!(header_structs().1, rust);
+}
+
+#[test]
 fn the_header_states_every_status_code() {
     let defines = header_defines();
     let statuses: BTreeMap<String, i64> = Status::ALL
@@ -191,4 +272,20 @@ fn the_parsers_read_what_they_are_given() {
         split_name(" uint32_t *major"),
         ("uint32_t *".to_owned(), "major".to_owned())
     );
+}
+
+#[test]
+fn the_header_states_the_client_constants() {
+    use crate::api::client;
+    let defines = header_defines();
+    assert_eq!(
+        defines["KARYOS_MAX_CLIENTS"],
+        i64::from(client::MAX_CLIENTS)
+    );
+    assert_eq!(
+        defines["KARYOS_IDLE_BUSY_SPIN"],
+        i64::from(client::IDLE_BUSY_SPIN)
+    );
+    assert_eq!(defines["KARYOS_IDLE_YIELD"], i64::from(client::IDLE_YIELD));
+    assert_eq!(defines["KARYOS_IDLE_SLEEP"], i64::from(client::IDLE_SLEEP));
 }

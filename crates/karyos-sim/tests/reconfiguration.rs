@@ -290,6 +290,8 @@ fn a_commit_counting_a_learner_is_caught() {
         client: 9,
         index: 2,
         term: 1,
+        generation: 1,
+        at: 0,
     };
     record.insert(3, reply);
     assert!(matches!(
@@ -328,6 +330,8 @@ fn a_joint_commit_needs_both_majorities() {
         client: 9,
         index: 1,
         term: 1,
+        generation: 1,
+        at: 0,
     });
     assert!(matches!(
         check::durable_majority_before_reply(&replied, 5),

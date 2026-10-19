@@ -404,6 +404,16 @@ release may break APIs, wire formats and shared-memory layouts.
   pending messages, polls and lanes are bounded by `WindowConfig`, and what
   a bound refuses, ages out or the mirror overwrites is counted
   (`TraceCounts`). karyos-agent now depends on karyos-trace (owner item 52).
+- Consistent reads of an endpoint's capability gauges (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M6b): the conductor
+  writes each endpoint's gauges inside a sampling pass on a new `capability
+  pass` cell (same keys; odd while it writes, even after, with the
+  `begin_pass`/`end_pass` fences), and `karyos_client::capabilities::
+  endpoint_capabilities` reads each group with `read_pass`, for tools and
+  the management agent alike, marking it inconsistent when every attempt
+  overlapped a write. The guard audit
+  ring's losses are counted: `guard audit records overwritten` and `guard
+  audit records dropped` (sequences exhausted).
 
 - The management agent's core, `karyos-agent` (phase 5, M6a; ADR-0055;
   quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`).
@@ -490,6 +500,31 @@ release may break APIs, wire formats and shared-memory layouts.
   frame. karyos-sim's `tests/purge_crash.rs` crashes the disk at every
   operation of two purges and fails every flush.
 
+- karyos-sim harness: a standby cluster, phase 5 batch P5-S2
+  (quantstratum-docs: `karyos/design/phase-5-cluster-scenarios.md`, H3 and
+  H4; ADR-0054). `Case::standby` adds a second group of servers fed by the
+  primary's leader with its committed entries (`harness::standby`: each
+  entry checksummed over its index, term and payload, resent from the
+  standby's acknowledged verified position, `FeedFault`s for one send),
+  which the standby's leader checks by log matching and checksum and
+  proposes, its service applying them with effects disabled. Fencing is
+  `Action::OperatorStop` or an `ExternalLease` (`Case::lease`,
+  `Action::CutArbiter`) that the primary's leader must hold to take a
+  command or release a reply; `Action::Promote` raises the generation once
+  the harness verifies the fencing, the standby reporting its verified
+  position, learnt commit and the requests in flight, and redirects the
+  clients. Replies and successes carry a generation, and a client rejects
+  a lower one. The reference fixture's leader is the lowest of its
+  bootstrap peers, so a standby leads itself. New checks: `check::group`
+  per group of servers, `check::standby` (no standby reply before a
+  promotion, no primary reply at or after the fencing point (the lease's
+  end on the holder's clock, recorded with `Fenced`, or the operator's
+  stop), no old-generation reply after it, every fed entry the
+  primary's, the verified prefix applied, the gap report bounded, no client
+  going back a generation) and `check::across_promotion`, which leaves an
+  old-generation answer above the verified position pending for C3.
+  Scenarios S1 to S4, S6 and S7 run on the reference; S5 is a client test.
+
 - `karyos-ffi`, the C ABI crate (SPEC.md §10.2; ADR-0053, ADR-0067;
   quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, batch F1). It
   builds `libkaryos_ffi` as a shared, a static and a Rust library, with a
@@ -504,6 +539,16 @@ release may break APIs, wire formats and shared-memory layouts.
   denied in the crate and expected only on `mod abi` and in the tests'
   `support::abi`; `make lint-sync` checks that, the clippy set, and that no
   profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- `karyos-ffi` clients (batch F2): `karyos_client_options_init`,
+  `karyos_client_connect`, `karyos_client_poll` and `karyos_client_close`,
+  with the sized `karyos_client_options` (copied, nothing consumed) and
+  `karyos_detail` structs. A driver that refuses the client's protocol
+  version, or admits it at another, answers `KARYOS_E_INCOMPATIBLE_DRIVER`
+  with the driver's version in the detail when it named one; tested on
+  Linux against a fake driver, and a real one for the admitted path. The
+  client tests also run over an embedded driver's conductor, under Miri
+  and on macOS, where connect answers the new `KARYOS_E_UNSUPPORTED`. The
+  header check now covers structs.
 - The C ABI conformance suite beside `karyos-ffi` (ADR-0067; batch F6), in
   the interim format 1 of `crates/karyos-ffi/conformance/FORMAT.md` until
   the owner chooses one (item 46): line-based `.kcs` scenarios (`call` and
