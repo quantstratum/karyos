@@ -394,6 +394,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- API v1's JSON carries each driver's trace window (M6c): `latencies`, one
+  object per lane with `p50`, `p90`, `p99`, `p999` and `max` as `null` or
+  `{"low","high"}` bounds, and `trace`, the window's counts. They come
+  after `guards` and before `alerts`, in `DriverView`'s declaration order
+  (quantstratum-docs: `karyos/design/agent-api-v1.md`).
+
 - Alerts in the management agent (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M9). `AlertRules`
   (`AgentConfig::with_alerts`; `karyos-agent --lag-bytes --lag-refreshes
