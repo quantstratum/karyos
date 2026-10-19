@@ -11,7 +11,9 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::*;
-use crate::api::{API_VERSION, Feed, Lane, LaneLatency, Sample, Subscriber, TraceCounts};
+use crate::api::{
+    API_VERSION, Alert, AlertKind, Feed, Lane, LaneLatency, Sample, Subscriber, TraceCounts,
+};
 
 fn counter(label: &str, type_id: u64, value: u64) -> Counter {
     Counter {
@@ -80,6 +82,14 @@ fn view() -> AgentView {
             max: None,
         }],
         trace: TraceCounts::default(),
+        alerts: vec![Alert {
+            kind: AlertKind::Lag,
+            stream: 3,
+            lane: 1,
+            participant: 5,
+            value: 1024,
+            since: 50,
+        }],
     };
     let closed = DriverView {
         dir: PathBuf::from("/run/karyos/c"),
@@ -92,6 +102,7 @@ fn view() -> AgentView {
         guards: Feed::default(),
         latencies: Vec::new(),
         trace: TraceCounts::default(),
+        alerts: Vec::new(),
     };
     AgentView {
         version: API_VERSION,
@@ -224,6 +235,23 @@ fn the_exposition_parses_and_each_counter_keeps_its_type() {
         .map(|(labels, _)| label(labels, "bound").unwrap())
         .collect();
     assert_eq!(p90, ["low"]);
+    // Alerts (M9): a count per driver, 0 included, and each one's value.
+    let firing: BTreeMap<&str, f64> = families["karyos_alerts_firing"]
+        .1
+        .iter()
+        .map(|(labels, value)| (label(labels, "driver").unwrap(), *value))
+        .collect();
+    assert_eq!(
+        firing.values().copied().collect::<Vec<_>>(),
+        [1.0, 0.0],
+        "{firing:?}"
+    );
+    let (labels, value) = &families["karyos_alert_value"].1[0];
+    assert_eq!(
+        (label(labels, "kind"), label(labels, "participant"), *value),
+        (Some("lag"), Some("5"), 1024.0)
+    );
+    assert_eq!(families["karyos_alert_since_ns"].1[0].1, 50.0);
     // The closed driver: attached 0, closed 1.
     let closed = |family: &str| {
         families[family]

@@ -165,7 +165,8 @@ usage: karyos-exporter --listen ADDRESS:PORT --driver DIR [--driver DIR]... \
 Serves the agent's view of each driver in the Prometheus text format on
 http://ADDRESS:PORT/metrics, reading each driver's CnC as a tool every MS
 milliseconds (default 1000). ADDRESS must be a loopback address (127.0.0.1
-or ::1): the exporter has no TLS and no authentication. Linux only.
+or ::1): the exporter has no TLS and no authentication. It takes one of
+each driver's tool slots (max_tools) while attached. Linux only.
 ";
 
 /// A parsed `karyos-exporter` command line.

@@ -17,6 +17,12 @@
 //!   writes. It is off unless the `karyos-exporter` binary is started with
 //!   an address. No TLS and no authentication: loopback is the interim's
 //!   boundary.
+//! - **Alerts** (M9) are `karyos_alerts_firing` per driver, 0 included,
+//!   and each firing alert's `karyos_alert_value` and
+//!   `karyos_alert_since_ns`, labelled by kind, stream, lane and
+//!   participant.
+//! - **Cost.** The exporter attaches to each driver as a tool, so it takes
+//!   one of the driver's tool slots (`max_tools`) while attached.
 //! - **Trace latencies** are the agent's window (M6c): observed latencies,
 //!   never trace verdicts; a quantile's bound past the histogram's range is
 //!   left out rather than written as infinite.
@@ -27,7 +33,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-use crate::api::{AgentView, Counter, DriverState, DriverView, QuantileBounds};
+use crate::api::{AgentView, Alert, AlertKind, Counter, DriverState, DriverView, QuantileBounds};
 
 /// The `Content-Type` of the exposition.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -146,6 +152,7 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
         &base,
         u8::from(driver.state == DriverState::Closed),
     );
+    render_alerts(families, &dir, &driver.alerts);
     if let Some(sample) = &driver.sample {
         families.sample(
             "karyos_sample_consistent",
@@ -253,7 +260,7 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
         families.sample(
             "karyos_error_occurrences",
             "gauge",
-            "Occurrences of each error code over the error records the agent keeps.",
+            "Occurrences of each error code in the error records the agent keeps only, not since the driver started.",
             &[("driver", dir.clone()), ("code", code.to_string())],
             sum,
         );
@@ -341,6 +348,48 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
 }
 
 /// One CnC cell, in the family its type gives.
+/// The alerts firing (M9): how many per driver, 0 included, and each
+/// one's value and start.
+fn render_alerts(families: &mut Families, dir: &str, alerts: &[Alert]) {
+    families.sample(
+        "karyos_alerts_firing",
+        "gauge",
+        "Alerts firing for the driver.",
+        &[("driver", dir.to_owned())],
+        alerts.len(),
+    );
+    for alert in alerts {
+        let keys = [
+            ("driver", dir.to_owned()),
+            (
+                "kind",
+                match alert.kind {
+                    AlertKind::Lag => "lag",
+                    AlertKind::Loss => "loss",
+                }
+                .to_owned(),
+            ),
+            ("stream", alert.stream.to_string()),
+            ("lane", alert.lane.to_string()),
+            ("participant", alert.participant.to_string()),
+        ];
+        families.sample(
+            "karyos_alert_value",
+            "gauge",
+            "A firing alert's value: the lag in bytes, or the losses counted.",
+            &keys,
+            alert.value,
+        );
+        families.sample(
+            "karyos_alert_since_ns",
+            "gauge",
+            "Host monotonic nanoseconds of the refresh at which the alert began firing.",
+            &keys,
+            alert.since,
+        );
+    }
+}
+
 fn render_counter(families: &mut Families, dir: &str, source: &str, counter: &Counter) {
     let labels = [
         ("driver", dir.to_owned()),
@@ -463,6 +512,14 @@ fn answer(stream: TcpStream, body: &impl Fn() -> String) -> Answered {
     let mut line = String::new();
     if !matches!(reader.read_line(&mut line), Ok(read) if read > 0) {
         return Answered::Dropped;
+    }
+    // The rest of the head, to its blank line, so the close does not reset
+    // the connection over unread bytes; bounded by the same limit.
+    let mut header = String::new();
+    while matches!(reader.read_line(&mut header), Ok(read) if read > 0)
+        && !matches!(header.as_str(), "\r\n" | "\n")
+    {
+        header.clear();
     }
     let mut words = line.split_whitespace();
     let (status, answered, content) = match (words.next(), words.next(), words.next()) {

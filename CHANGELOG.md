@@ -405,7 +405,10 @@ release may break APIs, wire formats and shared-memory layouts.
   100 ms I/O timeouts. The `karyos-exporter` binary, in karyos-agent, runs
   it as its own process: `--listen ADDRESS:PORT --driver DIR...
   [--refresh-ms MS]`; a non-loopback address is refused. No TLS, no
-  authentication and no new dependency.
+  authentication and no new dependency. It exports M9's alerts as
+  `karyos_alerts_firing` per driver and each alert's `karyos_alert_value`
+  and `karyos_alert_since_ns`, and takes one of each driver's tool slots
+  while attached.
 
 - Alerts in the management agent (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M9). `AlertRules`
