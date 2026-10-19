@@ -21,12 +21,26 @@
 //! counted once its own persistence is reported), if that entry is of its
 //! term. Every server saves its vote for the leader at its first Ready,
 //! and its hard state at each commit change.
+//!
+//! **Membership** (phase 5; quantstratum-docs:
+//! karyos/design/phase-5-cluster-scenarios.md, P5-S1). The leader takes
+//! one [`Change`] at a time, once the last configuration entry is
+//! committed, as a configuration entry ([`encode_configuration`]) that
+//! takes effect when it is appended, committed or not, on every server
+//! that holds it. A learner is promoted only within [`PROMOTION_LAG`]
+//! entries of the leader's commit, as the leader knows its durable index.
+//! The leader replicates to voters and learners and commits on a durable
+//! majority of the voters alone. It cannot remove itself: there is no
+//! election to replace it. A restart rebuilds the configuration from the
+//! log.
 
 use std::collections::BTreeMap;
 
 use karyos_cluster::{Entry, HardState};
 
-use super::core::{ConsensusCore, LogView, NotLeader, Persisted, Ready};
+use super::core::{
+    Change, ChangeRefused, Configuration, ConsensusCore, LogView, NotLeader, Persisted, Ready,
+};
 use crate::net::NodeId;
 
 /// The fixed leader.
@@ -37,6 +51,49 @@ pub const TERM: u64 = 1;
 pub const RESEND: u64 = 4;
 /// Frame bytes per append message at most (at least one entry).
 pub const BATCH_BYTES: u64 = 16 * 1024;
+/// Entries a learner may be behind the leader's commit and be promoted.
+pub const PROMOTION_LAG: u64 = 4;
+/// The tag every configuration entry's bytes start with, so it does not
+/// decode as a command.
+pub const CONFIG_MAGIC: [u8; 4] = *b"KR5C";
+
+/// A configuration entry's bytes: [`CONFIG_MAGIC`], then the voters and
+/// the learners, each a count and the ids, little endian.
+#[must_use]
+pub fn encode_configuration(voters: &[NodeId], learners: &[NodeId]) -> Vec<u8> {
+    let mut bytes = CONFIG_MAGIC.to_vec();
+    for members in [voters, learners] {
+        let count = u32::try_from(members.len()).unwrap_or(u32::MAX);
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for member in members {
+            bytes.extend_from_slice(&member.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// The voters and learners of a configuration entry's payload, if it is
+/// one.
+#[must_use]
+pub fn decode_configuration(bytes: &[u8]) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
+    let mut rest = bytes.strip_prefix(&CONFIG_MAGIC)?;
+    let mut sets = [Vec::new(), Vec::new()];
+    for set in &mut sets {
+        let (count, tail) = rest.split_first_chunk::<4>()?;
+        rest = tail;
+        for _ in 0..u32::from_le_bytes(*count) {
+            let (member, tail) = rest.split_first_chunk::<4>()?;
+            set.push(NodeId::from_le_bytes(*member));
+            rest = tail;
+        }
+    }
+    let [voters, learners] = sets;
+    rest.is_empty().then_some((voters, learners))
+}
+
+/// A configuration in the log: the entry's index, the voters and the
+/// learners.
+type Logged = (u64, Vec<NodeId>, Vec<NodeId>);
 
 /// The reference core's messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +116,10 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub struct Reference {
     id: NodeId,
+    /// The bootstrap voters, ascending.
     peers: Vec<NodeId>,
+    /// The configurations in the log, written or not, ascending.
+    configs: Vec<Logged>,
     /// Entries not yet handed to the node to persist.
     unpersisted: Vec<Entry>,
     /// The first index to remove before they are written.
@@ -110,10 +170,40 @@ impl Reference {
         log.term(index)
     }
 
+    /// The current voters and learners.
+    fn members(&self) -> (&[NodeId], &[NodeId]) {
+        match self.configs.last() {
+            Some((_, voters, learners)) => (voters, learners),
+            None => (&self.peers, &[]),
+        }
+    }
+
+    /// Takes in a configuration that `entry` holds.
+    fn note(&mut self, entry: &Entry) {
+        if let Some((voters, learners)) = decode_configuration(&entry.payload) {
+            self.configs.push((entry.index, voters, learners));
+        }
+    }
+
+    /// Forgets the configurations from `index` on, as their entries are.
+    fn forget_from(&mut self, index: u64) {
+        self.configs.retain(|(logged, ..)| *logged < index);
+    }
+
+    /// Entries `member` is behind the commit, as the leader knows.
+    fn behind(&self, member: NodeId) -> u64 {
+        let durable = self.acked.get(&member).copied().flatten().unwrap_or(0);
+        self.commit.unwrap_or(0).saturating_sub(durable)
+    }
+
     fn recompute_commit(&mut self, log: &LogView<'_>) {
-        let mut durable: Vec<Option<u64>> = self.acked.values().copied().collect();
+        let (voters, _) = self.members();
+        let mut durable: Vec<Option<u64>> = voters
+            .iter()
+            .map(|voter| self.acked.get(voter).copied().flatten())
+            .collect();
         durable.sort_unstable_by(|a, b| b.cmp(a));
-        let majority = self.peers.len() / 2;
+        let majority = voters.len() / 2;
         let candidate = durable.get(majority).copied().flatten();
         if candidate > self.commit
             && let Some(index) = candidate
@@ -133,13 +223,38 @@ impl ConsensusCore for Reference {
     type Message = Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        // The configurations its log holds, written or durable. A failed
+        // read leaves the bootstrap configuration, which the harness's
+        // checks compare with the log.
+        let first = log.first_index();
+        let entries = log
+            .last_index()
+            .and_then(|last| last.checked_add(1))
+            .filter(|end| first < *end)
+            .and_then(|end| log.entries(first..end, u64::MAX).ok())
+            .unwrap_or_default();
+        let configs: Vec<Logged> = entries
+            .iter()
+            .filter_map(|entry| {
+                let (voters, learners) = decode_configuration(&entry.payload)?;
+                Some((entry.index, voters, learners))
+            })
+            .collect();
         let mut acked: BTreeMap<NodeId, Option<u64>> =
             peers.iter().map(|peer| (*peer, None)).collect();
+        for (_, voters, learners) in &configs {
+            for member in voters.iter().chain(learners) {
+                let _ = acked.entry(*member).or_insert(None);
+            }
+        }
         let _ = acked.insert(id, log.durable_index());
         let stored = log.hard_state();
+        let mut peers = peers.to_vec();
+        peers.sort_unstable();
         Self {
             id,
-            peers: peers.to_vec(),
+            peers,
+            configs,
             unpersisted: Vec::new(),
             truncate: None,
             acked,
@@ -190,12 +305,15 @@ impl ConsensusCore for Reference {
                         // A stale entry of another term: remove it and
                         // everything after it.
                         self.unpersisted.retain(|kept| kept.index < entry.index);
+                        self.forget_from(entry.index);
                         if self.unpersisted.is_empty() {
                             self.truncate =
                                 Some(self.truncate.map_or(entry.index, |t| t.min(entry.index)));
                         }
+                        self.note(&entry);
                         self.unpersisted.push(entry);
                     } else if entry.index == next {
+                        self.note(&entry);
                         self.unpersisted.push(entry);
                     } else {
                         break;
@@ -227,10 +345,14 @@ impl ConsensusCore for Reference {
         let Some(end) = log.last_index().and_then(|last| last.checked_add(1)) else {
             return;
         };
-        for peer in self.peers.clone() {
-            if peer == self.id {
-                continue;
-            }
+        let (voters, learners) = self.members();
+        let members: Vec<NodeId> = voters
+            .iter()
+            .chain(learners)
+            .copied()
+            .filter(|member| *member != self.id)
+            .collect();
+        for peer in members {
             let from = self
                 .acked
                 .get(&peer)
@@ -351,5 +473,85 @@ impl ConsensusCore for Reference {
 
     fn committed(&self) -> Option<u64> {
         self.commit
+    }
+
+    fn configuration(&self) -> Option<Configuration> {
+        let (voters, learners) = self.members();
+        Some(Configuration {
+            index: self.configs.last().map(|(index, ..)| *index),
+            voters: voters.to_vec(),
+            outgoing: Vec::new(),
+            learners: learners.to_vec(),
+        })
+    }
+
+    fn propose_change(
+        &mut self,
+        change: Change,
+        log: &mut LogView<'_>,
+    ) -> Result<(), ChangeRefused> {
+        if !self.leading() {
+            return Err(ChangeRefused::NotLeader(NotLeader {
+                leader: Some(LEADER),
+            }));
+        }
+        // One change at a time: the last one must be committed.
+        if self
+            .configs
+            .last()
+            .is_some_and(|(index, ..)| Some(*index) > self.commit)
+        {
+            return Err(ChangeRefused::InProgress);
+        }
+        let (voters, learners) = self.members();
+        let (mut voters, mut learners) = (voters.to_vec(), learners.to_vec());
+        let member = |node: NodeId| voters.contains(&node) || learners.contains(&node);
+        match change {
+            Change::AddLearner(node) => {
+                if member(node) {
+                    return Err(ChangeRefused::Invalid);
+                }
+                learners.push(node);
+            }
+            Change::Promote(node) => {
+                if !learners.contains(&node) {
+                    return Err(ChangeRefused::Invalid);
+                }
+                let behind = self.behind(node);
+                if behind > PROMOTION_LAG {
+                    return Err(ChangeRefused::Lagging { behind });
+                }
+                learners.retain(|learner| *learner != node);
+                voters.push(node);
+            }
+            Change::Remove(node) => {
+                // The fixed leader cannot be replaced.
+                if node == self.id || !member(node) {
+                    return Err(ChangeRefused::Invalid);
+                }
+                voters.retain(|voter| *voter != node);
+                learners.retain(|learner| *learner != node);
+            }
+        }
+        voters.sort_unstable();
+        learners.sort_unstable();
+        // The last index is u64::MAX: the log takes no more.
+        let Some(index) = self.next(log) else {
+            return Err(ChangeRefused::Invalid);
+        };
+        for member in voters.iter().chain(&learners) {
+            let _ = self.acked.entry(*member).or_insert(None);
+        }
+        self.unpersisted.push(Entry {
+            index,
+            term: TERM,
+            event_time: 0,
+            payload: encode_configuration(&voters, &learners),
+        });
+        self.configs.push((index, voters, learners));
+        // A removal can leave a smaller majority that already holds more.
+        self.recompute_commit(log);
+        self.settle(log);
+        Ok(())
     }
 }
