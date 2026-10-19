@@ -14,6 +14,7 @@ use karyos_driver::{
 };
 use karyos_protocol::cnc::{StreamKey, SubscriberRole};
 use karyos_sys::conflation::ConflationConfig;
+use karyos_sys::counters::CellRead;
 use karyos_sys::error::SysError;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
@@ -63,6 +64,11 @@ pub struct Faults {
     /// long enough that the driver may time it out, sometimes while its
     /// reader holds a loan.
     pub stall: bool,
+    /// The driver runs no duty cycle for a while: its `conductor duty at`
+    /// must stand still meanwhile and move on after
+    /// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+    /// M1).
+    pub driver_pause: bool,
 }
 
 /// One stream of a scenario.
@@ -219,6 +225,12 @@ struct Sim<'s> {
     observed: u64,
     /// Client readers revoked while they held a loan.
     revoked_holding: usize,
+    /// The driver runs no duty cycle before this step.
+    driver_paused_until: u64,
+    /// The cell of `conductor duty at`.
+    duty_cell: usize,
+    /// Its value at the last duty cycle.
+    duty_at: u64,
 }
 
 /// The simulated driver's configuration. Its streams start at term id 7:
@@ -419,6 +431,16 @@ impl<'s> Sim<'s> {
                 larger: true,
             });
         }
+        let counters = driver.counters();
+        let duty_cell = (0..counters.capacity())
+            .find(|&index| {
+                matches!(
+                    counters.read(index),
+                    CellRead::Allocated { metadata, .. }
+                        if metadata.label() == b"conductor duty at"
+                )
+            })
+            .ok_or_else(|| fail("no conductor duty at cell".into()))?;
         Ok(Self {
             scenario,
             seed,
@@ -433,6 +455,9 @@ impl<'s> Sim<'s> {
             draining: false,
             observed: 0,
             revoked_holding: 0,
+            driver_paused_until: 0,
+            duty_cell,
+            duty_at: 0,
         })
     }
 
@@ -515,15 +540,42 @@ impl<'s> Sim<'s> {
         Ok(())
     }
 
+    /// The driver's `conductor duty at`; its value is host time, so it is
+    /// compared, never noted in the digest.
+    fn read_duty_at(&self) -> Result<u64, Failure> {
+        match self.driver.counters().read(self.duty_cell) {
+            CellRead::Allocated { value, .. } => Ok(value),
+            other => Err(self.failure(format!("conductor duty at: {other:?}"))),
+        }
+    }
+
     fn driver_step(&mut self) -> Result<(), Failure> {
+        if self.driver_paused_until > self.step {
+            if self.read_duty_at()? != self.duty_at {
+                return Err(self.failure("conductor duty at moved while paused".into()));
+            }
+            self.note("driver paused".into());
+            return Ok(());
+        }
         self.driver
             .do_work()
             .map_err(|error| self.failure(format!("do_work: {error}")))?;
+        let at = self.read_duty_at()?;
+        if at == 0 || at < self.duty_at {
+            return Err(self.failure(format!("conductor duty at {at} after {}", self.duty_at)));
+        }
+        self.duty_at = at;
         self.note("driver duty".into());
         if self.draining {
             return Ok(());
         }
         let faults = self.scenario.faults;
+        if faults.driver_pause && self.rng.chance(1, 40) {
+            let steps = 1 + self.rng.below(100);
+            self.driver_paused_until = self.step + steps;
+            self.note(format!("driver pauses for {steps}"));
+            return Ok(());
+        }
         let index = self.rng.below(self.streams.len() as u64) as usize;
         if faults.removal && self.rng.chance(1, 400) {
             if let Some(stream) = self.streams.get_mut(index).filter(|s| !s.removed) {
@@ -942,6 +994,7 @@ impl<'s> Sim<'s> {
     /// changes for a while.
     fn drain(&mut self) -> Result<(), Failure> {
         self.draining = true;
+        self.driver_paused_until = 0;
         for actor in self.actors.iter_mut().flatten() {
             actor.paused_until = 0;
         }

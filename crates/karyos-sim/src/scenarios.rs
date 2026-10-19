@@ -108,6 +108,15 @@ pub fn all() -> Vec<Scenario> {
             },
         ),
         scenario(
+            "driver-pauses",
+            Faults {
+                pause: true,
+                pause_in_claim: true,
+                driver_pause: true,
+                ..none
+            },
+        ),
+        scenario(
             "forgotten",
             Faults {
                 forget: true,
@@ -145,6 +154,7 @@ pub fn all() -> Vec<Scenario> {
                     removal: true,
                     cutover: true,
                     stall: false,
+                    driver_pause: false,
                 },
             )
         },
