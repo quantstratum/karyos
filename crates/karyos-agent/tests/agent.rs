@@ -105,6 +105,8 @@ fn the_agent_attaches_and_reports_the_driver() {
     let seen = &view.drivers[0];
     assert_eq!(seen.state, DriverState::Attached);
     assert_eq!(seen.instance, driver.instance());
+    // A quiet driver raises no alert (M9).
+    assert!(seen.alerts.is_empty());
     let sample = seen.sample.as_ref().unwrap();
     // The driver's own cells, among them its pid (M1).
     let pid = sample

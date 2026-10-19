@@ -41,6 +41,9 @@ pub const PROTOCOL: &str = "KARYOS-AGENT";
 pub const MAX_REQUEST: usize = 256;
 /// The read and write timeout of each connection.
 pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
+/// Connections one [`Server::poll`] serves at most; the rest wait for the
+/// next poll, so a burst of clients cannot hold the polling thread.
+pub const MAX_ACCEPTS: usize = 16;
 
 /// What an operator may do (SPEC §11, access control). Every API v1
 /// request reads, which every role may.
@@ -186,15 +189,16 @@ impl Server {
         &self.path
     }
 
-    /// Serves every pending connection from `agent`'s current view;
-    /// returns how each was answered. Never waits for a connection.
+    /// Serves the pending connections, at most [`MAX_ACCEPTS`], from
+    /// `agent`'s current view; returns how each was answered. Never waits
+    /// for a connection.
     ///
     /// # Errors
     ///
     /// The operating system's error when `accept` fails.
     pub fn poll(&mut self, agent: &Agent) -> Result<Vec<Served>, ServeError> {
         let mut served = Vec::new();
-        loop {
+        while served.len() < MAX_ACCEPTS {
             match self.listener.accept() {
                 Ok((stream, _)) => served.push(self.serve(stream, agent)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
