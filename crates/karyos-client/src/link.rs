@@ -86,6 +86,7 @@ pub struct LeaseEnd {
 
 /// The observed state of a [`LeaseEnd`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LeaseState {
     /// The capability is alive (held for hand-over or in a handle).
     Alive,
@@ -179,6 +180,11 @@ impl Export {
 }
 
 /// A capability created by the driver for a registration.
+///
+/// Not `#[non_exhaustive]`: the driver matches every kind when it joins a
+/// member, where a kind it did not know could not be handled; a contract
+/// between the driver and the client crates (quantstratum-docs:
+/// `karyos/testing/public-api-audit-alpha2.md`).
 #[derive(Debug)]
 pub enum Capability<T: TermBytes = HeapTerms> {
     /// A stream's exclusive publication.
@@ -243,6 +249,7 @@ pub struct ClientLink<T: TermBytes = HeapTerms> {
 
 /// Why a hand-over put or take failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HandOverError {
     /// The driver is gone or the entry was dropped.
     Closed,

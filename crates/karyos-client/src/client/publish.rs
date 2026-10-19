@@ -47,6 +47,7 @@ impl Accepted {
 
 /// Why an offer, a claim or a commit was not accepted (SPEC §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum OfferError {
     /// No subscriber is attached and the publication does not allow
     /// unconnected offers.

@@ -31,6 +31,7 @@ use crate::trace::{PublishTrace, TraceDecision};
 /// [`crate::OfferOutcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "back pressure, aborts and admin actions must be handled"]
+#[non_exhaustive]
 pub enum ConcurrentOfferOutcome {
     /// The message was accepted into the local publication log, with the
     /// meaning of [`crate::OfferOutcome::Accepted`].
@@ -65,6 +66,7 @@ pub enum ConcurrentOfferOutcome {
 /// provisional, as [`ConcurrentOfferOutcome`].
 #[derive(Debug)]
 #[must_use = "back pressure, aborts and admin actions must be handled"]
+#[non_exhaustive]
 pub enum ConcurrentClaimOutcome<'a, T: TermBytes = HeapTerms> {
     /// A block was reserved and marked; write the payload, then commit.
     Claimed(ClientConcurrentClaim<'a, T>),

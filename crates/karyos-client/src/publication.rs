@@ -28,6 +28,7 @@ use crate::trace::{PublishTrace, TraceDecision};
 /// as [`OfferOutcome::AdminAction`] and never retried silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "back pressure and admin actions must be handled"]
+#[non_exhaustive]
 pub enum OfferOutcome {
     /// The message was accepted into the local publication log at
     /// `position` in `lane`. Positions are per lane, so the pair identifies
@@ -71,6 +72,7 @@ pub enum OfferOutcome {
 /// those land.
 #[derive(Debug)]
 #[must_use = "back pressure and admin actions must be handled"]
+#[non_exhaustive]
 pub enum ClaimOutcome<'a, T: TermBytes = HeapTerms> {
     /// A block was reserved; write the payload, then commit.
     Claimed(ClientClaim<'a, T>),

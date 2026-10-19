@@ -52,6 +52,7 @@ pub fn representable<T: TermBytes>(base: u64, buffer: &LogBuffer<T>) -> bool {
 
 /// A successor capability reserved for one handle.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Successor<T: TermBytes = HeapTerms> {
     /// The successor's exclusive publication.
     Publication(Publication<Arc<LogBuffer<T>>>),
@@ -138,6 +139,7 @@ pub(crate) enum RetiredHandle<T: TermBytes = HeapTerms> {
 
 /// The link's state, as the driver sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LinkStatus {
     /// No cutover concerns the handle: it uses the stream's current mapping
     /// (after moving, if a cutover just opened).

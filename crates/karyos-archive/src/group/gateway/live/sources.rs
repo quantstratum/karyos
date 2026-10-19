@@ -193,6 +193,12 @@ impl<T: TermBytes> MessageSource for Subscription<T> {
                 summary: PollSummary::default(),
                 cause,
             }),
+            // A failure this crate does not know yet: the source ends, as
+            // when it is closed.
+            Err(_) => Err(PollError {
+                summary: PollSummary::default(),
+                cause: ClientError::Unknown,
+            }),
         }
     }
 
