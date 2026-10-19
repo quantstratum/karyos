@@ -404,6 +404,20 @@ release may break APIs, wire formats and shared-memory layouts.
   overlapped a write. The guard audit
   ring's losses are counted: `guard audit records overwritten` and `guard
   audit records dropped` (sequences exhausted).
+
+- The management agent's core, `karyos-agent` (phase 5, M6a; ADR-0055;
+  quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`).
+  `Agent` attaches to each configured driver as a tool, counting against its
+  `max_tools`, and keeps a model per driver: whether it is attached, closed
+  or unavailable; one sampling pass of the driver counters, with per stream
+  lane the limit, head, floor, headroom and each subscriber's lag; the
+  client counters; and followers of the error log, the loss report and the
+  guard audit ring with their cursors, a bounded history and the records
+  overwritten before they were read. `api` defines API v1 as Rust types
+  (`AgentView`), with no transport yet (M7). Trace histograms (M6c) and
+  capability groups (M6b) follow. The crate graph keeps the driver and the
+  client independent of it (owner item 52).
+
 - Spin time per idle loop (counter type 3, `TYPE_SPIN_TIME`; SPEC §11;
   quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`, M5,
   under the coordinator's ruling recorded in `cnc-primitives.md`).
