@@ -64,6 +64,22 @@
 //! | `trace mirror overwritten` | event | trace mirror ring records overwritten (mirror loss, never journal loss) |
 //! | `trace journals open` | gauge | client trace journals whose writer may still append |
 //! | `trace journal faults` | event | client trace journals the driver stopped draining for a protocol violation |
+//! | `driver pid` | gauge | the driver process's id in its own pid namespace, set at creation; a tool in another namespace knows it by another number |
+//! | `driver started at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds when the driver was created |
+//! | `conductor duty at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds of the last duty cycle, read at its end with the positions pass; 0 before the first |
+//!
+//! With a network, the agents' system counters are driver-wide event
+//! cells (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+//! M2), allocated when the driver is created, before any agent starts.
+//! Each is written only by the agent that counts it, with a plain store of
+//! its own checked count at the end of its duty cycle, in every threading
+//! mode; the conductor frees them when the network closes and the agents
+//! come back. Sender: `network controls sent`, `network control send
+//! failures`, `naks received`, `status messages received`, `heartbeats
+//! sent`. Receiver: `datagrams received`, `datagrams dropped by backend`,
+//! `invalid frames received`, `status messages sent`, `images retired at
+//! timeout`. When no cell is free one is not allocated and `counters
+//! unavailable` counts it.
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! "Per-stream positions") are allocated, set and released only inside a
@@ -107,7 +123,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 59] = [
+const LABELS: [(u64, &str); 62] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -167,6 +183,9 @@ const LABELS: [(u64, &str); 59] = [
     (TYPE_EVENTS, "network trace journals unhooked"),
     (TYPE_EVENTS, "replay targets not retired"),
     (TYPE_EVENTS, "overruns replayed"),
+    (TYPE_GAUGE, "driver pid"),
+    (TYPE_TIMESTAMP, "driver started at"),
+    (TYPE_TIMESTAMP, "conductor duty at"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -317,8 +336,20 @@ pub(crate) enum Event {
     /// then failed; such a target is no longer tracked.
     ReplayTargetsNotRetired,
     /// Reported overruns that `replay` recovered from a recording, merging
-    /// back into the live stream. Last, so no other counter's id moves.
+    /// back into the live stream.
     OverrunsReplayed,
+    /// The driver process's id in the driver's own pid namespace (a tool
+    /// in another namespace knows the process by another number), so a
+    /// tool can tell which process it reads
+    /// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+    /// M1).
+    DriverPid,
+    /// Host `CLOCK_MONOTONIC` nanoseconds when the driver was created.
+    DriverStartedAt,
+    /// Host `CLOCK_MONOTONIC` nanoseconds of the last duty cycle, read at
+    /// its end with the positions pass, 0 before the first: a tool's age
+    /// of it grows while the conductor stalls. Last, so no other counter's id moves.
+    ConductorDutyAt,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -582,6 +613,9 @@ mod tests {
             ),
             (Event::ReplayTargetsNotRetired, "replay targets not retired"),
             (Event::OverrunsReplayed, "overruns replayed"),
+            (Event::DriverPid, "driver pid"),
+            (Event::DriverStartedAt, "driver started at"),
+            (Event::ConductorDutyAt, "conductor duty at"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

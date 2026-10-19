@@ -34,6 +34,11 @@ fn pauses() {
 }
 
 #[test]
+fn driver_pauses() {
+    sweep("driver-pauses");
+}
+
+#[test]
 fn forgotten() {
     sweep("forgotten");
 }

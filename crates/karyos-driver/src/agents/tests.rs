@@ -532,3 +532,37 @@ fn the_path_defaults_are_section_sevens() {
     );
     assert_eq!(config.path_heartbeat_interval, 100_000_000);
 }
+
+/// M2: an agent's cells take its counts at the end of each cycle, store a
+/// count only when it changed, skip a cell the region had no room for,
+/// and go back to the conductor whole.
+#[test]
+fn agent_cells_store_changed_counts_and_go_back() {
+    use karyos_sys::counters::{CellRead, CounterKeys, counters};
+    let (mut manager, reader) = counters(4).unwrap();
+    let mut allocate = |label| {
+        Some(
+            manager
+                .allocate_keyed(1, label, CounterKeys::DRIVER)
+                .unwrap(),
+        )
+    };
+    let mut cells = AgentCells::new(vec![allocate("one"), None, allocate("three")]);
+    let value = |index| match reader.read(index) {
+        CellRead::Allocated { value, .. } => value,
+        other => panic!("{other:?}"),
+    };
+    cells.publish(&[5, 6, 7]);
+    assert_eq!((value(0), value(1)), (5, 7));
+    // An unchanged count is not stored: a write behind the agent's back
+    // stays until the agent's own count changes.
+    let taken: Vec<_> = cells.take().collect();
+    taken[0].set(99);
+    let mut cells = AgentCells::new(taken.into_iter().map(Some).collect());
+    cells.publish(&[0, 7]);
+    assert_eq!((value(0), value(1)), (99, 7));
+    cells.publish(&[1, 7]);
+    assert_eq!(value(0), 1);
+    assert_eq!(cells.take().count(), 2);
+    assert_eq!(cells.take().count(), 0);
+}

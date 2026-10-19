@@ -485,7 +485,10 @@ fn driver_cells(driver: &EmbeddedDriver) -> Vec<(usize, String, u64)> {
                 metadata, value, ..
             } => {
                 let label = String::from_utf8_lossy(metadata.label()).into_owned();
-                (!label.starts_with("positions ")).then_some((index, label, value))
+                // The sampling pass and the duty time move with every duty
+                // cycle, replay or not.
+                (!label.starts_with("positions ") && label != "conductor duty at")
+                    .then_some((index, label, value))
             }
             _ => None,
         })

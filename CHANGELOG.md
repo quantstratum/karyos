@@ -394,6 +394,47 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:
+  `karyos/design/cluster-dedup-and-snapshots.md` §2). `dedup::SessionTable`
+  is the replicated session table, driven only by applied entries: a
+  bounded window of replies per session (`Request` with its lowest
+  unanswered sequence; `Outcome::Applied`, `Retained`, `Duplicate`,
+  `WindowFull`, `OutOfOrder`, `ReplyTooLarge`), sessions refused when the
+  table is full and never evicted (`RegisterError::SessionsExhausted`),
+  session epochs assigned by the registering entry's log index
+  (`Registered`), so a late duplicate never revives a session, and expiry
+  by log time (`SessionExpired`). All
+  memory is allocated at `SessionTable::new`. `DedupConfig`'s defaults
+  (1024 sessions, 64 replies, 8 KiB, 60 s) are the proposal's interim
+  values until the owner decides (item 37). karyos-sim's `tests/dedup.rs`
+  checks retried, duplicated, late and expiring requests with C3's
+  checker.
+- Snapshots in karyos-cluster (phase 4, C8a; quantstratum-docs:
+  `karyos/design/cluster-dedup-and-snapshots.md` §3). `snapshot::SnapshotStore`
+  writes a snapshot as typed sections (`SectionKind`: consensus, sessions,
+  timers, guards, service; each with a version) into its own segment store,
+  syncs it, and only then publishes it by replacing the manifest
+  (`snapshot-manifest`: id, index, term, length, CRC-32C digest). It keeps
+  the newest `SnapshotConfig::keep` and removes the others' files.
+  `SnapshotConfig::log_floor` gives the first log index to keep with the
+  catch-up allowance, and `due` the entry and byte trigger. Recovery removes
+  every store the manifest does not name and reports a published snapshot
+  that no longer reads whole. The defaults (keep 2, a 1 GiB allowance, 1 Mi
+  entries, 256 MiB) are the proposal's interim values until the owner
+  decides (item 37). karyos-sim's `tests/snapshot_crash.rs` crashes the
+  disk at every operation and fails every flush.
+- The driver's CnC counters for tools and the management agent
+  (quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`, M1
+  and M2). M1: `driver pid` (in the driver's own pid namespace), `driver
+  started at` and `conductor duty at` (host `CLOCK_MONOTONIC`). M2: the
+  network agents' system counters as driver-wide event cells, each written
+  only by its agent at the end of its duty cycle in every threading mode:
+  `network controls sent`, `network control send failures`, `naks
+  received`, `status messages received`, `heartbeats sent`, `datagrams
+  received`, `datagrams dropped by backend`, `invalid frames received`,
+  `status messages sent` and `images retired at timeout`. Closing the
+  network frees them.
+
 - karyos-sim harness: phase 5 membership scenarios, batch P5-S1
   (quantstratum-docs: `karyos/design/phase-5-cluster-scenarios.md`;
   ADR-0054). `ConsensusCore` gains two provided methods,
