@@ -70,6 +70,14 @@ pub struct Detail {
     pub value: u64,
 }
 
+/// The size of `karyos_client_options` in ABI 0.1.0: the smallest a
+/// caller built against any 0.y header passes. A later minor version adds
+/// fields after it, and an older caller's smaller struct still connects,
+/// with the defaults for what it lacks (SPEC.md §13, ABI compatibility).
+const CLIENT_OPTIONS_SIZE_0_1: u32 = 40;
+/// The size of `karyos_detail` in ABI 0.1.0, likewise.
+const DETAIL_SIZE_0_1: u32 = 24;
+
 /// The size of `T` as the `size` field states it.
 fn size_of_u32<T>() -> u32 {
     u32::try_from(size_of::<T>()).unwrap_or(u32::MAX)
@@ -91,7 +99,7 @@ unsafe fn write_detail(detail: *mut Detail, failure: Failure) {
     // `karyos_detail` (the caller's contract), whose first field is the
     // `uint32_t` size.
     let size = unsafe { detail.cast::<u32>().read() };
-    if size < size_of_u32::<Detail>() {
+    if size < DETAIL_SIZE_0_1 {
         return;
     }
     let written = Detail {
@@ -100,8 +108,39 @@ unsafe fn write_detail(detail: *mut Detail, failure: Failure) {
         code: failure.code,
         value: failure.value,
     };
-    // SAFETY: as above; the caller's struct is at least this version's.
-    unsafe { detail.write(written) };
+    // The prefix both versions share: an older caller's struct is
+    // smaller, a newer one's keeps its later fields.
+    let length = prefix(size, size_of_u32::<Detail>());
+    // SAFETY: the caller's struct is at least `size` writable bytes (its
+    // contract), `length` is at most `size` and at most the size of
+    // `written`, a local that does not overlap it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (&raw const written).cast::<u8>(),
+            detail.cast::<u8>(),
+            length,
+        );
+    };
+}
+
+/// The bytes of a growing struct both sides know: the smaller of the
+/// caller's `size` and this version's.
+fn prefix(size: u32, ours: u32) -> usize {
+    usize::try_from(size.min(ours)).unwrap_or(0)
+}
+
+/// `karyos_client_options` with the defaults and this version's size.
+fn default_options() -> ClientOptions {
+    let defaults = client::Options::defaults();
+    ClientOptions {
+        size: size_of_u32::<ClientOptions>(),
+        idle_strategy: defaults.idle_strategy,
+        dir: core::ptr::null(),
+        idle_sleep_ns: defaults.idle_sleep_ns,
+        timeout_ns: defaults.timeout_ns,
+        max_pending: defaults.max_pending,
+        max_images: defaults.max_images,
+    }
 }
 
 /// Writes the ABI version this library implements through `major`, `minor`
@@ -164,16 +203,7 @@ pub unsafe extern "C" fn karyos_client_options_init(options: *mut ClientOptions)
         if !writable(options) {
             return Status::InvalidArgument;
         }
-        let defaults = client::Options::defaults();
-        let filled = ClientOptions {
-            size: size_of_u32::<ClientOptions>(),
-            idle_strategy: defaults.idle_strategy,
-            dir: core::ptr::null(),
-            idle_sleep_ns: defaults.idle_sleep_ns,
-            timeout_ns: defaults.timeout_ns,
-            max_pending: defaults.max_pending,
-            max_images: defaults.max_images,
-        };
+        let filled = default_options();
         // SAFETY: `options` is non-null and aligned, and the caller's
         // contract makes it a writable `karyos_client_options`.
         unsafe { options.write(filled) };
@@ -214,11 +244,24 @@ pub unsafe extern "C" fn karyos_client_connect(
         // `karyos_client_options` (the caller's contract), whose first
         // field is the `uint32_t` size.
         let size = unsafe { options.cast::<u32>().read() };
-        if size < size_of_u32::<ClientOptions>() {
+        if size < CLIENT_OPTIONS_SIZE_0_1 {
             return Status::InvalidArgument;
         }
-        // SAFETY: as above; its size covers this version's struct.
-        let raw = unsafe { options.read() };
+        // Fields an older caller's struct lacks keep their defaults.
+        let mut raw = default_options();
+        let length = prefix(size, size_of_u32::<ClientOptions>());
+        // SAFETY: the caller's struct is at least `size` readable bytes
+        // (its contract), `length` is at most `size` and at most the size
+        // of `raw`, a local that does not overlap it; every field of 0.1.0
+        // lies within it (`size` is at least that version's), so `dir` is
+        // copied whole.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                options.cast::<u8>(),
+                (&raw mut raw).cast::<u8>(),
+                length,
+            );
+        };
         let dir = if raw.dir.is_null() {
             None
         } else {

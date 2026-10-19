@@ -135,9 +135,11 @@ fn a_client_handle_is_served_and_closed_once() {
     let handle = client::insert_embedded(Client::with_conductor(conductor, context)).unwrap();
     let raw = handle.raw();
 
-    let (status, served) = poll(raw);
-    assert_eq!(status, Status::Ok.code());
-    assert!(served <= 1);
+    // An idle client serves nothing: `served` is written as 0. A 1 needs
+    // a completion or an event, which F3 and F4's calls bring.
+    for _ in 0..4 {
+        assert_eq!(poll(raw), (Status::Ok.code(), 0));
+    }
     // SAFETY: a null `served` is refused before any use.
     let null_served = unsafe { karyos_client_poll(raw, core::ptr::null_mut()) };
     assert_eq!(null_served, Status::InvalidArgument.code());
@@ -147,4 +149,60 @@ fn a_client_handle_is_served_and_closed_once() {
     assert_eq!(karyos_client_close(raw), Status::Closed.code());
     assert_eq!(poll(raw), (Status::Closed.code(), u32::MAX));
     let _ = driver.do_work().unwrap();
+}
+
+#[test]
+fn the_0_1_sizes_are_this_version_s() {
+    // Today's structs are the first released ones; a field added later
+    // goes after them and leaves these constants alone.
+    assert_eq!(CLIENT_OPTIONS_SIZE_0_1, size_of_u32::<ClientOptions>());
+    assert_eq!(DETAIL_SIZE_0_1, size_of_u32::<Detail>());
+}
+
+#[test]
+fn a_struct_from_a_newer_header_is_read_and_written_by_its_prefix() {
+    /// Options with one field more, as a later minor version may add.
+    #[repr(C)]
+    struct Newer {
+        options: ClientOptions,
+        later: u64,
+    }
+    let newer = Newer {
+        options: ClientOptions {
+            size: size_of_u32::<Newer>(),
+            timeout_ns: 0,
+            ..defaults()
+        },
+        later: 7,
+    };
+    #[repr(C)]
+    struct NewerDetail {
+        detail: Detail,
+        later: u64,
+    }
+    let mut detail = NewerDetail {
+        detail: Detail {
+            size: size_of_u32::<NewerDetail>(),
+            reserved: 7,
+            code: 7,
+            value: 7,
+        },
+        later: 9,
+    };
+    let mut client = u64::MAX;
+    // SAFETY: live, aligned structs at least as large as their `size`.
+    let status = unsafe {
+        karyos_client_connect(
+            core::ptr::from_ref(&newer).cast(),
+            &mut client,
+            core::ptr::from_mut(&mut detail).cast(),
+        )
+    };
+    // The prefix was read: its zero timeout is refused.
+    assert_eq!(status, Status::InvalidContext.code());
+    assert_eq!((detail.detail.code, detail.detail.value), (0, 0));
+    // The newer field is left alone, and the caller's size kept.
+    assert_eq!(detail.later, 9);
+    assert_eq!(detail.detail.size, size_of_u32::<NewerDetail>());
+    assert_eq!(newer.later, 7);
 }

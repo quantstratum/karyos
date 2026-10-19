@@ -134,8 +134,9 @@ extern "C" {
 
 /**
  * What a failed control call adds to its status. The caller sets size to
- * sizeof(karyos_detail); a smaller size, or a null pointer, receives
- * nothing. Untouched on success.
+ * sizeof(karyos_detail) of the header it was built with; the library
+ * writes the fields both versions know. A size below that of ABI 0.1.0,
+ * or a null pointer, receives nothing. Untouched on success.
  */
 typedef struct karyos_detail {
     uint32_t size;
@@ -149,7 +150,10 @@ typedef struct karyos_detail {
 /**
  * A client's options, copied by karyos_client_connect. Fill it with
  * karyos_client_options_init, which sets size and the defaults, then set
- * dir. Zero timeout_ns, max_pending or max_images are invalid.
+ * dir. Zero timeout_ns, max_pending or max_images are invalid. A struct
+ * from an older header of the same major version is accepted: the fields
+ * it lacks take their defaults. A size below that of ABI 0.1.0 is
+ * KARYOS_E_INVALID_ARGUMENT.
  */
 typedef struct karyos_client_options {
     uint32_t size;
