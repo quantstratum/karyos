@@ -16,7 +16,6 @@
 //! 10), which compares two recording group journals ([`replay`]).
 
 pub mod args;
-pub mod capabilities;
 pub mod daemon;
 pub mod errors;
 pub mod idle;

@@ -398,9 +398,10 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos/design/management-agent-gap-analysis.md`, M6b): the conductor
   writes each endpoint's gauges inside a sampling pass on a new `capability
   pass` cell (same keys; odd while it writes, even after, with the
-  `begin_pass`/`end_pass` fences), and `karyos_tools::capabilities::
-  endpoint_capabilities` reads each group with `read_pass`, marking it
-  inconsistent when every attempt overlapped a write. The guard audit
+  `begin_pass`/`end_pass` fences), and `karyos_client::capabilities::
+  endpoint_capabilities` reads each group with `read_pass`, for tools and
+  the management agent alike, marking it inconsistent when every attempt
+  overlapped a write. The guard audit
   ring's losses are counted: `guard audit records overwritten` and `guard
   audit records dropped` (sequences exhausted).
 - Spin time per idle loop (counter type 3, `TYPE_SPIN_TIME`; SPEC §11;

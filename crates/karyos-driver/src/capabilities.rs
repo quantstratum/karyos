@@ -27,8 +27,8 @@
 //!   keys): odd while the conductor writes them, even after, with the
 //!   Release fences of `begin_pass` and `end_pass`. A reader takes them as
 //!   one with `karyos_sys::counters::read_pass` over that cell
-//!   (management-agent-gap-analysis.md, M6b; `karyos-tools`'
-//!   `capabilities` reads them so).
+//!   (management-agent-gap-analysis.md, M6b;
+//!   `karyos_client::capabilities` reads them so).
 //!
 //! Allocation happens only when an endpoint appears; a steady duty cycle
 //! compares epochs and writes nothing.

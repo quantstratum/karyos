@@ -5,7 +5,8 @@
 //! M3 and M6b): the gauges of one endpoint are written together inside a
 //! sampling pass on its `capability pass` cell, so they are read as one
 //! with [`read_pass`] over that cell, or reported inconsistent after a few
-//! attempts. Never waits.
+//! attempts. Never waits. It lives here, beside the tool attach, so both
+//! `karyos-tools` and the management agent read the groups the same way.
 
 use karyos_sys::counters::{CellRead, CountersReader, KIND_ENDPOINT, PassRead, read_pass};
 
@@ -17,6 +18,7 @@ const ATTEMPTS: usize = 8;
 
 /// One endpoint's capability gauges.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EndpointCapabilities {
     /// The endpoint's instance id (`key2`).
     pub endpoint: u64,
