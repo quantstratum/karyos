@@ -394,6 +394,27 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- karyos-sim harness: phase 5 membership scenarios, batch P5-S1
+  (quantstratum-docs: `karyos/design/phase-5-cluster-scenarios.md`;
+  ADR-0054). `ConsensusCore` gains two provided methods,
+  `configuration()` and `propose_change()`, whose defaults describe static
+  membership, so a phase 4 core implements neither; `Configuration`,
+  `Change` and `ChangeRefused` describe them. Servers record
+  `Observation::Configuration` at each start and after each change, and
+  `Observation::Change` for an operator's change. Cases gain `spares`
+  (servers that wait down until `Action::Join`), `Action::Change` (sent by an
+  operator node to every server that is up) and `promotion_lag`. The
+  reference fixture changes its membership with its fixed leader: one change
+  at a time, configuration entries that take effect when appended,
+  promotion within `PROMOTION_LAG`, a commit on a majority of the voters
+  alone, and the configuration rebuilt from the log at a restart. New checks
+  `quorum_of_voters`, `configuration_from_log` and `learner_caught_up` run
+  with every case (`check::membership`), and the reply check counts the
+  voters of a server that reports a configuration. Scenarios M1 (add and
+  promote, with a split that a core counting its learner would commit
+  through), M5 (a lagging learner refused, then promoted) and M8 (a restart
+  under an uncommitted configuration) run on the reference.
+
 - A group's checkpoints in the Archive agent (phase 3, A9-3).
   `StartGroup::checkpoints` (`GroupCheckpoints`: `max_checkpoint`, and
   `reopen_hold`) gives a group a checkpoint store in its journal

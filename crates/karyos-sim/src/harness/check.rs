@@ -3,12 +3,20 @@
 //! The checks of a recorded run (ADR-0043, Harness): the clients' history
 //! through C3's checker, and the safety properties over the
 //! [`Observation`]s. Each returns the first [`Violation`] it finds.
+//!
+//! **Membership** (phase 5; quantstratum-docs:
+//! karyos/design/phase-5-cluster-scenarios.md §5). Where a core reports
+//! its configuration, a majority is one of the voters the reporting
+//! server acts under, never of every server, and [`membership`] adds
+//! three checks: [`quorum_of_voters`], [`configuration_from_log`] and
+//! [`learner_caught_up`]. A core with static membership reports none, and
+//! they pass at once.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use karyos_cluster::Entry;
 
-use super::core::{Applying, Release, Step};
+use super::core::{Applying, Change, Configuration, Release, Step};
 use super::node::{Breach, Observation, Op, Positions, Ret, ServiceModel};
 use crate::lin::{self, History, HistoryError, Limit, Verdict};
 use crate::net::NodeId;
@@ -128,6 +136,50 @@ pub enum Violation {
         node: NodeId,
         /// The entry's index.
         index: u64,
+    },
+    /// A leader committed an entry fewer than a majority of its voters
+    /// held durably: learners or strangers were counted.
+    QuorumOfVoters {
+        /// The leader.
+        node: NodeId,
+        /// The commit index.
+        index: u64,
+        /// The entry's term.
+        term: u64,
+        /// The voters that held it durably.
+        holding: usize,
+        /// The configuration it acted under.
+        configuration: Box<Configuration>,
+    },
+    /// A restarted server's configuration is not the latest one its log
+    /// holds.
+    ConfigurationNotFromLog {
+        /// The server.
+        node: NodeId,
+        /// The latest configuration in its reopened log, `None` for the
+        /// bootstrap one.
+        expected: Option<Box<Configuration>>,
+        /// What its core reported.
+        found: Box<Configuration>,
+    },
+    /// One configuration entry (its index and term) reported as two
+    /// configurations.
+    ConfigurationConflict {
+        /// The entry's index.
+        index: u64,
+        /// The entry's term.
+        term: u64,
+    },
+    /// A leader promoted a learner further behind its commit than the lag.
+    LearnerBehind {
+        /// The leader.
+        node: NodeId,
+        /// The learner.
+        learner: NodeId,
+        /// Entries the learner held durably behind the leader's commit.
+        behind: u64,
+        /// The promotion lag.
+        lag: u64,
     },
 }
 
@@ -265,10 +317,57 @@ impl DurableLogs {
             .filter(|log| log.get(&index) == Some(&term))
             .count()
     }
+
+    /// The servers of `members` holding entry `index` of `term` durably.
+    fn holding_among(&self, members: &[NodeId], index: u64, term: u64) -> usize {
+        members
+            .iter()
+            .filter(|member| {
+                self.logs
+                    .get(member)
+                    .is_some_and(|log| log.get(&index) == Some(&term))
+            })
+            .count()
+    }
+}
+
+/// Whether a durable majority of `configuration`'s voters, and of its
+/// outgoing voters under joint consensus, holds entry `index` of `term`.
+fn voters_hold(logs: &DurableLogs, configuration: &Configuration, index: u64, term: u64) -> bool {
+    let majority = |members: &[NodeId]| {
+        members.is_empty() || logs.holding_among(members, index, term) > members.len() / 2
+    };
+    !configuration.voters.is_empty()
+        && majority(&configuration.voters)
+        && majority(&configuration.outgoing)
+}
+
+/// Each server's configuration, from its last [`Observation::Configuration`].
+#[derive(Debug, Default)]
+struct Configurations {
+    current: BTreeMap<NodeId, Configuration>,
+}
+
+impl Configurations {
+    fn observe(&mut self, observation: &Observation) {
+        if let Observation::Configuration {
+            node,
+            configuration,
+            ..
+        } = observation
+        {
+            let _ = self.current.insert(*node, configuration.clone());
+        }
+    }
+
+    fn of(&self, node: NodeId) -> Option<&Configuration> {
+        self.current.get(&node)
+    }
 }
 
 /// Every reply a server releases is for an entry (its index and term) a
-/// majority of the `servers` held durably at that moment.
+/// majority of the `servers` held durably at that moment; where the server
+/// reports its configuration, a majority of its voters (see the module).
 ///
 /// # Errors
 ///
@@ -278,8 +377,10 @@ pub fn durable_majority_before_reply(
     servers: usize,
 ) -> Result<(), Violation> {
     let mut logs = DurableLogs::default();
+    let mut configurations = Configurations::default();
     for observation in observations {
         let _ = logs.observe(observation);
+        configurations.observe(observation);
         if let Observation::Reply {
             node,
             client,
@@ -287,7 +388,14 @@ pub fn durable_majority_before_reply(
             term,
         } = observation
         {
-            let durable = logs.holding(*index, *term);
+            let (durable, servers) = match configurations.of(*node) {
+                Some(configuration) if !voters_hold(&logs, configuration, *index, *term) => (
+                    logs.holding_among(&configuration.voters, *index, *term),
+                    configuration.voters.len(),
+                ),
+                Some(_) => continue,
+                None => (logs.holding(*index, *term), servers),
+            };
             if durable <= servers / 2 {
                 return Err(Violation::ReplyBeforeDurableMajority {
                     node: *node,
@@ -513,6 +621,156 @@ pub fn released_after_persistence(observations: &[Observation]) -> Result<(), Vi
         }
     }
     Ok(())
+}
+
+/// A leader's commit index moves only to an entry a durable majority of
+/// the voters it acts under holds, of both sets under joint consensus: a
+/// learner never counts (ADR-0054). A server with no configuration is not
+/// checked.
+///
+/// # Errors
+///
+/// [`Violation::QuorumOfVoters`].
+pub fn quorum_of_voters(observations: &[Observation]) -> Result<(), Violation> {
+    let mut logs = DurableLogs::default();
+    let mut configurations = Configurations::default();
+    for observation in observations {
+        let _ = logs.observe(observation);
+        configurations.observe(observation);
+        if let Observation::Commit {
+            node,
+            leader: true,
+            index,
+            entry_term,
+            ..
+        } = observation
+            && let Some(configuration) = configurations.of(*node)
+            && !voters_hold(&logs, configuration, *index, *entry_term)
+        {
+            return Err(Violation::QuorumOfVoters {
+                node: *node,
+                index: *index,
+                term: *entry_term,
+                holding: logs.holding_among(&configuration.voters, *index, *entry_term),
+                configuration: Box::new(configuration.clone()),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A restarted server's core acts under the latest configuration its
+/// reopened log holds, committed or not, or the bootstrap one when it
+/// holds none (Raft's rule; ADR-0054). The configuration entries are
+/// known by the [`Observation::Configuration`]s every server reported
+/// with their entry's term, and one entry is one configuration.
+///
+/// # Errors
+///
+/// [`Violation::ConfigurationNotFromLog`] and
+/// [`Violation::ConfigurationConflict`].
+pub fn configuration_from_log(observations: &[Observation]) -> Result<(), Violation> {
+    let mut known: BTreeMap<(u64, u64), Configuration> = BTreeMap::new();
+    let mut reopened: BTreeMap<NodeId, Vec<(u64, u64)>> = BTreeMap::new();
+    for observation in observations {
+        match observation {
+            Observation::Recovered { node, entries, .. } => {
+                let _ = reopened.insert(*node, entries.clone());
+            }
+            Observation::Crashed { node } => {
+                let _ = reopened.remove(node);
+            }
+            Observation::Configuration {
+                node,
+                configuration,
+                entry_term,
+            } => {
+                if let (Some(index), Some(term)) = (configuration.index, *entry_term) {
+                    match known.get(&(index, term)) {
+                        Some(seen) if seen != configuration => {
+                            return Err(Violation::ConfigurationConflict { index, term });
+                        }
+                        Some(_) => {}
+                        None => {
+                            let _ = known.insert((index, term), configuration.clone());
+                        }
+                    }
+                }
+                // The first configuration after a restart is the one the
+                // core recovered.
+                if let Some(entries) = reopened.remove(node) {
+                    let expected = entries.iter().rev().find_map(|key| known.get(key)).cloned();
+                    let matches = match &expected {
+                        Some(expected) => expected == configuration,
+                        None => configuration.index.is_none(),
+                    };
+                    if !matches {
+                        return Err(Violation::ConfigurationNotFromLog {
+                            node: *node,
+                            expected: expected.map(Box::new),
+                            found: Box::new(configuration.clone()),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A leader accepts the promotion of a learner only when the learner held
+/// durably every entry up to `lag` entries below the leader's commit, by
+/// their last reported positions (a leader that knows less refuses more).
+///
+/// # Errors
+///
+/// [`Violation::LearnerBehind`].
+pub fn learner_caught_up(observations: &[Observation], lag: u64) -> Result<(), Violation> {
+    let mut positions: BTreeMap<NodeId, Positions> = BTreeMap::new();
+    for observation in observations {
+        match observation {
+            Observation::Positions {
+                node,
+                positions: at,
+            } => {
+                let _ = positions.insert(*node, *at);
+            }
+            Observation::Change {
+                node,
+                change: Change::Promote(learner),
+                result: Ok(()),
+            } => {
+                let commit = positions.get(node).and_then(|at| at.committed).unwrap_or(0);
+                let durable = positions
+                    .get(learner)
+                    .and_then(|at| at.durable)
+                    .unwrap_or(0);
+                let behind = commit.saturating_sub(durable);
+                if behind > lag {
+                    return Err(Violation::LearnerBehind {
+                        node: *node,
+                        learner: *learner,
+                        behind,
+                        lag,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The membership checks (see the module), with promotion lag `lag`.
+///
+/// # Errors
+///
+/// The first [`Violation`].
+pub fn membership(observations: &[Observation], lag: u64) -> Result<(), Violation> {
+    quorum_of_voters(observations)?;
+    configuration_from_log(observations)?;
+    learner_caught_up(observations, lag)
 }
 
 /// Every check of a run with `servers` servers.

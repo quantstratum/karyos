@@ -17,9 +17,13 @@
 //!   elections.
 //! - [`workloads`]: ADR-0043's workloads as generators of cases, a runner
 //!   and pass predicates, safety and liveness reported apart.
+//! - [`membership`]: the phase 5 membership scenarios a fixed leader can
+//!   run (quantstratum-docs: karyos/design/phase-5-cluster-scenarios.md,
+//!   P5-S1).
 
 pub mod check;
 pub mod core;
+pub mod membership;
 pub mod node;
 pub mod reference;
 pub mod workloads;

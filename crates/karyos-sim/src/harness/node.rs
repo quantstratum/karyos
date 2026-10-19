@@ -23,6 +23,11 @@
 //!   received is the core's last index, written or not; written and
 //!   durable are the log's; committed is the core's; applied is the
 //!   service's.
+//! - **Membership** (phase 5): an operator's [`Wire::Change`] goes to a
+//!   server's core, and the server records the core's answer
+//!   ([`Observation::Change`]) and every configuration the core reports
+//!   ([`Observation::Configuration`]). A core with static membership
+//!   reports none.
 //!
 //! [`ClusterSim`]: crate::cluster::ClusterSim
 
@@ -34,7 +39,10 @@ use std::rc::Rc;
 use karyos_archive::segment::Geometry;
 use karyos_cluster::{Entry, LogError, RaftLog};
 
-use super::core::{Applying, ConsensusCore, DriveError, LogView, Release, Step, drive};
+use super::core::{
+    Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, LogView, Release,
+    Step, drive,
+};
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
 use crate::lin::{self, History};
@@ -359,6 +367,29 @@ pub enum Observation {
         /// The error.
         error: String,
     },
+    /// A server's core reports a configuration: at each start, and after a
+    /// duty that changed it (before that duty's [`Observation::Commit`]).
+    /// Only a core that changes its membership reports one.
+    Configuration {
+        /// The server.
+        node: NodeId,
+        /// The configuration.
+        configuration: Configuration,
+        /// The term of the entry that set it, as the server's log holds it
+        /// then; `None` for the bootstrap configuration or an entry not
+        /// written yet.
+        entry_term: Option<u64>,
+    },
+    /// A server's core answered an operator's membership change.
+    Change {
+        /// The server.
+        node: NodeId,
+        /// The change.
+        change: Change,
+        /// The core's answer: accepted (appended, not yet committed) or
+        /// refused.
+        result: Result<(), ChangeRefused>,
+    },
 }
 
 /// What a core broke.
@@ -455,6 +486,9 @@ pub enum Wire<M> {
         /// The client's sequence number.
         sequence: u64,
     },
+    /// An operator's membership change, which the server's core takes or
+    /// refuses ([`Observation::Change`]); nothing answers it.
+    Change(Change),
 }
 
 /// A server: a core over C4's log on its own disk, and the test service.
@@ -469,6 +503,8 @@ pub struct ServerNode<C: ConsensusCore> {
     /// Requests this server took, by client and sequence: it answers them.
     pending: BTreeSet<(NodeId, u64)>,
     commit: Option<u64>,
+    /// The configuration last recorded.
+    configuration: Option<Configuration>,
     /// Why the disk cannot come back, when its crash could not be taken.
     lost: Option<String>,
     recorder: Shared,
@@ -492,7 +528,8 @@ impl<C: ConsensusCore> ServerNode<C> {
         let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
         let core = C::recover(id, &peers, &mut LogView::new(&mut log));
         let commit = core.committed();
-        Ok(Self {
+        let configuration = core.configuration();
+        let mut server = Self {
             id,
             peers,
             geometry,
@@ -502,9 +539,14 @@ impl<C: ConsensusCore> ServerNode<C> {
             service: TestService::default(),
             pending: BTreeSet::new(),
             commit,
+            configuration: None,
             lost: None,
             recorder,
-        })
+        };
+        if let Some(configuration) = configuration {
+            server.record_configuration(configuration, None);
+        }
+        Ok(server)
     }
 
     /// Server `id` of `peers` over the log already on `disk`, started as
@@ -528,6 +570,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             service: TestService::default(),
             pending: BTreeSet::new(),
             commit: None,
+            configuration: None,
             lost: None,
             recorder,
         };
@@ -636,6 +679,12 @@ impl<C: ConsensusCore> ServerNode<C> {
                 response,
             });
         }
+        if let Some(configuration) = core.configuration()
+            && self.configuration.as_ref() != Some(&configuration)
+        {
+            let entry_term = configuration.index.and_then(|index| log.term(index));
+            self.record_configuration(configuration, entry_term);
+        }
         let committed = core.committed();
         if committed > self.commit
             && let Some(index) = committed
@@ -651,6 +700,15 @@ impl<C: ConsensusCore> ServerNode<C> {
         }
         self.positions(&core, &log);
         self.running = Some((core, log));
+    }
+
+    fn record_configuration(&mut self, configuration: Configuration, entry_term: Option<u64>) {
+        self.observe(Observation::Configuration {
+            node: self.id,
+            configuration: configuration.clone(),
+            entry_term,
+        });
+        self.configuration = Some(configuration);
     }
 
     fn positions(&self, core: &C, log: &RaftLog<SimDisk>) {
@@ -706,6 +764,11 @@ impl<C: ConsensusCore> ServerNode<C> {
         // baseline, not a new commit.
         self.service = TestService::default();
         self.commit = core.committed();
+        // Recorded at every start, so a check compares it with the log.
+        if let Some(configuration) = core.configuration() {
+            let entry_term = configuration.index.and_then(|index| log.term(index));
+            self.record_configuration(configuration, entry_term);
+        }
         self.positions(&core, &log);
         self.running = Some((core, log));
     }
@@ -745,6 +808,17 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                         },
                     )),
                 }
+            }
+            Wire::Change(change) => {
+                let result = core.propose_change(change, &mut view);
+                self.recorder
+                    .borrow_mut()
+                    .observations
+                    .push(Observation::Change {
+                        node: self.id,
+                        change,
+                        result,
+                    });
             }
             Wire::Response { .. } | Wire::Refused { .. } => {}
         }
