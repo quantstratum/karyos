@@ -394,6 +394,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyos-ffi`, the C ABI crate (SPEC.md §10.2; ADR-0053, ADR-0067;
+  quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, batch F1). It
+  builds `libkaryos_ffi` as a shared, a static and a Rust library, with a
+  hand-written `include/karyos.h` that a test checks against the Rust source
+  until `cbindgen` is admitted. F1 exports `karyos_abi_version` (ABI 0.1.0)
+  and `karyos_status_message`, and defines the status codes, grouped by
+  range and mapped from the client's Rust errors, the bounded tables of
+  generation-tagged handles (a per-slot `try_lock`, so a call never blocks:
+  `KARYOS_E_BUSY` from another thread, `KARYOS_E_REENTRANT` from the same
+  one, `KARYOS_E_INTERNAL` after a panic poisoned the slot; a slot whose
+  generation cannot grow is retired) and the panic boundary. `unsafe` is
+  denied in the crate and expected only on `mod abi` and in the tests'
+  `support::abi`; `make lint-sync` checks that, the clippy set, and that no
+  profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- `karyos_protocol::cnc::ErrorCode::code` is public: the wire value of a
+  refusal code, which the C ABI reports as a detail.
 - Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:
   `karyos/design/cluster-dedup-and-snapshots.md` §2). `dedup::SessionTable`
   is the replicated session table, driven only by applied entries: a
