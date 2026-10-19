@@ -930,6 +930,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) net: Option<crate::net::Network<T>>,
     /// Each guard's word gauge (M4).
     guard_cells: crate::guards::GuardCells,
+    /// The conductor loop's spin meter until its loop takes it (M5).
+    spin_meter: Option<crate::spin::SpinMeter>,
     /// Each network endpoint's capability gauges (M3).
     capabilities: crate::capabilities::CapabilityCells,
     /// What clients created by channel URI, owned by their registrations
@@ -1280,7 +1282,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let network_cells = config
             .network
             .as_ref()
-            .map(|_| network_cells(&mut counters));
+            .map(|network| network_cells(&mut counters, network.threading));
+        // The conductor loop's spin meter (M5), for whoever drives
+        // `do_work`.
+        let spin_meter = crate::spin::SpinMeter::new(counters.take_conductor_spin());
         counters.set(Event::DriverPid, u64::from(std::process::id()));
         counters.set(
             Event::DriverStartedAt,
@@ -1331,6 +1336,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 guard_ring,
             ),
             guard_cells: crate::guards::GuardCells::default(),
+            spin_meter: Some(spin_meter),
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
             #[cfg(test)]
             guard_lane_fault: None,
@@ -2004,6 +2010,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     #[must_use]
     pub fn guard_audit(&self) -> crate::guards::Audit {
         self.guards.audit()
+    }
+
+    /// The spin meter of the loop that drives [`EmbeddedDriver::do_work`]
+    /// (`conductor spin time`, M5), once: that loop's idle strategy is its
+    /// only writer (`crate::spin`). `None` once taken.
+    pub fn take_spin_meter(&mut self) -> Option<crate::spin::SpinMeter> {
+        self.spin_meter.take()
     }
 
     /// The tools' guard audit ring (M4), as a tool reads it: every
@@ -4232,9 +4245,14 @@ fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), Dri
 /// [`crate::agents::SENDER_CELLS`] and [`crate::agents::RECEIVER_CELLS`]
 /// order; a cell the region has no room for is `None`, counted in
 /// `counters unavailable`.
+/// With the spin meters of the agents' idle loops (M5) for `threading`:
+/// none in Shared mode, whose loop is the conductor's; one per agent in
+/// Dedicated mode; the one loop's, on the sender, in SharedNetwork mode.
 fn network_cells(
     counters: &mut DriverCounters,
+    threading: crate::agents::ThreadingMode,
 ) -> (crate::agents::AgentCells, crate::agents::AgentCells) {
+    use crate::agents::ThreadingMode;
     let mut allocate = |labels: &[&str]| {
         crate::agents::AgentCells::new(
             labels
@@ -4243,10 +4261,25 @@ fn network_cells(
                 .collect(),
         )
     };
-    (
-        allocate(&crate::agents::SENDER_CELLS),
-        allocate(&crate::agents::RECEIVER_CELLS),
-    )
+    let sender = allocate(&crate::agents::SENDER_CELLS);
+    let receiver = allocate(&crate::agents::RECEIVER_CELLS);
+    let (sender_spin, receiver_spin) = match threading {
+        ThreadingMode::Shared => (None, None),
+        ThreadingMode::Dedicated => (Some("sender spin time"), Some("receiver spin time")),
+        ThreadingMode::SharedNetwork => (Some("network spin time"), None),
+    };
+    let mut meter = |label: Option<&str>| {
+        label.map(|label| {
+            crate::spin::SpinMeter::new(counters.allocate_keyed(
+                crate::counters::TYPE_SPIN_TIME,
+                label,
+                CounterKeys::DRIVER,
+            ))
+        })
+    };
+    let sender = sender.with_spin(meter(sender_spin));
+    let receiver = receiver.with_spin(meter(receiver_spin));
+    (sender, receiver)
 }
 
 /// One conductor duty cycle, its work added.

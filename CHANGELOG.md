@@ -394,6 +394,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Spin time per idle loop (counter type 3, `TYPE_SPIN_TIME`; SPEC §11;
+  quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`, M5,
+  under the coordinator's ruling recorded in `cnc-primitives.md`).
+  `karyos_driver::spin::SpinMeter` measures per spin run, two host clock
+  reads a run and never on the wake path, flushing every 1024 spins for a
+  loop that spins without end, into a driver-wide cell it alone writes:
+  `conductor spin time` (taken by the loop that drives `do_work` with
+  `EmbeddedDriver::take_spin_meter`; `karyosd`'s `BackoffIdle` reports it),
+  and per agent loop `sender spin time` and `receiver spin time`
+  (Dedicated) or `network spin time` (SharedNetwork).
+  `IdleStrategy::attach_spin_meter` hands a loop its meter; the default
+  `YieldThenSleep` never spins and reports 0. `BackoffIdle` is no longer
+  `Clone`.
 - Guards for tools and the management agent (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M4). Every guard
   transition, refusals included, is also appended to a guard audit ring

@@ -125,6 +125,9 @@ pub const TYPE_EVENTS: u64 = 1;
 pub const TYPE_GAUGE: u64 = 2;
 /// Type id of a stream position in bytes, sampled by the driver.
 pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
+/// Type id of an idle loop's spin time: lifetime host `CLOCK_MONOTONIC`
+/// nanoseconds in busy-spin phases (`crate::spin`, cnc-primitives.md).
+pub const TYPE_SPIN_TIME: u64 = 3;
 /// Type id of a host `CLOCK_MONOTONIC` time in nanoseconds.
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
@@ -196,8 +199,10 @@ const LABELS: [(u64, &str); 64] = [
     (TYPE_EVENTS, "capability missing"),
 ];
 
-/// The fixed counters, which every counters region must hold.
-pub(crate) const FIXED_COUNTERS: usize = LABELS.len();
+/// The fixed counters, which every counters region must hold: the labels,
+/// and the conductor loop's spin time cell (`crate::spin`), which its
+/// loop's meter writes and so is held apart.
+pub(crate) const FIXED_COUNTERS: usize = LABELS.len() + 1;
 
 /// One of the driver's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +377,8 @@ pub(crate) struct DriverCounters {
     manager: CountersManager,
     reader: CountersReader,
     counters: Vec<Counter>,
+    /// The conductor loop's spin time cell until its meter takes it.
+    spin: Option<Counter>,
 }
 
 impl DriverCounters {
@@ -417,11 +424,20 @@ impl DriverCounters {
             .map(|&(type_id, label)| manager.allocate(type_id, label))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| DriverError::InvalidConfig)?;
+        let spin = manager
+            .allocate(TYPE_SPIN_TIME, "conductor spin time")
+            .map_err(|_| DriverError::InvalidConfig)?;
         Ok(Self {
             manager,
             reader,
             counters,
+            spin: Some(spin),
         })
+    }
+
+    /// The conductor loop's spin time cell, once (`crate::spin`).
+    pub(crate) fn take_conductor_spin(&mut self) -> Option<Counter> {
+        self.spin.take()
     }
 
     /// Allocates a keyed counter outside the fixed set (inside a sampling
