@@ -107,6 +107,7 @@ impl<T: TermBytes> Drop for Replay<T> {
 /// A replay a [`ReplayProvider`] is asked for: lane 0 of a recording of
 /// `source`, over `[from, to)`, in bytes of the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplayRequest {
     /// The live stream's publication: the recording must be of it.
     pub source: PublicationIdentity,
@@ -116,6 +117,15 @@ pub struct ReplayRequest {
     /// reader's position when the merge is made, with no poll of it in
     /// between.
     pub to: u64,
+}
+
+impl ReplayRequest {
+    /// A replay of `source` over `[from, to)`.
+    #[must_use]
+    pub const fn new(source: PublicationIdentity, from: u64, to: u64) -> Self {
+        debug_assert!(from <= to, "a replay range ends at or after its start");
+        Self { source, from, to }
+    }
 }
 
 /// Why a [`ReplayProvider`] cannot hand out a replay.

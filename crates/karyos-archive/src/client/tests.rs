@@ -43,11 +43,7 @@ fn source() -> PublicationIdentity {
 }
 
 fn request(from: u64, to: u64) -> ReplayRequest {
-    ReplayRequest {
-        source: source(),
-        from,
-        to,
-    }
+    ReplayRequest::new(source(), from, to)
 }
 
 /// A recording the fake Archive lists.

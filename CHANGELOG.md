@@ -29,9 +29,12 @@ release may break APIs, wire formats and shared-memory layouts.
   The types the Archive's Gateway builds or matches (`PollSummary`,
   `PollError`, the loss reports, `RejoinOutcome`, `SecondaryOutcome`,
   `ReplayFallbackReason`) follow with karyos-archive's change;
-  `ScheduleCounters`, `link::Capability`, `ReplayRequest`, `link::Owner` and
-  `link::HandOverEntry` stay as they are for now, built or matched by the
-  driver.
+  `ScheduleCounters` and `link::Capability` stay as they are, closed driver
+  contracts.
+- `karyos-client`: `ReplayRequest`, `link::Owner` and `link::HandOverEntry`
+  are `#[non_exhaustive]`, built through constructors: `ReplayRequest::new`,
+  `Owner::new` and `HandOverEntry::new` (`with_generation` and
+  `with_publication` add its optional parts).
 - `karyos-archive` recordings handle a mapping cutover
   (mapping-generations.md, "Recordings"). `Frames` gains `Cutover { at }`
   (the source moved to the successor; the recording goes on at `at`,

@@ -229,10 +229,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let receiver = self.broadcast.receiver();
         let id = self.admit(consumer, Arc::clone(&link), None)?;
         Ok(ClientConductor::new(
-            Owner {
-                driver: self.id,
-                client: id,
-            },
+            Owner::new(self.id, id),
             producer,
             receiver,
             link,
@@ -1100,13 +1097,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let end = Arc::new(LeaseEnd::default());
                 let lease = Lease::acquire(&target.leases, &end);
                 self.next_registration = next;
-                link.hold(HandOverEntry {
-                    key: registration,
-                    capability,
-                    lease,
-                    generation,
-                    publication: Some(publication),
-                });
+                link.hold(
+                    HandOverEntry::new(registration, capability, lease)
+                        .with_generation(generation)
+                        .with_publication(publication),
+                );
                 let stream_id = target.id;
                 let incarnation = target.incarnation;
                 if let Some(next) = occupant_used {
