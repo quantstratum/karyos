@@ -366,6 +366,73 @@ fn closing_and_failing_one_side_leaves_the_other_clean() {
     exchange(&mut a, &mut d, &publication, &mut reader, 32);
 }
 
+/// The value of each allocated cell labelled `label`, with its keys.
+fn cells<T: StreamTerms>(
+    driver: &EmbeddedDriver<T>,
+    label: &str,
+) -> Vec<(u64, karyos_sys::counters::CounterKeys)> {
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .filter_map(|index| match reader.read(index) {
+            karyos_sys::counters::CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == label.as_bytes() => Some((value, metadata.keys)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// M2 (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`):
+/// the agents' system counters reach the CnC in every threading mode, as
+/// driver-wide cells (keys zero) that only the agent writes. The
+/// publisher's sender counts the receiver's SMs, the receiver counts the
+/// datagrams and sends SMs, and a cell only grows. Closing the network
+/// frees every cell.
+#[test]
+fn the_agents_counters_reach_the_cnc_in_every_mode() {
+    let labels = crate::agents::SENDER_CELLS
+        .iter()
+        .chain(&crate::agents::RECEIVER_CELLS);
+    for mode in [
+        ThreadingMode::Shared,
+        ThreadingMode::Dedicated,
+        ThreadingMode::SharedNetwork,
+    ] {
+        let (mut a, mut b) = (driver(mode), driver(mode));
+        for label in labels.clone() {
+            let found = cells(&a, label);
+            assert_eq!(found.len(), 1, "{mode:?}: {label}");
+            assert_eq!(found[0].1, karyos_sys::counters::CounterKeys::DRIVER);
+        }
+        let (publication, image) = connected(&mut a, &mut b, true, 10);
+        let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+        let mut lane = a
+            .publication(publication.lane(Lane::ZERO).unwrap())
+            .unwrap();
+        exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..64);
+        let value = |driver: &EmbeddedDriver, label| cells(driver, label)[0].0;
+        // Threads publish at the end of their cycle: wait for the counts.
+        pump(&mut [&mut a, &mut b], |drivers| {
+            value(drivers[1], "datagrams received") >= 64
+                && value(drivers[1], "status messages sent") > 0
+                && value(drivers[0], "status messages received") > 0
+        });
+        let received = value(&b, "datagrams received");
+        exchange_on(&mut a, &mut b, &mut lane, &mut reader, 64..96);
+        pump(&mut [&mut a, &mut b], |drivers| {
+            value(drivers[1], "datagrams received") >= received + 32
+        });
+        assert_eq!(value(&b, "invalid frames received"), 0, "{mode:?}");
+        for driver in [&mut a, &mut b] {
+            let shutdown = driver.close_network().unwrap();
+            assert!(shutdown.late.is_empty(), "{mode:?}");
+            for label in labels.clone() {
+                assert!(cells(driver, label).is_empty(), "{mode:?}: {label} kept");
+            }
+        }
+    }
+}
+
 /// E5: in steady state, a network cycle on either side allocates nothing.
 #[test]
 fn a_steady_network_cycle_allocates_nothing() {

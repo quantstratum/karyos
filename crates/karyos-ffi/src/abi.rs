@@ -11,7 +11,7 @@ use std::panic::catch_unwind;
 use std::path::PathBuf;
 
 use crate::api::client;
-use crate::boundary::guard;
+use crate::boundary::{drop_payload, guard};
 use crate::handles::Handle;
 use crate::status::{Failure, Status, UNKNOWN_CODE};
 
@@ -140,9 +140,13 @@ pub unsafe extern "C" fn karyos_abi_version(
 /// fixed text.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_status_message(status: i32) -> *const c_char {
-    catch_unwind(|| Status::from_code(status).map_or(UNKNOWN_CODE, Status::message))
-        .unwrap_or(UNKNOWN_CODE)
-        .as_ptr()
+    match catch_unwind(|| Status::from_code(status).map_or(UNKNOWN_CODE, Status::message)) {
+        Ok(text) => text.as_ptr(),
+        Err(payload) => {
+            drop_payload(payload);
+            UNKNOWN_CODE.as_ptr()
+        }
+    }
 }
 
 /// Fills `options` with the defaults: no directory, `KARYOS_IDLE_YIELD`,
