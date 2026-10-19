@@ -419,6 +419,45 @@ fn a_tool_notices_the_driver_exit() {
     assert_eq!(tool.counters().capacity(), capacity);
 }
 
+/// The read-only counters name the driver's process and show its liveness
+/// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+/// M1): `driver pid` is this process, `driver started at` is a host
+/// monotonic time no later than the tool's own reading, and `conductor
+/// duty at` advances with duty cycles and stands still without them.
+#[test]
+fn a_tool_reads_the_driver_pid_and_its_duty_time() {
+    let _serial = serial();
+    let dir = dir("liveness");
+    let mut driver = driver(&dir, 4);
+    let tool = attach_serving(&mut driver, &dir).unwrap();
+    let fixed = |label: &str| {
+        let reader = tool.counters();
+        (0..reader.capacity())
+            .find_map(|index| match reader.read(index) {
+                karyos_sys::counters::CellRead::Allocated {
+                    metadata, value, ..
+                } if metadata.label() == label.as_bytes() => Some(value),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(fixed("driver pid"), u64::from(std::process::id()));
+    let started = fixed("driver started at");
+    assert_ne!(started, 0);
+    assert!(started <= karyos_sys::host_clock::host_monotonic_ns());
+    // The attach was served by duty cycles.
+    let served = fixed("conductor duty at");
+    assert!(served >= started);
+    // Without a duty cycle the time stands still, however long the wait.
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(fixed("conductor duty at"), served);
+    let before = karyos_sys::host_clock::host_monotonic_ns();
+    let _ = driver.do_work().unwrap();
+    let after = fixed("conductor duty at");
+    assert!(after >= before);
+    assert!(after > served);
+}
+
 // ---- Rollback against a fake driver ----
 
 /// The five diagnostic regions of a fake driver, made by the same

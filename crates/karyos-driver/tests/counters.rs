@@ -65,7 +65,15 @@ fn counters_track_clients_commands_and_streams() {
     let all = snapshot(&driver);
     assert_eq!(all["commands served"].0, TYPE_EVENTS);
     assert_eq!(all["streams active"].0, TYPE_GAUGE);
-    assert!(all.values().all(|&(_, value)| value == 0));
+    // Every counter starts at 0 but the identity the driver sets at
+    // creation: its process id and its start time.
+    assert_eq!(all["driver pid"].1, u64::from(std::process::id()));
+    assert_ne!(all["driver started at"].1, 0);
+    assert!(
+        all.iter()
+            .filter(|(label, _)| !matches!(label.as_str(), "driver pid" | "driver started at"))
+            .all(|(_, &(_, value))| value == 0)
+    );
 
     let stream = driver.add_stream(stream_config(2)).unwrap();
     assert_eq!(value(&driver, "streams active"), 1);
