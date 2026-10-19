@@ -6,46 +6,61 @@ The language-neutral conformance suite of the C ABI (SPEC.md §10.2, §13;
 ADR-0053, ADR-0067) lives here, beside `karyos-ffi`. Its final format is
 an owner decision (owner item 46); this is the interim format the
 `karyos-ffi` runner and the bindings use until then (quantstratum-docs:
-`karyos/design/ffi-gap-analysis.md`, F6). It needs no parser library: a
-binding reads it with its standard library.
+`karyos/design/ffi-gap-analysis.md`, F6). A binding's runner can be
+written from this file alone, with its language's standard library; the
+Rust runner, `../tests/conformance.rs`, is the reference.
 
 ## Files
 
-- `scenarios/*.kcs`: one scenario per file, UTF-8, read line by line.
+- `scenarios/*.kcs`: one scenario per file, UTF-8, read line by line. A
+  file in `scenarios/` with another extension is a failure.
 - `index.txt`: the coverage map from the §13 contract rows to scenario
-  ids, with the rows no scenario covers yet and the batch that brings
-  them.
+  ids (Index, below).
 - The status names come from `../include/karyos.h` (`#define KARYOS_OK`,
   `#define KARYOS_E_*`); a runner reads them from the header of the
   library it tests, never from a copy.
 
-## Lines
+## Lines and tokens
 
-A `#` starts a comment that runs to the end of the line; blank lines are
-ignored. Every other line is a keyword and its tokens, separated by
-spaces. A token is a bare word, or a double-quoted string in which `\"`
-and `\\` are the only escapes.
+Outside a quoted string, `#` starts a comment that runs to the end of
+the line. A line that holds only whitespace or a comment is blank and is
+ignored everywhere, before `format` too. Every other line is a keyword
+followed by tokens.
+
+Tokens are separated by runs of whitespace: spaces and tabs. A token is
+a run of characters with no whitespace between them, in which a double
+quote opens a quoted string that runs to the next unescaped double
+quote. Inside a quoted string, whitespace and `#` are literal, and `\"`
+and `\\` are the only escapes; any other backslash, or a line that ends
+inside a string, is a failure. So `text="a # b"` is one token, the name
+`text`, `=`, and the quoted value.
 
 | Keyword | Tokens | Meaning |
 | --- | --- | --- |
-| `format` | `1` | The format version; the first line that is not a comment |
-| `id` | a dotted name | The scenario's id, unique in the suite |
+| `format` | `1` | The format version; the first line that is not blank |
+| `id` | a name without whitespace | The scenario's id, unique in the suite |
 | `abi` | `MAJOR.MINOR` | The ABI version the scenario needs |
-| `covers` | a quoted string | The §13 contract row it checks, as `index.txt` names it |
+| `covers` | one quoted string | The §13 contract row it checks, as `index.txt` names it |
 | `call` | a function name, then `name=value` arguments | Calls the C function |
 | `expect` | an optional status name, then `name=value` results | Checks the last call |
 
-`format`, `id`, `abi` and `covers` come once each, before the first
-`call`. Every `call` is followed by exactly one `expect`.
+`format`, `id`, `abi` and `covers` come once each, in any order after
+`format`, and all before the first `call`. Every `call` is followed by
+exactly one `expect`, before the next `call`. A scenario has at least one
+`call`. A `name=value` token splits at its first `=`, and a name given
+twice in one line is a failure.
 
 ## Values
 
-- An integer, decimal, optionally negative: `108`, `-1`.
-- `null`: a null pointer for a pointer argument.
+- An integer: decimal, optionally negative, within 64-bit signed range
+  (`108`, `-1`). An argument whose C type is narrower (such as the
+  `int32_t` `status`) and that does not fit it is a failure.
+- `null`: a null pointer, for a pointer argument.
 - A quoted string.
-- `$name`: a variable. In an `expect`, an unbound variable binds to the
-  result; a bound one is compared with it. In a `call`, a variable must
-  be bound.
+- `$name`: a variable. Variables live for one scenario and carry across
+  its steps. In an `expect`, an unbound variable binds to the result,
+  and a bound one is compared with it. In a `call`, a variable must be
+  bound by an earlier `expect` of the same scenario.
 
 ## Calls
 
@@ -57,14 +72,63 @@ The arguments and results of each function are those of the header:
 | Function | Arguments | Results |
 | --- | --- | --- |
 | `karyos_abi_version` | `major`, `minor`, `patch` (`null` only) | status, `major`, `minor`, `patch` |
-| `karyos_status_message` | `status` | `text` (no status) |
+| `karyos_status_message` | `status` (required) | `text` (no status) |
 
-An `expect` without a status name checks a call that returns no status.
 A result named in an `expect` that the call did not write is a failure.
+
+## Failures
+
+A scenario fails, and is reported as failed, on any of these:
+
+- an unknown `format`, keyword, function, argument or status name (a
+  status name the header does not define);
+- a header line repeated, missing, or after a `call`;
+- a `call` without its `expect`, an `expect` without a `call`, or no
+  `call` at all;
+- a malformed token or value (Lines and tokens, Values);
+- an unbound variable in a `call`;
+- a status that differs from the `expect`'s, an `expect` with a status
+  for a function that returns none, or one without a status for a
+  function that returns one;
+- a result that differs from the `expect`'s, or was not written.
 
 ## Versions
 
 A runner compares each scenario's `abi` with `karyos_abi_version()` of
-the library: a different major, or a newer minor than the library's, is
-reported as skipped, never as passed. A scenario whose `format` the
-runner does not know is a failure.
+the library. A scenario runs when the major versions are equal and:
+
+- before 1.0 (major 0), the minor versions are equal, because a `0.y`
+  minor may break (ffi-gap-analysis.md §4.5);
+- from 1.0 on, the scenario's minor is not newer than the library's,
+  because minors only add.
+
+Any other scenario is skipped, never reported as passed.
+
+## Reporting
+
+A runner reports every scenario id with one outcome: passed, failed or
+skipped, and for a failure the file and line of the step that failed.
+A binding release requires no failure and no skip at the ABI version it
+targets (SPEC.md §13).
+
+## Index
+
+`index.txt` holds one row per line, with `#` comments and blank lines as
+in scenarios:
+
+```text
+<row name>: <scenario id> [<scenario id> ...]
+<row name>: pending <batch or reason>
+```
+
+The row name is the text before the first `:`, trimmed, not empty and
+without `#`; rows are unique. After the `:` comes either one or more
+scenario ids separated by whitespace, or `pending` followed by the
+batch of ffi-gap-analysis.md (or the reason) that will cover the row.
+
+The map is checked both ways, and any breach is a failure:
+
+- every id a row lists names an existing scenario whose `covers` is that
+  row;
+- every scenario is listed by the row its `covers` names, so a scenario
+  appears under exactly one row.

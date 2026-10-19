@@ -12,7 +12,7 @@
 // Test helpers outside `#[test]` functions.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use karyos_ffi as _;
@@ -302,9 +302,22 @@ fn call(step: &Step, at: &str) -> Returned {
 }
 
 /// Runs a scenario; `false` when it was skipped for its ABI version.
+/// Whether a scenario for ABI `wanted` runs against a library of ABI
+/// `library` (FORMAT.md, Versions): the same major, and then for 1.0 and
+/// later a minor not newer than the library's, before 1.0 the same minor
+/// (a `0.y` minor may break).
+fn runs(wanted: (u32, u32), library: (u32, u32)) -> bool {
+    match (wanted, library) {
+        ((0, minor), (0, library_minor)) => minor == library_minor,
+        ((major, minor), (library_major, library_minor)) => {
+            major == library_major && minor <= library_minor
+        }
+    }
+}
+
 fn run(scenario: &Scenario, statuses: &BTreeMap<String, i32>, library: (u32, u32)) -> bool {
     let name = scenario.file.display();
-    if scenario.abi.0 != library.0 || scenario.abi.1 > library.1 {
+    if !runs(scenario.abi, library) {
         return false;
     }
     let mut variables: BTreeMap<String, Value> = BTreeMap::new();
@@ -370,27 +383,70 @@ fn scenarios() -> Vec<Scenario> {
 }
 
 /// The coverage map: each row's scenario ids, or `None` while pending.
-fn index() -> BTreeMap<String, Option<Vec<String>>> {
-    let text = std::fs::read_to_string(root().join("conformance/index.txt")).unwrap();
+type Index = BTreeMap<String, Option<Vec<String>>>;
+
+/// Parses `index.txt` (FORMAT.md, Index).
+fn parse_index(text: &str) -> Result<Index, String> {
     let mut rows = BTreeMap::new();
     for (number, line) in text.lines().enumerate() {
+        let at = number + 1;
         let line = line.split('#').next().unwrap_or_default().trim();
         if line.is_empty() {
             continue;
         }
         let (row, covered) = line
             .split_once(':')
-            .unwrap_or_else(|| panic!("index.txt:{}: no `:`", number + 1));
-        let covered = covered.trim();
-        let ids = if covered.starts_with("pending ") {
-            None
-        } else {
-            Some(covered.split_whitespace().map(str::to_owned).collect())
+            .ok_or_else(|| format!("index.txt:{at}: no `:`"))?;
+        let (row, covered) = (row.trim(), covered.trim());
+        if row.is_empty() {
+            return Err(format!("index.txt:{at}: empty row name"));
+        }
+        let ids = match covered.strip_prefix("pending") {
+            Some(batch) if batch.starts_with(char::is_whitespace) && !batch.trim().is_empty() => {
+                None
+            }
+            _ if covered.is_empty() => {
+                return Err(format!("index.txt:{at}: no ids and not pending"));
+            }
+            _ => Some(covered.split_whitespace().map(str::to_owned).collect()),
         };
-        let previous = rows.insert(row.trim().to_owned(), ids);
-        assert!(previous.is_none(), "index.txt:{}: row repeated", number + 1);
+        if rows.insert(row.to_owned(), ids).is_some() {
+            return Err(format!("index.txt:{at}: row `{row}` repeated"));
+        }
     }
-    rows
+    Ok(rows)
+}
+
+/// The two-way check of the index against the scenarios' `(id, covers)`
+/// (FORMAT.md, Index): ids are unique; every id a row lists exists and
+/// covers exactly that row; every scenario is listed by its row.
+fn check_index(scenarios: &[(String, String)], index: &Index) -> Result<(), String> {
+    let mut covers = BTreeMap::new();
+    for (id, row) in scenarios {
+        if covers.insert(id.as_str(), row.as_str()).is_some() {
+            return Err(format!("id {id} repeated"));
+        }
+    }
+    for (row, covered) in index {
+        for id in covered.iter().flatten() {
+            match covers.get(id.as_str()) {
+                None => return Err(format!("row `{row}` lists unknown scenario {id}")),
+                Some(own) if own != row => {
+                    return Err(format!("row `{row}` lists {id}, which covers `{own}`"));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    for (id, row) in scenarios {
+        let listed = index
+            .get(row)
+            .ok_or_else(|| format!("{id} covers `{row}`, which index.txt has no row for"))?;
+        if !listed.iter().flatten().any(|listed| listed == id) {
+            return Err(format!("{id} covers `{row}`, whose row does not list it"));
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -420,42 +476,47 @@ fn every_scenario_passes_at_the_library_abi_version() {
     ignore = "reads the suite's files, which Miri's isolation forbids"
 )]
 fn the_index_maps_every_scenario_and_every_id_exists() {
-    let scenarios = scenarios();
-    let mut ids = BTreeSet::new();
-    for scenario in &scenarios {
-        assert!(
-            ids.insert(scenario.id.clone()),
-            "id {} repeated",
-            scenario.id
-        );
+    let scenarios: Vec<(String, String)> = scenarios()
+        .into_iter()
+        .map(|scenario| (scenario.id, scenario.covers))
+        .collect();
+    let text = std::fs::read_to_string(root().join("conformance/index.txt")).unwrap();
+    let index = parse_index(&text).unwrap();
+    check_index(&scenarios, &index).unwrap();
+}
+
+#[test]
+fn the_index_check_refuses_a_map_that_lies() {
+    let scenarios = [
+        ("a".to_owned(), "row a".to_owned()),
+        ("b".to_owned(), "row b".to_owned()),
+    ];
+    let check = |text: &str| parse_index(text).and_then(|index| check_index(&scenarios, &index));
+    assert_eq!(check("row a: a\nrow b: b\nrow c: pending F4\n"), Ok(()));
+    for lie in [
+        // A row listing a scenario that covers another row (the probe of
+        // the #469 review).
+        "row a: a\nrow b: b\nrow c: a\n",
+        "row a: a b\nrow b: b\n",
+        // A scenario its row does not list, or with no row at all.
+        "row a: a\nrow b: pending F4\n",
+        "row a: a\n",
+        // An unknown id, a repeated row, a row with nothing after `:`,
+        // `pending` with no batch, a line without `:`.
+        "row a: a z\nrow b: b\n",
+        "row a: a\nrow a: a\nrow b: b\n",
+        "row a: a\nrow b: b\nrow c:\n",
+        "row a: a\nrow b: b\nrow c: pending\n",
+        "row a: a\nrow b: b\nrow c\n",
+    ] {
+        assert!(check(lie).is_err(), "accepted:\n{lie}");
     }
-    let index = index();
-    let mut indexed = BTreeSet::new();
-    for (row, covered) in &index {
-        for id in covered.iter().flatten() {
-            assert!(
-                ids.contains(id),
-                "index row `{row}` names unknown scenario {id}"
-            );
-            indexed.insert(id.clone());
-        }
-    }
-    for scenario in &scenarios {
-        assert!(
-            indexed.contains(&scenario.id),
-            "{} is not in index.txt",
-            scenario.id
-        );
-        let covered = index
-            .get(&scenario.covers)
-            .unwrap_or_else(|| panic!("{} covers unknown row `{}`", scenario.id, scenario.covers));
-        assert!(
-            covered.iter().flatten().any(|id| *id == scenario.id),
-            "{} covers `{}`, whose index line does not name it",
-            scenario.id,
-            scenario.covers
-        );
-    }
+    let repeated = [
+        ("a".to_owned(), "row a".to_owned()),
+        ("a".to_owned(), "row a".to_owned()),
+    ];
+    let index = parse_index("row a: a\n").unwrap();
+    assert!(check_index(&repeated, &index).is_err());
 }
 
 #[test]
@@ -476,6 +537,19 @@ fn the_parser_refuses_what_the_format_does_not_allow() {
     assert_eq!(value("-1", at), Value::Integer(-1));
     assert_eq!(value("$x", at), Value::Variable("x".to_owned()));
     assert_eq!(value("null", at), Value::Null);
+    // Tabs separate tokens like spaces.
+    assert_eq!(tokens("call\tf  x=1\t", at), ["call", "f", "x=1"]);
+    // Blank and comment lines may come before `format`.
+    let dir = std::env::temp_dir().join(format!("karyos-ffi-kcs-ok-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("ok.kcs");
+    std::fs::write(
+        &file,
+        "\n  # a comment\n\nformat 1\nid a\nabi 0.1\ncovers \"r\"\ncall f\nexpect\n",
+    )
+    .unwrap();
+    assert_eq!(parse(&file).id, "a");
+    let _ = std::fs::remove_dir_all(&dir);
     for broken in [
         "id x\nformat 1\n",
         "format 2\n",
@@ -501,7 +575,7 @@ fn the_parser_refuses_what_the_format_does_not_allow() {
     miri,
     ignore = "reads the suite's files, which Miri's isolation forbids"
 )]
-fn a_scenario_of_another_major_or_a_newer_minor_is_skipped() {
+fn a_scenario_of_another_abi_version_is_skipped() {
     let statuses = statuses();
     let step = Step {
         line: 1,
@@ -518,7 +592,13 @@ fn a_scenario_of_another_major_or_a_newer_minor_is_skipped() {
         steps: vec![step.clone()],
     };
     assert!(run(&scenario((0, 1)), &statuses, (0, 1)));
-    assert!(run(&scenario((0, 1)), &statuses, (0, 2)));
+    // Before 1.0 a minor may break: only the same `0.y` runs.
+    assert!(!run(&scenario((0, 1)), &statuses, (0, 2)));
     assert!(!run(&scenario((0, 2)), &statuses, (0, 1)));
     assert!(!run(&scenario((1, 0)), &statuses, (0, 1)));
+    // From 1.0 minors add: an older one runs, a newer one does not.
+    assert!(runs((1, 2), (1, 3)));
+    assert!(runs((1, 3), (1, 3)));
+    assert!(!runs((1, 4), (1, 3)));
+    assert!(!runs((2, 0), (1, 3)));
 }
