@@ -659,51 +659,29 @@ fn a_recording_continues_across_a_cutover_it_follows() {
     assert_eq!(read, data(0, 50));
 }
 
-/// A source fenced at a cutover follows the lap policy from the seal:
-/// with `Resume` it joins the successor at its head, the range between is
-/// a gap and the recording is incomplete; with `Stop`, and for a required
-/// recording, it ends at the seal, incomplete. Each duty reports it.
+/// A source fenced at a cutover ends the recording at the seal,
+/// incomplete and lapped, whatever its lap policy: a fenced reader has no
+/// cell past the seal to rejoin at. Each duty reports it.
 #[test]
-fn a_fenced_recording_follows_its_lap_policy_from_the_seal() {
+fn a_fenced_recording_ends_at_the_seal_whatever_its_lap_policy() {
     let script = vec![
         Script::Data(data(0, 30)),
         Script::Fenced,
         Script::Data(data(70, 20)),
         Script::Sealed,
     ];
-    let mut resumed = recorder(
-        FaultDisk::default(),
+    for mode in [
         Mode::Async {
             on_lap: OnLap::Resume,
         },
-        script.clone(),
-    );
-    resumed.source.head = Some(70);
-    // The fence ends its duty; the next one records the successor.
-    let duty = resumed.duty(1).unwrap();
-    assert!(duty.fenced);
-    assert_eq!(duty.ended, None);
-    let duty = resumed.duty(1).unwrap();
-    assert!(!duty.fenced);
-    assert_eq!(
-        duty.ended,
-        Some(Ended {
-            position: 90,
-            reason: StopReason::Normal,
-            incomplete: true
-        })
-    );
-    assert_eq!(resumed.source.resumed, [30]);
-    assert_eq!(resumed.store.gaps(), [(30, 70)]);
-
-    for mode in [
         Mode::Async {
             on_lap: OnLap::Stop,
         },
         Mode::Required,
     ] {
-        let mut stopped = recorder(FaultDisk::default(), mode, script.clone());
-        let duty = stopped.duty(1).unwrap();
+        let mut fenced = recorder(FaultDisk::default(), mode, script.clone());
+        fenced.source.head = Some(70);
+        let duty = fenced.duty(1).unwrap();
         assert!(duty.fenced);
         assert_eq!(
             duty.ended,
@@ -714,8 +692,8 @@ fn a_fenced_recording_follows_its_lap_policy_from_the_seal() {
             }),
             "{mode:?}"
         );
-        assert!(stopped.source.resumed.is_empty());
-        assert!(stopped.store.gaps().is_empty());
+        assert!(fenced.source.resumed.is_empty());
+        assert!(fenced.store.gaps().is_empty());
     }
 }
 

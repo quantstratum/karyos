@@ -16,7 +16,9 @@ use std::sync::{Arc, Weak};
 
 use karyos_client::{GenerationLink, LinkStatus, Successor};
 use karyos_sys::error::SysError;
-use karyos_sys::log_buffer::{Conductor, LogBuffer, LogBufferConfig, Role, SealState};
+use karyos_sys::log_buffer::{
+    Conductor, DEFAULT_CORRUPT_RETRIES, LogBuffer, LogBufferConfig, Role, SealState, SenderRead,
+};
 use karyos_sys::sizing::TermLength;
 use karyos_sys::term::Generation;
 
@@ -56,7 +58,17 @@ pub(crate) struct Member<T: StreamTerms> {
 pub(crate) enum MemberKind {
     Exclusive,
     Concurrent,
-    Subscriber { role: Role, cell: usize },
+    Subscriber {
+        role: Role,
+        cell: usize,
+    },
+    /// An Archive recording's reader, admitted as `occupant`
+    /// (mapping-generations.md, "Recordings").
+    Recording {
+        role: Role,
+        cell: usize,
+        occupant: u64,
+    },
     Feeder,
 }
 
@@ -263,6 +275,32 @@ impl<T: StreamTerms> Stream<T> {
                         Some(lease),
                     ))
                 }),
+                // A recording's successor cell is admitted as its predecessor
+                // was, under a subscriber's progress lease.
+                MemberKind::Recording {
+                    role,
+                    cell,
+                    occupant,
+                } => conductor
+                    .subscribe_as(role, role == Role::Required, occupant)
+                    .and_then(|inner| {
+                        let kind = MemberKind::Recording {
+                            role,
+                            cell: inner.cell(),
+                            occupant,
+                        };
+                        let reader = SenderRead::for_recording(inner, DEFAULT_CORRUPT_RETRIES)?;
+                        let lease = ProgressLease {
+                            cell,
+                            sampled: self.conductor.cell_position(cell),
+                            sampled_at: now,
+                        };
+                        Ok(Some((
+                            Successor::Recording(Box::new(reader)),
+                            kind,
+                            Some(lease),
+                        )))
+                    }),
                 MemberKind::Feeder => conductor.subscribe(Role::Required).map(|inner| {
                     let scratch =
                         vec![0u8; inner.buffer().max_message_length() as usize].into_boxed_slice();
@@ -456,12 +494,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .is_some_and(|net| net.publication_state(registration).is_some())
         {
             return Err(DriverError::NetworkCutover { stream: id });
-        }
-        // A recording's reader follows one mapping too; following
-        // successors is a later step (A4c-2 review).
-        let target = self.active_stream_mut(stream)?;
-        if target.recordings.load(std::sync::atomic::Ordering::Acquire) > 0 {
-            return Err(DriverError::RecordingCutover { stream: id });
         }
         let target = self.active_stream_mut(stream)?;
         // An image's lane is written by the receive owner through the

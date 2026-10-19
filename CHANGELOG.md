@@ -49,20 +49,29 @@ release may break APIs, wire formats and shared-memory layouts.
   are `#[non_exhaustive]`, built through constructors: `ReplayRequest::new`,
   `Owner::new` and `HandOverEntry::new` (`with_generation` and
   `with_publication` add its optional parts).
-- `karyos-archive` recordings handle a mapping cutover
-  (mapping-generations.md, "Recordings"). `Frames` gains `Cutover { at }`
-  (the source moved to the successor; the recording goes on at `at`,
-  with no gap) and `Fenced { at }` (the source cannot follow it). A
-  fenced recording follows its lap policy from the seal: `resume` joins
-  the successor's head with a gap and marks the recording incomplete;
-  `stop`, and a required recording, end at the seal, incomplete, with
-  `StopReason::Lapped`. `Duty::fenced` reports it and
+- Recordings follow a mapping cutover (mapping-generations.md,
+  "Recordings"). The driver makes a recording reader a member of the
+  stream's cutovers: `recording_reader` registers it with a
+  `GenerationLink` (`RecordingReader::link`, `RecordingReader::base`;
+  `RecordingReader::into_following_parts` returns the reader, the link,
+  the base and the lease), and
+  a cutover offers it a successor recording cell (`Successor::Recording`)
+  under a subscriber's progress lease. `DriverError::RecordingCutover` is
+  removed: a recorded stream can be reconfigured. **A host must wire its
+  recordings through `into_following_parts` and
+  `Guarded::new(Following::new(reader, link, base), lease)`**: a reader
+  taken with `into_parts` has no link, so where a cutover used to be
+  refused, it now fences that reader and its recording ends at the seal,
+  `Lapped`. `karyos-archive`'s
+  `source::Following` reads stream positions across the cutovers: at a
+  seal with a successor it moves and reports `Frames::Cutover`, and the
+  recording goes on with no gap; fenced, it reports `Frames::Fenced`, and
+  the recording ends at the seal, incomplete, with `StopReason::Lapped`,
+  whatever its lap policy. `Duty::fenced` reports it and
   `ArchiveHandle::fenced_recordings` counts it; the segment format does
-  not change. `SenderRead::sealed_with_successor` lets the recording
-  source tell a seal for a cutover from a final one. The driver still
-  refuses a cutover of a recorded stream (`RecordingCutover`), so a
-  recording source is fenced at a seal for a cutover until recordings
-  get a successor cell.
+  not change. `karyos-client` exposes `GenerationLink::next` and its
+  `Next` outcome (`#[non_exhaustive]`), and `karyos-sys` adds
+  `SenderRead::buffer` and `SenderRead::sealed_with_successor`.
 - `karyos-archive` recovery gains a dry run: `SegmentStore::verify`
   returns a `RecoveryPlan` (the kept segment as a `KeptSegment`, the
   `Cut`, and each removed segment as a `DroppedSegment` with its

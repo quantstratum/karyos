@@ -305,10 +305,9 @@ fn a_copy_buffer_off_the_stride_still_records() {
     );
 }
 
-/// Gap 6: a lane sealed for a cutover is a seal with a successor. A
-/// recording's reader has no link to follow it yet, so the source is
-/// fenced there: the recording ends at the seal, incomplete, where a final
-/// seal ends it normally.
+/// Gap 6: a lane sealed for a cutover is a seal with a successor. A bare
+/// reader, with no link to follow it, is fenced there: the recording
+/// ends at the seal, incomplete, where a final seal ends it normally.
 #[test]
 fn a_seal_for_a_cutover_fences_the_recording_where_a_final_seal_ends_it() {
     for cutover in [false, true] {

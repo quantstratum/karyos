@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karyos_sys::log_buffer::{
     ConcurrentPublication, LogBuffer, PreparedConcurrentPublication, PreparedPublication,
-    PreparedSubscription, Publication, Subscription,
+    PreparedSubscription, Publication, SenderRead, Subscription,
 };
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
@@ -66,6 +66,10 @@ pub enum Successor<T: TermBytes = HeapTerms> {
         /// The copy buffer.
         scratch: Box<[u8]>,
     },
+    /// A recording reader's cell of the successor (mapping-generations.md,
+    /// "Recordings"), its read capability built by the driver on the
+    /// control path.
+    Recording(Box<SenderRead<Arc<LogBuffer<T>>>>),
     /// A remote grant's exclusive publication, prepared on the control path
     /// and activated by the handle at the seal.
     PreparedPublication {
@@ -102,6 +106,7 @@ impl<T: TermBytes> Successor<T> {
             Self::Publication(inner) => inner.buffer(),
             Self::Concurrent(inner) => inner.buffer(),
             Self::Subscription { inner, .. } => inner.buffer(),
+            Self::Recording(inner) => inner.buffer(),
             Self::PreparedPublication { prepared, .. } => prepared.buffer(),
             Self::PreparedConcurrent { prepared, .. } => prepared.buffer(),
             Self::PreparedSubscription { prepared, .. } => prepared.buffer(),
@@ -172,11 +177,17 @@ struct Inner<T: TermBytes = HeapTerms> {
 
 /// What a handle finds when its mapping ended.
 #[derive(Debug)]
-pub(crate) enum Next<T: TermBytes = HeapTerms> {
+#[non_exhaustive]
+pub enum Next<T: TermBytes = HeapTerms> {
     /// The cutover is pending: retry later.
     Wait,
     /// Moved: the successor and its base, now the handle's.
-    Moved { base: u64, successor: Successor<T> },
+    Moved {
+        /// The successor's base: the stream position of its first byte.
+        base: u64,
+        /// The successor capability.
+        successor: Successor<T>,
+    },
     /// No successor will come: fenced, or a seal without a successor.
     End,
 }
@@ -336,7 +347,7 @@ impl<T: TermBytes> GenerationLink<T> {
     /// whose seal marks a successor, whose control path has not heard of
     /// the cutover yet. A remote handle whose retired slot is still full
     /// waits until its control path empties it.
-    pub(crate) fn next(&self, successor: bool) -> Next<T> {
+    pub fn next(&self, successor: bool) -> Next<T> {
         let mut inner = self.lock();
         if self.remote && inner.retired.is_some() && matches!(inner.state, State::Offered { .. }) {
             return Next::Wait;
