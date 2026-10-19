@@ -433,6 +433,54 @@ fn the_agents_counters_reach_the_cnc_in_every_mode() {
     }
 }
 
+/// M3 (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+/// SPEC §16.8): each network endpoint's effective capabilities reach the
+/// CnC as gauges keyed by participant kind endpoint and its instance id,
+/// and closing the network frees them.
+#[test]
+fn endpoint_capabilities_reach_the_cnc() {
+    use karyos_sys::counters::{CellRead, KIND_ENDPOINT};
+    let endpoint_cells = |driver: &EmbeddedDriver| {
+        let reader = driver.counters();
+        (0..reader.capacity())
+            .filter_map(|index| match reader.read(index) {
+                CellRead::Allocated {
+                    metadata, value, ..
+                } if metadata.keys.kind == KIND_ENDPOINT => Some((
+                    metadata.keys.participant,
+                    String::from_utf8(metadata.label().to_vec()).unwrap(),
+                    value,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let _ = connected(&mut a, &mut b, true, 10);
+    for driver in [&mut a, &mut b] {
+        let cells = endpoint_cells(driver);
+        assert!(!cells.is_empty());
+        let value = |label: &str| {
+            cells
+                .iter()
+                .find(|(_, name, _)| name == label)
+                .map(|(_, _, value)| *value)
+                .unwrap()
+        };
+        assert_ne!(cells[0].0, 0, "keyed by the endpoint's instance");
+        assert_eq!(value("capability epoch"), 1);
+        let platform = if cfg!(target_os = "linux") { 1 } else { 2 };
+        assert_eq!(value("capability platform"), platform);
+        // The baseline observes receives in user space, actively.
+        assert_eq!(value("capability user observations"), 1);
+        // No UDP segmentation offload in the baseline: unavailable for
+        // lack of a library API, reported but not counted as missing.
+        assert_eq!(value("capability gso"), 3 | 3 << 8);
+        let _ = driver.close_network().unwrap();
+        assert!(endpoint_cells(driver).is_empty());
+    }
+}
+
 /// E5: in steady state, a network cycle on either side allocates nothing.
 #[test]
 fn a_steady_network_cycle_allocates_nothing() {

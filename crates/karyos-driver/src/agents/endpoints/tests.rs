@@ -17,6 +17,7 @@ use std::num::NonZeroU16;
 use karyos_io::backend::{
     Authority, Commit, SenderToken, TxBackend, TxFrame, TxOptions, TxQueueConfig,
 };
+use karyos_io::sockets::endpoint::CapabilitySet;
 use karyos_io::sockets::scripted::ScriptedSocket;
 
 use super::super::{AgentRunner, ThreadingMode, YieldThenSleep, network_agents};
@@ -379,7 +380,16 @@ fn a_loopback_endpoint_opens_resets_and_retires() {
     // Port 0 resolved by the kernel: a reset keeps that port (ACS 15721).
     let bound = endpoints.local_address(id).unwrap();
     assert_ne!(bound.port(), 0);
-    for _ in 0..3 {
+    // The table keeps each epoch's capabilities (M3).
+    let epoch = |endpoints: &Endpoints<OsSocket>| {
+        let all: Vec<_> = endpoints.capabilities().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, id);
+        assert_eq!(all[0].1.local, bound);
+        all[0].1.epoch.get().get()
+    };
+    assert_eq!(epoch(&endpoints), 1);
+    for reset in 0..3 {
         endpoints.reset(&links, id).unwrap();
         assert_eq!(
             settle(&mut agents, &links, &mut endpoints, 1),
@@ -389,7 +399,9 @@ fn a_loopback_endpoint_opens_resets_and_retires() {
             }]
         );
         assert_eq!(endpoints.local_address(id), Some(bound));
+        assert_eq!(epoch(&endpoints), reset + 2);
     }
+    assert_eq!(endpoints.missing(), 0);
     endpoints.retire(&links, id).unwrap();
     assert_eq!(
         settle(&mut agents, &links, &mut endpoints, 1),
@@ -575,4 +587,71 @@ fn a_clock_stepped_back_does_not_defer_resets() {
     endpoints.requested(&links, id, 50 * SEC);
     assert_eq!(endpoints.counters().resets, 2);
     assert_eq!(endpoints.counters().resets_deferred, 0);
+}
+
+/// An open refused because a required capability is not active counts in
+/// `missing` (`capability missing`, SPEC §16.8, M3); another refusal does
+/// not.
+#[test]
+fn a_required_capability_refusal_counts_as_missing() {
+    use karyos_io::backend::Capability;
+    use karyos_io::sockets::OsSocket;
+    let agent_config = AgentConfig::default();
+    let (_agents, links) = network_agents::<OsSocket>(agent_config).unwrap();
+    let mut endpoints = Endpoints::new(&agent_config);
+    let config = SocketsConfig {
+        // The baseline has no UDP segmentation offload.
+        require: CapabilitySet::EMPTY.with(Capability::Gso),
+        ..config()
+    };
+    assert!(matches!(
+        endpoints.open(&links, config, OsSocket::new()),
+        Err(EndpointError::Open(OpenError::RequiredCapability {
+            capability: Capability::Gso,
+            ..
+        }))
+    ));
+    assert_eq!(endpoints.missing(), 1);
+    assert_eq!(endpoints.capabilities().count(), 0);
+    let used = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let taken = SocketsConfig::new(used.local_addr().unwrap());
+    assert!(endpoints.open(&links, taken, OsSocket::new()).is_err());
+    assert_eq!(endpoints.missing(), 1);
+}
+
+/// A reopen refused for a required capability fails the endpoint and counts
+/// in `missing` (`capability missing`, M3), as an open's refusal does.
+#[test]
+fn a_reopen_refused_for_a_required_capability_counts_as_missing() {
+    use karyos_io::backend::{Capability, CapabilityState, Reason};
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let socket = ScriptedSocket::new();
+    // The open's probes, then a reopen whose required TX batching is gone.
+    let _ = socket
+        .push_open(Ok(karyos_io::sockets::scripted::default_probes(&config())))
+        .push_open(Err(OpenError::RequiredCapability {
+            capability: Capability::TxBatch,
+            state: CapabilityState::Fallback(Reason::Platform),
+        }));
+    let id = endpoints.open(&links, config(), socket).unwrap();
+    assert_eq!(
+        settle(&mut agents, &links, &mut endpoints, 1),
+        [EndpointEvent::Opened(id)]
+    );
+    assert_eq!(endpoints.missing(), 0);
+    endpoints.reset(&links, id).unwrap();
+    let events = settle(&mut agents, &links, &mut endpoints, 1);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [EndpointEvent::Failed {
+                endpoint,
+                error: EndpointError::Open(OpenError::RequiredCapability { .. }),
+            }] if *endpoint == id
+        ),
+        "{events:?}"
+    );
+    assert_eq!(endpoints.missing(), 1);
+    assert_eq!(endpoints.capabilities().count(), 0);
 }

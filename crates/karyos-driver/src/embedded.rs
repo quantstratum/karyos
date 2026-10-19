@@ -928,6 +928,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) guard_lane_fault: Option<usize>,
     /// The network agents and their tables, when configured.
     pub(crate) net: Option<crate::net::Network<T>>,
+    /// Each network endpoint's capability gauges (M3).
+    capabilities: crate::capabilities::CapabilityCells,
     /// What clients created by channel URI, owned by their registrations
     /// (W5b): at most `NetworkConfig::max_owned_per_client` per client,
     /// preallocated for every client.
@@ -1308,6 +1310,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             })),
             owned_refusals: 0,
             owned_refusals_overflowed: false,
+            capabilities: crate::capabilities::CapabilityCells::default(),
             // Last: a driver that fails to build starts no agent.
             net: config
                 .network
@@ -3676,6 +3679,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Ok(work) => (work, None),
             Err(error) => (0, Some(error)),
         };
+        // The endpoints' capabilities after their opens and resets (M3).
+        let (snapshots, missing) = net.endpoint_capabilities();
+        self.capabilities
+            .sync(&mut self.counters, snapshots, missing);
         // Subscriptions created since the last cycle learn of the images
         // already there first; the cycle's image events then go to every
         // announced subscription, so none is told twice.
@@ -4015,6 +4022,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         for cell in net.take_cells() {
             self.counters.free(cell);
         }
+        self.capabilities.close(&mut self.counters);
         // The closed network released every tracked guard sender: none of
         // them stays in a close acknowledgement.
         shutdown.guard_senders_released = self.deregister_released_guards();
@@ -4181,7 +4189,6 @@ fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), Dri
     Ok(())
 }
 
-/// One conductor duty cycle, its work added.
 /// The network agents' driver-wide CnC cells (`quantstratum-docs:
 /// karyos/design/management-agent-gap-analysis.md`, M2), in
 /// [`crate::agents::SENDER_CELLS`] and [`crate::agents::RECEIVER_CELLS`]
@@ -4204,6 +4211,7 @@ fn network_cells(
     )
 }
 
+/// One conductor duty cycle, its work added.
 fn duty<T: TermBytes>(
     counters: &DriverCounters,
     work: &mut u32,

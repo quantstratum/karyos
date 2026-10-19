@@ -38,7 +38,7 @@
 
 use karyos_io::backend::{InstanceId, OpenError, TxEntry, TxReport};
 use karyos_io::sockets::endpoint::{
-    Retired, SocketsConfig, SocketsEndpoint, SocketsRx, SocketsTx, SplitFailure,
+    CapabilitySnapshot, Retired, SocketsConfig, SocketsEndpoint, SocketsRx, SocketsTx, SplitFailure,
 };
 use karyos_io::sockets::ops::SocketOps;
 use karyos_sys::host_clock::age_ns;
@@ -197,6 +197,8 @@ struct Entry<O: SocketOps> {
     config: SocketsConfig,
     /// The bound local address of the current epoch.
     local: std::net::SocketAddr,
+    /// The effective capabilities of the current epoch.
+    capabilities: CapabilitySnapshot,
     state: State<O>,
     /// The least interval between two requested resets (ns).
     backoff: u64,
@@ -253,6 +255,9 @@ pub struct Endpoints<O: SocketOps> {
     next: Option<InstanceId>,
     report: TxReport,
     counters: EndpointCounters,
+    /// Opens and reopens refused for a required capability
+    /// (`capability missing`, SPEC §16.8); checked, never wraps.
+    missing: u64,
 }
 
 impl<O: SocketOps> std::fmt::Debug for Endpoints<O> {
@@ -292,6 +297,32 @@ impl<O: SocketOps> Endpoints<O> {
             next: Some(InstanceId::FIRST),
             report: TxReport::new(),
             counters: EndpointCounters::default(),
+            missing: 0,
+        }
+    }
+
+    /// Each endpoint's effective capabilities of its current epoch, failing
+    /// ones included (M3: the conductor publishes them to tools).
+    pub fn capabilities(&self) -> impl Iterator<Item = (EndpointId, &CapabilitySnapshot)> + '_ {
+        self.entries
+            .iter()
+            .map(|entry| (entry.id, &entry.capabilities))
+    }
+
+    /// Opens and reopens refused because a required capability was not
+    /// active (`capability missing`, SPEC §16.8).
+    #[must_use]
+    pub fn missing(&self) -> u64 {
+        self.missing
+    }
+
+    /// Counts `error` in [`Endpoints::missing`] when a required capability
+    /// refused the open; a count at `u64::MAX` stays there.
+    fn count_missing(&mut self, error: &OpenError) {
+        if matches!(error, OpenError::RequiredCapability { .. })
+            && let Some(next) = self.missing.checked_add(1)
+        {
+            self.missing = next;
         }
     }
 
@@ -354,9 +385,12 @@ impl<O: SocketOps> Endpoints<O> {
         let to_sender = links.sender.prepare().map_err(EndpointError::Agent)?;
         let to_receiver = links.receiver.prepare().map_err(EndpointError::Agent)?;
         let instance = self.next.ok_or(EndpointError::Exhausted)?;
-        let endpoint =
-            SocketsEndpoint::open(&config, instance, ops).map_err(EndpointError::Open)?;
-        let local = endpoint.capabilities().local;
+        let endpoint = SocketsEndpoint::open(&config, instance, ops).map_err(|error| {
+            self.count_missing(&error);
+            EndpointError::Open(error)
+        })?;
+        let capabilities = *endpoint.capabilities();
+        let local = capabilities.local;
         // The counter only moves forward: a later failure wastes the id.
         self.next = instance.next().ok();
         // A refused split drops the endpoint, which closes its socket.
@@ -390,6 +424,7 @@ impl<O: SocketOps> Endpoints<O> {
                     id,
                     config,
                     local,
+                    capabilities,
                     backoff: RESET_BACKOFF_MIN,
                     last_reset: None,
                     deferred: false,
@@ -406,6 +441,7 @@ impl<O: SocketOps> Endpoints<O> {
             id,
             config,
             local,
+            capabilities,
             state,
             backoff: RESET_BACKOFF_MIN,
             last_reset: None,
@@ -818,10 +854,11 @@ impl<O: SocketOps> Endpoints<O> {
                     .and_then(|returned| {
                         endpoint
                             .reopen(&config)
+                            .copied()
                             .map_err(EndpointError::Open)
                             .and_then(|snapshot| {
                                 if snapshot.local == bound {
-                                    Ok((returned, snapshot.local))
+                                    Ok((returned, snapshot))
                                 } else {
                                     Err(EndpointError::AddressChanged {
                                         expected: bound,
@@ -830,20 +867,24 @@ impl<O: SocketOps> Endpoints<O> {
                                 }
                             })
                     })
-                    .and_then(|(returned, local)| {
+                    .and_then(|(returned, snapshot)| {
                         endpoint
                             .split()
-                            .map(|halves| (halves, returned, local))
+                            .map(|halves| (halves, returned, snapshot))
                             .map_err(|error| EndpointError::Split(error.error))
                     });
                 match outcome {
-                    Ok(((tx, rx), returned, local)) => {
+                    Ok(((tx, rx), returned, snapshot)) => {
                         if let Some(entry) = self.entries.get_mut(index) {
-                            entry.local = local;
+                            entry.local = snapshot.local;
+                            entry.capabilities = snapshot;
                             entry.state = State::Split { tx, rx, returned };
                         }
                     }
                     Err(error) => {
+                        if let EndpointError::Open(open) = &error {
+                            self.count_missing(open);
+                        }
                         self.entries.swap_remove(index);
                         on_event(EndpointEvent::Failed {
                             endpoint: id,
