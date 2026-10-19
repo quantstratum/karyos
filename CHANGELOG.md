@@ -14,10 +14,17 @@ release may break APIs, wire formats and shared-memory layouts.
 - Recordings follow a mapping cutover (mapping-generations.md,
   "Recordings"). The driver makes a recording reader a member of the
   stream's cutovers: `recording_reader` registers it with a
-  `GenerationLink` (`RecordingReader::link`, `RecordingReader::base`), and
+  `GenerationLink` (`RecordingReader::link`, `RecordingReader::base`;
+  `RecordingReader::into_following_parts` returns the reader, the link,
+  the base and the lease), and
   a cutover offers it a successor recording cell (`Successor::Recording`)
   under a subscriber's progress lease. `DriverError::RecordingCutover` is
-  removed: a recorded stream can be reconfigured. `karyos-archive`'s
+  removed: a recorded stream can be reconfigured. **A host must wire its
+  recordings through `into_following_parts` and
+  `Guarded::new(Following::new(reader, link, base), lease)`**: a reader
+  taken with `into_parts` has no link, so where a cutover used to be
+  refused, it now fences that reader and its recording ends at the seal,
+  `Lapped`. `karyos-archive`'s
   `source::Following` reads stream positions across the cutovers: at a
   seal with a successor it moves and reports `Frames::Cutover`, and the
   recording goes on with no gap; fenced, it reports `Frames::Fenced`, and

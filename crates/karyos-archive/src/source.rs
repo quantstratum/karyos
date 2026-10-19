@@ -187,8 +187,11 @@ impl<T: TermBytes> Following<T> {
 
 impl<T: TermBytes> FrameSource for Following<T> {
     fn position(&self) -> u64 {
-        // The link refuses a base whose mapping could pass `2^63`.
-        self.base.saturating_add(self.reader.position())
+        // The link refuses a base whose mapping could pass `2^63`, so the
+        // sum is below it; the fallback is never taken.
+        let position = self.base.checked_add(self.reader.position());
+        debug_assert!(position.is_some(), "a mapping past 2^63");
+        position.unwrap_or(u64::MAX)
     }
 
     fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {

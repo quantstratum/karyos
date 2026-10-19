@@ -27,8 +27,12 @@ use crate::generations::MemberKind;
 /// [`GenerationLink`] is offered a successor recording cell when a
 /// cutover opens, and the reader's mapping starts at stream position
 /// [`RecordingReader::base`]. Take the parts with
-/// [`RecordingReader::into_parts`] and keep the lease for as long as the
-/// reader (the Archive's `Guarded` source drops the reader first).
+/// [`RecordingReader::into_following_parts`], which keeps the link, and
+/// keep the lease for as long as the reader (the Archive's `Guarded`
+/// source drops the reader first): the Archive's `source::Following` over
+/// the reader, the link and the base follows each cutover. A reader taken
+/// alone ([`RecordingReader::into_parts`]) has no link, so a cutover
+/// fences it and the recording ends at the seal.
 #[derive(Debug)]
 pub struct RecordingReader {
     reader: LaneReader,
@@ -75,10 +79,21 @@ impl RecordingReader {
         self.base
     }
 
-    /// The reader and the stream's lease.
+    /// The reader and the stream's lease, without the link: a cutover
+    /// fences such a reader, and its recording ends at the seal. To follow
+    /// cutovers, take [`RecordingReader::into_following_parts`].
     #[must_use]
     pub fn into_parts(self) -> (LaneReader, RecordingLease) {
         (self.reader, self.lease)
+    }
+
+    /// The reader, its generation link, the base of its mapping and the
+    /// stream's lease: what the Archive's `source::Following` takes
+    /// (`Following::new(reader, link, base)`), kept with the lease in a
+    /// `Guarded` source, so the recording follows each cutover.
+    #[must_use]
+    pub fn into_following_parts(self) -> (LaneReader, Arc<GenerationLink>, u64, RecordingLease) {
+        (self.reader, self.link, self.base, self.lease)
     }
 }
 

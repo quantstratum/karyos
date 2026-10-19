@@ -177,7 +177,12 @@ fn geometry() -> Geometry {
 /// The payload recorded at stream position `position`, read once the
 /// recorder is dropped.
 fn recorded(dir: &Path, position: u64) -> Vec<u8> {
-    let mut store = SegmentStore::recover(StdDisk, dir, 1, geometry(), SyncPolicy::PerSegment)
+    recorded_in(dir, 1, position)
+}
+
+/// [`recorded`], of recording `id`.
+fn recorded_in(dir: &Path, id: u64, position: u64) -> Vec<u8> {
+    let mut store = SegmentStore::recover(StdDisk, dir, id, geometry(), SyncPolicy::PerSegment)
         .unwrap()
         .store;
     let mut bytes = vec![0u8; PAYLOAD];
@@ -315,4 +320,80 @@ fn a_recording_draining_across_deadlines_keeps_its_lease() {
     assert_eq!(recorder.store().written(), first + FRAME);
     assert!(recorder.store().gaps().is_empty());
     assert_eq!(first, seal);
+}
+
+/// The documented host wiring, through the Archive's agent: a
+/// `Guarded` source over a `Following` reader, from
+/// `into_following_parts`, records across a cutover on the agent's own
+/// thread, every byte at its stream position and no gap, and no fence is
+/// counted.
+#[test]
+fn the_agent_records_across_a_cutover_through_its_documented_wiring() {
+    use std::time::{Duration, Instant};
+
+    use karyos_archive::agent::{AgentConfig, ArchiveHandle, StartRecording};
+    use karyos_archive::catalog::{SourceIncarnation, StreamFormat};
+    use karyos_archive::source::Guarded;
+
+    let dir = TempDir::new("agent");
+    let (mut driver, _clock) = driver();
+    let stream = stream(&mut driver);
+    let (reader, link, base, lease) = driver
+        .recording_reader(stream, Role::Optional)
+        .unwrap()
+        .into_following_parts();
+    let archive = ArchiveHandle::spawn(StdDisk, dir.path(), AgentConfig::default()).unwrap();
+    let id = archive
+        .start(StartRecording {
+            stream_id: 11,
+            session_id: 1,
+            channel: b"karyos:ipc".to_vec(),
+            geometry: geometry(),
+            policy: SyncPolicy::PerSegment,
+            mode: Mode::Async {
+                on_lap: OnLap::Resume,
+            },
+            format: StreamFormat {
+                lane: Lane::ZERO,
+                initial_term_id: 7,
+                mtu: core::num::NonZeroU32::new(DEFAULT_MTU).unwrap(),
+                source: SourceIncarnation {
+                    driver: [1, 2],
+                    registration: 3,
+                    incarnation: 1,
+                },
+            },
+            source: Box::new(Guarded::new(Following::new(reader, link, base), lease)),
+        })
+        .unwrap();
+    let mut writer = driver.publication(stream).unwrap();
+    let before = 6u64;
+    for index in 0..before {
+        let _ = publish(&mut driver, &mut writer, index);
+    }
+    let _ = driver.reconfigure_stream(stream, larger()).unwrap();
+    let mut positions = Vec::new();
+    for index in before..before + 6 {
+        positions.push(publish(&mut driver, &mut writer, index));
+    }
+    let seal = driver.generations(stream).unwrap()[0].seal.unwrap();
+    assert_eq!(positions[0], seal);
+    let end = positions[positions.len() - 1] + FRAME;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while archive.describe(id).unwrap().end < end {
+        let _ = driver.do_work().unwrap();
+        assert!(Instant::now() < deadline, "the agent never reached {end}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let ended = archive.stop(id).unwrap();
+    assert_eq!((ended.position, ended.incomplete), (end, false));
+    assert_eq!(archive.fenced_recordings(), 0);
+    archive.shutdown().unwrap();
+    for index in 0..before {
+        assert_eq!(recorded_in(dir.path(), id, index * FRAME), payload(index));
+    }
+    for (offset, &position) in positions.iter().enumerate() {
+        let index = before + u64::try_from(offset).unwrap();
+        assert_eq!(recorded_in(dir.path(), id, position), payload(index));
+    }
 }
