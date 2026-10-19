@@ -30,6 +30,7 @@ fn journal() -> [GroupRecord<'static>; 5] {
             contract_version: 1,
             clock: Clock::HostMonotonic,
             capture: Capture::Strict,
+            reopen_hold: 0,
             manifest: b"build",
         }),
         GroupRecord::Message(MessageEvent {
@@ -195,7 +196,7 @@ fn a_replay_cursor_steps_without_allocating() {
 fn a_replay_gateway_dispatches_without_allocating() {
     use karyos_archive::disk::StdDisk;
     use karyos_archive::group::gateway::{
-        Dispatched, Effects, Event, GroupGateway, Handler, PublicationId,
+        Dispatched, Effects, Event, GroupGateway, Handler, MessagePayload, PublicationId,
     };
     use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
     use karyos_archive::group::prefix::{Coverage, recover};
@@ -287,12 +288,13 @@ fn a_replay_gateway_dispatches_without_allocating() {
     let GroupRecord::Message(message) = records[1] else {
         panic!("no message");
     };
-    let subscriptions = [(message.stream_id, message.session_id)];
+    let subscriptions = [(message.stream_id, message.session_id, message.lane)];
     let mut gateway = ReplayGateway::new(
         cursor,
         &GatewayConfig {
             publications: &publications,
             subscriptions: &subscriptions,
+            network: &[],
             conflated: &[],
             max_claim: 64,
             max_payload: 0,
@@ -306,7 +308,11 @@ fn a_replay_gateway_dispatches_without_allocating() {
     struct Offers;
     impl Handler for Offers {
         fn on_event(&mut self, event: &Event<'_>, effects: &mut dyn Effects) {
-            if let Event::Message { payload, .. } = event {
+            if let Event::Message {
+                payload: MessagePayload::Bytes(payload),
+                ..
+            } = event
+            {
                 let _ = effects.offer(PublicationId(0), payload);
             }
         }

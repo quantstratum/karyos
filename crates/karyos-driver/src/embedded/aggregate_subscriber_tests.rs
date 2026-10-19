@@ -250,10 +250,7 @@ fn removing_the_aggregate_ends_every_lane_with_a_clean_eos() {
         }
         let _ = f.driver.do_work().unwrap();
     }
-    assert_eq!(
-        terminal,
-        Some(karyos_client::aggregate::Terminal { clean: true })
-    );
+    assert_eq!(terminal.map(|terminal| terminal.clean), Some(true));
 }
 
 #[test]
@@ -346,8 +343,5 @@ fn a_lapped_lane_records_its_loss_and_the_terminal_is_not_clean() {
             break;
         }
     }
-    assert_eq!(
-        terminal,
-        Some(karyos_client::aggregate::Terminal { clean: false })
-    );
+    assert_eq!(terminal.map(|terminal| terminal.clean), Some(false));
 }

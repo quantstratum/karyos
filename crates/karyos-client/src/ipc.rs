@@ -97,6 +97,7 @@ use crate::subscription::ClientSubscription;
 
 /// Why an attach failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum AttachError {
     /// The driver refused the client with this code
     /// (`karyos_protocol::admission::refusal`).
@@ -135,6 +136,7 @@ pub enum AttachError {
 /// copy buffer with the journal capacity (`quantstratum-docs:
 /// karyos/design/conflation-end-to-end.md`, Cross-process views).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConflatedLimits {
     /// Most keys.
     pub max_keys: u32,

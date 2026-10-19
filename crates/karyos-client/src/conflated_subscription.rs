@@ -12,7 +12,7 @@
 //! read them; an embedded view without such a client has only the
 //! accessors.
 
-use karyos_sys::conflation::{Budget, ConflationReader, PollReport};
+use karyos_sys::conflation::{Budget, ConflationConfig, ConflationReader, PollReport};
 use karyos_sys::freshness::{
     Freshness, TERMINAL_BARRIER_TIMEOUT, TERMINAL_BELOW_FRONTIER, TERMINAL_FEEDER_LOST,
     TERMINAL_FRESHNESS_EXHAUSTED, TERMINAL_IMAGE_RETIRED, Terminal,
@@ -72,6 +72,7 @@ impl<'a> ConflatedValue<'a> {
 /// publishes an empty interval: it marks no value stale, and only ends the
 /// view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ViewClosed {
     /// The receive owner's seal waited past its bound for the feeder's
     /// acknowledgement.
@@ -143,6 +144,7 @@ pub const CONFLATION_BUDGETS_EXHAUSTED: &str = "conflation budgets exhausted";
 
 /// A view's reader-side counts since it was created.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReaderCounts {
     /// Served keys whose value was already delivered (`PollReport::skipped`
     /// summed over every poll).
@@ -214,6 +216,13 @@ impl ConflatedSubscription {
             budgets_exhausted,
         });
         self
+    }
+
+    /// The configuration of the view's table: its keys, its largest value
+    /// and its journal. Fixed when the table is mapped.
+    #[must_use]
+    pub fn config(&self) -> ConflationConfig {
+        self.reader.config()
     }
 
     /// The reader-side counts since the view was created.
@@ -291,6 +300,19 @@ impl ConflatedSubscription {
 mod tests {
     use super::*;
     use karyos_sys::conflation::conflation;
+
+    #[test]
+    fn a_view_reports_its_table_config() {
+        let writer = conflation(2, 8, 1024).unwrap();
+        let subscription = ConflatedSubscription::new(
+            writer.reader(),
+            Budget {
+                keys: 1,
+                retries: 1,
+            },
+        );
+        assert_eq!(subscription.config(), writer.config());
+    }
 
     #[test]
     fn poll_changed_uses_the_subscription_budget() {

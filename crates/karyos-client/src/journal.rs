@@ -58,6 +58,7 @@ impl ClientJournal {
 
 /// A remote client's journal, ready to fetch with `RemoteClient::take_journal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FetchableJournal {
     /// The journal number the driver assigned.
     pub journal: u64,

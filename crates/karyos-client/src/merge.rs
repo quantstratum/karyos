@@ -107,6 +107,7 @@ impl<T: TermBytes> Drop for Replay<T> {
 /// A replay a [`ReplayProvider`] is asked for: lane 0 of a recording of
 /// `source`, over `[from, to)`, in bytes of the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplayRequest {
     /// The live stream's publication: the recording must be of it.
     pub source: PublicationIdentity,
@@ -118,8 +119,18 @@ pub struct ReplayRequest {
     pub to: u64,
 }
 
+impl ReplayRequest {
+    /// A replay of `source` over `[from, to)`.
+    #[must_use]
+    pub const fn new(source: PublicationIdentity, from: u64, to: u64) -> Self {
+        debug_assert!(from <= to, "a replay range ends at or after its start");
+        Self { source, from, to }
+    }
+}
+
 /// Why a [`ReplayProvider`] cannot hand out a replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReplayUnavailable {
     /// No recording of the source exists.
     NoRecording,
@@ -133,6 +144,7 @@ pub enum ReplayUnavailable {
 
 /// Where a request to a [`ReplayProvider`] stands.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ReplayStatus<T: TermBytes = HeapTerms> {
     /// Not answered yet: ask again.
     Pending,
@@ -160,6 +172,7 @@ pub trait ReplayProvider<T: TermBytes = HeapTerms>: Send {
 /// later polls report it again, deliver nothing, and the replay is
 /// stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum MergeError {
     /// The replay is of another publication or incarnation than the live
     /// stream: an epoch change, which no merge spans.
@@ -228,6 +241,7 @@ pub enum MergeError {
 
 /// What one [`LiveMerge::poll`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct MergePoll {
     /// The poll's deliveries and reports. Before the cutover, `skipped` and
     /// `aborted` are the replay's, below the cutover; the replay's own end
@@ -242,6 +256,7 @@ pub struct MergePoll {
 /// what was delivered before `cause`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the merge failed after {} deliveries: {cause}", poll.summary.delivered)]
+#[non_exhaustive]
 pub struct MergeFailed {
     /// Progress made before the failure.
     pub poll: MergePoll,

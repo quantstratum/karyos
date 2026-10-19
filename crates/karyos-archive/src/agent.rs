@@ -52,6 +52,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use karyos_sys::frame::Lane;
+
 use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
 use crate::group::capture::{
@@ -62,6 +64,7 @@ use crate::group::checkpoint::{
     CheckpointError, CheckpointInbox, CheckpointRequest, CheckpointStore, CheckpointWriter,
     handoff, recorded_end, store_dir,
 };
+use crate::group::gateway::live::RecordingWord;
 use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
 use crate::group::prefix::{CheckpointHeld, Coverage};
 use crate::group::record::{CONTRACT_VERSION, Capture, Clock, JournalHeader};
@@ -169,14 +172,27 @@ pub struct GroupCheckpoints {
     /// ([`PrefixTracker::failed_reopens`](crate::group::prefix::PrefixTracker::failed_reopens)).
     /// A hold below `in_flight` is taken as `in_flight`; one above
     /// [`MAX_REOPEN_HOLD`] is refused ([`AgentError::CheckpointConfig`]).
-    /// Recovery sizes its window so too. It must not shrink across
-    /// restarts of a group; it is recorded in the header in a follow-up.
+    /// It is fixed when the group is made and recorded in its journal's
+    /// header, which recovery and the running tracker both take; the
+    /// default is computed only then. A restart is refused when the
+    /// effective window it names, `max(hold, in_flight)`, differs from
+    /// the recorded one, when its `in_flight` is above it, or when it
+    /// turns checkpoints on or off: they are fixed per group. Raising a
+    /// group's hold would take a record of the raise in its journal; none
+    /// exists yet.
     pub reopen_hold: Option<usize>,
 }
 
-/// The largest reopen hold a group takes, in events: the window's three
-/// queues are allocated to it when the group starts.
-pub const MAX_REOPEN_HOLD: usize = 1 << 20;
+/// The largest reopening window a group takes, in events: its hold, or
+/// its `in_flight` when larger. The window's three queues are allocated
+/// to it when the group starts, about 216 bytes an event, about 14 MiB at
+/// the cap. The journal header's bound
+/// ([`crate::group::record::MAX_REOPEN_HOLD`]).
+pub const MAX_REOPEN_HOLD: usize = 1 << 16;
+
+// The agent's bound is the header's.
+const _: () =
+    assert!(MAX_REOPEN_HOLD == 1 << 16 && crate::group::record::MAX_REOPEN_HOLD == 1 << 16);
 
 /// A new group's journal header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +462,26 @@ pub enum AgentError {
     /// above [`MAX_REOPEN_HOLD`]. Nothing is made (A9-3).
     #[error("invalid checkpoint configuration")]
     CheckpointConfig,
+    /// A restart of a group whose journal never got its header: nothing
+    /// says how it was made. Start it as new (`StartGroup::new`), which
+    /// writes the header into the empty journal.
+    #[error("group {id}'s journal has no header: start it as new")]
+    NoHeader {
+        /// The group.
+        id: u64,
+    },
+    /// A journal whose recovery would cut it to nothing, dropping more
+    /// than the header's own write: a damaged header that events
+    /// followed, not one torn while it was written. Neither a restart nor
+    /// a new start takes it, and nothing is cut, so the journal can be
+    /// copied.
+    #[error("group {id}'s journal lost its header: recovery cut it at {cut:?}")]
+    HeaderCut {
+        /// The group.
+        id: u64,
+        /// Where and why recovery cut it.
+        cut: crate::segment::Cut,
+    },
     /// A group's checkpoint writer could not start (A9-3).
     #[error(transparent)]
     Checkpoint(Box<CheckpointError>),
@@ -466,6 +502,12 @@ enum Command {
     Start(Box<StartRecording>, Reply<u64>),
     Stop(u64, Reply<Ended>),
     List(Reply<Vec<Recording>>),
+    Word {
+        stream_id: i32,
+        session_id: i32,
+        lane: Lane,
+        reply: Reply<Option<Arc<RecordingWord>>>,
+    },
     Snapshot {
         from_id: u64,
         max: usize,
@@ -530,6 +572,17 @@ impl core::fmt::Debug for Command {
             Self::Start(start, _) => f.debug_tuple("Start").field(start).finish(),
             Self::Stop(id, _) => f.debug_tuple("Stop").field(id).finish(),
             Self::List(_) => f.write_str("List"),
+            Self::Word {
+                stream_id,
+                session_id,
+                lane,
+                ..
+            } => f
+                .debug_struct("Word")
+                .field("stream_id", stream_id)
+                .field("session_id", session_id)
+                .field("lane", lane)
+                .finish_non_exhaustive(),
             Self::Snapshot { from_id, max, .. } => f
                 .debug_struct("Snapshot")
                 .field("from_id", from_id)
@@ -712,6 +765,31 @@ impl ArchiveHandle {
     /// [`AgentError::Gone`].
     pub fn recordings(&self) -> Result<Vec<Recording>, AgentError> {
         self.call(Command::List)
+    }
+
+    /// The word of the `required` recording of stream `stream_id`, session
+    /// `session_id`, lane `lane` this Archive records, if any: recordings
+    /// are per lane, and a word for another lane would place references
+    /// into the wrong frames. A recording group Gateway's source reads it
+    /// to place payloads by reference. It names
+    /// the recording and its start while it records, and is cleared when
+    /// the recording stops, ends or fails. Configuration path only.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Gone`].
+    pub fn recording_word(
+        &self,
+        stream_id: i32,
+        session_id: i32,
+        lane: Lane,
+    ) -> Result<Option<Arc<RecordingWord>>, AgentError> {
+        self.call(|reply| Command::Word {
+            stream_id,
+            session_id,
+            lane,
+            reply,
+        })
     }
 
     /// Posts a snapshot of at most `max` recordings from id `from_id` on,
@@ -921,6 +999,24 @@ impl Outbox {
 struct Active<D: Disk> {
     id: u64,
     recorder: Recorder<D, Box<dyn FrameSource + Send>>,
+    stream_id: i32,
+    session_id: i32,
+    /// The lane it records: a recording is per lane.
+    lane: Lane,
+    /// A `required` recording's word, which recording group Gateways read
+    /// to place payloads by reference; cleared when the recording leaves
+    /// the active set, however it stopped, ended or failed.
+    word: Option<WordGuard>,
+}
+
+/// Clears a recording's word when the recording leaves the active set.
+#[derive(Debug)]
+struct WordGuard(Arc<RecordingWord>);
+
+impl Drop for WordGuard {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
 }
 
 impl FrameSource for Box<dyn FrameSource + Send> {
@@ -1184,8 +1280,9 @@ struct State<D: Disk> {
 /// A recording that failed: no stop in the catalog, so the groups settle
 /// their references to it by `durable`, its frames durable at the failure.
 ///
-/// The event loop stops naming a recording once it learns that it failed,
-/// so only references already in the groups' rings can name it. An entry
+/// A Gateway stops naming a recording once its word is cleared, which
+/// happens when it leaves the active set, so only references sent before
+/// that can name it. An entry
 /// is kept until every running group has read its ring empty in a duty
 /// that began after the failure (`seq`), and is dropped then when a start
 /// needs its slot. A failed recording
@@ -1482,6 +1579,23 @@ impl<D: Disk + Clone> State<D> {
             Command::List(reply) => {
                 let _ = reply.send(Ok(self.catalog.recordings().to_vec()));
             }
+            Command::Word {
+                stream_id,
+                session_id,
+                lane,
+                reply,
+            } => {
+                let word = self
+                    .active
+                    .iter()
+                    .filter(|active| {
+                        active.stream_id == stream_id
+                            && active.session_id == session_id
+                            && active.lane == lane
+                    })
+                    .find_map(|active| active.word.as_ref().map(|guard| Arc::clone(&guard.0)));
+                let _ = reply.send(Ok(word));
+            }
             Command::Snapshot {
                 from_id,
                 max,
@@ -1623,6 +1737,33 @@ impl<D: Disk + Clone> State<D> {
         closed
     }
 
+    /// Checks a restart against the reopen hold its journal's header
+    /// records (A9): the hold and checkpoints are fixed per group. Refused
+    /// ([`AgentError::CheckpointConfig`]): checkpoints on a group made
+    /// without them, or off for one made with them; an explicit hold whose
+    /// effective window, `max(hold, in_flight)`, differs from the recorded
+    /// one; and an `in_flight` above it (the clamp would raise the running
+    /// window).
+    fn check_hold(start: &StartGroup, recorded: u32) -> Result<(), AgentError> {
+        let Some(checkpoints) = &start.checkpoints else {
+            // Checkpoints off for a group made with them would take back
+            // the durability its reopened ranges reported.
+            return if recorded == 0 {
+                Ok(())
+            } else {
+                Err(AgentError::CheckpointConfig)
+            };
+        };
+        let recorded = usize::try_from(recorded).map_err(|_| AgentError::CheckpointConfig)?;
+        let differs = checkpoints
+            .reopen_hold
+            .is_some_and(|hold| hold.max(start.capture.in_flight) != recorded);
+        if recorded == 0 || differs || start.capture.in_flight > recorded {
+            return Err(AgentError::CheckpointConfig);
+        }
+        Ok(())
+    }
+
     /// Makes or recovers a group's journal and its capture path.
     fn start_group(
         &mut self,
@@ -1644,56 +1785,113 @@ impl<D: Disk + Clone> State<D> {
         {
             return Err(AgentError::CheckpointConfig);
         }
-        // The reopening window, sized before recovery so a restart
-        // recovers the prefixes the run had, and checked here, before the
-        // journal exists.
-        let hold = match &start.checkpoints {
-            None => None,
-            Some(GroupCheckpoints {
-                reopen_hold: Some(hold),
-                ..
-            }) => Some(*hold),
-            Some(GroupCheckpoints {
-                reopen_hold: None, ..
-            }) => Some(
-                start
-                    .capture
-                    .in_flight
-                    .checked_mul(4)
-                    .ok_or(AgentError::CheckpointConfig)?,
-            ),
+        // A new group's reopening window, recorded in its header (A9) and
+        // checked here, before the journal exists: configured, or four
+        // times `in_flight`, at least `in_flight`; 0 without checkpoints.
+        let new_hold = match (&start.new, &start.checkpoints) {
+            (None, _) | (Some(_), None) => 0,
+            (Some(_), Some(checkpoints)) => {
+                let hold = match checkpoints.reopen_hold {
+                    Some(hold) => hold,
+                    None => start
+                        .capture
+                        .in_flight
+                        .checked_mul(4)
+                        .ok_or(AgentError::CheckpointConfig)?,
+                }
+                .max(start.capture.in_flight);
+                if hold > MAX_REOPEN_HOLD {
+                    return Err(AgentError::CheckpointConfig);
+                }
+                u32::try_from(hold).map_err(|_| AgentError::CheckpointConfig)?
+            }
         };
-        if let Some(hold) = hold
-            && (hold > MAX_REOPEN_HOLD || hold.checked_mul(3).is_none())
-        {
-            return Err(AgentError::CheckpointConfig);
-        }
         let checkpoint_dir = store_dir(&start.dir);
+        // Before a journal is recovered, its plan. A recovery that would
+        // cut it to nothing, dropping more than the header's own write,
+        // cuts away a header that events followed: nothing takes it, with
+        // nothing written, on every start (the operator may copy the
+        // journal). A crash while the header was written tears that one
+        // write only, with nothing after it; that journal is taken over as
+        // never written, since nothing of it was ever reported durable.
+        let verified = |disk: &D| -> Result<(), AgentError> {
+            let plan = GroupJournal::verify(disk.clone(), &start.dir, id, start.journal)?;
+            let dropped = plan.kept.as_ref().map_or(0, |kept| kept.dropped_entries);
+            match plan.cut {
+                Some(cut) if cut.position == 0 && (dropped > 1 || !plan.dropped.is_empty()) => {
+                    Err(AgentError::HeaderCut { id, cut })
+                }
+                _ => Ok(()),
+            }
+        };
+        // The header a new group writes, once its store is open: a
+        // refusal writes nothing.
+        let mut pending_header = None;
         let journal = match &start.new {
-            Some(new) => GroupJournal::create(
-                self.disk.clone(),
-                &start.dir,
-                &JournalHeader {
+            Some(new) => {
+                let header = JournalHeader {
                     group_id: id,
                     first_group_seq: new.first_group_seq,
                     inline_threshold: new.inline_threshold,
                     contract_version: CONTRACT_VERSION,
                     clock: Clock::HostMonotonic,
                     capture: new.capture,
+                    reopen_hold: new_hold,
                     manifest: &new.manifest,
-                },
-                start.journal,
-            )?,
+                };
+                match GroupJournal::create(self.disk.clone(), &start.dir, &header, start.journal) {
+                    Ok(journal) => journal,
+                    // A journal whose header was never written: the new
+                    // group takes it over, its header written once its
+                    // store is open. One with a header is the group's
+                    // already.
+                    Err(exists @ JournalError::Segment(SegmentError::Exists { .. })) => {
+                        verified(&self.disk)?;
+                        let mut journal = GroupJournal::recover(
+                            self.disk.clone(),
+                            &start.dir,
+                            id,
+                            start.journal,
+                        )?
+                        .journal;
+                        if journal.reopen_hold()?.is_some() {
+                            return Err(exists.into());
+                        }
+                        pending_header = Some(header);
+                        journal
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             None => {
-                GroupJournal::recover(self.disk.clone(), &start.dir, id, start.journal)?.journal
+                verified(&self.disk)?;
+                let mut journal =
+                    GroupJournal::recover(self.disk.clone(), &start.dir, id, start.journal)?
+                        .journal;
+                if journal.reopen_hold()?.is_none() {
+                    return Err(AgentError::NoHeader { id });
+                }
+                journal
             }
         };
         let mut journal = journal;
+        // A restart takes the header's window as recorded, before the
+        // store or the capture path is touched; the journal's own
+        // recovery, which may cut a torn tail, has run. The hold is fixed
+        // per group.
+        if start.new.is_none() {
+            let recorded = journal.reopen_hold()?.ok_or(AgentError::NoHeader { id })?;
+            Self::check_hold(&start, recorded)?;
+        }
         // The store beside the journal, made or recovered with it: a
-        // recovered one is cut to what the journal's records name.
+        // recovered one is cut to what the journal's records name. A
+        // journal taken over may have a store from the same crash: it is
+        // opened as a restart's, cut to nothing. Without checkpoints, a
+        // store left there is not read.
+        let taken_over = pending_header.is_some();
         let store = match &start.checkpoints {
             None => None,
-            Some(_) if start.new.is_some() => Some(CheckpointStore::create(
+            Some(_) if start.new.is_some() && !taken_over => Some(CheckpointStore::create(
                 self.disk.clone(),
                 &checkpoint_dir,
                 id,
@@ -1728,6 +1926,9 @@ impl<D: Disk + Clone> State<D> {
                 )
             }
         };
+        if let Some(header) = pending_header {
+            let _ = journal.write_header(&header)?;
+        }
         let recorded = Recorded {
             active: &self.active,
             failed: &self.failed,
@@ -1737,8 +1938,8 @@ impl<D: Disk + Clone> State<D> {
             recorded: &recorded,
             store: store.as_ref(),
         };
-        let (mut sender, job) = capture::capture_with_hold(start.capture, journal, &coverage, hold)
-            .map_err(|error| match error {
+        let (mut sender, job) =
+            capture::capture(start.capture, journal, &coverage).map_err(|error| match error {
                 CaptureSetup::Config(error) => AgentError::Capture(error),
                 CaptureSetup::Journal(error) => AgentError::Journal(error),
             })?;
@@ -1883,7 +2084,19 @@ impl<D: Disk + Clone> State<D> {
         });
         match recorder {
             Ok(recorder) => {
-                self.active.push(Active { id, recorder });
+                let word = matches!(start.mode, Mode::Required).then(|| {
+                    let word = Arc::new(RecordingWord::new());
+                    word.set(id, position);
+                    WordGuard(word)
+                });
+                self.active.push(Active {
+                    id,
+                    recorder,
+                    stream_id: start.stream_id,
+                    session_id: start.session_id,
+                    lane: start.format.lane,
+                    word,
+                });
                 Ok(id)
             }
             Err(error) => {
@@ -2045,8 +2258,13 @@ fn stop<D: Disk>(
     reason: StopReason,
     now: u64,
 ) -> Result<Ended, AgentError> {
-    let id = recording.id;
-    let ended = recording.recorder.close(reason)?;
+    let Active {
+        id, recorder, word, ..
+    } = recording;
+    // Cleared first: a Gateway stops naming the recording before the close
+    // and the catalog's stop, which take time.
+    drop(word);
+    let ended = recorder.close(reason)?;
     catalog.stop(id, ended.position, now, ended.reason, ended.incomplete)?;
     Ok(ended)
 }

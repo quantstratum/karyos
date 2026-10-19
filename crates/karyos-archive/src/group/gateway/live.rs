@@ -30,12 +30,20 @@ use super::{
 };
 use crate::crc32c::crc32c;
 use crate::group::capture::{CaptureSender, GroupState, Refusal};
-use crate::group::record::{
-    Capture, DELIVERY_OBSERVATION, DELIVERY_POLL, DeliveryObservation, DeliveryPoll, EVENT_END,
-    EXTERNAL_OBSERVATION, EndOutcome, EventEnd, ExternalEvent, ExternalObservation, GapMarker,
-    GapReason, GroupRecord, MAX_INLINE, OUTCOME_OBSERVATION, Operation, Outcome,
-    OutcomeObservation, TIMER_OBSERVATION, TimerAction, TimerObservation,
+use crate::group::checkpoint::{
+    CheckpointError, CheckpointHandle, CheckpointStats, LastCheckpoint,
 };
+use crate::group::record::{
+    Capture, DEFAULT_INLINE_THRESHOLD, DELIVERY_OBSERVATION, DELIVERY_POLL, DeliveryObservation,
+    DeliveryPoll, EVENT_END, EXTERNAL_OBSERVATION, EndOutcome, EventEnd, ExternalEvent,
+    ExternalObservation, GapMarker, GapReason, GroupRecord, MAX_INLINE, MESSAGE_EVENT,
+    OUTCOME_OBSERVATION, Operation, Outcome, OutcomeObservation, TIMER_OBSERVATION, TimerAction,
+    TimerObservation,
+};
+
+mod sources;
+
+pub use sources::{ConflatedSource, MessageSource, RecordingWord, SourceIdentity};
 
 #[cfg(test)]
 mod tests;
@@ -131,8 +139,36 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
     scratch: Vec<u8>,
     pending: Option<Pending>,
     stats: GatewayStats,
-    /// Each timer's pending deadline, for a cancel to repeat it.
+    /// Each timer's pending deadline, for a cancel to repeat it and for
+    /// dispatch to fire it.
     deadlines: Vec<Option<u64>>,
+    /// The message sources, then the conflated views, polled in turn from
+    /// `turn`.
+    sources: Vec<sources::Source>,
+    views: Vec<sources::View>,
+    turn: usize,
+    /// Payloads above it are recorded by reference when they can be.
+    inline_threshold: u32,
+    /// Observations recorded per event at most.
+    observation_budget: u32,
+    /// The group's checkpoint handle, taken from the sender: `None` for a
+    /// group started without checkpoints.
+    checkpoints: Option<CheckpointHandle>,
+    /// A checkpoint names an event at or above it: the group's first, as
+    /// its journal header names it.
+    first_checkpoint: u64,
+    /// The `group_seq` of the last checkpoint handed over, 0 for none.
+    last_taken: u64,
+    /// Strict capture sent an incomplete end: the journal ends there, and
+    /// every later dispatch is refused, before the job ends the group.
+    ended: bool,
+    /// The next event's effects start incomplete: an event delivered so
+    /// that its record ends the strict journal, every call refused.
+    incomplete_next: bool,
+    /// The handler ran on the event being dispatched: a source's message
+    /// is then taken whatever the dispatch returns, so a later error (the
+    /// group closing as it is sent) does not deliver it twice.
+    delivered: bool,
 }
 
 /// Why a Gateway could not be configured.
@@ -159,6 +195,14 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     /// bytes, the sender's own bound; its timer table holds `timers`
     /// timers, ids below it.
     ///
+    /// A message whose record does not fit `max_event` cannot be recorded:
+    /// strict capture ends the journal at it, and best effort delivers it
+    /// in a gap (above `MAX_INLINE`, its payload recorded unavailable). To
+    /// record every inline payload of a source with no recording to
+    /// reference, `max_event` needs at least 147 + `MAX_INLINE` + the end
+    /// record (12 + its block): a message head with a trace extension, the
+    /// largest inline payload and its end.
+    ///
     /// # Errors
     ///
     /// [`ConfigError`] for a buffer too small for an event, or a first
@@ -175,11 +219,17 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         if next_seq == 0 {
             return Err(ConfigError::FirstSeq);
         }
-        // An external event with an empty value, and its end.
-        let least = 12 + 20 + 2 + END;
+        // The largest event head with no payload, and its end: a message
+        // with an empty payload and a trace extension (above a loss, a
+        // lifecycle or an external head), so every source's report and the
+        // strict end's loss fit.
+        let least = 12 + MESSAGE_EVENT.block_length as usize + 2 + 2 + 64 + END;
         if max_event < least {
             return Err(ConfigError::Buffer(max_event));
         }
+        let mut sender = sender;
+        let checkpoints = sender.take_checkpoints();
+        let first_checkpoint = sender.first_group_seq();
         Ok(Self {
             port,
             clock,
@@ -191,7 +241,101 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             pending: None,
             stats: GatewayStats::default(),
             deadlines: vec![None; usize::from(timers)],
+            sources: Vec::new(),
+            views: Vec::new(),
+            turn: 0,
+            inline_threshold: DEFAULT_INLINE_THRESHOLD,
+            observation_budget: u32::MAX,
+            checkpoints,
+            first_checkpoint,
+            last_taken: 0,
+            ended: false,
+            incomplete_next: false,
+            delivered: false,
         })
+    }
+
+    /// Takes a checkpoint of the state after the last event dispatched
+    /// (quantstratum-docs: karyos/design/recording-group-checkpoints.md,
+    /// section 3), between events: `write` fills the checkpoint buffer
+    /// and returns the snapshot's length, and the buffer goes to the
+    /// Archive's writer. The outcome comes later, from
+    /// [`Gateway::last_checkpoint`]. Nothing is allocated.
+    ///
+    /// # Errors
+    ///
+    /// In this order, `write` called only when none applies:
+    ///
+    /// - [`CheckpointError::Stopped`] once the group stopped, failed,
+    ///   ended or is closing.
+    /// - [`CheckpointError::NoCheckpoints`] for a group started without
+    ///   checkpoints.
+    /// - [`CheckpointError::NothingDispatched`] before the group's first
+    ///   event.
+    /// - [`CheckpointError::Repeated`] for the `group_seq` of the last
+    ///   checkpoint taken, unless its write failed.
+    /// - From the handle, counted in [`Gateway::checkpoint_stats`]:
+    ///   [`CheckpointError::Ended`] once a strict journal ended at an
+    ///   incomplete event, then [`CheckpointError::InFlight`],
+    ///   [`CheckpointError::TooLarge`] and [`CheckpointError::Empty`].
+    pub fn checkpoint(
+        &mut self,
+        format: u32,
+        write: impl FnOnce(&mut [u8]) -> usize,
+    ) -> Result<(), CheckpointError> {
+        if self.sender.state() != GroupState::Running || self.sender.closing() {
+            return Err(CheckpointError::Stopped);
+        }
+        let Some(handle) = self.checkpoints.as_mut() else {
+            return Err(CheckpointError::NoCheckpoints);
+        };
+        let group_seq = self
+            .next_seq
+            .checked_sub(1)
+            .filter(|seq| *seq != 0 && *seq >= self.first_checkpoint)
+            .ok_or(CheckpointError::NothingDispatched)?;
+        if group_seq == self.last_taken {
+            handle.poll();
+            let failed = matches!(
+                handle.last_checkpoint(),
+                Some(LastCheckpoint::Failed { group_seq: seq }) if seq == group_seq
+            );
+            if !failed {
+                return Err(CheckpointError::Repeated { group_seq });
+            }
+        }
+        handle.checkpoint(group_seq, format, write)?;
+        self.last_taken = group_seq;
+        Ok(())
+    }
+
+    /// How the last checkpoint the writer took ended: `None` before the
+    /// first, or for a group without checkpoints.
+    #[must_use]
+    pub fn last_checkpoint(&mut self) -> Option<LastCheckpoint> {
+        let handle = self.checkpoints.as_mut()?;
+        handle.poll();
+        handle.last_checkpoint()
+    }
+
+    /// The checkpoint counts: zero for a group without checkpoints.
+    #[must_use]
+    pub fn checkpoint_stats(&self) -> CheckpointStats {
+        self.checkpoints
+            .as_ref()
+            .map_or_else(CheckpointStats::default, CheckpointHandle::stats)
+    }
+
+    /// Sets the inline threshold: the journal header's. Configuration only.
+    pub fn set_inline_threshold(&mut self, threshold: u32) {
+        self.inline_threshold = threshold;
+    }
+
+    /// Sets the observation budget per event. Strict refuses a call past
+    /// it; best effort performs it and ends the event incomplete.
+    /// Configuration only.
+    pub fn set_observation_budget(&mut self, budget: u32) {
+        self.observation_budget = budget;
     }
 
     /// The refusals and uncaptured events so far.
@@ -287,6 +431,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         first: &FirstRecord<'_>,
         handler: &mut dyn Handler,
     ) -> Result<Dispatched, GatewayError> {
+        let forced = core::mem::take(&mut self.incomplete_next);
         let state = self.sender.state();
         if state != GroupState::Running {
             if self.capture == Capture::Strict {
@@ -336,11 +481,13 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             seq,
             index: 0,
             logical_time,
-            incomplete: false,
+            incomplete: forced,
             recording: true,
             strict: self.capture == Capture::Strict,
             deadlines: &mut self.deadlines,
+            budget: self.observation_budget,
         };
+        self.delivered = true;
         handler.on_event(event, &mut effects);
         let (length, index, incomplete) = (effects.length, effects.index, effects.incomplete);
         let end = GroupRecord::End(EventEnd {
@@ -361,11 +508,20 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             .ok_or(GatewayError::Ended)?;
         if incomplete {
             self.stats.bump(|stats| &mut stats.incomplete);
+            // A strict journal ends at an incomplete event: no checkpoint
+            // can open another range.
+            if self.capture == Capture::Strict
+                && let Some(handle) = self.checkpoints.as_mut()
+            {
+                handle.end();
+            }
         }
         // Admitted, so the ring has room: a refusal here is a failed group.
         self.sender
             .send(written, seq)
             .map_err(|_| GatewayError::Ended)?;
+        // A strict journal ends at an incomplete event: nothing follows it.
+        self.ended |= incomplete && self.capture == Capture::Strict;
         Ok(Dispatched::Event { group_seq: seq })
     }
 
@@ -430,20 +586,23 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             recording: false,
             strict: self.capture == Capture::Strict,
             deadlines: &mut self.deadlines,
+            budget: self.observation_budget,
         };
+        self.delivered = true;
         handler.on_event(event, &mut effects);
     }
 }
 
 impl<P: Port, C: FnMut() -> u64> GroupGateway for Gateway<P, C> {
-    /// A2b's sources dispatch here; until then there is no event but an
-    /// external one, so a dispatch only writes a pending gap.
-    fn dispatch(&mut self, _handler: &mut dyn Handler) -> Result<Dispatched, GatewayError> {
-        if self.capture == Capture::Strict && self.sender.state() != GroupState::Running {
+    /// Takes the next event, a timer due now or a source's, and delivers
+    /// it.
+    fn dispatch(&mut self, handler: &mut dyn Handler) -> Result<Dispatched, GatewayError> {
+        if self.ended
+            || (self.capture == Capture::Strict && self.sender.state() != GroupState::Running)
+        {
             return Err(GatewayError::Ended);
         }
-        let _ = self.flush();
-        Ok(Dispatched::Idle)
+        self.dispatch_next(handler)
     }
 
     fn deliver_external(
@@ -452,6 +611,9 @@ impl<P: Port, C: FnMut() -> u64> GroupGateway for Gateway<P, C> {
         value: &[u8],
         handler: &mut dyn Handler,
     ) -> Result<Dispatched, GatewayError> {
+        if self.ended {
+            return Err(GatewayError::Ended);
+        }
         let logical_time = (self.clock)();
         let event = Event::External { kind, value };
         let first = |group_seq: u64, out: &mut [u8]| {
@@ -513,6 +675,8 @@ struct Recording<'a, P: Port> {
     recording: bool,
     strict: bool,
     deadlines: &'a mut [Option<u64>],
+    /// Observations recorded per event at most.
+    budget: u32,
 }
 
 impl<P: Port> Recording<'_, P> {
@@ -524,6 +688,7 @@ impl<P: Port> Recording<'_, P> {
             return true;
         }
         let fits = !self.incomplete
+            && self.index < self.budget
             && bytes
                 .and_then(|bytes| self.length.checked_add(bytes))
                 .is_some_and(|end| end <= self.limit);
@@ -543,6 +708,10 @@ impl<P: Port> Recording<'_, P> {
     /// ends the event incomplete.
     fn push(&mut self, record: &GroupRecord<'_>) {
         if !self.recording || self.incomplete {
+            return;
+        }
+        if self.index >= self.budget {
+            self.incomplete = true;
             return;
         }
         let encoded = self

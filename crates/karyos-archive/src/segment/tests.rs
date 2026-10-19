@@ -1807,3 +1807,109 @@ fn a_backward_clock_does_not_sync() {
     assert_eq!(store.tick(50).unwrap(), 10, "no sync on a backward step");
     assert_eq!(store.tick(110).unwrap(), 20);
 }
+
+/// #430 re-check: `open_verified` opens only for reading, never writes,
+/// and reads what `recover` then keeps, older segments included.
+#[test]
+fn open_verified_opens_only_for_reading_and_reads_what_recover_keeps() {
+    let disk = FaultDisk::default();
+    {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(300)).unwrap();
+        store.close().unwrap();
+    }
+    // A torn entry on the last segment: recovery cuts its index.
+    let mut raw = disk.clone();
+    let index = raw
+        .open(&Path::new(DIR).join(index_name(RECORDING, 256)))
+        .unwrap();
+    let length = raw.len(&index).unwrap();
+    raw.set_len(&index, length - 1).unwrap();
+    let before = disk.snapshot();
+    let mut verified = SegmentStore::open_verified(
+        NoWritableOpen(crate::disk::ReadOnly(disk.clone())),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    let written = verified.written();
+    let mut seen = vec![0u8; usize::try_from(written).unwrap()];
+    verified.read(0, &mut seen).unwrap();
+    assert!(verified.append(written, b"x").is_err());
+    assert_eq!(disk.snapshot(), before);
+    let mut recovered = SegmentStore::recover(
+        disk,
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap()
+    .store;
+    assert_eq!(recovered.written(), written);
+    // The torn entry was the last segment's only one; the first is read.
+    assert_eq!(written, 256);
+    let mut kept = vec![0u8; seen.len()];
+    recovered.read(0, &mut kept).unwrap();
+    assert_eq!(seen, kept);
+}
+
+/// #437: a plan counts the index entries it drops past its cut, a torn
+/// one too: none when nothing is cut, one for a torn last entry, and
+/// every later whole entry when an earlier write's data fails.
+#[test]
+fn a_plan_counts_the_entries_it_drops() {
+    let dir = Path::new(DIR);
+    let dropped = |disk: &FaultDisk| {
+        SegmentStore::verify(disk.clone(), dir, RECORDING, geometry())
+            .unwrap()
+            .kept
+            .unwrap()
+            .dropped_entries
+    };
+    let written = |disk: &FaultDisk| {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            dir,
+            RECORDING,
+            geometry(),
+            SyncPolicy::None,
+            0,
+        )
+        .unwrap();
+        for at in [0u64, 10, 20, 30] {
+            let start = usize::try_from(at).unwrap();
+            store.append(at, &stream(40)[start..start + 10]).unwrap();
+        }
+    };
+    // Nothing cut.
+    let disk = FaultDisk::default();
+    written(&disk);
+    assert_eq!(dropped(&disk), 0);
+    // A torn last entry: one.
+    let free = FaultDisk::default();
+    let steps = [Step::Append(40), Step::Append(40)];
+    let _ = run(free.clone(), &steps, SyncPolicy::None, 0, false);
+    let disk = FaultDisk::with_budget(free.used() - 27);
+    let _ = run(disk.clone(), &steps, SyncPolicy::None, 0, false);
+    assert_eq!(dropped(&disk.after_crash(Survives::Everything)), 1);
+    // The second write's data fails: it and the two after it, three.
+    let disk = FaultDisk::default();
+    written(&disk);
+    let mut raw = disk.clone();
+    let data = raw.open(&dir.join(data_name(RECORDING, 0))).unwrap();
+    raw.write_at(&data, 12, &[0xEE; 2]).unwrap();
+    let plan = SegmentStore::verify(disk.clone(), dir, RECORDING, geometry()).unwrap();
+    assert_eq!(plan.cut.map(|cut| cut.position), Some(10));
+    assert_eq!(dropped(&disk), 3);
+}

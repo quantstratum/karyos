@@ -225,16 +225,15 @@ fn a_fetched_conflated_view_reads_the_table_read_only() {
     let Outcome::FetchableConflated(fetchable) = request_view(&mut driver, &mut client, KEY) else {
         panic!("expected a fetchable view");
     };
+    assert_eq!(fetchable.key, fetchable.registration);
+    assert_eq!(fetchable.stream, KEY);
     assert_eq!(
-        fetchable,
-        FetchableConflated {
-            key: fetchable.registration,
-            registration: fetchable.registration,
-            stream: KEY,
-            keys: 4,
-            value_capacity: 8,
-            journal_capacity: 1024,
-        }
+        (
+            fetchable.keys,
+            fetchable.value_capacity,
+            fetchable.journal_capacity
+        ),
+        (4, 8, 1024)
     );
     assert_eq!(counter(&driver, "grants reserved"), 1);
     let socket = client.admission_socket().unwrap();

@@ -11,6 +11,30 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- karyos-client's public enums and report structs are `#[non_exhaustive]`
+  before alpha.2 (quantstratum-docs:
+  `karyos/testing/public-api-audit-alpha2.md`), so later minor releases can
+  add variants and fields: errors (`ClientError`, `SubscriptionError`,
+  `OfferError`, `ConductorError`, `MergeError`, `MergeFailed`,
+  `HandOverError`, `AttachError`), outcomes and reports (`OfferOutcome`,
+  `ClaimOutcome`, the concurrent ones, `SubscriptionPoll`, `ImageStop`,
+  `MergePoll`, the aggregate's polls, `LinkStatus`, `LeaseState`,
+  `ViewClosed`, `ReplayStatus`, `ReplayUnavailable`, the conductor's
+  `Outcome`, `Completion`, `Fetchable*` and the counter snapshots) and inputs
+  users build from variants or `Default` (`IdleStrategy`, `RejoinPolicy`,
+  `Secondary`, `ClockDomain`, `Request`, `ScheduleOptions`,
+  `ConflatedLimits`). A match outside the crate needs a wildcard arm, and a
+  struct is built from `Default`: `ScheduleOptions` gains `with_domain`,
+  `with_max_horizon`, `with_lateness_tolerance` and `with_cancel_on_deadline`.
+  The types the Archive's Gateway builds or matches (`PollSummary`,
+  `PollError`, the loss reports, `RejoinOutcome`, `SecondaryOutcome`,
+  `ReplayFallbackReason`) follow with karyos-archive's change;
+  `ScheduleCounters` and `link::Capability` stay as they are, closed driver
+  contracts.
+- `karyos-client`: `ReplayRequest`, `link::Owner` and `link::HandOverEntry`
+  are `#[non_exhaustive]`, built through constructors: `ReplayRequest::new`,
+  `Owner::new` and `HandOverEntry::new` (`with_generation` and
+  `with_publication` add its optional parts).
 - Recordings follow a mapping cutover (mapping-generations.md,
   "Recordings"). The driver makes a recording reader a member of the
   stream's cutovers: `recording_reader` registers it with a
@@ -454,6 +478,38 @@ release may break APIs, wire formats and shared-memory layouts.
   the linger gets the repeats. The EOS counts as sent once one path
   submitted it; a closed guard sends it on none. Routed removals no
   longer linger without EOS.
+- karyos-client's `MessageInfo` gains `extent`, the bytes the message takes in
+  the stream (its frames end at `position + extent`), and is
+  `#[non_exhaustive]`, so later fields add without breaking; it was built only
+  by the client. `ClientSubscription::poll_taking` is public: a handler that
+  returns false declines the message, which stays pending for a required reader.
+  karyos-sys's `FrameReader::ready_end` gives a complete message's end. For the
+  recording group Gateway's sources (phase 3, A7d-2b).
+- The recording group Gateway takes its inputs (phase 3, A7d-2b;
+  `recording-group-gateway.md` sections 4 and 5). `Gateway::add_subscription`
+  adds a message source with its `SourceIdentity` and the `RecordingWord` of
+  the recording that holds its stream; `Gateway::add_conflated` adds a
+  conflated view, refused with `GatewayError::TooLarge` when its largest value
+  could not be recorded. A dispatch fires the earliest due timer first, else
+  takes one event from the next source or view in turn. A message whose
+  length exceeds the inline threshold and whose position the recording holds
+  is recorded by reference; otherwise inline up to `MAX_INLINE`; above it
+  strict capture declines the message (`TooLarge`) and best effort records
+  its payload as unavailable. `Event::Message` gains `extent`, `length` and
+  `payload: MessagePayload` (`Bytes` or `Unavailable`); replay presents the
+  same. A loss or an end a source reports stays held while strict capture
+  refuses it, and strict capture polls a view only when it can admit the
+  event, since reading a value consumes it. `set_inline_threshold` and
+  `set_observation_budget` tune placement and observation. The Archive's
+  `ArchiveHandle::recording_word(stream, session, lane)` gives the shared
+  word naming a required recording of that lane and its start; the word
+  clears when the recording stops, ends or fails. A Gateway takes one
+  source per stream and session (`GatewayError::DuplicateSource`). Strict
+  capture reads a source or a view only when it can admit the event; a
+  message it read and cannot record ends the journal at an incomplete
+  skipped range. `Event::Conflated` carries the value's key.
+  karyos-client's `ConflatedSubscription::config` gives a view's
+  table configuration.
 - The recording group Gateway (phase 3, A7d-2a; `recording-group-gateway.md`
   sections 3, 6 and 8). `karyos_archive::group::gateway` holds the
   `GroupGateway` trait that capture and replay share: `Event`, `Effects` (clock,

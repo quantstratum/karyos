@@ -40,8 +40,8 @@ pub mod trace;
 
 pub use client::{
     Accepted, Claim, Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES,
-    DEFAULT_MAX_PENDING, DEFAULT_TIMEOUT, IdleStrategy, ImageStop, MessageLength, OfferError,
-    Publication, Subscription, SubscriptionError, SubscriptionPoll,
+    DEFAULT_MAX_PENDING, DEFAULT_TIMEOUT, IdleStrategy, ImageChange, ImageStop, MessageLength,
+    OfferError, Publication, Subscription, SubscriptionError, SubscriptionPoll,
 };
 pub use concurrent::{
     ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,

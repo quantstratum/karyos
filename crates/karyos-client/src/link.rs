@@ -28,11 +28,20 @@ use crate::loss::LossReports;
 /// Who issued a capability: the driver instance and the client id. A handle
 /// can be removed only through the conductor with the same owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Owner {
     /// The driver instance.
     pub driver: u64,
     /// The client id within that driver.
     pub client: u64,
+}
+
+impl Owner {
+    /// Client `client` of driver instance `driver`.
+    #[must_use]
+    pub const fn new(driver: u64, client: u64) -> Self {
+        Self { driver, client }
+    }
 }
 
 /// Where a handed-over handle came from: its owner, its registration and
@@ -86,6 +95,7 @@ pub struct LeaseEnd {
 
 /// The observed state of a [`LeaseEnd`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LeaseState {
     /// The capability is alive (held for hand-over or in a handle).
     Alive,
@@ -179,6 +189,11 @@ impl Export {
 }
 
 /// A capability created by the driver for a registration.
+///
+/// Not `#[non_exhaustive]`: the driver matches every kind when it joins a
+/// member, where a kind it did not know could not be handled; a contract
+/// between the driver and the client crates (quantstratum-docs:
+/// `karyos/testing/public-api-audit-alpha2.md`).
 #[derive(Debug)]
 pub enum Capability<T: TermBytes = HeapTerms> {
     /// A stream's exclusive publication.
@@ -202,6 +217,7 @@ pub enum Capability<T: TermBytes = HeapTerms> {
 
 /// A capability with its lease and owner, waiting in the hand-over table.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct HandOverEntry<T: TermBytes = HeapTerms> {
     /// The hand-over key from the response.
     pub key: u64,
@@ -217,6 +233,38 @@ pub struct HandOverEntry<T: TermBytes = HeapTerms> {
     /// karyos/design/observability-and-tools.md`, "Loss reports from
     /// clients"); `None` reports nothing.
     pub publication: Option<PublicationIdentity>,
+}
+
+impl<T: TermBytes> HandOverEntry<T> {
+    /// The entry of hand-over `key` for `capability` and its `lease`,
+    /// with no generation link and no publication identity: add them with
+    /// [`HandOverEntry::with_generation`] and
+    /// [`HandOverEntry::with_publication`].
+    #[must_use]
+    pub const fn new(key: u64, capability: Capability<T>, lease: Lease) -> Self {
+        Self {
+            key,
+            capability,
+            lease,
+            generation: None,
+            publication: None,
+        }
+    }
+
+    /// The generation link and base the delivered handle starts with,
+    /// when the driver keeps one.
+    #[must_use]
+    pub fn with_generation(mut self, generation: Option<(Arc<GenerationLink<T>>, u64)>) -> Self {
+        self.generation = generation;
+        self
+    }
+
+    /// The stream's publication identity, for its overrun reports.
+    #[must_use]
+    pub const fn with_publication(mut self, publication: PublicationIdentity) -> Self {
+        self.publication = Some(publication);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -243,6 +291,7 @@ pub struct ClientLink<T: TermBytes = HeapTerms> {
 
 /// Why a hand-over put or take failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HandOverError {
     /// The driver is gone or the entry was dropped.
     Closed,

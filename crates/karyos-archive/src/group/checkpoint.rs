@@ -77,6 +77,7 @@ const _: () = assert!(CHECKPOINT.max_length == RECORD_LENGTH_U32);
 
 /// Why a checkpoint was not taken or not written.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CheckpointError {
     /// Another checkpoint is with the writer.
     #[error("a checkpoint is in flight")]
@@ -107,6 +108,21 @@ pub enum CheckpointError {
     /// and its buffer comes back.
     #[error("the group stopped")]
     Stopped,
+    /// The group was started without checkpoints
+    /// (`StartGroup::checkpoints` was `None`).
+    #[error("the group keeps no checkpoints")]
+    NoCheckpoints,
+    /// No event has been dispatched yet, in this run or the journal's:
+    /// there is no state after an event to name.
+    #[error("no event was dispatched yet")]
+    NothingDispatched,
+    /// A checkpoint at this `group_seq` was taken already, and is recorded
+    /// or being written: no event ran since.
+    #[error("a checkpoint at group_seq {group_seq} was taken already")]
+    Repeated {
+        /// The event both name.
+        group_seq: u64,
+    },
     /// No checkpoint is being written, or `advance` was given another
     /// request than `begin`.
     #[error("no checkpoint is being written for this request")]
@@ -178,6 +194,28 @@ impl<D: Disk> CheckpointStore<D> {
             let _ = store.append_gap(written, recorded_end)?;
             let _ = store.sync()?;
         }
+        Ok(Self { store })
+    }
+
+    /// Opens group `group_id`'s store in `dir` for reading, as
+    /// [`CheckpointStore::recover`] would leave it, changing nothing (a
+    /// replay diff's view, over a read-only directory): the store's
+    /// recovery plan applied in memory, its bytes past `recorded_end`
+    /// unnamed, and a range up to it that the store lost held as lost.
+    ///
+    /// # Errors
+    ///
+    /// The store's errors.
+    pub fn open_verified(
+        disk: D,
+        dir: &Path,
+        group_id: u64,
+        config: JournalConfig,
+        recorded_end: u64,
+    ) -> Result<Self, SegmentError> {
+        let mut store =
+            SegmentStore::open_verified(disk, dir, group_id, geometry(config)?, config.policy)?;
+        store.view_until(recorded_end);
         Ok(Self { store })
     }
 

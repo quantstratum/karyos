@@ -15,25 +15,30 @@
 //! bounded only by incomplete events and gap markers. A payload not
 //! captured, or a reference unavailable, in the range is not comparable.
 //!
-//! Recorded checkpoints (A9-2, template 30) are not compared yet: the
-//! cursor gives them right after their events, and the diff passes over
-//! them. Their comparison, matched by `group_seq` with the `state
-//! checkpoint` kind, and `--from-checkpoint` follow (A8-2).
+//! Recorded checkpoints (template 30, A8-2) are compared as records,
+//! matched by `group_seq`: their length, crc32c and format; a difference,
+//! or a checkpoint on one side only, is the `state checkpoint` kind.
+//! `--from-checkpoint <id>` opens the left journal at its checkpoint
+//! `<id>` and the right one at its checkpoint with the same `group_seq`,
+//! each through its store opened read only: what the store's recovery
+//! would cut or mark lost reads as lost, so a damaged checkpoint is not
+//! comparable.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use karyos_archive::disk::{Disk, ReadOnly};
+use karyos_archive::group::checkpoint::{CheckpointStore, recorded_end};
 use karyos_archive::group::journal::{GroupJournal, JournalConfig, JournalError};
-use karyos_archive::group::prefix::{Coverage, recover};
+use karyos_archive::group::prefix::{CheckpointHeld, Coverage, recover, recover_ranges};
 use karyos_archive::group::record::{
-    CONTRACT_VERSION, GroupRecord, Operation, Payload, Role, UnsupportedHeader,
+    CONTRACT_VERSION, CheckpointRecord, GroupRecord, Operation, Payload, Role, UnsupportedHeader,
 };
 use karyos_archive::group::replay::{
     CursorConfig, ReplayConfig, ReplayCursor, ReplayError, ReplayEvent, Step, Stop,
 };
-use karyos_archive::segment::{SyncPolicy, recorded_geometry};
+use karyos_archive::segment::{SegmentError, SyncPolicy, recorded_geometry};
 
 #[cfg(test)]
 mod tests;
@@ -45,12 +50,19 @@ journals (recording-group-replay.md section 10). It reads only.
 
 Usage: karyos-tools replay diff <left-dir> <left-group> <right-dir> <right-group>
            [--from <seq>] [--to <seq>] [--json] [--accept-manifest]
+           [--from-checkpoint <id>]
 
   --from <seq>          the first group_seq compared [the first event]
   --to <seq>            the last group_seq compared [the end of the shorter
                         complete prefix]
   --json                one JSON object instead of text
   --accept-manifest     compare journals whose manifests differ
+  --from-checkpoint <id>  compare from the event after the left journal's
+                        checkpoint <id> and the right one's at its group_seq
+                        (stores in <dir>/checkpoints; a replay capture has
+                        none, so it is not comparable). The prefix is
+                        recovered with the reopen hold the journal's header
+                        records, as the run kept it
   -h, --help            print this text
 
 Exit status: 0 identical over the range; 1 diverged, the first difference
@@ -88,6 +100,9 @@ pub struct DiffArgs {
     pub json: bool,
     /// Compare journals whose manifests differ.
     pub accept_manifest: bool,
+    /// Compare from the event after this checkpoint (A9 section 7), in
+    /// the range it opens.
+    pub from_checkpoint: Option<u64>,
 }
 
 /// Parses `replay diff`'s arguments, those after `replay diff`: `None`
@@ -99,6 +114,7 @@ pub struct DiffArgs {
 pub fn parse_diff(args: impl IntoIterator<Item = OsString>) -> Result<Option<DiffArgs>, String> {
     let mut positional = Vec::new();
     let (mut from, mut to, mut json, mut accept_manifest) = (None, None, false, false);
+    let mut from_checkpoint = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let text = arg
@@ -108,18 +124,23 @@ pub fn parse_diff(args: impl IntoIterator<Item = OsString>) -> Result<Option<Dif
             "-h" | "--help" => return Ok(None),
             "--json" => json = true,
             "--accept-manifest" => accept_manifest = true,
-            "--from" | "--to" => {
+            "--from" | "--to" | "--from-checkpoint" => {
+                let what = if text == "--from-checkpoint" {
+                    "a checkpoint id"
+                } else {
+                    "a group_seq"
+                };
                 let value = args
                     .next()
                     .and_then(|value| value.to_str().map(str::to_owned))
-                    .ok_or_else(|| format!("{text} needs a group_seq"))?;
+                    .ok_or_else(|| format!("{text} needs {what}"))?;
                 let seq = value
                     .parse::<u64>()
-                    .map_err(|_| format!("{text}: not a group_seq: {value}"))?;
-                if text == "--from" {
-                    from = Some(seq);
-                } else {
-                    to = Some(seq);
+                    .map_err(|_| format!("{text}: not {what}: {value}"))?;
+                match text {
+                    "--from" => from = Some(seq),
+                    "--to" => to = Some(seq),
+                    _ => from_checkpoint = Some(seq),
                 }
             }
             // Any dash but a lone one is an option; none other is known.
@@ -158,6 +179,7 @@ pub fn parse_diff(args: impl IntoIterator<Item = OsString>) -> Result<Option<Dif
         to,
         json,
         accept_manifest,
+        from_checkpoint,
     }))
 }
 
@@ -176,6 +198,9 @@ pub enum Kind {
     ExtraObservation,
     /// The event's end.
     End,
+    /// A checkpoint of the application's state (A9): its record differs,
+    /// or is on one side only.
+    StateCheckpoint,
 }
 
 impl Kind {
@@ -189,6 +214,7 @@ impl Kind {
             Self::MissingObservation => "missing observation",
             Self::ExtraObservation => "extra observation",
             Self::End => "end",
+            Self::StateCheckpoint => "state checkpoint",
         }
     }
 }
@@ -361,14 +387,95 @@ impl Coverage for Records {
     fn ended(&self, _recording_id: u64) -> Option<u64> {
         None
     }
+
+    // A checkpoint is compared as its record: the store's bytes are not
+    // read, so every recorded checkpoint opens its range.
+    fn checkpoint(&self, _position: u64, _end: u64) -> CheckpointHeld {
+        CheckpointHeld::Durable
+    }
+}
+
+/// As [`Records`], with checkpoints as a store opened read only holds
+/// them: one it lost never opens its range (`--from-checkpoint`).
+struct Stored<'s, D: Disk>(&'s CheckpointStore<D>);
+
+impl<D: Disk> Coverage for Stored<'_, D> {
+    fn positions(&self, recording_id: u64) -> Option<(u64, u64)> {
+        Records.positions(recording_id)
+    }
+
+    fn ended(&self, recording_id: u64) -> Option<u64> {
+        Records.ended(recording_id)
+    }
+
+    fn checkpoint(&self, position: u64, end: u64) -> CheckpointHeld {
+        self.0.holds(position, end)
+    }
+}
+
+/// Where a journal opens for the diff.
+#[derive(Debug, Clone, Copy)]
+enum At {
+    /// At its first event.
+    Start,
+    /// After its checkpoint with this id (the left journal's).
+    Id(u64),
+    /// After its checkpoint at this `group_seq` (the right journal's).
+    GroupSeq(u64),
+}
+
+impl At {
+    /// Whether `checkpoint` is the one this opens at.
+    fn names(self, checkpoint: &CheckpointRecord) -> bool {
+        match self {
+            Self::Start => false,
+            Self::Id(id) => checkpoint.checkpoint_id == id,
+            Self::GroupSeq(group_seq) => checkpoint.group_seq == group_seq,
+        }
+    }
+}
+
+/// The checkpoint directory beside a group's journal (A9 section 2).
+pub const CHECKPOINTS: &str = "checkpoints";
+
+/// The first checkpoint record in `journal` that `found` accepts.
+fn find_checkpoint<D: Disk>(
+    journal: &mut GroupJournal<D>,
+    found: impl Fn(&CheckpointRecord) -> bool,
+) -> Result<Option<CheckpointRecord>, JournalError> {
+    let mut checkpoint = None;
+    let _ = journal.walk(0, |_, _, record| {
+        if let GroupRecord::Checkpoint(recorded) = record
+            && found(recorded)
+        {
+            checkpoint = Some(*recorded);
+            return false;
+        }
+        true
+    })?;
+    Ok(checkpoint)
+}
+
+/// A zeroed buffer for `checkpoint`'s snapshot, one allocation that fails
+/// typed; empty for none (the open then says it is unknown).
+fn snapshot_buffer(checkpoint: Option<&CheckpointRecord>) -> Result<Vec<u8>, String> {
+    let length = checkpoint.map_or(0, |checkpoint| checkpoint.length);
+    let length = usize::try_from(length).map_err(|_| format!("a snapshot of {length} bytes"))?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| format!("a snapshot of {length} bytes cannot be allocated"))?;
+    buffer.resize(length, 0);
+    Ok(buffer)
 }
 
 /// A journal open for the diff: its cursor, its header's manifest and
-/// first `group_seq`.
+/// first `group_seq`, and the checkpoint it opened at.
 struct Opened<D: Disk> {
     cursor: ReplayCursor<ReadOnly<D>>,
     manifest: Vec<u8>,
     first: u64,
+    checkpoint: Option<CheckpointRecord>,
 }
 
 fn error(reason: impl Into<String>) -> Report {
@@ -384,8 +491,14 @@ fn not_comparable(reason: impl Into<String>) -> Report {
 }
 
 /// Opens `journal` on `disk`, read only.
-fn open<D: Disk>(disk: D, journal: &Journal, side: &str) -> Result<Opened<D>, Report> {
+fn open<D: Disk + Clone>(
+    disk: D,
+    journal: &Journal,
+    side: &str,
+    at: At,
+) -> Result<Opened<D>, Report> {
     let mut disk = ReadOnly(disk);
+    let store_disk = disk.clone();
     let context = |what: &dyn std::fmt::Display| {
         error(format!(
             "{side} journal (group {} in {}): {what}",
@@ -398,11 +511,16 @@ fn open<D: Disk>(disk: D, journal: &Journal, side: &str) -> Result<Opened<D>, Re
         .ok_or_else(|| context(&"no journal"))?;
     let segment_length = u32::try_from(geometry.segment_length())
         .map_err(|_| context(&"a segment longer than a journal's"))?;
-    let config = JournalConfig {
+    let journal_config = JournalConfig {
         segment_length,
         policy: SyncPolicy::PerSegment,
     };
-    let mut recovered = match GroupJournal::recover(disk, &journal.dir, journal.group, config) {
+    let mut recovered = match GroupJournal::recover(
+        disk,
+        &journal.dir,
+        journal.group,
+        journal_config,
+    ) {
         Ok(recovered) => recovered.journal,
         // Another contract or clock: another journal, not a corrupt one.
         Err(JournalError::Unsupported(header)) => {
@@ -470,8 +588,6 @@ fn open<D: Disk>(disk: D, journal: &Journal, side: &str) -> Result<Opened<D>, Re
         })
         .map_err(|failure| context(&failure))?;
     let (manifest, first) = header.ok_or_else(|| context(&"no header"))?;
-    let recovery = recover(&mut recovered, &Records, RECOVERY_CAPACITY)
-        .map_err(|failure| context(&failure))?;
     let config = ReplayConfig {
         manifest: &manifest,
         accept_manifest: false,
@@ -480,17 +596,104 @@ fn open<D: Disk>(disk: D, journal: &Journal, side: &str) -> Result<Opened<D>, Re
         bytes: largest.max(1),
         records: most.max(2),
     };
-    let cursor = match ReplayCursor::open(recovered, &recovery, &config, room) {
-        Ok(cursor) => cursor,
+    let opened = match at {
+        At::Start => {
+            let recovery = recover(&mut recovered, &Records, RECOVERY_CAPACITY)
+                .map_err(|failure| context(&failure))?;
+            ReplayCursor::open(recovered, &recovery, &config, room).map(|cursor| (cursor, None))
+        }
+        At::Id(_) | At::GroupSeq(_) => {
+            let found = find_checkpoint(&mut recovered, |found| at.names(found))
+                .map_err(|failure| context(&failure))?;
+            let checkpoint_id = match (found, at) {
+                (Some(found), _) => found.checkpoint_id,
+                // Unknown: the open says so.
+                (None, At::Id(id)) => id,
+                (None, At::GroupSeq(group_seq)) => {
+                    return Err(not_comparable(format!(
+                        "{side} journal: no checkpoint at group_seq {group_seq}"
+                    )));
+                }
+                (None, At::Start) => return Err(context(&"no checkpoint to open at")),
+            };
+            // The group's checkpoint store, in the checkpoint directory
+            // beside its journal (A9 section 2), opened as its recovery
+            // would leave it, without repairing it.
+            let ended = recorded_end(&mut recovered).map_err(|failure| context(&failure))?;
+            let mut store = match CheckpointStore::open_verified(
+                store_disk,
+                &journal.dir.join(CHECKPOINTS),
+                journal.group,
+                journal_config,
+                ended,
+            ) {
+                Ok(store) => store,
+                // No store, or no directory for it.
+                Err(SegmentError::NotFound { .. }) => {
+                    return Err(not_comparable(format!(
+                        "{side} journal: checkpoint {checkpoint_id}'s store is not there"
+                    )));
+                }
+                Err(SegmentError::Io(failure))
+                    if failure.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Err(not_comparable(format!(
+                        "{side} journal: checkpoint {checkpoint_id}'s store is not there"
+                    )));
+                }
+                Err(failure) => return Err(context(&failure)),
+            };
+            // Which ranges recover depends on the group's reopen hold:
+            // recovery takes the header's (A9-5); RECOVERY_CAPACITY only
+            // sizes the tracker's queues. Every range is derived, a middle
+            // one too.
+            let (recovery, ranges) =
+                recover_ranges(&mut recovered, &Stored(&store), RECOVERY_CAPACITY)
+                    .map_err(|failure| context(&failure))?;
+            // A checkpoint the store does not hold is not comparable, before
+            // its snapshot's buffer is reserved.
+            if let Some(found) = found
+                && !matches!(
+                    found.end().map(|end| store.holds(found.position, end)),
+                    Some(CheckpointHeld::Durable | CheckpointHeld::Written)
+                )
+            {
+                return Err(not_comparable(format!(
+                    "{side} journal: checkpoint {checkpoint_id}'s snapshot is lost or corrupt"
+                )));
+            }
+            let mut snapshot =
+                snapshot_buffer(found.as_ref()).map_err(|failure| context(&failure))?;
+            ReplayCursor::open_at_checkpoint(
+                recovered,
+                &recovery,
+                &ranges,
+                &mut store,
+                checkpoint_id,
+                &config,
+                room,
+                &mut snapshot,
+            )
+            .map(|(cursor, checkpoint)| (cursor, Some(checkpoint)))
+        }
+    };
+    let (cursor, checkpoint) = match opened {
+        Ok(opened) => opened,
         Err(ReplayError::Header(mismatch)) => {
             return Err(not_comparable(format!("{side} journal: {mismatch}")));
         }
+        Err(
+            failure @ (ReplayError::UnknownCheckpoint { .. }
+            | ReplayError::NotInPrefix { .. }
+            | ReplayError::CheckpointCorrupt { .. }),
+        ) => return Err(not_comparable(format!("{side} journal: {failure}"))),
         Err(failure) => return Err(context(&failure)),
     };
     Ok(Opened {
         cursor,
         manifest,
         first,
+        checkpoint,
     })
 }
 
@@ -503,24 +706,56 @@ pub fn diff(args: &DiffArgs) -> Report {
 /// Compares the journals `args` names on `disk`.
 #[must_use]
 pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
-    let mut left = match open(disk.clone(), &args.left, "left") {
+    let at = args.from_checkpoint.map_or(At::Start, At::Id);
+    let mut left = match open(disk.clone(), &args.left, "left", at) {
         Ok(left) => left,
         Err(report) => return report,
     };
-    let mut right = match open(disk, &args.right, "right") {
+    // The id names the left journal's checkpoint; the right journal's is
+    // the one at the same `group_seq`.
+    let at = left
+        .checkpoint
+        .map_or(At::Start, |checkpoint| At::GroupSeq(checkpoint.group_seq));
+    let mut right = match open(disk, &args.right, "right", at) {
         Ok(right) => right,
         Err(report) => return report,
     };
     if !args.accept_manifest && left.manifest != right.manifest {
         return not_comparable("the manifests differ (--accept-manifest compares them)");
     }
-    let first = left.first.max(right.first);
+    // From a checkpoint, the first event compared is the one after it,
+    // and the two checkpoints are compared first, as records.
+    let (left_first, right_first) = match (left.checkpoint, right.checkpoint) {
+        (Some(left_checkpoint), Some(right_checkpoint)) => {
+            let range = Range {
+                from: 0,
+                to: None,
+                explicit_from: false,
+                to_range_end: false,
+            };
+            if let Some(report) =
+                compare_checkpoints(&[left_checkpoint], &[right_checkpoint], range)
+            {
+                return report;
+            }
+            let after = |checkpoint: CheckpointRecord| checkpoint.group_seq.checked_add(1);
+            match (after(left_checkpoint), after(right_checkpoint)) {
+                (Some(left), Some(right)) => (left, right),
+                _ => return error("a checkpoint at the last group_seq"),
+            }
+        }
+        _ => (left.first, right.first),
+    };
+    let first = left_first.max(right_first);
     let from = args.from.unwrap_or(first);
     // Below a journal's first event, its events are not there to compare.
     if from < first {
-        return not_comparable(format!(
-            "--from {from} is before a journal's first event, group_seq {first}"
-        ));
+        let what = if left.checkpoint.is_some() {
+            "the event after the checkpoint"
+        } else {
+            "a journal's first event"
+        };
+        return not_comparable(format!("--from {from} is before {what}, group_seq {first}"));
     }
     compare(
         &mut left.cursor,
@@ -529,6 +764,7 @@ pub fn diff_on<D: Disk + Clone>(disk: D, args: &DiffArgs) -> Report {
             from,
             to: args.to,
             explicit_from: args.from.is_some(),
+            to_range_end: left.checkpoint.is_some(),
         },
     )
 }
@@ -544,22 +780,92 @@ fn next_from<'c, D: Disk>(
     cursor: &'c mut ReplayCursor<D>,
     from: u64,
     side: &str,
+    checkpoints: &mut Vec<CheckpointRecord>,
 ) -> Result<Item<'c>, Report> {
-    // Checkpoints (A9-2) are not compared here yet: the diff by
-    // `group_seq` and the `state checkpoint` kind follow (A8-2). The due
-    // ones are taken without reading the next event.
+    // The checkpoints due after the events already read come first, kept
+    // to be compared by `group_seq` (A9 section 7).
     loop {
         match cursor.due_checkpoint() {
-            Ok(Some(_)) => {}
+            Ok(Some(checkpoint)) => checkpoints.push(checkpoint),
             Ok(None) => break,
             Err(failure) => return Err(error(format!("{side} journal: {failure}"))),
         }
     }
+    // With the due ones taken, a step gives no checkpoint: the events it
+    // skips below `from` make only checkpoints below it due, which it
+    // skips too.
     match cursor.step_from(from) {
         Ok(Step::Event(event)) => Ok(Item::Event(event)),
         Ok(Step::Stop(stop)) => Ok(Item::Stop(stop)),
-        Ok(Step::Checkpoint(_)) => Err(error(format!("{side} journal: checkpoints out of order"))),
+        Ok(Step::Checkpoint(checkpoint)) => Err(error(format!(
+            "{side} journal: checkpoint {} out of order",
+            checkpoint.checkpoint_id
+        ))),
         Err(failure) => Err(error(format!("{side} journal: {failure}"))),
+    }
+}
+
+/// A checkpoint record as the output shows it.
+fn describe_checkpoint(checkpoint: Option<&CheckpointRecord>) -> String {
+    checkpoint.map_or_else(
+        || "none".to_owned(),
+        |checkpoint| {
+            format!(
+                "checkpoint {} at group_seq {}, length {}, crc32c {:#010x}, format {}",
+                checkpoint.checkpoint_id,
+                checkpoint.group_seq,
+                checkpoint.length,
+                checkpoint.crc32c,
+                checkpoint.format
+            )
+        },
+    )
+}
+
+/// The first difference between the two sides' checkpoints in the range,
+/// matched by `group_seq` in order: a checkpoint is compared as a record,
+/// by its `length`, `crc32c` and `format` (its `position` is where each
+/// store holds it, and a capture's is none).
+fn compare_checkpoints(
+    left: &[CheckpointRecord],
+    right: &[CheckpointRecord],
+    range: Range,
+) -> Option<Report> {
+    let in_range = |checkpoint: &&CheckpointRecord| {
+        checkpoint.group_seq >= range.from && range.to.is_none_or(|to| checkpoint.group_seq <= to)
+    };
+    let mut left = left.iter().filter(in_range);
+    let mut right = right.iter().filter(in_range);
+    loop {
+        let (expected, found) = match (left.next(), right.next()) {
+            (None, None) => return None,
+            (Some(expected), Some(found))
+                if expected.group_seq == found.group_seq
+                    && (expected.length, expected.crc32c, expected.format)
+                        == (found.length, found.crc32c, found.format) =>
+            {
+                continue;
+            }
+            // A checkpoint at another event, or on one side only: the
+            // earlier one is the difference.
+            (Some(expected), Some(found)) if expected.group_seq < found.group_seq => {
+                (Some(expected), None)
+            }
+            (Some(expected), Some(found)) if found.group_seq < expected.group_seq => {
+                (None, Some(found))
+            }
+            pair => pair,
+        };
+        let group_seq = expected
+            .or(found)
+            .map_or(0, |checkpoint| checkpoint.group_seq);
+        return Some(Report::Diverged {
+            group_seq,
+            index: None,
+            kind: Kind::StateCheckpoint,
+            expected: describe_checkpoint(expected),
+            found: describe_checkpoint(found),
+        });
     }
 }
 
@@ -704,6 +1010,13 @@ struct Range {
     /// left out is past it. The default `--from` is the journals' own
     /// first event, so an empty journal there is the `end` kind instead.
     explicit_from: bool,
+    /// From a checkpoint: the range the checkpoint opened is compared to
+    /// its end, and the stop that ends it (a gap or an incomplete event,
+    /// for a middle range) ends the comparison as the end of a complete
+    /// prefix does. Both sides must end there. A `--to` past that stop
+    /// still makes it not comparable: the stops' own checks against `to`
+    /// say so.
+    to_range_end: bool,
 }
 
 impl Range {
@@ -751,15 +1064,22 @@ fn compare<L: Disk, R: Disk>(
     }
     let mut events = 0u64;
     let mut last = None;
+    let (mut left_checkpoints, mut right_checkpoints) = (Vec::new(), Vec::new());
     loop {
-        let left_side = match next_from(left, from, "left") {
+        let left_side = match next_from(left, from, "left", &mut left_checkpoints) {
             Ok(item) => side(item, to),
             Err(report) => return report,
         };
-        let right_side = match next_from(right, from, "right") {
+        let right_side = match next_from(right, from, "right", &mut right_checkpoints) {
             Ok(item) => side(item, to),
             Err(report) => return report,
         };
+        // The checkpoints after the events compared so far.
+        if let Some(report) = compare_checkpoints(&left_checkpoints, &right_checkpoints, range) {
+            return report;
+        }
+        left_checkpoints.clear();
+        right_checkpoints.clear();
         let identical = Report::Identical {
             from,
             to: last,
@@ -768,7 +1088,8 @@ fn compare<L: Disk, R: Disk>(
         // A gap or an incomplete event inside the range is not comparable,
         // the left side first.
         let inside = |stop: &Stop| {
-            !matches!(stop, Stop::EndOfPrefix { .. })
+            !range.to_range_end
+                && !matches!(stop, Stop::EndOfPrefix { .. })
                 && first_missing(stop).is_some_and(|seq| to.is_none_or(|to| seq <= to))
         };
         for (stopped_side, name) in [(&left_side, "left"), (&right_side, "right")] {

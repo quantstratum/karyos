@@ -21,14 +21,15 @@
 //! [`super::reference::read_message`] (A5's replay source), when the
 //! Gateway has the Archive that holds it; a recording that no longer
 //! holds the frames leaves the payload unavailable. The configuration
-//! can opt in to present a message whose payload replay cannot give with
-//! an empty one.
+//! can opt in to present a message whose payload replay cannot give as
+//! `MessagePayload::Unavailable`, with its recorded length and extent.
 //!
 //! With a [`CaptureJournal`] it writes what the handler did (section 9):
 //! each presented event's records as the handler matched them, which are
 //! the recorded ones; at a divergence or an incomplete event, the records
 //! matched so far and an end that says incomplete, where replay stops.
 
+use karyos_sys::frame::Lane;
 use std::path::PathBuf;
 
 use super::effects::{Divergence as StateDivergence, DivergenceKind, ReplayEffects};
@@ -39,7 +40,8 @@ use super::{
 use crate::crc32c::crc32c;
 use crate::disk::Disk;
 use crate::group::gateway::{
-    ConflatedId, Dispatched, Event, GatewayError, GroupGateway, Handler, SubscriptionId, TimerId,
+    ConflatedId, Dispatched, Event, GatewayError, GroupGateway, Handler, MessagePayload,
+    SubscriptionId, TimerId,
 };
 use crate::group::journal::JournalError;
 use crate::group::record::{CheckpointRecord, EndOutcome, EventEnd, GroupRecord, Payload};
@@ -55,10 +57,14 @@ mod tests;
 pub struct GatewayConfig<'a> {
     /// By publication id.
     pub publications: &'a [(i32, i32)],
-    /// By subscription id. A subscription takes every lane of its stream
-    /// and session, as a client's subscription does, so the lane is not
-    /// part of its key; each pair is named once.
-    pub subscriptions: &'a [(i32, i32)],
+    /// By subscription id: each source by its stream, session and lane,
+    /// as the live Gateway added it; each triple is named once.
+    pub subscriptions: &'a [(i32, i32, Lane)],
+    /// The streams of `subscriptions` that are network subscriptions: the
+    /// entry of such a stream takes every session and lane, as the live
+    /// source took every image, which was then its stream's only source.
+    /// Each is named once in `subscriptions`.
+    pub network: &'a [i32],
     /// By conflated view id.
     pub conflated: &'a [(i32, i32)],
     /// The largest claim the handler makes, for the scratch claim.
@@ -66,7 +72,8 @@ pub struct GatewayConfig<'a> {
     /// The largest payload by reference, for the buffer it is read into.
     pub max_payload: usize,
     /// Present a message whose payload replay cannot give (not captured,
-    /// unavailable, or by reference) with an empty payload, for a handler
+    /// unavailable, or by reference) as `MessagePayload::Unavailable`,
+    /// with its recorded length and extent, for a handler
     /// that only counts or routes such messages (section 7). Off, such a
     /// message is not reproducible.
     pub present_unavailable: bool,
@@ -88,7 +95,9 @@ pub struct Archive<D: Disk> {
 pub struct ReplayGateway<D: Disk> {
     cursor: ReplayCursor<D>,
     publications: Vec<(i32, i32)>,
-    subscriptions: Vec<(i32, i32)>,
+    subscriptions: Vec<(i32, i32, Lane)>,
+    /// The network subscriptions' streams.
+    network: Vec<i32>,
     conflated: Vec<(i32, i32)>,
     scratch: Vec<u8>,
     archive: Option<Archive<D>>,
@@ -123,15 +132,19 @@ impl<D: Disk> ReplayGateway<D> {
         config: &GatewayConfig<'_>,
         archive: Option<Archive<D>>,
     ) -> Result<Self, ReplayError> {
-        let copied = |table: &[(i32, i32)]| -> Result<Vec<(i32, i32)>, ReplayError> {
-            let mut seen = std::collections::BTreeSet::new();
-            if !table.iter().all(|source| seen.insert(*source)) {
+        fn copied<K: Copy + PartialEq>(table: &[K]) -> Result<Vec<K>, ReplayError> {
+            let twice = table.iter().enumerate().any(|(index, key)| {
+                table
+                    .get(..index)
+                    .is_some_and(|before| before.contains(key))
+            });
+            if twice {
                 return Err(ReplayError::InvalidConfig);
             }
             let mut copy = allocate(table.len())?;
             copy.extend_from_slice(table);
             Ok(copy)
-        };
+        }
         let zeroed = |length: usize| -> Result<Vec<u8>, ReplayError> {
             let mut bytes = allocate(length)?;
             bytes.resize(length, 0);
@@ -141,6 +154,23 @@ impl<D: Disk> ReplayGateway<D> {
             cursor,
             publications: copied(config.publications)?,
             subscriptions: copied(config.subscriptions)?,
+            network: {
+                // Each network stream is one entry of the table.
+                let once = config.network.iter().all(|stream| {
+                    config
+                        .subscriptions
+                        .iter()
+                        .filter(|(entry, ..)| entry == stream)
+                        .count()
+                        == 1
+                });
+                if !once {
+                    return Err(ReplayError::InvalidConfig);
+                }
+                let mut network = allocate(config.network.len())?;
+                network.extend_from_slice(config.network);
+                network
+            },
             conflated: copied(config.conflated)?,
             scratch: zeroed(config.max_claim)?,
             archive,
@@ -156,7 +186,8 @@ impl<D: Disk> ReplayGateway<D> {
 
     /// Compares the handler's state at each recorded checkpoint (A9-2):
     /// it writes it into a buffer of `max_state` bytes, allocated here.
-    /// Without one, a recorded checkpoint finds no state and diverges.
+    /// A recorded snapshot larger than the buffer (empty without this
+    /// call) stops the replay with [`GatewayError::StateBuffer`].
     ///
     /// # Errors
     ///
@@ -289,6 +320,28 @@ impl<D: Disk> ReplayGateway<D> {
 }
 
 /// The id of `(stream_id, session_id)` in `table`.
+/// A subscription's id: its stream, session and lane, or its stream
+/// alone for a network subscription's.
+fn subscription_of(
+    table: &[(i32, i32, Lane)],
+    network: &[i32],
+    stream_id: i32,
+    session_id: i32,
+    lane: Lane,
+) -> Option<u16> {
+    let at = |index: usize| u16::try_from(index).ok();
+    if network.contains(&stream_id) {
+        return table
+            .iter()
+            .position(|&(stream, ..)| stream == stream_id)
+            .and_then(at);
+    }
+    table
+        .iter()
+        .position(|&source| source == (stream_id, session_id, lane))
+        .and_then(at)
+}
+
 fn id_of(table: &[(i32, i32)], stream_id: i32, session_id: i32) -> Option<u16> {
     table
         .iter()
@@ -409,22 +462,39 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                     ),
                     _ => None,
                 };
+                let length = match message.payload {
+                    Payload::Inline(bytes) => u32::try_from(bytes.len()).ok(),
+                    Payload::Reference { length, .. } | Payload::Unavailable { length } => {
+                        Some(length)
+                    }
+                };
                 let payload = match (message.payload, read) {
                     // Inline bytes are in the record itself: replay always has
                     // them, whatever names the event.
-                    (Payload::Inline(bytes), _) => Some(bytes),
-                    (Payload::Reference { .. }, Some(length)) => self.payload.get(..length),
-                    _ if self.present_unavailable => Some(&[][..]),
+                    (Payload::Inline(bytes), _) => Some(MessagePayload::Bytes(bytes)),
+                    (Payload::Reference { .. }, Some(length)) => {
+                        self.payload.get(..length).map(MessagePayload::Bytes)
+                    }
+                    _ if self.present_unavailable => Some(MessagePayload::Unavailable),
                     _ => None,
                 };
                 match (
                     payload,
-                    id_of(&self.subscriptions, message.stream_id, message.session_id),
+                    length,
+                    subscription_of(
+                        &self.subscriptions,
+                        &self.network,
+                        message.stream_id,
+                        message.session_id,
+                        message.lane,
+                    ),
                 ) {
-                    (Some(payload), Some(source)) => Some(Event::Message {
+                    (Some(payload), Some(length), Some(source)) => Some(Event::Message {
                         source: SubscriptionId(source),
                         lane: message.lane,
                         position: message.position,
+                        extent: message.extent,
+                        length,
                         reserved_value: message.reserved_value,
                         end_of_stream: message.end_of_stream,
                         extension: message.extension,
@@ -436,6 +506,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
             GroupRecord::Conflated(view) => id_of(&self.conflated, view.stream_id, view.session_id)
                 .map(|source| Event::Conflated {
                     source: ConflatedId(source),
+                    key: view.key,
                     version: view.version,
                     freshness: view.freshness,
                     value: view.value,
@@ -447,10 +518,12 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                         timer: TimerId(timer),
                     })
             }
-            GroupRecord::Lifecycle(lifecycle) => id_of(
+            GroupRecord::Lifecycle(lifecycle) => subscription_of(
                 &self.subscriptions,
+                &self.network,
                 lifecycle.stream_id,
                 lifecycle.session_id,
+                lifecycle.lane,
             )
             .map(|source| Event::Lifecycle {
                 source: SubscriptionId(source),
@@ -460,14 +533,20 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                 kind: external.kind,
                 value: external.value,
             }),
-            GroupRecord::Loss(loss) => id_of(&self.subscriptions, loss.stream_id, loss.session_id)
-                .map(|source| Event::Loss {
-                    source: SubscriptionId(source),
-                    loss: loss.loss,
-                    from: loss.from,
-                    lost_to: loss.lost_to,
-                    resume: loss.resume,
-                }),
+            GroupRecord::Loss(loss) => subscription_of(
+                &self.subscriptions,
+                &self.network,
+                loss.stream_id,
+                loss.session_id,
+                loss.lane,
+            )
+            .map(|source| Event::Loss {
+                source: SubscriptionId(source),
+                loss: loss.loss,
+                from: loss.from,
+                lost_to: loss.lost_to,
+                resume: loss.resume,
+            }),
             _ => None,
         };
         let Some(presented) = presented else {

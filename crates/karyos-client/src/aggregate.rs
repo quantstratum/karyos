@@ -53,6 +53,7 @@ const PEEKS_PER_PROBE: u32 = 2;
 
 /// How a lane ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LaneEnd {
     /// Closed at its seal, with no successor.
     Closed {
@@ -93,6 +94,7 @@ impl LaneEnd {
 
 /// What one poll did on one lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct LanePoll {
     /// Messages delivered.
     pub delivered: u64,
@@ -108,6 +110,7 @@ pub struct LanePoll {
 
 /// The aggregate's terminal: every configured lane ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Terminal {
     /// Whether it is a clean EOS: every lane closed at its seal with a
     /// normal reason and no lane reported a loss.
@@ -116,6 +119,7 @@ pub struct Terminal {
 
 /// What one [`AggregateSubscription::poll`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AggregatePoll {
     /// The DRR's report.
     pub drr: Report,
@@ -128,6 +132,8 @@ pub struct AggregatePoll {
 /// One lane: its frame reader and the subscription state around it.
 struct LaneState<T: TermBytes> {
     lane: Lane,
+    /// The stream's session, for each message's info.
+    session_id: i32,
     reader: Option<FrameReader<Arc<LogBuffer<T>>>>,
     rejoin: RejoinPolicy,
     link: Option<Arc<GenerationLink<T>>>,
@@ -156,8 +162,13 @@ impl<T: TermBytes> LaneState<T> {
             lease,
             export,
         } = subscription.into_lane_parts();
+        // No mapping, no message: the session is then never read.
+        let session_id = inner
+            .as_ref()
+            .map_or(0, |inner| inner.buffer().config().session_id);
         Self {
             lane,
+            session_id,
             reader: inner.map(FrameReader::new),
             rejoin,
             link,
@@ -220,13 +231,22 @@ impl<T: TermBytes> LaneState<T> {
         };
         let base = self.base;
         let lane = self.lane;
+        let session_id = self.session_id;
         let mut taken = None;
+        let end = reader.ready_end();
         let delivered = reader.take(|bytes, info| {
+            let extent = end
+                .and_then(|end| end.checked_sub(info.position))
+                .and_then(|extent| u32::try_from(extent).ok())
+                .unwrap_or(0);
             let info = MessageInfo {
                 position: base + info.position,
+                extent,
                 reserved_value: info.reserved_value,
                 end_of_stream: info.end_of_stream,
                 extension: info.extension,
+                session_id,
+                lane,
             };
             taken = Some(info);
             handler(bytes, lane, info);

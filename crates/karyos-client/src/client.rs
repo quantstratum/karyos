@@ -100,6 +100,7 @@ const ROLE: SubscriberRole = SubscriberRole::Required;
 
 /// How a control call waits between two services of its connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IdleStrategy {
     /// Spin without yielding.
     BusySpin,
@@ -241,12 +242,21 @@ impl ContextBuilder {
                 reason: "no image may be attached",
             });
         }
+        // A network subscription queues three times as many image
+        // changes: one adoption's retirements, arrivals and a close's
+        // drain.
+        if context.max_images.checked_mul(3).is_none() {
+            return Err(ClientError::InvalidContext {
+                reason: "too many images to queue their changes",
+            });
+        }
         Ok(context)
     }
 }
 
 /// A failed subscription poll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum SubscriptionError {
     /// An image's poll failed after `delivered` messages of this poll.
     #[error("image poll failed after {delivered} messages: {error}")]
@@ -265,6 +275,7 @@ pub enum SubscriptionError {
 
 /// What a subscription poll did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubscriptionPoll {
     /// Messages delivered, over every image.
     pub delivered: u32,
@@ -273,11 +284,49 @@ pub struct SubscriptionPoll {
     pub stopped: Option<ImageStop>,
 }
 
+/// An image of a network subscription attached or retired, as
+/// [`Subscription::image_changes`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImageChange {
+    /// The image's attach id: a session retired and announced again is
+    /// another image.
+    pub image_id: u64,
+    /// Its session.
+    pub session_id: i32,
+    /// Its lane.
+    pub lane: karyos_sys::frame::Lane,
+    /// Attached (`true`) or retired (`false`).
+    pub available: bool,
+}
+
+impl ImageChange {
+    /// A change of image `image_id` of session `session_id` on `lane`:
+    /// for sources other than a client's, and tests.
+    #[must_use]
+    pub const fn new(
+        image_id: u64,
+        session_id: i32,
+        lane: karyos_sys::frame::Lane,
+        available: bool,
+    ) -> Self {
+        Self {
+            image_id,
+            session_id,
+            lane,
+            available,
+        }
+    }
+}
+
 /// An image's poll that reported more than deliveries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImageStop {
     /// The image's session id, for a network subscription.
     pub session_id: Option<i32>,
+    /// The image's lane, for a network subscription.
+    pub lane: Option<karyos_sys::frame::Lane>,
     /// Its poll's summary.
     pub summary: PollSummary,
 }
@@ -664,6 +713,8 @@ struct InboxState<T: TermBytes> {
 struct Image<T: TermBytes> {
     id: u64,
     session_id: i32,
+    /// Its lane, read when it was attached.
+    lane: karyos_sys::frame::Lane,
     subscription: ClientSubscription<T>,
 }
 
@@ -1010,6 +1061,14 @@ impl<C: Connection> Client<C> {
         let sequence = self
             .connection
             .add_network_subscription(uri, stream_id.get())?;
+        // The context's build checked it.
+        let max_changes =
+            self.context
+                .max_images
+                .checked_mul(3)
+                .ok_or(ClientError::InvalidContext {
+                    reason: "too many images to queue their changes",
+                })?;
         match self.wait(sequence)? {
             Found::Outcome(outcome) => Ok(Subscription {
                 kind: Kind::Stream(Box::new(self.connection.subscription(*outcome)?)),
@@ -1022,6 +1081,9 @@ impl<C: Connection> Client<C> {
                     images: Vec::with_capacity(self.context.max_images),
                     next: 0,
                     closed: None,
+                    changes: std::collections::VecDeque::with_capacity(max_changes),
+                    max_changes,
+                    changes_lost: 0,
                 }),
             }),
         }
@@ -1149,9 +1211,19 @@ impl<C: Connection> Client<C> {
         match self.connection.subscription(completion.outcome) {
             Ok(subscription) => {
                 slot.attached = true;
+                // A subscription just attached is open, so it names its
+                // lane; one that does not is refused as a failed attach,
+                // never given a lane it does not read.
+                let Some(lane) = subscription.lane() else {
+                    let _ = self.connection.release_subscription(subscription);
+                    network.slots.retain(|slot| slot.id != attach.sequence);
+                    inbox.update(|state| bump(&mut state.refused));
+                    return;
+                };
                 let image = Image {
                     id: slot.id,
                     session_id: slot.session_id,
+                    lane,
                     subscription,
                 };
                 inbox.update(|state| state.arrived.push(image));
@@ -1327,6 +1399,15 @@ struct Images<T: TermBytes> {
     /// The image the next poll starts at.
     next: usize,
     closed: Option<ClientError>,
+    /// The image changes not yet drained, oldest first, at most
+    /// `max_changes`. Full, the oldest goes.
+    changes: std::collections::VecDeque<ImageChange>,
+    /// `3 * max_images`, which bounds one adoption: retirements, arrivals
+    /// and, with a close, every image left. The queue was reserved to it
+    /// (its capacity may be larger; this is the bound).
+    max_changes: usize,
+    /// The changes dropped from a full queue.
+    changes_lost: u64,
 }
 
 impl<T: TermBytes> Subscription<T> {
@@ -1358,6 +1439,81 @@ impl<T: TermBytes> Subscription<T> {
         }
     }
 
+    /// Presents to `each`, oldest first, the images attached and retired
+    /// since the last call, and forgets them: a network subscription's
+    /// images as it adopts them, each with its attach id. Nothing for a
+    /// stream. It allocates nothing; changes beyond the queue's room
+    /// (three times [`Context::max_images`]) drop the oldest, counted by
+    /// [`Subscription::image_changes_lost`].
+    pub fn image_changes(&mut self, each: &mut dyn FnMut(ImageChange)) {
+        while let Some(change) = self.next_image_change() {
+            each(change);
+        }
+    }
+
+    /// The oldest image change not yet drained, taken: one at a time, as
+    /// [`Subscription::image_changes`] gives them all. `None` for a
+    /// stream or once none is left.
+    pub fn next_image_change(&mut self) -> Option<ImageChange> {
+        match &mut self.kind {
+            Kind::Stream(_) => None,
+            Kind::Images(images) => {
+                images.adopt();
+                images.changes.pop_front()
+            }
+        }
+    }
+
+    /// Image changes dropped from a full queue before they were drained;
+    /// it holds at `u64::MAX`.
+    #[must_use]
+    pub fn image_changes_lost(&self) -> u64 {
+        match &self.kind {
+            Kind::Stream(_) => 0,
+            Kind::Images(images) => images.changes_lost,
+        }
+    }
+
+    /// [`Subscription::poll`], with a handler that may decline a message,
+    /// as [`ClientSubscription::poll_taking`]: the poll stops there, and a
+    /// required reader's message waits for the next poll, which starts at
+    /// that image. What the earlier images delivered stays taken.
+    ///
+    /// # Errors
+    ///
+    /// As [`Subscription::poll`].
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error carries the image's poll error by value, as ClientSubscription::poll does, so a failed poll reports its progress"
+    )]
+    pub fn poll_taking<H>(
+        &mut self,
+        mut handler: H,
+        limit: MessageLimit,
+    ) -> Result<SubscriptionPoll, SubscriptionError>
+    where
+        H: FnMut(&[u8], MessageInfo) -> bool,
+    {
+        match &mut self.kind {
+            Kind::Stream(subscription) => match subscription.poll_taking(&mut handler, limit) {
+                Ok(summary) => Ok(SubscriptionPoll {
+                    delivered: summary.delivered,
+                    stopped: stopped(&summary).then_some(ImageStop {
+                        session_id: None,
+                        lane: None,
+                        summary,
+                    }),
+                }),
+                Err(error) => Err(SubscriptionError::Poll {
+                    session_id: None,
+                    delivered: error.summary.delivered,
+                    error,
+                }),
+            },
+            Kind::Images(images) => images.poll_taking(&mut handler, limit),
+        }
+    }
+
     /// Delivers at most `limit` messages in all to `handler`. A network
     /// subscription polls its images in turn, starting after the image the
     /// last poll ended at, so none starves.
@@ -1384,6 +1540,7 @@ impl<T: TermBytes> Subscription<T> {
                     delivered: summary.delivered,
                     stopped: stopped(&summary).then_some(ImageStop {
                         session_id: None,
+                        lane: None,
                         summary,
                     }),
                 }),
@@ -1412,6 +1569,28 @@ impl<T: TermBytes> Images<T> {
         released.extend(images.into_iter().map(|image| image.subscription));
     }
 
+    /// Queues `image`'s change, dropping the oldest when full: never
+    /// allocates.
+    fn change(
+        changes: &mut std::collections::VecDeque<ImageChange>,
+        max: usize,
+        lost: &mut u64,
+        image: &Image<T>,
+        available: bool,
+    ) {
+        if changes.len() >= max && changes.pop_front().is_some() {
+            bump(lost);
+        }
+        if changes.len() < max {
+            changes.push_back(ImageChange {
+                image_id: image.id,
+                session_id: image.session_id,
+                lane: image.lane,
+                available,
+            });
+        }
+    }
+
     /// Takes what the client handed over.
     fn adopt(&mut self) {
         if !self.inbox.changed.swap(false, Ordering::Acquire) {
@@ -1432,8 +1611,25 @@ impl<T: TermBytes> Images<T> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for id in state.retired.drain(..) {
             if let Some(index) = self.images.iter().position(|image| image.id == id) {
-                released.push(self.images.remove(index).subscription);
+                let image = self.images.remove(index);
+                Self::change(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    &image,
+                    false,
+                );
+                released.push(image.subscription);
             }
+        }
+        for image in &state.arrived {
+            Self::change(
+                &mut self.changes,
+                self.max_changes,
+                &mut self.changes_lost,
+                image,
+                true,
+            );
         }
         self.images.append(&mut state.arrived);
         if self.closed.is_none() {
@@ -1441,7 +1637,16 @@ impl<T: TermBytes> Images<T> {
         }
         drop(state);
         if self.closed.is_some() {
-            released.extend(self.images.drain(..).map(|image| image.subscription));
+            for image in self.images.drain(..) {
+                Self::change(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    &image,
+                    false,
+                );
+                released.push(image.subscription);
+            }
         }
         drop(released);
         if self.next >= self.images.len() {
@@ -1457,6 +1662,52 @@ impl<T: TermBytes> Images<T> {
         &mut self,
         handler: &mut impl FnMut(&[u8], MessageInfo),
         limit: MessageLimit,
+    ) -> Result<SubscriptionPoll, SubscriptionError> {
+        self.poll_each(limit, |image, limit| {
+            image
+                .poll(&mut *handler, limit)
+                .map(|summary| (summary, false))
+        })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error carries the image's poll error by value, as ClientSubscription::poll does, so a failed poll reports its progress"
+    )]
+    fn poll_taking(
+        &mut self,
+        handler: &mut impl FnMut(&[u8], MessageInfo) -> bool,
+        limit: MessageLimit,
+    ) -> Result<SubscriptionPoll, SubscriptionError> {
+        self.poll_each(limit, |image, limit| {
+            let mut declined = false;
+            image
+                .poll_taking(
+                    |bytes, info| {
+                        let taken = handler(bytes, info);
+                        declined = !taken;
+                        taken
+                    },
+                    limit,
+                )
+                .map(|summary| (summary, declined))
+        })
+    }
+
+    /// Polls the images in turn under one `limit`, each by `poll`, which
+    /// also reports whether the handler declined a message: the poll then
+    /// stops, and the next starts at that image, whose message waits.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error carries the image's poll error by value, as ClientSubscription::poll does, so a failed poll reports its progress"
+    )]
+    fn poll_each(
+        &mut self,
+        limit: MessageLimit,
+        mut poll: impl FnMut(
+            &mut ClientSubscription<T>,
+            MessageLimit,
+        ) -> Result<(PollSummary, bool), PollError>,
     ) -> Result<SubscriptionPoll, SubscriptionError> {
         self.adopt();
         if let Some(error) = self.closed {
@@ -1481,6 +1732,7 @@ impl<T: TermBytes> Images<T> {
             };
             let Some(Image {
                 session_id,
+                lane,
                 subscription: image,
                 ..
             }) = self.images.get_mut(index)
@@ -1491,8 +1743,8 @@ impl<T: TermBytes> Images<T> {
                 .checked_add(1)
                 .and_then(|next| next.checked_rem(count))
                 .unwrap_or(0);
-            match image.poll(&mut *handler, MessageLimit::new(remaining)) {
-                Ok(summary) => {
+            match poll(image, MessageLimit::new(remaining)) {
+                Ok((summary, declined)) => {
                     // Within the limit, a u32.
                     if let Some(delivered) = result.delivered.checked_add(summary.delivered) {
                         result.delivered = delivered;
@@ -1500,8 +1752,14 @@ impl<T: TermBytes> Images<T> {
                     if result.stopped.is_none() && stopped(&summary) {
                         result.stopped = Some(ImageStop {
                             session_id: Some(*session_id),
+                            lane: Some(*lane),
                             summary,
                         });
+                    }
+                    if declined {
+                        // The declined message is this image's next.
+                        self.next = index;
+                        break;
                     }
                 }
                 Err(error) => {
@@ -1517,5 +1775,89 @@ impl<T: TermBytes> Images<T> {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    /// An image of attach id `id`, session `session`, over its own log.
+    fn image(id: u64, session: i32) -> Image<karyos_sys::term_bytes::HeapTerms> {
+        let buffer = Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 2,
+                max_subscribers: 2,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: session,
+                stream_id: 2,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            })
+            .unwrap(),
+        );
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        Image {
+            id,
+            session_id: session,
+            lane: Lane::ZERO,
+            subscription,
+        }
+    }
+
+    /// #440 review F1: one adoption's worst case, every image retired, as
+    /// many arriving and a close draining them, is `3 * max_images`
+    /// changes: all are queued, none lost.
+    #[test]
+    fn one_adoption_queues_every_change() {
+        let max_images = 2;
+        let inbox = Arc::new(Inbox::new(max_images));
+        let mut images = Images {
+            registration: 1,
+            inbox: Arc::clone(&inbox),
+            released: Arc::new(Mutex::new(Vec::with_capacity(4 * max_images))),
+            images: Vec::with_capacity(max_images),
+            next: 0,
+            closed: None,
+            changes: std::collections::VecDeque::with_capacity(3 * max_images),
+            max_changes: 3 * max_images,
+            changes_lost: 0,
+        };
+        images.images.push(image(1, 1));
+        images.images.push(image(2, 2));
+        inbox.update(|state| {
+            state.retired.extend([1, 2]);
+            state.arrived.push(image(3, 3));
+            state.arrived.push(image(4, 4));
+            state.closed = Some(ClientError::EmptyMessage);
+        });
+        images.adopt();
+        let seen: Vec<(u64, bool)> = images
+            .changes
+            .iter()
+            .map(|change| (change.image_id, change.available))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (1, false),
+                (2, false),
+                (3, true),
+                (4, true),
+                (3, false),
+                (4, false)
+            ]
+        );
+        assert_eq!(images.changes_lost, 0);
     }
 }

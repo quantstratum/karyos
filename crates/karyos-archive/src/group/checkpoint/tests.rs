@@ -53,6 +53,7 @@ fn header(capture: Capture) -> JournalHeader<'static> {
         contract_version: 1,
         clock: Clock::HostMonotonic,
         capture,
+        reopen_hold: 0,
         manifest: b"m",
     }
 }
@@ -596,13 +597,35 @@ fn check(crashed: &FaultDisk, survives: Survives, snapshots: &[Vec<u8>]) -> Resu
         Err(error) => return Err(format!("journal recovery: {error}")),
     };
     let end = recorded_end(&mut journal).map_err(|e| format!("walk: {e}"))?;
-    let store = match CheckpointStore::recover(
-        disk.clone(),
+    // Opened for reading first, over a disk that refuses writes: it sees
+    // what recovery then leaves, and changes nothing.
+    let verified = match CheckpointStore::open_verified(
+        crate::disk::ReadOnly(disk.clone()),
         Path::new(CHECKPOINTS),
         GROUP,
         config(SyncPolicy::PerSegment),
         end,
     ) {
+        Ok(verified) => Some(verified),
+        Err(SegmentError::NotFound { .. }) => None,
+        Err(error) => return Err(format!("store open_verified: {error}")),
+    };
+    let recovered = CheckpointStore::recover(
+        disk.clone(),
+        Path::new(CHECKPOINTS),
+        GROUP,
+        config(SyncPolicy::PerSegment),
+        end,
+    );
+    // Both find the store, or neither does.
+    if verified.is_none() != matches!(recovered, Err(SegmentError::NotFound { .. })) {
+        return Err(format!(
+            "open_verified found a store: {}, recovery: {}",
+            verified.is_some(),
+            recovered.is_ok()
+        ));
+    }
+    let store = match recovered {
         Ok(store) => store,
         Err(SegmentError::NotFound { .. }) => {
             if end > 0 {
@@ -629,11 +652,29 @@ fn check(crashed: &FaultDisk, survives: Survives, snapshots: &[Vec<u8>]) -> Resu
             group.writer.store().written()
         ));
     }
+    if let Some(verified) = &verified
+        && verified.written() != end
+    {
+        return Err(format!(
+            "open_verified at {}, records end at {end}",
+            verified.written()
+        ));
+    }
     let records = group.records();
     for record in &records {
         let Some(end) = record.end() else {
             return Err("a recorded checkpoint with no range".into());
         };
+        let held = group.writer.store().holds(record.position, end);
+        if let Some(verified) = &verified
+            && verified.holds(record.position, end) != held
+        {
+            return Err(format!(
+                "checkpoint {}: open_verified holds {:?}, recovery {held:?}",
+                record.checkpoint_id,
+                verified.holds(record.position, end)
+            ));
+        }
         let expected = &snapshots[usize::try_from(record.checkpoint_id - 1).unwrap()];
         match group.writer.store().holds(record.position, end) {
             CheckpointHeld::Written | CheckpointHeld::Durable => {
@@ -1400,13 +1441,15 @@ fn the_reopen_hold_keeps_the_events_a_checkpoint_write_spans() {
     assert_eq!(run(None), ((1, 1), 1), "overflows, counted");
 }
 
-/// #426 re-check h5: a hold below the tracker's capacity is taken as the
-/// capacity. With room for 2 in flight and a hold of 1, the 2 events
-/// that end while the checkpoint is written are both kept.
+/// #437 review P2: the window is exactly the hold, whatever the
+/// capacity: a reader with room for 64 in flight, over a run whose hold
+/// was 2, lets go of the events past 2 as the run did, and the range
+/// stays at the checkpoint, the failed reopen counted. (The agent records
+/// a hold of at least `in_flight`.)
 #[test]
-fn a_hold_below_the_capacity_is_the_capacity() {
-    let mut tracker = PrefixTracker::new(2);
-    tracker.reserve_reopen_hold(1).unwrap();
+fn the_window_is_exactly_the_hold() {
+    let mut tracker = PrefixTracker::new(64);
+    tracker.reserve_reopen_hold(2).unwrap();
     let store = Store::default();
     store.written.set(100);
     store.durable.set(100);
@@ -1416,10 +1459,10 @@ fn a_hold_below_the_capacity_is_the_capacity() {
         0,
     );
     at = feed(&mut tracker, &gap(1, 1), at);
-    for seq in 2..=3 {
+    for seq in 2..=7 {
         at = feed(&mut tracker, &event(seq, EndOutcome::Complete), at);
     }
     at = feed(&mut tracker, &checkpoint_record(1, 1, 0), at);
-    assert_eq!(tracker.advance(at, at, &store), (3, 3));
-    assert_eq!(tracker.failed_reopens(), 0);
+    assert_eq!(tracker.advance(at, at, &store), (1, 1));
+    assert_eq!(tracker.failed_reopens(), 1);
 }
