@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use karyos_client::{Client, ClientConductor, Context, IdleStrategy};
+use karyos_client::{Client, ClientConductor, ClientError, Context, IdleStrategy, StreamId};
+
+use crate::api::publication::Lanes;
 
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
@@ -53,12 +55,70 @@ impl AnyClient {
             Self::Embedded(client) => client.poll(),
         }
     }
+
+    /// The exclusive publication of `stream_id` on `uri` (a control call:
+    /// it waits for the driver up to the context's timeout).
+    pub(crate) fn add_publication(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+    ) -> Result<Lanes, Failure> {
+        let failure = |error: ClientError| Failure::from(&error);
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(client) => client
+                .add_exclusive_publication(uri, stream_id)
+                .map(Lanes::Remote)
+                .map_err(failure),
+            Self::Embedded(client) => client
+                .add_exclusive_publication(uri, stream_id)
+                .map(Lanes::Embedded)
+                .map_err(failure),
+        }
+    }
+
+    /// Releases `lanes`, granted to this client.
+    pub(crate) fn remove_publication(&mut self, lanes: Lanes) {
+        match (self, lanes) {
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), Lanes::Remote(lanes)) => client.remove_publication(lanes),
+            (Self::Embedded(client), Lanes::Embedded(lanes)) => client.remove_publication(lanes),
+            // A publication always has its client's connection; another
+            // one is only dropped.
+            #[cfg(target_os = "linux")]
+            (_, lanes) => drop(lanes),
+        }
+    }
+}
+
+/// A client handle's object: the client and its children's handles, which
+/// its close ends first.
+pub(crate) struct ClientEntry {
+    /// The client.
+    pub(crate) client: AnyClient,
+    /// Its open publications.
+    pub(crate) publications: Vec<Handle>,
 }
 
 /// The table of clients, allocated on first use.
-fn clients() -> &'static Table<AnyClient> {
-    static CLIENTS: OnceLock<Table<AnyClient>> = OnceLock::new();
+pub(crate) fn clients() -> &'static Table<ClientEntry> {
+    static CLIENTS: OnceLock<Table<ClientEntry>> = OnceLock::new();
     CLIENTS.get_or_init(|| Table::new(Kind::Client, MAX_CLIENTS))
+}
+
+/// A client's entry for its table.
+#[cfg_attr(
+    not(any(test, target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "only a remote client or a test's embedded one has an entry until F5"
+    )
+)]
+fn entry(client: AnyClient) -> ClientEntry {
+    ClientEntry {
+        client,
+        publications: Vec::new(),
+    }
 }
 
 /// A client's options, as `karyos_client_options` carries them.
@@ -142,7 +202,7 @@ pub(crate) fn connect(options: &Options) -> Result<Handle, Failure> {
 #[cfg(target_os = "linux")]
 fn connect_with(context: Context) -> Result<Handle, Failure> {
     let client = Client::connect(context).map_err(|error| Failure::from(&error))?;
-    Ok(clients().insert(AnyClient::Remote(client))?)
+    Ok(clients().insert(entry(AnyClient::Remote(client)))?)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -157,7 +217,7 @@ fn connect_with(_context: Context) -> Result<Handle, Failure> {
 /// [`Status::HandlesExhausted`].
 #[cfg(test)]
 pub(crate) fn insert_embedded(client: Client<ClientConductor>) -> Result<Handle, Status> {
-    clients().insert(AnyClient::Embedded(client))
+    clients().insert(entry(AnyClient::Embedded(client)))
 }
 
 /// Serves `client` once; whether anything was served.
@@ -166,15 +226,36 @@ pub(crate) fn insert_embedded(client: Client<ClientConductor>) -> Result<Handle,
 ///
 /// As [`Table::with`].
 pub(crate) fn poll(client: Handle) -> Result<bool, Status> {
-    clients().with(client, AnyClient::poll)
+    clients().with(client, |entry| entry.client.poll())
 }
 
-/// Closes `client`: the driver releases what it granted the client.
+/// Closes `entry`'s children, all or none, releasing each to its client:
+/// while one is in use nothing is closed. A driver's close (F5) closes its
+/// clients' children with it.
 ///
 /// # Errors
 ///
-/// As [`Table::remove`].
+/// As [`Table::remove_all`].
+pub(crate) fn close_entry(entry: &mut ClientEntry) -> Result<(), Status> {
+    let publications = crate::api::publication::table().remove_all(&entry.publications)?;
+    for publication in publications {
+        publication.release(&mut entry.client);
+    }
+    entry.publications.clear();
+    Ok(())
+}
+
+/// Closes `client` and its children: the driver releases what it granted
+/// the client. All or nothing: while a child is in use, by another thread
+/// ([`Status::Busy`]) or by this one's callback ([`Status::Reentrant`]),
+/// nothing is closed.
+///
+/// # Errors
+///
+/// As [`Table::remove_with`].
 pub(crate) fn close(client: Handle) -> Result<(), Status> {
-    // Dropping the client leaves the driver; its children come with F3.
-    clients().remove(client).map(drop)
+    let (entry, ()) = clients().remove_with(client, close_entry)?;
+    // Dropping the client leaves the driver.
+    drop(entry);
+    Ok(())
 }

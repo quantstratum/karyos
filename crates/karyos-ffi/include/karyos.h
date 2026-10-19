@@ -26,6 +26,7 @@
 #ifndef KARYOS_H
 #define KARYOS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -41,6 +42,10 @@ extern "C" {
 
 /** The most clients open at once. */
 #define KARYOS_MAX_CLIENTS 64
+/** The most publications open at once. */
+#define KARYOS_MAX_PUBLICATIONS 4096
+/** The most claims outstanding at once: one per publication. */
+#define KARYOS_MAX_CLAIMS 4096
 
 /** Idle strategies of a control call's wait (karyos_client_options). */
 #define KARYOS_IDLE_BUSY_SPIN 0
@@ -93,6 +98,8 @@ extern "C" {
 #define KARYOS_E_CONFLATION 110
 /** not supported on this platform */
 #define KARYOS_E_UNSUPPORTED 111
+/** the publication has a claim outstanding; commit or abort it first */
+#define KARYOS_E_CLAIM_OUTSTANDING 112
 /** closed */
 #define KARYOS_E_CLOSED 200
 /** the subscription was closed by its rejoin policy */
@@ -172,6 +179,18 @@ typedef struct karyos_client_options {
 } karyos_client_options;
 
 /**
+ * Where an accepted message went. The caller sets size to
+ * sizeof(karyos_accepted); the rule of karyos_detail applies.
+ */
+typedef struct karyos_accepted {
+    uint32_t size;
+    /* The lane the message was appended to. */
+    uint32_t lane;
+    /* The message's position in that lane. */
+    uint64_t position;
+} karyos_accepted;
+
+/**
  * Writes the ABI version this library implements. Returns KARYOS_OK, or
  * KARYOS_E_INVALID_ARGUMENT with nothing written when a pointer is null or
  * misaligned.
@@ -213,6 +232,56 @@ int32_t karyos_client_poll(uint64_t client, uint32_t *served);
  * closed when the handle is in use (KARYOS_E_BUSY, KARYOS_E_REENTRANT).
  */
 int32_t karyos_client_close(uint64_t client);
+
+/**
+ * Adds the exclusive publication of stream_id on the channel uri
+ * (karyos:ipc or karyos:udp) to the client and writes its handle. A
+ * control call: it waits for the driver up to the client's timeout and
+ * holds the client handle meanwhile. A failure opens nothing and fills
+ * detail (may be null).
+ */
+int32_t karyos_client_add_publication(uint64_t client, const char *uri,
+                                      int32_t stream_id, uint64_t *publication,
+                                      karyos_detail *detail);
+
+/**
+ * Offers length bytes at data on the lane, copied before it returns; data
+ * may be null when length is 0. On KARYOS_OK, accepted (may be null)
+ * receives the lane and position. Never waits.
+ */
+int32_t karyos_publication_offer(uint64_t publication, uint32_t lane,
+                                 const uint8_t *data, size_t length,
+                                 karyos_accepted *accepted);
+
+/**
+ * Stages a claim of length bytes on the lane: writes its handle and a
+ * pointer to length zeroed bytes to fill. The pointer is valid until the
+ * commit releases the claim, its abort, or the publication's close, and
+ * never points into a term or a shared mapping. One claim per publication
+ * (KARYOS_E_CLAIM_OUTSTANDING).
+ */
+int32_t karyos_publication_claim(uint64_t publication, uint32_t lane,
+                                 uint32_t length, uint64_t *claim,
+                                 uint8_t **buffer);
+
+/**
+ * Commits the claim: claims in the term, copies the staged bytes and
+ * commits, in one call. KARYOS_OK releases the claim and fills accepted
+ * (may be null). KARYOS_E_BACK_PRESSURED, KARYOS_E_NOT_CONNECTED,
+ * KARYOS_E_ADMIN_ACTION, KARYOS_E_RATE_LIMITED and KARYOS_E_GATED keep it
+ * staged and its buffer valid, to retry or abort; any other failure
+ * releases it.
+ */
+int32_t karyos_claim_commit(uint64_t claim, karyos_accepted *accepted);
+
+/** Aborts the claim: nothing reaches the term. */
+int32_t karyos_claim_abort(uint64_t claim);
+
+/**
+ * Closes the publication through its client, with its outstanding claim;
+ * nothing is closed while the client handle is in use.
+ */
+int32_t karyos_publication_close(uint64_t publication);
 
 #ifdef __cplusplus
 }

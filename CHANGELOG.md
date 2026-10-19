@@ -464,6 +464,19 @@ release may break APIs, wire formats and shared-memory layouts.
   denied in the crate and expected only on `mod abi` and in the tests'
   `support::abi`; `make lint-sync` checks that, the clippy set, and that no
   profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- `karyos-ffi` publications and staged claims (batch F3; D1 ruled reserve
+  at commit): `karyos_client_add_publication` (`karyos:ipc` or
+  `karyos:udp`), `karyos_publication_offer` on a lane, and the staged
+  claim `karyos_publication_claim`, `karyos_claim_commit` and
+  `karyos_claim_abort`, with `karyos_publication_close` and the sized
+  `karyos_accepted`. A claim's buffer belongs to `karyos-ffi`, never a
+  term or a shared mapping; the commit claims in the term, copies and
+  commits in one call. A commit that meets back pressure, no subscriber, an
+  administrative action, the rate limit or a closed guard keeps the claim
+  staged for a retry; one claim per publication
+  (`KARYOS_E_CLAIM_OUTSTANDING`). Closing a client closes its publications
+  and their claims, all or nothing: while one is in use nothing closes.
+  Tests over an embedded driver run under Miri and on macOS.
 - `karyos-ffi` clients (batch F2): `karyos_client_options_init`,
   `karyos_client_connect`, `karyos_client_poll` and `karyos_client_close`,
   with the sized `karyos_client_options` (copied, nothing consumed) and

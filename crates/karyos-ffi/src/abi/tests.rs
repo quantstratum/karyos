@@ -206,3 +206,366 @@ fn a_struct_from_a_newer_header_is_read_and_written_by_its_prefix() {
     assert_eq!(detail.detail.size, size_of_u32::<NewerDetail>());
     assert_eq!(newer.later, 7);
 }
+
+/// An embedded driver on its own thread, with the heap stream 1001, until
+/// dropped; control calls need it served while they wait.
+struct Driven {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Driven {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+/// The one-lane heap stream of the publication tests.
+const STREAM: i32 = 1001;
+
+/// A one-lane heap stream of `stream_id` that accepts offers with no
+/// subscriber.
+fn stream_config(stream_id: i32) -> karyos_driver::StreamConfig {
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+    karyos_driver::StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 3,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Exclusive,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: karyos_driver::LossPolicy::Hold,
+        conflation: None,
+    }
+}
+
+/// A stream whose offers are refused while no subscriber is connected.
+const STREAM_UNCONNECTED: i32 = 1002;
+
+/// A driven driver with the streams, and two conductors of it.
+fn driven() -> (
+    Driven,
+    karyos_client::ClientConductor,
+    karyos_client::ClientConductor,
+) {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let _ = driver.add_stream(stream_config(STREAM)).unwrap();
+    let mut unconnected = karyos_driver::StreamConfig {
+        allow_unconnected: false,
+        ..stream_config(STREAM_UNCONNECTED)
+    };
+    unconnected.buffer.stream_id = STREAM_UNCONNECTED;
+    let _ = driver.add_stream(unconnected).unwrap();
+    let ours = driver.connect().unwrap();
+    let theirs = driver.connect().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        while !flag.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = driver.do_work().unwrap();
+            std::thread::yield_now();
+        }
+    });
+    (
+        Driven {
+            stop,
+            thread: Some(thread),
+        },
+        ours,
+        theirs,
+    )
+}
+
+/// A `karyos_accepted` of this version, filled with a marker.
+fn accepted() -> Accepted {
+    Accepted {
+        size: size_of_u32::<Accepted>(),
+        lane: u32::MAX,
+        position: u64::MAX,
+    }
+}
+
+/// `karyos_client_add_publication` of the stream on `karyos:ipc`.
+fn add_publication(client: u64) -> (i32, u64) {
+    add_publication_of(client, STREAM)
+}
+
+/// `karyos_client_add_publication` of `stream` on `karyos:ipc`.
+fn add_publication_of(client: u64, stream: i32) -> (i32, u64) {
+    let mut publication = 0;
+    // SAFETY: a C string literal, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_publication(
+            client,
+            c"karyos:ipc".as_ptr(),
+            stream,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, publication)
+}
+
+/// `karyos_publication_offer` of `payload` on lane 0.
+fn offer(publication: u64, payload: &[u8]) -> (i32, Accepted) {
+    let mut done = accepted();
+    // SAFETY: `payload` is live for the call; `done` is a live
+    // `karyos_accepted` with its size.
+    let status = unsafe {
+        karyos_publication_offer(publication, 0, payload.as_ptr(), payload.len(), &mut done)
+    };
+    (status, done)
+}
+
+/// `karyos_publication_claim`: the status, the claim and the buffer.
+fn claim(publication: u64, lane: u32, length: u32) -> (i32, u64, *mut u8) {
+    let (mut claim, mut buffer) = (0, core::ptr::null_mut());
+    // SAFETY: live, aligned out-parameters.
+    let status =
+        unsafe { karyos_publication_claim(publication, lane, length, &mut claim, &mut buffer) };
+    (status, claim, buffer)
+}
+
+/// Writes `bytes` into a claim's staged buffer, as a C caller does.
+///
+/// # Safety
+///
+/// `buffer` holds at least `bytes.len()` bytes of an outstanding claim.
+unsafe fn fill(buffer: *mut u8, bytes: &[u8]) {
+    // SAFETY: the caller's contract; nothing else refers to the bytes
+    // while the slice lives.
+    let staged = unsafe { core::slice::from_raw_parts_mut(buffer, bytes.len()) };
+    staged.copy_from_slice(bytes);
+}
+
+/// `karyos_claim_commit`: the status and where the message went.
+fn commit(claim: u64) -> (i32, Accepted) {
+    let mut done = accepted();
+    // SAFETY: a live `karyos_accepted` with its size.
+    let status = unsafe { karyos_claim_commit(claim, &mut done) };
+    (status, done)
+}
+
+/// Reads up to `count` messages of `subscription`, serving `client`.
+fn read(
+    client: &mut Client<karyos_client::ClientConductor>,
+    subscription: &mut karyos_client::Subscription<karyos_sys::term_bytes::HeapTerms>,
+    count: usize,
+) -> Vec<Vec<u8>> {
+    let mut seen = Vec::new();
+    let start = std::time::Instant::now();
+    while seen.len() < count {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "{seen:?}"
+        );
+        let _ = client.poll();
+        let _ = subscription.poll(
+            |bytes, _| seen.push(bytes.to_vec()),
+            karyos_client::MessageLimit::new(16),
+        );
+        std::thread::yield_now();
+    }
+    seen
+}
+
+#[test]
+fn a_publication_offers_and_commits_staged_claims() {
+    let (_driven, ours, theirs) = driven();
+    let context = Context::builder().build().unwrap();
+    let client = client::insert_embedded(Client::with_conductor(ours, context.clone()))
+        .unwrap()
+        .raw();
+    let mut subscriber = Client::with_conductor(theirs, context);
+    let mut reading = subscriber
+        .add_subscription("karyos:ipc", karyos_client::StreamId::new(STREAM))
+        .unwrap();
+    let (status, publication) = add_publication(client);
+    assert_eq!(status, Status::Ok.code());
+
+    // An offer copies the bytes; a null pointer is refused unless empty.
+    let (status, offered) = offer(publication, b"hello");
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(offered.lane, 0);
+    // SAFETY: a null pointer with a nonzero length is refused before use.
+    let null = unsafe {
+        karyos_publication_offer(publication, 0, core::ptr::null(), 3, core::ptr::null_mut())
+    };
+    assert_eq!(null, Status::InvalidArgument.code());
+    // SAFETY: an empty payload is never read.
+    let empty = unsafe {
+        karyos_publication_offer(publication, 0, core::ptr::null(), 0, core::ptr::null_mut())
+    };
+    assert_eq!(empty, Status::EmptyMessage.code());
+
+    // A staged claim: written by the caller, reaching the term only at the
+    // commit, and one at a time.
+    let (status, staged, buffer) = claim(publication, 0, 5);
+    assert_eq!(status, Status::Ok.code());
+    assert!(!buffer.is_null());
+    // SAFETY: the buffer holds the 5 claimed bytes until the commit.
+    unsafe { fill(buffer, b"world") };
+    assert_eq!(claim(publication, 0, 1).0, Status::ClaimOutstanding.code());
+    let (status, committed) = commit(staged);
+    assert_eq!(status, Status::Ok.code());
+    assert!(committed.position > offered.position);
+    assert_eq!(commit(staged).0, Status::Closed.code());
+    assert_eq!(karyos_claim_abort(staged), Status::Closed.code());
+
+    // An aborted claim leaves nothing, and frees the publication's claim.
+    let (status, aborted, _) = claim(publication, 0, 4);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(karyos_claim_abort(aborted), Status::Ok.code());
+    assert_eq!(commit(aborted).0, Status::Closed.code());
+
+    // Refused claims.
+    assert_eq!(claim(publication, 9, 4).0, Status::InvalidLane.code());
+    assert_eq!(claim(publication, 300, 4).0, Status::InvalidLane.code());
+    assert_eq!(claim(publication, 0, 0).0, Status::EmptyMessage.code());
+    assert_eq!(
+        claim(publication, 0, u32::MAX).0,
+        Status::MessageTooLarge.code()
+    );
+
+    assert_eq!(
+        read(&mut subscriber, &mut reading, 2),
+        [b"hello".to_vec(), b"world".to_vec()]
+    );
+
+    // A publication closes once; a closed one refuses everything.
+    assert_eq!(karyos_publication_close(publication), Status::Ok.code());
+    assert_eq!(karyos_publication_close(publication), Status::Closed.code());
+    assert_eq!(offer(publication, b"x").0, Status::Closed.code());
+    assert_eq!(claim(publication, 0, 1).0, Status::Closed.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+#[test]
+fn closing_a_client_closes_its_publications_and_their_claims() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(
+        ours,
+        Context::builder().build().unwrap(),
+    ))
+    .unwrap()
+    .raw();
+    let (status, publication) = add_publication(client);
+    assert_eq!(status, Status::Ok.code());
+    let (status, staged, _) = claim(publication, 0, 3);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+    assert_eq!(offer(publication, b"x").0, Status::Closed.code());
+    assert_eq!(commit(staged).0, Status::Closed.code());
+    assert_eq!(karyos_publication_close(publication), Status::Closed.code());
+    // A closed client adds nothing.
+    assert_eq!(add_publication(client).0, Status::Closed.code());
+}
+
+#[test]
+fn add_publication_refuses_bad_arguments() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(
+        ours,
+        Context::builder().build().unwrap(),
+    ))
+    .unwrap()
+    .raw();
+    let mut publication = 0;
+    // SAFETY: a null URI is refused before any use.
+    let null_uri = unsafe {
+        karyos_client_add_publication(
+            client,
+            core::ptr::null(),
+            STREAM,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(null_uri, Status::InvalidArgument.code());
+    // SAFETY: a null out-parameter is refused before any use.
+    let null_out = unsafe {
+        karyos_client_add_publication(
+            client,
+            c"karyos:ipc".as_ptr(),
+            STREAM,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(null_out, Status::InvalidArgument.code());
+    let mut detail = Detail {
+        size: size_of_u32::<Detail>(),
+        reserved: 0,
+        code: 0,
+        value: 0,
+    };
+    // SAFETY: live pointers and a C string literal.
+    let bad_uri = unsafe {
+        karyos_client_add_publication(
+            client,
+            c"no-such-scheme:".as_ptr(),
+            STREAM,
+            &mut publication,
+            &mut detail,
+        )
+    };
+    assert_eq!(bad_uri, Status::InvalidChannel.code());
+    assert_eq!(publication, 0);
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+#[test]
+fn a_commit_that_finds_no_subscriber_keeps_its_claim_staged() {
+    let (_driven, ours, theirs) = driven();
+    let context = Context::builder().build().unwrap();
+    let client = client::insert_embedded(Client::with_conductor(ours, context.clone()))
+        .unwrap()
+        .raw();
+    let (status, publication) = add_publication_of(client, STREAM_UNCONNECTED);
+    assert_eq!(status, Status::Ok.code());
+    let (status, staged, buffer) = claim(publication, 0, 3);
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: the buffer holds the 3 claimed bytes until the claim is
+    // released.
+    unsafe { fill(buffer, b"abc") };
+    // No subscriber: the commit is refused, and the claim stays staged.
+    assert_eq!(commit(staged).0, Status::NotConnected.code());
+    assert_eq!(claim(publication, 0, 1).0, Status::ClaimOutstanding.code());
+    // A subscriber connects; the same claim, with its bytes, commits.
+    let mut subscriber = Client::with_conductor(theirs, context);
+    let mut reading = subscriber
+        .add_subscription(
+            "karyos:ipc",
+            karyos_client::StreamId::new(STREAM_UNCONNECTED),
+        )
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        assert!(start.elapsed() < std::time::Duration::from_secs(60));
+        let (status, _) = commit(staged);
+        if status == Status::Ok.code() {
+            break;
+        }
+        assert_eq!(status, Status::NotConnected.code());
+        let _ = subscriber.poll();
+        std::thread::yield_now();
+    }
+    assert_eq!(read(&mut subscriber, &mut reading, 1), [b"abc".to_vec()]);
+    assert_eq!(commit(staged).0, Status::Closed.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}

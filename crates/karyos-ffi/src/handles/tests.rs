@@ -193,3 +193,51 @@ fn a_create_waits_out_a_stale_use_of_its_free_slot() {
     // The slot went back to the free list: capacity is intact.
     assert!(table.insert(3_u32).is_ok());
 }
+
+#[test]
+fn a_parent_close_is_refused_as_a_whole_while_a_child_is_held() {
+    let parents = Table::new(Kind::Client, 1);
+    let children = Table::new(Kind::Publication, 2);
+    let parent = parents.insert(1_u32).unwrap();
+    let held = children.insert(10_u32).unwrap();
+    let free = children.insert(20_u32).unwrap();
+    let both = [held, free];
+    // A child held by this thread: the parent's close is refused, and
+    // nothing is closed.
+    let refused = children
+        .with(held, |_| {
+            parents.remove_with(parent, |_| children.remove_all(&both))
+        })
+        .unwrap();
+    assert_eq!(refused.map(|(value, _)| value), Err(Status::Reentrant));
+    assert_eq!(children.with(free, |value| *value), Ok(20));
+    assert_eq!(parents.with(parent, |value| *value), Ok(1));
+    // Free: all of it closes, a stale or repeated child is skipped.
+    let (value, closed) = parents
+        .remove_with(parent, |_| {
+            children.remove_all(&[held, free, held, Handle::from_raw(0)])
+        })
+        .unwrap();
+    assert_eq!(value, 1);
+    assert_eq!(closed, [10, 20]);
+    assert_eq!(children.with(held, |value| *value), Err(Status::Closed));
+    assert_eq!(parents.with(parent, |value| *value), Err(Status::Closed));
+    // Both children's slots were freed.
+    assert!(children.insert(1).is_ok() && children.insert(2).is_ok());
+}
+
+#[test]
+fn a_failed_check_before_a_close_closes_nothing() {
+    let table = Table::new(Kind::Client, 1);
+    let handle = table.insert(1_u32).unwrap();
+    assert_eq!(
+        table
+            .remove_with(handle, |_| Err::<(), _>(Status::Busy))
+            .map(|(value, ())| value),
+        Err(Status::Busy)
+    );
+    assert_eq!(table.with(handle, |value| *value), Ok(1));
+    // The callback runs holding the slot: reentering it is refused.
+    let inner = table.remove_with(handle, |_| Ok(table.with(handle, |value| *value)));
+    assert_eq!(inner, Ok((1, Err(Status::Reentrant))));
+}

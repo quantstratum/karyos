@@ -180,11 +180,28 @@ impl<T> Table<T> {
     ///
     /// [`Status::HandlesExhausted`] when every slot is taken or retired.
     pub(crate) fn insert(&self, value: T) -> Result<Handle, Status> {
+        self.insert_or_return(value).map_err(|(status, _)| status)
+    }
+
+    /// [`Table::insert`], giving `value` back when it fails, so the caller
+    /// can release what it holds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Table::insert`], with the value.
+    pub(crate) fn insert_or_return(&self, value: T) -> Result<Handle, (Status, T)> {
         let index = {
-            let mut free = self.free.lock().map_err(|_| Status::Internal)?;
-            free.pop().ok_or(Status::HandlesExhausted)?
+            let Ok(mut free) = self.free.lock() else {
+                return Err((Status::Internal, value));
+            };
+            match free.pop() {
+                Some(index) => index,
+                None => return Err((Status::HandlesExhausted, value)),
+            }
         };
-        let slot = self.slot(index)?;
+        let Ok(slot) = self.slot(index) else {
+            return Err((Status::Internal, value));
+        };
         // A free slot holds no object, so it is held only for the moment a
         // use of a stale handle compares generations, never across a
         // callback: waiting for it is short. Its mutex is not poisoned (a
@@ -195,7 +212,9 @@ impl<T> Table<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A free slot's generation is below u32::MAX (see remove).
-        let generation = entry.generation.checked_add(1).ok_or(Status::Internal)?;
+        let Some(generation) = entry.generation.checked_add(1) else {
+            return Err((Status::Internal, value));
+        };
         entry.generation = generation;
         entry.value = Some(value);
         Ok(Handle::new(self.kind, index, generation))
@@ -266,6 +285,89 @@ impl<T> Table<T> {
             free.push(handle.index());
         }
         Ok(value)
+    }
+
+    /// Closes `handle` after `before` succeeded on its object, holding
+    /// the slot throughout: a parent's close ends its children in
+    /// `before` and is refused as a whole when one of them is held. A
+    /// poisoned slot is closed too.
+    ///
+    /// # Errors
+    ///
+    /// As [`Table::remove`], and `before`'s error, with nothing closed.
+    pub(crate) fn remove_with<R>(
+        &self,
+        handle: Handle,
+        before: impl FnOnce(&mut T) -> Result<R, Status>,
+    ) -> Result<(T, R), Status> {
+        let slot = self.check(handle)?;
+        let (mut entry, poisoned) = match slot.entry.try_lock() {
+            Ok(entry) => (entry, false),
+            Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), true),
+            Err(TryLockError::WouldBlock) => return Err(Self::contended(slot)),
+        };
+        let _held = Held {
+            holder: &slot.holder,
+        };
+        slot.holder.store(thread_token(), Ordering::Release);
+        if entry.generation != handle.generation() {
+            return Err(Status::Closed);
+        }
+        let value = entry.value.as_mut().ok_or(Status::Closed)?;
+        let done = before(value)?;
+        let value = entry.value.take().ok_or(Status::Closed)?;
+        if poisoned {
+            slot.entry.clear_poison();
+        }
+        let reusable = entry.generation < u32::MAX;
+        drop(entry);
+        if reusable {
+            let mut free = self.free.lock().map_err(|_| Status::Internal)?;
+            free.push(handle.index());
+        }
+        Ok((value, done))
+    }
+
+    /// Closes every handle of `handles`, all or none: when one is held by
+    /// a thread, nothing is closed. Stale handles are skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Reentrant`] or [`Status::Busy`] for a held one.
+    pub(crate) fn remove_all(&self, handles: &[Handle]) -> Result<Vec<T>, Status> {
+        let mut taken = Vec::with_capacity(handles.len());
+        for (at, &handle) in handles.iter().enumerate() {
+            if handles.get(..at).is_some_and(|seen| seen.contains(&handle)) {
+                continue;
+            }
+            let Ok(slot) = self.check(handle) else {
+                continue;
+            };
+            let (entry, poisoned) = match slot.entry.try_lock() {
+                Ok(entry) => (entry, false),
+                Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), true),
+                Err(TryLockError::WouldBlock) => return Err(Self::contended(slot)),
+            };
+            if entry.generation == handle.generation() && entry.value.is_some() {
+                taken.push((handle, slot, entry, poisoned));
+            }
+        }
+        let mut values = Vec::with_capacity(taken.len());
+        let mut freed = Vec::with_capacity(taken.len());
+        for (handle, slot, mut entry, poisoned) in taken {
+            if let Some(value) = entry.value.take() {
+                values.push(value);
+            }
+            if poisoned {
+                slot.entry.clear_poison();
+            }
+            if entry.generation < u32::MAX {
+                freed.push(handle.index());
+            }
+        }
+        let mut free = self.free.lock().map_err(|_| Status::Internal)?;
+        free.extend(freed);
+        Ok(values)
     }
 
     /// The slot `handle` names, if it is one of this table.
