@@ -180,6 +180,11 @@ impl Export {
 }
 
 /// A capability created by the driver for a registration.
+///
+/// Not `#[non_exhaustive]`: the driver matches every kind when it joins a
+/// member, where a kind it did not know could not be handled; a contract
+/// between the driver and the client crates (quantstratum-docs:
+/// `karyos/testing/public-api-audit-alpha2.md`).
 #[derive(Debug)]
 pub enum Capability<T: TermBytes = HeapTerms> {
     /// A stream's exclusive publication.

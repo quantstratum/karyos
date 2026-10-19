@@ -188,6 +188,10 @@ impl core::fmt::Debug for ScheduleClock {
 /// is not kept. An increment that would overflow leaves the value
 /// unchanged; it is not counted elsewhere, since a client handle has no
 /// `counter overflows` cell.
+///
+/// Not `#[non_exhaustive]`: the driver builds it field by field, a
+/// contract between the driver and the client crates rather than an API
+/// for users (quantstratum-docs: `karyos/testing/public-api-audit-alpha2.md`).
 #[derive(Debug, Default)]
 pub struct ScheduleCounters {
     /// Timed offers accepted.
