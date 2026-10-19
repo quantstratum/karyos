@@ -18,6 +18,6 @@ pub mod log;
 pub mod mark;
 pub mod snapshot;
 
-pub use dedup::{DedupConfig, Outcome, Registered, Request, SessionTable};
+pub use dedup::{DecodeError, DedupConfig, Outcome, Registered, Request, SessionTable};
 pub use hard_state::HardState;
 pub use log::{ChainProblem, Corruption, Entry, LogError, Opened, RaftLog};
