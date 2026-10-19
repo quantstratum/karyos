@@ -123,6 +123,7 @@ impl ReplayRequest {
     /// A replay of `source` over `[from, to)`.
     #[must_use]
     pub const fn new(source: PublicationIdentity, from: u64, to: u64) -> Self {
+        debug_assert!(from <= to, "a replay range ends at or after its start");
         Self { source, from, to }
     }
 }
