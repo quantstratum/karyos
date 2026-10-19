@@ -180,3 +180,53 @@ fn a_lapped_cursor_reports_what_it_lost() {
     let operations: Vec<u64> = guards.records.iter().map(|entry| entry.operation).collect();
     assert_eq!(operations, [7, 8, 9, 10]);
 }
+
+/// REVIEWER-02's F1 on #473: a repeated error updates its record in place,
+/// and the agent shows the driver's count, not the one it first read.
+#[test]
+fn a_repeated_error_is_shown_with_its_current_count() {
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    let config = || StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 3,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 2,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Exclusive,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    };
+    let _serial = serial();
+    let dir = dir("repeated");
+    let mut driver = driver(&dir, DriverConfig::default(), 4);
+    let _ = driver.add_stream(config()).unwrap();
+    assert!(driver.add_stream(config()).is_err());
+    let mut agent = agent(&[&dir]);
+    refresh_serving(&mut driver, &mut agent);
+    let errors = &agent.view().drivers[0].errors;
+    assert_eq!(errors.records.len(), 1);
+    assert_eq!(errors.records[0].occurrences, 1);
+    for _ in 0..2 {
+        assert!(driver.add_stream(config()).is_err());
+    }
+    refresh_serving(&mut driver, &mut agent);
+    let errors = &agent.view().drivers[0].errors;
+    assert_eq!(errors.records.len(), 1, "{errors:?}");
+    assert_eq!(errors.records[0].occurrences, 3);
+    // One record, delivered once, nothing lost.
+    assert_eq!((errors.delivered, errors.overwritten), (1, 0));
+}

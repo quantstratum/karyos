@@ -157,9 +157,27 @@ impl<T: Clone> Follower<T> {
         }
     }
 
-    /// A new attach: the next scan starts from the ring's oldest record.
+    /// The oldest record kept.
+    pub(crate) fn oldest(&self) -> Option<&T> {
+        self.records.front()
+    }
+
+    /// Replaces the kept record `same` matches with `record`; a record no
+    /// longer kept is dropped.
+    pub(crate) fn update(&mut self, record: T, same: impl Fn(&T, &T) -> bool) {
+        if let Some(kept) = self.records.iter_mut().find(|kept| same(kept, &record)) {
+            *kept = record;
+        }
+    }
+
+    /// A new driver instance: its rings start over, so the records and
+    /// counts of the old one are dropped (their sequences would overlap the
+    /// new ones), and the next scan starts from the oldest record.
     pub(crate) fn restart(&mut self) {
         self.cursor = 0;
+        self.records.clear();
+        self.delivered = 0;
+        self.overwritten = 0;
     }
 
     pub(crate) fn feed(&self) -> Feed<T> {

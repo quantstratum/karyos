@@ -140,7 +140,7 @@ pub struct Subscriber {
 pub struct Feed<T> {
     /// The records kept.
     pub records: Vec<T>,
-    /// Records read since the first attach.
+    /// Records read from the current driver instance.
     pub delivered: u64,
     /// Records the ring overwrote before the agent read them: a lapped
     /// cursor.

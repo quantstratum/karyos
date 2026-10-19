@@ -239,10 +239,16 @@ fn read_rings(
     losses: &mut Follower<LossEntry>,
     guards: &mut Follower<GuardEntry>,
 ) {
-    let mut cursor = errors.cursor;
-    let mut kept = Vec::new();
+    // The error log updates a repeated error's record in place (its
+    // occurrences and last time), so the scan starts again from the oldest
+    // record kept, as `karyos-errors` does: an earlier record comes back
+    // updated, never as a new one.
+    let next = errors.cursor;
+    let start = errors.oldest().map_or(next, |oldest| oldest.seq.min(next));
+    let mut cursor = start;
+    let mut read = Vec::new();
     let scan = tool.error_log().scan(&mut cursor, |record| {
-        kept.push(ErrorEntry {
+        read.push(ErrorEntry {
             seq: record.seq,
             first: record.first,
             last: record.last,
@@ -253,9 +259,23 @@ fn read_rings(
             message: record.message,
         });
     });
-    errors.cursor = cursor;
-    errors.count(scan.delivered, scan.overwritten);
-    kept.into_iter().for_each(|entry| errors.push(entry));
+    // The boundary proved `start..proven` overwritten; only the part past
+    // what was read before is a loss.
+    let lost = start
+        .checked_add(scan.overwritten)
+        .and_then(|proven| proven.checked_sub(next))
+        .unwrap_or(0);
+    errors.cursor = cursor.max(next);
+    let mut new = 0;
+    for entry in read {
+        if entry.seq >= next {
+            new += 1;
+            errors.push(entry);
+        } else {
+            errors.update(entry, |kept, read| kept.seq == read.seq);
+        }
+    }
+    errors.count(new, lost);
 
     let mut cursor = losses.cursor;
     let mut kept = Vec::new();

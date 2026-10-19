@@ -131,3 +131,18 @@ fn a_follower_keeps_the_newest_records_and_counts_every_one() {
     none.count(1, 0);
     assert_eq!((none.feed().records.len(), none.feed().delivered), (0, 1));
 }
+
+#[test]
+fn a_restart_drops_the_old_instances_records_and_counts() {
+    let mut follower = Follower::new(4);
+    follower.push(1);
+    follower.count(1, 2);
+    follower.cursor = 9;
+    follower.restart();
+    let feed = follower.feed();
+    assert!(feed.records.is_empty());
+    assert_eq!(
+        (feed.delivered, feed.overwritten, follower.cursor),
+        (0, 0, 0)
+    );
+}
