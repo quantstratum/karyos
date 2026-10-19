@@ -118,14 +118,27 @@ pub enum AgentError {
 pub trait IdleStrategy: Send {
     /// Called after each iteration with its work count.
     fn idle(&mut self, work: u32);
+
+    /// Hands the strategy its loop's spin meter (`crate::spin`), before its
+    /// first iteration. A strategy that spins calls
+    /// [`crate::spin::SpinMeter::spin`] on each spin and
+    /// [`crate::spin::SpinMeter::end_run`] when a spin run ends; one that
+    /// never spins keeps the meter so its cell shows 0. The default drops
+    /// it, which releases the cell.
+    fn attach_spin_meter(&mut self, meter: crate::spin::SpinMeter) {
+        drop(meter);
+    }
 }
 
 /// The default idle strategy: yields for a few idle iterations, then
 /// sleeps up to 1 ms (`quantstratum-docs: karyos/design/sockets-backend.md`
 /// 5.3).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct YieldThenSleep {
     idle: u32,
+    /// Kept, never written: this strategy never spins, so its loop's spin
+    /// time stays 0.
+    meter: Option<crate::spin::SpinMeter>,
 }
 
 impl IdleStrategy for YieldThenSleep {
@@ -138,6 +151,10 @@ impl IdleStrategy for YieldThenSleep {
         } else {
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn attach_spin_meter(&mut self, meter: crate::spin::SpinMeter) {
+        self.meter = Some(meter);
     }
 }
 
@@ -1090,6 +1107,10 @@ fn receiver_values(counters: &roles::ReceiverCounters) -> [u64; RECEIVER_CELLS.l
 /// agent that never comes back keeps its cells pending release.
 #[derive(Debug, Default)]
 pub struct AgentCells {
+    /// The agent's idle loop's spin meter (M5), which the runner hands to
+    /// the loop's idle strategy; in `SharedNetwork` mode the sender's is
+    /// the one loop's.
+    spin: Option<crate::spin::SpinMeter>,
     cells: Vec<Option<Counter>>,
     /// The values last stored, so an unchanged count is not stored again.
     stored: Vec<u64>,
@@ -1099,7 +1120,17 @@ impl AgentCells {
     /// Cells in the agent's label order.
     pub(crate) fn new(cells: Vec<Option<Counter>>) -> Self {
         let stored = vec![0; cells.len()];
-        Self { cells, stored }
+        Self {
+            spin: None,
+            cells,
+            stored,
+        }
+    }
+
+    /// With the agent's idle loop's spin meter.
+    pub(crate) fn with_spin(mut self, spin: Option<crate::spin::SpinMeter>) -> Self {
+        self.spin = spin;
+        self
     }
 
     /// Stores each count that changed into its cell.
@@ -1649,6 +1680,15 @@ pub(crate) fn guarded(
 }
 
 impl<O: SocketOps, T: StreamTerms> Work<O, T> {
+    /// The spin meter of this work's idle loop (M5).
+    fn take_spin(&mut self) -> Option<crate::spin::SpinMeter> {
+        match self {
+            Work::Sender(agent) => agent.cells.spin.take(),
+            Work::Receiver(agent) => agent.cells.spin.take(),
+            Work::Both(agents) => agents.sender.cells.spin.take(),
+        }
+    }
+
     fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         match self {
             Work::Sender(agent) => guarded(AgentKind::Sender, || agent.do_work(now)),
@@ -1815,7 +1855,7 @@ impl<O: SocketOps + Send + 'static, T: StreamTerms + 'static> AgentRunner<O, T> 
             Arc::clone(&agents.sender.core.stop),
             Arc::clone(&agents.receiver.core.stop),
         ];
-        let work = match mode {
+        let mut work = match mode {
             ThreadingMode::Shared => {
                 return Err(StartError {
                     error: AgentError::SharedMode,
@@ -1844,10 +1884,15 @@ impl<O: SocketOps + Send + 'static, T: StreamTerms + 'static> AgentRunner<O, T> 
         let mut threads = Vec::with_capacity(work.len());
         let mut handoffs = Vec::with_capacity(work.len());
         let mut failure = None;
-        for (kinds, _) in &work {
+        for (kinds, item) in &mut work {
             let state = Arc::new(AtomicU8::new(RUNNING));
             let thread_state = Arc::clone(&state);
-            let strategy = idle();
+            let mut strategy = idle();
+            // The loop's spin meter (M5): its agent's, or in SharedNetwork
+            // mode the sender's.
+            if let Some(meter) = item.take_spin() {
+                strategy.attach_spin_meter(meter);
+            }
             let (handoff, waiting) = mpsc::channel::<Work<O, T>>();
             let name = match kinds.as_slice() {
                 [AgentKind::Sender] => "karyos-sender",

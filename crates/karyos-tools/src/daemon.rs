@@ -276,7 +276,9 @@ impl Daemon {
 #[cfg(target_os = "linux")]
 impl Daemon {
     fn serve(&mut self, stop: &AtomicBool) -> Shutdown {
-        let mut idle = BackoffIdle::default();
+        // This loop drives the conductor: its spin time is the driver's
+        // `conductor spin time` (M5).
+        let mut idle = BackoffIdle::default().with_spin_meter(self.driver.take_spin_meter());
         let mut clients = self.driver.clients();
         while !stop.load(Ordering::Acquire) {
             let work = self.cycle();

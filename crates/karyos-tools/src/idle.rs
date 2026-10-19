@@ -4,11 +4,17 @@
 //! after a cycle with work it returns at once; after consecutive idle
 //! cycles it spins, then yields, then sleeps with a doubling period up to a
 //! bound. A cycle with work resets it.
+//!
+//! With a spin meter (`karyos_driver::spin`, M5) it measures its spin
+//! runs: a run starts at its first spin and ends at work, at a reset or
+//! when the strategy moves on to yielding; yields and sleeps never count.
 
 use std::time::Duration;
 
+use karyos_driver::spin::SpinMeter;
+
 /// Spins, yields, then sleeps up to a bound while no work is done.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BackoffIdle {
     max_spins: u32,
     max_yields: u32,
@@ -17,6 +23,8 @@ pub struct BackoffIdle {
     spins: u32,
     yields: u32,
     sleep: Duration,
+    /// Its loop's spin time, if it reports one.
+    meter: Option<SpinMeter>,
 }
 
 impl BackoffIdle {
@@ -32,7 +40,16 @@ impl BackoffIdle {
             spins: 0,
             yields: 0,
             sleep: min_sleep,
+            meter: None,
         }
+    }
+
+    /// Reporting its spin time into `meter`, its loop's
+    /// (`EmbeddedDriver::take_spin_meter` for the conductor's loop).
+    #[must_use]
+    pub fn with_spin_meter(mut self, meter: Option<SpinMeter>) -> Self {
+        self.meter = meter;
+        self
     }
 
     /// Called after each duty cycle with the work it did: resets on work,
@@ -42,18 +59,31 @@ impl BackoffIdle {
             self.reset();
         } else if self.spins < self.max_spins {
             self.spins += 1;
+            if let Some(meter) = &mut self.meter {
+                meter.spin();
+            }
             std::hint::spin_loop();
         } else if self.yields < self.max_yields {
+            self.end_spin_run();
             self.yields += 1;
             std::thread::yield_now();
         } else {
+            self.end_spin_run();
             std::thread::sleep(self.sleep);
             self.sleep = self.sleep.saturating_mul(2).min(self.max_sleep);
         }
     }
 
-    /// Back to spinning.
+    /// Ends the spin run going on, if any.
+    fn end_spin_run(&mut self) {
+        if let Some(meter) = &mut self.meter {
+            meter.end_run();
+        }
+    }
+
+    /// Back to spinning; a spin run going on ends.
     pub fn reset(&mut self) {
+        self.end_spin_run();
         self.spins = 0;
         self.yields = 0;
         self.sleep = self.min_sleep;
@@ -93,6 +123,56 @@ mod tests {
         idle.idle(1);
         assert_eq!(idle.next_sleep(), Duration::from_nanos(1));
         assert_eq!((idle.spins, idle.yields), (0, 0));
+    }
+
+    /// The value of the driver's `conductor spin time`, after a duty cycle
+    /// copied the meter's total into it.
+    fn spin_time(driver: &mut karyos_driver::EmbeddedDriver) -> u64 {
+        let _ = driver.do_work().unwrap();
+        let reader = driver.counters();
+        (0..reader.capacity())
+            .find_map(|index| match reader.read(index) {
+                karyos_sys::counters::CellRead::Allocated {
+                    metadata, value, ..
+                } if metadata.label() == b"conductor spin time" => {
+                    assert_eq!(metadata.type_id, karyos_driver::counters::TYPE_SPIN_TIME);
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("the conductor spin time cell")
+    }
+
+    /// M5: a spinning backoff reports its spin runs in its loop's cell, and
+    /// only once a run ends; yields and sleeps never count, so a backoff
+    /// that does not spin reports 0 (the negative control).
+    #[test]
+    fn spin_runs_reach_the_loop_cell_and_yields_never_count() {
+        let mut driver = karyos_driver::EmbeddedDriver::new().unwrap();
+        let mut idle = BackoffIdle::new(100_000, 0, Duration::ZERO, Duration::ZERO)
+            .with_spin_meter(driver.take_spin_meter());
+        assert!(driver.take_spin_meter().is_none(), "taken once");
+        for _ in 0..20_000 {
+            idle.idle(0);
+        }
+        // Past the 1024-spin flushes, the run so far is stored; the rest
+        // counts at the end of the run.
+        let flushed = spin_time(&mut driver);
+        assert!(flushed > 0);
+        idle.idle(1);
+        let ended = spin_time(&mut driver);
+        assert!(ended >= flushed);
+        idle.idle(1);
+        assert_eq!(spin_time(&mut driver), ended, "no run, nothing added");
+
+        let mut driver = karyos_driver::EmbeddedDriver::new().unwrap();
+        let mut idle = BackoffIdle::new(0, 10, Duration::from_micros(1), Duration::from_micros(2))
+            .with_spin_meter(driver.take_spin_meter());
+        for _ in 0..50 {
+            idle.idle(0);
+        }
+        idle.idle(1);
+        assert_eq!(spin_time(&mut driver), 0);
     }
 
     #[test]
