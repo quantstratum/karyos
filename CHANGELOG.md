@@ -406,6 +406,20 @@ release may break APIs, wire formats and shared-memory layouts.
   them, and `karyos_client::groups::read_groups` reads any such group
   (`capabilities` now uses it).
 
+- Alerts in the management agent (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M9). `AlertRules`
+  (`AgentConfig::with_alerts`; `karyos-agent --lag-bytes --lag-refreshes
+  --loss-quiet`) are evaluated at every refresh: a subscriber lagging
+  `lag_bytes` or more over `lag_refreshes` consecutive consistent samples
+  (8 MiB and 3 by default; a mixed sample changes nothing), and a loss
+  report that grew (read or overwritten), cleared after `loss_quiet`
+  refreshes without a new loss (10). `DriverView::alerts` (`Alert`,
+  `AlertKind::{Lag, Loss}`) lists those firing, with the time each began;
+  API v1's JSON appends `alerts` to each driver. The agent's command line
+  refuses a uid given two roles, and one poll serves at most 16
+  connections (`server::MAX_ACCEPTS`). The guard pending-acknowledgement
+  rule follows M4b.
+
 - The management agent's trace latency window (phase 5, M6c;
   quantstratum-docs: `karyos/design/agent-trace-window.md`). Per driver, a
   follower of the trace mirror pairs each `Publish` with its

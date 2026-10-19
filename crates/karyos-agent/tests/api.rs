@@ -234,3 +234,29 @@ fn the_binary_serves_the_view() {
         "{answer}"
     );
 }
+
+/// IMPLEMENT's F3 on #477: one poll serves at most `MAX_ACCEPTS`
+/// connections; the rest wait for the next poll, and every one is answered.
+#[test]
+fn a_poll_serves_at_most_max_accepts() {
+    use karyos_agent::server::MAX_ACCEPTS;
+    let _serial = serial();
+    let (_driver, agent, dir) = attached("accepts");
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let extra = 4;
+    let mut clients: Vec<UnixStream> = (0..MAX_ACCEPTS + extra)
+        .map(|_| {
+            let mut stream = UnixStream::connect(server.path()).unwrap();
+            stream.write_all(b"KARYOS-AGENT 1 view\n").unwrap();
+            stream
+        })
+        .collect();
+    assert_eq!(server.poll(&agent).unwrap().len(), MAX_ACCEPTS);
+    assert_eq!(server.poll(&agent).unwrap().len(), extra);
+    for client in &mut clients {
+        let mut answer = String::new();
+        let _ = client.read_to_string(&mut answer).unwrap();
+        assert!(answer.starts_with(r#"{"version":1,"#), "{answer}");
+    }
+}

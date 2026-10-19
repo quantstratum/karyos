@@ -10,6 +10,7 @@ use karyos_client::tool::{RemoteTool, attach_tool};
 use karyos_sys::counters::{CellRead, CountersReader, PassRead, read_pass};
 use karyos_sys::host_clock::host_monotonic_ns;
 
+use crate::alerts::{AlertRules, Alerts};
 use crate::api::{
     API_VERSION, AgentView, Counter, DriverState, DriverView, ErrorEntry, GuardEntry, LossEntry,
     Sample,
@@ -39,6 +40,8 @@ pub struct AgentConfig {
     pub history: usize,
     /// The trace latency window's bounds.
     pub trace: WindowConfig,
+    /// The alert rules (M9).
+    pub alerts: AlertRules,
 }
 
 impl AgentConfig {
@@ -50,6 +53,7 @@ impl AgentConfig {
             attach_timeout: DEFAULT_ATTACH_TIMEOUT,
             history: DEFAULT_HISTORY,
             trace: WindowConfig::default(),
+            alerts: AlertRules::default(),
         }
     }
 
@@ -73,6 +77,13 @@ impl AgentConfig {
         self.history = history;
         self
     }
+
+    /// With `alerts` as the alert rules.
+    #[must_use]
+    pub fn with_alerts(mut self, alerts: AlertRules) -> Self {
+        self.alerts = alerts;
+        self
+    }
 }
 
 /// One watched driver.
@@ -88,6 +99,7 @@ struct Driver {
     losses: Follower<LossEntry>,
     guards: Follower<GuardEntry>,
     trace: Option<TraceWindow>,
+    alerts: Alerts,
 }
 
 /// The agent. Each driver it is attached to counts one tool against the
@@ -119,6 +131,7 @@ impl Agent {
                 losses: Follower::new(config.history),
                 guards: Follower::new(config.history),
                 trace: None,
+                alerts: Alerts::default(),
             })
             .collect();
         Self { config, drivers }
@@ -130,7 +143,7 @@ impl Agent {
     pub fn refresh(&mut self) {
         let (timeout, trace) = (self.config.attach_timeout, self.config.trace);
         for driver in &mut self.drivers {
-            driver.refresh(timeout, trace);
+            driver.refresh(timeout, trace, &self.config.alerts);
         }
     }
 
@@ -145,7 +158,7 @@ impl Agent {
 }
 
 impl Driver {
-    fn refresh(&mut self, timeout: Duration, trace: WindowConfig) {
+    fn refresh(&mut self, timeout: Duration, trace: WindowConfig, rules: &AlertRules) {
         if self.tool.is_none() {
             match attach_tool(&self.dir, timeout) {
                 Ok(tool) => {
@@ -154,6 +167,7 @@ impl Driver {
                         self.errors.restart();
                         self.losses.restart();
                         self.guards.restart();
+                        self.alerts.restart();
                         self.trace = Some(TraceWindow::new(trace, driver_id(tool.instance())));
                     }
                     self.instance = Some(tool.instance());
@@ -168,6 +182,9 @@ impl Driver {
                             reason: error.to_string(),
                         };
                     }
+                    // Nothing read: its lag alerts clear, a quiet refresh
+                    // for its loss alert (M9).
+                    self.alerts.detached(rules);
                     return;
                 }
             }
@@ -185,6 +202,15 @@ impl Driver {
         if let Some(window) = self.trace.as_mut() {
             window.scan(tool.trace_mirror(), host_monotonic_ns());
         }
+        // The rules see what this refresh read (M9).
+        let losses = self.losses.feed();
+        let reported = losses.delivered.checked_add(losses.overwritten);
+        self.alerts.update(
+            rules,
+            self.sample.as_ref(),
+            reported.unwrap_or(losses.delivered),
+            host_monotonic_ns(),
+        );
         match tool.driver_closed() {
             Ok(false) => {}
             Ok(true) => {
@@ -217,6 +243,7 @@ impl Driver {
             guards: self.guards.feed(),
             latencies,
             trace,
+            alerts: self.alerts.firing(),
         }
     }
 }

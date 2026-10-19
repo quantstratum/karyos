@@ -13,13 +13,14 @@
 //! - **Strings.** UTF-8, with `"`, `\` and the control characters escaped;
 //!   a path that is not UTF-8 is written lossily.
 //! - **Enums.** [`DriverState`] is an object with a `state` field
-//!   (`"attached"`, `"closed"`, `"unavailable"`) and its variant's fields.
+//!   (`"attached"`, `"closed"`, `"unavailable"`) and its variant's fields;
+//!   an [`AlertKind`] is a string (`"lag"`, `"loss"`).
 
 use std::fmt::Write;
 
 use crate::api::{
-    AgentView, Counter, DriverState, DriverView, ErrorEntry, Feed, GuardEntry, Lane, LossEntry,
-    Sample, Subscriber,
+    AgentView, Alert, AlertKind, Counter, DriverState, DriverView, ErrorEntry, Feed, GuardEntry,
+    Lane, LossEntry, Sample, Subscriber,
 };
 
 /// A JSON value being written into a string.
@@ -170,6 +171,26 @@ fn driver_view(out: &mut Out<'_>, driver: &DriverView) {
         feed(fields.key("errors"), &driver.errors, error_entry);
         feed(fields.key("losses"), &driver.losses, loss_entry);
         feed(fields.key("guards"), &driver.guards, guard_entry);
+        fields
+            .key("alerts")
+            .array(&driver.alerts, |out, alert| alert_json(out, alert));
+    });
+}
+
+fn alert_json(out: &mut Out<'_>, alert: &Alert) {
+    out.object(|fields| {
+        fields.string(
+            "kind",
+            match alert.kind {
+                AlertKind::Lag => "lag",
+                AlertKind::Loss => "loss",
+            },
+        );
+        fields.number("stream", alert.stream);
+        fields.number("lane", alert.lane);
+        fields.number("participant", alert.participant);
+        fields.number("value", alert.value);
+        fields.number("since", alert.since);
     });
 }
 
