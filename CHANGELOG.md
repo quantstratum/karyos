@@ -394,6 +394,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Each network endpoint's effective capabilities in the CnC, for tools and
+  the management agent (SPEC §16.8; quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M3): one gauge per
+  capability field (`capability epoch`, platform, copy mode, queue
+  assignment, max datagram, observation points, clock granularity, each
+  capability's state with its reason and detail, and the effective buffer
+  sizes), keyed by the new participant kind `KIND_ENDPOINT` (4) and the
+  endpoint's instance id, rewritten at each reopen and freed when the
+  endpoint leaves or the network closes. The driver-wide events
+  `capability fallback` (capabilities on a fallback, once per endpoint
+  epoch) and `capability missing` (opens and reopens refused for a
+  required capability) count degradations.
+
 - Streaming snapshot reads in karyos-cluster (C8a follow-up, REVIEWER-02's
   review of #463). `SnapshotStore::reader` returns a `SnapshotReader` that
   hands out sections (`SectionHeader`) and their bytes in the caller's
