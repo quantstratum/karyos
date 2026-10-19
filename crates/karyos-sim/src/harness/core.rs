@@ -222,6 +222,15 @@ pub struct Release {
     pub stored_state: Option<HardState>,
 }
 
+/// What the log held when an entry was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applying {
+    /// The log's durable last index.
+    pub durable: Option<u64>,
+    /// The term of the log's entry at that index, if it holds one.
+    pub logged_term: Option<u64>,
+}
+
 /// The [`Ready`]s one [`drive`] call takes at most: a core that is always
 /// ready breaks the work budget of a duty instead of hanging the run.
 pub const MAX_READIES: usize = 64;
@@ -255,7 +264,8 @@ impl From<LogError> for DriveError {
 /// 5. apply `committed`.
 ///
 /// `send` gets every message, with the [`Release`] it waited for when it
-/// is an `after_persist` one; `apply` gets every committed entry, and
+/// is an `after_persist` one; `apply` gets every committed entry, with
+/// what the log held then ([`Applying`]); and
 /// `observe` each [`Step`]. A failed persistence returns at once: nothing
 /// that depends on it leaves, and the log is poisoned until it is
 /// reopened.
@@ -268,7 +278,7 @@ pub fn drive<C: ConsensusCore>(
     core: &mut C,
     log: &mut RaftLog<SimDisk>,
     send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
-    apply: &mut dyn FnMut(&Entry),
+    apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
 ) -> Result<(), DriveError> {
     let mut readies = 0usize;
@@ -325,7 +335,11 @@ pub fn drive<C: ConsensusCore>(
         }
         // 5. Application.
         for entry in &ready.committed {
-            apply(entry);
+            let applying = Applying {
+                durable: log.durable_index(),
+                logged_term: log.term(entry.index),
+            };
+            apply(entry, applying);
         }
     }
     Ok(())

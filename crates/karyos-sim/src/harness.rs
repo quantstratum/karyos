@@ -13,9 +13,13 @@
 //!   deterministic test service) and a scripted client node, over one wire
 //!   type, with the [`node::Recorder`] they report to.
 //! - [`check`]: the recorded history through C3, and the safety checks.
-//!
-//! The workloads and a reference core follow in a later step.
+//! - [`reference`](mod@reference): a harness fixture core with a fixed leader and no
+//!   elections.
+//! - [`workloads`]: ADR-0043's workloads as generators of cases, a runner
+//!   and pass predicates, safety and liveness reported apart.
 
 pub mod check;
 pub mod core;
 pub mod node;
+pub mod reference;
+pub mod workloads;
