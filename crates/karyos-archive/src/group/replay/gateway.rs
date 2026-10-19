@@ -29,6 +29,7 @@
 //! the recorded ones; at a divergence or an incomplete event, the records
 //! matched so far and an end that says incomplete, where replay stops.
 
+use karyos_sys::frame::Lane;
 use std::path::PathBuf;
 
 use super::effects::{Divergence as StateDivergence, DivergenceKind, ReplayEffects};
@@ -56,14 +57,13 @@ mod tests;
 pub struct GatewayConfig<'a> {
     /// By publication id.
     pub publications: &'a [(i32, i32)],
-    /// By subscription id. A subscription takes every lane of its stream
-    /// and session, as a client's subscription does, so the lane is not
-    /// part of its key; each pair is named once.
-    pub subscriptions: &'a [(i32, i32)],
+    /// By subscription id: each source by its stream, session and lane,
+    /// as the live Gateway added it; each triple is named once.
+    pub subscriptions: &'a [(i32, i32, Lane)],
     /// The streams of `subscriptions` that are network subscriptions: the
-    /// entry of such a stream takes every session, as the live source
-    /// took every image, which was then its stream's only source. Each is
-    /// named once in `subscriptions`.
+    /// entry of such a stream takes every session and lane, as the live
+    /// source took every image, which was then its stream's only source.
+    /// Each is named once in `subscriptions`.
     pub network: &'a [i32],
     /// By conflated view id.
     pub conflated: &'a [(i32, i32)],
@@ -95,7 +95,7 @@ pub struct Archive<D: Disk> {
 pub struct ReplayGateway<D: Disk> {
     cursor: ReplayCursor<D>,
     publications: Vec<(i32, i32)>,
-    subscriptions: Vec<(i32, i32)>,
+    subscriptions: Vec<(i32, i32, Lane)>,
     /// The network subscriptions' streams.
     network: Vec<i32>,
     conflated: Vec<(i32, i32)>,
@@ -132,15 +132,19 @@ impl<D: Disk> ReplayGateway<D> {
         config: &GatewayConfig<'_>,
         archive: Option<Archive<D>>,
     ) -> Result<Self, ReplayError> {
-        let copied = |table: &[(i32, i32)]| -> Result<Vec<(i32, i32)>, ReplayError> {
-            let mut seen = std::collections::BTreeSet::new();
-            if !table.iter().all(|source| seen.insert(*source)) {
+        fn copied<K: Copy + PartialEq>(table: &[K]) -> Result<Vec<K>, ReplayError> {
+            let twice = table.iter().enumerate().any(|(index, key)| {
+                table
+                    .get(..index)
+                    .is_some_and(|before| before.contains(key))
+            });
+            if twice {
                 return Err(ReplayError::InvalidConfig);
             }
             let mut copy = allocate(table.len())?;
             copy.extend_from_slice(table);
             Ok(copy)
-        };
+        }
         let zeroed = |length: usize| -> Result<Vec<u8>, ReplayError> {
             let mut bytes = allocate(length)?;
             bytes.resize(length, 0);
@@ -156,7 +160,7 @@ impl<D: Disk> ReplayGateway<D> {
                     config
                         .subscriptions
                         .iter()
-                        .filter(|(entry, _)| entry == stream)
+                        .filter(|(entry, ..)| entry == stream)
                         .count()
                         == 1
                 });
@@ -316,21 +320,26 @@ impl<D: Disk> ReplayGateway<D> {
 }
 
 /// The id of `(stream_id, session_id)` in `table`.
-/// A subscription's id: its stream and session, or its stream alone for
-/// a network subscription's.
+/// A subscription's id: its stream, session and lane, or its stream
+/// alone for a network subscription's.
 fn subscription_of(
-    table: &[(i32, i32)],
+    table: &[(i32, i32, Lane)],
     network: &[i32],
     stream_id: i32,
     session_id: i32,
+    lane: Lane,
 ) -> Option<u16> {
+    let at = |index: usize| u16::try_from(index).ok();
     if network.contains(&stream_id) {
         return table
             .iter()
-            .position(|&(stream, _)| stream == stream_id)
-            .and_then(|index| u16::try_from(index).ok());
+            .position(|&(stream, ..)| stream == stream_id)
+            .and_then(at);
     }
-    id_of(table, stream_id, session_id)
+    table
+        .iter()
+        .position(|&source| source == (stream_id, session_id, lane))
+        .and_then(at)
 }
 
 fn id_of(table: &[(i32, i32)], stream_id: i32, session_id: i32) -> Option<u16> {
@@ -477,6 +486,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                         &self.network,
                         message.stream_id,
                         message.session_id,
+                        message.lane,
                     ),
                 ) {
                     (Some(payload), Some(length), Some(source)) => Some(Event::Message {
@@ -513,6 +523,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                 &self.network,
                 lifecycle.stream_id,
                 lifecycle.session_id,
+                lifecycle.lane,
             )
             .map(|source| Event::Lifecycle {
                 source: SubscriptionId(source),
@@ -527,6 +538,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                 &self.network,
                 loss.stream_id,
                 loss.session_id,
+                loss.lane,
             )
             .map(|source| Event::Loss {
                 source: SubscriptionId(source),

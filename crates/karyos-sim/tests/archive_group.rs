@@ -359,7 +359,7 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
         cursor,
         &GatewayConfig {
             publications: &[],
-            subscriptions: &[(STREAM, 1)],
+            subscriptions: &[(STREAM, 1, Lane::ZERO)],
             network: &[],
             conflated: &[],
             max_claim: 64,
@@ -738,7 +738,7 @@ fn a_replayed_group_reaches_nothing_of_a_running_driver() {
         cursor,
         &GatewayConfig {
             publications: &[(OUT, 1)],
-            subscriptions: &[(STREAM, 1)],
+            subscriptions: &[(STREAM, 1, Lane::ZERO)],
             network: &[],
             conflated: &[],
             max_claim: 8,
@@ -1031,7 +1031,7 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
         cursor,
         &GatewayConfig {
             publications: &[(0, 0)],
-            subscriptions: &[(STREAM, 1)],
+            subscriptions: &[(STREAM, 1, Lane::ZERO)],
             network: &[],
             conflated: &[],
             max_claim: 0,

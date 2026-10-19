@@ -35,7 +35,7 @@ const CONFIG: JournalConfig = JournalConfig {
 };
 /// Subscription 0 is stream 10, session 3; publication 0 is stream 20,
 /// session 5.
-const SUBSCRIPTIONS: [(i32, i32); 1] = [(10, 3)];
+const SUBSCRIPTIONS: [(i32, i32, Lane); 1] = [(10, 3, Lane::ZERO)];
 const PUBLICATIONS: [(i32, i32); 1] = [(20, 5)];
 
 /// Only recording 7, written and durable to 4096.
@@ -669,7 +669,10 @@ fn a_duplicate_source_is_refused_at_configuration() {
     let gateway = || replaying(Capture::Strict, &offered(), false).into_parts().0;
     for (publications, subscriptions) in [
         (&[(20, 5), (20, 5)][..], &SUBSCRIPTIONS[..]),
-        (&PUBLICATIONS[..], &[(10, 3), (10, 3)][..]),
+        (
+            &PUBLICATIONS[..],
+            &[(10, 3, Lane::ZERO), (10, 3, Lane::ZERO)][..],
+        ),
     ] {
         let refused = ReplayGateway::new(
             gateway(),

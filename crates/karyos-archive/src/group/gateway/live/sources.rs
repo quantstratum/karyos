@@ -129,8 +129,16 @@ pub trait MessageSource {
         false
     }
 
-    /// [`MessageSource::poll_taking`], with the session of the image whose
-    /// report the summary carries, when it names one.
+    /// The lane it reads, when it reads one: the Gateway refuses an
+    /// identity that names another. `None` for a source of several lanes
+    /// (a network subscription, each message naming its own) or one that
+    /// does not say.
+    fn lane(&self) -> Option<Lane> {
+        None
+    }
+
+    /// [`MessageSource::poll_taking`], with the session and lane of the
+    /// image whose report the summary carries, when it names one.
     ///
     /// # Errors
     ///
@@ -140,7 +148,7 @@ pub trait MessageSource {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<i32>), PollError> {
+    ) -> Result<(PollSummary, Option<(i32, Lane)>), PollError> {
         self.poll_taking(handler, limit)
             .map(|summary| (summary, None))
     }
@@ -168,12 +176,12 @@ impl<T: TermBytes> MessageSource for Subscription<T> {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<i32>), PollError> {
+    ) -> Result<(PollSummary, Option<(i32, Lane)>), PollError> {
         match Subscription::poll_taking(self, handler, limit) {
             // The image that reported more than deliveries: its report,
             // with the deliveries over every image, and its session.
             Ok(poll) => {
-                let session = poll.stopped.and_then(|stop| stop.session_id);
+                let session = poll.stopped.and_then(|stop| stop.session_id.zip(stop.lane));
                 let summary = PollSummary {
                     delivered: poll.delivered,
                     ..poll.stopped.map(|stop| stop.summary).unwrap_or_default()
@@ -200,6 +208,10 @@ impl<T: TermBytes> MessageSource for ClientSubscription<T> {
         limit: MessageLimit,
     ) -> Result<PollSummary, PollError> {
         ClientSubscription::poll_taking(self, handler, limit)
+    }
+
+    fn lane(&self) -> Option<Lane> {
+        ClientSubscription::lane(self)
     }
 }
 
@@ -265,8 +277,8 @@ enum Held {
         from: u64,
         lost_to: u64,
         resume: u64,
-        /// The image's session, for a network subscription's.
-        session_id: Option<i32>,
+        /// The image's session and lane, for a network subscription's.
+        image: Option<(i32, Lane)>,
     },
     Ended {
         position: u64,
@@ -276,6 +288,7 @@ enum Held {
     /// no position.
     Image {
         session_id: i32,
+        lane: Lane,
         available: bool,
     },
 }
@@ -345,7 +358,7 @@ fn reported(summary: &PollSummary) -> Option<Held> {
             from: lost.from,
             lost_to: lost.lost_to,
             resume: lost.resume,
-            session_id: None,
+            image: None,
         });
     }
     if let Some(skipped) = summary.skipped
@@ -356,7 +369,7 @@ fn reported(summary: &PollSummary) -> Option<Held> {
             from: skipped.position,
             lost_to: to,
             resume: to,
-            session_id: None,
+            image: None,
         });
     }
     if let Some(aborted) = summary.aborted
@@ -367,7 +380,7 @@ fn reported(summary: &PollSummary) -> Option<Held> {
             from: aborted.position,
             lost_to: to,
             resume: to,
-            session_id: None,
+            image: None,
         });
     }
     if let Some(lost) = summary.closed_by_overrun {
@@ -402,25 +415,40 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     /// # Errors
     ///
     /// [`GatewayError::DuplicateSource`] for a second source of the same
-    /// stream and session, even on another lane: replay could not tell
-    /// them apart.
+    /// stream, session and lane, or one alongside a network subscription
+    /// of its stream: replay tells sources apart by those.
+    /// [`GatewayError::WrongLane`] for an identity whose lane is not the
+    /// one the source reads.
     pub fn add_subscription(
         &mut self,
         source: Box<dyn MessageSource + Send>,
         identity: SourceIdentity,
         word: Arc<RecordingWord>,
     ) -> Result<SubscriptionId, GatewayError> {
+        // The identity names the lane the source reads: one that names
+        // another would record its messages under the wrong key.
+        if let Some(lane) = source.lane()
+            && lane != identity.lane
+        {
+            return Err(GatewayError::WrongLane {
+                named: identity.lane,
+                read: lane,
+            });
+        }
         // A network subscription takes every session of its stream: it is
         // then the stream's only source, so replay maps it as one.
         let fan_in = source.fan_in();
         if self.sources.iter().any(|slot| {
             let same_stream = slot.identity.stream_id == identity.stream_id;
             let either_fans_in = fan_in || slot.fan_in;
-            same_stream && (either_fans_in || slot.identity.session_id == identity.session_id)
+            let same_key = slot.identity.session_id == identity.session_id
+                && slot.identity.lane == identity.lane;
+            same_stream && (either_fans_in || same_key)
         }) {
             return Err(GatewayError::DuplicateSource {
                 stream_id: identity.stream_id,
                 session_id: identity.session_id,
+                lane: identity.lane,
             });
         }
         let id = u16::try_from(self.sources.len()).map_err(|_| GatewayError::Ended)?;
@@ -455,9 +483,11 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             .iter()
             .any(|view| (view.stream_id, view.session_id) == (stream_id, session_id))
         {
+            // Views are lane 0.
             return Err(GatewayError::DuplicateSource {
                 stream_id,
                 session_id,
+                lane: Lane::ZERO,
             });
         }
         let largest = source.config().value_capacity;
@@ -656,6 +686,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             slot.source = Some(source);
             let held = Held::Image {
                 session_id: change.session_id,
+                lane: change.lane,
                 available: change.available,
             };
             slot.held = Some(held);
@@ -695,7 +726,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                     from,
                     lost_to,
                     resume,
-                    session_id: session,
+                    image: session,
                 },
                 other => other,
             }),
@@ -741,9 +772,9 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 from,
                 lost_to,
                 resume,
-                session_id,
+                image,
             } => {
-                let session_id = session_id.unwrap_or(identity.session_id);
+                let (session_id, lane) = image.unwrap_or((identity.session_id, identity.lane));
                 let first = |group_seq: u64, out: &mut [u8]| {
                     GroupRecord::Loss(LossEvent {
                         group_seq,
@@ -754,7 +785,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                         resume,
                         stream_id: identity.stream_id,
                         session_id,
-                        lane: identity.lane,
+                        lane,
                         loss,
                     })
                     .encode(out)
@@ -789,6 +820,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             }
             Held::Image {
                 session_id,
+                lane,
                 available,
             } => {
                 let kind = if available {
@@ -796,9 +828,10 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 } else {
                     LifecycleKind::ImageUnavailable
                 };
-                // The image's session: replay finds the source by stream
-                // and session, so two images of one alias with one session
-                // name one source (owner note item 20, the image id).
+                // The image's session and lane. Replay finds a network
+                // subscription by its stream alone, so two images of one
+                // alias with one session are told apart only by the image
+                // id (owner note item 20).
                 let first = |group_seq: u64, out: &mut [u8]| {
                     GroupRecord::Lifecycle(LifecycleEvent {
                         group_seq,
@@ -807,7 +840,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                         position: 0,
                         stream_id: identity.stream_id,
                         session_id,
-                        lane: identity.lane,
+                        lane,
                         kind,
                     })
                     .encode(out)
@@ -847,7 +880,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         // The word names the recording of the source's own stream, session
         // and lane: another image of a network subscription is not in it,
         // and is placed as without a word.
-        let recorded = info.session_id == identity.session_id;
+        let recorded = info.session_id == identity.session_id && info.lane == identity.lane;
         // The word is read once: the record and the decision agree.
         let placement = match word.read() {
             // A recording that started after the message does not hold it.
@@ -873,7 +906,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 stream_id: identity.stream_id,
                 // The image's, which a network subscription's differ in.
                 session_id: info.session_id,
-                lane: identity.lane,
+                lane: info.lane,
                 reserved_value: info.reserved_value,
                 end_of_stream: info.end_of_stream,
                 extension,
@@ -915,7 +948,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                     lost_to: end,
                     resume: end,
                     // The message's image's.
-                    session_id: Some(info.session_id),
+                    image: Some((info.session_id, info.lane)),
                 },
                 now,
                 handler,
@@ -924,7 +957,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         let placed = |group_seq: u64, out: &mut [u8]| record(group_seq, payload, out);
         let event = Event::Message {
             source,
-            lane: identity.lane,
+            lane: info.lane,
             position: info.position,
             extent: info.extent,
             length: length32,
