@@ -58,6 +58,10 @@ const RING_HEADER: u64 = 8;
 /// A reference unavailable record's length: the envelope and its block.
 const UNAVAILABLE_LENGTH: usize = 12 + 16;
 
+/// The largest in-flight bound a group takes: about 14 MiB of tracker
+/// queues at about 216 bytes an event.
+pub const MAX_IN_FLIGHT: usize = 1 << 16;
+
 /// A capture path's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureConfig {
@@ -66,7 +70,9 @@ pub struct CaptureConfig {
     pub ring_capacity: usize,
     /// The largest event, in bytes of records: the event byte budget.
     pub max_event: usize,
-    /// The events written and not yet durable the tracker holds, at least 1.
+    /// The events written and not yet durable the tracker holds: 1 to
+    /// [`MAX_IN_FLIGHT`]. Each takes about 216 bytes of the tracker's
+    /// queues, allocated when the group starts.
     pub in_flight: usize,
 }
 
@@ -195,25 +201,8 @@ fn extent(payload: usize) -> Option<u64> {
 /// errors as [`CaptureSetup::Journal`].
 pub fn capture<D: Disk>(
     config: CaptureConfig,
-    journal: GroupJournal<D>,
-    coverage: &impl Coverage,
-) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
-    capture_with_hold(config, journal, coverage, None)
-}
-
-/// [`capture`], for a group that keeps checkpoints: its reopening window
-/// holds `reopen_hold` events, at least `in_flight`
-/// ([`CaptureJob::reserve_reopen_hold`]), in recovery as when running,
-/// so a restart recovers the prefixes the run had.
-///
-/// # Errors
-///
-/// [`capture`]'s.
-pub fn capture_with_hold<D: Disk>(
-    config: CaptureConfig,
     mut journal: GroupJournal<D>,
     coverage: &impl Coverage,
-    reopen_hold: Option<usize>,
 ) -> Result<(CaptureSender, CaptureJob<D>), CaptureSetup> {
     let policy = journal.policy();
     let (ring, max_extent, in_flight) = check(config, policy).map_err(CaptureSetup::Config)?;
@@ -222,12 +211,14 @@ pub fn capture_with_hold<D: Disk>(
             max_event: config.max_event,
         })
     })?;
-    let hold = match reopen_hold {
-        Some(hold) => hold,
-        None => config.in_flight,
-    };
-    let recovery = prefix::recover_with_hold(&mut journal, coverage, config.in_flight, hold)
-        .map_err(CaptureSetup::Journal)?;
+    // The reopening window is the header's (A9): recovery and the running
+    // tracker take the same.
+    let reopen_hold = journal
+        .reopen_hold()
+        .map_err(CaptureSetup::Journal)?
+        .unwrap_or(0);
+    let recovery =
+        prefix::recover(&mut journal, coverage, config.in_flight).map_err(CaptureSetup::Journal)?;
     if recovery.full {
         return Err(CaptureSetup::Config(CaptureError::RecoveryFull {
             capacity: config.in_flight,
@@ -246,7 +237,8 @@ pub fn capture_with_hold<D: Disk>(
         lock: Mutex::new(()),
         signal: Condvar::new(),
     });
-    let capture = journal_capture(&mut journal).map_err(CaptureSetup::Journal)?;
+    let (capture, first_group_seq) =
+        journal_capture(&mut journal).map_err(CaptureSetup::Journal)?;
     // A recovered strict journal that ended at an incomplete event takes
     // nothing more.
     if capture == Capture::Strict && tracker_stopped {
@@ -274,11 +266,16 @@ pub fn capture_with_hold<D: Disk>(
         dispatched,
         in_flight,
         checkpoints: None,
+        first_group_seq,
     };
-    let uncovered = config
+    let bound = config
         .in_flight
         .checked_mul(3)
         .ok_or(CaptureSetup::Config(CaptureError::InFlight))?;
+    let mut uncovered = Vec::new();
+    uncovered
+        .try_reserve_exact(bound)
+        .map_err(|_| CaptureSetup::Journal(JournalError::Allocation))?;
     let job = CaptureJob {
         consumer,
         journal,
@@ -287,7 +284,7 @@ pub fn capture_with_hold<D: Disk>(
         capture,
         sync_at_bound: policy == SyncPolicy::PerSegment,
         in_flight,
-        uncovered: Vec::with_capacity(uncovered),
+        uncovered,
         capacity: config.ring_capacity,
         emptied: 0,
         signalled: 0,
@@ -296,7 +293,9 @@ pub fn capture_with_hold<D: Disk>(
         stop_notified: false,
     };
     let mut job = job;
-    if let Some(hold) = reopen_hold {
+    if reopen_hold != 0 {
+        let hold = usize::try_from(reopen_hold)
+            .map_err(|_| CaptureSetup::Config(CaptureError::InFlight))?;
         job.reserve_reopen_hold(hold)
             .map_err(CaptureSetup::Config)?;
     }
@@ -333,10 +332,9 @@ fn check(config: CaptureConfig, policy: SyncPolicy) -> Result<(u64, u64, u64), C
         Ok(0) | Err(_) => return Err(CaptureError::InFlight),
         Ok(in_flight) => in_flight,
     };
-    // The events a recording that ended may leave uncovered: the tracker's
-    // queue, the first range's events still settling, and, past a stop,
-    // the events a checkpoint may yet take.
-    if config.in_flight.checked_mul(3).is_none() {
+    // The tracker's queues are allocated to the bound when the group
+    // starts: it is capped.
+    if config.in_flight > MAX_IN_FLIGHT {
         return Err(CaptureError::InFlight);
     }
     if policy == SyncPolicy::None {
@@ -357,15 +355,19 @@ pub enum CaptureSetup {
 }
 
 /// The journal's capture mode, from its header.
-fn journal_capture<D: Disk>(journal: &mut GroupJournal<D>) -> Result<Capture, JournalError> {
-    let mut capture = Capture::Strict;
+fn journal_capture<D: Disk>(journal: &mut GroupJournal<D>) -> Result<(Capture, u64), JournalError> {
+    let mut found = (Capture::Strict, 1);
     journal.walk(0, |_, _, record| {
-        if let Role::Header { capture: mode, .. } = record.role() {
-            capture = mode;
+        if let Role::Header {
+            capture,
+            first_group_seq,
+        } = record.role()
+        {
+            found = (capture, first_group_seq);
         }
         false
     })?;
-    Ok(capture)
+    Ok(found)
 }
 
 /// The event loop's end: it admits events and sends their records.
@@ -384,13 +386,21 @@ pub struct CaptureSender {
     /// The group's checkpoint handle, when it keeps checkpoints (A9-3),
     /// until the Gateway takes it.
     checkpoints: Option<super::checkpoint::CheckpointHandle>,
+    /// The journal header's first event.
+    first_group_seq: u64,
 }
 
 impl CaptureSender {
     /// The group's checkpoint handle, once: `None` for a group started
     /// without checkpoints, or once taken.
-    pub fn take_checkpoints(&mut self) -> Option<super::checkpoint::CheckpointHandle> {
+    pub(crate) fn take_checkpoints(&mut self) -> Option<super::checkpoint::CheckpointHandle> {
         self.checkpoints.take()
+    }
+
+    /// The group's first event, as its journal header names it.
+    #[must_use]
+    pub(crate) const fn first_group_seq(&self) -> u64 {
+        self.first_group_seq
     }
 
     /// Gives the sender the group's checkpoint handle.
@@ -507,6 +517,12 @@ impl CaptureSender {
     #[must_use]
     pub fn state(&self) -> GroupState {
         self.shared.state()
+    }
+
+    /// Whether the group is closing: the sender takes nothing more.
+    #[must_use]
+    pub(crate) fn closing(&self) -> bool {
+        self.shared.closing.load(Ordering::Acquire)
     }
 
     /// A waiter for durability, for threads other than the event loop's.

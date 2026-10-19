@@ -30,6 +30,9 @@ use super::{
 };
 use crate::crc32c::crc32c;
 use crate::group::capture::{CaptureSender, GroupState, Refusal};
+use crate::group::checkpoint::{
+    CheckpointError, CheckpointHandle, CheckpointStats, LastCheckpoint,
+};
 use crate::group::record::{
     Capture, DEFAULT_INLINE_THRESHOLD, DELIVERY_OBSERVATION, DELIVERY_POLL, DeliveryObservation,
     DeliveryPoll, EVENT_END, EXTERNAL_OBSERVATION, EndOutcome, EventEnd, ExternalEvent,
@@ -148,6 +151,14 @@ pub struct Gateway<P: Port, C: FnMut() -> u64> {
     inline_threshold: u32,
     /// Observations recorded per event at most.
     observation_budget: u32,
+    /// The group's checkpoint handle, taken from the sender: `None` for a
+    /// group started without checkpoints.
+    checkpoints: Option<CheckpointHandle>,
+    /// A checkpoint names an event at or above it: the group's first, as
+    /// its journal header names it.
+    first_checkpoint: u64,
+    /// The `group_seq` of the last checkpoint handed over, 0 for none.
+    last_taken: u64,
     /// Strict capture sent an incomplete end: the journal ends there, and
     /// every later dispatch is refused, before the job ends the group.
     ended: bool,
@@ -212,6 +223,9 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
         if max_event < least {
             return Err(ConfigError::Buffer(max_event));
         }
+        let mut sender = sender;
+        let checkpoints = sender.take_checkpoints();
+        let first_checkpoint = sender.first_group_seq();
         Ok(Self {
             port,
             clock,
@@ -228,9 +242,83 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             turn: 0,
             inline_threshold: DEFAULT_INLINE_THRESHOLD,
             observation_budget: u32::MAX,
+            checkpoints,
+            first_checkpoint,
+            last_taken: 0,
             ended: false,
             incomplete_next: false,
         })
+    }
+
+    /// Takes a checkpoint of the state after the last event dispatched
+    /// (quantstratum-docs: karyos/design/recording-group-checkpoints.md,
+    /// section 3), between events: `write` fills the checkpoint buffer
+    /// and returns the snapshot's length, and the buffer goes to the
+    /// Archive's writer. The outcome comes later, from
+    /// [`Gateway::last_checkpoint`]. Nothing is allocated.
+    ///
+    /// # Errors
+    ///
+    /// In this order, `write` called only when none applies:
+    ///
+    /// - [`CheckpointError::Stopped`] once the group stopped, failed,
+    ///   ended or is closing.
+    /// - [`CheckpointError::NoCheckpoints`] for a group started without
+    ///   checkpoints.
+    /// - [`CheckpointError::NothingDispatched`] before the group's first
+    ///   event.
+    /// - [`CheckpointError::Repeated`] for the `group_seq` of the last
+    ///   checkpoint taken, unless its write failed.
+    /// - From the handle, counted in [`Gateway::checkpoint_stats`]:
+    ///   [`CheckpointError::Ended`] once a strict journal ended at an
+    ///   incomplete event, then [`CheckpointError::InFlight`],
+    ///   [`CheckpointError::TooLarge`] and [`CheckpointError::Empty`].
+    pub fn checkpoint(
+        &mut self,
+        format: u32,
+        write: impl FnOnce(&mut [u8]) -> usize,
+    ) -> Result<(), CheckpointError> {
+        if self.sender.state() != GroupState::Running || self.sender.closing() {
+            return Err(CheckpointError::Stopped);
+        }
+        let Some(handle) = self.checkpoints.as_mut() else {
+            return Err(CheckpointError::NoCheckpoints);
+        };
+        let group_seq = self
+            .next_seq
+            .checked_sub(1)
+            .filter(|seq| *seq != 0 && *seq >= self.first_checkpoint)
+            .ok_or(CheckpointError::NothingDispatched)?;
+        if group_seq == self.last_taken {
+            handle.poll();
+            let failed = matches!(
+                handle.last_checkpoint(),
+                Some(LastCheckpoint::Failed { group_seq: seq }) if seq == group_seq
+            );
+            if !failed {
+                return Err(CheckpointError::Repeated { group_seq });
+            }
+        }
+        handle.checkpoint(group_seq, format, write)?;
+        self.last_taken = group_seq;
+        Ok(())
+    }
+
+    /// How the last checkpoint the writer took ended: `None` before the
+    /// first, or for a group without checkpoints.
+    #[must_use]
+    pub fn last_checkpoint(&mut self) -> Option<LastCheckpoint> {
+        let handle = self.checkpoints.as_mut()?;
+        handle.poll();
+        handle.last_checkpoint()
+    }
+
+    /// The checkpoint counts: zero for a group without checkpoints.
+    #[must_use]
+    pub fn checkpoint_stats(&self) -> CheckpointStats {
+        self.checkpoints
+            .as_ref()
+            .map_or_else(CheckpointStats::default, CheckpointHandle::stats)
     }
 
     /// Sets the inline threshold: the journal header's. Configuration only.
@@ -414,6 +502,13 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             .ok_or(GatewayError::Ended)?;
         if incomplete {
             self.stats.bump(|stats| &mut stats.incomplete);
+            // A strict journal ends at an incomplete event: no checkpoint
+            // can open another range.
+            if self.capture == Capture::Strict
+                && let Some(handle) = self.checkpoints.as_mut()
+            {
+                handle.end();
+            }
         }
         // Admitted, so the ring has room: a refusal here is a failed group.
         self.sender

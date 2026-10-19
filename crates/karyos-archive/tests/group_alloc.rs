@@ -30,6 +30,7 @@ fn journal() -> [GroupRecord<'static>; 5] {
             contract_version: 1,
             clock: Clock::HostMonotonic,
             capture: Capture::Strict,
+            reopen_hold: 0,
             manifest: b"build",
         }),
         GroupRecord::Message(MessageEvent {
@@ -287,12 +288,13 @@ fn a_replay_gateway_dispatches_without_allocating() {
     let GroupRecord::Message(message) = records[1] else {
         panic!("no message");
     };
-    let subscriptions = [(message.stream_id, message.session_id)];
+    let subscriptions = [(message.stream_id, message.session_id, message.lane)];
     let mut gateway = ReplayGateway::new(
         cursor,
         &GatewayConfig {
             publications: &publications,
             subscriptions: &subscriptions,
+            network: &[],
             conflated: &[],
             max_claim: 64,
             max_payload: 0,

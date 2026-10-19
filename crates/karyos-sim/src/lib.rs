@@ -19,12 +19,14 @@
 //! host (C1), which runs several message level nodes on skewed clocks over
 //! a faulty network (`cluster`, `net`), are the Cluster's first pieces,
 //! with a disk that crashes, reorders, tears and fails flushes ([`disk`],
-//! C2). The backend ring models, the Archive and the Cluster do not exist
-//! yet.
+//! C2). The evaluation harness of the Raft cores ([`harness`], C5) runs
+//! them over C4's log. The backend ring models, the Archive and the
+//! Cluster do not exist yet.
 
 pub mod clock;
 pub mod cluster;
 pub mod disk;
+pub mod harness;
 pub mod lin;
 pub mod net;
 pub mod oracle;

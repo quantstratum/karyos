@@ -242,6 +242,7 @@ impl<T: TermBytes> LaneState<T> {
                 end_of_stream: info.end_of_stream,
                 extension: info.extension,
                 session_id,
+                lane,
             };
             taken = Some(info);
             handler(bytes, lane, info);
