@@ -18,7 +18,7 @@
 
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::{
-    self, ADR_0043, Liveness, Progress, W1, W3, W3Fault, W4, W4Cut, W6,
+    self, ADR_0043, Failed, Liveness, Progress, W1, W3, W3Fault, W4, W4Cut, W6,
 };
 use karyos_sim::scenarios;
 
@@ -64,6 +64,31 @@ fn w1_passes() {
             );
         }
     }
+}
+
+/// The up servers agree with one another, but not with the register the
+/// linearized history builds: `pass` reports the wrong state, not
+/// success. The run is real and passes untouched; only the servers'
+/// digests are changed, all to the same value, so the divergence check
+/// cannot catch it first.
+#[test]
+fn a_state_the_history_does_not_build_is_wrong() {
+    let case = &W1::skeleton().cases()[0];
+    let mut outcome = workloads::run::<Reference>(case, CORPUS[0]).unwrap();
+    assert_eq!(workloads::pass(case, &outcome), Ok(None));
+    assert!(!outcome.states.is_empty());
+    let right = outcome.states[0].2;
+    let wrong = right ^ 1;
+    for state in &mut outcome.states {
+        state.2 = wrong;
+    }
+    assert_eq!(
+        workloads::pass(case, &outcome),
+        Err(Failed::WrongState {
+            expected: right,
+            states: outcome.states.clone(),
+        })
+    );
 }
 
 #[test]
