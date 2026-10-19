@@ -23,8 +23,9 @@ pub struct EndpointCapabilities {
     /// The endpoint's instance id (`key2`).
     pub endpoint: u64,
     /// Whether the values come from one completed pass. `false` when every
-    /// attempt overlapped a write, or the endpoint has no pass cell (the
-    /// region had no room for it).
+    /// attempt overlapped a write, when no pass completed yet (the pass
+    /// cell still 0: the gauges hold their allocation zeros), or when the
+    /// endpoint has no pass cell (the region had no room for it).
     pub consistent: bool,
     /// Label and value of each gauge, in cell order.
     pub gauges: Vec<(String, u64)>,
@@ -85,11 +86,14 @@ pub fn endpoint_capabilities(reader: &CountersReader) -> Vec<EndpointCapabilitie
                         .collect::<Vec<_>>()
                 };
                 let (consistent, gauges) = match pass {
-                    // An unreadable pass cell reads odd: never consistent.
+                    // An unreadable pass cell reads odd: never consistent. The
+                    // pass value read with the gauges tells a completed pass
+                    // (even and nonzero) from none yet (0).
                     Some(pass) => {
-                        match read_pass(|| reader.load_value(pass).unwrap_or(1), values, ATTEMPTS) {
-                            PassRead::Consistent(gauges) => (true, gauges),
-                            PassRead::Inconsistent(gauges) => (false, gauges),
+                        let epoch = || reader.load_value(pass).unwrap_or(1);
+                        match read_pass(epoch, || (epoch(), values()), ATTEMPTS) {
+                            PassRead::Consistent((passes, gauges)) => (passes > 0, gauges),
+                            PassRead::Inconsistent((_, gauges)) => (false, gauges),
                         }
                     }
                     None => (false, values()),
@@ -129,6 +133,10 @@ mod tests {
         let epoch = manager
             .allocate_keyed(2, "capability epoch", keys(7))
             .unwrap();
+        // Allocated, no pass begun yet: the gauges' zeros are no read
+        // (IMPLEMENT's P2 on #474).
+        let read = endpoint_capabilities(&reader);
+        assert!(!read[0].consistent);
         let mtu = manager
             .allocate_keyed(2, "capability max datagram", keys(7))
             .unwrap();
