@@ -562,7 +562,8 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
             | WireKind::ErrorLog
             | WireKind::LossReport
             | WireKind::TraceMirror
-            | WireKind::ConflationTable => {
+            | WireKind::ConflationTable
+            | WireKind::GuardAudit => {
                 return Err(AttachError::Protocol);
             }
         };

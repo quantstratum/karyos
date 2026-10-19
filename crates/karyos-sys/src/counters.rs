@@ -71,6 +71,15 @@ pub const KIND_SUBSCRIBER: u8 = 1;
 pub const KIND_PUBLICATION: u8 = 2;
 /// Participant kind: a client.
 pub const KIND_CLIENT: u8 = 3;
+/// Participant kind: a network endpoint, `key2` its instance id; its
+/// effective capabilities are gauges of this kind
+/// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+/// M3).
+pub const KIND_ENDPOINT: u8 = 4;
+/// Participant kind: a guard, `key2` its id; its word is a gauge labelled
+/// with the guard's name (`quantstratum-docs:
+/// karyos/design/management-agent-gap-analysis.md`, M4).
+pub const KIND_GUARD: u8 = 5;
 
 /// The three key words that let tools group counters without parsing
 /// labels.

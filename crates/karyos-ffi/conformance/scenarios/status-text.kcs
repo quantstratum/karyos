@@ -1,0 +1,19 @@
+# Every status has static text, and a code that is none gets a fixed one
+# (SPEC.md §10.2, Results).
+format 1
+id status.text
+abi 0.1
+covers "typed status codes"
+
+call karyos_status_message status=0
+expect text="success"
+call karyos_status_message status=108
+expect text="the handle is in use by this thread's callback"
+call karyos_status_message status=500
+expect text="internal error; the handle is poisoned"
+call karyos_status_message status=-1
+expect text="unknown status code"
+call karyos_status_message status=99
+expect text=$unknown
+call karyos_status_message status=12345
+expect text=$unknown

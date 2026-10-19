@@ -1,0 +1,13 @@
+# A null out-parameter is refused with a typed status, never undefined
+# behaviour (SPEC.md §13, C ABI boundary).
+format 1
+id abi.version.null
+abi 0.1
+covers "typed status codes"
+
+call karyos_abi_version major=null
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_abi_version minor=null
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_abi_version patch=null
+expect KARYOS_E_INVALID_ARGUMENT

@@ -463,8 +463,8 @@ pub enum Breach {
     TooLarge,
     /// A read or truncation outside the log.
     OutOfRange,
-    /// A prefix purge.
-    PurgeUnsupported,
+    /// A prefix purge past the commit.
+    PurgeBeyondCommit,
     /// A truncation that would remove committed entries.
     TruncateBelowCommit,
     /// A hard state the log refuses.
@@ -486,7 +486,7 @@ impl Breach {
             LogError::TermBack { .. } => Self::TermBack,
             LogError::TooLarge { .. } => Self::TooLarge,
             LogError::OutOfRange { .. } => Self::OutOfRange,
-            LogError::PurgeUnsupported => Self::PurgeUnsupported,
+            LogError::PurgeBeyondCommit { .. } => Self::PurgeBeyondCommit,
             LogError::TruncateBelowCommit { .. } => Self::TruncateBelowCommit,
             LogError::HardState(_) => Self::HardState,
             LogError::CommitBeyondDurable { .. } => Self::CommitBeyondDurable,

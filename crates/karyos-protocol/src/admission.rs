@@ -30,8 +30,8 @@
 //! **Tools** (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! Tool attach). A tool sends `ToolHello` instead of `Hello`, without a
 //! descriptor; the driver answers `ToolAdmitted` with the records of its
-//! five diagnostic regions (driver counters, client counters, error log,
-//! loss report, trace mirror), then one `Region` with fetch id 0 per
+//! six diagnostic regions (driver counters, client counters, error log,
+//! loss report, trace mirror, guard audit), then one `Region` with fetch id 0 per
 //! record, each with a read-only descriptor, or `Refused`. A tool gets no client id, command
 //! ring or capability: every record of `ToolAdmitted` carries capability
 //! none, and decoding refuses any other. The first two words of
@@ -101,7 +101,10 @@
 //! views (`quantstratum-docs: karyos/design/conflation-end-to-end.md`),
 //! under the rule of quantstratum/karyos#112: an addition to the
 //! unreleased version, which an older build of it refuses as an unknown
-//! kind.
+//! kind. Under the same rule it gains the `GuardAudit` kind (code 11 on
+//! both sides, `quantstratum-docs:
+//! karyos/design/management-agent-gap-analysis.md`, M4) and a sixth
+//! `ToolAdmitted` record.
 //!
 //! **Instance.** The instance of `Admitted` is the driver's 128-bit
 //! `driver_id` (SPEC.md §4), the one id per driver instance (ACS 13555).
@@ -246,6 +249,8 @@ pub enum RegionKind {
     /// A conflated stream's table, which only the driver writes; views
     /// map it read-only.
     ConflationTable,
+    /// The guard audit ring, which only the driver writes (tools only).
+    GuardAudit,
 }
 
 impl RegionKind {
@@ -261,6 +266,7 @@ impl RegionKind {
             Self::Journal => 8,
             Self::TraceMirror => 9,
             Self::ConflationTable => 10,
+            Self::GuardAudit => 11,
         }
     }
 
@@ -276,6 +282,7 @@ impl RegionKind {
             8 => Some(Self::Journal),
             9 => Some(Self::TraceMirror),
             10 => Some(Self::ConflationTable),
+            11 => Some(Self::GuardAudit),
             _ => None,
         }
     }
@@ -289,7 +296,7 @@ impl RegionKind {
 /// so the wire numbers the later kinds after it. Each side keeps its own
 /// codes; only this table relates them.
 #[cfg(target_os = "linux")]
-pub const SYS_KINDS: [(RegionKind, karyos_sys::ipc::RegionKind); 10] = {
+pub const SYS_KINDS: [(RegionKind, karyos_sys::ipc::RegionKind); 11] = {
     use karyos_sys::ipc::RegionKind as Sys;
     [
         (RegionKind::CommandRing, Sys::CommandRing),
@@ -302,6 +309,7 @@ pub const SYS_KINDS: [(RegionKind, karyos_sys::ipc::RegionKind); 10] = {
         (RegionKind::Journal, Sys::Journal),
         (RegionKind::TraceMirror, Sys::TraceMirror),
         (RegionKind::ConflationTable, Sys::ConflationTable),
+        (RegionKind::GuardAudit, Sys::GuardAudit),
     ]
 };
 
@@ -1013,7 +1021,7 @@ mod tests {
         ));
         // A record with export 0, an unknown kind, an unknown capability or
         // an index on a capability without one.
-        for (offset, value) in [(72, 0u8), (80, 11), (113, 7), (120, 1)] {
+        for (offset, value) in [(72, 0u8), (80, 12), (113, 7), (120, 1)] {
             let mut bad = encode(&Message::Manifest {
                 fetch: 1,
                 key: 2,
@@ -1167,11 +1175,11 @@ mod tests {
             assert_eq!(wire.to_sys(), sys);
             assert_eq!(RegionKind::from_sys(sys), wire);
         }
-        for code in 1..=10 {
+        for code in 1..=11 {
             let wire = RegionKind::from_code(code).unwrap();
             assert_eq!(RegionKind::from_sys(wire.to_sys()), wire);
         }
-        assert_eq!(RegionKind::from_code(11), None);
+        assert_eq!(RegionKind::from_code(12), None);
     }
 
     /// The protocol version is 2 (ACS 13677): the trace journal kinds.
@@ -1467,7 +1475,7 @@ mod tests {
         let first = 40;
         for (offset, value) in [
             (first + 8, 0u8),
-            (first + 16, 11),
+            (first + 16, 12),
             (first + 49, 1),
             (first + 49, 3),
             (first + 49, 5),
@@ -1736,6 +1744,7 @@ mod properties {
                 RegionKind::Journal,
                 RegionKind::TraceMirror,
                 RegionKind::ConflationTable,
+                RegionKind::GuardAudit,
             ][..],
         );
         let capability = prop_oneof![

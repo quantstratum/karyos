@@ -2055,6 +2055,22 @@ impl<T: StreamTerms> Network<T> {
         shutdown
     }
 
+    /// Each endpoint's effective capabilities of its current epoch, and the
+    /// opens and reopens a required capability refused (M3).
+    pub(crate) fn endpoint_capabilities(
+        &self,
+    ) -> (
+        impl Iterator<
+            Item = (
+                EndpointId,
+                &karyos_io::sockets::endpoint::CapabilitySnapshot,
+            ),
+        > + '_,
+        u64,
+    ) {
+        (self.endpoints.capabilities(), self.endpoints.missing())
+    }
+
     /// The agents' CnC cells taken back at the close, for the conductor to
     /// free; an agent that did not come back keeps its cells.
     pub(crate) fn take_cells(&mut self) -> Vec<Counter> {
