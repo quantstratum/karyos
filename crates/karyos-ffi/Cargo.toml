@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "karyos-ffi"
+description = "The C ABI: libkaryos as a shared and a static library, with a committed C header."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# The library is `karyos_ffi`: `karyos` would collide with the facade's
+# rlib in the shared target directory. The release packaging names the
+# artifacts `libkaryos` (SPEC.md §10.2). The rlib lets the crate's own tests
+# link the exported symbols.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+karyos-client.workspace = true
+karyos-protocol.workspace = true
+karyos-sys.workspace = true
+
+# The workspace lint set with `unsafe_code` denied instead of forbidden: only
+# the boundary module `abi` (and the tests' `support::abi`) may `expect` it
+# (SPEC.md §10.2, §14; ADR-0053). `make lint-sync` checks this table.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
