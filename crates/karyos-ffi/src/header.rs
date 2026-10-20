@@ -90,6 +90,26 @@ fn normalize(c: &str) -> String {
         .join(" ")
 }
 
+/// The lines (from 1) of `text` where a comment opener `/*` sits inside a
+/// comment: C does not nest comments, so the comment ends at the first
+/// `*/`, and compilers warn (`-Wcomment`).
+fn nested_comment_lines(text: &str) -> Vec<usize> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    while let Some(start) = text[offset..].find("/*") {
+        let body = offset + start + 2;
+        let end = text[body..].find("*/").map_or(text.len(), |end| body + end);
+        let mut inner = body;
+        while let Some(found) = text[inner..end].find("/*") {
+            let at = inner + found;
+            lines.push(text[..at].matches('\n').count() + 1);
+            inner = at + 2;
+        }
+        offset = (end + 2).min(text.len());
+    }
+    lines
+}
+
 /// The header without comments.
 fn header_code() -> String {
     let mut code = String::new();
@@ -348,6 +368,21 @@ fn the_header_states_the_abi_version() {
     assert!(
         HEADER.contains(&version),
         "the header's comment names {version}"
+    );
+}
+
+#[test]
+fn no_comment_of_the_header_opens_another() {
+    assert_eq!(nested_comment_lines(HEADER), Vec::<usize>::new());
+    // The check finds one: a stray opener left in a doc comment, as merge
+    // fc3be2c2 left in karyos_publication_claim's.
+    assert_eq!(
+        nested_comment_lines("int a;\n/**\n * text and a/**\n * text\n */\nint b;"),
+        [3]
+    );
+    assert_eq!(
+        nested_comment_lines("/* one */ /* two */"),
+        Vec::<usize>::new()
     );
 }
 
