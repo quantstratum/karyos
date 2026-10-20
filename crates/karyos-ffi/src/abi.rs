@@ -6,7 +6,7 @@
 //! safe modules. `include/karyos.h` declares every symbol; a test checks
 //! the two agree.
 
-use core::ffi::{CStr, c_char};
+use core::ffi::{CStr, c_char, c_void};
 use std::panic::catch_unwind;
 use std::path::PathBuf;
 
@@ -152,13 +152,13 @@ unsafe fn write_detail(detail: *mut Detail, failure: Failure) {
 /// # Safety
 ///
 /// As [`write_sized`].
-unsafe fn write_accepted(out: *mut Accepted, accepted: karyos_client::Accepted) {
+unsafe fn write_accepted(out: *mut Accepted, placed: api::publication::Placed) {
     // SAFETY: the caller's contract, passed on.
     unsafe {
         write_sized(out, ACCEPTED_SIZE_0_1, |size| Accepted {
             size,
-            lane: u32::from(accepted.lane().get()),
-            position: accepted.position(),
+            lane: u32::from(placed.lane.get()),
+            position: placed.position,
         });
     };
 }
@@ -197,6 +197,9 @@ fn prefix(size: u32, ours: u32) -> usize {
 ///
 /// `input` is null or points to a readable struct whose first field is
 /// the `uint32_t` size the caller set, and which is at least that size.
+/// `T` must be valid for every bit pattern (integers and raw pointers
+/// only: no `bool`, enum or reference), since its bytes come from the
+/// caller: `DriverOptions` and `StreamOptions` are.
 unsafe fn read_sized<T: Copy>(input: *const T, min: u32, defaults: T) -> Result<T, Status> {
     if !readable(input) {
         return Err(Status::InvalidArgument);
@@ -443,29 +446,67 @@ pub unsafe extern "C" fn karyos_client_add_publication(
     publication: *mut u64,
     detail: *mut Detail,
 ) -> i32 {
-    guard(|| {
-        if !writable(publication) {
-            return Status::InvalidArgument;
+    // SAFETY: the caller's contract, passed on.
+    guard(|| unsafe { add_publication(client, uri, stream_id, false, publication, detail) })
+}
+
+/// Adds a concurrent publication handle of `stream_id` on the channel
+/// `uri` to `client`, and writes its handle through `publication`. The
+/// stream must be a `karyos:ipc` stream the driver configures for
+/// concurrent publishers; the handle has lane 0 only, and the offer and
+/// claim calls of an exclusive publication apply to it. A control call,
+/// as `karyos_client_add_publication`; on failure nothing is opened and
+/// `detail` (may be null) receives the failure's detail.
+///
+/// # Safety
+///
+/// As `karyos_client_add_publication`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_concurrent_publication(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    publication: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    // SAFETY: the caller's contract, passed on.
+    guard(|| unsafe { add_publication(client, uri, stream_id, true, publication, detail) })
+}
+
+/// The body of both add calls.
+///
+/// # Safety
+///
+/// As `karyos_client_add_publication`.
+unsafe fn add_publication(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    concurrent: bool,
+    publication: *mut u64,
+    detail: *mut Detail,
+) -> Status {
+    if !writable(publication) {
+        return Status::InvalidArgument;
+    }
+    // SAFETY: the caller's contract on `uri`.
+    let uri = match unsafe { read_str(uri) } {
+        Ok(uri) => uri,
+        Err(status) => return status,
+    };
+    match api::publication::add(Handle::from_raw(client), uri, stream_id, concurrent) {
+        Ok(handle) => {
+            // SAFETY: `publication` is non-null and aligned, and the
+            // caller's contract makes it a writable `uint64_t`.
+            unsafe { publication.write(handle.raw()) };
+            Status::Ok
         }
-        // SAFETY: the caller's contract on `uri`.
-        let uri = match unsafe { read_str(uri) } {
-            Ok(uri) => uri,
-            Err(status) => return status,
-        };
-        match api::publication::add(Handle::from_raw(client), uri, stream_id) {
-            Ok(handle) => {
-                // SAFETY: `publication` is non-null and aligned, and the
-                // caller's contract makes it a writable `uint64_t`.
-                unsafe { publication.write(handle.raw()) };
-                Status::Ok
-            }
-            Err(failure) => {
-                // SAFETY: the caller's contract on `detail`.
-                unsafe { write_detail(detail, failure) };
-                failure.status
-            }
+        Err(failure) => {
+            // SAFETY: the caller's contract on `detail`.
+            unsafe { write_detail(detail, failure) };
+            failure.status
         }
-    })
+    }
 }
 
 /// Offers `length` bytes at `data` on `lane` of `publication`, copied into
@@ -592,6 +633,285 @@ pub extern "C" fn karyos_publication_close(publication: u64) -> i32 {
     )
 }
 
+// Subscriptions and their poll (F4; quantstratum-docs:
+// karyos/design/ffi-gap-analysis.md §4.4, ADR-0067).
+
+/// `KARYOS_MESSAGE_END_OF_STREAM`: the message ends its stream.
+pub(crate) const MESSAGE_END_OF_STREAM: u32 = 1;
+/// `KARYOS_MESSAGE_TRACED`: the message carries a trace extension.
+pub(crate) const MESSAGE_TRACED: u32 = 2;
+
+/// `karyos_message_info`: what the poll knows of a message, handed to the
+/// handler for the call only. `size` is this version's
+/// `sizeof(karyos_message_info)`: a handler built against an older header
+/// reads only the fields it knows.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MessageInfo {
+    /// The struct's size in bytes, set by the library.
+    pub size: u32,
+    /// The message's lane.
+    pub lane: u32,
+    /// The message's stream position.
+    pub position: u64,
+    /// The publisher's reserved value.
+    pub reserved_value: i64,
+    /// The bytes from the message to the next one.
+    pub extent: u32,
+    /// The image's session id; the stream's for a `karyos:ipc` one.
+    pub session_id: i32,
+    /// `KARYOS_MESSAGE_*` bits.
+    pub flags: u32,
+    /// Zero.
+    pub reserved: u32,
+}
+
+/// `karyos_image_change`: an image of a network subscription attached or
+/// retired.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ImageChange {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// The image's session id.
+    pub session_id: i32,
+    /// The image's attach id.
+    pub image_id: u64,
+    /// The image's lane.
+    pub lane: u32,
+    /// 1 when it was attached, 0 when it was retired.
+    pub available: u32,
+}
+
+/// The size of `karyos_image_change` in ABI 0.1.0.
+const IMAGE_CHANGE_SIZE_0_1: u32 = 24;
+
+/// `karyos_message_handler`: called once per message with the caller's
+/// `context`, the message's `length` bytes at `data` (a private copy, valid
+/// only during the call) and its `info`. It must return normally.
+pub type MessageHandler =
+    Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, *const MessageInfo)>;
+
+/// `info` as the C ABI hands it to a handler.
+fn message_info(info: &karyos_client::MessageInfo) -> MessageInfo {
+    let mut flags = 0;
+    if info.end_of_stream {
+        flags |= MESSAGE_END_OF_STREAM;
+    }
+    if info.extension.is_some() {
+        flags |= MESSAGE_TRACED;
+    }
+    MessageInfo {
+        size: size_of_u32::<MessageInfo>(),
+        lane: u32::from(info.lane.get()),
+        position: info.position,
+        reserved_value: info.reserved_value,
+        extent: info.extent,
+        session_id: info.session_id,
+        flags,
+        reserved: 0,
+    }
+}
+
+/// Adds the subscription of `stream_id` on the channel `uri` (`karyos:ipc`
+/// or `karyos:udp`) to `client`, with its private copy buffer, and writes
+/// its handle through `subscription`. A control call: it waits for the
+/// driver up to the client's timeout, and holds the client handle
+/// meanwhile (`KARYOS_E_BUSY` to another thread). On failure nothing is
+/// opened and `detail` (may be null) receives the failure's detail.
+///
+/// # Safety
+///
+/// `uri` is a NUL-terminated string; `subscription` points to a writable
+/// `uint64_t`; `detail` is null or a `karyos_detail` whose `size` is set.
+/// A null `uri` or `subscription` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_subscription(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    subscription: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(subscription) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `uri`.
+        let uri = match unsafe { read_str(uri) } {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match api::subscription::add(Handle::from_raw(client), uri, stream_id) {
+            Ok(handle) => {
+                // SAFETY: `subscription` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { subscription.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Delivers at most `limit` messages of `subscription` to `handler`, each
+/// copied first, and writes how many through `delivered` (may be null),
+/// also on failure: a failed poll's status follows the messages delivered
+/// before it. A `limit` of 0 delivers nothing. A data-path call: it never
+/// waits, and allocates only when a newly adopted image or mapping has a
+/// larger message than any before (`KARYOS_E_SYSTEM` when it cannot,
+/// before anything of that round is delivered: the count covers earlier
+/// rounds). The handler runs while the subscription
+/// is held: from it, polling or closing this subscription, or closing its
+/// client, returns `KARYOS_E_REENTRANT`.
+///
+/// A binding stops a poll after a failed handler with the bounded poll of
+/// ADR-0067: a `limit` of 1 in a loop, and no call after the failure. The
+/// failed message is acknowledged; the ones after it stay undelivered.
+///
+/// # Safety
+///
+/// `handler` is null or a function of the `karyos_message_handler`
+/// signature that returns normally; `context` is passed to it untouched;
+/// `delivered` is null or points to a writable `uint32_t`. A null
+/// `handler` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_subscription_poll(
+    subscription: u64,
+    handler: MessageHandler,
+    context: *mut c_void,
+    limit: u32,
+    delivered: *mut u32,
+) -> i32 {
+    guard(|| {
+        let Some(handler) = handler else {
+            return Status::InvalidArgument;
+        };
+        if !delivered.is_null() && !delivered.is_aligned() {
+            return Status::InvalidArgument;
+        }
+        let mut call = |bytes: &[u8], info: &karyos_client::MessageInfo| {
+            let info = message_info(info);
+            // SAFETY: `handler` has the handler's signature and returns
+            // normally (the caller's contract); `bytes` and `info` outlive
+            // the call, which only reads them.
+            unsafe { handler(context, bytes.as_ptr(), bytes.len(), &raw const info) };
+        };
+        let (status, count) =
+            match api::subscription::poll(Handle::from_raw(subscription), limit, &mut call) {
+                Ok(count) => (Status::Ok, count),
+                Err((failure, count)) => (failure.status, count),
+            };
+        if !delivered.is_null() {
+            // SAFETY: `delivered` is non-null and aligned, and the caller's
+            // contract makes it a writable `uint32_t`.
+            unsafe { delivered.write(count) };
+        }
+        status
+    })
+}
+
+/// Takes the oldest queued image change of `subscription` into `change`
+/// and writes 1 through `has`, or writes 0 through `has` when none is
+/// queued (a `karyos:ipc` subscription has none). The queue is bounded:
+/// `karyos_subscription_image_changes_lost` counts what a full queue
+/// dropped.
+///
+/// A null or misaligned `change` or `has`, or a `change` whose `size` is
+/// below this ABI's first `karyos_image_change`, returns
+/// `KARYOS_E_INVALID_ARGUMENT` and takes nothing from the queue.
+///
+/// # Safety
+///
+/// `change` points to a writable `karyos_image_change` whose `size` is set;
+/// `has` points to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_subscription_next_image_change(
+    subscription: u64,
+    change: *mut ImageChange,
+    has: *mut u32,
+) -> i32 {
+    guard(|| {
+        if !(writable(has) && writable(change)) {
+            return Status::InvalidArgument;
+        }
+        // Checked before the change is taken, so a struct that cannot hold
+        // it never loses one.
+        // SAFETY: `change` is non-null and aligned, and the caller's
+        // contract makes it a `karyos_image_change` whose first field is
+        // the `uint32_t` size it set.
+        if unsafe { change.cast::<u32>().read() } < IMAGE_CHANGE_SIZE_0_1 {
+            return Status::InvalidArgument;
+        }
+        match api::subscription::next_image_change(Handle::from_raw(subscription)) {
+            Ok(next) => {
+                if let Some(next) = next {
+                    // SAFETY: the caller's contract on `change`.
+                    unsafe {
+                        write_sized(change, IMAGE_CHANGE_SIZE_0_1, |size| ImageChange {
+                            size,
+                            session_id: next.session_id,
+                            image_id: next.image_id,
+                            lane: u32::from(next.lane.get()),
+                            available: u32::from(next.available),
+                        });
+                    };
+                }
+                // SAFETY: `has` is non-null and aligned, and the caller's
+                // contract makes it a writable `uint32_t`.
+                unsafe { has.write(u32::from(next.is_some())) };
+                Status::Ok
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+/// Writes through `lost` the image changes `subscription`'s full queue
+/// dropped.
+///
+/// # Safety
+///
+/// `lost` points to a writable `uint64_t`; a null or misaligned one
+/// returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_subscription_image_changes_lost(
+    subscription: u64,
+    lost: *mut u64,
+) -> i32 {
+    guard(|| {
+        if !writable(lost) {
+            return Status::InvalidArgument;
+        }
+        match api::subscription::image_changes_lost(Handle::from_raw(subscription)) {
+            Ok(count) => {
+                // SAFETY: `lost` is non-null and aligned, and the caller's
+                // contract makes it a writable `uint64_t`.
+                unsafe { lost.write(count) };
+                Status::Ok
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+/// Closes `subscription` through its client. It needs the client handle
+/// too: while that is in use (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`)
+/// nothing is closed.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_subscription_close(subscription: u64) -> i32 {
+    guard(
+        || match api::subscription::close(Handle::from_raw(subscription)) {
+            Ok(()) => Status::Ok,
+            Err(status) => status,
+        },
+    )
+}
+
 /// `karyos_driver_options`: an embedded driver's options, copied by
 /// `karyos_driver_create`. `size` comes first; every setting it does not
 /// carry is the driver's default.
@@ -612,7 +932,7 @@ pub struct DriverOptions {
     pub broadcast_capacity: u32,
     /// Cells of the counters region.
     pub counters_capacity: u32,
-    /// Zero.
+    /// Zero; anything else is refused (a later minor may use it).
     pub reserved: u32,
     /// How often the driver advances its heartbeat, in nanoseconds.
     pub heartbeat_interval_ns: u64,
@@ -701,6 +1021,10 @@ pub unsafe extern "C" fn karyos_driver_create(
                 Ok(raw) => raw,
                 Err(status) => return status,
             };
+        // A later minor may give it a meaning: refused, not ignored.
+        if raw.reserved != 0 {
+            return Status::InvalidArgument;
+        }
         let options = driver::Options {
             max_clients: raw.max_clients,
             max_streams: raw.max_streams,

@@ -434,6 +434,58 @@ release may break APIs, wire formats and shared-memory layouts.
   sized structs whose unset bytes hold a sentinel, so a write past a
   struct is seen. A runner that meets a function or argument it does not
   know fails the scenario.
+- Subscriptions over the C ABI (F4; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md` §4.4, ADR-0067):
+  `karyos_client_add_subscription`, `karyos_subscription_poll` (a
+  `karyos_message_handler` callback, a `MessageLimit` as `limit`, the
+  count delivered also on failure), `karyos_subscription_next_image_change`,
+  `karyos_subscription_image_changes_lost` and `karyos_subscription_close`,
+  with `karyos_message_info`, `karyos_image_change` and
+  `KARYOS_MAX_SUBSCRIPTIONS`. Each message reaches the handler from a
+  private copy owned by `libkaryos`, never a term or a shared mapping:
+  allocated at the add with the largest message the subscription can
+  deliver, grown only when a newly adopted image or mapping has a larger
+  one (`KARYOS_E_SYSTEM`, before anything is delivered, when it cannot).
+  The handler runs with the subscription held, so reentering it or closing
+  its client returns `KARYOS_E_REENTRANT`, and another thread gets
+  `KARYOS_E_BUSY`. A client's close takes every publication and
+  subscription before it closes any. The header checker reads callback
+  typedefs. A publication or subscription whose handle a panic poisoned is
+  now closed by its close (`karyos_publication_close` answered
+  `KARYOS_E_INTERNAL` and kept it).
+
+- A remote client binds a guarded exclusive publication (G-x3;
+  quantstratum-docs: `karyos/design/guards-and-abort.md`, "The binding
+  across processes"). `RemoteClient::take_publication` maps the grant's
+  outcome ring and guard words read-only and its consumed cell writable,
+  reads the guard's index and admission epoch from the ring's header, and
+  binds the handle: it is gated by the guard word it was granted and reads
+  its outcome records with `poll_outcomes`. Each binding region holds its
+  own export, detached when the handle drops, never at a mapping cutover.
+  The control path now issues guarded publications to remote clients;
+  clients of the in-process command ring and timed lanes are still
+  refused (`InvalidPublicationMode`). The facade's `Publication` gains
+  `poll_outcomes_on(lane, limit, handler)`.
+- The driver grants a guarded exclusive publication's binding over the
+  control path (G-x2; quantstratum-docs:
+  `karyos/design/guards-and-abort.md`, "The binding across processes"),
+  behind a test-only switch: the control path still refuses guarded
+  streams until the client binds the regions (G-x3). The grant carries,
+  under one key, the log buffer, then the handle's outcome ring
+  (driver-only), its consumed cell (writable by its client alone) and the
+  guard region (driver-only), each its own export and ledger entry,
+  checked against `max_exports_per_client` and the fetch bounds before
+  anything is reserved. Every guard's word now lives in one array of
+  `max_guards` words, a driver-only region in IPC mode; a guard's index
+  is never reused, and the ring's header names it. The walker's bound
+  holds the ring and the cell until its last outcome record, after the
+  handle or its grants are gone. Concurrent guarded publications follow
+  when GC-7 lifts. The admission manifest rule changes in place under
+  the unreleased version 2: a guarded grant's manifest lists exactly
+  `OutcomeRing`, `ConsumedCell`, `GuardRegion` after its log buffer
+  records and carries a base; the binding's kinds appear in no other
+  manifest. `outcome_ring::init` also zeroes the reserved header words
+  (DESIGN's P3 on #501).
 - The guard binding's region kinds and outcome header (G-x1;
   quantstratum-docs: `karyos/design/guards-and-abort.md`, "The binding
   across processes"). `RegionKind` gains `GuardRegion` (12),
@@ -867,6 +919,14 @@ release may break APIs, wire formats and shared-memory layouts.
   (`KARYOS_E_CLAIM_OUTSTANDING`). Closing a client closes its publications
   and their claims, all or nothing: while one is in use nothing closes.
   Tests over an embedded driver run under Miri and on macOS.
+- `karyos-ffi` concurrent publications (batch F7a-1):
+  `karyos_client_add_concurrent_publication` takes a concurrent handle on
+  lane 0 of a `karyos:ipc` stream the driver configures for concurrent
+  publishers. The offer, claim, commit, abort and close calls apply to it
+  as to an exclusive publication; any other lane is `KARYOS_E_INVALID_LANE`.
+  Closing the handle frees its publisher slot in the driver. Guarded and
+  timed lanes stay out of scope until the driver grants them across
+  processes (F7a-2).
 - `karyos-ffi` handle tables: a stale handle no longer touches its slot's
   mutex. Its slot's generation is now an atomic checked first, and a close
   moves it on at once, so a stale handle answers `KARYOS_E_CLOSED` and
@@ -899,14 +959,17 @@ release may break APIs, wire formats and shared-memory layouts.
   (the sized `karyos_stream_options` with `karyos_stream_options_init`:
   the fields of the Rust `StreamConfig` and its log buffer without
   conflation; lane 0 and exclusive publications only in this version, so
-  later minors only widen what is taken), `karyos_driver_connect` (a
+  later minors only widen what is taken; streams are keyed by stream id
+  alone, so a second session of one is refused), `karyos_driver_connect` (a
   client in this process over a conductor of the driver) and
   `karyos_driver_close`, with the sized
   `karyos_driver_options` (a subset of `DriverConfig`, the rest its
   defaults; an older header's smaller struct is read by its prefix). A
   client of an embedded driver follows it: `KARYOS_E_INTERNAL` once a
   panic poisoned the driver (in a called duty cycle or on its thread),
-  `KARYOS_E_CLOSED` once it is closed, and so do its publications.
+  `KARYOS_E_CLOSED` once it is closed, and so do its publications, by
+  one load of the driver's state, without its lock. A nonzero `reserved`
+  word in `karyos_driver_options` is refused.
   Closing a driver leaves its clients open, to be closed. `KARYOS_MAX_DRIVERS`,
   `KARYOS_PUBLICATION_EXCLUSIVE`, `KARYOS_LOSS_*` and
   `KARYOS_PROTOCOL_VERSION` (asserted at compile time against

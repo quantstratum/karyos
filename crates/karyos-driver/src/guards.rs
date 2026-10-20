@@ -4,9 +4,15 @@
 //! P2.10 batch 1): the registry of named guards, their transitions on the
 //! control path, and the interim audit ring (G9 interim).
 //!
-//! - **Words.** Each guard's word (`karyos_sys::guard`) lives in driver
-//!   memory and only the driver writes it, with Release. In-process
-//!   handles read it through a shared view.
+//! - **Words.** Every guard's word (`karyos_sys::guard`) lives in one
+//!   array of `max_guards` words, the guard region, and only the driver
+//!   writes it, with Release. In IPC mode (Linux) the array is a
+//!   driver-only region every guarded grant carries read-only
+//!   (`quantstratum-docs: karyos/design/guards-and-abort.md`, "The binding
+//!   across processes"); in process it is on the heap. A guard's word
+//!   index is its position at `add`: guards are never removed, so an
+//!   index is never reused while the driver lives, and the header of a
+//!   live or late outcome ring never names another guard.
 //! - **Authorization (G1).** A transition is authorized by the caller's
 //!   process credentials on the control path: the in-process caller of
 //!   the embedded API, or an admitted IPC client, whose uid admission
@@ -28,7 +34,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use karyos_client::HeapWords;
+use crate::shared_words::Words;
 use karyos_protocol::cnc::ErrorCode;
 use karyos_sys::counters::{Counter, CounterKeys, KIND_GUARD};
 use karyos_sys::diag::{GuardAudit, GuardAuditRecord};
@@ -121,7 +127,8 @@ pub struct Audit {
 struct Entry {
     name: String,
     id: u64,
-    word: Arc<HeapWords>,
+    /// Its word's index in the guard words, never reused.
+    index: usize,
     /// The epoch and driver clock time of the guard's latest closes,
     /// oldest first, at most [`CLOSE_HISTORY`].
     closes: VecDeque<(u64, u64)>,
@@ -172,6 +179,8 @@ pub struct GuardRate {
 pub(crate) struct Guards {
     driver: u64,
     max: usize,
+    /// Every guard's word, `max` of them: the guard region.
+    words: Arc<Words>,
     entries: Vec<Entry>,
     next: u64,
     audit: VecDeque<AuditRecord>,
@@ -186,10 +195,19 @@ pub(crate) struct Guards {
 }
 
 impl Guards {
-    pub(crate) fn new(driver: u64, max: usize, audit_capacity: usize, ring: GuardAudit) -> Self {
+    /// The registry of at most `max` guards over `words`, which holds at
+    /// least `max` words, zeroed.
+    pub(crate) fn new(
+        driver: u64,
+        max: usize,
+        words: Words,
+        audit_capacity: usize,
+        ring: GuardAudit,
+    ) -> Self {
         Self {
             driver,
-            max,
+            max: max.min(words.words().len()),
+            words: Arc::new(words),
             entries: Vec::with_capacity(max),
             next: 1,
             audit: VecDeque::with_capacity(audit_capacity),
@@ -222,7 +240,7 @@ impl Guards {
     fn words(&self) -> impl Iterator<Item = (u64, &str, u64)> + '_ {
         self.entries
             .iter()
-            .map(|entry| (entry.id, entry.name.as_str(), Self::raw(entry)))
+            .map(|entry| (entry.id, entry.name.as_str(), self.raw(entry)))
     }
 
     /// Adds a guard, created closed at epoch 1.
@@ -244,14 +262,17 @@ impl Guards {
         }
         let id = self.next;
         let next = id.checked_add(1).ok_or(DriverError::GuardIdsExhausted)?;
-        let word = Arc::new(HeapWords::zeroed(1));
-        if let Some(cell) = word.words().first() {
-            cell.store(guard::created(), karyos_sys::sync::Ordering::Release);
-        }
+        // The next unused word: guards are never removed, so an index is
+        // never reused.
+        let index = self.entries.len();
+        let Some(cell) = self.words.words().get(index) else {
+            return Err(DriverError::TooManyGuards);
+        };
+        cell.store(guard::created(), karyos_sys::sync::Ordering::Release);
         self.entries.push(Entry {
             name: name.to_owned(),
             id,
-            word,
+            index,
             closes: VecDeque::with_capacity(CLOSE_HISTORY),
         });
         self.next = next;
@@ -309,23 +330,35 @@ impl Guards {
         self.entry(handle.guard).ok_or(DriverError::UnknownGuard)
     }
 
-    /// The shared view of a guard's word, for in-process handles.
-    pub(crate) fn view(&self, handle: GuardHandle) -> Result<Arc<HeapWords>, DriverError> {
-        Ok(Arc::clone(&self.check(handle)?.word))
+    /// The guard words and the guard's index in them, for the handles,
+    /// gates and outcome rings bound to it.
+    pub(crate) fn view(&self, handle: GuardHandle) -> Result<(Arc<Words>, usize), DriverError> {
+        Ok((Arc::clone(&self.words), self.check(handle)?.index))
+    }
+
+    /// The guard words, to grant (`GuardRegion`).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn guard_words(&self) -> &Arc<Words> {
+        &self.words
     }
 
     /// The guard's state.
     pub(crate) fn state(&self, handle: GuardHandle) -> Result<GuardState, DriverError> {
         let entry = self.check(handle)?;
-        Ok(guard::load_in(&*entry.word, 0)?)
+        Ok(guard::load_in(&*self.words, entry.index)?)
     }
 
-    fn raw(entry: &Entry) -> u64 {
-        entry
-            .word
-            .words()
-            .first()
+    fn raw(&self, entry: &Entry) -> u64 {
+        self.cell(entry)
             .map_or(0, |cell| cell.load(karyos_sys::sync::Ordering::Relaxed))
+    }
+
+    /// The guard's word.
+    fn cell(&self, entry: &Entry) -> Option<&karyos_sys::sync::AtomicU64> {
+        self.words.words().get(entry.index)
     }
 
     /// Closes a guard and records the transition.
@@ -338,14 +371,12 @@ impl Guards {
         time: u64,
     ) -> Result<Closed, DriverError> {
         let checked = self.check(handle).map(|entry| {
-            let before = Self::raw(entry);
-            let result = entry
-                .word
-                .words()
-                .first()
+            let before = self.raw(entry);
+            let result = self
+                .cell(entry)
                 .ok_or(GuardError::Corrupt { word: before })
                 .and_then(guard::close);
-            (before, Self::raw(entry), result)
+            (before, self.raw(entry), result)
         });
         let (before, after, result) = match checked {
             Ok(found) => found,
@@ -394,14 +425,12 @@ impl Guards {
         time: u64,
     ) -> Result<u64, DriverError> {
         let checked = self.check(handle).map(|entry| {
-            let before = Self::raw(entry);
-            let result = entry
-                .word
-                .words()
-                .first()
+            let before = self.raw(entry);
+            let result = self
+                .cell(entry)
                 .ok_or(GuardError::Corrupt { word: before })
                 .and_then(|cell| guard::reopen(cell, expected));
-            (before, Self::raw(entry), result)
+            (before, self.raw(entry), result)
         });
         let (before, after, result) = match checked {
             Ok(found) => found,
@@ -511,7 +540,7 @@ impl Guards {
     #[cfg(test)]
     pub(crate) fn set_word(&self, handle: GuardHandle, word: u64) {
         if let Ok(entry) = self.check(handle)
-            && let Some(cell) = entry.word.words().first()
+            && let Some(cell) = self.cell(entry)
         {
             cell.store(word, karyos_sys::sync::Ordering::Release);
         }
@@ -634,7 +663,13 @@ mod tests {
 
     #[test]
     fn guards_are_named_closed_and_audited() {
-        let mut guards = Guards::new(7, 2, 3, karyos_sys::diag::guard_audit(4).unwrap());
+        let mut guards = Guards::new(
+            7,
+            2,
+            Words::heap(2),
+            3,
+            karyos_sys::diag::guard_audit(4).unwrap(),
+        );
         let orders = guards.add("orders").unwrap();
         assert_eq!(orders.id(), 1);
         assert_eq!(guards.find("orders"), Some(orders));
@@ -717,7 +752,13 @@ mod tests {
 
     #[test]
     fn a_close_is_recorded_even_without_audit_room() {
-        let mut guards = Guards::new(1, 1, 0, karyos_sys::diag::guard_audit(4).unwrap());
+        let mut guards = Guards::new(
+            1,
+            1,
+            Words::heap(1),
+            0,
+            karyos_sys::diag::guard_audit(4).unwrap(),
+        );
         let guard = guards.add("g").unwrap();
         assert_eq!(
             guards.close(guard, 1, Requester::InProcess, 0, 0),
@@ -734,7 +775,13 @@ mod tests {
     fn a_refused_guard_gauge_is_retried_every_nth_sync() {
         use crate::counters::{Event, FIXED_COUNTERS};
         let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 1).unwrap();
-        let mut guards = Guards::new(1, 2, 2, karyos_sys::diag::guard_audit(2).unwrap());
+        let mut guards = Guards::new(
+            1,
+            2,
+            Words::heap(2),
+            2,
+            karyos_sys::diag::guard_audit(2).unwrap(),
+        );
         let _ = guards.add("kill").unwrap();
         // The one spare cell is taken.
         let taken = counters

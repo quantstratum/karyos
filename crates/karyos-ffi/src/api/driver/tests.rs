@@ -116,12 +116,13 @@ fn a_panic_in_a_called_duty_cycle_poisons_the_driver_and_its_clients() {
     let _serial = serial();
     let driver = created();
     let client = client::connect_embedded(driver).unwrap();
+    // A panic in any call that holds the driver's slot, as a duty cycle
+    // does.
     let unwound = catch_unwind(AssertUnwindSafe(|| {
-        drivers()
-            .with(driver, |_| {
-                std::panic::resume_unwind(Box::new("in a duty cycle"))
-            })
-            .unwrap();
+        with_slot(driver, |_| {
+            std::panic::resume_unwind(Box::new("in a duty cycle"))
+        })
+        .unwrap();
     }));
     assert!(unwound.is_err());
     assert_eq!(do_work(driver), Err(Status::Internal.into()));
@@ -154,7 +155,15 @@ fn a_panic_on_the_drivers_thread_poisons_it_and_its_clients() {
         })
         .unwrap();
     assert_eq!(do_work(driver), Err(Status::Internal.into()));
-    assert_eq!(client::poll(client), Err(Status::Internal));
+    // The driver's thread marks it lost when it next finds it poisoned.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while client::poll(client) != Err(Status::Internal) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the client never saw it"
+        );
+        std::thread::yield_now();
+    }
     assert_eq!(
         client::connect_embedded(driver),
         Err(Status::Internal.into())
@@ -228,7 +237,7 @@ fn a_publication_follows_its_clients_driver() {
     let client = client::connect_embedded(driver).unwrap();
     // The driver's thread serves the control call.
     start(driver, YIELD).unwrap();
-    let opened = publication::add(client, "karyos:ipc", 7).unwrap();
+    let opened = publication::add(client, "karyos:ipc", 7, false).unwrap();
     assert_ne!(
         publication::offer(opened, 0, b"x"),
         Err(Status::Closed.into())
@@ -243,7 +252,7 @@ fn a_publication_follows_its_clients_driver() {
         Err(Status::Closed.into())
     );
     assert_eq!(
-        publication::add(client, "karyos:ipc", 8),
+        publication::add(client, "karyos:ipc", 8, false),
         Err(Status::Closed.into())
     );
     // The client's close closes it.
@@ -262,6 +271,16 @@ fn a_stream_is_added_once_and_removed_once() {
     add_stream(driver, &stream(11)).unwrap();
     assert_eq!(
         add_stream(driver, &stream(11)),
+        Err(Failure::with(Status::InvalidArgument, 11, 1))
+    );
+    // The C ABI keys streams by stream id: another session of it is
+    // refused too, naming the session it has.
+    let other_session = StreamOptions {
+        session_id: 2,
+        ..stream(11)
+    };
+    assert_eq!(
+        add_stream(driver, &other_session),
         Err(Failure::with(Status::InvalidArgument, 11, 1))
     );
     remove_stream(driver, 11).unwrap();
@@ -354,4 +373,29 @@ fn the_stream_defaults_are_a_valid_heap_stream() {
     assert_eq!(config.on_required_loss, LossPolicy::Hold);
     assert!(!config.allow_unconnected);
     assert!(config.conflation.is_none());
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_subscription_follows_its_clients_driver() {
+    use crate::api::subscription;
+    let _serial = serial();
+    let driver = created();
+    add_stream(driver, &stream(17)).unwrap();
+    let client = client::connect_embedded(driver).unwrap();
+    // The driver's thread serves the control call.
+    start(driver, YIELD).unwrap();
+    let opened = subscription::add(client, "karyos:ipc", 17).unwrap();
+    let mut ignore = |_: &[u8], _: &karyos_client::MessageInfo| {};
+    assert!(subscription::poll(opened, 1, &mut ignore).is_ok());
+    close(driver).unwrap();
+    assert_eq!(
+        subscription::poll(opened, 1, &mut ignore).map_err(|(failure, _)| failure.status),
+        Err(Status::Closed)
+    );
+    assert_eq!(
+        subscription::add(client, "karyos:ipc", 17).map_err(|failure| failure.status),
+        Err(Status::Closed)
+    );
+    client::close(client).unwrap();
 }

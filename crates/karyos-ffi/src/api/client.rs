@@ -16,6 +16,7 @@ use std::time::Duration;
 use karyos_client::{Client, ClientConductor, ClientError, Context, IdleStrategy, StreamId};
 
 use crate::api::publication::Lanes;
+use crate::api::subscription::Reader;
 
 use crate::api::driver;
 use crate::handles::{Handle, Kind, Table};
@@ -50,24 +51,72 @@ impl AnyClient {
         }
     }
 
-    /// The exclusive publication of `stream_id` on `uri` (a control call:
-    /// it waits for the driver up to the context's timeout).
+    /// The exclusive publication of `stream_id` on `uri`, or with
+    /// `concurrent` a concurrent handle on lane 0 of a `karyos:ipc` stream
+    /// (F7a-1). A control call: it waits for the driver up to the context's
+    /// timeout.
     pub(crate) fn add_publication(
         &mut self,
         uri: &str,
         stream_id: StreamId,
+        concurrent: bool,
     ) -> Result<Lanes, Failure> {
+        let failure = |error: ClientError| Failure::from(&error);
+        match (self, concurrent) {
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), false) => client
+                .add_exclusive_publication(uri, stream_id)
+                .map(Lanes::Remote)
+                .map_err(failure),
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), true) => client
+                .add_concurrent_publication(uri, stream_id)
+                .map(|handle| Lanes::ConcurrentRemote(Box::new(handle)))
+                .map_err(failure),
+            (Self::Embedded(client), false) => client
+                .add_exclusive_publication(uri, stream_id)
+                .map(Lanes::Embedded)
+                .map_err(failure),
+            (Self::Embedded(client), true) => client
+                .add_concurrent_publication(uri, stream_id)
+                .map(|handle| Lanes::ConcurrentEmbedded(Box::new(handle)))
+                .map_err(failure),
+        }
+    }
+
+    /// The subscription of `stream_id` on `uri` (a control call: it waits
+    /// for the driver up to the context's timeout).
+    pub(crate) fn add_subscription(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+    ) -> Result<Reader, Failure> {
         let failure = |error: ClientError| Failure::from(&error);
         match self {
             #[cfg(target_os = "linux")]
             Self::Remote(client) => client
-                .add_exclusive_publication(uri, stream_id)
-                .map(Lanes::Remote)
+                .add_subscription(uri, stream_id)
+                .map(Reader::Remote)
                 .map_err(failure),
             Self::Embedded(client) => client
-                .add_exclusive_publication(uri, stream_id)
-                .map(Lanes::Embedded)
+                .add_subscription(uri, stream_id)
+                .map(Reader::Embedded)
                 .map_err(failure),
+        }
+    }
+
+    /// Releases `reader`, granted to this client.
+    pub(crate) fn remove_subscription(&mut self, reader: Reader) {
+        match (self, reader) {
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), Reader::Remote(reader)) => client.remove_subscription(reader),
+            (Self::Embedded(client), Reader::Embedded(reader)) => {
+                client.remove_subscription(reader);
+            }
+            // A subscription always has its client's connection; another
+            // one is only dropped.
+            #[cfg(target_os = "linux")]
+            (_, reader) => drop(reader),
         }
     }
 
@@ -77,6 +126,13 @@ impl AnyClient {
             #[cfg(target_os = "linux")]
             (Self::Remote(client), Lanes::Remote(lanes)) => client.remove_publication(lanes),
             (Self::Embedded(client), Lanes::Embedded(lanes)) => client.remove_publication(lanes),
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), Lanes::ConcurrentRemote(handle)) => {
+                client.remove_concurrent_publication(*handle);
+            }
+            (Self::Embedded(client), Lanes::ConcurrentEmbedded(handle)) => {
+                client.remove_concurrent_publication(*handle);
+            }
             // A publication always has its client's connection; another
             // one is only dropped.
             #[cfg(target_os = "linux")]
@@ -92,21 +148,25 @@ pub(crate) struct ClientEntry {
     pub(crate) client: AnyClient,
     /// Its open publications.
     pub(crate) publications: Vec<Handle>,
-    /// The embedded driver whose conductor it is over, when the C ABI
-    /// created that driver (F5): the client follows its failure and its
-    /// close ([`driver::usable`]).
-    pub(crate) driver: Option<Handle>,
+    /// Its open subscriptions.
+    pub(crate) subscriptions: Vec<Handle>,
+    /// The state of the embedded driver whose conductor it is over, when
+    /// the C ABI created that driver (F5): the client follows its failure
+    /// and its close ([`driver::DriverState::usable`]).
+    pub(crate) driver: Option<driver::DriverState>,
 }
 
 impl ClientEntry {
-    /// Whether the client may act; see [`driver::usable`].
+    /// Whether the client may act; see [`driver::DriverState::usable`].
     ///
     /// # Errors
     ///
     /// [`Status::Internal`] once its driver is poisoned,
     /// [`Status::Closed`] once it is closed.
     pub(crate) fn usable(&self) -> Result<(), Status> {
-        self.driver.map_or(Ok(()), driver::usable)
+        self.driver
+            .as_ref()
+            .map_or(Ok(()), driver::DriverState::usable)
     }
 }
 
@@ -118,10 +178,11 @@ pub(crate) fn clients() -> &'static Table<ClientEntry> {
 
 /// A client's entry for its table, over `driver` when the C ABI created
 /// it.
-fn entry(client: AnyClient, driver: Option<Handle>) -> ClientEntry {
+fn entry(client: AnyClient, driver: Option<driver::DriverState>) -> ClientEntry {
     ClientEntry {
         client,
         publications: Vec::new(),
+        subscriptions: Vec::new(),
         driver,
     }
 }
@@ -232,12 +293,12 @@ pub(crate) fn insert_embedded(client: Client<ClientConductor>) -> Result<Handle,
 ///
 /// The driver's refusal, the context's, and the table's.
 pub(crate) fn connect_embedded(owner: Handle) -> Result<Handle, Failure> {
-    let conductor = driver::conductor(owner)?;
+    let (conductor, state) = driver::conductor(owner)?;
     let context = Context::builder()
         .build()
         .map_err(|error| Failure::from(&error))?;
     let client = Client::with_conductor(conductor, context);
-    Ok(clients().insert(entry(AnyClient::Embedded(client), Some(owner)))?)
+    Ok(clients().insert(entry(AnyClient::Embedded(client), Some(state)))?)
 }
 
 /// Serves `client` once; whether anything was served.
@@ -260,11 +321,18 @@ pub(crate) fn poll(client: Handle) -> Result<bool, Status> {
 ///
 /// As [`Table::remove_all`].
 pub(crate) fn close_entry(entry: &mut ClientEntry) -> Result<(), Status> {
-    let publications = crate::api::publication::table().remove_all(&entry.publications)?;
-    for publication in publications {
+    // Every child of both tables is taken before any is closed, so while
+    // one is in use nothing is.
+    let publications = crate::api::publication::table().take_all(&entry.publications)?;
+    let subscriptions = crate::api::subscription::table().take_all(&entry.subscriptions)?;
+    for publication in publications.close()? {
         publication.release(&mut entry.client);
     }
+    for subscription in subscriptions.close()? {
+        subscription.release(&mut entry.client);
+    }
     entry.publications.clear();
+    entry.subscriptions.clear();
     Ok(())
 }
 

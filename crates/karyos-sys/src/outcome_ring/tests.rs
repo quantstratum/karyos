@@ -418,7 +418,8 @@ fn the_header_names_the_binding() {
     };
     let written = binding_of(3, 2, 5, 8);
     let words = ring_words(6).unwrap();
-    let ring: Vec<AtomicU64> = (0..words).map(|_| AtomicU64::new(0)).collect();
+    // Reserved words dirty before init: it zeroes them.
+    let ring: Vec<AtomicU64> = (0..words).map(|_| AtomicU64::new(u64::MAX)).collect();
     init(&ring, &written).unwrap();
     assert_eq!(ring[VERSION].load(Ordering::Relaxed), 2);
     assert_eq!(ring[CAPACITY].load(Ordering::Relaxed), 6);
