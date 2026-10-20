@@ -11,6 +11,26 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-ffi`'s Miri profile (owner item 45): `crates/karyos-ffi/MIRI.md`
+  maps every unsafe site class of `src/abi.rs` and the test support to
+  the test that runs it under Miri, and lists what Miri does not cover.
+  Under Miri the tests' driver threads and waits sleep instead of
+  yielding, so a driver test takes about a minute instead of an hour;
+  driver integration tests that add no unsafe site are native only
+  (`driver integration; covered natively`). A PR touching `src/abi.rs`
+  or the test support runs Miri per that file on its head.
+- `karyos-replay start` and `stop` (quantstratum-docs:
+  `karyos/design/archive-host.md`, H6): ask a running Archive to replay a
+  recording into a stream, or to stop a replay, over its control streams.
+  `start --live DIR=REQ,RESP --recording ID --to-stream S [--from POS]
+  [--length BYTES] [--channel URI] [--timeout-ms N]` prints `replay=ID
+  stream=S session=N` for the reader, which the Archive waits for (H2b).
+  `stop --live DIR=REQ,RESP --replay ID`. Exit status 2 on any error, the
+  Archive's refusal included. They connect through `ArchiveConnection`
+  (Linux), one connection per request, closed after it.
+  `karyos_tools::args::parse_live` parses `--live` for these and for
+  `karyos-catalog list --live`. `tests/karyosd_replay.rs` runs both
+  against `karyosd --archive` (Linux).
 - karyos-tools: `replay::HELP` is replaced by `replay::help(command)`,
   which names the command the diff was invoked as (`karyos-replay diff` or
   its alias `karyos-tools replay diff`; H5, #521).
