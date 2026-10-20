@@ -51,23 +51,35 @@ impl AnyClient {
         }
     }
 
-    /// The exclusive publication of `stream_id` on `uri` (a control call:
-    /// it waits for the driver up to the context's timeout).
+    /// The exclusive publication of `stream_id` on `uri`, or with
+    /// `concurrent` a concurrent handle on lane 0 of a `karyos:ipc` stream
+    /// (F7a-1). A control call: it waits for the driver up to the context's
+    /// timeout.
     pub(crate) fn add_publication(
         &mut self,
         uri: &str,
         stream_id: StreamId,
+        concurrent: bool,
     ) -> Result<Lanes, Failure> {
         let failure = |error: ClientError| Failure::from(&error);
-        match self {
+        match (self, concurrent) {
             #[cfg(target_os = "linux")]
-            Self::Remote(client) => client
+            (Self::Remote(client), false) => client
                 .add_exclusive_publication(uri, stream_id)
                 .map(Lanes::Remote)
                 .map_err(failure),
-            Self::Embedded(client) => client
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), true) => client
+                .add_concurrent_publication(uri, stream_id)
+                .map(|handle| Lanes::ConcurrentRemote(Box::new(handle)))
+                .map_err(failure),
+            (Self::Embedded(client), false) => client
                 .add_exclusive_publication(uri, stream_id)
                 .map(Lanes::Embedded)
+                .map_err(failure),
+            (Self::Embedded(client), true) => client
+                .add_concurrent_publication(uri, stream_id)
+                .map(|handle| Lanes::ConcurrentEmbedded(Box::new(handle)))
                 .map_err(failure),
         }
     }
@@ -114,6 +126,13 @@ impl AnyClient {
             #[cfg(target_os = "linux")]
             (Self::Remote(client), Lanes::Remote(lanes)) => client.remove_publication(lanes),
             (Self::Embedded(client), Lanes::Embedded(lanes)) => client.remove_publication(lanes),
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), Lanes::ConcurrentRemote(handle)) => {
+                client.remove_concurrent_publication(*handle);
+            }
+            (Self::Embedded(client), Lanes::ConcurrentEmbedded(handle)) => {
+                client.remove_concurrent_publication(*handle);
+            }
             // A publication always has its client's connection; another
             // one is only dropped.
             #[cfg(target_os = "linux")]

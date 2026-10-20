@@ -237,7 +237,7 @@ fn a_publication_follows_its_clients_driver() {
     let client = client::connect_embedded(driver).unwrap();
     // The driver's thread serves the control call.
     start(driver, YIELD).unwrap();
-    let opened = publication::add(client, "karyos:ipc", 7).unwrap();
+    let opened = publication::add(client, "karyos:ipc", 7, false).unwrap();
     assert_ne!(
         publication::offer(opened, 0, b"x"),
         Err(Status::Closed.into())
@@ -252,7 +252,7 @@ fn a_publication_follows_its_clients_driver() {
         Err(Status::Closed.into())
     );
     assert_eq!(
-        publication::add(client, "karyos:ipc", 8),
+        publication::add(client, "karyos:ipc", 8, false),
         Err(Status::Closed.into())
     );
     // The client's close closes it.

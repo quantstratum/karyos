@@ -346,6 +346,19 @@ int32_t karyos_client_add_publication(uint64_t client, const char *uri,
                                       karyos_detail *detail);
 
 /**
+ * Adds a concurrent publication handle of stream_id on the karyos:ipc
+ * channel uri to the client and writes its handle. The driver must
+ * configure the stream for concurrent publishers; the handle has lane 0
+ * only, and the offer and claim calls apply to it. A control call, as
+ * karyos_client_add_publication.
+ */
+int32_t karyos_client_add_concurrent_publication(uint64_t client,
+                                                 const char *uri,
+                                                 int32_t stream_id,
+                                                 uint64_t *publication,
+                                                 karyos_detail *detail);
+
+/**
  * Offers length bytes at data on the lane, copied before it returns; data
  * may be null when length is 0. On KARYOS_OK, accepted (may be null)
  * receives the lane and position. Never waits.

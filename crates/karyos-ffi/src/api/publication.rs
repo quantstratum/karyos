@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exclusive publications and their staged claims (F3; quantstratum-docs:
-//! karyos/design/ffi-gap-analysis.md §4.4, D1).
+//! Exclusive and concurrent publications and their staged claims (F3, F7a-1;
+//! quantstratum-docs: karyos/design/ffi-gap-analysis.md §4.4, D1).
 //!
 //! A publication handle wraps the facade's `Publication` of its client's
-//! connection, and records the client, whose handle closes it. Offers copy
-//! the caller's bytes as Rust offers do.
+//! connection, or a concurrent handle on lane 0 of a `karyos:ipc` stream
+//! shared with other publishers, and records the client, whose handle
+//! closes it. Offers copy the caller's bytes as Rust offers do. Both kinds
+//! answer the same calls: a concurrent handle has lane 0 only.
 //!
 //! A C claim is staged (SPEC.md §10.2; D1, ruled (a)): the caller writes
 //! into a buffer owned by `karyos-ffi`, never into a term, and the commit
@@ -23,7 +25,10 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use karyos_client::{Accepted, MessageLength, OfferError, Publication};
+use karyos_client::{
+    ClientConcurrentPublication, ClientError, CommitOutcome, ConcurrentClaimOutcome,
+    ConcurrentOfferOutcome, MessageLength, OfferError, Publication,
+};
 use karyos_sys::frame::Lane;
 use karyos_sys::term_bytes::HeapTerms;
 
@@ -37,7 +42,17 @@ pub(crate) const MAX_PUBLICATIONS: u32 = 4096;
 /// per publication.
 pub(crate) const MAX_CLAIMS: u32 = MAX_PUBLICATIONS;
 
-/// A publication's lanes over either connection.
+/// Where an accepted message went: its lane and its position there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Placed {
+    /// The lane.
+    pub(crate) lane: Lane,
+    /// The position in it.
+    pub(crate) position: u64,
+}
+
+/// A publication over either connection: an exclusive one's lanes, or a
+/// concurrent handle on lane 0 (boxed: it is larger than the others).
 #[derive(Debug)]
 pub(crate) enum Lanes {
     /// Of a client attached to a driver in another process.
@@ -45,36 +60,88 @@ pub(crate) enum Lanes {
     Remote(Publication<karyos_sys::term_bytes::SharedTerms>),
     /// Of a client over an embedded driver's conductor.
     Embedded(Publication<HeapTerms>),
+    /// A concurrent handle of a client in another process.
+    #[cfg(target_os = "linux")]
+    ConcurrentRemote(Box<ClientConcurrentPublication<karyos_sys::term_bytes::SharedTerms>>),
+    /// A concurrent handle of a client over an embedded conductor.
+    ConcurrentEmbedded(Box<ClientConcurrentPublication<HeapTerms>>),
 }
 
-/// Runs `$body` on the publication of either connection.
+/// Runs `$exclusive` on an exclusive publication, `$concurrent` on a
+/// concurrent handle, of either connection.
 macro_rules! lanes {
-    ($lanes:expr, $publication:ident => $body:expr) => {
+    ($lanes:expr, $publication:ident => $exclusive:expr, $handle:ident => $concurrent:expr) => {
         match $lanes {
             #[cfg(target_os = "linux")]
-            Lanes::Remote($publication) => $body,
-            Lanes::Embedded($publication) => $body,
+            Lanes::Remote($publication) => $exclusive,
+            Lanes::Embedded($publication) => $exclusive,
+            #[cfg(target_os = "linux")]
+            Lanes::ConcurrentRemote($handle) => $concurrent,
+            Lanes::ConcurrentEmbedded($handle) => $concurrent,
         }
     };
+}
+
+/// An exclusive offer's or commit's acceptance as a [`Placed`].
+fn placed(accepted: karyos_client::Accepted) -> Placed {
+    Placed {
+        lane: accepted.lane(),
+        position: accepted.position(),
+    }
+}
+
+/// A concurrent offer's outcome as an exclusive one's result.
+fn concurrent_offered(outcome: ConcurrentOfferOutcome) -> Result<Placed, OfferError> {
+    match outcome {
+        ConcurrentOfferOutcome::Accepted { lane, position } => Ok(Placed { lane, position }),
+        ConcurrentOfferOutcome::BackPressured => Err(OfferError::BackPressured),
+        ConcurrentOfferOutcome::AdminAction => Err(OfferError::AdminAction),
+        ConcurrentOfferOutcome::NotConnected => Err(OfferError::NotConnected),
+        ConcurrentOfferOutcome::Aborted { lane, position } => {
+            Err(OfferError::Aborted { lane, position })
+        }
+        ConcurrentOfferOutcome::Closed => Err(OfferError::Closed),
+        _ => Err(OfferError::Client(ClientError::Unknown)),
+    }
+}
+
+/// A commit's outcome as an offer's result.
+fn committed(outcome: CommitOutcome) -> Result<Placed, OfferError> {
+    match outcome {
+        CommitOutcome::Accepted { lane, position } => Ok(Placed { lane, position }),
+        CommitOutcome::Aborted { lane, position } => Err(OfferError::Aborted { lane, position }),
+    }
 }
 
 impl Lanes {
     /// The largest message any lane accepts.
     fn max_message_length(&self) -> u32 {
-        lanes!(self, publication => (0..Lane::COUNT)
-            .filter_map(|lane| Lane::try_new(lane).ok())
-            .filter_map(|lane| publication.max_message_length(lane))
-            .max()
-            .unwrap_or(0))
+        lanes!(self,
+            publication => (0..Lane::COUNT)
+                .filter_map(|lane| Lane::try_new(lane).ok())
+                .filter_map(|lane| publication.max_message_length(lane))
+                .max()
+                .unwrap_or(0),
+            handle => handle.max_message_length())
     }
 
-    /// The largest message `lane` accepts; `None` for an unconfigured lane.
+    /// The largest message `lane` accepts; `None` for an unconfigured lane
+    /// (any lane but 0 of a concurrent handle).
     fn lane_max(&self, lane: Lane) -> Option<u32> {
-        lanes!(self, publication => publication.max_message_length(lane))
+        lanes!(self,
+            publication => publication.max_message_length(lane),
+            handle => (lane == Lane::ZERO).then(|| handle.max_message_length()))
     }
 
-    fn offer_on(&mut self, lane: Lane, payload: &[u8]) -> Result<Accepted, OfferError> {
-        lanes!(self, publication => publication.offer_on(lane, payload))
+    fn offer_on(&mut self, lane: Lane, payload: &[u8]) -> Result<Placed, OfferError> {
+        lanes!(self,
+        publication => publication.offer_on(lane, payload).map(placed),
+        handle => {
+            if lane != Lane::ZERO {
+                return Err(OfferError::InvalidLane { lane });
+            }
+            concurrent_offered(handle.offer(payload)?)
+        })
     }
 
     /// Claims `length` in `lane`'s term, copies `staged` into it and
@@ -84,13 +151,34 @@ impl Lanes {
         lane: Lane,
         length: MessageLength,
         staged: &[AtomicU8],
-    ) -> Result<Accepted, OfferError> {
-        lanes!(self, publication => {
+    ) -> Result<Placed, OfferError> {
+        lanes!(self,
+        publication => {
             let mut claim = publication.try_claim_on(lane, length)?;
             for (byte, staged) in claim.payload().iter_mut().zip(staged) {
                 *byte = staged.load(Ordering::Relaxed);
             }
-            claim.commit()
+            claim.commit().map(placed)
+        },
+        handle => {
+            if lane != Lane::ZERO {
+                return Err(OfferError::InvalidLane { lane });
+            }
+            let mut claim = match handle.try_claim(length.get())? {
+                ConcurrentClaimOutcome::Claimed(claim) => claim,
+                ConcurrentClaimOutcome::BackPressured => return Err(OfferError::BackPressured),
+                ConcurrentClaimOutcome::AdminAction => return Err(OfferError::AdminAction),
+                ConcurrentClaimOutcome::NotConnected => return Err(OfferError::NotConnected),
+                ConcurrentClaimOutcome::Aborted { lane, position } => {
+                    return Err(OfferError::Aborted { lane, position });
+                }
+                ConcurrentClaimOutcome::Closed => return Err(OfferError::Closed),
+                _ => return Err(OfferError::Client(ClientError::Unknown)),
+            };
+            for (byte, staged) in claim.payload().iter_mut().zip(staged) {
+                *byte = staged.load(Ordering::Relaxed);
+            }
+            committed(claim.commit())
         })
     }
 }
@@ -159,18 +247,27 @@ fn lane(raw: u32) -> Result<Lane, Failure> {
         .ok_or_else(|| Failure::with(Status::InvalidLane, u64::from(raw), 0))
 }
 
-/// Adds the exclusive publication of `stream_id` on `uri` to `client`.
+/// Adds the exclusive publication of `stream_id` on `uri` to `client`, or
+/// with `concurrent` a concurrent handle on lane 0 of a `karyos:ipc`
+/// stream.
 ///
 /// # Errors
 ///
 /// The client's handle and control call failures, and
 /// [`Status::HandlesExhausted`], with the publication released.
-pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, Failure> {
+pub(crate) fn add(
+    client: Handle,
+    uri: &str,
+    stream_id: i32,
+    concurrent: bool,
+) -> Result<Handle, Failure> {
     clients().with(client, |entry| {
         entry.usable()?;
-        let lanes = entry
-            .client
-            .add_publication(uri, karyos_client::StreamId::new(stream_id))?;
+        let lanes = entry.client.add_publication(
+            uri,
+            karyos_client::StreamId::new(stream_id),
+            concurrent,
+        )?;
         let staged: Arc<[AtomicU8]> = (0..lanes.max_message_length())
             .map(|_| AtomicU8::new(0))
             .collect();
@@ -199,11 +296,7 @@ pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, F
 /// # Errors
 ///
 /// The handle's and the offer's failures.
-pub(crate) fn offer(
-    publication: Handle,
-    lane_raw: u32,
-    payload: &[u8],
-) -> Result<Accepted, Failure> {
+pub(crate) fn offer(publication: Handle, lane_raw: u32, payload: &[u8]) -> Result<Placed, Failure> {
     let lane = lane(lane_raw)?;
     table().with(publication, |entry| {
         entry.usable()?;
@@ -286,7 +379,7 @@ fn retryable(error: &OfferError) -> bool {
 /// # Errors
 ///
 /// The commit's failures; a retryable one keeps the claim staged.
-pub(crate) fn commit(claim: Handle) -> Result<Accepted, Failure> {
+pub(crate) fn commit(claim: Handle) -> Result<Placed, Failure> {
     let publication = claims().with(claim, |publication| *publication)?;
     table().with(publication, |entry| {
         entry.usable()?;
@@ -372,5 +465,47 @@ mod tests {
         ] {
             assert!(!retryable(&released), "{released:?}");
         }
+    }
+
+    /// Each concurrent offer outcome and commit outcome maps to its
+    /// exclusive counterpart, so a concurrent handle answers as an
+    /// exclusive one does (REVIEWER-01's P3 on #504).
+    #[test]
+    fn concurrent_outcomes_map_to_their_exclusive_counterparts() {
+        let lane = Lane::ZERO;
+        let placed = Placed { lane, position: 9 };
+        assert_eq!(
+            concurrent_offered(ConcurrentOfferOutcome::Accepted { lane, position: 9 }).ok(),
+            Some(placed)
+        );
+        let offered = |outcome| concurrent_offered(outcome).unwrap_err();
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::BackPressured),
+            OfferError::BackPressured
+        ));
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::AdminAction),
+            OfferError::AdminAction
+        ));
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::NotConnected),
+            OfferError::NotConnected
+        ));
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::Aborted { lane, position: 9 }),
+            OfferError::Aborted { position: 9, .. }
+        ));
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::Closed),
+            OfferError::Closed
+        ));
+        assert_eq!(
+            committed(CommitOutcome::Accepted { lane, position: 9 }).ok(),
+            Some(placed)
+        );
+        assert!(matches!(
+            committed(CommitOutcome::Aborted { lane, position: 9 }),
+            Err(OfferError::Aborted { position: 9, .. })
+        ));
     }
 }
