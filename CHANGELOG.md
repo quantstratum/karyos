@@ -1733,6 +1733,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- One driver can hold both ends of a `karyos:udp` endpoint (karyos#490;
+  quantstratum-docs: `karyos/design/per-source-images.md`, D2-1 and
+  D2-4). A driver's own network publication's loopback image shares the
+  publication's key, and was installed but never exposed, so a
+  subscription of the same driver never got an image. A network image and
+  a local stream of the same key now coexist, in either order: key
+  lookups (`AddPublication`, `AddSubscription`, the `karyos:ipc` URI
+  paths, conflated views, a URI's lane check) take the local stream for
+  every client, so local behaviour is unchanged; a network subscription
+  attaches its images by registration (`AddImageSubscription`), and a key
+  with no local stream still resolves to its oldest image. A replay
+  target keeps its
+  key to itself while it lives, retiring included (#283 P3). A client's
+  `PublicationClosed` naming no image closes only its local links of the
+  key and lane, never an image's. The Archive's lookups by (stream,
+  session, lane) follow in karyos#490b.
+
 - An IPC driver no longer keeps the images a connected remote subscriber
   read. A registration kept its stream from freeing, and a remote client
   had no way to remove one, so every image it took stayed Retiring, with

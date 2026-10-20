@@ -301,12 +301,30 @@ fn two_images_of_one_alias_are_both_exposed_and_read() {
     });
 }
 
-/// The local key rule is symmetric (per-source-images.md, D2-1): an image
-/// whose alias is a live local stream's key stays unexposed and counted,
-/// and a local stream over a live image's key is `DuplicateStream`.
+/// A local stream and an image of its key coexist, in either order
+/// (karyos#490; per-source-images.md, D2-1 and D2-4): the image is exposed
+/// beside a local stream of its key, a local stream may be added over a
+/// live image's key, and key lookups take the local stream while the alias
+/// path of a network subscription takes the image.
 #[test]
-fn a_local_key_and_an_image_alias_never_coexist() {
-    // A local stream first: the image of its key is not exposed.
+fn a_local_key_and_an_image_alias_coexist() {
+    use karyos_protocol::cnc::StreamKey;
+    let key = StreamKey {
+        stream_id: 10,
+        session_id: 3,
+    };
+    // A key names the local stream; the image is there by registration.
+    let lookups = |b: &EmbeddedDriver| {
+        let local = b.find_stream(key, Some(Lane::ZERO)).unwrap();
+        let image = b.network_image(10, 3).unwrap().registration();
+        (
+            b.streams[local].source.is_none(),
+            b.streams
+                .iter()
+                .any(|stream| stream.id == image && stream.source.is_some()),
+        )
+    };
+    // A local stream first: the image of its key is exposed beside it.
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
     let _local = b.add_aggregate(aggregate(10, 3, 1)).unwrap();
@@ -315,9 +333,10 @@ fn a_local_key_and_an_image_alias_never_coexist() {
     let _publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
-    pump(&mut a, &mut b, |_, b| b.network_images_unexposed() == 1);
-    assert!(b.network_image(10, 3).is_none());
-    // An image first: a local stream of its key is refused.
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    assert_eq!(b.network_images_unexposed(), 0);
+    assert_eq!(lookups(&b), (true, true));
+    // An image first: a local stream of its key is added beside it.
     let mut a = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
     let _subscription = b.add_network_subscription(10, &channel(ANY_PORT)).unwrap();
@@ -326,6 +345,9 @@ fn a_local_key_and_an_image_alias_never_coexist() {
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
     pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    let _local = b.add_aggregate(aggregate(10, 3, 1)).unwrap();
+    assert_eq!(lookups(&b), (true, true));
+    // Two local streams of one key are still refused.
     assert!(matches!(
         b.add_aggregate(aggregate(10, 3, 1)),
         Err(crate::error::DriverError::DuplicateStream {
@@ -333,6 +355,91 @@ fn a_local_key_and_an_image_alias_never_coexist() {
             session_id: 3
         })
     ));
+}
+
+/// DESIGN's P2 on #493: a client holding a network subscription of a
+/// stream id and asking for that stream's key by `AddSubscription` gets the
+/// local stream, never the loopback image of the same key: a key names the
+/// local stream for every client, and images attach by registration.
+#[test]
+fn a_key_names_the_local_stream_for_a_network_subscriber_too() {
+    use karyos_client::Outcome;
+    use karyos_protocol::cnc::{StreamKey, SubscriberRole};
+    let mut b = driver(ThreadingMode::Shared);
+    let mut client = b.connect().unwrap();
+    let port = UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let address = SocketAddr::new(LOOPBACK, port);
+    let complete =
+        |b: &mut EmbeddedDriver, client: &mut karyos_client::ClientConductor, sequence| {
+            let mut outcome = None;
+            for _ in 0..20_000 {
+                let _ = b.do_work().unwrap();
+                let _ = client.poll(usize::MAX, |completion| {
+                    if completion.sequence == sequence {
+                        outcome = Some(completion.outcome);
+                    }
+                });
+                if outcome.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            outcome.unwrap()
+        };
+    // The client's network subscription of stream 10.
+    let sequence = client
+        .add_network_subscription(
+            &format!("karyos:udp?endpoint={address}"),
+            10,
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    assert!(matches!(
+        complete(&mut b, &mut client, sequence),
+        Outcome::NetworkSubscription { .. }
+    ));
+    // The driver's own network publication of (10, 3) to it: its loopback
+    // image shares the key.
+    let publication = b
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    for _ in 0..20_000 {
+        let _ = b.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |_| {});
+        if b.network_image(10, 3).is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    let image = b.network_image(10, 3).unwrap().registration();
+    let leases = |b: &EmbeddedDriver, id: u64| {
+        b.streams
+            .iter()
+            .find(|stream| stream.id == id)
+            .unwrap()
+            .leases
+            .live()
+    };
+    let local = publication.registration();
+    let (local_before, image_before) = (leases(&b, local), leases(&b, image));
+    // The same client asks for the key.
+    let key = StreamKey {
+        stream_id: 10,
+        session_id: 3,
+    };
+    let sequence = client
+        .add_subscription(key, SubscriberRole::Required)
+        .unwrap();
+    // Held while the leases are read: the handle owns its lease.
+    let granted = complete(&mut b, &mut client, sequence);
+    assert!(matches!(granted, Outcome::Subscription(_)));
+    assert_eq!(leases(&b, local), local_before + 1, "the local stream");
+    assert_eq!(leases(&b, image), image_before, "not the image");
+    drop(granted);
 }
 
 /// An image the stream table has no room for is installed, fed and
