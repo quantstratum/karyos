@@ -121,32 +121,34 @@ pub struct ConflationConfig {
 }
 
 impl ConflationConfig {
+    /// The shape of this table that its publications check: its keys and
+    /// its largest value (a capacity past `u32`, which no message reaches,
+    /// counts as `u32::MAX`).
+    #[must_use]
+    pub fn shape(&self) -> crate::log_buffer::ConflationShape {
+        crate::log_buffer::ConflationShape::new(
+            self.keys,
+            u32::try_from(self.value_capacity).unwrap_or(u32::MAX),
+        )
+    }
+
     /// Checks a publication's reserved value and payload length before it
-    /// attempts a reservation.
+    /// attempts a reservation, as [`ConflationShape::validate_publication`]
+    /// of [`ConflationConfig::shape`].
+    ///
+    /// [`ConflationShape::validate_publication`]:
+    ///     crate::log_buffer::ConflationShape::validate_publication
+    ///
+    /// # Errors
+    ///
+    /// As [`ConflationShape::validate_publication`].
     pub fn validate_publication(
         &self,
         reserved_value: i64,
         value_length: usize,
     ) -> Result<(), ConflationError> {
-        if self.keys == 0 || self.value_capacity == 0 {
-            return Err(ConflationError::InvalidConfig);
-        }
-        if u32::try_from(reserved_value)
-            .ok()
-            .filter(|key| *key < self.keys)
-            .is_none()
-        {
-            return Err(ConflationError::KeyOutOfRange {
-                key: reserved_value,
-            });
-        }
-        if value_length > self.value_capacity {
-            return Err(ConflationError::ValueTooLarge {
-                length: value_length,
-                max: self.value_capacity,
-            });
-        }
-        Ok(())
+        self.shape()
+            .validate_publication(reserved_value, value_length)
     }
 }
 
