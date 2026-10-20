@@ -394,6 +394,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The management agent's guard pending-acknowledgement alert (M4b's
+  follow-up to M9; quantstratum-docs: `karyos/design/agent-api-v1.md`,
+  Alerts). At every refresh the agent reads each guard's close
+  acknowledgement (`karyos_client::guard_acks`): a close in effect with
+  senders overdue, in a consistent read, fires `AlertKind::GuardAck`
+  (JSON `"guard_ack"`, the Prometheus `kind` label likewise), its
+  `participant` the guard id and its `value` the senders overdue. It
+  clears when a consistent read shows none overdue, the guard is gone or
+  a refresh reads nothing; a read that may mix passes changes nothing,
+  and a new close of the guard starts it over. The driver's
+  `guard_ack_timeout` is the bound: the rule has no option of its own.
+
 - Guard close acknowledgements for tools (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M4b). While a guard is
   closed by a close, the conductor counts that close's registered senders

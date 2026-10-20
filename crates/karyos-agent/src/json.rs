@@ -14,7 +14,7 @@
 //!   a path that is not UTF-8 is written lossily.
 //! - **Enums.** [`DriverState`] is an object with a `state` field
 //!   (`"attached"`, `"closed"`, `"unavailable"`) and its variant's fields;
-//!   an [`AlertKind`] is a string (`"lag"`, `"loss"`).
+//!   an [`AlertKind`] is a string (`"lag"`, `"loss"`, `"guard_ack"`).
 
 use std::fmt::Write;
 
@@ -240,6 +240,7 @@ fn alert_json(out: &mut Out<'_>, alert: &Alert) {
             match alert.kind {
                 AlertKind::Lag => "lag",
                 AlertKind::Loss => "loss",
+                AlertKind::GuardAck => "guard_ack",
             },
         );
         fields.number("stream", alert.stream);

@@ -16,7 +16,8 @@ operator, risk-officer, administrator), reading each driver's CnC as a
 tool every MS milliseconds (default 1000). A uid takes one role. Alerts:
 a subscriber lagging N bytes or more (default 8 MiB) for N consecutive
 refreshes (default 3); losses, cleared after N quiet refreshes (default
-10). Linux only.
+10); a guard close that senders have not applied past the driver's
+guard_ack_timeout. Linux only.
 
 A request is one line: KARYOS-AGENT 1 view
 ";
