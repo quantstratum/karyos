@@ -19,8 +19,10 @@ release may break APIs, wire formats and shared-memory layouts.
   stream=S session=N` for the reader, which the Archive waits for (H2b).
   `stop --live DIR=REQ,RESP --replay ID`. Exit status 2 on any error, the
   Archive's refusal included. They connect through `ArchiveConnection`
-  (Linux). `karyos_tools::args::parse_live` parses `--live` for these and
-  for `karyos-catalog list --live`.
+  (Linux), one connection per request, closed after it.
+  `karyos_tools::args::parse_live` parses `--live` for these and for
+  `karyos-catalog list --live`. `tests/karyosd_replay.rs` runs both
+  against `karyosd --archive` (Linux).
 - karyos-tools: `replay::HELP` is replaced by `replay::help(command)`,
   which names the command the diff was invoked as (`karyos-replay diff` or
   its alias `karyos-tools replay diff`; H5, #521).
