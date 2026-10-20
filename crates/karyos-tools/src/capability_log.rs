@@ -6,7 +6,7 @@
 //! from the daemon's own CnC, written as one line when the endpoint first
 //! appears and again at each new capability epoch.
 //!
-//! [`line`] names every capability and its state:
+//! [`line()`] names every capability and its state:
 //!
 //! - a value gauge as `name=value`, with the platform, copy mode and queue
 //!   assignment by name (`platform=linux`);
