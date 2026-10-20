@@ -98,6 +98,10 @@ pub struct Outcome {
 /// `karyos_outcome_handler`.
 type OutcomeHandler = unsafe extern "C" fn(*mut core::ffi::c_void, *const Outcome);
 
+/// `karyos_message_handler`; the info is not read here.
+type MessageHandler =
+    unsafe extern "C" fn(*mut core::ffi::c_void, *const u8, usize, *const core::ffi::c_void);
+
 /// `karyos_accepted`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -239,6 +243,13 @@ unsafe extern "C" {
         data: *const u8,
         length: usize,
         accepted: *mut core::ffi::c_void,
+    ) -> i32;
+    fn karyos_subscription_poll(
+        subscription: u64,
+        handler: Option<MessageHandler>,
+        context: *mut core::ffi::c_void,
+        limit: u32,
+        delivered: *mut u32,
     ) -> i32;
     fn karyos_publication_poll_outcomes(
         publication: u64,
@@ -1025,4 +1036,95 @@ pub fn publication_poll_outcomes(
         )
     };
     (status, delivered, records)
+}
+
+/// What a `subscription_poll` handler does with each message, besides
+/// keeping its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnMessage {
+    /// Nothing more.
+    Keep,
+    /// Polls its own subscription again from the handler, once, and keeps
+    /// that call's status.
+    Reenter,
+}
+
+/// A `subscription_poll`'s context.
+struct Polled {
+    subscription: u64,
+    on_message: OnMessage,
+    messages: Vec<Vec<u8>>,
+    reentered: Option<i32>,
+}
+
+/// A handler that never runs: what a reentering poll passes.
+unsafe extern "C" fn ignore(
+    _context: *mut core::ffi::c_void,
+    _data: *const u8,
+    _length: usize,
+    _info: *const core::ffi::c_void,
+) {
+}
+
+unsafe extern "C" fn keep_message(
+    context: *mut core::ffi::c_void,
+    data: *const u8,
+    length: usize,
+    _info: *const core::ffi::c_void,
+) {
+    // SAFETY: the context is the live `Polled` of `subscription_poll`.
+    let polled = unsafe { &mut *context.cast::<Polled>() };
+    let bytes = if length == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: `length` is nonzero here (an empty message never reaches
+        // `from_raw_parts`, whose pointer must be non-null even for 0
+        // bytes), and the library hands `length` readable bytes at `data`,
+        // its private copy, for the call.
+        unsafe { core::slice::from_raw_parts(data, length) }.to_vec()
+    };
+    polled.messages.push(bytes);
+    if polled.on_message == OnMessage::Reenter && polled.reentered.is_none() {
+        let mut delivered = 0u32;
+        // SAFETY: a handler that returns normally and reads nothing, and a
+        // live, aligned `u32`.
+        polled.reentered = Some(unsafe {
+            karyos_subscription_poll(
+                polled.subscription,
+                Some(ignore),
+                core::ptr::null_mut(),
+                1,
+                &mut delivered,
+            )
+        });
+    }
+}
+
+/// `karyos_subscription_poll` of at most `limit` messages: the status,
+/// the count it wrote, the messages the handler saw, and, for
+/// [`OnMessage::Reenter`], the status of the handler's own poll.
+pub fn subscription_poll(
+    subscription: u64,
+    limit: u32,
+    on_message: OnMessage,
+) -> (i32, u32, Vec<Vec<u8>>, Option<i32>) {
+    let mut polled = Polled {
+        subscription,
+        on_message,
+        messages: Vec::new(),
+        reentered: None,
+    };
+    let mut delivered = u32::MAX;
+    // SAFETY: `keep_message` returns normally and reads the live `polled`;
+    // `delivered` is a live, aligned `u32`.
+    let status = unsafe {
+        karyos_subscription_poll(
+            subscription,
+            Some(keep_message),
+            (&raw mut polled).cast(),
+            limit,
+            &mut delivered,
+        )
+    };
+    (status, delivered, polled.messages, polled.reentered)
 }
