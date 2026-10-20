@@ -442,21 +442,33 @@ fn a_call_on_a_busy_spinning_driver_waits_for_one_cycle() {
         },
     )
     .unwrap();
+    let cycles = || {
+        drivers()
+            .with(driver, |slot| match &slot.mode {
+                Mode::Threaded(threaded) => (
+                    threaded.cycles.done.load(Ordering::Acquire),
+                    threaded.cycles.most.load(Ordering::Acquire),
+                ),
+                _ => panic!("not started"),
+            })
+            .unwrap()
+    };
+    // The thread is spinning before the first call: on a loaded machine it
+    // may not have run yet.
+    let begun = std::time::Instant::now();
+    while cycles().0 == 0 {
+        assert!(
+            begun.elapsed() < std::time::Duration::from_secs(60),
+            "the thread never ran"
+        );
+        std::thread::yield_now();
+    }
     for id in 1000..1032 {
         add_stream(driver, &stream(id)).unwrap();
         remove_stream(driver, id).unwrap();
     }
-    let (done, most) = drivers()
-        .with(driver, |slot| match &slot.mode {
-            Mode::Threaded(threaded) => (
-                threaded.cycles.done.load(Ordering::Acquire),
-                threaded.cycles.most.load(Ordering::Acquire),
-            ),
-            _ => panic!("not started"),
-        })
-        .unwrap();
+    let (done, most) = cycles();
     close(driver).unwrap();
-    assert!(done > 0, "the thread ran no cycle");
     assert!(
         most <= 2,
         "a call waited through {most} cycles ({done} in all)"
