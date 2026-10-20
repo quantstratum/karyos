@@ -74,7 +74,8 @@ pub(crate) struct Command<'a> {
     /// `Some(expected)` for a reopen.
     pub(crate) reopen: Option<u64>,
     pub(crate) operation: u64,
-    pub(crate) operator: u64,
+    /// The operator's uid: the peer that asked.
+    pub(crate) operator: u32,
     pub(crate) reason: &'a [u8],
     pub(crate) timeout: Duration,
 }
@@ -85,12 +86,12 @@ impl Command<'_> {
         record.guard = self.guard;
         record.expected = self.reopen.unwrap_or(0);
         record.operation = self.operation;
-        record.operator = self.operator;
+        record.operator = u64::from(self.operator);
         record.parameters = karyos_protocol::cnc::guard_parameters(
             self.guard,
             self.reopen.unwrap_or(0),
             self.operation,
-            self.operator,
+            u64::from(self.operator),
             self.reason,
         );
         record.reason = self
@@ -146,12 +147,17 @@ fn send(command: &Command<'_>) -> GuardAnswer {
     };
     let operation = command.operation;
     let submitted = match command.reopen {
-        None => client.guard_close(command.guard, operation, command.operator, command.reason),
+        None => client.guard_close(
+            command.guard,
+            operation,
+            Some(command.operator),
+            command.reason,
+        ),
         Some(expected) => client.guard_reopen(
             command.guard,
             expected,
             operation,
-            command.operator,
+            Some(command.operator),
             command.reason,
         ),
     };

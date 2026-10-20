@@ -212,7 +212,7 @@ impl Agent {
             guard,
             reopen,
             operation,
-            operator: u64::from(uid),
+            operator: uid,
             reason,
             timeout: self.config.guard_timeout,
         };
