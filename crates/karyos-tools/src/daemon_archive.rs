@@ -393,6 +393,9 @@ impl Requester {
 pub struct DaemonArchive {
     server: ControlServer<DaemonHost, Requests, Responses>,
     requester: Requester,
+    /// The driver's dropped grant audits last seen: a growth is logged, so
+    /// a hole in the audit trail is never silent.
+    audits_dropped: u64,
 }
 
 impl std::fmt::Debug for DaemonArchive {
@@ -469,6 +472,7 @@ impl DaemonArchive {
         let mut archive = Self {
             server: ControlServer::new(agent, host, reading, writing),
             requester,
+            audits_dropped: 0,
         };
         for record in &options.records {
             archive.requester.ask(Asked::Start(*record), "karyos:ipc");
@@ -501,6 +505,18 @@ impl DaemonArchive {
         let _ = self.requester.serve();
         self.release_idle_requester();
         self.driver_mut().drain_grant_audits(audit_grant);
+        // Drained every cycle, the queue should never overflow; if it does,
+        // the audit has a hole, which is logged with the new total.
+        let dropped = self.driver().grant_audits_dropped();
+        if dropped > self.audits_dropped {
+            tracing::warn!(
+                target: AUDIT,
+                dropped,
+                before = self.audits_dropped,
+                "grant audits dropped: the audit trail has a hole"
+            );
+            self.audits_dropped = dropped;
+        }
         // A request served counts as work, so the idle strategy does not
         // back off while requests arrive.
         work.map(|work| if served { work.max(1) } else { work })
