@@ -726,7 +726,8 @@ typedef struct karyos_image_change {
     uint32_t available;
     uint32_t end_reason;
     uint32_t reserved;
-    /* 0 with no end, or a seal not positioned yet. */
+    /* 0 with no end, for a seal not positioned yet, and for a seal at
+       position 0: 0 alone does not tell them apart. */
     uint64_t end_position;
     uint64_t seal_code;
 } karyos_image_change;

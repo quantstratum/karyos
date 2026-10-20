@@ -1030,7 +1030,8 @@ pub struct ImageChange {
     pub end_reason: u32,
     /// Zero.
     pub reserved: u32,
-    /// The end's seal position; 0 with no end, or a seal not positioned.
+    /// The end's seal position; 0 with no end, for a seal not positioned
+    /// yet, and for a seal at position 0: 0 alone does not tell them apart.
     pub end_position: u64,
     /// The seal's raw reason code; 0 with no end.
     pub seal_code: u64,

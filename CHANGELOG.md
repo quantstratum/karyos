@@ -643,6 +643,8 @@ release may break APIs, wire formats and shared-memory layouts.
   (`KARYOS_IMAGE_CHANGE_SIZE_ENDS`) with `end_reason` (a `KARYOS_END_*`
   code), `reserved`, `end_position` and `seal_code`, written by the
   caller's size: a caller of the 24-byte struct gets what it got before.
+  The struct grew within the unreleased ABI 0.1.0, so the ABI version
+  stays 0.1.0, with no patch bump (BIND-Q8), as F9b and F9c did.
 - `karyos-ffi` replays an Archive's recordings from C (F9c, B6;
   quantstratum-docs: `karyos/design/archive-replay-control.md`):
   `karyos_archive_replay` (with `karyos_replay_options`, read by prefix)
