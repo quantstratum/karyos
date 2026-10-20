@@ -2360,6 +2360,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A guarded client publication gated by the guard word before the
+  close's seal landed never released, so the seal never positioned and
+  its walker never wrote the `Ended` record (#526): the C ABI outcomes
+  test waited for it until its bound. `ClientPublication::poll_outcomes`
+  (and so `poll_outcomes_on` and `karyos_publication_poll_outcomes`) now
+  releases a handle whose admission is not open once its buffer is
+  sealed, resolving a forgotten claim first, as an offer does. An open
+  handle's poll is unchanged. Later attempts still report `Gated`.
+
 - Three conversions in karyos-sys saturated to `u32::MAX`, a form SPEC §14
   excludes; each is now bounded by type, with no conversion left to fail:
   - the conflation reader's queue length is a `u32`: the queue holds each
