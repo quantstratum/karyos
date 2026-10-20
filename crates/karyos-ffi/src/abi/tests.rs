@@ -284,6 +284,9 @@ fn stream_config(stream_id: i32) -> karyos_driver::StreamConfig {
 /// A stream whose offers are refused while no subscriber is connected.
 const STREAM_UNCONNECTED: i32 = 1002;
 
+/// A stream shared by two concurrent publication handles.
+const STREAM_CONCURRENT: i32 = 1003;
+
 /// A driven driver with the streams, and two conductors of it. Its clients
 /// are timed out only after an hour without a heartbeat: under Miri, a
 /// client a test has not used yet would otherwise be retired first.
@@ -304,6 +307,12 @@ fn driven() -> (
     };
     unconnected.buffer.stream_id = STREAM_UNCONNECTED;
     let _ = driver.add_stream(unconnected).unwrap();
+    let mut shared = stream_config(STREAM_CONCURRENT);
+    shared.buffer.publication = karyos_sys::log_buffer::PublicationMode::Concurrent {
+        publishers: 2,
+        allow_non_lse: true,
+    };
+    let _ = driver.add_stream(shared).unwrap();
     let ours = driver.connect().unwrap();
     let theirs = driver.connect().unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -347,6 +356,22 @@ fn add_publication_of(client: u64, stream: i32) -> (i32, u64) {
             client,
             c"karyos:ipc".as_ptr(),
             stream,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, publication)
+}
+
+/// `karyos_client_add_concurrent_publication` of the shared stream.
+fn add_concurrent(client: u64) -> (i32, u64) {
+    let mut publication = 0;
+    // SAFETY: a C string literal, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_concurrent_publication(
+            client,
+            c"karyos:ipc".as_ptr(),
+            STREAM_CONCURRENT,
             &mut publication,
             core::ptr::null_mut(),
         )
@@ -636,4 +661,88 @@ fn a_commit_that_finds_no_subscriber_keeps_its_claim_staged() {
     assert_eq!(read(&mut subscriber, &mut reading, 1), [b"abc".to_vec()]);
     assert_eq!(commit(staged).0, Status::Closed.code());
     assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+#[test]
+fn concurrent_handles_share_a_stream_on_lane_0() {
+    let (_driven, ours, theirs) = driven();
+    let context = test_context();
+    let client = client::insert_embedded(Client::with_conductor(ours, context.clone()))
+        .unwrap()
+        .raw();
+    let mut subscriber = Client::with_conductor(theirs, context);
+    let mut reading = subscriber
+        .add_subscription(
+            "karyos:ipc",
+            karyos_client::StreamId::new(STREAM_CONCURRENT),
+        )
+        .unwrap();
+    let (status, first) = add_concurrent(client);
+    assert_eq!(status, Status::Ok.code());
+    let (status, second) = add_concurrent(client);
+    assert_eq!(status, Status::Ok.code());
+    // The stream takes two publishers; an exclusive one is refused too.
+    assert_ne!(add_concurrent(client).0, Status::Ok.code());
+    assert_ne!(
+        add_publication_of(client, STREAM_CONCURRENT).0,
+        Status::Ok.code()
+    );
+    // A concurrent handle of an exclusive stream is refused.
+    assert_ne!(add_concurrent_of_exclusive(client), Status::Ok.code());
+
+    // Offers and staged commits from both handles, on lane 0 only.
+    let (status, offered) = offer(first, b"one");
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(offered.lane, 0);
+    assert_eq!(offer(second, b"two").0, Status::Ok.code());
+    let (status, staged, buffer) = claim(second, 0, 5);
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: the claim's buffer holds 5 bytes.
+    unsafe { fill(buffer, b"three") };
+    let (status, committed) = commit(staged);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(committed.lane, 0);
+    assert!(committed.position > offered.position);
+    // SAFETY: a live payload of 1 byte, no out-parameter.
+    let other_lane =
+        unsafe { karyos_publication_offer(first, 1, b"x".as_ptr(), 1, core::ptr::null_mut()) };
+    assert_eq!(other_lane, Status::InvalidLane.code());
+    assert_eq!(claim(first, 1, 1).0, Status::InvalidLane.code());
+    // The claim bound is the handle's message limit, at max and max + 1.
+    let max = crate::api::publication::lane_max(
+        crate::handles::Handle::from_raw(first),
+        karyos_sys::frame::Lane::ZERO,
+    )
+    .unwrap();
+    let (status, at_max, _) = claim(first, 0, max);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(karyos_claim_abort(at_max), Status::Ok.code());
+    assert_eq!(claim(first, 0, max + 1).0, Status::MessageTooLarge.code());
+    assert_eq!(
+        read(&mut subscriber, &mut reading, 3),
+        [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+    );
+
+    // Closing a handle frees its publisher slot.
+    assert_eq!(karyos_publication_close(first), Status::Ok.code());
+    let (status, third) = add_concurrent(client);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(offer(third, b"four").0, Status::Ok.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+    assert_eq!(offer(second, b"x").0, Status::Closed.code());
+}
+
+/// `karyos_client_add_concurrent_publication` of the exclusive stream.
+fn add_concurrent_of_exclusive(client: u64) -> i32 {
+    let mut publication = 0;
+    // SAFETY: a C string literal, a live `u64`, no detail.
+    unsafe {
+        karyos_client_add_concurrent_publication(
+            client,
+            c"karyos:ipc".as_ptr(),
+            STREAM,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    }
 }
