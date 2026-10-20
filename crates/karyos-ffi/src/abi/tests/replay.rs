@@ -113,7 +113,7 @@ fn options() -> ReplayOptions {
     let mut options = core::mem::MaybeUninit::<ReplayOptions>::zeroed();
     // SAFETY: a live, aligned, writable `ReplayOptions`.
     let status = unsafe {
-        karyos_replay_options_init_sized(options.as_mut_ptr(), size_of_u32::<ReplayOptions>())
+        karyos_replay_options_init_sized(options.as_mut_ptr(), size_of::<ReplayOptions>())
     };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_replay_options_init` wrote every field.
@@ -344,14 +344,14 @@ fn the_replay_options_are_initialized_and_checked() {
     assert!(options.target_channel.is_null());
     // SAFETY: a null pointer is the check.
     let status = unsafe {
-        karyos_replay_options_init_sized(core::ptr::null_mut(), size_of_u32::<ReplayOptions>())
+        karyos_replay_options_init_sized(core::ptr::null_mut(), size_of::<ReplayOptions>())
     };
     assert_eq!(status, Status::InvalidArgument.code());
     // SAFETY: a null pointer is the check.
     let status = unsafe {
         karyos_replay_subscription_options_init_sized(
             core::ptr::null_mut(),
-            size_of_u32::<ReplaySubscriptionOptions>(),
+            size_of::<ReplaySubscriptionOptions>(),
         )
     };
     assert_eq!(status, Status::InvalidArgument.code());
@@ -363,7 +363,7 @@ fn the_replay_options_are_initialized_and_checked() {
     let status = unsafe {
         karyos_replay_subscription_options_init_sized(
             &mut sub,
-            size_of_u32::<ReplaySubscriptionOptions>(),
+            size_of::<ReplaySubscriptionOptions>(),
         )
     };
     assert_eq!((status, sub.size, sub.reserved), (Status::Ok.code(), 8, 0));

@@ -369,15 +369,15 @@ fn every_init_is_an_inline_over_a_sized_export() {
         .filter(|name| name.ends_with("_init"))
         .collect();
     assert_eq!(inits.len(), 7, "{inits:?}");
+    let flat = HEADER.split_whitespace().collect::<Vec<_>>().join(" ");
     for name in inits {
         assert!(
-            HEADER.contains(&format!("static inline int32_t {name}(")),
+            flat.contains(&format!("static inline int32_t {name}(")),
             "{name} is not the header's inline wrapper"
         );
         assert!(
-            HEADER.contains(&format!(
-                "return {name}_sized(options, (uint32_t)sizeof *options);"
-            )),
+            flat.contains(&format!("return {name}_sized( options, sizeof *options);"))
+                || flat.contains(&format!("return {name}_sized(options, sizeof *options);")),
             "{name} does not pass its sizeof"
         );
         assert!(

@@ -95,6 +95,11 @@ fn size_of_u32<T>() -> u32 {
     u32::try_from(size_of::<T>()).unwrap_or(u32::MAX)
 }
 
+/// A struct size as the `size_t` the sized inits take.
+fn widen(size: u32) -> usize {
+    usize::try_from(size).unwrap_or(usize::MAX)
+}
+
 /// `karyos_accepted`: where an accepted message went.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -152,12 +157,14 @@ unsafe fn write_sized<T>(out: *mut T, min: u32, fill: impl FnOnce(u32) -> T) {
 ///
 /// `out` is null or points to `size` writable bytes, and `T` is a
 /// `#[repr(C)]` struct whose first field is the `uint32_t` size.
-unsafe fn init_sized<T>(out: *mut T, size: u32, min: u32, filled: T) -> Status {
-    if !sized_struct(out) || size < min {
+unsafe fn init_sized<T>(out: *mut T, size: usize, min: u32, filled: T) -> Status {
+    if !sized_struct(out) || size < widen(min) {
         return Status::InvalidArgument;
     }
-    let written = size.min(size_of_u32::<T>());
-    let length = prefix(size, size_of_u32::<T>());
+    // A size past `u32::MAX` is past this version's struct, as its own is.
+    let ours = size_of_u32::<T>();
+    let written = u32::try_from(size).map_or(ours, |size| size.min(ours));
+    let length = prefix(written, ours);
     let mut filled = filled;
     // SAFETY: `filled` is a `#[repr(C)]` local whose first field is the
     // `uint32_t` size.
@@ -335,7 +342,7 @@ pub extern "C" fn karyos_status_message(status: i32) -> *const c_char {
 pub unsafe extern "C" fn karyos_client_options_init(options: *mut ClientOptions) -> i32 {
     // SAFETY: the caller's contract on `options`, of at least the 0.1.0
     // size.
-    unsafe { karyos_client_options_init_sized(options, CLIENT_OPTIONS_SIZE_0_1) }
+    unsafe { karyos_client_options_init_sized(options, widen(CLIENT_OPTIONS_SIZE_0_1)) }
 }
 
 /// Fills the first `size` bytes of `options` with the defaults, at most
@@ -353,7 +360,7 @@ pub unsafe extern "C" fn karyos_client_options_init(options: *mut ClientOptions)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_client_options_init_sized(
     options: *mut ClientOptions,
-    size: u32,
+    size: usize,
 ) -> i32 {
     guard(|| {
         let filled = default_options();
@@ -649,7 +656,7 @@ fn default_offer_options() -> OfferOptions {
 pub unsafe extern "C" fn karyos_offer_options_init(options: *mut OfferOptions) -> i32 {
     // SAFETY: the caller's contract on `options`, of at least the 0.1.0
     // size.
-    unsafe { karyos_offer_options_init_sized(options, OFFER_OPTIONS_SIZE_0_1) }
+    unsafe { karyos_offer_options_init_sized(options, widen(OFFER_OPTIONS_SIZE_0_1)) }
 }
 
 /// Fills the first `size` bytes of `options` with the defaults, at most
@@ -667,7 +674,7 @@ pub unsafe extern "C" fn karyos_offer_options_init(options: *mut OfferOptions) -
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_offer_options_init_sized(
     options: *mut OfferOptions,
-    size: u32,
+    size: usize,
 ) -> i32 {
     guard(|| {
         let filled = default_offer_options();
@@ -1324,7 +1331,7 @@ pub unsafe extern "C" fn karyos_subscription_options_init(
 ) -> i32 {
     // SAFETY: the caller's contract on `options`, of at least the 0.1.0
     // size.
-    unsafe { karyos_subscription_options_init_sized(options, SUBSCRIPTION_OPTIONS_SIZE_0_1) }
+    unsafe { karyos_subscription_options_init_sized(options, widen(SUBSCRIPTION_OPTIONS_SIZE_0_1)) }
 }
 
 /// Fills the first `size` bytes of `options` with the defaults, at most
@@ -1342,7 +1349,7 @@ pub unsafe extern "C" fn karyos_subscription_options_init(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_subscription_options_init_sized(
     options: *mut SubscriptionOptions,
-    size: u32,
+    size: usize,
 ) -> i32 {
     guard(|| {
         let filled = default_subscription_options();
@@ -1764,7 +1771,7 @@ fn default_driver_options() -> DriverOptions {
 pub unsafe extern "C" fn karyos_driver_options_init(options: *mut DriverOptions) -> i32 {
     // SAFETY: the caller's contract on `options`, of at least the 0.1.0
     // size.
-    unsafe { karyos_driver_options_init_sized(options, DRIVER_OPTIONS_SIZE_0_1) }
+    unsafe { karyos_driver_options_init_sized(options, widen(DRIVER_OPTIONS_SIZE_0_1)) }
 }
 
 /// Fills the first `size` bytes of `options` with the defaults, at most
@@ -1782,7 +1789,7 @@ pub unsafe extern "C" fn karyos_driver_options_init(options: *mut DriverOptions)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_driver_options_init_sized(
     options: *mut DriverOptions,
-    size: u32,
+    size: usize,
 ) -> i32 {
     guard(|| {
         let filled = default_driver_options();
@@ -2017,7 +2024,7 @@ fn default_stream_options() -> StreamOptions {
 pub unsafe extern "C" fn karyos_stream_options_init(options: *mut StreamOptions) -> i32 {
     // SAFETY: the caller's contract on `options`, of at least the 0.1.0
     // size.
-    unsafe { karyos_stream_options_init_sized(options, STREAM_OPTIONS_SIZE_0_1) }
+    unsafe { karyos_stream_options_init_sized(options, widen(STREAM_OPTIONS_SIZE_0_1)) }
 }
 
 /// Fills the first `size` bytes of `options` with the defaults, at most
@@ -2035,7 +2042,7 @@ pub unsafe extern "C" fn karyos_stream_options_init(options: *mut StreamOptions)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_stream_options_init_sized(
     options: *mut StreamOptions,
-    size: u32,
+    size: usize,
 ) -> i32 {
     guard(|| {
         let filled = default_stream_options();
@@ -2677,7 +2684,7 @@ fn default_replay_options() -> ReplayOptions {
 pub unsafe extern "C" fn karyos_replay_options_init(options: *mut ReplayOptions) -> i32 {
     // SAFETY: the caller's contract on `options`, of at least the 0.1.0
     // size.
-    unsafe { karyos_replay_options_init_sized(options, REPLAY_OPTIONS_SIZE_0_1) }
+    unsafe { karyos_replay_options_init_sized(options, widen(REPLAY_OPTIONS_SIZE_0_1)) }
 }
 
 /// Fills the first `size` bytes of `options` with the defaults, at most
@@ -2695,7 +2702,7 @@ pub unsafe extern "C" fn karyos_replay_options_init(options: *mut ReplayOptions)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_replay_options_init_sized(
     options: *mut ReplayOptions,
-    size: u32,
+    size: usize,
 ) -> i32 {
     guard(|| {
         let filled = default_replay_options();
@@ -2874,7 +2881,10 @@ pub unsafe extern "C" fn karyos_replay_subscription_options_init(
     // SAFETY: the caller's contract on `options`, of at least the 0.1.0
     // size.
     unsafe {
-        karyos_replay_subscription_options_init_sized(options, REPLAY_SUBSCRIPTION_OPTIONS_SIZE_0_1)
+        karyos_replay_subscription_options_init_sized(
+            options,
+            widen(REPLAY_SUBSCRIPTION_OPTIONS_SIZE_0_1),
+        )
     }
 }
 
@@ -2893,7 +2903,7 @@ pub unsafe extern "C" fn karyos_replay_subscription_options_init(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_replay_subscription_options_init_sized(
     options: *mut ReplaySubscriptionOptions,
-    size: u32,
+    size: usize,
 ) -> i32 {
     guard(|| {
         let filled = ReplaySubscriptionOptions {

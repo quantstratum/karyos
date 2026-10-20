@@ -178,7 +178,7 @@ fn a_started_driver_is_stopped_and_closed_from_other_threads() {
     let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
     // SAFETY: a live, aligned, writable `DriverOptions`.
     let status = unsafe {
-        karyos_driver_options_init_sized(options.as_mut_ptr(), size_of_u32::<DriverOptions>())
+        karyos_driver_options_init_sized(options.as_mut_ptr(), size_of::<DriverOptions>())
     };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_driver_options_init` wrote every field.

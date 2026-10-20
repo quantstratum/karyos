@@ -37,7 +37,7 @@ fn defaults() -> ClientOptions {
     let mut options = core::mem::MaybeUninit::<ClientOptions>::zeroed();
     // SAFETY: a live, aligned, writable `ClientOptions`.
     let status = unsafe {
-        karyos_client_options_init_sized(options.as_mut_ptr(), size_of_u32::<ClientOptions>())
+        karyos_client_options_init_sized(options.as_mut_ptr(), size_of::<ClientOptions>())
     };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_client_options_init` wrote every field.
@@ -80,7 +80,7 @@ fn options_init_fills_the_defaults_and_the_size() {
     assert_eq!(options.max_images, 8);
     // SAFETY: a null pointer is refused before any use.
     let status = unsafe {
-        karyos_client_options_init_sized(core::ptr::null_mut(), size_of_u32::<ClientOptions>())
+        karyos_client_options_init_sized(core::ptr::null_mut(), size_of::<ClientOptions>())
     };
     assert_eq!(status, Status::InvalidArgument.code());
 }
@@ -1660,7 +1660,7 @@ fn subscription_defaults() -> SubscriptionOptions {
     let status = unsafe {
         karyos_subscription_options_init_sized(
             options.as_mut_ptr(),
-            size_of_u32::<SubscriptionOptions>(),
+            size_of::<SubscriptionOptions>(),
         )
     };
     assert_eq!(status, Status::Ok.code());
@@ -1717,7 +1717,7 @@ fn subscription_options_init_fills_the_defaults_and_the_size() {
     let status = unsafe {
         karyos_subscription_options_init_sized(
             core::ptr::null_mut(),
-            size_of_u32::<SubscriptionOptions>(),
+            size_of::<SubscriptionOptions>(),
         )
     };
     assert_eq!(status, Status::InvalidArgument.code());
@@ -1780,7 +1780,7 @@ fn an_older_headers_subscription_options_are_filled_within_their_size() {
     let status = unsafe {
         karyos_subscription_options_init_sized(
             (&raw mut older).cast(),
-            SUBSCRIPTION_OPTIONS_SIZE_0_1 - 4,
+            widen(SUBSCRIPTION_OPTIONS_SIZE_0_1 - 4),
         )
     };
     assert_eq!(status, Status::InvalidArgument.code());
@@ -1788,10 +1788,9 @@ fn an_older_headers_subscription_options_are_filled_within_their_size() {
 }
 
 /// The sized init with this header's size fills every field, and the
-/// struct an older binary's init filled is read by its 16 bytes only: an
-/// exactly 16-byte allocation, so a read past it would be undefined
-/// behaviour under Miri. Its options are accepted (the client is looked
-/// up next: no client 0).
+/// struct an older binary's init filled is read by its 16 bytes only, at
+/// an address that is 4 mod 8 as an older header's struct may be. The
+/// options are accepted (the client is looked up next: no client 0).
 #[test]
 fn a_16_byte_struct_is_read_by_its_size() {
     let mut options = core::mem::MaybeUninit::<SubscriptionOptions>::zeroed();
@@ -1799,33 +1798,27 @@ fn a_16_byte_struct_is_read_by_its_size() {
     let status = unsafe {
         karyos_subscription_options_init_sized(
             options.as_mut_ptr(),
-            size_of_u32::<SubscriptionOptions>(),
+            size_of::<SubscriptionOptions>(),
         )
     };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: the sized init wrote every field.
     let full = unsafe { options.assume_init() };
     assert_eq!(full.size, SUBSCRIPTION_OPTIONS_SIZE_ARCHIVE);
-    #[repr(C)]
-    struct Exactly16 {
-        size: u32,
-        role: u32,
-        rejoin: u32,
-        reserved: u32,
-    }
-    let mut small = Exactly16 {
-        size: 0,
-        role: 0,
-        rejoin: 0,
-        reserved: 0,
-    };
-    // SAFETY: `small` is the 0.1.0 size.
-    let status = unsafe { karyos_subscription_options_init((&raw mut small).cast()) };
+    // An older header's struct is 4-aligned and may land at an address
+    // that is 4 mod 8, where this version's 8-aligned struct cannot: the
+    // 16 bytes start at whichever of the first two words sits there, so a
+    // check of this version's alignment would refuse them.
+    let mut words = [0_u32; 6];
+    let at = usize::from(words.as_ptr().addr() % 8 == 0);
+    let small = (&raw mut words[at]).cast::<SubscriptionOptions>();
+    assert_eq!(small.addr() % 8, 4);
+    // SAFETY: `words` holds the 0.1.0 size from `at` on.
+    let status = unsafe { karyos_subscription_options_init(small) };
     assert_eq!(status, Status::Ok.code());
-    assert_eq!(small.size, SUBSCRIPTION_OPTIONS_SIZE_0_1);
-    // SAFETY: `small` is a live struct of its stated 16 bytes.
-    let (status, subscription) =
-        unsafe { add_subscription_with(0, STREAM, (&raw const small).cast()) };
+    assert_eq!(words[at], SUBSCRIPTION_OPTIONS_SIZE_0_1);
+    // SAFETY: the struct is 16 bytes at `small`, of its stated size.
+    let (status, subscription) = unsafe { add_subscription_with(0, STREAM, small) };
     assert_eq!(
         status,
         Status::InvalidHandle.code(),
@@ -1855,7 +1848,7 @@ fn an_older_headers_stream_options_are_filled_within_their_size() {
             unsafe { karyos_stream_options_init(options) }
         } else {
             // SAFETY: `room` is more than `size` writable bytes.
-            unsafe { karyos_stream_options_init_sized(options, size) }
+            unsafe { karyos_stream_options_init_sized(options, widen(size)) }
         };
         assert_eq!(status, Status::Ok.code());
         let written = if legacy {
@@ -2022,7 +2015,7 @@ fn a_sealed_stream_closes_its_subscription() {
     let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
     // SAFETY: a live, aligned, writable `DriverOptions`.
     let status = unsafe {
-        karyos_driver_options_init_sized(options.as_mut_ptr(), size_of_u32::<DriverOptions>())
+        karyos_driver_options_init_sized(options.as_mut_ptr(), size_of::<DriverOptions>())
     };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_driver_options_init` wrote every field.
@@ -2034,7 +2027,7 @@ fn a_sealed_stream_closes_its_subscription() {
     let mut stream = core::mem::MaybeUninit::<StreamOptions>::zeroed();
     // SAFETY: a live, aligned, writable `StreamOptions`.
     let status = unsafe {
-        karyos_stream_options_init_sized(stream.as_mut_ptr(), size_of_u32::<StreamOptions>())
+        karyos_stream_options_init_sized(stream.as_mut_ptr(), size_of::<StreamOptions>())
     };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_stream_options_init` wrote every field.
@@ -2099,9 +2092,8 @@ fn a_sealed_stream_closes_its_subscription() {
 fn offer_defaults() -> OfferOptions {
     let mut options = core::mem::MaybeUninit::<OfferOptions>::zeroed();
     // SAFETY: a live, aligned, writable `OfferOptions`.
-    let status = unsafe {
-        karyos_offer_options_init_sized(options.as_mut_ptr(), size_of_u32::<OfferOptions>())
-    };
+    let status =
+        unsafe { karyos_offer_options_init_sized(options.as_mut_ptr(), size_of::<OfferOptions>()) };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_offer_options_init` wrote every field.
     unsafe { options.assume_init() }
@@ -2141,7 +2133,7 @@ fn offer_options_init_fills_the_defaults_and_the_size() {
     assert_eq!((options.reserved, options.reserved_value), (0, 0));
     // SAFETY: a null pointer is refused before any use.
     let status = unsafe {
-        karyos_offer_options_init_sized(core::ptr::null_mut(), size_of_u32::<OfferOptions>())
+        karyos_offer_options_init_sized(core::ptr::null_mut(), size_of::<OfferOptions>())
     };
     assert_eq!(status, Status::InvalidArgument.code());
 }
