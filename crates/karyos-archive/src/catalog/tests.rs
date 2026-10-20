@@ -847,3 +847,71 @@ fn a_mixed_catalog_keeps_each_mode() {
     assert!(!reopened.get(3).unwrap().required);
     assert_eq!(reopened.next_id(), 4);
 }
+
+/// H4: the read-only listing (archive-host.md) lists what the open lists,
+/// through a disk that refuses every write, and changes nothing.
+#[test]
+fn a_listing_reads_what_the_open_reads_and_writes_nothing() {
+    let (disk, _) = three_started();
+    let before = catalog_bytes(&disk);
+    let listing = list(crate::disk::ReadOnly(disk.clone()), Path::new(DIR)).unwrap();
+    assert!(!listing.missing);
+    assert_eq!(listing.behind, None);
+    let opened = Catalog::open(disk.clone(), Path::new(DIR)).unwrap();
+    assert_eq!(listing.recordings, opened.catalog.recordings());
+    assert_eq!(listing.recordings.len(), 3);
+    assert_eq!(catalog_bytes(&disk), before);
+}
+
+/// A torn last record (an Archive appending it, or a crash) is not cut:
+/// the listing stops before it and reports where; the file is unchanged.
+#[test]
+fn a_listing_stops_at_a_torn_last_record_and_reports_it() {
+    let (disk, _) = three_started();
+    let end = u64::try_from(catalog_bytes(&disk).len()).unwrap();
+    // A record's head whose length reaches past the end of the log.
+    poke(&disk, end, &[1, 0, 200, 0, 9, 9]);
+    let before = catalog_bytes(&disk);
+    let listing = list(crate::disk::ReadOnly(disk.clone()), Path::new(DIR)).unwrap();
+    assert_eq!(listing.recordings.len(), 3);
+    assert_eq!(listing.behind, Some(end));
+    assert_eq!(catalog_bytes(&disk), before, "nothing cut");
+}
+
+/// Damage before the last record is corruption, as the open judges it.
+#[test]
+fn a_listing_refuses_a_damaged_record_mid_log() {
+    let (disk, offsets) = three_started();
+    let before = catalog_bytes(&disk);
+    let at = offsets[1] + 6;
+    poke(&disk, at, &[before[usize::try_from(at).unwrap()] ^ 0x01]);
+    assert!(matches!(
+        list(crate::disk::ReadOnly(disk.clone()), Path::new(DIR)),
+        Err(CatalogError::Corrupt { offset }) if offset == offsets[1]
+    ));
+}
+
+/// A compaction's leftover file stays: the listing reads the catalog it
+/// would replace, which holds the same recordings.
+#[test]
+fn a_listing_leaves_a_compactions_leftover_file() {
+    let free = FaultDisk::default();
+    let ops = [Op::Start(1), Op::Compact];
+    let _ = run(free.clone(), &ops);
+    let before = FaultDisk::default();
+    let _ = run(before.clone(), &ops[..1]);
+    let disk = FaultDisk::with_budget(before.used() + 3);
+    let _ = run(disk.clone(), &ops);
+    assert!(disk.has_crashed());
+    let crashed = disk.after_crash(Survives::Everything);
+    let listing = list(crate::disk::ReadOnly(crashed.clone()), Path::new(DIR)).unwrap();
+    assert_eq!(listing.recordings.len(), 1);
+    let mut names = crashed.clone();
+    assert!(
+        names
+            .list(Path::new(DIR))
+            .unwrap()
+            .iter()
+            .any(|name| name == TEMPORARY)
+    );
+}
