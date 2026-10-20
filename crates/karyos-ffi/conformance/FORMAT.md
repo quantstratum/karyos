@@ -359,16 +359,25 @@ declares the feature absent.
   10 s, then sends SIGKILL.
 - **Seeding.** The runner connects a client with
   `karyos_client_connect` to that directory, binds it to
-  `$archive_client`, and through it publishes the messages `"r0"` to
-  `"r9"` on `karyos:ipc` stream 20, with a pause of 5 ms between `"r4"`
-  and `"r5"` (so a replay at a millionth of the recorded pace holds the
-  second half). It then opens an Archive connection (client id 1, the
-  streams above, a deadline of 10 s) and lists the catalog until the
-  first recording's position is past the last message's start, which,
-  one frame, is then recorded whole; it binds `$recording` to that
+  `$archive_client`, and opens an Archive connection through it (client
+  id 1, the streams above, a deadline of 10 s). It publishes the
+  messages `"r0"` to `"r4"` on `karyos:ipc` stream 20, lists the catalog
+  until the first recording's position is past `"r4"`'s start, pauses
+  50 ms, publishes `"r5"` to `"r9"`, and lists again until the position
+  is past `"r9"`'s start. A message of one frame is recorded whole once
+  the position is past its start. The runner binds `$recording` to that
   recording's id and `$recording_end` to that position, and closes the
-  connection. The recording stays live: karyosd cannot stop it from C
-  (recording control is B6b), so scenarios replay an explicit length.
+  connection. The barrier holds the second half: a recorder duty stamps
+  one record time on everything it copies and ends at an empty source,
+  so `"r5"` to `"r9"` carry a stamp at least 50 ms after the first
+  half's, and a replay at a millionth of the recorded pace holds them
+  for at least 50 000 s (op.replay.stopped). A pause alone does not: one
+  duty that copies all ten messages stamps them alike. The catalog shows
+  no record times, so a runner cannot check the gap; only a recorder
+  thread descheduled for the whole pause between writing `"r4"` and its
+  next read could still lose it. The recording stays live: karyosd
+  cannot stop it from C (recording control is B6b), so scenarios replay
+  an explicit length.
 - **Connections.** `archive.connect` opens a connection on the streams
   above with a deadline of 10 s and a client id the runner hands out,
   100, 200 and up, so no connection's id, nor its replayer's (one

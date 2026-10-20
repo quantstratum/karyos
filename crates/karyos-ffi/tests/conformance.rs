@@ -2483,12 +2483,49 @@ mod archive_host {
                 if status != 0 {
                     self.fail(&format!("no publication on stream {RECORDED} ({status})"));
                 }
+                let options = abi::ArchiveOptions {
+                    size: u32::try_from(size_of::<abi::ArchiveOptions>()).unwrap(),
+                    reserved: 0,
+                    requests: REQUESTS,
+                    responses: RESPONSES,
+                    client_id: 1,
+                    deadline_ns: 10_000_000_000,
+                };
+                let (status, archive) = abi::archive_connect(client, &options);
+                if status != 0 {
+                    self.fail(&format!("no Archive connection ({status})"));
+                }
+                // The recording once it is past `last`, the start of the
+                // last message offered, which, one frame, is then recorded
+                // whole: its id and position.
+                let recorded_past = |last: u64| {
+                    let start = Instant::now();
+                    loop {
+                        let (status, recordings) = abi::archive_recordings(archive, 0, 16);
+                        if let Some(&(id, position)) = recordings.first()
+                            && status == 0
+                            && position > last
+                        {
+                            break (id, position);
+                        }
+                        if start.elapsed() > deadline {
+                            self.fail(&format!("not recorded past {last}: {recordings:?}"));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                };
                 let mut last = 0;
                 for index in 0..10u8 {
-                    // The second half 5 ms after the first: a replay at a
-                    // millionth of the recorded pace holds it (op.replay.stopped).
+                    // The second half only once the first is recorded, and
+                    // 50 ms later. A recorder duty stamps one record time on
+                    // everything it copies and ends at an empty source, so
+                    // the first half's stamps are then taken, and the second
+                    // half's are at least 50 ms later: a replay at a
+                    // millionth of the recorded pace holds it
+                    // (op.replay.stopped).
                     if index == 5 {
-                        std::thread::sleep(Duration::from_millis(5));
+                        let _ = recorded_past(last);
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                     let message = format!("r{index}");
                     let start = Instant::now();
@@ -2506,34 +2543,7 @@ mod archive_host {
                     };
                 }
                 let _ = abi::publication_close(publication);
-                let options = abi::ArchiveOptions {
-                    size: u32::try_from(size_of::<abi::ArchiveOptions>()).unwrap(),
-                    reserved: 0,
-                    requests: REQUESTS,
-                    responses: RESPONSES,
-                    client_id: 1,
-                    deadline_ns: 10_000_000_000,
-                };
-                let (status, archive) = abi::archive_connect(client, &options);
-                if status != 0 {
-                    self.fail(&format!("no Archive connection ({status})"));
-                }
-                // The recording is past the last message's start once that
-                // message, one frame, is recorded whole.
-                let start = Instant::now();
-                let (recording, end) = loop {
-                    let (status, recordings) = abi::archive_recordings(archive, 0, 16);
-                    if let Some(&(id, position)) = recordings.first()
-                        && status == 0
-                        && position > last
-                    {
-                        break (id, position);
-                    }
-                    if start.elapsed() > deadline {
-                        self.fail(&format!("not recorded past {last}: {recordings:?}"));
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                };
+                let (recording, end) = recorded_past(last);
                 let _ = abi::archive_close(archive);
                 (client, recording, end)
             }

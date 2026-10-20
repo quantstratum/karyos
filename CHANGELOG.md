@@ -11,6 +11,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The conformance seeding of the `archive-replay` feature waits until
+  `"r0"` to `"r4"` are recorded before it pauses (now 50 ms) and
+  publishes `"r5"` to `"r9"`. Record times are per recorder duty, so a
+  duty that copied all ten messages stamped them alike, and
+  `op.replay.stopped`'s 1 ppm replay could end before its stop.
+
 - `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
   `karyos_detail`, `karyos_accepted` and the image change do: it wrote
   the library's 16 back into a newer caller's struct before. The new
