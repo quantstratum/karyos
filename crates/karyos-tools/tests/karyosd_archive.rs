@@ -443,3 +443,59 @@ fn karyosd_refuses_a_boot_recording_below_its_free_space_floor() {
     let _ = std::fs::remove_dir_all(&archive);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Every requester the request stream admits can read the response stream
+/// at once, beside the daemon's own requester for a boot recording: each
+/// `ArchiveConnection` reads it as an optional reader, which takes a
+/// spare-slot credit, and lists the recording through it.
+#[test]
+fn karyosd_admits_as_many_archive_connections_as_request_publishers() {
+    use karyos_archive::client::connection::{ArchiveConnection, ControlStreams};
+    use karyos_tools::daemon_archive::REQUEST_PUBLISHERS;
+
+    let dir = dir("readers");
+    let archive = dir.with_extension("archive");
+    let _ = std::fs::remove_dir_all(&archive);
+    std::fs::create_dir_all(&archive).unwrap();
+    let path = dir.with_extension("log");
+    let mut daemon = Daemon::start(
+        &dir,
+        &archive,
+        &["--record", &format!("{STREAM}:{SESSION}")],
+        &path,
+    );
+    let mut client = connect(&dir);
+    // The daemon's requester may still hold its handles: one of each.
+    let connections: Vec<_> = (1..REQUEST_PUBLISHERS)
+        .map(|index| {
+            ArchiveConnection::open(&mut client, ControlStreams::new(REQUESTS, RESPONSES))
+                .unwrap_or_else(|error| panic!("connection {index}: {error}"))
+        })
+        .collect();
+    // Each lists the boot recording.
+    for (index, connection) in connections.into_iter().enumerate() {
+        let (requests, responses) = connection.into_transports();
+        let mut lister = RecordingLister::new(
+            ListerConfig::new(0xD0 + u32::try_from(index).unwrap()),
+            requests,
+            responses,
+        );
+        lister.start();
+        let start = Instant::now();
+        let listing = loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "no listing");
+            let _ = client.poll();
+            match lister.poll() {
+                ListPoll::Done(listing) => break listing,
+                ListPoll::Pending => std::thread::sleep(Duration::from_millis(1)),
+                other => panic!("listing: {other:?}"),
+            }
+        };
+        assert_eq!(listing.recordings.len(), 1, "{listing:?}");
+    }
+    drop(client);
+    assert!(daemon.stop().success());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&archive);
+    let _ = std::fs::remove_dir_all(&dir);
+}

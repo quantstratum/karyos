@@ -2140,6 +2140,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `karyosd --archive` admits remote `ArchiveConnection`s again. Their
+  response reader is optional (#524), and an optional reader takes a
+  spare-slot credit; the response stream had the default three spare
+  slots, whose one free credit the daemon's own requester held, so every
+  remote open was refused (`ResourcesUnavailable`). The response stream
+  now has `RESPONSE_READERS` (8, as many as the request stream's
+  publishers) readers and `RESPONSE_SPARE_SLOTS` spare slots, and
+  `karyosd_admits_as_many_archive_connections_as_request_publishers`
+  opens them all beside a boot recording.
 - One driver can hold both ends of a `karyos:udp` endpoint (karyos#490;
   quantstratum-docs: `karyos/design/per-source-images.md`, D2-1 and
   D2-4). A driver's own network publication's loopback image shares the
