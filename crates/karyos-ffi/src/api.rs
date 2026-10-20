@@ -4,3 +4,4 @@
 //! and answers a handle, a value or a [`Failure`](crate::status::Failure).
 
 pub(crate) mod client;
+pub(crate) mod publication;

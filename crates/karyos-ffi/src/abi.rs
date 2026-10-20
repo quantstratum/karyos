@@ -10,6 +10,7 @@ use core::ffi::{CStr, c_char};
 use std::panic::catch_unwind;
 use std::path::PathBuf;
 
+use crate::api;
 use crate::api::client;
 use crate::boundary::{drop_payload, guard};
 use crate::handles::Handle;
@@ -83,44 +84,97 @@ fn size_of_u32<T>() -> u32 {
     u32::try_from(size_of::<T>()).unwrap_or(u32::MAX)
 }
 
-/// Writes `failure`'s detail through `detail`, when it is an aligned
-/// `karyos_detail` whose `size` covers this version's struct; otherwise
-/// writes nothing.
+/// `karyos_accepted`: where an accepted message went.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Accepted {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// The lane the message was appended to.
+    pub lane: u32,
+    /// The message's position in that lane.
+    pub position: u64,
+}
+
+/// The size of `karyos_accepted` in ABI 0.1.0.
+const ACCEPTED_SIZE_0_1: u32 = 16;
+
+/// Writes the value `fill` builds from the caller's `size` through `out`,
+/// a caller's growing struct, when it is aligned and its `size` is at
+/// least `min` (the struct's size in ABI 0.1.0): the prefix both versions
+/// know, so an older caller's smaller struct gets its fields and a newer
+/// one's later fields are left alone. Otherwise writes nothing.
 ///
 /// # Safety
 ///
-/// `detail` is null or points to a writable `karyos_detail` whose `size`
-/// field the caller set.
-unsafe fn write_detail(detail: *mut Detail, failure: Failure) {
-    if !writable(detail) {
+/// `out` is null or points to a writable struct whose first field is the
+/// `uint32_t` size the caller set, and which is at least that size.
+unsafe fn write_sized<T>(out: *mut T, min: u32, fill: impl FnOnce(u32) -> T) {
+    if !writable(out) {
         return;
     }
-    // SAFETY: `detail` is non-null and aligned, and points to a
-    // `karyos_detail` (the caller's contract), whose first field is the
-    // `uint32_t` size.
-    let size = unsafe { detail.cast::<u32>().read() };
-    if size < DETAIL_SIZE_0_1 {
+    // SAFETY: `out` is non-null and aligned, and points to the caller's
+    // struct (its contract), whose first field is the `uint32_t` size.
+    let size = unsafe { out.cast::<u32>().read() };
+    if size < min {
         return;
     }
-    let written = Detail {
-        size,
-        reserved: 0,
-        code: failure.code,
-        value: failure.value,
-    };
-    // The prefix both versions share: an older caller's struct is
-    // smaller, a newer one's keeps its later fields.
-    let length = prefix(size, size_of_u32::<Detail>());
+    let written = fill(size);
+    let length = prefix(size, size_of_u32::<T>());
     // SAFETY: the caller's struct is at least `size` writable bytes (its
     // contract), `length` is at most `size` and at most the size of
     // `written`, a local that does not overlap it.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            (&raw const written).cast::<u8>(),
-            detail.cast::<u8>(),
-            length,
-        );
+        core::ptr::copy_nonoverlapping((&raw const written).cast::<u8>(), out.cast::<u8>(), length);
     };
+}
+
+/// Writes `failure`'s detail through `detail` (see [`write_sized`]).
+///
+/// # Safety
+///
+/// As [`write_sized`].
+unsafe fn write_detail(detail: *mut Detail, failure: Failure) {
+    // SAFETY: the caller's contract, passed on.
+    unsafe {
+        write_sized(detail, DETAIL_SIZE_0_1, |size| Detail {
+            size,
+            reserved: 0,
+            code: failure.code,
+            value: failure.value,
+        });
+    };
+}
+
+/// Writes `accepted` through `out` (see [`write_sized`]).
+///
+/// # Safety
+///
+/// As [`write_sized`].
+unsafe fn write_accepted(out: *mut Accepted, accepted: karyos_client::Accepted) {
+    // SAFETY: the caller's contract, passed on.
+    unsafe {
+        write_sized(out, ACCEPTED_SIZE_0_1, |size| Accepted {
+            size,
+            lane: u32::from(accepted.lane().get()),
+            position: accepted.position(),
+        });
+    };
+}
+
+/// A NUL-terminated UTF-8 string the caller passes, read during the call.
+///
+/// # Safety
+///
+/// `text` is null or a NUL-terminated string that lives through the call.
+unsafe fn read_str<'a>(text: *const c_char) -> Result<&'a str, Status> {
+    if text.is_null() {
+        return Err(Status::InvalidArgument);
+    }
+    // SAFETY: non-null and NUL-terminated (the caller's contract), and
+    // used only during the call.
+    let text = unsafe { CStr::from_ptr(text) };
+    text.to_str().map_err(|_| Status::InvalidArgument)
 }
 
 /// The bytes of a growing struct both sides know: the smaller of the
@@ -332,6 +386,175 @@ pub extern "C" fn karyos_client_close(client: u64) -> i32 {
         Ok(()) => Status::Ok,
         Err(status) => status,
     })
+}
+
+/// Adds the exclusive publication of `stream_id` on the channel `uri`
+/// (`karyos:ipc` or `karyos:udp`) to `client`, and writes its handle
+/// through `publication`. A control call: it waits for the driver up to
+/// the client's timeout, and holds the client handle meanwhile
+/// (`KARYOS_E_BUSY` to another thread). On failure nothing is opened and
+/// `detail` (may be null) receives the failure's detail.
+///
+/// # Safety
+///
+/// `uri` is a NUL-terminated string; `publication` points to a writable
+/// `uint64_t`; `detail` is null or a `karyos_detail` whose `size` is set.
+/// A null `uri` or `publication` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_publication(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    publication: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(publication) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `uri`.
+        let uri = match unsafe { read_str(uri) } {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match api::publication::add(Handle::from_raw(client), uri, stream_id) {
+            Ok(handle) => {
+                // SAFETY: `publication` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { publication.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Offers `length` bytes at `data` on `lane` of `publication`, copied into
+/// the term before it returns. On `KARYOS_OK`, `accepted` (may be null)
+/// receives the lane and position. A data-path call: it never waits.
+///
+/// # Safety
+///
+/// `data` points to `length` readable bytes (it may be null when `length`
+/// is 0); `accepted` is null or a `karyos_accepted` whose `size` is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_publication_offer(
+    publication: u64,
+    lane: u32,
+    data: *const u8,
+    length: usize,
+    accepted: *mut Accepted,
+) -> i32 {
+    guard(|| {
+        let payload: &[u8] = if length == 0 {
+            &[]
+        } else if data.is_null() || isize::try_from(length).is_err() {
+            return Status::InvalidArgument;
+        } else {
+            // SAFETY: `data` is non-null and points to `length` readable
+            // bytes (the caller's contract), `length` fits an `isize`, and
+            // the slice is used only during the call.
+            unsafe { core::slice::from_raw_parts(data, length) }
+        };
+        match api::publication::offer(Handle::from_raw(publication), lane, payload) {
+            Ok(done) => {
+                // SAFETY: the caller's contract on `accepted`.
+                unsafe { write_accepted(accepted, done) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Stages a claim of `length` bytes on `lane` of `publication`: writes its
+/// handle through `claim` and, through `buffer`, a pointer to `length`
+/// zeroed bytes the caller fills. The pointer stays valid until
+/// `karyos_claim_commit` releases the claim, `karyos_claim_abort`, or the
+/// close of the publication or of its client; it never points into a term
+/// or a shared mapping.
+/// One claim per publication: another before it is released returns
+/// `KARYOS_E_CLAIM_OUTSTANDING`. Nothing reaches the term before the
+/// commit.
+///
+/// # Safety
+///
+/// `claim` points to a writable `uint64_t` and `buffer` to a writable
+/// `uint8_t *`; a null or misaligned one returns
+/// `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_publication_claim(
+    publication: u64,
+    lane: u32,
+    length: u32,
+    claim: *mut u64,
+    buffer: *mut *mut u8,
+) -> i32 {
+    guard(|| {
+        if !(writable(claim) && writable(buffer)) {
+            return Status::InvalidArgument;
+        }
+        match api::publication::claim(Handle::from_raw(publication), lane, length) {
+            Ok((handle, staged)) => {
+                // SAFETY: `claim` is non-null and aligned, and the caller's
+                // contract makes it a writable `uint64_t`.
+                unsafe { claim.write(handle.raw()) };
+                // SAFETY: as for `claim`, a writable `uint8_t *`.
+                unsafe { buffer.write(staged) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Commits `claim`: claims `length` in the term, copies the staged bytes
+/// and commits, in one call. On `KARYOS_OK`, `accepted` (may be null)
+/// receives the lane and position, and the claim is released. A data-path
+/// outcome that can clear (`KARYOS_E_BACK_PRESSURED`,
+/// `KARYOS_E_NOT_CONNECTED`, `KARYOS_E_ADMIN_ACTION`,
+/// `KARYOS_E_RATE_LIMITED`, `KARYOS_E_GATED`) keeps the claim staged and
+/// its buffer valid, to retry or abort; any other failure releases it.
+///
+/// # Safety
+///
+/// `accepted` is null or a `karyos_accepted` whose `size` is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_claim_commit(claim: u64, accepted: *mut Accepted) -> i32 {
+    guard(|| match api::publication::commit(Handle::from_raw(claim)) {
+        Ok(done) => {
+            // SAFETY: the caller's contract on `accepted`.
+            unsafe { write_accepted(accepted, done) };
+            Status::Ok
+        }
+        Err(failure) => failure.status,
+    })
+}
+
+/// Aborts `claim`: nothing reaches the term, and its buffer is released.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_claim_abort(claim: u64) -> i32 {
+    guard(|| match api::publication::abort(Handle::from_raw(claim)) {
+        Ok(()) => Status::Ok,
+        Err(status) => status,
+    })
+}
+
+/// Closes `publication` through its client, with its outstanding claim.
+/// It needs the client handle too: while that is in use
+/// (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`) nothing is closed.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_publication_close(publication: u64) -> i32 {
+    guard(
+        || match api::publication::close(Handle::from_raw(publication)) {
+            Ok(()) => Status::Ok,
+            Err(status) => status,
+        },
+    )
 }
 
 #[cfg(test)]
