@@ -16,7 +16,7 @@ use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
 use karyos_sys::term_bytes::HeapTerms;
 
 use crate::agents::data::LaneReader;
-use crate::embedded::{EmbeddedDriver, StreamHandle};
+use crate::embedded::{EmbeddedDriver, StreamHandle, StreamTerms};
 use crate::error::DriverError;
 use crate::generations::MemberKind;
 
@@ -34,11 +34,11 @@ use crate::generations::MemberKind;
 /// alone ([`RecordingReader::into_parts`]) has no link, so a cutover
 /// fences it and the recording ends at the seal.
 #[derive(Debug)]
-pub struct RecordingReader {
-    reader: LaneReader,
+pub struct RecordingReader<T: StreamTerms = HeapTerms> {
+    reader: LaneReader<T>,
     lease: RecordingLease,
     format: RecordingFormat,
-    link: Arc<GenerationLink>,
+    link: Arc<GenerationLink<T>>,
     base: u64,
 }
 
@@ -58,7 +58,7 @@ pub struct RecordingFormat {
     pub mtu: u32,
 }
 
-impl RecordingReader {
+impl<T: StreamTerms> RecordingReader<T> {
     /// The recorded lane's format.
     #[must_use]
     pub fn format(&self) -> RecordingFormat {
@@ -68,7 +68,7 @@ impl RecordingReader {
     /// The reader's generation link: what offers it a successor at a
     /// cutover.
     #[must_use]
-    pub fn link(&self) -> &Arc<GenerationLink> {
+    pub fn link(&self) -> &Arc<GenerationLink<T>> {
         &self.link
     }
 
@@ -83,7 +83,7 @@ impl RecordingReader {
     /// fences such a reader, and its recording ends at the seal. To follow
     /// cutovers, take [`RecordingReader::into_following_parts`].
     #[must_use]
-    pub fn into_parts(self) -> (LaneReader, RecordingLease) {
+    pub fn into_parts(self) -> (LaneReader<T>, RecordingLease) {
         (self.reader, self.lease)
     }
 
@@ -92,7 +92,9 @@ impl RecordingReader {
     /// (`Following::new(reader, link, base)`), kept with the lease in a
     /// `Guarded` source, so the recording follows each cutover.
     #[must_use]
-    pub fn into_following_parts(self) -> (LaneReader, Arc<GenerationLink>, u64, RecordingLease) {
+    pub fn into_following_parts(
+        self,
+    ) -> (LaneReader<T>, Arc<GenerationLink<T>>, u64, RecordingLease) {
         (self.reader, self.link, self.base, self.lease)
     }
 }
@@ -103,7 +105,7 @@ pub struct RecordingLease {
     _lease: Lease,
 }
 
-impl EmbeddedDriver<HeapTerms> {
+impl<T: StreamTerms> EmbeddedDriver<T> {
     /// A recording's reader of `stream`'s log, admitted as `role`:
     /// [`Role::Required`], with its spare-slot reservation, bounds the
     /// publisher as the network sender's readers do (a `required`
@@ -125,7 +127,7 @@ impl EmbeddedDriver<HeapTerms> {
         &mut self,
         stream: StreamHandle,
         role: Role,
-    ) -> Result<RecordingReader, DriverError> {
+    ) -> Result<RecordingReader<T>, DriverError> {
         if !matches!(role, Role::Required | Role::Optional) {
             return Err(SysError::InvalidPublicationMode {
                 reason: "a recording reads as a required or an optional participant",
