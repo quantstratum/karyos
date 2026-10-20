@@ -481,6 +481,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             });
             counters.push(cells);
         }
+        let cells = crate::embedded::stream_network_cells(
+            &mut self.counters,
+            handle.registration(),
+            &crate::agents::PUBLICATION_CELLS,
+        );
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
         // One send endpoint per path, all or nothing.
         let mut held: Vec<(EndpointId, SocketAddr)> = Vec::with_capacity(binds.len());
@@ -514,6 +519,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if let Some((policies, counters)) = timed {
                     let now = karyos_sys::host_clock::host_monotonic_ns();
                     outbound.set_timed(&policies, counters, now)?;
+                }
+                // Its counters' cells (M2b), dropped with the outbound if
+                // it is refused (a dropped cell is reused).
+                if let Some(cells) = cells {
+                    outbound.set_cells(cells);
                 }
                 Ok(outbound)
             })

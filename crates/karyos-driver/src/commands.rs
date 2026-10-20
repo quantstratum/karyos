@@ -1281,8 +1281,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// karyos/design/guards-and-abort.md`): an admitted client is
     /// authorized by the uid admission proved (G1). Every command is
     /// audited, an unknown guard against the id it named; `asked` is the
-    /// operation id, the operator uid the client acts for (0: none) and
-    /// the parameters digest (M10).
+    /// operation id, the operator uid the client acts for
+    /// (`NO_OPERATOR`: none; root's 0 is a uid) and the parameters digest
+    /// (M10).
     fn guard_command(
         &mut self,
         client: u64,
@@ -1293,7 +1294,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ) -> Response {
         let (operation, operator, parameters) = asked;
         let requester = match operator {
-            0 => crate::guards::Requester::Client(client),
+            karyos_protocol::cnc::NO_OPERATOR => crate::guards::Requester::Client(client),
             uid => crate::guards::Requester::Operator { client, uid },
         };
         let now = self.clock.now();
@@ -5038,7 +5039,7 @@ mod tests {
                 guard: id,
                 expected: 1,
                 operation: 70,
-                operator: 0,
+                operator: karyos_protocol::cnc::NO_OPERATOR,
                 parameters: 0,
             },
             Command::GuardReopen {
@@ -5046,21 +5047,21 @@ mod tests {
                 guard: id,
                 expected: 1,
                 operation: 71,
-                operator: 0,
+                operator: karyos_protocol::cnc::NO_OPERATOR,
                 parameters: 0,
             },
             Command::GuardClose {
                 sequence: 3,
                 guard: id,
                 operation: 72,
-                operator: 0,
+                operator: karyos_protocol::cnc::NO_OPERATOR,
                 parameters: 0,
             },
             Command::GuardClose {
                 sequence: 4,
                 guard: 99,
                 operation: 73,
-                operator: 0,
+                operator: karyos_protocol::cnc::NO_OPERATOR,
                 parameters: 0,
             },
         ] {
@@ -5139,7 +5140,8 @@ mod tests {
     /// M10: a client acting for an operator names the operator's uid and
     /// the request's parameters digest; the driver's audit and the tools'
     /// audit ring record both, with the client, and a command without an
-    /// operator stays the client's own.
+    /// operator (`NO_OPERATOR`) stays the client's own. Root's uid 0 is an
+    /// operator: the ring tells it by `requester_kind` 2, not by word 8.
     #[test]
     fn an_operator_command_is_audited_with_its_uid_and_digest() {
         let (mut driver, _stream) = driver_with_stream();
@@ -5147,7 +5149,9 @@ mod tests {
         let (client, mut producer) = remote_client(&mut driver, 4);
         let id = guard.id();
         let reopen = karyos_protocol::cnc::guard_parameters(id, 1, 80, 1000, b"open");
-        let close = karyos_protocol::cnc::guard_parameters(id, 0, 81, 0, b"");
+        let none = karyos_protocol::cnc::NO_OPERATOR;
+        let close = karyos_protocol::cnc::guard_parameters(id, 0, 81, none, b"");
+        let root = karyos_protocol::cnc::guard_parameters(id, 0, 82, 0, b"");
         for command in [
             Command::GuardReopen {
                 sequence: 1,
@@ -5161,8 +5165,16 @@ mod tests {
                 sequence: 2,
                 guard: id,
                 operation: 81,
-                operator: 0,
+                operator: none,
                 parameters: close,
+            },
+            // Root's uid 0 is an operator, not none.
+            Command::GuardClose {
+                sequence: 3,
+                guard: id,
+                operation: 82,
+                operator: 0,
+                parameters: root,
             },
         ] {
             write(&mut producer, command);
@@ -5185,6 +5197,11 @@ mod tests {
                     reopen
                 ),
                 (81, crate::guards::Requester::Client(client), close),
+                (
+                    82,
+                    crate::guards::Requester::Operator { client, uid: 0 },
+                    root
+                ),
             ]
         );
         let mut cursor = 0;
@@ -5200,7 +5217,11 @@ mod tests {
         });
         assert_eq!(
             ring,
-            [(80, 2, client, 1000, reopen), (81, 1, client, 0, close)]
+            [
+                (80, 2, client, 1000, reopen),
+                (81, 1, client, 0, close),
+                (82, 2, client, 0, root)
+            ]
         );
     }
 
@@ -5255,7 +5276,7 @@ mod tests {
                 guard: guard.id(),
                 expected: last,
                 operation: 5,
-                operator: 0,
+                operator: karyos_protocol::cnc::NO_OPERATOR,
                 parameters: 0,
             },
         );
@@ -5337,7 +5358,7 @@ mod tests {
                 sequence: 1,
                 guard: guard.id(),
                 operation: 9,
-                operator: 0,
+                operator: karyos_protocol::cnc::NO_OPERATOR,
                 parameters: 0,
             },
         );

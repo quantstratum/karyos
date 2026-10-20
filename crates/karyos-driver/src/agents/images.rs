@@ -229,6 +229,8 @@ pub struct ImageTable<T: StreamTerms = HeapTerms> {
     /// Term bytes charged.
     charged: u64,
     counters: ImageCounters,
+    /// Retired images' CnC cells (M2b), for the conductor to free.
+    released: Vec<karyos_sys::counters::Counter>,
     /// Calls of `allocate` (tests: no refusal allocates).
     #[cfg(test)]
     allocations: usize,
@@ -328,6 +330,7 @@ impl<T: StreamTerms> ImageTable<T> {
             template,
             charged: 0,
             counters: ImageCounters::default(),
+            released: Vec::new(),
             #[cfg(test)]
             allocations: 0,
             #[cfg(test)]
@@ -335,6 +338,13 @@ impl<T: StreamTerms> ImageTable<T> {
             #[cfg(test)]
             last_lanes: Vec::new(),
         }
+    }
+
+    /// Hands retired images' cells back, for the conductor to free (M2b).
+    pub(crate) fn take_released(
+        &mut self,
+    ) -> impl Iterator<Item = karyos_sys::counters::Counter> + '_ {
+        self.released.drain(..)
     }
 
     /// The images held, installed or not, refusals awaiting their reply
@@ -496,7 +506,14 @@ impl<T: StreamTerms> ImageTable<T> {
                 }
                 _ => self.counters.bump(|c| &mut c.stale_replies),
             },
-            SessionEvent::RetireImage { slot, complete } => {
+            SessionEvent::RetireImage {
+                slot,
+                complete,
+                cells,
+            } => {
+                if let Some(mut cells) = cells {
+                    self.released.extend(cells.take());
+                }
                 let found = self
                     .images
                     .iter_mut()

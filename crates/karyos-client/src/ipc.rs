@@ -1011,7 +1011,7 @@ impl RemoteClient {
         &mut self,
         guard: u64,
         operation: u64,
-        operator: u64,
+        operator: Option<u32>,
         reason: &[u8],
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?
@@ -1029,7 +1029,7 @@ impl RemoteClient {
         guard: u64,
         expected: u64,
         operation: u64,
-        operator: u64,
+        operator: Option<u32>,
         reason: &[u8],
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?

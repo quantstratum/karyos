@@ -33,7 +33,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-use crate::api::{AgentView, Alert, AlertKind, Counter, DriverState, DriverView, QuantileBounds};
+use crate::api::{
+    AgentView, Alert, AlertKind, Catalog, Counter, DriverState, DriverView, QuantileBounds,
+};
 
 /// The `Content-Type` of the exposition.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -153,6 +155,9 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
         u8::from(driver.state == DriverState::Closed),
     );
     render_alerts(families, &dir, &driver.alerts);
+    if let Some(catalog) = &driver.catalog {
+        render_catalog(families, &dir, catalog);
+    }
     if let Some(sample) = &driver.sample {
         families.sample(
             "karyos_sample_consistent",
@@ -367,6 +372,7 @@ fn render_alerts(families: &mut Families, dir: &str, alerts: &[Alert]) {
                     AlertKind::Lag => "lag",
                     AlertKind::Loss => "loss",
                     AlertKind::GuardAck => "guard_ack",
+                    AlertKind::JournalGap => "journal_gap",
                 }
                 .to_owned(),
             ),
@@ -387,6 +393,46 @@ fn render_alerts(families: &mut Families, dir: &str, alerts: &[Alert]) {
             "Host monotonic nanoseconds of the refresh at which the alert began firing.",
             &keys,
             alert.since,
+        );
+    }
+}
+
+/// A driver's Archive catalog (M11): its size and the agent's attempts.
+fn render_catalog(families: &mut Families, dir: &str, catalog: &Catalog) {
+    let base = [("driver", dir.to_owned())];
+    let listed = u64::try_from(catalog.recordings.len())
+        .ok()
+        .and_then(|kept| kept.checked_add(catalog.left_out));
+    if let Some(listed) = listed {
+        families.sample(
+            "karyos_archive_recordings",
+            "gauge",
+            "Recordings in the driver's Archive catalog at the last complete listing.",
+            &base,
+            listed,
+        );
+    }
+    families.sample(
+        "karyos_archive_listings_total",
+        "counter",
+        "Complete listings of the driver's Archive catalog.",
+        &base,
+        catalog.listings,
+    );
+    families.sample(
+        "karyos_archive_listing_failures_total",
+        "counter",
+        "Failed attempts to list the driver's Archive catalog.",
+        &base,
+        catalog.failures,
+    );
+    if let Some(at) = catalog.listed_at {
+        families.sample(
+            "karyos_archive_listed_at_ns",
+            "gauge",
+            "Host monotonic nanoseconds when the last listing ended.",
+            &base,
+            at,
         );
     }
 }
