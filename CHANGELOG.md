@@ -11,6 +11,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-ffi`: each copy of the library draws its own base generation
+  for its handles, once, from the address of one of its statics (never
+  0; no clock or process id, so it runs under Miri's isolation). A handle
+  of another copy in the same process (two static copies, BIND-CPP-Q12)
+  then names a slot at another generation and answers `KARYOS_E_CLOSED`,
+  except with
+  probability 2^-32 per call, instead of acting on that copy's object; a
+  copy cannot tell a foreign handle from a stale one. A slot's generation
+  counts on from the base, skipping 0, and the slot is retired only once
+  it would come back to the base, after all 2^32 - 1 generations (it was
+  retired at u32::MAX before). The handle's layout and the ABI are
+  unchanged (`handles::tests`).
+
 - `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
   `karyos_detail`, `karyos_accepted` and the image change do: it wrote
   the library's 16 back into a newer caller's struct before. The new

@@ -14,8 +14,14 @@
 //! of that slot still answers [`Status::Closed`] and never clears it.
 //!
 //! Closing moves the slot's generation on at once, so a stale or twice
-//! closed handle answers [`Status::Closed`]; a slot whose generation would
-//! wrap is retired, never reused. The generation is an atomic read before
+//! closed handle answers [`Status::Closed`]. Every slot of this copy of the
+//! library starts at one base generation, drawn once per copy
+//! ([`copy_base`]), and counts on from it, skipping 0; a slot whose next
+//! generation would come back to the base has cycled all 2^32 - 1 and is
+//! retired, never reused. A handle of another copy in the same process
+//! (two static copies, BIND-CPP-Q12) therefore names a slot at another
+//! generation and answers [`Status::Closed`], except with probability
+//! 2^-32 per call: a copy cannot tell a foreign handle from a stale one. The generation is an atomic read before
 //! the mutex is tried, so a stale handle never disturbs a live one. One
 //! narrow window is left: a call that read the generation just before a
 //! concurrent close and a reuse of the slot holds the mutex for a moment,
@@ -25,7 +31,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
 use crate::status::Status;
 
@@ -159,6 +165,9 @@ type Taken<'a, T> = (MutexGuard<'a, Option<T>>, bool);
 #[derive(Debug)]
 pub(crate) struct Table<T> {
     kind: Kind,
+    /// The generation every slot starts at, and comes back to only after
+    /// all 2^32 - 1 ([`copy_base`] for the library's tables).
+    base: u32,
     slots: Box<[Slot<T>]>,
     /// Slots free to take, as a stack. Taken on the control path only.
     free: Mutex<Vec<u32>>,
@@ -185,14 +194,51 @@ impl<T> TakenAll<'_, T> {
     }
 }
 
+/// This copy of the library's base generation: drawn once, never 0, from
+/// the address of a static of this copy. Two copies in one process hold
+/// their statics at different addresses, so their bases differ except
+/// with probability 2^-32 (the module). No clock or process id: an
+/// address is what tells copies apart, and it is read without a system
+/// call, as Miri's isolation requires.
+pub(crate) fn copy_base() -> u32 {
+    static BASE: OnceLock<u32> = OnceLock::new();
+    *BASE.get_or_init(|| {
+        static ANCHOR: u8 = 0;
+        let address = core::ptr::from_ref(&ANCHOR).addr() as u64;
+        nonzero(mix(address))
+    })
+}
+
+/// SplitMix64's finalizer: every input bit reaches every output bit.
+const fn mix(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// The high 32 bits of `value`, or 1 if they are 0.
+const fn nonzero(value: u64) -> u32 {
+    match (value >> 32) as u32 {
+        0 => 1,
+        high => high,
+    }
+}
+
 impl<T> Table<T> {
-    /// A table of `capacity` slots, at most [`MAX_CAPACITY`].
+    /// A table of `capacity` slots, at most [`MAX_CAPACITY`], at this
+    /// copy's base generation.
     pub(crate) fn new(kind: Kind, capacity: u32) -> Self {
+        Self::with_base(kind, capacity, copy_base())
+    }
+
+    /// A table whose slots start at generation `base` (never 0).
+    pub(crate) fn with_base(kind: Kind, capacity: u32, base: u32) -> Self {
+        let base = base.max(1);
         let capacity = capacity.min(MAX_CAPACITY);
         let slots = (0..capacity)
             .map(|_| Slot {
                 entry: Mutex::new(None),
-                generation: AtomicU32::new(1),
+                generation: AtomicU32::new(base),
                 holder: AtomicU64::new(NO_THREAD),
             })
             .collect();
@@ -200,6 +246,7 @@ impl<T> Table<T> {
         let free = (0..capacity).rev().collect();
         Self {
             kind,
+            base,
             slots,
             free: Mutex::new(free),
         }
@@ -431,12 +478,14 @@ impl<T> Table<T> {
     }
 
     /// Ends `handle` in its taken slot: takes its object, moves the
-    /// generation on, clears a poison and frees the slot; a slot whose
-    /// generation cannot grow is retired, never reused.
+    /// generation on (skipping 0), clears a poison and frees the slot; a
+    /// slot whose next generation would be the base again has used all
+    /// 2^32 - 1 and is retired, never reused.
     fn close(&self, slot: &Slot<T>, handle: Handle, taken: Taken<'_, T>) -> Result<T, Status> {
         let (mut entry, poisoned) = taken;
         let value = entry.take().ok_or(Status::Closed)?;
-        let next = handle.generation().checked_add(1);
+        let next =
+            Some(handle.generation().checked_add(1).unwrap_or(1)).filter(|next| *next != self.base);
         if let Some(next) = next {
             slot.generation.store(next, Ordering::Release);
         }
