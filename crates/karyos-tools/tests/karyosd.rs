@@ -67,6 +67,16 @@ impl Daemon {
 
 /// Starts `karyosd` on `dir` with one stream and `linger`.
 fn start(dir: &Path, linger: &str) -> Daemon {
+    start_with(dir, linger, &[])
+}
+
+/// As [`start`], with `extra` arguments.
+fn start_with(dir: &Path, linger: &str, extra: &[&str]) -> Daemon {
+    start_logging(dir, linger, extra, Stdio::null())
+}
+
+/// As [`start_with`], its log on `stderr`.
+fn start_logging(dir: &Path, linger: &str, extra: &[&str], stderr: Stdio) -> Daemon {
     let child = Command::new(env!("CARGO_BIN_EXE_karyosd"))
         .arg("--dir")
         .arg(dir)
@@ -80,9 +90,10 @@ fn start(dir: &Path, linger: &str) -> Daemon {
             "--log-level",
             "warn",
         ])
+        .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .unwrap();
     Daemon(child)
@@ -195,4 +206,191 @@ fn karyosd_exits_2_on_a_startup_error() {
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.starts_with("karyosd: "), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--network on`: through two `karyosd` processes, a client of one creates
+/// a `karyos:udp` subscription and a client of the other an exclusive
+/// publication, by URI, on loopback, and the subscriber reads what the
+/// publisher offers (SPEC §10). Without the flag a network subscription is
+/// refused: the daemon runs no network agents.
+#[test]
+fn karyosd_with_the_network_carries_a_udp_pair() {
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+
+    use karyos_client::{Client, Context, MessageLimit, OfferError, StreamId};
+
+    let port = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let context = |dir: &Path| {
+        Context::builder()
+            .dir(dir)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+    };
+    let (receiving, sending) = (dir("network-rx"), dir("network-tx"));
+    let mut receiver = start_with(&receiving, "1s", &["--network", "on"]);
+    let mut sender = start_with(&sending, "1s", &["--network", "on"]);
+    drop(attach_when_ready(&receiving));
+    drop(attach_when_ready(&sending));
+    let mut subscriber = Client::connect(context(&receiving)).unwrap();
+    let mut publisher = Client::connect(context(&sending)).unwrap();
+    let mut reading = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    let mut publication = publisher
+        .add_exclusive_publication(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    // The image joins where it attaches: offers before it are not seen.
+    let began = Instant::now();
+    while reading.image_count() == 0 {
+        assert!(began.elapsed() < Duration::from_secs(20), "no image");
+        let _ = (subscriber.poll(), publisher.poll());
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (mut sent, mut seen) = (0u32, 0u32);
+    while seen < 16 {
+        assert!(began.elapsed() < Duration::from_secs(30), "seen {seen}");
+        let _ = (subscriber.poll(), publisher.poll());
+        while sent < 16 {
+            match publication.offer(&sent.to_le_bytes()) {
+                Ok(_) => sent += 1,
+                Err(
+                    OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected,
+                ) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let _ = reading
+            .poll(
+                |bytes, _| {
+                    assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                    seen += 1;
+                },
+                MessageLimit::new(16),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop((reading, publication, subscriber, publisher));
+    for daemon in [&mut receiver, &mut sender] {
+        daemon.terminate();
+        assert_eq!(daemon.wait(Duration::from_secs(10)).code(), Some(0));
+    }
+    // Off, the default: a network subscription is refused.
+    let dir = self::dir("no-network");
+    let mut daemon = start(&dir, "1s");
+    drop(attach_when_ready(&dir));
+    let mut client = Client::connect(context(&dir)).unwrap();
+    assert!(
+        client
+            .add_subscription(
+                &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+                StreamId::new(7),
+            )
+            .is_err()
+    );
+    drop(client);
+    daemon.terminate();
+    assert_eq!(daemon.wait(Duration::from_secs(10)).code(), Some(0));
+}
+
+/// M3b: with the network on, `karyosd` logs an endpoint's capabilities
+/// when it first appears: one line naming every capability and its state.
+#[test]
+fn karyosd_logs_an_endpoints_capabilities_when_it_appears() {
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+
+    use karyos_client::{Client, Context, StreamId};
+
+    let port = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dir = dir("capabilities");
+    let log = std::env::temp_dir().join(format!("karyosd-{}-capabilities.log", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    let mut daemon = start_logging(
+        &dir,
+        "1s",
+        &["--network", "on", "--log-level", "info"],
+        Stdio::from(file),
+    );
+    drop(attach_when_ready(&dir));
+    let context = Context::builder()
+        .dir(&dir)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut client = Client::connect(context).unwrap();
+    let reading = client
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    let began = Instant::now();
+    let line = loop {
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "no capability log"
+        );
+        let _ = client.poll();
+        let text = std::fs::read_to_string(&log).unwrap();
+        if let Some(line) = text
+            .lines()
+            .find(|line| line.contains("endpoint capabilities"))
+        {
+            break line.to_owned();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for capability in [
+        "epoch=1",
+        "platform=linux",
+        "copy_mode=staged",
+        "queue_assignment=kernel_selected",
+        "max_datagram=",
+        "observation_points=",
+        "clock_granularity=",
+        "send_buffer_bytes=",
+        "recv_buffer_bytes=",
+        "dont_fragment=",
+        "tx_batch=",
+        "rx_batch=",
+        "gso=unavailable(library_api)",
+        "gro=",
+        "kernel_stamps=",
+        "hardware_stamps=",
+        "busy_poll=",
+        "user_observations=active",
+        "send_buffer=",
+        "recv_buffer=",
+    ] {
+        assert!(line.contains(capability), "{capability} not in {line}");
+    }
+    drop((reading, client));
+    daemon.terminate();
+    assert_eq!(daemon.wait(Duration::from_secs(10)).code(), Some(0));
+    // Logged once: the endpoint did not reopen.
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("endpoint capabilities"))
+            .count(),
+        1,
+        "{text}"
+    );
+    let _ = std::fs::remove_file(&log);
 }

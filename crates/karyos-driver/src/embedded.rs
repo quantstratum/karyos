@@ -4020,6 +4020,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     self.build_network_view(slot, endpoint, exposed.as_ref());
                     // Its receiver journals, while the receiver has a hook.
                     self.open_image_journals(slot);
+                    // Its loss counts' cells (M2b), keyed by its stream: an
+                    // unexposed image has no stream a tool could show.
+                    if let Some(handle) = &exposed
+                        && let Some(cells) = stream_network_cells(
+                            &mut self.counters,
+                            handle.registration(),
+                            &crate::agents::IMAGE_CELLS,
+                        )
+                        && let Some(net) = &self.net
+                    {
+                        let _ = net.post_image_cells(slot, cells);
+                    }
                     if let Some(handle) = exposed {
                         self.announce_image(endpoint, &handle, true);
                     }
@@ -4085,6 +4097,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         if let Some(net) = &mut self.net {
             net.return_image_events(events);
+            // The cells of removed publications and retired images (M2b),
+            // freed at once so no tool shows a stale count.
+            for cell in net.take_cells() {
+                self.counters.free(cell);
+            }
         }
     }
 
@@ -4269,6 +4286,36 @@ fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), Dri
         guarded.note_guard_abort(position);
     }
     Ok(())
+}
+
+/// The CnC cells of one network publication or image (M2b), keyed by
+/// its stream's `registration`, all or none: when the region has no room
+/// for one of them, those already allocated are freed, `counters
+/// unavailable` is counted once, and the stream runs without cells (its
+/// counts stay in process). It is not tried again later.
+pub(crate) fn stream_network_cells(
+    counters: &mut DriverCounters,
+    registration: u64,
+    labels: &[&str],
+) -> Option<crate::agents::AgentCells> {
+    let keys = CounterKeys {
+        stream: registration,
+        ..CounterKeys::DRIVER
+    };
+    let mut cells = Vec::with_capacity(labels.len());
+    for label in labels {
+        // The first refusal is counted; nothing more is asked.
+        let Some(cell) = counters.allocate_keyed(TYPE_EVENTS, label, keys) else {
+            for cell in cells {
+                counters.free(cell);
+            }
+            return None;
+        };
+        cells.push(cell);
+    }
+    Some(crate::agents::AgentCells::new(
+        cells.into_iter().map(Some).collect(),
+    ))
 }
 
 /// The network agents' driver-wide CnC cells (`quantstratum-docs:
@@ -5118,3 +5165,52 @@ mod aggregate_subscriber_tests;
 mod aggregate_tests;
 #[cfg(test)]
 mod initial_term_id_tests;
+
+/// M2b: a stream's cells are allocated all or none.
+#[cfg(test)]
+mod stream_cells_tests {
+    #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+
+    use karyos_sys::counters::CellRead;
+
+    use super::*;
+    use crate::counters::{Event, FIXED_COUNTERS};
+
+    fn allocated(counters: &DriverCounters) -> usize {
+        let reader = counters.reader();
+        (0..reader.capacity())
+            .filter(|&index| matches!(reader.read(index), CellRead::Allocated { .. }))
+            .count()
+    }
+
+    /// With room for three cells, a publication's four are refused whole:
+    /// the three taken are freed, `counters unavailable` counts one, and
+    /// the region holds what it held. With room, all four are keyed by the
+    /// stream's registration.
+    #[test]
+    fn a_full_region_refuses_the_whole_group_once() {
+        let labels = &crate::agents::PUBLICATION_CELLS;
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 3).unwrap();
+        let before = allocated(&counters);
+        assert!(stream_network_cells(&mut counters, 7, labels).is_none());
+        assert_eq!(allocated(&counters), before);
+        assert_eq!(counters.value(Event::CountersUnavailable), 1);
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 4).unwrap();
+        let mut cells = stream_network_cells(&mut counters, 7, labels).unwrap();
+        assert_eq!(counters.value(Event::CountersUnavailable), 0);
+        let reader = counters.reader();
+        let keyed: Vec<_> = (0..reader.capacity())
+            .filter_map(|index| match reader.read(index) {
+                CellRead::Allocated { metadata, .. } if metadata.keys.stream == 7 => {
+                    Some(String::from_utf8(metadata.label().to_vec()).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keyed, labels);
+        for cell in cells.take() {
+            counters.free(cell);
+        }
+        assert_eq!(allocated(&counters), before);
+    }
+}

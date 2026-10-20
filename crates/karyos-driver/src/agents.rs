@@ -611,6 +611,19 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// The journal the conductor created.
         journal: karyos_protocol::trace_hook::NetJournal,
     },
+    /// Keep `cells` for the installed image at `slot` and store its loss
+    /// counts in them (M2b). No reply: the unit is released. Cells still in
+    /// this command when the network closes, or for an image retired
+    /// meanwhile, are dropped and left pending release, which the
+    /// allocator reuses.
+    AttachImageCells {
+        /// The reply's slot, unused.
+        reply: Reservation,
+        /// The installed slot.
+        slot: crate::sessions::receive::SlotRef,
+        /// Its cells, in `IMAGE_CELLS` order.
+        cells: AgentCells,
+    },
     /// Close journal `number`, of `lane` of `publication`. Answer
     /// [`AgentEvent::NetworkJournalClosed`]. The number, not the
     /// publication and lane, names the journal, so a stale close never
@@ -989,7 +1002,8 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                 | AgentCommand::AddPublishedAlias { .. }
                 | AgentCommand::SetNetworkTrace { .. }
                 | AgentCommand::OpenNetworkJournal { .. }
-                | AgentCommand::CloseNetworkJournal { .. }) => {
+                | AgentCommand::CloseNetworkJournal { .. }
+                | AgentCommand::AttachImageCells { .. }) => {
                     if let Some((reply, event)) = role(command)
                         && self.reply(reply, event)?
                     {
@@ -1065,6 +1079,23 @@ pub(crate) const SENDER_CELLS: [&str; 5] = [
     "heartbeats sent",
 ];
 
+/// A network publication's counters in the CnC, in [`AgentCells`] order
+/// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
+/// M2b), keyed by its stream's registration: datagrams and their bytes
+/// staged for sending (PAD and ABORTED records included), repair
+/// datagrams submitted, and NAKs received.
+pub(crate) const PUBLICATION_CELLS: [&str; 4] = [
+    "network frames sent",
+    "network bytes sent",
+    "network retransmits",
+    "network naks received",
+];
+
+/// A network image's counters in the CnC (M2b), keyed by its stream's
+/// registration: NAKs sent, losses detected, losses repaired.
+pub(crate) const IMAGE_CELLS: [&str; 3] =
+    ["network naks sent", "network losses", "network repaired"];
+
 /// The receiver's system counters in the CnC, in [`AgentCells`] order:
 /// datagrams read, dropped by the backend and not decoded, SMs sent, and
 /// images retired at their liveness timeout.
@@ -1134,10 +1165,14 @@ impl AgentCells {
     }
 
     /// Stores each count that changed into its cell.
-    fn publish(&mut self, values: &[u64]) {
+    pub(crate) fn publish(&mut self, values: &[u64]) {
         for ((cell, stored), &value) in self.cells.iter().zip(&mut self.stored).zip(values) {
             if *stored != value {
                 if let Some(cell) = cell {
+                    // `set` (a swap), never a plain store: value updates
+                    // must extend the reset's release sequence, or a reader
+                    // could take a reused cell's old metadata with its new
+                    // value (karyos-sys counters.rs:18-22).
                     cell.set(value);
                 }
                 *stored = value;
@@ -1145,8 +1180,13 @@ impl AgentCells {
         }
     }
 
+    /// The values last stored, in label order.
+    pub(crate) fn stored(&self) -> &[u64] {
+        &self.stored
+    }
+
     /// Hands every cell back, for the conductor to free.
-    fn take(&mut self) -> impl Iterator<Item = Counter> + '_ {
+    pub(crate) fn take(&mut self) -> impl Iterator<Item = Counter> + '_ {
         self.stored.clear();
         self.cells.drain(..).flatten()
     }
@@ -1279,6 +1319,7 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         let result = self.duty(now);
         self.cells.publish(&sender_values(&self.role.counters()));
+        self.role.publish_stream_cells();
         result
     }
 
@@ -1347,6 +1388,7 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         let result = self.duty(now);
         self.cells.publish(&receiver_values(&self.role.counters()));
+        self.role.publish_stream_cells();
         result
     }
 
@@ -1439,11 +1481,16 @@ impl<O: SocketOps, T: StreamTerms> NetworkAgents<O, T> {
     /// Takes both agents' cells back (after a stop), for the conductor to
     /// free.
     pub(crate) fn take_cells(&mut self) -> Vec<Counter> {
-        self.sender
+        let mut cells: Vec<Counter> = self
+            .sender
             .cells
             .take()
             .chain(self.receiver.cells.take())
-            .collect()
+            .collect();
+        // The cells of the publications and images still held (M2b).
+        self.sender.role.take_stream_cells(&mut cells);
+        self.receiver.role.take_stream_cells(&mut cells);
+        cells
     }
 
     /// One iteration: the receiver's duty cycle, then the sender's.

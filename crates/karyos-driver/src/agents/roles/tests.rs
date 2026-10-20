@@ -1245,6 +1245,7 @@ fn installed_image_with(
             pending: None,
         }],
         closing: None,
+        cells: None,
         gate: None,
         tail_since: [None; 4],
         reset_requested: None,

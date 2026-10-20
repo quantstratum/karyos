@@ -213,13 +213,13 @@ fn a_remote_client_closes_and_reopens_a_guard_for_an_operator() {
         done.remove(0).outcome
     };
     let sequence = client
-        .guard_reopen(guard.id(), 1, 40, 1000, b"start of day")
+        .guard_reopen(guard.id(), 1, 40, Some(1000), b"start of day")
         .unwrap();
     assert!(matches!(
         complete(&mut driver, &mut client, sequence),
         Outcome::GuardState { guard: g, state: GuardState { epoch: 2, open: true } } if g == guard.id()
     ));
-    let sequence = client.guard_close(guard.id(), 41, 1000, b"").unwrap();
+    let sequence = client.guard_close(guard.id(), 41, Some(1000), b"").unwrap();
     assert!(matches!(
         complete(&mut driver, &mut client, sequence),
         Outcome::GuardState {
@@ -231,7 +231,7 @@ fn a_remote_client_closes_and_reopens_a_guard_for_an_operator() {
         }
     ));
     // A stale reopen: refused with the current word (epoch 3, closed).
-    let sequence = client.guard_reopen(guard.id(), 1, 42, 0, b"").unwrap();
+    let sequence = client.guard_reopen(guard.id(), 1, 42, None, b"").unwrap();
     assert!(matches!(
         complete(&mut driver, &mut client, sequence),
         Outcome::Refused {
@@ -240,7 +240,7 @@ fn a_remote_client_closes_and_reopens_a_guard_for_an_operator() {
         }
     ));
     assert_eq!(
-        client.guard_reopen(guard.id(), 2, 43, 0, b""),
+        client.guard_reopen(guard.id(), 2, 43, None, b""),
         Err(karyos_client::ConductorError::InvalidGuardEpoch)
     );
     let audit: Vec<_> = driver
@@ -263,7 +263,11 @@ fn a_remote_client_closes_and_reopens_a_guard_for_an_operator() {
                 digest(guard.id(), 1, 40, 1000, b"start of day")
             ),
             (41, operator, digest(guard.id(), 0, 41, 1000, b"")),
-            (42, Requester::Client(id), digest(guard.id(), 1, 42, 0, b"")),
+            (
+                42,
+                Requester::Client(id),
+                digest(guard.id(), 1, 42, karyos_protocol::cnc::NO_OPERATOR, b"")
+            ),
         ]
     );
     drop(client);

@@ -250,6 +250,8 @@ pub struct OutboundCounters {
     pub staged: u64,
     /// Canonical PAD or ABORTED records staged.
     pub records: u64,
+    /// Bytes of the datagrams and records staged (M2b).
+    pub bytes: u64,
     /// Datagrams the backend submitted.
     pub submitted: u64,
     /// Calls in which a head was returned or of unknown exposure.
@@ -355,6 +357,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     removal: Option<Box<removal::Removal>>,
     /// A timed publication's schedule ([`Outbound::set_timed`]).
     timed: Option<Box<Timed>>,
+    /// Its counters' CnC cells (M2b), when the region had room for them:
+    /// the sender agent is their only writer.
+    cells: Option<crate::agents::AgentCells>,
 }
 
 /// The guard of a guarded publication, as the conductor hands it to the
@@ -549,7 +554,45 @@ impl<T: StreamTerms> Outbound<T> {
             idle_since: [None; 4],
             removal: None,
             timed: None,
+            cells: None,
         })
+    }
+
+    /// With its counters' CnC cells, in `PUBLICATION_CELLS` order (M2b).
+    pub(crate) fn set_cells(&mut self, cells: crate::agents::AgentCells) {
+        self.cells = Some(cells);
+    }
+
+    /// Hands its cells back, for the conductor to free (M2b).
+    pub(crate) fn take_cells(&mut self) -> Option<crate::agents::AgentCells> {
+        self.cells.take()
+    }
+
+    /// Stores its counts that changed into its CnC cells, at the end of
+    /// the sender's duty cycle (M2b).
+    pub(crate) fn publish_cells(&mut self) {
+        let Some(cells) = self.cells.as_mut() else {
+            return;
+        };
+        let counters = &self.counters;
+        let repair = self
+            .repair
+            .as_deref()
+            .map(RepairPath::counts)
+            .unwrap_or_default();
+        // Every NAK the repair path took in, whatever became of it.
+        let naks = [repair.jobs_joined, repair.lingering, repair.jobs_full]
+            .into_iter()
+            .try_fold(repair.jobs_created, u64::checked_add);
+        let frames = counters.staged.checked_add(counters.records);
+        // A sum past `u64::MAX` keeps the last value stored; no allocation
+        // on the duty cycle.
+        let counts = [frames, Some(counters.bytes), Some(repair.submitted), naks];
+        let mut values = [0; crate::agents::PUBLICATION_CELLS.len()];
+        for ((value, count), stored) in values.iter_mut().zip(counts).zip(cells.stored()) {
+            *value = count.unwrap_or(*stored);
+        }
+        cells.publish(&values);
     }
 
     /// The endpoint it sends on.
@@ -1829,6 +1872,7 @@ impl<T: StreamTerms> Outbound<T> {
                 },
                 1,
             );
+            self.counters.bump(|c| &mut c.bytes, u64::from(len16));
             staged = staged.checked_add(1).ok_or(overflow.clone())?;
         }
         Ok(staged)

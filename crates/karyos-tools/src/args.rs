@@ -9,6 +9,14 @@
 //! (powers of 1024). Durations are an integer followed by `ns`, `us`, `ms`
 //! or `s`. Values are checked here only for their syntax and range; the
 //! driver validates the configuration as a whole when it starts.
+//!
+//! `--network on` gives the driver `NetworkConfig::default()`: the network
+//! agents on their own threads, so clients create `karyos:udp`
+//! publications and subscriptions by URI, whose `term-length`, `mtu` and
+//! `lanes` keys override the stream defaults. The rest of the network
+//! configuration is not on the command line yet: the agents' rings and
+//! session limits, the threading mode, the image template, the stream
+//! defaults, the NAK control groups and the per-client limit.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -64,6 +72,11 @@ Diagnostics:
   --loss-report-records <n>         records of the loss report [256]
   --error-dedup-window <duration>   window that merges a repeated error [1s]
   --log-level <level>               error, warn, info, debug or trace [info]
+
+Network:
+  --network <on|off>                run the network agents, so clients create karyos:udp
+                                    publications and subscriptions by URI, with the
+                                    driver's default network configuration [off]
 
 Streams:
   --stream <stream_id>:<session_id> configure a stream at start; repeatable
@@ -335,6 +348,7 @@ const OPTIONS: &[&str] = &[
     "--loss-report-records",
     "--error-dedup-window",
     "--log-level",
+    "--network",
     "--stream",
     "--term-length",
     "--mtu",
@@ -391,6 +405,13 @@ fn apply(options: &mut Options, option: &str, value: &str) -> Option<()> {
         "--loss-report-records" => driver.loss_report_records = count(value)?,
         "--error-dedup-window" => driver.error_dedup_window = nanos(value)?,
         "--log-level" => options.log_level = level(value)?,
+        "--network" => {
+            driver.network = match value {
+                "on" => Some(karyos_driver::net::NetworkConfig::default()),
+                "off" => None,
+                _ => return None,
+            };
+        }
         "--stream" => options.streams.push(stream(value)?),
         "--term-length" => terms.term_length = u32::try_from(size(value)?).ok()?,
         "--mtu" => terms.mtu = value.parse().ok()?,
@@ -646,6 +667,21 @@ mod tests {
         assert_eq!(parsed.log_level, LogLevel::Debug);
     }
 
+    /// `--network on` runs the network agents with the driver's default
+    /// network configuration; `off`, the default, runs none.
+    #[test]
+    fn the_network_is_off_unless_turned_on() {
+        let base = ["--dir", "/d"];
+        assert_eq!(options(&base).driver.network, None);
+        let on = options(&[base[0], base[1], "--network", "on"]);
+        assert_eq!(
+            on.driver.network,
+            Some(karyos_driver::net::NetworkConfig::default())
+        );
+        let off = options(&[base[0], base[1], "--network=on", "--network", "off"]);
+        assert_eq!(off.driver.network, None);
+    }
+
     #[test]
     fn help_is_recognised_in_both_spellings() {
         assert_eq!(run(&["--help"]), Ok(Command::Help));
@@ -688,6 +724,7 @@ mod tests {
             ("--stream", "10"),
             ("--stream", "10:x"),
             ("--log-level", "loud"),
+            ("--network", "yes"),
         ] {
             assert_eq!(
                 run(&["--dir", "/d", option, value]),
