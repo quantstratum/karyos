@@ -477,6 +477,11 @@ release may break APIs, wire formats and shared-memory layouts.
   (`KARYOS_E_CLAIM_OUTSTANDING`). Closing a client closes its publications
   and their claims, all or nothing: while one is in use nothing closes.
   Tests over an embedded driver run under Miri and on macOS.
+- `karyos-ffi` handle tables: a stale handle no longer touches its slot's
+  mutex. Its slot's generation is now an atomic checked first, and a close
+  moves it on at once, so a stale handle answers `KARYOS_E_CLOSED` and
+  never makes a live handle's call on another thread answer
+  `KARYOS_E_BUSY` (seen as a flake when the tests share the tables).
 - `karyos-ffi` clients (batch F2): `karyos_client_options_init`,
   `karyos_client_connect`, `karyos_client_poll` and `karyos_client_close`,
   with the sized `karyos_client_options` (copied, nothing consumed) and

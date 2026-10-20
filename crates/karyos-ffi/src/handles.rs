@@ -17,8 +17,8 @@
 //! never reused.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, TryLockError};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use crate::status::Status;
 
@@ -115,20 +115,20 @@ fn thread_token() -> u64 {
     })
 }
 
-/// A slot's state under its mutex.
-#[derive(Debug)]
-struct Entry<T> {
-    /// The generation of the handle that names the object; 0 while the
-    /// slot has never held one.
-    generation: u32,
-    /// The object, while the handle is open.
-    value: Option<T>,
-}
-
-/// A slot: its entry, and the token of the thread holding it.
+/// A slot: its object under a mutex, the generation of the handle that
+/// names it, and the token of the thread holding it.
+///
+/// The generation is an atomic read before the mutex is tried, so a stale
+/// handle answers [`Status::Closed`] without touching the mutex: it never
+/// makes a live handle's call on another thread answer [`Status::Busy`].
+/// A close moves it on at once (a slot whose generation cannot grow is
+/// retired), and a create hands out the slot's current one.
 #[derive(Debug)]
 struct Slot<T> {
-    entry: Mutex<Entry<T>>,
+    entry: Mutex<Option<T>>,
+    /// The generation of the slot's next or current handle; never 0. It
+    /// changes only under the mutex.
+    generation: AtomicU32,
     holder: AtomicU64,
 }
 
@@ -142,6 +142,9 @@ impl Drop for Held<'_> {
         self.holder.store(NO_THREAD, Ordering::Release);
     }
 }
+
+/// A slot taken by a close: its object, and whether a panic poisoned it.
+type Taken<'a, T> = (MutexGuard<'a, Option<T>>, bool);
 
 /// A bounded table of one kind of object.
 #[derive(Debug)]
@@ -158,10 +161,8 @@ impl<T> Table<T> {
         let capacity = capacity.min(MAX_CAPACITY);
         let slots = (0..capacity)
             .map(|_| Slot {
-                entry: Mutex::new(Entry {
-                    generation: 0,
-                    value: None,
-                }),
+                entry: Mutex::new(None),
+                generation: AtomicU32::new(1),
                 holder: AtomicU64::new(NO_THREAD),
             })
             .collect();
@@ -203,20 +204,15 @@ impl<T> Table<T> {
             return Err((Status::Internal, value));
         };
         // A free slot holds no object, so it is held only for the moment a
-        // use of a stale handle compares generations, never across a
-        // callback: waiting for it is short. Its mutex is not poisoned (a
-        // close clears the poison of the handle it ends), but a poisoned
-        // one would hold no object either.
+        // racing use of its previous handle compares generations, never
+        // across a callback: waiting for it is short. Its mutex is not
+        // poisoned (a close clears the poison of the handle it ends).
         let mut entry = slot
             .entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A free slot's generation is below u32::MAX (see remove).
-        let Some(generation) = entry.generation.checked_add(1) else {
-            return Err((Status::Internal, value));
-        };
-        entry.generation = generation;
-        entry.value = Some(value);
+        *entry = Some(value);
+        let generation = slot.generation.load(Ordering::Acquire);
         Ok(Handle::new(self.kind, index, generation))
     }
 
@@ -229,28 +225,21 @@ impl<T> Table<T> {
     /// thread holds the slot, [`Status::Reentrant`] while this thread does,
     /// [`Status::Internal`] after a panic poisoned it.
     pub(crate) fn with<R>(&self, handle: Handle, f: impl FnOnce(&mut T) -> R) -> Result<R, Status> {
-        let slot = self.check(handle)?;
+        let slot = self.current(handle)?;
         let mut entry = match slot.entry.try_lock() {
             Ok(entry) => entry,
-            // Poisoned: a stale handle is still only closed.
-            Err(TryLockError::Poisoned(poisoned)) => {
-                let entry = poisoned.into_inner();
-                return Err(if entry.generation == handle.generation() {
-                    Status::Internal
-                } else {
-                    Status::Closed
-                });
-            }
-            Err(TryLockError::WouldBlock) => return Err(Self::contended(slot)),
+            Err(TryLockError::Poisoned(_)) => return Err(Self::poisoned(slot, handle)),
+            Err(TryLockError::WouldBlock) => return Err(Self::contended(slot, handle)),
         };
         let _held = Held {
             holder: &slot.holder,
         };
         slot.holder.store(thread_token(), Ordering::Release);
-        if entry.generation != handle.generation() {
+        // Closed between the check and the lock.
+        if slot.generation.load(Ordering::Acquire) != handle.generation() {
             return Err(Status::Closed);
         }
-        let value = entry.value.as_mut().ok_or(Status::Closed)?;
+        let value = entry.as_mut().ok_or(Status::Closed)?;
         Ok(f(value))
     }
 
@@ -261,30 +250,9 @@ impl<T> Table<T> {
     ///
     /// As [`Table::with`], except that a poisoned slot is not an error.
     pub(crate) fn remove(&self, handle: Handle) -> Result<T, Status> {
-        let slot = self.check(handle)?;
-        let (mut entry, poisoned) = match slot.entry.try_lock() {
-            Ok(entry) => (entry, false),
-            Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), true),
-            Err(TryLockError::WouldBlock) => return Err(Self::contended(slot)),
-        };
-        // A stale handle closes nothing, and leaves the poison of the
-        // live handle that reused its slot.
-        if entry.generation != handle.generation() {
-            return Err(Status::Closed);
-        }
-        let value = entry.value.take().ok_or(Status::Closed)?;
-        if poisoned {
-            slot.entry.clear_poison();
-        }
-        // The next handle of the slot gets the next generation; a slot
-        // whose generation cannot grow is retired, never reused.
-        let reusable = entry.generation < u32::MAX;
-        drop(entry);
-        if reusable {
-            let mut free = self.free.lock().map_err(|_| Status::Internal)?;
-            free.push(handle.index());
-        }
-        Ok(value)
+        let slot = self.current(handle)?;
+        let taken = Self::take(slot, handle)?;
+        self.close(slot, handle, taken)
     }
 
     /// Closes `handle` after `before` succeeded on its object, holding
@@ -300,32 +268,16 @@ impl<T> Table<T> {
         handle: Handle,
         before: impl FnOnce(&mut T) -> Result<R, Status>,
     ) -> Result<(T, R), Status> {
-        let slot = self.check(handle)?;
-        let (mut entry, poisoned) = match slot.entry.try_lock() {
-            Ok(entry) => (entry, false),
-            Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), true),
-            Err(TryLockError::WouldBlock) => return Err(Self::contended(slot)),
-        };
-        let _held = Held {
+        let slot = self.current(handle)?;
+        let (mut entry, poisoned) = Self::take(slot, handle)?;
+        let held = Held {
             holder: &slot.holder,
         };
         slot.holder.store(thread_token(), Ordering::Release);
-        if entry.generation != handle.generation() {
-            return Err(Status::Closed);
-        }
-        let value = entry.value.as_mut().ok_or(Status::Closed)?;
+        let value = entry.as_mut().ok_or(Status::Closed)?;
         let done = before(value)?;
-        let value = entry.value.take().ok_or(Status::Closed)?;
-        if poisoned {
-            slot.entry.clear_poison();
-        }
-        let reusable = entry.generation < u32::MAX;
-        drop(entry);
-        if reusable {
-            let mut free = self.free.lock().map_err(|_| Status::Internal)?;
-            free.push(handle.index());
-        }
-        Ok((value, done))
+        drop(held);
+        Ok((self.close(slot, handle, (entry, poisoned))?, done))
     }
 
     /// Closes every handle of `handles`, all or none: when one is held by
@@ -340,42 +292,71 @@ impl<T> Table<T> {
             if handles.get(..at).is_some_and(|seen| seen.contains(&handle)) {
                 continue;
             }
-            let Ok(slot) = self.check(handle) else {
+            let Ok(slot) = self.current(handle) else {
                 continue;
             };
-            let (entry, poisoned) = match slot.entry.try_lock() {
-                Ok(entry) => (entry, false),
-                Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), true),
-                Err(TryLockError::WouldBlock) => return Err(Self::contended(slot)),
-            };
-            if entry.generation == handle.generation() && entry.value.is_some() {
-                taken.push((handle, slot, entry, poisoned));
+            match Self::take(slot, handle) {
+                Ok(held) => taken.push((handle, slot, held)),
+                Err(Status::Closed) => {}
+                Err(status) => return Err(status),
             }
         }
         let mut values = Vec::with_capacity(taken.len());
-        let mut freed = Vec::with_capacity(taken.len());
-        for (handle, slot, mut entry, poisoned) in taken {
-            if let Some(value) = entry.value.take() {
-                values.push(value);
-            }
-            if poisoned {
-                slot.entry.clear_poison();
-            }
-            if entry.generation < u32::MAX {
-                freed.push(handle.index());
-            }
+        for (handle, slot, held) in taken {
+            values.push(self.close(slot, handle, held)?);
         }
-        let mut free = self.free.lock().map_err(|_| Status::Internal)?;
-        free.extend(freed);
         Ok(values)
     }
 
-    /// The slot `handle` names, if it is one of this table.
-    fn check(&self, handle: Handle) -> Result<&Slot<T>, Status> {
+    /// The slot `handle` names, if it is one of this table and its handle
+    /// is current: a stale handle answers [`Status::Closed`] without
+    /// touching the slot's mutex.
+    fn current(&self, handle: Handle) -> Result<&Slot<T>, Status> {
         if handle.generation() == 0 || handle.kind() != self.kind as u64 {
             return Err(Status::InvalidHandle);
         }
-        self.slot(handle.index())
+        let slot = self.slot(handle.index())?;
+        if slot.generation.load(Ordering::Acquire) != handle.generation() {
+            return Err(Status::Closed);
+        }
+        Ok(slot)
+    }
+
+    /// Takes `handle`'s slot for a close, poisoned or not; the handle is
+    /// still current and its slot holds an object.
+    fn take<'a>(slot: &'a Slot<T>, handle: Handle) -> Result<Taken<'a, T>, Status> {
+        let (entry, poisoned) = match slot.entry.try_lock() {
+            Ok(entry) => (entry, false),
+            Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), true),
+            Err(TryLockError::WouldBlock) => return Err(Self::contended(slot, handle)),
+        };
+        // A stale handle closes nothing, and leaves the poison of the
+        // live handle that reused its slot.
+        if slot.generation.load(Ordering::Acquire) != handle.generation() || entry.is_none() {
+            return Err(Status::Closed);
+        }
+        Ok((entry, poisoned))
+    }
+
+    /// Ends `handle` in its taken slot: takes its object, moves the
+    /// generation on, clears a poison and frees the slot; a slot whose
+    /// generation cannot grow is retired, never reused.
+    fn close(&self, slot: &Slot<T>, handle: Handle, taken: Taken<'_, T>) -> Result<T, Status> {
+        let (mut entry, poisoned) = taken;
+        let value = entry.take().ok_or(Status::Closed)?;
+        let next = handle.generation().checked_add(1);
+        if let Some(next) = next {
+            slot.generation.store(next, Ordering::Release);
+        }
+        if poisoned {
+            slot.entry.clear_poison();
+        }
+        drop(entry);
+        if next.is_some() {
+            let mut free = self.free.lock().map_err(|_| Status::Internal)?;
+            free.push(handle.index());
+        }
+        Ok(value)
     }
 
     /// The slot at `index`.
@@ -384,12 +365,25 @@ impl<T> Table<T> {
         self.slots.get(index).ok_or(Status::InvalidHandle)
     }
 
-    /// Why a held slot cannot be taken: this thread holds it, or another.
-    fn contended(slot: &Slot<T>) -> Status {
-        if slot.holder.load(Ordering::Acquire) == thread_token() {
+    /// Why `handle`'s held slot cannot be taken: closed meanwhile, or held
+    /// by this thread or another.
+    fn contended(slot: &Slot<T>, handle: Handle) -> Status {
+        if slot.generation.load(Ordering::Acquire) != handle.generation() {
+            Status::Closed
+        } else if slot.holder.load(Ordering::Acquire) == thread_token() {
             Status::Reentrant
         } else {
             Status::Busy
+        }
+    }
+
+    /// What a poisoned slot answers `handle`: poisoned if current, closed
+    /// if not.
+    fn poisoned(slot: &Slot<T>, handle: Handle) -> Status {
+        if slot.generation.load(Ordering::Acquire) == handle.generation() {
+            Status::Internal
+        } else {
+            Status::Closed
         }
     }
 
@@ -397,10 +391,8 @@ impl<T> Table<T> {
     /// the last one.
     #[cfg(test)]
     fn set_generation(&self, index: u32, generation: u32) {
-        if let Ok(slot) = self.slot(index)
-            && let Ok(mut entry) = slot.entry.lock()
-        {
-            entry.generation = generation;
+        if let Ok(slot) = self.slot(index) {
+            slot.generation.store(generation, Ordering::Release);
         }
     }
 }

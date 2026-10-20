@@ -9,6 +9,15 @@ use karyos_driver::EmbeddedDriver;
 
 use super::*;
 
+/// A client context whose control calls wait long enough for a driver
+/// thread under Miri, whose clock runs fast against its slow execution.
+fn test_context() -> Context {
+    Context::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()
+        .unwrap()
+}
+
 /// Options from `karyos_client_options_init`.
 fn defaults() -> ClientOptions {
     let mut options = core::mem::MaybeUninit::<ClientOptions>::zeroed();
@@ -116,6 +125,24 @@ fn an_invalid_context_is_refused_with_its_detail_cleared() {
     assert_eq!((short.code, short.value), (7, 7));
 }
 
+/// The options' last fields are read: a zero bound there is refused, so a
+/// copy that stops short of them (keeping their defaults) fails here.
+#[test]
+fn connect_reads_the_options_to_their_last_field() {
+    for options in [
+        ClientOptions {
+            max_images: 0,
+            ..defaults()
+        },
+        ClientOptions {
+            max_pending: 0,
+            ..defaults()
+        },
+    ] {
+        assert_eq!(connect(&options).0, Status::InvalidContext.code());
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn connect_is_unsupported_without_a_cross_process_client() {
@@ -131,7 +158,7 @@ fn connect_is_unsupported_without_a_cross_process_client() {
 fn a_client_handle_is_served_and_closed_once() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let conductor = driver.connect().unwrap();
-    let context = Context::builder().build().unwrap();
+    let context = test_context();
     let handle = client::insert_embedded(Client::with_conductor(conductor, context)).unwrap();
     let raw = handle.raw();
 
@@ -257,13 +284,19 @@ fn stream_config(stream_id: i32) -> karyos_driver::StreamConfig {
 /// A stream whose offers are refused while no subscriber is connected.
 const STREAM_UNCONNECTED: i32 = 1002;
 
-/// A driven driver with the streams, and two conductors of it.
+/// A driven driver with the streams, and two conductors of it. Its clients
+/// are timed out only after an hour without a heartbeat: under Miri, a
+/// client a test has not used yet would otherwise be retired first.
 fn driven() -> (
     Driven,
     karyos_client::ClientConductor,
     karyos_client::ClientConductor,
 ) {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
+        client_liveness_timeout: 3_600_000_000_000,
+        ..karyos_driver::DriverConfig::default()
+    })
+    .unwrap();
     let _ = driver.add_stream(stream_config(STREAM)).unwrap();
     let mut unconnected = karyos_driver::StreamConfig {
         allow_unconnected: false,
@@ -371,7 +404,7 @@ fn read(
     let start = std::time::Instant::now();
     while seen.len() < count {
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(60),
+            start.elapsed() < std::time::Duration::from_secs(3600),
             "{seen:?}"
         );
         let _ = client.poll();
@@ -387,7 +420,7 @@ fn read(
 #[test]
 fn a_publication_offers_and_commits_staged_claims() {
     let (_driven, ours, theirs) = driven();
-    let context = Context::builder().build().unwrap();
+    let context = test_context();
     let client = client::insert_embedded(Client::with_conductor(ours, context.clone()))
         .unwrap()
         .raw();
@@ -458,12 +491,9 @@ fn a_publication_offers_and_commits_staged_claims() {
 #[test]
 fn closing_a_client_closes_its_publications_and_their_claims() {
     let (_driven, ours, _theirs) = driven();
-    let client = client::insert_embedded(Client::with_conductor(
-        ours,
-        Context::builder().build().unwrap(),
-    ))
-    .unwrap()
-    .raw();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
     let (status, publication) = add_publication(client);
     assert_eq!(status, Status::Ok.code());
     let (status, staged, _) = claim(publication, 0, 3);
@@ -479,12 +509,9 @@ fn closing_a_client_closes_its_publications_and_their_claims() {
 #[test]
 fn add_publication_refuses_bad_arguments() {
     let (_driven, ours, _theirs) = driven();
-    let client = client::insert_embedded(Client::with_conductor(
-        ours,
-        Context::builder().build().unwrap(),
-    ))
-    .unwrap()
-    .raw();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
     let mut publication = 0;
     // SAFETY: a null URI is refused before any use.
     let null_uri = unsafe {
@@ -532,7 +559,7 @@ fn add_publication_refuses_bad_arguments() {
 #[test]
 fn a_commit_that_finds_no_subscriber_keeps_its_claim_staged() {
     let (_driven, ours, theirs) = driven();
-    let context = Context::builder().build().unwrap();
+    let context = test_context();
     let client = client::insert_embedded(Client::with_conductor(ours, context.clone()))
         .unwrap()
         .raw();
@@ -556,7 +583,7 @@ fn a_commit_that_finds_no_subscriber_keeps_its_claim_staged() {
         .unwrap();
     let start = std::time::Instant::now();
     loop {
-        assert!(start.elapsed() < std::time::Duration::from_secs(60));
+        assert!(start.elapsed() < std::time::Duration::from_secs(3600));
         let (status, _) = commit(staged);
         if status == Status::Ok.code() {
             break;

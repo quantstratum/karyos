@@ -69,7 +69,7 @@ fn a_full_table_refuses_another_handle() {
 #[test]
 fn a_slot_whose_generation_cannot_grow_is_retired() {
     let table = Table::new(Kind::Client, 1);
-    table.set_generation(0, u32::MAX - 1);
+    table.set_generation(0, u32::MAX);
     let last = table.insert(1_u32).unwrap();
     assert_eq!(last.generation(), u32::MAX);
     table.remove(last).unwrap();
@@ -240,4 +240,62 @@ fn a_failed_check_before_a_close_closes_nothing() {
     // The callback runs holding the slot: reentering it is refused.
     let inner = table.remove_with(handle, |_| Ok(table.with(handle, |value| *value)));
     assert_eq!(inner, Ok((1, Err(Status::Reentrant))));
+}
+
+#[test]
+fn a_stale_handle_never_disturbs_the_live_one_that_reused_its_slot() {
+    let table = Arc::new(Table::new(Kind::Publication, 1));
+    let stale = table.insert(1_u32).unwrap();
+    table.remove(stale).unwrap();
+    let live = table.insert(2_u32).unwrap();
+    assert_eq!(stale.index(), live.index());
+    let held = Arc::new(Barrier::new(2));
+    let tried = Arc::new(Barrier::new(2));
+    let holder = {
+        let (table, held, tried) = (Arc::clone(&table), Arc::clone(&held), Arc::clone(&tried));
+        std::thread::spawn(move || {
+            table
+                .with(live, |value| {
+                    held.wait();
+                    tried.wait();
+                    *value
+                })
+                .unwrap()
+        })
+    };
+    held.wait();
+    // The live handle is held by another thread: the stale one is closed,
+    // never busy, and it does not take the slot's mutex.
+    assert_eq!(table.with(stale, |value| *value), Err(Status::Closed));
+    assert_eq!(table.remove(stale), Err(Status::Closed));
+    tried.wait();
+    assert_eq!(holder.join().unwrap(), 2);
+    assert_eq!(table.with(live, |value| *value), Ok(2));
+}
+
+/// The live handle's calls never answer BUSY because another thread uses
+/// the stale handle of the same slot (the flake that the stale handle's
+/// lock caused before the generation was checked outside the mutex).
+#[test]
+#[cfg_attr(miri, ignore = "a stress loop, too slow under Miri")]
+fn stale_uses_never_make_the_live_handle_busy() {
+    let table = Arc::new(Table::new(Kind::Publication, 1));
+    let stale = table.insert(1_u32).unwrap();
+    table.remove(stale).unwrap();
+    let live = table.insert(2_u32).unwrap();
+    let start = Arc::new(Barrier::new(2));
+    let staler = {
+        let (table, start) = (Arc::clone(&table), Arc::clone(&start));
+        std::thread::spawn(move || {
+            start.wait();
+            for _ in 0..200_000 {
+                assert_eq!(table.with(stale, |value| *value), Err(Status::Closed));
+            }
+        })
+    };
+    start.wait();
+    for _ in 0..200_000 {
+        assert_eq!(table.with(live, |value| *value), Ok(2));
+    }
+    staler.join().unwrap();
 }
