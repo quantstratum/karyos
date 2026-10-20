@@ -54,8 +54,10 @@
 //! its image. At most [`Context::max_images`] images are attached;
 //! another is refused and counted ([`Subscription::images_refused`]),
 //! never dropped silently.
-//! Every subscription takes the role `required` for now; role and rejoin
-//! policy by URI are a follow-up.
+//! [`Client::add_subscription`] takes a required reader that rejoins at
+//! the head; [`Client::add_subscription_with`] names the role and rejoin
+//! policy ([`SubscriptionOptions`]), which each image of a network
+//! subscription takes too. Role and policy by URI are a follow-up.
 //!
 //! A lap of the client's broadcast receiver loses what was broadcast
 //! meanwhile: the network subscriptions are then closed with
@@ -81,7 +83,9 @@ use crate::conductor::{
 };
 use crate::error::ClientError;
 use crate::publication::ClientPublication;
-use crate::subscription::{ClientSubscription, MessageInfo, MessageLimit, PollError, PollSummary};
+use crate::subscription::{
+    ClientSubscription, MessageInfo, MessageLimit, PollError, PollSummary, RejoinPolicy,
+};
 
 mod publish;
 
@@ -96,8 +100,38 @@ pub const DEFAULT_MAX_IMAGES: usize = 8;
 /// Default most requests in flight on a client's conductor.
 pub const DEFAULT_MAX_PENDING: usize = 64;
 
-/// The role every facade subscription takes.
-const ROLE: SubscriberRole = SubscriberRole::Required;
+/// How a subscription reads ([`Client::add_subscription_with`]): its
+/// role and what follows an overrun. The default is what
+/// [`Client::add_subscription`] takes: a required reader, rejoining at the
+/// head. A network subscription refuses a snapshot policy (or a replay
+/// whose secondary is one) with [`ClientError::InvalidOptions`]: each of
+/// its images takes a copy of the policy, and a snapshot source serves one
+/// subscription.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct SubscriptionOptions {
+    /// Required (bounds its publisher, never lapped), optional or observer
+    /// (lapped when behind; SPEC.md §4).
+    pub role: SubscriberRole,
+    /// What follows an overrun of an optional or observer reader; accepted
+    /// and never used for a required one.
+    pub rejoin: RejoinPolicy,
+}
+
+impl Default for SubscriptionOptions {
+    /// A required reader that rejoins at the head.
+    fn default() -> Self {
+        Self::new(SubscriberRole::Required, RejoinPolicy::default())
+    }
+}
+
+impl SubscriptionOptions {
+    /// Options of `role` and `rejoin`.
+    #[must_use]
+    pub fn new(role: SubscriberRole, rejoin: RejoinPolicy) -> Self {
+        Self { role, rejoin }
+    }
+}
 
 /// How a control call waits between two services of its connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,10 +413,15 @@ pub trait Connection: sealed::Sealed {
         &mut self,
         uri: &str,
         stream_id: i32,
+        role: SubscriberRole,
     ) -> Result<u64, ConductorError>;
 
     #[doc(hidden)]
-    fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError>;
+    fn add_subscription(
+        &mut self,
+        stream: StreamKey,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError>;
 
     /// Attaches to lane 0 of the image `image` of the alias `stream`
     /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-5).
@@ -391,6 +430,7 @@ pub trait Connection: sealed::Sealed {
         &mut self,
         stream: StreamKey,
         image: u64,
+        role: SubscriberRole,
     ) -> Result<u64, ConductorError>;
 
     #[doc(hidden)]
@@ -487,25 +527,31 @@ impl Connection for ClientConductor {
         &mut self,
         uri: &str,
         stream_id: i32,
+        role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
-        ClientConductor::add_network_subscription(self, uri, stream_id, ROLE)
+        ClientConductor::add_network_subscription(self, uri, stream_id, role)
     }
 
-    fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
-        ClientConductor::add_subscription(self, stream, ROLE)
+    fn add_subscription(
+        &mut self,
+        stream: StreamKey,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        ClientConductor::add_subscription(self, stream, role)
     }
 
     fn add_image_subscription(
         &mut self,
         stream: StreamKey,
         image: u64,
+        role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         ClientConductor::add_image_subscription(
             self,
             stream,
             image,
             karyos_sys::frame::Lane::ZERO,
-            ROLE,
+            role,
         )
     }
 
@@ -626,20 +672,26 @@ impl Connection for crate::ipc::RemoteClient {
         &mut self,
         uri: &str,
         stream_id: i32,
+        role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
-        crate::ipc::RemoteClient::add_network_subscription(self, uri, stream_id, ROLE)
+        crate::ipc::RemoteClient::add_network_subscription(self, uri, stream_id, role)
     }
 
-    fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
-        crate::ipc::RemoteClient::add_subscription(self, stream, ROLE)
+    fn add_subscription(
+        &mut self,
+        stream: StreamKey,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        crate::ipc::RemoteClient::add_subscription(self, stream, role)
     }
 
     fn add_image_subscription(
         &mut self,
         stream: StreamKey,
         image: u64,
+        role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
-        crate::ipc::RemoteClient::add_image_subscription(self, stream, image, ROLE)
+        crate::ipc::RemoteClient::add_image_subscription(self, stream, image, role)
     }
 
     fn add_publication_on_lane(
@@ -863,6 +915,11 @@ struct Network<T: TermBytes> {
     slots: Vec<Slot>,
     /// Closed (events were lost): its events are ignored.
     closed: bool,
+    /// The subscription's role, which each image takes.
+    role: SubscriberRole,
+    /// The subscription's rejoin policy, a copy of which each image takes
+    /// ([`RejoinPolicy::duplicate`]).
+    rejoin: RejoinPolicy,
 }
 
 /// An image holding a slot of its network subscription.
@@ -917,6 +974,10 @@ pub struct Client<C: Connection> {
     subscription_releases_failed: u64,
     completions: Vec<Completion>,
     events: Vec<Event>,
+    /// The role and rejoin policy of the network subscription being added,
+    /// which its record takes when its grant arrives, before the events
+    /// that announce its first images.
+    adding: Option<(SubscriberRole, RejoinPolicy)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -962,6 +1023,7 @@ impl<C: Connection> Client<C> {
             subscription_releases_failed: 0,
             completions: Vec::new(),
             events: Vec::new(),
+            adding: None,
         }
     }
 
@@ -1177,7 +1239,8 @@ impl<C: Connection> Client<C> {
 
     /// A subscription of `stream_id` on the channel `uri`: a `karyos:ipc`
     /// URI reads the only stream of the id, a `karyos:udp` one the images
-    /// of a network subscription (see the module docs).
+    /// of a network subscription (see the module docs). A required reader
+    /// that rejoins at the head ([`SubscriptionOptions::default`]).
     ///
     /// # Errors
     ///
@@ -1187,9 +1250,34 @@ impl<C: Connection> Client<C> {
         uri: &str,
         stream_id: StreamId,
     ) -> Result<Subscription<C::Terms>, ClientError> {
-        let sequence = self
-            .connection
-            .add_network_subscription(uri, stream_id.get())?;
+        self.add_subscription_with(uri, stream_id, SubscriptionOptions::default())
+    }
+
+    /// As [`Client::add_subscription`], with the reader's role and rejoin
+    /// policy (`quantstratum-docs: karyos/design/rejoin-policies.md`). Each
+    /// image of a network subscription takes the role and a copy of the
+    /// policy; a snapshot policy serves one stream, so a network
+    /// subscription refuses it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::add_exclusive_publication`];
+    /// [`ClientError::InvalidOptions`] for a snapshot policy (or a replay
+    /// whose secondary is one) on a `karyos:udp` URI, before anything is
+    /// requested.
+    pub fn add_subscription_with(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+        options: SubscriptionOptions,
+    ) -> Result<Subscription<C::Terms>, ClientError> {
+        let SubscriptionOptions { role, rejoin } = options;
+        let network = uri.starts_with("karyos:udp");
+        if network && rejoin.duplicate().is_none() {
+            return Err(ClientError::InvalidOptions {
+                reason: "a snapshot rejoin serves one stream, not a network subscription's images",
+            });
+        }
         // The context's build checked it.
         let max_changes =
             self.context
@@ -1198,10 +1286,26 @@ impl<C: Connection> Client<C> {
                 .ok_or(ClientError::InvalidContext {
                     reason: "too many images to queue their changes",
                 })?;
-        match self.wait(sequence)? {
-            Found::Outcome(outcome) => Ok(Subscription {
-                kind: Kind::Stream(Box::new(self.connection.subscription(*outcome)?)),
-            }),
+        let sequence = self
+            .connection
+            .add_network_subscription(uri, stream_id.get(), role)?;
+        // A network grant's record takes the role and policy when the grant
+        // arrives (`found`), before the events announcing its images; a
+        // stream subscription takes the policy back here.
+        self.adding = Some((role, rejoin));
+        let found = self.wait(sequence);
+        let unclaimed = self.adding.take();
+        match found? {
+            Found::Outcome(outcome) => {
+                let subscription = self.connection.subscription(*outcome)?;
+                let subscription = match unclaimed {
+                    Some((_, rejoin)) => subscription.with_rejoin(rejoin),
+                    None => subscription,
+                };
+                Ok(Subscription {
+                    kind: Kind::Stream(Box::new(subscription)),
+                })
+            }
             Found::Network(registration, inbox, released) => Ok(Subscription {
                 kind: Kind::Images(Images {
                     registration,
@@ -1290,12 +1394,18 @@ impl<C: Connection> Client<C> {
                 // announce its first images.
                 let inbox = Arc::new(Inbox::new(self.context.max_images));
                 let released = Arc::new(Mutex::new(Vec::with_capacity(self.context.max_images)));
+                let (role, rejoin) = self
+                    .adding
+                    .take()
+                    .unwrap_or((SubscriberRole::Required, RejoinPolicy::default()));
                 self.networks.push(Network {
                     registration,
                     inbox: Arc::downgrade(&inbox),
                     released: Arc::clone(&released),
                     slots: Vec::with_capacity(self.context.max_images),
                     closed: false,
+                    role,
+                    rejoin,
                 });
                 Found::Network(registration, inbox, released)
             }
@@ -1340,6 +1450,12 @@ impl<C: Connection> Client<C> {
         match self.connection.subscription(completion.outcome) {
             Ok(subscription) => {
                 slot.attached = true;
+                // Each image takes a copy of its subscription's policy; the
+                // add refused a policy that cannot be copied.
+                let subscription = match network.rejoin.duplicate() {
+                    Some(rejoin) => subscription.with_rejoin(rejoin),
+                    None => subscription,
+                };
                 // A subscription just attached is open, so it names its
                 // lane; one that does not is refused as a failed attach,
                 // never given a lane it does not read.
@@ -1401,7 +1517,10 @@ impl<C: Connection> Client<C> {
             inbox.update(|state| bump(&mut state.refused));
             return;
         }
-        match self.connection.add_image_subscription(stream, image) {
+        match self
+            .connection
+            .add_image_subscription(stream, image, network.role)
+        {
             Ok(sequence) => {
                 network.slots.push(Slot {
                     id: sequence,

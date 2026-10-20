@@ -463,6 +463,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `Client::add_subscription_with(uri, stream_id, SubscriptionOptions)`
+  (owner item 57; quantstratum-docs: `karyos/design/ffi-gap-analysis.md`
+  D3, F7b): the reader's role (`SubscriberRole::{Required, Optional,
+  Observer}`) and rejoin policy (`RejoinPolicy`), which the facade fixed
+  to required and rejoin-at-head. `SubscriptionOptions` is
+  `#[non_exhaustive]`, built with `new(role, rejoin)`; its `Default` is
+  `add_subscription`'s behaviour, which `add_subscription` now delegates
+  to. Each image of a network subscription takes the role and a copy of
+  the policy, so a snapshot policy (one stream's source) is refused on a
+  `karyos:udp` URI with the new `ClientError::InvalidOptions` before
+  anything is requested. The facade re-exports `SubscriptionOptions`,
+  `SubscriberRole`, `RejoinPolicy`, `Secondary` and `SnapshotSource`.
 - The C ABI's scheduled offer (quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §6, F7a-3):
   `karyos_publication_offer_at(publication, lane, data, length, tx_time,

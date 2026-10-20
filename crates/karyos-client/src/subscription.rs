@@ -159,7 +159,10 @@ pub struct SnapshotFailed;
 
 /// What follows an overrun of an optional or observer reader, declared at
 /// creation (SPEC.md §4 and §10). A required reader is never lapped, so for
-/// it the policy is accepted and never used.
+/// it the policy is accepted and never used. A snapshot source belongs to
+/// one subscription: a network subscription's images each take a copy of
+/// their subscription's policy, so a network subscription refuses
+/// `Snapshot` (and a `Replay` whose secondary is one).
 #[derive(Default)]
 #[non_exhaustive]
 pub enum RejoinPolicy {
@@ -209,6 +212,33 @@ impl core::fmt::Debug for Secondary {
             Self::RejoinAtHead => f.write_str("RejoinAtHead"),
             Self::Snapshot(_) => f.write_str("Snapshot(..)"),
             Self::Close => f.write_str("Close"),
+        }
+    }
+}
+
+impl RejoinPolicy {
+    /// A copy of the policy, for each image of a network subscription;
+    /// `None` for one that holds a snapshot source, which serves one
+    /// stream.
+    pub(crate) fn duplicate(&self) -> Option<Self> {
+        match self {
+            Self::RejoinAtHead => Some(Self::RejoinAtHead),
+            Self::Close => Some(Self::Close),
+            Self::Snapshot(_) => None,
+            Self::Replay { secondary } => Some(Self::Replay {
+                secondary: secondary.duplicate()?,
+            }),
+        }
+    }
+}
+
+impl Secondary {
+    /// As [`RejoinPolicy::duplicate`].
+    fn duplicate(&self) -> Option<Self> {
+        match self {
+            Self::RejoinAtHead => Some(Self::RejoinAtHead),
+            Self::Close => Some(Self::Close),
+            Self::Snapshot(_) => None,
         }
     }
 }
@@ -1193,6 +1223,47 @@ mod tests {
     use karyos_sys::log_buffer::{AppendOptions, ClaimOutcome, LogBufferConfig, Role};
     use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
     use karyos_sys::term::TermId;
+
+    /// A policy is copied for each image of a network subscription, except
+    /// one holding a snapshot source (directly or as a replay's secondary).
+    #[test]
+    fn a_policy_is_duplicated_unless_it_holds_a_snapshot_source() {
+        struct Source;
+        impl SnapshotSource for Source {
+            fn rebuild(&mut self, _: &Overrun) -> Result<(), SnapshotFailed> {
+                Ok(())
+            }
+        }
+        assert!(matches!(
+            RejoinPolicy::RejoinAtHead.duplicate(),
+            Some(RejoinPolicy::RejoinAtHead)
+        ));
+        assert!(matches!(
+            RejoinPolicy::Close.duplicate(),
+            Some(RejoinPolicy::Close)
+        ));
+        assert!(matches!(
+            RejoinPolicy::Replay {
+                secondary: Secondary::Close
+            }
+            .duplicate(),
+            Some(RejoinPolicy::Replay {
+                secondary: Secondary::Close
+            })
+        ));
+        assert!(
+            RejoinPolicy::Snapshot(Box::new(Source))
+                .duplicate()
+                .is_none()
+        );
+        assert!(
+            RejoinPolicy::Replay {
+                secondary: Secondary::Snapshot(Box::new(Source))
+            }
+            .duplicate()
+            .is_none()
+        );
+    }
 
     fn buffer() -> Arc<LogBuffer> {
         Arc::new(
