@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 /*
- * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.0.
+ * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.1.
  *
  * Written by hand until cbindgen is admitted; a test in karyos-ffi checks
  * it against the Rust source (quantstratum-docs:
@@ -25,6 +25,13 @@
  *   the workspace version. Before 1.0 a caller accepts exactly the 0.y
  *   it targets with at least its minimum 0.y.z, and refuses any other
  *   version.
+ * - A struct the caller passes starts with its uint32_t size, and may grow
+ *   in a later version. Each karyos_*_init is a static inline function
+ *   that calls the exported karyos_*_init_sized with the sizeof this
+ *   header gives it: the library fills that many bytes at most and sets
+ *   size to them, never past the caller's struct. The exported symbol of
+ *   the same name as the inline one, which a binary built against an
+ *   older header calls, fills only the struct's first (ABI 0.1.0) size.
  *
  * Threads (karyos/design/embedded-api.md, "Requirements for the C ABI"):
  * - No handle has thread affinity. A driver, client, publication, claim,
@@ -85,7 +92,7 @@ extern "C" {
 
 #define KARYOS_ABI_VERSION_MAJOR 0
 #define KARYOS_ABI_VERSION_MINOR 1
-#define KARYOS_ABI_VERSION_PATCH 0
+#define KARYOS_ABI_VERSION_PATCH 1
 
 /** No handle names an object with this value. */
 #define KARYOS_NULL_HANDLE 0
@@ -493,7 +500,10 @@ const char *karyos_status_message(int32_t status);
  * KARYOS_IDLE_YIELD_THEN_SLEEP. KARYOS_E_INVALID_ARGUMENT for a null or
  * misaligned pointer.
  */
-int32_t karyos_client_options_init(karyos_client_options *options);
+int32_t karyos_client_options_init_sized(karyos_client_options *options, uint32_t size);
+static inline int32_t karyos_client_options_init(karyos_client_options *options) {
+    return karyos_client_options_init_sized(options, (uint32_t)sizeof *options);
+}
 
 /**
  * Attaches a client to the driver whose admission socket is in
@@ -578,7 +588,10 @@ typedef struct karyos_offer_options {
  * Fills options with the defaults and its size. KARYOS_E_INVALID_ARGUMENT
  * for a null or misaligned pointer.
  */
-int32_t karyos_offer_options_init(karyos_offer_options *options);
+int32_t karyos_offer_options_init_sized(karyos_offer_options *options, uint32_t size);
+static inline int32_t karyos_offer_options_init(karyos_offer_options *options) {
+    return karyos_offer_options_init_sized(options, (uint32_t)sizeof *options);
+}
 
 /**
  * As karyos_publication_offer, with options: the reserved value every
@@ -807,7 +820,10 @@ typedef struct karyos_subscription_options {
  * Fills options with the defaults and its size. KARYOS_E_INVALID_ARGUMENT
  * for a null or misaligned pointer.
  */
-int32_t karyos_subscription_options_init(karyos_subscription_options *options);
+int32_t karyos_subscription_options_init_sized(karyos_subscription_options *options, uint32_t size);
+static inline int32_t karyos_subscription_options_init(karyos_subscription_options *options) {
+    return karyos_subscription_options_init_sized(options, (uint32_t)sizeof *options);
+}
 
 /**
  * As karyos_client_add_subscription, with the reader's role and rejoin
@@ -910,7 +926,10 @@ int32_t karyos_subscription_close(uint64_t subscription);
  * Fills options with the driver's defaults and its size.
  * KARYOS_E_INVALID_ARGUMENT for a null or misaligned pointer.
  */
-int32_t karyos_driver_options_init(karyos_driver_options *options);
+int32_t karyos_driver_options_init_sized(karyos_driver_options *options, uint32_t size);
+static inline int32_t karyos_driver_options_init(karyos_driver_options *options) {
+    return karyos_driver_options_init_sized(options, (uint32_t)sizeof *options);
+}
 
 /**
  * Creates an embedded driver and writes its handle. Its caller drives it
@@ -949,7 +968,10 @@ int32_t karyos_driver_stop(uint64_t driver);
  * and its size. KARYOS_E_INVALID_ARGUMENT for a null or misaligned
  * pointer.
  */
-int32_t karyos_stream_options_init(karyos_stream_options *options);
+int32_t karyos_stream_options_init_sized(karyos_stream_options *options, uint32_t size);
+static inline int32_t karyos_stream_options_init(karyos_stream_options *options) {
+    return karyos_stream_options_init_sized(options, (uint32_t)sizeof *options);
+}
 
 /**
  * Adds a stream to the driver, until karyos_driver_remove_stream or the
@@ -1155,7 +1177,10 @@ typedef struct karyos_replay_options {
 } karyos_replay_options;
 
 /** Fills options with the defaults and its size. */
-int32_t karyos_replay_options_init(karyos_replay_options *options);
+int32_t karyos_replay_options_init_sized(karyos_replay_options *options, uint32_t size);
+static inline int32_t karyos_replay_options_init(karyos_replay_options *options) {
+    return karyos_replay_options_init_sized(options, (uint32_t)sizeof *options);
+}
 
 /**
  * Starts a replay on the Archive connection of what options names, and
@@ -1209,8 +1234,10 @@ typedef struct karyos_replay_subscription_options {
 } karyos_replay_subscription_options;
 
 /** Fills options with the defaults and its size. */
-int32_t karyos_replay_subscription_options_init(
-    karyos_replay_subscription_options *options);
+int32_t karyos_replay_subscription_options_init_sized(karyos_replay_subscription_options *options, uint32_t size);
+static inline int32_t karyos_replay_subscription_options_init(karyos_replay_subscription_options *options) {
+    return karyos_replay_subscription_options_init_sized(options, (uint32_t)sizeof *options);
+}
 
 /**
  * Adds the subscription of the replay target at stream_id and session_id

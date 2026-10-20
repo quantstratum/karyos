@@ -2526,6 +2526,28 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `karyos-ffi`, memory safety (owner item 48, F-48; found by REVIEWER-02's
+  older-header run): every `karyos_*_init` wrote the whole current
+  struct, so a caller built against an older header was overrun.
+  `karyos_subscription_options_init` wrote 40 bytes into the first
+  header's 16-byte struct. Interim fix, item 48's option A, for the owner
+  to confirm:
+  - each init is now a `static inline` in `karyos.h` that calls a new
+    exported `karyos_*_init_sized(options, sizeof *options)`, which fills
+    at most the caller's size and sets `size` to the bytes written;
+  - the exported `karyos_*_init` symbols, which binaries built against
+    an older header call, fill only the struct's ABI 0.1.0 size;
+  - a growing struct needs only its leading `uint32_t` aligned: the
+    first `karyos_subscription_options` (four `uint32_t`, aligned to 4)
+    was refused as misaligned.
+  A binary built against a header from after a struct grew but before
+  this fix gets the 0.1.0 prefix from the legacy symbol, so the newer
+  fields it sets afterwards are not read; rebuilding against this header
+  fixes it. The ABI version moves to 0.1.1, so a binding states 0.1.1 as
+  its minimum and refuses an unfixed library at bootstrap (BIND-Q8). The
+  `abi.version` scenario no longer pins the patch. `karyos.h`'s Rules
+  state the init rule for every later growth.
+
 - `a_call_on_a_busy_spinning_driver_waits_for_one_cycle` failed once at
   a load of 16 ("a call waited through 3 cycles"): a caller preempted
   between reading the thread's cycle count and announcing itself counted

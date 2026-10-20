@@ -22,7 +22,7 @@ pub(crate) const ABI_VERSION_MAJOR: u32 = 0;
 /// The ABI version's minor number (`KARYOS_ABI_VERSION_MINOR`).
 pub(crate) const ABI_VERSION_MINOR: u32 = 1;
 /// The ABI version's patch number (`KARYOS_ABI_VERSION_PATCH`).
-pub(crate) const ABI_VERSION_PATCH: u32 = 0;
+pub(crate) const ABI_VERSION_PATCH: u32 = 1;
 
 /// Whether `out` can take a `T`: not null and aligned. It cannot tell a
 /// dangling pointer; the caller's contract excludes one.
@@ -33,6 +33,15 @@ fn writable<T>(out: *mut T) -> bool {
 /// Whether `input` can give a `T`: not null and aligned.
 fn readable<T>(input: *const T) -> bool {
     !input.is_null() && input.is_aligned()
+}
+
+/// Whether `sized` can be a caller's growing struct: not null, and aligned
+/// for its leading `uint32_t` size. Its other bytes are copied bytewise,
+/// so the struct need not have this version's alignment: an older
+/// header's struct may have a smaller one (the first
+/// `karyos_subscription_options` is four `uint32_t`, aligned to 4).
+fn sized_struct<T>(sized: *const T) -> bool {
+    !sized.is_null() && sized.cast::<u32>().is_aligned()
 }
 
 /// `karyos_client_options`: a client's options, copied by
@@ -112,10 +121,10 @@ const ACCEPTED_SIZE_0_1: u32 = 16;
 /// `out` is null or points to a writable struct whose first field is the
 /// `uint32_t` size the caller set, and which is at least that size.
 unsafe fn write_sized<T>(out: *mut T, min: u32, fill: impl FnOnce(u32) -> T) {
-    if !writable(out) {
+    if !sized_struct(out) {
         return;
     }
-    // SAFETY: `out` is non-null and aligned, and points to the caller's
+    // SAFETY: `out` is non-null and aligned for its `uint32_t` size, and points to the caller's
     // struct (its contract), whose first field is the `uint32_t` size.
     let size = unsafe { out.cast::<u32>().read() };
     if size < min {
@@ -129,6 +138,37 @@ unsafe fn write_sized<T>(out: *mut T, min: u32, fill: impl FnOnce(u32) -> T) {
     unsafe {
         core::ptr::copy_nonoverlapping((&raw const written).cast::<u8>(), out.cast::<u8>(), length);
     };
+}
+
+/// Writes the first `min(size, size_of::<T>())` bytes of `filled` through
+/// `out`, with its leading `uint32_t` size set to that length: a sized
+/// `_init` (owner item 48's option A, interim). The caller's bytes past
+/// the length are not touched.
+///
+/// Returns [`Status::InvalidArgument`], with nothing written, for a null or
+/// misaligned `out` or a `size` below `min`.
+///
+/// # Safety
+///
+/// `out` is null or points to `size` writable bytes, and `T` is a
+/// `#[repr(C)]` struct whose first field is the `uint32_t` size.
+unsafe fn init_sized<T>(out: *mut T, size: u32, min: u32, filled: T) -> Status {
+    if !sized_struct(out) || size < min {
+        return Status::InvalidArgument;
+    }
+    let written = size.min(size_of_u32::<T>());
+    let length = prefix(size, size_of_u32::<T>());
+    let mut filled = filled;
+    // SAFETY: `filled` is a `#[repr(C)]` local whose first field is the
+    // `uint32_t` size.
+    unsafe { (&raw mut filled).cast::<u32>().write(written) };
+    // SAFETY: the caller's struct is at least `size` writable bytes (its
+    // contract), `length` is at most `size` and at most the size of
+    // `filled`, a local that does not overlap it.
+    unsafe {
+        core::ptr::copy_nonoverlapping((&raw const filled).cast::<u8>(), out.cast::<u8>(), length);
+    };
+    Status::Ok
 }
 
 /// Writes `failure`'s detail through `detail` (see [`write_sized`]).
@@ -202,10 +242,10 @@ fn prefix(size: u32, ours: u32) -> usize {
 /// only: no `bool`, enum or reference), since its bytes come from the
 /// caller: `DriverOptions` and `StreamOptions` are.
 unsafe fn read_sized<T: Copy>(input: *const T, min: u32, defaults: T) -> Result<T, Status> {
-    if !readable(input) {
+    if !sized_struct(input) {
         return Err(Status::InvalidArgument);
     }
-    // SAFETY: `input` is non-null and aligned, and points to the caller's
+    // SAFETY: `input` is non-null and aligned for its `uint32_t` size, and points to the caller's
     // struct (its contract), whose first field is the `uint32_t` size.
     let size = unsafe { input.cast::<u32>().read() };
     if size < min {
@@ -281,27 +321,44 @@ pub extern "C" fn karyos_status_message(status: i32) -> *const c_char {
     }
 }
 
-/// Fills `options` with the defaults: no directory,
-/// `KARYOS_IDLE_YIELD_THEN_SLEEP` (ADR-0066), the default timeout and
-/// bounds, and `size`.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer.
+/// As `karyos_client_options_init_sized` with the size of `karyos_client_options` in ABI 0.1.0, the
+/// first: the symbol a binary built against an older header calls, which
+/// writes no field that header lacks (owner item 48's option A, interim).
+/// A caller built against this header calls the header's `static inline`
+/// `karyos_client_options_init`, which passes its own `sizeof`.
 ///
 /// # Safety
 ///
-/// `options` is null or points to a writable `karyos_client_options`.
+/// `options` is null or points to a writable `karyos_client_options` of at least that
+/// size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_client_options_init(options: *mut ClientOptions) -> i32 {
+    // SAFETY: the caller's contract on `options`, of at least the 0.1.0
+    // size.
+    unsafe { karyos_client_options_init_sized(options, CLIENT_OPTIONS_SIZE_0_1) }
+}
+
+/// Fills the first `size` bytes of `options` with the defaults, at most
+/// this version's struct: `size` is the caller's `sizeof`, and its field
+/// `size` is set to the bytes written. The caller's bytes past them are
+/// not touched.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
+/// written.
+///
+/// # Safety
+///
+/// `options` is null or points to `size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_options_init_sized(
+    options: *mut ClientOptions,
+    size: u32,
+) -> i32 {
     guard(|| {
-        if !writable(options) {
-            return Status::InvalidArgument;
-        }
         let filled = default_options();
-        // SAFETY: `options` is non-null and aligned, and the caller's
-        // contract makes it a writable `karyos_client_options`.
-        unsafe { options.write(filled) };
-        Status::Ok
+        // SAFETY: the caller's contract on `options` and `size`.
+        unsafe { init_sized(options, size, CLIENT_OPTIONS_SIZE_0_1, filled) }
     })
 }
 
@@ -578,24 +635,44 @@ fn default_offer_options() -> OfferOptions {
     }
 }
 
-/// Fills `options` with the defaults (`reserved_value` 0) and its size.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer.
+/// As `karyos_offer_options_init_sized` with the size of `karyos_offer_options` in ABI 0.1.0, the
+/// first: the symbol a binary built against an older header calls, which
+/// writes no field that header lacks (owner item 48's option A, interim).
+/// A caller built against this header calls the header's `static inline`
+/// `karyos_offer_options_init`, which passes its own `sizeof`.
 ///
 /// # Safety
 ///
-/// `options` is null or points to a writable `karyos_offer_options`.
+/// `options` is null or points to a writable `karyos_offer_options` of at least that
+/// size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_offer_options_init(options: *mut OfferOptions) -> i32 {
+    // SAFETY: the caller's contract on `options`, of at least the 0.1.0
+    // size.
+    unsafe { karyos_offer_options_init_sized(options, OFFER_OPTIONS_SIZE_0_1) }
+}
+
+/// Fills the first `size` bytes of `options` with the defaults, at most
+/// this version's struct: `size` is the caller's `sizeof`, and its field
+/// `size` is set to the bytes written. The caller's bytes past them are
+/// not touched.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
+/// written.
+///
+/// # Safety
+///
+/// `options` is null or points to `size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_offer_options_init_sized(
+    options: *mut OfferOptions,
+    size: u32,
+) -> i32 {
     guard(|| {
-        if !writable(options) {
-            return Status::InvalidArgument;
-        }
-        // SAFETY: `options` is non-null and aligned, and the caller's
-        // contract makes it a writable `karyos_offer_options`.
-        unsafe { options.write(default_offer_options()) };
-        Status::Ok
+        let filled = default_offer_options();
+        // SAFETY: the caller's contract on `options` and `size`.
+        unsafe { init_sized(options, size, OFFER_OPTIONS_SIZE_0_1, filled) }
     })
 }
 
@@ -1231,28 +1308,46 @@ fn subscription_options(
     ))
 }
 
-/// Fills `options` with the defaults (`KARYOS_ROLE_REQUIRED`,
-/// `KARYOS_REJOIN_AT_HEAD`) and its size.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer.
+/// As `karyos_subscription_options_init_sized` with the size of `karyos_subscription_options` in ABI 0.1.0, the
+/// first: the symbol a binary built against an older header calls, which
+/// writes no field that header lacks (owner item 48's option A, interim).
+/// A caller built against this header calls the header's `static inline`
+/// `karyos_subscription_options_init`, which passes its own `sizeof`.
 ///
 /// # Safety
 ///
-/// `options` is null or points to a writable
-/// `karyos_subscription_options`.
+/// `options` is null or points to a writable `karyos_subscription_options` of at least that
+/// size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_subscription_options_init(
     options: *mut SubscriptionOptions,
 ) -> i32 {
+    // SAFETY: the caller's contract on `options`, of at least the 0.1.0
+    // size.
+    unsafe { karyos_subscription_options_init_sized(options, SUBSCRIPTION_OPTIONS_SIZE_0_1) }
+}
+
+/// Fills the first `size` bytes of `options` with the defaults, at most
+/// this version's struct: `size` is the caller's `sizeof`, and its field
+/// `size` is set to the bytes written. The caller's bytes past them are
+/// not touched.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
+/// written.
+///
+/// # Safety
+///
+/// `options` is null or points to `size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_subscription_options_init_sized(
+    options: *mut SubscriptionOptions,
+    size: u32,
+) -> i32 {
     guard(|| {
-        if !writable(options) {
-            return Status::InvalidArgument;
-        }
-        // SAFETY: `options` is non-null and aligned, and the caller's
-        // contract makes it a writable `karyos_subscription_options`.
-        unsafe { options.write(default_subscription_options()) };
-        Status::Ok
+        let filled = default_subscription_options();
+        // SAFETY: the caller's contract on `options` and `size`.
+        unsafe { init_sized(options, size, SUBSCRIPTION_OPTIONS_SIZE_0_1, filled) }
     })
 }
 
@@ -1655,25 +1750,44 @@ fn default_driver_options() -> DriverOptions {
     }
 }
 
-/// Fills `options` with the driver's defaults and `size`.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer.
+/// As `karyos_driver_options_init_sized` with the size of `karyos_driver_options` in ABI 0.1.0, the
+/// first: the symbol a binary built against an older header calls, which
+/// writes no field that header lacks (owner item 48's option A, interim).
+/// A caller built against this header calls the header's `static inline`
+/// `karyos_driver_options_init`, which passes its own `sizeof`.
 ///
 /// # Safety
 ///
-/// `options` is null or points to a writable `karyos_driver_options`.
+/// `options` is null or points to a writable `karyos_driver_options` of at least that
+/// size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_driver_options_init(options: *mut DriverOptions) -> i32 {
+    // SAFETY: the caller's contract on `options`, of at least the 0.1.0
+    // size.
+    unsafe { karyos_driver_options_init_sized(options, DRIVER_OPTIONS_SIZE_0_1) }
+}
+
+/// Fills the first `size` bytes of `options` with the defaults, at most
+/// this version's struct: `size` is the caller's `sizeof`, and its field
+/// `size` is set to the bytes written. The caller's bytes past them are
+/// not touched.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
+/// written.
+///
+/// # Safety
+///
+/// `options` is null or points to `size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_options_init_sized(
+    options: *mut DriverOptions,
+    size: u32,
+) -> i32 {
     guard(|| {
-        if !writable(options) {
-            return Status::InvalidArgument;
-        }
         let filled = default_driver_options();
-        // SAFETY: `options` is non-null and aligned, and the caller's
-        // contract makes it a writable `karyos_driver_options`.
-        unsafe { options.write(filled) };
-        Status::Ok
+        // SAFETY: the caller's contract on `options` and `size`.
+        unsafe { init_sized(options, size, DRIVER_OPTIONS_SIZE_0_1, filled) }
     })
 }
 
@@ -1889,26 +2003,44 @@ fn default_stream_options() -> StreamOptions {
     }
 }
 
-/// Fills `options` with a stream's defaults (stream id 0, the smallest
-/// term) and `size`.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer.
+/// As `karyos_stream_options_init_sized` with the size of `karyos_stream_options` in ABI 0.1.0, the
+/// first: the symbol a binary built against an older header calls, which
+/// writes no field that header lacks (owner item 48's option A, interim).
+/// A caller built against this header calls the header's `static inline`
+/// `karyos_stream_options_init`, which passes its own `sizeof`.
 ///
 /// # Safety
 ///
-/// `options` is null or points to a writable `karyos_stream_options`.
+/// `options` is null or points to a writable `karyos_stream_options` of at least that
+/// size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_stream_options_init(options: *mut StreamOptions) -> i32 {
+    // SAFETY: the caller's contract on `options`, of at least the 0.1.0
+    // size.
+    unsafe { karyos_stream_options_init_sized(options, STREAM_OPTIONS_SIZE_0_1) }
+}
+
+/// Fills the first `size` bytes of `options` with the defaults, at most
+/// this version's struct: `size` is the caller's `sizeof`, and its field
+/// `size` is set to the bytes written. The caller's bytes past them are
+/// not touched.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
+/// written.
+///
+/// # Safety
+///
+/// `options` is null or points to `size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_stream_options_init_sized(
+    options: *mut StreamOptions,
+    size: u32,
+) -> i32 {
     guard(|| {
-        if !writable(options) {
-            return Status::InvalidArgument;
-        }
         let filled = default_stream_options();
-        // SAFETY: `options` is non-null and aligned, and the caller's
-        // contract makes it a writable `karyos_stream_options`.
-        unsafe { options.write(filled) };
-        Status::Ok
+        // SAFETY: the caller's contract on `options` and `size`.
+        unsafe { init_sized(options, size, STREAM_OPTIONS_SIZE_0_1, filled) }
     })
 }
 
@@ -2531,26 +2663,44 @@ fn default_replay_options() -> ReplayOptions {
     }
 }
 
-/// Fills `options` with the defaults (`KARYOS_REPLAY_FULL`, the whole
-/// recording from position 0, `karyos:ipc`) and its size; the caller sets
-/// the recording and the target stream.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer.
+/// As `karyos_replay_options_init_sized` with the size of `karyos_replay_options` in ABI 0.1.0, the
+/// first: the symbol a binary built against an older header calls, which
+/// writes no field that header lacks (owner item 48's option A, interim).
+/// A caller built against this header calls the header's `static inline`
+/// `karyos_replay_options_init`, which passes its own `sizeof`.
 ///
 /// # Safety
 ///
-/// `options` is null or points to a writable `karyos_replay_options`.
+/// `options` is null or points to a writable `karyos_replay_options` of at least that
+/// size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_replay_options_init(options: *mut ReplayOptions) -> i32 {
+    // SAFETY: the caller's contract on `options`, of at least the 0.1.0
+    // size.
+    unsafe { karyos_replay_options_init_sized(options, REPLAY_OPTIONS_SIZE_0_1) }
+}
+
+/// Fills the first `size` bytes of `options` with the defaults, at most
+/// this version's struct: `size` is the caller's `sizeof`, and its field
+/// `size` is set to the bytes written. The caller's bytes past them are
+/// not touched.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
+/// written.
+///
+/// # Safety
+///
+/// `options` is null or points to `size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_replay_options_init_sized(
+    options: *mut ReplayOptions,
+    size: u32,
+) -> i32 {
     guard(|| {
-        if !writable(options) {
-            return Status::InvalidArgument;
-        }
-        // SAFETY: `options` is non-null and aligned, and the caller's
-        // contract makes it a writable `karyos_replay_options`.
-        unsafe { options.write(default_replay_options()) };
-        Status::Ok
+        let filled = default_replay_options();
+        // SAFETY: the caller's contract on `options` and `size`.
+        unsafe { init_sized(options, size, REPLAY_OPTIONS_SIZE_0_1, filled) }
     })
 }
 
@@ -2707,32 +2857,51 @@ pub struct ReplaySubscriptionOptions {
     pub reserved: u32,
 }
 
-/// Fills `options` with the defaults and its size.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer.
+/// As `karyos_replay_subscription_options_init_sized` with the size of `karyos_replay_subscription_options` in ABI 0.1.0, the
+/// first: the symbol a binary built against an older header calls, which
+/// writes no field that header lacks (owner item 48's option A, interim).
+/// A caller built against this header calls the header's `static inline`
+/// `karyos_replay_subscription_options_init`, which passes its own `sizeof`.
 ///
 /// # Safety
 ///
-/// `options` is null or points to a writable
-/// `karyos_replay_subscription_options`.
+/// `options` is null or points to a writable `karyos_replay_subscription_options` of at least that
+/// size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_replay_subscription_options_init(
     options: *mut ReplaySubscriptionOptions,
 ) -> i32 {
+    // SAFETY: the caller's contract on `options`, of at least the 0.1.0
+    // size.
+    unsafe {
+        karyos_replay_subscription_options_init_sized(options, REPLAY_SUBSCRIPTION_OPTIONS_SIZE_0_1)
+    }
+}
+
+/// Fills the first `size` bytes of `options` with the defaults, at most
+/// this version's struct: `size` is the caller's `sizeof`, and its field
+/// `size` is set to the bytes written. The caller's bytes past them are
+/// not touched.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
+/// written.
+///
+/// # Safety
+///
+/// `options` is null or points to `size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_replay_subscription_options_init_sized(
+    options: *mut ReplaySubscriptionOptions,
+    size: u32,
+) -> i32 {
     guard(|| {
-        if !writable(options) {
-            return Status::InvalidArgument;
-        }
-        // SAFETY: `options` is non-null and aligned, and the caller's
-        // contract makes it a writable struct.
-        unsafe {
-            options.write(ReplaySubscriptionOptions {
-                size: size_of_u32::<ReplaySubscriptionOptions>(),
-                reserved: 0,
-            });
+        let filled = ReplaySubscriptionOptions {
+            size: size_of_u32::<ReplaySubscriptionOptions>(),
+            reserved: 0,
         };
-        Status::Ok
+        // SAFETY: the caller's contract on `options` and `size`.
+        unsafe { init_sized(options, size, REPLAY_SUBSCRIPTION_OPTIONS_SIZE_0_1, filled) }
     })
 }
 

@@ -16,7 +16,9 @@ const PLAIN: i32 = 1021;
 fn stream_options_of(stream_id: i32) -> StreamOptions {
     let mut stream = core::mem::MaybeUninit::<StreamOptions>::zeroed();
     // SAFETY: a live, aligned, writable `StreamOptions`.
-    let status = unsafe { karyos_stream_options_init(stream.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_stream_options_init_sized(stream.as_mut_ptr(), size_of_u32::<StreamOptions>())
+    };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_stream_options_init` wrote every field.
     let mut stream = unsafe { stream.assume_init() };
@@ -45,7 +47,9 @@ fn add_stream(driver: u64, options: &StreamOptions) -> i32 {
 fn c_driver() -> u64 {
     let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
     // SAFETY: a live, aligned, writable `DriverOptions`.
-    let status = unsafe { karyos_driver_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_driver_options_init_sized(options.as_mut_ptr(), size_of_u32::<DriverOptions>())
+    };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_driver_options_init` wrote every field.
     let options = unsafe { options.assume_init() };
