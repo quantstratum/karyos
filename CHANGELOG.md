@@ -641,6 +641,26 @@ release may break APIs, wire formats and shared-memory layouts.
   comes back with `into_subscription`. Public client surface under owner
   item 57: `Subscription::rejoin_with`, `RejoiningSubscription` and
   `NotRejoinable`.
+- The facade's Archive-backed rejoin, polled as the C ABI polls, and
+  its replay targets through the facade (quantstratum-docs:
+  `karyos/design/ffi-archive.md`, F9b core; owner item 57).
+  - `RejoiningSubscription::adopt`, `max_message_length` and
+    `poll_adopted`, as `Subscription`'s. A holding poll moves neither
+    the live reader nor a merging replay to a successor mapping. A
+    replay handed out during it is read only after the next `adopt`,
+    and only then counts in `max_message_length`, which is the larger of
+    the live stream's and the replay's while it merges.
+  - `Client::replay_targets()` gives a `ReplayTargetSubscriber`, whose
+    non-blocking `subscribe(stream_id, session_id)` asks for a
+    `karyos:ipc` required reader of that exact target and returns it
+    once the client's polls have the grant. Asking for another target
+    withdraws the previous one: a grant that comes after, or one never
+    taken, is released by the client, as is anything left when the
+    subscriber drops. A refused request (the target not there yet) is
+    asked again on the next call.
+  - karyos-archive implements `ReplayTargets` for it, so an
+    `ArchiveClient` can be built from one facade client alone:
+    `ArchiveConnection`'s transports and `client.replay_targets()`.
 
 - `karyos-catalog list DIR [--json]` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H4a): an archive directory's
