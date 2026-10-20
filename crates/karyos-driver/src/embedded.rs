@@ -2943,8 +2943,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if found.conductor.seal_reason() == Some(SealReason::GuardClosed) {
             return Err(DriverError::GuardSealed { stream: found.id });
         }
-        let (ring, writer) =
-            crate::guard_streams::new_ring(guarded.messages).map_err(DriverError::Outcomes)?;
+        let (ring, writer) = crate::guard_streams::new_ring(guarded.messages, state.epoch)
+            .map_err(DriverError::Outcomes)?;
         let consumed = Arc::new(karyos_sys::sync::AtomicU64::new(0));
         let client = karyos_client::GuardBinding::new(
             self.guards.view(guarded.guard)?,

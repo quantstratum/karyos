@@ -385,20 +385,31 @@ pub(crate) const fn end_reason(seal: SealReason) -> u64 {
     }
 }
 
-/// The ring and writer of a new handle: `C_m` message records plus the
-/// one local `Ended` record.
+/// The ring and writer of a new handle admitted under open epoch
+/// `epoch`: `C_m` message records plus the one local `Ended` record. Its
+/// header names guard word 0, the handle's one-word view of the guard in
+/// process (the guard region's index comes with G-x2).
 ///
 /// # Errors
 ///
 /// [`OutcomeError::Layout`] when `messages` is too large to size.
-pub(crate) fn new_ring(messages: u64) -> Result<(Arc<HeapWords>, OutcomeWriter), OutcomeError> {
-    let capacity = karyos_sys::outcome_ring::capacity(messages, 1).ok_or(OutcomeError::Layout)?;
+pub(crate) fn new_ring(
+    messages: u64,
+    epoch: u64,
+) -> Result<(Arc<HeapWords>, OutcomeWriter), OutcomeError> {
+    let binding = karyos_sys::outcome_ring::Binding {
+        messages,
+        ranges: 1,
+        guard_index: 0,
+        epoch,
+    };
+    let capacity = binding.capacity().ok_or(OutcomeError::Layout)?;
     let words = usize::try_from(capacity)
         .ok()
         .and_then(karyos_sys::outcome_ring::ring_words)
         .ok_or(OutcomeError::Layout)?;
     let ring = Arc::new(HeapWords::zeroed(words));
-    karyos_sys::outcome_ring::init(ring.words(), capacity)?;
+    karyos_sys::outcome_ring::init(ring.words(), &binding)?;
     Ok((ring, OutcomeWriter::new(capacity)?))
 }
 
@@ -436,7 +447,7 @@ mod tests {
             guard: 1,
         };
         let mut guarded = GuardedStream::new(guard, 2, None, walker, 64);
-        let (ring, writer) = new_ring(2).unwrap();
+        let (ring, writer) = new_ring(2, 2).unwrap();
         let consumed = Arc::new(AtomicU64::new(0));
         guarded.bind(Bound {
             from: 0,

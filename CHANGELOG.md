@@ -421,6 +421,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The guard binding's region kinds and outcome header (G-x1;
+  quantstratum-docs: `karyos/design/guards-and-abort.md`, "The binding
+  across processes"). `RegionKind` gains `GuardRegion` (12),
+  `OutcomeRing` (13) and `ConsumedCell` (14), with the same codes in
+  `karyos-sys` and on the wire, under the unreleased admission version
+  2; no grant carries them yet, and the control path still refuses
+  guarded streams. The outcome ring's layout version moves to 2
+  (unreleased): `outcome_ring::init` takes a `Binding` and writes
+  `C_m`, `C_r`, the guard's word index and the admission epoch in header
+  words 2 to 5, and `outcome_ring::binding` reads them back for a
+  client, refusing a slot count other than `C_m + C_r + 1`, an index
+  past the client's guard words, or an epoch that is not open.
+
 - karyos-client's `Subscription` gains `adopt()`, `max_message_length()`
   and `poll_adopted(handler, limit)` (owner item 57; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §4.4), so a caller can size a copy
