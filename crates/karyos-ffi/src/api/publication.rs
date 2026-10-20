@@ -119,7 +119,9 @@ impl Entry {
     /// Releases the publication to `client`, and its outstanding claim.
     pub(crate) fn release(self, client: &mut AnyClient) {
         if let Some(staged) = self.claim {
-            let _ = claims().remove(staged.handle);
+            // A claim's slot is held only while a call reads it: waiting
+            // never leaks it.
+            let _ = claims().remove_waiting(staged.handle);
         }
         client.remove_publication(self.lanes);
     }
@@ -242,6 +244,15 @@ pub(crate) fn claim(
     })?
 }
 
+/// The largest message `lane` of `publication` accepts (tests).
+#[cfg(test)]
+pub(crate) fn lane_max(publication: Handle, lane: Lane) -> Option<u32> {
+    table()
+        .with(publication, |entry| entry.lanes.lane_max(lane))
+        .ok()
+        .flatten()
+}
+
 /// Whether a commit that met `error` keeps its claim staged for a retry.
 fn retryable(error: &OfferError) -> bool {
     matches!(
@@ -271,7 +282,7 @@ pub(crate) fn commit(claim: Handle) -> Result<Accepted, Failure> {
             .commit_staged(staged.lane, staged.length, &entry.staged);
         if !committed.as_ref().is_err_and(retryable) {
             entry.claim = None;
-            let _ = claims().remove(claim);
+            let _ = claims().remove_waiting(claim);
         }
         committed.map_err(|error| Failure::from(&error))
     })?
@@ -287,7 +298,7 @@ pub(crate) fn abort(claim: Handle) -> Result<(), Status> {
     table().with(publication, |entry| {
         if entry.claim.is_some_and(|staged| staged.handle == claim) {
             entry.claim = None;
-            claims().remove(claim).map(drop)
+            claims().remove_waiting(claim).map(drop)
         } else {
             Err(Status::Closed)
         }
@@ -307,4 +318,35 @@ pub(crate) fn close(publication: Handle) -> Result<(), Status> {
         removed.release(&mut entry.client);
         Ok(())
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The outcomes that can clear keep a claim staged; every other one
+    /// releases it.
+    #[test]
+    fn only_outcomes_that_can_clear_keep_a_claim_staged() {
+        let lane = Lane::ZERO;
+        for kept in [
+            OfferError::BackPressured,
+            OfferError::NotConnected,
+            OfferError::AdminAction,
+            OfferError::RateLimited,
+            OfferError::Gated,
+        ] {
+            assert!(retryable(&kept), "{kept:?}");
+        }
+        for released in [
+            OfferError::Closed,
+            OfferError::Aborted { lane, position: 0 },
+            OfferError::InvalidLane { lane },
+            OfferError::MessageTooLarge { length: 2, max: 1 },
+            OfferError::InvalidSchedule { reason: "r" },
+            OfferError::Client(karyos_client::ClientError::Timeout),
+        ] {
+            assert!(!retryable(&released), "{released:?}");
+        }
+    }
 }

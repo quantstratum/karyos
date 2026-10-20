@@ -466,6 +466,47 @@ fn a_publication_offers_and_commits_staged_claims() {
     assert_eq!(karyos_claim_abort(aborted), Status::Ok.code());
     assert_eq!(commit(aborted).0, Status::Closed.code());
 
+    // The lane's largest message is the bound of the staged buffer: a
+    // claim of exactly it is staged, one byte more is refused with the
+    // length and the bound.
+    let max = crate::api::publication::lane_max(
+        crate::handles::Handle::from_raw(publication),
+        karyos_sys::frame::Lane::ZERO,
+    )
+    .unwrap();
+    let (status, largest, _) = claim(publication, 0, max);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(karyos_claim_abort(largest), Status::Ok.code());
+    assert_eq!(
+        claim(publication, 0, max + 1).0,
+        Status::MessageTooLarge.code()
+    );
+    let refused =
+        crate::api::publication::claim(crate::handles::Handle::from_raw(publication), 0, max + 1)
+            .map(|_| ());
+    assert_eq!(
+        refused,
+        Err(crate::status::Failure::with(
+            Status::MessageTooLarge,
+            u64::from(max + 1),
+            u64::from(max)
+        ))
+    );
+
+    // A new claim starts zeroed, whatever the last one held.
+    let (status, dirty, buffer) = claim(publication, 0, 4);
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: the buffer holds the 4 claimed bytes until the abort.
+    unsafe { fill(buffer, b"xxxx") };
+    assert_eq!(karyos_claim_abort(dirty), Status::Ok.code());
+    let (status, fresh, buffer) = claim(publication, 0, 4);
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: the buffer holds the 4 claimed bytes until the abort, and
+    // nothing writes them meanwhile.
+    let zeroed = unsafe { core::slice::from_raw_parts(buffer, 4) }.to_vec();
+    assert_eq!(zeroed, [0; 4]);
+    assert_eq!(karyos_claim_abort(fresh), Status::Ok.code());
+
     // Refused claims.
     assert_eq!(claim(publication, 9, 4).0, Status::InvalidLane.code());
     assert_eq!(claim(publication, 300, 4).0, Status::InvalidLane.code());

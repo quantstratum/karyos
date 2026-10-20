@@ -475,7 +475,8 @@ pub unsafe extern "C" fn karyos_publication_offer(
 /// handle through `claim` and, through `buffer`, a pointer to `length`
 /// zeroed bytes the caller fills. The pointer stays valid until
 /// `karyos_claim_commit` releases the claim, `karyos_claim_abort`, or the
-/// publication's close; it never points into a term or a shared mapping.
+/// close of the publication or of its client; it never points into a term
+/// or a shared mapping.
 /// One claim per publication: another before it is released returns
 /// `KARYOS_E_CLAIM_OUTSTANDING`. Nothing reaches the term before the
 /// commit.

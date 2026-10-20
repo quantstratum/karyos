@@ -11,10 +11,17 @@
 //! reenters its handle) answers [`Status::Reentrant`]. A panic while a
 //! slot is held poisons its mutex, and every later use of its handle
 //! answers [`Status::Internal`] until the handle is closed; a stale handle
-//! of that slot still answers [`Status::Closed`] and never clears it. Closing bumps the
-//! generation, so a stale or twice closed handle answers
-//! [`Status::Closed`]; a slot whose generation would wrap is retired,
-//! never reused.
+//! of that slot still answers [`Status::Closed`] and never clears it.
+//!
+//! Closing moves the slot's generation on at once, so a stale or twice
+//! closed handle answers [`Status::Closed`]; a slot whose generation would
+//! wrap is retired, never reused. The generation is an atomic read before
+//! the mutex is tried, so a stale handle never disturbs a live one. One
+//! narrow window is left: a call that read the generation just before a
+//! concurrent close and a reuse of the slot holds the mutex for a moment,
+//! and a call on the new handle at that instant answers [`Status::Busy`].
+//! Both are racing a close; `BUSY` around a close is transient, and a
+//! retry succeeds.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -253,6 +260,31 @@ impl<T> Table<T> {
         let slot = self.current(handle)?;
         let taken = Self::take(slot, handle)?;
         self.close(slot, handle, taken)
+    }
+
+    /// [`Table::remove`] for a table whose slots are never held across a
+    /// callback (claims: a call only reads the handle they name): it waits
+    /// for a slot another thread holds instead of answering
+    /// [`Status::Busy`], so a close that must end the handle never fails
+    /// for a moment's contention.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::InvalidHandle`], [`Status::Closed`], and
+    /// [`Status::Reentrant`] when this thread holds the slot.
+    pub(crate) fn remove_waiting(&self, handle: Handle) -> Result<T, Status> {
+        let slot = self.current(handle)?;
+        if slot.holder.load(Ordering::Acquire) == thread_token() {
+            return Err(Status::Reentrant);
+        }
+        let (entry, poisoned) = match slot.entry.lock() {
+            Ok(entry) => (entry, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        if slot.generation.load(Ordering::Acquire) != handle.generation() || entry.is_none() {
+            return Err(Status::Closed);
+        }
+        self.close(slot, handle, (entry, poisoned))
     }
 
     /// Closes `handle` after `before` succeeded on its object, holding

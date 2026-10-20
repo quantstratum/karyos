@@ -256,8 +256,8 @@ int32_t karyos_publication_offer(uint64_t publication, uint32_t lane,
 /**
  * Stages a claim of length bytes on the lane: writes its handle and a
  * pointer to length zeroed bytes to fill. The pointer is valid until the
- * commit releases the claim, its abort, or the publication's close, and
- * never points into a term or a shared mapping. One claim per publication
+ * commit releases the claim, its abort, or the close of the publication or
+ * of its client, and never points into a term or a shared mapping. One claim per publication
  * (KARYOS_E_CLAIM_OUTSTANDING).
  */
 int32_t karyos_publication_claim(uint64_t publication, uint32_t lane,
