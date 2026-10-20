@@ -15,6 +15,7 @@ use crate::api::{
     API_VERSION, AgentView, Alert, AlertKind, Counter, DriverState, DriverView, ErrorEntry,
     GapView, GuardEntry, JournalView, LossEntry, Sample,
 };
+use crate::catalog::{CatalogConfig, CatalogWatch};
 use crate::journal::{Journal, JournalError};
 use crate::model::{self, Cell, Follower};
 use crate::operations::{self, GuardAnswer};
@@ -49,6 +50,9 @@ pub struct AgentConfig {
     pub journal: Option<PathBuf>,
     /// The wait for a driver's answer to a guard operation (M10b).
     pub guard_timeout: Duration,
+    /// The drivers whose Archive catalog the agent lists (M11), each a
+    /// directory of `drivers`; none by default.
+    pub archives: Vec<(PathBuf, CatalogConfig)>,
 }
 
 impl AgentConfig {
@@ -63,6 +67,7 @@ impl AgentConfig {
             alerts: AlertRules::default(),
             journal: None,
             guard_timeout: DEFAULT_ATTACH_TIMEOUT,
+            archives: Vec::new(),
         }
     }
 
@@ -100,6 +105,15 @@ impl AgentConfig {
         self.alerts = alerts;
         self
     }
+
+    /// Listing the Archive catalog of the driver in `dir` as `catalog`
+    /// says (M11). A directory that is not one of the drivers lists
+    /// nothing.
+    #[must_use]
+    pub fn with_archive(mut self, dir: PathBuf, catalog: CatalogConfig) -> Self {
+        self.archives.push((dir, catalog));
+        self
+    }
 }
 
 /// One watched driver.
@@ -116,6 +130,7 @@ struct Driver {
     guards: Follower<GuardEntry>,
     trace: Option<TraceWindow>,
     alerts: Alerts,
+    catalog: Option<CatalogWatch>,
 }
 
 /// The agent. Each driver it is attached to counts one tool against the
@@ -154,6 +169,12 @@ impl Agent {
                 guards: Follower::new(config.history),
                 trace: None,
                 alerts: Alerts::default(),
+                // The catalog's own thread connects, off the refresh path.
+                catalog: config
+                    .archives
+                    .iter()
+                    .find(|(archive, _)| archive == dir)
+                    .map(|(_, catalog)| CatalogWatch::start(dir.clone(), *catalog)),
             })
             .collect();
         let (journal, journal_error) = match config.journal.as_deref() {
@@ -394,6 +415,7 @@ impl Driver {
             latencies,
             trace,
             alerts: self.alerts.firing(),
+            catalog: self.catalog.as_ref().map(CatalogWatch::view),
         }
     }
 }

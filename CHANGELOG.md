@@ -440,6 +440,24 @@ release may break APIs, wire formats and shared-memory layouts.
   agent restarts (`Journal::failed_at`). `Server::poll` takes the agent
   mutably.
 
+- The management agent lists a driver's Archive catalog (phase 5, M11;
+  quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`).
+  `karyos-agent --archive DIR=REQ,RESP` (`AgentConfig::with_archive`,
+  `karyos_agent::catalog::CatalogConfig`), off by default, names a
+  watched driver and its host's Archive control streams. A thread per
+  such driver connects as an IPC client with a short timeout, takes a
+  concurrent handle on the request stream (which the host configures
+  concurrent) and subscribes the response stream, lists the catalog with
+  `RecordingLister` within a deadline and lists again after an interval;
+  failures are counted and retried. `DriverView::catalog` (API v1, after
+  `alerts`) holds the last complete listing, `left_out`, `listed_at`,
+  `listings`, `failures` and `last_error`; the exporter adds
+  `karyos_archive_recordings`, `karyos_archive_listings_total`,
+  `karyos_archive_listing_failures_total` and
+  `karyos_archive_listed_at_ns`. It costs one client slot of that driver.
+  The crate graph test checks that karyos-archive never depends on the
+  agent.
+
 - The management agent's operations journal (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M10b, owner item 7
   interim). `karyos_agent::journal::Journal` keeps the guard operations as

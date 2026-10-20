@@ -44,7 +44,15 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut config = AgentConfig::new(args.drivers).with_alerts(args.alerts);
+    let mut config = args.archives.iter().fold(
+        AgentConfig::new(args.drivers).with_alerts(args.alerts),
+        |config, (dir, streams)| {
+            config.with_archive(
+                dir.clone(),
+                karyos_agent::catalog::CatalogConfig::new(*streams),
+            )
+        },
+    );
     if let Some(journal) = args.journal {
         config = config.with_journal(journal);
     }
