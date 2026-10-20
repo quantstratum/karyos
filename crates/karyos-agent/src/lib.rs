@@ -75,6 +75,8 @@ pub use trace_window::WindowConfig;
 #[cfg(target_os = "linux")]
 mod agent;
 #[cfg(target_os = "linux")]
+pub mod operations;
+#[cfg(target_os = "linux")]
 pub mod server;
 
 #[cfg(target_os = "linux")]
