@@ -239,7 +239,16 @@ pub enum GapReason {
     /// The journal recording was stopped by another hand, and a new one
     /// begins.
     JournalReplaced,
+    /// The journal could not be opened at the agent's start, so nothing
+    /// of the run is recorded. Never written: the agent holds it in memory
+    /// at [`UNOPENED_POSITION`], and its acknowledgement too.
+    JournalUnavailableAtStart,
 }
+
+/// The position that names the unknown interval of a journal that could
+/// not be opened ([`GapReason::JournalUnavailableAtStart`]): it has no
+/// record, so no position in the journal.
+pub const UNOPENED_POSITION: u64 = u64::MAX;
 
 impl GapReason {
     /// The code an unknown-interval record carries.
@@ -250,6 +259,7 @@ impl GapReason {
             Self::TornTail => 2,
             Self::UncleanStop => 3,
             Self::JournalReplaced => 4,
+            Self::JournalUnavailableAtStart => 5,
         }
     }
 
@@ -261,6 +271,7 @@ impl GapReason {
             1 => Self::RequestWithoutOutcome,
             2 => Self::TornTail,
             4 => Self::JournalReplaced,
+            5 => Self::JournalUnavailableAtStart,
             _ => Self::UncleanStop,
         }
     }

@@ -256,6 +256,7 @@ fn gap_reasons_round_trip() {
         GapReason::TornTail,
         GapReason::UncleanStop,
         GapReason::JournalReplaced,
+        GapReason::JournalUnavailableAtStart,
     ] {
         assert_eq!(GapReason::from_code(reason.code()), reason);
     }

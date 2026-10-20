@@ -435,6 +435,15 @@ release may break APIs, wire formats and shared-memory layouts.
   and `PollSummary`. `poll` is unchanged: it adopts, and moves within
   the poll. The C ABI's subscription poll (F4) builds on it.
 
+- A journal that cannot be opened at the agent's start raises the
+  `journal_gap` alert (karyos#497; quantstratum-docs:
+  `karyos/design/guards-and-abort.md`). The view shows its unknown
+  interval with reason `journal_unavailable_at_start` (code 5) at
+  position `u64::MAX` until an administrator acknowledges it with
+  `gap-ack`. With no journal to record it, the interval and its
+  acknowledgement are held in memory only, the acknowledgement logged at
+  info on standard error with the uid and the interval, and the next
+  start raises it again while the journal still cannot be opened.
 - The operations journal records how each agent run ends (DESIGN, a
   follow-up of M10b): `agent started` (kind 8) is written durably when
   the journal opens and `agent stopped` (kind 7) by `Agent::stop` /
