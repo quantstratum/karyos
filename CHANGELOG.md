@@ -426,7 +426,27 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos_archive_recordings`, `karyos_archive_listings_total`,
   `karyos_archive_listing_failures_total` and
   `karyos_archive_listed_at_ns`. It costs one client slot of that driver.
-  karyos-agent now depends on karyos-archive, which never depends on it.
+  The crate graph test checks that karyos-archive never depends on the
+  agent.
+
+- The management agent's operations journal (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M10b, owner item 7
+  interim). `karyos_agent::journal::Journal` keeps the guard operations as
+  one `required` Archive recording on channel `karyos:operations-journal`
+  in a journal directory, resumed at start, recorded through the Archive's
+  `Recorder` from the new `karyos_archive::queue::QueueSource`, which lays
+  queued records out as the DATA frames of a log (padding a term's end).
+  Each record is version 1: kind, host time, guard, expected epoch,
+  operation, operator, parameters digest, outcome code, guard word and up
+  to 128 bytes of reason. `append_durable` returns only once the record is
+  durable (a reopen fails closed without it); an append that fails leaves
+  the journal unavailable and counts in `failed_appends`. At start, a
+  request with no outcome after it, a tail recovery cut, or a journal
+  recording stopped by another hand records an unknown interval, which
+  stays open across restarts until `acknowledge_gap` records an
+  administrator's acknowledgement of it. `Recorder::sync` and
+  `Recorder::source_mut` support it. The agent's requests, roles and alert
+  follow.
 
 - `Client::add_concurrent_publication(uri, stream_id)` in karyos-client
   (M11): a concurrent handle on lane 0 of the only `karyos:ipc` stream of

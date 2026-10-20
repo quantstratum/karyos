@@ -35,9 +35,12 @@
 //!   default.
 //! - **Not yet.** An endpoint's capability gauges read as one group in
 //!   the view (M6b's `karyos_client::capabilities` reads them).
-//! - **Crate graph** (owner item 52): it depends on `karyos-client`,
-//!   `karyos-sys`, `karyos-trace` and `karyos-archive`; neither the
-//!   driver, the client nor the Archive depends on it.
+//! - **Operations journal** (M10b): [`journal`] keeps the agent's guard
+//!   operations as an Archive recording (owner item 7, interim).
+//! - **Crate graph** (owner item 52): it depends on `karyos-archive`,
+//!   `karyos-client`, `karyos-sys` and `karyos-trace`, never on the driver
+//!   or the tools; neither the driver, the client nor the Archive depends
+//!   on it.
 //!
 //! The attach is Linux only, as the tool attach is; [`api`] builds
 //! everywhere.
@@ -54,6 +57,7 @@ pub mod api;
 pub mod catalog;
 pub mod cli;
 pub mod exporter;
+pub mod journal;
 pub mod json;
 #[cfg_attr(
     not(target_os = "linux"),
