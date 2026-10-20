@@ -582,3 +582,23 @@ fn a_closed_connection_leaves_its_client_open() {
     }
     assert_eq!(karyos_client_close(client), Status::Ok.code());
 }
+
+/// An Archive connection has no thread affinity (`karyos.h`, "Threads"):
+/// one made on a thread lists on another and closes on a third.
+#[test]
+fn a_connection_moves_between_threads() {
+    let (archive, asked) =
+        std::thread::spawn(|| archive(Answer::Catalog, Duration::from_secs(3600)))
+            .join()
+            .unwrap();
+    std::thread::spawn(move || {
+        let (status, delivered, _) = list(archive, 0, 3, &mut detail());
+        assert_eq!((status, delivered), (Status::Ok.code(), 3));
+    })
+    .join()
+    .unwrap();
+    assert_eq!(*asked.lock().unwrap(), [(1, 3)]);
+    std::thread::spawn(move || assert_eq!(karyos_archive_close(archive), Status::Ok.code()))
+        .join()
+        .unwrap();
+}

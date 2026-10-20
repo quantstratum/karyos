@@ -609,6 +609,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The C ABI's thread rules per handle kind (BIND-S2; quantstratum-docs:
+  `karyos/design/embedded-api.md`, "Requirements for the C ABI"), in a
+  "Threads" section of `karyos.h`. No handle has thread affinity: every
+  kind may be created, used, moved and closed on any thread, and a claim
+  committed on another thread. Concurrent calls on one handle are refused
+  with `KARYOS_E_BUSY`, never serialized, and calls on different handles
+  run concurrently: a data-path call holds only its handle, while a
+  control call also holds the client. Two waits are bounded: a call on a
+  started driver waits for one duty cycle, and ending a claim waits for
+  the claim's slot. `karyos-ffi` asserts at compile time that each
+  kind's object is `Send` and its table `Sync`
+  (`src/threads.rs`), and `abi::tests::threads` checks the runtime rules.
+
 - Conformance scenarios for the C ABI added since batch 1
   (quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, F6; SPEC §13).
   The runner (`tests/conformance.rs`, FORMAT.md) now calls

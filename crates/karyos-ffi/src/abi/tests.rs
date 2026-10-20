@@ -1644,6 +1644,7 @@ mod concurrent;
 mod conflated;
 mod outcomes;
 mod rejoin;
+mod threads;
 
 // Subscription options (F7b).
 
