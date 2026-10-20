@@ -1,0 +1,10 @@
+# A binding reports the library's ABI version before any other call
+# (SPEC.md §13 "abi version"; each binding's version check at step B0).
+format 2
+id op.library.version
+abi 0.1
+covers "abi version"
+since B0
+
+op library.version
+expect ok major=0 minor=1

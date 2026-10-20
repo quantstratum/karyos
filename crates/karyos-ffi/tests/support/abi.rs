@@ -646,6 +646,31 @@ pub fn publication_claim(publication: u64, lane: u32, length: u32) -> (i32, u64)
     (status, claim)
 }
 
+/// `karyos_publication_claim` of `length` bytes on `lane`, with `message`
+/// written into the staged buffer on success when it is `length` bytes
+/// long (otherwise the buffer is left as staged): the status and the
+/// claim's handle.
+pub fn publication_claim_filled(
+    publication: u64,
+    lane: u32,
+    length: u32,
+    message: &[u8],
+) -> (i32, u64) {
+    let mut claim = 0;
+    let mut buffer = core::ptr::null_mut();
+    // SAFETY: a live, aligned `u64` and pointer.
+    let status =
+        unsafe { karyos_publication_claim(publication, lane, length, &mut claim, &mut buffer) };
+    let fits = usize::try_from(length).is_ok_and(|length| length == message.len());
+    if status == 0 && fits && !message.is_empty() {
+        // SAFETY: on success `buffer` points at `length` writable bytes,
+        // valid until the claim's commit or abort, and `message` is a
+        // separate allocation of that many bytes.
+        unsafe { core::ptr::copy_nonoverlapping(message.as_ptr(), buffer, message.len()) };
+    }
+    (status, claim)
+}
+
 /// `karyos_claim_commit`, with an accepted sized as `accepted_size`: the
 /// status and the accepted.
 pub fn claim_commit(claim: u64, accepted_size: u32) -> (i32, SizedStruct<Accepted>) {

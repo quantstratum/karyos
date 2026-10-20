@@ -1,0 +1,12 @@
+# The monotonic clock of scheduled offers never goes backwards
+# (karyos_clock_now; publication.timed.offer).
+format 2
+id op.clock.monotonic
+abi 0.1
+covers "clocks"
+since B2
+
+op clock.now domain="monotonic"
+expect ok now=$first
+op clock.now domain="monotonic"
+expect ok now>=$first

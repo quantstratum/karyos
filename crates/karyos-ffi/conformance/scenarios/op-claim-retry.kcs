@@ -1,0 +1,43 @@
+# A claim held for explicit retry or abort (BIND-S3; the C++ and Go object
+# APIs): one outstanding claim per publication, a retryable commit keeps
+# it staged, an abort ends it, and a commit after the abort answers
+# closed. A one-shot claim leaves nothing outstanding.
+format 2
+id op.claim.retry
+abi 0.1
+covers "staged claims"
+since B1
+feature claim-retry
+
+op client.connect driver=$driver
+expect ok client=$client
+op publication.add client=$client stream_id=6
+expect ok publication=$publication
+op publication.claim publication=$publication length=8
+expect ok claim=$claim
+op publication.claim publication=$publication length=8
+expect status=claim_outstanding
+op publication.publish_claimed publication=$publication length=8
+expect status=claim_outstanding
+op claim.commit claim=$claim
+expect status=not_connected
+op claim.commit claim=$claim
+expect status=not_connected
+op claim.abort claim=$claim
+expect ok
+op claim.commit claim=$claim
+expect status=closed
+op claim.abort claim=$claim
+expect status=closed
+op publication.publish_claimed publication=$publication length=8
+expect status=not_connected
+op publication.claim publication=$publication length=8
+expect ok claim=$next
+op publication.close publication=$publication
+expect ok
+op claim.commit claim=$next
+expect status=closed
+op claim.abort claim=$next
+expect status=closed
+op client.close client=$client
+expect ok

@@ -1,0 +1,36 @@
+# The C ABI of BIND-S3's one outstanding claim per publication, with the
+# raw status of each call; claim.double.commit pins the retryable commit
+# that keeps a claim staged and the KARYOS_E_CLOSED commit after an abort.
+format 2
+id claim.outstanding
+abi 0.1
+covers "staged claims"
+since B1
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=7
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_publication client=$client stream_id=7
+expect KARYOS_OK publication=$publication
+call karyos_publication_claim publication=$publication length=8
+expect KARYOS_OK claim=$claim
+call karyos_publication_claim publication=$publication length=8
+expect KARYOS_E_CLAIM_OUTSTANDING
+call karyos_claim_abort claim=$claim
+expect KARYOS_OK
+call karyos_publication_claim publication=$publication length=8
+expect KARYOS_OK claim=$next
+call karyos_claim_abort claim=$next
+expect KARYOS_OK
+# A handle past the signed range is a handle like any other: unknown.
+call karyos_claim_abort claim=18446744073709551615
+expect KARYOS_E_INVALID_HANDLE
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

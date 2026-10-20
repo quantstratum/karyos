@@ -11,6 +11,24 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The conformance suite gains format 2 (ADR-0073, owner item 46,
+  decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged;
+  format 1's `karyos_driver_start` now defaults its `idle_strategy` to
+  the ABI's declared default, `KARYOS_IDLE_YIELD_THEN_SLEEP` (3), in
+  place of `KARYOS_IDLE_YIELD` (1), which changes no result.
+  Format 2 adds a semantic layer of ops that a binding runs through its
+  public API, with a binding's close rules (a second close is `ok`; an
+  op on a closed object or a closed parent's child answers `closed`)
+  and outcomes named by header status; values from -2^63 to 2^64 - 1;
+  `since`, the binding SPEC step that requires a scenario; `feature`;
+  bounds on files, lines, steps and variables; and a pinning line with
+  the SHA-256 of the suite and header and the core's identity. The
+  reference runner runs the ops through a semantic adapter over the C
+  ABI and reports each scenario passed, skipped, unsupported or later.
+  Twelve scenarios: the claim semantics every binding shares (BIND-S3:
+  one outstanding claim, a retryable commit that keeps the claim, a
+  one-shot claim that leaves none), the close rules, concurrent
+  publication, conflated views, outcome streams and the clocks.
 - `karyos-ffi`'s default idle strategy is `KARYOS_IDLE_YIELD_THEN_SLEEP`
   (ADR-0066): `karyos_client_options_init` now fills it in place of
   `KARYOS_IDLE_YIELD`, and `karyos_driver_start` takes it. The new

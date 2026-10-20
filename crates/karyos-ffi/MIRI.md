@@ -76,6 +76,7 @@ test-only unsafe of the integration tests.
 | The rejoin state: `size` read first, nothing written on refusal, the sized write by the caller's size (F9b) | `karyos_subscription_rejoin_state` (`write_rejoin_state`) | `abi::tests::rejoin::the_rejoin_state_is_written_by_the_callers_size` (no driver) |
 | A caller's sized struct of another minor version (test support: `SizedStruct` in `tests/support/abi.rs`) | the conformance runner | `tests/conformance.rs` `the_sized_struct_checks_see_writes`; the library's side is `a_struct_from_a_newer_header_is_read_and_written_by_its_prefix` |
 | The conformance runner's message handler: the message slice read, and a poll of its own subscription from inside it (test support: `keep_message` and `ignore` in `tests/support/abi.rs`) | the conformance runner | none under Miri: the conformance scenarios are native only (below). The library's side of both is covered: `abi::tests::a_subscription_delivers_each_message_from_its_private_copy` and `abi::tests::a_handler_that_reenters_its_subscription_is_refused` |
+| The semantic adapter's claim fill: the message copied into a staged claim's buffer (test support: `publication_claim_filled` in `tests/support/abi.rs`) | `publication.publish_claimed` of the conformance runner | `tests/driver.rs` `a_claim_filled_by_its_caller_is_staged_until_its_abort`; the library's side, the caller writing through the claim's `*mut u8` and the commit loading it, is `abi::tests::a_publication_offers_and_commits_staged_claims` |
 
 ## What Miri does not cover
 
