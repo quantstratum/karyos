@@ -26,6 +26,25 @@ release may break APIs, wire formats and shared-memory layouts.
   one outstanding claim, a retryable commit that keeps the claim, a
   one-shot claim that leaves none), the close rules, concurrent
   publication, conflated views, outcome streams and the clocks.
+- `karyos-ffi`'s default idle strategy is `KARYOS_IDLE_YIELD_THEN_SLEEP`
+  (ADR-0066): `karyos_client_options_init` now fills it in place of
+  `KARYOS_IDLE_YIELD`, and `karyos_driver_start` takes it. The new
+  constant (3) yields for the first 64 consecutive idle waits, then sleeps
+  1 ms per wait, and starts again after a wait that found work; the driver
+  thread uses the agents' own `YieldThenSleep`. Busy-spin stays an
+  explicit choice.
+- `karyos_client::Context`'s default idle strategy is the new
+  `IdleStrategy::YieldThenSleep` (ADR-0066), in place of `Yield`, so a
+  client's control-call wait yields for 64 idle waits and then sleeps
+  1 ms per wait. The ABI's default is the facade's. `BusySpin`, `Yield`
+  and `Sleep` stay explicit choices.
+- `karyos.h` states the ABI version rule of decision BIND-Q8 in place of
+  "a different major is incompatible": call `karyos_abi_version` first,
+  before any other call and before using newer symbols or layouts; the
+  ABI version is independent of the workspace version; before 1.0 a
+  caller accepts exactly the `0.y` it targets with at least its minimum
+  `0.y.z`.
+
 - The alpha.2 public API audit's refresh (quantstratum-docs:
   `karyos/testing/public-api-audit-alpha2.md`, 2026-10-20):
   `karyos_archive::source::Rejoin` is `#[non_exhaustive]`, so a match

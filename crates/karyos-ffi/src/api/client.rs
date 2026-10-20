@@ -31,6 +31,8 @@ pub(crate) const IDLE_BUSY_SPIN: u32 = 0;
 pub(crate) const IDLE_YIELD: u32 = 1;
 /// `KARYOS_IDLE_SLEEP`.
 pub(crate) const IDLE_SLEEP: u32 = 2;
+/// `KARYOS_IDLE_YIELD_THEN_SLEEP`: the default (ADR-0066).
+pub(crate) const IDLE_YIELD_THEN_SLEEP: u32 = 3;
 
 /// A client over either connection.
 pub(crate) enum AnyClient {
@@ -304,7 +306,7 @@ impl Options {
         );
         Self {
             dir: None,
-            idle_strategy: IDLE_YIELD,
+            idle_strategy: IDLE_YIELD_THEN_SLEEP,
             idle_sleep_ns: 0,
             timeout_ns: u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX),
             max_pending: u32::try_from(max_pending).unwrap_or(u32::MAX),
@@ -318,6 +320,7 @@ impl Options {
             IDLE_BUSY_SPIN => IdleStrategy::BusySpin,
             IDLE_YIELD => IdleStrategy::Yield,
             IDLE_SLEEP => IdleStrategy::Sleep(Duration::from_nanos(self.idle_sleep_ns)),
+            IDLE_YIELD_THEN_SLEEP => IdleStrategy::YieldThenSleep,
             _ => return Err(Status::InvalidArgument.into()),
         };
         let max_pending = usize::try_from(self.max_pending).map_err(|_| Status::InvalidArgument)?;
@@ -504,5 +507,41 @@ where
             client.remove_subscription(subscription);
             Err(Status::InvalidArgument.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each `KARYOS_IDLE_*` maps to its facade strategy, and the default is
+    /// `KARYOS_IDLE_YIELD_THEN_SLEEP` (ADR-0066).
+    #[test]
+    fn each_idle_strategy_maps_to_the_facades() {
+        assert_eq!(Options::defaults().idle_strategy, IDLE_YIELD_THEN_SLEEP);
+        // The ABI's default is the facade's: bindings define none of their
+        // own (ADR-0066).
+        assert_eq!(
+            Options::defaults().context().unwrap().idle_strategy(),
+            Context::builder().build().unwrap().idle_strategy()
+        );
+        for (code, strategy) in [
+            (IDLE_BUSY_SPIN, IdleStrategy::BusySpin),
+            (IDLE_YIELD, IdleStrategy::Yield),
+            (IDLE_SLEEP, IdleStrategy::Sleep(Duration::from_nanos(7))),
+            (IDLE_YIELD_THEN_SLEEP, IdleStrategy::YieldThenSleep),
+        ] {
+            let options = Options {
+                idle_strategy: code,
+                idle_sleep_ns: 7,
+                ..Options::defaults()
+            };
+            assert_eq!(options.context().unwrap().idle_strategy(), strategy);
+        }
+        let unknown = Options {
+            idle_strategy: 4,
+            ..Options::defaults()
+        };
+        assert!(unknown.context().is_err());
     }
 }

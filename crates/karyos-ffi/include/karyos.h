@@ -19,8 +19,11 @@
  *   it held.
  * - Callbacks must return normally: an exception, a panic or a longjmp
  *   through Karyos frames is outside this contract.
- * - Call karyos_abi_version first; a different major version is
- *   incompatible.
+ * - Call karyos_abi_version first: before any other call, and before
+ *   using newer symbols or layouts. The ABI version is independent of
+ *   the workspace version. Before 1.0 a caller accepts exactly the 0.y
+ *   it targets with at least its minimum 0.y.z, and refuses any other
+ *   version.
  */
 
 #ifndef KARYOS_H
@@ -169,11 +172,15 @@ extern "C" {
 
 /**
  * Idle strategies of a control call's wait (karyos_client_options) and of
- * a driver's own thread (karyos_driver_start).
+ * a driver's own thread (karyos_driver_start). KARYOS_IDLE_YIELD_THEN_SLEEP
+ * yields for the first 64 consecutive idle waits, then sleeps 1 ms per
+ * wait, and starts again after a wait that found work; it is the default
+ * (karyos ADR-0066), and busy-spin is an explicit low-latency choice.
  */
 #define KARYOS_IDLE_BUSY_SPIN 0
 #define KARYOS_IDLE_YIELD 1
 #define KARYOS_IDLE_SLEEP 2
+#define KARYOS_IDLE_YIELD_THEN_SLEEP 3
 
 /*
  * Status codes. 0 is success; 1-99 data-path outcomes, 100-199 usage,
@@ -287,7 +294,8 @@ typedef struct karyos_detail {
  */
 typedef struct karyos_client_options {
     uint32_t size;
-    /* KARYOS_IDLE_BUSY_SPIN, KARYOS_IDLE_YIELD or KARYOS_IDLE_SLEEP. */
+    /* KARYOS_IDLE_BUSY_SPIN, KARYOS_IDLE_YIELD, KARYOS_IDLE_SLEEP or
+       KARYOS_IDLE_YIELD_THEN_SLEEP (the default). */
     uint32_t idle_strategy;
     /* The driver's directory, NUL-terminated UTF-8. */
     const char *dir;
@@ -433,8 +441,9 @@ int32_t karyos_abi_version(uint32_t *major, uint32_t *minor, uint32_t *patch);
 const char *karyos_status_message(int32_t status);
 
 /**
- * Fills options with the defaults and its size. KARYOS_E_INVALID_ARGUMENT
- * for a null or misaligned pointer.
+ * Fills options with the defaults and its size; the idle strategy is
+ * KARYOS_IDLE_YIELD_THEN_SLEEP. KARYOS_E_INVALID_ARGUMENT for a null or
+ * misaligned pointer.
  */
 int32_t karyos_client_options_init(karyos_client_options *options);
 
@@ -870,8 +879,8 @@ int32_t karyos_driver_do_work(uint64_t driver, uint32_t *work);
 /**
  * Gives the driver a thread of its own, which runs its duty cycle and
  * idles by idle_strategy (KARYOS_IDLE_*; idle_sleep_ns for
- * KARYOS_IDLE_SLEEP) after a cycle without work. KARYOS_E_BUSY when it
- * already has one.
+ * KARYOS_IDLE_SLEEP) after a cycle without work. The agents' default is
+ * KARYOS_IDLE_YIELD_THEN_SLEEP. KARYOS_E_BUSY when it already has one.
  */
 int32_t karyos_driver_start(uint64_t driver, uint32_t idle_strategy, uint64_t idle_sleep_ns);
 
