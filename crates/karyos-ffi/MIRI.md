@@ -77,6 +77,7 @@ test-only unsafe of the integration tests.
 | Replay options: the init write, the prefix read, the target channel's C string read during the call (F9c) | `karyos_replay_options_init`, `karyos_archive_replay` | `abi::tests::replay::the_replay_options_are_initialized_and_checked`, `a_replay_checks_its_arguments_before_its_handle`, `a_replay_is_started_and_stopped_driverless` (in-memory transports, no driver) |
 | A replay's `replay_id` and `session_id` out-parameters and its `detail` (F9c) | `karyos_archive_replay`, `karyos_archive_stop_replay` | `abi::tests::replay::a_replay_is_started_and_stopped_driverless`, `a_refused_or_unanswered_replay_reports_why` (no driver) |
 | Replay subscription options: the init write, the prefix read of a non-null struct, checked before the client (F9c) | `karyos_replay_subscription_options_init`, `karyos_client_add_replay_subscription` | `abi::tests::replay::the_replay_options_are_initialized_and_checked` (the granted subscription's out-parameter, the class of every add, is native only: `a_replay_through_a_real_archive_ends_at_its_targets_seal`) |
+| The image change's end fields, written by the caller's size: a 24-byte struct takes none, a 48-byte one takes them, a newer one keeps its tail | `karyos_subscription_next_image_change` (`write_image_change`) | `abi::tests::an_image_change_is_written_by_the_callers_size` (no driver) |
 | The subscription end: `size` read first, nothing written on refusal, the sized write by the caller's size (F9c) | `karyos_subscription_end_state` (`write_subscription_end`) | `abi::tests::replay::the_subscription_end_is_written_by_the_callers_size` (no driver) |
 | A caller's sized struct of another minor version (test support: `SizedStruct` in `tests/support/abi.rs`) | the conformance runner | `tests/conformance.rs` `the_sized_struct_checks_see_writes`; the library's side is `a_struct_from_a_newer_header_is_read_and_written_by_its_prefix` |
 | The thread rules' tests (`karyos.h`, Threads): claim buffer fills, an outcome handler that reads nothing, options init and `assume_init`, moves of handles across threads (test only: `abi::tests::threads`, `conflated::a_view_moves_between_threads`, `archive::a_connection_moves_between_threads`) | `karyos_publication_claim`, `karyos_claim_commit`, `karyos_publication_poll_outcomes`, `karyos_driver_options_init`, the closes | `archive::a_connection_moves_between_threads` runs under Miri. The others are driver integration, native only (below); their unsafe patterns are the classes above: the claim's staged buffer (`a_publication_offers_and_commits_staged_claims`), the outcome handler call (`records_reach_the_handler_which_cannot_reenter_its_publication`) and options init writes (`the_options_carry_their_size_and_the_drivers_defaults`) |
@@ -94,10 +95,11 @@ test-only unsafe of the integration tests.
   including a remote client's guarded publication (`tests/outcomes.rs`)
   and conflated view.
 - **Network images** (UDP sockets):
-  `a_network_subscription_grows_its_copy_with_a_larger_image` runs
-  natively, and so does the image change's populated write (`has` = 1,
-  through `write_sized`), which only a network image produces; under
-  Miri only `has` = 0 runs.
+  `a_network_subscription_grows_its_copy_with_a_larger_image` and
+  `a_retired_images_change_carries_its_end` run natively, and so does
+  the image change's populated write (`has` = 1), which only a network
+  image produces. Under Miri, `has` = 0 runs, and the populated write
+  runs driverless through `write_image_change`.
 - **Real C callers.** Miri calls the exports from Rust. The header check
   (`src/header.rs`) and the conformance runner (`tests/conformance.rs`)
   cover the C declarations; a binding's own runner covers its language.

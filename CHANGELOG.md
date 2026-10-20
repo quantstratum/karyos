@@ -631,6 +631,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A retired image's change carries how its stream ended (owner item
+  57). In `karyos-client`, `ImageChange.end` is an `ImageEnd`, the
+  stream's terminal seal: its `SealReason` and its stream position.
+  `EndOfStream` means the source's EOS was reached through a complete
+  prefix. `ImageRetired` means the image retired without one: its
+  publisher timed out, or a lane lost a frame. It is `None` for an
+  arrival and for an image released unsealed. `ImageChange::with_end`
+  sets it. `karyos-sys` gains `LogBuffer::terminal_seal`. In C,
+  `karyos_image_change` grows from 24 to 48 bytes
+  (`KARYOS_IMAGE_CHANGE_SIZE_ENDS`) with `end_reason` (a `KARYOS_END_*`
+  code), `reserved`, `end_position` and `seal_code`, written by the
+  caller's size: a caller of the 24-byte struct gets what it got before.
 - `karyos-ffi` replays an Archive's recordings from C (F9c, B6;
   quantstratum-docs: `karyos/design/archive-replay-control.md`):
   `karyos_archive_replay` (with `karyos_replay_options`, read by prefix)
@@ -646,8 +658,9 @@ release may break APIs, wire formats and shared-memory layouts.
   subscription ended: `KARYOS_END_*`, with `END_OF_STREAM` for a replay
   that reached its end, `IMAGE_RETIRED` for one stopped,
   `STREAM_REMOVED`, `REVOKED`, `CLOSED_BY_OVERRUN`, and `OTHER` for any
-  other reason, a newer core's included, with the raw seal code. A network subscription reads `KARYOS_END_NONE`: its images'
-  ends come through its image changes.
+  other reason, a newer core's included, with the raw seal code. A
+  network subscription reads `KARYOS_END_NONE`: its images' ends come
+  through its image changes.
 - `karyos_client`: `From<ClientSubscription<T>> for Subscription<T>`, so a
   replay target granted by `Client::replay_targets` polls and is released
   (`Client::remove_subscription`) as any stream subscription.
