@@ -272,10 +272,11 @@ impl<T> Table<T> {
     }
 
     /// Reads the object `handle` names even when a panic poisoned its slot,
-    /// for what a close needs before it takes the slot: a field set when
-    /// the object was created and never changed (the client a publication
-    /// or a subscription belongs to), which a panic cannot have left
-    /// half-written.
+    /// for what a close needs before it takes the slot. `f` must read only
+    /// fields written when the object was created and never assigned
+    /// afterwards (the client a publication or a subscription belongs to):
+    /// a panic cannot have left such a field half-written, while any other
+    /// field of a poisoned object may be inconsistent.
     ///
     /// # Errors
     ///

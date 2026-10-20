@@ -311,7 +311,12 @@ pub(crate) fn abort(claim: Handle) -> Result<(), Status> {
 ///
 /// The handle's failures, its client's included.
 pub(crate) fn close(publication: Handle) -> Result<(), Status> {
-    // A poisoned handle is closed too: its client is read regardless.
+    // A poisoned handle is closed too, and released like any other: its
+    // client, written at the add and never changed, is read regardless
+    // (`Table::read_even_poisoned`); the table hands the poisoned object
+    // over, and its outstanding claim is removed from the claims table and its lanes are released to the client (`remove_publication`). What a release touches cannot be left invalid by a
+    // panic inside a call: at worst it releases what that call left
+    // half-done, as a drop would.
     let client = table().read_even_poisoned(publication, |entry| entry.client)?;
     clients().with(client, |entry| {
         let removed = table().remove(publication)?;
