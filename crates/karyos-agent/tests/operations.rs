@@ -441,9 +441,16 @@ fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
         let _ = driver.do_work().unwrap();
         std::thread::sleep(Duration::from_micros(200));
     }
-    // Attached, so its request record is written; unserved, the driver
-    // gives no answer, so it has no outcome. The agent's own child, by its
-    // pid.
+    // Attached, so its request record is written. The cycle that admitted
+    // it may also serve a close written in time (admission is served
+    // before commands): an unchanged audit proves no answer exists, and
+    // with the driver no longer served none can come, so no outcome. The
+    // agent's own child, by its pid.
+    assert_eq!(
+        driver.guard_audit().records.len(),
+        audited,
+        "the close was served in the admitting cycle"
+    );
     child.kill().unwrap();
     let _ = child.wait().unwrap();
     let mut answer = String::new();
