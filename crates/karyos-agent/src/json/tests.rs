@@ -232,6 +232,7 @@ fn every_field() -> AgentView {
                 position: 96,
                 from: 10,
                 to: 70,
+                reason: "unclean_stop",
             }),
             alerts: vec![Alert {
                 kind: AlertKind::JournalGap,
@@ -305,7 +306,7 @@ const V1: &str = concat!(
     r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0},"alerts":[],"#,
     r#""catalog":{"recordings":[],"left_out":0,"listed_at":null,"listings":0,"failures":0,"last_error":null}}"#,
     r#"],"journal":{"recording":4,"unsealed":true,"unavailable":false,"error":null,"failed_appends":2,"#,
-    r#""gap":{"position":96,"from":10,"to":70},"#,
+    r#""gap":{"position":96,"from":10,"to":70,"reason":"unclean_stop"},"#,
     r#""alerts":[{"kind":"journal_gap","stream":0,"lane":0,"participant":96,"value":60,"since":70}]}}"#,
 );
 

@@ -60,11 +60,13 @@ fn a_journal_resumes_its_recording() {
     let first = journal
         .append(&request(Kind::CloseRequest, 11, 3), 11)
         .unwrap();
-    assert_eq!(first, 0);
+    // After the run's `agent started` record.
+    assert!(first > 0);
     let second = journal
         .append_durable(&request(Kind::CloseOutcome, 12, 3), 12)
         .unwrap();
     assert!(second > first);
+    journal.stop(13).unwrap();
     drop(journal);
     let journal = Journal::open(&dir, 20).unwrap();
     assert_eq!(journal.recording(), recording);
@@ -85,9 +87,11 @@ fn an_unanswered_request_opens_an_unknown_interval_until_acknowledged() {
         .append_durable(&request(Kind::ReopenRequest, 15, 3), 15)
         .unwrap();
     drop(journal);
-    let journal = Journal::open(&dir, 100).unwrap();
+    let mut journal = Journal::open(&dir, 100).unwrap();
     let gap = journal.gap().unwrap();
     assert_eq!((gap.from, gap.to), (15, 100));
+    assert_eq!(gap.reason, GapReason::RequestWithoutOutcome);
+    journal.stop(101).unwrap();
     drop(journal);
     // Still open after another start, and not recorded twice.
     let mut journal = Journal::open(&dir, 200).unwrap();
@@ -102,6 +106,7 @@ fn an_unanswered_request_opens_an_unknown_interval_until_acknowledged() {
         journal.acknowledge_gap(gap.position, 0, 211),
         Err(JournalError::NoGap)
     ));
+    journal.stop(212).unwrap();
     drop(journal);
     let journal = Journal::open(&dir, 300).unwrap();
     assert_eq!(journal.gap(), None);
@@ -183,4 +188,76 @@ fn a_failed_journal_refuses_appends_until_it_reopens() {
     let journal = Journal::open(&dir, 40).unwrap();
     assert!(!journal.unavailable());
     assert_eq!(journal.failed_at(), None);
+    // The failed run could not record its stop: an unclean stop.
+    assert_eq!(
+        journal.gap().map(|gap| gap.reason),
+        Some(GapReason::UncleanStop)
+    );
+}
+
+/// Kind 7 (DESIGN, karyos#490 follow-up): a run that ends with
+/// `agent stopped` leaves no unknown interval; one that ends otherwise,
+/// even with every request answered, leaves an unclean stop, with the last
+/// record's time as its start. An empty journal is no gap.
+#[test]
+fn a_run_without_a_clean_stop_leaves_an_unclean_stop() {
+    let dir = dir("unclean");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    assert_eq!(journal.gap(), None, "an empty journal");
+    let _ = journal
+        .append(&request(Kind::CloseRequest, 11, 3), 11)
+        .unwrap();
+    let _ = journal
+        .append_durable(&request(Kind::CloseOutcome, 12, 3), 12)
+        .unwrap();
+    // A crash: no stop.
+    drop(journal);
+    let mut journal = Journal::open(&dir, 50).unwrap();
+    let gap = journal.gap().unwrap();
+    assert_eq!(
+        (gap.reason, gap.from, gap.to),
+        (GapReason::UncleanStop, 12, 50)
+    );
+    journal.acknowledge_gap(gap.position, 0, 51).unwrap();
+    journal.stop(52).unwrap();
+    drop(journal);
+    let journal = Journal::open(&dir, 60).unwrap();
+    assert_eq!(journal.gap(), None, "a clean stop");
+}
+
+/// A journal that failed cannot record its stop: the next start records
+/// the unclean stop, so a close made while it was down, which has no
+/// record, falls in an unknown interval.
+#[test]
+fn a_failed_journal_cannot_stop_cleanly() {
+    let dir = dir("unstoppable");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    journal.break_recorder();
+    // A close while the journal is down: its request is not written.
+    assert!(
+        journal
+            .append(&request(Kind::CloseRequest, 20, 3), 20)
+            .is_err()
+    );
+    assert!(journal.stop(30).is_err());
+    drop(journal);
+    let journal = Journal::open(&dir, 40).unwrap();
+    assert_eq!(
+        journal.gap().map(|gap| gap.reason),
+        Some(GapReason::UncleanStop)
+    );
+}
+
+/// Reason codes round-trip, an unknown one reading as an unclean stop.
+#[test]
+fn gap_reasons_round_trip() {
+    for reason in [
+        GapReason::RequestWithoutOutcome,
+        GapReason::TornTail,
+        GapReason::UncleanStop,
+        GapReason::JournalReplaced,
+    ] {
+        assert_eq!(GapReason::from_code(reason.code()), reason);
+    }
+    assert_eq!(GapReason::from_code(99), GapReason::UncleanStop);
 }

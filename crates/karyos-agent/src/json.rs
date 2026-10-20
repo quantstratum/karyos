@@ -149,6 +149,7 @@ fn journal_view(out: &mut Out<'_>, journal: &JournalView) {
                 fields.number("position", gap.position);
                 fields.number("from", gap.from);
                 fields.number("to", gap.to);
+                fields.string("reason", gap.reason);
             });
         });
         fields
