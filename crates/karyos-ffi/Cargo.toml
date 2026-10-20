@@ -27,6 +27,12 @@ karyos-driver.workspace = true
 karyos-protocol.workspace = true
 karyos-sys.workspace = true
 
+[dev-dependencies]
+# The production Archive host (H2, H2b) for a gap recovered through a real
+# Archive over the C ABI (#549): tests only, never a normal edge, so the
+# published crate gains no dependency.
+karyos-tools.workspace = true
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The admission socket of the connect tests' fake driver.
 karyos-protocol.workspace = true
