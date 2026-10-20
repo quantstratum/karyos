@@ -27,7 +27,8 @@ release may break APIs, wire formats and shared-memory layouts.
   an Archive over a facade client. `ArchiveConnection::open(&mut client,
   ControlStreams::new(requests, responses))` takes a concurrent publication
   on the shared request stream and a subscription on the response stream
-  (`karyos:ipc`). `into_transports` gives the `Requests` and `Responses`
+  (`karyos:ipc`), or answers `OpenError` naming the stream it could not
+  take. `into_transports` gives the `Requests` and `Responses`
   an `ArchiveClient` or a `RecordingLister` takes. An answer longer than
   the caller's buffer is skipped. The management agent's catalog uses it
   in place of its private adapters, and so do `karyos-catalog list --live`
