@@ -2500,6 +2500,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `karyos_driver_stop` and `karyos_driver_close` of a started driver
+  whose idle strategy is `KARYOS_IDLE_SLEEP` waited out the thread's idle
+  sleep, which is unbounded: with `sleep_ns` near `UINT64_MAX` they never
+  returned once the thread had gone idle. The Go binding's
+  `FuzzDurations` seed hung its Linux gate this way. The thread now parks
+  for its idle sleep, and a stop or a close unparks it after asking it to
+  stop, so neither waits on any idle strategy
+  (`no_idle_strategy_holds_a_stop_or_a_close`).
 - `a_call_on_a_busy_spinning_driver_waits_for_one_cycle` failed once at
   a load of 16 ("a call waited through 3 cycles"): a caller preempted
   between reading the thread's cycle count and announcing itself counted

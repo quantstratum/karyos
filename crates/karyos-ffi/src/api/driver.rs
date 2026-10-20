@@ -310,7 +310,9 @@ impl Idle {
         }
         match self.strategy {
             IDLE_BUSY_SPIN => std::hint::spin_loop(),
-            IDLE_SLEEP => std::thread::sleep(Duration::from_nanos(self.sleep_ns)),
+            // Parked, not slept: a stop or a close unparks the thread, so
+            // neither waits out a long idle sleep (`karyos.h`, Threads).
+            IDLE_SLEEP => std::thread::park_timeout(Duration::from_nanos(self.sleep_ns)),
             _ => std::thread::yield_now(),
         }
     }
@@ -348,10 +350,13 @@ impl Threaded {
     /// dropped (its poison stays on the driver).
     fn join(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take()
-            && let Err(payload) = thread.join()
-        {
-            drop_payload(payload);
+        if let Some(thread) = self.thread.take() {
+            // Wakes an idle sleep, which parks: the thread then sees the
+            // stop before its next cycle.
+            thread.thread().unpark();
+            if let Err(payload) = thread.join() {
+                drop_payload(payload);
+            }
         }
     }
 }
