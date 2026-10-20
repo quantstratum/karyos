@@ -720,14 +720,33 @@ typedef struct karyos_message_info {
     uint32_t reserved;
 } karyos_message_info;
 
-/** An image of a network subscription attached (available 1) or retired. */
+/**
+ * An image of a network subscription attached (available 1) or retired.
+ * A retired image's end follows: a KARYOS_END_* code (defined with
+ * karyos_subscription_end), its seal position and the raw seal reason.
+ * KARYOS_END_END_OF_STREAM is a clean end, KARYOS_END_IMAGE_RETIRED one
+ * without (its publisher timed out, or a lane lost a frame on the way);
+ * KARYOS_END_NONE for an attached image, and for one released unsealed
+ * when its client closed. Set size to sizeof(karyos_image_change): a
+ * caller built against the first version sets 24 and gets no end fields,
+ * one built with them sets at least KARYOS_IMAGE_CHANGE_SIZE_ENDS.
+ */
 typedef struct karyos_image_change {
     uint32_t size;
     int32_t session_id;
     uint64_t image_id;
     uint32_t lane;
     uint32_t available;
+    uint32_t end_reason;
+    uint32_t reserved;
+    /* 0 with no end, for a seal not positioned yet, and for a seal at
+       position 0: 0 alone does not tell them apart. */
+    uint64_t end_position;
+    uint64_t seal_code;
 } karyos_image_change;
+
+/** The size of karyos_image_change with its end fields. */
+#define KARYOS_IMAGE_CHANGE_SIZE_ENDS 48
 
 /**
  * Called once per message with the caller's context, the message's length
