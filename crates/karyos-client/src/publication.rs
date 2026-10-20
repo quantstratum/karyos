@@ -281,6 +281,7 @@ impl<T: TermBytes> ClientPublication<T> {
     /// are read from the buffer the publication itself appends to.
     #[must_use]
     pub fn new(inner: Publication<Arc<LogBuffer<T>>>, allow_unconnected: bool) -> Self {
+        let conflation = crate::publication::buffer_conflation(inner.buffer());
         Self {
             inner,
             allow_unconnected,
@@ -288,7 +289,7 @@ impl<T: TermBytes> ClientPublication<T> {
             link: None,
             base: 0,
             trace: None,
-            conflation: None,
+            conflation,
             _lease: None,
             guard: None,
             schedule: None,
@@ -382,9 +383,10 @@ impl<T: TermBytes> ClientPublication<T> {
         }
     }
 
-    /// Binds the stream's keyed conflation limits to this publication.
-    /// The driver calls this while issuing a publication for a conflated
-    /// stream; callers should normally obtain handles from the driver.
+    /// Binds keyed conflation limits to this publication, in place of the
+    /// table its buffer carries: every publication of a conflated stream
+    /// already reads its stream's from the buffer (F7b-2c-2), in process
+    /// or attached, so this is for tests and for buffers built without one.
     #[must_use]
     pub fn with_conflation(mut self, config: ConflationConfig) -> Self {
         self.conflation = Some(config);
@@ -932,6 +934,17 @@ fn reserves<T: TermBytes>(outcome: &SysClaimOutcome<'_, Arc<LogBuffer<T>>>) -> b
         outcome,
         SysClaimOutcome::Claimed(_) | SysClaimOutcome::Aborted { .. }
     )
+}
+
+/// The conflation table `buffer` carries, as a publication checks it: its
+/// keys and largest value (F7b-2c-2). The journal is no publisher's
+/// concern, and a publication's check never reads it.
+pub(crate) fn buffer_conflation<T: TermBytes>(buffer: &LogBuffer<T>) -> Option<ConflationConfig> {
+    buffer.conflation().map(|shape| ConflationConfig {
+        keys: shape.keys,
+        value_capacity: usize::try_from(shape.value_capacity).unwrap_or(usize::MAX),
+        journal_capacity: 0,
+    })
 }
 
 #[cfg(test)]

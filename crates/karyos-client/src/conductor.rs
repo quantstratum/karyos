@@ -1761,7 +1761,6 @@ impl<T: TermBytes> ClientConductor<T> {
                         lease: entry.lease,
                     };
                     let generation = entry.generation;
-                    let conflation = entry.conflation;
                     let outcome = match (kind, entry.capability) {
                         (
                             Kind::AddPublication,
@@ -1776,10 +1775,6 @@ impl<T: TermBytes> ClientConductor<T> {
                             // defect, and the handle is dropped.
                             let publication =
                                 ClientPublication::from_hand_over(inner, allow_unconnected, origin);
-                            let publication = match conflation {
-                                Some(config) => publication.with_conflation(config),
-                                None => publication,
-                            };
                             match publication.with_ring_schedule() {
                                 Ok(publication) => Outcome::Publication(publication),
                                 Err(_) => Outcome::Unknown,
@@ -1797,10 +1792,7 @@ impl<T: TermBytes> ClientConductor<T> {
                                 allow_unconnected,
                                 origin,
                             );
-                            Outcome::ConcurrentPublication(match conflation {
-                                Some(config) => publication.with_conflation(config),
-                                None => publication,
-                            })
+                            Outcome::ConcurrentPublication(publication)
                         }
                         (Kind::AddSubscription, Capability::Subscription(inner)) => {
                             let subscription = ClientSubscription::from_hand_over(inner, origin);
@@ -1984,7 +1976,6 @@ mod tests {
             lease: Lease::acquire(&leases, &Arc::new(LeaseEnd::default())),
             generation: None,
             publication: None,
-            conflation: None,
         });
         let response = Response::PublicationReady {
             request: RequestId {

@@ -219,6 +219,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
     /// read from the buffer the handle publishes to.
     #[must_use]
     pub fn new(inner: ConcurrentPublication<Arc<LogBuffer<T>>>, allow_unconnected: bool) -> Self {
+        let conflation = crate::publication::buffer_conflation(inner.buffer());
         Self {
             inner,
             allow_unconnected,
@@ -226,15 +227,16 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             link: None,
             base: 0,
             trace: None,
-            conflation: None,
+            conflation,
             _lease: None,
             _export: None,
         }
     }
 
-    /// Binds the stream's keyed conflation limits to this publication.
-    /// The driver calls this while issuing a publication for a conflated
-    /// stream; callers should normally obtain handles from the driver.
+    /// Binds keyed conflation limits to this publication, in place of the
+    /// table its buffer carries: every publication of a conflated stream
+    /// already reads its stream's from the buffer (F7b-2c-2), in process
+    /// or attached, so this is for tests and for buffers built without one.
     #[must_use]
     pub fn with_conflation(mut self, config: ConflationConfig) -> Self {
         self.conflation = Some(config);
