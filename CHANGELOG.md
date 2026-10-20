@@ -590,6 +590,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The libkaryos package carries `lib/pkgconfig/karyos-static.pc` for a
+  static link: `karyos.pc`'s `-lkaryos` makes the linker pick the shared
+  library even under `pkg-config --static` (macOS ld, and GNU ld without
+  `-Bstatic`), so `karyos-static.pc` names `lib/libkaryos.a` itself, with
+  the archive's system libraries from rustc's `native-static-libs` in
+  `Libs` (cgo's `#cgo pkg-config:` reads `--libs` without `--static`).
+  The MANIFEST lists both files (`pkg_config=`). `make
+  libkaryos-static-check` links a C program of a few lines through it,
+  with and without `--static`, runs `karyos_abi_version` and checks with
+  `otool -L` or `ldd` that no libkaryos is loaded. It compiles C, so it
+  is not part of pre-push, and the package script still compiles none.
+
 - Conformance scenarios for the C ABI added since batch 1
   (quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, F6; SPEC §13).
   The runner (`tests/conformance.rs`, FORMAT.md) now calls

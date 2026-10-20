@@ -9,6 +9,7 @@
 #   lib/libkaryos.so.X.Y.Z, .so.<soname>, .so      (Linux)
 #   lib/libkaryos.<soname>.dylib, libkaryos.dylib  (macOS)
 #   lib/pkgconfig/karyos.pc
+#   lib/pkgconfig/karyos-static.pc                 (links lib/libkaryos.a)
 #   share/karyos/conformance/                      (the suite of this commit)
 #   share/karyos/MANIFEST                          (versions and build)
 #   LICENSE.md
@@ -164,6 +165,24 @@ Libs.private: $native
 Cflags: -I\${includedir}
 EOF
 
+# karyos.pc's `-lkaryos` makes the linker pick the shared library even
+# under `pkg-config --static` (macOS ld, and GNU ld without -Bstatic), so
+# a static link names the archive itself. The archive's system libraries
+# are in Libs, not Libs.private: cgo's `#cgo pkg-config:` runs
+# `pkg-config --libs` without --static, and this file is only for a
+# static link.
+cat >"$stage/lib/pkgconfig/karyos-static.pc" <<EOF
+prefix=\${pcfiledir}/../..
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: karyos-static
+Description: The Karyos C ABI (libkaryos) linked statically, ABI version $abi
+Version: $abi
+Libs: \${libdir}/libkaryos.a $native
+Cflags: -I\${includedir}
+EOF
+
 cat >"$stage/share/karyos/MANIFEST" <<EOF
 abi_version=$abi
 soname=$soname
@@ -176,6 +195,7 @@ core_dirty=$dirty
 target=$triple
 rustc=$(rustc -V)
 profile=release
+pkg_config=karyos.pc karyos-static.pc
 EOF
 
 # The functions the header declares: one declaration per line, starting
@@ -241,9 +261,13 @@ if command -v pkg-config >/dev/null 2>&1; then
         fail "pkg-config cannot read karyos.pc"
     PKG_CONFIG_PATH="$stage/lib/pkgconfig" pkg-config --static --libs karyos >/dev/null ||
         fail "pkg-config cannot resolve the static libraries of karyos.pc"
-    pc="pkg-config checked"
+    version="$(PKG_CONFIG_PATH="$stage/lib/pkgconfig" pkg-config --modversion karyos-static)"
+    [ "$version" = "$abi" ] || fail "pkg-config reads karyos-static version '$version', not '$abi'"
+    PKG_CONFIG_PATH="$stage/lib/pkgconfig" pkg-config --libs karyos-static |
+        grep -q '/lib/libkaryos\.a' || fail "karyos-static.pc does not name lib/libkaryos.a"
+    pc="pkg-config checked (karyos, karyos-static)"
 else
-    pc="pkg-config not installed: karyos.pc not checked"
+    pc="pkg-config not installed: karyos.pc and karyos-static.pc not checked"
 fi
 
 rm -rf "$dest"
