@@ -352,17 +352,17 @@ fn a_close_acknowledgement_reaches_the_cnc() {
     let (_first, cell) = driver.register_guard_sender(guard).unwrap();
     let (_second, _never) = driver.register_guard_sender(guard).unwrap();
     let _ = driver.do_work().unwrap();
-    // Open: no close in effect.
+    // Open: no close in effect, written once so a reader trusts it.
     let (gauges, pass) = ack_gauges(&driver, guard);
-    assert_eq!((values(&gauges), pass), ([0; 5], 0));
+    assert_eq!((values(&gauges), pass), ([0; 5], 2));
     now.store(10, Ordering::Relaxed);
     assert_eq!(driver.close_guard(guard, 1), Ok(Closed::Now { epoch: 3 }));
     let _ = driver.do_work().unwrap();
     let (gauges, pass) = ack_gauges(&driver, guard);
-    assert_eq!((values(&gauges), pass), ([3, 0, 0, 2, 0], 2));
+    assert_eq!((values(&gauges), pass), ([3, 0, 0, 2, 0], 4));
     // Nothing changed: no pass.
     let _ = driver.do_work().unwrap();
-    assert_eq!(ack_gauges(&driver, guard).1, 2);
+    assert_eq!(ack_gauges(&driver, guard).1, 4);
     // Past the timeout, both are overdue; one then applies with work in
     // flight, then drains.
     now.store(10 + SECOND, Ordering::Relaxed);
@@ -374,7 +374,7 @@ fn a_close_acknowledgement_reaches_the_cnc() {
     cell.publish(applied(3, 0));
     let _ = driver.do_work().unwrap();
     let (gauges, pass) = ack_gauges(&driver, guard);
-    assert_eq!((values(&gauges), pass), ([3, 1, 0, 0, 1], 8));
+    assert_eq!((values(&gauges), pass), ([3, 1, 0, 0, 1], 10));
     // The counts agree with close_guard_ack's report.
     let ack = driver.close_guard_ack(guard, 3).unwrap();
     assert_eq!(ack.senders.len(), 2);

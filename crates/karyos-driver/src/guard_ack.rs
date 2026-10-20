@@ -325,7 +325,10 @@ struct AckCells {
     /// The last even pass value.
     passes: u64,
     cells: Vec<Option<Counter>>,
-    stored: [u64; 5],
+    /// The values the last pass wrote; `None` until the first, so a new
+    /// group is written once even while it counts nothing, and a reader
+    /// finds it consistent (pass 0 never is).
+    stored: Option<[u64; 5]>,
 }
 
 /// Each guard's close acknowledgement as gauges for tools (M4b), keyed by
@@ -335,7 +338,8 @@ struct AckCells {
 /// would report them, recomputed at every conductor duty cycle without
 /// allocating, since a pending sender becomes overdue with time alone.
 /// They are written inside a pass on the guard's `guard ack pass` cell,
-/// and only when a value changed. The driver clock is read only while
+/// at the first sync after their allocation (zeros included, so a reader
+/// finds the group consistent) and then only when a value changed. The driver clock is read only while
 /// such a close exists. The six cells are allocated together or not at
 /// all; a refusal is counted once and retried every
 /// [`crate::guards::GUARD_CELL_RETRY`] syncs.
@@ -373,7 +377,7 @@ impl GuardAckCells {
                     pass: None,
                     passes: 0,
                     cells: Vec::new(),
-                    stored: [0; 5],
+                    stored: None,
                 });
             }
             let Some(entry) = self.guards.get_mut(index) else {
@@ -403,7 +407,7 @@ impl GuardAckCells {
                 if pass.is_some() && cells.iter().all(Option::is_some) {
                     entry.pass = pass;
                     entry.cells = cells;
-                    entry.stored = [0; 5];
+                    entry.stored = None;
                 } else {
                     for cell in pass.into_iter().chain(cells.into_iter().flatten()) {
                         counters.free(cell);
@@ -437,7 +441,7 @@ impl GuardAckCells {
                     ])
                 })
                 .unwrap_or([0; 5]);
-            if values == entry.stored {
+            if entry.stored == Some(values) {
                 continue;
             }
             // Checked: 2^63 changes of one guard's counts never come; at
@@ -456,7 +460,7 @@ impl GuardAckCells {
                 pass.end_pass(even);
                 entry.passes = even;
             }
-            entry.stored = values;
+            entry.stored = Some(values);
         }
         if refused {
             self.retry_in = crate::guards::GUARD_CELL_RETRY;
