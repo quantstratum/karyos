@@ -481,12 +481,12 @@ int32_t karyos_offer_options_init(karyos_offer_options *options);
  *
  * On a conflated stream the driver is authoritative: a key outside the
  * table never enters the conflated view, and the driver counts it as a
- * rejected key. A publication whose grant carries the table also refuses
- * such a key, or a value larger than the capacity, before it appends:
- * KARYOS_E_CONFLATION, with nothing reserved. A client of a driver in
- * this process checks; a client attached to a driver in another process
- * does not yet. Conflation is a view over the log, not a filter on it:
- * an appended message reaches the stream's subscribers whatever its key.
+ * rejected key. Every publication also refuses such a key, or a value
+ * larger than the capacity, before it appends: KARYOS_E_CONFLATION, with
+ * nothing reserved. The table's shape comes with the log buffer the
+ * publication writes to, for a client of a driver in this process or in
+ * another. Conflation is a view over the log, not a filter on it: an
+ * appended message reaches the stream's subscribers whatever its key.
  */
 int32_t karyos_publication_offer_with(uint64_t publication, uint32_t lane,
                                       const uint8_t *data, size_t length,

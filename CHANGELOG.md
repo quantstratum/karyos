@@ -11,19 +11,47 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-replay start` and `stop` (quantstratum-docs:
+  `karyos/design/archive-host.md`, H6): ask a running Archive to replay a
+  recording into a stream, or to stop a replay, over its control streams.
+  `start --live DIR=REQ,RESP --recording ID --to-stream S [--from POS]
+  [--length BYTES] [--channel URI] [--timeout-ms N]` prints `replay=ID
+  stream=S session=N` for the reader, which the Archive waits for (H2b).
+  `stop --live DIR=REQ,RESP --replay ID`. Exit status 2 on any error, the
+  Archive's refusal included. They connect through `ArchiveConnection`
+  (Linux), one connection per request, closed after it.
+  `karyos_tools::args::parse_live` parses `--live` for these and for
+  `karyos-catalog list --live`. `tests/karyosd_replay.rs` runs both
+  against `karyosd --archive` (Linux).
 - karyos-tools: `replay::HELP` is replaced by `replay::help(command)`,
   which names the command the diff was invoked as (`karyos-replay diff` or
   its alias `karyos-tools replay diff`; H5, #521).
-- A publication a client is granted through the command ring of a driver
-  in its process binds its stream's conflation table, as the driver's own
-  publication does: an offer with a key outside the table, or a value
-  larger than its capacity, is refused before it appends
-  (`ClientError::Conflation`), where until now it was appended and the
-  driver's feeder dropped it from the conflated view and counted it as a
-  rejected key. The low-level `ClientPublication` taken from such a grant
-  was the earlier route to that gap. karyos-client's `HandOverEntry` gains
-  `conflation` and `with_conflation`. A client attached to a driver in
-  another process is not checked yet (F7b-2c).
+- Every publication of a conflated stream checks its key against the
+  stream's table before it appends (#523; F7b-2a, F7b-2c-2): an offer or
+  claim with a key outside the table, or a value larger than its
+  capacity, is refused (`ClientError::Conflation`), whether the
+  publication is the driver's own, granted through the command ring of a
+  driver in the client's process, or taken by a client attached to a
+  driver in another process. Until now only the driver's own publication
+  checked; the others appended such a message and the driver's feeder
+  dropped it from the conflated view and counted it as a rejected key.
+  The low-level `ClientPublication` taken from a grant was the earlier
+  route to that gap. The feeder still counts what a raw writer appends.
+  - The table's shape travels with the log buffer: words 19 (keys) and 20
+    (largest value) of its configuration block, written by the driver
+    before the buffer is shared (`LogBuffer::with_conflation`,
+    `ConflationShape`, `LogBuffer::conflation`), and read back at attach.
+    `ClientPublication::new` and `ClientConcurrentPublication::new` bind
+    it, so in-process and remote grants bind it the same way.
+  - The check is `ConflationShape::validate_publication`: a publication
+    holds the shape alone, not a table configuration with a journal it
+    does not have. `ConflationConfig::shape` gives a configuration's, and
+    `ConflationConfig::validate_publication` delegates to it.
+  - The log buffer's `LAYOUT_VERSION` goes to 5; regions of versions 1 to
+    4 are refused at attach. A configuration block with half a shape, or
+    one the buffer cannot carry, is refused (`SysError::InvalidRegion`);
+    `LogBuffer::with_conflation` refuses such a shape with the new
+    `SysError::InvalidConflationShape`.
 
 - karyos-archive's `client::connection` (quantstratum-docs:
   `karyos/design/ffi-archive.md`, F9-0): a requester's control streams to
@@ -615,7 +643,7 @@ release may break APIs, wire formats and shared-memory layouts.
   binary: `karyos-replay diff` is the recording group journal diff, and
   `karyos-tools replay diff` stays as its alias, running the same code
   (`replay::run_diff`, with the usage text named after the command it came
-  through). Replaying into a stream (`karyos-replay to`) is H6.
+  through). Replaying into a stream is H6's `karyos-replay start`.
 - Subscription options over the C ABI (F7b-1; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` D3):
   `karyos_subscription_options` (`role`: `KARYOS_ROLE_REQUIRED`,
