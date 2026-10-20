@@ -10,14 +10,22 @@
 //! A host's loop is the driver's duty, then the server's, then
 //! [`DriverHost::finish_ended`]. A replay that ended keeps its target for
 //! the host's replay linger before it is finished, which retires it. A
-//! subscriber joins the target where it is when it attaches: one that
-//! attaches after the replay began writing, as a requester subscribing
-//! after the `Replay` answer does, may miss what was written before it.
-//! Until the sink waits for the target's first reader (archive-host.md,
-//! H2b), only a reader attached before the replay starts reads it whole. At shutdown the server hands the host back
+//! subscriber joins the target where it is when it attaches, so the sink
+//! writes nothing until the target has its first reader (archive-host.md,
+//! H2b): a requester that subscribes after the `Replay` answer attaches to
+//! a target still empty and reads the replay from its first position. A
+//! replay whose target has no reader by the agent's attach deadline ends
+//! unattended, having written nothing, and its target retires at once.
+//!
+//! Any active local stream can be recorded, a replay target included: a
+//! copy of a replay is legitimate. The recording's lease keeps the target
+//! until the recording stops, and the replay's seal ends the recording, so
+//! it never outlives the replay.
+//!
+//! At shutdown the server hands the host back
 //! ([`ControlServer::shutdown_into_host`]), the host finishes what the
-//! agent's stop ended, and [`DriverHost::into_driver`] returns the driver
-//! for its own shutdown.
+//! agent's stop ended ([`DriverHost::finish_all_ended`]), and
+//! [`DriverHost::into_driver`] returns the driver for its own shutdown.
 //!
 //! [`ControlServer::shutdown_into_host`]: karyos_archive::server::ControlServer::shutdown_into_host
 
