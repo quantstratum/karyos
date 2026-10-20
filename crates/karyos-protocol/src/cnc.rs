@@ -111,8 +111,9 @@
 //! under admission `VERSION` 2, which no release has used): a
 //! `karyos:ipc` URI only, so the stream is shared with its other
 //! publishers. A `karyos:udp` one is refused with `UnsupportedChannel`,
-//! an exclusive stream with `InvalidPublicationMode`; a driver that does
-//! not know the bit refuses the command as reserved.
+//! an exclusive stream with `InvalidPublicationMode`. A driver that does
+//! not know the bit fails to decode the command and retires the client as
+//! faulty (`ClientProtocolViolation`), with no response.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues

@@ -416,7 +416,8 @@ release may break APIs, wire formats and shared-memory layouts.
   the id, shared with its other publishers, as the Archive's request
   stream is by its requesters. The CnC command `AddNetworkPublication`
   (0x0F) gains flag bit 1, concurrent, in place under admission
-  `VERSION` 2; a driver that does not know the bit refuses the command.
+  `VERSION` 2; a driver that does not know the bit retires the client as
+  faulty (`ClientProtocolViolation`).
   The driver refuses an exclusive stream with `InvalidPublicationMode`
   and a `karyos:udp` channel with `UnsupportedChannel`.
 
