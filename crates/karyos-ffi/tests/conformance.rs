@@ -417,9 +417,10 @@ fn call(step: &Step, at: &str) -> Returned {
             }
         }
         "karyos_driver_create" => {
-            let arguments = Arguments::new(step, &["size"], at);
-            let (status, options) = abi::driver_options();
+            let arguments = Arguments::new(step, &["size", "reserved"], at);
+            let (status, mut options) = abi::driver_options();
             assert_eq!(status, 0, "{at}: karyos_driver_options_init");
+            options.reserved = arguments.narrow("reserved", options.reserved);
             let size = size_argument::<abi::DriverOptions>(&arguments, "size");
             let (status, driver) = abi::driver_create_sized(&options, size);
             with_handle(status, "driver", driver, at)

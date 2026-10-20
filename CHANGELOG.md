@@ -429,10 +429,11 @@ release may break APIs, wire formats and shared-memory layouts.
   refusals and an offer with no subscriber
   (`publication.typed.statuses`); and the struct size rule of both minor
   directions for the driver, stream and client options and
-  `karyos_detail` (`struct.size.*`). The interim format 1 gains the
-  driver's thread and streams, the publication and claim calls, and
-  sized structs whose unset bytes hold a sentinel, so a write past a
-  struct is seen. A runner that meets a function or argument it does not
+  `karyos_detail` (`struct.size.*`), and a nonzero `reserved` in the
+  driver options refused (`struct.reserved.driver.options`). The
+  interim format 1 gains the driver's thread and streams, the
+  publication and claim calls, and sized structs whose unset bytes hold
+  a sentinel, so a write past a struct is seen. A runner that meets a function or argument it does not
   know fails the scenario.
 - Subscriptions over the C ABI (F4; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §4.4, ADR-0067):
