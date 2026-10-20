@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The per-host management agent (SPEC.md §11 "Agent", ADR-0055;
+//! quantstratum-docs: karyos/design/management-agent-gap-analysis.md, M6a).
+//!
+//! - **What it is.** A library the `karyos-agent` binary (M7) and the
+//!   exporter (M8) build on. It attaches to each configured driver as a
+//!   tool (`karyos_client::tool::attach_tool`), maps the CnC read-only
+//!   and never touches the data path; each attach counts against the
+//!   driver's `max_tools`.
+//! - **The model.** Per driver: its instance and whether it is attached,
+//!   closed or unavailable; one sampling pass of the driver counters
+//!   (counters by key, and per stream lane the limit, head, floor,
+//!   headroom and each subscriber's lag, consistent or marked mixed); the
+//!   client counters; and followers of the error log, the loss report and
+//!   the guard audit ring, each with its cursor, the newest records up to
+//!   a bound, and the records delivered and overwritten (a lapped cursor
+//!   reports what it lost).
+//! - **API v1.** [`api`] defines what the agent reports, as Rust types;
+//!   [`json`] writes them as JSON, by hand (owner item 51, interim 3), and
+//!   `server` serves them on a local Unix socket to the uids of a role
+//!   table (interims 1 and 2; M7).
+//! - **Trace latencies** (M6c): per publication lane, the observed
+//!   latencies between `Publish` and `SubscriberPoll` within a bounded
+//!   window of the agent's time, from a follower of the driver's trace
+//!   mirror whose memory is bounded by [`WindowConfig`]; never trace
+//!   verdicts (quantstratum-docs: karyos/design/agent-trace-window.md).
+//! - **Exporter** (M8): [`exporter`] renders the view in the Prometheus
+//!   text format and answers `GET /metrics` on a loopback address only;
+//!   the `karyos-exporter` binary runs it as its own process (owner item
+//!   51, interim 4).
+//! - **Not yet.** An endpoint's capability gauges read as one group in
+//!   the view (M6b's `karyos_client::capabilities` reads them), and the
+//!   trace latencies in the JSON encoding.
+//! - **Crate graph** (owner item 52): it depends on `karyos-client`,
+//!   `karyos-sys` and `karyos-trace`; neither the driver nor the client
+//!   depends on it.
+//!
+//! The attach is Linux only, as the tool attach is; [`api`] builds
+//! everywhere.
+
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "the attach that evaluates the rules is Linux only"
+    )
+)]
+pub mod alerts;
+pub mod api;
+pub mod cli;
+pub mod exporter;
+pub mod json;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the attach that uses it is Linux only")
+)]
+mod model;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the attach that uses it is Linux only")
+)]
+mod trace_window;
+
+pub use trace_window::WindowConfig;
+
+#[cfg(target_os = "linux")]
+mod agent;
+#[cfg(target_os = "linux")]
+pub mod server;
+
+#[cfg(target_os = "linux")]
+pub use agent::{Agent, AgentConfig, DEFAULT_ATTACH_TIMEOUT, DEFAULT_HISTORY};

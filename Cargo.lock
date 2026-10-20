@@ -232,6 +232,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "karyos-agent"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "karyos-client",
+ "karyos-driver",
+ "karyos-protocol",
+ "karyos-sys",
+ "karyos-trace",
+ "thiserror",
+]
+
+[[package]]
 name = "karyos-archive"
 version = "0.1.0-alpha.1"
 dependencies = [

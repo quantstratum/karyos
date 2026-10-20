@@ -39,6 +39,7 @@ pub mod rtt;
 pub mod schedule;
 pub mod sessions;
 pub mod sm_schedule;
+pub mod spin;
 pub mod timed_gate;
 mod trace_journals;
 

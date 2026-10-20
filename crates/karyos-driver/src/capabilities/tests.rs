@@ -125,7 +125,9 @@ fn endpoint_gauges_follow_the_table() {
         [(EndpointId(1), &one), (EndpointId(2), &two)].into_iter(),
         0,
     );
-    assert_eq!(gauges(&counters, 1).len(), LABELS.len());
+    // The gauges and their pass cell, even after one pass.
+    assert_eq!(gauges(&counters, 1).len(), LABELS.len() + 1);
+    assert_eq!(gauge(&counters, 1, PASS_LABEL), 2);
     assert_eq!(gauge(&counters, 1, "capability epoch"), 1);
     assert_eq!(gauge(&counters, 1, "capability platform"), 1);
     assert_eq!(gauge(&counters, 1, "capability max datagram"), 1408);
@@ -153,6 +155,8 @@ fn endpoint_gauges_follow_the_table() {
     };
     cells.sync(&mut counters, [(EndpointId(1), &reopened)].into_iter(), 1);
     assert_eq!(gauge(&counters, 1, "capability epoch"), 2);
+    // The rewrite was a second pass.
+    assert_eq!(gauge(&counters, 1, PASS_LABEL), 4);
     assert_eq!(gauge(&counters, 1, "capability tx batch"), 1);
     assert_eq!(counters.value(Event::CapabilityFallback), 5);
     assert!(gauges(&counters, 2).is_empty());
@@ -173,10 +177,12 @@ fn a_full_region_skips_the_gauges() {
     let mut cells = CapabilityCells::default();
     let one = snapshot(1, 1);
     cells.sync(&mut counters, [(EndpointId(1), &one)].into_iter(), 0);
+    // The pass cell first, then two gauges.
     assert_eq!(gauges(&counters, 1).len(), 3);
+    assert_eq!(gauge(&counters, 1, PASS_LABEL), 2);
     assert_eq!(
         counters.value(Event::CountersUnavailable),
-        u64::try_from(LABELS.len() - 3).unwrap()
+        u64::try_from(LABELS.len() - 2).unwrap()
     );
     assert_eq!(counters.value(Event::CapabilityFallback), 2);
 }

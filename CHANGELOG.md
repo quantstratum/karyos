@@ -394,6 +394,107 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- API v1's JSON carries each driver's trace window (M6c): `latencies`, one
+  object per lane with `p50`, `p90`, `p99`, `p999` and `max` as `null` or
+  `{"low","high"}` bounds, and `trace`, the window's counts. They come
+  after `guards` and before `alerts`, in `DriverView`'s declaration order
+  (quantstratum-docs: `karyos/design/agent-api-v1.md`).
+
+- The Prometheus exporter (phase 5, M8; ADR-0055; SPEC.md §11
+  `karyos-exporter`; owner item 51, interim 4). `karyos_agent::exporter`
+  renders an `AgentView` in the Prometheus text format (0.0.4): the CnC
+  cells by type (events and spin time as counters, gauges, positions and
+  timestamps as gauges), lane positions, headroom and subscriber lag, ring
+  read and overwrite counts, error occurrences by code, and the trace
+  window's latency quantile bounds and counts. It answers `GET /metrics`
+  only, on a loopback address only, at most 16 connections per poll, with
+  100 ms I/O timeouts. The `karyos-exporter` binary, in karyos-agent, runs
+  it as its own process: `--listen ADDRESS:PORT --driver DIR...
+  [--refresh-ms MS]`; a non-loopback address is refused. No TLS, no
+  authentication and no new dependency. It exports M9's alerts as
+  `karyos_alerts_firing` per driver and each alert's `karyos_alert_value`
+  and `karyos_alert_since_ns`, and takes one of each driver's tool slots
+  while attached.
+
+- Alerts in the management agent (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M9). `AlertRules`
+  (`AgentConfig::with_alerts`; `karyos-agent --lag-bytes --lag-refreshes
+  --loss-quiet`) are evaluated at every refresh: a subscriber lagging
+  `lag_bytes` or more over `lag_refreshes` consecutive consistent samples
+  (8 MiB and 3 by default; a mixed sample changes nothing), and a loss
+  report that grew (read or overwritten), cleared after `loss_quiet`
+  refreshes without a new loss (10). `DriverView::alerts` (`Alert`,
+  `AlertKind::{Lag, Loss}`) lists those firing, with the time each began;
+  API v1's JSON appends `alerts` to each driver. The agent's command line
+  refuses a uid given two roles, and one poll serves at most 16
+  connections (`server::MAX_ACCEPTS`). The guard pending-acknowledgement
+  rule follows M4b.
+
+- The management agent's trace latency window (phase 5, M6c;
+  quantstratum-docs: `karyos/design/agent-trace-window.md`). Per driver, a
+  follower of the trace mirror pairs each `Publish` with its
+  `SubscriberPoll`s and keeps per publication lane the observed latencies
+  of the last window of the agent's time (`DriverView::latencies`,
+  `LaneLatency` with p50, p90, p99, p99.9 and max as intervals), under the
+  trace report's automatic calibration rule; never trace verdicts. Journals,
+  pending messages, polls and lanes are bounded by `WindowConfig`, and what
+  a bound refuses, ages out or the mirror overwrites is counted
+  (`TraceCounts`). karyos-agent now depends on karyos-trace (owner item 52).
+- The management agent's local API v1 (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M7; owner item 51
+  interims, no new dependency). `karyos_agent::json` writes API v1 by hand
+  (fields under their Rust names in declaration order, exact integers, the
+  instance as 32 hex digits, `null` for none); `karyos_agent::server`
+  serves it on `<api-dir>/agent.sock` (a private `0700` directory, the
+  socket `0600`; a stale socket replaced, a live one never) to the uids of
+  a role table (`Role`: viewer, operator, risk officer, administrator),
+  checking the peer's uid (`SO_PEERCRED`). One request line per connection,
+  `KARYOS-AGENT 1 view`, one JSON answer; another version is answered with
+  the versions supported, a uid without a role `not authorized`. The
+  `karyos-agent` binary runs it (`--api-dir`, `--driver`, `--role
+  UID=ROLE`, `--refresh-ms`). The API compatibility test pins API v1's
+  JSON field for field.
+
+- Consistent reads of an endpoint's capability gauges (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M6b): the conductor
+  writes each endpoint's gauges inside a sampling pass on a new `capability
+  pass` cell (same keys; odd while it writes, even after, with the
+  `begin_pass`/`end_pass` fences), and `karyos_client::capabilities::
+  endpoint_capabilities` reads each group with `read_pass`, for tools and
+  the management agent alike, marking it inconsistent when every attempt
+  overlapped a write. The guard audit
+  ring's losses are counted: `guard audit records overwritten` and `guard
+  audit records dropped` (sequences exhausted).
+
+- The management agent's core, `karyos-agent` (phase 5, M6a; ADR-0055;
+  quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`).
+  `Agent` attaches to each configured driver as a tool, counting against its
+  `max_tools`, and keeps a model per driver: whether it is attached, closed
+  or unavailable; one sampling pass of the driver counters, with per stream
+  lane the limit, head, floor, headroom and each subscriber's lag; the
+  client counters; and followers of the error log, the loss report and the
+  guard audit ring with their cursors, a bounded history and the records
+  overwritten before they were read. `api` defines API v1 as Rust types
+  (`AgentView`), with no transport yet (M7). Trace histograms (M6c) and
+  capability groups (M6b) follow. The crate graph keeps the driver and the
+  client independent of it (owner item 52).
+
+- Spin time per idle loop (counter type 3, `TYPE_SPIN_TIME`; SPEC §11;
+  quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`, M5,
+  under the coordinator's ruling recorded in `cnc-primitives.md`).
+  `karyos_driver::spin::SpinMeter` measures per spin run, two host clock
+  reads a run and never on the wake path, flushing every 1024 spins for a
+  loop that spins without end, into one driver-wide cell per idle loop:
+  `conductor spin time`, a fixed counter the driver keeps and copies from
+  the meter's shared word at each duty cycle (the meter goes to the loop
+  that drives `do_work` with `EmbeddedDriver::take_spin_meter`; `karyosd`'s
+  `BackoffIdle` reports it), and per agent loop `sender spin time` and
+  `receiver spin time` (Dedicated) or `network spin time` (SharedNetwork),
+  keyed cells their meters own and alone write.
+  `IdleStrategy::attach_spin_meter` hands a loop its meter; the default
+  `YieldThenSleep` never spins and reports 0. `BackoffIdle` is no longer
+  `Clone`.
+
 - The session table in snapshots (phase 4, C7/C8 glue).
   `SessionTable::encode` writes the table as a snapshot's sessions section
   (`dedup::SESSIONS_VERSION`), and `SessionTable::decode` rebuilds it, with
@@ -449,6 +550,31 @@ release may break APIs, wire formats and shared-memory layouts.
   crash leaves the first-index file stale, `RaftLog::open` follows the first
   frame. karyos-sim's `tests/purge_crash.rs` crashes the disk at every
   operation of two purges and fails every flush.
+
+- karyos-sim harness: a standby cluster, phase 5 batch P5-S2
+  (quantstratum-docs: `karyos/design/phase-5-cluster-scenarios.md`, H3 and
+  H4; ADR-0054). `Case::standby` adds a second group of servers fed by the
+  primary's leader with its committed entries (`harness::standby`: each
+  entry checksummed over its index, term and payload, resent from the
+  standby's acknowledged verified position, `FeedFault`s for one send),
+  which the standby's leader checks by log matching and checksum and
+  proposes, its service applying them with effects disabled. Fencing is
+  `Action::OperatorStop` or an `ExternalLease` (`Case::lease`,
+  `Action::CutArbiter`) that the primary's leader must hold to take a
+  command or release a reply; `Action::Promote` raises the generation once
+  the harness verifies the fencing, the standby reporting its verified
+  position, learnt commit and the requests in flight, and redirects the
+  clients. Replies and successes carry a generation, and a client rejects
+  a lower one. The reference fixture's leader is the lowest of its
+  bootstrap peers, so a standby leads itself. New checks: `check::group`
+  per group of servers, `check::standby` (no standby reply before a
+  promotion, no primary reply at or after the fencing point (the lease's
+  end on the holder's clock, recorded with `Fenced`, or the operator's
+  stop), no old-generation reply after it, every fed entry the
+  primary's, the verified prefix applied, the gap report bounded, no client
+  going back a generation) and `check::across_promotion`, which leaves an
+  old-generation answer above the verified position pending for C3.
+  Scenarios S1 to S4, S6 and S7 run on the reference; S5 is a client test.
 
 - `karyos-ffi`, the C ABI crate (SPEC.md §10.2; ADR-0053, ADR-0067;
   quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, batch F1). It

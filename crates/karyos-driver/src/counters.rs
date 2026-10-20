@@ -69,6 +69,8 @@
 //! | `conductor duty at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds of the last duty cycle, read at its end with the positions pass; 0 before the first |
 //! | `capability fallback` | event | endpoint capabilities on a fallback, once per endpoint epoch (SPEC §16.8) |
 //! | `capability missing` | event | endpoint opens and reopens refused for a required capability (SPEC §16.8) |
+//! | `guard audit records overwritten` | event | guard audit ring records overwritten by newer ones |
+//! | `guard audit records dropped` | event | guard audit ring records dropped once its sequences were exhausted |
 //!
 //! With a network, each endpoint's effective capabilities are gauges keyed
 //! by participant kind endpoint and its instance id (`crate::capabilities`,
@@ -125,11 +127,14 @@ pub const TYPE_EVENTS: u64 = 1;
 pub const TYPE_GAUGE: u64 = 2;
 /// Type id of a stream position in bytes, sampled by the driver.
 pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
+/// Type id of an idle loop's spin time: lifetime host `CLOCK_MONOTONIC`
+/// nanoseconds in busy-spin phases (`crate::spin`, cnc-primitives.md).
+pub const TYPE_SPIN_TIME: u64 = 3;
 /// Type id of a host `CLOCK_MONOTONIC` time in nanoseconds.
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 64] = [
+const LABELS: [(u64, &str); 66] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -194,10 +199,14 @@ const LABELS: [(u64, &str); 64] = [
     (TYPE_TIMESTAMP, "conductor duty at"),
     (TYPE_EVENTS, "capability fallback"),
     (TYPE_EVENTS, "capability missing"),
+    (TYPE_EVENTS, "guard audit records overwritten"),
+    (TYPE_EVENTS, "guard audit records dropped"),
 ];
 
-/// The fixed counters, which every counters region must hold.
-pub(crate) const FIXED_COUNTERS: usize = LABELS.len();
+/// The fixed counters, which every counters region must hold: the labels,
+/// and the conductor loop's spin time cell (`crate::spin`), which its
+/// loop's meter writes and so is held apart.
+pub(crate) const FIXED_COUNTERS: usize = LABELS.len() + 1;
 
 /// One of the driver's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,8 +371,13 @@ pub(crate) enum Event {
     /// epoch (SPEC §16.8; `crate::capabilities`).
     CapabilityFallback,
     /// Endpoint opens and reopens refused because a required capability
-    /// was not active (SPEC §16.8). Last, so no other counter's id moves.
+    /// was not active (SPEC §16.8).
     CapabilityMissing,
+    /// Guard audit ring records overwritten by newer ones (M4).
+    GuardAuditOverwritten,
+    /// Guard audit ring records dropped once its sequences were exhausted
+    /// (M4). Last, so no other counter's id moves.
+    GuardAuditDropped,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -372,6 +386,9 @@ pub(crate) struct DriverCounters {
     manager: CountersManager,
     reader: CountersReader,
     counters: Vec<Counter>,
+    /// The conductor loop's spin time cell: fixed, kept here, written from
+    /// the meter's shared word (`crate::spin`).
+    spin: Counter,
 }
 
 impl DriverCounters {
@@ -417,11 +434,20 @@ impl DriverCounters {
             .map(|&(type_id, label)| manager.allocate(type_id, label))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| DriverError::InvalidConfig)?;
+        let spin = manager
+            .allocate(TYPE_SPIN_TIME, "conductor spin time")
+            .map_err(|_| DriverError::InvalidConfig)?;
         Ok(Self {
             manager,
             reader,
             counters,
+            spin,
         })
+    }
+
+    /// Sets the conductor loop's spin time (`crate::spin`).
+    pub(crate) fn set_conductor_spin(&self, value: u64) {
+        self.spin.set(value);
     }
 
     /// Allocates a keyed counter outside the fixed set (inside a sampling
@@ -632,6 +658,11 @@ mod tests {
             (Event::ConductorDutyAt, "conductor duty at"),
             (Event::CapabilityFallback, "capability fallback"),
             (Event::CapabilityMissing, "capability missing"),
+            (
+                Event::GuardAuditOverwritten,
+                "guard audit records overwritten",
+            ),
+            (Event::GuardAuditDropped, "guard audit records dropped"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();
