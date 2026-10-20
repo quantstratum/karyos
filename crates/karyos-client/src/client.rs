@@ -411,6 +411,14 @@ pub trait Connection: sealed::Sealed {
     #[doc(hidden)]
     fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) -> bool;
 
+    /// Releases a concurrent handle, as `release_publication` does an
+    /// exclusive one: whether the removal was submitted.
+    #[doc(hidden)]
+    fn release_concurrent_publication(
+        &mut self,
+        publication: ClientConcurrentPublication<Self::Terms>,
+    ) -> bool;
+
     #[doc(hidden)]
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError>;
 
@@ -512,6 +520,14 @@ impl Connection for ClientConductor {
     fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) -> bool {
         // A handle that cannot be removed now is dropped, ending its lease.
         self.remove_publication(publication).is_ok()
+    }
+
+    fn release_concurrent_publication(
+        &mut self,
+        publication: ClientConcurrentPublication<Self::Terms>,
+    ) -> bool {
+        // A handle that cannot be removed now is dropped, ending its lease.
+        self.remove_concurrent_publication(publication).is_ok()
     }
 
     fn release_subscription(&mut self, subscription: ClientSubscription<Self::Terms>) -> bool {
@@ -638,6 +654,15 @@ impl Connection for crate::ipc::RemoteClient {
         // A handle that cannot be removed now is dropped: it detaches its
         // export, and its registration ends with the client.
         crate::ipc::RemoteClient::remove_publication(self, publication).is_ok()
+    }
+
+    fn release_concurrent_publication(
+        &mut self,
+        publication: ClientConcurrentPublication<Self::Terms>,
+    ) -> bool {
+        // As an exclusive handle: one that cannot be removed now is
+        // dropped, and its registration ends with the client.
+        crate::ipc::RemoteClient::remove_concurrent_publication(self, publication).is_ok()
     }
 
     fn release_subscription(&mut self, subscription: ClientSubscription<Self::Terms>) -> bool {
@@ -1108,6 +1133,23 @@ impl<C: Connection> Client<C> {
             if !self.connection.release_publication(lane) {
                 bump(&mut self.releases_failed);
             }
+        }
+    }
+
+    /// Removes a concurrent handle this client took
+    /// ([`Client::add_concurrent_publication`]), as
+    /// [`Client::remove_publication`] does an exclusive publication: the
+    /// driver frees its publisher slot, so the stream's `publishers` bound
+    /// counts it no more. A removal that cannot be sent drops the handle
+    /// instead and is counted ([`Client::publication_releases_failed`]):
+    /// in process its lease ends; for a remote client the slot is held
+    /// until the client ends.
+    pub fn remove_concurrent_publication(
+        &mut self,
+        publication: ClientConcurrentPublication<C::Terms>,
+    ) {
+        if !self.connection.release_concurrent_publication(publication) {
+            bump(&mut self.releases_failed);
         }
     }
 

@@ -830,6 +830,48 @@ mod remote {
         ));
     }
 
+    /// `Client::remove_concurrent_publication` remote: the removal frees the
+    /// handle's publisher slot at the driver, so a client at the stream's
+    /// bound of two takes a third handle once it removed one.
+    #[test]
+    fn a_remote_removed_concurrent_handle_frees_its_slot() {
+        use karyos_protocol::cnc::ErrorCode;
+
+        let (_driver, dir) = ipc_driver("concurrent-remove");
+        let mut client = connect(&dir);
+        let first = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        let _second = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        assert!(matches!(
+            client.add_concurrent_publication("karyos:ipc", StreamId::new(4)),
+            Err(ClientError::Refused {
+                code: ErrorCode::PublicationTaken,
+                ..
+            })
+        ));
+        client.remove_concurrent_publication(first);
+        assert_eq!(client.publication_releases_failed(), 0);
+        let start = Instant::now();
+        let _third = loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "slot never freed"
+            );
+            let _ = client.poll();
+            match client.add_concurrent_publication("karyos:ipc", StreamId::new(4)) {
+                Ok(publication) => break publication,
+                Err(ClientError::Refused {
+                    code: ErrorCode::PublicationTaken,
+                    ..
+                }) => std::thread::sleep(Duration::from_millis(1)),
+                Err(error) => panic!("{error:?}"),
+            }
+        };
+    }
+
     /// SPEC §10 remote over the network (network-shared-terms n4): on two
     /// IPC drivers, a remote client publishes by `karyos:udp` and another
     /// subscribes by it; the subscriber reads the exact sequence from the
@@ -1564,6 +1606,59 @@ fn a_concurrent_publication_is_taken_by_uri() {
             client.add_concurrent_publication("karyos:udp?endpoint=127.0.0.1:9", StreamId::new(4)),
             Err(ClientError::UnsupportedChannel { .. })
         ));
+    });
+}
+
+/// `Client::remove_concurrent_publication` frees the handle's publisher
+/// slot: on a stream of two publishers, a third handle is refused while two
+/// are held, and taken once one is removed.
+#[test]
+fn a_removed_concurrent_handle_frees_its_slot() {
+    use karyos_protocol::cnc::ErrorCode;
+    use karyos_sys::log_buffer::PublicationMode;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut shared = heap_stream(4);
+    shared.buffer.publication = PublicationMode::Concurrent {
+        publishers: 2,
+        allow_non_lse: true,
+    };
+    let _ = driver.add_stream(shared).unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let first = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        let _second = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        assert!(matches!(
+            client.add_concurrent_publication("karyos:ipc", StreamId::new(4)),
+            Err(ClientError::Refused {
+                code: ErrorCode::PublicationTaken,
+                ..
+            })
+        ));
+        client.remove_concurrent_publication(first);
+        assert_eq!(client.publication_releases_failed(), 0);
+        // The removal is served on the driver's thread; then the slot is
+        // free again.
+        let start = Instant::now();
+        let _third = loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "slot never freed"
+            );
+            let _ = client.poll();
+            match client.add_concurrent_publication("karyos:ipc", StreamId::new(4)) {
+                Ok(publication) => break publication,
+                Err(ClientError::Refused {
+                    code: ErrorCode::PublicationTaken,
+                    ..
+                }) => std::thread::sleep(Duration::from_millis(1)),
+                Err(error) => panic!("{error:?}"),
+            }
+        };
     });
 }
 
