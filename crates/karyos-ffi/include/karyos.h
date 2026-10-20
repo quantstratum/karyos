@@ -70,6 +70,25 @@ extern "C" {
 #define KARYOS_OUTCOME_ENDED 18
 #define KARYOS_OUTCOME_OUTCOMES_LOST 19
 
+/**
+ * A subscriber's role (karyos_subscription_options): a required reader
+ * bounds its publisher and is never lapped; an optional one does not and
+ * may be lapped; an observer is optional and only copies.
+ */
+#define KARYOS_ROLE_REQUIRED 0
+#define KARYOS_ROLE_OPTIONAL 1
+#define KARYOS_ROLE_OBSERVER 2
+
+/**
+ * What follows an overrun of an optional or observer reader: delivery
+ * goes on at the head, or the subscription closes and its polls return
+ * KARYOS_E_CLOSED_BY_OVERRUN. Not yet in the C ABI, and the next codes when
+ * added: a snapshot rebuild (a C callback on the polling thread) and a
+ * replay from a recording (batch F9).
+ */
+#define KARYOS_REJOIN_AT_HEAD 0
+#define KARYOS_REJOIN_CLOSE 1
+
 /** The most embedded drivers open at once. */
 #define KARYOS_MAX_DRIVERS 8
 
@@ -537,6 +556,41 @@ int32_t karyos_client_add_subscription(uint64_t client, const char *uri,
                                        karyos_detail *detail);
 
 /**
+ * A subscription's role and rejoin policy, read by
+ * karyos_client_add_subscription_with. Fill it with
+ * karyos_subscription_options_init (KARYOS_ROLE_REQUIRED,
+ * KARYOS_REJOIN_AT_HEAD: what karyos_client_add_subscription takes), then
+ * set the fields. The size rule of karyos_driver_options applies.
+ */
+typedef struct karyos_subscription_options {
+    uint32_t size;
+    /* KARYOS_ROLE_*. */
+    uint32_t role;
+    /* KARYOS_REJOIN_*. */
+    uint32_t rejoin;
+    /* Zero; anything else is KARYOS_E_INVALID_ARGUMENT. */
+    uint32_t reserved;
+} karyos_subscription_options;
+
+/**
+ * Fills options with the defaults and its size. KARYOS_E_INVALID_ARGUMENT
+ * for a null or misaligned pointer.
+ */
+int32_t karyos_subscription_options_init(karyos_subscription_options *options);
+
+/**
+ * As karyos_client_add_subscription, with the reader's role and rejoin
+ * policy; each image of a karyos:udp subscription takes both. A null
+ * options, a size below that of ABI 0.1.0, an unknown role or policy, or a
+ * nonzero reserved returns KARYOS_E_INVALID_ARGUMENT and opens nothing.
+ */
+int32_t karyos_client_add_subscription_with(uint64_t client, const char *uri,
+                                            int32_t stream_id,
+                                            const karyos_subscription_options *options,
+                                            uint64_t *subscription,
+                                            karyos_detail *detail);
+
+/**
  * Delivers at most limit messages to handler, each from a private copy,
  * and writes their count through delivered (may be null), also when it
  * fails: a failed poll's status follows the messages delivered before it.
@@ -544,7 +598,14 @@ int32_t karyos_client_add_subscription(uint64_t client, const char *uri,
  * has a larger message than any before (KARYOS_E_SYSTEM when it cannot,
  * before anything of that round is delivered: the count covers earlier
  * rounds). From the handler, polling or closing this subscription, or
- * closing its client, returns KARYOS_E_REENTRANT. To stop
+ * closing its client, returns KARYOS_E_REENTRANT. A karyos:ipc
+ * subscription's end is its poll's status, after the messages before it,
+ * and every later poll's: KARYOS_E_CLOSED_BY_OVERRUN once its rejoin
+ * policy closed it, KARYOS_E_CLOSED once its stream's seal is reached or
+ * it was revoked with its client. An overrun it rejoined after, an aborted
+ * block or a skip is KARYOS_OK and the next poll goes on. A karyos:udp
+ * subscription's images end one by one (image changes report them): its
+ * poll answers KARYOS_OK. To stop
  * after a failed handler (ADR-0067), poll with a limit of 1 in a loop and
  * stop calling: the failed message is acknowledged, the later ones are
  * not delivered.

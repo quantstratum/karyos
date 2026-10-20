@@ -492,6 +492,28 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Subscription options over the C ABI (F7b-1; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md` D3):
+  `karyos_subscription_options` (`role`: `KARYOS_ROLE_REQUIRED`,
+  `_OPTIONAL`, `_OBSERVER`; `rejoin`: `KARYOS_REJOIN_AT_HEAD`, `_CLOSE`;
+  read by prefix, 16 bytes in 0.1.0), `karyos_subscription_options_init`
+  and `karyos_client_add_subscription_with`, over
+  `Client::add_subscription_with`. An unknown role or policy, or a nonzero
+  `reserved`, is `KARYOS_E_INVALID_ARGUMENT` with nothing opened;
+  `ClientError::InvalidOptions` maps to it too. Snapshot and replay
+  policies are not yet in the C ABI and keep the next codes.
+- `karyos_subscription_poll` reports a `karyos:ipc` subscription's end,
+  after the messages before it and on every later poll:
+  `KARYOS_E_CLOSED_BY_OVERRUN` once its rejoin policy closed it,
+  `KARYOS_E_CLOSED` once its stream's seal is reached or it was revoked.
+  An overrun it rejoined after, an aborted block or a skip stays
+  `KARYOS_OK`; a `karyos:udp` subscription's images end one by one and
+  its poll stays `KARYOS_OK`. Until now these stops answered `KARYOS_OK`
+  with nothing delivered (an F4 gap, unreachable before a policy could
+  close a subscription).
+- Conformance: `struct.size.subscription.options` and
+  `subscription.options.typed.statuses`, and the runner's
+  `karyos_client_add_subscription_with` and `karyos_subscription_close`.
 - `Client::add_subscription_with(uri, stream_id, SubscriptionOptions)`
   (owner item 57; quantstratum-docs: `karyos/design/ffi-gap-analysis.md`
   D3, F7b): the reader's role (`SubscriberRole::{Required, Optional,

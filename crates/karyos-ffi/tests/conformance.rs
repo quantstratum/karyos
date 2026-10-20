@@ -621,6 +621,59 @@ fn call(step: &Step, at: &str) -> Returned {
             status: Some(abi::claim_abort(handle_argument(step, "claim", at))),
             results: BTreeMap::new(),
         },
+        "karyos_client_add_subscription_with" => {
+            let arguments = Arguments::new(
+                step,
+                &[
+                    "client",
+                    "stream_id",
+                    "uri",
+                    "size",
+                    "role",
+                    "rejoin",
+                    "reserved",
+                ],
+                at,
+            );
+            let uri = std::ffi::CString::new(
+                arguments
+                    .text("uri")
+                    .unwrap_or_else(|| "karyos:ipc".to_owned()),
+            )
+            .unwrap_or_else(|_| panic!("{at}: `uri` holds a NUL"));
+            let stream_id = arguments
+                .integer("stream_id")
+                .map(|_| arguments.narrow("stream_id", 0))
+                .unwrap_or_else(|| panic!("{at}: `stream_id` is required"));
+            let (status, mut options) = abi::subscription_options();
+            assert_eq!(status, 0, "{at}: karyos_subscription_options_init");
+            options.role = arguments.narrow("role", options.role);
+            options.rejoin = arguments.narrow("rejoin", options.rejoin);
+            options.reserved = arguments.narrow("reserved", options.reserved);
+            let (status, subscription) = abi::client_add_subscription_with(
+                arguments.handle("client"),
+                &uri,
+                stream_id,
+                &options,
+                size_argument::<abi::SubscriptionOptions>(&arguments, "size"),
+            );
+            if status == 0 {
+                with_handle(status, "subscription", subscription, at)
+            } else {
+                Returned {
+                    status: Some(status),
+                    results: BTreeMap::new(),
+                }
+            }
+        }
+        "karyos_subscription_close" => Returned {
+            status: Some(abi::subscription_close(handle_argument(
+                step,
+                "subscription",
+                at,
+            ))),
+            results: BTreeMap::new(),
+        },
         "karyos_publication_close" => Returned {
             status: Some(abi::publication_close(handle_argument(
                 step,

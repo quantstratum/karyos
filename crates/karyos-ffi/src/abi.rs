@@ -995,6 +995,160 @@ pub unsafe extern "C" fn karyos_client_add_subscription(
     })
 }
 
+/// `KARYOS_ROLE_REQUIRED`: the reader bounds its publisher and is never
+/// lapped (SPEC.md §4); the role `karyos_client_add_subscription` takes.
+pub(crate) const ROLE_REQUIRED: u32 = 0;
+/// `KARYOS_ROLE_OPTIONAL`: the reader does not bound its publisher and may
+/// be lapped.
+pub(crate) const ROLE_OPTIONAL: u32 = 1;
+/// `KARYOS_ROLE_OBSERVER`: as optional, and it only copies.
+pub(crate) const ROLE_OBSERVER: u32 = 2;
+/// `KARYOS_REJOIN_AT_HEAD`: after an overrun, delivery continues at the
+/// head; the policy `karyos_client_add_subscription` takes.
+pub(crate) const REJOIN_AT_HEAD: u32 = 0;
+/// `KARYOS_REJOIN_CLOSE`: an overrun closes the subscription, whose polls
+/// then return `KARYOS_E_CLOSED_BY_OVERRUN`.
+pub(crate) const REJOIN_CLOSE: u32 = 1;
+
+/// `karyos_subscription_options`: a subscription's role and rejoin policy
+/// (`quantstratum-docs: karyos/design/rejoin-policies.md`), read by
+/// `karyos_client_add_subscription_with`. Only integers: the library reads
+/// it by prefix from the caller's bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SubscriptionOptions {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// `KARYOS_ROLE_*`.
+    pub role: u32,
+    /// `KARYOS_REJOIN_*`.
+    pub rejoin: u32,
+    /// Zero.
+    pub reserved: u32,
+}
+
+/// The size of `karyos_subscription_options` in ABI 0.1.0, the smallest a
+/// caller passes.
+const SUBSCRIPTION_OPTIONS_SIZE_0_1: u32 = 16;
+
+/// `karyos_subscription_options` with the defaults (a required reader that
+/// rejoins at the head) and this version's size.
+fn default_subscription_options() -> SubscriptionOptions {
+    SubscriptionOptions {
+        size: size_of_u32::<SubscriptionOptions>(),
+        role: ROLE_REQUIRED,
+        rejoin: REJOIN_AT_HEAD,
+        reserved: 0,
+    }
+}
+
+/// The client options of `options`: an unknown role or policy, or a
+/// nonzero `reserved`, is [`Status::InvalidArgument`].
+fn subscription_options(
+    options: SubscriptionOptions,
+) -> Result<karyos_client::SubscriptionOptions, Status> {
+    use karyos_client::{RejoinPolicy, SubscriberRole};
+    if options.reserved != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let role = match options.role {
+        ROLE_REQUIRED => SubscriberRole::Required,
+        ROLE_OPTIONAL => SubscriberRole::Optional,
+        ROLE_OBSERVER => SubscriberRole::Observer,
+        _ => return Err(Status::InvalidArgument),
+    };
+    let rejoin = match options.rejoin {
+        REJOIN_AT_HEAD => RejoinPolicy::RejoinAtHead,
+        REJOIN_CLOSE => RejoinPolicy::Close,
+        _ => return Err(Status::InvalidArgument),
+    };
+    Ok(karyos_client::SubscriptionOptions::new(role, rejoin))
+}
+
+/// Fills `options` with the defaults (`KARYOS_ROLE_REQUIRED`,
+/// `KARYOS_REJOIN_AT_HEAD`) and its size.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable
+/// `karyos_subscription_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_subscription_options_init(
+    options: *mut SubscriptionOptions,
+) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable `karyos_subscription_options`.
+        unsafe { options.write(default_subscription_options()) };
+        Status::Ok
+    })
+}
+
+/// As `karyos_client_add_subscription`, with the reader's role and rejoin
+/// policy from `options` (filled by `karyos_subscription_options_init`).
+/// Each image of a `karyos:udp` subscription takes the role and the policy.
+/// The options are copied; a struct from an older header of the same major
+/// version is read by its prefix. A null `options`, a `size` below that of
+/// ABI 0.1.0, an unknown role or policy, or a nonzero `reserved` returns
+/// `KARYOS_E_INVALID_ARGUMENT` and opens nothing.
+///
+/// # Safety
+///
+/// As `karyos_client_add_subscription`; `options` is null or points to a
+/// readable `karyos_subscription_options` of at least its `size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_subscription_with(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    options: *const SubscriptionOptions,
+    subscription: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(subscription) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `options`; `SubscriptionOptions`
+        // holds integers only, valid for every bit pattern.
+        let read = unsafe {
+            read_sized(
+                options,
+                SUBSCRIPTION_OPTIONS_SIZE_0_1,
+                default_subscription_options(),
+            )
+        };
+        let options = match read.and_then(subscription_options) {
+            Ok(options) => options,
+            Err(status) => return status,
+        };
+        // SAFETY: the caller's contract on `uri`.
+        let uri = match unsafe { read_str(uri) } {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match api::subscription::add_with(Handle::from_raw(client), uri, stream_id, options) {
+            Ok(handle) => {
+                // SAFETY: `subscription` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { subscription.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
 /// Delivers at most `limit` messages of `subscription` to `handler`, each
 /// copied first, and writes how many through `delivered` (may be null),
 /// also on failure: a failed poll's status follows the messages delivered

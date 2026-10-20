@@ -1,0 +1,42 @@
+# A subscription's options are checked before anything is opened: an
+# unknown role (KARYOS_ROLE_*), an unknown rejoin policy (KARYOS_REJOIN_*)
+# or a nonzero reserved answers KARYOS_E_INVALID_ARGUMENT. The three roles
+# and both policies of ABI 0.1 are granted. Each subscription is closed
+# before the next: a stream of karyos_stream_options_init's defaults has a
+# subscriber capacity that a third open subscription passes, which the
+# driver refuses with KARYOS_E_REFUSED (SPEC.md §10.2, §13).
+format 1
+id subscription.options.typed.statuses
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=5
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_subscription_with client=$client stream_id=5 role=3
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_subscription_with client=$client stream_id=5 rejoin=2
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_subscription_with client=$client stream_id=5 reserved=1
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_subscription_with client=$client stream_id=5 role=0 rejoin=0
+expect KARYOS_OK subscription=$required
+call karyos_subscription_close subscription=$required
+expect KARYOS_OK
+call karyos_client_add_subscription_with client=$client stream_id=5 role=1 rejoin=1
+expect KARYOS_OK subscription=$optional
+call karyos_subscription_close subscription=$optional
+expect KARYOS_OK
+call karyos_client_add_subscription_with client=$client stream_id=5 role=2 rejoin=1
+expect KARYOS_OK subscription=$observer
+call karyos_subscription_close subscription=$observer
+expect KARYOS_OK
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK
