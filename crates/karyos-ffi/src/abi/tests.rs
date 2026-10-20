@@ -1885,8 +1885,10 @@ fn offer_options_init_fills_the_defaults_and_the_size() {
     assert_eq!(status, Status::InvalidArgument.code());
 }
 
-/// Bad options are refused before the handle is looked up, with nothing
-/// written to `accepted`.
+/// Bad options, then a null payload, are refused before the handle is
+/// looked up, with nothing written to `accepted`; a newer header's options
+/// and a payload reach the handle check. No driver: a Miri test of the
+/// options read and the payload slice.
 #[test]
 fn offer_with_refuses_bad_options() {
     let refused = |options: *const OfferOptions| {
@@ -1904,6 +1906,33 @@ fn offer_with_refuses_bad_options() {
         reserved: 1,
         ..offer_defaults()
     });
+    // A null payload of nonzero length is refused after the options.
+    let mut done = accepted();
+    // SAFETY: a null payload, as the case under test; live options and
+    // accepted of their sizes.
+    let status = unsafe {
+        karyos_publication_offer_with(0, 0, core::ptr::null(), 1, &offer_defaults(), &mut done)
+    };
+    assert_eq!(status, Status::InvalidArgument.code());
+    /// `karyos_offer_options` of a newer header: one more field.
+    #[repr(C)]
+    struct Newer {
+        options: OfferOptions,
+        later: u64,
+    }
+    // Options of a newer header, read by their prefix, and a payload
+    // borrowed for the call reach the handle check.
+    let newer = Newer {
+        options: OfferOptions {
+            size: size_of_u32::<Newer>(),
+            ..offer_defaults()
+        },
+        later: u64::MAX,
+    };
+    // SAFETY: `newer` is live and its stated size.
+    let (status, done) = unsafe { offer_with(0, b"payload", (&raw const newer).cast()) };
+    assert_eq!(status, Status::InvalidHandle.code());
+    assert_eq!((done.lane, done.position), (u32::MAX, u64::MAX));
 }
 
 /// A reserved value reaches every subscriber's message info; the options
