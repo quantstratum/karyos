@@ -620,8 +620,20 @@ release may break APIs, wire formats and shared-memory layouts.
   up to it and reports the listing as maybe behind (an Archive appending,
   or a crash its next open cuts), never as an error. A directory with no
   catalog lists nothing; a damaged catalog, another format version or a
-  missing directory exit 2. Listing a running Archive (`--live`) is H4b,
-  after H3.
+  missing directory exit 2.
+- `karyos-catalog list --live DIR=REQ,RESP [--timeout-ms N] [--json]`
+  (quantstratum-docs: `karyos/design/archive-host.md`, H4b): a running
+  Archive's recordings, listed over its control streams on the driver in
+  DIR with a `RecordingLister` (Linux), each still recording with the
+  position written so far, or where and why it stopped. The connection is
+  opened for the listing and closed after it, so it holds none of the
+  Archive's requester slots; `--timeout-ms` bounds the wait for the driver
+  and then for the whole listing (default 5 s). An Archive that cannot be
+  reached, or refuses, exits 2. `karyos_tools::catalog::list_live` is the
+  same listing over any facade client; `ListArgs` names its source
+  (`Source::Offline` or `Source::Live`). `tests/karyosd_catalog.rs` lists
+  a `karyosd --archive` recording live and offline beside it, then
+  offline once the daemon stopped.
 - `karyos-replay` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H5), the replay and output diff
   binary: `karyos-replay diff` is the recording group journal diff, and
