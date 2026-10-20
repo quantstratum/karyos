@@ -103,7 +103,10 @@ pub const DEFAULT_MAX_PENDING: usize = 64;
 /// How a subscription reads ([`Client::add_subscription_with`]): its
 /// role and what follows an overrun. The default is what
 /// [`Client::add_subscription`] takes: a required reader, rejoining at the
-/// head.
+/// head. A network subscription refuses a snapshot policy (or a replay
+/// whose secondary is one) with [`ClientError::InvalidOptions`]: each of
+/// its images takes a copy of the policy, and a snapshot source serves one
+/// subscription.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct SubscriptionOptions {
@@ -1259,7 +1262,7 @@ impl<C: Connection> Client<C> {
     /// # Errors
     ///
     /// As [`Client::add_exclusive_publication`];
-    /// [`ClientError::InvalidContext`] for a snapshot policy (or a replay
+    /// [`ClientError::InvalidOptions`] for a snapshot policy (or a replay
     /// whose secondary is one) on a `karyos:udp` URI, before anything is
     /// requested.
     pub fn add_subscription_with(
@@ -1271,7 +1274,7 @@ impl<C: Connection> Client<C> {
         let SubscriptionOptions { role, rejoin } = options;
         let network = uri.starts_with("karyos:udp");
         if network && rejoin.duplicate().is_none() {
-            return Err(ClientError::InvalidContext {
+            return Err(ClientError::InvalidOptions {
                 reason: "a snapshot rejoin serves one stream, not a network subscription's images",
             });
         }

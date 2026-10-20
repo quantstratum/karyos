@@ -79,6 +79,15 @@ pub enum ClientError {
         /// What is wrong.
         reason: &'static str,
     },
+    /// A subscription's options do not fit its channel
+    /// (`client::SubscriptionOptions`): a snapshot rejoin policy, or a
+    /// replay whose secondary is one, on a network subscription, whose
+    /// several images cannot share one snapshot source.
+    #[error("invalid subscription options: {reason}")]
+    InvalidOptions {
+        /// What is wrong.
+        reason: &'static str,
+    },
     /// `Client::connect` needs the driver's directory.
     #[error("the context names no driver directory")]
     NoDirectory,

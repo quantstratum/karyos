@@ -1993,7 +1993,7 @@ fn a_network_subscription_refuses_a_snapshot_rejoin() {
         ),
     );
     assert!(
-        matches!(refused, Err(ClientError::InvalidContext { .. })),
+        matches!(refused, Err(ClientError::InvalidOptions { .. })),
         "{refused:?}"
     );
     let _ = driver.do_work();
@@ -2048,5 +2048,66 @@ fn a_network_subscription_attaches_its_images_with_its_options() {
             .poll(|_, _| seen += 1, MessageLimit::new(16))
             .unwrap();
         std::thread::sleep(Duration::from_micros(100));
+    }
+}
+
+/// An image takes a copy of its network subscription's policy: an
+/// optional reader under `Close` that never polls is lapped as its image
+/// fills past its window, and the poll then reports the overrun that
+/// closed it.
+#[test]
+fn a_network_image_is_closed_by_its_copied_policy() {
+    use karyos_client::{RejoinPolicy, SubscriberRole, SubscriptionOptions};
+
+    let (_a, mut a) = driven(1, None);
+    let (_b, mut b) = driven(1, None);
+    let mut publisher = Client::with_conductor(a.remove(0), context());
+    let mut subscriber = Client::with_conductor(b.remove(0), context());
+    let port = port();
+    let mut reading = subscriber
+        .add_subscription_with(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+            SubscriptionOptions::new(SubscriberRole::Optional, RejoinPolicy::Close),
+        )
+        .unwrap();
+    let mut publication = publisher
+        .add_exclusive_publication(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    until(&mut [&mut subscriber, &mut publisher], || {
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        reading.image_count() == 1
+    });
+    // Four terms (64 KiB each in `driven`) offered, none read.
+    let message = [7u8; 1024];
+    let mut sent = 0usize;
+    let start = Instant::now();
+    while sent < 4 * 64 {
+        assert!(start.elapsed() < Duration::from_secs(20), "sent {sent}");
+        let _ = publisher.poll();
+        let _ = subscriber.poll();
+        match publication.offer(&message) {
+            Ok(_) => sent += 1,
+            Err(OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected) => {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(20), "never closed");
+        let _ = subscriber.poll();
+        let poll = reading.poll(|_, _| {}, MessageLimit::new(4096));
+        if let Ok(poll) = poll
+            && let Some(stop) = poll.stopped
+            && stop.summary.closed_by_overrun.is_some()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }

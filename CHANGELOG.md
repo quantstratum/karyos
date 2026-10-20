@@ -472,8 +472,8 @@ release may break APIs, wire formats and shared-memory layouts.
   `add_subscription`'s behaviour, which `add_subscription` now delegates
   to. Each image of a network subscription takes the role and a copy of
   the policy, so a snapshot policy (one stream's source) is refused on a
-  `karyos:udp` URI with `ClientError::InvalidContext` before anything is
-  requested. The facade re-exports `SubscriptionOptions`,
+  `karyos:udp` URI with the new `ClientError::InvalidOptions` before
+  anything is requested. The facade re-exports `SubscriptionOptions`,
   `SubscriberRole`, `RejoinPolicy`, `Secondary` and `SnapshotSource`.
 - `Publication::offer_at_on(lane, payload, tx_time)` on the client facade
   (quantstratum-docs: `karyos/design/timed-tx.md`; owner item 57): a timed
