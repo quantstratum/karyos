@@ -557,12 +557,16 @@ fn replay_ended(agent: &ArchiveHandle) -> ReplayEnded {
 }
 
 fn replay_of(recording_id: u64, to: u64, sink: Sink) -> StartReplay {
+    replay_of_sink(recording_id, to, Box::new(sink))
+}
+
+fn replay_of_sink(recording_id: u64, to: u64, sink: Box<dyn ReplaySink + Send>) -> StartReplay {
     StartReplay {
         recording_id,
         from: 0,
         to,
         rate: Rate::Full,
-        sink: Box::new(sink),
+        sink,
     }
 }
 
@@ -600,6 +604,107 @@ fn a_recording_replays_into_its_sink() {
         assert_eq!(seen.finished, Some((end, true)));
         assert!(seen.calls > refuse);
     }
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A sink whose target waits for its first reader: not ready until the
+/// test opens it.
+struct Unjoined {
+    sink: Sink,
+    joined: Arc<AtomicBool>,
+}
+
+impl ReplaySink for Unjoined {
+    fn frames(&mut self, position: u64, bytes: &[u8]) -> Result<bool, SinkClosed> {
+        self.sink.frames(position, bytes)
+    }
+
+    fn fill(&mut self, position: u64, record: &[u8], extent: u32) -> Result<bool, SinkClosed> {
+        self.sink.fill(position, record, extent)
+    }
+
+    fn gap(&mut self, from: u64, to: u64) -> Result<bool, SinkClosed> {
+        self.sink.gap(from, to)
+    }
+
+    fn finish(&mut self, end: u64, complete: bool) {
+        self.sink.finish(end, complete);
+    }
+
+    fn ready(&mut self) -> bool {
+        self.joined.load(Ordering::Acquire)
+    }
+}
+
+/// A replay steps nothing into a sink that is not ready (H2b): one that
+/// becomes ready within the attach deadline replays everything from its
+/// first position, and one that never does ends `NoSubscriber` at the
+/// deadline, finished incomplete where it began, its sink never written.
+#[test]
+fn a_replay_waits_for_its_target_until_the_attach_deadline() {
+    let dir = temp_dir("replay-attach");
+    let config = AgentConfig {
+        attach_deadline: Duration::from_millis(200),
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    let (recording, all) = sealed_recording(&agent);
+    let end = all.len() as u64;
+
+    // Joined within the deadline: everything, from the first position.
+    let seen = Arc::default();
+    let joined = Arc::new(AtomicBool::new(false));
+    let id = agent
+        .replay(replay_of_sink(
+            recording,
+            end,
+            Box::new(Unjoined {
+                sink: Sink::new(&seen),
+                joined: Arc::clone(&joined),
+            }),
+        ))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(seen.lock().unwrap().calls, 0, "nothing before the reader");
+    joined.store(true, Ordering::Release);
+    assert_eq!(
+        replay_ended(&agent),
+        ReplayEnded {
+            id,
+            position: end,
+            outcome: ReplayOutcome::Complete
+        }
+    );
+    assert_eq!(seen.lock().unwrap().bytes, all);
+
+    // Never joined: unattended at the deadline, nothing written.
+    let seen = Arc::default();
+    let started = std::time::Instant::now();
+    let id = agent
+        .replay(replay_of_sink(
+            recording,
+            end,
+            Box::new(Unjoined {
+                sink: Sink::new(&seen),
+                joined: Arc::new(AtomicBool::new(false)),
+            }),
+        ))
+        .unwrap();
+    assert_eq!(
+        replay_ended(&agent),
+        ReplayEnded {
+            id,
+            position: 0,
+            outcome: ReplayOutcome::NoSubscriber
+        }
+    );
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.calls, 0);
+    assert!(seen.bytes.is_empty());
+    assert_eq!(seen.finished, Some((0, false)));
+    drop(seen);
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
