@@ -2291,6 +2291,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A conflation table's value capacity past `u32` was saturated to
+  `u32::MAX` when its shape was taken (#535), a form SPEC §14 excludes.
+  `ConflationConfig::shape` now returns `Result<ConflationShape,
+  ConflationError>` and refuses such a capacity with `ValueTooLarge`;
+  `ConflationConfig::validate_publication` passes the refusal on, and a
+  publication given such a table by `with_conflation` fails every keyed
+  offer and claim with it. The shape's own check and a claim's length
+  conversion refuse with `InvalidConfig` where they saturated before (a
+  target whose `usize` is narrower than 32 bits).
 - `karyos.h`: `karyos_publication_claim`'s doc comment held a stray `/**`
   and a repeated line, which merge `fc3be2c2` (F7a-3) left. C compilers
   warned (`-Wcomment`, "'/*' within block comment"), and so did a cgo

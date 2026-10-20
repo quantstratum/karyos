@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use karyos_sys::conflation::ConflationConfig;
+use karyos_sys::conflation::{ConflationConfig, ConflationError};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::ConflationShape;
 use karyos_sys::log_buffer::{
@@ -195,7 +195,9 @@ pub struct ClientConcurrentPublication<T: TermBytes = HeapTerms> {
     /// The trace hook and publication identity, for a traced handle.
     trace: Option<PublishTrace>,
     /// Limits for the stream's conflated view, when configured by the driver.
-    conflation: Option<ConflationShape>,
+    /// The table's shape, or why the one `with_conflation` was given has
+    /// none: every keyed offer and claim then fails with it.
+    conflation: Option<Result<ConflationShape, ConflationError>>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -220,7 +222,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
     /// read from the buffer the handle publishes to.
     #[must_use]
     pub fn new(inner: ConcurrentPublication<Arc<LogBuffer<T>>>, allow_unconnected: bool) -> Self {
-        let conflation = inner.buffer().conflation();
+        let conflation = inner.buffer().conflation().map(Ok);
         Self {
             inner,
             allow_unconnected,
@@ -238,6 +240,8 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
     /// table its buffer carries: every publication of a conflated stream
     /// already reads its stream's from the buffer (F7b-2c-2), in process
     /// or attached, so this is for tests and for buffers built without one.
+    /// A `config` whose value capacity has no shape (past `u32`) is kept as
+    /// its refusal: every later offer and claim fails with it.
     #[must_use]
     pub fn with_conflation(mut self, config: ConflationConfig) -> Self {
         self.conflation = Some(config.shape());
@@ -353,7 +357,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             return Ok(ConcurrentOfferOutcome::NotConnected);
         }
         if let Some(shape) = self.conflation {
-            shape.validate_publication(options.reserved_value, payload.len())?;
+            shape?.validate_publication(options.reserved_value, payload.len())?;
         }
         let lane = self.inner.buffer().lane();
         match offer_outcome(self.inner.offer(payload, options)?, lane, self.base) {
@@ -484,12 +488,11 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             return Ok(self.after_end().concurrent_claim());
         }
         if let Some(shape) = self.conflation {
-            let value_length = usize::try_from(length).map_err(|_| {
-                ClientError::from(karyos_sys::conflation::ConflationError::ValueTooLarge {
-                    length: usize::MAX,
-                    max: usize::try_from(shape.value_capacity).unwrap_or(usize::MAX),
-                })
-            })?;
+            let shape = shape?;
+            // A claim length no usize of this target holds is no value it
+            // can carry.
+            let value_length =
+                usize::try_from(length).map_err(|_| ConflationError::InvalidConfig)?;
             shape.validate_publication(options.reserved_value, value_length)?;
         }
         let lane = self.inner.buffer().lane();
