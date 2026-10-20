@@ -352,17 +352,17 @@ fn a_close_acknowledgement_reaches_the_cnc() {
     let (_first, cell) = driver.register_guard_sender(guard).unwrap();
     let (_second, _never) = driver.register_guard_sender(guard).unwrap();
     let _ = driver.do_work().unwrap();
-    // Open: no close in effect.
+    // Open: no close in effect, written once so a reader trusts it.
     let (gauges, pass) = ack_gauges(&driver, guard);
-    assert_eq!((values(&gauges), pass), ([0; 5], 0));
+    assert_eq!((values(&gauges), pass), ([0; 5], 2));
     now.store(10, Ordering::Relaxed);
     assert_eq!(driver.close_guard(guard, 1), Ok(Closed::Now { epoch: 3 }));
     let _ = driver.do_work().unwrap();
     let (gauges, pass) = ack_gauges(&driver, guard);
-    assert_eq!((values(&gauges), pass), ([3, 0, 0, 2, 0], 2));
+    assert_eq!((values(&gauges), pass), ([3, 0, 0, 2, 0], 4));
     // Nothing changed: no pass.
     let _ = driver.do_work().unwrap();
-    assert_eq!(ack_gauges(&driver, guard).1, 2);
+    assert_eq!(ack_gauges(&driver, guard).1, 4);
     // Past the timeout, both are overdue; one then applies with work in
     // flight, then drains.
     now.store(10 + SECOND, Ordering::Relaxed);
@@ -374,7 +374,7 @@ fn a_close_acknowledgement_reaches_the_cnc() {
     cell.publish(applied(3, 0));
     let _ = driver.do_work().unwrap();
     let (gauges, pass) = ack_gauges(&driver, guard);
-    assert_eq!((values(&gauges), pass), ([3, 1, 0, 0, 1], 8));
+    assert_eq!((values(&gauges), pass), ([3, 1, 0, 0, 1], 10));
     // The counts agree with close_guard_ack's report.
     let ack = driver.close_guard_ack(guard, 3).unwrap();
     assert_eq!(ack.senders.len(), 2);
@@ -382,4 +382,20 @@ fn a_close_acknowledgement_reaches_the_cnc() {
     assert_eq!(driver.reopen_guard(guard, 3, 2), Ok(4));
     let _ = driver.do_work().unwrap();
     assert_eq!(values(&ack_gauges(&driver, guard).0), [0; 5]);
+}
+
+/// DESIGN's P2 on #479: a guard's word gauge carries its name beside its
+/// acknowledgement group, so a name equal to a group label is refused,
+/// whatever readers would make of it; other names are not.
+#[test]
+fn a_guard_may_not_take_an_acknowledgement_label_as_its_name() {
+    let (mut driver, _, _) = driver(DriverConfig::default());
+    for name in ACK_LABELS.iter().chain([&ACK_PASS_LABEL]) {
+        assert_eq!(
+            driver.add_guard(name),
+            Err(DriverError::InvalidConfig),
+            "{name}"
+        );
+    }
+    assert!(driver.add_guard("guard ack").is_ok());
 }

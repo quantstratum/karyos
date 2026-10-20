@@ -1757,8 +1757,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// # Errors
     ///
-    /// [`DriverError::InvalidConfig`] for an empty name or one longer than
-    /// [`crate::guards::MAX_GUARD_NAME`] bytes, [`DriverError::DuplicateGuard`],
+    /// [`DriverError::InvalidConfig`] for an empty name, one longer than
+    /// [`crate::guards::MAX_GUARD_NAME`] bytes, or one of the labels of a
+    /// guard's close acknowledgement gauges (`guard ack pass`, `guard ack
+    /// epoch`, `guard senders applied`, `in flight`, `pending` and
+    /// `overdue`, each `guard senders ...`); [`DriverError::DuplicateGuard`],
     /// [`DriverError::TooManyGuards`] and [`DriverError::GuardIdsExhausted`].
     pub fn add_guard(&mut self, name: &str) -> Result<GuardHandle, DriverError> {
         self.guards.add(name)

@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 use karyos_archive::agent::{AgentConfig, ArchiveHandle, ReplaySink, SinkClosed};
 use karyos_archive::catalog::{Recording, SourceIncarnation, StopReason, StreamFormat};
+use karyos_archive::client::list::{ListPoll, ListerConfig, RecordingLister};
 use karyos_archive::client::{
     ArchiveClient, ClientConfig, ControlRequests, ControlResponses, ReplayTargets,
 };
@@ -1041,4 +1042,39 @@ fn a_stream_with_no_recording_falls_back_to_the_secondary() {
     assert!(outcomes(&reports).is_empty(), "{reports:?}");
     assert!(seen == sent[before..], "from the resume on");
     drop(publication);
+}
+
+/// M11: the agent's lister reads the catalog through the real control
+/// server, page by page: a full page of one, then an empty one.
+#[test]
+fn the_catalog_is_listed_page_by_page_through_the_control_streams() {
+    let mut rig = Rig::new(INITIAL_TERM_ID);
+    let recording_id = rig.start_recording(Mode::Required);
+    let Client {
+        requests,
+        responses,
+    } = rig.client.take().unwrap();
+    let mut lister = RecordingLister::new(
+        ListerConfig::new(0xA7).with_bounds(1, 16),
+        Writing(requests),
+        Reading(responses),
+    );
+    lister.start();
+    let start = Instant::now();
+    let listing = loop {
+        assert!(start.elapsed() < Duration::from_secs(10), "no listing");
+        rig.cycle();
+        match lister.poll() {
+            ListPoll::Pending => {}
+            ListPoll::Done(listing) => break listing,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(listing.left_out, 0);
+    let [recording] = listing.recordings.as_slice() else {
+        panic!("{listing:?}")
+    };
+    assert_eq!(recording.recording_id, recording_id);
+    assert_eq!((recording.stream_id, recording.session_id), (DATA, 1));
+    assert_eq!(recording.channel, "karyos:ipc");
 }
