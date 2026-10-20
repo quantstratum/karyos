@@ -466,8 +466,10 @@ fn a_subscription_follows_its_clients_driver() {
 /// "Threads"). Against a busy-spinning thread, which takes the lock back
 /// at once after each cycle, 32 adds and removes of streams each wait
 /// through at most the cycle in progress and the one that may start
-/// before the call announces itself: the thread's own cycle count, not a
-/// clock, so a loaded machine cannot fail it.
+/// before the thread sees the call's announcement. The count starts at
+/// the announcement and is the thread's own, not a clock, so a loaded
+/// machine cannot fail it: a caller preempted before it announces itself
+/// counts none of the cycles run meanwhile.
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_call_on_a_busy_spinning_driver_waits_for_one_cycle() {
