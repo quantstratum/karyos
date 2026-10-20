@@ -643,6 +643,19 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos-ffi` asserts at compile time that each
   kind's object is `Send` and its table `Sync`
   (`src/threads.rs`), and `abi::tests::threads` checks the runtime rules.
+- `karyos_archive::client::replay` (B6; quantstratum-docs:
+  `karyos/design/archive-replay-control.md`): a `Replayer` that starts and
+  stops replays over the Archive's control streams for a requester that
+  reads them elsewhere, such as a binding. It never blocks: `start` and
+  `stop` queue a request and return its `RequestId`, and each `poll`
+  sends what it can and reports one `Started` (with the target's session
+  id), `Stopped`, `Refused` or `Expired`. At most `MAX_PENDING` (16)
+  requests and unpolled answers wait, and nothing grows after `new`. A
+  replay request that expired and is answered late has its replay
+  stopped, so a request that timed out never leaves a replay running.
+  A replay's end is its target's seal: `EndOfStream` when it ran to its
+  requested end, `ImageRetired` when it was stopped; no control message
+  tells the requester.
 - The libkaryos package carries `lib/pkgconfig/karyos-static.pc` for a
   static link: `karyos.pc`'s `-lkaryos` makes the linker pick the shared
   library even under `pkg-config --static` (macOS ld, and GNU ld without
@@ -2443,6 +2456,17 @@ release may break APIs, wire formats and shared-memory layouts.
   position stays within each required member's edge.
 
 ### Fixed
+
+- `make libkaryos` failed on main after #555 ("no format version in
+  conformance/FORMAT.md"): the package script read the format from
+  FORMAT.md's title, which #555 retitled. FORMAT.md now carries a marker
+  line, `<!-- conformance-formats: 1 2 -->`, read by the new
+  `scripts/conformance-formats.sh`. The MANIFEST keeps
+  `conformance_format`, one number, the newest format (now 2), and
+  gains `conformance_formats=1 2`. `make lint-sync`, part of pre-push,
+  fails when the marker is missing, malformed or differs from the
+  reference runner's `FORMATS`, so a retitled or extended FORMAT.md
+  cannot break the package unseen. The bindings read neither key.
 
 - A guarded client publication gated by the guard word before the
   close's seal landed never released, so the seal never positioned and
