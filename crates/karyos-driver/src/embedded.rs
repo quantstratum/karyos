@@ -70,19 +70,34 @@ impl StreamTerms for HeapTerms {}
 impl StreamTerms for SharedTerms {}
 
 pub(crate) mod sealed {
-    use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig};
+    use karyos_sys::log_buffer::{ConflationShape, LogBuffer, LogBufferConfig};
     use karyos_sys::term::Generation;
+    use karyos_sys::term_bytes::TermBytes;
 
     use crate::embedded::{EmbeddedDriver, StreamTerms};
     use crate::error::DriverError;
 
+    /// `buffer` with the shape of its stream's conflation table written in
+    /// its configuration block, before it is shared (F7b-2c-2).
+    fn shaped<T: TermBytes>(
+        buffer: LogBuffer<T>,
+        conflation: Option<ConflationShape>,
+    ) -> Result<LogBuffer<T>, DriverError> {
+        Ok(match conflation {
+            Some(shape) => buffer.with_conflation(shape)?,
+            None => buffer,
+        })
+    }
+
     /// Creates a stream's log buffer on the driver's backing.
     pub trait Create: Sized {
-        /// A log buffer of `generation` for `config`.
+        /// A log buffer of `generation` for `config`, carrying the shape of
+        /// the stream's conflation table, if it has one.
         fn create(
             driver: &mut EmbeddedDriver<Self>,
             config: LogBufferConfig,
             generation: Generation,
+            conflation: Option<ConflationShape>,
         ) -> Result<LogBuffer<Self>, DriverError>
         where
             Self: StreamTerms;
@@ -110,8 +125,12 @@ pub(crate) mod sealed {
             _driver: &mut EmbeddedDriver<Self>,
             config: LogBufferConfig,
             generation: Generation,
+            conflation: Option<ConflationShape>,
         ) -> Result<LogBuffer<Self>, DriverError> {
-            Ok(LogBuffer::new_with_generation(config, generation)?)
+            shaped(
+                LogBuffer::new_with_generation(config, generation)?,
+                conflation,
+            )
         }
 
         #[cfg(target_os = "linux")]
@@ -133,13 +152,17 @@ pub(crate) mod sealed {
             driver: &mut EmbeddedDriver<Self>,
             config: LogBufferConfig,
             generation: Generation,
+            conflation: Option<ConflationShape>,
         ) -> Result<LogBuffer<Self>, DriverError> {
             let admission = driver
                 .admission
                 .as_mut()
                 .ok_or(DriverError::InvalidConfig)?;
             let (instance, region) = admission.next_region()?;
-            Ok(LogBuffer::create_in(instance, region, config, generation)?)
+            shaped(
+                LogBuffer::create_in(instance, region, config, generation)?,
+                conflation,
+            )
         }
 
         fn region(buffer: &LogBuffer<Self>) -> Option<&karyos_sys::ipc::Region> {
@@ -907,6 +930,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) broadcast: BroadcastTransmitter,
     pub(crate) clients: Vec<ClientSlot<T>>,
     pub(crate) registrations: Vec<crate::commands::Registration>,
+    /// The audited streams and their grants not drained yet (H3).
+    pub(crate) grant_audits: crate::grant_audit::GrantAudits,
     pub(crate) next_client: u64,
     pub(crate) next_stream: u64,
     /// The replay targets this driver made (A5b).
@@ -1377,6 +1402,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             broadcast,
             clients: Vec::new(),
             registrations: Vec::new(),
+            grant_audits: crate::grant_audit::GrantAudits::default(),
             next_client: 1,
             next_stream: 1,
             replays: crate::replay::ReplayTargets::default(),
@@ -2370,10 +2396,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ));
         }
         let key = (config.buffer.stream_id, config.buffer.session_id);
+        let shape = config.conflation.map(conflation_shape).transpose()?;
         let buffer = Arc::new(<T as sealed::Create>::create(
             self,
             buffer_config,
             Generation::default(),
+            shape,
         )?);
         let mut conductor = buffer
             .conductor_owned()
@@ -2515,11 +2543,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
         let (link, base) = stream.join(MemberKind::Exclusive);
-        let conflation = stream.conflation;
-        let mut publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease);
-        if let Some(config) = conflation {
-            publication = publication.with_conflation(config);
-        }
+        // Its stream's conflation table comes with the buffer (F7b-2c-2).
+        let publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease);
         let mut publication = publication.with_generation(link, base)?;
         if let (Some((client, bound)), Some(guarded)) = (binding, stream.guarded.as_mut()) {
             publication = publication.with_guard(client);
@@ -2602,6 +2627,34 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream: StreamHandle,
     ) -> Result<Option<&[karyos_sys::sync::AtomicU64]>, DriverError> {
         Ok(self.stream_ref(stream)?.buffer.schedule_ring())
+    }
+
+    /// Audits the grants of the stream `stream` from now on (`quantstratum-docs:
+    /// karyos/design/archive-host.md`, H3): each handle the control path
+    /// grants on it is recorded for [`Self::drain_grant_audits`]. A handle
+    /// the host takes in process ([`Self::publication`], [`Self::subscribe`])
+    /// is the host's own and is not recorded. Control path.
+    ///
+    /// # Errors
+    ///
+    /// The stream lookup errors.
+    pub fn audit_grants(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+        let id = self.stream_ref(stream)?.id;
+        self.grant_audits.watch(id);
+        Ok(())
+    }
+
+    /// Hands every grant recorded on an audited stream since the last
+    /// drain to `each`, oldest first.
+    pub fn drain_grant_audits(&mut self, each: impl FnMut(crate::grant_audit::GrantAudit)) {
+        self.grant_audits.drain(each);
+    }
+
+    /// Grants on audited streams dropped because more than 64 waited for a
+    /// drain.
+    #[must_use]
+    pub fn grant_audits_dropped(&self) -> u64 {
+        self.grant_audits.dropped()
     }
 
     /// Seals a timed lane whose sender's [`crate::timed_gate::TimedGate`]
@@ -2775,10 +2828,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// The buffer, conductor and walker of the incarnation `plan`, not
     /// installed yet.
     fn prepare_incarnation(&mut self, plan: &Incarnation) -> Result<Fresh<T>, DriverError> {
+        // A conflated stream has no fresh incarnation
+        // (`reincarnation_plan` refuses it), so its buffer has no table.
         let buffer = Arc::new(<T as sealed::Create>::create(
             self,
             plan.config,
             plan.generation,
+            None,
         )?);
         let mut conductor = buffer
             .conductor_owned()
@@ -3103,12 +3159,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .ok_or(DriverError::PublicationTaken)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
         let (link, base) = stream.join(MemberKind::Concurrent);
-        let conflation = stream.conflation;
-        let mut publication =
+        // Its stream's conflation table comes with the buffer (F7b-2c-2).
+        let publication =
             ClientConcurrentPublication::with_lease(inner, stream.allow_unconnected, lease);
-        if let Some(config) = conflation {
-            publication = publication.with_conflation(config);
-        }
         let publication = publication.with_generation(link, base)?;
         self.update_stream_gauges();
         Ok(publication)
@@ -4746,15 +4799,15 @@ mod tests {
     }
 
     /// conflation-end-to-end.md, Counters: the feeder counts the messages
-    /// it writes and those it rejects, by cause. A driver-issued
-    /// publication refuses bad keys and oversized values before reserving,
-    /// so the rejected ones come through a raw publication without those
-    /// checks, as a misbehaving process could write them.
+    /// it writes and those it rejects, by cause. Every client publication
+    /// refuses bad keys and oversized values before reserving, from the
+    /// table its buffer carries (F7b-2c-2), so the rejected ones are
+    /// appended through the buffer's raw publication, as a misbehaving
+    /// process could write them.
     #[test]
     fn the_feeder_counts_writes_and_rejections_by_cause() {
-        use karyos_client::{ClientPublication, OfferOutcome};
         use karyos_sys::counters::CellRead;
-        use karyos_sys::log_buffer::AppendOptions;
+        use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
 
         let mut driver = EmbeddedDriver::new().unwrap();
         let mut stream_config = config(42);
@@ -4771,7 +4824,7 @@ mod tests {
             .publication_owned()
             .unwrap()
             .unwrap();
-        let mut publication = ClientPublication::new(inner, false);
+        let mut publication = inner;
         for (key, value) in [
             (1, b"ok".as_slice()),
             (99, b"bad-key"),
@@ -4784,8 +4837,8 @@ mod tests {
                 ..AppendOptions::default()
             };
             assert!(matches!(
-                publication.offer_with(value, options).unwrap(),
-                OfferOutcome::Accepted { .. }
+                publication.append(value, options).unwrap(),
+                AppendOutcome::Appended { .. }
             ));
         }
         let _ = driver.do_work().unwrap();
@@ -5449,4 +5502,22 @@ mod stream_cells_tests {
         }
         assert_eq!(allocated(&counters), before);
     }
+}
+
+/// The shape of `config`'s table that its publications check, written in
+/// every log buffer of the stream (F7b-2c-2).
+///
+/// # Errors
+///
+/// [`DriverError::InvalidConfig`] for a value capacity past `u32`, which
+/// no message carries.
+pub(crate) fn conflation_shape(
+    config: ConflationConfig,
+) -> Result<karyos_sys::log_buffer::ConflationShape, DriverError> {
+    let value_capacity =
+        u32::try_from(config.value_capacity).map_err(|_| DriverError::InvalidConfig)?;
+    Ok(karyos_sys::log_buffer::ConflationShape::new(
+        config.keys,
+        value_capacity,
+    ))
 }

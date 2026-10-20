@@ -140,6 +140,33 @@ impl MessageLength {
     }
 }
 
+/// Per-offer options ([`Publication::offer_on_with`]). The default is what
+/// [`Publication::offer_on`] sends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OfferOptions {
+    /// The value written in every fragment's header, which subscribers
+    /// read as `MessageInfo::reserved_value`. On a conflated stream it is
+    /// the message's key, in `0..keys` of the stream's table; see
+    /// [`Publication::offer_on_with`].
+    pub reserved_value: i64,
+}
+
+impl OfferOptions {
+    /// The default options: a reserved value of 0.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// These options with `reserved_value`.
+    #[must_use]
+    pub fn with_reserved_value(mut self, reserved_value: i64) -> Self {
+        self.reserved_value = reserved_value;
+        self
+    }
+}
+
 /// An exclusive publication of a [`Client`](super::Client): one handle per
 /// configured lane.
 #[derive(Debug)]
@@ -262,6 +289,36 @@ impl<T: TermBytes> Publication<T> {
     #[must_use = "an offer can be refused"]
     pub fn offer_on(&mut self, lane: Lane, payload: &[u8]) -> Result<Accepted, OfferError> {
         offered(self.lane(lane)?.offer(payload)?)
+    }
+
+    /// Offers `payload` on `lane` with `options`: its reserved value, which
+    /// on a conflated stream is its key.
+    ///
+    /// On a conflated stream the driver is authoritative: a key outside
+    /// the table never enters the conflated view, and the driver counts it
+    /// as a rejected key. Every publication also refuses such a key, or a
+    /// value larger than the capacity, before it appends: the table's shape
+    /// comes with the log buffer it publishes to, in process or attached.
+    /// Conflation is a view over the log, not a filter on it: an appended
+    /// message reaches the stream's subscribers whatever its key.
+    ///
+    /// # Errors
+    ///
+    /// As [`Publication::offer_on`]; a key or value the publication checks
+    /// and refuses, as [`OfferError::Client`] with
+    /// `ClientError::Conflation`.
+    #[must_use = "an offer can be refused"]
+    pub fn offer_on_with(
+        &mut self,
+        lane: Lane,
+        payload: &[u8],
+        options: OfferOptions,
+    ) -> Result<Accepted, OfferError> {
+        let append = karyos_sys::log_buffer::AppendOptions {
+            reserved_value: options.reserved_value,
+            ..karyos_sys::log_buffer::AppendOptions::default()
+        };
+        offered(self.lane(lane)?.offer_with(payload, append)?)
     }
 
     /// Offers `payload` on the timed `lane` with its requested not-before

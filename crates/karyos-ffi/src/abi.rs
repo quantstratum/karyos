@@ -547,6 +547,109 @@ pub unsafe extern "C" fn karyos_publication_offer(
     })
 }
 
+/// `karyos_offer_options`: per-offer options of
+/// `karyos_publication_offer_with`. Only integers: the library reads it by
+/// prefix from the caller's bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OfferOptions {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// Zero.
+    pub reserved: u32,
+    /// The value written in every fragment's header; a conflated stream's
+    /// key.
+    pub reserved_value: i64,
+}
+
+/// The size of `karyos_offer_options` in ABI 0.1.0, the smallest a caller
+/// passes.
+const OFFER_OPTIONS_SIZE_0_1: u32 = 16;
+
+/// `karyos_offer_options` with the defaults (a reserved value of 0) and
+/// this version's size.
+fn default_offer_options() -> OfferOptions {
+    OfferOptions {
+        size: size_of_u32::<OfferOptions>(),
+        reserved: 0,
+        reserved_value: 0,
+    }
+}
+
+/// Fills `options` with the defaults (`reserved_value` 0) and its size.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable `karyos_offer_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_offer_options_init(options: *mut OfferOptions) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable `karyos_offer_options`.
+        unsafe { options.write(default_offer_options()) };
+        Status::Ok
+    })
+}
+
+/// As `karyos_publication_offer`, with `options`: the reserved value every
+/// fragment's header carries (subscribers read it as
+/// `karyos_message_info.reserved_value`). On a conflated stream it is the
+/// message's key, in `0..keys` of the stream's table, and the value is at
+/// most its capacity: otherwise `KARYOS_E_CONFLATION`, with nothing
+/// reserved. A null `options`, a `size` below that of ABI 0.1.0 or a
+/// nonzero `reserved` returns `KARYOS_E_INVALID_ARGUMENT`.
+///
+/// # Safety
+///
+/// As [`karyos_publication_offer`]; `options` is null or points to a
+/// readable `karyos_offer_options` of at least its `size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_publication_offer_with(
+    publication: u64,
+    lane: u32,
+    data: *const u8,
+    length: usize,
+    options: *const OfferOptions,
+    accepted: *mut Accepted,
+) -> i32 {
+    guard(|| {
+        // SAFETY: the caller's contract on `options`; `OfferOptions` holds
+        // integers only, valid for every bit pattern.
+        let options =
+            match unsafe { read_sized(options, OFFER_OPTIONS_SIZE_0_1, default_offer_options()) } {
+                Ok(options) if options.reserved == 0 => {
+                    karyos_client::OfferOptions::new().with_reserved_value(options.reserved_value)
+                }
+                Ok(_) => return Status::InvalidArgument,
+                Err(status) => return status,
+            };
+        let payload: &[u8] = if length == 0 {
+            &[]
+        } else if data.is_null() || isize::try_from(length).is_err() {
+            return Status::InvalidArgument;
+        } else {
+            // SAFETY: `data` is non-null and points to `length` readable
+            // bytes (the caller's contract), `length` fits an `isize`, and
+            // the slice is used only during the call.
+            unsafe { core::slice::from_raw_parts(data, length) }
+        };
+        match api::publication::offer_with(Handle::from_raw(publication), lane, payload, options) {
+            Ok(done) => {
+                // SAFETY: the caller's contract on `accepted`.
+                unsafe { write_accepted(accepted, done) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
 /// Offers `length` bytes at `data` on the timed `lane` of `publication`,
 /// with its requested not-before time `tx_time` in the lane's clock domain
 /// (`karyos_clock_now` reads it), copied into the term before it returns.
@@ -995,6 +1098,160 @@ pub unsafe extern "C" fn karyos_client_add_subscription(
     })
 }
 
+/// `KARYOS_ROLE_REQUIRED`: the reader bounds its publisher and is never
+/// lapped (SPEC.md §4); the role `karyos_client_add_subscription` takes.
+pub(crate) const ROLE_REQUIRED: u32 = 0;
+/// `KARYOS_ROLE_OPTIONAL`: the reader does not bound its publisher and may
+/// be lapped.
+pub(crate) const ROLE_OPTIONAL: u32 = 1;
+/// `KARYOS_ROLE_OBSERVER`: as optional, and it only copies.
+pub(crate) const ROLE_OBSERVER: u32 = 2;
+/// `KARYOS_REJOIN_AT_HEAD`: after an overrun, delivery continues at the
+/// head; the policy `karyos_client_add_subscription` takes.
+pub(crate) const REJOIN_AT_HEAD: u32 = 0;
+/// `KARYOS_REJOIN_CLOSE`: an overrun closes the subscription, whose polls
+/// then return `KARYOS_E_CLOSED_BY_OVERRUN`.
+pub(crate) const REJOIN_CLOSE: u32 = 1;
+
+/// `karyos_subscription_options`: a subscription's role and rejoin policy
+/// (`quantstratum-docs: karyos/design/rejoin-policies.md`), read by
+/// `karyos_client_add_subscription_with`. Only integers: the library reads
+/// it by prefix from the caller's bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SubscriptionOptions {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// `KARYOS_ROLE_*`.
+    pub role: u32,
+    /// `KARYOS_REJOIN_*`.
+    pub rejoin: u32,
+    /// Zero.
+    pub reserved: u32,
+}
+
+/// The size of `karyos_subscription_options` in ABI 0.1.0, the smallest a
+/// caller passes.
+const SUBSCRIPTION_OPTIONS_SIZE_0_1: u32 = 16;
+
+/// `karyos_subscription_options` with the defaults (a required reader that
+/// rejoins at the head) and this version's size.
+fn default_subscription_options() -> SubscriptionOptions {
+    SubscriptionOptions {
+        size: size_of_u32::<SubscriptionOptions>(),
+        role: ROLE_REQUIRED,
+        rejoin: REJOIN_AT_HEAD,
+        reserved: 0,
+    }
+}
+
+/// The client options of `options`: an unknown role or policy, or a
+/// nonzero `reserved`, is [`Status::InvalidArgument`].
+fn subscription_options(
+    options: SubscriptionOptions,
+) -> Result<karyos_client::SubscriptionOptions, Status> {
+    use karyos_client::{RejoinPolicy, SubscriberRole};
+    if options.reserved != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let role = match options.role {
+        ROLE_REQUIRED => SubscriberRole::Required,
+        ROLE_OPTIONAL => SubscriberRole::Optional,
+        ROLE_OBSERVER => SubscriberRole::Observer,
+        _ => return Err(Status::InvalidArgument),
+    };
+    let rejoin = match options.rejoin {
+        REJOIN_AT_HEAD => RejoinPolicy::RejoinAtHead,
+        REJOIN_CLOSE => RejoinPolicy::Close,
+        _ => return Err(Status::InvalidArgument),
+    };
+    Ok(karyos_client::SubscriptionOptions::new(role, rejoin))
+}
+
+/// Fills `options` with the defaults (`KARYOS_ROLE_REQUIRED`,
+/// `KARYOS_REJOIN_AT_HEAD`) and its size.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable
+/// `karyos_subscription_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_subscription_options_init(
+    options: *mut SubscriptionOptions,
+) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable `karyos_subscription_options`.
+        unsafe { options.write(default_subscription_options()) };
+        Status::Ok
+    })
+}
+
+/// As `karyos_client_add_subscription`, with the reader's role and rejoin
+/// policy from `options` (filled by `karyos_subscription_options_init`).
+/// Each image of a `karyos:udp` subscription takes the role and the policy.
+/// The options are copied; a struct from an older header of the same major
+/// version is read by its prefix. A null `options`, a `size` below that of
+/// ABI 0.1.0, an unknown role or policy, or a nonzero `reserved` returns
+/// `KARYOS_E_INVALID_ARGUMENT` and opens nothing.
+///
+/// # Safety
+///
+/// As `karyos_client_add_subscription`; `options` is null or points to a
+/// readable `karyos_subscription_options` of at least its `size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_subscription_with(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    options: *const SubscriptionOptions,
+    subscription: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(subscription) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `options`; `SubscriptionOptions`
+        // holds integers only, valid for every bit pattern.
+        let read = unsafe {
+            read_sized(
+                options,
+                SUBSCRIPTION_OPTIONS_SIZE_0_1,
+                default_subscription_options(),
+            )
+        };
+        let options = match read.and_then(subscription_options) {
+            Ok(options) => options,
+            Err(status) => return status,
+        };
+        // SAFETY: the caller's contract on `uri`.
+        let uri = match unsafe { read_str(uri) } {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match api::subscription::add_with(Handle::from_raw(client), uri, stream_id, options) {
+            Ok(handle) => {
+                // SAFETY: `subscription` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { subscription.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
 /// Delivers at most `limit` messages of `subscription` to `handler`, each
 /// copied first, and writes how many through `delivered` (may be null),
 /// also on failure: a failed poll's status follows the messages delivered
@@ -1379,11 +1636,24 @@ pub struct StreamOptions {
     pub on_required_loss: u32,
     /// How long a claim may stay open, in nanoseconds.
     pub claim_deadline_ns: u64,
+    /// Keys of the stream's conflation table; 0, with the two below, for
+    /// none (F7b-2b).
+    pub conflation_keys: u32,
+    /// The largest value of the table, in bytes.
+    pub conflation_value_capacity: u32,
+    /// Bytes of the table's update journal.
+    pub conflation_journal_capacity: u64,
 }
 
-/// The size of `karyos_stream_options` in the first ABI version that has
-/// it (as `CLIENT_OPTIONS_SIZE_0_1`).
+/// The smallest size of `karyos_stream_options` accepted: that of the
+/// first ABI version that has it (as `CLIENT_OPTIONS_SIZE_0_1`), with no
+/// conflation fields. Such a caller's stream has no conflation table.
 const STREAM_OPTIONS_SIZE_0_1: u32 = 64;
+
+/// The size of `karyos_stream_options` with its conflation fields (F7b-2b).
+/// A size between [`STREAM_OPTIONS_SIZE_0_1`] and this one comes from no
+/// header, and could cut a field: it is refused.
+const STREAM_OPTIONS_SIZE_CONFLATION: u32 = 80;
 
 /// `karyos_stream_options` with the defaults and this version's size.
 fn default_stream_options() -> StreamOptions {
@@ -1404,6 +1674,9 @@ fn default_stream_options() -> StreamOptions {
         schedule_capacity: defaults.schedule_capacity,
         on_required_loss: defaults.on_required_loss,
         claim_deadline_ns: defaults.claim_deadline_ns,
+        conflation_keys: defaults.conflation_keys,
+        conflation_value_capacity: defaults.conflation_value_capacity,
+        conflation_journal_capacity: defaults.conflation_journal_capacity,
     }
 }
 
@@ -1440,8 +1713,9 @@ pub unsafe extern "C" fn karyos_stream_options_init(options: *mut StreamOptions)
 ///
 /// `options` points to a readable `karyos_stream_options` whose `size` is
 /// set; `detail` is null or a `karyos_detail` whose `size` is set. A null
-/// or misaligned `options`, or a `size` below the first version's,
-/// returns `KARYOS_E_INVALID_ARGUMENT`.
+/// or misaligned `options`, a `size` below the first version's (64), or a
+/// `size` between it and that of the conflation fields (80), returns
+/// `KARYOS_E_INVALID_ARGUMENT`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_driver_add_stream(
     driver: u64,
@@ -1456,6 +1730,11 @@ pub unsafe extern "C" fn karyos_driver_add_stream(
                 Ok(raw) => raw,
                 Err(status) => return status,
             };
+        // The copy above went only to a local; a size no header produces is
+        // refused before anything is used.
+        if raw.size > STREAM_OPTIONS_SIZE_0_1 && raw.size < STREAM_OPTIONS_SIZE_CONFLATION {
+            return Status::InvalidArgument;
+        }
         let options = driver::StreamOptions {
             stream_id: raw.stream_id,
             term_length: raw.term_length,
@@ -1471,6 +1750,9 @@ pub unsafe extern "C" fn karyos_driver_add_stream(
             schedule_capacity: raw.schedule_capacity,
             on_required_loss: raw.on_required_loss,
             claim_deadline_ns: raw.claim_deadline_ns,
+            conflation_keys: raw.conflation_keys,
+            conflation_value_capacity: raw.conflation_value_capacity,
+            conflation_journal_capacity: raw.conflation_journal_capacity,
         };
         match driver::add_stream(Handle::from_raw(driver), &options) {
             Ok(()) => Status::Ok,
@@ -1492,6 +1774,174 @@ pub extern "C" fn karyos_driver_remove_stream(driver: u64, stream_id: i32) -> i3
         || match driver::remove_stream(Handle::from_raw(driver), stream_id) {
             Ok(()) => Status::Ok,
             Err(failure) => failure.status,
+        },
+    )
+}
+
+/// `karyos_conflated_handler`: called once per delivered key with the
+/// caller's `context`, the `key`, its latest value's `length` bytes at
+/// `data` (the reader's private copy, valid only during the call), the
+/// value's `version` and its `freshness` (`KARYOS_FRESH`, or the start of
+/// the gap that made it stale). It must return normally.
+pub type ConflatedHandler =
+    Option<unsafe extern "C" fn(*mut c_void, u32, *const u8, usize, u64, u64)>;
+
+/// Subscribes to the conflation table of `driver`'s stream `stream_id` and
+/// writes the conflated subscription's handle through `conflated`. The
+/// view follows its driver: once the driver is closed it answers
+/// `KARYOS_E_CLOSED`, and is still closed with `karyos_conflated_close`.
+/// `KARYOS_E_INVALID_ARGUMENT` for a stream id the driver does not have,
+/// `KARYOS_E_CONFLATION` for a stream without a conflation table,
+/// `KARYOS_E_CLOSED` for a stream being removed or a closed driver; on
+/// failure nothing is opened.
+///
+/// # Safety
+///
+/// `conflated` points to a writable `uint64_t`; a null or misaligned one
+/// returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_subscribe_conflated(
+    driver: u64,
+    stream_id: i32,
+    conflated: *mut u64,
+) -> i32 {
+    guard(|| {
+        if !writable(conflated) {
+            return Status::InvalidArgument;
+        }
+        match api::conflated::subscribe(Handle::from_raw(driver), stream_id) {
+            Ok(handle) => {
+                // SAFETY: `conflated` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { conflated.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Adds a view of the conflation table of the `karyos:ipc` stream
+/// `stream_id` to `client` and writes its handle through `conflated`
+/// (F7b-2c). A client attached to a driver in another process takes it;
+/// a client of a driver in this process is refused by its driver
+/// (`KARYOS_E_REFUSED`): take that view with
+/// `karyos_driver_subscribe_conflated`. The view is the client's: closing
+/// the client closes it, and its handle then answers `KARYOS_E_CLOSED`.
+/// Its poll reads with the default retries and its table must be within
+/// the default limits (2^20 keys, 64 KiB values, a 64 MiB journal); the
+/// key budget is each poll's. A control call: it waits for the driver up
+/// to the client's timeout, and holds the client handle meanwhile. On
+/// failure nothing is opened and `detail` (may be null) receives the
+/// failure's detail; another channel than `karyos:ipc` is
+/// `KARYOS_E_UNSUPPORTED_CHANNEL`.
+///
+/// # Safety
+///
+/// `uri` is a NUL-terminated string; `conflated` points to a writable
+/// `uint64_t`; `detail` is null or a `karyos_detail` whose `size` is set.
+/// A null `uri` or `conflated` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_conflated_subscription(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    conflated: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(conflated) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `uri`.
+        let uri = match unsafe { read_str(uri) } {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match api::conflated::add(Handle::from_raw(client), uri, stream_id) {
+            Ok(handle) => {
+                // SAFETY: `conflated` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { conflated.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Delivers the latest value of at most `key_budget` changed keys of
+/// `conflated` to `handler`, and writes how many through `delivered` (may
+/// be null), also on failure. Intermediate versions may be skipped; a
+/// `key_budget` of 0 delivers nothing. A data-path call: it never waits
+/// and never allocates. Once the table published a terminal invalidation
+/// the view is closed: that poll and every later one return
+/// `KARYOS_E_CLOSED`. The handler runs while the view is held: from it,
+/// polling or closing this view returns `KARYOS_E_REENTRANT`.
+///
+/// # Safety
+///
+/// `handler` is null or a function of the `karyos_conflated_handler`
+/// signature that returns normally; `context` is passed to it untouched;
+/// `delivered` is null or points to a writable `uint32_t`. A null
+/// `handler` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_conflated_poll(
+    conflated: u64,
+    handler: ConflatedHandler,
+    context: *mut c_void,
+    key_budget: u32,
+    delivered: *mut u32,
+) -> i32 {
+    guard(|| {
+        let Some(handler) = handler else {
+            return Status::InvalidArgument;
+        };
+        if !delivered.is_null() && !delivered.is_aligned() {
+            return Status::InvalidArgument;
+        }
+        let mut call = |key: u32, value: &[u8], version: u64, freshness: u64| {
+            // SAFETY: `handler` has the handler's signature and returns
+            // normally (the caller's contract); `value` outlives the call,
+            // which only reads it.
+            unsafe {
+                handler(
+                    context,
+                    key,
+                    value.as_ptr(),
+                    value.len(),
+                    version,
+                    freshness,
+                )
+            };
+        };
+        let (status, count) =
+            match api::conflated::poll(Handle::from_raw(conflated), key_budget, &mut call) {
+                Ok(count) => (Status::Ok, count),
+                Err((failure, count)) => (failure.status, count),
+            };
+        if !delivered.is_null() {
+            // SAFETY: `delivered` is non-null and aligned, and the caller's
+            // contract makes it a writable `uint32_t`.
+            unsafe { delivered.write(count) };
+        }
+        status
+    })
+}
+
+/// Closes `conflated`. A client's view is closed through its client: while
+/// that is in use (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`) nothing is
+/// closed.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_conflated_close(conflated: u64) -> i32 {
+    guard(
+        || match api::conflated::close(Handle::from_raw(conflated)) {
+            Ok(()) => Status::Ok,
+            Err(status) => status,
         },
     )
 }

@@ -87,6 +87,21 @@ Streams:
   --max-subscribers <n>             subscriber registry capacity [4]
   --claim-deadline <duration>       commit deadline of claims [1s]
 
+Archive:
+  --archive <path>                  run the Archive agent, its catalog in this directory
+  --archive-control <req>,<resp>    the Archive's request and response stream ids, which the
+                                    daemon adds (the request stream concurrent); required
+                                    with --archive
+  --record <stream_id>:<session_id>[:<sync>]
+                                    start recording a configured stream at boot, through the
+                                    control path; sync is none, segment or a duration
+                                    [segment]; repeatable; needs --archive
+                                    Under same-uid admission every admitted client may
+                                    control the Archive: the trust boundary is the daemon's
+                                    uid. Per-client authorization comes with owner item 43.
+  --archive-min-free <size>         refuse a recording while the archive's file system has
+                                    less free space [1g]
+
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
 
@@ -165,6 +180,39 @@ pub struct StreamOption {
     pub session_id: i32,
 }
 
+/// A recording the daemon starts at boot (`--record`), through the
+/// Archive's control path like any requester's `StartRecording`
+/// (`quantstratum-docs: karyos/design/archive-host.md`, H3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordOption {
+    /// The recorded stream's wire stream id.
+    pub stream_id: i32,
+    /// Its session alias.
+    pub session_id: i32,
+    /// The store's sync policy.
+    pub sync: karyos_archive::segment::SyncPolicy,
+}
+
+/// The Archive agent's settings (`--archive`, `--archive-control`,
+/// `--record`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveOptions {
+    /// The directory of the Archive's catalog and segments.
+    pub dir: PathBuf,
+    /// The control request stream's id; the daemon adds it concurrent.
+    pub requests: i32,
+    /// The control response stream's id.
+    pub responses: i32,
+    /// The recordings started at boot, in command-line order.
+    pub records: Vec<RecordOption>,
+    /// The free bytes of the archive's file system below which a
+    /// recording is refused.
+    pub min_free: u64,
+}
+
+/// The default `--archive-min-free`: 1 GiB.
+pub const DEFAULT_ARCHIVE_MIN_FREE: u64 = 1 << 30;
+
 /// The verbosity of the control-path log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -195,6 +243,8 @@ pub struct Options {
     pub shutdown_linger: Duration,
     /// The control-path log verbosity.
     pub log_level: LogLevel,
+    /// The Archive agent, when `--archive` is given.
+    pub archive: Option<ArchiveOptions>,
 }
 
 impl Options {
@@ -226,6 +276,7 @@ impl Options {
             streams: Vec::new(),
             shutdown_linger: DEFAULT_SHUTDOWN_LINGER,
             log_level: LogLevel::Info,
+            archive: None,
         }
     }
 }
@@ -247,6 +298,13 @@ pub enum ArgsError {
     },
     /// A required option is absent.
     Missing(&'static str),
+    /// An option that needs another, which is absent.
+    Needs {
+        /// The option given.
+        option: &'static str,
+        /// The option it needs.
+        needs: &'static str,
+    },
 }
 
 impl fmt::Display for ArgsError {
@@ -258,6 +316,7 @@ impl fmt::Display for ArgsError {
                 write!(f, "invalid value {value:?} for {option}")
             }
             Self::Missing(option) => write!(f, "option {option} is required"),
+            Self::Needs { option, needs } => write!(f, "option {option} needs {needs}"),
         }
     }
 }
@@ -277,6 +336,7 @@ where
 {
     let mut options = Options::new(PathBuf::new());
     let mut dir = None;
+    let mut archive = Archive::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let text = arg
@@ -297,18 +357,29 @@ where
             dir = Some(PathBuf::from(value));
             continue;
         }
+        if option == "--archive" {
+            archive.dir = Some(PathBuf::from(value));
+            continue;
+        }
         let value = value
             .into_string()
             .map_err(|value| ArgsError::InvalidValue {
                 option,
                 value: value.to_string_lossy().into_owned(),
             })?;
-        apply(&mut options, option, &value).ok_or_else(|| ArgsError::InvalidValue {
+        let applied = match option {
+            "--archive-control" => control(&value).map(|control| archive.control = Some(control)),
+            "--record" => record(&value).map(|record| archive.records.push(record)),
+            "--archive-min-free" => size(&value).map(|size| archive.min_free = Some(size)),
+            _ => apply(&mut options, option, &value),
+        };
+        applied.ok_or_else(|| ArgsError::InvalidValue {
             option,
             value: value.clone(),
         })?;
     }
     options.admission.dir = dir.ok_or(ArgsError::Missing("--dir"))?;
+    options.archive = archive.finish()?;
     Ok(Command::Run(Box::new(options)))
 }
 
@@ -357,6 +428,10 @@ const OPTIONS: &[&str] = &[
     "--max-subscribers",
     "--claim-deadline",
     "--shutdown-linger",
+    "--archive",
+    "--archive-control",
+    "--record",
+    "--archive-min-free",
 ];
 
 /// The static name of a known option.
@@ -423,6 +498,43 @@ fn apply(options: &mut Options, option: &str, value: &str) -> Option<()> {
         _ => return None,
     }
     Some(())
+}
+
+/// A live Archive, as `--live DIR=REQ,RESP` names it: the driver's
+/// directory and the Archive's request and response streams there
+/// (`quantstratum-docs: karyos/design/archive-host.md`, H4b and H6; the
+/// shape of karyos-agent's `--archive`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveArchive {
+    /// The driver's directory.
+    pub dir: PathBuf,
+    /// The Archive's request stream.
+    pub requests: i32,
+    /// The Archive's response stream.
+    pub responses: i32,
+}
+
+/// Parses `value`, the value of `--live`, as `DIR=REQ,RESP`.
+///
+/// # Errors
+///
+/// [`ArgsError::InvalidValue`] for a value without `=` or `,`, an empty
+/// directory, or a stream id that is not an `i32`.
+pub fn parse_live(value: &str) -> Result<LiveArchive, ArgsError> {
+    let invalid = || ArgsError::InvalidValue {
+        option: "--live",
+        value: value.to_owned(),
+    };
+    let (dir, streams) = value.rsplit_once('=').ok_or_else(invalid)?;
+    let (requests, responses) = streams.split_once(',').ok_or_else(invalid)?;
+    if dir.is_empty() {
+        return Err(invalid());
+    }
+    Ok(LiveArchive {
+        dir: PathBuf::from(dir),
+        requests: requests.trim().parse().map_err(|_| invalid())?,
+        responses: responses.trim().parse().map_err(|_| invalid())?,
+    })
 }
 
 /// The command line of a diagnostic tool (`karyos-stat`,
@@ -547,6 +659,82 @@ fn stream(value: &str) -> Option<StreamOption> {
     Some(StreamOption {
         stream_id: stream_id.parse().ok()?,
         session_id: session_id.parse().ok()?,
+    })
+}
+
+/// The Archive options as the command line gives them, in any order.
+#[derive(Debug, Default)]
+struct Archive {
+    dir: Option<PathBuf>,
+    control: Option<(i32, i32)>,
+    records: Vec<RecordOption>,
+    min_free: Option<u64>,
+}
+
+impl Archive {
+    /// The Archive's settings: `--archive` with its `--archive-control`,
+    /// or nothing when neither the agent nor a recording is asked for.
+    fn finish(self) -> Result<Option<ArchiveOptions>, ArgsError> {
+        let Some(dir) = self.dir else {
+            if self.control.is_some() {
+                return Err(ArgsError::Needs {
+                    option: "--archive-control",
+                    needs: "--archive",
+                });
+            }
+            for (given, option) in [
+                (!self.records.is_empty(), "--record"),
+                (self.min_free.is_some(), "--archive-min-free"),
+            ] {
+                if given {
+                    return Err(ArgsError::Needs {
+                        option,
+                        needs: "--archive",
+                    });
+                }
+            }
+            return Ok(None);
+        };
+        let (requests, responses) = self.control.ok_or(ArgsError::Needs {
+            option: "--archive",
+            needs: "--archive-control",
+        })?;
+        Ok(Some(ArchiveOptions {
+            dir,
+            requests,
+            responses,
+            records: self.records,
+            min_free: self.min_free.unwrap_or(DEFAULT_ARCHIVE_MIN_FREE),
+        }))
+    }
+}
+
+/// `<req>,<resp>`: two distinct stream ids.
+fn control(value: &str) -> Option<(i32, i32)> {
+    let (requests, responses) = value.split_once(',')?;
+    let (requests, responses) = (requests.parse().ok()?, responses.parse().ok()?);
+    (requests != responses).then_some((requests, responses))
+}
+
+/// `<stream_id>:<session_id>[:<sync>]`, the sync `none`, `segment` or a
+/// duration (`Every`), `segment` by default.
+fn record(value: &str) -> Option<RecordOption> {
+    use karyos_archive::segment::SyncPolicy;
+
+    let mut parts = value.splitn(3, ':');
+    let stream_id = parts.next()?.parse().ok()?;
+    let session_id = parts.next()?.parse().ok()?;
+    let sync = match parts.next() {
+        None | Some("segment") => SyncPolicy::PerSegment,
+        Some("none") => SyncPolicy::None,
+        Some(interval) => SyncPolicy::Every {
+            interval_ns: nanos(interval).filter(|nanos| *nanos > 0)?,
+        },
+    };
+    Some(RecordOption {
+        stream_id,
+        session_id,
+        sync,
     })
 }
 
@@ -750,6 +938,116 @@ mod tests {
         ] {
             assert!(!error.to_string().contains('\n'));
         }
+    }
+
+    /// H3 (archive-host.md): `--archive` with its control streams and
+    /// boot recordings, each sync form, in any order.
+    #[test]
+    fn the_archive_options_parse() {
+        use karyos_archive::segment::SyncPolicy;
+
+        let parsed = options(&[
+            "--record",
+            "7:1",
+            "--dir",
+            "/run/k",
+            "--archive=/var/archive",
+            "--archive-control",
+            "100,101",
+            "--record=8:2:none",
+            "--record",
+            "9:3:250ms",
+            "--record",
+            "10:4:segment",
+        ]);
+        let record = |stream_id, session_id, sync| RecordOption {
+            stream_id,
+            session_id,
+            sync,
+        };
+        assert_eq!(
+            parsed.archive,
+            Some(ArchiveOptions {
+                dir: PathBuf::from("/var/archive"),
+                requests: 100,
+                responses: 101,
+                records: vec![
+                    record(7, 1, SyncPolicy::PerSegment),
+                    record(8, 2, SyncPolicy::None),
+                    record(
+                        9,
+                        3,
+                        SyncPolicy::Every {
+                            interval_ns: 250_000_000
+                        }
+                    ),
+                    record(10, 4, SyncPolicy::PerSegment),
+                ],
+                min_free: DEFAULT_ARCHIVE_MIN_FREE,
+            })
+        );
+        let guarded = options(&[
+            "--dir",
+            "d",
+            "--archive",
+            "a",
+            "--archive-control",
+            "1,2",
+            "--archive-min-free=64m",
+        ])
+        .archive
+        .unwrap();
+        assert_eq!(guarded.min_free, 64 << 20);
+        assert_eq!(options(&["--dir", "/run/k"]).archive, None);
+    }
+
+    /// The Archive's options need each other, and their values are checked.
+    #[test]
+    fn the_archive_options_are_checked() {
+        let needs = |option, needs| Err(ArgsError::Needs { option, needs });
+        assert_eq!(
+            run(&["--dir", "d", "--archive", "a"]),
+            needs("--archive", "--archive-control")
+        );
+        assert_eq!(
+            run(&["--dir", "d", "--archive-control", "1,2"]),
+            needs("--archive-control", "--archive")
+        );
+        assert_eq!(
+            run(&["--dir", "d", "--record", "1:2"]),
+            needs("--record", "--archive")
+        );
+        assert_eq!(
+            run(&["--dir", "d", "--archive-min-free", "1g"]),
+            needs("--archive-min-free", "--archive")
+        );
+        for (option, value) in [
+            ("--archive-control", "1"),
+            ("--archive-control", "1,1"),
+            ("--archive-control", "1,x"),
+            ("--record", "1"),
+            ("--record", "1:x"),
+            ("--record", "1:2:sometimes"),
+            ("--record", "1:2:0ms"),
+            ("--archive-min-free", "lots"),
+        ] {
+            assert_eq!(
+                run(&["--dir", "d", "--archive", "a", option, value]),
+                Err(ArgsError::InvalidValue {
+                    option,
+                    value: value.to_owned()
+                }),
+                "{option} {value}"
+            );
+        }
+        assert_eq!(
+            ArgsError::Needs {
+                option: "--record",
+                needs: "--archive"
+            }
+            .to_string(),
+            "option --record needs --archive"
+        );
     }
 }
 

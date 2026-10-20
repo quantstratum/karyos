@@ -26,7 +26,7 @@ use karyos_archive::segment::SyncPolicy;
 use karyos_archive::server::{
     ArchiveHost, ControlServer, MAX_REQUEST, RequestSource, ResponseSink,
 };
-use karyos_client::OfferOutcome;
+use karyos_client::{MessageLimit, OfferOutcome};
 use karyos_driver::embedded::StreamConfig;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode};
@@ -111,10 +111,14 @@ where
     DriverHost<T>: ArchiveHost,
 {
     fn new(name: &str, driver: EmbeddedDriver<T>) -> Self {
+        Self::with(name, driver, AgentConfig::default())
+    }
+
+    fn with(name: &str, driver: EmbeddedDriver<T>, config: AgentConfig) -> Self {
         let dir = std::env::temp_dir().join(format!("karyos-h2-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
-        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
         let (requests, responses) = (Requests::default(), Responses::default());
         let server = ControlServer::new(
             agent,
@@ -223,11 +227,13 @@ fn start(correlation_id: u64, key: StreamKey) -> ControlMessage<'static> {
 /// have, stopped where the publisher's messages end; then its replay
 /// opens a target at the replay's key, which lingers past the replay's
 /// end and then retires.
-fn records_and_replays<T: StreamTerms + 'static>(mut rig: Rig<T>)
+/// Records the publisher's [`MESSAGES`] on [`DATA`] and stops: the
+/// recording id and where it stopped. A key the driver does not have is
+/// refused first, and nothing records.
+fn record<T: StreamTerms + 'static>(rig: &mut Rig<T>) -> (u64, u64)
 where
     DriverHost<T>: ArchiveHost,
 {
-    // A key the driver does not have is refused, and nothing records.
     rig.request(&start(
         1,
         StreamKey {
@@ -275,7 +281,15 @@ where
         _ => None,
     });
     assert!(stopped > last, "recorded past the last message's start");
+    (recording, stopped)
+}
 
+/// Asks for the whole recording's replay onto [`TARGET`]: the target's
+/// key, an ordinary stream of the driver at the replay's session id.
+fn replay<T: StreamTerms + 'static>(rig: &mut Rig<T>, recording: u64, stopped: u64) -> StreamKey
+where
+    DriverHost<T>: ArchiveHost,
+{
     rig.request(&ControlMessage::Replay(control::Replay {
         correlation_id: 4,
         recording_id: recording,
@@ -287,17 +301,43 @@ where
     }));
     let (code, replay) = rig.response(4);
     assert_eq!(code, ResponseCode::Ok);
-    // The target is an ordinary stream of the driver, at the replay's
-    // session id, which a subscriber finds by its key.
-    let target = StreamKey {
+    StreamKey {
         stream_id: TARGET,
         session_id: replay_session_id(replay),
-    };
-    assert!(rig.driver().stream_handle(target).is_some(), "opened");
-    // A replay of this size ends at once; its target lingers for the
-    // host's replay linger, then is finished and retires. A subscriber
-    // added after the answer reads it once the sink waits for one (H2b,
-    // archive-host.md): until then this test reads nothing from it.
+    }
+}
+
+/// A recording of a local stream, then its replay: a subscriber that
+/// joins the target after the Replay answer reads every message, in order,
+/// because nothing is written before the target's first reader (H2b).
+/// The target then lingers past the replay's end and retires.
+fn records_and_replays<T: StreamTerms + 'static>(mut rig: Rig<T>)
+where
+    DriverHost<T>: ArchiveHost,
+{
+    let (recording, stopped) = record(&mut rig);
+    let target = replay(&mut rig, recording, stopped);
+    // The answer came first; the requester subscribes now.
+    let handle = rig.driver().stream_handle(target).unwrap();
+    let mut reader = rig.driver().subscribe(handle, Role::Required).unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..5000 {
+        rig.cycle();
+        let _ = reader.poll(
+            |bytes, _| seen.push(bytes.to_vec()),
+            MessageLimit::new(u32::try_from(MESSAGES).unwrap()),
+        );
+        if seen.len() == MESSAGES {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(seen.len(), MESSAGES, "every recorded message replayed");
+    for (index, bytes) in seen.iter().enumerate() {
+        assert_eq!(bytes, &vec![u8::try_from(index).unwrap(); LENGTH]);
+    }
+    drop(reader);
+    // The target lingers past the replay's end, then retires.
     let started = std::time::Instant::now();
     while started.elapsed() < LINGER / 2 {
         rig.cycle();
@@ -309,6 +349,37 @@ where
         rig.cycle();
         std::thread::sleep(Duration::from_millis(1));
     }
+    assert_eq!(rig.server().unattended(), 0);
+    assert_eq!(rig.server().host().unfinished(), 0);
+}
+
+/// A replay whose target gets no reader by the attach deadline ends
+/// unattended: it wrote nothing, the server counts it, and its target
+/// retires at once, without the linger, so a requester that comes later
+/// finds no such stream (H2b).
+#[test]
+fn a_replay_with_no_reader_by_the_deadline_ends_unattended() {
+    let mut config = AgentConfig::default();
+    config.attach_deadline = Duration::from_millis(100);
+    let mut rig = Rig::with("unattended", EmbeddedDriver::new().unwrap(), config);
+    let (recording, stopped) = record(&mut rig);
+    let target = replay(&mut rig, recording, stopped);
+    let started = std::time::Instant::now();
+    while rig.server().unattended() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "never ended");
+        rig.cycle();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "held to the deadline"
+    );
+    while rig.driver().stream_handle(target).is_some() {
+        assert!(started.elapsed() < LINGER, "retired without the linger");
+        rig.cycle();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(rig.server().unattended(), 1);
     assert_eq!(rig.server().host().unfinished(), 0);
 }
 

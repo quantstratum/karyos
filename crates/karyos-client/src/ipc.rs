@@ -70,7 +70,7 @@ use karyos_protocol::cnc::{Event, StreamKey, SubscriberRole};
 use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::BroadcastReceiver;
 use karyos_sys::command_ring::RingProducer;
-use karyos_sys::conflation::{Budget, ConflationConfig, ConflationReader};
+use karyos_sys::conflation::{Budget, ConflationReader};
 use karyos_sys::counters::{CellRead, ClientCells, CountersReader};
 use karyos_sys::error::SysError;
 use karyos_sys::frame::Lane;
@@ -131,50 +131,7 @@ pub enum AttachError {
     TooLarge,
 }
 
-/// What a remote conflated view accepts of its table's configuration,
-/// checked before anything is mapped or allocated for it: the reader's
-/// private state grows with the key count and the value capacity, and its
-/// copy buffer with the journal capacity (`quantstratum-docs:
-/// karyos/design/conflation-end-to-end.md`, Cross-process views).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ConflatedLimits {
-    /// Most keys.
-    pub max_keys: u32,
-    /// Largest value capacity in bytes.
-    pub max_value_capacity: usize,
-    /// Largest journal capacity in bytes.
-    pub max_journal_capacity: usize,
-}
-
-impl Default for ConflatedLimits {
-    /// 2^20 keys, 64 KiB values and a 64 MiB journal: provisional
-    /// defaults, to be calibrated before the release (coordinator
-    /// decision, ACS 14545); a view passes its own limits to
-    /// [`RemoteClient::take_conflated`].
-    fn default() -> Self {
-        Self {
-            max_keys: 1 << 20,
-            max_value_capacity: 1 << 16,
-            max_journal_capacity: 1 << 26,
-        }
-    }
-}
-
-impl ConflatedLimits {
-    /// The configuration of `fetchable`, if it is within these limits.
-    fn admit(&self, fetchable: &FetchableConflated) -> Option<ConflationConfig> {
-        let config = ConflationConfig {
-            keys: fetchable.keys,
-            value_capacity: usize::try_from(fetchable.value_capacity).ok()?,
-            journal_capacity: usize::try_from(fetchable.journal_capacity).ok()?,
-        };
-        (config.keys <= self.max_keys
-            && config.value_capacity <= self.max_value_capacity
-            && config.journal_capacity <= self.max_journal_capacity)
-            .then_some(config)
-    }
-}
+pub use crate::conflated_subscription::ConflatedLimits;
 
 /// A client admitted by a driver in another process.
 #[derive(Debug)]
@@ -1280,9 +1237,14 @@ impl RemoteClient {
         let attached = (|| {
             let config = limits.admit(fetchable).ok_or(AttachError::TooLarge)?;
             let record = &fetched.record;
-            if (record.stream_id, record.session_id)
-                != (fetchable.stream.stream_id, fetchable.stream.session_id)
-            {
+            // A request with session 0 (a facade's `karyos:ipc` view) takes
+            // the grant's session; the stream id is still checked, as for
+            // a request by URI (W7).
+            let wanted = match fetchable.stream.session_id {
+                0 => record.session_id,
+                asked => asked,
+            };
+            if (record.stream_id, record.session_id) != (fetchable.stream.stream_id, wanted) {
                 return Err(AttachError::Protocol);
             }
             let expected = fetched_region(session.instance, record)?;

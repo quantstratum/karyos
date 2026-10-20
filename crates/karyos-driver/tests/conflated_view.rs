@@ -668,3 +668,80 @@ fn serve_while<R: Send>(driver: &mut IpcDriver, client: impl FnOnce() -> R + Sen
         handle.join().unwrap()
     })
 }
+
+/// Waits for the completion of request `sequence`.
+fn completion(driver: &mut IpcDriver, client: &mut RemoteClient, sequence: u64) -> Outcome {
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+        let _ = driver.do_work().unwrap();
+        let mut done = None;
+        let _ = client.poll(usize::MAX, |completion| {
+            if completion.sequence == sequence {
+                done = Some(completion.outcome);
+            }
+        });
+        if let Some(outcome) = done {
+            return outcome;
+        }
+    }
+}
+
+/// F7b-2c: a view asked with session 0 (as a facade client asks by
+/// `karyos:ipc` URI) names the stream such a URI names, as a subscription
+/// by URI does: with two sessions of the id, neither is chosen and both
+/// requests are refused; with one, both resolve to it, and the view is
+/// taken with the grant's session.
+#[test]
+fn a_session_0_view_resolves_as_a_subscription_by_uri() {
+    let dir = dir("session-0");
+    let mut driver = driver(&dir);
+    let _first = driver.add_stream(stream_config(2, Some(TABLE))).unwrap();
+    let mut second = stream_config(2, Some(TABLE));
+    second.buffer.session_id = 2;
+    let second = driver.add_stream(second).unwrap();
+    let mut client = attach_serving(&mut driver, &dir);
+    let any = StreamKey {
+        stream_id: 2,
+        session_id: 0,
+    };
+    let by_uri = |driver: &mut IpcDriver, client: &mut RemoteClient| {
+        let sequence = client
+            .add_network_subscription(
+                "karyos:ipc",
+                2,
+                karyos_protocol::cnc::SubscriberRole::Required,
+            )
+            .unwrap();
+        completion(driver, client, sequence)
+    };
+    assert!(matches!(
+        request_view(&mut driver, &mut client, any),
+        Outcome::Refused {
+            code: ErrorCode::UnknownStream,
+            ..
+        }
+    ));
+    assert!(matches!(
+        by_uri(&mut driver, &mut client),
+        Outcome::Refused {
+            code: ErrorCode::UnknownStream,
+            ..
+        }
+    ));
+    driver.remove_stream(second).unwrap();
+    let _ = driver.do_work().unwrap();
+    assert!(matches!(
+        by_uri(&mut driver, &mut client),
+        Outcome::Fetchable(_)
+    ));
+    let Outcome::FetchableConflated(fetchable) = request_view(&mut driver, &mut client, any) else {
+        panic!("expected a fetchable view");
+    };
+    assert_eq!(fetchable.stream, any);
+    let view = serve_while(&mut driver, || {
+        client.take_conflated(&fetchable, BUDGET, ConflatedLimits::default())
+    })
+    .unwrap();
+    assert_eq!(view.config(), TABLE);
+}

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `karyos-tools replay diff` (`quantstratum-docs:
-//! karyos/design/recording-group-replay.md` section 10): the first
-//! difference between two recording group journals.
+//! `karyos-replay diff`, and its alias `karyos-tools replay diff`
+//! (`quantstratum-docs: karyos/design/recording-group-replay.md` section
+//! 10; `karyos/design/archive-host.md`, H5): the first difference between
+//! two recording group journals.
 //!
 //! It recovers both journals, compares their headers, then their events
 //! in order over the range, record by record: the input event, each
@@ -43,14 +44,20 @@ use karyos_archive::segment::{SegmentError, SyncPolicy, recorded_geometry};
 #[cfg(test)]
 mod tests;
 
-/// The usage text of `karyos-tools replay diff --help`.
-pub const HELP: &str = "\
-karyos-tools replay diff: the first difference between two recording group
+/// The usage text of `<command> --help`, where `command` is how the diff
+/// was named: `karyos-replay diff`, or its alias `karyos-tools replay
+/// diff`.
+#[must_use]
+pub fn help(command: &str) -> String {
+    let indent = " ".repeat("Usage: ".len() + command.len() + 1);
+    format!(
+        "\
+{command}: the first difference between two recording group
 journals (recording-group-replay.md section 10). It reads only.
 
-Usage: karyos-tools replay diff <left-dir> <left-group> <right-dir> <right-group>
-           [--from <seq>] [--to <seq>] [--json] [--accept-manifest]
-           [--from-checkpoint <id>]
+Usage: {command} <left-dir> <left-group> <right-dir> <right-group>
+{indent}[--from <seq>] [--to <seq>] [--json] [--accept-manifest]
+{indent}[--from-checkpoint <id>]
 
   --from <seq>          the first group_seq compared [the first event]
   --to <seq>            the last group_seq compared [the end of the shorter
@@ -68,7 +75,51 @@ Usage: karyos-tools replay diff <left-dir> <left-group> <right-dir> <right-group
 Exit status: 0 identical over the range; 1 diverged, the first difference
 reported; 2 not comparable; 3 error (arguments, I/O, or a journal that does
 not recover read only).
-";
+"
+    )
+}
+
+/// Exit status of a command-line error.
+pub const EXIT_ERROR: u8 = 3;
+
+/// Runs the diff command named `command` on `args` (the arguments after
+/// `diff`): prints the help, the report (to `stdout`; an error report as
+/// text to `stderr`) or the argument error (to `stderr`), and returns the
+/// exit status.
+pub fn run_diff(
+    command: &str,
+    args: impl IntoIterator<Item = OsString>,
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+) -> u8 {
+    let parsed = match parse_diff(args) {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => {
+            let _ = stdout.write_all(help(command).as_bytes());
+            return 0;
+        }
+        Err(error) => {
+            let program = command.split(' ').next().unwrap_or(command);
+            let _ = writeln!(
+                stderr,
+                "{program}: {error} ({command} --help for the usage)"
+            );
+            return EXIT_ERROR;
+        }
+    };
+    let report = diff(&parsed);
+    let output = if parsed.json {
+        report.json()
+    } else {
+        report.text()
+    };
+    let _ = if matches!(report, Report::Error { .. }) && !parsed.json {
+        stderr.write_all(output.as_bytes())
+    } else {
+        stdout.write_all(output.as_bytes())
+    };
+    report.exit_code()
+}
 
 /// The records one event may hold, its first, its observations and its
 /// end: an event past it is an error (exit 3).
@@ -357,7 +408,7 @@ impl Report {
 }
 
 /// `text` as a JSON string.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     out.push('"');
     for c in text.chars() {

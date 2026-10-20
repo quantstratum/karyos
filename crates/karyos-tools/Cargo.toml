@@ -27,9 +27,20 @@ signal-hook.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+karyos-agent.workspace = true
+
 [[bin]]
 name = "karyosd"
 path = "src/bin/karyosd.rs"
+
+[[bin]]
+name = "karyos-catalog"
+path = "src/bin/karyos-catalog.rs"
+
+[[bin]]
+name = "karyos-replay"
+path = "src/bin/karyos-replay.rs"
 
 [[bin]]
 name = "karyos-stat"

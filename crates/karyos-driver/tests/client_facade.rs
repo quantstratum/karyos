@@ -668,6 +668,15 @@ mod remote {
                 allow_non_lse: true,
             };
             let _ = driver.add_stream(shared).unwrap();
+            // Stream 5 has a conflation table of 4 keys (F7b-2c).
+            let mut keyed = stream;
+            keyed.buffer.stream_id = 5;
+            keyed.conflation = Some(karyos_sys::conflation::ConflationConfig {
+                keys: 4,
+                value_capacity: 8,
+                journal_capacity: 1024,
+            });
+            let _ = driver.add_stream(keyed).unwrap();
             ready.send(()).unwrap();
             while !flag.load(Ordering::Acquire) {
                 let held = pause.asked.load(Ordering::Acquire);
@@ -1106,6 +1115,152 @@ mod remote {
             match client.add_subscription("karyos:ipc", StreamId::new(3)) {
                 Ok(subscription) => granted = Some(subscription),
                 Err(ClientError::Refused { .. } | ClientError::Timeout) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    /// F7b-2c: a remote facade client's conflated view of a `karyos:ipc`
+    /// stream reads each key's latest value; a stream without a table is
+    /// refused by the driver, and another channel before any request.
+    #[test]
+    fn a_remote_client_reads_a_conflated_view() {
+        let (_driver, dir) = ipc_driver("conflated");
+        let mut client = connect(&dir);
+        assert!(matches!(
+            client.add_conflated_subscription("karyos:udp?endpoint=127.0.0.1:1", StreamId::new(5)),
+            Err(ClientError::UnsupportedChannel { .. })
+        ));
+        assert!(matches!(
+            client.add_conflated_subscription("karyos:ipc", StreamId::new(3)),
+            Err(ClientError::Refused { .. })
+        ));
+        let mut view = client
+            .add_conflated_subscription("karyos:ipc", StreamId::new(5))
+            .unwrap();
+        assert_eq!(view.config().keys, 4);
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(5))
+            .unwrap();
+        let start = Instant::now();
+        for (key, value) in [(1, b"old".as_slice()), (1, b"new"), (2, b"two")] {
+            let options = karyos_client::OfferOptions::new().with_reserved_value(key);
+            while publication
+                .offer_on_with(Lane::ZERO, value, options)
+                .is_err()
+            {
+                assert!(start.elapsed() < Duration::from_secs(10), "never accepted");
+                let _ = client.poll();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let mut latest: Vec<(u32, Vec<u8>)> = Vec::new();
+        while latest != [(1, b"new".to_vec()), (2, b"two".to_vec())] {
+            assert!(start.elapsed() < Duration::from_secs(10), "{latest:?}");
+            let _ = view.poll_changed(|key, value| {
+                latest.retain(|(seen, _)| *seen != key);
+                latest.push((key, value.payload().to_vec()));
+            });
+            latest.sort();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// #523, F7b-2c-2: a remote client's publication of a conflated stream
+    /// reads the table's shape from the buffer it attached, as an
+    /// in-process one does, and refuses a key outside the table, or a
+    /// value larger than its capacity, before anything is appended: the
+    /// next key inside the table is the stream's first message.
+    #[test]
+    fn a_remote_publication_refuses_a_key_outside_its_table() {
+        let (_driver, dir) = ipc_driver("remote-key");
+        let mut client = connect(&dir);
+        let mut subscription = client
+            .add_subscription("karyos:ipc", StreamId::new(5))
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(5))
+            .unwrap();
+        let keyed = |key| karyos_client::OfferOptions::new().with_reserved_value(key);
+        for (key, value) in [(4, b"v".as_slice()), (-1, b"v"), (0, b"too-long!")] {
+            assert!(
+                matches!(
+                    publication.offer_on_with(Lane::ZERO, value, keyed(key)),
+                    Err(karyos_client::OfferError::Client(ClientError::Conflation(
+                        _
+                    )))
+                ),
+                "key {key}, {} bytes accepted",
+                value.len()
+            );
+        }
+        let start = Instant::now();
+        let accepted = loop {
+            match publication.offer_on_with(Lane::ZERO, b"first", keyed(3)) {
+                Ok(accepted) => break accepted,
+                Err(_) => {
+                    assert!(start.elapsed() < Duration::from_secs(10), "never accepted");
+                    let _ = client.poll();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        assert_eq!(accepted.position(), 0);
+        let mut seen = Vec::new();
+        while seen.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "nothing read");
+            let _ = subscription.poll(
+                |bytes, info| seen.push((bytes.to_vec(), info.reserved_value)),
+                karyos_client::MessageLimit::new(8),
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(seen, [(b"first".to_vec(), 3)]);
+    }
+
+    /// F7b-2c: a conflated grant that arrives after its request timed out
+    /// is taken and dropped, which sends its `Detach`: with one export per
+    /// client, the next view is granted.
+    #[test]
+    fn a_remote_late_conflated_grant_is_released() {
+        let (_driver, dir, paused) = ipc_driver_with("late-view", 1, DriverConfig::default());
+        let mut client = Client::connect(
+            Context::builder()
+                .dir(&dir)
+                .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        paused.hold();
+        assert_eq!(
+            client
+                .add_conflated_subscription("karyos:ipc", StreamId::new(5))
+                .err(),
+            Some(ClientError::Timeout)
+        );
+        paused.resume();
+        let start = Instant::now();
+        while client.late_grants_released() == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "not released");
+            let _ = client.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The only export is free again.
+        let mut granted = None;
+        let start = Instant::now();
+        while granted.is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the export is still held"
+            );
+            match client.add_conflated_subscription("karyos:ipc", StreamId::new(5)) {
+                Ok(view) => granted = Some(view),
+                Err(ClientError::Refused { .. } | ClientError::Timeout) => {
+                    let _ = client.poll();
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => panic!("{error}"),

@@ -76,7 +76,10 @@ The arguments and results of each function are those of the header:
 | `karyos_driver_create` | `size`, `reserved`: the options of `karyos_driver_options_init`, with `reserved` set when given | status, `driver` |
 | `karyos_driver_start` | `driver` (required), `idle_strategy` (default `KARYOS_IDLE_YIELD`, 1), `idle_sleep_ns` (default 0) | status |
 | `karyos_driver_stop` | `driver` (required) | status |
-| `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `schedule_capacity`, `size`: the options of `karyos_stream_options_init` otherwise | status |
+| `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `schedule_capacity`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`, `size`: the options of `karyos_stream_options_init` otherwise | status |
+| `karyos_driver_subscribe_conflated` | `driver` and `stream_id` (required) | status, `conflated` (on `KARYOS_OK`) |
+| `karyos_conflated_poll` | `conflated` (required), `key_budget` (default 1): a handler that counts the values | status, `delivered` (the count written, checked against the handler's calls) |
+| `karyos_conflated_close` | `conflated` (required) | status |
 | `karyos_driver_connect` | `driver` (required) | status, `client` |
 | `karyos_driver_do_work` | `driver` (required) | status, `work` |
 | `karyos_driver_close` | `driver` (required) | status |
@@ -91,6 +94,9 @@ The arguments and results of each function are those of the header:
 | `karyos_claim_commit` | `claim` (required), `accepted_size` | status, `lane`, `position`, `tail` |
 | `karyos_claim_abort` | `claim` (required) | status |
 | `karyos_publication_close` | `publication` (required) | status |
+| `karyos_client_add_subscription_with` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`), `size`, `role`, `rejoin`, `reserved`: the options of `karyos_subscription_options_init` with each given field set | status, `subscription` (on `KARYOS_OK`) |
+| `karyos_subscription_close` | `subscription` (required) | status |
+| `karyos_publication_offer_with` | `publication` (required), `lane` (default 0), `payload` or `length` (one of them), `size`, `reserved`, `reserved_value`: the options of `karyos_offer_options_init` with each given field set, `accepted_size` | status, `lane`, `position`, `tail` |
 
 `payload` is a quoted string whose UTF-8 bytes are the message; `length`
 is a message of that many zero bytes. A `karyos_client_connect` with a
