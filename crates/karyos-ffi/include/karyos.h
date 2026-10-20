@@ -421,7 +421,8 @@ typedef struct karyos_stream_options {
     uint32_t publication_mode;
     /* Offers allowed with no subscriber attached: 0 or 1. */
     uint32_t allow_unconnected;
-    /* Entries of the stream's schedule ring; 0 for none. */
+    /* Entries of the stream's schedule ring: 0 for none, or a power of
+       two up to 1 << 20 on an exclusive stream. */
     uint32_t schedule_capacity;
     /* KARYOS_LOSS_*: what a lost required subscriber does. */
     uint32_t on_required_loss;

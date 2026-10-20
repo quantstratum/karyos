@@ -367,6 +367,31 @@ fn stream_options_this_version_does_not_take_are_refused() {
             },
             Status::InvalidArgument,
         ),
+        // A schedule ring the driver refuses (TT-1, GC-7) is an invalid
+        // argument, not a system failure.
+        (
+            StreamOptions {
+                schedule_capacity: 3,
+                ..stream(1)
+            },
+            Status::InvalidArgument,
+        ),
+        (
+            StreamOptions {
+                schedule_capacity: MAX_CAPACITY * 2,
+                ..stream(1)
+            },
+            Status::InvalidArgument,
+        ),
+        (
+            StreamOptions {
+                schedule_capacity: 4,
+                publication_mode: PUBLICATION_CONCURRENT,
+                publishers: 1,
+                ..stream(1)
+            },
+            Status::InvalidArgument,
+        ),
     ];
     for (options, status) in refused {
         assert_eq!(
@@ -383,6 +408,12 @@ fn stream_options_this_version_does_not_take_are_refused() {
         };
         add_stream(driver, &options).unwrap();
     }
+    // A power of two up to the ring's largest is taken.
+    let timed = StreamOptions {
+        schedule_capacity: 4,
+        ..stream(5)
+    };
+    add_stream(driver, &timed).unwrap();
     close(driver).unwrap();
 }
 
