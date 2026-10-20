@@ -3470,3 +3470,50 @@ fn validate_agrees_with_new() {
         assert_eq!(LogBuffer::<Terms>::validate(&invalid).err(), expected);
     }
 }
+
+/// F7b-2c-2: a buffer carries its stream's conflation table only when the
+/// table fits it (some keys, a value that is not empty and fits one
+/// message), and its configuration block then holds the shape in words 19
+/// and 20.
+#[test]
+fn a_conflation_shape_must_fit_its_buffer() {
+    let max = new_buffer(config(3, 4)).unwrap().max_message_length();
+    for shape in [
+        ConflationShape::new(0, 8),
+        ConflationShape::new(4, 0),
+        ConflationShape::new(4, max + 1),
+    ] {
+        assert_eq!(
+            new_buffer(config(3, 4)).unwrap().with_conflation(shape).err(),
+            Some(SysError::InvalidConflationShape {
+                keys: shape.keys,
+                value_capacity: shape.value_capacity,
+            })
+        );
+    }
+    assert_eq!(new_buffer(config(3, 4)).unwrap().conflation(), None);
+    let shape = ConflationShape::new(4, max);
+    let buffer = new_buffer(config(3, 4))
+        .unwrap()
+        .with_conflation(shape)
+        .unwrap();
+    assert_eq!(buffer.conflation(), Some(shape));
+    let words = config_words(
+        buffer.config(),
+        buffer.generation,
+        buffer.max_message_length(),
+        buffer.conflation(),
+    );
+    assert_eq!(
+        (words[19], words[20], words[21]),
+        (4, u64::from(max), 0)
+    );
+    let block = |index: usize| {
+        buffer
+            .backing
+            .word(buffer.layout.config + index)
+            .unwrap()
+            .load(Ordering::Acquire)
+    };
+    assert_eq!((block(19), block(20), block(21)), (4, u64::from(max), 0));
+}

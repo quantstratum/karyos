@@ -1168,6 +1168,58 @@ mod remote {
         }
     }
 
+    /// #523, F7b-2c-2: a remote client's publication of a conflated stream
+    /// reads the table's shape from the buffer it attached, as an
+    /// in-process one does, and refuses a key outside the table, or a
+    /// value larger than its capacity, before anything is appended: the
+    /// next key inside the table is the stream's first message.
+    #[test]
+    fn a_remote_publication_refuses_a_key_outside_its_table() {
+        let (_driver, dir) = ipc_driver("remote-key");
+        let mut client = connect(&dir);
+        let mut subscription = client
+            .add_subscription("karyos:ipc", StreamId::new(5))
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(5))
+            .unwrap();
+        let keyed = |key| karyos_client::OfferOptions::new().with_reserved_value(key);
+        for (key, value) in [(4, b"v".as_slice()), (-1, b"v"), (0, b"too-long!")] {
+            assert!(
+                matches!(
+                    publication.offer_on_with(Lane::ZERO, value, keyed(key)),
+                    Err(karyos_client::OfferError::Client(ClientError::Conflation(
+                        _
+                    )))
+                ),
+                "key {key}, {} bytes accepted",
+                value.len()
+            );
+        }
+        let start = Instant::now();
+        let accepted = loop {
+            match publication.offer_on_with(Lane::ZERO, b"first", keyed(3)) {
+                Ok(accepted) => break accepted,
+                Err(_) => {
+                    assert!(start.elapsed() < Duration::from_secs(10), "never accepted");
+                    let _ = client.poll();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        assert_eq!(accepted.position(), 0);
+        let mut seen = Vec::new();
+        while seen.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "nothing read");
+            let _ = subscription.poll(
+                |bytes, info| seen.push((bytes.to_vec(), info.reserved_value)),
+                karyos_client::MessageLimit::new(8),
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(seen, [(b"first".to_vec(), 3)]);
+    }
+
     /// F7b-2c: a conflated grant that arrives after its request timed out
     /// is taken and dropped, which sends its `Detach`: with one export per
     /// client, the next view is granted.

@@ -296,6 +296,10 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     generation: Generation,
     config: LogBufferConfig,
     max_message_length: u32,
+    /// The shape of the stream's conflation table, which every publisher
+    /// checks a key against (F7b-2c-2): written in the configuration block
+    /// before the buffer is shared, read back at attach.
+    conflation: Option<ConflationShape>,
     /// Section pointers into `backing`, checked at construction
     /// (`quantstratum-docs: karyos/design/ipc-log-buffer.md`). Declared before `backing` so that
     /// nothing derived from it outlives it.
@@ -464,7 +468,12 @@ impl LogBuffer<SharedTerms> {
         if words[0] != LAYOUT_VERSION {
             return Err(version(words[0]));
         }
-        let (config, generation, max_message_length) = parse_config(&words).ok_or(invalid)?;
+        let Parsed {
+            config,
+            generation,
+            max_message_length,
+            conflation,
+        } = parse_config(&words).ok_or(invalid)?;
         let (layout, slots, expected_max) = Self::plan(&config)?;
         let structure_length = layout.total.checked_mul(crate::atomic_view::WORD_BYTES);
         if record.generation != u64::from(generation.get())
@@ -474,7 +483,7 @@ impl LogBuffer<SharedTerms> {
             return Err(invalid);
         }
         let backing = Arc::new(Backing::Region(region));
-        let buffer = Self::over(
+        let mut buffer = Self::over(
             backing,
             layout,
             config,
@@ -482,6 +491,7 @@ impl LogBuffer<SharedTerms> {
             slots,
             max_message_length,
         )?;
+        buffer.conflation = conflation;
         // Capacities whose rings round to the same region length (1 and
         // 2) would attach on a rewritten configuration word: the ring's own
         // capacity word, written at creation, must agree.
@@ -595,6 +605,7 @@ impl<T: TermBytes> LogBuffer<T> {
             generation,
             config,
             max_message_length,
+            conflation: None,
             control,
             descriptors: backing.overlays(layout.descriptors, layout.slots)?,
             table: backing.overlays(layout.table, layout.slots)?,
@@ -701,7 +712,12 @@ impl<T: TermBytes> LogBuffer<T> {
 
     /// The configuration block (`quantstratum-docs: karyos/design/ipc-log-buffer.md`).
     fn write_config(&self) {
-        let words = config_words(&self.config, self.generation, self.max_message_length);
+        let words = config_words(
+            &self.config,
+            self.generation,
+            self.max_message_length,
+            self.conflation,
+        );
         for (index, value) in words.into_iter().enumerate() {
             if let Some(word) = self.backing.word(self.layout.config + index) {
                 word.store(value, Ordering::Relaxed);
@@ -914,6 +930,37 @@ impl<T: TermBytes> LogBuffer<T> {
     #[must_use]
     pub fn max_message_length(&self) -> u32 {
         self.max_message_length
+    }
+
+    /// The shape of the stream's conflation table, when it has one: every
+    /// publication of this buffer, in process or attached, checks its keys
+    /// and values against it (F7b-2c-2).
+    #[inline]
+    #[must_use]
+    pub fn conflation(&self) -> Option<ConflationShape> {
+        self.conflation
+    }
+
+    /// This new buffer with the shape of its stream's conflation table,
+    /// written in its configuration block (the driver, at creation). It
+    /// takes the buffer by value, so the words are written before the
+    /// buffer is shared: no handle and no attached participant can read
+    /// them earlier.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::InvalidConflationShape`] for no keys, an empty value or
+    /// a value larger than the buffer's largest message.
+    pub fn with_conflation(mut self, shape: ConflationShape) -> Result<Self, SysError> {
+        if !shape.fits(self.max_message_length) {
+            return Err(SysError::InvalidConflationShape {
+                keys: shape.keys,
+                value_capacity: shape.value_capacity,
+            });
+        }
+        self.conflation = Some(shape);
+        self.write_config();
+        Ok(self)
     }
 
     /// Number of attached subscribers. Advisory: it can change right after
@@ -5126,6 +5173,7 @@ fn config_words(
     config: &LogBufferConfig,
     generation: Generation,
     max_message_length: u32,
+    conflation: Option<ConflationShape>,
 ) -> [u64; CONFIG_WORDS] {
     let (mode, publishers, allow_non_lse, join, capabilities) = match config.publication {
         PublicationMode::Exclusive => (1, 0, 0, 0, 0),
@@ -5158,6 +5206,8 @@ fn config_words(
         join,
         capabilities,
         u64::from(config.schedule_capacity),
+        conflation.map_or(0, |shape| u64::from(shape.keys)),
+        conflation.map_or(0, |shape| u64::from(shape.value_capacity)),
     ];
     for (word, field) in words.iter_mut().zip(fields) {
         *word = field;
@@ -5170,7 +5220,7 @@ fn config_words(
 /// is unknown. Range checks of the configuration itself are left to
 /// [`LogBuffer::new`]'s validation.
 #[cfg(target_os = "linux")]
-fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generation, u32)> {
+fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<Parsed> {
     let [
         version,
         term_length,
@@ -5191,6 +5241,8 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
         join,
         capabilities,
         schedule_capacity,
+        conflation_keys,
+        conflation_value_capacity,
         rest @ ..,
     ] = words;
     if *version != LAYOUT_VERSION || rest.iter().any(|word| *word != 0) {
@@ -5229,11 +5281,67 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
         publication,
         schedule_capacity: small(schedule_capacity)?,
     };
-    Some((
+    let max_message_length = small(max_message_length)?;
+    // Both words 0: no table; otherwise a table this buffer's messages can
+    // carry, or the block is not valid.
+    let conflation = match (*conflation_keys, *conflation_value_capacity) {
+        (0, 0) => None,
+        (keys, value_capacity) => Some(ConflationShape {
+            keys: small(&keys)?,
+            value_capacity: small(&value_capacity)?,
+        })
+        .filter(|shape| shape.fits(max_message_length)),
+    };
+    if conflation.is_none() && (*conflation_keys, *conflation_value_capacity) != (0, 0) {
+        return None;
+    }
+    Some(Parsed {
         config,
-        Generation::try_new(small(generation)?).ok()?,
-        small(max_message_length)?,
-    ))
+        generation: Generation::try_new(small(generation)?).ok()?,
+        max_message_length,
+        conflation,
+    })
+}
+
+/// What a valid configuration block holds.
+#[cfg(target_os = "linux")]
+struct Parsed {
+    config: LogBufferConfig,
+    generation: Generation,
+    max_message_length: u32,
+    conflation: Option<ConflationShape>,
+}
+
+/// The shape of a stream's keyed conflation table that its publications
+/// check (`quantstratum-docs: karyos/design/conflation-end-to-end.md`;
+/// F7b-2c-2): its key count and its largest value. The journal is the
+/// feeder's and the views' concern, not a publisher's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConflationShape {
+    /// Valid keys are `0..keys`.
+    pub keys: u32,
+    /// The largest value, in bytes.
+    pub value_capacity: u32,
+}
+
+impl ConflationShape {
+    /// A table of `keys` keys and values of at most `value_capacity` bytes.
+    #[must_use]
+    pub const fn new(keys: u32, value_capacity: u32) -> Self {
+        Self {
+            keys,
+            value_capacity,
+        }
+    }
+
+    /// Whether a buffer whose largest message is `max_message_length` can
+    /// carry this table: some keys, and a value that is not empty and fits
+    /// one message.
+    #[must_use]
+    pub const fn fits(&self, max_message_length: u32) -> bool {
+        self.keys > 0 && self.value_capacity > 0 && self.value_capacity <= max_message_length
+    }
 }
 
 /// The layout version of the shared log buffer region. Version 2 gives bit
@@ -5243,10 +5351,12 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
 /// configuration block and, for a timed lane, the schedule ring section
 /// before the terms (`quantstratum-docs: karyos/design/timed-tx.md`,
 /// TT-1). Version 4 grows the schedule ring's header from three words to
-/// eight, with the lane's binding (timed-tx.md section 11, TT-6b). Regions
-/// of versions 1 to 3 are refused at attach (only version 1 shipped, in
-/// v0.1.0-alpha.1).
-pub const LAYOUT_VERSION: u64 = 4;
+/// eight, with the lane's binding (timed-tx.md section 11, TT-6b). Version
+/// 5 gives words 19 and 20 of the configuration block the shape of the
+/// stream's conflation table, which every publication checks its keys
+/// against (F7b-2c-2). Regions of versions 1 to 4 are refused at attach
+/// (only version 1 shipped, in v0.1.0-alpha.1).
+pub const LAYOUT_VERSION: u64 = 5;
 
 /// Bit 0 of an image's capabilities word (`image_capabilities`, the word
 /// after `join` in the configuration block): the image may hold local gap
@@ -5613,7 +5723,8 @@ mod region_tests {
             (0, 1),
             (0, 2),
             (0, 3),
-            (0, 5),
+            (0, 4),
+            (0, 6),
             (18, 3),
             (18, 8),
             (19, 1),
@@ -5624,6 +5735,8 @@ mod region_tests {
             (14, 4),
             (15, 1),
             (20, 1),
+            (21, 1),
+            (31, 1),
         ] {
             assert!(
                 corrupt(index, value).is_err(),
@@ -5728,12 +5841,14 @@ mod region_tests {
     /// misreads a seal or a ring.
     #[test]
     fn attach_refuses_an_older_region() {
-        assert_eq!(LAYOUT_VERSION, 4);
+        assert_eq!(LAYOUT_VERSION, 5);
         let creator =
             LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
         let record = creator.region().unwrap().record();
         let source = creator.region().unwrap().structure();
-        for (record_layout, block_version) in [(1, 1), (2, 2), (3, 3), (3, 4), (4, 3), (4, 1)] {
+        for (record_layout, block_version) in
+            [(1, 1), (2, 2), (3, 3), (4, 4), (4, 5), (5, 4), (5, 1)]
+        {
             let old = Region::create(RegionRecord {
                 region: 9,
                 layout: record_layout,
@@ -5774,6 +5889,47 @@ mod region_tests {
                 "record layout {record_layout}, block version {block_version}"
             );
         }
+    }
+
+    /// F7b-2c-2: the shape of a stream's conflation table travels in
+    /// words 19 and 20 of the configuration block, written before the
+    /// buffer is shared: an attached participant reads the creator's. A
+    /// shape the buffer cannot carry, or half of one, is refused at attach.
+    #[test]
+    fn attach_reads_the_conflation_shape_and_refuses_a_bad_one() {
+        let shape = ConflationShape::new(4, 64);
+        let creator = LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation())
+            .unwrap()
+            .with_conflation(shape)
+            .unwrap();
+        assert_eq!(creator.conflation(), Some(shape));
+        assert_eq!(attach(&creator).unwrap().conflation(), Some(shape));
+        let max = u64::from(creator.max_message_length());
+        let structure = creator.region().unwrap().structure();
+        let corrupt = |index: usize, value: u64| {
+            let word = structure.get(index).unwrap();
+            let before = word.swap(value, Ordering::AcqRel);
+            let result = attach(&creator);
+            word.store(before, Ordering::Release);
+            result
+        };
+        // No keys with a value, a value with no keys (half a shape), a
+        // value past the largest message, a key count past `u32`.
+        for (index, value) in [(19, 0), (20, 0), (20, max + 1), (19, 1 << 32)] {
+            assert!(
+                corrupt(index, value).is_err(),
+                "word {index} = {value} accepted"
+            );
+        }
+        // The largest value one message carries is accepted.
+        assert_eq!(
+            corrupt(20, max).unwrap().conflation(),
+            Some(ConflationShape::new(4, creator.max_message_length()))
+        );
+        // A buffer created without a table has none, attached too.
+        let plain =
+            LogBuffer::create_in(1, 8, config(PublicationMode::Exclusive), generation()).unwrap();
+        assert_eq!(attach(&plain).unwrap().conflation(), None);
     }
 
     /// A self-consistent region of another kind whose structure holds a

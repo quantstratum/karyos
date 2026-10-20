@@ -92,6 +92,15 @@ pub enum SysError {
         /// The version this build reads.
         expected: u64,
     },
+    /// A conflation table a buffer cannot carry (F7b-2c-2): no keys, an
+    /// empty value, or a value larger than the buffer's largest message.
+    #[error("conflation table of {keys} keys and {value_capacity}-byte values does not fit")]
+    InvalidConflationShape {
+        /// The key count.
+        keys: u32,
+        /// The largest value, in bytes.
+        value_capacity: u32,
+    },
     /// A system call failed.
     #[error("{operation} failed with OS error {errno}")]
     Os {
