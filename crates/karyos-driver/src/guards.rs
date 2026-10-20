@@ -63,6 +63,14 @@ pub enum Requester {
     InProcess,
     /// An admitted client, by client id.
     Client(u64),
+    /// An operator, by uid, acting through an admitted client, such as the
+    /// management agent (M10): the client says whom it acts for.
+    Operator {
+        /// The client id.
+        client: u64,
+        /// The operator's uid, as the client gave it.
+        uid: u64,
+    },
 }
 
 /// What a transition did.
@@ -95,6 +103,9 @@ pub struct AuditRecord {
     pub requester: Requester,
     /// What happened.
     pub outcome: AuditOutcome,
+    /// The command's parameters digest
+    /// (`karyos_protocol::cnc::guard_parameters`); 0 when none was given.
+    pub parameters: u64,
 }
 
 /// A snapshot of the audit ring.
@@ -312,6 +323,7 @@ impl Guards {
         handle: GuardHandle,
         operation: u64,
         requester: Requester,
+        parameters: u64,
         time: u64,
     ) -> Result<Closed, DriverError> {
         let checked = self.check(handle).map(|entry| {
@@ -328,7 +340,8 @@ impl Guards {
             Ok(found) => found,
             Err(error) => {
                 let id = handle.guard;
-                self.record(time, id, 0, 0, operation, requester, refused(&error));
+                let asked = (operation, requester, parameters);
+                self.record(time, id, 0, 0, asked, refused(&error));
                 return Err(error);
             }
         };
@@ -353,8 +366,7 @@ impl Guards {
             handle.guard,
             before,
             after,
-            operation,
-            requester,
+            (operation, requester, parameters),
             outcome,
         );
         Ok(result?)
@@ -367,6 +379,7 @@ impl Guards {
         expected: u64,
         operation: u64,
         requester: Requester,
+        parameters: u64,
         time: u64,
     ) -> Result<u64, DriverError> {
         let checked = self.check(handle).map(|entry| {
@@ -383,7 +396,8 @@ impl Guards {
             Ok(found) => found,
             Err(error) => {
                 let id = handle.guard;
-                self.record(time, id, 0, 0, operation, requester, refused(&error));
+                let asked = (operation, requester, parameters);
+                self.record(time, id, 0, 0, asked, refused(&error));
                 return Err(error);
             }
         };
@@ -396,27 +410,28 @@ impl Guards {
             handle.guard,
             before,
             after,
-            operation,
-            requester,
+            (operation, requester, parameters),
             outcome,
         );
         Ok(result?)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "one audit record's fields")]
+    /// Records a transition; `asked` is the operation id, the requester and
+    /// the parameters digest.
     fn record(
         &mut self,
         time: u64,
         guard: u64,
         before: u64,
         after: u64,
-        operation: u64,
-        requester: Requester,
+        asked: (u64, Requester, u64),
         outcome: AuditOutcome,
     ) {
-        let (requester_kind, requester_id) = match requester {
-            Requester::InProcess => (0, 0),
-            Requester::Client(client) => (1, client),
+        let (operation, requester, parameters) = asked;
+        let (requester_kind, requester_id, operator) = match requester {
+            Requester::InProcess => (0, 0, 0),
+            Requester::Client(client) => (1, client, 0),
+            Requester::Operator { client, uid } => (2, client, uid),
         };
         let (outcome_code, refusal) = match outcome {
             AuditOutcome::Closed => (1, 0),
@@ -437,6 +452,8 @@ impl Guards {
             requester: requester_id,
             outcome: outcome_code,
             refusal,
+            operator,
+            parameters,
         });
         let count = match appended {
             Some(appended) if appended.overwrote.is_some() => Some(&mut self.ring_overwritten),
@@ -474,6 +491,7 @@ impl Guards {
             operation,
             requester,
             outcome,
+            parameters,
         });
     }
 
@@ -621,11 +639,11 @@ mod tests {
             }
         );
         assert_eq!(
-            guards.reopen(orders, 1, 10, Requester::InProcess, 100),
+            guards.reopen(orders, 1, 10, Requester::InProcess, 0, 100),
             Ok(2)
         );
         assert_eq!(
-            guards.reopen(orders, 1, 11, Requester::Client(4), 101),
+            guards.reopen(orders, 1, 11, Requester::Client(4), 0, 101),
             Err(DriverError::Guard(GuardError::NotClosedAt {
                 expected: 1,
                 current: GuardState {
@@ -635,7 +653,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            guards.close(orders, 12, Requester::Client(4), 102),
+            guards.close(orders, 12, Requester::Client(4), 0, 102),
             Ok(Closed::Now { epoch: 3 })
         );
         let foreign = GuardHandle {
@@ -643,7 +661,7 @@ mod tests {
             guard: 1,
         };
         assert_eq!(
-            guards.close(foreign, 13, Requester::InProcess, 103),
+            guards.close(foreign, 13, Requester::InProcess, 0, 103),
             Err(DriverError::UnknownGuard)
         );
         let audit = guards.audit();
@@ -660,6 +678,7 @@ mod tests {
                     operation: 11,
                     requester: Requester::Client(4),
                     outcome: AuditOutcome::Refused(ErrorCode::GuardNotClosedAt),
+                    parameters: 0,
                 },
                 AuditRecord {
                     time: 102,
@@ -669,6 +688,7 @@ mod tests {
                     operation: 12,
                     requester: Requester::Client(4),
                     outcome: AuditOutcome::Closed,
+                    parameters: 0,
                 },
                 AuditRecord {
                     time: 103,
@@ -678,6 +698,7 @@ mod tests {
                     operation: 13,
                     requester: Requester::InProcess,
                     outcome: AuditOutcome::Refused(ErrorCode::UnknownGuard),
+                    parameters: 0,
                 },
             ]
         );
@@ -688,7 +709,7 @@ mod tests {
         let mut guards = Guards::new(1, 1, 0, karyos_sys::diag::guard_audit(4).unwrap());
         let guard = guards.add("g").unwrap();
         assert_eq!(
-            guards.close(guard, 1, Requester::InProcess, 0),
+            guards.close(guard, 1, Requester::InProcess, 0, 0),
             Ok(Closed::Already { epoch: 1 })
         );
         assert_eq!(guards.audit().overwritten, 1);

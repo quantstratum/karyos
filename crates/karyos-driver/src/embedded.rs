@@ -1794,9 +1794,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         operation: u64,
     ) -> Result<karyos_sys::guard::Closed, DriverError> {
         let now = self.clock.now();
-        let closed = self
-            .guards
-            .close(guard, operation, crate::guards::Requester::InProcess, now);
+        let closed = self.guards.close(
+            guard,
+            operation,
+            crate::guards::Requester::InProcess,
+            0,
+            now,
+        );
         match &closed {
             // The close took effect: a failed seal is reported, never
             // returned as a failed close.
@@ -2002,6 +2006,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             expected,
             operation,
             crate::guards::Requester::InProcess,
+            0,
             now,
         );
         if let Err(error) = &reopened {

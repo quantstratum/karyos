@@ -634,14 +634,22 @@ pub struct GuardAuditRecord {
     pub after: u64,
     /// The requester's operation id.
     pub operation: u64,
-    /// Who asked: 0 the in-process caller, 1 an admitted client.
+    /// Who asked: 0 the in-process caller, 1 an admitted client, 2 an
+    /// operator through an admitted client (M10).
     pub requester_kind: u8,
-    /// The client id for a client, else 0.
+    /// The client id for a client or an operator's client, else 0.
     pub requester: u64,
     /// What happened: 1 closed, 2 already closed, 3 reopened, 4 refused.
     pub outcome: u8,
     /// The control error code of a refusal, else 0.
     pub refusal: u16,
+    /// The operator uid (`requester_kind` 2), else 0. Word 8, zero in
+    /// records written before M10, so older records read as none.
+    pub operator: u64,
+    /// The command's parameters digest
+    /// (`karyos_protocol::cnc::guard_parameters`), 0 when none was given.
+    /// Word 9, likewise.
+    pub parameters: u64,
 }
 
 impl GuardAuditRecord {
@@ -657,8 +665,8 @@ impl GuardAuditRecord {
                 | u64::from(self.outcome) << 8
                 | u64::from(self.refusal) << 16,
             self.requester,
-            0,
-            0,
+            self.operator,
+            self.parameters,
             0,
             0,
             0,
@@ -680,6 +688,8 @@ impl GuardAuditRecord {
             outcome,
             refusal: u16::from_le_bytes([refusal_low, refusal_high]),
             requester: field(7),
+            operator: field(8),
+            parameters: field(9),
         }
     }
 }
@@ -823,10 +833,12 @@ mod tests {
             before: 1,
             after: 3,
             operation: 99,
-            requester_kind: 1,
+            requester_kind: 2,
             requester: 7,
             outcome: 4,
             refusal: u16::MAX,
+            operator: 1000,
+            parameters: u64::MAX,
         };
         for guard in 1..=3 {
             assert!(ring.record(&record(guard)).is_some());

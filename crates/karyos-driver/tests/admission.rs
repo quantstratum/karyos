@@ -188,6 +188,88 @@ fn a_remote_client_is_admitted_served_and_leaves() {
     serve_until(&mut driver, |driver| driver.clients() == 0);
 }
 
+/// M10: a remote client closes and reopens a guard for an operator. Each
+/// completes as the guard's state, a stale reopen is refused with the
+/// current word, and the driver audits the client, the operator's uid and
+/// the request's digest.
+#[test]
+fn a_remote_client_closes_and_reopens_a_guard_for_an_operator() {
+    use karyos_driver::guards::Requester;
+    use karyos_sys::guard::GuardState;
+    let dir = dir("guard-ops");
+    let mut driver = system_driver(&dir);
+    let guard = driver.add_guard("orders").unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let id = client.client();
+    let complete = |driver: &mut IpcDriver, client: &mut RemoteClient, sequence: u64| {
+        let mut done: Vec<Completion> = Vec::new();
+        let start = Instant::now();
+        while done.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(5), "timed out");
+            let _ = driver.do_work().unwrap();
+            let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        }
+        assert_eq!(done[0].sequence, sequence);
+        done.remove(0).outcome
+    };
+    let sequence = client
+        .guard_reopen(guard.id(), 1, 40, 1000, b"start of day")
+        .unwrap();
+    assert!(matches!(
+        complete(&mut driver, &mut client, sequence),
+        Outcome::GuardState { guard: g, state: GuardState { epoch: 2, open: true } } if g == guard.id()
+    ));
+    let sequence = client.guard_close(guard.id(), 41, 1000, b"").unwrap();
+    assert!(matches!(
+        complete(&mut driver, &mut client, sequence),
+        Outcome::GuardState {
+            state: GuardState {
+                epoch: 3,
+                open: false
+            },
+            ..
+        }
+    ));
+    // A stale reopen: refused with the current word (epoch 3, closed).
+    let sequence = client.guard_reopen(guard.id(), 1, 42, 0, b"").unwrap();
+    assert!(matches!(
+        complete(&mut driver, &mut client, sequence),
+        Outcome::Refused {
+            code: ErrorCode::GuardNotClosedAt,
+            detail: 6
+        }
+    ));
+    assert_eq!(
+        client.guard_reopen(guard.id(), 2, 43, 0, b""),
+        Err(karyos_client::ConductorError::InvalidGuardEpoch)
+    );
+    let audit: Vec<_> = driver
+        .guard_audit()
+        .records
+        .iter()
+        .map(|record| (record.operation, record.requester, record.parameters))
+        .collect();
+    let digest = karyos_protocol::cnc::guard_parameters;
+    let operator = Requester::Operator {
+        client: id,
+        uid: 1000,
+    };
+    assert_eq!(
+        audit,
+        [
+            (
+                40,
+                operator,
+                digest(guard.id(), 1, 40, 1000, b"start of day")
+            ),
+            (41, operator, digest(guard.id(), 0, 41, 1000, b"")),
+            (42, Requester::Client(id), digest(guard.id(), 1, 42, 0, b"")),
+        ]
+    );
+    drop(client);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+}
+
 /// A remote client maps the client counters region writable: a counter it
 /// writes is read by the driver, and while it lives the client does not
 /// send `Leave`, so its cell stays charged; once it is gone, `Leave`
