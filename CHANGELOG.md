@@ -12,7 +12,10 @@ release may break APIs, wire formats and shared-memory layouts.
 ### Changed
 
 - The conformance suite gains format 2 (ADR-0073, owner item 46,
-  decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged.
+  decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged;
+  format 1's `karyos_driver_start` now defaults its `idle_strategy` to
+  the ABI's declared default, `KARYOS_IDLE_YIELD_THEN_SLEEP` (3), in
+  place of `KARYOS_IDLE_YIELD` (1), which changes no result.
   Format 2 adds a semantic layer of ops that a binding runs through its
   public API, with a binding's close rules (a second close is `ok`; an
   op on a closed object or a closed parent's child answers `closed`)
