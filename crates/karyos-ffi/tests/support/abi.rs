@@ -157,11 +157,10 @@ pub struct SizedStruct<T> {
 impl<T: Copy> SizedStruct<T> {
     /// `value`, or the sentinel for an output, with size field `size`.
     pub fn new(value: Option<&T>, size: u32) -> Self {
-        let bytes = usize::try_from(size)
-            .unwrap_or(usize::MAX)
-            .max(size_of::<T>())
-            .checked_add(16)
-            .unwrap_or(usize::MAX);
+        // A `u32` size plus sixteen fits a `usize` on every target the
+        // library supports.
+        let bytes =
+            usize::try_from(size).map_or(size_of::<T>(), |size| size.max(size_of::<T>())) + 16;
         let mut words = vec![u64::from_ne_bytes([SENTINEL; 8]); bytes.div_ceil(8)];
         let base = words.as_mut_ptr().cast::<u8>();
         if let Some(value) = value {
