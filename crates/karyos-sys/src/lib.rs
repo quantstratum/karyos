@@ -37,6 +37,8 @@ pub mod diag_ring;
 pub mod error;
 pub mod frame;
 pub mod freshness;
+#[cfg(target_os = "linux")]
+pub mod fs;
 pub mod guard;
 pub mod host_clock;
 pub mod load_words;

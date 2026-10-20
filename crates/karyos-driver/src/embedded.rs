@@ -907,6 +907,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) broadcast: BroadcastTransmitter,
     pub(crate) clients: Vec<ClientSlot<T>>,
     pub(crate) registrations: Vec<crate::commands::Registration>,
+    /// The audited streams and their grants not drained yet (H3).
+    pub(crate) grant_audits: crate::grant_audit::GrantAudits,
     pub(crate) next_client: u64,
     pub(crate) next_stream: u64,
     /// The replay targets this driver made (A5b).
@@ -1377,6 +1379,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             broadcast,
             clients: Vec::new(),
             registrations: Vec::new(),
+            grant_audits: crate::grant_audit::GrantAudits::default(),
             next_client: 1,
             next_stream: 1,
             replays: crate::replay::ReplayTargets::default(),
@@ -2602,6 +2605,34 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream: StreamHandle,
     ) -> Result<Option<&[karyos_sys::sync::AtomicU64]>, DriverError> {
         Ok(self.stream_ref(stream)?.buffer.schedule_ring())
+    }
+
+    /// Audits the grants of the stream `stream` from now on (`quantstratum-docs:
+    /// karyos/design/archive-host.md`, H3): each handle the control path
+    /// grants on it is recorded for [`Self::drain_grant_audits`]. A handle
+    /// the host takes in process ([`Self::publication`], [`Self::subscribe`])
+    /// is the host's own and is not recorded. Control path.
+    ///
+    /// # Errors
+    ///
+    /// The stream lookup errors.
+    pub fn audit_grants(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+        let id = self.stream_ref(stream)?.id;
+        self.grant_audits.watch(id);
+        Ok(())
+    }
+
+    /// Hands every grant recorded on an audited stream since the last
+    /// drain to `each`, oldest first.
+    pub fn drain_grant_audits(&mut self, each: impl FnMut(crate::grant_audit::GrantAudit)) {
+        self.grant_audits.drain(each);
+    }
+
+    /// Grants on audited streams dropped because more than 64 waited for a
+    /// drain.
+    #[must_use]
+    pub fn grant_audits_dropped(&self) -> u64 {
+        self.grant_audits.dropped()
     }
 
     /// Seals a timed lane whose sender's [`crate::timed_gate::TimedGate`]

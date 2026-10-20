@@ -82,6 +82,9 @@ pub enum StartError {
         /// Why it was refused.
         error: DriverError,
     },
+    /// The Archive did not start (`--archive`).
+    #[cfg(target_os = "linux")]
+    Archive(crate::daemon_archive::ArchiveStartError),
 }
 
 impl fmt::Display for StartError {
@@ -95,6 +98,8 @@ impl fmt::Display for StartError {
                 "stream {}:{} refused: {error}",
                 stream.stream_id, stream.session_id
             ),
+            #[cfg(target_os = "linux")]
+            Self::Archive(error) => write!(f, "{error}"),
         }
     }
 }
@@ -186,11 +191,21 @@ pub fn ipc_config(admission: &AdmissionOptions) -> IpcConfig {
     }
 }
 
+/// The daemon's driver, alone or behind its Archive (`--archive`).
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum Serving {
+    /// The driver alone (boxed, as the Archive is).
+    Plain(Box<EmbeddedDriver<SharedTerms>>),
+    /// The driver behind the Archive's control server.
+    Archive(Box<crate::daemon_archive::DaemonArchive>),
+}
+
 /// A started daemon: its driver and the streams it configured.
 #[derive(Debug)]
 pub struct Daemon {
     #[cfg(target_os = "linux")]
-    driver: EmbeddedDriver<SharedTerms>,
+    serving: Serving,
     #[cfg(target_os = "linux")]
     streams: Vec<StreamHandle>,
     #[cfg(target_os = "linux")]
@@ -231,15 +246,28 @@ impl Daemon {
                 Box::new(SystemClock::new()),
             )
             .map_err(StartError::Driver)?;
-            let mut streams = Vec::with_capacity(configs.len());
+            let mut streams = Vec::with_capacity(configs.len().checked_add(2).unwrap_or(0));
             for (stream, config) in configs {
                 let handle = driver
                     .add_stream(config)
                     .map_err(|error| StartError::Stream { stream, error })?;
                 streams.push(handle);
             }
+            let serving = match &options.archive {
+                Some(archive) => {
+                    let (archive, control) = crate::daemon_archive::DaemonArchive::start(
+                        driver,
+                        &options.terms,
+                        archive,
+                    )
+                    .map_err(StartError::Archive)?;
+                    streams.extend(control);
+                    Serving::Archive(Box::new(archive))
+                }
+                None => Serving::Plain(Box::new(driver)),
+            };
             Ok(Self {
-                driver,
+                serving,
                 streams,
                 linger: options.shutdown_linger,
                 last_error: None,
@@ -260,10 +288,11 @@ impl Daemon {
         #[cfg(target_os = "linux")]
         tracing::info!(
             dir = %options.admission.dir.display(),
-            instance = ?self.driver.instance().map(|instance| format!("{instance:032x}")),
+            instance = ?self.driver().instance().map(|instance| format!("{instance:032x}")),
             streams = self.streams.len(),
             max_clients = options.driver.max_clients,
             network = options.driver.network.is_some(),
+            archive = ?options.archive.as_ref().map(|archive| archive.dir.display().to_string()),
             shutdown_linger_ms = u64::try_from(options.shutdown_linger.as_millis()).unwrap_or(u64::MAX),
             "karyosd started"
         );
@@ -279,8 +308,7 @@ impl Daemon {
     pub fn run(self, stop: &AtomicBool) -> Shutdown {
         #[cfg(target_os = "linux")]
         {
-            let mut daemon = self;
-            daemon.serve(stop)
+            self.serve(stop)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -292,11 +320,66 @@ impl Daemon {
 
 #[cfg(target_os = "linux")]
 impl Daemon {
-    fn serve(&mut self, stop: &AtomicBool) -> Shutdown {
+    /// The driver.
+    fn driver(&self) -> &EmbeddedDriver<SharedTerms> {
+        match &self.serving {
+            Serving::Plain(driver) => driver,
+            Serving::Archive(archive) => archive.driver(),
+        }
+    }
+
+    /// The driver, mutably.
+    fn driver_mut(&mut self) -> &mut EmbeddedDriver<SharedTerms> {
+        match &mut self.serving {
+            Serving::Plain(driver) => driver,
+            Serving::Archive(archive) => archive.driver_mut(),
+        }
+    }
+
+    /// Ends the Archive, if there is one: stops the boot recordings
+    /// through the control path while duty cycles run, for at most
+    /// `within`, then stops the agent and keeps the driver alone.
+    fn end_archive(mut self, within: std::time::Duration) -> Self {
+        let Serving::Archive(archive) = &mut self.serving else {
+            return self;
+        };
+        archive.stop_recordings();
+        let deadline = Instant::now().checked_add(within);
+        while archive.stopping() && deadline.is_none_or(|deadline| Instant::now() < deadline) {
+            let _ = archive.cycle();
+            std::thread::yield_now();
+        }
+        if archive.stopping() {
+            tracing::warn!("boot recordings not confirmed stopped; the agent stops them");
+        }
+        let Self {
+            serving,
+            streams,
+            linger,
+            last_error,
+            logged,
+            next_check,
+        } = self;
+        let driver = match serving {
+            Serving::Archive(archive) => Box::new(archive.shutdown()),
+            Serving::Plain(driver) => driver,
+        };
+        tracing::info!("archive stopped");
+        Self {
+            serving: Serving::Plain(driver),
+            streams,
+            linger,
+            last_error,
+            logged,
+            next_check,
+        }
+    }
+
+    fn serve(mut self, stop: &AtomicBool) -> Shutdown {
         // This loop drives the conductor: its spin time is the driver's
         // `conductor spin time` (M5).
-        let mut idle = BackoffIdle::default().with_spin_meter(self.driver.take_spin_meter());
-        let mut clients = self.driver.clients();
+        let mut idle = BackoffIdle::default().with_spin_meter(self.driver_mut().take_spin_meter());
+        let mut clients = self.driver().clients();
         while !stop.load(Ordering::Acquire) {
             let work = self.cycle();
             self.log_capabilities();
@@ -312,13 +395,17 @@ impl Daemon {
             linger_ms = u64::try_from(self.linger.as_millis()).unwrap_or(u64::MAX),
             "shutdown requested"
         );
-        self.driver.stop_admitting();
-        for &stream in &self.streams {
-            if let Err(error) = self.driver.remove_stream(stream) {
+        // The Archive first, within the linger: its recordings, then its
+        // agent; the driver serves on alone.
+        let deadline = Instant::now().checked_add(self.linger);
+        let linger = self.linger;
+        self = self.end_archive(linger);
+        self.driver_mut().stop_admitting();
+        for stream in self.streams.clone() {
+            if let Err(error) = self.driver_mut().remove_stream(stream) {
                 tracing::warn!(%error, "stream removal failed");
             }
         }
-        let deadline = Instant::now().checked_add(self.linger);
         idle.reset();
         loop {
             let work = self.cycle();
@@ -350,7 +437,7 @@ impl Daemon {
     /// [`Shutdown::Terminal`], logged as an error, once the driver is in
     /// its terminal state.
     fn terminal(&self, clients: usize) -> Option<Shutdown> {
-        if !self.driver.is_terminal() {
+        if !self.driver().is_terminal() {
             return None;
         }
         tracing::error!(
@@ -364,7 +451,11 @@ impl Daemon {
     /// One duty cycle; its work, 0 on error. A duty cycle error is logged
     /// when it differs from the last one logged.
     fn cycle(&mut self) -> u32 {
-        match self.driver.do_work() {
+        let done = match &mut self.serving {
+            Serving::Plain(driver) => driver.do_work(),
+            Serving::Archive(archive) => archive.cycle(),
+        };
+        match done {
             Ok(work) => work,
             Err(error) => {
                 if self.last_error != Some(error) {
@@ -385,7 +476,8 @@ impl Daemon {
             return;
         }
         self.next_check = now.checked_add(CAPABILITY_CHECK).unwrap_or(now);
-        let endpoints = karyos_client::capabilities::endpoint_capabilities(&self.driver.counters());
+        let endpoints =
+            karyos_client::capabilities::endpoint_capabilities(&self.driver().counters());
         self.logged
             .retain(|(endpoint, _)| endpoints.iter().any(|found| found.endpoint == *endpoint));
         for found in endpoints.iter().filter(|found| found.consistent) {
@@ -411,7 +503,7 @@ impl Daemon {
 
     /// Logs a change of the admitted client count; returns the new count.
     fn log_clients(&self, before: usize) -> usize {
-        let clients = self.driver.clients();
+        let clients = self.driver().clients();
         if clients != before {
             tracing::info!(clients, before, "clients changed");
         }
@@ -422,7 +514,9 @@ impl Daemon {
     fn unfreed(&self) -> usize {
         self.streams
             .iter()
-            .filter(|&&stream| !matches!(self.driver.stream_state(stream), Ok(StreamState::Freed)))
+            .filter(|&&stream| {
+                !matches!(self.driver().stream_state(stream), Ok(StreamState::Freed))
+            })
             .count()
     }
 }
@@ -483,6 +577,73 @@ mod tests {
             Daemon::start(&options),
             Err(StartError::Unsupported)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_with_an_archive_starts_and_shuts_down_cleanly() {
+        let dir = std::env::temp_dir().join(format!("karyosd-unit-archive-{}", std::process::id()));
+        let archive =
+            std::env::temp_dir().join(format!("karyosd-unit-catalog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&archive);
+        std::fs::create_dir_all(&archive).unwrap();
+        let mut options = Options::new(dir.clone());
+        options.terms.term_length = karyos_sys::sizing::MIN_TERM_LENGTH;
+        options.streams.push(STREAM);
+        options.archive = Some(crate::args::ArchiveOptions {
+            dir: archive.clone(),
+            requests: 100,
+            responses: 101,
+            records: vec![crate::args::RecordOption {
+                stream_id: STREAM.stream_id,
+                session_id: STREAM.session_id,
+                sync: karyos_archive::segment::SyncPolicy::PerSegment,
+            }],
+            min_free: 0,
+        });
+        let daemon = Daemon::start(&options).unwrap();
+        // The configured stream and the two control streams.
+        assert_eq!(daemon.streams.len(), 3);
+        let stop = AtomicBool::new(true);
+        assert_eq!(daemon.run(&stop), Shutdown::Clean);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&archive);
+    }
+
+    /// Control streams that collide with a configured stream fail the
+    /// start.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_archive_control_stream_that_collides_fails_the_start() {
+        let dir = std::env::temp_dir().join(format!("karyosd-unit-collide-{}", std::process::id()));
+        let archive = std::env::temp_dir().join(format!(
+            "karyosd-unit-collide-catalog-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&archive).unwrap();
+        let mut options = Options::new(dir.clone());
+        options.terms.term_length = karyos_sys::sizing::MIN_TERM_LENGTH;
+        options.streams.push(StreamOption {
+            stream_id: 100,
+            session_id: 0,
+        });
+        options.archive = Some(crate::args::ArchiveOptions {
+            dir: archive.clone(),
+            requests: 100,
+            responses: 101,
+            records: Vec::new(),
+            min_free: 0,
+        });
+        assert!(matches!(
+            Daemon::start(&options),
+            Err(StartError::Archive(
+                crate::daemon_archive::ArchiveStartError::Stream(_)
+            ))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&archive);
     }
 
     #[cfg(target_os = "linux")]
