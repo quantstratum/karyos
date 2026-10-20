@@ -1713,10 +1713,11 @@ release may break APIs, wire formats and shared-memory layouts.
   subscription of the same driver never got an image. A network image and
   a local stream of the same key now coexist, in either order: key
   lookups (`AddPublication`, `AddSubscription`, the `karyos:ipc` URI
-  paths, conflated views, a URI's lane check) take the local stream, so
-  local behaviour is unchanged; an image is reached by its registration,
-  and by its alias from a client that owns a network subscription of the
-  stream id, which resolves among images only. A replay target keeps its
+  paths, conflated views, a URI's lane check) take the local stream for
+  every client, so local behaviour is unchanged; a network subscription
+  attaches its images by registration (`AddImageSubscription`), and a key
+  with no local stream still resolves to its oldest image. A replay
+  target keeps its
   key to itself while it lives, retiring included (#283 P3). A client's
   `PublicationClosed` naming no image closes only its local links of the
   key and lane, never an image's. The Archive's lookups by (stream,

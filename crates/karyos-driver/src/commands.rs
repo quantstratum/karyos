@@ -719,19 +719,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// A live key may name a local stream (a network publication's lane
     /// included) and images of the same alias at once, such as a driver's
     /// own network publication and its loopback image (karyos#490;
-    /// `quantstratum-docs: karyos/design/per-source-images.md`, D2-4): the
-    /// local stream wins, so a local lookup never switches to an image.
-    /// Images alone resolve to the oldest, the lowest registration.
+    /// `quantstratum-docs: karyos/design/per-source-images.md`, D2-2): a
+    /// key names the local stream whenever there is one, for every client,
+    /// so a local lookup never switches to an image; a network
+    /// subscription attaches its images by registration
+    /// (`AddImageSubscription`, D2-3). A key with no local stream resolves
+    /// to its oldest image, the lowest registration.
     pub(crate) fn find_stream(&self, stream: StreamKey, lane: Option<Lane>) -> Option<usize> {
         self.find_keyed(stream, lane, false)
             .or_else(|| self.find_keyed(stream, lane, true))
-    }
-
-    /// As [`Self::find_stream`], among images only: the alias path of a
-    /// client that owns a network subscription of the stream id, which asks
-    /// for remote data by definition (D2-4).
-    pub(crate) fn find_alias_image(&self, stream: StreamKey, lane: Option<Lane>) -> Option<usize> {
-        self.find_keyed(stream, lane, true)
     }
 
     /// The oldest live lane of `stream` on `lane` that is an image, or that
@@ -972,17 +968,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let (found, detail) = match command {
                     Command::AddImageSubscription { image, lane, .. } => {
                         (self.find_image(image, lane), image)
-                    }
-                    // A client subscribed to the network on this stream id
-                    // names an image by its alias, never the local stream
-                    // of the same key (D2-4).
-                    Command::AddSubscription { stream, lane, .. }
-                        if self.owns_network_subscription(client, stream.stream_id) =>
-                    {
-                        (
-                            self.find_alias_image(stream, Some(lane)),
-                            u64::from(stream.stream_id.cast_unsigned()),
-                        )
                     }
                     Command::AddPublication { stream, lane, .. }
                     | Command::AddConcurrentPublication { stream, lane, .. }
