@@ -204,8 +204,9 @@ where
             },
             MessageLimit::new(1),
         );
-        if oversized {
-            self.oversized = self.oversized.saturating_add(1);
+        if oversized && let Some(next) = self.oversized.checked_add(1) {
+            // Once at `u64::MAX` it stays there, never wrapping.
+            self.oversized = next;
         }
         length
     }

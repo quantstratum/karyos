@@ -11,6 +11,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-replay start` and `stop` (quantstratum-docs:
+  `karyos/design/archive-host.md`, H6): ask a running Archive to replay a
+  recording into a stream, or to stop a replay, over its control streams.
+  `start --live DIR=REQ,RESP --recording ID --to-stream S [--from POS]
+  [--length BYTES] [--channel URI] [--timeout-ms N]` prints `replay=ID
+  stream=S session=N` for the reader, which the Archive waits for (H2b).
+  `stop --live DIR=REQ,RESP --replay ID`. Exit status 2 on any error, the
+  Archive's refusal included. They connect through `ArchiveConnection`
+  (Linux), one connection per request, closed after it.
+  `karyos_tools::args::parse_live` parses `--live` for these and for
+  `karyos-catalog list --live`. `tests/karyosd_replay.rs` runs both
+  against `karyosd --archive` (Linux).
 - karyos-tools: `replay::HELP` is replaced by `replay::help(command)`,
   which names the command the diff was invoked as (`karyos-replay diff` or
   its alias `karyos-tools replay diff`; H5, #521).
@@ -627,7 +639,7 @@ release may break APIs, wire formats and shared-memory layouts.
   binary: `karyos-replay diff` is the recording group journal diff, and
   `karyos-tools replay diff` stays as its alias, running the same code
   (`replay::run_diff`, with the usage text named after the command it came
-  through). Replaying into a stream (`karyos-replay to`) is H6.
+  through). Replaying into a stream is H6's `karyos-replay start`.
 - Subscription options over the C ABI (F7b-1; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` D3):
   `karyos_subscription_options` (`role`: `KARYOS_ROLE_REQUIRED`,
