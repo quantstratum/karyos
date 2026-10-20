@@ -539,6 +539,33 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Remote conflated views through the facade and the C ABI (F7b-2c-1;
+  quantstratum-docs: `karyos/design/ffi-gap-analysis.md`,
+  `conflation-end-to-end.md`, owner item 57):
+  - `Client::add_conflated_subscription(uri, stream_id)` and
+    `Client::add_conflated_subscription_with(uri, stream_id,
+    ConflatedOptions)`: a view of a `karyos:ipc` stream's conflation table.
+    A client attached to a driver in another process takes it; a client
+    of a driver in this process is refused by its driver
+    (`ClientError::Refused`), which gives in-process views itself
+    (`EmbeddedDriver::subscribe_conflated`). Another channel is
+    `ClientError::UnsupportedChannel`, before anything is requested.
+  - `ConflatedOptions { budget, limits }` (`#[non_exhaustive]`; the
+    default is the driver's view budget, 1024 keys and 3 retries, and the
+    default limits), re-exported with `ConflatedLimits` and
+    `ConflatedBudget` from the facade. `ConflatedLimits` moves from
+    `karyos_client::ipc` to the crate root, on every platform
+    (`ipc::ConflatedLimits` stays as a re-export), and gains `new`.
+  - `karyos_client_add_conflated_subscription(client, uri, stream_id,
+    *conflated, *detail)`: a client's view, closed with its client, after
+    which its handle answers `KARYOS_E_CLOSED`. It takes the default
+    retries and limits; the key budget is each poll's.
+  - `AddConflatedSubscription` with session 0 names the stream a
+    `karyos:ipc` URI of the id names, when there is one (the key is exact
+    otherwise), and `RemoteClient::take_conflated` takes the grant's
+    session for such a request, checking the stream id, as a request by
+    URI does (W7).
+
 - Conflated subscriptions over the C ABI (F7b-2b; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md`, `conflation-end-to-end.md`):
   - `karyos_stream_options` grows `conflation_keys`,
@@ -2206,6 +2233,22 @@ release may break APIs, wire formats and shared-memory layouts.
   overrun, abort, skip or close in the same poll) reaches the facade
   caller of a `RejoiningSubscription`: the facade's poll report kept a
   summary only when it stopped (F9-0b, karyos#532).
+- `karyosd --archive` admits remote `ArchiveConnection`s again. Their
+  response reader is optional (#524), and an optional reader takes a
+  spare-slot credit; the response stream had the default three spare
+  slots, whose one free credit the daemon's own requester held, so every
+  remote open was refused (`ResourcesUnavailable`). The response stream
+  now has `RESPONSE_READERS` (8, as many as the request stream's
+  publishers) readers and `RESPONSE_SPARE_SLOTS` spare slots, and
+  `karyosd_admits_as_many_archive_connections_as_request_publishers`
+  opens them all beside a boot recording. The management agent's
+  catalog, which had stopped listing a karyosd Archive, lists it again
+  (`the_management_agent_lists_a_karyosd_archive`; karyos-tools now has
+  karyos-agent as a dev-dependency for it).
+- A remote conflated grant that arrived after its request timed out was
+  not released: `Connection::release` ignored `FetchableConflated`, so the
+  grant stayed held until the client ended. It is now taken and dropped,
+  which sends its `Detach`.
 
 - One driver can hold both ends of a `karyos:udp` endpoint (karyos#490;
   quantstratum-docs: `karyos/design/per-source-images.md`, D2-1 and

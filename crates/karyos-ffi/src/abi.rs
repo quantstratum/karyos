@@ -1787,7 +1787,9 @@ pub type ConflatedHandler =
     Option<unsafe extern "C" fn(*mut c_void, u32, *const u8, usize, u64, u64)>;
 
 /// Subscribes to the conflation table of `driver`'s stream `stream_id` and
-/// writes the conflated subscription's handle through `conflated`.
+/// writes the conflated subscription's handle through `conflated`. The
+/// view follows its driver: once the driver is closed it answers
+/// `KARYOS_E_CLOSED`, and is still closed with `karyos_conflated_close`.
 /// `KARYOS_E_INVALID_ARGUMENT` for a stream id the driver does not have,
 /// `KARYOS_E_CONFLATION` for a stream without a conflation table,
 /// `KARYOS_E_CLOSED` for a stream being removed or a closed driver; on
@@ -1815,6 +1817,59 @@ pub unsafe extern "C" fn karyos_driver_subscribe_conflated(
                 Status::Ok
             }
             Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Adds a view of the conflation table of the `karyos:ipc` stream
+/// `stream_id` to `client` and writes its handle through `conflated`
+/// (F7b-2c). A client attached to a driver in another process takes it;
+/// a client of a driver in this process is refused by its driver
+/// (`KARYOS_E_REFUSED`): take that view with
+/// `karyos_driver_subscribe_conflated`. The view is the client's: closing
+/// the client closes it, and its handle then answers `KARYOS_E_CLOSED`.
+/// Its poll reads with the default retries and its table must be within
+/// the default limits (2^20 keys, 64 KiB values, a 64 MiB journal); the
+/// key budget is each poll's. A control call: it waits for the driver up
+/// to the client's timeout, and holds the client handle meanwhile. On
+/// failure nothing is opened and `detail` (may be null) receives the
+/// failure's detail; another channel than `karyos:ipc` is
+/// `KARYOS_E_UNSUPPORTED_CHANNEL`.
+///
+/// # Safety
+///
+/// `uri` is a NUL-terminated string; `conflated` points to a writable
+/// `uint64_t`; `detail` is null or a `karyos_detail` whose `size` is set.
+/// A null `uri` or `conflated` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_conflated_subscription(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    conflated: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(conflated) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `uri`.
+        let uri = match unsafe { read_str(uri) } {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match api::conflated::add(Handle::from_raw(client), uri, stream_id) {
+            Ok(handle) => {
+                // SAFETY: `conflated` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { conflated.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
         }
     })
 }
@@ -1878,7 +1933,9 @@ pub unsafe extern "C" fn karyos_conflated_poll(
     })
 }
 
-/// Closes `conflated`.
+/// Closes `conflated`. A client's view is closed through its client: while
+/// that is in use (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`) nothing is
+/// closed.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_conflated_close(conflated: u64) -> i32 {
     guard(

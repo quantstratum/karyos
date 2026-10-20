@@ -56,8 +56,8 @@ pub use conductor::{
     DEFAULT_HEARTBEAT_INTERVAL, EVENT_QUEUE, Fetchable, FetchableConflated, Outcome, Request,
 };
 pub use conflated_subscription::{
-    CONFLATION_BUDGETS_EXHAUSTED, CONFLATION_SKIPS, ConflatedSubscription, ConflatedValue,
-    ReaderCounts, ViewClosed,
+    CONFLATION_BUDGETS_EXHAUSTED, CONFLATION_SKIPS, ConflatedLimits, ConflatedOptions,
+    ConflatedSubscription, ConflatedValue, ReaderCounts, ViewClosed,
 };
 pub use counter::{ClientCounterHandle, CounterReleases};
 pub use error::ClientError;
@@ -67,6 +67,7 @@ pub use journal::{ClientJournal, FetchableJournal};
 pub use karyos_protocol::cnc::{StreamId, SubscriberRole};
 /// The publication identity a replay and a live merge name (merge module).
 pub use karyos_protocol::trace_hook::PublicationIdentity;
+pub use karyos_sys::conflation::Budget as ConflatedBudget;
 pub use karyos_sys::frame::Lane;
 pub use karyos_sys::freshness::Freshness;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};

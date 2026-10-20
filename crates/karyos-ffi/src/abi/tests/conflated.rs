@@ -287,3 +287,73 @@ fn a_conflated_view_delivers_each_keys_latest_value() {
     assert_eq!(karyos_conflated_close(view), Status::Ok.code());
     assert_eq!(karyos_conflated_close(view), Status::Closed.code());
 }
+
+/// `karyos_client_add_conflated_subscription` of `stream_id` on `uri`.
+fn add_view(client: u64, uri: &core::ffi::CStr, stream_id: i32) -> (i32, u64) {
+    let mut conflated = 0;
+    // SAFETY: a live C string and a live, aligned `u64`; no detail.
+    let status = unsafe {
+        karyos_client_add_conflated_subscription(
+            client,
+            uri.as_ptr(),
+            stream_id,
+            &mut conflated,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, conflated)
+}
+
+/// A client's view request checks its arguments before the client is
+/// looked up (no driver).
+#[test]
+fn a_client_view_checks_its_arguments() {
+    // SAFETY: a null out-pointer, the case under test.
+    let status = unsafe {
+        karyos_client_add_conflated_subscription(
+            0,
+            c"karyos:ipc".as_ptr(),
+            KEYED,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::InvalidArgument.code());
+    let mut conflated = 0;
+    // SAFETY: a null URI, the case under test.
+    let status = unsafe {
+        karyos_client_add_conflated_subscription(
+            0,
+            core::ptr::null(),
+            KEYED,
+            &mut conflated,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::InvalidArgument.code());
+    assert_eq!(
+        add_view(0, c"karyos:ipc", KEYED),
+        (Status::InvalidHandle.code(), 0)
+    );
+}
+
+/// A client of a driver in this process is refused a view by its driver,
+/// which gives in-process views itself; another channel is refused before
+/// anything is requested. Nothing is opened, and the client goes on.
+#[test]
+fn an_embedded_client_is_refused_a_view() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    assert_eq!(
+        add_view(client, c"karyos:ipc", STREAM_CONFLATED),
+        (Status::Refused.code(), 0)
+    );
+    assert_eq!(
+        add_view(client, c"karyos:udp?endpoint=127.0.0.1:1", STREAM_CONFLATED),
+        (Status::UnsupportedChannel.code(), 0)
+    );
+    assert_eq!(add_publication_of(client, STREAM).0, Status::Ok.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
