@@ -372,6 +372,7 @@ fn render_alerts(families: &mut Families, dir: &str, alerts: &[Alert]) {
                     AlertKind::Lag => "lag",
                     AlertKind::Loss => "loss",
                     AlertKind::GuardAck => "guard_ack",
+                    AlertKind::JournalGap => "journal_gap",
                 }
                 .to_owned(),
             ),

@@ -44,7 +44,7 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config = args.archives.iter().fold(
+    let mut config = args.archives.iter().fold(
         AgentConfig::new(args.drivers).with_alerts(args.alerts),
         |config, (dir, streams)| {
             config.with_archive(
@@ -53,6 +53,9 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
             )
         },
     );
+    if let Some(journal) = args.journal {
+        config = config.with_journal(journal);
+    }
     let mut agent = Agent::new(config);
     // Between refreshes the socket is polled every 10 ms.
     let tick = Duration::from_millis(10).min(args.refresh);
@@ -60,7 +63,7 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
         agent.refresh();
         let next = Instant::now().checked_add(args.refresh);
         loop {
-            if let Err(error) = server.poll(&agent) {
+            if let Err(error) = server.poll(&mut agent) {
                 let _ = writeln!(std::io::stderr(), "karyos-agent: {error}");
                 return ExitCode::from(1);
             }

@@ -16,9 +16,10 @@
 //!   short bounded timeout, lists with
 //!   [`karyos_archive::client::list::RecordingLister`] within a deadline,
 //!   and lists again after an interval. A failure (the connection, a grant,
-//!   a refusal, a listing past its deadline) is counted in the view and
-//!   retried after the interval, on a new connection unless the Archive
-//!   refused. The view keeps the last complete listing.
+//!   a refusal, a listing past its deadline, the driver closing under the
+//!   agent's attach) is counted in the view and retried after the
+//!   interval, on a new connection unless the Archive refused. The view
+//!   keeps the last complete listing.
 //! - **Correlation.** The agent's correlation ids carry
 //!   [`CATALOG_CLIENT_ID`] in their high 32 bits; a host's other
 //!   requesters must not use it (§7a).
@@ -165,11 +166,28 @@ mod watch {
         }
     }
 
+    /// What the agent tells the thread.
+    #[derive(Debug, Default)]
+    struct Signals {
+        /// Stop for good.
+        stop: AtomicBool,
+        /// The agent saw the driver close or become unavailable: the
+        /// session ends now rather than at its deadline.
+        gone: AtomicBool,
+    }
+
+    /// Why a wait ended.
+    enum Wake {
+        Elapsed,
+        Stop,
+        Gone,
+    }
+
     /// The thread listing one driver's catalog, and what it last found.
     #[derive(Debug)]
     pub(crate) struct CatalogWatch {
         shared: Arc<Mutex<Catalog>>,
-        stop: Arc<AtomicBool>,
+        signals: Arc<Signals>,
         thread: Option<JoinHandle<()>>,
     }
 
@@ -177,12 +195,12 @@ mod watch {
         /// Starts listing the catalog of the driver in `dir`.
         pub(crate) fn start(dir: PathBuf, config: CatalogConfig) -> Self {
             let shared = Arc::new(Mutex::new(Catalog::default()));
-            let stop = Arc::new(AtomicBool::new(false));
+            let signals = Arc::new(Signals::default());
             let thread = {
-                let (shared, stop) = (Arc::clone(&shared), Arc::clone(&stop));
+                let (shared, signals) = (Arc::clone(&shared), Arc::clone(&signals));
                 std::thread::Builder::new()
                     .name("karyos-agent-catalog".to_owned())
-                    .spawn(move || run(&dir, config, &shared, &stop))
+                    .spawn(move || run(&dir, config, &shared, &signals))
             };
             let thread = match thread {
                 Ok(thread) => Some(thread),
@@ -194,7 +212,7 @@ mod watch {
             };
             Self {
                 shared,
-                stop,
+                signals,
                 thread,
             }
         }
@@ -203,11 +221,18 @@ mod watch {
         pub(crate) fn view(&self) -> Catalog {
             lock(&self.shared).clone()
         }
+
+        /// The agent saw the driver close or become unavailable: the
+        /// session ends at once, is counted as a failure, and a new one is
+        /// tried after the interval (REVIEWER-02's P3-2 on #488).
+        pub(crate) fn driver_gone(&self) {
+            self.signals.gone.store(true, Ordering::Release);
+        }
     }
 
     impl Drop for CatalogWatch {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Release);
+            self.signals.stop.store(true, Ordering::Release);
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
@@ -276,29 +301,47 @@ mod watch {
         }
     }
 
-    /// Sleeps `every`, or until asked to stop; polls `client` meanwhile,
-    /// so its connection stays alive. Whether to go on.
-    fn wait(client: Option<&mut Client<RemoteClient>>, every: Duration, stop: &AtomicBool) -> bool {
+    /// What the signals ask now, if anything.
+    fn signalled(signals: &Signals) -> Option<Wake> {
+        if signals.stop.load(Ordering::Acquire) {
+            Some(Wake::Stop)
+        } else if signals.gone.load(Ordering::Acquire) {
+            Some(Wake::Gone)
+        } else {
+            None
+        }
+    }
+
+    /// Sleeps `every`, unless signalled; polls `client` meanwhile, so its
+    /// connection stays alive.
+    fn wait(client: Option<&mut Client<RemoteClient>>, every: Duration, signals: &Signals) -> Wake {
         let start = Instant::now();
         let mut client = client;
         while start.elapsed() < every {
-            if stop.load(Ordering::Acquire) {
-                return false;
+            if let Some(wake) = signalled(signals) {
+                return wake;
             }
             if let Some(client) = client.as_mut() {
                 let _ = client.poll();
             }
             std::thread::sleep(IDLE_TICK.min(every));
         }
-        !stop.load(Ordering::Acquire)
+        signalled(signals).unwrap_or(Wake::Elapsed)
     }
 
-    fn run(dir: &Path, config: CatalogConfig, shared: &Mutex<Catalog>, stop: &AtomicBool) {
-        while !stop.load(Ordering::Acquire) {
-            if let Err(error) = session(dir, config, shared, stop) {
+    fn run(dir: &Path, config: CatalogConfig, shared: &Mutex<Catalog>, signals: &Signals) {
+        while !signals.stop.load(Ordering::Acquire) {
+            if let Err(error) = session(dir, config, shared, signals) {
                 fail(shared, &error);
             }
-            if !wait(None, config.every, stop) {
+            // Between sessions only a stop matters: the signal that ended
+            // the last one is spent, and the next connection finds out
+            // whether the driver is back.
+            signals.gone.store(false, Ordering::Release);
+            while matches!(wait(None, config.every, signals), Wake::Gone) {
+                signals.gone.store(false, Ordering::Release);
+            }
+            if signals.stop.load(Ordering::Acquire) {
                 return;
             }
         }
@@ -310,8 +353,10 @@ mod watch {
         dir: &Path,
         config: CatalogConfig,
         shared: &Mutex<Catalog>,
-        stop: &AtomicBool,
+        signals: &Signals,
     ) -> Result<(), String> {
+        // A close seen before this connection is not this one's.
+        signals.gone.store(false, Ordering::Release);
         let context = Context::builder()
             .dir(dir)
             .timeout(config.connect_timeout)
@@ -333,8 +378,10 @@ mod watch {
             lister.start();
             let start = Instant::now();
             loop {
-                if stop.load(Ordering::Acquire) {
-                    return Ok(());
+                match signalled(signals) {
+                    Some(Wake::Stop) => return Ok(()),
+                    Some(_) => return Err("the driver closed".to_owned()),
+                    None => {}
                 }
                 let _ = client.poll();
                 match lister.poll() {
@@ -356,8 +403,10 @@ mod watch {
                     }
                 }
             }
-            if !wait(Some(&mut client), config.every, stop) {
-                return Ok(());
+            match wait(Some(&mut client), config.every, signals) {
+                Wake::Elapsed => {}
+                Wake::Stop => return Ok(()),
+                Wake::Gone => return Err("the driver closed".to_owned()),
             }
         }
     }

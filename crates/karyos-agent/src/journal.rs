@@ -13,7 +13,10 @@
 //!   an outcome record after it ([`Kind`]); each is one DATA frame
 //!   ([`JournalRecord::encode`]).
 //! - **Failure.** An append that fails leaves the journal unavailable until
-//!   the agent restarts, and counts in [`Journal::failed_appends`]. A close
+//!   the agent restarts, and counts in [`Journal::failed_appends`]; the
+//!   restart is the recovery, since [`Journal::open`] recovers the store
+//!   and records the unknown interval. [`Journal::failed_at`] is when it
+//!   first failed, for the alert raised at once. A close
 //!   goes ahead without its record (failing toward safety); a reopen needs
 //!   its request durable first ([`Journal::append_durable`]) and is refused
 //!   otherwise (failing closed).
@@ -258,6 +261,8 @@ pub struct Journal {
     recorder: Option<Recorder<StdDisk, QueueSource>>,
     recording: u64,
     failed_appends: u64,
+    /// Host time of the first failed append.
+    failed_at: Option<u64>,
     gap: Option<Gap>,
 }
 
@@ -308,6 +313,7 @@ impl Journal {
             recorder: Some(recorder),
             recording,
             failed_appends: 0,
+            failed_at: None,
             gap: scan.gap,
         };
         let pending = scan
@@ -337,6 +343,12 @@ impl Journal {
     #[must_use]
     pub const fn failed_appends(&self) -> u64 {
         self.failed_appends
+    }
+
+    /// Host time of the first append that failed, if one did.
+    #[must_use]
+    pub const fn failed_at(&self) -> Option<u64> {
+        self.failed_at
     }
 
     /// Whether an append failed: the journal then refuses every append.
@@ -407,7 +419,7 @@ impl Journal {
         durable: bool,
     ) -> Result<u64, JournalError> {
         let Some(recorder) = self.recorder.as_mut() else {
-            self.count_failure();
+            self.count_failure(now);
             return Err(JournalError::Unavailable);
         };
         let result = (|| {
@@ -426,12 +438,19 @@ impl Journal {
         })();
         if result.is_err() {
             self.recorder = None;
-            self.count_failure();
+            self.count_failure(now);
         }
         result
     }
 
-    fn count_failure(&mut self) {
+    /// Tests: the journal as an append failure leaves it.
+    #[cfg(test)]
+    pub(crate) fn break_recorder(&mut self) {
+        self.recorder = None;
+    }
+
+    fn count_failure(&mut self, now: u64) {
+        self.failed_at.get_or_insert(now);
         // Checked: at its end the count keeps its value.
         if let Some(next) = self.failed_appends.checked_add(1) {
             self.failed_appends = next;
