@@ -9,10 +9,12 @@
 //!
 //! A host's loop is the driver's duty, then the server's, then
 //! [`DriverHost::finish_ended`]. A replay that ended keeps its target for
-//! the host's replay linger before it is finished, so a requester that
-//! subscribes after the answer still reads it from its first position: the
-//! target is joined there (`karyos_driver::replay`), and finishing it
-//! retires it. At shutdown the server hands the host back
+//! the host's replay linger before it is finished, which retires it. A
+//! subscriber joins the target where it is when it attaches: one that
+//! attaches after the replay began writing, as a requester subscribing
+//! after the `Replay` answer does, may miss what was written before it.
+//! Until the sink waits for the target's first reader (archive-host.md,
+//! H2b), only a reader attached before the replay starts reads it whole. At shutdown the server hands the host back
 //! ([`ControlServer::shutdown_into_host`]), the host finishes what the
 //! agent's stop ended, and [`DriverHost::into_driver`] returns the driver
 //! for its own shutdown.
