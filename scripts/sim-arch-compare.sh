@@ -36,6 +36,8 @@ printf 'seeds per scenario: %s\n' "$seeds"
 # interrupted comparison leaves nothing running.
 native_container="karyos-sim-arch-native-$$"
 container="karyos-sim-arch-$$"
+# Called by the trap below, which shellcheck does not follow.
+# shellcheck disable=SC2329
 cleanup() {
     docker stop "$native_container" "$container" >/dev/null 2>&1 || true
 }

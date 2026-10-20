@@ -10,6 +10,8 @@
 # boundary catches panics only if libkaryos unwinds). Also fail unless the
 # conformance formats of FORMAT.md's marker line, which the package script
 # reads, equal the reference runner's FORMATS.
+# Also fail on a shellcheck finding in scripts/, where shellcheck is
+# installed.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 workspace_lints="$(awk '/^\[workspace.lints.clippy\]/{f=1;next} /^\[/{f=0} f && /=/' "$root/Cargo.toml" | sed 's/ //g')"
@@ -34,6 +36,8 @@ if ! grep -qx '#!\[deny(unsafe_code)\]' "$ffi/src/lib.rs"; then
     echo 'karyos-ffi src/lib.rs must declare #![deny(unsafe_code)]' >&2
     status=1
 fi
+# $ARGV is perl's, in a single-quoted perl program.
+# shellcheck disable=SC2016
 expects="$(cd "$ffi" && find src tests -name '*.rs' -print0 | sort -z | xargs -0 perl -0ne 'while (/expect\(\s*unsafe_code\b/g) { print "$ARGV\n" }')"
 if [ "$expects" != "$(printf 'src/lib.rs\ntests/support/abi.rs')" ]; then
     printf 'karyos-ffi expects unsafe_code outside src/lib.rs (mod abi) and tests/support/abi.rs, or not once in each:\n%s\n' "$expects" >&2
@@ -60,6 +64,16 @@ if marker="$("$root/scripts/conformance-formats.sh")"; then
     fi
 else
     status=1
+fi
+# The scripts stay shellcheck-clean, where shellcheck is installed (a
+# directive in a script states each deliberate exception).
+if command -v shellcheck >/dev/null 2>&1; then
+    if ! shellcheck "$root"/scripts/*.sh; then
+        echo 'a script under scripts/ has shellcheck findings' >&2
+        status=1
+    fi
+else
+    echo 'lint-sync: shellcheck not installed: scripts/ not checked' >&2
 fi
 if grep -qE '^[[:space:]]*panic[[:space:]]*=[[:space:]]*"abort"' "$root/Cargo.toml"; then
     echo 'a workspace profile sets panic = "abort"; libkaryos must unwind' >&2
