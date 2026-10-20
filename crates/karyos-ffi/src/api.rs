@@ -5,6 +5,7 @@
 
 pub(crate) mod client;
 pub(crate) mod clock;
+pub(crate) mod conflated;
 pub(crate) mod driver;
 pub(crate) mod outcomes;
 pub(crate) mod publication;

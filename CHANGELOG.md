@@ -11,6 +11,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- karyos-tools: `replay::HELP` is replaced by `replay::help(command)`,
+  which names the command the diff was invoked as (`karyos-replay diff` or
+  its alias `karyos-tools replay diff`; H5, #521).
+- A publication a client is granted through the command ring of a driver
+  in its process binds its stream's conflation table, as the driver's own
+  publication does: an offer with a key outside the table, or a value
+  larger than its capacity, is refused before it appends
+  (`ClientError::Conflation`), where until now it was appended and the
+  driver's feeder dropped it from the conflated view and counted it as a
+  rejected key. The low-level `ClientPublication` taken from such a grant
+  was the earlier route to that gap. karyos-client's `HandOverEntry` gains
+  `conflation` and `with_conflation`. A client attached to a driver in
+  another process is not checked yet (F7b-2c).
+
 - karyos-archive's `client::connection` (quantstratum-docs:
   `karyos/design/ffi-archive.md`, F9-0): a requester's control streams to
   an Archive over a facade client. `ArchiveConnection::open(&mut client,
@@ -524,6 +538,40 @@ release may break APIs, wire formats and shared-memory layouts.
   of its incarnation plus its cell position.
 
 ### Added
+
+- Conflated subscriptions over the C ABI (F7b-2b; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md`, `conflation-end-to-end.md`):
+  - `karyos_stream_options` grows `conflation_keys`,
+    `conflation_value_capacity` (u32) and `conflation_journal_capacity`
+    (u64): an ABI addition, 80 bytes. All three 0 means no table; a
+    partial set, or a table the driver cannot build, is
+    `KARYOS_E_INVALID_ARGUMENT`. A 64-byte struct of the first layout is
+    still accepted, with no table; a size between 64 and 80 is refused.
+    `karyos_stream_options_init` now writes 80.
+  - `karyos_driver_subscribe_conflated`, `karyos_conflated_poll` (a
+    `karyos_conflated_handler` gets the key, the value from the reader's
+    private copy, its version and its freshness: `KARYOS_FRESH` or the
+    stale start) and `karyos_conflated_close`, with
+    `KARYOS_MAX_CONFLATED_SUBSCRIPTIONS`. A stream without a table is
+    `KARYOS_E_CONFLATION`; a closed view, or one of a closed driver,
+    answers `KARYOS_E_CLOSED`.
+  - Conformance: `conflated.typed.statuses`; `struct.size.stream.options`
+    covers both layouts; the runner's three new calls and the stream's
+    conflation arguments.
+
+- Per-offer options (F7b-2a; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md`): the facade's
+  `Publication::offer_on_with(lane, payload, OfferOptions)`, with
+  `OfferOptions { reserved_value }` (`#[non_exhaustive]`; `Default`,
+  `new`, `with_reserved_value`), and over the C ABI the new struct
+  `karyos_offer_options` (`size`, `reserved`, `reserved_value`; read by
+  prefix, 16 bytes in 0.1.0), `karyos_offer_options_init` and
+  `karyos_publication_offer_with`. The reserved value is every fragment's
+  header value, which subscribers read as `reserved_value`, and a
+  conflated stream's key. A null options, a short size or a nonzero
+  `reserved` is `KARYOS_E_INVALID_ARGUMENT`; a key or value the
+  publication refuses is `KARYOS_E_CONFLATION`, with nothing reserved.
+  Claims do not take options yet.
 
 - `karyos-catalog list DIR [--json]` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H4a): an archive directory's

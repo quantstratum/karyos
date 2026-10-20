@@ -1,0 +1,38 @@
+# An offer's options are checked before its message: a nonzero reserved
+# answers KARYOS_E_INVALID_ARGUMENT even for an empty message, with
+# nothing appended. Valid options leave the offer's other statuses as
+# karyos_publication_offer's: an empty message and a lane the stream does
+# not configure. A subscriber is attached, so those checks are reached;
+# any reserved value is accepted on a stream without a conflation table
+# (SPEC.md §10.2, §13).
+format 1
+id offer.options.typed.statuses
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=7
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_publication client=$client stream_id=7
+expect KARYOS_OK publication=$publication
+call karyos_client_add_subscription_with client=$client stream_id=7
+expect KARYOS_OK subscription=$subscription
+call karyos_publication_offer_with publication=$publication length=0 reserved=1
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_publication_offer_with publication=$publication length=0
+expect KARYOS_E_EMPTY_MESSAGE
+call karyos_publication_offer_with publication=$publication lane=1 payload="x"
+expect KARYOS_E_INVALID_LANE
+call karyos_publication_offer_with publication=$publication payload="x" reserved_value=-1
+expect KARYOS_OK lane=0 position=0 tail="intact"
+call karyos_subscription_close subscription=$subscription
+expect KARYOS_OK
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

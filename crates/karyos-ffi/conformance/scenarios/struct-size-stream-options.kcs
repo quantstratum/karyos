@@ -1,7 +1,9 @@
-# karyos_stream_options of ABI 0.1.0 is 64 bytes: a smaller size adds no
-# stream (KARYOS_E_INVALID_ARGUMENT), and a newer caller's larger struct
-# adds the stream its 0.1.0 prefix describes (SPEC.md §10.2, §13, C ABI
-# boundary).
+# karyos_stream_options has two layouts: 64 bytes in ABI 0.1.0 before
+# conflation (a stream with no conflation table), and 80 bytes with the
+# conflation fields. A smaller size, or one between the two, which no
+# header produces and which could cut a field, adds no stream
+# (KARYOS_E_INVALID_ARGUMENT). A newer caller's larger struct adds the
+# stream its 80-byte prefix describes (SPEC.md §10.2, §13, C ABI boundary).
 format 1
 id struct.size.stream.options
 abi 0.1
@@ -11,10 +13,31 @@ call karyos_driver_create
 expect KARYOS_OK driver=$driver
 call karyos_driver_add_stream driver=$driver stream_id=7 size=60
 expect KARYOS_E_INVALID_ARGUMENT
-call karyos_driver_add_stream driver=$driver stream_id=7 size=80
+call karyos_driver_add_stream driver=$driver stream_id=7 size=72
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_add_stream driver=$driver stream_id=7 size=76 conflation_keys=4 conflation_value_capacity=64 conflation_journal_capacity=4096
+expect KARYOS_E_INVALID_ARGUMENT
+# 64 bytes: the conflation fields are not read, so the stream has no table.
+call karyos_driver_add_stream driver=$driver stream_id=7 size=64 conflation_keys=4 conflation_value_capacity=64 conflation_journal_capacity=4096
 expect KARYOS_OK
-# The stream exists once: the newer struct added exactly it.
+call karyos_driver_subscribe_conflated driver=$driver stream_id=7
+expect KARYOS_E_CONFLATION
+call karyos_driver_add_stream driver=$driver stream_id=8 size=80 conflation_keys=4 conflation_value_capacity=64 conflation_journal_capacity=4096
+expect KARYOS_OK
+call karyos_driver_subscribe_conflated driver=$driver stream_id=8
+expect KARYOS_OK conflated=$view
+call karyos_conflated_close conflated=$view
+expect KARYOS_OK
+call karyos_driver_add_stream driver=$driver stream_id=9 size=96 conflation_keys=4 conflation_value_capacity=64 conflation_journal_capacity=4096
+expect KARYOS_OK
+call karyos_driver_subscribe_conflated driver=$driver stream_id=9
+expect KARYOS_OK conflated=$newer
+call karyos_conflated_close conflated=$newer
+expect KARYOS_OK
+# Each stream exists once: each accepted struct added exactly it.
 call karyos_driver_add_stream driver=$driver stream_id=7
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_add_stream driver=$driver stream_id=9
 expect KARYOS_E_INVALID_ARGUMENT
 call karyos_driver_close driver=$driver
 expect KARYOS_OK
