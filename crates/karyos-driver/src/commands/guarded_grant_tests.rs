@@ -2,9 +2,8 @@
 
 //! A guarded publication's grant over the control path (G-x2;
 //! `quantstratum-docs: karyos/design/guards-and-abort.md`, "The binding
-//! across processes"), over real sockets, descriptors and regions, with
-//! the test-only switch that lifts the control path's refusal until the
-//! client binds the regions (G-x3).
+//! across processes"), over real sockets, descriptors and regions, read
+//! below the client's binding (G-x3) to see what the driver grants.
 
 #![allow(
     clippy::unwrap_used,
@@ -51,7 +50,7 @@ fn dir(name: &str) -> PathBuf {
 }
 
 /// An IPC driver whose clients hold at most `exports` grants, with one
-/// guarded stream whose guard is open at epoch 2, issuing guarded grants.
+/// guarded stream whose guard is open at epoch 2.
 fn guarded_driver(dir: &Path, exports: usize) -> (IpcDriver, GuardHandle, StreamHandle) {
     let timeout = 5_000_000_000;
     let mut driver = EmbeddedDriver::with_ipc(
@@ -97,7 +96,6 @@ fn guarded_driver(dir: &Path, exports: usize) -> (IpcDriver, GuardHandle, Stream
     let guard = driver.add_guard("orders").unwrap();
     driver.guard_stream(stream, guard, MESSAGES, None).unwrap();
     assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
-    driver.guarded_grants = true;
     (driver, guard, stream)
 }
 
