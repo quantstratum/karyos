@@ -1077,7 +1077,10 @@ unsafe extern "C" fn keep_message(
     let bytes = if length == 0 {
         Vec::new()
     } else {
-        // SAFETY: the library hands `length` readable bytes for the call.
+        // SAFETY: `length` is nonzero here (an empty message never reaches
+        // `from_raw_parts`, whose pointer must be non-null even for 0
+        // bytes), and the library hands `length` readable bytes at `data`,
+        // its private copy, for the call.
         unsafe { core::slice::from_raw_parts(data, length) }.to_vec()
     };
     polled.messages.push(bytes);
