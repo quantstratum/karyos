@@ -364,6 +364,8 @@ fn guard_entry(out: &mut Out<'_>, entry: &GuardEntry) {
         fields.number("requester", entry.requester);
         fields.number("outcome", entry.outcome);
         fields.number("refusal", entry.refusal);
+        fields.number("operator", entry.operator);
+        fields.number("parameters", entry.parameters);
     });
 }
 

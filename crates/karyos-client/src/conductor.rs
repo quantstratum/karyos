@@ -108,6 +108,10 @@ pub enum ConductorError {
     /// driver's minimum (`DriverConfig::ring_capacity`).
     #[error("command larger than the command ring carries")]
     CommandTooLarge,
+    /// A guard reopen names an epoch that cannot be closed: 0, an even
+    /// (open) epoch, or one above `karyos_sys::guard::MAX_EPOCH`.
+    #[error("not a closed guard epoch")]
+    InvalidGuardEpoch,
 }
 
 /// The channel URI `uri` for a command: it parses (SPEC §5) and fits.
@@ -162,6 +166,13 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     NetworkSubscription {
         /// The network subscription's registration.
         registration: u64,
+    },
+    /// A guard's word after a guard close or reopen (M10).
+    GuardState {
+        /// The guard id.
+        guard: u64,
+        /// Its state after the transition.
+        state: karyos_sys::guard::GuardState,
     },
     /// The command succeeded.
     Succeeded,
@@ -358,6 +369,8 @@ enum Kind {
         allow(dead_code, reason = "remote clients exist only on Linux")
     )]
     QueryCutover,
+    /// A guard close or reopen (M10).
+    Guard,
 }
 
 impl Kind {
@@ -1205,6 +1218,77 @@ impl<T: TermBytes> ClientConductor<T> {
         })
     }
 
+    /// Closes guard `guard` (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, local guards; M10), on behalf of
+    /// operator `operator` (a uid; 0 when the client acts for itself) with
+    /// the operator's `reason`. The driver audits it with `operation`, the
+    /// client (and the operator) and the request's parameters digest,
+    /// `karyos_protocol::cnc::guard_parameters` over the guard, epoch 0,
+    /// the operation, the operator and the reason. Returns the request
+    /// sequence. It completes as [`Outcome::GuardState`] with the guard's
+    /// state after the close (already closed included), or is refused with
+    /// `UnknownGuard`, `GuardExhausted` or `NotAuthorized`.
+    ///
+    /// # Errors
+    ///
+    /// The [`ConductorError`]s of a submission; nothing is submitted on
+    /// error.
+    pub fn guard_close(
+        &mut self,
+        guard: u64,
+        operation: u64,
+        operator: u64,
+        reason: &[u8],
+    ) -> Result<u64, ConductorError> {
+        let parameters =
+            karyos_protocol::cnc::guard_parameters(guard, 0, operation, operator, reason);
+        self.submit(Kind::Guard, None, |sequence| Command::GuardClose {
+            sequence,
+            guard,
+            operation,
+            operator,
+            parameters,
+        })
+    }
+
+    /// Reopens guard `guard`, closed at `expected`, as
+    /// [`ClientConductor::guard_close`] closes one: audited alike, its
+    /// digest over `expected`. It completes as [`Outcome::GuardState`], or
+    /// is refused with `UnknownGuard`, `GuardNotClosedAt` (detail: the
+    /// current guard word), `GuardExhausted` or `NotAuthorized`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConductorError::InvalidGuardEpoch`] when `expected` is not
+    /// a closed epoch, and the other [`ConductorError`]s; nothing is
+    /// submitted on error.
+    pub fn guard_reopen(
+        &mut self,
+        guard: u64,
+        expected: u64,
+        operation: u64,
+        operator: u64,
+        reason: &[u8],
+    ) -> Result<u64, ConductorError> {
+        let closed = karyos_sys::guard::GuardState {
+            epoch: expected,
+            open: false,
+        };
+        if karyos_sys::guard::encode(closed).is_none() {
+            return Err(ConductorError::InvalidGuardEpoch);
+        }
+        let parameters =
+            karyos_protocol::cnc::guard_parameters(guard, expected, operation, operator, reason);
+        self.submit(Kind::Guard, None, |sequence| Command::GuardReopen {
+            sequence,
+            guard,
+            expected,
+            operation,
+            operator,
+            parameters,
+        })
+    }
+
     /// Loss reports of this client's subscriptions dropped because the
     /// queue was full: the local count, complete whether or not the client
     /// counter `loss reports dropped` could be allocated.
@@ -1706,6 +1790,9 @@ impl<T: TermBytes> ClientConductor<T> {
             },
             (Kind::Remove | Kind::CloseJournal, Response::OperationSucceeded { .. }) => {
                 Outcome::Succeeded
+            }
+            (Kind::Guard, Response::GuardState { guard, state, .. }) => {
+                Outcome::GuardState { guard, state }
             }
             (
                 Kind::AddNetworkSubscription,

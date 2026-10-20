@@ -28,8 +28,8 @@
 //! | `0x0A` | `CloseJournal` | sequence | journal number (nonzero) | final delivery boundary | |
 //! | `0x0B` | `QueryCutover` | sequence | registration | | |
 //! | `0x0C` | `AddConflatedSubscription` | sequence | stream and session as above | | |
-//! | `0x0D` | `GuardClose` | sequence | guard | operation id | |
-//! | `0x0E` | `GuardReopen` | sequence | guard | expected closed epoch | operation id |
+//! | `0x0D` | `GuardClose` | sequence | guard | operation id | operator uid, then the parameters digest |
+//! | `0x0E` | `GuardReopen` | sequence | guard | expected closed epoch | operation id, operator uid, then the parameters digest |
 //! | `0x0F` | `AddNetworkPublication` | sequence | stream id (low 32; high 32 zero) | flags: as `AddPublication`, and bit 1 concurrent | channel URI length |
 //! | `0x10` | `AddNetworkSubscription` | sequence | stream id (low 32; high 32 zero) | role as `AddSubscription` | channel URI length |
 //! | `0x11` | `AddImageSubscription` | sequence | image registration (nonzero) | role as `AddSubscription` | lane as `AddPublication` |
@@ -49,7 +49,15 @@
 //! closes a guard, or reopens one closed at the epoch it names, on the
 //! driver's control path, authorized by the calling process's credentials
 //! (G1). The operation id is the requester's own id for the audit record
-//! (Audit A). The driver answers `GuardState` with the guard's word after
+//! (Audit A). The operator uid names the person a tool acts for (0: none,
+//! the client itself), and the parameters digest is
+//! [`guard_parameters`] over what was asked (`quantstratum-docs:
+//! karyos/design/management-agent-gap-analysis.md`, M10 and owner item 6);
+//! both go to the audit record as given. The operator uid is asserted by
+//! the admitted client, not verified by the driver: the driver knows only
+//! the client, whose uid admission proved equal to its own (G1), and the
+//! tool that sets the operator (the management agent) authenticates its
+//! own caller. The driver answers `GuardState` with the guard's word after
 //! the transition, or `Error` with `UnknownGuard`, `GuardNotClosedAt`
 //! (detail: the current guard word), `GuardExhausted` or `NotAuthorized`.
 //!
@@ -834,6 +842,10 @@ pub enum Command {
         guard: u64,
         /// The requester's operation id, for the audit record.
         operation: u64,
+        /// The operator uid the requester acts for; 0 for none.
+        operator: u64,
+        /// [`guard_parameters`] of the request, for the audit record.
+        parameters: u64,
     },
     /// Reopen a guard closed at `expected` (local control, G1).
     GuardReopen {
@@ -845,7 +857,39 @@ pub enum Command {
         expected: u64,
         /// The requester's operation id, for the audit record.
         operation: u64,
+        /// The operator uid the requester acts for; 0 for none.
+        operator: u64,
+        /// [`guard_parameters`] of the request, for the audit record.
+        parameters: u64,
     },
+}
+
+/// The parameters digest of a guard command: 64-bit FNV-1a over the guard,
+/// the expected epoch (0 for a close), the operation id and the operator
+/// uid, each as eight little-endian bytes, then the operator's reason.
+/// It binds the audit record to what was asked, and is nonzero even with
+/// no reason; it is a correlation aid, not a security digest
+/// (authenticated audit waits on ADR-0035).
+#[must_use]
+pub fn guard_parameters(
+    guard: u64,
+    expected: u64,
+    operation: u64,
+    operator: u64,
+    reason: &[u8],
+) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    [guard, expected, operation, operator]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .chain(reason.iter().copied())
+        .fold(OFFSET, |hash, byte| {
+            // FNV-1a multiplies modulo 2^64 by definition. ADR-0007's rule
+            // against wrapping covers positions, lengths and counters, whose
+            // overflow is an error; a hash has no overflow to report.
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
 }
 
 /// Why the driver refused a command.
@@ -1299,19 +1343,26 @@ impl Command {
                 sequence,
                 guard,
                 operation,
-            } => write_words(&[sequence, guard, operation], out),
+                operator,
+                parameters,
+            } => write_words(&[sequence, guard, operation, operator, parameters], out),
             Self::GuardReopen {
                 sequence,
                 guard,
                 expected,
                 operation,
+                operator,
+                parameters,
             } => {
                 if !closed_epoch(expected) {
                     return Err(CncError::Reserved {
                         type_id: GUARD_REOPEN,
                     });
                 }
-                write_words(&[sequence, guard, expected, operation], out)
+                write_words(
+                    &[sequence, guard, expected, operation, operator, parameters],
+                    out,
+                )
             }
             Self::AddNetworkPublication {
                 sequence,
@@ -1533,15 +1584,19 @@ impl Command {
                 })
             }
             GUARD_CLOSE => {
-                let [sequence, guard, operation] = read_words::<3>(type_id, bytes)?;
+                let [sequence, guard, operation, operator, parameters] =
+                    read_words::<5>(type_id, bytes)?;
                 Ok(Self::GuardClose {
                     sequence,
                     guard,
                     operation,
+                    operator,
+                    parameters,
                 })
             }
             GUARD_REOPEN => {
-                let [sequence, guard, expected, operation] = read_words::<4>(type_id, bytes)?;
+                let [sequence, guard, expected, operation, operator, parameters] =
+                    read_words::<6>(type_id, bytes)?;
                 // Only a closed epoch can be reopened: odd, 1 to MAX_EPOCH.
                 if !closed_epoch(expected) {
                     return Err(CncError::Reserved { type_id });
@@ -1551,6 +1606,8 @@ impl Command {
                     guard,
                     expected,
                     operation,
+                    operator,
+                    parameters,
                 })
             }
             ADD_NETWORK_PUBLICATION | ADD_NETWORK_SUBSCRIPTION => {
@@ -3633,6 +3690,8 @@ mod journal_tests {
             sequence: 5,
             guard: 3,
             operation: 77,
+            operator: 1000,
+            parameters: 0xFEED,
         };
         let length = close.encode(&mut out).unwrap();
         assert_eq!(close.type_id(), 0x0D);
@@ -3640,7 +3699,8 @@ mod journal_tests {
         assert_eq!(
             &out[..length],
             &[
-                5, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0,
+                5, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0, 0xE8, 3,
+                0, 0, 0, 0, 0, 0, 0xED, 0xFE, 0, 0, 0, 0, 0, 0,
             ]
         );
         assert_eq!(Command::decode(0x0D, &out[..length]), Ok(close));
@@ -3649,10 +3709,12 @@ mod journal_tests {
             guard: 3,
             expected: 1,
             operation: 78,
+            operator: 1000,
+            parameters: 9,
         };
         let length = reopen.encode(&mut out).unwrap();
         assert_eq!(reopen.type_id(), 0x0E);
-        assert_eq!(words_of(&out[..length]), [6, 3, 1, 78]);
+        assert_eq!(words_of(&out[..length]), [6, 3, 1, 78, 1000, 9]);
         assert_eq!(Command::decode(0x0E, &out[..length]), Ok(reopen));
         let request = RequestId {
             client: 2,
@@ -3691,12 +3753,31 @@ mod journal_tests {
         assert_eq!(ErrorCode::from_code(17), None);
     }
 
+    /// The digest is 64-bit FNV-1a over the four words, little endian,
+    /// then the reason: a reference value pins it, and each input moves it.
+    #[test]
+    fn the_guard_parameters_digest_is_fnv_1a_over_the_request() {
+        let digest = guard_parameters(3, 0, 77, 1000, b"drill");
+        assert_eq!(digest, 0x9886_bd28_db8b_bca7);
+        for other in [
+            guard_parameters(4, 0, 77, 1000, b"drill"),
+            guard_parameters(3, 1, 77, 1000, b"drill"),
+            guard_parameters(3, 0, 78, 1000, b"drill"),
+            guard_parameters(3, 0, 77, 1001, b"drill"),
+            guard_parameters(3, 0, 77, 1000, b"drilL"),
+            guard_parameters(3, 0, 77, 1000, b""),
+        ] {
+            assert_ne!(other, digest);
+            assert_ne!(other, 0);
+        }
+    }
+
     #[test]
     fn a_reopen_of_an_impossible_epoch_is_refused() {
         // Epoch 0, an open (even) epoch, and one above MAX_EPOCH.
         for expected in [0, 2, karyos_sys::guard::MAX_EPOCH + 1, u64::MAX] {
             assert_eq!(
-                Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, expected, 7])),
+                Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, expected, 7, 0, 0])),
                 Err(CncError::Reserved {
                     type_id: GUARD_REOPEN
                 }),
@@ -3709,6 +3790,8 @@ mod journal_tests {
                     guard: 3,
                     expected,
                     operation: 7,
+                    operator: 0,
+                    parameters: 0,
                 }
                 .encode(&mut out),
                 Err(CncError::Reserved {
@@ -3717,7 +3800,7 @@ mod journal_tests {
             );
         }
         let last = karyos_sys::guard::MAX_EPOCH;
-        assert!(Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, last, 7])).is_ok());
+        assert!(Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, last, 7, 0, 0])).is_ok());
     }
 
     #[test]
@@ -4260,25 +4343,31 @@ mod properties {
             (any::<u64>(), stream()).prop_map(|(sequence, stream)| {
                 Command::AddConflatedSubscription { sequence, stream }
             }),
-            any::<(u64, u64, u64)>().prop_map(|(sequence, guard, operation)| {
-                Command::GuardClose {
+            any::<(u64, u64, u64, u64, u64)>().prop_map(
+                |(sequence, guard, operation, operator, parameters)| Command::GuardClose {
                     sequence,
                     guard,
                     operation,
+                    operator,
+                    parameters,
                 }
-            }),
+            ),
             (
-                any::<(u64, u64, u64)>(),
+                any::<(u64, u64, u64, u64, u64)>(),
                 0..=(karyos_sys::guard::MAX_EPOCH >> 1)
             )
-                .prop_map(|((sequence, guard, operation), half)| {
-                    Command::GuardReopen {
-                        sequence,
-                        guard,
-                        expected: half * 2 + 1,
-                        operation,
+                .prop_map(
+                    |((sequence, guard, operation, operator, parameters), half)| {
+                        Command::GuardReopen {
+                            sequence,
+                            guard,
+                            expected: half * 2 + 1,
+                            operation,
+                            operator,
+                            parameters,
+                        }
                     }
-                }),
+                ),
         ]
     }
 
@@ -4472,8 +4561,8 @@ mod properties {
                     (CLOSE_JOURNAL, 3),
                     (QUERY_CUTOVER, 2),
                     (ADD_CONFLATED_SUBSCRIPTION, 2),
-                    (GUARD_CLOSE, 3),
-                    (GUARD_REOPEN, 4),
+                    (GUARD_CLOSE, 5),
+                    (GUARD_REOPEN, 6),
                     (ADD_IMAGE_SUBSCRIPTION, 4),
                 ],
             ),

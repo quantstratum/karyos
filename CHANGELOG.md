@@ -11,6 +11,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `GuardClose` and `GuardReopen` carry the operator a client acts for and
+  a parameters digest (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M10 and owner item 6),
+  in place under admission `VERSION` 2, which is unreleased: `GuardClose`
+  grows from 3 to 5 words and `GuardReopen` from 4 to 6.
+  `karyos_protocol::cnc::guard_parameters` is the digest, 64-bit FNV-1a
+  over the guard, the expected epoch (0 for a close), the operation id and
+  the operator uid, then the operator's reason: a correlation aid, not a
+  security digest. The driver audits a command naming an operator as
+  `Requester::Operator { client, uid }`, and every record carries the
+  digest (`AuditRecord::parameters`). The guard audit ring of
+  `karyos_sys::diag` writes the operator uid and the digest into words 8
+  and 9 of its record, zero before, with `requester_kind` 2 for an
+  operator; the record's size is unchanged. The management agent's guard
+  feed and API v1's JSON append `operator` and `parameters` to each
+  record.
+
 - karyos-client's public enums and report structs are `#[non_exhaustive]`
   before alpha.2 (quantstratum-docs:
   `karyos/testing/public-api-audit-alpha2.md`), so later minor releases can
@@ -402,6 +419,38 @@ release may break APIs, wire formats and shared-memory layouts.
   `VERSION` 2; a driver that does not know the bit refuses the command.
   The driver refuses an exclusive stream with `InvalidPublicationMode`
   and a `karyos:udp` channel with `UnsupportedChannel`.
+
+- Guard close and reopen for a client (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M10):
+  `ClientConductor::guard_close(guard, operation, operator, reason)` and
+  `guard_reopen(guard, expected, operation, operator, reason)`, and the same
+  on `RemoteClient`, complete as `Outcome::GuardState { guard, state }` or
+  are refused as the driver documents. They compute the parameters digest
+  from the request; a reopen naming an epoch that cannot be closed is
+  refused before submission (`ConductorError::InvalidGuardEpoch`).
+
+- Guard close acknowledgements for tools (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M4b). While a guard is
+  closed by a close, the conductor counts that close's registered senders
+  as `close_guard_ack` reports them, at every duty cycle and without
+  allocating: `guard senders applied`, `guard senders in flight`, `guard
+  senders pending` and `guard senders overdue`, with `guard ack epoch`
+  (0 while no close is in effect), gauges keyed by `KIND_GUARD` and the
+  guard id, written inside a pass on `guard ack pass` and allocated all
+  together or not at all. `karyos_client::guard_acks::guard_acks` reads
+  them, and `karyos_client::groups::read_groups` reads any such group
+  (`capabilities` now uses it). A guard may not be named after one of the
+  six labels, as its word gauge shares their keys (`InvalidConfig`).
+
+- karyos-archive's recording lister (phase 5, M11; quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`):
+  `client::list::RecordingLister` reads the whole catalog over the control
+  streams, page by page, never blocking. A page that delivered any
+  recording asks for the next one from the id after its last, since the
+  Archive leaves out a recording it cannot describe; the listing ends at an
+  empty page or a refusal. It keeps at most `ListerConfig::max_recordings`
+  and counts the rest; answers to other requesters are skipped. The
+  management agent's catalog view builds on it.
 
 - API v1's JSON carries each driver's trace window (M6c): `latencies`, one
   object per lane with `p50`, `p90`, `p99`, `p999` and `max` as `null` or

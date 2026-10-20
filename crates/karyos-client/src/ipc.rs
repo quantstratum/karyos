@@ -1000,6 +1000,42 @@ impl RemoteClient {
             .allocate_counter(type_id, label, stream, participant)
     }
 
+    /// Closes guard `guard` on behalf of `operator`, as
+    /// [`ClientConductor::guard_close`]; it completes as
+    /// [`Outcome::GuardState`](crate::Outcome::GuardState).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::guard_close`].
+    pub fn guard_close(
+        &mut self,
+        guard: u64,
+        operation: u64,
+        operator: u64,
+        reason: &[u8],
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .guard_close(guard, operation, operator, reason)
+    }
+
+    /// Reopens guard `guard` closed at `expected`, as
+    /// [`ClientConductor::guard_reopen`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::guard_reopen`].
+    pub fn guard_reopen(
+        &mut self,
+        guard: u64,
+        expected: u64,
+        operation: u64,
+        operator: u64,
+        reason: &[u8],
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .guard_reopen(guard, expected, operation, operator, reason)
+    }
+
     /// Requests a trace journal of `layout` observing `registration` with
     /// the clock `provenance` word, as [`ClientConductor::trace_journal`];
     /// it completes as

@@ -930,6 +930,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) net: Option<crate::net::Network<T>>,
     /// Each guard's word gauge (M4).
     guard_cells: crate::guards::GuardCells,
+    /// Each guard's close acknowledgement gauges (M4b).
+    guard_ack_cells: crate::guard_ack::GuardAckCells,
     /// The word the conductor loop's spin meter stores into (M5), copied
     /// into the fixed `conductor spin time` cell at each duty cycle, and
     /// whether the meter was handed out.
@@ -1339,6 +1341,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 guard_ring,
             ),
             guard_cells: crate::guards::GuardCells::default(),
+            guard_ack_cells: crate::guard_ack::GuardAckCells::default(),
             spin_word,
             spin_taken: false,
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
@@ -1754,8 +1757,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// # Errors
     ///
-    /// [`DriverError::InvalidConfig`] for an empty name or one longer than
-    /// [`crate::guards::MAX_GUARD_NAME`] bytes, [`DriverError::DuplicateGuard`],
+    /// [`DriverError::InvalidConfig`] for an empty name, one longer than
+    /// [`crate::guards::MAX_GUARD_NAME`] bytes, or one of the labels of a
+    /// guard's close acknowledgement gauges (`guard ack pass`, `guard ack
+    /// epoch`, `guard senders applied`, `in flight`, `pending` and
+    /// `overdue`, each `guard senders ...`); [`DriverError::DuplicateGuard`],
     /// [`DriverError::TooManyGuards`] and [`DriverError::GuardIdsExhausted`].
     pub fn add_guard(&mut self, name: &str) -> Result<GuardHandle, DriverError> {
         self.guards.add(name)
@@ -1794,9 +1800,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         operation: u64,
     ) -> Result<karyos_sys::guard::Closed, DriverError> {
         let now = self.clock.now();
-        let closed = self
-            .guards
-            .close(guard, operation, crate::guards::Requester::InProcess, now);
+        let closed = self.guards.close(
+            guard,
+            operation,
+            crate::guards::Requester::InProcess,
+            0,
+            now,
+        );
         match &closed {
             // The close took effect: a failed seal is reported, never
             // returned as a failed close.
@@ -2002,6 +2012,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             expected,
             operation,
             crate::guards::Requester::InProcess,
+            0,
             now,
         );
         if let Err(error) = &reopened {
@@ -3144,6 +3155,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         add_work(&self.counters, &mut work, &mut first_error, mirrored);
         self.update_stream_gauges();
         self.guard_cells.sync(&self.guards, &mut self.counters);
+        // The close acknowledgements of closed guards (M4b).
+        let clock = &mut self.clock;
+        self.guard_ack_cells.sync(
+            &self.guards,
+            &self.guard_senders,
+            &mut self.counters,
+            &mut || clock.now(),
+            self.config.guard_ack_timeout,
+        );
         // The conductor loop's spin time, stored by its meter on this thread.
         self.counters
             .set_conductor_spin(self.spin_word.load(std::sync::atomic::Ordering::Relaxed));
