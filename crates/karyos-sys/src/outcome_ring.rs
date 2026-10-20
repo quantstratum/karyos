@@ -49,6 +49,9 @@ const CONSUMED_STORE: Ordering = Ordering::Release;
 /// karyos/design/guards-and-abort.md`, "The binding across processes",
 /// G-x1).
 pub const OUTCOME_LAYOUT_VERSION: u64 = 2;
+/// The consumed cell region's layout version (`ConsumedCell`, G-x2):
+/// the client's consumed count in word 0, the rest reserved.
+pub const CONSUMED_CELL_LAYOUT_VERSION: u64 = 1;
 /// Words of the header stride.
 pub const HEADER_WORDS: usize = 16;
 /// Words of one record: 64 bytes.
@@ -259,8 +262,8 @@ impl Record {
 }
 
 /// Writes the header of a new ring for `binding`, of
-/// [`Binding::capacity`] slots. Called on the control path before the
-/// region is shared.
+/// [`Binding::capacity`] slots, its reserved words zeroed. Called on the
+/// control path before the region is shared.
 ///
 /// # Errors
 ///
@@ -280,6 +283,11 @@ pub fn init(ring: &[AtomicU64], binding: &Binding) -> Result<(), OutcomeError> {
         if let Some(cell) = ring.get(word) {
             cell.store(value, Ordering::Relaxed);
         }
+    }
+    // The reserved words are zero whatever memory the ring was given
+    // (DESIGN's P3 on #501).
+    for cell in ring.iter().take(HEADER_WORDS).skip(EPOCH + 1) {
+        cell.store(0, Ordering::Relaxed);
     }
     Ok(())
 }
