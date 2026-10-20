@@ -24,6 +24,9 @@ fn run(args: &[&std::ffi::OsStr]) -> (Option<i32>, String, String) {
 fn the_binary_lists_reads_only_and_refuses_what_it_does_not_know() {
     let (status, out, _) = run(&["--help".as_ref()]);
     assert_eq!(status, Some(0));
+    assert!(out.starts_with("karyos-catalog: "), "{out}");
+    let (status, list_help, _) = run(&["list".as_ref(), "--help".as_ref()]);
+    assert_eq!((status, list_help.as_str()), (Some(0), out.as_str()));
     assert!(
         out.contains("Usage: karyos-catalog list <dir> [--json]"),
         "{out}"

@@ -19,7 +19,7 @@ use karyos_archive::disk::{ReadOnly, StdDisk};
 use crate::replay::quoted;
 
 /// The usage text of `karyos-catalog --help`.
-pub const HELP: &str = "\\
+pub const HELP: &str = "\
 karyos-catalog: an archive directory's recordings (SPEC.md section 11).
 
 Usage: karyos-catalog list <dir> [--json]
@@ -88,6 +88,20 @@ fn channel(recording: &Recording) -> String {
     String::from_utf8_lossy(&recording.channel).into_owned()
 }
 
+/// A recording's channel on one line of text: a control character or a
+/// backslash in it is escaped as in a Rust string.
+fn channel_line(recording: &Recording) -> String {
+    let mut out = String::new();
+    for c in channel(recording).chars() {
+        if c == '\\' || c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// The listing as text, one line per recording.
 #[must_use]
 pub fn text(dir: &std::path::Path, listing: &Listing) -> String {
@@ -109,7 +123,7 @@ pub fn text(dir: &std::path::Path, listing: &Listing) -> String {
             recording.id,
             recording.stream_id,
             recording.session_id,
-            channel(recording),
+            channel_line(recording),
             recording.start,
             if recording.required {
                 "required"

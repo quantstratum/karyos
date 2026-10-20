@@ -987,7 +987,6 @@ enum Parsed {
     Corrupt,
 }
 
-/// Validates a whole header.
 /// What [`list`] read: the recordings, and whether the listing may be
 /// behind a live Archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1065,6 +1064,7 @@ pub fn list<D: Disk>(mut disk: D, dir: &Path) -> Result<Listing, CatalogError> {
     })
 }
 
+/// Validates a whole header.
 fn check_header(found: &[u8; HEADER]) -> Result<(), CatalogError> {
     let corrupt = CatalogError::Corrupt { offset: 0 };
     let word = |at: usize| -> Option<u32> {

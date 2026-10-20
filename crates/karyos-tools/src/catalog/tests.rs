@@ -123,6 +123,28 @@ fn a_catalog_is_listed_as_text_and_as_json() {
     assert!(out.contains("\"required\":true,\"stop\":null}]}"), "{out}");
 }
 
+/// A channel's control characters and backslashes are escaped in the
+/// text, which keeps one line per recording; the JSON quotes it.
+#[test]
+fn a_channel_stays_on_its_line() {
+    let scratch = Scratch::new();
+    let mut catalog = Catalog::open(StdDisk, &scratch.0).unwrap().catalog;
+    let _ = catalog
+        .start(NewRecording {
+            channel: b"a\nb\\c\td",
+            ..new_recording(1001, false)
+        })
+        .unwrap();
+    drop(catalog);
+    let (status, out, _) = run(&[scratch.0.as_os_str()]);
+    assert_eq!(status, 0);
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(out.contains("  channel a\\nb\\\\c\\td  "), "{out}");
+    let (status, out, _) = run(&[scratch.0.as_os_str(), "--json".as_ref()]);
+    assert_eq!(status, 0);
+    assert!(out.contains("\"channel\":\"a\\nb\\\\c\\u0009d\""), "{out}");
+}
+
 /// A record an Archive is still writing: listed up to it, reported, and
 /// the file left as it was.
 #[test]
