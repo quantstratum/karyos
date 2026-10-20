@@ -389,7 +389,7 @@ fn a_detached_ring_still_gets_its_last_record() {
     let consumed = cell.structure().as_slice().first().unwrap();
     let mut seen = Vec::new();
     let start = Instant::now();
-    while !seen.iter().any(|kind| *kind == Kind::Ended) {
+    while !seen.contains(&Kind::Ended) {
         assert!(start.elapsed() < Duration::from_secs(5), "saw {seen:?}");
         let _ = driver.do_work().unwrap();
         let _ = reader
