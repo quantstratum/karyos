@@ -283,7 +283,10 @@ fn a_bounded_listing_asks_for_no_more_than_its_count() {
     rig.page(second, &[9]);
     let done = rig.lister.poll();
     assert_eq!(ids(&done), [4, 6, 9]);
-    assert!(rig.sent.lock().unwrap().is_empty(), "no page past the count");
+    assert!(
+        rig.sent.lock().unwrap().is_empty(),
+        "no page past the count"
+    );
     // An Archive that sends more than asked: only the count is kept.
     rig.lister.start_from(0, 1);
     assert_eq!(rig.lister.poll(), ListPoll::Pending);
