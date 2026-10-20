@@ -42,3 +42,31 @@ fn every_status_has_static_text() {
     let first = abi::status_message(1);
     assert_eq!(abi::status_message(1), first);
 }
+
+/// The F9c wrappers of the conformance runner's `archive-replay` ops
+/// (tests/support/abi.rs) under Miri, with no driver: each passes its
+/// pointers and reads what the library wrote for an unknown handle, and
+/// the replay options' init fills its defaults.
+#[test]
+fn the_replay_wrappers_pass_their_pointers() {
+    const INVALID_HANDLE: i32 = 101;
+    let (status, options) = abi::replay_options();
+    assert_eq!((status, options.size, options.rate), (0, 48, 1));
+    assert_eq!(options.length, u64::MAX);
+    let options = abi::ReplayOptions {
+        recording_id: 3,
+        target_stream_id: 1041,
+        ..options
+    };
+    assert_eq!(abi::archive_replay(0, &options).0, INVALID_HANDLE);
+    assert_eq!(abi::archive_stop_replay(0, 5).0, INVALID_HANDLE);
+    assert_eq!(
+        abi::client_add_replay_subscription(0, 1041, 9).0,
+        INVALID_HANDLE
+    );
+    let (status, end) = abi::subscription_end_state(0);
+    assert_eq!((status, end.reason, end.position), (INVALID_HANDLE, 0, 0));
+    let (status, kept) = abi::archive_recordings(0, 0, 4);
+    assert_eq!(status, INVALID_HANDLE);
+    assert!(kept.is_empty());
+}

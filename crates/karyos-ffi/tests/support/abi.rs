@@ -164,6 +164,30 @@ pub struct Recording {
     pub channel_length: usize,
 }
 
+/// `karyos_replay_options` (F9c).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayOptions {
+    pub size: u32,
+    pub rate: u32,
+    pub scale_ppm: u32,
+    pub target_stream_id: i32,
+    pub recording_id: u64,
+    pub position: u64,
+    pub length: u64,
+    pub target_channel: *const c_char,
+}
+
+/// `karyos_subscription_end` (F9c).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubscriptionEnd {
+    pub size: u32,
+    pub reason: u32,
+    pub position: u64,
+    pub seal_code: u64,
+}
+
 unsafe extern "C" {
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
@@ -220,6 +244,23 @@ unsafe extern "C" {
         detail: *mut Detail,
     ) -> i32;
     safe fn karyos_archive_close(archive: u64) -> i32;
+    fn karyos_replay_options_init(options: *mut ReplayOptions) -> i32;
+    fn karyos_archive_replay(
+        archive: u64,
+        options: *const ReplayOptions,
+        replay_id: *mut u64,
+        session_id: *mut i32,
+        detail: *mut Detail,
+    ) -> i32;
+    fn karyos_archive_stop_replay(archive: u64, replay_id: u64, detail: *mut Detail) -> i32;
+    fn karyos_client_add_replay_subscription(
+        client: u64,
+        stream_id: i32,
+        session_id: i32,
+        options: *const core::ffi::c_void,
+        subscription: *mut u64,
+    ) -> i32;
+    fn karyos_subscription_end_state(subscription: u64, end: *mut SubscriptionEnd) -> i32;
     fn karyos_client_add_conflated_subscription(
         client: u64,
         uri: *const c_char,
@@ -795,6 +836,114 @@ unsafe extern "C" fn count_recording(
     // SAFETY: the context is the live `u32` of `archive_list`.
     let counted = unsafe { &mut *context.cast::<u32>() };
     *counted = counted.checked_add(1).unwrap_or(u32::MAX);
+}
+
+/// `T`'s size as a struct's `uint32_t` size field: 0, which the library
+/// refuses, if it did not fit.
+fn struct_size<T>() -> u32 {
+    u32::try_from(size_of::<T>()).unwrap_or_default()
+}
+
+/// What [`archive_recordings`] keeps of each recording: its id and
+/// position.
+unsafe extern "C" fn keep_recording(context: *mut core::ffi::c_void, recording: *const Recording) {
+    // SAFETY: the context is the live `Vec` of `archive_recordings`.
+    let kept = unsafe { &mut *context.cast::<Vec<(u64, u64)>>() };
+    // SAFETY: the library passes a live recording for the call.
+    let recording = unsafe { &*recording };
+    kept.push((recording.id, recording.position));
+}
+
+/// `karyos_archive_list` of `limit` recordings after `after_id`: the
+/// status, and each recording's id and position (F9c's conformance
+/// provisioning).
+pub fn archive_recordings(archive: u64, after_id: u64, limit: u32) -> (i32, Vec<(u64, u64)>) {
+    let mut kept: Vec<(u64, u64)> = Vec::new();
+    // SAFETY: a handler of the signature that returns normally and its live
+    // `Vec` context; no count, no detail.
+    let status = unsafe {
+        karyos_archive_list(
+            archive,
+            after_id,
+            limit,
+            Some(keep_recording),
+            (&raw mut kept).cast(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    (status, kept)
+}
+
+/// `karyos_replay_options_init`: the status and the defaults (F9c).
+pub fn replay_options() -> (i32, ReplayOptions) {
+    let mut options = core::mem::MaybeUninit::<ReplayOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `ReplayOptions`.
+    let status = unsafe { karyos_replay_options_init(options.as_mut_ptr()) };
+    // SAFETY: zeroed, then written in full on success; a zeroed struct is a
+    // value too (a null channel).
+    (status, unsafe { options.assume_init() })
+}
+
+/// `karyos_archive_replay`: the status, the replay id, its target's
+/// session and the detail's code.
+pub fn archive_replay(archive: u64, options: &ReplayOptions) -> (i32, u64, i32, u64) {
+    let (mut replay_id, mut session_id) = (0u64, 0i32);
+    let mut detail = Detail {
+        size: struct_size::<Detail>(),
+        ..Detail::default()
+    };
+    // SAFETY: live, aligned pointers of their stated sizes; the options'
+    // channel is null or a live C string (the caller's).
+    let status = unsafe {
+        karyos_archive_replay(
+            archive,
+            options,
+            &mut replay_id,
+            &mut session_id,
+            &mut detail,
+        )
+    };
+    (status, replay_id, session_id, detail.code)
+}
+
+/// `karyos_archive_stop_replay`: the status and the detail's code.
+pub fn archive_stop_replay(archive: u64, replay_id: u64) -> (i32, u64) {
+    let mut detail = Detail {
+        size: struct_size::<Detail>(),
+        ..Detail::default()
+    };
+    // SAFETY: a live detail of its stated size.
+    let status = unsafe { karyos_archive_stop_replay(archive, replay_id, &mut detail) };
+    (status, detail.code)
+}
+
+/// `karyos_client_add_replay_subscription` with the default options: the
+/// status and the subscription's handle.
+pub fn client_add_replay_subscription(client: u64, stream_id: i32, session_id: i32) -> (i32, u64) {
+    let mut subscription = 0;
+    // SAFETY: null options (the defaults) and a live, aligned `u64`.
+    let status = unsafe {
+        karyos_client_add_replay_subscription(
+            client,
+            stream_id,
+            session_id,
+            core::ptr::null(),
+            &mut subscription,
+        )
+    };
+    (status, subscription)
+}
+
+/// `karyos_subscription_end_state`: the status and the end written.
+pub fn subscription_end_state(subscription: u64) -> (i32, SubscriptionEnd) {
+    let mut end = SubscriptionEnd {
+        size: struct_size::<SubscriptionEnd>(),
+        ..SubscriptionEnd::default()
+    };
+    // SAFETY: a live, aligned struct of its stated size.
+    let status = unsafe { karyos_subscription_end_state(subscription, &mut end) };
+    (status, end)
 }
 
 /// `karyos_archive_list` of `limit` recordings after `after_id`: the
