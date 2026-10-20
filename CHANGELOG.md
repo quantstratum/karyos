@@ -11,6 +11,11 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The alpha.2 public API audit's refresh (quantstratum-docs:
+  `karyos/testing/public-api-audit-alpha2.md`, 2026-10-20):
+  `karyos_archive::source::Rejoin` is `#[non_exhaustive]`, so a match
+  outside karyos-archive needs a wildcard arm; hosts still build every
+  variant. `ClientSubscription::poll_taking` documents its errors.
 - `karyos-ffi` stream options take a concurrent publication mode:
   `KARYOS_PUBLICATION_CONCURRENT` with `publishers` (1 to 255), in an
   88-byte `karyos_stream_options` read by prefix (64, 80 and 88 bytes are
