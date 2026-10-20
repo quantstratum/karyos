@@ -41,12 +41,23 @@ case "$dest" in
 /*) ;;
 *) dest="$PWD/$dest" ;;
 esac
+# Without trailing slashes, so the stage lands beside DEST, not in it.
+while [ "$dest" != / ] && [ "${dest%/}" != "$dest" ]; do dest="${dest%/}"; done
 header="$root/crates/karyos-ffi/include/karyos.h"
 
 fail() {
     echo "package-libkaryos: $*" >&2
     exit 1
 }
+
+# DEST is replaced at the end, so it must be absent or a previous
+# package (its MANIFEST), and never / or $HOME.
+if [ "$dest" = / ] || [ "$dest" = "${HOME%/}" ]; then
+    fail "refusing DEST $dest"
+fi
+if [ -e "$dest" ] && [ ! -f "$dest/share/karyos/MANIFEST" ]; then
+    fail "$dest exists and is not a libkaryos package; remove it or pick another DEST"
+fi
 
 define() {
     sed -n "s/^#define $1 \\([0-9][0-9]*\\)\$/\\1/p" "$header"
@@ -168,10 +179,16 @@ profile=release
 EOF
 
 # The functions the header declares: one declaration per line, starting
-# with its return type.
+# with its return type (the hand-written header's style, ffi-gap-analysis.md
+# §4.6). Every `karyos_name(` outside comments and typedefs must be one of
+# them, so a declaration in another style fails here.
 declared="$(grep -oE '^(const )?[a-z_0-9]+ \*?karyos_[a-z0-9_]+\(' "$header" |
     sed -E 's/.*(karyos_[a-z0-9_]+)\($/\1/' | sort -u)"
 [ -n "$declared" ] || fail "no function declarations in $header"
+named="$(grep -vE '^[[:space:]]*(\*|/\*|//)|^typedef' "$header" |
+    grep -oE '\bkaryos_[a-z0-9_]+\(' | sed 's/($//' | sort -u)"
+[ "$named" = "$declared" ] ||
+    fail "the header names functions outside one-line declarations: $(comm -13 <(echo "$declared") <(echo "$named") | tr '\n' ' ')"
 
 # The karyos_ symbols a library defines, without the platform's prefix:
 # `nm -gU` on macOS (external, defined; Mach-O prefixes `_`), `nm -D
