@@ -656,8 +656,9 @@ release may break APIs, wire formats and shared-memory layouts.
     once the client's polls have the grant. Asking for another target
     withdraws the previous one: a grant that comes after, or one never
     taken, is released by the client, as is anything left when the
-    subscriber drops. A refused request (the target not there yet) is
-    asked again on the next call.
+    subscriber drops. A grant that comes while one is held is released
+    too, never put over it. A refused request (the target not there
+    yet) is asked again on the next call.
   - karyos-archive implements `ReplayTargets` for it, so an
     `ArchiveClient` can be built from one facade client alone:
     `ArchiveConnection`'s transports and `client.replay_targets()`.

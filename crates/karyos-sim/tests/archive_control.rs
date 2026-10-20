@@ -1093,6 +1093,8 @@ fn a_replay_target_is_subscribed_through_the_facade_client_without_blocking() {
         serve(&mut rig, &mut client);
     }
     drop(granted(&mut rig, &mut client, &mut targets));
+    // Every withdrawn grant went through the client's release, none failed.
+    assert_eq!(client.subscription_releases_failed(), 0);
 }
 
 /// F9b: a facade subscription whose Archive client is built only from the
