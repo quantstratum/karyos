@@ -11,8 +11,18 @@ use super::*;
 fn ring(capacity: u64) -> Vec<AtomicU64> {
     let words = ring_words(usize::try_from(capacity).unwrap()).unwrap();
     let ring: Vec<AtomicU64> = (0..words).map(|_| AtomicU64::new(0)).collect();
-    init(&ring, capacity).unwrap();
+    init(&ring, &bound(capacity - 2, 1)).unwrap();
     ring
+}
+
+/// A binding of `messages` and `ranges` to guard word 0 at epoch 2.
+fn bound(messages: u64, ranges: u64) -> Binding {
+    Binding {
+        messages,
+        ranges,
+        guard_index: 0,
+        epoch: 2,
+    }
 }
 
 fn message(kind: Kind, start: u64) -> Record {
@@ -247,19 +257,24 @@ fn a_panicking_handler_gets_the_record_again() {
 #[test]
 fn a_reader_refuses_another_layout_version() {
     let ring = ring(4);
-    ring[VERSION].store(2, Ordering::Relaxed);
+    ring[VERSION].store(1, Ordering::Relaxed);
     assert_eq!(
         OutcomeReader::attach(&ring.as_slice(), 2).unwrap_err(),
-        OutcomeError::Version(2)
+        OutcomeError::Version(1)
+    );
+    assert_eq!(
+        binding(&ring.as_slice(), 1).unwrap_err(),
+        OutcomeError::Version(1)
     );
 }
 
 #[test]
 fn layouts_are_checked() {
     let short: Vec<AtomicU64> = (0..HEADER_WORDS).map(|_| AtomicU64::new(0)).collect();
-    assert_eq!(init(&short, 2), Err(OutcomeError::Layout));
+    assert_eq!(init(&short, &bound(1, 0)), Err(OutcomeError::Layout));
     let ring = ring(4);
-    assert_eq!(init(&ring, 1), Err(OutcomeError::Layout));
+    assert_eq!(init(&ring, &bound(0, 0)), Err(OutcomeError::Layout));
+    assert_eq!(init(&ring, &bound(u64::MAX, 1)), Err(OutcomeError::Layout));
     assert_eq!(OutcomeWriter::new(1).unwrap_err(), OutcomeError::Layout);
     assert_eq!(
         OutcomeReader::attach(&ring.as_slice(), 0).unwrap_err(),
@@ -388,4 +403,43 @@ fn an_abandoned_ring_ends_with_an_unknown_count() {
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[1].1.kind, Kind::OutcomesLost);
     assert_eq!(seen[1].1.lost, LOST_UNKNOWN);
+}
+
+/// The header names the handle's binding (G-x1): written at creation,
+/// read back, and refused when it breaks the slot count, the guard index
+/// or the open epoch.
+#[test]
+fn the_header_names_the_binding() {
+    let binding_of = |messages, ranges, guard_index, epoch| Binding {
+        messages,
+        ranges,
+        guard_index,
+        epoch,
+    };
+    let written = binding_of(3, 2, 5, 8);
+    let words = ring_words(6).unwrap();
+    let ring: Vec<AtomicU64> = (0..words).map(|_| AtomicU64::new(0)).collect();
+    init(&ring, &written).unwrap();
+    assert_eq!(ring[VERSION].load(Ordering::Relaxed), 2);
+    assert_eq!(ring[CAPACITY].load(Ordering::Relaxed), 6);
+    for (word, cell) in ring.iter().enumerate().take(HEADER_WORDS).skip(EPOCH + 1) {
+        assert_eq!(cell.load(Ordering::Relaxed), 0, "reserved word {word}");
+    }
+    assert_eq!(binding(&ring.as_slice(), 6), Ok(written));
+    // The guard index must fall within the client's guard words.
+    assert_eq!(binding(&ring.as_slice(), 5), Err(OutcomeError::Layout));
+    // A slot count other than C_m + C_r + 1.
+    ring[RANGES].store(1, Ordering::Relaxed);
+    assert_eq!(binding(&ring.as_slice(), 6), Err(OutcomeError::Layout));
+    ring[RANGES].store(2, Ordering::Relaxed);
+    // An epoch that is not open: odd, or 0.
+    for epoch in [7, 0] {
+        ring[EPOCH].store(epoch, Ordering::Relaxed);
+        assert_eq!(binding(&ring.as_slice(), 6), Err(OutcomeError::Layout));
+    }
+    ring[EPOCH].store(8, Ordering::Relaxed);
+    assert_eq!(binding(&ring.as_slice(), 6), Ok(written));
+    // A header whose C_m + C_r + 1 overflows.
+    ring[MESSAGES].store(u64::MAX, Ordering::Relaxed);
+    assert_eq!(binding(&ring.as_slice(), 6), Err(OutcomeError::Layout));
 }

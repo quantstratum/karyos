@@ -1345,7 +1345,7 @@ mod tests {
         use crate::guarded::{GuardBinding, HeapWords};
         use karyos_sys::guard;
         use karyos_sys::outcome_ring::{
-            Kind, OutcomeWriter, Produced, Record, capacity, init, ring_words,
+            Binding, Kind, OutcomeWriter, Produced, Record, capacity, init, ring_words,
         };
         use karyos_sys::sync::{AtomicU64, Ordering};
 
@@ -1411,7 +1411,13 @@ mod tests {
             let ring = Arc::new(HeapWords::zeroed(
                 ring_words(usize::try_from(slots).unwrap()).unwrap(),
             ));
-            init(ring.words(), slots).unwrap();
+            let header = Binding {
+                messages: MESSAGES,
+                ranges: 1,
+                guard_index: 1,
+                epoch: 2,
+            };
+            init(ring.words(), &header).unwrap();
             let consumed = Arc::new(AtomicU64::new(0));
             let binding = GuardBinding::new(
                 Arc::clone(&guard) as Arc<dyn crate::guarded::SharedWords>,
@@ -1816,11 +1822,21 @@ mod tests {
             assert!(matches!(publication.try_claim(8), Ok(ClaimOutcome::Gated)));
         }
 
+        /// A three-slot ring's header: one message, one range.
+        fn one_message() -> Binding {
+            Binding {
+                messages: 1,
+                ranges: 1,
+                guard_index: 0,
+                epoch: 2,
+            }
+        }
+
         #[test]
         fn a_binding_refuses_a_bad_ring() {
             let ring = Arc::new(HeapWords::zeroed(ring_words(3).unwrap()));
-            init(ring.words(), 3).unwrap();
-            ring.words()[0].store(2, Ordering::Relaxed);
+            init(ring.words(), &one_message()).unwrap();
+            ring.words()[0].store(1, Ordering::Relaxed);
             let words = |words: HeapWords| Arc::new(words) as Arc<dyn crate::guarded::SharedWords>;
             let cell = || Arc::new(AtomicU64::new(0)) as Arc<dyn crate::guarded::ConsumedCell>;
             assert_eq!(
@@ -1834,10 +1850,10 @@ mod tests {
                     1,
                 )
                 .unwrap_err(),
-                ClientError::Outcomes(karyos_sys::outcome_ring::OutcomeError::Version(2))
+                ClientError::Outcomes(karyos_sys::outcome_ring::OutcomeError::Version(1))
             );
             let ring = Arc::new(HeapWords::zeroed(ring_words(3).unwrap()));
-            init(ring.words(), 3).unwrap();
+            init(ring.words(), &one_message()).unwrap();
             // A guard index past the guard view.
             assert_eq!(
                 GuardBinding::new(

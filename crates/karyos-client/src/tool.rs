@@ -96,7 +96,10 @@ impl Staged {
             | WireKind::Broadcast
             | WireKind::LogBuffer
             | WireKind::Journal
-            | WireKind::ConflationTable => None,
+            | WireKind::ConflationTable
+            | WireKind::GuardRegion
+            | WireKind::OutcomeRing
+            | WireKind::ConsumedCell => None,
         }
     }
 }

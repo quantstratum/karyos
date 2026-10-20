@@ -9,7 +9,8 @@
 //!   sequence of the last record it consumed in a cell it owns (the
 //!   consumed cell), which the driver reads.
 //! - **Layout.** A header of [`HEADER_WORDS`] words (word 0 the layout
-//!   version, word 1 the slot count), then `capacity` records of
+//!   version, word 1 the slot count, words 2 to 5 the handle's
+//!   [`Binding`], the rest reserved and zero), then `capacity` records of
 //!   [`RECORD_WORDS`] words. Record `seq` (from 1, gapless) lives in slot
 //!   `(seq - 1) mod capacity`. Word 0 of a record is its sequence; words 1
 //!   to 7 are its fields.
@@ -43,8 +44,11 @@ const CONSUMED_LOAD: Ordering = Ordering::Acquire;
 /// The client's store of the consumed count: Release, after its reads.
 const CONSUMED_STORE: Ordering = Ordering::Release;
 
-/// The outcome ring's layout version.
-pub const OUTCOME_LAYOUT_VERSION: u64 = 1;
+/// The outcome ring's layout version: 2 (unreleased) names the handle's
+/// binding in header words 2 to 5 (`quantstratum-docs:
+/// karyos/design/guards-and-abort.md`, "The binding across processes",
+/// G-x1).
+pub const OUTCOME_LAYOUT_VERSION: u64 = 2;
 /// Words of the header stride.
 pub const HEADER_WORDS: usize = 16;
 /// Words of one record: 64 bytes.
@@ -53,6 +57,14 @@ pub const RECORD_WORDS: usize = 8;
 const VERSION: usize = 0;
 /// Header word: the slot count.
 const CAPACITY: usize = 1;
+/// Header word: `C_m`, the message capacity.
+const MESSAGES: usize = 2;
+/// Header word: `C_r`, the range capacity.
+const RANGES: usize = 3;
+/// Header word: the guard's word index in the guard region.
+const GUARD_INDEX: usize = 4;
+/// Header word: the open epoch the handle was admitted under.
+const EPOCH: usize = 5;
 
 /// Words of a ring of `capacity` slots, header included; `None` on
 /// overflow.
@@ -71,6 +83,29 @@ pub const fn capacity(messages: u64, ranges: u64) -> Option<u64> {
     match messages.checked_add(ranges) {
         Some(records) => records.checked_add(1),
         None => None,
+    }
+}
+
+/// What a ring's header says of its handle (header words 2 to 5): the
+/// driver writes it at creation, before the region is granted, and a
+/// client reads it to bind the handle across processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Binding {
+    /// `C_m`, the message capacity.
+    pub messages: u64,
+    /// `C_r`, the range capacity.
+    pub ranges: u64,
+    /// The guard's word index in the guard region.
+    pub guard_index: u64,
+    /// The open epoch the handle was admitted under.
+    pub epoch: u64,
+}
+
+impl Binding {
+    /// The ring's slot count, `C_m + C_r + 1`; `None` on overflow.
+    #[must_use]
+    pub const fn capacity(&self) -> Option<u64> {
+        capacity(self.messages, self.ranges)
     }
 }
 
@@ -223,20 +258,69 @@ impl Record {
     }
 }
 
-/// Writes the header of a new ring of `capacity` slots. Called on the
-/// control path before the region is shared.
+/// Writes the header of a new ring for `binding`, of
+/// [`Binding::capacity`] slots. Called on the control path before the
+/// region is shared.
 ///
 /// # Errors
 ///
-/// [`OutcomeError::Layout`] when `ring` is too small or `capacity` is
-/// below 2.
-pub fn init(ring: &[AtomicU64], capacity: u64) -> Result<(), OutcomeError> {
+/// [`OutcomeError::Layout`] when the slot count overflows or is below 2,
+/// or `ring` is too small for it.
+pub fn init(ring: &[AtomicU64], binding: &Binding) -> Result<(), OutcomeError> {
+    let capacity = binding.capacity().ok_or(OutcomeError::Layout)?;
     check_layout(ring.len(), capacity)?;
-    if let (Some(version), Some(slots)) = (ring.get(VERSION), ring.get(CAPACITY)) {
-        version.store(OUTCOME_LAYOUT_VERSION, Ordering::Relaxed);
-        slots.store(capacity, Ordering::Relaxed);
+    for (word, value) in [
+        (VERSION, OUTCOME_LAYOUT_VERSION),
+        (CAPACITY, capacity),
+        (MESSAGES, binding.messages),
+        (RANGES, binding.ranges),
+        (GUARD_INDEX, binding.guard_index),
+        (EPOCH, binding.epoch),
+    ] {
+        if let Some(cell) = ring.get(word) {
+            cell.store(value, Ordering::Relaxed);
+        }
     }
     Ok(())
+}
+
+/// The binding a ring's header names, checked for a client given
+/// `guard_words` guard words: the slot count is `C_m + C_r + 1`, the
+/// guard's index is within them and the epoch is open (even, and never
+/// 0: a guard is created closed at epoch 1). Read after the region is
+/// mapped, whose header the driver wrote before granting it.
+///
+/// # Errors
+///
+/// [`OutcomeError::Version`] for another layout version;
+/// [`OutcomeError::Layout`] for a header that breaks these, a protocol
+/// error.
+pub fn binding(
+    ring: &(impl LoadWords + ?Sized),
+    guard_words: usize,
+) -> Result<Binding, OutcomeError> {
+    let version = ring.load_acquire(VERSION).ok_or(OutcomeError::Layout)?;
+    if version != OUTCOME_LAYOUT_VERSION {
+        return Err(OutcomeError::Version(version));
+    }
+    let word = |index| ring.load(index).ok_or(OutcomeError::Layout);
+    let binding = Binding {
+        messages: word(MESSAGES)?,
+        ranges: word(RANGES)?,
+        guard_index: word(GUARD_INDEX)?,
+        epoch: word(EPOCH)?,
+    };
+    let capacity = word(CAPACITY)?;
+    let index_fits = usize::try_from(binding.guard_index).is_ok_and(|index| index < guard_words);
+    if binding.capacity() != Some(capacity)
+        || !index_fits
+        || binding.epoch == 0
+        || !binding.epoch.is_multiple_of(2)
+    {
+        return Err(OutcomeError::Layout);
+    }
+    check_layout(ring.len(), capacity)?;
+    Ok(binding)
 }
 
 fn check_layout(words: usize, capacity: u64) -> Result<(), OutcomeError> {
