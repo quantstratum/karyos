@@ -168,9 +168,11 @@ impl<T: Copy> SizedStruct<T> {
             // SAFETY: `words` holds at least `size_of::<T>()` bytes and is
             // 8-aligned, which covers `T`'s alignment (a C struct of
             // integers and pointers); `value` does not overlap it. `T` has
-            // no padding bytes, so every byte read is initialized: each
-            // struct of this module lays its fields out in size order
-            // with no gap (callers pass only those).
+            // no padding bytes, so every byte read is initialized: on the
+            // 64-bit targets the suite runs on, each struct of this module
+            // lays its fields out in size order with no gap (callers pass
+            // only those). On a 32-bit target `ClientOptions`'s pointer
+            // would leave a gap before its first `u64`.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     core::ptr::from_ref(value).cast::<u8>(),
