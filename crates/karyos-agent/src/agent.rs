@@ -15,6 +15,7 @@ use crate::api::{
     API_VERSION, AgentView, Counter, DriverState, DriverView, ErrorEntry, GuardEntry, LossEntry,
     Sample,
 };
+use crate::catalog::{CatalogConfig, CatalogWatch};
 use crate::model::{self, Cell, Follower};
 use crate::trace_window::{TraceWindow, WindowConfig};
 
@@ -42,6 +43,9 @@ pub struct AgentConfig {
     pub trace: WindowConfig,
     /// The alert rules (M9).
     pub alerts: AlertRules,
+    /// The drivers whose Archive catalog the agent lists (M11), each a
+    /// directory of `drivers`; none by default.
+    pub archives: Vec<(PathBuf, CatalogConfig)>,
 }
 
 impl AgentConfig {
@@ -54,6 +58,7 @@ impl AgentConfig {
             history: DEFAULT_HISTORY,
             trace: WindowConfig::default(),
             alerts: AlertRules::default(),
+            archives: Vec::new(),
         }
     }
 
@@ -84,6 +89,15 @@ impl AgentConfig {
         self.alerts = alerts;
         self
     }
+
+    /// Listing the Archive catalog of the driver in `dir` as `catalog`
+    /// says (M11). A directory that is not one of the drivers lists
+    /// nothing.
+    #[must_use]
+    pub fn with_archive(mut self, dir: PathBuf, catalog: CatalogConfig) -> Self {
+        self.archives.push((dir, catalog));
+        self
+    }
 }
 
 /// One watched driver.
@@ -100,6 +114,7 @@ struct Driver {
     guards: Follower<GuardEntry>,
     trace: Option<TraceWindow>,
     alerts: Alerts,
+    catalog: Option<CatalogWatch>,
 }
 
 /// The agent. Each driver it is attached to counts one tool against the
@@ -132,6 +147,12 @@ impl Agent {
                 guards: Follower::new(config.history),
                 trace: None,
                 alerts: Alerts::default(),
+                // The catalog's own thread connects, off the refresh path.
+                catalog: config
+                    .archives
+                    .iter()
+                    .find(|(archive, _)| archive == dir)
+                    .map(|(_, catalog)| CatalogWatch::start(dir.clone(), *catalog)),
             })
             .collect();
         Self { config, drivers }
@@ -254,6 +275,7 @@ impl Driver {
             latencies,
             trace,
             alerts: self.alerts.firing(),
+            catalog: self.catalog.as_ref().map(CatalogWatch::view),
         }
     }
 }

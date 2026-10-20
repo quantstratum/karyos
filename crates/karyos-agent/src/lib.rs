@@ -29,12 +29,15 @@
 //!   text format and answers `GET /metrics` on a loopback address only;
 //!   the `karyos-exporter` binary runs it as its own process (owner item
 //!   51, interim 4).
+//! - **Archive catalog** (M11): for a driver given an Archive,
+//!   [`catalog`] lists its recordings over the Archive's control streams
+//!   on a thread of its own, as a full IPC client of that driver; off by
+//!   default.
 //! - **Not yet.** An endpoint's capability gauges read as one group in
-//!   the view (M6b's `karyos_client::capabilities` reads them), and the
-//!   trace latencies in the JSON encoding.
+//!   the view (M6b's `karyos_client::capabilities` reads them).
 //! - **Crate graph** (owner item 52): it depends on `karyos-client`,
-//!   `karyos-sys` and `karyos-trace`; neither the driver nor the client
-//!   depends on it.
+//!   `karyos-sys`, `karyos-trace` and `karyos-archive`; neither the
+//!   driver, the client nor the Archive depends on it.
 //!
 //! The attach is Linux only, as the tool attach is; [`api`] builds
 //! everywhere.
@@ -48,6 +51,7 @@
 )]
 pub mod alerts;
 pub mod api;
+pub mod catalog;
 pub mod cli;
 pub mod exporter;
 pub mod json;

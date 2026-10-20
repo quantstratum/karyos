@@ -19,8 +19,8 @@
 use std::fmt::Write;
 
 use crate::api::{
-    AgentView, Alert, AlertKind, Counter, DriverState, DriverView, ErrorEntry, Feed, GuardEntry,
-    Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
+    AgentView, Alert, AlertKind, Catalog, CatalogRecording, Counter, DriverState, DriverView,
+    ErrorEntry, Feed, GuardEntry, Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
 };
 
 /// A JSON value being written into a string.
@@ -178,6 +178,53 @@ fn driver_view(out: &mut Out<'_>, driver: &DriverView) {
         fields
             .key("alerts")
             .array(&driver.alerts, |out, alert| alert_json(out, alert));
+        fields
+            .key("catalog")
+            .option(driver.catalog.as_ref(), catalog_json);
+    });
+}
+
+/// A driver's Archive catalog (M11).
+fn catalog_json(out: &mut Out<'_>, catalog: &Catalog) {
+    out.object(|fields| {
+        fields
+            .key("recordings")
+            .array(&catalog.recordings, |out, recording| {
+                catalog_recording(out, recording)
+            });
+        fields.number("left_out", catalog.left_out);
+        fields
+            .key("listed_at")
+            .option(catalog.listed_at, |out, at| out.number(at));
+        fields.number("listings", catalog.listings);
+        fields.number("failures", catalog.failures);
+        fields
+            .key("last_error")
+            .option(catalog.last_error.as_deref(), |out, error| {
+                out.string(error)
+            });
+    });
+}
+
+fn catalog_recording(out: &mut Out<'_>, recording: &CatalogRecording) {
+    out.object(|fields| {
+        fields.number("recording_id", recording.recording_id);
+        fields.number("stream_id", recording.stream_id);
+        fields.number("session_id", recording.session_id);
+        fields.string("channel", &recording.channel);
+        fields.number("start", recording.start);
+        fields.number("start_time_ns", recording.start_time_ns);
+        fields.key("recording").bool(recording.recording);
+        fields.number("position", recording.position);
+        fields
+            .key("stopped_ns")
+            .option(recording.stopped_ns, |out, at| out.number(at));
+        fields
+            .key("stop_reason")
+            .option(recording.stop_reason.as_deref(), |out, reason| {
+                out.string(reason)
+            });
+        fields.key("incomplete").bool(recording.incomplete);
     });
 }
 

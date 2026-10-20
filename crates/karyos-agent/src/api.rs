@@ -48,6 +48,61 @@ pub struct DriverView {
     pub trace: TraceCounts,
     /// The alerts firing for this driver (M9).
     pub alerts: Vec<Alert>,
+    /// The Archive catalog listed for this driver (M11); `None` unless the
+    /// driver is configured with an Archive (`--archive`).
+    pub catalog: Option<Catalog>,
+}
+
+/// The Archive catalog of a driver, as the agent last listed it over the
+/// Archive control streams (SPEC §11; management-agent-gap-analysis.md,
+/// M11).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Catalog {
+    /// The recordings of the last complete listing, in id order.
+    pub recordings: Vec<CatalogRecording>,
+    /// Recordings that listing found past the agent's bound, not kept.
+    pub left_out: u64,
+    /// Host `CLOCK_MONOTONIC` nanoseconds when that listing ended; `None`
+    /// before the first.
+    pub listed_at: Option<u64>,
+    /// Complete listings so far.
+    pub listings: u64,
+    /// Attempts that failed so far: a connection, a grant, a refusal or a
+    /// listing past its deadline.
+    pub failures: u64,
+    /// The last failure, until a listing completes.
+    pub last_error: Option<String>,
+}
+
+/// One recording of a catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CatalogRecording {
+    /// The recording id, never 0.
+    pub recording_id: u64,
+    /// The recorded stream.
+    pub stream_id: i32,
+    /// The recorded session.
+    pub session_id: i32,
+    /// The recorded channel.
+    pub channel: String,
+    /// Its first position.
+    pub start: u64,
+    /// When it started, in the Archive host's nanoseconds.
+    pub start_time_ns: u64,
+    /// Whether it still records.
+    pub recording: bool,
+    /// The position written so far, or where it stopped.
+    pub position: u64,
+    /// When it stopped, in the Archive host's nanoseconds.
+    pub stopped_ns: Option<u64>,
+    /// Why it stopped: `normal`, `recovered`, `empty`, `lapped`, `stopped`,
+    /// `shutdown`, or `failed_source`, `failed_required_lapped`,
+    /// `failed_invalid`.
+    pub stop_reason: Option<String>,
+    /// It lost ranges (an async recording that lapped and resumed).
+    pub incomplete: bool,
 }
 
 /// What an alert watches (SPEC §11, alerting; management-agent-gap-analysis.md,

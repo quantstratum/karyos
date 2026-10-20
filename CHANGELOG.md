@@ -411,6 +411,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The management agent lists a driver's Archive catalog (phase 5, M11;
+  quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`).
+  `karyos-agent --archive DIR=REQ,RESP` (`AgentConfig::with_archive`,
+  `karyos_agent::catalog::CatalogConfig`), off by default, names a
+  watched driver and its host's Archive control streams. A thread per
+  such driver connects as an IPC client with a short timeout, takes a
+  concurrent handle on the request stream (which the host configures
+  concurrent) and subscribes the response stream, lists the catalog with
+  `RecordingLister` within a deadline and lists again after an interval;
+  failures are counted and retried. `DriverView::catalog` (API v1, after
+  `alerts`) holds the last complete listing, `left_out`, `listed_at`,
+  `listings`, `failures` and `last_error`; the exporter adds
+  `karyos_archive_recordings`, `karyos_archive_listings_total`,
+  `karyos_archive_listing_failures_total` and
+  `karyos_archive_listed_at_ns`. It costs one client slot of that driver.
+  karyos-agent now depends on karyos-archive, which never depends on it.
+
 - `Client::add_concurrent_publication(uri, stream_id)` in karyos-client
   (M11): a concurrent handle on lane 0 of the only `karyos:ipc` stream of
   the id, shared with its other publishers, as the Archive's request
