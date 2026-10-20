@@ -599,6 +599,21 @@ release may break APIs, wire formats and shared-memory layouts.
   `KARYOS_E_UNSUPPORTED`. The conformance format gains both calls and the
   `schedule_capacity` argument of `karyos_driver_add_stream`, with the
   scenario `publication.timed.offer`.
+- `karyosd` runs the Archive (quantstratum-docs:
+  `karyos/design/archive-host.md`, H3). `--archive DIR` starts the agent
+  with its catalog in `DIR`, and `--archive-control REQ,RESP` names the
+  control streams, which the daemon adds (REQ concurrent). `--record
+  id:session[:sync]` (repeatable; sync `none`, `segment` or a duration)
+  starts a recording at boot through the control path, and a shutdown
+  stops it, then the agent. `--archive-min-free` (default 1 GiB) refuses a
+  recording while the archive's file system has less free space,
+  measured by the new `karyos_sys::fs::free_bytes` (Linux). Under
+  same-uid admission every admitted client may control the Archive: the
+  trust boundary is the daemon's uid, and per-client authorization comes
+  with owner item 43. The audit trail (target
+  `karyos::archive::audit`) names each grant on the control streams, each
+  request and each answer, through the driver's new
+  `EmbeddedDriver::audit_grants` and `drain_grant_audits`.
 
 - `Publication::offer_at_on(lane, payload, tx_time)` on the client facade
   (quantstratum-docs: `karyos/design/timed-tx.md`; owner item 57): a timed
