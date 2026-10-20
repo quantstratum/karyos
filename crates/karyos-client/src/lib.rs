@@ -44,7 +44,8 @@ pub mod trace;
 pub use client::{
     Accepted, Claim, Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES,
     DEFAULT_MAX_PENDING, DEFAULT_TIMEOUT, IdleStrategy, ImageChange, ImageStop, MessageLength,
-    OfferError, Publication, Subscription, SubscriptionError, SubscriptionPoll,
+    OfferError, Publication, Subscription, SubscriptionError, SubscriptionOptions,
+    SubscriptionPoll,
 };
 pub use concurrent::{
     ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,
@@ -63,7 +64,7 @@ pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Next, Successor};
 pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
-pub use karyos_protocol::cnc::StreamId;
+pub use karyos_protocol::cnc::{StreamId, SubscriberRole};
 /// The publication identity a replay and a live merge name (merge module).
 pub use karyos_protocol::trace_hook::PublicationIdentity;
 pub use karyos_sys::frame::Lane;

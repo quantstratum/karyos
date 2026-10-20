@@ -1883,3 +1883,170 @@ fn a_reader_that_adopts_follows_a_cutover() {
     }
     assert_eq!(seen.len(), written.len());
 }
+
+/// `Client::add_subscription_with` (owner item 57): an optional reader does
+/// not bound its publisher, so offers run past it while it reads nothing;
+/// under the `Close` policy its next poll reports the overrun that closed
+/// it, and it stays closed. A required reader of the same stream bounds
+/// the publisher instead.
+#[test]
+fn an_optional_reader_under_close_is_closed_by_its_overrun() {
+    use karyos_client::{RejoinPolicy, SubscriberRole, SubscriptionOptions};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let _ = driver.add_stream(heap_stream(1)).unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let mut optional = client
+            .add_subscription_with(
+                "karyos:ipc",
+                StreamId::new(1),
+                SubscriptionOptions::new(SubscriberRole::Optional, RejoinPolicy::Close),
+            )
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(1))
+            .unwrap();
+        // Far more than the reader's window, unread: the publisher's limit
+        // moves on without it (back pressure only until the driver's next
+        // duty cycle advances the limit).
+        let message = [7u8; 1024];
+        let terms = karyos_sys::sizing::MIN_TERM_LENGTH as usize * 4;
+        let start = Instant::now();
+        for _ in 0..terms / message.len() {
+            while publication.offer(&message).is_err() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "held by an optional reader"
+                );
+                std::thread::sleep(Duration::from_micros(50));
+            }
+        }
+        let poll = optional.poll(|_, _| {}, MessageLimit::new(1024)).unwrap();
+        let summary = poll.stopped.expect("the overrun stops the poll").summary;
+        assert!(summary.closed_by_overrun.is_some(), "{summary:?}");
+        // Closed for good: nothing more is delivered.
+        let again = optional.poll(
+            |_, _| panic!("delivered after its close"),
+            MessageLimit::new(8),
+        );
+        assert!(
+            again.is_err() || again.as_ref().is_ok_and(|poll| poll.delivered == 0),
+            "{again:?}"
+        );
+    });
+}
+
+/// A required reader (the default options) bounds its publisher: offers
+/// past its window are back pressured until it reads.
+#[test]
+fn a_required_reader_bounds_its_publisher() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let _ = driver.add_stream(heap_stream(1)).unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let _required = client
+            .add_subscription_with(
+                "karyos:ipc",
+                StreamId::new(1),
+                karyos_client::SubscriptionOptions::default(),
+            )
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(1))
+            .unwrap();
+        let message = [7u8; 1024];
+        let terms = karyos_sys::sizing::MIN_TERM_LENGTH as usize * 4;
+        let refused = (0..terms / message.len())
+            .map(|_| publication.offer(&message))
+            .filter(Result::is_err)
+            .count();
+        assert!(
+            refused > 0,
+            "an unread required reader holds the publisher back"
+        );
+    });
+}
+
+/// A snapshot rejoin serves one stream: a network subscription refuses it
+/// before anything is requested.
+#[test]
+fn a_network_subscription_refuses_a_snapshot_rejoin() {
+    use karyos_client::{
+        Overrun, RejoinPolicy, SnapshotFailed, SnapshotSource, SubscriberRole, SubscriptionOptions,
+    };
+
+    struct Source;
+    impl SnapshotSource for Source {
+        fn rebuild(&mut self, _: &Overrun) -> Result<(), SnapshotFailed> {
+            Ok(())
+        }
+    }
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    let refused = client.add_subscription_with(
+        &format!("karyos:udp?endpoint=127.0.0.1:{}", port()),
+        StreamId::new(1),
+        SubscriptionOptions::new(
+            SubscriberRole::Optional,
+            RejoinPolicy::Snapshot(Box::new(Source)),
+        ),
+    );
+    assert!(
+        matches!(refused, Err(ClientError::InvalidContext { .. })),
+        "{refused:?}"
+    );
+    let _ = driver.do_work();
+}
+
+/// A network subscription's options reach its images: an optional reader
+/// under `Close` attaches its image with that role and a copy of the policy
+/// (the driver accepts the role), and reads its messages.
+#[test]
+fn a_network_subscription_attaches_its_images_with_its_options() {
+    use karyos_client::{RejoinPolicy, SubscriberRole, SubscriptionOptions};
+
+    let (_a, mut a) = driven(1, None);
+    let (_b, mut b) = driven(1, None);
+    let mut publisher = Client::with_conductor(a.remove(0), context());
+    let mut subscriber = Client::with_conductor(b.remove(0), context());
+    let port = port();
+    let mut reading = subscriber
+        .add_subscription_with(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+            SubscriptionOptions::new(SubscriberRole::Optional, RejoinPolicy::Close),
+        )
+        .unwrap();
+    let mut publication = publisher
+        .add_exclusive_publication(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    until(&mut [&mut subscriber, &mut publisher], || {
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        reading.image_count() == 1
+    });
+    assert_eq!(reading.images_refused(), 0);
+    let (mut sent, mut seen) = (0u32, 0u32);
+    let start = Instant::now();
+    while seen < 16 {
+        assert!(start.elapsed() < Duration::from_secs(20), "seen {seen}");
+        let _ = publisher.poll();
+        let _ = subscriber.poll();
+        while sent < 16 {
+            match publication.offer(&sent.to_le_bytes()) {
+                Ok(_) => sent += 1,
+                Err(
+                    OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected,
+                ) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let _ = reading
+            .poll(|_, _| seen += 1, MessageLimit::new(16))
+            .unwrap();
+        std::thread::sleep(Duration::from_micros(100));
+    }
+}

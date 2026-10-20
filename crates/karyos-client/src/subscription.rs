@@ -213,6 +213,33 @@ impl core::fmt::Debug for Secondary {
     }
 }
 
+impl RejoinPolicy {
+    /// A copy of the policy, for each image of a network subscription;
+    /// `None` for one that holds a snapshot source, which serves one
+    /// stream.
+    pub(crate) fn duplicate(&self) -> Option<Self> {
+        match self {
+            Self::RejoinAtHead => Some(Self::RejoinAtHead),
+            Self::Close => Some(Self::Close),
+            Self::Snapshot(_) => None,
+            Self::Replay { secondary } => Some(Self::Replay {
+                secondary: secondary.duplicate()?,
+            }),
+        }
+    }
+}
+
+impl Secondary {
+    /// As [`RejoinPolicy::duplicate`].
+    fn duplicate(&self) -> Option<Self> {
+        match self {
+            Self::RejoinAtHead => Some(Self::RejoinAtHead),
+            Self::Close => Some(Self::Close),
+            Self::Snapshot(_) => None,
+        }
+    }
+}
+
 /// What a non-replay policy did after an overrun.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
