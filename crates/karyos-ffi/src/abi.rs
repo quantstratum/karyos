@@ -151,13 +151,13 @@ unsafe fn write_detail(detail: *mut Detail, failure: Failure) {
 /// # Safety
 ///
 /// As [`write_sized`].
-unsafe fn write_accepted(out: *mut Accepted, accepted: karyos_client::Accepted) {
+unsafe fn write_accepted(out: *mut Accepted, placed: api::publication::Placed) {
     // SAFETY: the caller's contract, passed on.
     unsafe {
         write_sized(out, ACCEPTED_SIZE_0_1, |size| Accepted {
             size,
-            lane: u32::from(accepted.lane().get()),
-            position: accepted.position(),
+            lane: u32::from(placed.lane.get()),
+            position: placed.position,
         });
     };
 }
@@ -408,29 +408,67 @@ pub unsafe extern "C" fn karyos_client_add_publication(
     publication: *mut u64,
     detail: *mut Detail,
 ) -> i32 {
-    guard(|| {
-        if !writable(publication) {
-            return Status::InvalidArgument;
+    // SAFETY: the caller's contract, passed on.
+    guard(|| unsafe { add_publication(client, uri, stream_id, false, publication, detail) })
+}
+
+/// Adds a concurrent publication handle of `stream_id` on the channel
+/// `uri` to `client`, and writes its handle through `publication`. The
+/// stream must be a `karyos:ipc` stream the driver configures for
+/// concurrent publishers; the handle has lane 0 only, and the offer and
+/// claim calls of an exclusive publication apply to it. A control call,
+/// as `karyos_client_add_publication`; on failure nothing is opened and
+/// `detail` (may be null) receives the failure's detail.
+///
+/// # Safety
+///
+/// As `karyos_client_add_publication`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_concurrent_publication(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    publication: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    // SAFETY: the caller's contract, passed on.
+    guard(|| unsafe { add_publication(client, uri, stream_id, true, publication, detail) })
+}
+
+/// The body of both add calls.
+///
+/// # Safety
+///
+/// As `karyos_client_add_publication`.
+unsafe fn add_publication(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    concurrent: bool,
+    publication: *mut u64,
+    detail: *mut Detail,
+) -> Status {
+    if !writable(publication) {
+        return Status::InvalidArgument;
+    }
+    // SAFETY: the caller's contract on `uri`.
+    let uri = match unsafe { read_str(uri) } {
+        Ok(uri) => uri,
+        Err(status) => return status,
+    };
+    match api::publication::add(Handle::from_raw(client), uri, stream_id, concurrent) {
+        Ok(handle) => {
+            // SAFETY: `publication` is non-null and aligned, and the
+            // caller's contract makes it a writable `uint64_t`.
+            unsafe { publication.write(handle.raw()) };
+            Status::Ok
         }
-        // SAFETY: the caller's contract on `uri`.
-        let uri = match unsafe { read_str(uri) } {
-            Ok(uri) => uri,
-            Err(status) => return status,
-        };
-        match api::publication::add(Handle::from_raw(client), uri, stream_id) {
-            Ok(handle) => {
-                // SAFETY: `publication` is non-null and aligned, and the
-                // caller's contract makes it a writable `uint64_t`.
-                unsafe { publication.write(handle.raw()) };
-                Status::Ok
-            }
-            Err(failure) => {
-                // SAFETY: the caller's contract on `detail`.
-                unsafe { write_detail(detail, failure) };
-                failure.status
-            }
+        Err(failure) => {
+            // SAFETY: the caller's contract on `detail`.
+            unsafe { write_detail(detail, failure) };
+            failure.status
         }
-    })
+    }
 }
 
 /// Offers `length` bytes at `data` on `lane` of `publication`, copied into

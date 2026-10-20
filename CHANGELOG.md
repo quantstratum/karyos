@@ -906,6 +906,14 @@ release may break APIs, wire formats and shared-memory layouts.
   (`KARYOS_E_CLAIM_OUTSTANDING`). Closing a client closes its publications
   and their claims, all or nothing: while one is in use nothing closes.
   Tests over an embedded driver run under Miri and on macOS.
+- `karyos-ffi` concurrent publications (batch F7a-1):
+  `karyos_client_add_concurrent_publication` takes a concurrent handle on
+  lane 0 of a `karyos:ipc` stream the driver configures for concurrent
+  publishers. The offer, claim, commit, abort and close calls apply to it
+  as to an exclusive publication; any other lane is `KARYOS_E_INVALID_LANE`.
+  Closing the handle frees its publisher slot in the driver. Guarded and
+  timed lanes stay out of scope until the driver grants them across
+  processes (F7a-2).
 - `karyos-ffi` handle tables: a stale handle no longer touches its slot's
   mutex. Its slot's generation is now an atomic checked first, and a close
   moves it on at once, so a stale handle answers `KARYOS_E_CLOSED` and
