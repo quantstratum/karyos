@@ -499,3 +499,59 @@ fn karyosd_admits_as_many_archive_connections_as_request_publishers() {
     let _ = std::fs::remove_dir_all(&archive);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The management agent lists a karyosd Archive's catalog over its
+/// control streams, as an operator sees it: the boot recording, live.
+#[test]
+fn the_management_agent_lists_a_karyosd_archive() {
+    use karyos_agent::catalog::{ArchiveStreams, CatalogConfig};
+    use karyos_agent::{Agent, AgentConfig};
+
+    let dir = dir("agent");
+    let archive = dir.with_extension("archive");
+    let _ = std::fs::remove_dir_all(&archive);
+    std::fs::create_dir_all(&archive).unwrap();
+    let path = dir.with_extension("log");
+    let mut daemon = Daemon::start(
+        &dir,
+        &archive,
+        &["--record", &format!("{STREAM}:{SESSION}")],
+        &path,
+    );
+    // The socket answers: the daemon is up.
+    drop(connect(&dir));
+    let mut agent = Agent::new(
+        AgentConfig::new(vec![dir.clone()])
+            .with_attach_timeout(Duration::from_secs(5))
+            .with_archive(
+                dir.clone(),
+                CatalogConfig::new(ArchiveStreams::new(REQUESTS, RESPONSES)).with_timing(
+                    Duration::from_secs(2),
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                ),
+            ),
+    );
+    let start = Instant::now();
+    let catalog = loop {
+        agent.refresh();
+        let catalog = agent.view().drivers[0].catalog.clone().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "no listing: {catalog:?}"
+        );
+        if catalog.listings > 0 && !catalog.recordings.is_empty() {
+            break catalog;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(catalog.recordings.len(), 1, "{catalog:?}");
+    let recorded = &catalog.recordings[0];
+    assert_eq!((recorded.stream_id, recorded.session_id), (STREAM, SESSION));
+    assert!(recorded.recording, "{recorded:?}");
+    drop(agent);
+    assert!(daemon.stop().success());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&archive);
+    let _ = std::fs::remove_dir_all(&dir);
+}
