@@ -769,8 +769,21 @@ fn a_schedule_violation_seals_the_lane_with_its_reason() {
         let _ = a.do_work().unwrap();
     }
     assert_eq!(a.counters.value(Event::ScheduleViolations), 1);
-    let net = a.net.as_ref().unwrap();
-    assert_eq!(net.schedule_violations_dropped(), 0);
+    assert_eq!(a.counters.value(Event::ScheduleViolationsDropped), 0);
+    // A report for another incarnation of the lane is stale: dropped and
+    // counted, never applied.
+    a.net
+        .as_mut()
+        .unwrap()
+        .schedule_violations
+        .push(crate::net::ScheduleViolation {
+            registration: publication.registration(),
+            incarnation: 99,
+            lane: 0,
+        });
+    let _ = a.do_work().unwrap();
+    assert_eq!(a.counters.value(Event::ScheduleViolationsDropped), 1);
+    assert_eq!(a.counters.value(Event::ScheduleViolations), 1);
     assert_eq!(
         shared(&mut a)
             .sender

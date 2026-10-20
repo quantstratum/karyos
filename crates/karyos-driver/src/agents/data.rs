@@ -1198,15 +1198,6 @@ impl<T: StreamTerms> Outbound<T> {
         });
     }
 
-    /// Makes its lanes timed (control path, before it is posted): each lane
-    /// whose buffer has a schedule ring holds every head until its
-    /// message's requested time, under `policies[lane]` (its tolerance),
-    /// counting into `counters[lane]`; the gate's clock starts at `now`,
-    /// the network clock.
-    ///
-    /// # Errors
-    ///
-    /// [`OutboundError::Lanes`] for a lane's ring that is not one.
     /// The first lane whose publisher breached its schedule ring's
     /// protocol and that was not reported yet (`quantstratum-docs:
     /// karyos/design/timed-tx.md`, section 11, TT-6).
@@ -1232,6 +1223,15 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Makes its lanes timed (control path, before it is posted): each lane
+    /// whose buffer has a schedule ring holds every head until its
+    /// message's requested time, under `policies[lane]` (its tolerance),
+    /// counting into `counters[lane]`; the gate's clock starts at `now`,
+    /// the network clock.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboundError::Lanes`] for a lane's ring that is not one.
     pub(crate) fn set_timed(
         &mut self,
         policies: &[LatePolicy],

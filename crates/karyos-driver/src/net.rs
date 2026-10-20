@@ -1612,18 +1612,17 @@ impl<T: StreamTerms> Network<T> {
         Ok(())
     }
 
-    /// A released guard sender to deregister, each once.
     /// The next schedule violation a sender reported, for the conductor to
     /// apply (timed-tx.md section 11, TT-6).
     pub(crate) fn pop_schedule_violation(&mut self) -> Option<ScheduleViolation> {
         self.schedule_violations.pending.pop()
     }
 
-    /// Schedule violation reports dropped: past the bound, or naming no
-    /// live publication or incarnation.
-    #[cfg(test)]
-    pub(crate) fn schedule_violations_dropped(&self) -> u64 {
-        self.schedule_violations.dropped
+    /// Schedule violation reports dropped since the last call, for the
+    /// driver's `schedule violations dropped` counter: past the bound, or
+    /// naming no live publication or incarnation.
+    pub(crate) fn take_schedule_violations_dropped(&mut self) -> u64 {
+        core::mem::take(&mut self.schedule_violations.dropped)
     }
 
     /// A report the conductor found stale: its lane is gone, or in another
@@ -1632,6 +1631,7 @@ impl<T: StreamTerms> Network<T> {
         self.schedule_violations.drop_one();
     }
 
+    /// A released guard sender to deregister, each once.
     pub(crate) fn pop_released_guard(&mut self) -> Option<crate::guard_ack::GuardSenderId> {
         self.released_guards.ids.pop()
     }

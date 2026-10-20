@@ -4258,8 +4258,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// `SealReason::ScheduleViolation` (a lane already sealed keeps its
     /// first reason), counted, and logged with its holder; a remote holder
     /// is retired as faulty, an in-process one gets only the seal. A report
-    /// for a lane gone or reincarnated since is dropped and counted.
-    /// Returns how many lanes it sealed.
+    /// for a lane gone or reincarnated since is dropped, and every dropped
+    /// report counts in `schedule violations dropped`. Returns how many
+    /// lanes it sealed.
     fn apply_schedule_violations(&mut self) -> usize {
         let mut sealed = 0usize;
         while let Some(violation) = self
@@ -4308,6 +4309,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             {
                 self.faulty_pending.push(client);
             }
+        }
+        let dropped = self
+            .net
+            .as_mut()
+            .map_or(0, crate::net::Network::take_schedule_violations_dropped);
+        if dropped > 0 {
+            self.counters
+                .add(crate::counters::Event::ScheduleViolationsDropped, dropped);
         }
         sealed
     }

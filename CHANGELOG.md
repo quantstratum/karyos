@@ -23,7 +23,8 @@ release may break APIs, wire formats and shared-memory layouts.
   and `from_binding`, and `schedule::ring_binding`; a binding it does not
   know is a protocol error. The sender posts `AgentEvent::ScheduleViolated`
   once per breached lane; the conductor seals the lane with
-  `ScheduleViolation` if the report names the live incarnation, counts it in
+  `ScheduleViolation` if the report names the live incarnation (a stale or
+  over-bound report counts in `schedule violations dropped`), counts it in
   the new driver counter `schedule violations`, logs a
   `ClientProtocolViolation` error, and has admission retire a remote holder
   as faulty. `LatePolicy` and the T-x1 interim stop are unchanged.

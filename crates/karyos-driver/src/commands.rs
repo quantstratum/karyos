@@ -1044,13 +1044,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if target.issuing().is_err() {
                     return refuse(ErrorCode::ResourcesUnavailable, detail);
                 }
-                // A timed lane's settings are fixed, and written for the
-                // handle to read, before it is issued (TT-6b).
-                if matches!(command, Command::AddPublication { .. })
-                    && target.fix_schedule().is_err()
-                {
-                    return refuse(ErrorCode::InvalidPublicationMode, detail);
-                }
                 let occupant = self.next_export;
                 let mut subscriber = None;
                 let mut occupant_used = None;
@@ -1123,6 +1116,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     },
                     None => None,
                 };
+                // A timed lane's settings are fixed, and written for the
+                // handle to read, once its capability is taken and before
+                // it is issued (TT-6b); a refusal gives the capability back.
+                if matches!(capability, Capability::Publication { .. })
+                    && target.fix_schedule().is_err()
+                {
+                    if let Capability::Publication { inner, .. } = capability {
+                        target.spare = Some(inner);
+                    }
+                    return refuse(ErrorCode::InvalidPublicationMode, detail);
+                }
                 // Effect: everything below cannot fail.
                 let member = match &capability {
                     Capability::Publication { .. } => MemberKind::Exclusive,
@@ -1905,13 +1909,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if target.spare.is_some() {
                     return refuse(ErrorCode::PublicationTaken, detail);
                 }
-                // A timed lane's settings are fixed, and written into the
-                // ring for the remote publisher to read, before it is
-                // registered (TT-6b).
-                if target.fix_schedule().is_err() {
-                    return refuse(ErrorCode::InvalidPublicationMode, detail);
-                }
                 match target.conductor.register_publication(export) {
+                    // A timed lane's settings are fixed, and written into
+                    // the ring for the remote publisher to read, once it is
+                    // registered and before it is granted (TT-6b); a
+                    // refusal ends the registration.
+                    Ok(true) if target.fix_schedule().is_err() => {
+                        let _ = target.conductor.end_publication(export);
+                        return refuse(ErrorCode::InvalidPublicationMode, detail);
+                    }
                     Ok(true) => Participant::Exclusive,
                     Ok(false) => return refuse(ErrorCode::PublicationTaken, detail),
                     Err(error) => return refuse(issue_refusal(&error), detail),
