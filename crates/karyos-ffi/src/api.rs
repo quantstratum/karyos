@@ -3,6 +3,7 @@
 //! The safe implementations behind `abi`: each takes checked Rust values
 //! and answers a handle, a value or a [`Failure`](crate::status::Failure).
 
+pub(crate) mod archive;
 pub(crate) mod client;
 pub(crate) mod clock;
 pub(crate) mod conflated;

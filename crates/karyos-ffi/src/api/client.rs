@@ -43,7 +43,7 @@ pub(crate) enum AnyClient {
 
 impl AnyClient {
     /// Serves the connection once; whether anything was served.
-    fn poll(&mut self) -> bool {
+    pub(crate) fn poll(&mut self) -> bool {
         match self {
             #[cfg(target_os = "linux")]
             Self::Remote(client) => client.poll(),
@@ -173,6 +173,10 @@ pub(crate) struct ClientEntry {
     pub(crate) subscriptions: Vec<Handle>,
     /// Its open conflated subscriptions (F7b-2c).
     pub(crate) conflated: Vec<Handle>,
+    /// Its open Archive connections (F9a).
+    pub(crate) archives: Vec<Handle>,
+    /// The longest wait of its control calls, as its context set it.
+    pub(crate) timeout: Duration,
     /// The state of the embedded driver whose conductor it is over, when
     /// the C ABI created that driver (F5): the client follows its failure
     /// and its close ([`driver::DriverState::usable`]).
@@ -201,12 +205,14 @@ pub(crate) fn clients() -> &'static Table<ClientEntry> {
 
 /// A client's entry for its table, over `driver` when the C ABI created
 /// it.
-fn entry(client: AnyClient, driver: Option<driver::DriverState>) -> ClientEntry {
+fn entry(client: AnyClient, driver: Option<driver::DriverState>, timeout: Duration) -> ClientEntry {
     ClientEntry {
         client,
         publications: Vec::new(),
         subscriptions: Vec::new(),
         conflated: Vec::new(),
+        archives: Vec::new(),
+        timeout,
         driver,
     }
 }
@@ -291,8 +297,9 @@ pub(crate) fn connect(options: &Options) -> Result<Handle, Failure> {
 
 #[cfg(target_os = "linux")]
 fn connect_with(context: Context) -> Result<Handle, Failure> {
+    let timeout = context.timeout();
     let client = Client::connect(context).map_err(|error| Failure::from(&error))?;
-    Ok(clients().insert(entry(AnyClient::Remote(client), None))?)
+    Ok(clients().insert(entry(AnyClient::Remote(client), None, timeout))?)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -307,7 +314,11 @@ fn connect_with(_context: Context) -> Result<Handle, Failure> {
 /// [`Status::HandlesExhausted`].
 #[cfg(test)]
 pub(crate) fn insert_embedded(client: Client<ClientConductor>) -> Result<Handle, Status> {
-    clients().insert(entry(AnyClient::Embedded(client), None))
+    clients().insert(entry(
+        AnyClient::Embedded(client),
+        None,
+        karyos_client::DEFAULT_TIMEOUT,
+    ))
 }
 
 /// The releases of `client`'s publications that could not be sent
@@ -332,8 +343,9 @@ pub(crate) fn connect_embedded(owner: Handle) -> Result<Handle, Failure> {
     let context = Context::builder()
         .build()
         .map_err(|error| Failure::from(&error))?;
+    let timeout = context.timeout();
     let client = Client::with_conductor(conductor, context);
-    Ok(clients().insert(entry(AnyClient::Embedded(client), Some(state)))?)
+    Ok(clients().insert(entry(AnyClient::Embedded(client), Some(state), timeout))?)
 }
 
 /// Serves `client` once; whether anything was served.
@@ -356,11 +368,12 @@ pub(crate) fn poll(client: Handle) -> Result<bool, Status> {
 ///
 /// As [`Table::remove_all`].
 pub(crate) fn close_entry(entry: &mut ClientEntry) -> Result<(), Status> {
-    // Every child of all three tables is taken before any is closed, so
+    // Every child of all four tables is taken before any is closed, so
     // while one is in use nothing is.
     let publications = crate::api::publication::table().take_all(&entry.publications)?;
     let subscriptions = crate::api::subscription::table().take_all(&entry.subscriptions)?;
     let conflated = crate::api::conflated::table().take_all(&entry.conflated)?;
+    let archives = crate::api::archive::table().take_all(&entry.archives)?;
     for publication in publications.close()? {
         publication.release(&mut entry.client);
     }
@@ -370,9 +383,13 @@ pub(crate) fn close_entry(entry: &mut ClientEntry) -> Result<(), Status> {
     // A view is released by its drop: it unmaps its table and sends its
     // grant's `Detach`.
     drop(conflated.close()?);
+    for archive in archives.close()? {
+        archive.release(&mut entry.client);
+    }
     entry.publications.clear();
     entry.subscriptions.clear();
     entry.conflated.clear();
+    entry.archives.clear();
     Ok(())
 }
 
