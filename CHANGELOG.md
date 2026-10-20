@@ -11,6 +11,28 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The Archive's host over a driver (quantstratum-docs:
+  `karyos/design/archive-host.md`, H2).
+  - `karyos_tools::archive::DriverHost<T>` implements
+    `karyos_archive::server::ArchiveHost` over an `EmbeddedDriver<T>` it
+    owns. It opens a recording reader for each `StartRecording` of an
+    active local stream, found by its key (refused as "no such stream"
+    otherwise), and a replay target for each replay.
+  - A replay that ended keeps its target for the host's replay linger
+    (`with_replay_linger`; default 5 s, the interim of owner item 16)
+    before `finish_ended` finishes and retires it. `finish_all_ended` is
+    for shutdown, and `into_driver` returns the driver.
+  - karyos-archive's `ControlServer::shutdown_into_host` stops the agent
+    and hands the host back. karyos-driver gains
+    `EmbeddedDriver::stream_handle(StreamKey)`, the active local stream of
+    a key (never a network image, nor a retiring stream).
+  - The host's loop is the driver's duty, `ControlServer::duty`, then
+    `finish_ended`. Tests run on a heap driver, and on Linux on a
+    shared-terms one.
+  - A subscriber that joins a target after the Replay answer does not
+    read the replay yet: the sink waiting for a first subscriber comes
+    in H2b.
+
 - `EmbeddedDriver::recording_reader` works on every driver, not only a
   heap one: `RecordingReader` is generic over the driver's terms
   (`RecordingReader<T = HeapTerms>`, its parts `LaneReader<T>` and

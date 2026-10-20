@@ -350,6 +350,15 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
         self.agent.shutdown()
     }
 
+    /// Stops the agent as [`ControlServer::shutdown`] does, then hands the
+    /// host back with the agent's result: a host that owns a driver keeps
+    /// it, finishes the replays the stop ended, and shuts it down itself
+    /// (`quantstratum-docs: karyos/design/archive-host.md`, H2).
+    pub fn shutdown_into_host(self) -> (H, Result<(), AgentError>) {
+        let stopped = self.agent.shutdown();
+        (self.host, stopped)
+    }
+
     fn flush(&mut self) -> bool {
         let mut sent = false;
         while let Some(message) = self.pending.front() {
