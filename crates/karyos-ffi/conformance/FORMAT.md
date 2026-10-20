@@ -73,12 +73,28 @@ The arguments and results of each function are those of the header:
 | --- | --- | --- |
 | `karyos_abi_version` | `major`, `minor`, `patch` (`null` only) | status, `major`, `minor`, `patch` |
 | `karyos_status_message` | `status` (required) | `text` (no status) |
-| `karyos_driver_create` | none: the options of `karyos_driver_options_init` | status, `driver` |
+| `karyos_driver_create` | `size`: the options of `karyos_driver_options_init` | status, `driver` |
+| `karyos_driver_start` | `driver` (required), `idle_strategy` (default `KARYOS_IDLE_YIELD`, 1), `idle_sleep_ns` (default 0) | status |
+| `karyos_driver_stop` | `driver` (required) | status |
+| `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `size`: the options of `karyos_stream_options_init` otherwise | status |
 | `karyos_driver_connect` | `driver` (required) | status, `client` |
 | `karyos_driver_do_work` | `driver` (required) | status, `work` |
 | `karyos_driver_close` | `driver` (required) | status |
 | `karyos_client_poll` | `client` (required) | status, `served` |
 | `karyos_client_close` | `client` (required) | status |
+| `karyos_client_connect` | `size` (required): the options of `karyos_client_options_init` with a null `dir` | status |
+| `karyos_client_add_publication` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`), `detail_size` | status, `publication` (on `KARYOS_OK`), `detail_written`, `code`, `value`, `detail_tail` |
+| `karyos_publication_offer` | `publication` (required), `lane` (default 0), `payload` or `length` (one of them), `accepted_size` | status, `lane`, `position`, `tail` |
+| `karyos_publication_claim` | `publication` and `length` (required), `lane` (default 0) | status, `claim` (on `KARYOS_OK`) |
+| `karyos_claim_commit` | `claim` (required), `accepted_size` | status, `lane`, `position`, `tail` |
+| `karyos_claim_abort` | `claim` (required) | status |
+| `karyos_publication_close` | `publication` (required) | status |
+
+`payload` is a quoted string whose UTF-8 bytes are the message; `length`
+is a message of that many zero bytes. A `karyos_client_connect` with a
+size the library accepts goes on to find no driver, and what it answers
+then depends on the platform: a scenario names only a size below the
+smallest.
 
 A handle is an integer value, bound from a result (`expect KARYOS_OK
 driver=$driver`) and passed back (`call karyos_driver_do_work
@@ -86,12 +102,39 @@ driver=$driver`).
 
 A result named in an `expect` that the call did not write is a failure.
 
+## Sized structs
+
+A struct whose first field is its `uint32_t` size (SPEC.md §10.2) is
+passed as a header of another minor version lays it out, so a scenario
+can check both halves of minor compatibility. An argument `size`,
+`detail_size` or `accepted_size` sets the size field to its value; left
+out, it is the size of the struct in the header the runner reads.
+
+- The runner places the struct in 8-aligned memory of the larger of that
+  size and its header's size, plus 16 bytes, and fills every byte the
+  struct does not set with the sentinel `0xA5`: the tail past its
+  header's size, and every field but the size of an output struct
+  (`karyos_detail`, `karyos_accepted`).
+- An input struct carries the values the defaults or the other arguments
+  give it, then the sentinel.
+- An output field is written when it no longer holds the sentinel; only
+  then is it a result (`lane` and `position` of `karyos_accepted`;
+  `code` and `value` of `karyos_detail`). `detail_written` is 1 when
+  `code` and `value` were written, 0 otherwise, so a scenario can expect
+  nothing written.
+- `tail` (`karyos_accepted`) and `detail_tail` (`karyos_detail`) are
+  `"intact"` when every byte past the header's size still holds the
+  sentinel, `"changed"` otherwise.
+
 ## Failures
 
 A scenario fails, and is reported as failed, on any of these:
 
 - an unknown `format`, keyword, function, argument or status name (a
-  status name the header does not define);
+  status name the header does not define). A runner that meets a
+  function or argument it does not know fails the scenario, never skips
+  it, so an older runner never passes a newer scenario by ignoring part
+  of it;
 - a header line repeated, missing, or after a `call`;
 - a `call` without its `expect`, an `expect` without a `call`, or no
   `call` at all;

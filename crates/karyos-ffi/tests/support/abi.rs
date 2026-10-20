@@ -73,6 +73,15 @@ pub struct Detail {
     pub value: u64,
 }
 
+/// `karyos_accepted`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Accepted {
+    pub size: u32,
+    pub lane: u32,
+    pub position: u64,
+}
+
 unsafe extern "C" {
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
@@ -116,6 +125,245 @@ unsafe extern "C" {
         length: usize,
         accepted: *mut core::ffi::c_void,
     ) -> i32;
+    fn karyos_publication_claim(
+        publication: u64,
+        lane: u32,
+        length: u32,
+        claim: *mut u64,
+        buffer: *mut *mut u8,
+    ) -> i32;
+    fn karyos_claim_commit(claim: u64, accepted: *mut core::ffi::c_void) -> i32;
+    safe fn karyos_claim_abort(claim: u64) -> i32;
+    safe fn karyos_publication_close(publication: u64) -> i32;
+}
+
+/// The byte every part of a [`SizedStruct`] the caller did not set holds:
+/// its tail past this header's struct, and for an output struct every field
+/// but its size.
+pub const SENTINEL: u8 = 0xA5;
+
+/// A caller's `T` as a header of another minor version lays it out: its
+/// size field says `size`, which may be below or above `size_of::<T>()`,
+/// and it lies in `size_of::<T>()` plus at least sixteen bytes of
+/// 8-aligned memory. The first `size_of::<T>()` bytes hold `value` (or the
+/// sentinel, for an output), and every byte past them holds the sentinel,
+/// so a library that reads or writes past its own prefix is seen.
+#[derive(Debug)]
+pub struct SizedStruct<T> {
+    words: Vec<u64>,
+    _of: core::marker::PhantomData<T>,
+}
+
+impl<T: Copy> SizedStruct<T> {
+    /// `value`, or the sentinel for an output, with size field `size`.
+    pub fn new(value: Option<&T>, size: u32) -> Self {
+        let bytes = usize::try_from(size)
+            .unwrap_or(usize::MAX)
+            .max(size_of::<T>())
+            .checked_add(16)
+            .unwrap_or(usize::MAX);
+        let mut words = vec![u64::from_ne_bytes([SENTINEL; 8]); bytes.div_ceil(8)];
+        let base = words.as_mut_ptr().cast::<u8>();
+        if let Some(value) = value {
+            // SAFETY: `words` holds at least `size_of::<T>()` bytes and is
+            // 8-aligned, which covers `T`'s alignment (a C struct of
+            // integers and pointers); `value` does not overlap it.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::from_ref(value).cast::<u8>(),
+                    base,
+                    size_of::<T>(),
+                );
+            }
+        }
+        // SAFETY: the size is the struct's first field, a `u32` at offset
+        // 0 of the aligned words.
+        unsafe { base.cast::<u32>().write(size) };
+        Self {
+            words,
+            _of: core::marker::PhantomData,
+        }
+    }
+
+    /// The struct, for an input.
+    pub fn as_ptr(&self) -> *const T {
+        self.words.as_ptr().cast()
+    }
+
+    /// The struct, for an output.
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.words.as_mut_ptr().cast()
+    }
+
+    /// Every byte.
+    fn bytes(&self) -> Vec<u8> {
+        self.words
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect()
+    }
+
+    /// Sets byte `offset` to `byte`, as a library's write would: for the
+    /// runner's self-test.
+    pub fn poke(&mut self, offset: usize, byte: u8) {
+        if let Some(word) = self.words.get_mut(offset / 8) {
+            let mut bytes = word.to_ne_bytes();
+            if let Some(slot) = bytes.get_mut(offset % 8) {
+                *slot = byte;
+            }
+            *word = u64::from_ne_bytes(bytes);
+        }
+    }
+
+    /// Whether every byte past this header's struct still holds the
+    /// sentinel.
+    pub fn tail_intact(&self) -> bool {
+        self.bytes()
+            .get(size_of::<T>()..)
+            .is_some_and(|tail| tail.iter().all(|byte| *byte == SENTINEL))
+    }
+
+    /// The `N` bytes at `offset` within this header's struct, unless they
+    /// still hold the sentinel: the field was not written.
+    pub fn written<const N: usize>(&self, offset: usize) -> Option<[u8; N]> {
+        let field: [u8; N] = self
+            .bytes()
+            .get(offset..offset.checked_add(N)?)?
+            .try_into()
+            .ok()?;
+        (field != [SENTINEL; N]).then_some(field)
+    }
+}
+
+/// A `karyos_accepted` of size `size` filled with the sentinel.
+pub fn accepted(size: u32) -> SizedStruct<Accepted> {
+    SizedStruct::new(None, size)
+}
+
+/// `karyos_accepted`'s lane and position, when the library wrote them.
+pub fn accepted_fields(accepted: &SizedStruct<Accepted>) -> Option<(u32, u64)> {
+    let lane = accepted.written::<4>(4)?;
+    let position = accepted.written::<8>(8)?;
+    Some((u32::from_ne_bytes(lane), u64::from_ne_bytes(position)))
+}
+
+/// `karyos_detail`'s code and value, when the library wrote them.
+pub fn detail_fields(detail: &SizedStruct<Detail>) -> Option<(u64, u64)> {
+    let code = detail.written::<8>(8)?;
+    let value = detail.written::<8>(16)?;
+    Some((u64::from_ne_bytes(code), u64::from_ne_bytes(value)))
+}
+
+/// `karyos_driver_create` with `options` sized as `size`: the status and
+/// the handle.
+pub fn driver_create_sized(options: &DriverOptions, size: u32) -> (i32, u64) {
+    let options = SizedStruct::new(Some(options), size);
+    let mut driver = 0;
+    // SAFETY: a struct of at least `size` readable bytes and a live,
+    // aligned `u64`; a null detail is allowed.
+    let status =
+        unsafe { karyos_driver_create(options.as_ptr(), &mut driver, core::ptr::null_mut()) };
+    (status, driver)
+}
+
+/// `karyos_driver_add_stream` with `options` sized as `size`.
+pub fn driver_add_stream_sized(driver: u64, options: &StreamOptions, size: u32) -> i32 {
+    let options = SizedStruct::new(Some(options), size);
+    // SAFETY: a struct of at least `size` readable bytes; a null detail is
+    // allowed.
+    unsafe { karyos_driver_add_stream(driver, options.as_ptr(), core::ptr::null_mut()) }
+}
+
+/// `karyos_client_connect` with the default options sized as `size` and no
+/// directory: the status.
+pub fn client_connect_sized(size: u32) -> i32 {
+    let mut options = core::mem::MaybeUninit::<ClientOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `ClientOptions`.
+    let status = unsafe { karyos_client_options_init(options.as_mut_ptr()) };
+    assert_eq!(status, 0);
+    // SAFETY: `karyos_client_options_init` wrote every field.
+    let options = SizedStruct::new(Some(&unsafe { options.assume_init() }), size);
+    let mut client = 0;
+    // SAFETY: a struct of at least `size` readable bytes whose `dir` is
+    // null, and a live, aligned `u64`; a null detail is allowed.
+    unsafe { karyos_client_connect(options.as_ptr(), &mut client, core::ptr::null_mut()) }
+}
+
+/// `karyos_client_add_publication` of `stream_id` on `uri`, with a detail
+/// sized as `detail_size`: the status, the handle and the detail.
+pub fn client_add_publication(
+    client: u64,
+    uri: &CStr,
+    stream_id: i32,
+    detail_size: u32,
+) -> (i32, u64, SizedStruct<Detail>) {
+    let mut publication = 0;
+    let mut detail = SizedStruct::<Detail>::new(None, detail_size);
+    // SAFETY: a live C string, a live, aligned `u64` and a detail of at
+    // least `detail_size` writable bytes.
+    let status = unsafe {
+        karyos_client_add_publication(
+            client,
+            uri.as_ptr(),
+            stream_id,
+            &mut publication,
+            detail.as_mut_ptr(),
+        )
+    };
+    (status, publication, detail)
+}
+
+/// `karyos_publication_offer` of `data` on `lane`, with an accepted sized
+/// as `accepted_size`: the status and the accepted.
+pub fn publication_offer_on(
+    publication: u64,
+    lane: u32,
+    data: &[u8],
+    accepted_size: u32,
+) -> (i32, SizedStruct<Accepted>) {
+    let mut accepted = accepted(accepted_size);
+    // SAFETY: `data` is live for the call; `accepted` holds at least
+    // `accepted_size` writable bytes.
+    let status = unsafe {
+        karyos_publication_offer(
+            publication,
+            lane,
+            data.as_ptr(),
+            data.len(),
+            accepted.as_mut_ptr().cast(),
+        )
+    };
+    (status, accepted)
+}
+
+/// `karyos_publication_claim` of `length` bytes on `lane`: the status and
+/// the claim's handle.
+pub fn publication_claim(publication: u64, lane: u32, length: u32) -> (i32, u64) {
+    let mut claim = 0;
+    let mut buffer = core::ptr::null_mut();
+    // SAFETY: a live, aligned `u64` and pointer.
+    let status =
+        unsafe { karyos_publication_claim(publication, lane, length, &mut claim, &mut buffer) };
+    (status, claim)
+}
+
+/// `karyos_claim_commit`, with an accepted sized as `accepted_size`: the
+/// status and the accepted.
+pub fn claim_commit(claim: u64, accepted_size: u32) -> (i32, SizedStruct<Accepted>) {
+    let mut accepted = accepted(accepted_size);
+    // SAFETY: `accepted` holds at least `accepted_size` writable bytes.
+    let status = unsafe { karyos_claim_commit(claim, accepted.as_mut_ptr().cast()) };
+    (status, accepted)
+}
+
+/// `karyos_claim_abort`.
+pub fn claim_abort(claim: u64) -> i32 {
+    karyos_claim_abort(claim)
+}
+
+/// `karyos_publication_close`.
+pub fn publication_close(publication: u64) -> i32 {
+    karyos_publication_close(publication)
 }
 
 /// `karyos_stream_options_init` with `stream_id` set: the status and the

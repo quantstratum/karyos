@@ -1,0 +1,40 @@
+# A claim ends at its abort or at a commit that releases it: a second
+# abort, or a commit after it, answers KARYOS_E_CLOSED. A commit refused
+# with KARYOS_E_NOT_CONNECTED keeps the claim staged, so its abort is the
+# one close (SPEC.md §13, C ABI boundary; karyos_claim_commit).
+format 1
+id claim.double.commit
+abi 0.1
+covers "double close"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=7
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_publication client=$client stream_id=7
+expect KARYOS_OK publication=$publication
+call karyos_publication_claim publication=$publication length=8
+expect KARYOS_OK claim=$claim
+call karyos_claim_commit claim=$claim
+expect KARYOS_E_NOT_CONNECTED
+call karyos_claim_commit claim=$claim
+expect KARYOS_E_NOT_CONNECTED
+call karyos_claim_abort claim=$claim
+expect KARYOS_OK
+call karyos_claim_abort claim=$claim
+expect KARYOS_E_CLOSED
+call karyos_claim_commit claim=$claim
+expect KARYOS_E_CLOSED
+# The publication takes a new claim once the old one is closed.
+call karyos_publication_claim publication=$publication length=8
+expect KARYOS_OK claim=$next
+call karyos_claim_abort claim=$next
+expect KARYOS_OK
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

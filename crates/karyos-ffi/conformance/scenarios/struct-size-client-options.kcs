@@ -1,0 +1,12 @@
+# karyos_client_options of ABI 0.1.0 is 40 bytes: a smaller size is
+# refused before anything else, on every platform (SPEC.md §10.2, §13, C
+# ABI boundary).
+format 1
+id struct.size.client.options
+abi 0.1
+covers "struct sizes of another minor version"
+
+call karyos_client_connect size=0
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_connect size=36
+expect KARYOS_E_INVALID_ARGUMENT
