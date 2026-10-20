@@ -1674,7 +1674,9 @@ mod owned {
         queued: Box<[u64]>,
         queue: Box<[u32]>,
         head: usize,
-        len: usize,
+        /// Keys queued: at most `keys`, the queue's capacity, so a `u32`
+        /// always holds it (SPEC §14: no conversion to saturate).
+        len: u32,
         in_flight: Option<u32>,
         scan_cursor: u32,
         scan_remaining: u32,
@@ -1828,24 +1830,27 @@ mod owned {
         /// Queues `key` at the back unless it is already queued. The queue
         /// holds each key at most once, so it never overflows.
         fn push(&mut self, key: u32) {
-            if self.is_queued(key) || self.len >= self.queue.len() {
+            if self.is_queued(key) || self.len >= self.keys {
                 return;
             }
-            let tail = (self.head + self.len) % self.queue.len();
+            // Below `keys`, so the increment cannot overflow; a length no
+            // usize of this target holds queues nothing.
+            let (Ok(len), Some(next)) = (usize::try_from(self.len), self.len.checked_add(1)) else {
+                return;
+            };
+            let tail = (self.head + len) % self.queue.len();
             if let Some(entry) = self.queue.get_mut(tail) {
                 *entry = key;
-                self.len += 1;
+                self.len = next;
                 self.set_queued(key, true);
             }
         }
 
         fn pop(&mut self) -> Option<u32> {
-            if self.len == 0 {
-                return None;
-            }
+            let rest = self.len.checked_sub(1)?;
             let key = *self.queue.get(self.head)?;
             self.head = (self.head + 1) % self.queue.len();
-            self.len -= 1;
+            self.len = rest;
             self.set_queued(key, false);
             Some(key)
         }
@@ -1903,7 +1908,7 @@ mod owned {
             self.sweep(budget.keys);
             // Serve only the keys queued now, so a key requeued as unstable
             // is not retried again in this poll.
-            let eligible = budget.keys.min(u32::try_from(self.len).unwrap_or(u32::MAX));
+            let eligible = budget.keys.min(self.len);
             for _ in 0..eligible {
                 let Some(key) = self.pop() else {
                     break;
@@ -1914,7 +1919,7 @@ mod owned {
         }
 
         fn report(&self, mut report: PollReport) -> PollReport {
-            report.pending = u32::try_from(self.len).unwrap_or(u32::MAX);
+            report.pending = self.len;
             report.scanning = self.scan_remaining > 0 || self.loss_scan > 0;
             report.closed = self.closed_seen;
             report.terminal = self.terminal;
