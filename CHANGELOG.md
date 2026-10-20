@@ -508,6 +508,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyos-replay` (SPEC §11; quantstratum-docs:
+  `karyos/design/archive-host.md`, H5), the replay and output diff
+  binary: `karyos-replay diff` is the recording group journal diff, and
+  `karyos-tools replay diff` stays as its alias, running the same code
+  (`replay::run_diff`, with the usage text named after the command it came
+  through). Replaying into a stream (`karyos-replay to`) is H6.
 - Subscription options over the C ABI (F7b-1; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` D3):
   `karyos_subscription_options` (`role`: `KARYOS_ROLE_REQUIRED`,
