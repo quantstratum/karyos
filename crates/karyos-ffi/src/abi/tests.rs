@@ -1237,3 +1237,34 @@ fn a_panic_in_the_poll_poisons_the_subscription() {
     );
     assert_eq!(karyos_client_close(client), Status::Ok.code());
 }
+
+/// The size of `change` is read and checked before the handle is looked up,
+/// so with no driver: a null or too small `change` is refused with
+/// INVALID_ARGUMENT and `has` untouched; a full one passes the check and
+/// meets the handle's own failure. It runs under Miri, for the read of the
+/// caller's `size`.
+#[test]
+fn next_image_change_checks_its_struct_before_its_handle() {
+    let stale = Handle::from_raw(0).raw();
+    let mut has = u32::MAX;
+    // SAFETY: a null `change` is refused before any use; `has` is live.
+    let status =
+        unsafe { karyos_subscription_next_image_change(stale, core::ptr::null_mut(), &mut has) };
+    assert_eq!((status, has), (Status::InvalidArgument.code(), u32::MAX));
+    let mut change = ImageChange {
+        size: IMAGE_CHANGE_SIZE_0_1 - 1,
+        session_id: 7,
+        image_id: 7,
+        lane: 7,
+        available: 7,
+    };
+    // SAFETY: live, aligned out-parameters.
+    let status = unsafe { karyos_subscription_next_image_change(stale, &mut change, &mut has) };
+    assert_eq!((status, has), (Status::InvalidArgument.code(), u32::MAX));
+    change.size = size_of_u32::<ImageChange>();
+    // SAFETY: as above.
+    let status = unsafe { karyos_subscription_next_image_change(stale, &mut change, &mut has) };
+    assert_eq!(status, Status::InvalidHandle.code());
+    // Nothing was written: the handle failed after the check.
+    assert_eq!((has, change.image_id), (u32::MAX, 7));
+}
