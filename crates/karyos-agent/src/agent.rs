@@ -3,6 +3,7 @@
 //! The agent: one tool attach per configured driver, and the model it
 //! keeps of each.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use crate::api::{
     GapView, GuardEntry, JournalView, LossEntry, Sample,
 };
 use crate::catalog::{CatalogConfig, CatalogWatch};
-use crate::journal::{GapReason, Journal, JournalError};
+use crate::journal::{Gap, GapReason, Journal, JournalError, UNOPENED_POSITION};
 use crate::model::{self, Cell, Follower};
 use crate::operations::{self, GuardAnswer};
 use crate::trace_window::{TraceWindow, WindowConfig};
@@ -143,6 +144,10 @@ pub struct Agent {
     journal: Option<Journal>,
     /// Why the configured journal could not be opened.
     journal_error: Option<String>,
+    /// The unknown interval of a journal that could not be opened, until
+    /// an administrator acknowledges it. Held in memory: nothing durable
+    /// can record it or its acknowledgement.
+    unopened_gap: Option<Gap>,
     /// The next guard operation's id.
     next_operation: u64,
 }
@@ -177,18 +182,26 @@ impl Agent {
                     .map(|(_, catalog)| CatalogWatch::start(dir.clone(), *catalog)),
             })
             .collect();
+        let start = host_monotonic_ns();
         let (journal, journal_error) = match config.journal.as_deref() {
             None => (None, None),
-            Some(dir) => match Journal::open(dir, host_monotonic_ns()) {
+            Some(dir) => match Journal::open(dir, start) {
                 Ok(journal) => (Some(journal), None),
                 Err(error) => (None, Some(error.to_string())),
             },
         };
+        let unopened_gap = journal_error.as_ref().map(|_| Gap {
+            position: UNOPENED_POSITION,
+            reason: GapReason::JournalUnavailableAtStart,
+            from: 0,
+            to: start,
+        });
         Self {
             config,
             drivers,
             journal,
             journal_error,
+            unopened_gap,
             // Ids from the agent's start time: unique across restarts.
             next_operation: host_monotonic_ns().max(1),
         }
@@ -260,24 +273,43 @@ impl Agent {
     }
 
     /// Records administrator `uid`'s acknowledgement of the open unknown
-    /// interval at `position` (M10b).
+    /// interval at `position` (M10b). That of a journal that could not be
+    /// opened, at [`UNOPENED_POSITION`], is kept in memory only and
+    /// logged at info on standard error with `uid` and the interval: the
+    /// run has no journal to record it, and the next start raises it again
+    /// if the journal still cannot be opened.
     ///
     /// # Errors
     ///
-    /// [`JournalError::NoGap`] when there is no journal or that interval
-    /// is not the open one, and the journal's errors.
+    /// [`JournalError::NoGap`] when there is no such interval open, and
+    /// the journal's errors.
     pub fn acknowledge_gap(&mut self, position: u64, uid: u32) -> Result<(), JournalError> {
-        self.journal
-            .as_mut()
-            .ok_or(JournalError::NoGap)?
-            .acknowledge_gap(position, u64::from(uid), host_monotonic_ns())
+        match self.journal.as_mut() {
+            Some(journal) => journal.acknowledge_gap(position, u64::from(uid), host_monotonic_ns()),
+            None => match self.unopened_gap.take_if(|gap| gap.position == position) {
+                // The one operator act nothing durable records: logged at
+                // info on standard error, as the agent logs (DESIGN's P3 on
+                // #498).
+                Some(gap) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "karyos-agent: info: uid {uid} acknowledged the unknown interval of a \
+                         journal that could not be opened, from {} to {}; held in memory only",
+                        gap.from,
+                        gap.to,
+                    );
+                    Ok(())
+                }
+                None => Err(JournalError::NoGap),
+            },
+        }
     }
 
     /// The journal's state, for the view.
     fn journal_view(&self) -> Option<JournalView> {
         self.config.journal.as_ref()?;
         let journal = self.journal.as_ref();
-        let gap = journal.and_then(Journal::gap);
+        let gap = journal.and_then(Journal::gap).or(self.unopened_gap);
         Some(JournalView {
             recording: journal.map(Journal::recording),
             unsealed: true,
@@ -292,6 +324,7 @@ impl Agent {
                     GapReason::RequestWithoutOutcome => "request_without_outcome",
                     GapReason::TornTail => "torn_tail",
                     GapReason::JournalReplaced => "journal_replaced",
+                    GapReason::JournalUnavailableAtStart => "journal_unavailable_at_start",
                     _ => "unclean_stop",
                 },
             }),

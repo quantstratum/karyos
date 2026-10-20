@@ -433,6 +433,40 @@ release may break APIs, wire formats and shared-memory layouts.
   words 2 to 5, and `outcome_ring::binding` reads them back for a
   client, refusing a slot count other than `C_m + C_r + 1`, an index
   past the client's guard words, or an epoch that is not open.
+
+- karyos-client's `Subscription` gains `adopt()`, `max_message_length()`
+  and `poll_adopted(handler, limit)` (owner item 57; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md` §4.4), so a caller can size a copy
+  of each message before it polls. `adopt` takes the images a network
+  subscription's client has attached or retired, and moves every handle
+  a previous `poll_adopted` left at a mapping's seal to its successor;
+  `max_message_length` is the largest message of the stream, or of the
+  adopted images, and changes only at an adoption; `poll_adopted` is the
+  same poll that never adopts and never moves, so an image or a
+  successor offered meanwhile waits for the next adoption, and a handle
+  stopped at a seal sets the new `stopped_at_seal` of `SubscriptionPoll`
+  and `PollSummary`. `poll` is unchanged: it adopts, and moves within
+  the poll. The C ABI's subscription poll (F4) builds on it.
+
+- `Client::remove_concurrent_publication`, the removal matching
+  `Client::add_concurrent_publication` (#484): the driver frees the
+  handle's publisher slot when it serves it, so the stream's `publishers`
+  bound counts it no more. A removal that cannot be sent drops the handle
+  and counts in `publication_releases_failed`. `RemoteClient` gains
+  `remove_concurrent_publication`, and `Connection` a hidden
+  `release_concurrent_publication`. Needed by the C ABI's concurrent
+  publications (quantstratum-docs: karyos/design/ffi-gap-analysis.md,
+  F7a-1); owner item 57 lists it for the alpha.2 audit.
+
+- A journal that cannot be opened at the agent's start raises the
+  `journal_gap` alert (karyos#497; quantstratum-docs:
+  `karyos/design/guards-and-abort.md`). The view shows its unknown
+  interval with reason `journal_unavailable_at_start` (code 5) at
+  position `u64::MAX` until an administrator acknowledges it with
+  `gap-ack`. With no journal to record it, the interval and its
+  acknowledgement are held in memory only, the acknowledgement logged at
+  info on standard error with the uid and the interval, and the next
+  start raises it again while the journal still cannot be opened.
 - The operations journal records how each agent run ends (DESIGN, a
   follow-up of M10b): `agent started` (kind 8) is written durably when
   the journal opens and `agent stopped` (kind 7) by `Agent::stop` /

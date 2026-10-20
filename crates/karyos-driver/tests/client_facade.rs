@@ -830,6 +830,48 @@ mod remote {
         ));
     }
 
+    /// `Client::remove_concurrent_publication` remote: the removal frees the
+    /// handle's publisher slot at the driver, so a client at the stream's
+    /// bound of two takes a third handle once it removed one.
+    #[test]
+    fn a_remote_removed_concurrent_handle_frees_its_slot() {
+        use karyos_protocol::cnc::ErrorCode;
+
+        let (_driver, dir) = ipc_driver("concurrent-remove");
+        let mut client = connect(&dir);
+        let first = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        let _second = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        assert!(matches!(
+            client.add_concurrent_publication("karyos:ipc", StreamId::new(4)),
+            Err(ClientError::Refused {
+                code: ErrorCode::PublicationTaken,
+                ..
+            })
+        ));
+        client.remove_concurrent_publication(first);
+        assert_eq!(client.publication_releases_failed(), 0);
+        let start = Instant::now();
+        let _third = loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "slot never freed"
+            );
+            let _ = client.poll();
+            match client.add_concurrent_publication("karyos:ipc", StreamId::new(4)) {
+                Ok(publication) => break publication,
+                Err(ClientError::Refused {
+                    code: ErrorCode::PublicationTaken,
+                    ..
+                }) => std::thread::sleep(Duration::from_millis(1)),
+                Err(error) => panic!("{error:?}"),
+            }
+        };
+    }
+
     /// SPEC §10 remote over the network (network-shared-terms n4): on two
     /// IPC drivers, a remote client publishes by `karyos:udp` and another
     /// subscribes by it; the subscriber reads the exact sequence from the
@@ -1567,6 +1609,59 @@ fn a_concurrent_publication_is_taken_by_uri() {
     });
 }
 
+/// `Client::remove_concurrent_publication` frees the handle's publisher
+/// slot: on a stream of two publishers, a third handle is refused while two
+/// are held, and taken once one is removed.
+#[test]
+fn a_removed_concurrent_handle_frees_its_slot() {
+    use karyos_protocol::cnc::ErrorCode;
+    use karyos_sys::log_buffer::PublicationMode;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut shared = heap_stream(4);
+    shared.buffer.publication = PublicationMode::Concurrent {
+        publishers: 2,
+        allow_non_lse: true,
+    };
+    let _ = driver.add_stream(shared).unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let first = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        let _second = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        assert!(matches!(
+            client.add_concurrent_publication("karyos:ipc", StreamId::new(4)),
+            Err(ClientError::Refused {
+                code: ErrorCode::PublicationTaken,
+                ..
+            })
+        ));
+        client.remove_concurrent_publication(first);
+        assert_eq!(client.publication_releases_failed(), 0);
+        // The removal is served on the driver's thread; then the slot is
+        // free again.
+        let start = Instant::now();
+        let _third = loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "slot never freed"
+            );
+            let _ = client.poll();
+            match client.add_concurrent_publication("karyos:ipc", StreamId::new(4)) {
+                Ok(publication) => break publication,
+                Err(ClientError::Refused {
+                    code: ErrorCode::PublicationTaken,
+                    ..
+                }) => std::thread::sleep(Duration::from_millis(1)),
+                Err(error) => panic!("{error:?}"),
+            }
+        };
+    });
+}
+
 /// karyos#490: one driver holds both ends of a `karyos:udp` endpoint. Its
 /// own network publication's loopback image shares the publication's key,
 /// and is exposed beside it: a subscription of the driver reads what a
@@ -1628,4 +1723,103 @@ fn one_driver_carries_its_own_udp_publication_to_its_subscription() {
         let _ = reading.poll(|_, _| {}, MessageLimit::new(16));
         reading.image_count() == 0
     });
+}
+
+/// Item 57 (FFI F4): a reader that polls as the C ABI does (`adopt`, then
+/// `poll_adopted`, and one more round when it stopped at a seal) follows
+/// a cutover to a larger term within its calls: every message arrives in
+/// order, none longer than the largest it read after adopting, and the
+/// driver's fence never fires (the predecessor is freed: its reader
+/// moved). A reconfiguration keeps the MTU and `max_reserved`, so the
+/// largest message stays the same here; the unit tests of karyos-client
+/// cover a successor whose largest message grows.
+#[test]
+fn a_reader_that_adopts_follows_a_cutover() {
+    use karyos_client::Subscription;
+    use karyos_driver::Reconfiguration;
+    use karyos_sys::sizing::{MIN_TERM_LENGTH, TermLength};
+
+    /// One call of the C ABI's poll: at most one extra round at a seal.
+    fn ffi_poll(
+        reading: &mut Subscription<karyos_sys::term_bytes::HeapTerms>,
+        seen: &mut Vec<Vec<u8>>,
+    ) -> usize {
+        let mut largest = 0;
+        for _ in 0..2 {
+            reading.adopt();
+            largest = largest.max(reading.max_message_length() as usize);
+            let poll = reading
+                .poll_adopted(
+                    |bytes, _| {
+                        assert!(bytes.len() <= largest, "a message past the largest");
+                        seen.push(bytes.to_vec());
+                    },
+                    MessageLimit::new(8),
+                )
+                .unwrap();
+            if !poll.stopped_at_seal {
+                break;
+            }
+        }
+        largest
+    }
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver.add_stream(heap_stream(11)).unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    let mut reading = serve(&mut driver, || {
+        client
+            .add_subscription("karyos:ipc", StreamId::new(11))
+            .unwrap()
+    });
+    let mut writer = driver.publication(stream).unwrap();
+    let mut seen = Vec::new();
+    assert!(matches!(
+        writer.offer(b"one").unwrap(),
+        karyos_client::OfferOutcome::Accepted { .. }
+    ));
+    let before = ffi_poll(&mut reading, &mut seen);
+    let _ = driver
+        .reconfigure_stream(
+            stream,
+            Reconfiguration {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                spare_slots: 3,
+            },
+        )
+        .unwrap();
+    // The writer moves to the successor (its offers answer AdminAction
+    // until then) and writes its largest message there.
+    let mut written = vec![b"one".to_vec()];
+    let start = Instant::now();
+    while written.len() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(10), "no move");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll();
+        let message = vec![7u8; writer.max_message_length() as usize];
+        if matches!(
+            writer.offer(&message).unwrap(),
+            karyos_client::OfferOutcome::Accepted { .. }
+        ) {
+            written.push(message);
+        }
+        let _ = ffi_poll(&mut reading, &mut seen);
+    }
+    let start = Instant::now();
+    while seen.len() < written.len() {
+        assert!(start.elapsed() < Duration::from_secs(10), "{}", seen.len());
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll();
+        let _ = ffi_poll(&mut reading, &mut seen);
+    }
+    assert_eq!(seen, written, "every message, in order");
+    assert_eq!(written[1].len(), before, "the largest message, unchanged");
+    // The reader moved: the predecessor goes once nothing holds it.
+    let start = Instant::now();
+    while driver.generations(stream).unwrap().len() > 1 {
+        assert!(start.elapsed() < Duration::from_secs(10), "not freed");
+        let _ = driver.do_work().unwrap();
+        let _ = ffi_poll(&mut reading, &mut seen);
+    }
+    assert_eq!(seen.len(), written.len());
 }
