@@ -2469,6 +2469,9 @@ release may break APIs, wire formats and shared-memory layouts.
   `1 << 20`, or on a concurrent stream (TT-1, GC-7). It now answers
   `KARYOS_E_INVALID_ARGUMENT`, as for the other stream options, and
   `karyos.h` states the rule. The Go binding's fuzz test found it.
+  The driver's own refusal of a schedule capacity or a publication
+  mode also maps to `KARYOS_E_INVALID_ARGUMENT` now, so a rule the
+  options check misses is not reported as `KARYOS_E_SYSTEM` either.
 - `make libkaryos` failed on main after #555 ("no format version in
   conformance/FORMAT.md"): the package script read the format from
   FORMAT.md's title, which #555 retitled. FORMAT.md now carries a marker

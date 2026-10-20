@@ -28,11 +28,12 @@ use karyos_client::ClientConductor;
 use karyos_driver::agents::{IdleStrategy as _, YieldThenSleep};
 use karyos_driver::{DriverConfig, DriverError, EmbeddedDriver, StreamConfig, StreamHandle};
 use karyos_sys::conflation::ConflationConfig;
+use karyos_sys::error::SysError;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     DEFAULT_CLAIM_DEADLINE, LogBufferConfig, LossPolicy, PublicationMode,
 };
-use karyos_sys::schedule_ring::MAX_CAPACITY;
+use karyos_sys::schedule_ring::{MAX_CAPACITY, ScheduleError};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
@@ -494,6 +495,14 @@ impl From<&DriverError> for Failure {
             // value.
             DriverError::DescriptorLimit { needed, limit, .. } => {
                 Self::with(Status::System, *needed, *limit)
+            }
+            // A stream configuration the buffer refuses is the caller's
+            // argument, whichever check found it first.
+            DriverError::Sys(SysError::Schedule(ScheduleError::Capacity { capacity })) => {
+                Self::with(Status::InvalidArgument, u64::from(*capacity), 0)
+            }
+            DriverError::Sys(SysError::InvalidPublicationMode { .. }) => {
+                Status::InvalidArgument.into()
             }
             DriverError::Sys(error) => error.into(),
             DriverError::DuplicateStream {
