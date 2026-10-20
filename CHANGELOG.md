@@ -421,6 +421,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `Client::remove_concurrent_publication`, the removal matching
+  `Client::add_concurrent_publication` (#484): the driver frees the
+  handle's publisher slot when it serves it, so the stream's `publishers`
+  bound counts it no more. A removal that cannot be sent drops the handle
+  and counts in `publication_releases_failed`. `RemoteClient` gains
+  `remove_concurrent_publication`, and `Connection` a hidden
+  `release_concurrent_publication`. Needed by the C ABI's concurrent
+  publications (quantstratum-docs: karyos/design/ffi-gap-analysis.md,
+  F7a-1); owner item 57 lists it for the alpha.2 audit.
+
 - A journal that cannot be opened at the agent's start raises the
   `journal_gap` alert (karyos#497; quantstratum-docs:
   `karyos/design/guards-and-abort.md`). The view shows its unknown
