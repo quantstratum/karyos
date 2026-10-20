@@ -463,6 +463,11 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `Publication::offer_at_on(lane, payload, tx_time)` on the client facade
+  (quantstratum-docs: `karyos/design/timed-tx.md`; owner item 57): a timed
+  offer on one lane of a publication, checked by the lane's handle before
+  anything is reserved.
+
 - Subscriptions over the C ABI (F4; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §4.4, ADR-0067):
   `karyos_client_add_subscription`, `karyos_subscription_poll` (a
