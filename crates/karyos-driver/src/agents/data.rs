@@ -241,6 +241,9 @@ struct Timed {
     /// and its entry is released (a reset rewinds to that position and
     /// reads the messages above it again). Sized by the lane's ring.
     unacknowledged: Vec<VecDeque<u64>>,
+    /// Per lane, whether its consumer's violation was reported to the
+    /// conductor (`AgentEvent::ScheduleViolated`, posted once).
+    reported: Vec<bool>,
 }
 
 /// The counters of one outbound publication; checked, sticky on overflow.
@@ -1195,6 +1198,31 @@ impl<T: StreamTerms> Outbound<T> {
         });
     }
 
+    /// The first lane whose publisher breached its schedule ring's
+    /// protocol and that was not reported yet (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`, section 11, TT-6).
+    pub(crate) fn violation_unreported(&self) -> Option<usize> {
+        let timed = self.timed.as_deref()?;
+        timed
+            .consumers
+            .iter()
+            .zip(&timed.reported)
+            .position(|(consumer, reported)| {
+                !*reported && consumer.as_ref().is_some_and(ScheduleConsumer::violated)
+            })
+    }
+
+    /// `lane`'s violation was reported: it is not reported again.
+    pub(crate) fn violation_reported(&mut self, lane: usize) {
+        if let Some(reported) = self
+            .timed
+            .as_deref_mut()
+            .and_then(|timed| timed.reported.get_mut(lane))
+        {
+            *reported = true;
+        }
+    }
+
     /// Makes its lanes timed (control path, before it is posted): each lane
     /// whose buffer has a schedule ring holds every head until its
     /// message's requested time, under `policies[lane]` (its tolerance),
@@ -1238,10 +1266,12 @@ impl<T: StreamTerms> Outbound<T> {
             };
             unacknowledged.push(VecDeque::with_capacity(capacity));
         }
+        let reported = vec![false; consumers.len()];
         self.timed = Some(Box::new(Timed {
             state,
             consumers,
             unacknowledged,
+            reported,
         }));
         Ok(())
     }
@@ -1669,8 +1699,9 @@ impl<T: StreamTerms> Outbound<T> {
             }
             // Nor does a timed lane whose publisher breached the schedule
             // ring's protocol, counted once in `schedule_faults` when it was
-            // found. Interim: T-x2 seals the lane with `ScheduleViolation`
-            // and retires the client (timed-tx.md section 11).
+            // found; the sender reports it (`ScheduleViolated`), and the
+            // conductor seals the lane and retires a remote client
+            // (timed-tx.md section 11).
             if self
                 .timed
                 .as_deref()

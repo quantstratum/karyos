@@ -515,7 +515,18 @@ impl<T: StreamTerms> Admission<T> {
         // One datagram per client, then its outbound queue.
         let mut index = 0;
         while let Some(remote) = self.remotes.get_mut(index) {
-            let step = match Self::receive(remote, driver, &self.config) {
+            // A client the conductor found faulty (a timed lane's schedule
+            // violation) is retired as one admission found faulty.
+            let faulty = driver
+                .faulty_pending
+                .iter()
+                .position(|client| *client == remote.client)
+                .map(|found| driver.faulty_pending.swap_remove(found));
+            let step = match faulty {
+                Some(_) => Step::Retire,
+                None => Self::receive(remote, driver, &self.config),
+            };
+            let step = match step {
                 Step::Keep => {
                     let (step, sent) = Self::drain(remote);
                     Self::account(driver, remote.client, &sent);
@@ -563,6 +574,8 @@ impl<T: StreamTerms> Admission<T> {
                 }
             }
         }
+        // A faulty client no longer admitted has nothing left to retire.
+        driver.faulty_pending.clear();
         self.serve_tools(driver, &mut now, &mut work);
         // Exit proofs.
         let before = self.remotes.len() + self.retiring.len();

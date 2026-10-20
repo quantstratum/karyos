@@ -295,7 +295,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         for stream in handle.streams() {
             self.schedule_stream(stream, options)?;
             self.ensure_timed_counters(stream)?;
-            self.stream(stream)?.schedule_issued = true;
+            self.stream(stream)?.fix_schedule()?;
         }
         Ok(())
     }

@@ -408,6 +408,88 @@ fn a_remote_udp_publisher_process_reaches_an_ipc_subscriber() {
     remote_publisher_reaches("pub-ipc", ipc_driver(&other, network()));
 }
 
+/// The horizon of the timed publication below: the sender's own bound.
+const TIMED_HORIZON: u64 = 5_000_000_000;
+/// How far ahead the remote timed publisher schedules its first message.
+const TIMED_AHEAD: u64 = 200_000_000;
+
+/// T-x2 (quantstratum-docs: karyos/design/timed-tx.md, section 11): a
+/// remote process takes a timed lane's handle over the control path, its
+/// schedule read from the ring's binding, and its message is sent no
+/// earlier than its time. The same process then breaches the ring with a
+/// binding of its own making, a time past the sender's horizon: the sender
+/// reports it, the lane is sealed with `ScheduleViolation` (the handle
+/// meets `Gated`), and the client is retired as faulty. The time
+/// namespace refusal needs an unshared time namespace, which this harness
+/// cannot create unprivileged: it is covered by the unit tests only.
+#[test]
+fn a_remote_timed_publisher_is_sent_on_time_and_retired_for_a_breach() {
+    const SESSION: i32 = 31;
+    let dir = dir("timed");
+    let mut a = ipc_driver(&dir, network());
+    let mut b = heap_driver(network());
+    let _subscription = b
+        .add_network_subscription(STREAM_ID, &channel(ANY_PORT))
+        .unwrap();
+    let address = b.network_subscription_address(STREAM_ID).unwrap();
+    let mut config = aggregate(SESSION);
+    config.stream.buffer.schedule_capacity = 4;
+    let _publication = a
+        .add_timed_network_publication(
+            config,
+            &channel(address),
+            None,
+            karyos_client::schedule::ScheduleOptions::default().with_max_horizon(TIMED_HORIZON),
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut a, &mut b, "the image", |_, b| {
+        image = b.network_image(STREAM_ID, SESSION);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    let (mut child, reports) = spawn("timed-publish", &dir, &SESSION.to_string());
+    assert_eq!(
+        pump_until_report(&mut a, &mut b, &reports, "bound "),
+        TIMED_HORIZON.to_string()
+    );
+    tell(&mut child.0, "go");
+    let at: u64 = pump_until_report(&mut a, &mut b, &reports, "offered ")
+        .parse()
+        .unwrap();
+    let mut read_at = None;
+    pump(&mut a, &mut b, "the timed message", |_, _| {
+        let _ = reader.poll(
+            |payload, _, _| {
+                assert_eq!(index_of(payload), 0);
+                read_at = Some(karyos_sys::host_clock::host_monotonic_ns());
+            },
+            BUDGET,
+        );
+        read_at.is_some()
+    });
+    let read_at = read_at.unwrap();
+    assert!(read_at >= at, "read {} ns before its time", at - read_at);
+    // The breach: sealed, counted once, and the client retired as faulty.
+    tell(&mut child.0, "breach");
+    assert_eq!(
+        pump_until_report(&mut a, &mut b, &reports, "gated "),
+        format!("{:?}", Some(SealReason::ScheduleViolation))
+    );
+    pump(&mut a, &mut b, "the client retired", |a, _| {
+        counter(a, "clients faulty") == 1
+    });
+    assert_eq!(counter(&a, "schedule violations"), 1);
+    tell(&mut child.0, "go");
+    assert!(child.0.wait().unwrap().success());
+    // Nothing past the breach reached the subscriber.
+    let mut extra = 0u32;
+    let _ = reader.poll(|_, _, _| extra += 1, BUDGET);
+    assert_eq!(extra, 0);
+}
+
 /// Case 2: a remote subscriber process on an IPC driver B subscribes by
 /// `karyos:udp`, gets `NetworkSubscription`, then `ImageAvailable` for the
 /// image of a heap driver A's publication, takes the image's grant and
@@ -818,6 +900,50 @@ fn child() {
                 offer(&mut publication, &message(index));
             }
             report(&format!("sent {MESSAGES}"));
+            let _ = wait_for_line();
+            drop(publication);
+            drop(client);
+        }
+        "timed-publish" => {
+            use karyos_client::schedule::{ScheduleBinding, ScheduleClock};
+
+            let session: i32 = arg.parse().unwrap();
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let _ = client.add_publication(key(session), false).unwrap();
+            let grant = fetchable(next_outcome(&mut client));
+            let mut publication = client.take_publication(&grant).unwrap();
+            let options = publication.schedule().unwrap().options();
+            report(&format!("bound {}", options.max_horizon));
+            let _ = wait_for_line();
+            let at = karyos_sys::host_clock::host_monotonic_ns() + TIMED_AHEAD;
+            let start = Instant::now();
+            while !matches!(
+                publication.offer_at(&message(0), at).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                assert!(start.elapsed() < STEP, "offer_at");
+                std::thread::yield_now();
+            }
+            report(&format!("offered {at}"));
+            let _ = wait_for_line();
+            // A hostile publisher: its own, looser binding, and a time
+            // past the sender's horizon, which the sender alone checks.
+            let hostile = options.with_max_horizon(u64::MAX / 2);
+            let mut publication = publication.with_schedule(ScheduleBinding::new(
+                hostile,
+                ScheduleClock::host(hostile.domain).unwrap(),
+            ));
+            let far = karyos_sys::host_clock::host_monotonic_ns() + 100 * TIMED_HORIZON;
+            let start = Instant::now();
+            let gated = loop {
+                assert!(start.elapsed() < STEP, "never gated");
+                let outcome = publication.offer_at(&message(1), far);
+                if matches!(outcome, Ok(OfferOutcome::Gated)) {
+                    break publication.seal_reason();
+                }
+                std::thread::yield_now();
+            };
+            report(&format!("gated {gated:?}"));
             let _ = wait_for_line();
             drop(publication);
             drop(client);

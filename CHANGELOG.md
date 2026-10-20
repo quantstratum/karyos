@@ -11,6 +11,24 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A timed lane's handle is granted over the control path (quantstratum-docs:
+  `karyos/design/timed-tx.md`, section 11, T-x2): `AddPublication` no longer
+  refuses a timed lane. A `Monotonic` lane goes to a remote client only when
+  admission proves it in the driver's time namespace, and is otherwise
+  `InvalidPublicationMode` with the client's `TimeNamespace` code as the
+  detail; a `Tai` lane goes to any client. The driver writes the lane's
+  binding into the schedule ring when its settings are fixed (the first
+  handle, the sender, or a grant). The client reads it when it takes the
+  handle: `ClockDomain::code` and `from_code`, `ScheduleOptions::binding`
+  and `from_binding`, and `schedule::ring_binding`; a binding it does not
+  know is a protocol error. The sender posts `AgentEvent::ScheduleViolated`
+  once per breached lane; the conductor seals the lane with
+  `ScheduleViolation` if the report names the live incarnation (a stale or
+  over-bound report counts in `schedule violations dropped`), counts it in
+  the new driver counter `schedule violations`, logs a
+  `ClientProtocolViolation` error, and has admission retire a remote holder
+  as faulty. `LatePolicy` and the T-x1 interim stop are unchanged.
+
 - The schedule ring's sender trusts no word its publisher writes
   (quantstratum-docs: `karyos/design/timed-tx.md`, section 11, TT-6;
   T-x1). The ring's header grows from three words to eight, with the
