@@ -44,6 +44,19 @@ impl ControlStreams {
     }
 }
 
+/// Why an [`ArchiveConnection`] could not be opened: which stream the
+/// client could not take, and the client's error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum OpenError {
+    /// The request stream: absent, not concurrent, or the driver refused.
+    #[error("request stream: {0}")]
+    Requests(ClientError),
+    /// The response stream.
+    #[error("response stream: {0}")]
+    Responses(ClientError),
+}
+
 /// A requester's connection to an Archive: its request publication and
 /// response subscription, taken from a facade client.
 #[derive(Debug)]
@@ -59,15 +72,19 @@ impl<T: TermBytes> ArchiveConnection<T> {
     ///
     /// # Errors
     ///
-    /// The client's errors for either; a publication taken before a failed
-    /// subscription is dropped, which ends its lease.
-    pub fn open<C>(client: &mut Client<C>, streams: ControlStreams) -> Result<Self, ClientError>
+    /// [`OpenError`], naming the stream and the client's error; a
+    /// publication taken before a failed subscription is dropped, which
+    /// ends its lease.
+    pub fn open<C>(client: &mut Client<C>, streams: ControlStreams) -> Result<Self, OpenError>
     where
         C: Connection<Terms = T>,
     {
-        let requests =
-            client.add_concurrent_publication("karyos:ipc", StreamId::new(streams.requests))?;
-        let responses = client.add_subscription("karyos:ipc", StreamId::new(streams.responses))?;
+        let requests = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(streams.requests))
+            .map_err(OpenError::Requests)?;
+        let responses = client
+            .add_subscription("karyos:ipc", StreamId::new(streams.responses))
+            .map_err(OpenError::Responses)?;
         Ok(Self {
             requests: Requests(requests),
             responses: Responses(responses),

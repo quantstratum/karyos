@@ -331,7 +331,7 @@ mod watch {
             &mut client,
             ControlStreams::new(config.streams.requests, config.streams.responses),
         )
-        .map_err(|error| format!("control streams: {error}"))?
+        .map_err(|error| error.to_string())?
         .into_transports();
         let mut lister =
             RecordingLister::new(ListerConfig::new(config.client_id), requests, responses);

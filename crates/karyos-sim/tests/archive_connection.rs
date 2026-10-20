@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use karyos_archive::client::connection::{ArchiveConnection, ControlStreams};
+use karyos_archive::client::connection::{ArchiveConnection, ControlStreams, OpenError};
 use karyos_archive::client::{ControlRequests, ControlResponses};
 use karyos_client::{Client, Context, MessageLimit, OfferOutcome};
 use karyos_driver::embedded::{DriverConfig, EmbeddedDriver, StreamConfig};
@@ -193,7 +193,8 @@ fn an_exclusive_request_stream_refuses_the_connection() {
     let conductor = driver.connect().unwrap();
     let _driven = drive(driver);
     let mut client = Client::with_conductor(conductor, context());
-    assert!(
-        ArchiveConnection::open(&mut client, ControlStreams::new(REQUESTS, RESPONSES)).is_err()
-    );
+    assert!(matches!(
+        ArchiveConnection::open(&mut client, ControlStreams::new(REQUESTS, RESPONSES)),
+        Err(OpenError::Requests(_))
+    ));
 }
