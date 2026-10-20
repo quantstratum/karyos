@@ -987,6 +987,83 @@ enum Parsed {
     Corrupt,
 }
 
+/// What [`list`] read: the recordings, and whether the listing may be
+/// behind a live Archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Listing {
+    /// The recordings, in id order: those of the log's complete records.
+    pub recordings: Vec<Recording>,
+    /// The log offset of a torn last record (one that reaches the end of
+    /// the log, or with only zeros after its start), where the listing
+    /// stopped: an Archive may be appending it, or a crash left it, which
+    /// the next [`Catalog::open`] cuts. `None` when the whole log was read.
+    pub behind: Option<u64>,
+    /// The directory has no catalog: nothing was ever recorded there.
+    pub missing: bool,
+}
+
+/// Lists the catalog of `dir` without writing anything (quantstratum-docs:
+/// `karyos/design/archive-host.md`, H4), so it may run beside a live
+/// Archive. Unlike [`Catalog::open`], it neither removes a compaction's
+/// leftover file (the catalog it would replace holds the same recordings)
+/// nor cuts a torn last record: it reads up to that record and reports it
+/// in [`Listing::behind`]. A catalog whose creation did not complete (a
+/// header shorter than its length) lists nothing, behind at 0. Any other
+/// damage is corruption, as [`Catalog::open`] judges it. Pass a
+/// [`crate::disk::ReadOnly`] disk to have the disk refuse any write too.
+///
+/// # Errors
+///
+/// [`CatalogError::Corrupt`], [`CatalogError::UnsupportedVersion`], and the
+/// operating system's errors (a missing directory among them).
+pub fn list<D: Disk>(mut disk: D, dir: &Path) -> Result<Listing, CatalogError> {
+    let names = disk.list(dir)?;
+    if !names.iter().any(|name| name == CATALOG) {
+        return Ok(Listing {
+            recordings: Vec::new(),
+            behind: None,
+            missing: true,
+        });
+    }
+    let file = disk.open(&dir.join(CATALOG))?;
+    let length = disk.len(&file)?;
+    if length < HEADER_LEN {
+        return Ok(Listing {
+            recordings: Vec::new(),
+            behind: Some(0),
+            missing: false,
+        });
+    }
+    let mut found = [0u8; HEADER];
+    disk.read_at(&file, 0, &mut found)?;
+    check_header(&found)?;
+    let mut state = State::default();
+    let mut behind = None;
+    let mut offset = HEADER_LEN;
+    let mut buf = Vec::new();
+    while offset < length {
+        match parse(&mut disk, &file, offset, length, &mut buf)? {
+            Parsed::Record(record, end) => {
+                if !state.apply(record) {
+                    return Err(CatalogError::Corrupt { offset });
+                }
+                offset = end;
+            }
+            Parsed::Torn => {
+                behind = Some(offset);
+                break;
+            }
+            Parsed::Corrupt => return Err(CatalogError::Corrupt { offset }),
+        }
+    }
+    Ok(Listing {
+        recordings: state.recordings,
+        behind,
+        missing: false,
+    })
+}
+
 /// Validates a whole header.
 fn check_header(found: &[u8; HEADER]) -> Result<(), CatalogError> {
     let corrupt = CatalogError::Corrupt { offset: 0 };
