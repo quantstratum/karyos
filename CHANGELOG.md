@@ -421,6 +421,33 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyos_archive::agent::RecordedFrom { Local, Image }` (karyos#490b;
+  quantstratum-docs: `karyos/design/per-source-images.md`, D2-2): what a
+  recording reads, as its host knows it. `HostRecording::with_origin` and
+  `StartRecording::with_origin` set it; `new` means `Local`, so existing
+  hosts are unchanged. A host recording its own `karyos:udp` publication
+  beside that publication's loopback image has two recordings of one
+  stream, session and lane, with the same channel and source
+  incarnation: `ArchiveHandle::recording_word` now answers the local
+  stream's recording first, and an image's only when it is the one
+  recorded, never a silent pick. It is not kept in the catalog, as the
+  word is live only. A Gateway's network subscription beside a local
+  source of its stream stays refused, `DuplicateSource`, in either
+  order.
+
+- Per-stream network counters in the CnC (phase 5, M2b; quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`). Each network
+  publication has `network frames sent`, `network bytes sent`, `network
+  retransmits` and `network naks received`, and each exposed image
+  `network naks sent`, `network losses` and `network repaired`, keyed by
+  the stream's registration; `karyos-stat` and the agent show them with
+  no change. The owning agent stores its own counts at the end of its
+  duty cycle, so no atomic is added per datagram. The cells are allocated
+  all or none (when the region is full, `counters unavailable` counts one
+  and the stream runs without them, never retried) and freed when the
+  publication is removed, the image retires or the network closes. Size
+  `counters_capacity` for 4 cells per publication and 3 per image.
+
 - `karyosd`'s startup capability log (SPEC §11, "logged at startup";
   quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`,
   M3b). With the network on, the daemon reads its own CnC at most every

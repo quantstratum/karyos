@@ -101,6 +101,9 @@ pub struct HostRecording {
     pub term_length: u32,
     /// The recorded stream's format, kept in the catalog for its replays.
     pub format: StreamFormat,
+    /// What the source reads: a local stream unless the host says it is a
+    /// network image ([`HostRecording::with_origin`]; karyos#490).
+    pub origin: crate::agent::RecordedFrom,
 }
 
 impl HostRecording {
@@ -116,7 +119,16 @@ impl HostRecording {
             source,
             term_length,
             format,
+            origin: crate::agent::RecordedFrom::Local,
         }
+    }
+
+    /// The same, reading `origin`: a host that opens a network image to
+    /// record passes [`RecordedFrom::Image`](crate::agent::RecordedFrom).
+    #[must_use]
+    pub fn with_origin(mut self, origin: crate::agent::RecordedFrom) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
@@ -545,6 +557,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             mode: request.mode,
             format: opened.format,
             source: opened.source,
+            origin: opened.origin,
         });
         match posted {
             Ok(answer) => Some(Waiting::Start {

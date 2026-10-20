@@ -125,6 +125,8 @@ pub enum SessionEvent {
         /// Liveness and terminal transitions). Otherwise it is retired
         /// with its prefix possibly unresolved.
         complete: bool,
+        /// Its CnC cells (M2b), back for the conductor to free.
+        cells: Option<super::AgentCells>,
     },
 }
 

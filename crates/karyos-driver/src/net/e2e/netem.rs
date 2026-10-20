@@ -617,3 +617,43 @@ fn ipc_driver(dir: &std::path::Path) -> EmbeddedDriver<karyos_sys::term_bytes::S
     )
     .unwrap()
 }
+
+/// N9 (M2b): under the job's faults the per-stream cells show the repair
+/// work, in Shared and Dedicated mode alike (where N4 had no counters to
+/// read): B's image counts losses and NAKs sent, A's publication counts
+/// NAKs received and retransmits, while every message still arrives.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n9_per_stream_cells_show_the_repair_work() {
+    super::super::netem::require_netem();
+    for threading in [ThreadingMode::Shared, ThreadingMode::Dedicated] {
+        let (mut a, mut b) = (driver(threading), driver(threading));
+        let (publication, image) = connected(&mut a, &mut b, true, 10);
+        let (sent, seen) = (publication.registration(), image.registration());
+        let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+        exchange(&mut a, &mut b, &publication, &mut reader, 2000);
+        let value = |driver: &EmbeddedDriver, label: &str, stream: u64| {
+            super::cells(driver, label)
+                .into_iter()
+                .find(|(_, keys)| keys.stream == stream)
+                .map_or(0, |(value, _)| value)
+        };
+        // The agents store at the end of their cycles.
+        pump(&mut [&mut a, &mut b], |drivers| {
+            value(drivers[1], "network losses", seen) > 0
+                && value(drivers[1], "network naks sent", seen) > 0
+                && value(drivers[0], "network naks received", sent) > 0
+                && value(drivers[0], "network retransmits", sent) > 0
+        });
+        println!(
+            "N9 {threading:?}: losses {}, naks sent {}, repaired {}; naks received {}, \
+             retransmits {}, frames sent {}",
+            value(&b, "network losses", seen),
+            value(&b, "network naks sent", seen),
+            value(&b, "network repaired", seen),
+            value(&a, "network naks received", sent),
+            value(&a, "network retransmits", sent),
+            value(&a, "network frames sent", sent),
+        );
+    }
+}

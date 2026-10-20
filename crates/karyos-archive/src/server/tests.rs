@@ -178,6 +178,7 @@ impl ArchiveHost for Host {
                     incarnation: 1,
                 },
             },
+            origin: crate::agent::RecordedFrom::Local,
         })
     }
 
