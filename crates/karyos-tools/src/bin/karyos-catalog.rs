@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `karyos-catalog` (SPEC §11; `quantstratum-docs:
-//! karyos/design/archive-host.md`, H4): an archive directory's
-//! recordings. `list` reads the catalog offline and read only, whose logic
-//! is [`karyos_tools::catalog`]. See `karyos-catalog --help`.
+//! karyos/design/archive-host.md`, H4 and H4b): an Archive's recordings.
+//! `list DIR` reads the catalog offline and read only; `list --live` asks a
+//! running Archive over its control streams. The logic is
+//! [`karyos_tools::catalog`]. See `karyos-catalog --help`.
 
 use std::io::Write;
 use std::process::ExitCode;

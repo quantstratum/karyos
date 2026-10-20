@@ -217,3 +217,69 @@ fn errors_exit_2() {
     assert_eq!(status, 0);
     assert!(out.contains("Usage: karyos-catalog list <dir> [--json]"));
 }
+
+fn parsed(args: &[&str]) -> Result<Option<ListArgs>, String> {
+    parse_list(args.iter().map(std::ffi::OsString::from))
+}
+
+/// H4b: `--live DIR=REQ,RESP` names a running Archive instead of a
+/// directory, with `--timeout-ms` for it alone; one or the other.
+#[test]
+fn live_is_a_source_of_its_own() {
+    let live = LiveArchive {
+        dir: PathBuf::from("/run/k"),
+        requests: 100,
+        responses: 101,
+    };
+    assert_eq!(
+        parsed(&["--live", "/run/k=100,101"]).unwrap(),
+        Some(ListArgs {
+            source: Source::Live(live.clone()),
+            json: false,
+            timeout: DEFAULT_TIMEOUT,
+        })
+    );
+    assert_eq!(
+        parsed(&["--json", "--live=/run/k=100,101", "--timeout-ms=10"]).unwrap(),
+        Some(ListArgs {
+            source: Source::Live(live),
+            json: true,
+            timeout: std::time::Duration::from_millis(10),
+        })
+    );
+    assert_eq!(
+        parsed(&["d"]).unwrap().unwrap().source,
+        Source::Offline(PathBuf::from("d"))
+    );
+    for (args, why) in [
+        (&["d", "--live", "e=1,2"][..], "not both"),
+        (&["--live"], "needs a value"),
+        (&["--live", "e"], "--live"),
+        (&["--live", "e=1,2", "--timeout-ms", "x"], "--timeout-ms"),
+        (&["d", "--timeout-ms", "5"], "is for --live"),
+        (&["--json=1", "d"], "unknown option"),
+    ] {
+        let error = parsed(args).unwrap_err();
+        assert!(error.contains(why), "{args:?}: {error}");
+    }
+}
+
+/// H4b: an Archive that cannot be reached is an error (exit 2), as a
+/// damaged catalog is: on Linux no driver answers in an empty directory;
+/// elsewhere a remote client does not exist.
+#[test]
+fn an_unreachable_archive_exits_2() {
+    let scratch = Scratch::new();
+    let live = format!("{}=100,101", scratch.0.display());
+    let (status, out, err) = run(&[
+        "--live".as_ref(),
+        live.as_ref(),
+        "--timeout-ms".as_ref(),
+        "200".as_ref(),
+    ]);
+    assert_eq!((status, out.as_str()), (EXIT_ERROR, ""));
+    assert!(
+        err.starts_with("karyos-catalog: cannot reach the Archive"),
+        "{err}"
+    );
+}

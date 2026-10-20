@@ -16,8 +16,9 @@
 //! karyos/design/recording-group-replay.md` section 10,
 //! `karyos/design/archive-host.md` H5), which compares two recording group
 //! journals ([`replay`]); and `karyos-catalog list`
-//! (`karyos/design/archive-host.md`, H4), which lists an archive
-//! directory's catalog read only ([`catalog`]).
+//! (`karyos/design/archive-host.md`, H4 and H4b), which lists an archive
+//! directory's catalog read only, or a running Archive's recordings over
+//! its control streams ([`catalog`]).
 
 pub mod archive;
 pub mod args;
