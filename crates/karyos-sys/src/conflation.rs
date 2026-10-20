@@ -122,16 +122,28 @@ pub struct ConflationConfig {
 
 impl ConflationConfig {
     /// The shape of this table that its publications check: its keys and
-    /// its largest value (a capacity past `u32`, which no message reaches,
-    /// counts as `u32::MAX`).
-    #[must_use]
+    /// its largest value.
+    ///
+    /// # Errors
+    ///
+    /// [`ConflationError::ValueTooLarge`] for a value capacity past `u32`,
+    /// which no message carries (SPEC §14: refused, not saturated).
     // Loom builds leave `log_buffer` out, and model no publication.
     #[cfg(not(loom))]
-    pub fn shape(&self) -> crate::log_buffer::ConflationShape {
-        crate::log_buffer::ConflationShape::new(
+    pub fn shape(&self) -> Result<crate::log_buffer::ConflationShape, ConflationError> {
+        let value_capacity = u32::try_from(self.value_capacity).map_err(|_| {
+            // A capacity past u32 holds on this target, so u32::MAX does.
+            usize::try_from(u32::MAX).map_or(ConflationError::InvalidConfig, |max| {
+                ConflationError::ValueTooLarge {
+                    length: self.value_capacity,
+                    max,
+                }
+            })
+        })?;
+        Ok(crate::log_buffer::ConflationShape::new(
             self.keys,
-            u32::try_from(self.value_capacity).unwrap_or(u32::MAX),
-        )
+            value_capacity,
+        ))
     }
 
     /// Checks a publication's reserved value and payload length before it
@@ -143,14 +155,15 @@ impl ConflationConfig {
     ///
     /// # Errors
     ///
-    /// As [`ConflationShape::validate_publication`].
+    /// As [`ConflationConfig::shape`], then as
+    /// [`ConflationShape::validate_publication`].
     #[cfg(not(loom))]
     pub fn validate_publication(
         &self,
         reserved_value: i64,
         value_length: usize,
     ) -> Result<(), ConflationError> {
-        self.shape()
+        self.shape()?
             .validate_publication(reserved_value, value_length)
     }
 }
