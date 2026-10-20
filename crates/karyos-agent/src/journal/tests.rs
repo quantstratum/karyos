@@ -160,3 +160,27 @@ fn a_stopped_journal_is_followed_by_a_new_one_with_an_unknown_interval() {
     let gap = journal.gap().unwrap();
     assert_eq!((gap.position, gap.from, gap.to), (0, 0, 50));
 }
+
+/// Once an append failed, the journal refuses every append, counts each,
+/// and keeps the time of the first; the next start recovers it.
+#[test]
+fn a_failed_journal_refuses_appends_until_it_reopens() {
+    let dir = dir("failed");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    journal.break_recorder();
+    for now in [20, 30] {
+        assert!(matches!(
+            journal.append(&request(Kind::CloseRequest, now, 3), now),
+            Err(JournalError::Unavailable)
+        ));
+    }
+    assert!(journal.unavailable());
+    assert_eq!(
+        (journal.failed_appends(), journal.failed_at()),
+        (2, Some(20))
+    );
+    drop(journal);
+    let journal = Journal::open(&dir, 40).unwrap();
+    assert!(!journal.unavailable());
+    assert_eq!(journal.failed_at(), None);
+}

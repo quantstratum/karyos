@@ -114,6 +114,11 @@ pub enum ConductorError {
     InvalidGuardEpoch,
 }
 
+/// The operator word of a guard command for `operator`.
+fn operator_word(operator: Option<u32>) -> u64 {
+    operator.map_or(karyos_protocol::cnc::NO_OPERATOR, u64::from)
+}
+
 /// The channel URI `uri` for a command: it parses (SPEC §5) and fits.
 /// Also whether it names an IPC channel.
 fn channel_uri(uri: &str) -> Result<(ChannelUri, bool), ConductorError> {
@@ -1220,8 +1225,9 @@ impl<T: TermBytes> ClientConductor<T> {
 
     /// Closes guard `guard` (`quantstratum-docs:
     /// karyos/design/guards-and-abort.md`, local guards; M10), on behalf of
-    /// operator `operator` (a uid; 0 when the client acts for itself) with
-    /// the operator's `reason`. The driver audits it with `operation`, the
+    /// operator `operator` (a uid, root's 0 included; `None` when the
+    /// client acts for itself, sent as `NO_OPERATOR`) with the operator's
+    /// `reason`. The driver audits it with `operation`, the
     /// client (and the operator) and the request's parameters digest,
     /// `karyos_protocol::cnc::guard_parameters` over the guard, epoch 0,
     /// the operation, the operator and the reason. Returns the request
@@ -1237,9 +1243,10 @@ impl<T: TermBytes> ClientConductor<T> {
         &mut self,
         guard: u64,
         operation: u64,
-        operator: u64,
+        operator: Option<u32>,
         reason: &[u8],
     ) -> Result<u64, ConductorError> {
+        let operator = operator_word(operator);
         let parameters =
             karyos_protocol::cnc::guard_parameters(guard, 0, operation, operator, reason);
         self.submit(Kind::Guard, None, |sequence| Command::GuardClose {
@@ -1267,9 +1274,10 @@ impl<T: TermBytes> ClientConductor<T> {
         guard: u64,
         expected: u64,
         operation: u64,
-        operator: u64,
+        operator: Option<u32>,
         reason: &[u8],
     ) -> Result<u64, ConductorError> {
+        let operator = operator_word(operator);
         let closed = karyos_sys::guard::GuardState {
             epoch: expected,
             open: false,
