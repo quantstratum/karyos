@@ -2428,6 +2428,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `make libkaryos` failed on main after #555 ("no format version in
+  conformance/FORMAT.md"): the package script read the format from
+  FORMAT.md's title, which #555 retitled. FORMAT.md now carries a marker
+  line, `<!-- conformance-formats: 1 2 -->`, read by the new
+  `scripts/conformance-formats.sh`. The MANIFEST keeps
+  `conformance_format`, one number, the newest format (now 2), and
+  gains `conformance_formats=1 2`. `make lint-sync`, part of pre-push,
+  fails when the marker is missing, malformed or differs from the
+  reference runner's `FORMATS`, so a retitled or extended FORMAT.md
+  cannot break the package unseen. The bindings read neither key.
+
 - A guarded client publication gated by the guard word before the
   close's seal landed never released, so the seal never positioned and
   its walker never wrote the `Ended` record (#526): the C ABI outcomes

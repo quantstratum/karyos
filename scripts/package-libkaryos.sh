@@ -93,9 +93,12 @@ triple="$(rustc -vV | sed -n 's/^host: //p')"
 if [ -n "${CARGO_BUILD_TARGET:-}" ] && [ "$CARGO_BUILD_TARGET" != "$triple" ]; then
     fail "cross builds are not packaged: CARGO_BUILD_TARGET=$CARGO_BUILD_TARGET, host $triple"
 fi
-format="$(sed -n 's/^# Conformance scenarios, interim format \([0-9][0-9]*\)$/\1/p' \
-    "$root/crates/karyos-ffi/conformance/FORMAT.md")"
-[ -n "$format" ] || fail "no format version in conformance/FORMAT.md"
+# The suite's formats, from FORMAT.md's marker line (never its title):
+# conformance_formats lists them all, and conformance_format keeps its
+# meaning of one number, the newest format a runner needs.
+formats="$("$root/scripts/conformance-formats.sh")" ||
+    fail "no conformance formats in conformance/FORMAT.md"
+format="${formats##* }"
 
 case "$(uname -s)" in
 Linux)
@@ -190,6 +193,7 @@ soname=$soname
 soname_policy=$soname_policy
 protocol_version=$protocol
 conformance_format=$format
+conformance_formats=$formats
 core_version=$core_version
 core_commit=$commit
 core_dirty=$dirty
