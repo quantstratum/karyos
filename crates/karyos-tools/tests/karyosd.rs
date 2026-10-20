@@ -215,8 +215,6 @@ fn karyosd_exits_2_on_a_startup_error() {
 /// refused: the daemon runs no network agents.
 #[test]
 fn karyosd_with_the_network_carries_a_udp_pair() {
-    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-
     use karyos_client::{Client, Context, MessageLimit, OfferError, StreamId};
 
     let port = test_port();
@@ -305,8 +303,6 @@ fn karyosd_with_the_network_carries_a_udp_pair() {
 /// when it first appears: one line naming every capability and its state.
 #[test]
 fn karyosd_logs_an_endpoints_capabilities_when_it_appears() {
-    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-
     use karyos_client::{Client, Context, StreamId};
 
     let port = test_port();

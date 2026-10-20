@@ -56,14 +56,13 @@ mod tests {
 
     /// The range is the point: a thousand binds to port 0, the race of
     /// karyos#520, never land in it on this host, and the ports handed out
-    /// are in it and distinct.
+    /// are in it and distinct. One socket at a time, within any limit of
+    /// open files.
     #[test]
     fn ephemeral_binds_never_land_in_the_test_range() {
         let range = FIRST..FIRST + COUNT;
-        let held: Vec<UdpSocket> = (0..1000)
-            .map(|_| UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap())
-            .collect();
-        for socket in &held {
+        for _ in 0..1000 {
+            let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
             let port = u32::from(socket.local_addr().unwrap().port());
             assert!(
                 !range.contains(&port),
