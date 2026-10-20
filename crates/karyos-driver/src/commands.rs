@@ -271,6 +271,66 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// Records the grant of `command` to `client` on the stream `stream`
+    /// (an internal id) as `registration`, if that stream is audited.
+    fn audit_grant(&mut self, client: u64, stream: u64, command: Command, registration: u64) {
+        if !self.grant_audits.watches(stream) {
+            return;
+        }
+        let role = match command {
+            Command::AddPublication { .. } => crate::grant_audit::GrantRole::Publication,
+            Command::AddConcurrentPublication { .. } => {
+                crate::grant_audit::GrantRole::ConcurrentPublication
+            }
+            _ => crate::grant_audit::GrantRole::Subscription,
+        };
+        let Some(found) = self.streams.iter().find(|found| found.id == stream) else {
+            return;
+        };
+        let (stream_id, session_id) = (found.stream_id, found.session_id);
+        let audit = crate::grant_audit::GrantAudit {
+            client,
+            pid: self.client_pid(client),
+            uid: self.client_uid(),
+            stream_id,
+            session_id,
+            role,
+            registration,
+        };
+        self.grant_audits.record(audit);
+    }
+
+    /// The process of `client`: proven by its pidfd for a remote client,
+    /// this process for one of the in-process command ring.
+    #[cfg(target_os = "linux")]
+    fn client_pid(&self, client: u64) -> Option<u32> {
+        if self.ledger(client).is_none() {
+            return Some(std::process::id());
+        }
+        self.admission
+            .as_ref()
+            .and_then(|admission| admission.pid(client))
+    }
+
+    /// Off Linux every client is in process.
+    #[cfg(not(target_os = "linux"))]
+    fn client_pid(&self, client: u64) -> Option<u32> {
+        let _ = client;
+        Some(std::process::id())
+    }
+
+    /// The uid admission proved every client's: the driver's own.
+    #[cfg(target_os = "linux")]
+    fn client_uid(&self) -> Option<u32> {
+        Some(karyos_sys::ipc::own_uid())
+    }
+
+    /// Off Linux the driver does not tell.
+    #[cfg(not(target_os = "linux"))]
+    fn client_uid(&self) -> Option<u32> {
+        None
+    }
+
     /// The client that holds the publication of lane stream `stream`, and
     /// whether it is remote; `None` for one the driver issued itself.
     pub(crate) fn publication_holder(&self, stream: u64) -> Option<(u64, bool)> {
@@ -1167,6 +1227,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     join,
                     incarnation,
                 });
+                self.audit_grant(client, stream_id, command, registration);
                 match kind {
                     Kind::Publication => Response::PublicationReady {
                         request,
@@ -2029,6 +2090,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             join,
             incarnation,
         });
+        self.audit_grant(client, stream, command, registration);
         self.counters.add(Event::GrantsReserved, 1);
         match kind {
             Kind::Publication => Response::PublicationReady {
@@ -5637,6 +5699,18 @@ mod tests {
         ));
     }
 
+    /// The driver's uid, as admission proves every client's (Linux).
+    #[cfg(target_os = "linux")]
+    fn own_uid_for_tests() -> u32 {
+        karyos_sys::ipc::own_uid()
+    }
+
+    /// Off Linux the audit names no uid.
+    #[cfg(not(target_os = "linux"))]
+    fn own_uid_for_tests() -> u32 {
+        0
+    }
+
     /// The answer to `client`'s `AddPublication` of [`KEY`] after a few
     /// duties.
     fn add_timed_publication(
@@ -5753,6 +5827,82 @@ mod tests {
             karyos_sys::schedule_ring::binding(ring),
             Ok(options.binding())
         );
+    }
+
+    /// H3 (archive-host.md): a grant on an audited stream is recorded with
+    /// its client, process, uid and role, for the in-process command ring
+    /// and a remote client alike; a stream not audited records nothing,
+    /// and a drain empties the record.
+    #[test]
+    fn grants_on_an_audited_stream_are_recorded() {
+        use crate::grant_audit::{GrantAudit, GrantRole};
+
+        let (mut driver, stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (ring_client, mut ring_producer, _link) = raw_client(&mut driver);
+        // Not audited yet: nothing recorded.
+        write(
+            &mut ring_producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Optional,
+                lane: Lane::ZERO,
+            },
+        );
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        let mut seen: Vec<GrantAudit> = Vec::new();
+        driver.drain_grant_audits(|audit| seen.push(audit));
+        assert!(seen.is_empty());
+        driver.audit_grants(stream).unwrap();
+        write(
+            &mut ring_producer,
+            Command::AddPublication {
+                sequence: 2,
+                stream: KEY,
+                allow_unconnected: true,
+                lane: Lane::ZERO,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        let registration = answers
+            .iter()
+            .find_map(|answer| match answer {
+                Response::PublicationReady {
+                    request: RequestId { sequence: 2, .. },
+                    registration,
+                    ..
+                } => Some(*registration),
+                _ => None,
+            })
+            .unwrap();
+        driver.drain_grant_audits(|audit| seen.push(audit));
+        assert_eq!(
+            seen,
+            [GrantAudit {
+                client: ring_client,
+                pid: Some(std::process::id()),
+                uid: if cfg!(target_os = "linux") {
+                    Some(own_uid_for_tests())
+                } else {
+                    None
+                },
+                stream_id: KEY.stream_id,
+                session_id: KEY.session_id,
+                role: GrantRole::Publication,
+                registration,
+            }]
+        );
+        seen.clear();
+        driver.drain_grant_audits(|audit| seen.push(audit));
+        assert!(seen.is_empty());
+        assert_eq!(driver.grant_audits_dropped(), 0);
     }
 
     /// A guarded stream issues no publication without its binding: a
