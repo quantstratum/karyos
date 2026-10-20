@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The embedded driver through its exported symbols (F5): options,
-//! create, the two modes, a client of it, and the close; on every
-//! platform and under Miri.
+//! create, the two modes, a client of it, streams, and the close, on
+//! every platform. Under Miri the tests that reach each unsafe site of
+//! the driver's exports run (the options' inits, create with its prefixed
+//! read and detail, do_work and connect with their out-parameters, the
+//! stream's options and detail); the thread and publication tests are
+//! covered natively.
 
 // Links the library whose symbols `support::abi` declares.
 use karyos_ffi as _;
@@ -33,6 +37,7 @@ fn the_options_carry_their_size_and_the_drivers_defaults() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_driver_runs_by_its_caller_then_on_its_thread() {
     let (status, driver) = abi::driver_create();
     assert_eq!(status, OK);
@@ -53,6 +58,10 @@ fn a_client_of_the_driver_is_served_and_follows_its_close() {
     let (status, client) = abi::driver_connect(driver);
     assert_eq!(status, OK);
     assert_eq!(abi::client_poll(client).0, OK);
+    // The duty cycle's count is written (the out-parameter's Miri test).
+    let (status, work) = abi::driver_do_work(driver);
+    assert_eq!(status, OK);
+    assert_ne!(work, u32::MAX);
     // A client handle is no driver handle.
     assert_eq!(abi::driver_do_work(client).0, INVALID_HANDLE);
     assert_eq!(abi::driver_close(driver), OK);
@@ -112,6 +121,7 @@ fn a_stream_is_added_and_removed_through_the_abi() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_c_caller_publishes_on_a_stream_of_its_own_driver() {
     let (_, driver) = abi::driver_create();
     let (_, options) = abi::stream_options(9);

@@ -31,6 +31,7 @@ const YIELD: Idle = Idle {
 };
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_driver_is_driven_by_its_caller_then_by_its_thread() {
     let _serial = serial();
     let driver = created();
@@ -48,6 +49,7 @@ fn a_driver_is_driven_by_its_caller_then_by_its_thread() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_driver_closes_with_its_thread_running() {
     let _serial = serial();
     let driver = created();
@@ -64,6 +66,7 @@ fn a_driver_closes_with_its_thread_running() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn an_unknown_idle_strategy_or_configuration_is_refused() {
     let _serial = serial();
     let driver = created();
@@ -93,6 +96,7 @@ fn the_defaults_are_the_drivers() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_client_follows_its_driver_to_the_close() {
     let _serial = serial();
     let driver = created();
@@ -107,6 +111,7 @@ fn a_client_follows_its_driver_to_the_close() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_panic_in_a_called_duty_cycle_poisons_the_driver_and_its_clients() {
     let _serial = serial();
     let driver = created();
@@ -127,6 +132,7 @@ fn a_panic_in_a_called_duty_cycle_poisons_the_driver_and_its_clients() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_panic_on_the_drivers_thread_poisons_it_and_its_clients() {
     let _serial = serial();
     let driver = created();
@@ -195,6 +201,7 @@ fn driver_errors_map_to_statuses() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn the_clients_of_a_full_driver_are_refused() {
     let _serial = serial();
     let options = Options {
@@ -212,6 +219,7 @@ fn the_clients_of_a_full_driver_are_refused() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_publication_follows_its_clients_driver() {
     let _serial = serial();
     use crate::api::publication;
@@ -247,6 +255,7 @@ fn a_publication_follows_its_clients_driver() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_stream_is_added_once_and_removed_once() {
     let _serial = serial();
     let driver = created();
@@ -270,6 +279,7 @@ fn a_stream_is_added_once_and_removed_once() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn stream_options_this_version_does_not_take_are_refused() {
     let _serial = serial();
     let driver = created();
