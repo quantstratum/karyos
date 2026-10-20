@@ -627,6 +627,20 @@ release may break APIs, wire formats and shared-memory layouts.
   `reserved` is `KARYOS_E_INVALID_ARGUMENT`; a key or value the
   publication refuses is `KARYOS_E_CONFLATION`, with nothing reserved.
   Claims do not take options yet.
+- `Subscription::rejoin_with(provider, secondary)` on the client facade
+  (quantstratum-docs: `karyos/design/ffi-archive.md`, F9-0; owner item
+  57): a stream subscription becomes a `RejoiningSubscription` whose
+  overruns are recovered from a `ReplayProvider`'s replays of its own
+  publication and merged back into the live stream (`ReplayRejoin`),
+  falling back to `secondary`. Its poll reports as `Subscription::poll`
+  does, with a rejoin's outcome also reported on its own;
+  `is_recovering`, `merge_failure`, `source` and `into_subscription`
+  complete it. A network subscription, or one with no publication
+  identity, is refused as `NotRejoinable`, the subscription handed back.
+  The subscription's own rejoin policy is set aside while it rejoins and
+  comes back with `into_subscription`. Public client surface under owner
+  item 57: `Subscription::rejoin_with`, `RejoiningSubscription` and
+  `NotRejoinable`.
 
 - `karyos-catalog list DIR [--json]` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H4a): an archive directory's
@@ -2243,6 +2257,10 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A rejoin's outcome reported alone (`RejoinOutcome::Replayed` with no
+  overrun, abort, skip or close in the same poll) reaches the facade
+  caller of a `RejoiningSubscription`: the facade's poll report kept a
+  summary only when it stopped (F9-0b, karyos#532).
 - `karyosd --archive` admits remote `ArchiveConnection`s again. Their
   response reader is optional (#524), and an optional reader takes a
   spare-slot credit; the response stream had the default three spare
