@@ -1220,14 +1220,32 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // Local guard control (G1): an admitted client's uid was
             // proved equal to the driver's at admission.
             Command::GuardClose {
-                guard, operation, ..
-            } => self.guard_command(client, request, guard, operation, None),
+                guard,
+                operation,
+                operator,
+                parameters,
+                ..
+            } => self.guard_command(
+                client,
+                request,
+                guard,
+                (operation, operator, parameters),
+                None,
+            ),
             Command::GuardReopen {
                 guard,
                 expected,
                 operation,
+                operator,
+                parameters,
                 ..
-            } => self.guard_command(client, request, guard, operation, Some(expected)),
+            } => self.guard_command(
+                client,
+                request,
+                guard,
+                (operation, operator, parameters),
+                Some(expected),
+            ),
             // Network channels by URI (W5b, net/client.rs).
             Command::AddNetworkPublication {
                 stream_id,
@@ -1261,16 +1279,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Serves `GuardClose` and `GuardReopen` (`quantstratum-docs:
     /// karyos/design/guards-and-abort.md`): an admitted client is
     /// authorized by the uid admission proved (G1). Every command is
-    /// audited, an unknown guard against the id it named.
+    /// audited, an unknown guard against the id it named; `asked` is the
+    /// operation id, the operator uid the client acts for (0: none) and
+    /// the parameters digest (M10).
     fn guard_command(
         &mut self,
         client: u64,
         request: RequestId,
         guard: u64,
-        operation: u64,
+        asked: (u64, u64, u64),
         reopen: Option<u64>,
     ) -> Response {
-        let requester = crate::guards::Requester::Client(client);
+        let (operation, operator, parameters) = asked;
+        let requester = match operator {
+            0 => crate::guards::Requester::Client(client),
+            uid => crate::guards::Requester::Operator { client, uid },
+        };
         let now = self.clock.now();
         // An unknown id is still audited, against the id it named.
         let handle = self
@@ -1283,11 +1307,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let done = match reopen {
             None => self
                 .guards
-                .close(handle, operation, requester, now)
+                .close(handle, operation, requester, parameters, now)
                 .map(|_| self.seal_guarded_reporting(handle)),
             Some(expected) => self
                 .guards
-                .reopen(handle, expected, operation, requester, now)
+                .reopen(handle, expected, operation, requester, parameters, now)
                 .map(|_| ()),
         };
         let state = done.and_then(|()| self.guards.state(handle));
@@ -5013,22 +5037,30 @@ mod tests {
                 guard: id,
                 expected: 1,
                 operation: 70,
+                operator: 0,
+                parameters: 0,
             },
             Command::GuardReopen {
                 sequence: 2,
                 guard: id,
                 expected: 1,
                 operation: 71,
+                operator: 0,
+                parameters: 0,
             },
             Command::GuardClose {
                 sequence: 3,
                 guard: id,
                 operation: 72,
+                operator: 0,
+                parameters: 0,
             },
             Command::GuardClose {
                 sequence: 4,
                 guard: 99,
                 operation: 73,
+                operator: 0,
+                parameters: 0,
             },
         ] {
             write(&mut producer, command);
@@ -5103,6 +5135,74 @@ mod tests {
         );
     }
 
+    /// M10: a client acting for an operator names the operator's uid and
+    /// the request's parameters digest; the driver's audit and the tools'
+    /// audit ring record both, with the client, and a command without an
+    /// operator stays the client's own.
+    #[test]
+    fn an_operator_command_is_audited_with_its_uid_and_digest() {
+        let (mut driver, _stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let id = guard.id();
+        let reopen = karyos_protocol::cnc::guard_parameters(id, 1, 80, 1000, b"open");
+        let close = karyos_protocol::cnc::guard_parameters(id, 0, 81, 0, b"");
+        for command in [
+            Command::GuardReopen {
+                sequence: 1,
+                guard: id,
+                expected: 1,
+                operation: 80,
+                operator: 1000,
+                parameters: reopen,
+            },
+            Command::GuardClose {
+                sequence: 2,
+                guard: id,
+                operation: 81,
+                operator: 0,
+                parameters: close,
+            },
+        ] {
+            write(&mut producer, command);
+        }
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        let audit: Vec<_> = driver
+            .guard_audit()
+            .records
+            .iter()
+            .map(|record| (record.operation, record.requester, record.parameters))
+            .collect();
+        assert_eq!(
+            audit,
+            [
+                (
+                    80,
+                    crate::guards::Requester::Operator { client, uid: 1000 },
+                    reopen
+                ),
+                (81, crate::guards::Requester::Client(client), close),
+            ]
+        );
+        let mut cursor = 0;
+        let mut ring = Vec::new();
+        let _ = driver.guard_audit_ring().scan(&mut cursor, |_, record| {
+            ring.push((
+                record.operation,
+                record.requester_kind,
+                record.requester,
+                record.operator,
+                record.parameters,
+            ));
+        });
+        assert_eq!(
+            ring,
+            [(80, 2, client, 1000, reopen), (81, 1, client, 0, close)]
+        );
+    }
+
     /// The embedded API (G1, in process): the same transitions and audit.
     #[test]
     fn guard_api_transitions_and_audit() {
@@ -5154,6 +5254,8 @@ mod tests {
                 guard: guard.id(),
                 expected: last,
                 operation: 5,
+                operator: 0,
+                parameters: 0,
             },
         );
         let mut answers = Vec::new();
@@ -5234,6 +5336,8 @@ mod tests {
                 sequence: 1,
                 guard: guard.id(),
                 operation: 9,
+                operator: 0,
+                parameters: 0,
             },
         );
         for _ in 0..3 {

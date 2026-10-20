@@ -87,10 +87,12 @@ fn every_field() -> AgentView {
                 before: 2,
                 after: 3,
                 operation: 42,
-                requester_kind: 1,
+                requester_kind: 2,
                 requester: 6,
                 outcome: 4,
                 refusal: 9,
+                operator: 1000,
+                parameters: 77,
             }],
             delivered: 2,
             overwritten: 0,
@@ -181,7 +183,8 @@ fn every_field() -> AgentView {
 /// (ADR-0055 Validation): a field renamed, removed, retyped or moved fails
 /// here, and needs API v2. A field added to v1 is appended to this text:
 /// `latencies` and `trace` (M6c) were, in M8, and `alerts` (M9), each
-/// at the end of its driver, in `DriverView`'s declaration order.
+/// at the end of its driver, in `DriverView`'s declaration order; a guard
+/// record's `operator` and `parameters` (M10) at the end of the record.
 const V1: &str = concat!(
     r#"{"version":1,"drivers":["#,
     r#"{"dir":"/run/karyos/a","state":{"state":"attached"},"#,
@@ -193,7 +196,7 @@ const V1: &str = concat!(
     r#""client_counters":[{"label":"streams active","type_id":2,"stream":0,"lane":0,"kind":0,"participant":0,"value":18446744073709551615}],"#,
     r#""errors":{"records":[{"seq":0,"first":10,"last":20,"occurrences":3,"code":4,"source":1,"key":[2,1],"message":"stream \"2\" rejected\n\ttwice\u0001"}],"delivered":1,"overwritten":0},"#,
     r#""losses":{"records":[{"seq":7,"time":30,"kind":1,"reason":2,"lane":0,"stream_id":9,"stream_registration":3,"from":100,"to":200,"participant":5,"client":6}],"delivered":8,"overwritten":7},"#,
-    r#""guards":{"records":[{"seq":1,"time":40,"guard":1,"before":2,"after":3,"operation":42,"requester_kind":1,"requester":6,"outcome":4,"refusal":9}],"delivered":2,"overwritten":0}"#,
+    r#""guards":{"records":[{"seq":1,"time":40,"guard":1,"before":2,"after":3,"operation":42,"requester_kind":2,"requester":6,"outcome":4,"refusal":9,"operator":1000,"parameters":77}],"delivered":2,"overwritten":0}"#,
     r#","latencies":[{"stream":3,"incarnation":1,"lane":1,"available":10,"unavailable":2,"incomplete":false,"p50":{"low":480,"high":520},"p90":{"low":900,"high":null},"p99":null,"p999":null,"max":{"low":-5,"high":1000}}],"#,
     r#""trace":{"records":1,"malformed":2,"unknown_journal":3,"network_ignored":4,"points_ignored":5,"duplicates":6,"journals_dropped":7,"pending_dropped":8,"polls_dropped":9,"lanes_dropped":10,"aged_out":11,"mirror_overwritten":12,"pending":13},"#,
     r#""alerts":[{"kind":"lag","stream":3,"lane":1,"participant":5,"value":1024,"since":50},{"kind":"loss","stream":0,"lane":0,"participant":0,"value":15,"since":60}]},"#,
