@@ -1208,6 +1208,66 @@ fn offers_and_claims_have_the_spec_shape() {
     });
 }
 
+/// `offer_at_on` (timed-tx.md; owner item 57): a timed lane granted over
+/// the in-process command ring is bound to the schedule its driver wrote,
+/// so the facade offers on it with a time. A plain offer, a time below the
+/// lane's last, one past the horizon and an unconfigured lane are refused
+/// before anything is reserved; the accepted message is delivered.
+#[test]
+fn a_timed_lane_is_offered_at_its_time() {
+    use karyos_client::schedule::{ClockDomain, ScheduleOptions, now};
+    use karyos_sys::frame::Lane;
+
+    const HORIZON: u64 = 1_000_000_000;
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut config = heap_stream(3);
+    config.buffer.schedule_capacity = 4;
+    let stream = driver.add_stream(config).unwrap();
+    driver
+        .schedule_stream(stream, ScheduleOptions::default().with_max_horizon(HORIZON))
+        .unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let mut reading = client
+            .add_subscription("karyos:ipc", StreamId::new(3))
+            .unwrap();
+        let mut publication = client
+            .add_exclusive_publication("karyos:ipc", StreamId::new(3))
+            .unwrap();
+        let at = now(ClockDomain::Monotonic).unwrap();
+        let accepted = publication.offer_at_on(Lane::ZERO, b"timed", at).unwrap();
+        assert_eq!(accepted.lane(), Lane::ZERO);
+        assert!(matches!(
+            publication.offer_on(Lane::ZERO, b"plain"),
+            Err(OfferError::InvalidSchedule { .. })
+        ));
+        assert!(matches!(
+            publication.offer_at_on(Lane::ZERO, b"back", at - 1),
+            Err(OfferError::InvalidSchedule { .. })
+        ));
+        assert!(matches!(
+            publication.offer_at_on(Lane::ZERO, b"far", at + 10 * HORIZON),
+            Err(OfferError::Client(ClientError::ScheduleTooFar { .. }))
+        ));
+        assert_eq!(
+            publication.offer_at_on(Lane::try_new(1).unwrap(), b"x", at),
+            Err(OfferError::InvalidLane {
+                lane: Lane::try_new(1).unwrap()
+            })
+        );
+        let mut seen = Vec::new();
+        let start = Instant::now();
+        while seen.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never read");
+            let _ = client.poll();
+            let _ = reading
+                .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+                .unwrap();
+        }
+        assert_eq!(seen, [b"timed".to_vec()]);
+    });
+}
+
 /// A publication holds every lane its aggregate configures: `offer_on`
 /// reaches the lane's own handle, and a lane beyond them is refused.
 #[test]

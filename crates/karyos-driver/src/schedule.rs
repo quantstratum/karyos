@@ -131,8 +131,8 @@ impl ScheduleConsumer {
     /// [`ScheduleError::Violation`] of the ring, or a frame its entries
     /// contradict (an entry's position is checked against its frame,
     /// timed-tx.md section 11, TT-6). Every later frame is refused, so the
-    /// sender stages nothing more of the lane. Until the lane is sealed
-    /// with `ScheduleViolation` (T-x2), that is the whole reaction.
+    /// sender stages nothing more of the lane, and reports it once for the
+    /// conductor to seal the lane with `ScheduleViolation`.
     #[must_use]
     pub fn violated(&self) -> bool {
         self.breached || self.reader.violated()

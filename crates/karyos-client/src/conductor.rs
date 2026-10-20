@@ -1772,11 +1772,22 @@ impl<T: TermBytes> ClientConductor<T> {
                                 inner,
                                 allow_unconnected,
                             },
-                        ) => Outcome::Publication(ClientPublication::from_hand_over(
-                            inner,
-                            allow_unconnected,
-                            origin,
-                        )),
+                        ) => {
+                            // A timed lane's handle reads its schedule from
+                            // the ring (timed-tx.md section 11); a binding
+                            // this build does not know would be a driver
+                            // defect, and the handle is dropped.
+                            match ClientPublication::from_hand_over(
+                                inner,
+                                allow_unconnected,
+                                origin,
+                            )
+                            .with_ring_schedule()
+                            {
+                                Ok(publication) => Outcome::Publication(publication),
+                                Err(_) => Outcome::Unknown,
+                            }
+                        }
                         (
                             Kind::AddConcurrentPublication,
                             Capability::ConcurrentPublication {

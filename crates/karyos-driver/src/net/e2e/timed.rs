@@ -722,3 +722,74 @@ fn a_repair_of_a_timed_lane_bypasses_the_timed_gate() {
     assert_eq!((counts.sent, counts.rewound), (6, 0), "{counts:?}");
     assert_clean(&mut a);
 }
+
+/// T-x2 (timed-tx.md section 11, TT-6): a breach of the ring, here an
+/// entry's time rewritten past the sender's horizon after the offer and
+/// before the sender read it, is reported once by the sender and sealed
+/// by the conductor with `ScheduleViolation`: the handle meets a gate
+/// (`Gated`), the driver counts it once, and an in-process holder is only
+/// sealed. A second breach changes nothing: the first reason stays.
+#[test]
+fn a_schedule_violation_seals_the_lane_with_its_reason() {
+    use karyos_sys::log_buffer::SealReason;
+    use karyos_sys::schedule_ring::HEADER_WORDS;
+    use karyos_sys::sync::Ordering;
+
+    use crate::counters::Event;
+
+    let (mut a, mut b, publication, _reader) = timed_pair(4, ScheduleOptions::default(), false);
+    let handle = publication.lane(Lane::ZERO).unwrap();
+    let mut lane = a.publication(handle).unwrap();
+    let now = karyos_sys::host_clock::host_monotonic_ns();
+    assert!(matches!(
+        lane.offer_at(&0u32.to_le_bytes(), now).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    // The publisher's word, rewritten before the sender's first duty.
+    let ring = a.schedule_ring(handle).unwrap().unwrap();
+    ring[HEADER_WORDS + 1].store(u64::MAX, Ordering::Release);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0]
+            .stream_ref(handle)
+            .is_ok_and(|found| found.conductor.seal_reason().is_some())
+    });
+    let found = a.stream_ref(handle).unwrap();
+    assert_eq!(
+        found.conductor.seal_reason(),
+        Some(SealReason::ScheduleViolation)
+    );
+    assert_eq!(a.counters.value(Event::ScheduleViolations), 1);
+    assert_eq!(
+        lane.offer_at(&1u32.to_le_bytes(), now).unwrap(),
+        OfferOutcome::Gated
+    );
+    assert_eq!(lane.seal_reason(), Some(SealReason::ScheduleViolation));
+    // More duties: reported once, sealed once, nothing dropped.
+    for _ in 0..8 {
+        let _ = a.do_work().unwrap();
+    }
+    assert_eq!(a.counters.value(Event::ScheduleViolations), 1);
+    assert_eq!(a.counters.value(Event::ScheduleViolationsDropped), 0);
+    // A report for another incarnation of the lane is stale: dropped and
+    // counted, never applied.
+    a.net
+        .as_mut()
+        .unwrap()
+        .schedule_violations
+        .push(crate::net::ScheduleViolation {
+            registration: publication.registration(),
+            incarnation: 99,
+            lane: 0,
+        });
+    let _ = a.do_work().unwrap();
+    assert_eq!(a.counters.value(Event::ScheduleViolationsDropped), 1);
+    assert_eq!(a.counters.value(Event::ScheduleViolations), 1);
+    assert_eq!(
+        shared(&mut a)
+            .sender
+            .outbound_counters(0)
+            .unwrap()
+            .schedule_faults,
+        1
+    );
+}

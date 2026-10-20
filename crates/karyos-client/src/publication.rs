@@ -305,6 +305,27 @@ impl<T: TermBytes> ClientPublication<T> {
         self
     }
 
+    /// Binds a handle of a timed lane to the schedule its driver wrote into
+    /// the lane's ring ([`crate::schedule::ring_binding`]); a handle of a
+    /// lane that is not timed is unchanged. A handle the control path
+    /// granted is bound so, in process or not.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::schedule::ring_binding`].
+    pub(crate) fn with_ring_schedule(self) -> Result<Self, ClientError> {
+        let binding = self
+            .inner
+            .buffer()
+            .schedule_ring()
+            .map(crate::schedule::ring_binding)
+            .transpose()?;
+        Ok(match binding {
+            Some(binding) => self.with_schedule(binding),
+            None => self,
+        })
+    }
+
     /// The schedule of a timed lane's handle, if any.
     #[must_use]
     pub fn schedule(&self) -> Option<&crate::schedule::ScheduleBinding> {

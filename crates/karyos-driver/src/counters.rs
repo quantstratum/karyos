@@ -149,7 +149,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 66] = [
+const LABELS: [(u64, &str); 68] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -216,6 +216,8 @@ const LABELS: [(u64, &str); 66] = [
     (TYPE_EVENTS, "capability missing"),
     (TYPE_EVENTS, "guard audit records overwritten"),
     (TYPE_EVENTS, "guard audit records dropped"),
+    (TYPE_EVENTS, "schedule violations"),
+    (TYPE_EVENTS, "schedule violations dropped"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -391,8 +393,16 @@ pub(crate) enum Event {
     /// Guard audit ring records overwritten by newer ones (M4).
     GuardAuditOverwritten,
     /// Guard audit ring records dropped once its sequences were exhausted
-    /// (M4). Last, so no other counter's id moves.
+    /// (M4).
     GuardAuditDropped,
+    /// Timed lanes sealed with `ScheduleViolation`: their publisher breached
+    /// the schedule ring's protocol (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`, section 11, TT-6).
+    ScheduleViolations,
+    /// Schedule violation reports dropped: past their bound, or naming a
+    /// publication, lane or incarnation no longer live. Last, so no other
+    /// counter's id moves.
+    ScheduleViolationsDropped,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -678,6 +688,11 @@ mod tests {
                 "guard audit records overwritten",
             ),
             (Event::GuardAuditDropped, "guard audit records dropped"),
+            (Event::ScheduleViolations, "schedule violations"),
+            (
+                Event::ScheduleViolationsDropped,
+                "schedule violations dropped",
+            ),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

@@ -4709,6 +4709,38 @@ impl<T: StreamTerms> SenderRole<T> {
         }
     }
 
+    /// Posts, through `post` (which says whether it was posted), the
+    /// `ScheduleViolated` of each timed lane whose publisher breached its
+    /// ring's protocol, once per lane; one the ring refused is posted again
+    /// next cycle. A publication with no session identity reports nothing.
+    pub(super) fn report_violations<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O, T>) -> bool,
+    ) {
+        for outbound in &mut self.publications {
+            while let Some(lane) = outbound.violation_unreported() {
+                let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+                let Some(identity) = self.sessions.identity(endpoint, alias) else {
+                    break;
+                };
+                let Ok(lane_index) = u8::try_from(lane) else {
+                    break;
+                };
+                let event = AgentEvent::ScheduleViolated {
+                    endpoint,
+                    alias,
+                    registration: identity.registration_id,
+                    incarnation: identity.incarnation,
+                    lane: lane_index,
+                };
+                if !post(event) {
+                    return;
+                }
+                outbound.violation_reported(lane);
+            }
+        }
+    }
+
     /// Stops the publication `alias` on `endpoint`: its SETUP side, its
     /// bindings and its data path, which goes back to the conductor.
     fn remove<O: SocketOps>(
