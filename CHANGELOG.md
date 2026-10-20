@@ -643,6 +643,16 @@ release may break APIs, wire formats and shared-memory layouts.
   Three scenarios: a complete replay ends `end_of_stream` at its end; a
   stopped one `image_retired`; refusals carry codes 2 and 3, and a
   mismatched rate is refused locally.
+- `make libkaryos-testkit` (`scripts/package-testkit.sh`) builds the
+  conformance test kit beside a libkaryos package, in its own
+  `<package>-testkit` directory: `bin/karyosd` from the package's core
+  commit, for the suite's `archive-replay` scenarios, and a MANIFEST with
+  `role=conformance test kit, not for release`, `core_commit`,
+  `core_dirty` and `karyosd_sha256`. It refuses a package of another
+  commit or tree state, and is Linux only (those scenarios connect a
+  cross-process client). It is not part of the release package, whose
+  contents are owner item 44's, nor of pre-push.
+
 - `karyos-ffi` replays an Archive's recordings from C (F9c, B6;
   quantstratum-docs: `karyos/design/archive-replay-control.md`):
   `karyos_archive_replay` (with `karyos_replay_options`, read by prefix)
