@@ -36,6 +36,10 @@ name = "karyos-catalog"
 path = "src/bin/karyos-catalog.rs"
 
 [[bin]]
+name = "karyos-replay"
+path = "src/bin/karyos-replay.rs"
+
+[[bin]]
 name = "karyos-stat"
 path = "src/bin/karyos-stat.rs"
 

@@ -91,6 +91,8 @@ The arguments and results of each function are those of the header:
 | `karyos_claim_commit` | `claim` (required), `accepted_size` | status, `lane`, `position`, `tail` |
 | `karyos_claim_abort` | `claim` (required) | status |
 | `karyos_publication_close` | `publication` (required) | status |
+| `karyos_client_add_subscription_with` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`), `size`, `role`, `rejoin`, `reserved`: the options of `karyos_subscription_options_init` with each given field set | status, `subscription` (on `KARYOS_OK`) |
+| `karyos_subscription_close` | `subscription` (required) | status |
 
 `payload` is a quoted string whose UTF-8 bytes are the message; `length`
 is a message of that many zero bytes. A `karyos_client_connect` with a
