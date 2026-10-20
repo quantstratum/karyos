@@ -463,6 +463,11 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `Publication::offer_at_on(lane, payload, tx_time)` on the client facade
+  (quantstratum-docs: `karyos/design/timed-tx.md`; owner item 57): a timed
+  offer on one lane of a publication, checked by the lane's handle before
+  anything is reserved.
+
 - The C ABI conformance suite covers more of SPEC.md §13's C ABI
   boundary row (F6; `crates/karyos-ffi/conformance/`): a closed
   publication and a closed or ended claim answer `KARYOS_E_CLOSED`

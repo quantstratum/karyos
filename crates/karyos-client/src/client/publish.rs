@@ -231,6 +231,29 @@ impl<T: TermBytes> Publication<T> {
         offered(self.lane(lane)?.offer(payload)?)
     }
 
+    /// Offers `payload` on the timed `lane` with its requested not-before
+    /// time `tx_time`, in the lane's clock domain (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`). The lane's handle checks the time
+    /// first, before anything is reserved; the driver's sender holds the
+    /// message until its time.
+    ///
+    /// # Errors
+    ///
+    /// [`OfferError::InvalidLane`] for a lane the stream does not
+    /// configure; [`OfferError::InvalidSchedule`] for a lane that is not
+    /// timed or a time below the lane's last; `ClientError::ScheduleTooFar`
+    /// and `ClientError::ScheduleOverflow` as [`OfferError::Client`]; and
+    /// see [`OfferError`].
+    #[must_use = "an offer can be refused"]
+    pub fn offer_at_on(
+        &mut self,
+        lane: Lane,
+        payload: &[u8],
+        tx_time: u64,
+    ) -> Result<Accepted, OfferError> {
+        offered(self.lane(lane)?.offer_at(payload, tx_time)?)
+    }
+
     /// Reserves one complete frame of `length` on lane 0, to encode in
     /// place.
     ///
