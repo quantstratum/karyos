@@ -1,0 +1,38 @@
+# A caller stops after a failed handler with a bounded poll (SPEC.md
+# §10.2, §13 "bounded poll stops on callback failure"; ADR-0067): a poll
+# of limit 1 delivers one message and acknowledges it, and nothing after
+# it is delivered until the caller polls again. So a caller whose handler
+# failed on "a" stops there, and "a" is not delivered again.
+format 1
+id subscription.poll.bounded
+abi 0.1
+covers "bounded poll stops on callback failure"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=6
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_subscription_with client=$client stream_id=6
+expect KARYOS_OK subscription=$subscription
+call karyos_client_add_publication client=$client stream_id=6
+expect KARYOS_OK publication=$publication
+call karyos_publication_offer publication=$publication payload="a"
+expect KARYOS_OK
+call karyos_publication_offer publication=$publication payload="b"
+expect KARYOS_OK
+call karyos_publication_offer publication=$publication payload="c"
+expect KARYOS_OK
+call karyos_subscription_poll subscription=$subscription limit=1
+expect KARYOS_OK delivered=1 last="a"
+call karyos_subscription_poll subscription=$subscription limit=1
+expect KARYOS_OK delivered=1 last="b"
+call karyos_subscription_poll subscription=$subscription limit=8
+expect KARYOS_OK delivered=1 last="c"
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

@@ -80,6 +80,7 @@ The arguments and results of each function are those of the header:
 | `karyos_driver_subscribe_conflated` | `driver` and `stream_id` (required) | status, `conflated` (on `KARYOS_OK`) |
 | `karyos_conflated_poll` | `conflated` (required), `key_budget` (default 1): a handler that counts the values | status, `delivered` (the count written, checked against the handler's calls) |
 | `karyos_conflated_close` | `conflated` (required) | status |
+| `karyos_client_add_conflated_subscription` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`) | status, `conflated` (on `KARYOS_OK`) |
 | `karyos_driver_connect` | `driver` (required) | status, `client` |
 | `karyos_driver_do_work` | `driver` (required) | status, `work` |
 | `karyos_driver_close` | `driver` (required) | status |
@@ -97,6 +98,8 @@ The arguments and results of each function are those of the header:
 | `karyos_client_add_subscription_with` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`), `size`, `role`, `rejoin`, `reserved`: the options of `karyos_subscription_options_init` with each given field set | status, `subscription` (on `KARYOS_OK`) |
 | `karyos_subscription_close` | `subscription` (required) | status |
 | `karyos_publication_offer_with` | `publication` (required), `lane` (default 0), `payload` or `length` (one of them), `size`, `reserved`, `reserved_value`: the options of `karyos_offer_options_init` with each given field set, `accepted_size` | status, `lane`, `position`, `tail` |
+| `karyos_subscription_poll` | `subscription` (required), `limit` (default 1), `handler`: `"keep"` (default) keeps each message's bytes; `"reenter"` also polls the same subscription from inside the handler, once, with a limit of 1 | status, `delivered` (the count written, checked against the handler's calls), `last` (the last message delivered, as UTF-8 text, when there is one), `reentered` (with `"reenter"`, the name of the status the inner poll returned, as text) |
+| `karyos_publication_poll_outcomes` | `publication` (required), `lane` (default 0), `limit` (default 1): a handler that counts the records | status, `delivered` (the count written, checked against the handler's calls) |
 
 `payload` is a quoted string whose UTF-8 bytes are the message; `length`
 is a message of that many zero bytes. A `karyos_client_connect` with a

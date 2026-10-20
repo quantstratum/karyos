@@ -575,6 +575,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Conformance scenarios for the C ABI added since batch 1
+  (quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, F6; SPEC §13).
+  The runner (`tests/conformance.rs`, FORMAT.md) now calls
+  `karyos_subscription_poll` (`handler` `"keep"`, or `"reenter"`, which
+  polls the same subscription from inside the handler; results
+  `delivered`, `last` and `reentered`), `karyos_publication_poll_outcomes`
+  and `karyos_client_add_conflated_subscription`. New scenarios:
+  `subscription.poll.reentrant` and `subscription.poll.bounded` now cover
+  the §13 rows "reentrant poll" and "bounded poll stops on callback
+  failure", which were pending; `outcomes.typed.statuses` and
+  `conflated.client.view` join "typed status codes". "Kept fragment
+  pointer" stays pending: a portable runner cannot see the library's
+  mappings, and the library's own test covers it.
 - `karyos-replay start` and `stop` (quantstratum-docs:
   `karyos/design/archive-host.md`, H6): ask a running Archive to replay a
   recording into a stream, or to stop a replay, over its control streams.

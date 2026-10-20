@@ -1,0 +1,32 @@
+# A publication's outcome poll answers typed statuses (SPEC.md §10.2,
+# §13; F7a-2): an unguarded lane delivers no record; a lane the
+# publication does not configure is KARYOS_E_INVALID_LANE; a closed
+# publication's handle is closed. Each writes its count, 0, also when it
+# fails.
+format 1
+id outcomes.typed.statuses
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=7
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_publication client=$client stream_id=7
+expect KARYOS_OK publication=$publication
+call karyos_publication_poll_outcomes publication=$publication limit=8
+expect KARYOS_OK delivered=0
+call karyos_publication_poll_outcomes publication=$publication lane=1 limit=8
+expect KARYOS_E_INVALID_LANE delivered=0
+call karyos_publication_close publication=$publication
+expect KARYOS_OK
+call karyos_publication_poll_outcomes publication=$publication limit=8
+expect KARYOS_E_CLOSED delivered=0
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK
