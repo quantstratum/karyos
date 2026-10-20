@@ -20,6 +20,11 @@
 //! [`Shutdown::Terminal`], logged as an error, whether or not a stop was
 //! requested, so that a supervisor sees the failure.
 //!
+//! With the network on, it logs each network endpoint's capabilities when
+//! the endpoint first appears and at each new capability epoch (M3b;
+//! [`crate::capability_log`]), from its own CnC, checked at most every
+//! [`CAPABILITY_CHECK`].
+//!
 //! The daemon only emits `tracing` events; installing a subscriber is the
 //! binary's job.
 
@@ -45,6 +50,9 @@ use crate::args::AdmissionOptions;
 use crate::args::{Options, StreamOption, TermOptions};
 #[cfg(target_os = "linux")]
 use crate::idle::BackoffIdle;
+
+/// How often, at most, the daemon looks for endpoints to log.
+pub const CAPABILITY_CHECK: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Exit status after an orderly shutdown with every client gone.
 pub const EXIT_CLEAN: u8 = 0;
@@ -190,6 +198,12 @@ pub struct Daemon {
     /// The last duty cycle error logged, so a repeated one is logged once.
     #[cfg(target_os = "linux")]
     last_error: Option<DriverError>,
+    /// The endpoints whose capabilities are logged, with their epoch.
+    #[cfg(target_os = "linux")]
+    logged: Vec<(u64, u64)>,
+    /// When to look for endpoints next.
+    #[cfg(target_os = "linux")]
+    next_check: Instant,
     #[cfg(not(target_os = "linux"))]
     never: core::convert::Infallible,
 }
@@ -229,6 +243,8 @@ impl Daemon {
                 streams,
                 linger: options.shutdown_linger,
                 last_error: None,
+                logged: Vec::new(),
+                next_check: Instant::now(),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -283,6 +299,7 @@ impl Daemon {
         let mut clients = self.driver.clients();
         while !stop.load(Ordering::Acquire) {
             let work = self.cycle();
+            self.log_capabilities();
             clients = self.log_clients(clients);
             if let Some(terminal) = self.terminal(clients) {
                 return terminal;
@@ -305,6 +322,7 @@ impl Daemon {
         idle.reset();
         loop {
             let work = self.cycle();
+            self.log_capabilities();
             clients = self.log_clients(clients);
             if let Some(terminal) = self.terminal(clients) {
                 return terminal;
@@ -355,6 +373,39 @@ impl Daemon {
                 }
                 0
             }
+        }
+    }
+
+    /// Logs each endpoint's capabilities (M3b) the first time a
+    /// consistent read shows it at an epoch; forgets endpoints that left.
+    /// Reads the CnC at most every [`CAPABILITY_CHECK`].
+    fn log_capabilities(&mut self) {
+        let now = Instant::now();
+        if now < self.next_check {
+            return;
+        }
+        self.next_check = now.checked_add(CAPABILITY_CHECK).unwrap_or(now);
+        let endpoints = karyos_client::capabilities::endpoint_capabilities(&self.driver.counters());
+        self.logged
+            .retain(|(endpoint, _)| endpoints.iter().any(|found| found.endpoint == *endpoint));
+        for found in endpoints.iter().filter(|found| found.consistent) {
+            let epoch = found
+                .gauges
+                .iter()
+                .find(|(label, _)| label == crate::capability_log::EPOCH)
+                .map_or(0, |(_, epoch)| *epoch);
+            if self.logged.contains(&(found.endpoint, epoch)) {
+                continue;
+            }
+            self.logged
+                .retain(|(endpoint, _)| *endpoint != found.endpoint);
+            self.logged.push((found.endpoint, epoch));
+            tracing::info!(
+                endpoint = found.endpoint,
+                epoch,
+                capabilities = %crate::capability_log::line(&found.gauges),
+                "endpoint capabilities"
+            );
         }
     }
 
