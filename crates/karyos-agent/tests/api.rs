@@ -85,7 +85,7 @@ fn own() -> u32 {
 
 /// Sends `request` from another thread and serves it; the answer, and how
 /// the server says it served it.
-fn ask(server: &mut Server, agent: &Agent, request: &str) -> (String, Vec<Served>) {
+fn ask(server: &mut Server, agent: &mut Agent, request: &str) -> (String, Vec<Served>) {
     let path = server.path().to_path_buf();
     std::thread::scope(|scope| {
         let client = scope.spawn(move || {
@@ -111,10 +111,10 @@ fn ask(server: &mut Server, agent: &Agent, request: &str) -> (String, Vec<Served
 #[test]
 fn a_v1_client_reads_the_view() {
     let _serial = serial();
-    let (driver, agent, dir) = attached("view");
+    let (driver, mut agent, dir) = attached("view");
     let mut server =
         Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
-    let (answer, served) = ask(&mut server, &agent, "KARYOS-AGENT 1 view\n");
+    let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 view\n");
     assert_eq!(served, [Served::View]);
     let instance = format!("{:032x}", driver.instance().unwrap());
     let expected = format!(
@@ -122,26 +122,27 @@ fn a_v1_client_reads_the_view() {
         dir.join("driver").display()
     );
     assert!(answer.starts_with(&expected), "{answer}");
-    assert!(answer.ends_with("}]}\n"), "{answer}");
+    // No journal configured: `journal` is null (M10b).
+    assert!(answer.ends_with("}],\"journal\":null}\n"), "{answer}");
     assert!(answer.contains(r#""label":"driver pid""#));
 }
 
 #[test]
 fn other_versions_uids_without_a_role_and_bad_requests_are_refused() {
     let _serial = serial();
-    let (_driver, agent, dir) = attached("refused");
+    let (_driver, mut agent, dir) = attached("refused");
     let mut server = Server::bind(ApiConfig::new(
         dir.join("api"),
         vec![(own(), Role::Operator)],
     ))
     .unwrap();
-    let (answer, served) = ask(&mut server, &agent, "KARYOS-AGENT 2 view\n");
+    let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 2 view\n");
     assert_eq!(served, [Served::Refused]);
     assert_eq!(
         answer,
         "{\"error\":\"unsupported version\",\"supported\":[1]}\n"
     );
-    let (answer, _) = ask(&mut server, &agent, "GET / HTTP/1.1\r\n");
+    let (answer, _) = ask(&mut server, &mut agent, "GET / HTTP/1.1\r\n");
     assert_eq!(answer, "{\"error\":\"bad request\"}\n");
     drop(server);
     // This uid has no role here.
@@ -150,7 +151,7 @@ fn other_versions_uids_without_a_role_and_bad_requests_are_refused() {
         vec![(own().wrapping_add(1), Role::Administrator)],
     ))
     .unwrap();
-    let (answer, served) = ask(&mut server, &agent, "KARYOS-AGENT 1 view\n");
+    let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 view\n");
     assert_eq!(served, [Served::Refused]);
     assert_eq!(answer, "{\"error\":\"not authorized\"}\n");
 }
@@ -241,7 +242,7 @@ fn the_binary_serves_the_view() {
 fn a_poll_serves_at_most_max_accepts() {
     use karyos_agent::server::MAX_ACCEPTS;
     let _serial = serial();
-    let (_driver, agent, dir) = attached("accepts");
+    let (_driver, mut agent, dir) = attached("accepts");
     let mut server =
         Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
     let extra = 4;
@@ -252,8 +253,8 @@ fn a_poll_serves_at_most_max_accepts() {
             stream
         })
         .collect();
-    assert_eq!(server.poll(&agent).unwrap().len(), MAX_ACCEPTS);
-    assert_eq!(server.poll(&agent).unwrap().len(), extra);
+    assert_eq!(server.poll(&mut agent).unwrap().len(), MAX_ACCEPTS);
+    assert_eq!(server.poll(&mut agent).unwrap().len(), extra);
     for client in &mut clients {
         let mut answer = String::new();
         let _ = client.read_to_string(&mut answer).unwrap();
