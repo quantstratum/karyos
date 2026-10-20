@@ -8,10 +8,15 @@
 //! each [`RecordingLister::poll`] sends what it can and reads the answers
 //! there are, never blocking. A page asks for [`ListerConfig::page`]
 //! recordings; the Archive answers one descriptor each, then a response
-//! with the count, and a full page asks for the next one from the id after
-//! its last. The listing ends at a page shorter than asked, or when the
-//! Archive refuses. At most [`ListerConfig::max_recordings`] are kept; past
-//! it the listing goes on to its end, counting what it left out.
+//! with the count. A page that delivered any recording asks for the next
+//! one from the id after its last, whatever its count: the Archive leaves
+//! out a recording it cannot describe (a channel that is not UTF-8) or
+//! cannot queue, so a short page does not mean the end. The listing ends
+//! at an empty page, or when the Archive refuses; a page whose recordings
+//! were all left out therefore ends it early. At most
+//! [`ListerConfig::max_recordings`] are kept; past it the listing goes on
+//! to its end, counting what it left out. A lost answer leaves the listing
+//! pending: its owner bounds the wait and starts it again.
 //!
 //! Correlation ids carry [`ListerConfig::client_id`] in their high 32 bits,
 //! as the replay client's do; answers to other requesters are skipped.
@@ -180,36 +185,46 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
         (u64::from(self.config.client_id) << 32) | u64::from(low)
     }
 
-    /// Sends what it can and reads the answers there are.
-    pub fn poll(&mut self) -> ListPoll {
-        if let Step::Sending {
+    /// Sends the page of [`Step::Sending`], if any: `None` once it is sent
+    /// (or there is none), what to answer otherwise.
+    fn send(&mut self) -> Option<ListPoll> {
+        let Step::Sending {
             correlation_id,
             from_id,
         } = self.step
-        {
-            let message = ControlMessage::ListRecordings(ListRecordings {
-                correlation_id,
-                from_id,
-                max_count: self.config.page.clamp(1, MAX_LIST_COUNT),
+        else {
+            return None;
+        };
+        let message = ControlMessage::ListRecordings(ListRecordings {
+            correlation_id,
+            from_id,
+            max_count: self.config.page.clamp(1, MAX_LIST_COUNT),
+        });
+        let Ok(length) = message.encode(&mut self.request) else {
+            self.step = Step::Idle;
+            return Some(ListPoll::Refused {
+                code: ResponseCode::InvalidRequest,
+                message: "the list request does not encode".to_owned(),
             });
-            let Ok(length) = message.encode(&mut self.request) else {
-                self.step = Step::Idle;
-                return ListPoll::Refused {
-                    code: ResponseCode::InvalidRequest,
-                    message: "the list request does not encode".to_owned(),
-                };
-            };
-            let Some(bytes) = self.request.get(..length) else {
-                self.step = Step::Idle;
-                return ListPoll::Idle;
-            };
-            if !self.requests.send(bytes) {
-                return ListPoll::Pending;
-            }
-            self.step = Step::Waiting {
-                correlation_id,
-                last: None,
-            };
+        };
+        let Some(bytes) = self.request.get(..length) else {
+            self.step = Step::Idle;
+            return Some(ListPoll::Idle);
+        };
+        if !self.requests.send(bytes) {
+            return Some(ListPoll::Pending);
+        }
+        self.step = Step::Waiting {
+            correlation_id,
+            last: None,
+        };
+        None
+    }
+
+    /// Sends what it can and reads the answers there are.
+    pub fn poll(&mut self) -> ListPoll {
+        if let Some(answer) = self.send() {
+            return answer;
         }
         let Step::Waiting {
             correlation_id,
@@ -271,22 +286,20 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
                 };
                 ListPoll::Pending
             }
-            Some(Ok(count)) if count == u64::from(self.config.page) => {
-                match last.and_then(|last| last.checked_add(1)) {
-                    Some(from_id) => {
-                        let correlation_id = self.correlation_id();
-                        self.step = Step::Sending {
-                            correlation_id,
-                            from_id,
-                        };
-                        // The next page goes out now: no answer of its can
-                        // have come yet, so this poll stops there.
-                        self.poll()
-                    }
-                    None => self.done(),
+            // A page that delivered a recording: the next one, from the id
+            // after its last, goes out now. No answer of its can have come
+            // yet, so this poll stops there.
+            Some(Ok(_)) => match last.and_then(|last| last.checked_add(1)) {
+                Some(from_id) => {
+                    let correlation_id = self.correlation_id();
+                    self.step = Step::Sending {
+                        correlation_id,
+                        from_id,
+                    };
+                    self.send().unwrap_or(ListPoll::Pending)
                 }
-            }
-            Some(Ok(_)) => self.done(),
+                None => self.done(),
+            },
             Some(Err((code, message))) => {
                 self.step = Step::Idle;
                 ListPoll::Refused { code, message }

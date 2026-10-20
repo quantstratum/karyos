@@ -143,7 +143,7 @@ fn ids(poll: &ListPoll) -> Vec<u64> {
 }
 
 #[test]
-fn a_listing_follows_full_pages_to_a_short_one() {
+fn a_listing_follows_its_pages_to_an_empty_one() {
     let mut rig = rig(2, 100);
     assert_eq!(rig.lister.poll(), ListPoll::Idle);
     rig.lister.start();
@@ -157,6 +157,11 @@ fn a_listing_follows_full_pages_to_a_short_one() {
     assert_ne!(second, first);
     assert_eq!(from, 6);
     rig.page(second, &[8]);
+    // A short page is not the end: the Archive may have left one out.
+    assert_eq!(rig.lister.poll(), ListPoll::Pending);
+    let (third, from, _) = rig.request();
+    assert_eq!(from, 9);
+    rig.page(third, &[]);
     let done = rig.lister.poll();
     assert_eq!(ids(&done), [3, 5, 8]);
     let ListPoll::Done(listing) = done else {
@@ -176,6 +181,9 @@ fn another_requesters_answers_are_skipped() {
     rig.page(correlation_id + 1000, &[1, 2]);
     rig.page(correlation_id, &[4]);
     // Up to 64 answers a poll: the stranger's three, then ours.
+    assert_eq!(rig.lister.poll(), ListPoll::Pending);
+    let (next, _, _) = rig.request();
+    rig.page(next, &[]);
     assert_eq!(ids(&rig.lister.poll()), [4]);
 }
 
@@ -207,6 +215,10 @@ fn recordings_past_the_bound_are_counted_not_kept() {
     let _ = rig.lister.poll();
     let (correlation_id, _, _) = rig.request();
     rig.page(correlation_id, &[1, 2, 3, 4]);
+    assert_eq!(rig.lister.poll(), ListPoll::Pending);
+    let (next, from, _) = rig.request();
+    assert_eq!(from, 5);
+    rig.page(next, &[]);
     let ListPoll::Done(listing) = rig.lister.poll() else {
         panic!()
     };
@@ -227,4 +239,27 @@ fn a_request_without_room_is_offered_again() {
     assert_eq!(from, 0);
     rig.page(correlation_id, &[]);
     assert_eq!(ids(&rig.lister.poll()), Vec::<u64>::new());
+}
+
+/// REVIEWER-02's P2 on #481: the Archive leaves out a recording it cannot
+/// describe (a channel that is not UTF-8), so a page asked for 3 can
+/// answer 2 with more to come; the listing goes on past it.
+#[test]
+fn a_page_short_of_a_left_out_recording_does_not_end_the_listing() {
+    let mut rig = rig(3, 100);
+    rig.lister.start();
+    let _ = rig.lister.poll();
+    let (first, _, count) = rig.request();
+    assert_eq!(count, 3);
+    // Recording 2 was left out: 1 and 3, count 2.
+    rig.page(first, &[1, 3]);
+    assert_eq!(rig.lister.poll(), ListPoll::Pending);
+    let (second, from, _) = rig.request();
+    assert_eq!(from, 4);
+    rig.page(second, &[4, 5, 6]);
+    assert_eq!(rig.lister.poll(), ListPoll::Pending);
+    let (third, from, _) = rig.request();
+    assert_eq!(from, 7);
+    rig.page(third, &[]);
+    assert_eq!(ids(&rig.lister.poll()), [1, 3, 4, 5, 6]);
 }
