@@ -10,6 +10,7 @@
 //! §4.7).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -518,17 +519,24 @@ fn ended() -> MutexGuard<'static, Vec<(Handle, Ended)>> {
     ENDED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Takes `client`'s ended children out of `held`.
+/// The entries of the ended list, changed only under its mutex: a client
+/// call finds the list empty without taking the mutex, so the clients'
+/// calls do not serialize on it while no close is deferred.
+static ENDED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Pushes `child` of `client` onto `held`, the locked ended list.
+fn push_ended(held: &mut Vec<(Handle, Ended)>, client: Handle, child: Ended) {
+    held.push((client, child));
+    ENDED_COUNT.store(held.len(), Ordering::Release);
+}
+
+/// Takes `client`'s ended children out of `held`, the locked ended list.
 fn take_ended(held: &mut Vec<(Handle, Ended)>, client: Handle) -> Vec<Ended> {
-    let mut taken = Vec::new();
-    let mut at = 0;
-    while at < held.len() {
-        if held.get(at).is_some_and(|(owner, _)| *owner == client) {
-            taken.push(held.swap_remove(at).1);
-        } else {
-            at += 1;
-        }
-    }
+    let taken = held
+        .extract_if(.., |(owner, _)| *owner == client)
+        .map(|(_, child)| child)
+        .collect();
+    ENDED_COUNT.store(held.len(), Ordering::Release);
     taken
 }
 
@@ -545,7 +553,12 @@ pub(crate) fn with_client<R>(
     f: impl FnOnce(&mut ClientEntry) -> R,
 ) -> Result<R, Status> {
     clients().with(client, |entry| {
-        let taken = take_ended(&mut ended(), client);
+        // A push racing this load is released by the client's next call.
+        let taken = if ENDED_COUNT.load(Ordering::Acquire) == 0 {
+            Vec::new()
+        } else {
+            take_ended(&mut ended(), client)
+        };
         for child in taken {
             child.release(entry);
         }
@@ -579,7 +592,7 @@ pub(crate) fn close_child<T>(
         Err(Status::Busy | Status::Reentrant) => {
             let mut held = ended();
             let removed = table.remove(handle)?;
-            held.push((client, wrap(handle, removed)));
+            push_ended(&mut held, client, wrap(handle, removed));
             Ok(())
         }
         Err(status) => Err(status),

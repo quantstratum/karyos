@@ -54,7 +54,9 @@
  *   next call or its close. A client with no further calls holds the
  *   released resources (a publisher slot, lanes, streams) until its next
  *   call or close. KARYOS_E_BUSY and KARYOS_E_REENTRANT from a child's
- *   close mean the child itself is in use.
+ *   close mean the child itself is in use. A child's close racing its
+ *   client's close may answer KARYOS_E_CLOSED: the client's close closed
+ *   it, so treat it as already closed, not as an error.
  * - Callbacks run on the calling thread, inside the call, and the
  *   handles the call holds stay held until they return. A started
  *   driver's own thread (karyos_driver_start) runs duty cycles only and
