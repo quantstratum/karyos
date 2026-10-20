@@ -65,6 +65,28 @@ fn a_driver_closes_with_its_thread_running() {
     assert_eq!(stop(driver), Err(Status::Closed));
 }
 
+/// `KARYOS_IDLE_YIELD_THEN_SLEEP` (ADR-0066) runs the thread with the
+/// agents' own strategy: the thread starts, idles past its 64 yields into
+/// its sleeps, and stops.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_driver_thread_runs_with_yield_then_sleep() {
+    let _serial = serial();
+    let driver = created();
+    start(
+        driver,
+        Idle {
+            strategy: IDLE_YIELD_THEN_SLEEP,
+            sleep_ns: 0,
+        },
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    stop(driver).unwrap();
+    assert!(do_work(driver).is_ok());
+    close(driver).unwrap();
+}
+
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn an_unknown_idle_strategy_or_configuration_is_refused() {
@@ -74,7 +96,7 @@ fn an_unknown_idle_strategy_or_configuration_is_refused() {
         start(
             driver,
             Idle {
-                strategy: 3,
+                strategy: 4,
                 sleep_ns: 0
             }
         ),

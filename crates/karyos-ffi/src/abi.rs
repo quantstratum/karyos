@@ -44,7 +44,8 @@ fn readable<T>(input: *const T) -> bool {
 pub struct ClientOptions {
     /// The struct's size in bytes.
     pub size: u32,
-    /// `KARYOS_IDLE_BUSY_SPIN`, `KARYOS_IDLE_YIELD` or `KARYOS_IDLE_SLEEP`.
+    /// `KARYOS_IDLE_BUSY_SPIN`, `KARYOS_IDLE_YIELD`, `KARYOS_IDLE_SLEEP` or
+    /// `KARYOS_IDLE_YIELD_THEN_SLEEP` (the default).
     pub idle_strategy: u32,
     /// The driver's directory, NUL-terminated UTF-8; null for none.
     pub dir: *const c_char,
@@ -280,8 +281,9 @@ pub extern "C" fn karyos_status_message(status: i32) -> *const c_char {
     }
 }
 
-/// Fills `options` with the defaults: no directory, `KARYOS_IDLE_YIELD`,
-/// the default timeout and bounds, and `size`.
+/// Fills `options` with the defaults: no directory,
+/// `KARYOS_IDLE_YIELD_THEN_SLEEP` (ADR-0066), the default timeout and
+/// bounds, and `size`.
 ///
 /// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
 /// misaligned pointer.
@@ -1763,8 +1765,9 @@ pub unsafe extern "C" fn karyos_driver_do_work(driver: u64, work: *mut u32) -> i
 
 /// Moves `driver` to a thread of its own, which runs its duty cycle and,
 /// when one did no work, idles by `idle_strategy` (`KARYOS_IDLE_*`;
-/// `idle_sleep_ns` for `KARYOS_IDLE_SLEEP`) until `karyos_driver_stop` or
-/// the close. `KARYOS_E_BUSY` when it already runs on one.
+/// `idle_sleep_ns` for `KARYOS_IDLE_SLEEP`; `KARYOS_IDLE_YIELD_THEN_SLEEP`
+/// is the agents' default, ADR-0066) until `karyos_driver_stop` or the
+/// close. `KARYOS_E_BUSY` when it already runs on one.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_driver_start(driver: u64, idle_strategy: u32, idle_sleep_ns: u64) -> i32 {
     guard(|| {
