@@ -50,7 +50,8 @@ fn suite_runs_on(library: [u32; 3]) -> bool {
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
 
 /// The features a format 2 scenario may need (FORMAT.md, Features).
-const FEATURES: [&str; 6] = [
+const FEATURES: [&str; 7] = [
+    "archive-replay",
     "claim-retry",
     "concurrent-publication",
     "conflation",
@@ -68,7 +69,8 @@ const MAX_VARIABLES: usize = 256;
 const MAX_SCENARIOS: usize = 4096;
 
 /// The argument names that take an object of the semantic layer.
-const OBJECTS: [&str; 6] = [
+const OBJECTS: [&str; 7] = [
+    "archive",
     "driver",
     "client",
     "publication",
@@ -229,7 +231,54 @@ const OPS: &[Op] = &[
         &["conflation"],
     ),
     op("conflated.close", &["conflated"], &[], &[], &["conflation"]),
+    op(
+        "archive.connect",
+        &["client"],
+        &[],
+        &["archive"],
+        &["archive-replay"],
+    ),
+    op(
+        "archive.replay",
+        &["archive", "recording", "target_stream_id"],
+        &["position", "length", "rate", "scale_ppm"],
+        &["replay", "session"],
+        &["archive-replay"],
+    ),
+    op(
+        "archive.stop_replay",
+        &["archive", "replay"],
+        &[],
+        &[],
+        &["archive-replay"],
+    ),
+    op("archive.close", &["archive"], &[], &[], &["archive-replay"]),
+    op(
+        "replay.subscribe",
+        &["client", "stream_id", "session"],
+        &[],
+        &["subscription"],
+        &["archive-replay"],
+    ),
+    op(
+        "subscription.poll_to_end",
+        &["subscription"],
+        &["limit"],
+        &["delivered", "last"],
+        &[],
+    ),
+    op(
+        "subscription.end",
+        &["subscription"],
+        &[],
+        &["reason", "position", "seal_code"],
+        &[],
+    ),
 ];
+
+/// The ops whose refusal carries the Archive's response code, `code`
+/// (FORMAT.md, Outcomes).
+const ARCHIVE_REFUSALS: [&str; 2] = ["archive.replay", "archive.stop_replay"];
 
 /// A value of a scenario.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,6 +503,7 @@ fn check_op(step: &Step, features: &BTreeSet<String>, names: &BTreeSet<String>, 
     // feature (FORMAT.md, Ops).
     for (name, allowed) in [
         ("domain", &["monotonic", "tai"][..]),
+        ("rate", &["full", "as_recorded", "scaled"][..]),
         (
             "idle_strategy",
             &["busy_spin", "yield", "sleep", "yield_then_sleep"][..],
@@ -493,7 +543,14 @@ fn check_op(step: &Step, features: &BTreeSet<String>, names: &BTreeSet<String>, 
                 status, "invalid_handle",
                 "{at}: `invalid_handle` is no op outcome"
             );
-            assert!(step.results.is_empty(), "{at}: a status expects no results");
+            // Only an Archive's refusal carries a result: its code.
+            let code_only = status == "refused"
+                && ARCHIVE_REFUSALS.contains(&op.name)
+                && step.results.keys().all(|name| name == "code");
+            assert!(
+                step.results.is_empty() || code_only,
+                "{at}: a status expects no results"
+            );
         }
         None => panic!("{at}: an op's expect is `ok` or `status=<name>`"),
     }
@@ -1360,6 +1417,8 @@ struct Runner {
     step: usize,
     offered: BTreeSet<&'static str>,
     absent: BTreeSet<&'static str>,
+    /// What it provides for `archive-replay`, when it offers it.
+    archive: Option<archive_host::Provided>,
 }
 
 impl Runner {
@@ -1384,22 +1443,36 @@ impl Runner {
             step,
             offered,
             absent,
+            archive: None,
         }
     }
 
     /// The reference runner: every step, and every feature but a TAI clock
     /// where the library has none (Linux only).
     fn reference() -> Self {
-        let tai: &[&'static str] = if cfg!(target_os = "linux") {
-            &[]
+        let absent: &[&'static str] = if cfg!(target_os = "linux") {
+            &["archive-replay"]
         } else {
-            &["tai-clock"]
+            &["archive-replay", "tai-clock"]
         };
         let offered: Vec<&'static str> = FEATURES
             .into_iter()
-            .filter(|feature| !tai.contains(feature))
+            .filter(|feature| !absent.contains(feature))
             .collect();
-        Self::new(STEPS.len() - 1, &offered, tai)
+        Self::new(STEPS.len() - 1, &offered, absent)
+    }
+
+    /// The reference runner with what `archive-replay` needs, on Linux,
+    /// where it provisions karyosd (FORMAT.md, Archive replays); as
+    /// [`Runner::reference`] elsewhere.
+    fn reference_with_archive() -> Self {
+        let mut runner = Self::reference();
+        if let Some(provided) = archive_host::provide() {
+            runner.absent.remove("archive-replay");
+            runner.offered.insert("archive-replay");
+            runner.archive = Some(provided);
+        }
+        runner
     }
 
     /// The line a run prints after its pinning line (FORMAT.md,
@@ -1479,6 +1552,24 @@ fn run(
     if semantic && !scenario.features.contains("embedded-driver") {
         variables.insert("driver".to_owned(), adapter.provided_driver());
     }
+    if scenario.features.contains("archive-replay") {
+        let provided = runner
+            .archive
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: archive-replay offered with nothing provided"));
+        variables.insert(
+            "archive_client".to_owned(),
+            adapter.provided_client(provided.client),
+        );
+        variables.insert(
+            "recording".to_owned(),
+            Value::Integer(i128::from(provided.recording)),
+        );
+        variables.insert(
+            "recording_end".to_owned(),
+            Value::Integer(i128::from(provided.end)),
+        );
+    }
     for step in &scenario.steps {
         let at = format!("{name}:{}", step.line);
         // A step takes its variables' values.
@@ -1510,6 +1601,14 @@ fn run(
                         "{at}: status={got}"
                     );
                     BTreeMap::new()
+                }
+                semantic::Answer::StatusWith(got, results) => {
+                    assert_eq!(
+                        step.status.as_deref(),
+                        Some(got.as_str()),
+                        "{at}: status={got} {results:?}"
+                    );
+                    results
                 }
             },
         };
@@ -1727,7 +1826,7 @@ fn every_scenario_passes_at_the_library_abi_version() {
     );
     // The run's identities come first (FORMAT.md, Pinning).
     println!("{}", pinning([major, minor, patch]));
-    let runner = Runner::reference();
+    let runner = Runner::reference_with_archive();
     println!("{}", runner.declaration());
     let scenarios = scenarios();
     assert!(!scenarios.is_empty());
@@ -1739,8 +1838,10 @@ fn every_scenario_passes_at_the_library_abi_version() {
         // clock may be missing, off Linux.
         match outcome {
             Outcome::Passed => {}
+            // Off Linux, the TAI clock and the Archive replays are absent.
             Outcome::Unsupported(feature)
-                if feature == "tai-clock" && !cfg!(target_os = "linux") => {}
+                if ["tai-clock", "archive-replay"].contains(&feature.as_str())
+                    && !cfg!(target_os = "linux") => {}
             other => panic!("{}: {other}", scenario.id),
         }
     }
@@ -1877,6 +1978,15 @@ fn format_2_is_parsed_strictly_and_within_its_bounds() {
          op driver.close driver=$d\nexpect status=busy\n"
     ));
     assert_eq!((ok.format, ok.since), (2, Some(1)));
+    // An Archive's refusal may check its code.
+    let refused = parse(&format!(
+        "{head}feature archive-replay\nop archive.stop_replay archive=$a replay=1\n\
+         expect status=refused code=3\n"
+    ));
+    assert_eq!(
+        refused.steps[0].results["code"],
+        Expected::Equal(Value::Integer(3))
+    );
     assert_eq!(
         ok.steps[2].results["now"],
         Expected::AtLeast(Value::Variable("n".to_owned()))
@@ -1966,6 +2076,31 @@ fn format_2_is_parsed_strictly_and_within_its_bounds() {
         (
             format!("{head}op clock.now domain=\"wall\"\nexpect ok\n"),
             "`domain` is one of",
+        ),
+        // Only an Archive's refusal carries a result, and only `code`.
+        (
+            format!(
+                "{head}feature archive-replay\nop archive.close archive=$a\nexpect status=refused code=2\n"
+            ),
+            "expects no results",
+        ),
+        (
+            format!(
+                "{head}feature archive-replay\nop archive.stop_replay archive=$a replay=1\n\
+                 expect status=refused reason=2\n"
+            ),
+            "expects no results",
+        ),
+        (
+            format!(
+                "{head}feature archive-replay\nop archive.replay archive=$a recording=1 \
+                 target_stream_id=1 rate=\"fast\"\nexpect ok\n"
+            ),
+            "`rate` is one of",
+        ),
+        (
+            format!("{head}op archive.close archive=$a\nexpect ok\n"),
+            "needs `feature archive-replay`",
         ),
         (
             format!(
@@ -2088,6 +2223,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
         1,
         &["embedded-driver"],
         &[
+            "archive-replay",
             "claim-retry",
             "concurrent-publication",
             "conflation",
@@ -2097,7 +2233,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     );
     assert_eq!(
         b1.declaration(),
-        "step B1 offers embedded-driver absent claim-retry concurrent-publication \
+        "step B1 offers embedded-driver absent archive-replay claim-retry concurrent-publication \
          conflation guarded-publication tai-clock"
     );
     assert_eq!(
@@ -2185,4 +2321,251 @@ fn the_sized_struct_checks_see_writes() {
     // One byte past the 0.1.0 struct.
     accepted.poke(size_of::<abi::Accepted>(), 0);
     assert!(!accepted.tail_intact());
+}
+
+/// What a runner offering `archive-replay` provides (FORMAT.md, Archive
+/// replays): karyosd with an Archive, a client of it, and a recording of
+/// "r0" to "r9" on stream 20. Linux only: the client attaches to karyosd
+/// in another process, which only Linux's remote client does.
+mod archive_host {
+    /// The provided client, the recording and its end; dropping it closes
+    /// the client and stops karyosd.
+    pub(crate) struct Provided {
+        pub(crate) client: u64,
+        pub(crate) recording: u64,
+        pub(crate) end: u64,
+        #[cfg(target_os = "linux")]
+        _karyosd: linux::Karyosd,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Provided {
+        fn drop(&mut self) {
+            let _ = super::abi::client_close(self.client);
+        }
+    }
+
+    /// The provisioning, or `None` where `archive-replay` is absent.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn provide() -> Option<Provided> {
+        None
+    }
+
+    /// The provisioning (FORMAT.md, Archive replays); a step that fails
+    /// fails the run, with karyosd's output.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn provide() -> Option<Provided> {
+        let karyosd = linux::Karyosd::start();
+        let (client, recording, end) = karyosd.seed();
+        Some(Provided {
+            client,
+            recording,
+            end,
+            _karyosd: karyosd,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use std::ffi::CString;
+        use std::path::PathBuf;
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        use super::super::abi;
+
+        /// The recorded stream and the Archive's control streams
+        /// (FORMAT.md, Archive replays). The replay target's stream, 1041,
+        /// is not configured: each replay opens its own target there.
+        const RECORDED: i32 = 20;
+        const REQUESTS: i32 = 1030;
+        const RESPONSES: i32 = 1031;
+
+        /// A karyosd of the runner's: stopped with SIGTERM, a bounded
+        /// wait, then SIGKILL, when dropped.
+        pub(crate) struct Karyosd {
+            child: Child,
+            root: PathBuf,
+            log: PathBuf,
+        }
+
+        /// The karyosd binary: `KARYOS_KARYOSD`, else the one this
+        /// workspace built beside the test, else built now with cargo
+        /// (FORMAT.md's fallback) in the test's own profile, so that it
+        /// lands beside the test under `--release` too.
+        fn binary() -> PathBuf {
+            if let Ok(path) = std::env::var("KARYOS_KARYOSD") {
+                return PathBuf::from(path);
+            }
+            let exe = std::env::current_exe().unwrap();
+            let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
+            let built = profile.join("karyosd");
+            if !built.exists() {
+                // Cargo names the dev profile's directory `debug`.
+                let name = match profile.file_name().and_then(|name| name.to_str()) {
+                    Some("debug") | None => "dev",
+                    Some(name) => name,
+                };
+                let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+                let status = Command::new(cargo)
+                    .args([
+                        "build",
+                        "--locked",
+                        "-p",
+                        "karyos-tools",
+                        "--bin",
+                        "karyosd",
+                        "--profile",
+                        name,
+                    ])
+                    .env("CARGO_TARGET_DIR", profile.parent().unwrap())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "karyosd did not build");
+            }
+            built
+        }
+
+        impl Karyosd {
+            pub(crate) fn start() -> Self {
+                let root = std::env::temp_dir()
+                    .join(format!("karyos-conformance-archive-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&root);
+                let (dir, archive) = (root.join("driver"), root.join("archive"));
+                std::fs::create_dir_all(&archive).unwrap();
+                std::fs::create_dir_all(&dir).unwrap();
+                // A private directory, as karyosd's admission requires.
+                std::process::Command::new("chmod")
+                    .args(["700", dir.to_str().unwrap()])
+                    .status()
+                    .unwrap();
+                let log = root.join("karyosd.log");
+                let out = std::fs::File::create(&log).unwrap();
+                let child = Command::new(binary())
+                    .arg("--dir")
+                    .arg(&dir)
+                    .args(["--stream", &format!("{RECORDED}:1")])
+                    .arg("--archive")
+                    .arg(&archive)
+                    .args(["--archive-control", &format!("{REQUESTS},{RESPONSES}")])
+                    .args(["--record", &format!("{RECORDED}:1")])
+                    .stdout(Stdio::from(out.try_clone().unwrap()))
+                    .stderr(Stdio::from(out))
+                    .spawn()
+                    .unwrap();
+                Self { child, root, log }
+            }
+
+            fn fail(&self, what: &str) -> ! {
+                let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+                panic!("archive-replay provisioning: {what}\nkaryosd:\n{log}");
+            }
+
+            /// Connects the client and records "r0" to "r9" on the
+            /// recorded stream: the client, the recording's id and its
+            /// end.
+            pub(crate) fn seed(&self) -> (u64, u64, u64) {
+                let deadline = Duration::from_secs(20);
+                let dir = CString::new(self.root.join("driver").to_str().unwrap()).unwrap();
+                let start = Instant::now();
+                let client = loop {
+                    let (status, client, _) = abi::client_connect(&dir);
+                    if status == 0 {
+                        break client;
+                    }
+                    if start.elapsed() > deadline {
+                        self.fail(&format!("no client of karyosd (status {status})"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                let (status, publication, _) =
+                    abi::client_add_publication(client, c"karyos:ipc", RECORDED, 24);
+                if status != 0 {
+                    self.fail(&format!("no publication on stream {RECORDED} ({status})"));
+                }
+                let options = abi::ArchiveOptions {
+                    size: u32::try_from(size_of::<abi::ArchiveOptions>()).unwrap(),
+                    reserved: 0,
+                    requests: REQUESTS,
+                    responses: RESPONSES,
+                    client_id: 1,
+                    deadline_ns: 10_000_000_000,
+                };
+                let (status, archive) = abi::archive_connect(client, &options);
+                if status != 0 {
+                    self.fail(&format!("no Archive connection ({status})"));
+                }
+                // The recording once it is past `last`, the start of the
+                // last message offered, which, one frame, is then recorded
+                // whole: its id and position.
+                let recorded_past = |last: u64| {
+                    let start = Instant::now();
+                    loop {
+                        let (status, recordings) = abi::archive_recordings(archive, 0, 16);
+                        if let Some(&(id, position)) = recordings.first()
+                            && status == 0
+                            && position > last
+                        {
+                            break (id, position);
+                        }
+                        if start.elapsed() > deadline {
+                            self.fail(&format!("not recorded past {last}: {recordings:?}"));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                };
+                let mut last = 0;
+                for index in 0..10u8 {
+                    // The second half only once the first is recorded, and
+                    // 50 ms later. A recorder duty stamps one record time on
+                    // everything it copies and ends at an empty source, so
+                    // the first half's stamps are then taken, and the second
+                    // half's are at least 50 ms later: a replay at a
+                    // millionth of the recorded pace holds it
+                    // (op.replay.stopped).
+                    if index == 5 {
+                        let _ = recorded_past(last);
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let message = format!("r{index}");
+                    let start = Instant::now();
+                    last = loop {
+                        let (status, accepted) =
+                            abi::publication_offer_on(publication, 0, message.as_bytes(), 16);
+                        if status == 0 {
+                            break abi::accepted_fields(&accepted).unwrap().1;
+                        }
+                        if start.elapsed() > deadline {
+                            self.fail(&format!("{message} not offered ({status})"));
+                        }
+                        let _ = abi::client_poll(client);
+                        std::thread::sleep(Duration::from_millis(1));
+                    };
+                }
+                let _ = abi::publication_close(publication);
+                let (recording, end) = recorded_past(last);
+                let _ = abi::archive_close(archive);
+                (client, recording, end)
+            }
+        }
+
+        impl Drop for Karyosd {
+            fn drop(&mut self) {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &self.child.id().to_string()])
+                    .status();
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(10) {
+                    if matches!(self.child.try_wait(), Ok(Some(_))) {
+                        let _ = std::fs::remove_dir_all(&self.root);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+    }
 }

@@ -195,6 +195,7 @@ offers. The features are:
 
 | Feature | What it needs |
 | --- | --- |
+| `archive-replay` | An Archive the runner provides, and the replay ops: `archive.*`, `replay.subscribe` (Archive replays, below; Linux only) |
 | `claim-retry` | A claim held across calls: `publication.claim`, `claim.commit`, `claim.abort` (the C++ and Go object APIs) |
 | `concurrent-publication` | `publication.add_concurrent` |
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
@@ -219,23 +220,28 @@ an embedded driver, closed after the scenario.
 An `op` is followed by an `expect` that starts with its outcome:
 
 - `ok`, then the results it checks as `name=value`;
-- `status=<name>`, with no results: a failure, named by its header
-  status in lower case without `KARYOS_E_` (`not_connected`,
-  `claim_outstanding`, `closed`). A binding maps its own results to
-  these names through the one mapping it already has (BIND-S1); the
-  class follows the header's range, and whether the binding returns or
-  raises it is the binding's own policy. A name the header does not
-  define is a failure, and so is `invalid_handle`, which no op answers
-  (Close).
+- `status=<name>`: a failure, named by its header status in lower case
+  without `KARYOS_E_` (`not_connected`, `claim_outstanding`, `closed`),
+  with no results but one exception below. A binding maps its own
+  results to these names through the one mapping it already has
+  (BIND-S1); the class follows the header's range, and whether the
+  binding returns or raises it is the binding's own policy. A name the
+  header does not define is a failure, and so is `invalid_handle`,
+  which no op answers (Close). The exception: after `status=refused`,
+  `archive.replay` and `archive.stop_replay` may check `code=<n>`, the
+  Archive's response code (1 an error, such as a host's refusal; 2 an
+  unknown recording; 3 an unknown replay; 4 an invalid request; 5 an
+  unsupported schema), so a refusal for one reason cannot pass for
+  another.
 
 A result checked as `name>=value` (format 2, either layer) holds an
 integer at least `value`; `value` is a literal or a bound variable.
 
-Objects (the arguments named `driver`, `client`, `publication`,
-`subscription`, `conflated` and `claim`) are opaque: an op's result
-binds one to a variable, and an op takes it only as a variable. A
-result an op does not have, or an argument it does not take, is a
-failure; so is a required argument left out.
+Objects (the arguments named `archive`, `driver`, `client`,
+`publication`, `subscription`, `conflated` and `claim`) are opaque: an
+op's result binds one to a variable, and an op takes it only as a
+variable. A result an op does not have, or an argument it does not
+take, is a failure; so is a required argument left out.
 
 ### Close
 
@@ -291,6 +297,13 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `conflated.add` | `client`, `stream_id`, [`uri`] | `conflated` | `conflation` |
 | `conflated.poll` | `conflated`, [`key_budget` (default 1)] | `delivered` | `conflation` |
 | `conflated.close` | `conflated` | none | `conflation` |
+| `subscription.poll_to_end` | `subscription`, [`limit` (default 16)] | `delivered` (the count of every poll), `last` | |
+| `subscription.end` | `subscription` | `reason`: `"none"`, `"end_of_stream"`, `"image_retired"`, `"stream_removed"`, `"revoked"`, `"closed_by_overrun"` or `"other"`; `position`; `seal_code` | |
+| `archive.connect` | `client` | `archive` | `archive-replay` |
+| `archive.replay` | `archive`, `recording`, `target_stream_id`, [`position` (default 0), `length` (default to the recording's end), `rate`: `"full"` (default), `"as_recorded"` or `"scaled"`, `scale_ppm`] | `replay`, `session` | `archive-replay` |
+| `archive.stop_replay` | `archive`, `replay` | none | `archive-replay` |
+| `archive.close` | `archive` | none | `archive-replay` |
+| `replay.subscribe` | `client`, `stream_id`, `session` | `subscription` | `archive-replay` |
 
 A text argument with a fixed set of values (`domain`, `idle_strategy`)
 is checked when the scenario is read, so a value outside its set fails
@@ -298,12 +311,89 @@ even in a scenario reported `skipped`, `later` or `unsupported`; so
 does `clock.now` with `domain="tai"` in a scenario without `feature
 tai-clock`.
 
+`subscription.poll_to_end` polls the subscription, serving its client
+before each poll, until a poll answers `closed` or `closed_by_overrun`,
+then answers `ok` with the messages delivered on the way and the last
+of them; another status ends it with that status, and no end within 20
+s (past a replay target's linger, 5 s) answers `timeout`.
+`subscription.end` reads how a stream subscription ended
+(`karyos_subscription_end_state`): `"none"` while it has not, and for a
+network subscription, whose images' ends its image changes report.
+`seal_code` is the raw seal code of the core, which a scenario does not
+pin; `reason` and `position` are the contract.
+
 `publication.publish_claimed` is one claim, fill and commit through the
 binding's claim API (BIND-S3): on a retryable status it returns that
 status with no claim left outstanding, so the next attempt starts
 afresh. An object API runs it as a claim, a commit and, on a retryable
 status, an abort; a fill-callback API as its one commit attempt. Every
 binding offers it, so it needs no feature.
+
+### Archive replays
+
+Feature `archive-replay` (B6; quantstratum-docs:
+`karyos/design/archive-replay-control.md`). It needs a client of a
+driver that runs an Archive, which a runner provides as below, with no
+Rust: Linux only, because the client attaches to a driver in another
+process, which only Linux's remote client does. A runner elsewhere
+declares the feature absent.
+
+- **karyosd.** The runner starts the karyosd of the pinned core:
+  `KARYOS_KARYOSD` when set, else `bin/karyosd` of the conformance test
+  kit (`make libkaryos-testkit`, beside the libkaryos package and from
+  the same core commit, which its MANIFEST records), else one built with
+  `cargo build --release --locked -p karyos-tools --bin karyosd` from
+  the pinned core. The core's own runner builds it in the test's
+  profile instead, beside the test binary:
+
+  ```text
+  karyosd --dir <private directory> --stream 20:1 --archive <empty directory>
+          --archive-control 1030,1031 --record 20:1
+  ```
+
+  Stream 20 is recorded from boot; 1030 and 1031 are the Archive's
+  request and response streams. Stream 1041, the replay target's, is
+  not configured: each replay opens its own target there. Its output
+  goes to a file the runner prints when the provisioning or a scenario
+  fails; after the scenarios the runner sends it SIGTERM, waits at most
+  10 s, then sends SIGKILL.
+- **Seeding.** The runner connects a client with
+  `karyos_client_connect` to that directory, binds it to
+  `$archive_client`, and opens an Archive connection through it (client
+  id 1, the streams above, a deadline of 10 s). It publishes the
+  messages `"r0"` to `"r4"` on `karyos:ipc` stream 20, lists the catalog
+  until the first recording's position is past `"r4"`'s start, pauses
+  50 ms, publishes `"r5"` to `"r9"`, and lists again until the position
+  is past `"r9"`'s start. A message of one frame is recorded whole once
+  the position is past its start. The runner binds `$recording` to that
+  recording's id and `$recording_end` to that position, and closes the
+  connection. The barrier holds the second half: a recorder duty stamps
+  one record time on everything it copies and ends at an empty source,
+  so `"r5"` to `"r9"` carry a stamp at least 50 ms after the first
+  half's, and a replay at a millionth of the recorded pace holds them
+  for at least 50 000 s (op.replay.stopped). A pause alone does not: one
+  duty that copies all ten messages stamps them alike. The catalog shows
+  no record times, so a runner cannot check the gap; only a recorder
+  thread descheduled for the whole pause between writing `"r4"` and its
+  next read could still lose it. The recording stays live: karyosd
+  cannot stop it from C (recording control is B6b), so scenarios replay
+  an explicit length.
+- **Connections.** `archive.connect` opens a connection on the streams
+  above with a deadline of 10 s and a client id the runner hands out,
+  100, 200 and up, so no connection's id, nor its replayer's (one
+  more), meets another's, and a late answer never lands in another
+  connection. The request stream takes 8 concurrent publishers (karyosd's
+  `REQUEST_PUBLISHERS`): the provisioning holds none once seeded, and a
+  scenario at most two, its connection and that connection's replayer.
+- **Replay subscriptions.** `replay.subscribe` serves the client until
+  the target's grant (`KARYOS_E_NOT_CONNECTED` before it), up to the
+  connection's deadline, then answers `timeout`: no grant by then, not
+  a transport failure.
+- **Isolation.** A scenario uses `$archive_client` and never closes it:
+  its close ends only the scenario's use of it. At a scenario's end the
+  runner stops every replay the scenario started and did not stop
+  (their answers ignored), since closing a connection leaves its
+  replays running, then closes what the scenario left open.
 
 ### Bounds
 

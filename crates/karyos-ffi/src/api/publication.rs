@@ -32,7 +32,7 @@ use karyos_client::{
 use karyos_sys::frame::Lane;
 use karyos_sys::term_bytes::HeapTerms;
 
-use crate::api::client::{AnyClient, ClientEntry, clients};
+use crate::api::client::{AnyClient, ClientEntry, Ended, with_client};
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
 
@@ -322,7 +322,7 @@ pub(crate) fn add(
     stream_id: i32,
     concurrent: bool,
 ) -> Result<Handle, Failure> {
-    clients().with(client, |entry| {
+    with_client(client, |entry| {
         entry.usable()?;
         let lanes = entry.client.add_publication(
             uri,
@@ -374,7 +374,7 @@ pub(crate) fn insert_local(
     client: Handle,
     publication: Publication<HeapTerms>,
 ) -> Result<Handle, Failure> {
-    clients().with(client, |entry| {
+    with_client(client, |entry| {
         insert(client, entry, Lanes::Embedded(publication))
     })?
 }
@@ -550,7 +550,8 @@ pub(crate) fn abort(claim: Handle) -> Result<(), Status> {
     })?
 }
 
-/// Closes `publication` through its client, and its outstanding claim.
+/// Closes `publication` and its outstanding claim
+/// ([`crate::api::client::close_child`]).
 ///
 /// # Errors
 ///
@@ -564,12 +565,9 @@ pub(crate) fn close(publication: Handle) -> Result<(), Status> {
     // cannot be left invalid by a panic inside a call: at worst it releases
     // what that call left half-done, as a drop would.
     let client = table().read_even_poisoned(publication, |entry| entry.client)?;
-    clients().with(client, |entry| {
-        let removed = table().remove(publication)?;
-        entry.publications.retain(|handle| *handle != publication);
-        removed.release(&mut entry.client);
-        Ok(())
-    })?
+    crate::api::client::close_child(client, table(), publication, |handle, entry| {
+        Ended::Publication(handle, Box::new(entry))
+    })
 }
 
 #[cfg(test)]

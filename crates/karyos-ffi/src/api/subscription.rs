@@ -36,7 +36,7 @@ use karyos_client::{
 use karyos_sys::log_buffer::SealReason;
 use karyos_sys::term_bytes::HeapTerms;
 
-use crate::api::client::{AnyClient, clients};
+use crate::api::client::{AnyClient, Ended, with_client};
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
 
@@ -343,7 +343,7 @@ pub(crate) fn add_rejoining(
     options: karyos_client::SubscriptionOptions,
     rejoin: Option<ArchiveRejoin>,
 ) -> Result<Handle, Failure> {
-    clients().with(client, |entry| {
+    with_client(client, |entry| {
         entry.usable()?;
         let source = match rejoin {
             Some(rejoin) => Some(crate::api::archive::rejoin_source(
@@ -418,7 +418,7 @@ pub(crate) fn add_replay(
     stream_id: i32,
     session_id: i32,
 ) -> Result<Handle, Failure> {
-    clients().with(client, |entry| {
+    with_client(client, |entry| {
         entry.usable()?;
         let reader = entry
             .client
@@ -572,7 +572,7 @@ pub(crate) fn copy_length(subscription: Handle) -> Option<usize> {
     table().with(subscription, |entry| entry.copy.len()).ok()
 }
 
-/// Closes `subscription` through its client.
+/// Closes `subscription` ([`crate::api::client::close_child`]).
 ///
 /// # Errors
 ///
@@ -585,12 +585,9 @@ pub(crate) fn close(subscription: Handle) -> Result<(), Status> {
     // touches cannot be left invalid by a panic inside a call: at worst it
     // releases what that call left half-done, as a drop would.
     let client = table().read_even_poisoned(subscription, |entry| entry.client)?;
-    clients().with(client, |entry| {
-        let removed = table().remove(subscription)?;
-        entry.subscriptions.retain(|handle| *handle != subscription);
-        removed.release(&mut entry.client);
-        Ok(())
-    })?
+    crate::api::client::close_child(client, table(), subscription, |handle, entry| {
+        Ended::Subscription(handle, Box::new(entry))
+    })
 }
 
 #[cfg(test)]

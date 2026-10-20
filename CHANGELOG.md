@@ -11,10 +11,31 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The conformance seeding of the `archive-replay` feature waits until
+  `"r0"` to `"r4"` are recorded before it pauses (now 50 ms) and
+  publishes `"r5"` to `"r9"`. Record times are per recorder duty, so a
+  duty that copied all ten messages stamped them alike, and
+  `op.replay.stopped`'s 1 ppm replay could end before its stop.
+
 - `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
   `karyos_detail`, `karyos_accepted` and the image change do: it wrote
   the library's 16 back into a newer caller's struct before. The new
   `karyos_subscription_end_state` (F9c) follows the same rule.
+- `karyos-ffi`: a child's close (publication, subscription, conflated
+  view, Archive connection) no longer answers `KARYOS_E_BUSY` because
+  another call holds its client. With the client free it releases the
+  child at once, as before; while another call holds the client, on
+  another thread or by a callback, it ends the child at once (the close
+  answers `KARYOS_OK` and the handle is stale) and the client releases it
+  at its next call or its close. A client with no further calls holds the
+  released resources (a publisher slot, lanes, streams) until its next
+  call or close. `KARYOS_E_BUSY` and `KARYOS_E_REENTRANT` from a child's
+  close now mean the child itself is in use, so binding destructors, which
+  may not retry (BIND-Q6), no longer leak sibling handles destroyed on
+  several threads at once (found by karyos-cpp's C-THREAD-RULES test).
+  `karyos.h` Threads and the four closes' docs state it
+  (`api::client::tests`, `abi::tests::threads`).
+
 - The conformance suite gains format 2 (ADR-0073, owner item 46,
   decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged;
   format 1's `karyos_driver_start` now defaults its `idle_strategy` to
@@ -648,6 +669,31 @@ release may break APIs, wire formats and shared-memory layouts.
   (`KARYOS_IMAGE_CHANGE_SIZE_ENDS`) with `end_reason` (a `KARYOS_END_*`
   code), `reserved`, `end_position` and `seal_code`, written by the
   caller's size: a caller of the 24-byte struct gets what it got before.
+  The struct grew within the unreleased ABI 0.1.0, so the ABI version
+  stays 0.1.0, with no patch bump (BIND-Q8), as F9b and F9c did.
+- The conformance suite gains the `archive-replay` feature (B6-3; ADR-0073
+  format 2): ops `archive.connect`, `archive.replay`,
+  `archive.stop_replay`, `archive.close` and `replay.subscribe`, the
+  feature-free `subscription.poll_to_end` and `subscription.end`, and an
+  Archive refusal's `code=` after `status=refused`. A runner provides
+  the Archive with no Rust: it starts the pinned core's karyosd (the
+  conformance test kit's, or one built with cargo) with an Archive that
+  records stream 20 from boot, connects `$archive_client`, seeds
+  "r0" to "r9" and binds `$recording` and `$recording_end`; Linux only.
+  Three scenarios: a complete replay ends `end_of_stream` at its end; a
+  stopped one `image_retired`; refusals carry codes 2 and 3, and a
+  mismatched rate is refused locally.
+- `make libkaryos-testkit` (`scripts/package-testkit.sh`) builds the
+  conformance test kit beside a libkaryos package, in its own
+  `<package>-testkit` directory: `bin/karyosd` from the package's core
+  commit, for the suite's `archive-replay` scenarios, and a MANIFEST with
+  `role=conformance test kit, not for release`, `core_commit`,
+  `core_dirty` and `karyosd_sha256`. It refuses a package of another
+  commit or tree state, and is Linux only (those scenarios connect a
+  cross-process client). It is not part of the release package, whose
+  contents are owner item 44's, nor of pre-push. A kit is not rebuilt
+  with its package: a consumer checks that the kit's `core_commit` equals
+  the package's before using it.
 - `karyos-ffi` replays an Archive's recordings from C (F9c, B6;
   quantstratum-docs: `karyos/design/archive-replay-control.md`):
   `karyos_archive_replay` (with `karyos_replay_options`, read by prefix)
@@ -2506,6 +2552,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `karyos_driver_stop` and `karyos_driver_close` of a started driver
+  whose idle strategy is `KARYOS_IDLE_SLEEP` waited out the thread's idle
+  sleep, which is unbounded: with `sleep_ns` near `UINT64_MAX` they never
+  returned once the thread had gone idle. The Go binding's
+  `FuzzDurations` seed hung its Linux gate this way. The thread now parks
+  for its idle sleep, and a stop or a close unparks it after asking it to
+  stop, so neither waits on any idle strategy
+  (`no_idle_strategy_holds_a_stop_or_a_close`).
+- `a_call_on_a_busy_spinning_driver_waits_for_one_cycle` failed once at
+  a load of 16 ("a call waited through 3 cycles"): a caller preempted
+  between reading the thread's cycle count and announcing itself counted
+  cycles the thread ran before it could see the caller. The count now
+  starts after the announcement, so the bound of 2 holds at any load.
+  Test-only code in `api/driver.rs`; DESIGN found and diagnosed it.
 - `karyos_driver_add_stream_with` answered `KARYOS_E_SYSTEM` for a
   `schedule_capacity` the driver refuses: not a power of two, above
   `1 << 20`, or on a concurrent stream (TT-1, GC-7). It now answers
