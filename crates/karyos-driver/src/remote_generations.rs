@@ -40,7 +40,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             && grant.generation == predecessor
                             && grant.sent
                             && !grant.fenced
-                            && grant.participant != Participant::Conflation
+                            && !outlives_generations(grant.participant)
                     })
                     .map(move |grant| (client, *grant))
             })
@@ -153,7 +153,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             // A journal grant names no stream, and a conflation table
             // outlives generations: no cutover moves either.
-            Participant::Journal { .. } | Participant::Conflation => return None,
+            Participant::Journal { .. } | Participant::Conflation | Participant::Binding { .. } => {
+                return None;
+            }
         };
         self.next_export = next_export;
         self.next_registration = next_handover;
@@ -238,7 +240,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Concurrent { slot } => {
                 conductor.fence_concurrent_publication(slot, grant.export)
             }
-            Participant::Journal { .. } | Participant::Conflation => false,
+            Participant::Journal { .. } | Participant::Conflation | Participant::Binding { .. } => {
+                false
+            }
         }
     }
 
@@ -258,7 +262,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .filter(|grant| {
                 grant.registration == registration
                     && grant.stream != 0
-                    && grant.participant != Participant::Conflation
+                    && !outlives_generations(grant.participant)
             })
             .max_by_key(|grant| (grant.incarnation, grant.generation))
             .copied()?;
@@ -313,7 +317,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 ledger
                     .grants()
                     .iter()
-                    .filter(|g| g.participant != Participant::Conflation)
+                    .filter(|g| !outlives_generations(g.participant))
                     .map(|g| (g.stream, g.incarnation, g.generation))
             })
             .collect();
@@ -321,4 +325,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         charged.dedup();
         charged
     }
+}
+
+/// Whether a grant's region outlives mapping generations, so a cutover
+/// neither moves nor fences it and it charges none: a conflation table's
+/// view, or a region of a guarded publication's binding.
+const fn outlives_generations(participant: Participant) -> bool {
+    matches!(
+        participant,
+        Participant::Conflation | Participant::Binding { .. }
+    )
 }

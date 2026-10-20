@@ -70,7 +70,7 @@ use karyos_sys::ipc::{self, PidFd, Recv, Region, Sent};
 use crate::counters::Event;
 use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
-use crate::ledger::{Grant, GrantState, Ledger, Participant};
+use crate::ledger::{BindingRegion, Grant, GrantState, Ledger, Participant};
 use karyos_sys::log_buffer::Role;
 
 /// Region id of the broadcast buffer.
@@ -156,8 +156,10 @@ struct Mark {
     /// It carries a descriptor of the grant: once sent, the grant is
     /// charged until its `Detach` or the exit proof.
     descriptor: bool,
-    /// The fetch's last message: once sent, the grant is `Exported`.
-    last: bool,
+    /// The grant's last message: once sent, the grant is `Exported`.
+    exported: bool,
+    /// The fetch's last message: once sent, the fetch is no longer open.
+    ends: bool,
 }
 
 /// An admitted client with an open socket.
@@ -916,7 +918,15 @@ impl<T: StreamTerms> Admission<T> {
             let Some((record, fd)) = found else {
                 return refuse(remote, refusal::RESOURCES);
             };
-            return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, 0, fd);
+            return Self::queue_fetch(
+                remote,
+                driver,
+                config,
+                fetch,
+                key,
+                vec![(grant, record, fd)],
+                0,
+            );
         }
         if grant.participant == Participant::Conflation {
             // The table's region, reopened read-only (A1): the view never
@@ -939,7 +949,15 @@ impl<T: StreamTerms> Admission<T> {
             let Some((record, fd)) = found else {
                 return refuse(remote, refusal::RESOURCES);
             };
-            return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, 0, fd);
+            return Self::queue_fetch(
+                remote,
+                driver,
+                config,
+                fetch,
+                key,
+                vec![(grant, record, fd)],
+                0,
+            );
         }
         let Some(stream) = driver.streams.iter().find(|s| s.id == grant.stream) else {
             return refuse(remote, refusal::RESOURCES);
@@ -967,46 +985,66 @@ impl<T: StreamTerms> Admission<T> {
         ) else {
             return refuse(remote, refusal::RESOURCES);
         };
-        let fd = descriptor(region);
-        Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, base, fd)
+        let mut parts = vec![(grant, record, descriptor(region))];
+        // A guarded publication's binding, under the same key: its regions
+        // in manifest order, each its own export.
+        let binding = driver
+            .ledger(remote.client)
+            .map(|ledger| ledger.held_binding(key))
+            .unwrap_or_default();
+        for part in binding {
+            let Some(found) = binding_part(driver, &part, record) else {
+                return refuse(remote, refusal::RESOURCES);
+            };
+            parts.push(found);
+        }
+        Self::queue_fetch(remote, driver, config, fetch, key, parts, base)
     }
 
-    /// Queues the `Manifest` and the one `Region` of a grant's fetch, after
-    /// the fetch bounds; the grant is spent before anything is queued.
-    /// `base` is the stream position where a log buffer grant's mapping
-    /// starts; zero for any other region.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one fetch's whole context; a struct would only rename it"
-    )]
+    /// Queues the `Manifest` and one `Region` per record of a grant's
+    /// fetch, after the fetch bounds; every grant of the fetch is spent
+    /// before anything is queued. `parts` holds the grant, its record and
+    /// descriptor, then those of a guarded publication's binding, in
+    /// manifest order. `base` is the stream position where a log buffer
+    /// grant's mapping starts; zero for any other region.
     fn queue_fetch(
         remote: &mut Remote<T>,
         driver: &mut EmbeddedDriver<T>,
         config: &IpcConfig,
         fetch: u64,
         key: u64,
-        grant: &Grant,
-        record: Record,
+        parts: Vec<(Grant, Record, Option<OwnedFd>)>,
         base: u64,
-        fd: Option<OwnedFd>,
     ) -> Step {
         let bound = config.max_outbound_per_client;
         let refuse = |remote: &mut Remote<T>, code: u64| {
             Self::queue(remote, &Message::Refused { fetch, code }, bound)
         };
-        // One region per grant: one lane, or one journal. The byte bound
-        // counts whole regions, header included.
-        let bytes = u64::try_from(karyos_sys::ipc::HEADER_STRIDE)
-            .ok()
-            .and_then(|header| record.structure_length.checked_add(header));
-        if config.max_regions_per_fetch < 1
+        let Some((grant, _, _)) = parts.first() else {
+            return refuse(remote, refusal::RESOURCES);
+        };
+        let grant = *grant;
+        // One log buffer region per grant: one lane, or one journal, and a
+        // guarded publication's binding beside it. The byte bound counts
+        // whole regions, headers included.
+        let bytes = parts.iter().try_fold(0u64, |total, (_, record, _)| {
+            u64::try_from(karyos_sys::ipc::HEADER_STRIDE)
+                .ok()
+                .and_then(|header| record.structure_length.checked_add(header))
+                .and_then(|bytes| total.checked_add(bytes))
+        });
+        if config.max_regions_per_fetch < parts.len()
             || bytes.is_none_or(|bytes| bytes > config.max_fetch_bytes)
         {
             return refuse(remote, refusal::LIMIT);
         }
-        let Some(fd) = fd else {
-            return refuse(remote, refusal::RESOURCES);
-        };
+        let mut regions = Vec::with_capacity(parts.len());
+        for (part, record, fd) in parts {
+            let Some(fd) = fd else {
+                return refuse(remote, refusal::RESOURCES);
+            };
+            regions.push((part.export, record, fd));
+        }
         // The publication identity of the grant, whose driver part is the
         // instance of `Admitted` (ACS 13555), and the incarnation the grant
         // was issued on (a fresh incarnation follows a guard close and
@@ -1025,45 +1063,63 @@ impl<T: StreamTerms> Admission<T> {
                 grant.incarnation,
             ),
         };
-        let (Some(manifest), Some(region_message)) = (
-            encode(&Message::Manifest {
-                fetch,
-                key,
-                registration: grant.registration,
-                stream_registration,
-                incarnation,
-                base,
-                records: vec![record],
-            }),
-            encode(&Message::Region { fetch, index: 0 }),
-        ) else {
+        let Some(manifest) = encode(&Message::Manifest {
+            fetch,
+            key,
+            registration: grant.registration,
+            stream_registration,
+            incarnation,
+            base,
+            records: regions.iter().map(|(_, record, _)| *record).collect(),
+        }) else {
             return refuse(remote, refusal::RESOURCES);
         };
-        if remote.outbound.len() + 2 > bound {
+        let mut messages = Vec::with_capacity(regions.len());
+        for (index, (export, _, fd)) in (0u64..).zip(regions) {
+            let Some(bytes) = encode(&Message::Region { fetch, index }) else {
+                return refuse(remote, refusal::RESOURCES);
+            };
+            messages.push((export, bytes, fd));
+        }
+        if messages
+            .len()
+            .checked_add(remote.outbound.len())
+            .is_none_or(|queued| queued >= bound)
+        {
             return Step::Retire;
         }
-        // Effect: the grant is spent before anything is queued.
+        // Effect: every grant of the fetch is spent before anything is
+        // queued.
         if let Some(ledger) = driver.ledger_mut(remote.client) {
-            ledger.set_state(grant.export, GrantState::Exporting);
+            for (export, _, _) in &messages {
+                ledger.set_state(*export, GrantState::Exporting);
+            }
         }
-        let mark = |descriptor: bool, last: bool| {
-            Some(Mark {
-                fetch,
-                export: grant.export,
-                descriptor,
-                last,
-            })
-        };
         remote.outbound.push_back(Outgoing {
             bytes: manifest,
             fd: None,
-            mark: mark(false, false),
+            mark: Some(Mark {
+                fetch,
+                export: grant.export,
+                descriptor: false,
+                exported: false,
+                ends: false,
+            }),
         });
-        remote.outbound.push_back(Outgoing {
-            bytes: region_message,
-            fd: Some(fd),
-            mark: mark(true, true),
-        });
+        let count = messages.len();
+        for (index, (export, bytes, fd)) in messages.into_iter().enumerate() {
+            remote.outbound.push_back(Outgoing {
+                bytes,
+                fd: Some(fd),
+                mark: Some(Mark {
+                    fetch,
+                    export,
+                    descriptor: true,
+                    exported: true,
+                    ends: index.checked_add(1) == Some(count),
+                }),
+            });
+        }
         remote.open.push(fetch);
         Step::Keep
     }
@@ -1100,7 +1156,7 @@ impl<T: StreamTerms> Admission<T> {
             if mark.descriptor {
                 ledger.mark_sent(mark.export);
             }
-            if mark.last {
+            if mark.exported {
                 ledger.set_state(mark.export, GrantState::Exported);
                 exported += 1;
             }
@@ -1148,7 +1204,7 @@ impl<T: StreamTerms> Admission<T> {
             ) {
                 Ok(Sent::Sent) => {
                     if let Some(mark) = remote.outbound.pop_front().and_then(|done| done.mark) {
-                        if mark.last {
+                        if mark.ends {
                             remote.open.retain(|open| *open != mark.fetch);
                         }
                         sent.push(mark);
@@ -1160,6 +1216,48 @@ impl<T: StreamTerms> Admission<T> {
         }
         (Step::Keep, sent)
     }
+}
+
+/// The record and descriptor of a guarded publication's binding grant
+/// `grant`, beside the log buffer record `buffer` of its publication: the
+/// ring and the guard words read-only, the consumed cell writable for its
+/// client alone. `None` when its region is gone.
+fn binding_part<T: StreamTerms>(
+    driver: &EmbeddedDriver<T>,
+    grant: &Grant,
+    buffer: Record,
+) -> Option<(Grant, Record, Option<OwnedFd>)> {
+    let Participant::Binding { region: which } = grant.participant else {
+        return None;
+    };
+    let held = |export: u64| {
+        driver
+            .binding_exports
+            .iter()
+            .find(|(held, _)| *held == export)
+            .and_then(|(_, words)| words.shared())
+    };
+    let (region, fd) = match which {
+        BindingRegion::Outcomes => {
+            let region = held(grant.export)?;
+            (region, region.read_only_descriptor().ok())
+        }
+        BindingRegion::Consumed => {
+            let region = held(grant.export)?;
+            (region, descriptor(region))
+        }
+        BindingRegion::Guards => {
+            let region = driver.guards.guard_words().shared()?;
+            (region, region.read_only_descriptor().ok())
+        }
+    };
+    let record = Record {
+        stream_id: buffer.stream_id,
+        session_id: buffer.session_id,
+        lane: 0,
+        ..record(region, grant.export)?
+    };
+    Some((*grant, record, fd))
 }
 
 /// A copy of the descriptor of a region the driver created.
@@ -1216,7 +1314,9 @@ fn grant_record(
                 role: Role::Walker, ..
             } => return None,
             // A journal or conflation grant has no log buffer record.
-            Participant::Journal { .. } | Participant::Conflation => return None,
+            Participant::Journal { .. } | Participant::Conflation | Participant::Binding { .. } => {
+                return None;
+            }
         },
     })
 }

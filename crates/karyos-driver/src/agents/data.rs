@@ -368,7 +368,8 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
 /// epoch its incarnation was admitted under and its rate policy.
 #[derive(Clone)]
 pub struct GuardSpec {
-    /// The guard word (word 0).
+    /// The guard word, as word 0 (in the driver, a view of the guard's
+    /// word in the guard words).
     pub word: Arc<dyn karyos_client::SharedWords>,
     /// The cell this publication's gate alone writes.
     pub cell: Arc<karyos_sys::applied_epoch::AppliedEpoch>,

@@ -92,7 +92,7 @@ use crate::counters::Event;
 use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::generations::MemberKind;
-use crate::ledger::{Grant, GrantState, Ledger, Participant};
+use crate::ledger::{BindingRegion, Grant, GrantState, Ledger, Participant};
 use crate::trace_journals::Observed;
 
 /// A client's registration in the driver.
@@ -981,14 +981,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
                 // A guarded stream's publications are bound to the guard's
-                // open epoch with an outcome ring; that binding exists only
-                // in process (`EmbeddedDriver::publication`) until its CnC
-                // form, so the control path issues none.
+                // open epoch with an outcome ring: a remote client is granted
+                // the binding's regions (G-x2) and binds them (G-x3); a
+                // client of the in-process command ring has no such grant,
+                // so it is issued none.
                 // A timed lane's handle needs its schedule binding, in
                 // process only for now (timed-tx.md, T1).
+                let remote = self.ledger(client).is_some();
                 if matches!(command, Command::AddPublication { .. })
                     && self.streams.get(index).is_some_and(|found| {
-                        found.guarded.is_some() || found.buffer.schedule_ring().is_some()
+                        (found.guarded.is_some() && !remote)
+                            || found.buffer.schedule_ring().is_some()
                     })
                 {
                     return refuse(ErrorCode::InvalidPublicationMode, detail);
@@ -1788,19 +1791,57 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if target.issuing().is_err() {
             return refuse(ErrorCode::ResourcesUnavailable, detail);
         }
-        // A grant no fetch could carry is refused rather than handed a key
-        // (one log buffer region per grant: one lane).
-        let bytes = fetch_bytes(&target.buffer);
+        // A guarded publication's grant carries its binding's three regions
+        // beside its log buffer (`quantstratum-docs:
+        // karyos/design/guards-and-abort.md`, "The binding across
+        // processes"), each its own export and ledger entry.
+        let guarded = match command {
+            Command::AddPublication { .. } => {
+                target.guarded.as_ref().map(|guarded| guarded.messages)
+            }
+            _ => None,
+        };
+        let stream_id = target.id;
+        let records = if guarded.is_some() { 4 } else { 1 };
+        // A grant no fetch could carry, or past the export bound with its
+        // binding, is refused rather than handed a key, before anything is
+        // reserved (one log buffer region per grant: one lane).
+        let buffer_bytes = fetch_bytes(&target.buffer);
+        let bytes = match guarded {
+            Some(messages) => self
+                .binding_bytes(messages)
+                .and_then(|binding| buffer_bytes.checked_add(binding)),
+            None => Some(buffer_bytes),
+        };
         let fetchable = self
             .clients
             .iter()
             .find(|slot| slot.id == client)
             .and_then(|slot| slot.ledger.as_ref())
-            .is_some_and(|ledger| ledger.fetchable(1, bytes));
+            .is_some_and(|ledger| {
+                ledger.has_room(records)
+                    && bytes.is_some_and(|bytes| ledger.fetchable(records, bytes))
+            });
+        let last_export = u64::try_from(records)
+            .ok()
+            .and_then(|records| export.checked_add(records - 1));
+        if !last_export.is_some_and(registration::valid_export) {
+            return refuse(ErrorCode::IdentitiesExhausted, 0);
+        }
         if !fetchable {
             return refuse(ErrorCode::ResourcesUnavailable, detail);
         }
-        let Some(target) = self.streams.get_mut(index) else {
+        // The binding first, as `publication()` prepares it: the fresh
+        // incarnation after a guard reopen, the ring and the cell in their
+        // regions. A refusal registers nothing.
+        let bound = match guarded {
+            Some(_) => match self.prepare_remote_bound(stream_id) {
+                Ok(bound) => Some(bound),
+                Err(code) => return refuse(code, detail),
+            },
+            None => None,
+        };
+        let Some(target) = self.streams.iter_mut().find(|found| found.id == stream_id) else {
             return refuse(ErrorCode::UnknownStream, 0);
         };
         let participant = match command {
@@ -1856,21 +1897,40 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let generation = target.generation.get();
         let incarnation = target.incarnation;
         self.next_registration = next;
-        self.next_export = export + 1;
+        self.next_export = last_export.map_or(export, |last| last + 1);
+        let grant = |export, participant| Grant {
+            export,
+            registration,
+            key: registration,
+            stream,
+            participant,
+            state: GrantState::Held,
+            sent: false,
+            generation,
+            incarnation,
+            fence_at: None,
+            fenced: false,
+        };
         if let Some(ledger) = self.ledger_mut(client) {
-            ledger.push(Grant {
-                export,
-                registration,
-                key: registration,
-                stream,
-                participant,
-                state: GrantState::Held,
-                sent: false,
-                generation,
-                incarnation,
-                fence_at: None,
-                fenced: false,
-            });
+            ledger.push(grant(export, participant));
+        }
+        // The binding's grants, under the same key, and its bound to the
+        // walker.
+        if let Some(bound) = bound {
+            let held = [
+                (BindingRegion::Outcomes, Some(Arc::clone(&bound.ring))),
+                (BindingRegion::Consumed, Some(Arc::clone(&bound.consumed))),
+                (BindingRegion::Guards, None),
+            ];
+            for (next, (region, words)) in (export + 1..).zip(held) {
+                if let Some(ledger) = self.ledger_mut(client) {
+                    ledger.push(grant(next, Participant::Binding { region }));
+                }
+                if let Some(words) = words {
+                    self.binding_exports.push((next, words));
+                }
+            }
+            self.bind_remote_guard(stream, bound);
         }
         let (kind, subscriber) = match participant {
             Participant::Subscriber { cell, role } => {
@@ -1879,7 +1939,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // Never built here: a journal grant comes from `TraceJournal`.
             Participant::Exclusive
             | Participant::Concurrent { .. }
-            | Participant::Journal { .. } => (Kind::Publication, None),
+            | Participant::Journal { .. }
+            | Participant::Binding { .. } => (Kind::Publication, None),
             // Never built here either: `AddConflatedSubscription` builds it.
             Participant::Conflation => (Kind::ConflatedView, None),
         };
@@ -1908,6 +1969,68 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 key: registration,
             },
         }
+    }
+
+    /// The bytes of a guarded publication's binding regions, headers
+    /// included: its outcome ring for `messages` message records and one
+    /// local record, its consumed cell and the guard words.
+    #[cfg(target_os = "linux")]
+    fn binding_bytes(&self, messages: u64) -> Option<u64> {
+        use crate::shared_words::region_bytes;
+        let capacity = karyos_sys::outcome_ring::capacity(messages, 1)?;
+        let ring = karyos_sys::outcome_ring::ring_words(usize::try_from(capacity).ok()?)?;
+        let guards = self.guards.guard_words().words().len();
+        region_bytes(ring)?
+            .checked_add(region_bytes(1)?)?
+            .checked_add(region_bytes(guards)?)
+    }
+
+    /// Remote clients exist only on Linux.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the Linux version sizes the driver's guard words"
+    )]
+    const fn binding_bytes(&self, _messages: u64) -> Option<u64> {
+        None
+    }
+
+    /// The bound of a guarded publication granted to a remote client, its
+    /// ring and cell in two new regions; the refusal's code otherwise.
+    #[cfg(target_os = "linux")]
+    fn prepare_remote_bound(
+        &mut self,
+        stream: u64,
+    ) -> Result<crate::guard_streams::Bound, ErrorCode> {
+        let admission = self
+            .admission
+            .as_mut()
+            .ok_or(ErrorCode::ResourcesUnavailable)?;
+        let mut ids = admission.region_ids();
+        let (instance, ring) = ids
+            .next()
+            .map_err(|error| crate::guards::error_code(&error))?;
+        let (_, cell) = ids
+            .next()
+            .map_err(|error| crate::guards::error_code(&error))?;
+        match self.prepare_remote_guard(stream, instance, ring, cell) {
+            Ok(Some(bound)) => Ok(bound),
+            Ok(None) => Err(ErrorCode::InvalidPublicationMode),
+            Err(error) => Err(crate::guards::error_code(&error)),
+        }
+    }
+
+    /// Remote clients exist only on Linux.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the Linux version creates the regions through the admission"
+    )]
+    fn prepare_remote_bound(
+        &mut self,
+        _stream: u64,
+    ) -> Result<crate::guard_streams::Bound, ErrorCode> {
+        Err(ErrorCode::ResourcesUnavailable)
     }
 
     /// The export ledger of remote client `client`.
@@ -1975,6 +2098,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.counters.add(Event::GrantsEnded, 1);
             return;
         }
+        // A region of a guarded publication's binding: the driver drops
+        // its hold on a ring or cell; the walker's bound keeps the region
+        // until its last outcome record is written. The guard region
+        // outlives every grant.
+        if let Participant::Binding { .. } = grant.participant {
+            self.binding_exports
+                .retain(|(export, _)| *export != grant.export);
+            self.counters.add(Event::GrantsEnded, 1);
+            return;
+        }
         let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
             return;
         };
@@ -1990,7 +2123,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Concurrent { slot } => conductor
                 .end_concurrent_publication(slot, grant.export)
                 .unwrap_or(false),
-            Participant::Journal { .. } | Participant::Conflation => false,
+            Participant::Journal { .. } | Participant::Conflation | Participant::Binding { .. } => {
+                false
+            }
         };
         if ended {
             self.counters.add(Event::GrantsEnded, 1);
@@ -2095,6 +2230,9 @@ impl<T: StreamTerms> Drop for EmbeddedDriver<T> {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod guarded_grant_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5460,38 +5598,53 @@ mod tests {
         );
     }
 
+    /// A guarded stream issues no publication without its binding: a
+    /// client of the in-process command ring has no grant to carry it, and
+    /// a remote client of a driver without shared regions cannot be
+    /// granted them. Nothing is reserved either way.
     #[test]
-    fn a_guarded_stream_refuses_cnc_publications() {
+    fn a_guarded_stream_issues_no_publication_without_its_binding() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
         driver.guard_stream(stream, guard, 4, None).unwrap();
         let mut observer = driver.broadcast.receiver();
+        let (ring_client, mut ring_producer, _link) = raw_client(&mut driver);
         let (client, mut producer) = remote_client(&mut driver, 4);
-        write(
-            &mut producer,
-            Command::AddPublication {
-                sequence: 1,
-                stream: KEY,
-                allow_unconnected: true,
-                lane: Lane::ZERO,
-            },
-        );
+        let add = Command::AddPublication {
+            sequence: 1,
+            stream: KEY,
+            allow_unconnected: true,
+            lane: Lane::ZERO,
+        };
+        write(&mut ring_producer, add);
+        write(&mut producer, add);
         let mut answers = Vec::new();
         for _ in 0..3 {
             let _ = driver.do_work().unwrap();
             answers.extend(responses(&mut observer));
         }
+        let refused = |who: u64, why: ErrorCode| {
+            answers.iter().any(|answer| {
+                matches!(
+                    answer,
+                    Response::Error {
+                        request: RequestId { client: c, sequence: 1 },
+                        code,
+                        ..
+                    } if *c == who && *code == why
+                )
+            })
+        };
         assert!(
-            answers.iter().any(|answer| matches!(
-                answer,
-                Response::Error {
-                    request: RequestId { client: c, sequence: 1 },
-                    code: ErrorCode::InvalidPublicationMode,
-                    ..
-                } if *c == client
-            )),
+            refused(ring_client, ErrorCode::InvalidPublicationMode),
             "{answers:?}"
         );
+        assert!(
+            refused(client, ErrorCode::ResourcesUnavailable),
+            "{answers:?}"
+        );
+        assert!(ledger(&driver, client).is_empty());
+        assert!(driver.binding_exports.is_empty());
     }
 
     /// The guard counters count what the walker did.
