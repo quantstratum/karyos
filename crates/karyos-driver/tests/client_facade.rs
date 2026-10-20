@@ -640,27 +640,34 @@ mod remote {
                 Box::new(SystemClock::new()),
             )
             .unwrap();
-            let _ = driver
-                .add_stream(StreamConfig {
-                    buffer: LogBufferConfig {
-                        term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
-                        spare_slots: 3,
-                        max_subscribers: 4,
-                        mtu: DEFAULT_MTU,
-                        max_reserved: MIN_TERM_LENGTH / 8,
-                        initial_term_id: TermId::new(7),
-                        lane: Lane::ZERO,
-                        session_id: 1,
-                        stream_id: 3,
-                        claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
-                        publication: PublicationMode::Exclusive,
-                        schedule_capacity: 0,
-                    },
-                    allow_unconnected: false,
-                    on_required_loss: LossPolicy::Hold,
-                    conflation: None,
-                })
-                .unwrap();
+            let stream = StreamConfig {
+                buffer: LogBufferConfig {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 3,
+                    max_subscribers: 4,
+                    mtu: DEFAULT_MTU,
+                    max_reserved: MIN_TERM_LENGTH / 8,
+                    initial_term_id: TermId::new(7),
+                    lane: Lane::ZERO,
+                    session_id: 1,
+                    stream_id: 3,
+                    claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                    publication: PublicationMode::Exclusive,
+                    schedule_capacity: 0,
+                },
+                allow_unconnected: false,
+                on_required_loss: LossPolicy::Hold,
+                conflation: None,
+            };
+            let _ = driver.add_stream(stream).unwrap();
+            // Stream 4 is shared by concurrent publishers (M11).
+            let mut shared = stream;
+            shared.buffer.stream_id = 4;
+            shared.buffer.publication = PublicationMode::Concurrent {
+                publishers: 2,
+                allow_non_lse: true,
+            };
+            let _ = driver.add_stream(shared).unwrap();
             ready.send(()).unwrap();
             while !flag.load(Ordering::Acquire) {
                 let held = pause.asked.load(Ordering::Acquire);
@@ -768,6 +775,58 @@ mod remote {
                 .add_subscription("karyos:ipc", StreamId::new(99))
                 .err(),
             Some(ClientError::Refused { .. })
+        ));
+    }
+
+    /// M11 remote: two clients take concurrent handles on the shared
+    /// `karyos:ipc` stream 4 by URI and both reach its subscriber; the
+    /// exclusive stream 3 refuses a concurrent handle.
+    #[test]
+    fn remote_clients_share_a_concurrent_stream_by_uri() {
+        use karyos_client::ConcurrentOfferOutcome;
+        use karyos_protocol::cnc::ErrorCode;
+
+        let (_driver, dir) = ipc_driver("concurrent");
+        let mut reader = connect(&dir);
+        let mut reading = reader
+            .add_subscription("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        let mut clients = [connect(&dir), connect(&dir)];
+        let mut publications = clients.each_mut().map(|client| {
+            client
+                .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+                .unwrap()
+        });
+        let mut sent = [false; 2];
+        let mut seen = Vec::new();
+        let start = Instant::now();
+        while seen.len() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(20), "{seen:?}");
+            for client in &mut clients {
+                let _ = client.poll();
+            }
+            let _ = reader.poll();
+            for ((publication, sent), byte) in publications.iter_mut().zip(&mut sent).zip([1u8, 2])
+            {
+                if !*sent {
+                    *sent = matches!(
+                        publication.offer(&[byte; 8]),
+                        Ok(ConcurrentOfferOutcome::Accepted { .. })
+                    );
+                }
+            }
+            let _ = reading
+                .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+                .unwrap();
+        }
+        seen.sort();
+        assert_eq!(seen, [vec![1; 8], vec![2; 8]]);
+        assert!(matches!(
+            clients[0].add_concurrent_publication("karyos:ipc", StreamId::new(3)),
+            Err(ClientError::Refused {
+                code: ErrorCode::InvalidPublicationMode,
+                ..
+            })
         ));
     }
 
@@ -1444,4 +1503,66 @@ fn a_network_subscription_takes_messages_and_declines_one() {
     }
     let session = |tag| delivered.iter().find(|(t, ..)| *t == tag).unwrap().2;
     assert_ne!(session(b'1'), session(b'2'));
+}
+
+/// M11: `add_concurrent_publication` takes a concurrent handle on lane 0
+/// of a `karyos:ipc` stream configured concurrent, by URI, shared with the
+/// stream's other publishers; an exclusive stream refuses it with
+/// `InvalidPublicationMode`, a `karyos:udp` channel with
+/// `UnsupportedChannel`.
+#[test]
+fn a_concurrent_publication_is_taken_by_uri() {
+    use karyos_client::ConcurrentOfferOutcome;
+    use karyos_protocol::cnc::ErrorCode;
+    use karyos_sys::log_buffer::PublicationMode;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut shared = heap_stream(4);
+    shared.buffer.publication = PublicationMode::Concurrent {
+        publishers: 2,
+        allow_non_lse: true,
+    };
+    let _ = driver.add_stream(shared).unwrap();
+    let _ = driver.add_stream(heap_stream(5)).unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let mut reading = client
+            .add_subscription("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        // Two handles at once: the stream is shared.
+        let mut first = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        let mut second = client
+            .add_concurrent_publication("karyos:ipc", StreamId::new(4))
+            .unwrap();
+        for (publication, byte) in [(&mut first, 1u8), (&mut second, 2)] {
+            assert!(matches!(
+                publication.offer(&[byte; 8]).unwrap(),
+                ConcurrentOfferOutcome::Accepted { .. }
+            ));
+        }
+        let mut seen = Vec::new();
+        let start = Instant::now();
+        while seen.len() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(10), "{seen:?}");
+            let _ = client.poll();
+            let _ = reading
+                .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+                .unwrap();
+        }
+        assert_eq!(seen, [vec![1; 8], vec![2; 8]]);
+        // An exclusive stream, and a network channel, refuse it.
+        assert!(matches!(
+            client.add_concurrent_publication("karyos:ipc", StreamId::new(5)),
+            Err(ClientError::Refused {
+                code: ErrorCode::InvalidPublicationMode,
+                ..
+            })
+        ));
+        assert!(matches!(
+            client.add_concurrent_publication("karyos:udp?endpoint=127.0.0.1:9", StreamId::new(4)),
+            Err(ClientError::UnsupportedChannel { .. })
+        ));
+    });
 }

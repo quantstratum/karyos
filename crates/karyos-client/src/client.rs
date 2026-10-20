@@ -75,6 +75,7 @@ use karyos_protocol::cnc::{ErrorCode, Event, StreamId, StreamKey, SubscriberRole
 use karyos_sys::term_bytes::TermBytes;
 use thiserror::Error;
 
+use crate::concurrent::ClientConcurrentPublication;
 use crate::conductor::{
     ClientConductor, Completion, ConductorError, ConductorPoll, EVENT_QUEUE, Outcome,
 };
@@ -363,6 +364,13 @@ pub trait Connection: sealed::Sealed {
     -> Result<u64, ConductorError>;
 
     #[doc(hidden)]
+    fn add_network_concurrent_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<u64, ConductorError>;
+
+    #[doc(hidden)]
     fn add_network_subscription(
         &mut self,
         uri: &str,
@@ -426,6 +434,12 @@ pub trait Connection: sealed::Sealed {
     fn publication(&self, outcome: Outcome) -> Result<ClientPublication<Self::Terms>, ClientError>;
 
     #[doc(hidden)]
+    fn concurrent_publication(
+        &self,
+        outcome: Outcome,
+    ) -> Result<ClientConcurrentPublication<Self::Terms>, ClientError>;
+
+    #[doc(hidden)]
     fn subscription(
         &self,
         outcome: Outcome,
@@ -447,6 +461,14 @@ impl Connection for ClientConductor {
         stream_id: i32,
     ) -> Result<u64, ConductorError> {
         ClientConductor::add_network_publication(self, uri, stream_id, false)
+    }
+
+    fn add_network_concurrent_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<u64, ConductorError> {
+        ClientConductor::add_network_concurrent_publication(self, uri, stream_id, false)
     }
 
     fn add_network_subscription(
@@ -520,6 +542,16 @@ impl Connection for ClientConductor {
         }
     }
 
+    fn concurrent_publication(
+        &self,
+        outcome: Outcome,
+    ) -> Result<ClientConcurrentPublication<Self::Terms>, ClientError> {
+        match outcome {
+            Outcome::ConcurrentPublication(publication) => Ok(publication),
+            other => Err(refusal(&other)),
+        }
+    }
+
     fn subscription(
         &self,
         outcome: Outcome,
@@ -535,6 +567,9 @@ impl Connection for ClientConductor {
             // Removed by the matching command; a handle that cannot be
             // removed now is dropped, which ends its lease.
             Outcome::Publication(publication) => self.remove_publication(publication).is_ok(),
+            Outcome::ConcurrentPublication(publication) => {
+                self.remove_concurrent_publication(publication).is_ok()
+            }
             Outcome::Subscription(subscription) => self.remove_subscription(subscription).is_ok(),
             Outcome::NetworkSubscription { registration } => {
                 ClientConductor::remove_network_subscription(self, registration).is_ok()
@@ -557,6 +592,14 @@ impl Connection for crate::ipc::RemoteClient {
         stream_id: i32,
     ) -> Result<u64, ConductorError> {
         crate::ipc::RemoteClient::add_network_publication(self, uri, stream_id, false)
+    }
+
+    fn add_network_concurrent_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<u64, ConductorError> {
+        crate::ipc::RemoteClient::add_network_concurrent_publication(self, uri, stream_id, false)
     }
 
     fn add_network_subscription(
@@ -626,6 +669,16 @@ impl Connection for crate::ipc::RemoteClient {
         }
     }
 
+    fn concurrent_publication(
+        &self,
+        outcome: Outcome,
+    ) -> Result<ClientConcurrentPublication<Self::Terms>, ClientError> {
+        match outcome {
+            Outcome::Fetchable(fetchable) => Ok(self.take_concurrent_publication(&fetchable)?),
+            other => Err(refusal(&other)),
+        }
+    }
+
     fn subscription(
         &self,
         outcome: Outcome,
@@ -652,6 +705,11 @@ impl Connection for crate::ipc::RemoteClient {
                         }
                         Err(_) => false,
                     }
+                }
+                // Taken and dropped: it detaches its export, and its
+                // registration ends with the client.
+                crate::conductor::Request::ConcurrentPublication { .. } => {
+                    self.take_concurrent_publication(&fetchable).is_ok()
                 }
                 crate::conductor::Request::Subscription { .. } => {
                     match self.take_subscription(&fetchable) {
@@ -978,6 +1036,31 @@ impl<C: Connection> Client<C> {
             return Err(refused);
         }
         Ok(Publication::new(lanes))
+    }
+
+    /// A concurrent publication of `stream_id` on the `karyos:ipc` channel
+    /// `uri`: a handle on lane 0 of the only stream of the id, shared with
+    /// its other publishers (SPEC §4, concurrent publication; M11). The
+    /// stream must be configured concurrent: the driver refuses an
+    /// exclusive one with `InvalidPublicationMode`, and a `karyos:udp`
+    /// channel with `UnsupportedChannel`, as a network publication is
+    /// exclusive. Offers are refused while no subscriber is connected.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::add_exclusive_publication`].
+    pub fn add_concurrent_publication(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+    ) -> Result<ClientConcurrentPublication<C::Terms>, ClientError> {
+        let sequence = self
+            .connection
+            .add_network_concurrent_publication(uri, stream_id.get())?;
+        match self.wait(sequence)? {
+            Found::Outcome(outcome) => self.connection.concurrent_publication(*outcome),
+            Found::Network(..) => Err(ClientError::Unknown),
+        }
     }
 
     /// The exclusive publication of `lane` of `stream`; `None` when the

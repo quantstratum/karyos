@@ -430,6 +430,16 @@ release may break APIs, wire formats and shared-memory layouts.
   `Recorder::source_mut` support it. The agent's requests, roles and alert
   follow.
 
+- `Client::add_concurrent_publication(uri, stream_id)` in karyos-client
+  (M11): a concurrent handle on lane 0 of the only `karyos:ipc` stream of
+  the id, shared with its other publishers, as the Archive's request
+  stream is by its requesters. The CnC command `AddNetworkPublication`
+  (0x0F) gains flag bit 1, concurrent, in place under admission
+  `VERSION` 2; a driver that does not know the bit retires the client as
+  faulty (`ClientProtocolViolation`).
+  The driver refuses an exclusive stream with `InvalidPublicationMode`
+  and a `karyos:udp` channel with `UnsupportedChannel`.
+
 - The management agent's guard pending-acknowledgement alert (M4b's
   follow-up to M9; quantstratum-docs: `karyos/design/agent-api-v1.md`,
   Alerts). At every refresh the agent reads each guard's close
