@@ -1249,13 +1249,17 @@ mod tests {
         assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
-    /// A guard close or a missed deadline seals with a gate reason: offers
-    /// and claims report `Gated`, connected or not, never `Closed`
-    /// (guards-and-abort.md, GC-8; quantstratum/karyos#178).
+    /// A guard close, a missed deadline or a schedule violation seals with
+    /// a gate reason: offers and claims report `Gated`, connected or not,
+    /// never `Closed` (guards-and-abort.md, GC-8; quantstratum/karyos#178).
     #[test]
     fn a_gate_seal_is_gated_connected_or_not() {
         use karyos_sys::log_buffer::SealReason;
-        for reason in [SealReason::GuardClosed, SealReason::DeadlineMissed] {
+        for reason in [
+            SealReason::GuardClosed,
+            SealReason::DeadlineMissed,
+            SealReason::ScheduleViolation,
+        ] {
             for allow_unconnected in [false, true] {
                 let (_buffer, mut conductor, mut publication) = setup(allow_unconnected);
                 conductor.seal_with_reason(reason).unwrap();

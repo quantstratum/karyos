@@ -74,6 +74,16 @@ pub struct ScheduleConsumer {
     /// After a rewind, until the first frame: the rewind may land inside a
     /// message, whose continuation then takes the entry at `head`.
     resuming: bool,
+    /// The sender's own horizon: an entry's time past `now` plus it is a
+    /// violation of the publisher (timed-tx.md section 11, TT-6).
+    max_horizon: u64,
+    /// The sender's clock at its last duty ([`Self::set_now`]).
+    now: u64,
+    /// A frame and the entries disagreed ([`ScheduleConsumerError::
+    /// CorruptTerm`] from [`Self::frame`]): the lane's publisher wrote both,
+    /// so it breached the protocol (timed-tx.md section 11, TT-6), for
+    /// good, as a [`ScheduleError::Violation`] of the ring is.
+    breached: bool,
 }
 
 /// A frame's message: its requested time, and whether it was read before
@@ -88,12 +98,14 @@ pub struct Scheduled {
 
 impl ScheduleConsumer {
     /// The consumer of the timed lane whose ring is `ring`, sized by the
-    /// ring's own capacity; it allocates only here.
+    /// ring's own capacity; it allocates only here. It checks each entry's
+    /// time against the sender's clock plus `max_horizon`, its own
+    /// configuration, never the ring's binding words.
     ///
     /// # Errors
     ///
     /// [`ScheduleConsumerError::Ring`] for a ring that is not one.
-    pub fn new(ring: &[AtomicU64]) -> Result<Self, ScheduleConsumerError> {
+    pub fn new(ring: &[AtomicU64], max_horizon: u64) -> Result<Self, ScheduleConsumerError> {
         let reader = ScheduleReader::attach(ring)?;
         let capacity = usize::try_from(reader.capacity()).map_err(|_| ScheduleError::Layout)?;
         Ok(Self {
@@ -103,7 +115,43 @@ impl ScheduleConsumer {
             replay_to: 0,
             current_replayed: false,
             resuming: false,
+            max_horizon,
+            now: 0,
+            breached: false,
         })
+    }
+
+    /// The sender's clock, read once a duty: the entries read from now on
+    /// are checked against it.
+    pub fn set_now(&mut self, now: u64) {
+        self.now = now;
+    }
+
+    /// Whether the lane's publisher breached the ring's protocol: a
+    /// [`ScheduleError::Violation`] of the ring, or a frame its entries
+    /// contradict (an entry's position is checked against its frame,
+    /// timed-tx.md section 11, TT-6). Every later frame is refused, so the
+    /// sender stages nothing more of the lane. Until the lane is sealed
+    /// with `ScheduleViolation` (T-x2), that is the whole reaction.
+    #[must_use]
+    pub fn violated(&self) -> bool {
+        self.breached || self.reader.violated()
+    }
+
+    /// Runs one frame's step, refused after a breach; a frame its entries
+    /// contradict is a breach, for good.
+    fn checked<T>(
+        &mut self,
+        step: impl FnOnce(&mut Self) -> Result<T, ScheduleConsumerError>,
+    ) -> Result<T, ScheduleConsumerError> {
+        if self.violated() {
+            return Err(ScheduleError::Violation.into());
+        }
+        let result = step(self);
+        if matches!(result, Err(ScheduleConsumerError::CorruptTerm { .. })) {
+            self.breached = true;
+        }
+        result
     }
 
     /// A reliable lane's log was rewound to a position no message of an
@@ -155,6 +203,14 @@ impl ScheduleConsumer {
         ring: &[AtomicU64],
         frame: LaneFrame,
     ) -> Result<Option<Scheduled>, ScheduleConsumerError> {
+        self.checked(|consumer| consumer.scheduled_step(ring, frame))
+    }
+
+    fn scheduled_step(
+        &mut self,
+        ring: &[AtomicU64],
+        frame: LaneFrame,
+    ) -> Result<Option<Scheduled>, ScheduleConsumerError> {
         let resuming = std::mem::take(&mut self.resuming);
         // A rewind inside a message: its continuation takes the entry at
         // `head`, the message's own, which starts below the frame.
@@ -168,13 +224,13 @@ impl ScheduleConsumer {
             let index = self.reader.read();
             let entry = self
                 .reader
-                .peek(ring)?
+                .peek(ring, self.now, self.max_horizon)?
                 .filter(|entry| entry.position < position)
                 .ok_or(ScheduleConsumerError::CorruptTerm {
                     position,
                     reason: "a resumed continuation with no entry below it",
                 })?;
-            self.reader.advance(ring)?;
+            self.reader.advance()?;
             self.outstanding.push_back(false);
             self.current_replayed = index < self.replay_to;
             if !end {
@@ -187,7 +243,7 @@ impl ScheduleConsumer {
         }
         let index = self.reader.read();
         let first = matches!(frame, LaneFrame::Data { begin: true, .. });
-        let time = self.frame(ring, frame)?;
+        let time = self.frame_step(ring, frame)?;
         if first {
             self.current_replayed = index < self.replay_to;
         }
@@ -208,9 +264,18 @@ impl ScheduleConsumer {
     ///
     /// # Errors
     ///
-    /// [`ScheduleConsumerError::CorruptTerm`] when a rule fails, and ring
-    /// errors.
+    /// [`ScheduleConsumerError::CorruptTerm`] when a rule fails, which is
+    /// the publisher's breach: from then on, as after a ring violation,
+    /// every frame is [`ScheduleError::Violation`]. Ring errors.
     pub fn frame(
+        &mut self,
+        ring: &[AtomicU64],
+        frame: LaneFrame,
+    ) -> Result<Option<u64>, ScheduleConsumerError> {
+        self.checked(|consumer| consumer.frame_step(ring, frame))
+    }
+
+    fn frame_step(
         &mut self,
         ring: &[AtomicU64],
         frame: LaneFrame,
@@ -227,13 +292,13 @@ impl ScheduleConsumer {
                 }
                 let entry = self
                     .reader
-                    .peek(ring)?
+                    .peek(ring, self.now, self.max_horizon)?
                     .filter(|entry| entry.position == position)
                     .ok_or(corrupt(
                         position,
                         "a first fragment with no entry at its position",
                     ))?;
-                self.reader.advance(ring)?;
+                self.reader.advance()?;
                 self.outstanding.push_back(false);
                 if !end {
                     self.current = Some(entry.time);
@@ -265,10 +330,10 @@ impl ScheduleConsumer {
                 }
                 let matches = self
                     .reader
-                    .peek(ring)?
+                    .peek(ring, self.now, self.max_horizon)?
                     .is_some_and(|entry| entry.position == position);
                 if matches {
-                    self.reader.advance(ring)?;
+                    self.reader.advance()?;
                     self.outstanding.push_back(true);
                     self.release_done(ring)?;
                 }
