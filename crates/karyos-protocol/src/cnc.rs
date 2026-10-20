@@ -49,8 +49,10 @@
 //! closes a guard, or reopens one closed at the epoch it names, on the
 //! driver's control path, authorized by the calling process's credentials
 //! (G1). The operation id is the requester's own id for the audit record
-//! (Audit A). The operator uid names the person a tool acts for (0: none,
-//! the client itself), and the parameters digest is
+//! (Audit A). The operator uid names the person a tool acts for
+//! ([`NO_OPERATOR`]: none, the client acts for itself; any other word is a
+//! 32-bit uid, root's 0 included, and a word above `u32::MAX` but
+//! [`NO_OPERATOR`] is a reserved value), and the parameters digest is
 //! [`guard_parameters`] over what was asked (`quantstratum-docs:
 //! karyos/design/management-agent-gap-analysis.md`, M10 and owner item 6);
 //! both go to the audit record as given. The operator uid is asserted by
@@ -843,7 +845,7 @@ pub enum Command {
         guard: u64,
         /// The requester's operation id, for the audit record.
         operation: u64,
-        /// The operator uid the requester acts for; 0 for none.
+        /// The operator uid the requester acts for; [`NO_OPERATOR`] for none.
         operator: u64,
         /// [`guard_parameters`] of the request, for the audit record.
         parameters: u64,
@@ -858,11 +860,21 @@ pub enum Command {
         expected: u64,
         /// The requester's operation id, for the audit record.
         operation: u64,
-        /// The operator uid the requester acts for; 0 for none.
+        /// The operator uid the requester acts for; [`NO_OPERATOR`] for none.
         operator: u64,
         /// [`guard_parameters`] of the request, for the audit record.
         parameters: u64,
     },
+}
+
+/// The operator word of a guard command that acts for no operator: the
+/// client acts for itself. Every other word is a uid, at most `u32::MAX`
+/// (root's 0 included).
+pub const NO_OPERATOR: u64 = u64::MAX;
+
+/// Whether `operator` is an operator word a guard command may carry.
+fn operator_word(operator: u64) -> bool {
+    operator == NO_OPERATOR || u32::try_from(operator).is_ok()
 }
 
 /// The parameters digest of a guard command: 64-bit FNV-1a over the guard,
@@ -1346,7 +1358,14 @@ impl Command {
                 operation,
                 operator,
                 parameters,
-            } => write_words(&[sequence, guard, operation, operator, parameters], out),
+            } => {
+                if !operator_word(operator) {
+                    return Err(CncError::Reserved {
+                        type_id: GUARD_CLOSE,
+                    });
+                }
+                write_words(&[sequence, guard, operation, operator, parameters], out)
+            }
             Self::GuardReopen {
                 sequence,
                 guard,
@@ -1355,7 +1374,7 @@ impl Command {
                 operator,
                 parameters,
             } => {
-                if !closed_epoch(expected) {
+                if !closed_epoch(expected) || !operator_word(operator) {
                     return Err(CncError::Reserved {
                         type_id: GUARD_REOPEN,
                     });
@@ -1587,6 +1606,10 @@ impl Command {
             GUARD_CLOSE => {
                 let [sequence, guard, operation, operator, parameters] =
                     read_words::<5>(type_id, bytes)?;
+                // A uid, or none: a word no uid can be is malformed.
+                if !operator_word(operator) {
+                    return Err(CncError::Reserved { type_id });
+                }
                 Ok(Self::GuardClose {
                     sequence,
                     guard,
@@ -1598,8 +1621,9 @@ impl Command {
             GUARD_REOPEN => {
                 let [sequence, guard, expected, operation, operator, parameters] =
                     read_words::<6>(type_id, bytes)?;
-                // Only a closed epoch can be reopened: odd, 1 to MAX_EPOCH.
-                if !closed_epoch(expected) {
+                // Only a closed epoch can be reopened: odd, 1 to MAX_EPOCH;
+                // and the operator word is a uid or none.
+                if !closed_epoch(expected) || !operator_word(operator) {
                     return Err(CncError::Reserved { type_id });
                 }
                 Ok(Self::GuardReopen {
@@ -3754,12 +3778,63 @@ mod journal_tests {
         assert_eq!(ErrorCode::from_code(17), None);
     }
 
+    /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
+    /// word no uid can be is refused both ways.
+    #[test]
+    fn a_guard_command_carries_a_uid_or_no_operator() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        for operator in [0, 1000, u64::from(u32::MAX), NO_OPERATOR] {
+            let close = Command::GuardClose {
+                sequence: 1,
+                guard: 3,
+                operation: 7,
+                operator,
+                parameters: 0,
+            };
+            let length = close.encode(&mut out).unwrap();
+            assert_eq!(Command::decode(GUARD_CLOSE, &out[..length]), Ok(close));
+        }
+        for operator in [u64::from(u32::MAX) + 1, NO_OPERATOR - 1] {
+            assert_eq!(
+                Command::decode(GUARD_CLOSE, &bytes_of(&[1, 3, 7, operator, 0])),
+                Err(CncError::Reserved {
+                    type_id: GUARD_CLOSE
+                }),
+                "{operator}"
+            );
+            assert_eq!(
+                Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, 1, 7, operator, 0])),
+                Err(CncError::Reserved {
+                    type_id: GUARD_REOPEN
+                })
+            );
+            let close = Command::GuardClose {
+                sequence: 1,
+                guard: 3,
+                operation: 7,
+                operator,
+                parameters: 0,
+            };
+            assert_eq!(
+                close.encode(&mut out),
+                Err(CncError::Reserved {
+                    type_id: GUARD_CLOSE
+                })
+            );
+        }
+    }
+
     /// The digest is 64-bit FNV-1a over the four words, little endian,
     /// then the reason: a reference value pins it, and each input moves it.
     #[test]
     fn the_guard_parameters_digest_is_fnv_1a_over_the_request() {
         let digest = guard_parameters(3, 0, 77, 1000, b"drill");
         assert_eq!(digest, 0x9886_bd28_db8b_bca7);
+        // No operator: the word as sent, NO_OPERATOR.
+        assert_eq!(
+            guard_parameters(3, 0, 77, NO_OPERATOR, b""),
+            0x24a0_d127_84c9_2c23
+        );
         for other in [
             guard_parameters(4, 0, 77, 1000, b"drill"),
             guard_parameters(3, 1, 77, 1000, b"drill"),
@@ -3778,7 +3853,10 @@ mod journal_tests {
         // Epoch 0, an open (even) epoch, and one above MAX_EPOCH.
         for expected in [0, 2, karyos_sys::guard::MAX_EPOCH + 1, u64::MAX] {
             assert_eq!(
-                Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, expected, 7, 0, 0])),
+                Command::decode(
+                    GUARD_REOPEN,
+                    &bytes_of(&[1, 3, expected, 7, NO_OPERATOR, 0])
+                ),
                 Err(CncError::Reserved {
                     type_id: GUARD_REOPEN
                 }),
@@ -3791,7 +3869,7 @@ mod journal_tests {
                     guard: 3,
                     expected,
                     operation: 7,
-                    operator: 0,
+                    operator: NO_OPERATOR,
                     parameters: 0,
                 }
                 .encode(&mut out),
@@ -3801,7 +3879,7 @@ mod journal_tests {
             );
         }
         let last = karyos_sys::guard::MAX_EPOCH;
-        assert!(Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, last, 7, 0, 0])).is_ok());
+        assert!(Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, last, 7, NO_OPERATOR, 0])).is_ok());
     }
 
     #[test]
@@ -4344,21 +4422,26 @@ mod properties {
             (any::<u64>(), stream()).prop_map(|(sequence, stream)| {
                 Command::AddConflatedSubscription { sequence, stream }
             }),
-            any::<(u64, u64, u64, u64, u64)>().prop_map(
-                |(sequence, guard, operation, operator, parameters)| Command::GuardClose {
-                    sequence,
-                    guard,
-                    operation,
-                    operator,
-                    parameters,
-                }
-            ),
             (
-                any::<(u64, u64, u64, u64, u64)>(),
+                any::<(u64, u64, u64, u64)>(),
+                prop_oneof![Just(NO_OPERATOR), (0..=u64::from(u32::MAX))]
+            )
+                .prop_map(|((sequence, guard, operation, parameters), operator)| {
+                    Command::GuardClose {
+                        sequence,
+                        guard,
+                        operation,
+                        operator,
+                        parameters,
+                    }
+                }),
+            (
+                any::<(u64, u64, u64, u64)>(),
+                prop_oneof![Just(NO_OPERATOR), (0..=u64::from(u32::MAX))],
                 0..=(karyos_sys::guard::MAX_EPOCH >> 1)
             )
                 .prop_map(
-                    |((sequence, guard, operation, operator, parameters), half)| {
+                    |((sequence, guard, operation, parameters), operator, half)| {
                         Command::GuardReopen {
                             sequence,
                             guard,

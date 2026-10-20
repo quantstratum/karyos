@@ -299,3 +299,201 @@ fn the_exporter_renders_an_attached_driver() {
     );
     assert!(text.contains(&pid), "{text}");
 }
+
+/// M11 end to end: the agent lists the Archive catalog of a driver given
+/// one, over its control streams: it connects as an IPC client, takes a
+/// concurrent handle on the request stream the host configured concurrent
+/// and reads the response stream. A fake Archive on this thread answers
+/// each page from a catalog of three recordings, two per page.
+#[test]
+fn the_agent_lists_the_archive_catalog_of_a_driver() {
+    use karyos_agent::catalog::{ArchiveStreams, CatalogConfig};
+    use karyos_archive::catalog::{SourceIncarnation, Stop, StopReason};
+    use karyos_archive::control::{
+        ControlMessage, ControlResponse, RecordingDescriptor, RecordingState, ResponseCode,
+    };
+    use karyos_archive::segment::Geometry;
+    use karyos_archive::server::MAX_ANSWER;
+    use karyos_client::{MessageLimit, OfferOutcome};
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    const REQUESTS: i32 = 100;
+    const RESPONSES: i32 = 101;
+    let stream = |stream_id, publication| StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            // Two concurrent publishers and a reader take their credits.
+            spare_slots: 6,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    };
+    let _serial = serial();
+    let dir = dir("catalog");
+    let mut driver = driver(&dir, DriverConfig::default(), 4);
+    // The host's control streams: the request stream shared (§7a).
+    let requests = driver
+        .add_stream(stream(
+            REQUESTS,
+            PublicationMode::Concurrent {
+                publishers: 2,
+                allow_non_lse: true,
+            },
+        ))
+        .unwrap();
+    let responses = driver
+        .add_stream(stream(RESPONSES, PublicationMode::Exclusive))
+        .unwrap();
+    let mut reading = driver.subscribe(requests, Role::Optional).unwrap();
+    let mut answering = driver.publication(responses).unwrap();
+    let agent = Agent::new(AgentConfig::new(vec![dir.clone()]).with_archive(
+        dir.clone(),
+        CatalogConfig::new(ArchiveStreams::new(REQUESTS, RESPONSES)).with_timing(
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        ),
+    ));
+    let descriptor = |correlation_id, recording_id| RecordingDescriptor {
+        correlation_id,
+        recording_id,
+        start: 0,
+        start_time_ns: recording_id,
+        state: if recording_id == 3 {
+            RecordingState::Recording {
+                written: 4096,
+                incomplete: false,
+            }
+        } else {
+            RecordingState::Stopped(Stop {
+                position: 100,
+                time_ns: 2,
+                reason: StopReason::Stopped,
+                incomplete: false,
+            })
+        },
+        geometry: Geometry::new(MIN_TERM_LENGTH, 4 * u64::from(MIN_TERM_LENGTH)).unwrap(),
+        source: SourceIncarnation {
+            driver: [1, 2],
+            registration: recording_id,
+            incarnation: 1,
+        },
+        stream_id: 42,
+        session_id: 1,
+        channel: "karyos:ipc",
+    };
+    let mut out = vec![0u8; MAX_ANSWER];
+    let mut answer = |message: &ControlMessage<'_>, driver: &mut IpcDriver| {
+        let length = message.encode(&mut out).unwrap();
+        while !matches!(
+            answering.offer(&out[..length]),
+            Ok(OfferOutcome::Accepted { .. })
+        ) {
+            let _ = driver.do_work().unwrap();
+        }
+    };
+    let start = Instant::now();
+    let catalog = loop {
+        assert!(start.elapsed() < Duration::from_secs(30), "no listing");
+        let _ = driver.do_work().unwrap();
+        let mut pages = Vec::new();
+        let _ = reading.poll(
+            |bytes, _| {
+                if let Ok(ControlMessage::ListRecordings(list)) = ControlMessage::decode(bytes) {
+                    pages.push((list.correlation_id, list.from_id, list.max_count));
+                }
+            },
+            MessageLimit::new(8),
+        );
+        for (correlation_id, from_id, max_count) in pages {
+            // Two per page at most, as an Archive may answer fewer.
+            let ids: Vec<u64> = (from_id.max(1)..=3)
+                .take(max_count.min(2) as usize)
+                .collect();
+            for &id in &ids {
+                answer(
+                    &ControlMessage::RecordingDescriptor(descriptor(correlation_id, id)),
+                    &mut driver,
+                );
+            }
+            answer(
+                &ControlMessage::ControlResponse(ControlResponse {
+                    correlation_id,
+                    id: ids.len() as u64,
+                    code: ResponseCode::Ok,
+                    message: "",
+                }),
+                &mut driver,
+            );
+        }
+        let catalog = agent.view().drivers[0].catalog.clone().unwrap();
+        if catalog.listings > 0 {
+            break catalog;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let ids: Vec<u64> = catalog.recordings.iter().map(|r| r.recording_id).collect();
+    assert_eq!(ids, [1, 2, 3], "{catalog:?}");
+    assert_eq!(catalog.left_out, 0);
+    assert!(catalog.listed_at.is_some());
+    assert_eq!(catalog.last_error, None);
+    let (stopped, live) = (&catalog.recordings[0], &catalog.recordings[2]);
+    assert!(!stopped.recording);
+    assert_eq!(
+        (stopped.position, stopped.stop_reason.as_deref()),
+        (100, Some("stopped"))
+    );
+    assert!(live.recording);
+    assert_eq!((live.position, live.stopped_ns), (4096, None));
+    assert_eq!(live.channel, "karyos:ipc");
+    // A driver without `--archive` has no catalog.
+    assert!(
+        agent_without_archive(&dir).view().drivers[0]
+            .catalog
+            .is_none()
+    );
+    drop(agent);
+    // Streams the host does not have: each attempt fails, is counted and
+    // retried; nothing was listed.
+    let missing = Agent::new(AgentConfig::new(vec![dir.clone()]).with_archive(
+        dir.clone(),
+        CatalogConfig::new(ArchiveStreams::new(200, 201)).with_timing(
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        ),
+    ));
+    let start = Instant::now();
+    let catalog = loop {
+        assert!(start.elapsed() < Duration::from_secs(30), "no failure");
+        let _ = driver.do_work().unwrap();
+        let catalog = missing.view().drivers[0].catalog.clone().unwrap();
+        if catalog.failures >= 2 {
+            break catalog;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(catalog.listings, 0);
+    assert!(catalog.recordings.is_empty());
+    let error = catalog.last_error.unwrap();
+    assert!(error.starts_with("request stream:"), "{error}");
+}
+
+fn agent_without_archive(dir: &Path) -> Agent {
+    Agent::new(AgentConfig::new(vec![dir.to_path_buf()]))
+}

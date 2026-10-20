@@ -11,6 +11,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A guard command's "no operator" word is `NO_OPERATOR` (`u64::MAX`), not
+  0, so root's uid 0 is audited as an operator (M10b; a defect of M10a
+  that M10b's end-to-end test found as root), changed in place under
+  admission `VERSION` 2 (owner item 54). Any other word is a 32-bit uid;
+  a word above `u32::MAX` but `NO_OPERATOR` is a reserved value, refused
+  in both directions. `ClientConductor::guard_close` and `guard_reopen`
+  (and `RemoteClient`'s) take `operator: Option<u32>`. The audit ring's
+  readers tell an operator by `requester_kind` 2, never by word 8, which
+  holds 0 for root.
+
 - `GuardClose` and `GuardReopen` carry the operator a client acts for and
   a parameters digest (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M10 and owner item 6),
@@ -421,6 +431,43 @@ release may break APIs, wire formats and shared-memory layouts.
   and session limits, the threading mode, the image template, the stream
   defaults, the NAK control groups and the per-client limit. Tested end to
   end through two `karyosd` processes on loopback.
+
+- Guard operations through the management agent (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M10b2). The agent's
+  socket takes `guard-close DIR GUARD [REASON]`, `guard-reopen DIR GUARD
+  EPOCH [REASON]` (the reason is the rest of the line) and `gap-ack
+  POSITION`, bounded by the interim role matrix (owner item 2): operators
+  and risk officers close, risk officers and administrators reopen,
+  administrators acknowledge; any other request of a role is `forbidden`.
+  The agent attaches to the driver as a client for the one command, for
+  the peer's uid as the operator, and journals a request record before
+  and an outcome record after (`karyos_agent::operations`). A close goes
+  ahead whether its record was written; a reopen is refused (`journal
+  unavailable`) unless its record is durable first, and without a journal
+  (`karyos-agent --journal DIR`, `AgentConfig::with_journal`). API v1's
+  view appends `journal`: its recording, `unsealed`, whether it is
+  unavailable and why, its failed appends, the open unknown interval and
+  its `journal_gap` alert, raised also from a failed append until the
+  agent restarts (`Journal::failed_at`). `Server::poll` takes the agent
+  mutably.
+
+- The management agent lists a driver's Archive catalog (phase 5, M11;
+  quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`).
+  `karyos-agent --archive DIR=REQ,RESP` (`AgentConfig::with_archive`,
+  `karyos_agent::catalog::CatalogConfig`), off by default, names a
+  watched driver and its host's Archive control streams. A thread per
+  such driver connects as an IPC client with a short timeout, takes a
+  concurrent handle on the request stream (which the host configures
+  concurrent) and subscribes the response stream, lists the catalog with
+  `RecordingLister` within a deadline and lists again after an interval;
+  failures are counted and retried. `DriverView::catalog` (API v1, after
+  `alerts`) holds the last complete listing, `left_out`, `listed_at`,
+  `listings`, `failures` and `last_error`; the exporter adds
+  `karyos_archive_recordings`, `karyos_archive_listings_total`,
+  `karyos_archive_listing_failures_total` and
+  `karyos_archive_listed_at_ns`. It costs one client slot of that driver.
+  The crate graph test checks that karyos-archive never depends on the
+  agent.
 
 - The management agent's operations journal (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M10b, owner item 7

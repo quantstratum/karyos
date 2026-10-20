@@ -3,7 +3,7 @@
 //! The agent: one tool attach per configured driver, and the model it
 //! keeps of each.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use karyos_client::tool::{RemoteTool, attach_tool};
@@ -12,10 +12,13 @@ use karyos_sys::host_clock::host_monotonic_ns;
 
 use crate::alerts::{AckRead, AlertRules, Alerts};
 use crate::api::{
-    API_VERSION, AgentView, Counter, DriverState, DriverView, ErrorEntry, GuardEntry, LossEntry,
-    Sample,
+    API_VERSION, AgentView, Alert, AlertKind, Counter, DriverState, DriverView, ErrorEntry,
+    GapView, GuardEntry, JournalView, LossEntry, Sample,
 };
+use crate::catalog::{CatalogConfig, CatalogWatch};
+use crate::journal::{Journal, JournalError};
 use crate::model::{self, Cell, Follower};
+use crate::operations::{self, GuardAnswer};
 use crate::trace_window::{TraceWindow, WindowConfig};
 
 /// Attempts at a consistent sampling pass before the values are reported
@@ -42,6 +45,14 @@ pub struct AgentConfig {
     pub trace: WindowConfig,
     /// The alert rules (M9).
     pub alerts: AlertRules,
+    /// The operations journal's directory (M10b); `None` for none, and
+    /// guard reopens are then refused.
+    pub journal: Option<PathBuf>,
+    /// The wait for a driver's answer to a guard operation (M10b).
+    pub guard_timeout: Duration,
+    /// The drivers whose Archive catalog the agent lists (M11), each a
+    /// directory of `drivers`; none by default.
+    pub archives: Vec<(PathBuf, CatalogConfig)>,
 }
 
 impl AgentConfig {
@@ -54,7 +65,17 @@ impl AgentConfig {
             history: DEFAULT_HISTORY,
             trace: WindowConfig::default(),
             alerts: AlertRules::default(),
+            journal: None,
+            guard_timeout: DEFAULT_ATTACH_TIMEOUT,
+            archives: Vec::new(),
         }
+    }
+
+    /// With the operations journal in `dir` (M10b).
+    #[must_use]
+    pub fn with_journal(mut self, dir: PathBuf) -> Self {
+        self.journal = Some(dir);
+        self
     }
 
     /// With the trace latency window `trace`.
@@ -84,6 +105,15 @@ impl AgentConfig {
         self.alerts = alerts;
         self
     }
+
+    /// Listing the Archive catalog of the driver in `dir` as `catalog`
+    /// says (M11). A directory that is not one of the drivers lists
+    /// nothing.
+    #[must_use]
+    pub fn with_archive(mut self, dir: PathBuf, catalog: CatalogConfig) -> Self {
+        self.archives.push((dir, catalog));
+        self
+    }
 }
 
 /// One watched driver.
@@ -100,6 +130,7 @@ struct Driver {
     guards: Follower<GuardEntry>,
     trace: Option<TraceWindow>,
     alerts: Alerts,
+    catalog: Option<CatalogWatch>,
 }
 
 /// The agent. Each driver it is attached to counts one tool against the
@@ -108,6 +139,12 @@ struct Driver {
 pub struct Agent {
     config: AgentConfig,
     drivers: Vec<Driver>,
+    /// The operations journal, once opened.
+    journal: Option<Journal>,
+    /// Why the configured journal could not be opened.
+    journal_error: Option<String>,
+    /// The next guard operation's id.
+    next_operation: u64,
 }
 
 impl Agent {
@@ -132,9 +169,132 @@ impl Agent {
                 guards: Follower::new(config.history),
                 trace: None,
                 alerts: Alerts::default(),
+                // The catalog's own thread connects, off the refresh path.
+                catalog: config
+                    .archives
+                    .iter()
+                    .find(|(archive, _)| archive == dir)
+                    .map(|(_, catalog)| CatalogWatch::start(dir.clone(), *catalog)),
             })
             .collect();
-        Self { config, drivers }
+        let (journal, journal_error) = match config.journal.as_deref() {
+            None => (None, None),
+            Some(dir) => match Journal::open(dir, host_monotonic_ns()) {
+                Ok(journal) => (Some(journal), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+        };
+        Self {
+            config,
+            drivers,
+            journal,
+            journal_error,
+            // Ids from the agent's start time: unique across restarts.
+            next_operation: host_monotonic_ns().max(1),
+        }
+    }
+
+    /// Closes guard `guard` of the driver in `dir` for operator `uid`
+    /// with `reason`, journalled (M10b; see `operations`).
+    pub fn guard_close(&mut self, dir: &Path, guard: u64, uid: u32, reason: &[u8]) -> GuardAnswer {
+        self.guard_command(dir, guard, None, uid, reason)
+    }
+
+    /// Reopens guard `guard`, closed at `expected`, of the driver in `dir`
+    /// for operator `uid`; refused unless its request is journalled
+    /// durably first.
+    pub fn guard_reopen(
+        &mut self,
+        dir: &Path,
+        guard: u64,
+        expected: u64,
+        uid: u32,
+        reason: &[u8],
+    ) -> GuardAnswer {
+        self.guard_command(dir, guard, Some(expected), uid, reason)
+    }
+
+    fn guard_command(
+        &mut self,
+        dir: &Path,
+        guard: u64,
+        reopen: Option<u64>,
+        uid: u32,
+        reason: &[u8],
+    ) -> GuardAnswer {
+        if !self.drivers.iter().any(|driver| driver.dir == dir) {
+            return GuardAnswer::UnknownDriver;
+        }
+        let operation = self.next_operation;
+        // Checked: at their end the ids keep the last one.
+        self.next_operation = operation.checked_add(1).unwrap_or(operation);
+        let command = operations::Command {
+            dir,
+            guard,
+            reopen,
+            operation,
+            operator: uid,
+            // Cut once, so the digest covers what is journalled (DESIGN's
+            // P2 on #487).
+            reason: operations::cut_reason(reason),
+            timeout: self.config.guard_timeout,
+        };
+        operations::guard_command(self.journal.as_mut(), &command)
+    }
+
+    /// Records administrator `uid`'s acknowledgement of the open unknown
+    /// interval at `position` (M10b).
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::NoGap`] when there is no journal or that interval
+    /// is not the open one, and the journal's errors.
+    pub fn acknowledge_gap(&mut self, position: u64, uid: u32) -> Result<(), JournalError> {
+        self.journal
+            .as_mut()
+            .ok_or(JournalError::NoGap)?
+            .acknowledge_gap(position, u64::from(uid), host_monotonic_ns())
+    }
+
+    /// The journal's state, for the view.
+    fn journal_view(&self) -> Option<JournalView> {
+        self.config.journal.as_ref()?;
+        let journal = self.journal.as_ref();
+        let gap = journal.and_then(Journal::gap);
+        Some(JournalView {
+            recording: journal.map(Journal::recording),
+            unsealed: true,
+            unavailable: journal.is_none_or(Journal::unavailable),
+            error: self.journal_error.clone(),
+            failed_appends: journal.map_or(0, Journal::failed_appends),
+            gap: gap.map(|gap| GapView {
+                position: gap.position,
+                from: gap.from,
+                to: gap.to,
+            }),
+            // An unknown interval stays an alert until it is acknowledged;
+            // a journal that failed is one from its failure on, until the
+            // restart that records it (DESIGN's P3 on #485).
+            alerts: gap
+                .map(|gap| Alert {
+                    kind: AlertKind::JournalGap,
+                    stream: 0,
+                    lane: 0,
+                    participant: gap.position,
+                    value: gap.to.abs_diff(gap.from),
+                    since: gap.to,
+                })
+                .into_iter()
+                .chain(journal.and_then(Journal::failed_at).map(|since| Alert {
+                    kind: AlertKind::JournalGap,
+                    stream: 0,
+                    lane: 0,
+                    participant: u64::MAX,
+                    value: journal.map_or(0, Journal::failed_appends),
+                    since,
+                }))
+                .collect(),
+        })
     }
 
     /// Attaches to every driver it is not attached to, reads every one it
@@ -153,6 +313,7 @@ impl Agent {
         AgentView {
             version: API_VERSION,
             drivers: self.drivers.iter().map(Driver::view).collect(),
+            journal: self.journal_view(),
         }
     }
 }
@@ -254,6 +415,7 @@ impl Driver {
             latencies,
             trace,
             alerts: self.alerts.firing(),
+            catalog: self.catalog.as_ref().map(CatalogWatch::view),
         }
     }
 }
