@@ -185,6 +185,39 @@ impl<T: TermBytes> Publication<T> {
         Self { lanes }
     }
 
+    /// A publication over the handles of an in-process driver's stream,
+    /// lane 0 first, as `EmbeddedDriver::publication` returns them: the
+    /// facade API over handles that no [`crate::Client`] granted. The
+    /// publication then owns them; a client's
+    /// [`crate::Client::remove_publication`] cannot release them to their
+    /// driver, so it drops them and counts the release as failed.
+    ///
+    /// The handles must be of one registration of one driver. That is the
+    /// caller's duty: this checks only that there is at least one, that
+    /// handle `n` publishes on lane `n`, and that every one publishes to
+    /// the same stream and session.
+    ///
+    /// # Errors
+    ///
+    /// The handles, untouched, when a check fails.
+    pub fn from_handles(
+        lanes: Vec<ClientPublication<T>>,
+    ) -> Result<Self, Vec<ClientPublication<T>>> {
+        let Some(first) = lanes.first() else {
+            return Err(lanes);
+        };
+        let stream = first.stream();
+        // Handle n on lane n: a handle past the last lane cannot be.
+        let ordered = (0u8..)
+            .zip(&lanes)
+            .all(|(index, lane)| lane.lane().get() == index && lane.stream() == stream);
+        if ordered {
+            Ok(Self::new(lanes))
+        } else {
+            Err(lanes)
+        }
+    }
+
     /// The handles, lane 0 first, to release them.
     pub(crate) fn into_lanes(self) -> Vec<ClientPublication<T>> {
         self.lanes
@@ -339,6 +372,63 @@ mod tests {
 
     fn lane(index: u8) -> Lane {
         Lane::try_new(index).unwrap()
+    }
+
+    /// The exclusive handle of a new heap buffer on `lane` of `stream_id`.
+    fn handle(lane: Lane, stream_id: i32) -> ClientPublication {
+        use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig, PublicationMode};
+        use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+
+        let buffer = std::sync::Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 1,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: karyos_sys::term::TermId::new(7),
+                lane,
+                session_id: 1,
+                stream_id,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            })
+            .unwrap(),
+        );
+        ClientPublication::new(buffer.publication_owned().unwrap().unwrap(), true)
+    }
+
+    /// The handles of lanes 0 to n of one stream make a publication with
+    /// those lanes.
+    #[test]
+    fn handles_of_one_stream_in_lane_order_make_a_publication() {
+        let publication =
+            Publication::from_handles(vec![handle(lane(0), 2), handle(lane(1), 2)]).unwrap();
+        assert_eq!(publication.lane_count(), 2);
+        assert!(publication.max_message_length(lane(1)).is_some());
+        assert!(publication.max_message_length(lane(2)).is_none());
+    }
+
+    /// No handles, handles out of lane order, handles of two streams and
+    /// more handles than lanes are refused, and handed back.
+    #[test]
+    fn handles_that_cannot_be_one_publication_are_handed_back() {
+        let refused = |lanes: Vec<ClientPublication>| {
+            let count = lanes.len();
+            let back = Publication::from_handles(lanes).unwrap_err();
+            assert_eq!(back.len(), count);
+        };
+        refused(Vec::new());
+        refused(vec![handle(lane(1), 2)]);
+        refused(vec![handle(lane(1), 2), handle(lane(0), 2)]);
+        refused(vec![handle(lane(0), 2), handle(lane(0), 2)]);
+        refused(vec![handle(lane(0), 2), handle(lane(1), 3)]);
+        let mut five: Vec<ClientPublication> = (0..Lane::COUNT)
+            .map(|index| handle(lane(index), 2))
+            .collect();
+        five.push(handle(lane(0), 2));
+        refused(five);
     }
 
     /// Every offer outcome maps to its own result: only an acceptance is

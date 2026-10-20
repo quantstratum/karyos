@@ -1437,3 +1437,5 @@ fn next_image_change_checks_its_struct_before_its_handle() {
     // Nothing was written: the handle failed after the check.
     assert_eq!((has, change.image_id), (u32::MAX, 7));
 }
+
+mod outcomes;

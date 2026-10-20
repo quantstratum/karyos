@@ -56,6 +56,20 @@ extern "C" {
 #define KARYOS_MESSAGE_END_OF_STREAM 1
 #define KARYOS_MESSAGE_TRACED 2
 
+/**
+ * karyos_outcome kinds. A newer library may add kinds: a binding keeps a
+ * record of a kind it does not know.
+ */
+#define KARYOS_OUTCOME_SUBMITTED 1
+#define KARYOS_OUTCOME_CONFIRMED_CANCELLED 2
+#define KARYOS_OUTCOME_UNKNOWN 3
+#define KARYOS_OUTCOME_REJECTED 4
+#define KARYOS_OUTCOME_ABORTED 5
+#define KARYOS_OUTCOME_RANGE 16
+#define KARYOS_OUTCOME_INTERRUPTED 17
+#define KARYOS_OUTCOME_ENDED 18
+#define KARYOS_OUTCOME_OUTCOMES_LOST 19
+
 /** The most embedded drivers open at once. */
 #define KARYOS_MAX_DRIVERS 8
 
@@ -339,7 +353,10 @@ int32_t karyos_client_close(uint64_t client);
  * (karyos:ipc or karyos:udp) to the client and writes its handle. A
  * control call: it waits for the driver up to the client's timeout and
  * holds the client handle meanwhile. A failure opens nothing and fills
- * detail (may be null).
+ * detail (may be null). A guarded stream's publication binds its guard
+ * and outcome stream (karyos_publication_poll_outcomes) for a client of a
+ * driver in another process; an embedded driver's client is refused one
+ * with KARYOS_E_REFUSED, detail code 6 (invalid publication mode).
  */
 int32_t karyos_client_add_publication(uint64_t client, const char *uri,
                                       int32_t stream_id, uint64_t *publication,
@@ -396,6 +413,50 @@ int32_t karyos_claim_abort(uint64_t claim);
  * nothing is closed while the client handle is in use.
  */
 int32_t karyos_publication_close(uint64_t publication);
+
+/**
+ * One outcome record of a guarded publication, valid during the handler's
+ * call. size is the library's sizeof(karyos_outcome): read only the fields
+ * it covers.
+ */
+typedef struct karyos_outcome {
+    uint32_t size;
+    uint32_t kind;
+    uint32_t lane;
+    uint32_t receiver;
+    uint64_t sequence;
+    uint64_t incarnation;
+    uint64_t start;
+    uint64_t end;
+    uint64_t epoch;
+    uint64_t reason;
+    uint64_t lost;
+} karyos_outcome;
+
+/**
+ * Called once per outcome record with the caller's context and the
+ * record, valid only during the call. It must return normally.
+ */
+typedef void (*karyos_outcome_handler)(void *context,
+                                       const karyos_outcome *outcome);
+
+/**
+ * Delivers at most limit outcome records of the publication's lane to
+ * handler, in sequence order, and writes their count through delivered
+ * (may be null), also when it fails: a failed poll's status follows the
+ * records delivered before it. Never waits and never allocates. A lane
+ * that is not guarded, and lane 0 of a concurrent handle, deliver 0; a
+ * lane the publication does not configure returns KARYOS_E_INVALID_LANE.
+ * After the final KARYOS_OUTCOME_OUTCOMES_LOST record, polls deliver 0
+ * and offers and claims return KARYOS_E_OUTCOMES_LOST. From the handler,
+ * offering, claiming, polling or closing this publication, or closing its
+ * client, returns KARYOS_E_REENTRANT. To stop after a failed handler
+ * (ADR-0067), poll with a limit of 1 in a loop and stop calling.
+ */
+int32_t karyos_publication_poll_outcomes(uint64_t publication, uint32_t lane,
+                                         karyos_outcome_handler handler,
+                                         void *context, uint32_t limit,
+                                         uint32_t *delivered);
 
 /**
  * What the poll knows of a message, valid during the handler's call. size

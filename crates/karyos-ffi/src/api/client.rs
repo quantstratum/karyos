@@ -286,6 +286,17 @@ pub(crate) fn insert_embedded(client: Client<ClientConductor>) -> Result<Handle,
     clients().insert(entry(AnyClient::Embedded(client), None))
 }
 
+/// The releases of `client`'s publications that could not be sent
+/// (`Client::publication_releases_failed`; tests).
+#[cfg(test)]
+pub(crate) fn publication_releases_failed(client: Handle) -> Result<u64, Status> {
+    clients().with(client, |entry| match &entry.client {
+        #[cfg(target_os = "linux")]
+        AnyClient::Remote(client) => client.publication_releases_failed(),
+        AnyClient::Embedded(client) => client.publication_releases_failed(),
+    })
+}
+
 /// Opens a client handle over a new conductor of the embedded driver
 /// `owner`, with the facade's default context.
 ///

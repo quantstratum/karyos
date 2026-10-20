@@ -5,5 +5,6 @@
 
 pub(crate) mod client;
 pub(crate) mod driver;
+pub(crate) mod outcomes;
 pub(crate) mod publication;
 pub(crate) mod subscription;

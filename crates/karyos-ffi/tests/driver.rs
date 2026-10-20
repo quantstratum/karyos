@@ -137,9 +137,15 @@ fn a_c_caller_publishes_on_a_stream_of_its_own_driver() {
     assert_eq!(status, OK);
     // Live, with no subscriber yet (subscriptions come with F4).
     assert_eq!(abi::publication_offer(publication, b"hello"), NOT_CONNECTED);
+    // An unguarded lane has no outcome records.
+    assert_eq!(
+        abi::publication_poll_outcomes(publication, 0, 8),
+        (OK, 0, Vec::new())
+    );
     // A stream the driver does not have is refused by the driver.
     assert_ne!(abi::client_add_ipc_publication(client, 10).0, OK);
     assert_eq!(abi::driver_close(driver), OK);
     assert_eq!(abi::publication_offer(publication, b"hello"), CLOSED);
+    assert_eq!(abi::publication_poll_outcomes(publication, 0, 8).0, CLOSED);
     assert_eq!(abi::client_close(client), OK);
 }
