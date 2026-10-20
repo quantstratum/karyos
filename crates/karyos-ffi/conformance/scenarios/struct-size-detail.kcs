@@ -1,0 +1,26 @@
+# karyos_detail of ABI 0.1.0 is 24 bytes. A failed control call fills a
+# detail of that size or larger with the fields of 0.1.0 and leaves a
+# newer caller's tail untouched; a smaller one receives nothing (SPEC.md
+# §10.2, §13, C ABI boundary).
+format 1
+id struct.size.detail
+abi 0.1
+covers "struct sizes of another minor version"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+# Stream 9 does not exist: the driver refuses it.
+call karyos_client_add_publication client=$client stream_id=9 detail_size=24
+expect KARYOS_E_REFUSED detail_written=1 code=$code value=$value detail_tail="intact"
+call karyos_client_add_publication client=$client stream_id=9 detail_size=40
+expect KARYOS_E_REFUSED detail_written=1 code=$code value=$value detail_tail="intact"
+call karyos_client_add_publication client=$client stream_id=9 detail_size=16
+expect KARYOS_E_REFUSED detail_written=0 detail_tail="intact"
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

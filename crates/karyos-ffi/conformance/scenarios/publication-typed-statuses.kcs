@@ -1,0 +1,36 @@
+# The data path answers with typed statuses, never undefined behaviour: a
+# claim of an empty message, on a lane the stream does not configure or
+# past the largest message, an offer with no subscriber, and a stream the
+# driver does not have (SPEC.md §13, C ABI boundary; SPEC.md §10.2).
+format 1
+id publication.typed.statuses
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=7
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_publication client=$client stream_id=7
+expect KARYOS_OK publication=$publication
+# A claim checks its message before staging it.
+call karyos_publication_claim publication=$publication length=0
+expect KARYOS_E_EMPTY_MESSAGE
+call karyos_publication_claim publication=$publication lane=1 length=8
+expect KARYOS_E_INVALID_LANE
+call karyos_publication_claim publication=$publication length=16777216
+expect KARYOS_E_MESSAGE_TOO_LARGE
+# With no subscriber an offer is refused before anything else.
+call karyos_publication_offer publication=$publication payload="x"
+expect KARYOS_E_NOT_CONNECTED
+# A stream the driver does not have is refused by the driver.
+call karyos_client_add_publication client=$client stream_id=9
+expect KARYOS_E_REFUSED
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK
