@@ -41,6 +41,8 @@ fn c_struct(rust: &str) -> &'static str {
         "Outcome" => "karyos_outcome",
         "SubscriptionOptions" => "karyos_subscription_options",
         "OfferOptions" => "karyos_offer_options",
+        "ArchiveOptions" => "karyos_archive_options",
+        "Recording" => "karyos_recording",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -77,6 +79,9 @@ fn c_type(rust: &str) -> String {
         "ConflatedHandler" => "karyos_conflated_handler",
         "*const Outcome" => "const karyos_outcome *",
         "OutcomeHandler" => "karyos_outcome_handler",
+        "*const ArchiveOptions" => "const karyos_archive_options *",
+        "*const Recording" => "const karyos_recording *",
+        "RecordingHandler" => "karyos_recording_handler",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -495,6 +500,51 @@ fn the_header_states_the_conflation_constants() {
             .lines()
             .any(|line| line.trim() == "#define KARYOS_FRESH UINT64_MAX")
     );
+}
+
+#[test]
+fn the_header_states_the_archive_constants() {
+    use crate::abi::{RECORDING_RECORDING, RECORDING_STOPPED};
+    use karyos_archive::catalog::{FailKind, StopReason};
+    let defines = header_defines();
+    assert_eq!(
+        defines["KARYOS_MAX_ARCHIVES"],
+        i64::from(crate::api::archive::MAX_ARCHIVES)
+    );
+    assert_eq!(
+        defines["KARYOS_RECORDING_RECORDING"],
+        i64::from(RECORDING_RECORDING)
+    );
+    assert_eq!(
+        defines["KARYOS_RECORDING_STOPPED"],
+        i64::from(RECORDING_STOPPED)
+    );
+    for (name, reason) in [
+        ("KARYOS_STOP_NORMAL", StopReason::Normal),
+        ("KARYOS_STOP_RECOVERED", StopReason::Recovered),
+        ("KARYOS_STOP_EMPTY", StopReason::Empty),
+        ("KARYOS_STOP_LAPPED", StopReason::Lapped),
+        ("KARYOS_STOP_STOPPED", StopReason::Stopped),
+        ("KARYOS_STOP_SHUTDOWN", StopReason::Shutdown),
+        (
+            "KARYOS_STOP_SOURCE_FAILED",
+            StopReason::Failed(FailKind::Source),
+        ),
+        (
+            "KARYOS_STOP_REQUIRED_LAPPED",
+            StopReason::Failed(FailKind::RequiredLapped),
+        ),
+        (
+            "KARYOS_STOP_INVALID_SOURCE",
+            StopReason::Failed(FailKind::Invalid),
+        ),
+    ] {
+        assert_eq!(
+            defines[name],
+            i64::from(crate::abi::stop_reason(reason)),
+            "{name}"
+        );
+    }
 }
 
 #[test]

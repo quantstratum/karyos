@@ -1,0 +1,35 @@
+# An Archive connection answers typed statuses (quantstratum-docs:
+# karyos/design/ffi-archive.md): a handle of another kind or the null
+# handle is refused; a connection's options are checked before its
+# client; a request stream the driver does not have opens nothing.
+format 1
+id archive.typed.statuses
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_archive_close archive=$driver
+expect KARYOS_E_INVALID_HANDLE
+call karyos_archive_close archive=0
+expect KARYOS_E_INVALID_HANDLE
+call karyos_archive_list archive=$driver limit=1
+expect KARYOS_E_INVALID_HANDLE delivered=0
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_archive_connect client=$client requests=40 responses=41 reserved=1
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_archive_connect client=$client requests=40 responses=41 size=31
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_archive_connect client=$client requests=40 responses=41 client_id=4294967296
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_archive_connect client=$driver requests=40 responses=41
+expect KARYOS_E_INVALID_HANDLE
+call karyos_archive_connect client=$client requests=40 responses=41
+expect KARYOS_E_REFUSED
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK
