@@ -547,6 +547,86 @@ pub unsafe extern "C" fn karyos_publication_offer(
     })
 }
 
+/// Offers `length` bytes at `data` on the timed `lane` of `publication`,
+/// with its requested not-before time `tx_time` in the lane's clock domain
+/// (`karyos_clock_now` reads it), copied into the term before it returns.
+/// The lane's handle checks the time first, before anything is reserved;
+/// on a network route the driver's sender holds the message until its
+/// time. On `KARYOS_OK`, `accepted` (may be null) receives the lane and
+/// position. A data-path call: it never waits.
+///
+/// # Safety
+///
+/// As [`karyos_publication_offer`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_publication_offer_at(
+    publication: u64,
+    lane: u32,
+    data: *const u8,
+    length: usize,
+    tx_time: u64,
+    accepted: *mut Accepted,
+) -> i32 {
+    guard(|| {
+        let payload: &[u8] = if length == 0 {
+            &[]
+        } else if data.is_null() || isize::try_from(length).is_err() {
+            return Status::InvalidArgument;
+        } else {
+            // SAFETY: `data` is non-null and points to `length` readable
+            // bytes (the caller's contract), `length` fits an `isize`, and
+            // the slice is used only during the call.
+            unsafe { core::slice::from_raw_parts(data, length) }
+        };
+        match api::publication::offer_at(Handle::from_raw(publication), lane, payload, tx_time) {
+            Ok(done) => {
+                // SAFETY: the caller's contract on `accepted`.
+                unsafe { write_accepted(accepted, done) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// `KARYOS_CLOCK_MONOTONIC`: the host's monotonic clock, a timed lane's
+/// default domain.
+pub(crate) const CLOCK_MONOTONIC: u32 = 0;
+/// `KARYOS_CLOCK_TAI`: the host's `CLOCK_TAI`, Linux only.
+pub(crate) const CLOCK_TAI: u32 = 1;
+
+/// Writes the current time of `domain` (`KARYOS_CLOCK_*`) through `now`:
+/// the time `karyos_publication_offer_at` expects for a lane of that
+/// domain. Callers use it on every platform rather than read the clocks
+/// themselves: on Linux it equals `CLOCK_MONOTONIC` or `CLOCK_TAI`, but on
+/// macOS the monotonic domain has a per-process origin, so a value means
+/// something only within this process (an embedded driver). A data-path
+/// call: it never waits and takes no handle.
+///
+/// # Safety
+///
+/// `now` points to a writable `uint64_t`; null or misaligned returns
+/// `KARYOS_E_INVALID_ARGUMENT`, as does an unknown domain, and nothing is
+/// written then. A domain this platform cannot read returns
+/// `KARYOS_E_UNSUPPORTED`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_clock_now(domain: u32, now: *mut u64) -> i32 {
+    guard(|| {
+        if !writable(now) {
+            return Status::InvalidArgument;
+        }
+        match api::clock::now(domain) {
+            Ok(time) => {
+                // SAFETY: `now` is non-null and aligned, and the caller's
+                // contract makes it a writable `uint64_t`.
+                unsafe { now.write(time) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
 /// Stages a claim of `length` bytes on `lane` of `publication`: writes its
 /// handle through `claim` and, through `buffer`, a pointer to `length`
 /// zeroed bytes the caller fills. The pointer stays valid until
@@ -631,6 +711,163 @@ pub extern "C" fn karyos_publication_close(publication: u64) -> i32 {
             Err(status) => status,
         },
     )
+}
+
+// The outcome streams of guarded publications (F7a-2; quantstratum-docs:
+// karyos/design/ffi-gap-analysis.md §6, guards-and-abort.md G5).
+
+/// `KARYOS_OUTCOME_SUBMITTED`: handed to the backend under an open guard.
+pub(crate) const OUTCOME_SUBMITTED: u32 = 1;
+/// `KARYOS_OUTCOME_CONFIRMED_CANCELLED`: a pending backend operation whose
+/// cancellation the backend established.
+pub(crate) const OUTCOME_CONFIRMED_CANCELLED: u32 = 2;
+/// `KARYOS_OUTCOME_UNKNOWN`: the backend could not establish whether the
+/// operation was handed off.
+pub(crate) const OUTCOME_UNKNOWN: u32 = 3;
+/// `KARYOS_OUTCOME_REJECTED`: refused at the gate under a closed or changed
+/// guard.
+pub(crate) const OUTCOME_REJECTED: u32 = 4;
+/// `KARYOS_OUTCOME_ABORTED`: aborted before submission.
+pub(crate) const OUTCOME_ABORTED: u32 = 5;
+/// `KARYOS_OUTCOME_RANGE`: a receiver's delivered prefix and unresolved
+/// range.
+pub(crate) const OUTCOME_RANGE: u32 = 16;
+/// `KARYOS_OUTCOME_INTERRUPTED`: a required receiver that did not
+/// acknowledge an abort.
+pub(crate) const OUTCOME_INTERRUPTED: u32 = 17;
+/// `KARYOS_OUTCOME_ENDED`: the summary that ends an incarnation's records.
+pub(crate) const OUTCOME_ENDED: u32 = 18;
+/// `KARYOS_OUTCOME_OUTCOMES_LOST`: the final record of a faulted client.
+pub(crate) const OUTCOME_OUTCOMES_LOST: u32 = 19;
+
+/// `karyos_outcome`: one outcome record, handed to the handler for the
+/// call only. `size` is this version's `sizeof(karyos_outcome)`: a handler
+/// built against an older header reads only the fields it knows.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Outcome {
+    /// The struct's size in bytes, set by the library.
+    pub size: u32,
+    /// A `KARYOS_OUTCOME_*` kind; a newer library may add kinds.
+    pub kind: u32,
+    /// The lane, 0 to 3.
+    pub lane: u32,
+    /// The receiver index, for range kinds; 0 otherwise.
+    pub receiver: u32,
+    /// The record's sequence.
+    pub sequence: u64,
+    /// The incarnation.
+    pub incarnation: u64,
+    /// Message start position, or a receiver's contiguous delivered prefix.
+    pub start: u64,
+    /// Message end position, or the unresolved range end.
+    pub end: u64,
+    /// The guard epoch at the decision, or of the abort.
+    pub epoch: u64,
+    /// The reason, for rejected, aborted and range kinds.
+    pub reason: u64,
+    /// The lost count, for `KARYOS_OUTCOME_OUTCOMES_LOST` only.
+    pub lost: u64,
+}
+
+/// `karyos_outcome_handler`: called once per record with the caller's
+/// `context` and the record, valid only during the call. It must return
+/// normally.
+pub type OutcomeHandler = Option<unsafe extern "C" fn(*mut c_void, *const Outcome)>;
+
+/// The `KARYOS_OUTCOME_*` code of `kind`.
+fn outcome_kind(kind: karyos_sys::outcome_ring::Kind) -> u32 {
+    use karyos_sys::outcome_ring::Kind;
+    match kind {
+        Kind::Submitted => OUTCOME_SUBMITTED,
+        Kind::ConfirmedCancelled => OUTCOME_CONFIRMED_CANCELLED,
+        Kind::Unknown => OUTCOME_UNKNOWN,
+        Kind::Rejected => OUTCOME_REJECTED,
+        Kind::Aborted => OUTCOME_ABORTED,
+        Kind::Range => OUTCOME_RANGE,
+        Kind::Interrupted => OUTCOME_INTERRUPTED,
+        Kind::Ended => OUTCOME_ENDED,
+        Kind::OutcomesLost => OUTCOME_OUTCOMES_LOST,
+    }
+}
+
+/// `record`, of `sequence`, as the C ABI hands it to a handler.
+fn outcome(sequence: u64, record: &karyos_sys::outcome_ring::Record) -> Outcome {
+    Outcome {
+        size: size_of_u32::<Outcome>(),
+        kind: outcome_kind(record.kind),
+        lane: u32::from(record.lane),
+        receiver: u32::from(record.receiver),
+        sequence,
+        incarnation: record.incarnation,
+        start: record.start,
+        end: record.end,
+        epoch: record.epoch,
+        reason: record.reason,
+        lost: record.lost,
+    }
+}
+
+/// Delivers at most `limit` outcome records of `lane` of `publication` to
+/// `handler`, in sequence order, and writes how many through `delivered`
+/// (may be null), also on failure: a failed poll's status follows the
+/// records delivered before it. A `limit` of 0 delivers nothing. A
+/// data-path call: it never waits and never allocates.
+///
+/// A lane that is not guarded has no records: 0 with `KARYOS_OK`, as has
+/// lane 0 of a concurrent handle, which is never guarded; a lane the
+/// publication does not configure returns `KARYOS_E_INVALID_LANE`. After
+/// the driver's final `KARYOS_OUTCOME_OUTCOMES_LOST` record the stream has
+/// ended: later polls deliver 0 with `KARYOS_OK`, and offers and claims
+/// return `KARYOS_E_OUTCOMES_LOST`. The handler runs while the publication
+/// is held: from it, offering, claiming, polling or closing this
+/// publication, or closing its client, returns `KARYOS_E_REENTRANT`.
+///
+/// A binding stops a poll after a failed handler with the bounded poll of
+/// ADR-0067: a `limit` of 1 in a loop, and no call after the failure. The
+/// failed record is consumed; the ones after it stay undelivered.
+///
+/// # Safety
+///
+/// `handler` is null or a function of the `karyos_outcome_handler`
+/// signature that returns normally; `context` is passed to it untouched;
+/// `delivered` is null or points to a writable `uint32_t`. A null
+/// `handler` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_publication_poll_outcomes(
+    publication: u64,
+    lane: u32,
+    handler: OutcomeHandler,
+    context: *mut c_void,
+    limit: u32,
+    delivered: *mut u32,
+) -> i32 {
+    guard(|| {
+        let Some(handler) = handler else {
+            return Status::InvalidArgument;
+        };
+        if !delivered.is_null() && !delivered.is_aligned() {
+            return Status::InvalidArgument;
+        }
+        let mut call = |sequence: u64, record: &karyos_sys::outcome_ring::Record| {
+            let outcome = outcome(sequence, record);
+            // SAFETY: `handler` has the handler's signature and returns
+            // normally (the caller's contract); `outcome` outlives the
+            // call, which only reads it.
+            unsafe { handler(context, &raw const outcome) };
+        };
+        let (status, count) =
+            match api::outcomes::poll(Handle::from_raw(publication), lane, limit, &mut call) {
+                Ok(count) => (Status::Ok, count),
+                Err((failure, count)) => (failure.status, count),
+            };
+        if !delivered.is_null() {
+            // SAFETY: `delivered` is non-null and aligned, and the caller's
+            // contract makes it a writable `uint32_t`.
+            unsafe { delivered.write(count) };
+        }
+        status
+    })
 }
 
 // Subscriptions and their poll (F4; quantstratum-docs:

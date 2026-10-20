@@ -475,6 +475,20 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos:udp` URI with the new `ClientError::InvalidOptions` before
   anything is requested. The facade re-exports `SubscriptionOptions`,
   `SubscriberRole`, `RejoinPolicy`, `Secondary` and `SnapshotSource`.
+- The C ABI's scheduled offer (quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md` §6, F7a-3):
+  `karyos_publication_offer_at(publication, lane, data, length, tx_time,
+  accepted)` offers on a timed lane at its requested time, with
+  `KARYOS_E_INVALID_SCHEDULE` for a lane that is not timed, a time below
+  the lane's last, one past its horizon or an overflowing deadline; and
+  `karyos_clock_now(domain, now)` with `KARYOS_CLOCK_MONOTONIC` and
+  `KARYOS_CLOCK_TAI`, the time it expects, which callers read on every
+  platform (on macOS the monotonic domain has a per-process origin). An
+  unknown domain is `KARYOS_E_INVALID_ARGUMENT`, and `CLOCK_TAI` off Linux
+  `KARYOS_E_UNSUPPORTED`. The conformance format gains both calls and the
+  `schedule_capacity` argument of `karyos_driver_add_stream`, with the
+  scenario `publication.timed.offer`.
+
 - `Publication::offer_at_on(lane, payload, tx_time)` on the client facade
   (quantstratum-docs: `karyos/design/timed-tx.md`; owner item 57): a timed
   offer on one lane of a publication, checked by the lane's handle before
@@ -1053,6 +1067,32 @@ release may break APIs, wire formats and shared-memory layouts.
   of `karyos-ffi` (SPEC.md §14). The conformance runner gains the driver
   and client calls and variable arguments; new scenarios cover use after
   close, double close and a handle of the wrong kind.
+- `karyos-ffi` guarded publications and their outcome streams (batch
+  F7a-2): `karyos_client_add_publication` takes a guarded stream's
+  publication for a client of a driver in another process, which binds its
+  guard and outcome ring (G-x3); an embedded driver's client is refused one
+  with `KARYOS_E_REFUSED`, detail code 6 (invalid publication mode), as in
+  Rust. `karyos_publication_poll_outcomes` hands up to `limit` records of a
+  lane to a `karyos_outcome_handler`, in sequence order, each as a
+  `karyos_outcome` (72 bytes: its size, a `KARYOS_OUTCOME_*` kind, lane,
+  receiver, sequence, incarnation, start, end, epoch, reason and lost)
+  valid for the call; it never waits and never allocates. An unguarded
+  lane and lane 0 of a concurrent handle have no records. After the final
+  `KARYOS_OUTCOME_OUTCOMES_LOST` record, polls deliver 0 and offers and
+  claims return `KARYOS_E_OUTCOMES_LOST`, as the facade's do. The
+  handler's calls on its publication are `KARYOS_E_REENTRANT`. Tests over
+  an in-process guarded publication run under Miri; a remote client's runs
+  end to end on Linux. The guard operator API is not exported (owner item
+  59).
+- karyos-client's `Publication::from_handles`: the facade publication over
+  the handles of an in-process driver's stream, lane 0 first, as
+  `EmbeddedDriver::publication` returns them. It refuses no handles, lanes
+  out of order and handles of different streams, and hands them back; that
+  they are of one registration is the caller's duty. A client cannot
+  release such handles to their driver: its `remove_publication` drops
+  them and counts them in `publication_releases_failed`. Needed by the C
+  ABI's outcome tests under Miri (F7a-2); owner item 57 lists it for the
+  alpha.2 audit.
 - `karyos_protocol::cnc::ErrorCode::code` is public: the wire value of a
   refusal code, which the C ABI reports as a detail.
 - Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:

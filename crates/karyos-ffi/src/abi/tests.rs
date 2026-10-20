@@ -287,6 +287,9 @@ const STREAM_UNCONNECTED: i32 = 1002;
 /// A stream shared by two concurrent publication handles.
 const STREAM_CONCURRENT: i32 = 1003;
 
+/// A timed stream: a schedule ring of four entries, the default settings.
+const STREAM_TIMED: i32 = 1004;
+
 /// A driven driver with the streams, and two conductors of it. Its clients
 /// are timed out only after an hour without a heartbeat: under Miri, a
 /// client a test has not used yet would otherwise be retired first.
@@ -313,6 +316,9 @@ fn driven() -> (
         allow_non_lse: true,
     };
     let _ = driver.add_stream(shared).unwrap();
+    let mut timed = stream_config(STREAM_TIMED);
+    timed.buffer.schedule_capacity = 4;
+    let _ = driver.add_stream(timed).unwrap();
     let ours = driver.connect().unwrap();
     let theirs = driver.connect().unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -388,6 +394,33 @@ fn offer(publication: u64, payload: &[u8]) -> (i32, Accepted) {
         karyos_publication_offer(publication, 0, payload.as_ptr(), payload.len(), &mut done)
     };
     (status, done)
+}
+
+/// `karyos_publication_offer_at` of `payload` on lane 0 at `tx_time`.
+fn offer_at(publication: u64, payload: &[u8], tx_time: u64) -> (i32, Accepted) {
+    let mut done = accepted();
+    // SAFETY: `payload` is live for the call; `done` is a live
+    // `karyos_accepted` with its size.
+    let status = unsafe {
+        karyos_publication_offer_at(
+            publication,
+            0,
+            payload.as_ptr(),
+            payload.len(),
+            tx_time,
+            &mut done,
+        )
+    };
+    (status, done)
+}
+
+/// `karyos_clock_now` of `domain`: the status and the time written, the
+/// marker `u64::MAX` when nothing was.
+fn clock_now(domain: u32) -> (i32, u64) {
+    let mut now = u64::MAX;
+    // SAFETY: a live, aligned `u64`.
+    let status = unsafe { karyos_clock_now(domain, &mut now) };
+    (status, now)
 }
 
 /// `karyos_publication_claim`: the status, the claim and the buffer.
@@ -1437,3 +1470,111 @@ fn next_image_change_checks_its_struct_before_its_handle() {
     // Nothing was written: the handle failed after the check.
     assert_eq!((has, change.image_id), (u32::MAX, 7));
 }
+
+/// F7a-3 (quantstratum-docs: karyos/design/ffi-gap-analysis.md §6): the
+/// monotonic clock reads, never backwards; an unknown domain and a null or
+/// misaligned out-pointer are refused and nothing is written.
+#[test]
+fn the_clock_reads_the_monotonic_domain_and_refuses_bad_arguments() {
+    let (status, first) = clock_now(CLOCK_MONOTONIC);
+    assert_eq!(status, Status::Ok.code());
+    let (status, second) = clock_now(CLOCK_MONOTONIC);
+    assert_eq!(status, Status::Ok.code());
+    assert!(second >= first);
+    assert_eq!(clock_now(7), (Status::InvalidArgument.code(), u64::MAX));
+    // SAFETY: a null pointer, which the call refuses before any write.
+    let status = unsafe { karyos_clock_now(CLOCK_MONOTONIC, core::ptr::null_mut()) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    let mut words = [0u64; 2];
+    let misaligned = words
+        .as_mut_ptr()
+        .cast::<u8>()
+        .wrapping_add(1)
+        .cast::<u64>();
+    // SAFETY: a misaligned pointer, which the call refuses before any
+    // write.
+    let status = unsafe { karyos_clock_now(CLOCK_MONOTONIC, misaligned) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    assert_eq!(words, [0, 0]);
+}
+
+/// F7a-3: `CLOCK_TAI` is a platform capability: read on Linux when the
+/// kernel serves it, `KARYOS_E_UNSUPPORTED` otherwise (never a bad
+/// schedule), with nothing written.
+#[test]
+#[cfg_attr(miri, ignore = "Miri's isolation reads no CLOCK_TAI")]
+fn the_tai_clock_is_read_where_the_platform_has_it() {
+    let (status, now) = clock_now(CLOCK_TAI);
+    #[cfg(target_os = "linux")]
+    let served = karyos_sys::host_clock::host_tai_ns().is_some();
+    #[cfg(not(target_os = "linux"))]
+    let served = false;
+    if served {
+        assert_eq!(status, Status::Ok.code());
+        assert_ne!(now, u64::MAX);
+    } else {
+        assert_eq!((status, now), (Status::Unsupported.code(), u64::MAX));
+    }
+}
+
+/// F7a-3: a timed offer's arguments are checked as an offer's, before the
+/// handle: a null payload of a length is refused, and a handle that is
+/// none answers its status with nothing written.
+#[test]
+fn a_timed_offer_checks_its_arguments_first() {
+    let mut done = accepted();
+    // SAFETY: a null payload of a length, refused before any read.
+    let status = unsafe { karyos_publication_offer_at(1, 0, core::ptr::null(), 4, 0, &mut done) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    let (status, done) = offer_at(u64::MAX, b"x", 0);
+    assert_eq!(status, Status::InvalidHandle.code());
+    assert_eq!((done.lane, done.position), (u32::MAX, u64::MAX));
+}
+
+/// F7a-3: a timed lane granted over the in-process command ring (T-x2)
+/// takes a timed offer, delivered; a plain offer, a time below the lane's
+/// last or past its horizon, a lane that is not timed and a concurrent
+/// handle are refused with `KARYOS_E_INVALID_SCHEDULE`, and an unconfigured
+/// lane with `KARYOS_E_INVALID_LANE`.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_timed_lane_takes_a_timed_offer() {
+    let (_driven, ours, theirs) = driven();
+    let context = test_context();
+    let client = client::insert_embedded(Client::with_conductor(ours, context.clone()))
+        .unwrap()
+        .raw();
+    let mut subscriber = Client::with_conductor(theirs, context);
+    let mut reading = subscriber
+        .add_subscription("karyos:ipc", karyos_client::StreamId::new(STREAM_TIMED))
+        .unwrap();
+    let (status, publication) = add_publication_of(client, STREAM_TIMED);
+    assert_eq!(status, Status::Ok.code());
+    let (status, now) = clock_now(CLOCK_MONOTONIC);
+    assert_eq!(status, Status::Ok.code());
+    let (status, done) = offer_at(publication, b"timed", now);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(done.lane, 0);
+    let schedule = Status::InvalidSchedule.code();
+    assert_eq!(offer(publication, b"plain").0, schedule);
+    assert_eq!(offer_at(publication, b"back", now - 1).0, schedule);
+    assert_eq!(
+        offer_at(publication, b"far", now + 60_000_000_000).0,
+        schedule
+    );
+    let mut ignored = accepted();
+    // SAFETY: a live payload and `karyos_accepted`.
+    let status =
+        unsafe { karyos_publication_offer_at(publication, 1, b"x".as_ptr(), 1, now, &mut ignored) };
+    assert_eq!(status, Status::InvalidLane.code());
+    // A lane that is not timed, and a concurrent handle.
+    let (status, plain) = add_publication(client);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(offer_at(plain, b"x", now).0, schedule);
+    let (status, concurrent) = add_concurrent(client);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(offer_at(concurrent, b"x", now).0, schedule);
+    assert_eq!(read(&mut subscriber, &mut reading, 1), [b"timed".to_vec()]);
+}
+
+mod outcomes;

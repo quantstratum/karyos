@@ -32,7 +32,7 @@ use karyos_client::{
 use karyos_sys::frame::Lane;
 use karyos_sys::term_bytes::HeapTerms;
 
-use crate::api::client::{AnyClient, clients};
+use crate::api::client::{AnyClient, ClientEntry, clients};
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
 
@@ -144,6 +144,46 @@ impl Lanes {
         })
     }
 
+    /// Delivers up to `limit` outcome records of `lane` to `handler`
+    /// (F7a-2): a lane that is not guarded has none. A concurrent handle
+    /// is never guarded (GC-7): lane 0 has none, any other is invalid.
+    pub(super) fn poll_outcomes_on(
+        &mut self,
+        lane: Lane,
+        limit: usize,
+        handler: impl FnMut(u64, karyos_sys::outcome_ring::Record),
+    ) -> Result<usize, OfferError> {
+        lanes!(self,
+        publication => publication.poll_outcomes_on(lane, limit, handler),
+        _handle => {
+            if lane != Lane::ZERO {
+                return Err(OfferError::InvalidLane { lane });
+            }
+            Ok(0)
+        })
+    }
+
+    /// A timed offer on `lane`: timed lanes are exclusive (GC-7), so a
+    /// concurrent handle has no schedule.
+    fn offer_at_on(
+        &mut self,
+        lane: Lane,
+        payload: &[u8],
+        tx_time: u64,
+    ) -> Result<Placed, OfferError> {
+        lanes!(self,
+        publication => publication.offer_at_on(lane, payload, tx_time).map(placed),
+        handle => {
+            let _ = handle;
+            if lane != Lane::ZERO {
+                return Err(OfferError::InvalidLane { lane });
+            }
+            Err(OfferError::InvalidSchedule {
+                reason: "a concurrent publication is never timed",
+            })
+        })
+    }
+
     /// Claims `length` in `lane`'s term, copies `staged` into it and
     /// commits it.
     fn commit_staged(
@@ -201,7 +241,7 @@ pub(crate) struct Entry {
     /// publication follows its failure and its close
     /// (`crate::api::driver::DriverState::usable`), with no lock.
     driver: Option<crate::api::driver::DriverState>,
-    lanes: Lanes,
+    pub(super) lanes: Lanes,
     /// The staging buffer of its claims.
     staged: Arc<[AtomicU8]>,
     claim: Option<Staged>,
@@ -210,7 +250,7 @@ pub(crate) struct Entry {
 impl Entry {
     /// Whether the publication may act: its client's embedded driver,
     /// if any, is neither poisoned nor closed.
-    fn usable(&self) -> Result<(), Status> {
+    pub(super) fn usable(&self) -> Result<(), Status> {
         self.driver
             .as_ref()
             .map_or(Ok(()), crate::api::driver::DriverState::usable)
@@ -240,7 +280,7 @@ fn claims() -> &'static Table<Handle> {
 }
 
 /// The lane `raw`, or [`Status::InvalidLane`].
-fn lane(raw: u32) -> Result<Lane, Failure> {
+pub(super) fn lane(raw: u32) -> Result<Lane, Failure> {
     u8::try_from(raw)
         .ok()
         .and_then(|lane| Lane::try_new(lane).ok())
@@ -268,26 +308,53 @@ pub(crate) fn add(
             karyos_client::StreamId::new(stream_id),
             concurrent,
         )?;
-        let staged: Arc<[AtomicU8]> = (0..lanes.max_message_length())
-            .map(|_| AtomicU8::new(0))
-            .collect();
-        let publication = Entry {
-            client,
-            driver: entry.driver.clone(),
-            lanes,
-            staged,
-            claim: None,
-        };
-        match table().insert_or_return(publication) {
-            Ok(handle) => {
-                entry.publications.push(handle);
-                Ok(handle)
-            }
-            Err((status, publication)) => {
-                publication.release(&mut entry.client);
-                Err(status.into())
-            }
+        insert(client, entry, lanes)
+    })?
+}
+
+/// Opens a handle over `lanes` of `client`, whose `entry` lists it.
+///
+/// # Errors
+///
+/// [`Status::HandlesExhausted`], with the publication released.
+fn insert(client: Handle, entry: &mut ClientEntry, lanes: Lanes) -> Result<Handle, Failure> {
+    let staged: Arc<[AtomicU8]> = (0..lanes.max_message_length())
+        .map(|_| AtomicU8::new(0))
+        .collect();
+    let publication = Entry {
+        client,
+        driver: entry.driver.clone(),
+        lanes,
+        staged,
+        claim: None,
+    };
+    match table().insert_or_return(publication) {
+        Ok(handle) => {
+            entry.publications.push(handle);
+            Ok(handle)
         }
+        Err((status, publication)) => {
+            publication.release(&mut entry.client);
+            Err(status.into())
+        }
+    }
+}
+
+/// Adds `publication`, built from an in-process driver's handles
+/// (`Publication::from_handles`), to `client`: the outcome poll's path
+/// under Miri, since a guarded publication reaches the C ABI only through
+/// a remote client (F7a-2).
+///
+/// # Errors
+///
+/// The client's handle failures, and [`Status::HandlesExhausted`].
+#[cfg(test)]
+pub(crate) fn insert_local(
+    client: Handle,
+    publication: Publication<HeapTerms>,
+) -> Result<Handle, Failure> {
+    clients().with(client, |entry| {
+        insert(client, entry, Lanes::Embedded(publication))
     })?
 }
 
@@ -303,6 +370,31 @@ pub(crate) fn offer(publication: Handle, lane_raw: u32, payload: &[u8]) -> Resul
         entry
             .lanes
             .offer_on(lane, payload)
+            .map_err(|error| Failure::from(&error))
+    })?
+}
+
+/// Offers `payload` on the timed `lane` with its requested not-before time
+/// `tx_time`, in the lane's clock domain (`quantstratum-docs:
+/// karyos/design/timed-tx.md`).
+///
+/// # Errors
+///
+/// The handle's and the timed offer's failures; [`Status::InvalidSchedule`]
+/// for a lane that is not timed, a time below the lane's last, one past the
+/// horizon or an overflowing deadline.
+pub(crate) fn offer_at(
+    publication: Handle,
+    lane_raw: u32,
+    payload: &[u8],
+    tx_time: u64,
+) -> Result<Placed, Failure> {
+    let lane = lane(lane_raw)?;
+    table().with(publication, |entry| {
+        entry.usable()?;
+        entry
+            .lanes
+            .offer_at_on(lane, payload, tx_time)
             .map_err(|error| Failure::from(&error))
     })?
 }

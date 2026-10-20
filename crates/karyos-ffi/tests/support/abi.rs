@@ -73,6 +73,26 @@ pub struct Detail {
     pub value: u64,
 }
 
+/// `karyos_outcome`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Outcome {
+    pub size: u32,
+    pub kind: u32,
+    pub lane: u32,
+    pub receiver: u32,
+    pub sequence: u64,
+    pub incarnation: u64,
+    pub start: u64,
+    pub end: u64,
+    pub epoch: u64,
+    pub reason: u64,
+    pub lost: u64,
+}
+
+/// `karyos_outcome_handler`.
+type OutcomeHandler = unsafe extern "C" fn(*mut core::ffi::c_void, *const Outcome);
+
 /// `karyos_accepted`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -125,6 +145,23 @@ unsafe extern "C" {
         length: usize,
         accepted: *mut core::ffi::c_void,
     ) -> i32;
+    fn karyos_publication_poll_outcomes(
+        publication: u64,
+        lane: u32,
+        handler: Option<OutcomeHandler>,
+        context: *mut core::ffi::c_void,
+        limit: u32,
+        delivered: *mut u32,
+    ) -> i32;
+    fn karyos_publication_offer_at(
+        publication: u64,
+        lane: u32,
+        data: *const u8,
+        length: usize,
+        tx_time: u64,
+        accepted: *mut core::ffi::c_void,
+    ) -> i32;
+    fn karyos_clock_now(domain: u32, now: *mut u64) -> i32;
     fn karyos_publication_claim(
         publication: u64,
         lane: u32,
@@ -339,6 +376,41 @@ pub fn publication_offer_on(
         )
     };
     (status, accepted)
+}
+
+/// `karyos_publication_offer_at` of `data` on `lane` at `tx_time`, with an
+/// accepted sized as `accepted_size`: the status and the accepted.
+pub fn publication_offer_at(
+    publication: u64,
+    lane: u32,
+    data: &[u8],
+    tx_time: u64,
+    accepted_size: u32,
+) -> (i32, SizedStruct<Accepted>) {
+    let mut accepted = accepted(accepted_size);
+    // SAFETY: `data` is live for the call; `accepted` holds at least
+    // `accepted_size` writable bytes.
+    let status = unsafe {
+        karyos_publication_offer_at(
+            publication,
+            lane,
+            data.as_ptr(),
+            data.len(),
+            tx_time,
+            accepted.as_mut_ptr().cast(),
+        )
+    };
+    (status, accepted)
+}
+
+/// `karyos_clock_now` of `domain`: the status and the time, `None` when
+/// nothing was written.
+pub fn clock_now(domain: u32) -> (i32, Option<u64>) {
+    const UNWRITTEN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    let mut now = UNWRITTEN;
+    // SAFETY: a live, aligned `u64`.
+    let status = unsafe { karyos_clock_now(domain, &mut now) };
+    (status, (now != UNWRITTEN).then_some(now))
 }
 
 /// `karyos_publication_claim` of `length` bytes on `lane`: the status and
@@ -606,4 +678,36 @@ pub fn status_message(status: i32) -> String {
     // SAFETY: the function returns a NUL-terminated static string.
     let text = unsafe { CStr::from_ptr(text) };
     text.to_string_lossy().into_owned()
+}
+
+/// Appends each record to the `Vec<Outcome>` at `context`.
+unsafe extern "C" fn collect(context: *mut core::ffi::c_void, outcome: *const Outcome) {
+    // SAFETY: the library hands a live `Outcome` for the call.
+    let outcome = unsafe { *outcome };
+    // SAFETY: `publication_poll_outcomes` passes a live `Vec<Outcome>`.
+    unsafe { (*context.cast::<Vec<Outcome>>()).push(outcome) };
+}
+
+/// `karyos_publication_poll_outcomes` of `lane`: the status, the count
+/// written and the records handed to the handler.
+pub fn publication_poll_outcomes(
+    publication: u64,
+    lane: u32,
+    limit: u32,
+) -> (i32, u32, Vec<Outcome>) {
+    let mut records = Vec::new();
+    let mut delivered = u32::MAX;
+    // SAFETY: `collect` returns normally and reads the live `records`;
+    // `delivered` is a live, aligned `u32`.
+    let status = unsafe {
+        karyos_publication_poll_outcomes(
+            publication,
+            lane,
+            Some(collect),
+            core::ptr::from_mut(&mut records).cast(),
+            limit,
+            &mut delivered,
+        )
+    };
+    (status, delivered, records)
 }

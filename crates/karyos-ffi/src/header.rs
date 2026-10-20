@@ -38,6 +38,7 @@ fn c_struct(rust: &str) -> &'static str {
         "StreamOptions" => "karyos_stream_options",
         "MessageInfo" => "karyos_message_info",
         "ImageChange" => "karyos_image_change",
+        "Outcome" => "karyos_outcome",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -67,6 +68,8 @@ fn c_type(rust: &str) -> String {
         "*const MessageInfo" => "const karyos_message_info *",
         "*mut ImageChange" => "karyos_image_change *",
         "MessageHandler" => "karyos_message_handler",
+        "*const Outcome" => "const karyos_outcome *",
+        "OutcomeHandler" => "karyos_outcome_handler",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -402,6 +405,22 @@ fn the_header_states_the_driver_constants() {
     assert_eq!(defines["KARYOS_LOSS_ABORT"], i64::from(driver::LOSS_ABORT));
 }
 
+/// The clock domains match the client's codes (`ClockDomain::code`).
+#[test]
+fn the_header_states_the_clock_domains() {
+    use karyos_client::schedule::ClockDomain;
+
+    use crate::abi::{CLOCK_MONOTONIC, CLOCK_TAI};
+    let defines = header_defines();
+    assert_eq!(
+        defines["KARYOS_CLOCK_MONOTONIC"],
+        i64::from(CLOCK_MONOTONIC)
+    );
+    assert_eq!(defines["KARYOS_CLOCK_TAI"], i64::from(CLOCK_TAI));
+    assert_eq!(u64::from(CLOCK_MONOTONIC), ClockDomain::Monotonic.code());
+    assert_eq!(u64::from(CLOCK_TAI), ClockDomain::Tai.code());
+}
+
 #[test]
 fn the_header_states_the_subscription_constants() {
     use crate::abi::{MESSAGE_END_OF_STREAM, MESSAGE_TRACED};
@@ -416,4 +435,30 @@ fn the_header_states_the_subscription_constants() {
         i64::from(MESSAGE_END_OF_STREAM)
     );
     assert_eq!(defines["KARYOS_MESSAGE_TRACED"], i64::from(MESSAGE_TRACED));
+}
+
+#[test]
+fn the_header_states_the_outcome_kinds() {
+    use crate::abi::{
+        OUTCOME_ABORTED, OUTCOME_CONFIRMED_CANCELLED, OUTCOME_ENDED, OUTCOME_INTERRUPTED,
+        OUTCOME_OUTCOMES_LOST, OUTCOME_RANGE, OUTCOME_REJECTED, OUTCOME_SUBMITTED, OUTCOME_UNKNOWN,
+    };
+    let defines = header_defines();
+    for (name, value) in [
+        ("SUBMITTED", OUTCOME_SUBMITTED),
+        ("CONFIRMED_CANCELLED", OUTCOME_CONFIRMED_CANCELLED),
+        ("UNKNOWN", OUTCOME_UNKNOWN),
+        ("REJECTED", OUTCOME_REJECTED),
+        ("ABORTED", OUTCOME_ABORTED),
+        ("RANGE", OUTCOME_RANGE),
+        ("INTERRUPTED", OUTCOME_INTERRUPTED),
+        ("ENDED", OUTCOME_ENDED),
+        ("OUTCOMES_LOST", OUTCOME_OUTCOMES_LOST),
+    ] {
+        assert_eq!(
+            defines[&format!("KARYOS_OUTCOME_{name}")],
+            i64::from(value),
+            "{name}"
+        );
+    }
 }
