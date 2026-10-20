@@ -14,13 +14,13 @@
 //!   a path that is not UTF-8 is written lossily.
 //! - **Enums.** [`DriverState`] is an object with a `state` field
 //!   (`"attached"`, `"closed"`, `"unavailable"`) and its variant's fields;
-//!   an [`AlertKind`] is a string (`"lag"`, `"loss"`, `"guard_ack"`).
+//!   an [`AlertKind`] is a string (`"lag"`, `"loss"`, `"guard_ack"`, `"journal_gap"`).
 
 use std::fmt::Write;
 
 use crate::api::{
     AgentView, Alert, AlertKind, Counter, DriverState, DriverView, ErrorEntry, Feed, GuardEntry,
-    Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
+    JournalView, Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
 };
 
 /// A JSON value being written into a string.
@@ -122,7 +122,87 @@ pub fn view(view: &AgentView) -> String {
         fields
             .key("drivers")
             .array(&view.drivers, |out, driver| driver_view(out, driver));
+        fields
+            .key("journal")
+            .option(view.journal.as_ref(), |out, journal| {
+                journal_view(out, journal)
+            });
     });
+    text
+}
+
+/// The operations journal (M10b).
+fn journal_view(out: &mut Out<'_>, journal: &JournalView) {
+    out.object(|fields| {
+        fields
+            .key("recording")
+            .option(journal.recording, |out, id| out.number(id));
+        fields.key("unsealed").bool(journal.unsealed);
+        fields.key("unavailable").bool(journal.unavailable);
+        fields
+            .key("error")
+            .option(journal.error.as_deref(), |out, error| out.string(error));
+        fields.number("failed_appends", journal.failed_appends);
+        fields.key("gap").option(journal.gap, |out, gap| {
+            out.object(|fields| {
+                fields.number("position", gap.position);
+                fields.number("from", gap.from);
+                fields.number("to", gap.to);
+            });
+        });
+        fields
+            .key("alerts")
+            .array(&journal.alerts, |out, alert| alert_json(out, alert));
+    });
+}
+
+/// A guard operation's answer (M10b): the guard's state after it, or why
+/// it came to nothing; `operation` is the id it was journalled and audited
+/// under, when it was sent.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn guard_answer(answer: &crate::operations::GuardAnswer) -> String {
+    use crate::operations::GuardAnswer;
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match *answer {
+        GuardAnswer::State {
+            operation,
+            guard,
+            state,
+        } => {
+            fields.number("operation", operation);
+            fields.number("guard", guard);
+            fields.key("state").object(|fields| {
+                fields.number("epoch", state.epoch);
+                fields.key("open").bool(state.open);
+            });
+        }
+        GuardAnswer::Refused {
+            operation,
+            code,
+            detail,
+        } => {
+            fields.string("error", "refused");
+            fields.number("operation", operation);
+            fields.number("code", code);
+            fields.number("detail", detail);
+        }
+        GuardAnswer::NoAnswer { operation } => {
+            fields.string("error", "no answer");
+            fields.number("operation", operation);
+        }
+        GuardAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
+        GuardAnswer::UnknownDriver => fields.string("error", "unknown driver"),
+        GuardAnswer::Unattached => fields.string("error", "driver unavailable"),
+    });
+    text
+}
+
+/// The answer to an acknowledged unknown interval (M10b).
+#[must_use]
+pub fn acknowledged(position: u64) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| fields.number("acknowledged", position));
     text
 }
 
@@ -241,6 +321,7 @@ fn alert_json(out: &mut Out<'_>, alert: &Alert) {
                 AlertKind::Lag => "lag",
                 AlertKind::Loss => "loss",
                 AlertKind::GuardAck => "guard_ack",
+                AlertKind::JournalGap => "journal_gap",
             },
         );
         fields.number("stream", alert.stream);

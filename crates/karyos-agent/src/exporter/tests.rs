@@ -107,6 +107,7 @@ fn view() -> AgentView {
     AgentView {
         version: API_VERSION,
         drivers: vec![attached, closed],
+        journal: None,
     }
 }
 

@@ -10,16 +10,21 @@
 //!   this uid; the socket has mode `0600`. A stale socket (one that
 //!   refuses connections) is replaced; a live agent's never is.
 //! - **Who.** The peer's uid (`SO_PEERCRED`) is looked up in the role
-//!   table; a uid not in it is answered `not authorized`. Every v1 request
-//!   reads, so every role may make it; the roles bound the operations M10
-//!   adds.
+//!   table; a uid not in it is answered `not authorized`. Every role may
+//!   read; the roles bound the guard operations (M10b, item 2 interim:
+//!   [`Role::may_close`], [`Role::may_reopen`], [`Role::may_acknowledge`]),
+//!   and an operation the role may not make is answered `forbidden`.
 //! - **Exchange.** One request per connection: a line `KARYOS-AGENT
 //!   <version> <request>`, at most [`MAX_REQUEST`] bytes. The answer is one
 //!   JSON object and a newline, then the agent closes the connection. A
 //!   version other than [`API_VERSION`] is answered with the versions
 //!   supported (`{"error":"unsupported version","supported":[1]}`), so a
 //!   client learns what to ask for. Requests: `view` (the whole
-//!   [`AgentView`](crate::api::AgentView)).
+//!   [`AgentView`](crate::api::AgentView)); `guard-close DIR GUARD
+//!   [REASON]` and `guard-reopen DIR GUARD EPOCH [REASON]`, made for the
+//!   peer's uid as the operator, the reason being the rest of the line
+//!   (M10b; a `DIR` holds no space); `gap-ack POSITION`, an
+//!   administrator's acknowledgement of the journal's unknown interval.
 //! - **Bounds.** Each connection is served on the calling thread with
 //!   [`IO_TIMEOUT`] on its reads and writes, so a slow client delays the
 //!   others by that much at most.
@@ -61,6 +66,27 @@ pub enum Role {
 }
 
 impl Role {
+    /// Whether the role may close a guard: an operator or a risk officer
+    /// (interim matrix, owner item 2).
+    #[must_use]
+    pub const fn may_close(self) -> bool {
+        matches!(self, Self::Operator | Self::RiskOfficer)
+    }
+
+    /// Whether the role may reopen a guard: a risk officer or an
+    /// administrator.
+    #[must_use]
+    pub const fn may_reopen(self) -> bool {
+        matches!(self, Self::RiskOfficer | Self::Administrator)
+    }
+
+    /// Whether the role may acknowledge the journal's unknown interval: an
+    /// administrator.
+    #[must_use]
+    pub const fn may_acknowledge(self) -> bool {
+        matches!(self, Self::Administrator)
+    }
+
     /// The role named `name`: `viewer`, `operator`, `risk-officer` or
     /// `administrator`.
     #[must_use]
@@ -115,6 +141,9 @@ pub enum ServeError {
 pub enum Served {
     /// The view.
     View,
+    /// A guard operation or an acknowledgement, made (whatever came of
+    /// it).
+    Operated,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -196,7 +225,7 @@ impl Server {
     /// # Errors
     ///
     /// The operating system's error when `accept` fails.
-    pub fn poll(&mut self, agent: &Agent) -> Result<Vec<Served>, ServeError> {
+    pub fn poll(&mut self, agent: &mut Agent) -> Result<Vec<Served>, ServeError> {
         let mut served = Vec::new();
         while served.len() < MAX_ACCEPTS {
             match self.listener.accept() {
@@ -209,28 +238,68 @@ impl Server {
     }
 
     /// Answers one connection.
-    fn serve(&self, stream: UnixStream, agent: &Agent) -> Served {
+    fn serve(&self, stream: UnixStream, agent: &mut Agent) -> Served {
         let ready = stream.set_nonblocking(false).is_ok()
             && stream.set_read_timeout(Some(IO_TIMEOUT)).is_ok()
             && stream.set_write_timeout(Some(IO_TIMEOUT)).is_ok();
         if !ready {
             return Served::Dropped;
         }
-        let role = karyos_sys::ipc::peer_credentials(stream.as_fd())
+        let peer = karyos_sys::ipc::peer_credentials(stream.as_fd())
             .ok()
             .and_then(|peer| {
                 let uid = peer.uid.as_raw();
                 self.roles
                     .iter()
                     .find(|(allowed, _)| *allowed == uid)
-                    .map(|(_, role)| *role)
+                    .map(|(_, role)| (uid, *role))
             });
         let Some(line) = read_request(&stream) else {
             return Served::Dropped;
         };
-        let (answer, served) = match (role, parse(&line)) {
+        let forbidden = || (json::error("forbidden", None), Served::Refused);
+        let (answer, served) = match (peer, parse(&line)) {
             (None, _) => (json::error("not authorized", None), Served::Refused),
             (Some(_), Request::View) => (json::view(&agent.view()), Served::View),
+            (Some((uid, role)), Request::GuardClose { dir, guard, reason }) => {
+                if role.may_close() {
+                    let answer = agent.guard_close(Path::new(dir), guard, uid, reason.as_bytes());
+                    (json::guard_answer(&answer), Served::Operated)
+                } else {
+                    forbidden()
+                }
+            }
+            (
+                Some((uid, role)),
+                Request::GuardReopen {
+                    dir,
+                    guard,
+                    expected,
+                    reason,
+                },
+            ) => {
+                if role.may_reopen() {
+                    let answer =
+                        agent.guard_reopen(Path::new(dir), guard, expected, uid, reason.as_bytes());
+                    (json::guard_answer(&answer), Served::Operated)
+                } else {
+                    forbidden()
+                }
+            }
+            (Some((uid, role)), Request::GapAck { position }) => {
+                if role.may_acknowledge() {
+                    let answer = match agent.acknowledge_gap(position, uid) {
+                        Ok(()) => json::acknowledged(position),
+                        Err(crate::journal::JournalError::NoGap) => {
+                            json::error("no such unknown interval", None)
+                        }
+                        Err(_) => json::error("journal unavailable", None),
+                    };
+                    (answer, Served::Operated)
+                } else {
+                    forbidden()
+                }
+            }
             (Some(_), Request::Version) => (
                 json::error("unsupported version", Some(&[API_VERSION])),
                 Served::Refused,
@@ -258,8 +327,22 @@ impl Drop for Server {
 
 /// A request line, as the agent understood it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Request {
+enum Request<'a> {
     View,
+    GuardClose {
+        dir: &'a str,
+        guard: u64,
+        reason: &'a str,
+    },
+    GuardReopen {
+        dir: &'a str,
+        guard: u64,
+        expected: u64,
+        reason: &'a str,
+    },
+    GapAck {
+        position: u64,
+    },
     /// A well-formed request of another version.
     Version,
     Bad,
@@ -277,24 +360,56 @@ fn read_request(stream: &UnixStream) -> Option<String> {
     }
 }
 
-/// `KARYOS-AGENT <version> <request>`, with or without its newline.
-fn parse(line: &str) -> Request {
+/// `KARYOS-AGENT <version> <request> [arguments]`, with or without its
+/// newline. A reason is the rest of the line after the last fixed
+/// argument, single spaces kept.
+fn parse(line: &str) -> Request<'_> {
     if line.len() > MAX_REQUEST {
         return Request::Bad;
     }
-    let mut words = line.trim_end_matches(['\n', '\r']).split(' ');
-    let (Some(PROTOCOL), Some(version), Some(request), None) =
-        (words.next(), words.next(), words.next(), words.next())
+    let line = line.trim_end_matches(['\n', '\r']);
+    let mut words = line.splitn(3, ' ');
+    let (Some(PROTOCOL), Some(version), Some(rest)) = (words.next(), words.next(), words.next())
     else {
         return Request::Bad;
     };
     match version.parse::<u32>() {
-        Ok(API_VERSION) => match request {
-            "view" => Request::View,
-            _ => Request::Bad,
-        },
+        Ok(API_VERSION) => request(rest).unwrap_or(Request::Bad),
         Ok(_) => Request::Version,
         Err(_) => Request::Bad,
+    }
+}
+
+/// A v1 request and its arguments.
+fn request(rest: &str) -> Option<Request<'_>> {
+    let (name, arguments) = rest.split_once(' ').unwrap_or((rest, ""));
+    let number = |word: &str| word.parse::<u64>().ok();
+    match name {
+        "view" if arguments.is_empty() => Some(Request::View),
+        "guard-close" => {
+            let mut fields = arguments.splitn(3, ' ');
+            let dir = fields.next().filter(|dir| !dir.is_empty())?;
+            let guard = number(fields.next()?)?;
+            let reason = fields.next().unwrap_or("");
+            Some(Request::GuardClose { dir, guard, reason })
+        }
+        "guard-reopen" => {
+            let mut fields = arguments.splitn(4, ' ');
+            let dir = fields.next().filter(|dir| !dir.is_empty())?;
+            let guard = number(fields.next()?)?;
+            let expected = number(fields.next()?)?;
+            let reason = fields.next().unwrap_or("");
+            Some(Request::GuardReopen {
+                dir,
+                guard,
+                expected,
+                reason,
+            })
+        }
+        "gap-ack" => Some(Request::GapAck {
+            position: number(arguments)?,
+        }),
+        _ => None,
     }
 }
 
@@ -314,6 +429,72 @@ mod tests {
         assert_eq!(parse(""), Request::Bad);
         let long = format!("KARYOS-AGENT 1 {}", "v".repeat(MAX_REQUEST));
         assert_eq!(parse(&long), Request::Bad);
+    }
+
+    /// M10b: the guard requests and their arguments, a reason being the
+    /// rest of the line.
+    #[test]
+    fn guard_requests_parse_with_their_reason() {
+        assert_eq!(
+            parse("KARYOS-AGENT 1 guard-close /run/a 3 desk halted, see ticket 7\n"),
+            Request::GuardClose {
+                dir: "/run/a",
+                guard: 3,
+                reason: "desk halted, see ticket 7"
+            }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 guard-close /run/a 3"),
+            Request::GuardClose {
+                dir: "/run/a",
+                guard: 3,
+                reason: ""
+            }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 guard-reopen /run/a 3 5 cleared"),
+            Request::GuardReopen {
+                dir: "/run/a",
+                guard: 3,
+                expected: 5,
+                reason: "cleared"
+            }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 gap-ack 96"),
+            Request::GapAck { position: 96 }
+        );
+        for bad in [
+            "KARYOS-AGENT 1 guard-close /run/a",
+            "KARYOS-AGENT 1 guard-close /run/a x",
+            "KARYOS-AGENT 1 guard-close  3",
+            "KARYOS-AGENT 1 guard-reopen /run/a 3",
+            "KARYOS-AGENT 1 guard-reopen /run/a 3 -1",
+            "KARYOS-AGENT 1 gap-ack",
+            "KARYOS-AGENT 1 gap-ack 1 2",
+        ] {
+            assert_eq!(parse(bad), Request::Bad, "{bad}");
+        }
+    }
+
+    /// The interim matrix (owner item 2): operators and risk officers
+    /// close; risk officers and administrators reopen; administrators
+    /// acknowledge; viewers only read.
+    #[test]
+    fn the_roles_bound_the_guard_operations() {
+        let matrix = [
+            (Role::Viewer, false, false, false),
+            (Role::Operator, true, false, false),
+            (Role::RiskOfficer, true, true, false),
+            (Role::Administrator, false, true, true),
+        ];
+        for (role, close, reopen, acknowledge) in matrix {
+            assert_eq!(
+                (role.may_close(), role.may_reopen(), role.may_acknowledge()),
+                (close, reopen, acknowledge),
+                "{role:?}"
+            );
+        }
     }
 
     #[test]

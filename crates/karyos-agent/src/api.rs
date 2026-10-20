@@ -19,6 +19,46 @@ pub struct AgentView {
     pub version: u32,
     /// One entry per configured driver directory, in configuration order.
     pub drivers: Vec<DriverView>,
+    /// The operations journal, when one is configured (M10b).
+    pub journal: Option<JournalView>,
+}
+
+/// The operations journal of the agent's guard operations (M10b; owner
+/// item 7, interim).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JournalView {
+    /// Its recording's id in the journal directory's catalog; `None` when
+    /// it could not be opened.
+    pub recording: Option<u64>,
+    /// Always `true` until A10 seals the journal: its records carry no
+    /// seal yet.
+    pub unsealed: bool,
+    /// Whether it refuses appends: it could not be opened, or an append
+    /// failed. Closes still go ahead; reopens are refused.
+    pub unavailable: bool,
+    /// Why it could not be opened.
+    pub error: Option<String>,
+    /// Appends that failed since the agent started.
+    pub failed_appends: u64,
+    /// The unknown interval not acknowledged yet.
+    pub gap: Option<GapView>,
+    /// The journal's alerts: [`AlertKind::JournalGap`] while `gap` is open.
+    pub alerts: Vec<Alert>,
+}
+
+/// An unknown interval in the journal: operations may have taken effect
+/// without their records between `from` and `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GapView {
+    /// Its record's position, which an acknowledgement names.
+    pub position: u64,
+    /// The last record's time before it (host `CLOCK_MONOTONIC`
+    /// nanoseconds); 0 when none was readable.
+    pub from: u64,
+    /// The start of the agent that recorded it.
+    pub to: u64,
 }
 
 /// One configured driver.
@@ -63,6 +103,10 @@ pub enum AlertKind {
     /// A guard's close is in effect and senders have not applied it past
     /// the driver's `guard_ack_timeout` (M4b's acknowledgements).
     GuardAck,
+    /// The operations journal holds an unknown interval no administrator
+    /// acknowledged (M10b): `participant` is its position, `value` its
+    /// length in nanoseconds, `since` its end.
+    JournalGap,
 }
 
 /// One alert firing.

@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::api::{API_VERSION, LaneLatency, QuantileBounds, TraceCounts};
+use crate::api::{API_VERSION, GapView, JournalView, LaneLatency, QuantileBounds, TraceCounts};
 
 /// One view with every type and every `DriverState` variant, `None` and
 /// `Some` alike.
@@ -184,7 +184,53 @@ fn every_field() -> AgentView {
     AgentView {
         version: API_VERSION,
         drivers: vec![attached, unavailable, closed],
+        journal: Some(JournalView {
+            recording: Some(4),
+            unsealed: true,
+            unavailable: false,
+            error: None,
+            failed_appends: 2,
+            gap: Some(GapView {
+                position: 96,
+                from: 10,
+                to: 70,
+            }),
+            alerts: vec![Alert {
+                kind: AlertKind::JournalGap,
+                stream: 0,
+                lane: 0,
+                participant: 96,
+                value: 60,
+                since: 70,
+            }],
+        }),
     }
+}
+
+/// A journal that could not be opened, written beside the full one.
+#[test]
+fn a_journal_that_could_not_open_is_written_with_its_error() {
+    let agent = AgentView {
+        version: API_VERSION,
+        drivers: Vec::new(),
+        journal: Some(JournalView {
+            recording: None,
+            unsealed: true,
+            unavailable: true,
+            error: Some("no such directory".to_owned()),
+            failed_appends: 0,
+            gap: None,
+            alerts: Vec::new(),
+        }),
+    };
+    assert_eq!(
+        view(&agent),
+        concat!(
+            r#"{"version":1,"drivers":[],"journal":{"recording":null,"unsealed":true,"#,
+            r#""unavailable":true,"error":"no such directory","failed_appends":0,"#,
+            r#""gap":null,"alerts":[]}}"#
+        )
+    );
 }
 
 /// API v1's JSON, field for field. This is the compatibility contract
@@ -192,7 +238,8 @@ fn every_field() -> AgentView {
 /// here, and needs API v2. A field added to v1 is appended to this text:
 /// `latencies` and `trace` (M6c) were, in M8, and `alerts` (M9), each
 /// at the end of its driver, in `DriverView`'s declaration order; a guard
-/// record's `operator` and `parameters` (M10) at the end of the record.
+/// record's `operator` and `parameters` (M10) at the end of the record;
+/// `journal` (M10b) at the end of the view.
 const V1: &str = concat!(
     r#"{"version":1,"drivers":["#,
     r#"{"dir":"/run/karyos/a","state":{"state":"attached"},"#,
@@ -214,7 +261,9 @@ const V1: &str = concat!(
     r#"{"dir":"/run/karyos/c","state":{"state":"closed"},"instance":null,"sample":null,"client_counters":[],"#,
     r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0},"#,
     r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0},"alerts":[]}"#,
-    r#"]}"#,
+    r#"],"journal":{"recording":4,"unsealed":true,"unavailable":false,"error":null,"failed_appends":2,"#,
+    r#""gap":{"position":96,"from":10,"to":70},"#,
+    r#""alerts":[{"kind":"journal_gap","stream":0,"lane":0,"participant":96,"value":60,"since":70}]}}"#,
 );
 
 #[test]
