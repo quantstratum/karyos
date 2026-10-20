@@ -124,6 +124,9 @@ thread_local! {
     /// Makes every growth of a copy on this thread fail, as a refused
     /// allocation (tests).
     pub(crate) static REFUSE_GROWTH: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Makes the poll panic while it hands a message over, with the
+    /// subscription held (tests of the poison).
+    pub(crate) static PANIC_IN_POLL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Grows `copy` to `length` bytes without reallocating twice; never
@@ -206,6 +209,10 @@ pub(crate) fn poll(
                     .map_err(|status| (Failure::from(status), delivered))?;
                 let polled = reader.poll_adopted(
                     |bytes, info| {
+                        #[cfg(test)]
+                        if PANIC_IN_POLL.with(core::cell::Cell::get) {
+                            std::panic::resume_unwind(Box::new("a panic in the poll"));
+                        }
                         if let Some(copied) = copy.get_mut(..bytes.len()) {
                             copied.copy_from_slice(bytes);
                             handler(copied, &info);
@@ -273,7 +280,8 @@ pub(crate) fn copy_length(subscription: Handle) -> Option<usize> {
 ///
 /// The handle's failures, its client's included.
 pub(crate) fn close(subscription: Handle) -> Result<(), Status> {
-    let client = table().with(subscription, |entry| entry.client)?;
+    // A poisoned handle is closed too: its client is read regardless.
+    let client = table().read_even_poisoned(subscription, |entry| entry.client)?;
     clients().with(client, |entry| {
         let removed = table().remove(subscription)?;
         entry.subscriptions.retain(|handle| *handle != subscription);

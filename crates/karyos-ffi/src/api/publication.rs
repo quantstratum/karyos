@@ -311,7 +311,8 @@ pub(crate) fn abort(claim: Handle) -> Result<(), Status> {
 ///
 /// The handle's failures, its client's included.
 pub(crate) fn close(publication: Handle) -> Result<(), Status> {
-    let client = table().with(publication, |entry| entry.client)?;
+    // A poisoned handle is closed too: its client is read regardless.
+    let client = table().read_even_poisoned(publication, |entry| entry.client)?;
     clients().with(client, |entry| {
         let removed = table().remove(publication)?;
         entry.publications.retain(|handle| *handle != publication);

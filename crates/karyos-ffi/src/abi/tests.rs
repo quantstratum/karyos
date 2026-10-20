@@ -799,6 +799,7 @@ fn a_subscription_delivers_each_message_from_its_private_copy() {
 /// The failed message is acknowledged; the ones after it stay undelivered
 /// and are the next poll's.
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn the_bounded_poll_stops_after_a_failed_handler() {
     let (_driven, ours, _theirs) = driven();
     let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
@@ -866,6 +867,7 @@ fn a_handler_that_reenters_its_subscription_is_refused() {
 /// thread's poll answer BUSY, and the client's close answer BUSY with
 /// nothing closed; both work once it returns.
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_subscription_held_by_another_thread_is_busy() {
     use std::sync::{Arc, Barrier};
 
@@ -936,6 +938,7 @@ fn a_subscription_held_by_another_thread_is_busy() {
 /// A `karyos:ipc` subscription has no image change; arguments are checked
 /// before anything else.
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn image_changes_and_bad_arguments() {
     let (_driven, ours, _theirs) = driven();
     let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
@@ -1015,6 +1018,7 @@ fn image_changes_and_bad_arguments() {
 /// nothing is acknowledged, and the next poll delivers the message, with
 /// the copy grown to the stream's largest message.
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_copy_that_cannot_grow_delivers_nothing_and_loses_nothing() {
     let (_driven, ours, _theirs) = driven();
     let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
@@ -1166,5 +1170,44 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
         grow_to(&mut seen, &mut two, &mut second, &largest);
     }
     assert_eq!(api::subscription::copy_length(handle), Some(large_max));
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// A panic inside the poll, while it holds the subscription, returns
+/// INTERNAL instead of unwinding into the caller, and poisons the handle:
+/// every later poll answers INTERNAL, and its close still ends it.
+#[test]
+fn a_panic_in_the_poll_poisons_the_subscription() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let (_, subscription) = add_subscription_of(client, STREAM);
+    let (_, publication) = add_publication(client);
+    assert_eq!(offer(publication, b"boom").0, Status::Ok.code());
+    let mut seen = Seen::default();
+    api::subscription::PANIC_IN_POLL.with(|panics| panics.set(true));
+    let start = std::time::Instant::now();
+    let status = loop {
+        assert!(start.elapsed() < std::time::Duration::from_secs(3600));
+        let _ = poll(client);
+        let (status, _) = poll_into(subscription, &mut seen, 1);
+        if status != Status::Ok.code() {
+            break status;
+        }
+        std::thread::yield_now();
+    };
+    api::subscription::PANIC_IN_POLL.with(|panics| panics.set(false));
+    assert_eq!(status, Status::Internal.code());
+    assert!(seen.messages.is_empty());
+    assert_eq!(
+        poll_into(subscription, &mut seen, 1).0,
+        Status::Internal.code()
+    );
+    assert_eq!(karyos_subscription_close(subscription), Status::Ok.code());
+    assert_eq!(
+        poll_into(subscription, &mut seen, 1).0,
+        Status::Closed.code()
+    );
     assert_eq!(karyos_client_close(client), Status::Ok.code());
 }
