@@ -102,6 +102,11 @@ pub struct AgentConfig {
     /// takes to open a target: 0 drops every prepared replay on the
     /// agent's next cycle, before any attach can find it.
     pub prepared_timeout: Duration,
+    /// How long an attached replay waits for its target's first
+    /// subscriber ([`ReplaySink::ready`]) before it ends unattended
+    /// ([`ReplayOutcome::NoSubscriber`]), having written nothing
+    /// (`quantstratum-docs: karyos/design/archive-host.md`, H2b).
+    pub attach_deadline: Duration,
     /// How long an idle cycle waits for a command.
     pub idle: Duration,
     /// Recording groups captured at once at most (A7d).
@@ -125,6 +130,7 @@ impl Default for AgentConfig {
             max_recordings: 64,
             max_replays: 16,
             prepared_timeout: Duration::from_secs(5),
+            attach_deadline: Duration::from_secs(5),
             idle: Duration::from_millis(1),
             max_groups: 16,
             group_budget: 64,
@@ -442,6 +448,17 @@ pub trait ReplaySink {
     /// The replay ended at `end`: `complete` when it reached its requested
     /// end, else it was stopped or failed.
     fn finish(&mut self, end: u64, complete: bool);
+
+    /// Whether the target is ready for the replay's first step: a target
+    /// that waits for its first reader answers `false` until it has one,
+    /// so that reader reads the replay from its first position. Asked
+    /// before every step until it first answers `true`; never again after.
+    /// A replay that stays not ready past the agent's
+    /// [`AgentConfig::attach_deadline`] ends
+    /// [`ReplayOutcome::NoSubscriber`]. Ready at once by default.
+    fn ready(&mut self) -> bool {
+        true
+    }
 }
 
 /// A replay target that is gone.
@@ -549,6 +566,9 @@ pub enum ReplayOutcome {
     Complete,
     /// Its recording could not be read, or its target closed.
     Failed,
+    /// Its target had no reader within the attach deadline
+    /// ([`ReplaySink::ready`]): it wrote nothing.
+    NoSubscriber,
 }
 
 /// A recording as the catalog lists it, and where it ends now: its stop,
@@ -1243,6 +1263,10 @@ struct ActiveReplay<D: Disk> {
     id: u64,
     source: ReplaySource<D>,
     sink: Box<dyn ReplaySink + Send>,
+    /// When its sink was attached, on the agent's clock.
+    attached: u64,
+    /// Its sink answered ready once; it is not asked again.
+    started: bool,
     /// How it ended, once it did; it leaves the set at the cycle's end.
     ended: Option<ReplayOutcome>,
 }
@@ -1286,7 +1310,13 @@ impl<D: Disk> Replays<D> {
 
     /// Runs the replays in turn, each up to `budget` bytes, all together up
     /// to `share`; returns whether any moved.
-    fn duty(&mut self, now: u64, budget: u64, share: u64, outbox: &Outbox) -> bool {
+    fn duty(
+        &mut self,
+        now: u64,
+        (budget, share, deadline): (u64, u64, Duration),
+        outbox: &Outbox,
+    ) -> bool {
+        let deadline = u64::try_from(deadline.as_nanos()).unwrap_or(u64::MAX);
         let count = self.active.len();
         if count == 0 {
             return false;
@@ -1302,7 +1332,7 @@ impl<D: Disk> Replays<D> {
             let Some(replay) = self.active.get_mut((first + offset) % count) else {
                 break;
             };
-            let (moved, spent, ended) = run_replay(replay, now, budget.min(left));
+            let (moved, spent, ended) = run_replay(replay, now, budget.min(left), deadline);
             worked |= moved || ended.is_some();
             left -= spent.min(left);
             replay.ended = ended;
@@ -1333,7 +1363,21 @@ fn run_replay<D: Disk>(
     replay: &mut ActiveReplay<D>,
     now: u64,
     budget: u64,
+    deadline: u64,
 ) -> (bool, u64, Option<ReplayOutcome>) {
+    // Nothing is written before the target is ready (its first reader
+    // joined): past the deadline the replay ends unattended, having
+    // written nothing, so a reader that joins the target later can only
+    // find it empty and then retired, never part of the replay.
+    if !replay.started {
+        if replay.sink.ready() {
+            replay.started = true;
+        } else if now.saturating_sub(replay.attached) >= deadline {
+            return (false, 0, Some(ReplayOutcome::NoSubscriber));
+        } else {
+            return (false, 0, None);
+        }
+    }
     let mut moved = false;
     let mut spent = 0u64;
     while spent < budget {
@@ -1442,9 +1486,11 @@ fn run<D>(
         // After the recorders, whose positions cover the groups' payloads.
         worked |= state.group_duty(now());
         // After the recorders: they keep priority.
-        worked |= state
-            .replays
-            .duty(now(), config.budget, config.replay_budget, outbox);
+        worked |= state.replays.duty(
+            now(),
+            (config.budget, config.replay_budget, config.attach_deadline),
+            outbox,
+        );
         if !worked {
             match inbox.recv_timeout(config.idle) {
                 Ok(command) => {
@@ -1843,6 +1889,8 @@ impl<D: Disk + Clone> State<D> {
                             id,
                             source: prepared.source,
                             sink,
+                            attached: now,
+                            started: false,
                             ended: None,
                         });
                         Ok(id)
@@ -2433,6 +2481,8 @@ impl<D: Disk + Clone> State<D> {
             id: prepared.replay_id,
             source,
             sink: start.sink,
+            attached: now,
+            started: false,
             ended: None,
         });
         Ok(prepared.replay_id)

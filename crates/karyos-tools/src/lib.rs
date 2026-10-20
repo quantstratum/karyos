@@ -11,9 +11,11 @@
 //! which attach as tools, with their shared command line
 //! ([`args::parse_tool`]); and `karyos-trace` (`quantstratum-docs:
 //! karyos/design/trace-tool.md`), whose command line, mirror reader,
-//! output and run loop live in [`trace`]; and `karyos-tools replay diff`
-//! (`quantstratum-docs: karyos/design/recording-group-replay.md` section
-//! 10), which compares two recording group journals ([`replay`]).
+//! output and run loop live in [`trace`]; and `karyos-replay diff`, with
+//! its alias `karyos-tools replay diff` (`quantstratum-docs:
+//! karyos/design/recording-group-replay.md` section 10,
+//! `karyos/design/archive-host.md` H5), which compares two recording group
+//! journals ([`replay`]).
 
 pub mod archive;
 pub mod args;
