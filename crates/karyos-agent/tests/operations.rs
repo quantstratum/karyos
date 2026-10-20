@@ -5,7 +5,10 @@
 //! M10b): a request of a role that may make it reaches the driver for the
 //! peer's uid, journalled before and after; a role that may not is
 //! refused; a reopen without a journal is refused and never sent; an
-//! unknown interval is acknowledged by an administrator only.
+//! unknown interval is acknowledged by an administrator only. The local
+//! rest of SPEC §13's Audited operations row: a close while the journal
+//! is down goes ahead and leaves an unknown interval, and so does an agent
+//! host that fails during a close.
 
 #![cfg(target_os = "linux")]
 // Test helpers outside #[test] functions are not covered by clippy.toml's
@@ -15,6 +18,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -292,4 +296,190 @@ fn a_long_reason_is_cut_before_its_digest() {
         &reason.as_bytes()[..128],
     );
     assert_eq!(record.parameters, cut);
+}
+
+/// The driver's `clients connected` gauge.
+fn clients_connected(driver: &IpcDriver) -> u64 {
+    use karyos_sys::counters::CellRead;
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .find_map(|index| match reader.read(index) {
+            CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == b"clients connected" => Some(value),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A close while the journal is down goes ahead (No A2): an agent whose
+/// journal cannot be opened closes a guard for a risk officer through the
+/// socket, refuses the reopen unsent, and shows the unknown interval and
+/// its alert until an administrator acknowledges it.
+#[test]
+fn a_close_with_the_journal_down_goes_ahead_into_an_unknown_interval() {
+    let _serial = serial();
+    let dir = dir("journal-down");
+    let mut driver = driver(&dir.join("driver"));
+    let guard = driver.add_guard("orders").unwrap();
+    let _ = driver.reopen_guard(guard, 1, 1).unwrap();
+    // A file where the journal directory should be: it cannot open.
+    std::fs::write(dir.join("journal"), b"not a journal").unwrap();
+    let mut agent = agent(&dir, true);
+    let journal = agent.view().journal.unwrap();
+    assert!(journal.unavailable && journal.error.is_some());
+    let gap = journal.gap.unwrap();
+    assert_eq!(gap.reason, "journal_unavailable_at_start");
+    assert_eq!(journal.alerts.len(), 1);
+    let driver_dir = dir.join("driver");
+    let mut server = Server::bind(ApiConfig::new(
+        dir.join("api"),
+        vec![(own(), Role::RiskOfficer)],
+    ))
+    .unwrap();
+    let close = format!(
+        "KARYOS-AGENT 1 guard-close {} {}\n",
+        driver_dir.display(),
+        guard.id()
+    );
+    let (answer, served) = ask(&mut driver, &mut server, &mut agent, &close);
+    assert_eq!(served, [Served::Operated]);
+    assert!(
+        answer.contains(r#""state":{"epoch":3,"open":false}"#),
+        "{answer}"
+    );
+    assert!(
+        !driver.guard_state(guard).unwrap().open,
+        "the close took effect"
+    );
+    let audited = driver.guard_audit().records.len();
+    let reopen = format!(
+        "KARYOS-AGENT 1 guard-reopen {} {} 3\n",
+        driver_dir.display(),
+        guard.id()
+    );
+    let (answer, _) = ask(&mut driver, &mut server, &mut agent, &reopen);
+    assert_eq!(answer, "{\"error\":\"journal unavailable\"}\n");
+    assert_eq!(driver.guard_audit().records.len(), audited, "never sent");
+    assert!(!driver.guard_state(guard).unwrap().open);
+    // The interval stands, for the close made unrecorded, until an
+    // administrator acknowledges it.
+    let journal = agent.view().journal.unwrap();
+    assert_eq!((journal.gap, journal.alerts.len()), (Some(gap), 1));
+    drop(server);
+    let mut server = Server::bind(ApiConfig::new(
+        dir.join("api"),
+        vec![(own(), Role::Administrator)],
+    ))
+    .unwrap();
+    let ack = format!("KARYOS-AGENT 1 gap-ack {}\n", gap.position);
+    let (answer, served) = ask(&mut driver, &mut server, &mut agent, &ack);
+    assert_eq!(served, [Served::Operated]);
+    assert_eq!(answer, format!("{{\"acknowledged\":{}}}\n", gap.position));
+    let journal = agent.view().journal.unwrap();
+    assert_eq!((journal.gap, journal.alerts.len()), (None, 0));
+}
+
+/// The `karyos-agent` binary serving `dir`'s driver and journal, with this
+/// uid as a risk officer.
+fn spawn_agent(dir: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_karyos-agent"))
+        .arg("--api-dir")
+        .arg(dir.join("api"))
+        .arg("--driver")
+        .arg(dir.join("driver"))
+        .arg("--journal")
+        .arg(dir.join("journal"))
+        .arg("--role")
+        .arg(format!("{}=risk-officer", own()))
+        .arg("--refresh-ms")
+        .arg("10")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// An agent host that fails during a close leaves an unknown interval. The
+/// agent binary journals the close's request, then attaches to the driver
+/// as a one-command client: once the driver counts that client, the
+/// request record is written, and with the driver no longer served no
+/// answer can come, so no outcome. The agent is killed there. The next
+/// agent on that journal shows a request without an outcome, whatever the
+/// driver made of the close, until an administrator acknowledges it.
+#[test]
+fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
+    let _serial = serial();
+    let dir = dir("killed");
+    let mut driver = driver(&dir.join("driver"));
+    let guard = driver.add_guard("orders").unwrap();
+    let _ = driver.reopen_guard(guard, 1, 1).unwrap();
+    let audited = driver.guard_audit().records.len();
+    let mut child = spawn_agent(&dir);
+    let socket = dir.join("api").join(karyos_agent::server::SOCKET_NAME);
+    let start = Instant::now();
+    let mut stream = loop {
+        let _ = driver.do_work().unwrap();
+        if let Ok(stream) = UnixStream::connect(&socket) {
+            break stream;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "no agent socket");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    // The agent reads the CnC as a tool: not a client.
+    assert_eq!(clients_connected(&driver), 0);
+    let close = format!(
+        "KARYOS-AGENT 1 guard-close {} {}\n",
+        dir.join("driver").display(),
+        guard.id()
+    );
+    stream.write_all(close.as_bytes()).unwrap();
+    let start = Instant::now();
+    while clients_connected(&driver) == 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "never attached");
+        let _ = driver.do_work().unwrap();
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    // Attached, so its request record is written. The cycle that admitted
+    // it may also serve a close written in time (admission is served
+    // before commands): an unchanged audit proves no answer exists, and
+    // with the driver no longer served none can come, so no outcome. The
+    // agent's own child, by its pid.
+    assert_eq!(
+        driver.guard_audit().records.len(),
+        audited,
+        "the close was served in the admitting cycle"
+    );
+    child.kill().unwrap();
+    let _ = child.wait().unwrap();
+    let mut answer = String::new();
+    let _ = stream.read_to_string(&mut answer);
+    assert_eq!(answer, "", "the killed agent answered");
+    // Serve the driver past the dead client, whatever it makes of a close
+    // it may have taken.
+    let start = Instant::now();
+    while clients_connected(&driver) != 0 {
+        assert!(start.elapsed() < Duration::from_secs(30), "client kept");
+        let _ = driver.do_work().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let closes = driver.guard_audit().records.len() - audited;
+    assert!(closes <= 1, "{closes} closes audited");
+    let mut agent = agent(&dir, true);
+    let journal = agent.view().journal.unwrap();
+    let gap = journal.gap.unwrap();
+    assert_eq!(gap.reason, "request_without_outcome");
+    assert_eq!(journal.alerts.len(), 1);
+    let mut server = Server::bind(ApiConfig::new(
+        dir.join("api"),
+        vec![(own(), Role::Administrator)],
+    ))
+    .unwrap();
+    let ack = format!("KARYOS-AGENT 1 gap-ack {}\n", gap.position);
+    let (answer, served) = ask(&mut driver, &mut server, &mut agent, &ack);
+    assert_eq!(served, [Served::Operated]);
+    assert_eq!(answer, format!("{{\"acknowledged\":{}}}\n", gap.position));
+    let journal = agent.view().journal.unwrap();
+    assert_eq!((journal.gap, journal.alerts.len()), (None, 0));
 }
