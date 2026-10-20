@@ -1150,8 +1150,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 link.hold(
                     HandOverEntry::new(registration, capability, lease)
                         .with_generation(generation)
-                        .with_publication(publication)
-                        .with_conflation(target.conflation),
+                        .with_publication(publication),
                 );
                 let stream_id = target.id;
                 let incarnation = target.incarnation;
