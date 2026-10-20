@@ -408,6 +408,50 @@ int32_t karyos_publication_offer(uint64_t publication, uint32_t lane,
                                  karyos_accepted *accepted);
 
 /**
+ * Per-offer options of karyos_publication_offer_with. Fill it with
+ * karyos_offer_options_init (reserved_value 0, what
+ * karyos_publication_offer sends), then set reserved_value. The size rule
+ * of karyos_driver_options applies.
+ */
+typedef struct karyos_offer_options {
+    uint32_t size;
+    /* Zero; anything else is KARYOS_E_INVALID_ARGUMENT. */
+    uint32_t reserved;
+    /*
+     * The value every fragment's header carries, which subscribers read as
+     * karyos_message_info.reserved_value. On a conflated stream it is the
+     * message's key, in 0..keys of the stream's table; see
+     * karyos_publication_offer_with.
+     */
+    int64_t reserved_value;
+} karyos_offer_options;
+
+/**
+ * Fills options with the defaults and its size. KARYOS_E_INVALID_ARGUMENT
+ * for a null or misaligned pointer.
+ */
+int32_t karyos_offer_options_init(karyos_offer_options *options);
+
+/**
+ * As karyos_publication_offer, with options: the reserved value every
+ * fragment's header carries. A null options, a size below that of ABI
+ * 0.1.0, or a nonzero reserved returns KARYOS_E_INVALID_ARGUMENT.
+ *
+ * On a conflated stream the driver is authoritative: a key outside the
+ * table never enters the conflated view, and the driver counts it as a
+ * rejected key. A publication whose grant carries the table also refuses
+ * such a key, or a value larger than the capacity, before it appends:
+ * KARYOS_E_CONFLATION, with nothing reserved. A client of a driver in
+ * this process checks; a client attached to a driver in another process
+ * does not yet. Conflation is a view over the log, not a filter on it:
+ * an appended message reaches the stream's subscribers whatever its key.
+ */
+int32_t karyos_publication_offer_with(uint64_t publication, uint32_t lane,
+                                      const uint8_t *data, size_t length,
+                                      const karyos_offer_options *options,
+                                      karyos_accepted *accepted);
+
+/**
  * Offers length bytes at data on the timed lane with its requested
  * not-before time tx_time in the lane's clock domain (karyos_clock_now
  * reads it), copied before it returns; data may be null when length is 0.

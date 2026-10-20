@@ -541,6 +541,35 @@ fn call(step: &Step, at: &str) -> Returned {
             );
             with_accepted(status, &accepted)
         }
+        "karyos_publication_offer_with" => {
+            let arguments = Arguments::new(
+                step,
+                &[
+                    "publication",
+                    "lane",
+                    "payload",
+                    "length",
+                    "size",
+                    "reserved",
+                    "reserved_value",
+                    "accepted_size",
+                ],
+                at,
+            );
+            let (status, mut options) = abi::offer_options();
+            assert_eq!(status, 0, "{at}: karyos_offer_options_init");
+            options.reserved = arguments.narrow("reserved", options.reserved);
+            options.reserved_value = arguments.narrow("reserved_value", options.reserved_value);
+            let (status, accepted) = abi::publication_offer_with(
+                arguments.handle("publication"),
+                arguments.narrow("lane", 0),
+                &arguments.message(),
+                &options,
+                size_argument::<abi::OfferOptions>(&arguments, "size"),
+                size_argument::<abi::Accepted>(&arguments, "accepted_size"),
+            );
+            with_accepted(status, &accepted)
+        }
         "karyos_publication_offer_at" => {
             let arguments = Arguments::new(
                 step,

@@ -93,6 +93,7 @@ The arguments and results of each function are those of the header:
 | `karyos_publication_close` | `publication` (required) | status |
 | `karyos_client_add_subscription_with` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`), `size`, `role`, `rejoin`, `reserved`: the options of `karyos_subscription_options_init` with each given field set | status, `subscription` (on `KARYOS_OK`) |
 | `karyos_subscription_close` | `subscription` (required) | status |
+| `karyos_publication_offer_with` | `publication` (required), `lane` (default 0), `payload` or `length` (one of them), `size`, `reserved`, `reserved_value`: the options of `karyos_offer_options_init` with each given field set, `accepted_size` | status, `lane`, `position`, `tail` |
 
 `payload` is a quoted string whose UTF-8 bytes are the message; `length`
 is a message of that many zero bytes. A `karyos_client_connect` with a

@@ -40,6 +40,7 @@ fn c_struct(rust: &str) -> &'static str {
         "ImageChange" => "karyos_image_change",
         "Outcome" => "karyos_outcome",
         "SubscriptionOptions" => "karyos_subscription_options",
+        "OfferOptions" => "karyos_offer_options",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -69,6 +70,8 @@ fn c_type(rust: &str) -> String {
         "*const MessageInfo" => "const karyos_message_info *",
         "*mut ImageChange" => "karyos_image_change *",
         "*const SubscriptionOptions" => "const karyos_subscription_options *",
+        "*const OfferOptions" => "const karyos_offer_options *",
+        "*mut OfferOptions" => "karyos_offer_options *",
         "*mut SubscriptionOptions" => "karyos_subscription_options *",
         "MessageHandler" => "karyos_message_handler",
         "*const Outcome" => "const karyos_outcome *",
