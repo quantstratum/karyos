@@ -1,0 +1,31 @@
+# A staged claim ends with its publication's close and with its client's
+# close: its first op afterwards, an abort or a commit, answers closed
+# (FORMAT.md, Close). An abort is no close: it never answers ok for a
+# claim its parent already ended.
+format 2
+id op.claim.parent.close
+abi 0.1
+covers "staged claims"
+since B1
+feature claim-retry
+
+op client.connect driver=$driver
+expect ok client=$client
+op publication.add client=$client stream_id=11
+expect ok publication=$p
+op publication.claim publication=$p length=8
+expect ok claim=$a
+op publication.close publication=$p
+expect ok
+op claim.abort claim=$a
+expect status=closed
+op publication.add client=$client stream_id=12
+expect ok publication=$q
+op publication.claim publication=$q length=8
+expect ok claim=$b
+op client.close client=$client
+expect ok
+op claim.abort claim=$b
+expect status=closed
+op claim.commit claim=$b
+expect status=closed

@@ -21,5 +21,5 @@ struct sizes of another minor version: struct.size.driver.options struct.size.st
 # Not §13 rows of their own: the claim semantics every binding shares
 # (BIND-S3 in quantstratum-docs: reviews/2026-10-20-product-open-questions.md)
 # and the clocks of scheduled offers (F7a-3).
-staged claims: claim.outstanding op.claim.published op.claim.retry
+staged claims: claim.outstanding op.claim.published op.claim.retry op.claim.parent.close
 clocks: op.clock.monotonic op.clock.tai

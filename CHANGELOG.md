@@ -656,6 +656,13 @@ release may break APIs, wire formats and shared-memory layouts.
   A replay's end is its target's seal: `EndOfStream` when it ran to its
   requested end, `ImageRetired` when it was stopped; no control message
   tells the requester.
+- Conformance scenario `op.claim.parent.close` (format 2, `claim-retry`,
+  row "staged claims"): a staged claim ends with its publication's close
+  and with its client's close, and its first op afterwards, an abort or
+  a commit, answers `closed` (FORMAT.md, Close). `op.claim.retry` ended
+  its claim by a commit first, so no scenario reached a binding's abort
+  on a claim its parent had ended.
+
 - The libkaryos package carries `lib/pkgconfig/karyos-static.pc` for a
   static link: `karyos.pc`'s `-lkaryos` makes the linker pick the shared
   library even under `pkg-config --static` (macOS ld, and GNU ld without
@@ -2467,6 +2474,11 @@ release may break APIs, wire formats and shared-memory layouts.
   fails when the marker is missing, malformed or differs from the
   reference runner's `FORMATS`, so a retitled or extended FORMAT.md
   cannot break the package unseen. The bindings read neither key.
+- `karyos_message_info.extent` is documented as the facade defines it:
+  the bytes the message takes in the stream, its frames and their
+  alignment, ending at `position + extent`; a pad, an abort or a gap may
+  follow before the next message. `abi.rs` said "to the next one", and
+  `karyos.h` said nothing.
 
 - A guarded client publication gated by the guard word before the
   close's seal landed never released, so the seal never positioned and

@@ -695,6 +695,9 @@ typedef struct karyos_message_info {
     uint32_t lane;
     uint64_t position;
     int64_t reserved_value;
+    /* The bytes the message takes in the stream, its frames and their
+       alignment: its frames end at position + extent (a pad, an abort or
+       a gap may follow before the next message). */
     uint32_t extent;
     int32_t session_id;
     uint32_t flags;
