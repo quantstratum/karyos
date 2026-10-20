@@ -1,0 +1,46 @@
+# A conflated subscription answers typed statuses (SPEC.md §7.1, §10.2,
+# §13): a partial conflation table adds no stream; subscribing needs a
+# stream the driver has, with a table; an offer's key outside the table
+# is refused before it appends; a view with nothing changed delivers
+# nothing; and a closed view's handle is closed.
+format 1
+id conflated.typed.statuses
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=9 conflation_keys=4
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_add_stream driver=$driver stream_id=9 conflation_keys=4 conflation_value_capacity=64
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_add_stream driver=$driver stream_id=9 conflation_keys=4 conflation_value_capacity=64 conflation_journal_capacity=4096
+expect KARYOS_OK
+call karyos_driver_add_stream driver=$driver stream_id=10
+expect KARYOS_OK
+call karyos_driver_subscribe_conflated driver=$driver stream_id=11
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_subscribe_conflated driver=$driver stream_id=10
+expect KARYOS_E_CONFLATION
+call karyos_driver_subscribe_conflated driver=$driver stream_id=9
+expect KARYOS_OK conflated=$view
+call karyos_conflated_poll conflated=$view key_budget=8
+expect KARYOS_OK delivered=0
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_publication client=$client stream_id=9
+expect KARYOS_OK publication=$publication
+call karyos_publication_offer_with publication=$publication payload="v" reserved_value=4
+expect KARYOS_E_CONFLATION
+call karyos_conflated_close conflated=$view
+expect KARYOS_OK
+call karyos_conflated_close conflated=$view
+expect KARYOS_E_CLOSED
+call karyos_conflated_poll conflated=$view
+expect KARYOS_E_CLOSED delivered=0
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

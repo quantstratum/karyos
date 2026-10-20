@@ -52,6 +52,15 @@ extern "C" {
  */
 #define KARYOS_MAX_SUBSCRIPTIONS 4096
 
+/** The most conflated subscriptions open at once. */
+#define KARYOS_MAX_CONFLATED_SUBSCRIPTIONS 4096
+
+/**
+ * The freshness of a conflated value no committed gap covers; any other
+ * freshness is the start of the gap that made the value stale.
+ */
+#define KARYOS_FRESH UINT64_MAX
+
 /** karyos_message_info flags. */
 #define KARYOS_MESSAGE_END_OF_STREAM 1
 #define KARYOS_MESSAGE_TRACED 2
@@ -290,11 +299,14 @@ typedef struct karyos_driver_options {
 
 /**
  * A stream's options, copied by karyos_driver_add_stream: the driver's
- * stream configuration without conflation. Fill it with
+ * stream configuration and its conflation table. Fill it with
  * karyos_stream_options_init, then set stream_id. This version takes lane
  * 0 and KARYOS_PUBLICATION_EXCLUSIVE only (KARYOS_E_INVALID_LANE and
  * KARYOS_E_INVALID_ARGUMENT otherwise); the driver checks the sizes. The
- * size rule of karyos_driver_options applies.
+ * size rule of karyos_driver_options applies, with two layouts: 64 bytes
+ * up to claim_deadline_ns (a stream with no conflation table), and 80
+ * bytes with the conflation fields. A size between them is
+ * KARYOS_E_INVALID_ARGUMENT.
  */
 typedef struct karyos_stream_options {
     uint32_t size;
@@ -326,6 +338,15 @@ typedef struct karyos_stream_options {
     uint32_t on_required_loss;
     /* How long a claim may stay open, in nanoseconds. */
     uint64_t claim_deadline_ns;
+    /*
+     * The stream's conflation table (from 80 bytes): its keys, its largest
+     * value and its update journal, in bytes. All three 0 for none; a
+     * partial set, or a table the driver cannot build, is
+     * KARYOS_E_INVALID_ARGUMENT. An offer's reserved value is its key.
+     */
+    uint32_t conflation_keys;
+    uint32_t conflation_value_capacity;
+    uint64_t conflation_journal_capacity;
 } karyos_stream_options;
 
 /**
@@ -740,6 +761,44 @@ int32_t karyos_driver_add_stream(uint64_t driver, const karyos_stream_options *o
  * driver does not have.
  */
 int32_t karyos_driver_remove_stream(uint64_t driver, int32_t stream_id);
+
+/**
+ * Called once per delivered key with the caller's context, the key, its
+ * latest value's length bytes at data (the reader's private copy, never
+ * the shared table, valid only during the call), the value's version and
+ * its freshness (KARYOS_FRESH, or the start of the gap that made it
+ * stale). It must return normally.
+ */
+typedef void (*karyos_conflated_handler)(void *context, uint32_t key,
+                                         const uint8_t *data, size_t length,
+                                         uint64_t version, uint64_t freshness);
+
+/**
+ * Subscribes to the conflation table of the driver's stream and writes
+ * the conflated subscription's handle. KARYOS_E_INVALID_ARGUMENT for a
+ * stream id the driver does not have, KARYOS_E_CONFLATION for a stream
+ * without a table, KARYOS_E_CLOSED for a stream being removed or a closed
+ * driver; a failure opens nothing.
+ */
+int32_t karyos_driver_subscribe_conflated(uint64_t driver, int32_t stream_id,
+                                          uint64_t *conflated);
+
+/**
+ * Delivers the latest value of at most key_budget changed keys to handler
+ * and writes how many through delivered (may be null), also on failure.
+ * Intermediate versions may be skipped; a key_budget of 0 delivers
+ * nothing. A data-path call: it never waits and never allocates. Once the
+ * table published a terminal invalidation the view is closed: that poll
+ * and every later one return KARYOS_E_CLOSED. From the handler, polling
+ * or closing this view returns KARYOS_E_REENTRANT.
+ */
+int32_t karyos_conflated_poll(uint64_t conflated,
+                              karyos_conflated_handler handler,
+                              void *context, uint32_t key_budget,
+                              uint32_t *delivered);
+
+/** Closes the conflated subscription. */
+int32_t karyos_conflated_close(uint64_t conflated);
 
 /**
  * Opens a client of the driver in this process and writes its handle. The
