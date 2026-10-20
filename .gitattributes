@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# Every pull request appends to CHANGELOG.md; a union merge keeps both
+# entries instead of reporting a conflict.
+CHANGELOG.md merge=union
