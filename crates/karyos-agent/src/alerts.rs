@@ -16,6 +16,12 @@
 //!   loss alert, which counts the records; [`AlertRules::loss_quiet`]
 //!   refreshes without a new one clear it, a refresh that reads nothing
 //!   included. A new driver instance starts the count over.
+//! - **Guard acknowledgement.** A guard whose close is in effect with
+//!   senders overdue (M4b: pending past the driver's `guard_ack_timeout`)
+//!   in a consistent read fires, its value the senders overdue; a
+//!   consistent read with none overdue, the guard gone, or a refresh that
+//!   reads nothing clears it. An inconsistent read changes nothing. A new
+//!   close epoch starts it over.
 //!
 //! An alert carries the host time of the refresh at which it began firing.
 
@@ -93,6 +99,24 @@ struct Losing {
     quiet: u32,
 }
 
+/// What the guard acknowledgement rule reads of one guard
+/// (`karyos_client::guard_acks::GuardAck`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AckRead {
+    pub(crate) guard: u64,
+    pub(crate) consistent: bool,
+    pub(crate) epoch: u64,
+    pub(crate) overdue: u64,
+}
+
+/// A guard's acknowledgement alert while it fires.
+#[derive(Debug, Clone, Copy)]
+struct Overdue {
+    epoch: u64,
+    senders: u64,
+    since: u64,
+}
+
 /// One driver's alert state across refreshes.
 #[derive(Debug, Default)]
 pub(crate) struct Alerts {
@@ -101,6 +125,8 @@ pub(crate) struct Alerts {
     /// last refresh, for this instance.
     losses_seen: u64,
     losing: Option<Losing>,
+    /// By guard id.
+    overdue: BTreeMap<u64, Overdue>,
 }
 
 impl Alerts {
@@ -110,6 +136,7 @@ impl Alerts {
     /// refresh for the loss alert.
     pub(crate) fn detached(&mut self, rules: &AlertRules) {
         self.lagging.clear();
+        self.overdue.clear();
         self.losing = self.losing.and_then(|losing| {
             let quiet = losing.quiet.checked_add(1).unwrap_or(losing.quiet);
             (quiet < rules.loss_quiet.max(1)).then_some(Losing { quiet, ..losing })
@@ -186,6 +213,32 @@ impl Alerts {
         };
     }
 
+    /// Evaluates the guard acknowledgement rule on the `acks` a refresh at
+    /// host time `now` read.
+    pub(crate) fn update_guard_acks(&mut self, acks: &[AckRead], now: u64) {
+        let mut overdue = BTreeMap::new();
+        for ack in acks {
+            let previous = self.overdue.get(&ack.guard).copied();
+            let state = if ack.consistent {
+                (ack.epoch != 0 && ack.overdue > 0).then(|| Overdue {
+                    epoch: ack.epoch,
+                    senders: ack.overdue,
+                    // The same close keeps its start; a new one starts over.
+                    since: previous
+                        .filter(|previous| previous.epoch == ack.epoch)
+                        .map_or(now, |previous| previous.since),
+                })
+            } else {
+                previous
+            };
+            if let Some(state) = state {
+                let _ = overdue.insert(ack.guard, state);
+            }
+        }
+        // A guard not read is gone: it clears.
+        self.overdue = overdue;
+    }
+
     /// The alerts firing.
     pub(crate) fn firing(&self) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self
@@ -212,6 +265,14 @@ impl Alerts {
                 since: losing.since,
             });
         }
+        alerts.extend(self.overdue.iter().map(|(&guard, state)| Alert {
+            kind: AlertKind::GuardAck,
+            stream: 0,
+            lane: 0,
+            participant: guard,
+            value: state.senders,
+            since: state.since,
+        }));
         alerts
     }
 }

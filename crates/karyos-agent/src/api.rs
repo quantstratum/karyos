@@ -51,8 +51,8 @@ pub struct DriverView {
 }
 
 /// What an alert watches (SPEC §11, alerting; management-agent-gap-analysis.md,
-/// M9). Guard pending acknowledgement comes with M4b, replication lag and
-/// clock divergence with the Cluster and the Archive's retention work.
+/// M9). Replication lag and clock divergence come with the Cluster and the
+/// Archive's retention work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AlertKind {
@@ -60,6 +60,9 @@ pub enum AlertKind {
     Lag,
     /// The driver reported unrecoverable losses (its loss report grew).
     Loss,
+    /// A guard's close is in effect and senders have not applied it past
+    /// the driver's `guard_ack_timeout` (M4b's acknowledgements).
+    GuardAck,
 }
 
 /// One alert firing.
@@ -72,10 +75,12 @@ pub struct Alert {
     pub stream: u64,
     /// The lane (`Lag`).
     pub lane: u8,
-    /// The subscriber's registration (`Lag`); 0 when none.
+    /// The subscriber's registration (`Lag`) or the guard id
+    /// (`GuardAck`); 0 when none.
     pub participant: u64,
     /// `Lag`: the lag in bytes at the last consistent sample. `Loss`: the
     /// loss records reported since it began firing, read or overwritten.
+    /// `GuardAck`: the senders overdue at the last consistent read.
     pub value: u64,
     /// Host `CLOCK_MONOTONIC` nanoseconds of the refresh it began firing.
     pub since: u64,

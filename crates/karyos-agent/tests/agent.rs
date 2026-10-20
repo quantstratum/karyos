@@ -183,6 +183,49 @@ fn a_lapped_cursor_reports_what_it_lost() {
     assert_eq!(operations, [7, 8, 9, 10]);
 }
 
+/// The guard acknowledgement alert end to end (M4b): a close whose
+/// registered sender has not applied it past `guard_ack_timeout` fires,
+/// keyed by the guard; once the sender applies it, it clears.
+#[test]
+fn a_close_not_applied_in_time_raises_a_guard_alert() {
+    use karyos_agent::api::AlertKind;
+    use karyos_sys::applied_epoch::Applied;
+    let _serial = serial();
+    let dir = dir("guard-ack");
+    let config = DriverConfig {
+        guard_ack_timeout: 1,
+        ..DriverConfig::default()
+    };
+    let mut driver = driver(&dir, config, 4);
+    // A guard is created closed; open, then closed by a close.
+    let guard = driver.add_guard("orders").unwrap();
+    let _ = driver.reopen_guard(guard, 1, 1).unwrap();
+    let (_sender, cell) = driver.register_guard_sender(guard).unwrap();
+    let mut agent = agent(&[&dir]);
+    refresh_serving(&mut driver, &mut agent);
+    assert!(agent.view().drivers[0].alerts.is_empty());
+    let epoch = match driver.close_guard(guard, 2).unwrap() {
+        karyos_sys::guard::Closed::Now { epoch } => epoch,
+        other => panic!("{other:?}"),
+    };
+    sampled(&mut driver);
+    refresh_serving(&mut driver, &mut agent);
+    let alerts = &agent.view().drivers[0].alerts;
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(
+        (alerts[0].kind, alerts[0].participant, alerts[0].value),
+        (AlertKind::GuardAck, guard.id(), 1)
+    );
+    cell.publish(Applied {
+        epoch,
+        positions: [0; 4],
+        in_flight: 0,
+    });
+    sampled(&mut driver);
+    refresh_serving(&mut driver, &mut agent);
+    assert!(agent.view().drivers[0].alerts.is_empty());
+}
+
 /// REVIEWER-02's F1 on #473: a repeated error updates its record in place,
 /// and the agent shows the driver's count, not the one it first read.
 #[test]
