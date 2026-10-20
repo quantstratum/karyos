@@ -742,6 +742,21 @@ impl<T: TermBytes> ClientSubscription<T> {
         )
     }
 
+    /// [`ClientSubscription::poll_taking`] that never moves to a successor
+    /// mapping, as [`ClientSubscription::poll_holding`] (a merge's live
+    /// reader under the facade's `poll_adopted`).
+    #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
+    pub(crate) fn poll_taking_holding<H>(
+        &mut self,
+        handler: H,
+        message_limit: MessageLimit,
+    ) -> Result<PollSummary, PollError>
+    where
+        H: FnMut(&[u8], MessageInfo) -> bool,
+    {
+        self.poll_with(handler, message_limit, true)
+    }
+
     /// Moves to the successor mapping a holding poll stopped before, if it
     /// is offered (the facade's `adopt`); otherwise the handle stays at its
     /// seal for a later call.

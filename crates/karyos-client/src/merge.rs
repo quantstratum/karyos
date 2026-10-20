@@ -423,8 +423,62 @@ impl<T: TermBytes> LiveMerge<T> {
     )]
     pub fn poll<H>(
         &mut self,
+        handler: H,
+        message_limit: MessageLimit,
+    ) -> Result<MergePoll, MergeFailed>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        self.poll_with(handler, message_limit, false)
+    }
+
+    /// [`LiveMerge::poll`] that never moves the live reader or the replay
+    /// to a successor mapping: at a seal with a successor each stops, and
+    /// [`LiveMerge::adopt`] moves them (the facade's `poll_adopted`).
+    #[expect(clippy::result_large_err, reason = "as LiveMerge::poll")]
+    pub(crate) fn poll_adopted<H>(
+        &mut self,
+        handler: H,
+        message_limit: MessageLimit,
+    ) -> Result<MergePoll, MergeFailed>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        self.poll_with(handler, message_limit, true)
+    }
+
+    /// Moves the live reader and the replay, if it still runs, to the
+    /// successor mapping a holding poll stopped them before.
+    pub(crate) fn adopt(&mut self) {
+        self.live.advance();
+        if let State::Replaying(replay) = &mut self.state {
+            replay.subscription.advance();
+        }
+    }
+
+    /// The live reader's largest message.
+    pub(crate) fn live_max_message_length(&self) -> u32 {
+        self.live.max_message_length()
+    }
+
+    /// The largest message the merge can deliver until the next
+    /// [`LiveMerge::adopt`]: the live reader's, or the replay's while it
+    /// still runs, whichever is larger.
+    pub(crate) fn max_message_length(&self) -> u32 {
+        let live = self.live.max_message_length();
+        match &self.state {
+            State::Replaying(replay) => live.max(replay.subscription.max_message_length()),
+            State::Live { .. } | State::Failed(_) => live,
+        }
+    }
+
+    /// The poll; with `hold`, [`LiveMerge::poll_adopted`]'s.
+    #[expect(clippy::result_large_err, reason = "as LiveMerge::poll")]
+    fn poll_with<H>(
+        &mut self,
         mut handler: H,
         message_limit: MessageLimit,
+        hold: bool,
     ) -> Result<MergePoll, MergeFailed>
     where
         H: FnMut(&[u8], MessageInfo),
@@ -438,8 +492,10 @@ impl<T: TermBytes> LiveMerge<T> {
         }
         let failure = match self.state {
             State::Failed(cause) => Some(cause),
-            State::Replaying(_) => self.replay(&mut handler, message_limit, &mut poll).err(),
-            State::Live { .. } => self.live(&mut handler, message_limit, &mut poll),
+            State::Replaying(_) => self
+                .replay(&mut handler, message_limit, &mut poll, hold)
+                .err(),
+            State::Live { .. } => self.live(&mut handler, message_limit, &mut poll, hold),
         };
         match failure {
             // The live reader's own failure: the merge goes on.
@@ -460,6 +516,7 @@ impl<T: TermBytes> LiveMerge<T> {
         handler: &mut H,
         message_limit: MessageLimit,
         poll: &mut MergePoll,
+        hold: bool,
     ) -> Result<(), MergeError>
     where
         H: FnMut(&[u8], MessageInfo),
@@ -482,7 +539,7 @@ impl<T: TermBytes> LiveMerge<T> {
             if !at && poll.summary.delivered == limit {
                 break;
             }
-            let (event, after) = Self::replay_one(replay, cutover, handler)?;
+            let (event, after) = Self::replay_one(replay, cutover, handler, hold)?;
             let step = if at {
                 Self::at_cutover(event, cutover)?
             } else {
@@ -606,34 +663,36 @@ impl<T: TermBytes> LiveMerge<T> {
     }
 
     /// One replay poll of at most one message; returns what it found and
-    /// the reader's position after it.
+    /// the reader's position after it. With `hold`, a reader at a seal with
+    /// a successor stays there and finds nothing.
     fn replay_one<H>(
         replay: &mut Replay<T>,
         cutover: u64,
         handler: &mut H,
+        hold: bool,
     ) -> Result<(Event, u64), MergeError>
     where
         H: FnMut(&[u8], MessageInfo),
     {
         let mut seen = None;
-        let summary = replay
-            .subscription
-            .poll(
-                |bytes, info| {
-                    seen = Some(if info.position >= cutover {
-                        Event::Duplicate(info.position, bytes.len())
-                    } else if shortest_end(info.position, bytes.len())
-                        .is_none_or(|end| end > cutover)
-                    {
-                        Event::Across(info.position)
-                    } else {
-                        handler(bytes, info);
-                        Event::Delivered(info.position)
-                    });
-                },
-                MessageLimit::new(1),
-            )
-            .map_err(|error| MergeError::Replay(error.cause))?;
+        let mut one = |bytes: &[u8], info: MessageInfo| {
+            seen = Some(if info.position >= cutover {
+                Event::Duplicate(info.position, bytes.len())
+            } else if shortest_end(info.position, bytes.len()).is_none_or(|end| end > cutover) {
+                Event::Across(info.position)
+            } else {
+                handler(bytes, info);
+                Event::Delivered(info.position)
+            });
+        };
+        let polled = if hold {
+            replay
+                .subscription
+                .poll_holding(&mut one, MessageLimit::new(1))
+        } else {
+            replay.subscription.poll(&mut one, MessageLimit::new(1))
+        };
+        let summary = polled.map_err(|error| MergeError::Replay(error.cause))?;
         if let Some(overrun) = summary.overrun.or(summary.closed_by_overrun) {
             return Err(MergeError::ReplayOverrun(overrun));
         }
@@ -662,6 +721,7 @@ impl<T: TermBytes> LiveMerge<T> {
         handler: &mut H,
         message_limit: MessageLimit,
         poll: &mut MergePoll,
+        hold: bool,
     ) -> Option<MergeError>
     where
         H: FnMut(&[u8], MessageInfo),
@@ -678,23 +738,25 @@ impl<T: TermBytes> LiveMerge<T> {
         };
         let mut mismatch = None;
         let mut delivered = 0;
-        let polled = self.live.poll_taking(
-            |bytes, info| {
-                if let Some((position, length)) = *expect
-                    && (info.position != position || bytes.len() != length)
-                {
-                    // Declined: a required reader keeps it pending.
-                    mismatch = Some(info.position);
-                    return false;
-                }
-                *expect = None;
-                *first = false;
-                delivered += 1;
-                handler(bytes, info);
-                true
-            },
-            limit,
-        );
+        let take = |bytes: &[u8], info: MessageInfo| {
+            if let Some((position, length)) = *expect
+                && (info.position != position || bytes.len() != length)
+            {
+                // Declined: a required reader keeps it pending.
+                mismatch = Some(info.position);
+                return false;
+            }
+            *expect = None;
+            *first = false;
+            delivered += 1;
+            handler(bytes, info);
+            true
+        };
+        let polled = if hold {
+            self.live.poll_taking_holding(take, limit)
+        } else {
+            self.live.poll_taking(take, limit)
+        };
         let summary = match polled {
             Ok(summary) => summary,
             Err(error) => {
@@ -783,6 +845,9 @@ pub struct ReplayRejoin<T: TermBytes = HeapTerms> {
     loss: Option<Box<LossReporter>>,
     lane: u8,
     failure: Option<MergeError>,
+    /// A replay handed out by a holding poll, not adopted yet: holding
+    /// polls deliver nothing until [`ReplayRejoin::adopt`].
+    unadopted: bool,
 }
 
 /// Where a [`ReplayRejoin`] stands.
@@ -846,6 +911,7 @@ impl<T: TermBytes> ReplayRejoin<T> {
             loss,
             lane,
             failure: None,
+            unadopted: false,
         }
     }
 
@@ -911,26 +977,106 @@ impl<T: TermBytes> ReplayRejoin<T> {
     #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
     pub fn poll<H>(
         &mut self,
-        mut handler: H,
+        handler: H,
         message_limit: MessageLimit,
     ) -> Result<PollSummary, PollError>
     where
         H: FnMut(&[u8], MessageInfo),
     {
-        if let Rejoin::Asking { overrun, .. } = self.state
-            && let Some(resolved) = self.ask(overrun)
-        {
-            return Ok(resolved);
+        self.poll_with(handler, message_limit, false)
+    }
+
+    /// [`ReplayRejoin::poll`] that moves no reader to a successor mapping
+    /// and reads nothing it has not adopted: a reader at a seal with a
+    /// successor stops there until [`ReplayRejoin::adopt`], and a replay
+    /// handed out in this poll is read only after the next adopt. So no
+    /// message is longer than [`ReplayRejoin::max_message_length`] read
+    /// after the last adopt (the facade's `poll_adopted`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ReplayRejoin::poll`].
+    #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
+    pub(crate) fn poll_adopted<H>(
+        &mut self,
+        handler: H,
+        message_limit: MessageLimit,
+    ) -> Result<PollSummary, PollError>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        self.poll_with(handler, message_limit, true)
+    }
+
+    /// Moves the readers a holding poll stopped at a seal to their
+    /// successor mappings, and lets a replay handed out since the last
+    /// adopt be read.
+    pub(crate) fn adopt(&mut self) {
+        match &mut self.state {
+            Rejoin::Live(live) | Rejoin::Asking { live, .. } => live.advance(),
+            Rejoin::Merging { merge, .. } => merge.adopt(),
+            Rejoin::Moving => {}
+        }
+        self.unadopted = false;
+    }
+
+    /// The largest message the next [`ReplayRejoin::poll_adopted`] can
+    /// deliver: the live reader's, or while an adopted replay merges, the
+    /// larger of its and the replay's. A replay handed out since the last
+    /// adopt counts only from the next one.
+    pub(crate) fn max_message_length(&self) -> u32 {
+        match &self.state {
+            Rejoin::Live(live) | Rejoin::Asking { live, .. } => live.max_message_length(),
+            Rejoin::Merging { merge, .. } if self.unadopted => merge.live_max_message_length(),
+            Rejoin::Merging { merge, .. } => merge.max_message_length(),
+            Rejoin::Moving => 0,
+        }
+    }
+
+    /// The poll; with `hold`, [`ReplayRejoin::poll_adopted`]'s.
+    #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
+    fn poll_with<H>(
+        &mut self,
+        mut handler: H,
+        message_limit: MessageLimit,
+        hold: bool,
+    ) -> Result<PollSummary, PollError>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        if let Rejoin::Asking { overrun, .. } = self.state {
+            if let Some(resolved) = self.ask(overrun) {
+                return Ok(resolved);
+            }
+            if hold && matches!(self.state, Rejoin::Merging { .. }) {
+                // A replay just handed out: read after the next adopt,
+                // which sizes for it.
+                self.unadopted = true;
+            }
+        }
+        if hold && self.unadopted {
+            return Ok(PollSummary::default());
         }
         match &mut self.state {
             Rejoin::Live(live) => {
-                let summary = live.poll(&mut handler, message_limit)?;
+                let summary = if hold {
+                    live.poll_holding(&mut handler, message_limit)?
+                } else {
+                    live.poll(&mut handler, message_limit)?
+                };
                 Ok(self.overran(summary))
             }
-            Rejoin::Merging { merge, .. } => match merge.poll(&mut handler, message_limit) {
-                Ok(poll) => Ok(self.merged(poll.summary)),
-                Err(failed) => self.merge_failed(failed),
-            },
+            Rejoin::Merging { merge, .. } => {
+                let polled = if hold {
+                    merge.poll_adopted(&mut handler, message_limit)
+                } else {
+                    merge.poll(&mut handler, message_limit)
+                };
+                match polled {
+                    Ok(poll) => Ok(self.merged(poll.summary)),
+                    Err(failed) => self.merge_failed(failed),
+                }
+            }
             Rejoin::Asking { .. } | Rejoin::Moving => Ok(PollSummary::default()),
         }
     }

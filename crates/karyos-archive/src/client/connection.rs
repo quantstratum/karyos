@@ -22,12 +22,13 @@
 //! [`Responses::close`] once its transports are taken).
 
 use karyos_client::{
-    Client, ClientConcurrentPublication, ClientError, ConcurrentOfferOutcome, Connection,
-    MessageLimit, RejoinPolicy, StreamId, SubscriberRole, Subscription, SubscriptionOptions,
+    Client, ClientConcurrentPublication, ClientError, ClientSubscription, ConcurrentOfferOutcome,
+    Connection, MessageLimit, RejoinPolicy, ReplayTargetSubscriber, StreamId, SubscriberRole,
+    Subscription, SubscriptionOptions,
 };
 use karyos_sys::term_bytes::TermBytes;
 
-use super::{ControlRequests, ControlResponses};
+use super::{ControlRequests, ControlResponses, ReplayTargets};
 
 /// The two control streams of an Archive, as its host configures them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,5 +210,18 @@ where
             self.oversized = next;
         }
         length
+    }
+}
+
+/// The replay targets of an [`super::ArchiveClient`] over a facade client:
+/// the client's [`ReplayTargetSubscriber`] (`Client::replay_targets`),
+/// whose requests that client's polls submit and complete. A target the
+/// Archive client stops asking for is released by the client.
+impl<T: TermBytes> ReplayTargets<T> for ReplayTargetSubscriber<T>
+where
+    ReplayTargetSubscriber<T>: Send,
+{
+    fn subscribe(&mut self, stream_id: i32, session_id: i32) -> Option<ClientSubscription<T>> {
+        ReplayTargetSubscriber::subscribe(self, stream_id, session_id)
     }
 }

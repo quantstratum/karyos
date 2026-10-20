@@ -20,13 +20,19 @@ use karyos_sys::term::TermId;
 use super::*;
 
 fn buffer() -> Arc<LogBuffer> {
+    buffer_of(MIN_TERM_LENGTH)
+}
+
+/// A buffer of terms of `term_length`, reserving up to an eighth of one:
+/// its largest message grows with it.
+fn buffer_of(term_length: u32) -> Arc<LogBuffer> {
     Arc::new(
         LogBuffer::new(LogBufferConfig {
-            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            term_length: TermLength::try_new(term_length).unwrap(),
             spare_slots: 2,
             max_subscribers: 2,
             mtu: DEFAULT_MTU,
-            max_reserved: MIN_TERM_LENGTH / 8,
+            max_reserved: term_length / 8,
             initial_term_id: TermId::new(7),
             lane: Lane::ZERO,
             session_id: 1,
@@ -182,4 +188,90 @@ fn the_gap_asked_for_runs_to_the_resume() {
         }]
     );
     assert!(rejoin.is_recovering(), "still asking");
+}
+
+/// A provider whose replay is ready at the first ask.
+struct Ready(Option<Box<Replay>>);
+
+impl ReplayProvider for Ready {
+    fn replay(&mut self, _: &ReplayRequest) -> ReplayStatus {
+        self.0
+            .take()
+            .map_or(ReplayStatus::Pending, ReplayStatus::Ready)
+    }
+
+    fn cancel(&mut self) {}
+}
+
+/// F9b (ffi-archive.md): a holding poll reads nothing it has not adopted.
+/// The replay handed out in a `poll_adopted`, of a stream whose messages
+/// can be longer than the live one's, is not read in that poll, and the
+/// largest message stays the live reader's until `adopt`; after it, the
+/// merge delivers every message once, in order.
+#[test]
+fn a_replay_handed_out_in_a_holding_poll_waits_for_the_next_adopt() {
+    let (replayed, live) = (buffer_of(2 * MIN_TERM_LENGTH), buffer());
+    let mut replayed_publication = replayed.publication_owned().unwrap().unwrap();
+    let mut live_publication = live.publication_owned().unwrap().unwrap();
+    // The replay reads from the start; the live reader joins at 20.
+    let replay = ClientSubscription::new(
+        replayed
+            .conductor_owned()
+            .unwrap()
+            .subscribe(Role::Required)
+            .unwrap(),
+    );
+    append(&mut replayed_publication, 0, 30);
+    append(&mut live_publication, 0, 20);
+    let reader = ClientSubscription::new(
+        live.conductor_owned()
+            .unwrap()
+            .subscribe(Role::Required)
+            .unwrap(),
+    );
+    append(&mut live_publication, 20, 30);
+    let (small, large) = (reader.max_message_length(), replay.max_message_length());
+    assert!(large > small, "{large} > {small}");
+    let source = PublicationIdentity::default();
+    let resume = reader.position();
+    let mut rejoin = ReplayRejoin::new(
+        reader,
+        source,
+        Box::new(Ready(Some(Box::new(Replay::new(replay, source))))),
+        Secondary::RejoinAtHead,
+    );
+    let overrun = Overrun {
+        from: 0,
+        lost_to: resume,
+        resume,
+    };
+    rejoin.state = match std::mem::replace(&mut rejoin.state, Rejoin::Moving) {
+        Rejoin::Live(live) => Rejoin::Asking { live, overrun },
+        other => other,
+    };
+    let mut seen = Vec::new();
+    let read = |rejoin: &mut ReplayRejoin, seen: &mut Vec<u32>| {
+        rejoin
+            .poll_adopted(
+                |bytes, _| seen.push(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+                MessageLimit::new(64),
+            )
+            .unwrap()
+            .delivered
+    };
+    // The replay is handed out, and held.
+    assert_eq!(read(&mut rejoin, &mut seen), 0);
+    assert!(rejoin.is_recovering());
+    assert_eq!(rejoin.max_message_length(), small, "not before the adopt");
+    assert_eq!(read(&mut rejoin, &mut seen), 0, "still held");
+    rejoin.adopt();
+    assert_eq!(rejoin.max_message_length(), large);
+    for _ in 0..8 {
+        rejoin.adopt();
+        let _ = read(&mut rejoin, &mut seen);
+    }
+    assert_eq!(seen, (0..30).collect::<Vec<_>>());
+    // Once the replay is merged, only the live reader's size remains.
+    rejoin.adopt();
+    assert_eq!(rejoin.max_message_length(), small);
 }
