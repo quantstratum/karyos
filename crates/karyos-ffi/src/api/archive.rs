@@ -10,12 +10,22 @@
 //! client. A listing is a control call: it holds the Archive handle and its
 //! client while it serves the client and polls the lister, so another
 //! thread meets [`Status::Busy`] and the handler [`Status::Reentrant`].
+//!
+//! A replay's start and stop (F9c, B6; quantstratum-docs:
+//! karyos/design/archive-replay-control.md) are control calls too, over a
+//! [`Replayer`] the handle opens on its first replay call: control streams
+//! of its own, as a rejoin's (F9b), with the next requester id the handle
+//! hands out, so its answers and correlation ids never mix with the
+//! listing's. The handle's close releases them with the listing's.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use karyos_archive::client::connection::{ArchiveConnection, ControlStreams};
 use karyos_archive::client::list::{ListPoll, ListedRecording, ListerConfig, RecordingLister};
+use karyos_archive::client::replay::{
+    ReplaySpec, Replayer, ReplayerConfig, ReplayerError, ReplayerEvent, RequestId,
+};
 #[cfg(test)]
 use karyos_archive::client::{ControlRequests, ControlResponses};
 use karyos_archive::control::ResponseCode;
@@ -77,11 +87,87 @@ impl Lister {
     }
 }
 
+/// The replayer of one connection, over either client's terms (F9c).
+pub(crate) enum Replays {
+    /// Of a client attached to a driver in another process.
+    #[cfg(target_os = "linux")]
+    Remote(
+        Box<
+            Replayer<
+                karyos_archive::client::connection::Requests<karyos_sys::term_bytes::SharedTerms>,
+                karyos_archive::client::connection::Responses<karyos_sys::term_bytes::SharedTerms>,
+            >,
+        >,
+    ),
+    /// Of a client over an embedded driver's conductor.
+    Embedded(
+        Box<
+            Replayer<
+                karyos_archive::client::connection::Requests<karyos_sys::term_bytes::HeapTerms>,
+                karyos_archive::client::connection::Responses<karyos_sys::term_bytes::HeapTerms>,
+            >,
+        >,
+    ),
+    /// In-memory transports with no client (tests: the driverless path).
+    #[cfg(test)]
+    Memory(Box<Replayer<MemoryRequests, MemoryResponses>>),
+}
+
+/// Runs `$body` on the replayer of any transports.
+macro_rules! replays {
+    ($replays:expr, $replayer:ident => $body:expr) => {
+        match $replays {
+            #[cfg(target_os = "linux")]
+            Replays::Remote($replayer) => $body,
+            Replays::Embedded($replayer) => $body,
+            #[cfg(test)]
+            Replays::Memory($replayer) => $body,
+        }
+    };
+}
+
+impl Replays {
+    fn start(&mut self, spec: &ReplaySpec, now: Instant) -> Result<RequestId, ReplayerError> {
+        replays!(self, replayer => replayer.start(spec, now))
+    }
+
+    fn stop(&mut self, replay_id: u64, now: Instant) -> Result<RequestId, ReplayerError> {
+        replays!(self, replayer => replayer.stop(replay_id, now))
+    }
+
+    fn poll(&mut self, now: Instant) -> Option<ReplayerEvent> {
+        replays!(self, replayer => replayer.poll(now))
+    }
+
+    /// Removes its handles from `client`, which opened them.
+    fn release(self, client: &mut AnyClient) {
+        match (self, client) {
+            #[cfg(target_os = "linux")]
+            (Self::Remote(replayer), AnyClient::Remote(client)) => {
+                let (requests, responses) = (*replayer).into_transports();
+                requests.close(client);
+                responses.close(client);
+            }
+            (Self::Embedded(replayer), AnyClient::Embedded(client)) => {
+                let (requests, responses) = (*replayer).into_transports();
+                requests.close(client);
+                responses.close(client);
+            }
+            // A replayer of another kind than its client is never built;
+            // the handles drop, ending their leases.
+            #[cfg(any(target_os = "linux", test))]
+            _ => {}
+        }
+    }
+}
+
 /// An Archive handle's object.
 pub(crate) struct Entry {
     /// The client that opened it; `None` for the tests' in-memory one.
     client: Option<Handle>,
     lister: Lister,
+    /// Its replayer, once a replay call opened it (F9c).
+    replays: Option<Replays>,
     /// How long a listing waits: the options' deadline, or the client's
     /// timeout.
     deadline: Duration,
@@ -106,8 +192,12 @@ pub(crate) struct RejoinSource {
 }
 
 impl Entry {
-    /// Removes the connection's handles from `client`, which opened them.
+    /// Removes the connection's handles from `client`, which opened them,
+    /// the replayer's included.
     pub(crate) fn release(self, client: &mut AnyClient) {
+        if let Some(replays) = self.replays {
+            replays.release(client);
+        }
         match (self.lister, client) {
             #[cfg(target_os = "linux")]
             (Lister::Remote(lister), AnyClient::Remote(client)) => {
@@ -189,6 +279,7 @@ pub(crate) fn connect(client: Handle, options: Options) -> Result<Handle, Failur
         match table().insert_or_return(Entry {
             client: Some(client),
             lister,
+            replays: None,
             deadline,
             streams,
             next_client_id,
@@ -350,6 +441,163 @@ pub(crate) fn rejoin_source(
     })?
 }
 
+/// What a replay call asks once its replayer is open.
+enum ReplayCall<'a> {
+    Start(&'a ReplaySpec),
+    Stop(u64),
+}
+
+/// What a replay call's answer was.
+enum Answered {
+    Started { replay_id: u64, session_id: i32 },
+    Stopped,
+}
+
+/// Starts a replay of `spec` on `archive` (F9c): returns the replay id and
+/// its target's session id, `replay_session_id` of the id. A control call:
+/// it serves the client and polls the replayer until the answer comes or
+/// the connection's deadline passes.
+///
+/// # Errors
+///
+/// [`Status::Refused`] with the Archive's response code;
+/// [`Status::Timeout`] (a late start is stopped by the replayer);
+/// [`Status::Busy`] while `MAX_PENDING` requests wait;
+/// [`Status::InvalidArgument`] for a bad spec, or requester ids the handle
+/// has run out of; the replayer's opening failures; the handles'.
+pub(crate) fn replay(archive: Handle, spec: &ReplaySpec) -> Result<(u64, i32), Failure> {
+    match replay_call(archive, &ReplayCall::Start(spec))? {
+        Answered::Started {
+            replay_id,
+            session_id,
+        } => Ok((replay_id, session_id)),
+        Answered::Stopped => Err(Status::Internal.into()),
+    }
+}
+
+/// Stops replay `replay_id` on `archive` (F9c). A control call, as
+/// [`replay`].
+///
+/// # Errors
+///
+/// As [`replay`]; [`Status::Refused`] with `UnknownReplay`'s code for a
+/// replay the Archive does not run.
+pub(crate) fn stop_replay(archive: Handle, replay_id: u64) -> Result<(), Failure> {
+    match replay_call(archive, &ReplayCall::Stop(replay_id))? {
+        Answered::Stopped => Ok(()),
+        Answered::Started { .. } => Err(Status::Internal.into()),
+    }
+}
+
+fn replay_call(archive: Handle, call: &ReplayCall<'_>) -> Result<Answered, Failure> {
+    let client = table().with(archive, |entry| entry.client)?;
+    match client {
+        Some(client) => clients().with(client, |client_entry| {
+            client_entry.usable()?;
+            table().with(archive, |entry| {
+                replay_entry(entry, Some(&mut client_entry.client), call)
+            })?
+        })?,
+        None => table().with(archive, |entry| replay_entry(entry, None, call))?,
+    }
+}
+
+/// Opens `entry`'s replayer on `client`: the connection's control streams
+/// again, with the next requester id the handle hands out.
+fn open_replays(entry: &mut Entry, client: &mut AnyClient) -> Result<Replays, Failure> {
+    let client_id = entry.next_client_id.ok_or(Status::InvalidArgument)?;
+    let mut config = ReplayerConfig::new(client_id);
+    config.deadline = entry.deadline;
+    let replays = match client {
+        #[cfg(target_os = "linux")]
+        AnyClient::Remote(remote) => {
+            let (requests, responses) = ArchiveConnection::open(remote, entry.streams)
+                .map_err(open_failure)?
+                .into_transports();
+            Replays::Remote(Box::new(Replayer::new(config, requests, responses)))
+        }
+        AnyClient::Embedded(embedded) => {
+            let (requests, responses) = ArchiveConnection::open(embedded, entry.streams)
+                .map_err(open_failure)?
+                .into_transports();
+            Replays::Embedded(Box::new(Replayer::new(config, requests, responses)))
+        }
+    };
+    entry.next_client_id = client_id.checked_add(1);
+    Ok(replays)
+}
+
+fn replay_entry(
+    entry: &mut Entry,
+    mut client: Option<&mut AnyClient>,
+    call: &ReplayCall<'_>,
+) -> Result<Answered, Failure> {
+    if entry.replays.is_none() {
+        let Some(client) = client.as_deref_mut() else {
+            // An in-memory handle comes with its replayer.
+            return Err(Status::Internal.into());
+        };
+        entry.replays = Some(open_replays(entry, client)?);
+    }
+    let deadline = entry.deadline;
+    let Some(replays) = entry.replays.as_mut() else {
+        return Err(Status::Internal.into());
+    };
+    let start = Instant::now();
+    let request = match call {
+        ReplayCall::Start(spec) => replays.start(spec, start),
+        ReplayCall::Stop(replay_id) => replays.stop(*replay_id, start),
+    }
+    .map_err(|error| match error {
+        ReplayerError::Busy => Status::Busy,
+        _ => Status::InvalidArgument,
+    })?;
+    loop {
+        if let Some(client) = client.as_deref_mut() {
+            let _ = client.poll();
+        }
+        let now = Instant::now();
+        // An event of another request is dropped: none waits between
+        // calls, which each wait for their own.
+        match replays.poll(now) {
+            Some(ReplayerEvent::Started {
+                request: answered,
+                replay_id,
+                session_id,
+            }) if answered == request => {
+                return Ok(Answered::Started {
+                    replay_id,
+                    session_id,
+                });
+            }
+            Some(ReplayerEvent::Stopped {
+                request: answered, ..
+            }) if answered == request => return Ok(Answered::Stopped),
+            Some(ReplayerEvent::Refused {
+                request: answered,
+                code,
+                ..
+            }) if answered == request => {
+                return Err(Failure::with(Status::Refused, response_code(code), 0));
+            }
+            Some(ReplayerEvent::Expired { request: answered }) if answered == request => {
+                return Err(Status::Timeout.into());
+            }
+            Some(_) => {}
+            // The replayer expires the request at the deadline; this only
+            // bounds a call whose clock never reaches it (twice the wait).
+            None if now
+                .checked_duration_since(start)
+                .and_then(|waited| waited.checked_sub(deadline))
+                .is_some_and(|past| past > deadline) =>
+            {
+                return Err(Status::Timeout.into());
+            }
+            None => std::thread::yield_now(),
+        }
+    }
+}
+
 /// Closes `archive`: its handles are removed from its client.
 ///
 /// # Errors
@@ -385,9 +633,36 @@ pub(crate) fn insert_memory(
             requests,
             responses,
         ))),
+        replays: None,
         deadline,
         streams: ControlStreams::new(0, 0),
         next_client_id: Some(2),
+    })
+}
+
+/// Opens an Archive handle over in-memory transports whose replayer runs
+/// on `replays` (tests: the driverless path of F9c).
+#[cfg(test)]
+pub(crate) fn insert_memory_replaying(
+    listing: (MemoryRequests, MemoryResponses),
+    replays: (MemoryRequests, MemoryResponses),
+    deadline: Duration,
+) -> Result<Handle, Status> {
+    let mut config = ReplayerConfig::new(2);
+    config.deadline = deadline;
+    table().insert(Entry {
+        client: None,
+        lister: Lister::Memory(Box::new(RecordingLister::new(
+            ListerConfig::new(1),
+            listing.0,
+            listing.1,
+        ))),
+        replays: Some(Replays::Memory(Box::new(Replayer::new(
+            config, replays.0, replays.1,
+        )))),
+        deadline,
+        streams: ControlStreams::new(0, 0),
+        next_client_id: Some(3),
     })
 }
 

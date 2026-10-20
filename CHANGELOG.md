@@ -11,6 +11,10 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
+  `karyos_detail`, `karyos_accepted` and the image change do: it wrote
+  the library's 16 back into a newer caller's struct before. The new
+  `karyos_subscription_end_state` (F9c) follows the same rule.
 - The conformance suite gains format 2 (ADR-0073, owner item 46,
   decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged;
   format 1's `karyos_driver_start` now defaults its `idle_strategy` to
@@ -627,6 +631,26 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyos-ffi` replays an Archive's recordings from C (F9c, B6;
+  quantstratum-docs: `karyos/design/archive-replay-control.md`):
+  `karyos_archive_replay` (with `karyos_replay_options`, read by prefix)
+  starts a replay and writes its id and its target's session id;
+  `karyos_archive_stop_replay` stops it; and
+  `karyos_client_add_replay_subscription` (with
+  `karyos_replay_subscription_options`, null for the defaults) takes the
+  replay target, `KARYOS_E_NOT_CONNECTED` until a `karyos_client_poll`
+  has its grant. An Archive handle's first replay call opens control
+  streams of its own, with the handle's next requester id, so replay and
+  listing answers never mix. `karyos_subscription_end_state` (with the
+  24-byte sized struct `karyos_subscription_end`) reads how a stream
+  subscription ended: `KARYOS_END_*`, with `END_OF_STREAM` for a replay
+  that reached its end, `IMAGE_RETIRED` for one stopped,
+  `STREAM_REMOVED`, `REVOKED`, `CLOSED_BY_OVERRUN`, and `OTHER` for any
+  other reason, a newer core's included, with the raw seal code. A network subscription reads `KARYOS_END_NONE`: its images'
+  ends come through its image changes.
+- `karyos_client`: `From<ClientSubscription<T>> for Subscription<T>`, so a
+  replay target granted by `Client::replay_targets` polls and is released
+  (`Client::remove_subscription`) as any stream subscription.
 - The C ABI's thread rules per handle kind (BIND-S2; quantstratum-docs:
   `karyos/design/embedded-api.md`, "Requirements for the C ABI"), in a
   "Threads" section of `karyos.h`. No handle has thread affinity: every

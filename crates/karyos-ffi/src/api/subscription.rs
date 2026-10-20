@@ -33,6 +33,7 @@ use karyos_client::{
     ImageChange, MergeError, MessageInfo, MessageLimit, RejoiningSubscription, StreamId,
     Subscription, SubscriptionError, SubscriptionPoll,
 };
+use karyos_sys::log_buffer::SealReason;
 use karyos_sys::term_bytes::HeapTerms;
 
 use crate::api::client::{AnyClient, clients};
@@ -178,6 +179,52 @@ fn stop_status(poll: &SubscriptionPoll, network: bool) -> Option<Status> {
     }
 }
 
+/// How a stream subscription ended, as its poll saw it (F9c): the poll that
+/// answered `Closed` or `ClosedByOverrun` records it. A network
+/// subscription outlives its images, whose ends its image changes report,
+/// so it records none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum End {
+    /// The stream sealed at `position`, for `reason`.
+    Sealed {
+        /// Why.
+        reason: SealReason,
+        /// The seal's position.
+        position: u64,
+    },
+    /// Revoked with its client's loss, at its read position.
+    Revoked {
+        /// The read position.
+        position: u64,
+    },
+    /// Closed by its rejoin policy after an overrun, from the first
+    /// position not delivered.
+    ClosedByOverrun {
+        /// The first position not delivered.
+        position: u64,
+    },
+}
+
+/// The end a stopped poll reports, for a stream subscription.
+fn end_of(poll: &SubscriptionPoll, network: bool) -> Option<End> {
+    let summary = &poll.stopped.as_ref()?.summary;
+    if network {
+        return None;
+    }
+    if let Some(overrun) = summary.closed_by_overrun {
+        Some(End::ClosedByOverrun {
+            position: overrun.from,
+        })
+    } else if let Some(position) = summary.closed {
+        Some(End::Sealed {
+            reason: summary.close_reason.unwrap_or(SealReason::Unspecified),
+            position,
+        })
+    } else {
+        summary.revoked.map(|position| End::Revoked { position })
+    }
+}
+
 /// A subscription handle's object.
 #[derive(Debug)]
 pub(crate) struct Entry {
@@ -191,6 +238,8 @@ pub(crate) struct Entry {
     /// The private copy each message is handed from; its length is the
     /// largest message the subscription delivered or can deliver.
     copy: Vec<u8>,
+    /// How it ended, once a poll saw it end (F9c).
+    end: Option<End>,
 }
 
 impl Entry {
@@ -318,27 +367,64 @@ pub(crate) fn add_rejoining(
                 .client
                 .rejoin(reader, source, rejoin.replay_stream_id, secondary)?;
         }
-        let mut copy = Vec::new();
-        if let Err(status) = fit(&mut copy, reader.max_message_length()) {
-            entry.client.remove_subscription(reader);
-            return Err(status.into());
+        insert(entry, client, reader)
+    })?
+}
+
+/// Inserts `reader` of `client` (its `entry`) as a subscription handle, with
+/// its copy buffer; on failure the reader is released.
+fn insert(
+    entry: &mut crate::api::client::ClientEntry,
+    client: Handle,
+    reader: Reader,
+) -> Result<Handle, Failure> {
+    let mut copy = Vec::new();
+    if let Err(status) = fit(&mut copy, reader.max_message_length()) {
+        entry.client.remove_subscription(reader);
+        return Err(status.into());
+    }
+    let subscription = Entry {
+        client,
+        driver: entry.driver.clone(),
+        reader,
+        copy,
+        end: None,
+    };
+    match table().insert_or_return(subscription) {
+        Ok(handle) => {
+            entry.subscriptions.push(handle);
+            Ok(handle)
         }
-        let subscription = Entry {
-            client,
-            driver: entry.driver.clone(),
-            reader,
-            copy,
-        };
-        match table().insert_or_return(subscription) {
-            Ok(handle) => {
-                entry.subscriptions.push(handle);
-                Ok(handle)
-            }
-            Err((status, subscription)) => {
-                subscription.release(&mut entry.client);
-                Err(status.into())
-            }
+        Err((status, subscription)) => {
+            subscription.release(&mut entry.client);
+            Err(status.into())
         }
+    }
+}
+
+/// Adds the subscription of the replay target at `stream_id` and
+/// `session_id` to `client` (F9c): `Status::NotConnected` until a poll of
+/// the client has the target's grant, then a stream subscription like any
+/// other. One target is asked for at a time per client: asking for another
+/// withdraws the one asked for before.
+///
+/// # Errors
+///
+/// [`Status::NotConnected`] until the grant; the client's handle failures,
+/// [`Status::System`] when the copy buffer cannot be allocated, and
+/// [`Status::HandlesExhausted`], with the subscription released.
+pub(crate) fn add_replay(
+    client: Handle,
+    stream_id: i32,
+    session_id: i32,
+) -> Result<Handle, Failure> {
+    clients().with(client, |entry| {
+        entry.usable()?;
+        let reader = entry
+            .client
+            .replay_target(&mut entry.replay_target, stream_id, session_id)
+            .ok_or(Status::NotConnected)?;
+        insert(entry, client, reader)
     })?
 }
 
@@ -362,7 +448,9 @@ pub(crate) fn poll(
                     .usable()
                     .map_err(|status| (Failure::from(status), 0))?;
             }
-            let Entry { reader, copy, .. } = entry;
+            let Entry {
+                reader, copy, end, ..
+            } = entry;
             let mut delivered = 0u32;
             for _ in 0..ROUNDS {
                 let Some(remaining) = limit.checked_sub(delivered).filter(|left| *left > 0) else {
@@ -406,6 +494,9 @@ pub(crate) fn poll(
                     Ok(poll) => {
                         delivered = delivered.checked_add(poll.delivered).unwrap_or(limit);
                         if let Some(status) = stop_status(&poll, reader.is_network()) {
+                            if end.is_none() {
+                                *end = end_of(&poll, reader.is_network());
+                            }
                             return Err((Failure::from(status), delivered));
                         }
                         if !poll.stopped_at_seal {
@@ -443,6 +534,16 @@ pub(crate) fn next_image_change(subscription: Handle) -> Result<Option<ImageChan
 /// The handle's failures.
 pub(crate) fn image_changes_lost(subscription: Handle) -> Result<u64, Status> {
     table().with(subscription, |entry| entry.reader.image_changes_lost())
+}
+
+/// How `subscription` ended, once a poll saw it end (F9c): `None` while it
+/// has not, and always for a network subscription.
+///
+/// # Errors
+///
+/// The handle's failures.
+pub(crate) fn end(subscription: Handle) -> Result<Option<End>, Status> {
+    table().with(subscription, |entry| entry.end)
 }
 
 /// Whether `subscription` recovers a gap, and its last merge failure;

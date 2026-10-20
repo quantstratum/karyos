@@ -196,7 +196,8 @@ fn the_rejoin_state_is_written_by_the_callers_size() {
             newer.state.merge_failure,
             newer.state.reserved
         ),
-        (16, 1, 9, 0)
+        (size_of_u32::<Newer>(), 1, 9, 0),
+        "the caller's size stays"
     );
     assert_eq!(newer.later, u64::MAX);
     let mut exact = SubscriptionRejoin {
@@ -274,7 +275,8 @@ fn the_rejoin_state_checks_its_arguments_and_writes_by_size() {
             newer.state.recovering,
             newer.state.merge_failure
         ),
-        (16, 0, MERGE_NONE)
+        (size_of_u32::<Newer>(), 0, MERGE_NONE),
+        "the caller's size stays"
     );
     assert_eq!(newer.later, u64::MAX);
     assert_eq!(state(0).0, Status::InvalidHandle.code());
@@ -300,12 +302,12 @@ fn each_merge_failure_has_its_code() {
 
 /// The Archive's control streams as a real Archive's server reads and
 /// writes them (#549).
-mod real {
+pub(super) mod real {
     use karyos_archive::server::{RequestSource, ResponseSink};
     use karyos_client::{ClientPublication, ClientSubscription, MessageLimit, OfferOutcome};
 
     /// The request stream as the server reads it.
-    pub(super) struct Reading(pub(super) ClientSubscription);
+    pub(crate) struct Reading(pub(crate) ClientSubscription);
 
     impl RequestSource for Reading {
         fn next(&mut self, out: &mut [u8]) -> Option<usize> {
@@ -324,7 +326,7 @@ mod real {
     }
 
     /// The response stream as the server writes it.
-    pub(super) struct Writing(pub(super) ClientPublication);
+    pub(crate) struct Writing(pub(crate) ClientPublication);
 
     impl ResponseSink for Writing {
         fn send(&mut self, message: &[u8]) -> bool {

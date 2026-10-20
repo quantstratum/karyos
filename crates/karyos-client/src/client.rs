@@ -1822,6 +1822,18 @@ struct Images<T: TermBytes> {
     changes_lost: u64,
 }
 
+/// A stream subscription taken outside [`Client::add_subscription`], such
+/// as a replay target granted by [`Client::replay_targets`], as a
+/// facade subscription: it polls as any stream subscription does, and
+/// [`Client::remove_subscription`] releases it.
+impl<T: TermBytes> From<ClientSubscription<T>> for Subscription<T> {
+    fn from(subscription: ClientSubscription<T>) -> Self {
+        Self {
+            kind: Kind::Stream(Box::new(subscription)),
+        }
+    }
+}
+
 impl<T: TermBytes> Subscription<T> {
     /// The network subscription's registration; `None` for a stream.
     #[must_use]
