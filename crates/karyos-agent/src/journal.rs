@@ -152,7 +152,7 @@ impl JournalRecord {
         }
     }
 
-    /// The record's payload: [`WORDS`] little-endian words (the layout's
+    /// The record's payload: eleven little-endian words (the layout's
     /// version, the kind, then the fields in declaration order, then the
     /// reason's length) and the reason, cut to [`MAX_REASON`] bytes.
     #[must_use]
