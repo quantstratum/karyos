@@ -445,6 +445,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The C ABI conformance suite covers more of SPEC.md §13's C ABI
+  boundary row (F6; `crates/karyos-ffi/conformance/`): a closed
+  publication and a closed or ended claim answer `KARYOS_E_CLOSED`
+  (`publication.use.after.close`, `claim.use.after.close`,
+  `claim.double.commit`); one claim per publication; a claim's typed
+  refusals and an offer with no subscriber
+  (`publication.typed.statuses`); and the struct size rule of both minor
+  directions for the driver, stream and client options and
+  `karyos_detail` (`struct.size.*`), and a nonzero `reserved` in the
+  driver options refused (`struct.reserved.driver.options`). The
+  interim format 1 gains the driver's thread and streams, the
+  publication and claim calls, and sized structs whose unset bytes hold
+  a sentinel, so a write past a struct is seen. A runner that meets a function or argument it does not
+  know fails the scenario.
 - `make libkaryos` packages the C ABI for the language bindings
   (quantstratum-docs: `karyos/design/bindings-plan.md`, B1) into
   `LIBKARYOS_DIR`, by default `target/libkaryos`: `include/karyos.h`,
