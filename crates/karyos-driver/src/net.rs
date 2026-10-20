@@ -1888,12 +1888,13 @@ impl<T: StreamTerms> Network<T> {
         #[cfg(test)]
         let mut reopened = Some(self.reopened);
         let mut refusals = self.subscription_refusals;
-        let (publications, send_endpoints, released, trace_events, reincarnations) = (
+        let (publications, send_endpoints, released, trace_events, reincarnations, cells) = (
             &mut self.publications,
             &mut self.send_endpoints,
             &mut self.released_guards,
             &mut self.trace_events,
             &mut self.reincarnations,
+            &mut self.cells,
         );
         // The removal's end is read when its answer is applied, not at the
         // cycle's start.
@@ -1957,7 +1958,7 @@ impl<T: StreamTerms> Network<T> {
                     publications,
                     send_endpoints,
                     &mut stale,
-                    released,
+                    (released, cells),
                     (reincarnations, clock),
                     event,
                 );
@@ -2037,7 +2038,7 @@ impl<T: StreamTerms> Network<T> {
             Agents::Closed => None,
         };
         if let Some(mut agents) = agents {
-            self.cells = agents.take_cells();
+            self.cells.extend(agents.take_cells());
             shutdown.agents_stopped = agents.is_stopped();
             shutdown.endpoints_retired = self.endpoints.reclaim(&self.links, &mut agents, |_| {});
         }
@@ -2074,7 +2075,9 @@ impl<T: StreamTerms> Network<T> {
     /// The agents' CnC cells taken back at the close, for the conductor to
     /// free; an agent that did not come back keeps its cells.
     pub(crate) fn take_cells(&mut self) -> Vec<Counter> {
-        core::mem::take(&mut self.cells)
+        let mut cells = core::mem::take(&mut self.cells);
+        cells.extend(self.images.take_released());
+        cells
     }
 
     /// Moves the guard sender of every tracked publication to the released
@@ -2464,7 +2467,7 @@ fn publication_answer<T: StreamTerms>(
     publications: &mut Vec<NetPublication>,
     send_endpoints: &mut [SendEndpoint],
     stale: &mut Stale<'_>,
-    released: &mut ReleasedGuards,
+    (released, cells): (&mut ReleasedGuards, &mut Vec<Counter>),
     (reincarnations, clock): (&mut [Reincarnation], fn() -> u64),
     event: AgentEvent<OsSocket, T>,
 ) {
@@ -2558,8 +2561,11 @@ fn publication_answer<T: StreamTerms>(
             registration,
             outbound,
         } => {
-            // The lane readers drop here, on the control path.
-            drop(outbound);
+            // Its cells (M2b) go to the conductor to free; the lane readers
+            // drop here, on the control path.
+            if let Some(mut taken) = outbound.and_then(|mut outbound| outbound.take_cells()) {
+                cells.extend(taken.take());
+            }
             if let Some(index) = find(publications, endpoint, alias, registration) {
                 let mut entry = publications.swap_remove(index);
                 release_guard(&mut entry);

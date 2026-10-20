@@ -79,8 +79,9 @@
 //! With a network, the agents' system counters are driver-wide event
 //! cells (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
 //! M2), allocated when the driver is created, before any agent starts.
-//! Each is written only by the agent that counts it, with a plain store of
-//! its own checked count at the end of its duty cycle, in every threading
+//! Each is written only by the agent that counts it, with `set` (a swap,
+//! as karyos-sys requires of value updates) of its own checked count at
+//! the end of its duty cycle, in every threading
 //! mode; the conductor frees them when the network closes and the agents
 //! come back. Sender: `network controls sent`, `network control send
 //! failures`, `naks received`, `status messages received`, `heartbeats
@@ -88,6 +89,20 @@
 //! `invalid frames received`, `status messages sent`, `images retired at
 //! timeout`. When no cell is free one is not allocated and `counters
 //! unavailable` counts it.
+//!
+//! Each network publication and exposed image has its own cells (M2b),
+//! keyed by its stream's registration (key0; lane, kind and participant
+//! 0) and written the same way by its agent. Publication: `network frames
+//! sent`, `network bytes sent`, `network retransmits`, `network naks
+//! received`. Image: `network naks sent`, `network losses`, `network
+//! repaired`. They are allocated all or none with the publication, or
+//! once the image is installed and exposed; when the region has no room
+//! for the whole group, `counters unavailable` counts one and the stream
+//! runs without cells, never retried. They are freed when the publication
+//! is removed, the image retires or the network closes; cells still in
+//! flight to the receiver at the close are left pending release, which
+//! the allocator reuses. Size the region for 4 cells per network
+//! publication and 3 per image on top of the rest.
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! "Per-stream positions") are allocated, set and released only inside a
