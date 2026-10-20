@@ -61,7 +61,7 @@ use karyos_archive::source::Guarded;
 use karyos_client::aggregate::LaneEnd;
 use karyos_client::{
     ClientPublication, ClientSubscription, MessageLimit, OfferOutcome, PollSummary, RejoinOutcome,
-    ReplayFallbackReason, ReplayRejoin, Secondary, SecondaryOutcome,
+    RejoinPolicy, ReplayFallbackReason, ReplayRejoin, Secondary, SecondaryOutcome,
 };
 use karyos_driver::DriverError;
 use karyos_driver::embedded::{AggregateHandle, EmbeddedDriver, StreamConfig, StreamHandle};
@@ -905,6 +905,91 @@ fn a_lapped_reader_recovers_its_gap_through_the_archive() {
     );
     assert_eq!(seen.len(), sent.len());
     assert!(seen == sent, "once, in order, byte-exact, at its position");
+    drop(publication);
+}
+
+/// F9-0 (ffi-archive.md): the same recovery through the facade. A
+/// `Client`'s subscription of the stream, taken over the command ring,
+/// becomes a rejoin with `Subscription::rejoin_with` and the Archive's
+/// client as its provider; lapped, it reports the replay and its merge,
+/// and every message comes once, in order, byte-exact.
+#[test]
+fn a_facade_subscription_recovers_its_gap_through_the_archive() {
+    use karyos_client::{Client, Context, StreamId, SubscriberRole, SubscriptionOptions};
+
+    let mut rig = Rig::new(INITIAL_TERM_ID);
+    let data = rig.server.host().data;
+    let mut publication = rig.driver().publication(data).unwrap();
+    let conductor = rig.driver().connect().unwrap();
+    let mut client = Client::with_conductor(
+        conductor,
+        Context::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap(),
+    );
+    // The add waits for the driver, which this thread runs meanwhile.
+    let subscription = std::thread::scope(|scope| {
+        let adding = scope.spawn(|| {
+            client.add_subscription_with(
+                "karyos:ipc",
+                StreamId::new(DATA),
+                SubscriptionOptions::new(SubscriberRole::Optional, RejoinPolicy::RejoinAtHead),
+            )
+        });
+        while !adding.is_finished() {
+            rig.cycle();
+        }
+        adding.join().unwrap().unwrap()
+    });
+    let _ = rig.start_recording(Mode::Required);
+    let archive = rig.archive_client();
+    let mut rejoin = subscription
+        .rejoin_with(Box::new(archive), Secondary::RejoinAtHead)
+        .unwrap();
+
+    let mut sent = Vec::new();
+    publish(
+        &mut rig,
+        &mut publication,
+        &mut sent,
+        5 * u64::from(MIN_TERM_LENGTH),
+        0,
+    );
+    let mut seen: Vec<Sent> = Vec::new();
+    let mut outcomes = Vec::new();
+    let start = Instant::now();
+    while !matches!(outcomes.last(), Some(RejoinOutcome::Replayed { .. })) {
+        assert!(start.elapsed() < Duration::from_secs(20), "{outcomes:?}");
+        rig.cycle();
+        let poll = rejoin
+            .poll(
+                |bytes, info| seen.push((info.position, bytes.to_vec())),
+                MessageLimit::new(64),
+            )
+            .unwrap();
+        if let Some(outcome) = poll.stopped.and_then(|stop| stop.summary.rejoin) {
+            outcomes.push(outcome);
+        }
+    }
+    assert_eq!(outcomes[0], RejoinOutcome::Replaying);
+    assert!(!rejoin.is_recovering());
+    assert_eq!(rejoin.merge_failure(), None);
+    // Drained to the end: every message once, in order, byte-exact.
+    let start = Instant::now();
+    while seen.len() < sent.len() {
+        assert!(start.elapsed() < Duration::from_secs(20), "{}", seen.len());
+        rig.cycle();
+        let _ = rejoin
+            .poll(
+                |bytes, info| seen.push((info.position, bytes.to_vec())),
+                MessageLimit::new(64),
+            )
+            .unwrap();
+    }
+    assert!(seen == sent, "once, in order, byte-exact, at its position");
+    let back = rejoin.into_subscription().unwrap();
+    drop(back);
     drop(publication);
 }
 

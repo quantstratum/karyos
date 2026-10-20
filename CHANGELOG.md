@@ -572,6 +572,16 @@ release may break APIs, wire formats and shared-memory layouts.
   `reserved` is `KARYOS_E_INVALID_ARGUMENT`; a key or value the
   publication refuses is `KARYOS_E_CONFLATION`, with nothing reserved.
   Claims do not take options yet.
+- `Subscription::rejoin_with(provider, secondary)` on the client facade
+  (quantstratum-docs: `karyos/design/ffi-archive.md`, F9-0; owner item
+  57): a stream subscription becomes a `RejoiningSubscription` whose
+  overruns are recovered from a `ReplayProvider`'s replays of its own
+  publication and merged back into the live stream (`ReplayRejoin`),
+  falling back to `secondary`. Its poll reports as `Subscription::poll`
+  does, with a rejoin's outcome also reported on its own;
+  `is_recovering`, `merge_failure`, `source` and `into_subscription`
+  complete it. A network subscription, or one with no publication
+  identity, is refused as `NotRejoinable`, the subscription handed back.
 
 - `karyos-catalog list DIR [--json]` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H4a): an archive directory's

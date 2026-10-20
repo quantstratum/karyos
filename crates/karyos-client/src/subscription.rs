@@ -639,6 +639,12 @@ impl<T: TermBytes> ClientSubscription<T> {
 
     /// Takes the loss reporter, for a wrapper that reports the overruns
     /// itself.
+    /// The publication its loss reports name, which a replay of its gaps
+    /// recovers from; `None` for a subscription handed over without one.
+    pub(crate) fn loss_source(&self) -> Option<karyos_protocol::trace_hook::PublicationIdentity> {
+        self.loss.as_ref().map(|reporter| reporter.publication)
+    }
+
     pub(crate) fn take_loss_reports(&mut self) -> Option<Box<LossReporter>> {
         self.loss.take()
     }
