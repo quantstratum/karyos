@@ -53,6 +53,7 @@ use crate::server::{MAX_ANSWER, MAX_REQUEST, replay_session_id};
 
 pub mod connection;
 pub mod list;
+pub mod replay;
 
 #[cfg(test)]
 mod tests;
