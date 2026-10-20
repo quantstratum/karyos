@@ -33,6 +33,7 @@ const COUNT: u32 = 12_000;
 ///
 /// When every port of the range was handed out or found taken.
 #[must_use]
+#[allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
 pub(crate) fn test_port() -> u16 {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     // A process's own starting point, so that test processes running at
@@ -41,7 +42,8 @@ pub(crate) fn test_port() -> u16 {
     loop {
         let taken = NEXT.fetch_add(1, Ordering::Relaxed);
         assert!(taken < COUNT, "no free test port left in the range");
-        let port = u16::try_from(FIRST + (start + taken) % COUNT).unwrap_or(u16::MAX);
+        // The range ends at 31999, within a u16: a failure here is loud.
+        let port = u16::try_from(FIRST + (start + taken) % COUNT).unwrap();
         if UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).is_ok() {
             return port;
         }
