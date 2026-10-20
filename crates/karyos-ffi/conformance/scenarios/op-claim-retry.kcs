@@ -37,5 +37,7 @@ op publication.close publication=$publication
 expect ok
 op claim.commit claim=$next
 expect status=closed
+op claim.abort claim=$next
+expect status=closed
 op client.close client=$client
 expect ok

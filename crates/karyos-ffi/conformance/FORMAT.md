@@ -238,17 +238,19 @@ failure; so is a required argument left out.
 - Closing a parent closes its children: a driver its clients and views,
   a client its publications, subscriptions and views, a publication its
   claim. A child's close after its parent's close is `ok`, as a
-  deferred close or a destructor runs it.
+  deferred close or a destructor runs it. This covers the closes of the
+  table below, not `claim.abort`, which is no close (the last rule).
 - Any other op on a closed object, or on a child of a closed parent,
   answers `status=closed`, whatever the C ABI answers for its stale
   handle.
 - A close that answers `busy` or `reentrant` closes nothing: the object
   stays usable and the close may be retried.
-- A claim ends at a successful commit, at an abort, or at a commit that
+- A claim ends at a successful commit, at an abort, at a commit that
   answers a status other than the five retryable ones
   (`back_pressured`, `not_connected`, `admin_action`, `rate_limited`,
-  `gated`), which keep it staged. An ended claim answers `closed` to
-  both `claim.commit` and `claim.abort`.
+  `gated`), which keep it staged, or at the close of its publication or
+  client. An ended claim answers `closed` to both `claim.commit` and
+  `claim.abort`.
 
 ### Ops
 
@@ -283,6 +285,12 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `conflated.add` | `client`, `stream_id`, [`uri`] | `conflated` | `conflation` |
 | `conflated.poll` | `conflated`, [`key_budget` (default 1)] | `delivered` | `conflation` |
 | `conflated.close` | `conflated` | none | `conflation` |
+
+A text argument with a fixed set of values (`domain`, `idle_strategy`)
+is checked when the scenario is read, so a value outside its set fails
+even in a scenario reported `skipped`, `later` or `unsupported`; so
+does `clock.now` with `domain="tai"` in a scenario without `feature
+tai-clock`.
 
 `idle_strategy` is required until the ABI defines a default idle
 strategy (R-CORE-37); then it becomes optional with that default.

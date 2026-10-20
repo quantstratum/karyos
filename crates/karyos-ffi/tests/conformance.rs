@@ -450,6 +450,25 @@ fn check_op(step: &Step, features: &BTreeSet<String>, names: &BTreeSet<String>, 
             op.name
         );
     }
+    // The text arguments with a fixed set of values, and the TAI domain's
+    // feature (FORMAT.md, Ops).
+    for (name, allowed) in [
+        ("domain", &["monotonic", "tai"][..]),
+        ("idle_strategy", &["busy_spin", "yield", "sleep"][..]),
+    ] {
+        if let Some(value) = step.arguments.get(name) {
+            assert!(
+                matches!(value, Value::Text(text) if allowed.contains(&text.as_str())),
+                "{at}: `{name}` is one of {allowed:?}, not {value:?}"
+            );
+        }
+    }
+    if step.arguments.get("domain") == Some(&Value::Text("tai".to_owned())) {
+        assert!(
+            features.contains("tai-clock"),
+            "{at}: `domain=\"tai\"` needs `feature tai-clock`"
+        );
+    }
     match step.status.as_deref() {
         Some("ok") => {
             for name in step.results.keys() {
@@ -1924,6 +1943,21 @@ fn format_2_is_parsed_strictly_and_within_its_bounds() {
         (
             format!("{head}op driver.create\nexpect ok\n"),
             "needs `feature embedded-driver`",
+        ),
+        (
+            format!("{head}op clock.now domain=\"tai\"\nexpect ok\n"),
+            "needs `feature tai-clock`",
+        ),
+        (
+            format!("{head}op clock.now domain=\"wall\"\nexpect ok\n"),
+            "`domain` is one of",
+        ),
+        (
+            format!(
+                "{head}feature embedded-driver\nop driver.create\nexpect ok driver=$d\n\
+                 op driver.start driver=$d idle_strategy=\"nap\"\nexpect ok\n"
+            ),
+            "`idle_strategy` is one of",
         ),
         (
             format!("{head}op client.poll client=1\nexpect ok\n"),
