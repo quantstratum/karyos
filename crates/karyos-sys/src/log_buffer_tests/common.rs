@@ -3517,3 +3517,18 @@ fn a_conflation_shape_must_fit_its_buffer() {
     };
     assert_eq!((block(19), block(20), block(21)), (4, u64::from(max), 0));
 }
+
+/// SPEC §14: `attached_subscribers` counts only the buffer's subscriber
+/// cells, so it reaches `max_subscribers` and never passes it.
+#[test]
+fn the_attached_count_reaches_the_subscriber_cells_and_stops() {
+    let buffer = new_buffer(config(3, 4)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut readers = Vec::new();
+    for attached in 1..=4u32 {
+        readers.push(conductor.subscribe(Role::Required).unwrap());
+        assert_eq!(buffer.attached_subscribers(), attached);
+    }
+    assert!(conductor.subscribe(Role::Required).is_err());
+    assert_eq!(buffer.attached_subscribers(), 4);
+}

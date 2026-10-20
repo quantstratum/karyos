@@ -82,6 +82,37 @@ fn publication_config_rejects_invalid_keys_and_oversized_values() {
     );
 }
 
+/// SPEC §14: a value capacity past `u32`, which no message carries, has no
+/// shape: it is refused, never saturated to `u32::MAX`, and a publication
+/// check of such a table fails with that refusal. The capacity `u32::MAX`
+/// itself still has one.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn a_capacity_past_u32_has_no_shape() {
+    let largest = usize::try_from(u32::MAX).unwrap();
+    let past = largest + 1;
+    let config = ConflationConfig {
+        keys: 3,
+        value_capacity: past,
+        journal_capacity: 1024,
+    };
+    let refused = ConflationError::ValueTooLarge {
+        length: past,
+        max: largest,
+    };
+    assert_eq!(config.shape(), Err(refused));
+    assert_eq!(config.validate_publication(0, 1), Err(refused));
+    let largest_config = ConflationConfig {
+        value_capacity: largest,
+        ..config
+    };
+    assert_eq!(
+        largest_config.shape(),
+        Ok(crate::log_buffer::ConflationShape::new(3, u32::MAX))
+    );
+    assert_eq!(largest_config.validate_publication(0, largest), Ok(()));
+}
+
 #[test]
 fn every_length_round_trips_and_shorter_values_leave_no_stale_bytes() {
     let mut writer = conflation(2, 40, 1024).unwrap();
@@ -146,6 +177,48 @@ fn a_new_reader_scans_existing_values() {
     .collect();
     seen.sort_unstable();
     assert_eq!(seen, (0..70).step_by(3).collect::<Vec<_>>());
+}
+
+/// SPEC §14: the reader's queue holds each key at most once, so its length
+/// (a `u32`) reaches `keys` and never passes it. Every slot stuck
+/// mid-write keeps every key queued (unstable, requeued); once released,
+/// every key is delivered.
+#[test]
+fn the_pending_count_reaches_the_keys_and_stops() {
+    let keys = 4;
+    let mut writer = conflation(keys, 8, 1024).unwrap();
+    for key in 0..keys {
+        writer.write(key, &value(key, 1, 8)).unwrap();
+    }
+    let mut reader = writer.reader();
+    // Every slot is stuck: a writer paused between its odd and even stores.
+    let mut stuck = Vec::new();
+    for key in 0..keys {
+        let word = writer.slot_seq_word(key).unwrap();
+        let even = word.load(Ordering::Relaxed);
+        word.store(even + 1, Ordering::Relaxed);
+        stuck.push((key, even));
+    }
+    let all = Budget { keys, retries: 1 };
+    let mut most = 0;
+    for _ in 0..16 {
+        let report = reader.poll_changed(all, |_, _, _, _| panic!("a stuck slot was delivered"));
+        assert!(report.pending <= keys, "pending {}", report.pending);
+        most = most.max(report.pending);
+    }
+    assert_eq!(most, keys, "every key was queued at once");
+    for (key, even) in stuck {
+        writer
+            .slot_seq_word(key)
+            .unwrap()
+            .store(even, Ordering::Relaxed);
+    }
+    let mut seen: Vec<u32> = drain(&mut reader, all)
+        .into_iter()
+        .map(|(key, ..)| key)
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, (0..keys).collect::<Vec<_>>());
 }
 
 /// The journal laps the reader; it scans and still converges.

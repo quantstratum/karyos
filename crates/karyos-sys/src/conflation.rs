@@ -122,16 +122,28 @@ pub struct ConflationConfig {
 
 impl ConflationConfig {
     /// The shape of this table that its publications check: its keys and
-    /// its largest value (a capacity past `u32`, which no message reaches,
-    /// counts as `u32::MAX`).
-    #[must_use]
+    /// its largest value.
+    ///
+    /// # Errors
+    ///
+    /// [`ConflationError::ValueTooLarge`] for a value capacity past `u32`,
+    /// which no message carries (SPEC §14: refused, not saturated).
     // Loom builds leave `log_buffer` out, and model no publication.
     #[cfg(not(loom))]
-    pub fn shape(&self) -> crate::log_buffer::ConflationShape {
-        crate::log_buffer::ConflationShape::new(
+    pub fn shape(&self) -> Result<crate::log_buffer::ConflationShape, ConflationError> {
+        let value_capacity = u32::try_from(self.value_capacity).map_err(|_| {
+            // A capacity past u32 holds on this target, so u32::MAX does.
+            usize::try_from(u32::MAX).map_or(ConflationError::InvalidConfig, |max| {
+                ConflationError::ValueTooLarge {
+                    length: self.value_capacity,
+                    max,
+                }
+            })
+        })?;
+        Ok(crate::log_buffer::ConflationShape::new(
             self.keys,
-            u32::try_from(self.value_capacity).unwrap_or(u32::MAX),
-        )
+            value_capacity,
+        ))
     }
 
     /// Checks a publication's reserved value and payload length before it
@@ -143,14 +155,15 @@ impl ConflationConfig {
     ///
     /// # Errors
     ///
-    /// As [`ConflationShape::validate_publication`].
+    /// As [`ConflationConfig::shape`], then as
+    /// [`ConflationShape::validate_publication`].
     #[cfg(not(loom))]
     pub fn validate_publication(
         &self,
         reserved_value: i64,
         value_length: usize,
     ) -> Result<(), ConflationError> {
-        self.shape()
+        self.shape()?
             .validate_publication(reserved_value, value_length)
     }
 }
@@ -1661,7 +1674,9 @@ mod owned {
         queued: Box<[u64]>,
         queue: Box<[u32]>,
         head: usize,
-        len: usize,
+        /// Keys queued: at most `keys`, the queue's capacity, so a `u32`
+        /// always holds it (SPEC §14: no conversion to saturate).
+        len: u32,
         in_flight: Option<u32>,
         scan_cursor: u32,
         scan_remaining: u32,
@@ -1815,24 +1830,27 @@ mod owned {
         /// Queues `key` at the back unless it is already queued. The queue
         /// holds each key at most once, so it never overflows.
         fn push(&mut self, key: u32) {
-            if self.is_queued(key) || self.len >= self.queue.len() {
+            if self.is_queued(key) || self.len >= self.keys {
                 return;
             }
-            let tail = (self.head + self.len) % self.queue.len();
+            // Below `keys`, so the increment cannot overflow; a length no
+            // usize of this target holds queues nothing.
+            let (Ok(len), Some(next)) = (usize::try_from(self.len), self.len.checked_add(1)) else {
+                return;
+            };
+            let tail = (self.head + len) % self.queue.len();
             if let Some(entry) = self.queue.get_mut(tail) {
                 *entry = key;
-                self.len += 1;
+                self.len = next;
                 self.set_queued(key, true);
             }
         }
 
         fn pop(&mut self) -> Option<u32> {
-            if self.len == 0 {
-                return None;
-            }
+            let rest = self.len.checked_sub(1)?;
             let key = *self.queue.get(self.head)?;
             self.head = (self.head + 1) % self.queue.len();
-            self.len -= 1;
+            self.len = rest;
             self.set_queued(key, false);
             Some(key)
         }
@@ -1890,7 +1908,7 @@ mod owned {
             self.sweep(budget.keys);
             // Serve only the keys queued now, so a key requeued as unstable
             // is not retried again in this poll.
-            let eligible = budget.keys.min(u32::try_from(self.len).unwrap_or(u32::MAX));
+            let eligible = budget.keys.min(self.len);
             for _ in 0..eligible {
                 let Some(key) = self.pop() else {
                     break;
@@ -1901,7 +1919,7 @@ mod owned {
         }
 
         fn report(&self, mut report: PollReport) -> PollReport {
-            report.pending = u32::try_from(self.len).unwrap_or(u32::MAX);
+            report.pending = self.len;
             report.scanning = self.scan_remaining > 0 || self.loss_scan > 0;
             report.closed = self.closed_seen;
             report.terminal = self.terminal;

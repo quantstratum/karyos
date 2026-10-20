@@ -963,17 +963,30 @@ impl<T: TermBytes> LogBuffer<T> {
         Ok(self)
     }
 
-    /// Number of attached subscribers. Advisory: it can change right after
-    /// it is read; used for connection policy, never for memory safety.
+    /// Number of attached subscribers: at most the buffer's configured
+    /// subscriber cells (`LogBufferConfig::max_subscribers`, a `u8`), the
+    /// only cells it counts. Advisory: it can change right after it is
+    /// read; used for connection policy, never for memory safety.
     #[must_use]
     pub fn attached_subscribers(&self) -> u32 {
+        let bound = self.config.max_subscribers;
+        // At most `bound` cells are counted, so the count fits a u8 and the
+        // increment never fails; were it to, the count is the bound itself,
+        // never a value past it (SPEC §14: no saturation to a type's MAX).
         let attached = self
             .cells()
             .iter()
             .skip(self.first_subscriber_cell())
-            .filter(|cell| connected(cell.state.load(Ordering::Acquire)))
-            .count();
-        u32::try_from(attached).unwrap_or(u32::MAX)
+            .take(usize::from(bound))
+            .try_fold(0u8, |count, cell| {
+                if connected(cell.state.load(Ordering::Acquire)) {
+                    count.checked_add(1)
+                } else {
+                    Some(count)
+                }
+            })
+            .unwrap_or(bound);
+        u32::from(attached)
     }
 
     fn cell(&self, index: usize) -> Result<&Cell, SysError> {
@@ -5348,9 +5361,10 @@ impl ConflationShape {
     ///
     /// # Errors
     ///
-    /// [`InvalidConfig`] for a table with no keys or an empty value,
-    /// [`KeyOutOfRange`] for a key outside `0..keys`, and [`ValueTooLarge`]
-    /// for a value past the capacity.
+    /// [`InvalidConfig`] for a table with no keys or an empty value (or a
+    /// capacity this target's `usize` cannot hold), [`KeyOutOfRange`] for a
+    /// key outside `0..keys`, and [`ValueTooLarge`] for a value past the
+    /// capacity.
     ///
     /// [`InvalidConfig`]: crate::conflation::ConflationError::InvalidConfig
     /// [`KeyOutOfRange`]: crate::conflation::ConflationError::KeyOutOfRange
@@ -5373,7 +5387,9 @@ impl ConflationShape {
                 key: reserved_value,
             });
         }
-        let max = usize::try_from(self.value_capacity).unwrap_or(usize::MAX);
+        // A u32 capacity a target's usize cannot hold is no table it serves.
+        let max =
+            usize::try_from(self.value_capacity).map_err(|_| ConflationError::InvalidConfig)?;
         if value_length > max {
             return Err(ConflationError::ValueTooLarge {
                 length: value_length,
