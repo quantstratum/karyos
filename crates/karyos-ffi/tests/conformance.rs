@@ -2391,7 +2391,8 @@ mod archive_host {
 
         /// The karyosd binary: `KARYOS_KARYOSD`, else the one this
         /// workspace built beside the test, else built now with cargo
-        /// (FORMAT.md's fallback).
+        /// (FORMAT.md's fallback) in the test's own profile, so that it
+        /// lands beside the test under `--release` too.
         fn binary() -> PathBuf {
             if let Ok(path) = std::env::var("KARYOS_KARYOSD") {
                 return PathBuf::from(path);
@@ -2400,6 +2401,11 @@ mod archive_host {
             let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
             let built = profile.join("karyosd");
             if !built.exists() {
+                // Cargo names the dev profile's directory `debug`.
+                let name = match profile.file_name().and_then(|name| name.to_str()) {
+                    Some("debug") | None => "dev",
+                    Some(name) => name,
+                };
                 let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
                 let status = Command::new(cargo)
                     .args([
@@ -2409,6 +2415,8 @@ mod archive_host {
                         "karyos-tools",
                         "--bin",
                         "karyosd",
+                        "--profile",
+                        name,
                     ])
                     .env("CARGO_TARGET_DIR", profile.parent().unwrap())
                     .status()

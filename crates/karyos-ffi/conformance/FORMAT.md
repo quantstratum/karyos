@@ -343,7 +343,8 @@ declares the feature absent.
   kit (`make libkaryos-testkit`, beside the libkaryos package and from
   the same core commit, which its MANIFEST records), else one built with
   `cargo build --release --locked -p karyos-tools --bin karyosd` from
-  the pinned core:
+  the pinned core. The core's own runner builds it in the test's
+  profile instead, beside the test binary:
 
   ```text
   karyosd --dir <private directory> --stream 20:1 --archive <empty directory>
