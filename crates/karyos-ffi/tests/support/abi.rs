@@ -64,6 +64,8 @@ pub struct StreamOptions {
     pub conflation_keys: u32,
     pub conflation_value_capacity: u32,
     pub conflation_journal_capacity: u64,
+    pub publishers: u32,
+    pub reserved: u32,
 }
 
 /// `karyos_detail`.
@@ -218,6 +220,13 @@ unsafe extern "C" {
         detail: *mut Detail,
     ) -> i32;
     fn karyos_client_add_publication(
+        client: u64,
+        uri: *const c_char,
+        stream_id: i32,
+        publication: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
+    fn karyos_client_add_concurrent_publication(
         client: u64,
         uri: *const c_char,
         stream_id: i32,
@@ -444,12 +453,29 @@ pub fn client_add_publication(
     stream_id: i32,
     detail_size: u32,
 ) -> (i32, u64, SizedStruct<Detail>) {
+    client_add_publication_of(client, uri, stream_id, detail_size, false)
+}
+
+/// `karyos_client_add_publication`, or with `concurrent`
+/// `karyos_client_add_concurrent_publication`, of `stream_id` on `uri`.
+pub fn client_add_publication_of(
+    client: u64,
+    uri: &CStr,
+    stream_id: i32,
+    detail_size: u32,
+    concurrent: bool,
+) -> (i32, u64, SizedStruct<Detail>) {
+    let add = if concurrent {
+        karyos_client_add_concurrent_publication
+    } else {
+        karyos_client_add_publication
+    };
     let mut publication = 0;
     let mut detail = SizedStruct::<Detail>::new(None, detail_size);
     // SAFETY: a live C string, a live, aligned `u64` and a detail of at
     // least `detail_size` writable bytes.
     let status = unsafe {
-        karyos_client_add_publication(
+        add(
             client,
             uri.as_ptr(),
             stream_id,

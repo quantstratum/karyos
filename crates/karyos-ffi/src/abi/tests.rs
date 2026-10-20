@@ -1641,6 +1641,7 @@ fn a_timed_lane_takes_a_timed_offer() {
 }
 
 mod archive;
+mod concurrent;
 mod conflated;
 mod outcomes;
 

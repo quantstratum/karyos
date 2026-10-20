@@ -1,9 +1,10 @@
-# karyos_stream_options has two layouts: 64 bytes in ABI 0.1.0 before
-# conflation (a stream with no conflation table), and 80 bytes with the
-# conflation fields. A smaller size, or one between the two, which no
-# header produces and which could cut a field, adds no stream
-# (KARYOS_E_INVALID_ARGUMENT). A newer caller's larger struct adds the
-# stream its 80-byte prefix describes (SPEC.md §10.2, §13, C ABI boundary).
+# karyos_stream_options has three layouts: 64 bytes in ABI 0.1.0 before
+# conflation (an exclusive stream with no conflation table), 80 bytes
+# with the conflation fields, and 88 bytes with publishers. A smaller
+# size, or one between two layouts, which no header produces and which
+# could cut a field, adds no stream (KARYOS_E_INVALID_ARGUMENT). A newer
+# caller's larger struct adds the stream its 88-byte prefix describes
+# (SPEC.md §10.2, §13, C ABI boundary).
 format 1
 id struct.size.stream.options
 abi 0.1
@@ -27,6 +28,13 @@ expect KARYOS_OK
 call karyos_driver_subscribe_conflated driver=$driver stream_id=8
 expect KARYOS_OK conflated=$view
 call karyos_conflated_close conflated=$view
+expect KARYOS_OK
+call karyos_driver_add_stream driver=$driver stream_id=10 size=84
+expect KARYOS_E_INVALID_ARGUMENT
+# 80 bytes: publishers is not read, so the stream stays exclusive.
+call karyos_driver_add_stream driver=$driver stream_id=10 size=80 publishers=2
+expect KARYOS_OK
+call karyos_driver_add_stream driver=$driver stream_id=11 size=88 publication_mode=1 publishers=2
 expect KARYOS_OK
 call karyos_driver_add_stream driver=$driver stream_id=9 size=96 conflation_keys=4 conflation_value_capacity=64 conflation_journal_capacity=4096
 expect KARYOS_OK

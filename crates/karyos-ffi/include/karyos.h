@@ -128,8 +128,13 @@ extern "C" {
  */
 #define KARYOS_PROTOCOL_VERSION 2
 
-/** Publication modes of a stream (karyos_stream_options); exclusive only. */
+/**
+ * Publication modes of a stream (karyos_stream_options): one exclusive
+ * publication, or up to `publishers` concurrent handles on lane 0
+ * (karyos_client_add_concurrent_publication).
+ */
 #define KARYOS_PUBLICATION_EXCLUSIVE 0
+#define KARYOS_PUBLICATION_CONCURRENT 1
 
 /** The clock domains of a timed lane (karyos_clock_now). */
 #define KARYOS_CLOCK_MONOTONIC 0
@@ -322,11 +327,11 @@ typedef struct karyos_driver_options {
  * A stream's options, copied by karyos_driver_add_stream: the driver's
  * stream configuration and its conflation table. Fill it with
  * karyos_stream_options_init, then set stream_id. This version takes lane
- * 0 and KARYOS_PUBLICATION_EXCLUSIVE only (KARYOS_E_INVALID_LANE and
- * KARYOS_E_INVALID_ARGUMENT otherwise); the driver checks the sizes. The
- * size rule of karyos_driver_options applies, with two layouts: 64 bytes
- * up to claim_deadline_ns (a stream with no conflation table), and 80
- * bytes with the conflation fields. A size between them is
+ * 0 only (KARYOS_E_INVALID_LANE otherwise); the driver checks the sizes.
+ * The size rule of karyos_driver_options applies, with three layouts: 64
+ * bytes up to claim_deadline_ns (an exclusive stream with no conflation
+ * table), 80 bytes with the conflation fields, and 88 bytes with
+ * publishers. A size between two layouts, or a nonzero reserved, is
  * KARYOS_E_INVALID_ARGUMENT.
  */
 typedef struct karyos_stream_options {
@@ -349,7 +354,7 @@ typedef struct karyos_stream_options {
     uint32_t initial_term_id;
     /* The lane: 0. */
     uint32_t lane;
-    /* KARYOS_PUBLICATION_EXCLUSIVE. */
+    /* KARYOS_PUBLICATION_*. */
     uint32_t publication_mode;
     /* Offers allowed with no subscriber attached: 0 or 1. */
     uint32_t allow_unconnected;
@@ -368,6 +373,16 @@ typedef struct karyos_stream_options {
     uint32_t conflation_keys;
     uint32_t conflation_value_capacity;
     uint64_t conflation_journal_capacity;
+    /*
+     * Concurrent handles at once (from 88 bytes): 1 to 255 with
+     * KARYOS_PUBLICATION_CONCURRENT, 0 with KARYOS_PUBLICATION_EXCLUSIVE;
+     * anything else is KARYOS_E_INVALID_ARGUMENT. Each handle reserves with
+     * one atomic fetch_add: on aarch64 without LSE atomics the driver
+     * refuses a concurrent stream, its default.
+     */
+    uint32_t publishers;
+    /* Zero. */
+    uint32_t reserved;
 } karyos_stream_options;
 
 /**

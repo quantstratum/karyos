@@ -1,0 +1,39 @@
+# A concurrent stream takes up to `publishers` concurrent handles on lane
+# 0: a third is refused, and so is an exclusive publication; another lane
+# is KARYOS_E_INVALID_LANE; closing a handle frees its slot. The mode and
+# publishers must agree (SPEC.md §13, C ABI boundary; F7a-1).
+format 1
+id publication.concurrent
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=7 publication_mode=1 publishers=0
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_add_stream driver=$driver stream_id=7 publishers=2
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_add_stream driver=$driver stream_id=7 publication_mode=1 publishers=2
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_concurrent_publication client=$client stream_id=7
+expect KARYOS_OK publication=$first
+call karyos_client_add_concurrent_publication client=$client stream_id=7
+expect KARYOS_OK publication=$second
+call karyos_client_add_concurrent_publication client=$client stream_id=7
+expect KARYOS_E_REFUSED
+call karyos_client_add_publication client=$client stream_id=7
+expect KARYOS_E_REFUSED
+call karyos_publication_claim publication=$first lane=1 length=8
+expect KARYOS_E_INVALID_LANE
+call karyos_publication_close publication=$first
+expect KARYOS_OK
+call karyos_client_add_concurrent_publication client=$client stream_id=7
+expect KARYOS_OK publication=$third
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

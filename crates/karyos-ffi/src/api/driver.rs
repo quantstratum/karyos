@@ -111,9 +111,11 @@ impl Options {
     }
 }
 
-/// `KARYOS_PUBLICATION_EXCLUSIVE`, the only publication mode of this
-/// version.
+/// `KARYOS_PUBLICATION_EXCLUSIVE`: one publication.
 pub(crate) const PUBLICATION_EXCLUSIVE: u32 = 0;
+/// `KARYOS_PUBLICATION_CONCURRENT`: up to `publishers` concurrent handles
+/// on lane 0 (F7a-1).
+pub(crate) const PUBLICATION_CONCURRENT: u32 = 1;
 /// `KARYOS_LOSS_HOLD`.
 pub(crate) const LOSS_HOLD: u32 = 0;
 /// `KARYOS_LOSS_CONTINUE`.
@@ -144,7 +146,7 @@ pub(crate) struct StreamOptions {
     pub(crate) initial_term_id: u32,
     /// The lane; 0 in this version.
     pub(crate) lane: u32,
-    /// `KARYOS_PUBLICATION_*`; exclusive in this version.
+    /// `KARYOS_PUBLICATION_*`.
     pub(crate) publication_mode: u32,
     /// Offers allowed with no subscriber attached: 0 or 1.
     pub(crate) allow_unconnected: u32,
@@ -160,6 +162,9 @@ pub(crate) struct StreamOptions {
     pub(crate) conflation_value_capacity: u32,
     /// Bytes of the table's update journal.
     pub(crate) conflation_journal_capacity: u64,
+    /// Concurrent handles at once: at least 1 for a concurrent stream, 0
+    /// for an exclusive one.
+    pub(crate) publishers: u32,
 }
 
 impl StreamOptions {
@@ -183,6 +188,7 @@ impl StreamOptions {
             conflation_keys: 0,
             conflation_value_capacity: 0,
             conflation_journal_capacity: 0,
+            publishers: 0,
         }
     }
 
@@ -216,9 +222,20 @@ impl StreamOptions {
             .filter(|lane| *lane == 0)
             .and_then(|lane| Lane::try_new(lane).ok())
             .ok_or_else(|| Failure::with(Status::InvalidLane, u64::from(self.lane), 0))?;
-        if self.publication_mode != PUBLICATION_EXCLUSIVE {
-            return Err(invalid(u64::from(self.publication_mode)));
-        }
+        // A concurrent stream's handles reserve with one `fetch_add`; on a
+        // target where that is not a single instruction (aarch64 without
+        // LSE) the driver refuses the stream, as its default is (ADR-0012).
+        let publication = match (self.publication_mode, self.publishers) {
+            (PUBLICATION_EXCLUSIVE, 0) => PublicationMode::Exclusive,
+            (PUBLICATION_CONCURRENT, publishers) if publishers > 0 => PublicationMode::Concurrent {
+                publishers: u8::try_from(publishers).map_err(|_| invalid(u64::from(publishers)))?,
+                allow_non_lse: false,
+            },
+            (PUBLICATION_EXCLUSIVE | PUBLICATION_CONCURRENT, publishers) => {
+                return Err(invalid(u64::from(publishers)));
+            }
+            (mode, _) => return Err(invalid(u64::from(mode))),
+        };
         let allow_unconnected = match self.allow_unconnected {
             0 => false,
             1 => true,
@@ -243,7 +260,7 @@ impl StreamOptions {
                 session_id: self.session_id,
                 stream_id: self.stream_id,
                 claim_deadline: self.claim_deadline_ns,
-                publication: PublicationMode::Exclusive,
+                publication,
                 schedule_capacity: self.schedule_capacity,
             },
             allow_unconnected,
