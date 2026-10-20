@@ -360,9 +360,18 @@ fn a_lapped_subscription_recovers_its_gap_through_a_real_archive() {
     use karyos_sys::sizing::MIN_TERM_LENGTH;
     use karyos_tools::archive::DriverHost;
 
+    /// Removes the directory when the test ends, a failing one included.
+    struct Removed(std::path::PathBuf);
+    impl Drop for Removed {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     let dir = std::env::temp_dir().join(format!("karyos-ffi-rejoin-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let _removed = Removed(dir.clone());
     let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
         client_liveness_timeout: 3_600_000_000_000,
         ..karyos_driver::DriverConfig::default()
@@ -523,5 +532,4 @@ fn a_lapped_subscription_recovers_its_gap_through_a_real_archive() {
     assert_eq!(karyos_client_close(client), Status::Ok.code());
     drop(publication);
     let _ = server.shutdown_into_host();
-    let _ = std::fs::remove_dir_all(&dir);
 }
