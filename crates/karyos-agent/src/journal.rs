@@ -152,7 +152,7 @@ impl JournalRecord {
         }
     }
 
-    /// The record's payload: [`WORDS`] little-endian words (the layout's
+    /// The record's payload: eleven little-endian words (the layout's
     /// version, the kind, then the fields in declaration order, then the
     /// reason's length) and the reason, cut to [`MAX_REASON`] bytes.
     #[must_use]
@@ -262,9 +262,10 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Opens the journal in `dir` at host time `now`: resumes its open
-    /// recording, or starts one, then records an unknown interval when the
-    /// last run may have lost a record.
+    /// Opens the journal in `dir` at host time `now`, creating the
+    /// directory if need be: resumes its open recording, or starts one,
+    /// then records an unknown interval when the last run may have lost a
+    /// record.
     ///
     /// # Errors
     ///
@@ -272,6 +273,7 @@ impl Journal {
     /// cannot be opened, or the unknown interval cannot be recorded.
     pub fn open(dir: &Path, now: u64) -> Result<Self, JournalError> {
         let geometry = Geometry::with_default_length(TERM_LENGTH)?;
+        std::fs::create_dir_all(dir).map_err(CatalogError::Io)?;
         let mut catalog = Catalog::open(StdDisk, dir)?.catalog;
         let open = catalog
             .recordings()

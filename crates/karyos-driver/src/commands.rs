@@ -1250,6 +1250,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Command::AddNetworkPublication {
                 stream_id,
                 allow_unconnected,
+                concurrent,
                 uri,
                 ..
             } => self.serve_network_publication(
@@ -1257,7 +1258,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 link,
                 request,
                 stream_id,
-                allow_unconnected,
+                (allow_unconnected, concurrent),
                 uri.as_str(),
             ),
             Command::AddNetworkSubscription {
