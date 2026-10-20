@@ -5342,6 +5342,46 @@ impl ConflationShape {
     pub const fn fits(&self, max_message_length: u32) -> bool {
         self.keys > 0 && self.value_capacity > 0 && self.value_capacity <= max_message_length
     }
+
+    /// Checks a publication's reserved value (its key) and its value's
+    /// length against this table before it attempts a reservation.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidConfig`] for a table with no keys or an empty value,
+    /// [`KeyOutOfRange`] for a key outside `0..keys`, and [`ValueTooLarge`]
+    /// for a value past the capacity.
+    ///
+    /// [`InvalidConfig`]: crate::conflation::ConflationError::InvalidConfig
+    /// [`KeyOutOfRange`]: crate::conflation::ConflationError::KeyOutOfRange
+    /// [`ValueTooLarge`]: crate::conflation::ConflationError::ValueTooLarge
+    pub fn validate_publication(
+        &self,
+        reserved_value: i64,
+        value_length: usize,
+    ) -> Result<(), crate::conflation::ConflationError> {
+        use crate::conflation::ConflationError;
+        if self.keys == 0 || self.value_capacity == 0 {
+            return Err(ConflationError::InvalidConfig);
+        }
+        if u32::try_from(reserved_value)
+            .ok()
+            .filter(|key| *key < self.keys)
+            .is_none()
+        {
+            return Err(ConflationError::KeyOutOfRange {
+                key: reserved_value,
+            });
+        }
+        let max = usize::try_from(self.value_capacity).unwrap_or(usize::MAX);
+        if value_length > max {
+            return Err(ConflationError::ValueTooLarge {
+                length: value_length,
+                max,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The layout version of the shared log buffer region. Version 2 gives bit
