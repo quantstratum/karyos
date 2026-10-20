@@ -368,7 +368,7 @@ pub(crate) fn poll(client: Handle) -> Result<bool, Status> {
 ///
 /// As [`Table::remove_all`].
 pub(crate) fn close_entry(entry: &mut ClientEntry) -> Result<(), Status> {
-    // Every child of all three tables is taken before any is closed, so
+    // Every child of all four tables is taken before any is closed, so
     // while one is in use nothing is.
     let publications = crate::api::publication::table().take_all(&entry.publications)?;
     let subscriptions = crate::api::subscription::table().take_all(&entry.subscriptions)?;
