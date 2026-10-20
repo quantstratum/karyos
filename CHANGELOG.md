@@ -11,6 +11,10 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
+  `karyos_detail`, `karyos_accepted` and the image change do: it wrote
+  the library's 16 back into a newer caller's struct before. The new
+  `karyos_subscription_end_state` (F9c) follows the same rule.
 - The conformance suite gains format 2 (ADR-0073, owner item 46,
   decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged;
   format 1's `karyos_driver_start` now defaults its `idle_strategy` to

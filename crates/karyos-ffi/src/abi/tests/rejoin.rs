@@ -196,7 +196,8 @@ fn the_rejoin_state_is_written_by_the_callers_size() {
             newer.state.merge_failure,
             newer.state.reserved
         ),
-        (16, 1, 9, 0)
+        (size_of_u32::<Newer>(), 1, 9, 0),
+        "the caller's size stays"
     );
     assert_eq!(newer.later, u64::MAX);
     let mut exact = SubscriptionRejoin {
@@ -274,7 +275,8 @@ fn the_rejoin_state_checks_its_arguments_and_writes_by_size() {
             newer.state.recovering,
             newer.state.merge_failure
         ),
-        (16, 0, MERGE_NONE)
+        (size_of_u32::<Newer>(), 0, MERGE_NONE),
+        "the caller's size stays"
     );
     assert_eq!(newer.later, u64::MAX);
     assert_eq!(state(0).0, Status::InvalidHandle.code());

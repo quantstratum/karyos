@@ -422,7 +422,7 @@ fn the_subscription_end_is_written_by_the_callers_size() {
             newer.end.seal_code,
             newer.tail
         ),
-        (24, END_END_OF_STREAM, 4096, 8, 0xA5A5)
+        (32, END_END_OF_STREAM, 4096, 8, 0xA5A5)
     );
     for (end, fields) in [
         (None, (END_NONE, 0, 0)),

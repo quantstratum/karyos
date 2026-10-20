@@ -1434,14 +1434,15 @@ unsafe fn write_rejoin_state(
     recovering: bool,
     failure: Option<&karyos_client::MergeError>,
 ) {
-    let filled = SubscriptionRejoin {
-        size: size_of_u32::<SubscriptionRejoin>(),
+    // The caller's size stays, as every sized output's does.
+    let filled = |size| SubscriptionRejoin {
+        size,
         recovering: u32::from(recovering),
         merge_failure: failure.map_or(MERGE_NONE, merge_code),
         reserved: 0,
     };
     // SAFETY: the caller's contract on `state`.
-    unsafe { write_sized(state, SUBSCRIPTION_REJOIN_SIZE_0_1, |_| filled) };
+    unsafe { write_sized(state, SUBSCRIPTION_REJOIN_SIZE_0_1, filled) };
 }
 
 /// Delivers at most `limit` messages of `subscription` to `handler`, each
@@ -2893,14 +2894,15 @@ unsafe fn write_subscription_end(
     end: *mut SubscriptionEnd,
     (reason, position, seal_code): (u32, u64, u64),
 ) {
-    let filled = SubscriptionEnd {
-        size: size_of_u32::<SubscriptionEnd>(),
+    // The caller's size stays, as every sized output's does.
+    let filled = |size| SubscriptionEnd {
+        size,
         reason,
         position,
         seal_code,
     };
     // SAFETY: the caller's contract on `end`.
-    unsafe { write_sized(end, SUBSCRIPTION_END_SIZE_0_1, |_| filled) };
+    unsafe { write_sized(end, SUBSCRIPTION_END_SIZE_0_1, filled) };
 }
 
 #[cfg(test)]
