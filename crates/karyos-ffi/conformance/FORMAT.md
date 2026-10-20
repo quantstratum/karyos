@@ -310,7 +310,8 @@ suite <sha256> header <sha256> core <major.minor.patch> <library id>
 ```
 
 - `suite`: SHA-256 over the suite's files, `FORMAT.md`, `index.txt`
-  and `scenarios/*.kcs`, sorted by their path under this directory as
+  and every file under `scenarios/` (only `.kcs` files may be there,
+  Files), sorted by their path under this directory as
   bytes, each hashed as its path in UTF-8, a NUL byte, its length as
   8 bytes big-endian, then its bytes.
 - `header`: SHA-256 of the `karyos.h` the runner was compiled against,
@@ -385,6 +386,10 @@ file and line of the step that failed:
   absent. A feature the runner neither offers nor declares absent is a
   failure, never `unsupported`;
 - `later`: its `since` step comes after the runner's step.
+
+A runner checks a scenario in that order, its `abi` (`skipped`), its
+`since` (`later`), then its features (`unsupported`), and reports the
+first that applies, so the reports of two runners compare line by line.
 
 A scenario is required when its `abi` runs, its `since` is the runner's
 step or earlier, and the runner offers its features; a required
