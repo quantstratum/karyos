@@ -2269,6 +2269,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `karyos.h`: `karyos_publication_claim`'s doc comment held a stray `/**`
+  and a repeated line, which merge `fc3be2c2` (F7a-3) left. C compilers
+  warned (`-Wcomment`, "'/*' within block comment"), and so did a cgo
+  build's `go vet`. `header.rs` now checks that no comment of the header
+  opens another (`no_comment_of_the_header_opens_another`, with a negative
+  control).
+
 - A rejoin's outcome reported alone (`RejoinOutcome::Replayed` with no
   overrun, abort, skip or close in the same poll) reaches the facade
   caller of a `RejoiningSubscription`: the facade's poll report kept a
