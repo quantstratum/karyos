@@ -1136,6 +1136,9 @@ struct Installed<T: StreamTerms = HeapTerms> {
     naks: Vec<PendingNak>,
     /// The close repair decided, carried out by the next timer step.
     closing: Option<CloseReason>,
+    /// Its loss counts' CnC cells (M2b), once the conductor attached them
+    /// to its exposed stream: the receiver is their only writer.
+    cells: Option<crate::agents::AgentCells>,
     /// The seal gate of its conflated lane, with a conflated view
     /// (conflated-network-images.md (b)).
     gate: Option<Box<super::conflated_gate::ConflatedGate>>,
@@ -1971,7 +1974,35 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     },
                 ))
             }
+            // No reply: its unit is released. An image retired meanwhile
+            // drops the cells, which the allocator reuses.
+            AgentCommand::AttachImageCells { slot, cells, .. } => {
+                if let Some(image) = self.images.iter_mut().find(|image| image.slot == slot) {
+                    image.cells = Some(cells);
+                }
+                None
+            }
             _ => None,
+        }
+    }
+
+    /// Hands its images' cells back into `cells`, at the close.
+    pub(crate) fn take_stream_cells(&mut self, cells: &mut Vec<karyos_sys::counters::Counter>) {
+        for image in &mut self.images {
+            if let Some(mut taken) = image.cells.take() {
+                cells.extend(taken.take());
+            }
+        }
+    }
+
+    /// Stores each image's changed loss counts into its CnC cells, at the
+    /// end of a duty cycle (M2b).
+    pub(crate) fn publish_stream_cells(&mut self) {
+        for image in &mut self.images {
+            if let Some(cells) = image.cells.as_mut() {
+                let loss = image.loss.counters();
+                cells.publish(&[loss.submitted, loss.detected, loss.repaired]);
+            }
         }
     }
 
@@ -2437,6 +2468,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                             SessionEvent::RetireImage {
                                 slot: installed,
                                 complete: false,
+                                cells: None,
                             },
                         );
                     }
@@ -2669,6 +2701,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             skip,
             naks,
             closing: None,
+            cells: None,
             gate,
             tail_since: [None; 4],
             reset_requested: None,
@@ -3244,6 +3277,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             slot,
             owner,
             retire,
+            cells,
             ..
         } = image;
         // Its lanes' journals close now, with their facts, for the
@@ -3260,9 +3294,15 @@ impl<T: StreamTerms> ReceiverRole<T> {
         match retire {
             // The conductor gone: the driver is stopping.
             Some(unit) => {
-                let _ = sessions
-                    .events
-                    .post(unit, SessionEvent::RetireImage { slot, complete });
+                // Its cells go back with it, for the conductor to free.
+                let _ = sessions.events.post(
+                    unit,
+                    SessionEvent::RetireImage {
+                        slot,
+                        complete,
+                        cells,
+                    },
+                );
             }
             None => self.count(|c| &mut c.chain_invariant),
         }
@@ -4442,6 +4482,23 @@ impl<T: StreamTerms> SenderRole<T> {
     #[must_use]
     pub fn session_counters(&self) -> crate::sessions::send::SendCounters {
         self.sessions.counters()
+    }
+
+    /// Stores each publication's changed counts into its CnC cells, at
+    /// the end of a duty cycle (M2b).
+    pub(crate) fn publish_stream_cells(&mut self) {
+        for outbound in &mut self.publications {
+            outbound.publish_cells();
+        }
+    }
+
+    /// Hands its publications' cells back into `cells`, at the close.
+    pub(crate) fn take_stream_cells(&mut self, cells: &mut Vec<karyos_sys::counters::Counter>) {
+        for outbound in &mut self.publications {
+            if let Some(mut taken) = outbound.take_cells() {
+                cells.extend(taken.take());
+            }
+        }
     }
 
     /// The data path of its `index`-th publication (tests).

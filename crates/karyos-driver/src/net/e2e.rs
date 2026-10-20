@@ -433,6 +433,105 @@ fn the_agents_counters_reach_the_cnc_in_every_mode() {
     }
 }
 
+/// M2b (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`):
+/// a network publication's and an image's counts reach the CnC in every
+/// threading mode, as cells keyed by their stream's registration that
+/// only their agent writes; the publication's are freed when it is
+/// removed, the image's when it retires, and none is left at the close.
+#[test]
+fn per_stream_network_counters_reach_the_cnc_in_every_mode() {
+    use crate::agents::{IMAGE_CELLS, PUBLICATION_CELLS};
+    let keyed = |driver: &EmbeddedDriver, label: &str, stream: u64| {
+        cells(driver, label)
+            .into_iter()
+            .filter(|(_, keys)| keys.stream == stream)
+            .map(|(value, _)| value)
+            .collect::<Vec<_>>()
+    };
+    for mode in [
+        ThreadingMode::Shared,
+        ThreadingMode::Dedicated,
+        ThreadingMode::SharedNetwork,
+    ] {
+        // A short linger, so the removal ends soon.
+        let quick = || {
+            EmbeddedDriver::with_config(DriverConfig {
+                network: Some(NetworkConfig {
+                    threading: mode,
+                    agents: fast_agents(),
+                    stream_defaults: crate::net::NetworkStreamDefaults {
+                        publication_linger: 20 * MS,
+                        ..crate::net::NetworkStreamDefaults::default()
+                    },
+                    ..NetworkConfig::default()
+                }),
+                ..DriverConfig::default()
+            })
+            .unwrap()
+        };
+        let (mut a, mut b) = (quick(), quick());
+        let (publication, image) = connected(&mut a, &mut b, true, 10);
+        let (sent, seen) = (publication.registration(), image.registration());
+        for label in PUBLICATION_CELLS {
+            assert_eq!(keyed(&a, label, sent).len(), 1, "{mode:?}: {label}");
+        }
+        for label in IMAGE_CELLS {
+            assert_eq!(keyed(&b, label, seen).len(), 1, "{mode:?}: {label}");
+        }
+        let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+        let mut lane = a
+            .publication(publication.lane(Lane::ZERO).unwrap())
+            .unwrap();
+        exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..64);
+        // The sender stores at the end of its cycle: wait for the counts.
+        pump(&mut [&mut a, &mut b], |drivers| {
+            keyed(drivers[0], "network frames sent", sent)[0] >= 64
+                && keyed(drivers[0], "network bytes sent", sent)[0] >= 64 * 4
+        });
+        // Nothing was lost on the loopback: nothing to repair.
+        assert_eq!(keyed(&a, "network retransmits", sent), [0], "{mode:?}");
+        // The removal frees the publication's cells, and the image retires
+        // with its EOS, freeing its own.
+        drop(lane);
+        drop(reader);
+        a.remove_aggregate(&publication).unwrap();
+        pump(&mut [&mut a, &mut b], |drivers| {
+            keyed(drivers[0], "network frames sent", sent).is_empty()
+                && keyed(drivers[1], "network losses", seen).is_empty()
+        });
+        for label in PUBLICATION_CELLS.iter().chain(&IMAGE_CELLS) {
+            assert!(keyed(&a, label, sent).is_empty(), "{mode:?}: {label}");
+            assert!(keyed(&b, label, seen).is_empty(), "{mode:?}: {label}");
+        }
+        for driver in [&mut a, &mut b] {
+            let shutdown = driver.close_network().unwrap();
+            assert!(shutdown.late.is_empty(), "{mode:?}");
+        }
+    }
+}
+
+/// M2b: the cells of a publication and an image still held at the close
+/// come back with the agents and are freed.
+#[test]
+fn the_close_frees_the_stream_cells_still_held() {
+    use crate::agents::{IMAGE_CELLS, PUBLICATION_CELLS};
+    for mode in [ThreadingMode::Shared, ThreadingMode::Dedicated] {
+        let (mut a, mut b) = (driver(mode), driver(mode));
+        let (publication, image) = connected(&mut a, &mut b, true, 10);
+        // Traffic, so the receiver has taken its image's cells.
+        let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+        exchange(&mut a, &mut b, &publication, &mut reader, 8);
+        drop(reader);
+        for driver in [&mut a, &mut b] {
+            let shutdown = driver.close_network().unwrap();
+            assert!(shutdown.late.is_empty(), "{mode:?}");
+            for label in PUBLICATION_CELLS.iter().chain(&IMAGE_CELLS) {
+                assert!(cells(driver, label).is_empty(), "{mode:?}: {label} kept");
+            }
+        }
+    }
+}
+
 /// M3 (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
 /// SPEC §16.8): each network endpoint's effective capabilities reach the
 /// CnC as gauges keyed by participant kind endpoint and its instance id,
