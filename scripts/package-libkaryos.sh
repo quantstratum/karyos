@@ -170,7 +170,8 @@ EOF
 # a static link names the archive itself. The archive's system libraries
 # are in Libs, not Libs.private: cgo's `#cgo pkg-config:` runs
 # `pkg-config --libs` without --static, and this file is only for a
-# static link.
+# static link. Static means libkaryos only: the system libraries
+# (libgcc_s on Linux, libSystem on macOS) stay dynamic.
 cat >"$stage/lib/pkgconfig/karyos-static.pc" <<EOF
 prefix=\${pcfiledir}/../..
 libdir=\${prefix}/lib

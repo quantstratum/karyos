@@ -4,7 +4,8 @@
 # statically through its karyos-static.pc: a C program of a few lines is
 # linked with `pkg-config --libs karyos-static` and with `--static`, each
 # binary runs karyos_abi_version and prints the MANIFEST's ABI version,
-# and `otool -L` (macOS) or `ldd` (Linux) shows no libkaryos.
+# and `otool -L` (macOS) or `ldd` (Linux) shows no libkaryos. The system
+# libraries stay dynamic: only libkaryos is linked statically.
 #
 # It compiles C, so it is a check of its own (`make libkaryos-static-check`)
 # for the bindings' static builds: neither the package script nor the

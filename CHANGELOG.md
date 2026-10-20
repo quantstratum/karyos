@@ -596,6 +596,8 @@ release may break APIs, wire formats and shared-memory layouts.
   `-Bstatic`), so `karyos-static.pc` names `lib/libkaryos.a` itself, with
   the archive's system libraries from rustc's `native-static-libs` in
   `Libs` (cgo's `#cgo pkg-config:` reads `--libs` without `--static`).
+  Static means libkaryos only: the system libraries, `libgcc_s` on Linux
+  included, stay dynamic.
   The MANIFEST lists both files (`pkg_config=`). `make
   libkaryos-static-check` links a C program of a few lines through it,
   with and without `--static`, runs `karyos_abi_version` and checks with
