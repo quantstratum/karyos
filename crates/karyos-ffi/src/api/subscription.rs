@@ -30,8 +30,8 @@
 use std::sync::OnceLock;
 
 use karyos_client::{
-    ImageChange, MessageInfo, MessageLimit, StreamId, Subscription, SubscriptionError,
-    SubscriptionPoll,
+    ImageChange, MergeError, MessageInfo, MessageLimit, RejoiningSubscription, StreamId,
+    Subscription, SubscriptionError, SubscriptionPoll,
 };
 use karyos_sys::term_bytes::HeapTerms;
 
@@ -53,15 +53,26 @@ pub(crate) enum Reader {
     Remote(Subscription<karyos_sys::term_bytes::SharedTerms>),
     /// Of a client over an embedded driver's conductor.
     Embedded(Subscription<HeapTerms>),
+    /// A remote client's subscription that recovers its overruns from an
+    /// Archive (F9b).
+    #[cfg(target_os = "linux")]
+    RemoteRejoining(Box<RejoiningSubscription<karyos_sys::term_bytes::SharedTerms>>),
+    /// An embedded client's subscription that recovers its overruns from
+    /// an Archive (F9b).
+    EmbeddedRejoining(Box<RejoiningSubscription<HeapTerms>>),
 }
 
-/// Runs `$body` on the subscription of either connection.
+/// Runs `$body` on the subscription of either connection, rejoining or
+/// not: the four share F4's adopt, size and poll.
 macro_rules! reader {
     ($reader:expr, $subscription:ident => $body:expr) => {
         match $reader {
             #[cfg(target_os = "linux")]
             Reader::Remote($subscription) => $body,
             Reader::Embedded($subscription) => $body,
+            #[cfg(target_os = "linux")]
+            Reader::RemoteRejoining($subscription) => $body,
+            Reader::EmbeddedRejoining($subscription) => $body,
         }
     };
 }
@@ -87,17 +98,57 @@ impl Reader {
         reader!(self, subscription => subscription.poll_adopted(handler, limit))
     }
 
+    /// A rejoin reads one stream: it has no images to report.
     fn next_image_change(&mut self) -> Option<ImageChange> {
-        reader!(self, subscription => subscription.next_image_change())
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(subscription) => subscription.next_image_change(),
+            Self::Embedded(subscription) => subscription.next_image_change(),
+            #[cfg(target_os = "linux")]
+            Self::RemoteRejoining(_) => None,
+            Self::EmbeddedRejoining(_) => None,
+        }
     }
 
     fn image_changes_lost(&self) -> u64 {
-        reader!(self, subscription => subscription.image_changes_lost())
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(subscription) => subscription.image_changes_lost(),
+            Self::Embedded(subscription) => subscription.image_changes_lost(),
+            #[cfg(target_os = "linux")]
+            Self::RemoteRejoining(_) => 0,
+            Self::EmbeddedRejoining(_) => 0,
+        }
     }
 
-    /// Whether it reads the images of a network subscription.
+    /// Whether it reads the images of a network subscription; a rejoin
+    /// never does.
     fn is_network(&self) -> bool {
-        reader!(self, subscription => subscription.registration().is_some())
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(subscription) => subscription.registration().is_some(),
+            Self::Embedded(subscription) => subscription.registration().is_some(),
+            #[cfg(target_os = "linux")]
+            Self::RemoteRejoining(_) => false,
+            Self::EmbeddedRejoining(_) => false,
+        }
+    }
+
+    /// Whether it recovers a gap, and its last merge failure; `None` for a
+    /// subscription that does not rejoin.
+    fn rejoin_state(&self) -> Option<(bool, Option<MergeError>)> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(_) => None,
+            Self::Embedded(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::RemoteRejoining(rejoining) => {
+                Some((rejoining.is_recovering(), rejoining.merge_failure()))
+            }
+            Self::EmbeddedRejoining(rejoining) => {
+                Some((rejoining.is_recovering(), rejoining.merge_failure()))
+            }
+        }
     }
 }
 
@@ -198,6 +249,20 @@ pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, F
     )
 }
 
+/// A rejoin from an Archive handle (`KARYOS_REJOIN_ARCHIVE`, F9b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArchiveRejoin {
+    /// The Archive handle, of the same client.
+    pub(crate) archive: Handle,
+    /// The rejoin's requester id; 0 for the library's.
+    pub(crate) client_id: u64,
+    /// The stream replays are asked onto.
+    pub(crate) replay_stream_id: i32,
+    /// Whether a failed merge closes the subscription, rather than
+    /// rejoining at the head.
+    pub(crate) close_on_failure: bool,
+}
+
 /// As [`add`], with the reader's role and rejoin policy.
 ///
 /// # Errors
@@ -210,11 +275,49 @@ pub(crate) fn add_with(
     stream_id: i32,
     options: karyos_client::SubscriptionOptions,
 ) -> Result<Handle, Failure> {
+    add_rejoining(client, uri, stream_id, options, None)
+}
+
+/// As [`add_with`], and with `rejoin`, a subscription that recovers its
+/// overruns from an Archive (F9b): the Archive handle lends its streams
+/// and an id; the rejoin takes its own connection, which the
+/// subscription owns. On failure nothing stays open.
+///
+/// # Errors
+///
+/// As [`add_with`]; [`crate::api::archive::rejoin_source`]'s and
+/// [`AnyClient::rejoin`]'s failures.
+pub(crate) fn add_rejoining(
+    client: Handle,
+    uri: &str,
+    stream_id: i32,
+    options: karyos_client::SubscriptionOptions,
+    rejoin: Option<ArchiveRejoin>,
+) -> Result<Handle, Failure> {
     clients().with(client, |entry| {
         entry.usable()?;
-        let reader = entry
-            .client
-            .add_subscription_with(uri, StreamId::new(stream_id), options)?;
+        let source = match rejoin {
+            Some(rejoin) => Some(crate::api::archive::rejoin_source(
+                rejoin.archive,
+                client,
+                rejoin.client_id,
+            )?),
+            None => None,
+        };
+        let mut reader =
+            entry
+                .client
+                .add_subscription_with(uri, StreamId::new(stream_id), options)?;
+        if let (Some(rejoin), Some(source)) = (rejoin, source) {
+            let secondary = if rejoin.close_on_failure {
+                karyos_client::Secondary::Close
+            } else {
+                karyos_client::Secondary::RejoinAtHead
+            };
+            reader = entry
+                .client
+                .rejoin(reader, source, rejoin.replay_stream_id, secondary)?;
+        }
         let mut copy = Vec::new();
         if let Err(status) = fit(&mut copy, reader.max_message_length()) {
             entry.client.remove_subscription(reader);
@@ -340,6 +443,18 @@ pub(crate) fn next_image_change(subscription: Handle) -> Result<Option<ImageChan
 /// The handle's failures.
 pub(crate) fn image_changes_lost(subscription: Handle) -> Result<u64, Status> {
     table().with(subscription, |entry| entry.reader.image_changes_lost())
+}
+
+/// Whether `subscription` recovers a gap, and its last merge failure;
+/// `None` for one that does not rejoin (F9b).
+///
+/// # Errors
+///
+/// The handle's failures.
+pub(crate) fn rejoin_state(
+    subscription: Handle,
+) -> Result<Option<(bool, Option<MergeError>)>, Status> {
+    table().with(subscription, |entry| entry.reader.rejoin_state())
 }
 
 /// Empties `subscription`'s copy buffer, so its next poll grows it (tests).
