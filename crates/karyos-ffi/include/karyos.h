@@ -232,7 +232,7 @@ typedef struct karyos_driver_options {
     uint32_t broadcast_capacity;
     /* Cells of the counters region. */
     uint32_t counters_capacity;
-    /* Zero. */
+    /* Zero; anything else is KARYOS_E_INVALID_ARGUMENT. */
     uint32_t reserved;
     /* How often the driver advances its heartbeat, in nanoseconds. */
     uint64_t heartbeat_interval_ns;

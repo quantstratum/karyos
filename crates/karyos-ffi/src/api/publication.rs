@@ -109,10 +109,10 @@ struct Staged {
 pub(crate) struct Entry {
     /// The client handle it belongs to.
     client: Handle,
-    /// Its client's embedded driver, if the C ABI created it: the
+    /// Its client's embedded driver's state, if the C ABI created it: the
     /// publication follows its failure and its close
-    /// (`crate::api::driver::usable`).
-    driver: Option<Handle>,
+    /// (`crate::api::driver::DriverState::usable`), with no lock.
+    driver: Option<crate::api::driver::DriverState>,
     lanes: Lanes,
     /// The staging buffer of its claims.
     staged: Arc<[AtomicU8]>,
@@ -123,7 +123,9 @@ impl Entry {
     /// Whether the publication may act: its client's embedded driver,
     /// if any, is neither poisoned nor closed.
     fn usable(&self) -> Result<(), Status> {
-        self.driver.map_or(Ok(()), crate::api::driver::usable)
+        self.driver
+            .as_ref()
+            .map_or(Ok(()), crate::api::driver::DriverState::usable)
     }
 
     /// Releases the publication to `client`, and its outstanding claim.
@@ -174,7 +176,7 @@ pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, F
             .collect();
         let publication = Entry {
             client,
-            driver: entry.driver,
+            driver: entry.driver.clone(),
             lanes,
             staged,
             claim: None,

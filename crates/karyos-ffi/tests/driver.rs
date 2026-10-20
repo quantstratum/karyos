@@ -90,6 +90,10 @@ fn a_refused_configuration_fills_nothing_but_the_status() {
     let (status, driver, detail) = abi::driver_create_with(&options);
     assert_eq!((status, driver), (INVALID_ARGUMENT, 0));
     assert_eq!((detail.code, detail.value), (0, 0));
+    // A nonzero reserved word is refused, so a later minor can use it.
+    let (_, mut options) = abi::driver_options();
+    options.reserved = 1;
+    assert_eq!(abi::driver_create_with(&options).0, INVALID_ARGUMENT);
     // An options' field is read: a zero client bound is refused too.
     let (_, mut options) = abi::driver_options();
     options.max_clients = 0;

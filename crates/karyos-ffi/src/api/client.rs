@@ -92,21 +92,23 @@ pub(crate) struct ClientEntry {
     pub(crate) client: AnyClient,
     /// Its open publications.
     pub(crate) publications: Vec<Handle>,
-    /// The embedded driver whose conductor it is over, when the C ABI
-    /// created that driver (F5): the client follows its failure and its
-    /// close ([`driver::usable`]).
-    pub(crate) driver: Option<Handle>,
+    /// The state of the embedded driver whose conductor it is over, when
+    /// the C ABI created that driver (F5): the client follows its failure
+    /// and its close ([`driver::DriverState::usable`]).
+    pub(crate) driver: Option<driver::DriverState>,
 }
 
 impl ClientEntry {
-    /// Whether the client may act; see [`driver::usable`].
+    /// Whether the client may act; see [`driver::DriverState::usable`].
     ///
     /// # Errors
     ///
     /// [`Status::Internal`] once its driver is poisoned,
     /// [`Status::Closed`] once it is closed.
     pub(crate) fn usable(&self) -> Result<(), Status> {
-        self.driver.map_or(Ok(()), driver::usable)
+        self.driver
+            .as_ref()
+            .map_or(Ok(()), driver::DriverState::usable)
     }
 }
 
@@ -118,7 +120,7 @@ pub(crate) fn clients() -> &'static Table<ClientEntry> {
 
 /// A client's entry for its table, over `driver` when the C ABI created
 /// it.
-fn entry(client: AnyClient, driver: Option<Handle>) -> ClientEntry {
+fn entry(client: AnyClient, driver: Option<driver::DriverState>) -> ClientEntry {
     ClientEntry {
         client,
         publications: Vec::new(),
@@ -232,12 +234,12 @@ pub(crate) fn insert_embedded(client: Client<ClientConductor>) -> Result<Handle,
 ///
 /// The driver's refusal, the context's, and the table's.
 pub(crate) fn connect_embedded(owner: Handle) -> Result<Handle, Failure> {
-    let conductor = driver::conductor(owner)?;
+    let (conductor, state) = driver::conductor(owner)?;
     let context = Context::builder()
         .build()
         .map_err(|error| Failure::from(&error))?;
     let client = Client::with_conductor(conductor, context);
-    Ok(clients().insert(entry(AnyClient::Embedded(client), Some(owner)))?)
+    Ok(clients().insert(entry(AnyClient::Embedded(client), Some(state)))?)
 }
 
 /// Serves `client` once; whether anything was served.

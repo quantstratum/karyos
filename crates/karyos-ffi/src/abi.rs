@@ -197,6 +197,9 @@ fn prefix(size: u32, ours: u32) -> usize {
 ///
 /// `input` is null or points to a readable struct whose first field is
 /// the `uint32_t` size the caller set, and which is at least that size.
+/// `T` must be valid for every bit pattern (integers and raw pointers
+/// only: no `bool`, enum or reference), since its bytes come from the
+/// caller: `DriverOptions` and `StreamOptions` are.
 unsafe fn read_sized<T: Copy>(input: *const T, min: u32, defaults: T) -> Result<T, Status> {
     if !readable(input) {
         return Err(Status::InvalidArgument);
@@ -612,7 +615,7 @@ pub struct DriverOptions {
     pub broadcast_capacity: u32,
     /// Cells of the counters region.
     pub counters_capacity: u32,
-    /// Zero.
+    /// Zero; anything else is refused (a later minor may use it).
     pub reserved: u32,
     /// How often the driver advances its heartbeat, in nanoseconds.
     pub heartbeat_interval_ns: u64,
@@ -701,6 +704,10 @@ pub unsafe extern "C" fn karyos_driver_create(
                 Ok(raw) => raw,
                 Err(status) => return status,
             };
+        // A later minor may give it a meaning: refused, not ignored.
+        if raw.reserved != 0 {
+            return Status::InvalidArgument;
+        }
         let options = driver::Options {
             max_clients: raw.max_clients,
             max_streams: raw.max_streams,

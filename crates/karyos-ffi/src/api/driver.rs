@@ -17,7 +17,7 @@
 //!   and speak the protocol version this library was built with,
 //!   [`PROTOCOL_VERSION`], asserted at compile time (ADR-0053).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -269,6 +269,61 @@ impl Threaded {
     }
 }
 
+/// What a driver's dependants (its clients and their publications) see
+/// of it, without taking its slot: one Acquire load per call.
+#[derive(Debug, Clone)]
+pub(crate) struct DriverState(Arc<AtomicU8>);
+
+/// The driver runs.
+const LIVE: u8 = 0;
+/// A panic poisoned it, or it was lost between modes.
+const LOST: u8 = 1;
+/// It is closed.
+const CLOSED: u8 = 2;
+
+impl DriverState {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(LIVE)))
+    }
+
+    /// Marks it lost, unless it is closed.
+    fn lose(&self) {
+        let _ = self
+            .0
+            .compare_exchange(LIVE, LOST, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn close(&self) {
+        self.0.store(CLOSED, Ordering::Release);
+    }
+
+    /// Whether a dependant may act.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Internal`] once the driver is poisoned or lost,
+    /// [`Status::Closed`] once it is closed.
+    pub(crate) fn usable(&self) -> Result<(), Status> {
+        match self.0.load(Ordering::Acquire) {
+            LIVE => Ok(()),
+            LOST => Err(Status::Internal),
+            _ => Err(Status::Closed),
+        }
+    }
+}
+
+/// Marks a driver lost when a panic unwinds past it: in a call that holds
+/// its slot, or on its thread.
+struct Watch(DriverState);
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.lose();
+        }
+    }
+}
+
 /// How a driver runs.
 enum Mode {
     /// Its caller drives it (boxed: the other modes are small).
@@ -283,8 +338,11 @@ enum Mode {
 /// A driver handle's object.
 pub(crate) struct Driver {
     mode: Mode,
-    /// Its streams, by wire stream id.
-    streams: BTreeMap<i32, StreamHandle>,
+    /// Its streams, by wire stream id, with their session ids: the C ABI
+    /// keys a driver's streams by stream id alone.
+    streams: BTreeMap<i32, (StreamHandle, i32)>,
+    /// What its dependants see of it.
+    state: DriverState,
 }
 
 impl Drop for Driver {
@@ -310,21 +368,21 @@ impl Driver {
             Mode::Lost => Err(Status::Internal),
         }
     }
-
-    /// Whether it can no longer be used.
-    fn failed(&self) -> bool {
-        match &self.mode {
-            Mode::Invoker(_) => false,
-            Mode::Threaded(threaded) => threaded.shared.is_poisoned(),
-            Mode::Lost => true,
-        }
-    }
 }
 
 /// The table of drivers, allocated on first use.
 fn drivers() -> &'static Table<Driver> {
     static DRIVERS: OnceLock<Table<Driver>> = OnceLock::new();
     DRIVERS.get_or_init(|| Table::new(Kind::Driver, MAX_DRIVERS))
+}
+
+/// Runs `f` on `driver`'s slot; a panic in it poisons the slot (the
+/// table) and marks the driver lost for its dependants.
+fn with_slot<R>(driver: Handle, f: impl FnOnce(&mut Driver) -> R) -> Result<R, Status> {
+    drivers().with(driver, |slot| {
+        let _watch = Watch(slot.state.clone());
+        f(slot)
+    })
 }
 
 impl From<&DriverError> for Failure {
@@ -370,6 +428,7 @@ pub(crate) fn create(options: &Options) -> Result<Handle, Failure> {
     Ok(drivers().insert(Driver {
         mode: Mode::Invoker(Box::new(driver)),
         streams: BTreeMap::new(),
+        state: DriverState::new(),
     })?)
 }
 
@@ -381,7 +440,7 @@ pub(crate) fn create(options: &Options) -> Result<Handle, Failure> {
 /// [`Status::Internal`] for a lost one, the table's errors, and the duty
 /// cycle's.
 pub(crate) fn do_work(driver: Handle) -> Result<u32, Failure> {
-    drivers().with(driver, |slot| match &mut slot.mode {
+    with_slot(driver, |slot| match &mut slot.mode {
         Mode::Invoker(driver) => driver.do_work().map_err(|error| Failure::from(&error)),
         Mode::Threaded(threaded) if threaded.shared.is_poisoned() => Err(Status::Internal.into()),
         Mode::Threaded(_) => Err(Status::Busy.into()),
@@ -401,7 +460,7 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
     if ![IDLE_BUSY_SPIN, IDLE_YIELD, IDLE_SLEEP].contains(&idle.strategy) {
         return Err(Status::InvalidArgument.into());
     }
-    drivers().with(driver, |slot| {
+    with_slot(driver, |slot| {
         match &slot.mode {
             Mode::Invoker(_) => {}
             Mode::Threaded(_) => return Err(Status::Busy.into()),
@@ -415,9 +474,10 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
         let spawned = {
             let shared = Arc::clone(&shared);
             let stop = Arc::clone(&stop);
+            let state = slot.state.clone();
             std::thread::Builder::new()
                 .name("karyos-driver".to_owned())
-                .spawn(move || run(&shared, &stop, idle))
+                .spawn(move || run(&shared, &stop, idle, state))
         };
         match spawned {
             Ok(thread) => {
@@ -430,10 +490,13 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
             }
             Err(error) => {
                 // No thread holds the driver: it goes back to its caller.
-                if let Ok(mutex) = Arc::try_unwrap(shared) {
-                    slot.mode = Mode::Invoker(Box::new(
-                        mutex.into_inner().unwrap_or_else(PoisonError::into_inner),
-                    ));
+                match Arc::try_unwrap(shared) {
+                    Ok(mutex) => {
+                        slot.mode = Mode::Invoker(Box::new(
+                            mutex.into_inner().unwrap_or_else(PoisonError::into_inner),
+                        ));
+                    }
+                    Err(_) => slot.state.lose(),
                 }
                 let errno = error.raw_os_error().map_or(0, i32::unsigned_abs);
                 Err(Failure::with(Status::System, 0, u64::from(errno)))
@@ -444,10 +507,13 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
 
 /// The driver's thread: duty cycles until asked to stop. A panic in one
 /// poisons the shared driver and ends the thread.
-fn run(shared: &Mutex<EmbeddedDriver>, stop: &AtomicBool, idle: Idle) {
+fn run(shared: &Mutex<EmbeddedDriver>, stop: &AtomicBool, idle: Idle, state: DriverState) {
+    let watch = Watch(state);
     while !stop.load(Ordering::Acquire) {
         let work = {
             let Ok(mut driver) = shared.lock() else {
+                // Poisoned by a panic in another holder.
+                watch.0.lose();
                 return;
             };
             // A duty cycle's error is not fatal: the next one runs.
@@ -465,7 +531,7 @@ fn run(shared: &Mutex<EmbeddedDriver>, stop: &AtomicBool, idle: Idle) {
 /// [`Status::Internal`] when a panic on its thread poisoned it (it stays
 /// lost until closed), and the table's errors.
 pub(crate) fn stop(driver: Handle) -> Result<(), Status> {
-    drivers().with(driver, |slot| {
+    with_slot(driver, |slot| {
         let Mode::Threaded(threaded) = &mut slot.mode else {
             return Err(match slot.mode {
                 Mode::Lost => Status::Internal,
@@ -487,7 +553,10 @@ pub(crate) fn stop(driver: Handle) -> Result<(), Status> {
                 slot.mode = Mode::Invoker(Box::new(driver));
                 Ok(())
             }
-            None => Err(Status::Internal),
+            None => {
+                slot.state.lose();
+                Err(Status::Internal)
+            }
         }
     })?
 }
@@ -497,19 +566,29 @@ pub(crate) fn stop(driver: Handle) -> Result<(), Status> {
 ///
 /// # Errors
 ///
-/// The options' and the driver's refusals (a duplicate stream id is
-/// [`Status::InvalidArgument`] with the stream and session ids),
+/// The options' and the driver's refusals: a stream id the driver already
+/// has, in any session, is [`Status::InvalidArgument`] with the stream id
+/// and the session id it has (the C ABI keys a driver's streams by stream
+/// id alone, while the driver keys them by stream and session);
 /// [`Status::Internal`] for a lost driver, and the table's errors.
 pub(crate) fn add_stream(driver: Handle, options: &StreamOptions) -> Result<(), Failure> {
     let config = options.config()?;
-    drivers()
-        .with(driver, |slot| {
-            let added = slot.with_driver(|driver| driver.add_stream(config))?;
-            let stream = added.map_err(|error| Failure::from(&error))?;
-            let _ = slot.streams.insert(options.stream_id, stream);
-            Ok(())
-        })
-        .map_err(Failure::from)?
+    with_slot(driver, |slot| {
+        if let Some((_, session)) = slot.streams.get(&options.stream_id) {
+            return Err(Failure::with(
+                Status::InvalidArgument,
+                u64::from(options.stream_id.unsigned_abs()),
+                u64::from(session.unsigned_abs()),
+            ));
+        }
+        let added = slot.with_driver(|driver| driver.add_stream(config))?;
+        let stream = added.map_err(|error| Failure::from(&error))?;
+        let _ = slot
+            .streams
+            .insert(options.stream_id, (stream, options.session_id));
+        Ok(())
+    })
+    .map_err(Failure::from)?
 }
 
 /// Removes the stream `stream_id` of `driver`: its publication closes,
@@ -520,51 +599,36 @@ pub(crate) fn add_stream(driver: Handle, options: &StreamOptions) -> Result<(), 
 /// [`Status::InvalidArgument`] for a stream id the driver does not have,
 /// [`Status::Internal`] for a lost driver, and the table's errors.
 pub(crate) fn remove_stream(driver: Handle, stream_id: i32) -> Result<(), Failure> {
-    drivers()
-        .with(driver, |slot| {
-            let stream = slot.streams.get(&stream_id).copied().ok_or_else(|| {
-                Failure::with(
-                    Status::InvalidArgument,
-                    u64::from(stream_id.unsigned_abs()),
-                    0,
-                )
-            })?;
-            let removed = slot.with_driver(|driver| driver.remove_stream(stream))?;
-            removed.map_err(|error| Failure::from(&error))?;
-            let _ = slot.streams.remove(&stream_id);
-            Ok(())
-        })
-        .map_err(Failure::from)?
+    with_slot(driver, |slot| {
+        let (stream, _) = slot.streams.get(&stream_id).copied().ok_or_else(|| {
+            Failure::with(
+                Status::InvalidArgument,
+                u64::from(stream_id.unsigned_abs()),
+                0,
+            )
+        })?;
+        let removed = slot.with_driver(|driver| driver.remove_stream(stream))?;
+        removed.map_err(|error| Failure::from(&error))?;
+        let _ = slot.streams.remove(&stream_id);
+        Ok(())
+    })
+    .map_err(Failure::from)?
 }
 
-/// A conductor of `driver` for a new client.
+/// A conductor of `driver` for a new client, and the state the client
+/// follows.
 ///
 /// # Errors
 ///
 /// The driver's refusal, [`Status::Internal`] for a lost driver, and the
 /// table's errors.
-pub(crate) fn conductor(driver: Handle) -> Result<ClientConductor, Failure> {
-    drivers()
-        .with(driver, |slot| {
-            slot.with_driver(|driver| driver.connect().map_err(|error| Failure::from(&error)))
-        })?
-        .map_err(Failure::from)?
-}
-
-/// Whether a client of `driver` may act: [`Status::Internal`] once the
-/// driver is poisoned or lost, [`Status::Closed`] once it is closed. A
-/// driver another thread holds, or this thread's callback, is not
-/// failed.
-///
-/// # Errors
-///
-/// As described.
-pub(crate) fn usable(driver: Handle) -> Result<(), Status> {
-    match drivers().with(driver, |slot| slot.failed()) {
-        Ok(false) | Err(Status::Busy | Status::Reentrant) => Ok(()),
-        Ok(true) => Err(Status::Internal),
-        Err(status) => Err(status),
-    }
+pub(crate) fn conductor(driver: Handle) -> Result<(ClientConductor, DriverState), Failure> {
+    with_slot(driver, |slot| {
+        slot.state.usable()?;
+        let conductor =
+            slot.with_driver(|driver| driver.connect().map_err(|error| Failure::from(&error)))??;
+        Ok((conductor, slot.state.clone()))
+    })?
 }
 
 /// Closes `driver`, stopping its thread first; its clients stay to be
@@ -574,7 +638,11 @@ pub(crate) fn usable(driver: Handle) -> Result<(), Status> {
 ///
 /// As [`Table::remove`].
 pub(crate) fn close(driver: Handle) -> Result<(), Status> {
-    drivers().remove(driver).map(drop)
+    let closed = drivers().remove(driver)?;
+    closed.state.close();
+    // Dropping it joins its thread.
+    drop(closed);
+    Ok(())
 }
 
 #[cfg(test)]
