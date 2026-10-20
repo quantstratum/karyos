@@ -348,6 +348,11 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         &self.store
     }
 
+    /// The source, for a writer that feeds it (a [`crate::queue::QueueSource`]).
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
     /// The store, to read it back (tests).
     #[cfg(test)]
     pub(crate) fn store_mut(&mut self) -> &mut SegmentStore<D> {

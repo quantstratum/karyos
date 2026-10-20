@@ -11,6 +11,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+karyos-archive.workspace = true
 karyos-client.workspace = true
 karyos-sys.workspace = true
 karyos-trace.workspace = true

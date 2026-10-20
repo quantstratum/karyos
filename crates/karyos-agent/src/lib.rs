@@ -50,6 +50,7 @@ pub mod alerts;
 pub mod api;
 pub mod cli;
 pub mod exporter;
+pub mod journal;
 pub mod json;
 #[cfg_attr(
     not(target_os = "linux"),
