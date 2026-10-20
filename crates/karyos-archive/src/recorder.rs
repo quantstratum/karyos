@@ -348,6 +348,11 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         &self.store
     }
 
+    /// The source, for a writer that feeds it (a [`crate::queue::QueueSource`]).
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
     /// The store, to read it back (tests).
     #[cfg(test)]
     pub(crate) fn store_mut(&mut self) -> &mut SegmentStore<D> {
@@ -562,6 +567,20 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         };
         self.ended = Some(ended);
         ended
+    }
+
+    /// Syncs the store ([`SegmentStore::sync`]) and returns the durable
+    /// position: a writer that must know its record is on disk before it
+    /// acts (the agent's journal, M10) syncs after the duty that recorded
+    /// it. Under a policy other than no sync, that is everything recorded;
+    /// under no sync, a segment finished unsynced holds it back.
+    ///
+    /// # Errors
+    ///
+    /// The store's errors, after which the recording must be stopped and
+    /// recovered.
+    pub fn sync(&mut self) -> Result<u64, RecorderError> {
+        Ok(self.store.sync()?)
     }
 
     /// Closes the store with everything written durable, whatever its
