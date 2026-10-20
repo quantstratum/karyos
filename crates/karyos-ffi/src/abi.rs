@@ -547,6 +547,109 @@ pub unsafe extern "C" fn karyos_publication_offer(
     })
 }
 
+/// `karyos_offer_options`: per-offer options of
+/// `karyos_publication_offer_with`. Only integers: the library reads it by
+/// prefix from the caller's bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OfferOptions {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// Zero.
+    pub reserved: u32,
+    /// The value written in every fragment's header; a conflated stream's
+    /// key.
+    pub reserved_value: i64,
+}
+
+/// The size of `karyos_offer_options` in ABI 0.1.0, the smallest a caller
+/// passes.
+const OFFER_OPTIONS_SIZE_0_1: u32 = 16;
+
+/// `karyos_offer_options` with the defaults (a reserved value of 0) and
+/// this version's size.
+fn default_offer_options() -> OfferOptions {
+    OfferOptions {
+        size: size_of_u32::<OfferOptions>(),
+        reserved: 0,
+        reserved_value: 0,
+    }
+}
+
+/// Fills `options` with the defaults (`reserved_value` 0) and its size.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable `karyos_offer_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_offer_options_init(options: *mut OfferOptions) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable `karyos_offer_options`.
+        unsafe { options.write(default_offer_options()) };
+        Status::Ok
+    })
+}
+
+/// As `karyos_publication_offer`, with `options`: the reserved value every
+/// fragment's header carries (subscribers read it as
+/// `karyos_message_info.reserved_value`). On a conflated stream it is the
+/// message's key, in `0..keys` of the stream's table, and the value is at
+/// most its capacity: otherwise `KARYOS_E_CONFLATION`, with nothing
+/// reserved. A null `options`, a `size` below that of ABI 0.1.0 or a
+/// nonzero `reserved` returns `KARYOS_E_INVALID_ARGUMENT`.
+///
+/// # Safety
+///
+/// As [`karyos_publication_offer`]; `options` is null or points to a
+/// readable `karyos_offer_options` of at least its `size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_publication_offer_with(
+    publication: u64,
+    lane: u32,
+    data: *const u8,
+    length: usize,
+    options: *const OfferOptions,
+    accepted: *mut Accepted,
+) -> i32 {
+    guard(|| {
+        // SAFETY: the caller's contract on `options`; `OfferOptions` holds
+        // integers only, valid for every bit pattern.
+        let options =
+            match unsafe { read_sized(options, OFFER_OPTIONS_SIZE_0_1, default_offer_options()) } {
+                Ok(options) if options.reserved == 0 => {
+                    karyos_client::OfferOptions::new().with_reserved_value(options.reserved_value)
+                }
+                Ok(_) => return Status::InvalidArgument,
+                Err(status) => return status,
+            };
+        let payload: &[u8] = if length == 0 {
+            &[]
+        } else if data.is_null() || isize::try_from(length).is_err() {
+            return Status::InvalidArgument;
+        } else {
+            // SAFETY: `data` is non-null and points to `length` readable
+            // bytes (the caller's contract), `length` fits an `isize`, and
+            // the slice is used only during the call.
+            unsafe { core::slice::from_raw_parts(data, length) }
+        };
+        match api::publication::offer_with(Handle::from_raw(publication), lane, payload, options) {
+            Ok(done) => {
+                // SAFETY: the caller's contract on `accepted`.
+                unsafe { write_accepted(accepted, done) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
 /// Offers `length` bytes at `data` on the timed `lane` of `publication`,
 /// with its requested not-before time `tx_time` in the lane's clock domain
 /// (`karyos_clock_now` reads it), copied into the term before it returns.

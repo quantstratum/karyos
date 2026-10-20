@@ -144,6 +144,27 @@ impl Lanes {
         })
     }
 
+    /// An offer on `lane` with `options` (F7b-2a): its reserved value.
+    fn offer_on_with(
+        &mut self,
+        lane: Lane,
+        payload: &[u8],
+        options: karyos_client::OfferOptions,
+    ) -> Result<Placed, OfferError> {
+        lanes!(self,
+        publication => publication.offer_on_with(lane, payload, options).map(placed),
+        handle => {
+            if lane != Lane::ZERO {
+                return Err(OfferError::InvalidLane { lane });
+            }
+            let append = karyos_sys::log_buffer::AppendOptions {
+                reserved_value: options.reserved_value,
+                ..karyos_sys::log_buffer::AppendOptions::default()
+            };
+            concurrent_offered(handle.offer_with(payload, append)?)
+        })
+    }
+
     /// Delivers up to `limit` outcome records of `lane` to `handler`
     /// (F7a-2): a lane that is not guarded has none. A concurrent handle
     /// is never guarded (GC-7): lane 0 has none, any other is invalid.
@@ -370,6 +391,28 @@ pub(crate) fn offer(publication: Handle, lane_raw: u32, payload: &[u8]) -> Resul
         entry
             .lanes
             .offer_on(lane, payload)
+            .map_err(|error| Failure::from(&error))
+    })?
+}
+
+/// Offers `payload` on `lane` with `options` (F7b-2a).
+///
+/// # Errors
+///
+/// As [`offer`]; a key outside a conflated stream's table, or a value
+/// larger than its capacity, as [`Status::Conflation`].
+pub(crate) fn offer_with(
+    publication: Handle,
+    lane_raw: u32,
+    payload: &[u8],
+    options: karyos_client::OfferOptions,
+) -> Result<Placed, Failure> {
+    let lane = lane(lane_raw)?;
+    table().with(publication, |entry| {
+        entry.usable()?;
+        entry
+            .lanes
+            .offer_on_with(lane, payload, options)
             .map_err(|error| Failure::from(&error))
     })?
 }

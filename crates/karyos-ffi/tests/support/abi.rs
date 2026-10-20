@@ -112,6 +112,15 @@ pub struct SubscriptionOptions {
     pub reserved: u32,
 }
 
+/// `karyos_offer_options`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OfferOptions {
+    pub size: u32,
+    pub reserved: u32,
+    pub reserved_value: i64,
+}
+
 unsafe extern "C" {
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
@@ -192,6 +201,15 @@ unsafe extern "C" {
         detail: *mut Detail,
     ) -> i32;
     safe fn karyos_subscription_close(subscription: u64) -> i32;
+    fn karyos_offer_options_init(options: *mut OfferOptions) -> i32;
+    fn karyos_publication_offer_with(
+        publication: u64,
+        lane: u32,
+        data: *const u8,
+        length: usize,
+        options: *const OfferOptions,
+        accepted: *mut core::ffi::c_void,
+    ) -> i32;
 }
 
 /// The byte every part of a [`SizedStruct`] the caller did not set holds:
@@ -431,6 +449,43 @@ pub fn publication_offer_on(
             lane,
             data.as_ptr(),
             data.len(),
+            accepted.as_mut_ptr().cast(),
+        )
+    };
+    (status, accepted)
+}
+
+/// `karyos_offer_options_init`: the status and the options.
+pub fn offer_options() -> (i32, OfferOptions) {
+    let mut options = OfferOptions::default();
+    // SAFETY: a live, aligned, writable `OfferOptions`.
+    let status = unsafe { karyos_offer_options_init(&mut options) };
+    (status, options)
+}
+
+/// `karyos_publication_offer_with` of `data` on `lane`, with `options`
+/// sized as `size` and an accepted sized as `accepted_size`: the status
+/// and the accepted.
+pub fn publication_offer_with(
+    publication: u64,
+    lane: u32,
+    data: &[u8],
+    options: &OfferOptions,
+    size: u32,
+    accepted_size: u32,
+) -> (i32, SizedStruct<Accepted>) {
+    let options = SizedStruct::new(Some(options), size);
+    let mut accepted = accepted(accepted_size);
+    // SAFETY: `data` is live for the call; options of at least `size`
+    // readable bytes; `accepted` holds at least `accepted_size` writable
+    // bytes.
+    let status = unsafe {
+        karyos_publication_offer_with(
+            publication,
+            lane,
+            data.as_ptr(),
+            data.len(),
+            options.as_ptr(),
             accepted.as_mut_ptr().cast(),
         )
     };
