@@ -156,6 +156,7 @@ pub struct SizedStruct<T> {
 
 impl<T: Copy> SizedStruct<T> {
     /// `value`, or the sentinel for an output, with size field `size`.
+    /// `T` must have no padding bytes, as every struct of this module.
     pub fn new(value: Option<&T>, size: u32) -> Self {
         // A `u32` size plus sixteen fits a `usize` on every target the
         // library supports.
@@ -166,7 +167,10 @@ impl<T: Copy> SizedStruct<T> {
         if let Some(value) = value {
             // SAFETY: `words` holds at least `size_of::<T>()` bytes and is
             // 8-aligned, which covers `T`'s alignment (a C struct of
-            // integers and pointers); `value` does not overlap it.
+            // integers and pointers); `value` does not overlap it. `T` has
+            // no padding bytes, so every byte read is initialized: each
+            // struct of this module lays its fields out in size order
+            // with no gap (callers pass only those).
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     core::ptr::from_ref(value).cast::<u8>(),

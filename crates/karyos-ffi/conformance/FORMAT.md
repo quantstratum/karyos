@@ -121,7 +121,9 @@ out, it is the size of the struct in the header the runner reads.
   then is it a result (`lane` and `position` of `karyos_accepted`;
   `code` and `value` of `karyos_detail`). `detail_written` is 1 when
   `code` and `value` were written, 0 otherwise, so a scenario can expect
-  nothing written.
+  nothing written. A field written with a value whose bytes are all
+  `0xA5` reads as unwritten: no 0.1.0 output field holds such a value in
+  practice, but a runner cannot tell it apart.
 - `tail` (`karyos_accepted`) and `detail_tail` (`karyos_detail`) are
   `"intact"` when every byte past the header's size still holds the
   sentinel, `"changed"` otherwise.
