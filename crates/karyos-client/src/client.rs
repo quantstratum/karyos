@@ -1498,7 +1498,8 @@ impl<C: Connection> Client<C> {
                 idle = 0;
             }
             self.context.idle.idle(idle);
-            idle = idle.saturating_add(1);
+            // Past the yields every count sleeps alike, so it stops there.
+            idle = (idle + 1).min(YIELDS_BEFORE_SLEEP);
         }
     }
 
