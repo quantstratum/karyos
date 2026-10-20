@@ -64,6 +64,11 @@ test-only unsafe of the integration tests.
 | The outcome poll's arguments and `delivered` write, checked before the handle (F7a-2) | `karyos_publication_poll_outcomes` | `abi::tests::outcomes::the_arguments_are_checked_before_the_handle` |
 | The timed offer's payload slice (F7a-3) | `karyos_publication_offer_at` | `abi::tests::a_timed_offer_checks_its_arguments_first` |
 | The clock's `now` write; nothing written on refusal (F7a-3) | `karyos_clock_now` | `abi::tests::the_clock_reads_the_monotonic_domain_and_refuses_bad_arguments` (a TAI read is native only) |
+| Subscription options: the init write, the prefix read, a newer struct by prefix (F7b-1) | `karyos_subscription_options_init`, `karyos_client_add_subscription_with` | `abi::tests::subscription_options_init_fills_the_defaults_and_the_size`, `add_with_refuses_bad_options_and_opens_nothing`, `an_optional_reader_under_close_is_closed_by_its_overrun` |
+| Offer options: the init write, the prefix read, the payload slice (F7b-2a) | `karyos_offer_options_init`, `karyos_publication_offer_with` | `abi::tests::offer_options_init_fills_the_defaults_and_the_size`, `offer_with_refuses_bad_options`, `an_offer_carries_its_reserved_value` |
+| Stream options of two layouts, refused between them (F7b-2b) | `karyos_driver_add_stream` | `abi::tests::conflated::stream_options_take_two_layouts_and_nothing_between` |
+| Conflated views: the out-parameters, the arguments checked before the handle (F7b-2b, F7b-2c) | `karyos_driver_subscribe_conflated`, `karyos_client_add_conflated_subscription`, `karyos_conflated_poll` | `abi::tests::conflated::conflated_calls_check_their_arguments`, `a_client_view_checks_its_arguments` |
+| The conflated handler call: the reader's private copy of a value, valid for the call; `delivered` (F7b-2b) | `karyos_conflated_poll` | `abi::tests::conflated::a_conflated_view_delivers_each_keys_latest_value` |
 | A caller's sized struct of another minor version (test support: `SizedStruct` in `tests/support/abi.rs`) | the conformance runner | `tests/conformance.rs` `the_sized_struct_checks_see_writes`; the library's side is `a_struct_from_a_newer_header_is_read_and_written_by_its_prefix` |
 
 ## What Miri does not cover
@@ -73,7 +78,9 @@ test-only unsafe of the integration tests.
   site the table lacks, and run natively on macOS and Linux.
 - **The cross-process client** (`RemoteClient`, Linux only): shared
   mappings, descriptors and syscalls are outside Miri. The Linux tests
-  of `karyos-client`, `karyos-driver` and `tests/connect.rs` cover them.
+  of `karyos-client`, `karyos-driver` and `tests/connect.rs` cover them,
+  including a remote client's guarded publication (`tests/outcomes.rs`)
+  and conflated view.
 - **Network images** (UDP sockets):
   `a_network_subscription_grows_its_copy_with_a_larger_image` runs
   natively, and so does the image change's populated write (`has` = 1,
