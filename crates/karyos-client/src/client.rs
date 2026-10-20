@@ -90,9 +90,11 @@ use crate::subscription::{
 
 mod publish;
 mod rejoin;
+mod targets;
 
 pub use publish::{Accepted, Claim, MessageLength, OfferError, OfferOptions, Publication};
 pub use rejoin::{NotRejoinable, RejoiningSubscription};
+pub use targets::ReplayTargetSubscriber;
 
 /// Default wait of a control call.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1033,6 +1035,10 @@ pub struct Client<C: Connection> {
     /// which its record takes when its grant arrives, before the events
     /// that announce its first images.
     adding: Option<(SubscriberRole, RejoinPolicy)>,
+    /// The replay-target subscribers made by [`Client::replay_targets`].
+    targets: Vec<Arc<Mutex<targets::Target<C::Terms>>>>,
+    /// Their requests in flight.
+    target_asks: Vec<targets::TargetAsk<C::Terms>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1079,6 +1085,8 @@ impl<C: Connection> Client<C> {
             completions: Vec::new(),
             events: Vec::new(),
             adding: None,
+            targets: Vec::new(),
+            target_asks: Vec::new(),
         }
     }
 
@@ -1458,6 +1466,7 @@ impl<C: Connection> Client<C> {
     /// Serves the connection once; returns whether anything was served and
     /// the completion of `wanted`, when it arrived.
     fn service(&mut self, wanted: Option<u64>) -> (bool, Option<Found<C::Terms>>) {
+        self.serve_targets();
         let mut completions = core::mem::take(&mut self.completions);
         let mut events = core::mem::take(&mut self.events);
         // At most one queue of events per service: none is dropped before
@@ -1469,9 +1478,14 @@ impl<C: Connection> Client<C> {
         for completion in completions.drain(..) {
             if Some(completion.sequence) == wanted {
                 found = Some(self.found(completion.outcome));
-            } else {
+            } else if let Some(outcome) =
+                self.target_completed(completion.sequence, completion.outcome)
+            {
                 // Anything else is an attach, or a late answer released.
-                self.attached(completion);
+                self.attached(Completion {
+                    sequence: completion.sequence,
+                    outcome,
+                });
             }
         }
         for event in events.drain(..) {
