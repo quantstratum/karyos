@@ -447,6 +447,10 @@ fn the_header_states_the_driver_constants() {
         defines["KARYOS_PUBLICATION_EXCLUSIVE"],
         i64::from(driver::PUBLICATION_EXCLUSIVE)
     );
+    assert_eq!(
+        defines["KARYOS_PUBLICATION_CONCURRENT"],
+        i64::from(driver::PUBLICATION_CONCURRENT)
+    );
     assert_eq!(defines["KARYOS_LOSS_HOLD"], i64::from(driver::LOSS_HOLD));
     assert_eq!(
         defines["KARYOS_LOSS_CONTINUE"],

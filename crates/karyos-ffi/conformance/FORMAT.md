@@ -76,7 +76,7 @@ The arguments and results of each function are those of the header:
 | `karyos_driver_create` | `size`, `reserved`: the options of `karyos_driver_options_init`, with `reserved` set when given | status, `driver` |
 | `karyos_driver_start` | `driver` (required), `idle_strategy` (default `KARYOS_IDLE_YIELD`, 1), `idle_sleep_ns` (default 0) | status |
 | `karyos_driver_stop` | `driver` (required) | status |
-| `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `schedule_capacity`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`, `size`: the options of `karyos_stream_options_init` otherwise | status |
+| `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `schedule_capacity`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`, `publication_mode`, `publishers`, `size`: the options of `karyos_stream_options_init` otherwise | status |
 | `karyos_driver_subscribe_conflated` | `driver` and `stream_id` (required) | status, `conflated` (on `KARYOS_OK`) |
 | `karyos_conflated_poll` | `conflated` (required), `key_budget` (default 1): a handler that counts the values | status, `delivered` (the count written, checked against the handler's calls) |
 | `karyos_conflated_close` | `conflated` (required) | status |
@@ -87,6 +87,7 @@ The arguments and results of each function are those of the header:
 | `karyos_client_close` | `client` (required) | status |
 | `karyos_client_connect` | `size` (required): the options of `karyos_client_options_init` with a null `dir` | status |
 | `karyos_client_add_publication` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`), `detail_size` | status, `publication` (on `KARYOS_OK`), `detail_written`, `code`, `value`, `detail_tail` |
+| `karyos_client_add_concurrent_publication` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`), `detail_size` | status, `publication` (on `KARYOS_OK`), `detail_written`, `code`, `value`, `detail_tail` |
 | `karyos_publication_offer` | `publication` (required), `lane` (default 0), `payload` or `length` (one of them), `accepted_size` | status, `lane`, `position`, `tail` |
 | `karyos_publication_offer_at` | `publication` and `tx_time` (required), `lane` (default 0), `payload` or `length` (one of them), `accepted_size` | status, `lane`, `position`, `tail` |
 | `karyos_clock_now` | `domain` (required): `KARYOS_CLOCK_MONOTONIC` 0 or `KARYOS_CLOCK_TAI` 1 | status, `now` (when written) |
