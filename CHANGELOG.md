@@ -651,8 +651,9 @@ release may break APIs, wire formats and shared-memory layouts.
   `core_dirty` and `karyosd_sha256`. It refuses a package of another
   commit or tree state, and is Linux only (those scenarios connect a
   cross-process client). It is not part of the release package, whose
-  contents are owner item 44's, nor of pre-push.
-
+  contents are owner item 44's, nor of pre-push. A kit is not rebuilt
+  with its package: a consumer checks that the kit's `core_commit` equals
+  the package's before using it.
 - `karyos-ffi` replays an Archive's recordings from C (F9c, B6;
   quantstratum-docs: `karyos/design/archive-replay-control.md`):
   `karyos_archive_replay` (with `karyos_replay_options`, read by prefix)

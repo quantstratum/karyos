@@ -11,7 +11,11 @@
 #   share/karyos-testkit/MANIFEST   (role, commit, the binary's SHA-256)
 #
 # The kit refuses a package of another commit or tree state, and builds
-# for the host only. It is Linux only: the scenarios that need it connect
+# for the host only. It is not rebuilt with its package: a later
+# `make libkaryos` at another commit leaves a stale kit beside the new
+# package, so a consumer compares the kit MANIFEST's core_commit with the
+# package MANIFEST's before using bin/karyosd, and rebuilds the kit when
+# they differ. It is Linux only: the scenarios that need it connect
 # a cross-process client, which exists on Linux only.
 #
 # Usage: scripts/package-testkit.sh [PACKAGE] (default target/libkaryos).
