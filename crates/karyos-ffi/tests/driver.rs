@@ -15,6 +15,7 @@ mod support {
 use support::abi;
 
 const OK: i32 = 0;
+const NOT_CONNECTED: i32 = 2;
 const INVALID_ARGUMENT: i32 = 100;
 const INVALID_HANDLE: i32 = 101;
 const BUSY: i32 = 109;
@@ -84,4 +85,47 @@ fn a_refused_configuration_fills_nothing_but_the_status() {
     let (_, mut options) = abi::driver_options();
     options.max_clients = 0;
     assert_eq!(abi::driver_create_with(&options).0, INVALID_ARGUMENT);
+}
+
+#[test]
+fn a_stream_is_added_and_removed_through_the_abi() {
+    let (_, driver) = abi::driver_create();
+    let (status, options) = abi::stream_options(5);
+    assert_eq!(status, OK);
+    assert_eq!(options.size, 64);
+    assert_eq!(options.term_length, 64 * 1024);
+    assert_eq!(abi::driver_add_stream(driver, &options).0, OK);
+    // A duplicate names the stream and the session.
+    let (status, detail) = abi::driver_add_stream(driver, &options);
+    assert_eq!(
+        (status, detail.code, detail.value),
+        (INVALID_ARGUMENT, 5, 1)
+    );
+    assert_eq!(abi::driver_remove_stream(driver, 5), OK);
+    assert_eq!(abi::driver_remove_stream(driver, 5), INVALID_ARGUMENT);
+    // Below the first size.
+    let mut small = options;
+    small.size = 63;
+    small.stream_id = 6;
+    assert_eq!(abi::driver_add_stream(driver, &small).0, INVALID_ARGUMENT);
+    assert_eq!(abi::driver_close(driver), OK);
+}
+
+#[test]
+fn a_c_caller_publishes_on_a_stream_of_its_own_driver() {
+    let (_, driver) = abi::driver_create();
+    let (_, options) = abi::stream_options(9);
+    assert_eq!(abi::driver_add_stream(driver, &options).0, OK);
+    let (_, client) = abi::driver_connect(driver);
+    // The driver's own thread serves the control call.
+    assert_eq!(abi::driver_start(driver, IDLE_YIELD, 0), OK);
+    let (status, publication) = abi::client_add_ipc_publication(client, 9);
+    assert_eq!(status, OK);
+    // Live, with no subscriber yet (subscriptions come with F4).
+    assert_eq!(abi::publication_offer(publication, b"hello"), NOT_CONNECTED);
+    // A stream the driver does not have is refused by the driver.
+    assert_ne!(abi::client_add_ipc_publication(client, 10).0, OK);
+    assert_eq!(abi::driver_close(driver), OK);
+    assert_eq!(abi::publication_offer(publication, b"hello"), CLOSED);
+    assert_eq!(abi::client_close(client), OK);
 }

@@ -1,12 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::MutexGuard;
 
 use super::*;
 use crate::api::client;
 
+/// Serializes these tests: together they would open more drivers at once
+/// than the table holds ([`MAX_DRIVERS`]).
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn created() -> Handle {
     create(&Options::defaults()).unwrap()
+}
+
+/// A stream of `stream_id` with the defaults otherwise.
+fn stream(stream_id: i32) -> StreamOptions {
+    StreamOptions {
+        stream_id,
+        ..StreamOptions::defaults()
+    }
 }
 
 const YIELD: Idle = Idle {
@@ -16,6 +32,7 @@ const YIELD: Idle = Idle {
 
 #[test]
 fn a_driver_is_driven_by_its_caller_then_by_its_thread() {
+    let _serial = serial();
     let driver = created();
     assert!(do_work(driver).is_ok());
     assert_eq!(stop(driver), Err(Status::Busy));
@@ -32,6 +49,7 @@ fn a_driver_is_driven_by_its_caller_then_by_its_thread() {
 
 #[test]
 fn a_driver_closes_with_its_thread_running() {
+    let _serial = serial();
     let driver = created();
     start(
         driver,
@@ -47,6 +65,7 @@ fn a_driver_closes_with_its_thread_running() {
 
 #[test]
 fn an_unknown_idle_strategy_or_configuration_is_refused() {
+    let _serial = serial();
     let driver = created();
     assert_eq!(
         start(
@@ -68,12 +87,14 @@ fn an_unknown_idle_strategy_or_configuration_is_refused() {
 
 #[test]
 fn the_defaults_are_the_drivers() {
+    let _serial = serial();
     let config = Options::defaults().config().unwrap();
     assert_eq!(config, DriverConfig::default());
 }
 
 #[test]
 fn a_client_follows_its_driver_to_the_close() {
+    let _serial = serial();
     let driver = created();
     let client = client::connect_embedded(driver).unwrap();
     assert!(client::poll(client).is_ok());
@@ -87,6 +108,7 @@ fn a_client_follows_its_driver_to_the_close() {
 
 #[test]
 fn a_panic_in_a_called_duty_cycle_poisons_the_driver_and_its_clients() {
+    let _serial = serial();
     let driver = created();
     let client = client::connect_embedded(driver).unwrap();
     let unwound = catch_unwind(AssertUnwindSafe(|| {
@@ -106,6 +128,7 @@ fn a_panic_in_a_called_duty_cycle_poisons_the_driver_and_its_clients() {
 
 #[test]
 fn a_panic_on_the_drivers_thread_poisons_it_and_its_clients() {
+    let _serial = serial();
     let driver = created();
     let client = client::connect_embedded(driver).unwrap();
     start(driver, YIELD).unwrap();
@@ -140,6 +163,7 @@ fn a_panic_on_the_drivers_thread_poisons_it_and_its_clients() {
 
 #[test]
 fn driver_errors_map_to_statuses() {
+    let _serial = serial();
     let cases = [
         (DriverError::InvalidConfig, Status::InvalidArgument),
         (DriverError::TooManyClients, Status::ResourcesUnavailable),
@@ -149,7 +173,12 @@ fn driver_errors_map_to_statuses() {
         ),
         (DriverError::Terminal, Status::Closed),
         (DriverError::NotAdmitting, Status::Refused),
-        (DriverError::TooManyStreams, Status::Unknown),
+        (DriverError::TooManyStreams, Status::ResourcesUnavailable),
+        (
+            DriverError::StreamIdsExhausted,
+            Status::ResourcesUnavailable,
+        ),
+        (DriverError::NetworkBusy, Status::Unknown),
     ];
     for (error, status) in cases {
         assert_eq!(Failure::from(&error).status, status, "{error:?}");
@@ -167,6 +196,7 @@ fn driver_errors_map_to_statuses() {
 
 #[test]
 fn the_clients_of_a_full_driver_are_refused() {
+    let _serial = serial();
     let options = Options {
         max_clients: 1,
         ..Options::defaults()
@@ -179,4 +209,139 @@ fn the_clients_of_a_full_driver_are_refused() {
     );
     client::close(first).unwrap();
     close(driver).unwrap();
+}
+
+#[test]
+fn a_publication_follows_its_clients_driver() {
+    let _serial = serial();
+    use crate::api::publication;
+    let driver = created();
+    add_stream(driver, &stream(7)).unwrap();
+    let client = client::connect_embedded(driver).unwrap();
+    // The driver's thread serves the control call.
+    start(driver, YIELD).unwrap();
+    let opened = publication::add(client, "karyos:ipc", 7).unwrap();
+    assert_ne!(
+        publication::offer(opened, 0, b"x"),
+        Err(Status::Closed.into())
+    );
+    close(driver).unwrap();
+    assert_eq!(
+        publication::offer(opened, 0, b"x"),
+        Err(Status::Closed.into())
+    );
+    assert_eq!(
+        publication::claim(opened, 0, 1).map(|(handle, _)| handle),
+        Err(Status::Closed.into())
+    );
+    assert_eq!(
+        publication::add(client, "karyos:ipc", 8),
+        Err(Status::Closed.into())
+    );
+    // The client's close closes it.
+    client::close(client).unwrap();
+    assert_eq!(
+        publication::offer(opened, 0, b"x"),
+        Err(Status::Closed.into())
+    );
+}
+
+#[test]
+fn a_stream_is_added_once_and_removed_once() {
+    let _serial = serial();
+    let driver = created();
+    add_stream(driver, &stream(11)).unwrap();
+    assert_eq!(
+        add_stream(driver, &stream(11)),
+        Err(Failure::with(Status::InvalidArgument, 11, 1))
+    );
+    remove_stream(driver, 11).unwrap();
+    assert_eq!(
+        remove_stream(driver, 11),
+        Err(Failure::with(Status::InvalidArgument, 11, 0))
+    );
+    // A removed stream retires in the driver: its id stays taken.
+    assert_eq!(
+        add_stream(driver, &stream(11)).map_err(|failure| failure.status),
+        Err(Status::InvalidArgument)
+    );
+    close(driver).unwrap();
+    assert_eq!(add_stream(driver, &stream(12)), Err(Status::Closed.into()));
+}
+
+#[test]
+fn stream_options_this_version_does_not_take_are_refused() {
+    let _serial = serial();
+    let driver = created();
+    let refused = [
+        (
+            StreamOptions {
+                lane: 1,
+                ..stream(1)
+            },
+            Status::InvalidLane,
+        ),
+        (
+            StreamOptions {
+                publication_mode: 1,
+                ..stream(1)
+            },
+            Status::InvalidArgument,
+        ),
+        (
+            StreamOptions {
+                allow_unconnected: 2,
+                ..stream(1)
+            },
+            Status::InvalidArgument,
+        ),
+        (
+            StreamOptions {
+                on_required_loss: 3,
+                ..stream(1)
+            },
+            Status::InvalidArgument,
+        ),
+        (
+            StreamOptions {
+                term_length: 1000,
+                ..stream(1)
+            },
+            Status::InvalidArgument,
+        ),
+        (
+            StreamOptions {
+                spare_slots: 256,
+                ..stream(1)
+            },
+            Status::InvalidArgument,
+        ),
+    ];
+    for (options, status) in refused {
+        assert_eq!(
+            add_stream(driver, &options).map_err(|failure| failure.status),
+            Err(status),
+            "{options:?}"
+        );
+    }
+    // Each loss policy the driver has is taken.
+    for (stream_id, loss) in [(2, LOSS_HOLD), (3, LOSS_CONTINUE), (4, LOSS_ABORT)] {
+        let options = StreamOptions {
+            on_required_loss: loss,
+            ..stream(stream_id)
+        };
+        add_stream(driver, &options).unwrap();
+    }
+    close(driver).unwrap();
+}
+
+#[test]
+fn the_stream_defaults_are_a_valid_heap_stream() {
+    let _serial = serial();
+    let config = StreamOptions::defaults().config().unwrap();
+    assert_eq!(config.buffer.term_length.get(), MIN_TERM_LENGTH);
+    assert_eq!(config.buffer.publication, PublicationMode::Exclusive);
+    assert_eq!(config.on_required_loss, LossPolicy::Hold);
+    assert!(!config.allow_unconnected);
+    assert!(config.conflation.is_none());
 }

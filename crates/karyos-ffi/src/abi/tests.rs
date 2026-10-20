@@ -637,3 +637,63 @@ fn a_commit_that_finds_no_subscriber_keeps_its_claim_staged() {
     assert_eq!(commit(staged).0, Status::Closed.code());
     assert_eq!(karyos_client_close(client), Status::Ok.code());
 }
+
+// F5: the growing structs of the driver are read to their last field.
+
+#[test]
+fn a_driver_options_struct_is_read_to_its_last_field() {
+    let mut given = default_driver_options();
+    given.max_clients = 3;
+    given.cutover_deadline_ns = 123_456;
+    // SAFETY: a live, aligned `DriverOptions` whose size is set.
+    let read = unsafe { read_sized(&given, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) };
+    let read = read.unwrap();
+    assert_eq!((read.max_clients, read.cutover_deadline_ns), (3, 123_456));
+    // A struct below the first size is refused.
+    given.size = DRIVER_OPTIONS_SIZE_0_1 - 1;
+    // SAFETY: as above.
+    let refused = unsafe { read_sized(&given, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) };
+    assert_eq!(refused.map(|_| ()), Err(Status::InvalidArgument));
+}
+
+#[test]
+fn a_stream_options_struct_is_read_to_its_last_field() {
+    let mut given = default_stream_options();
+    given.stream_id = 77;
+    given.claim_deadline_ns = 654_321;
+    // SAFETY: a live, aligned `StreamOptions` whose size is set.
+    let read = unsafe { read_sized(&given, STREAM_OPTIONS_SIZE_0_1, default_stream_options()) };
+    let read = read.unwrap();
+    assert_eq!((read.stream_id, read.claim_deadline_ns), (77, 654_321));
+}
+
+#[test]
+fn an_older_structs_missing_tail_keeps_the_defaults() {
+    /// A first version of a growing struct, and a later one with a field
+    /// more.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct Later {
+        size: u32,
+        first: u32,
+        added: u64,
+    }
+    let older = Later {
+        size: 8,
+        first: 5,
+        added: 99,
+    };
+    let defaults = Later {
+        size: 16,
+        first: 0,
+        added: 7,
+    };
+    // SAFETY: a live, aligned `Later`; the function reads only its first
+    // `size` bytes.
+    let read = unsafe { read_sized(&older, 8, defaults) }.unwrap();
+    assert_eq!((read.size, read.first, read.added), (8, 5, 7));
+    // A null struct is refused.
+    // SAFETY: a null pointer is refused before any use.
+    let null = unsafe { read_sized(core::ptr::null::<Later>(), 8, defaults) };
+    assert_eq!(null.map(|_| ()), Err(Status::InvalidArgument));
+}

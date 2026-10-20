@@ -33,6 +33,7 @@ fn c_struct(rust: &str) -> &'static str {
         "Detail" => "karyos_detail",
         "Accepted" => "karyos_accepted",
         "DriverOptions" => "karyos_driver_options",
+        "StreamOptions" => "karyos_stream_options",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -55,6 +56,8 @@ fn c_type(rust: &str) -> String {
         "*mut *mut u8" => "uint8_t **",
         "*const DriverOptions" => "const karyos_driver_options *",
         "*mut DriverOptions" => "karyos_driver_options *",
+        "*const StreamOptions" => "const karyos_stream_options *",
+        "*mut StreamOptions" => "karyos_stream_options *",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -322,4 +325,14 @@ fn the_header_states_the_driver_constants() {
         defines["KARYOS_PROTOCOL_VERSION"],
         i64::try_from(driver::PROTOCOL_VERSION).unwrap()
     );
+    assert_eq!(
+        defines["KARYOS_PUBLICATION_EXCLUSIVE"],
+        i64::from(driver::PUBLICATION_EXCLUSIVE)
+    );
+    assert_eq!(defines["KARYOS_LOSS_HOLD"], i64::from(driver::LOSS_HOLD));
+    assert_eq!(
+        defines["KARYOS_LOSS_CONTINUE"],
+        i64::from(driver::LOSS_CONTINUE)
+    );
+    assert_eq!(defines["KARYOS_LOSS_ABORT"], i64::from(driver::LOSS_ABORT));
 }

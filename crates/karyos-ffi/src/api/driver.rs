@@ -22,8 +22,16 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use std::collections::BTreeMap;
+
 use karyos_client::ClientConductor;
-use karyos_driver::{DriverConfig, DriverError, EmbeddedDriver};
+use karyos_driver::{DriverConfig, DriverError, EmbeddedDriver, StreamConfig, StreamHandle};
+use karyos_sys::frame::Lane;
+use karyos_sys::log_buffer::{
+    DEFAULT_CLAIM_DEADLINE, LogBufferConfig, LossPolicy, PublicationMode,
+};
+use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+use karyos_sys::term::TermId;
 
 use crate::api::client::{IDLE_BUSY_SPIN, IDLE_SLEEP, IDLE_YIELD};
 use crate::boundary::drop_payload;
@@ -102,6 +110,119 @@ impl Options {
     }
 }
 
+/// `KARYOS_PUBLICATION_EXCLUSIVE`, the only publication mode of this
+/// version.
+pub(crate) const PUBLICATION_EXCLUSIVE: u32 = 0;
+/// `KARYOS_LOSS_HOLD`.
+pub(crate) const LOSS_HOLD: u32 = 0;
+/// `KARYOS_LOSS_CONTINUE`.
+pub(crate) const LOSS_CONTINUE: u32 = 1;
+/// `KARYOS_LOSS_ABORT`.
+pub(crate) const LOSS_ABORT: u32 = 2;
+
+/// A stream's options, as `karyos_stream_options` carries them: the
+/// fields of the Rust `StreamConfig` and its `LogBufferConfig`, with no
+/// conflation (SPEC.md §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamOptions {
+    /// The wire stream id.
+    pub(crate) stream_id: i32,
+    /// Bytes of each term, a power of two.
+    pub(crate) term_length: u32,
+    /// The largest frame, header included.
+    pub(crate) mtu: u32,
+    /// The most bytes one claim reserves.
+    pub(crate) max_reserved: u32,
+    /// Term slots beyond the three in use.
+    pub(crate) spare_slots: u32,
+    /// Subscribers at once.
+    pub(crate) max_subscribers: u32,
+    /// The session alias.
+    pub(crate) session_id: i32,
+    /// The first term's id.
+    pub(crate) initial_term_id: u32,
+    /// The lane; 0 in this version.
+    pub(crate) lane: u32,
+    /// `KARYOS_PUBLICATION_*`; exclusive in this version.
+    pub(crate) publication_mode: u32,
+    /// Offers allowed with no subscriber attached: 0 or 1.
+    pub(crate) allow_unconnected: u32,
+    /// Entries of the stream's schedule ring; 0 for none.
+    pub(crate) schedule_capacity: u32,
+    /// `KARYOS_LOSS_*`: what a lost required subscriber does.
+    pub(crate) on_required_loss: u32,
+    /// How long a claim may stay open, in nanoseconds.
+    pub(crate) claim_deadline_ns: u64,
+}
+
+impl StreamOptions {
+    /// A heap stream of the smallest term, as the driver's tests use.
+    pub(crate) fn defaults() -> Self {
+        Self {
+            stream_id: 0,
+            term_length: MIN_TERM_LENGTH,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            spare_slots: 3,
+            max_subscribers: 4,
+            session_id: 1,
+            initial_term_id: 0,
+            lane: 0,
+            publication_mode: PUBLICATION_EXCLUSIVE,
+            allow_unconnected: 0,
+            schedule_capacity: 0,
+            on_required_loss: LOSS_HOLD,
+            claim_deadline_ns: DEFAULT_CLAIM_DEADLINE,
+        }
+    }
+
+    /// The driver's stream configuration; the driver checks the rest.
+    fn config(&self) -> Result<StreamConfig, Failure> {
+        let invalid = |code: u64| Failure::with(Status::InvalidArgument, code, 0);
+        let term_length = TermLength::try_new(self.term_length)
+            .map_err(|_| invalid(u64::from(self.term_length)))?;
+        let lane = u8::try_from(self.lane)
+            .ok()
+            .filter(|lane| *lane == 0)
+            .and_then(|lane| Lane::try_new(lane).ok())
+            .ok_or_else(|| Failure::with(Status::InvalidLane, u64::from(self.lane), 0))?;
+        if self.publication_mode != PUBLICATION_EXCLUSIVE {
+            return Err(invalid(u64::from(self.publication_mode)));
+        }
+        let allow_unconnected = match self.allow_unconnected {
+            0 => false,
+            1 => true,
+            other => return Err(invalid(u64::from(other))),
+        };
+        let on_required_loss = match self.on_required_loss {
+            LOSS_HOLD => LossPolicy::Hold,
+            LOSS_CONTINUE => LossPolicy::Continue,
+            LOSS_ABORT => LossPolicy::Abort,
+            other => return Err(invalid(u64::from(other))),
+        };
+        let narrow = |value: u32| u8::try_from(value).map_err(|_| invalid(u64::from(value)));
+        Ok(StreamConfig {
+            buffer: LogBufferConfig {
+                term_length,
+                spare_slots: narrow(self.spare_slots)?,
+                max_subscribers: narrow(self.max_subscribers)?,
+                mtu: self.mtu,
+                max_reserved: self.max_reserved,
+                initial_term_id: TermId::new(self.initial_term_id),
+                lane,
+                session_id: self.session_id,
+                stream_id: self.stream_id,
+                claim_deadline: self.claim_deadline_ns,
+                publication: PublicationMode::Exclusive,
+                schedule_capacity: self.schedule_capacity,
+            },
+            allow_unconnected,
+            on_required_loss,
+            conflation: None,
+        })
+    }
+}
+
 /// An idle strategy, as `karyos_driver_start` takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Idle {
@@ -162,6 +283,8 @@ enum Mode {
 /// A driver handle's object.
 pub(crate) struct Driver {
     mode: Mode,
+    /// Its streams, by wire stream id.
+    streams: BTreeMap<i32, StreamHandle>,
 }
 
 impl Drop for Driver {
@@ -219,6 +342,17 @@ impl From<&DriverError> for Failure {
                 Self::with(Status::System, *needed, *limit)
             }
             DriverError::Sys(error) => error.into(),
+            DriverError::DuplicateStream {
+                stream_id,
+                session_id,
+            } => Self::with(
+                Status::InvalidArgument,
+                u64::from(stream_id.unsigned_abs()),
+                u64::from(session_id.unsigned_abs()),
+            ),
+            DriverError::TooManyStreams | DriverError::StreamIdsExhausted => {
+                Status::ResourcesUnavailable.into()
+            }
             _ => Status::Unknown.into(),
         }
     }
@@ -235,6 +369,7 @@ pub(crate) fn create(options: &Options) -> Result<Handle, Failure> {
         EmbeddedDriver::with_config(options.config()?).map_err(|error| Failure::from(&error))?;
     Ok(drivers().insert(Driver {
         mode: Mode::Invoker(Box::new(driver)),
+        streams: BTreeMap::new(),
     })?)
 }
 
@@ -355,6 +490,51 @@ pub(crate) fn stop(driver: Handle) -> Result<(), Status> {
             None => Err(Status::Internal),
         }
     })?
+}
+
+/// Adds a stream to `driver`; it lives until removed or the driver's
+/// close.
+///
+/// # Errors
+///
+/// The options' and the driver's refusals (a duplicate stream id is
+/// [`Status::InvalidArgument`] with the stream and session ids),
+/// [`Status::Internal`] for a lost driver, and the table's errors.
+pub(crate) fn add_stream(driver: Handle, options: &StreamOptions) -> Result<(), Failure> {
+    let config = options.config()?;
+    drivers()
+        .with(driver, |slot| {
+            let added = slot.with_driver(|driver| driver.add_stream(config))?;
+            let stream = added.map_err(|error| Failure::from(&error))?;
+            let _ = slot.streams.insert(options.stream_id, stream);
+            Ok(())
+        })
+        .map_err(Failure::from)?
+}
+
+/// Removes the stream `stream_id` of `driver`: its publication closes,
+/// and its subscribers read up to its seal.
+///
+/// # Errors
+///
+/// [`Status::InvalidArgument`] for a stream id the driver does not have,
+/// [`Status::Internal`] for a lost driver, and the table's errors.
+pub(crate) fn remove_stream(driver: Handle, stream_id: i32) -> Result<(), Failure> {
+    drivers()
+        .with(driver, |slot| {
+            let stream = slot.streams.get(&stream_id).copied().ok_or_else(|| {
+                Failure::with(
+                    Status::InvalidArgument,
+                    u64::from(stream_id.unsigned_abs()),
+                    0,
+                )
+            })?;
+            let removed = slot.with_driver(|driver| driver.remove_stream(stream))?;
+            removed.map_err(|error| Failure::from(&error))?;
+            let _ = slot.streams.remove(&stream_id);
+            Ok(())
+        })
+        .map_err(Failure::from)?
 }
 
 /// A conductor of `driver` for a new client.

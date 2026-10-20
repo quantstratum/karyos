@@ -56,6 +56,14 @@ extern "C" {
  */
 #define KARYOS_PROTOCOL_VERSION 2
 
+/** Publication modes of a stream (karyos_stream_options); exclusive only. */
+#define KARYOS_PUBLICATION_EXCLUSIVE 0
+
+/** What a lost required subscriber does (karyos_stream_options). */
+#define KARYOS_LOSS_HOLD 0
+#define KARYOS_LOSS_CONTINUE 1
+#define KARYOS_LOSS_ABORT 2
+
 /**
  * Idle strategies of a control call's wait (karyos_client_options) and of
  * a driver's own thread (karyos_driver_start).
@@ -235,6 +243,46 @@ typedef struct karyos_driver_options {
 } karyos_driver_options;
 
 /**
+ * A stream's options, copied by karyos_driver_add_stream: the driver's
+ * stream configuration without conflation. Fill it with
+ * karyos_stream_options_init, then set stream_id. This version takes lane
+ * 0 and KARYOS_PUBLICATION_EXCLUSIVE only (KARYOS_E_INVALID_LANE and
+ * KARYOS_E_INVALID_ARGUMENT otherwise); the driver checks the sizes. The
+ * size rule of karyos_driver_options applies.
+ */
+typedef struct karyos_stream_options {
+    uint32_t size;
+    /* The wire stream id. */
+    int32_t stream_id;
+    /* Bytes of each term, a power of two. */
+    uint32_t term_length;
+    /* The largest frame, header included. */
+    uint32_t mtu;
+    /* The most bytes one claim reserves. */
+    uint32_t max_reserved;
+    /* Term slots beyond the three in use. */
+    uint32_t spare_slots;
+    /* Subscribers at once. */
+    uint32_t max_subscribers;
+    /* The session alias. */
+    int32_t session_id;
+    /* The first term's id. */
+    uint32_t initial_term_id;
+    /* The lane: 0. */
+    uint32_t lane;
+    /* KARYOS_PUBLICATION_EXCLUSIVE. */
+    uint32_t publication_mode;
+    /* Offers allowed with no subscriber attached: 0 or 1. */
+    uint32_t allow_unconnected;
+    /* Entries of the stream's schedule ring; 0 for none. */
+    uint32_t schedule_capacity;
+    /* KARYOS_LOSS_*: what a lost required subscriber does. */
+    uint32_t on_required_loss;
+    /* How long a claim may stay open, in nanoseconds. */
+    uint64_t claim_deadline_ns;
+} karyos_stream_options;
+
+/**
  * Writes the ABI version this library implements. Returns KARYOS_OK, or
  * KARYOS_E_INVALID_ARGUMENT with nothing written when a pointer is null or
  * misaligned.
@@ -364,6 +412,29 @@ int32_t karyos_driver_start(uint64_t driver, uint32_t idle_strategy, uint64_t id
  * poisoned the driver.
  */
 int32_t karyos_driver_stop(uint64_t driver);
+
+/**
+ * Fills options with a stream's defaults (stream id 0, the smallest term)
+ * and its size. KARYOS_E_INVALID_ARGUMENT for a null or misaligned
+ * pointer.
+ */
+int32_t karyos_stream_options_init(karyos_stream_options *options);
+
+/**
+ * Adds a stream to the driver, until karyos_driver_remove_stream or the
+ * driver's close. A failure adds nothing and fills detail (may be null): a
+ * duplicate stream id is KARYOS_E_INVALID_ARGUMENT with the stream id in
+ * code and the session id in value.
+ */
+int32_t karyos_driver_add_stream(uint64_t driver, const karyos_stream_options *options,
+                                 karyos_detail *detail);
+
+/**
+ * Removes the driver's stream: its publication closes, and its subscribers
+ * read up to its seal. KARYOS_E_INVALID_ARGUMENT for a stream id the
+ * driver does not have.
+ */
+int32_t karyos_driver_remove_stream(uint64_t driver, int32_t stream_id);
 
 /**
  * Opens a client of the driver in this process and writes its handle. The

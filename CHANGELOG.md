@@ -882,13 +882,20 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos_driver_create`, `karyos_driver_do_work` (the caller drives it),
   `karyos_driver_start` and `karyos_driver_stop` (a thread of its own
   drives it under an idle strategy; `KARYOS_E_BUSY` to the caller
-  meanwhile), `karyos_driver_connect` (a client in this process over a
-  conductor of the driver) and `karyos_driver_close`, with the sized
+  meanwhile), `karyos_driver_add_stream` and `karyos_driver_remove_stream`
+  (the sized `karyos_stream_options` with `karyos_stream_options_init`:
+  the fields of the Rust `StreamConfig` and its log buffer without
+  conflation; lane 0 and exclusive publications only in this version, so
+  later minors only widen what is taken), `karyos_driver_connect` (a
+  client in this process over a conductor of the driver) and
+  `karyos_driver_close`, with the sized
   `karyos_driver_options` (a subset of `DriverConfig`, the rest its
   defaults; an older header's smaller struct is read by its prefix). A
   client of an embedded driver follows it: `KARYOS_E_INTERNAL` once a
   panic poisoned the driver (in a called duty cycle or on its thread),
-  `KARYOS_E_CLOSED` once it is closed. `KARYOS_MAX_DRIVERS` and
+  `KARYOS_E_CLOSED` once it is closed, and so do its publications.
+  Closing a driver leaves its clients open, to be closed. `KARYOS_MAX_DRIVERS`,
+  `KARYOS_PUBLICATION_EXCLUSIVE`, `KARYOS_LOSS_*` and
   `KARYOS_PROTOCOL_VERSION` (asserted at compile time against
   karyos-protocol's) join the header. `karyos-driver` becomes a dependency
   of `karyos-ffi` (SPEC.md §14). The conformance runner gains the driver

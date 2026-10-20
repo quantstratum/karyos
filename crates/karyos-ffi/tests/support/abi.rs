@@ -42,6 +42,27 @@ pub struct DriverOptions {
     pub cutover_deadline_ns: u64,
 }
 
+/// `karyos_stream_options`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StreamOptions {
+    pub size: u32,
+    pub stream_id: i32,
+    pub term_length: u32,
+    pub mtu: u32,
+    pub max_reserved: u32,
+    pub spare_slots: u32,
+    pub max_subscribers: u32,
+    pub session_id: i32,
+    pub initial_term_id: u32,
+    pub lane: u32,
+    pub publication_mode: u32,
+    pub allow_unconnected: u32,
+    pub schedule_capacity: u32,
+    pub on_required_loss: u32,
+    pub claim_deadline_ns: u64,
+}
+
 /// `karyos_detail`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,6 +95,89 @@ unsafe extern "C" {
     safe fn karyos_driver_stop(driver: u64) -> i32;
     fn karyos_driver_connect(driver: u64, client: *mut u64, detail: *mut Detail) -> i32;
     safe fn karyos_driver_close(driver: u64) -> i32;
+    fn karyos_stream_options_init(options: *mut StreamOptions) -> i32;
+    fn karyos_driver_add_stream(
+        driver: u64,
+        options: *const StreamOptions,
+        detail: *mut Detail,
+    ) -> i32;
+    safe fn karyos_driver_remove_stream(driver: u64, stream_id: i32) -> i32;
+    fn karyos_client_add_publication(
+        client: u64,
+        uri: *const c_char,
+        stream_id: i32,
+        publication: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
+    fn karyos_publication_offer(
+        publication: u64,
+        lane: u32,
+        data: *const u8,
+        length: usize,
+        accepted: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+/// `karyos_stream_options_init` with `stream_id` set: the status and the
+/// options.
+pub fn stream_options(stream_id: i32) -> (i32, StreamOptions) {
+    let mut options = core::mem::MaybeUninit::<StreamOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `StreamOptions`.
+    let status = unsafe { karyos_stream_options_init(options.as_mut_ptr()) };
+    // SAFETY: zeroed, then written in full on success; every field is an
+    // integer, so the zeroes are a value too.
+    let mut options = unsafe { options.assume_init() };
+    options.stream_id = stream_id;
+    (status, options)
+}
+
+/// `karyos_driver_add_stream`: the status and the detail.
+pub fn driver_add_stream(driver: u64, options: &StreamOptions) -> (i32, Detail) {
+    let mut detail = Detail {
+        size: u32::try_from(size_of::<Detail>()).unwrap_or(u32::MAX),
+        ..Detail::default()
+    };
+    // SAFETY: live, aligned pointers.
+    let status = unsafe { karyos_driver_add_stream(driver, options, &mut detail) };
+    (status, detail)
+}
+
+/// `karyos_driver_remove_stream`.
+pub fn driver_remove_stream(driver: u64, stream_id: i32) -> i32 {
+    karyos_driver_remove_stream(driver, stream_id)
+}
+
+/// `karyos_client_add_publication` of `stream_id` on `karyos:ipc`: the
+/// status and the handle.
+pub fn client_add_ipc_publication(client: u64, stream_id: i32) -> (i32, u64) {
+    let mut publication = 0;
+    // SAFETY: a static C string and a live, aligned `u64`; a null detail
+    // is allowed.
+    let status = unsafe {
+        karyos_client_add_publication(
+            client,
+            c"karyos:ipc".as_ptr(),
+            stream_id,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, publication)
+}
+
+/// `karyos_publication_offer` of `data` on lane 0, without the accepted
+/// position.
+pub fn publication_offer(publication: u64, data: &[u8]) -> i32 {
+    // SAFETY: `data` is live for the call; a null `accepted` is allowed.
+    unsafe {
+        karyos_publication_offer(
+            publication,
+            0,
+            data.as_ptr(),
+            data.len(),
+            core::ptr::null_mut(),
+        )
+    }
 }
 
 /// `karyos_driver_options_init`: the status and the options.
