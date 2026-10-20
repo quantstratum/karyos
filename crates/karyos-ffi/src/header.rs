@@ -405,6 +405,22 @@ fn the_header_states_the_driver_constants() {
     assert_eq!(defines["KARYOS_LOSS_ABORT"], i64::from(driver::LOSS_ABORT));
 }
 
+/// The clock domains match the client's codes (`ClockDomain::code`).
+#[test]
+fn the_header_states_the_clock_domains() {
+    use karyos_client::schedule::ClockDomain;
+
+    use crate::abi::{CLOCK_MONOTONIC, CLOCK_TAI};
+    let defines = header_defines();
+    assert_eq!(
+        defines["KARYOS_CLOCK_MONOTONIC"],
+        i64::from(CLOCK_MONOTONIC)
+    );
+    assert_eq!(defines["KARYOS_CLOCK_TAI"], i64::from(CLOCK_TAI));
+    assert_eq!(u64::from(CLOCK_MONOTONIC), ClockDomain::Monotonic.code());
+    assert_eq!(u64::from(CLOCK_TAI), ClockDomain::Tai.code());
+}
+
 #[test]
 fn the_header_states_the_subscription_constants() {
     use crate::abi::{MESSAGE_END_OF_STREAM, MESSAGE_TRACED};

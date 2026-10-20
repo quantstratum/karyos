@@ -547,6 +547,86 @@ pub unsafe extern "C" fn karyos_publication_offer(
     })
 }
 
+/// Offers `length` bytes at `data` on the timed `lane` of `publication`,
+/// with its requested not-before time `tx_time` in the lane's clock domain
+/// (`karyos_clock_now` reads it), copied into the term before it returns.
+/// The lane's handle checks the time first, before anything is reserved;
+/// on a network route the driver's sender holds the message until its
+/// time. On `KARYOS_OK`, `accepted` (may be null) receives the lane and
+/// position. A data-path call: it never waits.
+///
+/// # Safety
+///
+/// As [`karyos_publication_offer`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_publication_offer_at(
+    publication: u64,
+    lane: u32,
+    data: *const u8,
+    length: usize,
+    tx_time: u64,
+    accepted: *mut Accepted,
+) -> i32 {
+    guard(|| {
+        let payload: &[u8] = if length == 0 {
+            &[]
+        } else if data.is_null() || isize::try_from(length).is_err() {
+            return Status::InvalidArgument;
+        } else {
+            // SAFETY: `data` is non-null and points to `length` readable
+            // bytes (the caller's contract), `length` fits an `isize`, and
+            // the slice is used only during the call.
+            unsafe { core::slice::from_raw_parts(data, length) }
+        };
+        match api::publication::offer_at(Handle::from_raw(publication), lane, payload, tx_time) {
+            Ok(done) => {
+                // SAFETY: the caller's contract on `accepted`.
+                unsafe { write_accepted(accepted, done) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// `KARYOS_CLOCK_MONOTONIC`: the host's monotonic clock, a timed lane's
+/// default domain.
+pub(crate) const CLOCK_MONOTONIC: u32 = 0;
+/// `KARYOS_CLOCK_TAI`: the host's `CLOCK_TAI`, Linux only.
+pub(crate) const CLOCK_TAI: u32 = 1;
+
+/// Writes the current time of `domain` (`KARYOS_CLOCK_*`) through `now`:
+/// the time `karyos_publication_offer_at` expects for a lane of that
+/// domain. Callers use it on every platform rather than read the clocks
+/// themselves: on Linux it equals `CLOCK_MONOTONIC` or `CLOCK_TAI`, but on
+/// macOS the monotonic domain has a per-process origin, so a value means
+/// something only within this process (an embedded driver). A data-path
+/// call: it never waits and takes no handle.
+///
+/// # Safety
+///
+/// `now` points to a writable `uint64_t`; null or misaligned returns
+/// `KARYOS_E_INVALID_ARGUMENT`, as does an unknown domain, and nothing is
+/// written then. A domain this platform cannot read returns
+/// `KARYOS_E_UNSUPPORTED`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_clock_now(domain: u32, now: *mut u64) -> i32 {
+    guard(|| {
+        if !writable(now) {
+            return Status::InvalidArgument;
+        }
+        match api::clock::now(domain) {
+            Ok(time) => {
+                // SAFETY: `now` is non-null and aligned, and the caller's
+                // contract makes it a writable `uint64_t`.
+                unsafe { now.write(time) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
 /// Stages a claim of `length` bytes on `lane` of `publication`: writes its
 /// handle through `claim` and, through `buffer`, a pointer to `length`
 /// zeroed bytes the caller fills. The pointer stays valid until

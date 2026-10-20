@@ -82,6 +82,10 @@ extern "C" {
 /** Publication modes of a stream (karyos_stream_options); exclusive only. */
 #define KARYOS_PUBLICATION_EXCLUSIVE 0
 
+/** The clock domains of a timed lane (karyos_clock_now). */
+#define KARYOS_CLOCK_MONOTONIC 0
+#define KARYOS_CLOCK_TAI 1
+
 /** What a lost required subscriber does (karyos_stream_options). */
 #define KARYOS_LOSS_HOLD 0
 #define KARYOS_LOSS_CONTINUE 1
@@ -385,6 +389,34 @@ int32_t karyos_publication_offer(uint64_t publication, uint32_t lane,
                                  karyos_accepted *accepted);
 
 /**
+ * Offers length bytes at data on the timed lane with its requested
+ * not-before time tx_time in the lane's clock domain (karyos_clock_now
+ * reads it), copied before it returns; data may be null when length is 0.
+ * The lane's handle checks the time before anything is reserved; on a
+ * network route the driver's sender holds the message until its time.
+ * KARYOS_E_INVALID_SCHEDULE for a lane that is not timed, a time below the
+ * lane's last, one past the horizon or an overflowing deadline. On
+ * KARYOS_OK, accepted (may be null) receives the lane and position. Never
+ * waits.
+ */
+int32_t karyos_publication_offer_at(uint64_t publication, uint32_t lane,
+                                    const uint8_t *data, size_t length,
+                                    uint64_t tx_time,
+                                    karyos_accepted *accepted);
+
+/**
+ * Writes the current time of domain (KARYOS_CLOCK_*): the time
+ * karyos_publication_offer_at expects for a lane of that domain. Use it on
+ * every platform rather than read the clocks: on macOS the monotonic
+ * domain has a per-process origin, meaningful only within this process.
+ * KARYOS_E_INVALID_ARGUMENT for an unknown domain or a null or misaligned
+ * now (nothing is written); KARYOS_E_UNSUPPORTED for a domain this
+ * platform cannot read (KARYOS_CLOCK_TAI off Linux). Never waits.
+ */
+int32_t karyos_clock_now(uint32_t domain, uint64_t *now);
+
+/**
+ * Stages a claim of length bytes on the lane: writes its handle and a/**
  * Stages a claim of length bytes on the lane: writes its handle and a
  * pointer to length zeroed bytes to fill. The pointer is valid until the
  * commit releases the claim, its abort, or the close of the publication or

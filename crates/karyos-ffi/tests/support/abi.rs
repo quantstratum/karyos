@@ -153,6 +153,15 @@ unsafe extern "C" {
         limit: u32,
         delivered: *mut u32,
     ) -> i32;
+    fn karyos_publication_offer_at(
+        publication: u64,
+        lane: u32,
+        data: *const u8,
+        length: usize,
+        tx_time: u64,
+        accepted: *mut core::ffi::c_void,
+    ) -> i32;
+    fn karyos_clock_now(domain: u32, now: *mut u64) -> i32;
     fn karyos_publication_claim(
         publication: u64,
         lane: u32,
@@ -367,6 +376,41 @@ pub fn publication_offer_on(
         )
     };
     (status, accepted)
+}
+
+/// `karyos_publication_offer_at` of `data` on `lane` at `tx_time`, with an
+/// accepted sized as `accepted_size`: the status and the accepted.
+pub fn publication_offer_at(
+    publication: u64,
+    lane: u32,
+    data: &[u8],
+    tx_time: u64,
+    accepted_size: u32,
+) -> (i32, SizedStruct<Accepted>) {
+    let mut accepted = accepted(accepted_size);
+    // SAFETY: `data` is live for the call; `accepted` holds at least
+    // `accepted_size` writable bytes.
+    let status = unsafe {
+        karyos_publication_offer_at(
+            publication,
+            lane,
+            data.as_ptr(),
+            data.len(),
+            tx_time,
+            accepted.as_mut_ptr().cast(),
+        )
+    };
+    (status, accepted)
+}
+
+/// `karyos_clock_now` of `domain`: the status and the time, `None` when
+/// nothing was written.
+pub fn clock_now(domain: u32) -> (i32, Option<u64>) {
+    const UNWRITTEN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    let mut now = UNWRITTEN;
+    // SAFETY: a live, aligned `u64`.
+    let status = unsafe { karyos_clock_now(domain, &mut now) };
+    (status, (now != UNWRITTEN).then_some(now))
 }
 
 /// `karyos_publication_claim` of `length` bytes on `lane`: the status and

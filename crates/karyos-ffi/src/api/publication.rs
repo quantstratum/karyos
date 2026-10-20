@@ -163,6 +163,27 @@ impl Lanes {
         })
     }
 
+    /// A timed offer on `lane`: timed lanes are exclusive (GC-7), so a
+    /// concurrent handle has no schedule.
+    fn offer_at_on(
+        &mut self,
+        lane: Lane,
+        payload: &[u8],
+        tx_time: u64,
+    ) -> Result<Placed, OfferError> {
+        lanes!(self,
+        publication => publication.offer_at_on(lane, payload, tx_time).map(placed),
+        handle => {
+            let _ = handle;
+            if lane != Lane::ZERO {
+                return Err(OfferError::InvalidLane { lane });
+            }
+            Err(OfferError::InvalidSchedule {
+                reason: "a concurrent publication is never timed",
+            })
+        })
+    }
+
     /// Claims `length` in `lane`'s term, copies `staged` into it and
     /// commits it.
     fn commit_staged(
@@ -349,6 +370,31 @@ pub(crate) fn offer(publication: Handle, lane_raw: u32, payload: &[u8]) -> Resul
         entry
             .lanes
             .offer_on(lane, payload)
+            .map_err(|error| Failure::from(&error))
+    })?
+}
+
+/// Offers `payload` on the timed `lane` with its requested not-before time
+/// `tx_time`, in the lane's clock domain (`quantstratum-docs:
+/// karyos/design/timed-tx.md`).
+///
+/// # Errors
+///
+/// The handle's and the timed offer's failures; [`Status::InvalidSchedule`]
+/// for a lane that is not timed, a time below the lane's last, one past the
+/// horizon or an overflowing deadline.
+pub(crate) fn offer_at(
+    publication: Handle,
+    lane_raw: u32,
+    payload: &[u8],
+    tx_time: u64,
+) -> Result<Placed, Failure> {
+    let lane = lane(lane_raw)?;
+    table().with(publication, |entry| {
+        entry.usable()?;
+        entry
+            .lanes
+            .offer_at_on(lane, payload, tx_time)
             .map_err(|error| Failure::from(&error))
     })?
 }

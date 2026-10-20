@@ -26,13 +26,6 @@ mod boundary;
     reason = "the other handle kinds get their tables from F3 on"
 )]
 mod handles;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "most codes and the error mapping are used from F2 on"
-    )
-)]
 mod status;
 
 #[cfg(test)]
