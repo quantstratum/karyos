@@ -443,7 +443,13 @@ fn call(step: &Step, at: &str) -> Returned {
         "karyos_driver_add_stream" => {
             let arguments = Arguments::new(
                 step,
-                &["driver", "stream_id", "allow_unconnected", "size"],
+                &[
+                    "driver",
+                    "stream_id",
+                    "allow_unconnected",
+                    "schedule_capacity",
+                    "size",
+                ],
                 at,
             );
             let stream_id = arguments
@@ -454,6 +460,8 @@ fn call(step: &Step, at: &str) -> Returned {
             assert_eq!(status, 0, "{at}: karyos_stream_options_init");
             options.allow_unconnected =
                 arguments.narrow("allow_unconnected", options.allow_unconnected);
+            options.schedule_capacity =
+                arguments.narrow("schedule_capacity", options.schedule_capacity);
             let size = size_argument::<abi::StreamOptions>(&arguments, "size");
             Returned {
                 status: Some(abi::driver_add_stream_sized(
@@ -532,6 +540,54 @@ fn call(step: &Step, at: &str) -> Returned {
                 size_argument::<abi::Accepted>(&arguments, "accepted_size"),
             );
             with_accepted(status, &accepted)
+        }
+        "karyos_publication_offer_at" => {
+            let arguments = Arguments::new(
+                step,
+                &[
+                    "publication",
+                    "lane",
+                    "payload",
+                    "length",
+                    "tx_time",
+                    "accepted_size",
+                ],
+                at,
+            );
+            let tx_time = arguments
+                .integer("tx_time")
+                .map(|value| {
+                    u64::try_from(value)
+                        .unwrap_or_else(|_| panic!("{at}: `tx_time` is not a uint64_t"))
+                })
+                .unwrap_or_else(|| panic!("{at}: `tx_time` is required"));
+            let (status, accepted) = abi::publication_offer_at(
+                arguments.handle("publication"),
+                arguments.narrow("lane", 0),
+                &arguments.message(),
+                tx_time,
+                size_argument::<abi::Accepted>(&arguments, "accepted_size"),
+            );
+            with_accepted(status, &accepted)
+        }
+        "karyos_clock_now" => {
+            let arguments = Arguments::new(step, &["domain"], at);
+            let domain = arguments
+                .integer("domain")
+                .map(|_| arguments.narrow("domain", 0))
+                .unwrap_or_else(|| panic!("{at}: `domain` is required"));
+            let (status, now) = abi::clock_now(domain);
+            let results = now
+                .map(|now| {
+                    let now = i64::try_from(now)
+                        .unwrap_or_else(|_| panic!("{at}: `now` does not fit an integer"));
+                    BTreeMap::from([("now".to_owned(), Value::Integer(now))])
+                })
+                .unwrap_or_default();
+            Returned {
+                status: Some(status),
+                results,
+            }
         }
         "karyos_publication_claim" => {
             let arguments = Arguments::new(step, &["publication", "lane", "length"], at);

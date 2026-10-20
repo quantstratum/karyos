@@ -267,8 +267,8 @@ impl<T: TermBytes> Publication<T> {
     /// Offers `payload` on the timed `lane` with its requested not-before
     /// time `tx_time`, in the lane's clock domain (`quantstratum-docs:
     /// karyos/design/timed-tx.md`). The lane's handle checks the time
-    /// first, before anything is reserved; the driver's sender holds the
-    /// message until its time.
+    /// first, before anything is reserved; on a network route the driver's
+    /// sender holds the message until its time.
     ///
     /// # Errors
     ///

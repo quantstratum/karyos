@@ -463,6 +463,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The C ABI's scheduled offer (quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md` §6, F7a-3):
+  `karyos_publication_offer_at(publication, lane, data, length, tx_time,
+  accepted)` offers on a timed lane at its requested time, with
+  `KARYOS_E_INVALID_SCHEDULE` for a lane that is not timed, a time below
+  the lane's last, one past its horizon or an overflowing deadline; and
+  `karyos_clock_now(domain, now)` with `KARYOS_CLOCK_MONOTONIC` and
+  `KARYOS_CLOCK_TAI`, the time it expects, which callers read on every
+  platform (on macOS the monotonic domain has a per-process origin). An
+  unknown domain is `KARYOS_E_INVALID_ARGUMENT`, and `CLOCK_TAI` off Linux
+  `KARYOS_E_UNSUPPORTED`. The conformance format gains both calls and the
+  `schedule_capacity` argument of `karyos_driver_add_stream`, with the
+  scenario `publication.timed.offer`.
+
 - `Publication::offer_at_on(lane, payload, tx_time)` on the client facade
   (quantstratum-docs: `karyos/design/timed-tx.md`; owner item 57): a timed
   offer on one lane of a publication, checked by the lane's handle before
