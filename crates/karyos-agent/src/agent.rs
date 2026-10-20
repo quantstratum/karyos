@@ -3,6 +3,7 @@
 //! The agent: one tool attach per configured driver, and the model it
 //! keeps of each.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -273,9 +274,10 @@ impl Agent {
 
     /// Records administrator `uid`'s acknowledgement of the open unknown
     /// interval at `position` (M10b). That of a journal that could not be
-    /// opened, at [`UNOPENED_POSITION`], is kept in memory only: the run
-    /// has no journal to record it, and the next start raises it again if
-    /// the journal still cannot be opened.
+    /// opened, at [`UNOPENED_POSITION`], is kept in memory only and
+    /// logged at info on standard error with `uid` and the interval: the
+    /// run has no journal to record it, and the next start raises it again
+    /// if the journal still cannot be opened.
     ///
     /// # Errors
     ///
@@ -284,11 +286,22 @@ impl Agent {
     pub fn acknowledge_gap(&mut self, position: u64, uid: u32) -> Result<(), JournalError> {
         match self.journal.as_mut() {
             Some(journal) => journal.acknowledge_gap(position, u64::from(uid), host_monotonic_ns()),
-            None if self.unopened_gap.map(|gap| gap.position) == Some(position) => {
-                self.unopened_gap = None;
-                Ok(())
-            }
-            None => Err(JournalError::NoGap),
+            None => match self.unopened_gap.take_if(|gap| gap.position == position) {
+                // The one operator act nothing durable records: logged at
+                // info on standard error, as the agent logs (DESIGN's P3 on
+                // #498).
+                Some(gap) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "karyos-agent: info: uid {uid} acknowledged the unknown interval of a \
+                         journal that could not be opened, from {} to {}; held in memory only",
+                        gap.from,
+                        gap.to,
+                    );
+                    Ok(())
+                }
+                None => Err(JournalError::NoGap),
+            },
         }
     }
 
