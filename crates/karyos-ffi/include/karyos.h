@@ -730,7 +730,11 @@ typedef struct karyos_subscription_options {
      * UINT32_MAX, or 0 for one the library assigns (a caller that
      * chooses one keeps it unique among the Archive's requesters); the
      * stream replays are asked onto; and the policy after a failed merge,
-     * KARYOS_REJOIN_AT_HEAD or KARYOS_REJOIN_CLOSE.
+     * KARYOS_REJOIN_AT_HEAD or KARYOS_REJOIN_CLOSE. The library assigns
+     * the Archive handle's own client_id plus 1, then plus 2 and up, one
+     * per rejoin (KARYOS_E_INVALID_ARGUMENT past UINT32_MAX): space the
+     * client_ids of Archive handles that share an Archive so their ranges
+     * do not meet.
      */
     uint64_t archive;
     uint64_t archive_client_id;
