@@ -111,13 +111,35 @@ extern "C" {
 
 /**
  * What follows an overrun of an optional or observer reader: delivery
- * goes on at the head, or the subscription closes and its polls return
- * KARYOS_E_CLOSED_BY_OVERRUN. Not yet in the C ABI, and the next codes when
- * added: a snapshot rebuild (a C callback on the polling thread) and a
- * replay from a recording (batch F9).
+ * goes on at the head; the subscription closes and its polls return
+ * KARYOS_E_CLOSED_BY_OVERRUN; or the gap is recovered from an Archive and
+ * merged back into the live stream (KARYOS_REJOIN_ARCHIVE, with the
+ * options' Archive fields). Not yet in the C ABI: a snapshot rebuild (a C
+ * callback on the polling thread).
  */
 #define KARYOS_REJOIN_AT_HEAD 0
 #define KARYOS_REJOIN_CLOSE 1
+#define KARYOS_REJOIN_ARCHIVE 2
+
+/**
+ * karyos_subscription_rejoin merge failures: none; an epoch change; a
+ * replay that ended short; a mismatch at the cutover; another lane; the
+ * replay overrun; the replay revoked; the replay's failure; the live
+ * reader overrun; the live reader's failure. KARYOS_MERGE_OTHER is a
+ * failure a newer library knows and this header names no code for; a
+ * binding keeps a code it does not know.
+ */
+#define KARYOS_MERGE_NONE 0
+#define KARYOS_MERGE_EPOCH_CHANGED 1
+#define KARYOS_MERGE_REPLAY_SHORT 2
+#define KARYOS_MERGE_MISMATCH 3
+#define KARYOS_MERGE_LANE 4
+#define KARYOS_MERGE_REPLAY_OVERRUN 5
+#define KARYOS_MERGE_REPLAY_REVOKED 6
+#define KARYOS_MERGE_REPLAY 7
+#define KARYOS_MERGE_LIVE_OVERRUN 8
+#define KARYOS_MERGE_LIVE 9
+#define KARYOS_MERGE_OTHER 255
 
 /** The most embedded drivers open at once. */
 #define KARYOS_MAX_DRIVERS 8
@@ -702,6 +724,18 @@ typedef struct karyos_subscription_options {
     uint32_t rejoin;
     /* Zero; anything else is KARYOS_E_INVALID_ARGUMENT. */
     uint32_t reserved;
+    /*
+     * For KARYOS_REJOIN_ARCHIVE, and 0 for any other policy: the Archive
+     * handle, of the same client; the rejoin's requester id, at most
+     * UINT32_MAX, or 0 for one the library assigns (a caller that
+     * chooses one keeps it unique among the Archive's requesters); the
+     * stream replays are asked onto; and the policy after a failed merge,
+     * KARYOS_REJOIN_AT_HEAD or KARYOS_REJOIN_CLOSE.
+     */
+    uint64_t archive;
+    uint64_t archive_client_id;
+    int32_t replay_stream_id;
+    uint32_t secondary;
 } karyos_subscription_options;
 
 /**
@@ -713,14 +747,52 @@ int32_t karyos_subscription_options_init(karyos_subscription_options *options);
 /**
  * As karyos_client_add_subscription, with the reader's role and rejoin
  * policy; each image of a karyos:udp subscription takes both. A null
- * options, a size below that of ABI 0.1.0, an unknown role or policy, or a
- * nonzero reserved returns KARYOS_E_INVALID_ARGUMENT and opens nothing.
+ * options, a size below that of ABI 0.1.0 (16) or between it and that of
+ * the Archive fields (40), an unknown role or policy, or a nonzero
+ * reserved returns KARYOS_E_INVALID_ARGUMENT and opens nothing.
+ *
+ * KARYOS_REJOIN_ARCHIVE recovers an overrun's gap from the Archive handle
+ * and merges it back into the live stream. The Archive handle lends only
+ * its control streams and an id: the rejoin takes its own request
+ * publication and response subscription, which the subscription owns. A
+ * rejoin's Archive streams are released by their drop when the
+ * subscription closes, and closing the Archive handle leaves the rejoin
+ * working. Each rejoin takes one of the request stream's publisher slots
+ * (KARYOS_E_REFUSED when none is free). While a gap is recovered, keep
+ * calling karyos_client_poll, so the replay target's grant completes;
+ * karyos_subscription_rejoin_state tells the recovery and a failed merge.
+ * A network subscription is KARYOS_E_UNSUPPORTED_CHANNEL; one that names
+ * no publication to recover, an Archive of another client, an Archive
+ * field set for another policy, or another secondary is
+ * KARYOS_E_INVALID_ARGUMENT. Nothing stays open on failure.
  */
 int32_t karyos_client_add_subscription_with(uint64_t client, const char *uri,
                                             int32_t stream_id,
                                             const karyos_subscription_options *options,
                                             uint64_t *subscription,
                                             karyos_detail *detail);
+
+/**
+ * Where a subscription's Archive rejoin stands. size is the caller's
+ * sizeof(karyos_subscription_rejoin); the rule of karyos_detail applies.
+ * recovering is 1 while a gap is asked for or merged; merge_failure is
+ * the last failed merge's KARYOS_MERGE_* code.
+ */
+typedef struct karyos_subscription_rejoin {
+    uint32_t size;
+    uint32_t recovering;
+    uint32_t merge_failure;
+    uint32_t reserved;
+} karyos_subscription_rejoin;
+
+/**
+ * Writes where the subscription's Archive rejoin stands. A subscription
+ * that does not rejoin from an Archive reads 0 and KARYOS_MERGE_NONE.
+ * Never waits. A null or misaligned state, or a size below 16, is
+ * KARYOS_E_INVALID_ARGUMENT with nothing written.
+ */
+int32_t karyos_subscription_rejoin_state(uint64_t subscription,
+                                         karyos_subscription_rejoin *state);
 
 /**
  * Delivers at most limit messages to handler, each from a private copy,

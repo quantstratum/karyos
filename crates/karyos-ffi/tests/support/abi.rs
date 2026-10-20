@@ -115,6 +115,10 @@ pub struct SubscriptionOptions {
     pub role: u32,
     pub rejoin: u32,
     pub reserved: u32,
+    pub archive: u64,
+    pub archive_client_id: u64,
+    pub replay_stream_id: i32,
+    pub secondary: u32,
 }
 
 /// `karyos_offer_options`.

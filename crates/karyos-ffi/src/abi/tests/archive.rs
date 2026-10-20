@@ -352,7 +352,7 @@ fn a_handler_cannot_reenter_its_archive() {
     assert_eq!(karyos_archive_close(archive), Status::Ok.code());
 }
 
-fn archive_options() -> ArchiveOptions {
+pub(super) fn archive_options() -> ArchiveOptions {
     ArchiveOptions {
         size: size_of_u32::<ArchiveOptions>(),
         reserved: 0,
@@ -414,13 +414,23 @@ fn a_connect_refuses_a_client_id_past_32_bits() {
 }
 
 /// The control streams of the embedded Archive.
-const REQUESTS: i32 = 1030;
-const RESPONSES: i32 = 1031;
+pub(super) const REQUESTS: i32 = 1030;
+pub(super) const RESPONSES: i32 = 1031;
+/// A data stream beside them, whose subscriptions rejoin (F9b).
+pub(super) const DATA: i32 = 1032;
 
 /// A driven driver with an Archive's control streams, whose Archive side
 /// answers each listing from the in-memory catalog until dropped, and a
 /// conductor for the client.
 fn served_archive() -> (Driven, Driven, karyos_client::ClientConductor) {
+    served_archive_with(2)
+}
+
+/// As [`served_archive`], with `publishers` request publishers and the
+/// data stream [`DATA`].
+pub(super) fn served_archive_with(
+    publishers: u8,
+) -> (Driven, Driven, karyos_client::ClientConductor) {
     use karyos_client::{MessageLimit, OfferOutcome};
     use karyos_sys::log_buffer::{PublicationMode, Role};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -433,11 +443,17 @@ fn served_archive() -> (Driven, Driven, karyos_client::ClientConductor) {
     let mut requests = stream_config(REQUESTS);
     requests.buffer.spare_slots = 6;
     requests.buffer.publication = PublicationMode::Concurrent {
-        publishers: 2,
+        publishers,
         allow_non_lse: true,
     };
     let requests = driver.add_stream(requests).unwrap();
-    let responses = driver.add_stream(stream_config(RESPONSES)).unwrap();
+    let mut responses = stream_config(RESPONSES);
+    responses.buffer.spare_slots = 6;
+    let responses = driver.add_stream(responses).unwrap();
+    // Room for the rejoins' optional readers.
+    let mut data = stream_config(DATA);
+    data.buffer.spare_slots = 6;
+    let _ = driver.add_stream(data).unwrap();
     let mut reader = driver.subscribe(requests, Role::Required).unwrap();
     let mut answers = driver.publication(responses).unwrap();
     let conductor = driver.connect().unwrap();

@@ -106,6 +106,43 @@ impl AnyClient {
         }
     }
 
+    /// Turns `reader`, this client's, into a rejoin that recovers its
+    /// overruns from the Archive `source` names (F9b): its own connection
+    /// to the control streams, an `ArchiveClient` over it and this
+    /// client's replay targets, with `secondary` after a failed merge. On
+    /// failure nothing stays open: the reader is removed, and the
+    /// connection's streams are released by their drop.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::UnsupportedChannel`] for a network subscription;
+    /// [`Status::InvalidArgument`] for one that names no publication to
+    /// recover; the driver's refusal of either control stream.
+    pub(crate) fn rejoin(
+        &mut self,
+        reader: Reader,
+        source: crate::api::archive::RejoinSource,
+        replay_stream_id: i32,
+        secondary: karyos_client::Secondary,
+    ) -> Result<Reader, Failure> {
+        match (self, reader) {
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), Reader::Remote(live)) => {
+                rejoin_reader(client, live, source, replay_stream_id, secondary)
+                    .map(|rejoining| Reader::RemoteRejoining(Box::new(rejoining)))
+            }
+            (Self::Embedded(client), Reader::Embedded(live)) => {
+                rejoin_reader(client, live, source, replay_stream_id, secondary)
+                    .map(|rejoining| Reader::EmbeddedRejoining(Box::new(rejoining)))
+            }
+            // Only a plain reader of the client's own connection rejoins.
+            (client, reader) => {
+                client.remove_subscription(reader);
+                Err(Status::Internal.into())
+            }
+        }
+    }
+
     /// A view of the conflation table of the `karyos:ipc` stream
     /// `stream_id` (F7b-2c): a remote client takes it; an embedded one is
     /// refused by its driver, which gives views itself. A control call.
@@ -133,6 +170,19 @@ impl AnyClient {
             (Self::Remote(client), Reader::Remote(reader)) => client.remove_subscription(reader),
             (Self::Embedded(client), Reader::Embedded(reader)) => {
                 client.remove_subscription(reader);
+            }
+            // A rejoin gives its live reader back to be removed; its
+            // Archive streams are released by their drop (F9b).
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), Reader::RemoteRejoining(reader)) => {
+                if let Some(live) = reader.into_subscription() {
+                    client.remove_subscription(live);
+                }
+            }
+            (Self::Embedded(client), Reader::EmbeddedRejoining(reader)) => {
+                if let Some(live) = reader.into_subscription() {
+                    client.remove_subscription(live);
+                }
             }
             // A subscription always has its client's connection; another
             // one is only dropped.
@@ -406,4 +456,53 @@ pub(crate) fn close(client: Handle) -> Result<(), Status> {
     // Dropping the client leaves the driver.
     drop(entry);
     Ok(())
+}
+
+/// [`AnyClient::rejoin`] on one connection.
+fn rejoin_reader<C>(
+    client: &mut Client<C>,
+    live: karyos_client::Subscription<C::Terms>,
+    source: crate::api::archive::RejoinSource,
+    replay_stream_id: i32,
+    secondary: karyos_client::Secondary,
+) -> Result<karyos_client::RejoiningSubscription<C::Terms>, Failure>
+where
+    C: karyos_client::Connection,
+    C::Terms: 'static,
+    karyos_archive::client::connection::Requests<C::Terms>: karyos_archive::client::ControlRequests,
+    karyos_archive::client::connection::Responses<C::Terms>:
+        karyos_archive::client::ControlResponses,
+{
+    use karyos_archive::client::connection::ArchiveConnection;
+    use karyos_archive::client::{ArchiveClient, ClientConfig};
+    if live.registration().is_some() {
+        client.remove_subscription(live);
+        return Err(Status::UnsupportedChannel.into());
+    }
+    let (requests, responses) = match ArchiveConnection::open(client, source.streams) {
+        Ok(connection) => connection.into_transports(),
+        Err(error) => {
+            client.remove_subscription(live);
+            return Err(crate::api::archive::open_failure(error));
+        }
+    };
+    let mut config = ClientConfig::new(source.client_id, replay_stream_id);
+    config.deadline = source.deadline;
+    let targets = client.replay_targets();
+    let archive = match ArchiveClient::new(config, requests, responses, targets) {
+        Ok(archive) => archive,
+        // The default channel always fits; the transports drop.
+        Err(_) => {
+            client.remove_subscription(live);
+            return Err(Status::Internal.into());
+        }
+    };
+    match live.rejoin_with(Box::new(archive), secondary) {
+        Ok(rejoining) => Ok(rejoining),
+        Err(refused) => {
+            let karyos_client::NotRejoinable { subscription, .. } = *refused;
+            client.remove_subscription(subscription);
+            Err(Status::InvalidArgument.into())
+        }
+    }
 }
