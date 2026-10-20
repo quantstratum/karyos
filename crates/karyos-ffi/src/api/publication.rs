@@ -109,6 +109,10 @@ struct Staged {
 pub(crate) struct Entry {
     /// The client handle it belongs to.
     client: Handle,
+    /// Its client's embedded driver, if the C ABI created it: the
+    /// publication follows its failure and its close
+    /// (`crate::api::driver::usable`).
+    driver: Option<Handle>,
     lanes: Lanes,
     /// The staging buffer of its claims.
     staged: Arc<[AtomicU8]>,
@@ -116,6 +120,12 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
+    /// Whether the publication may act: its client's embedded driver,
+    /// if any, is neither poisoned nor closed.
+    fn usable(&self) -> Result<(), Status> {
+        self.driver.map_or(Ok(()), crate::api::driver::usable)
+    }
+
     /// Releases the publication to `client`, and its outstanding claim.
     pub(crate) fn release(self, client: &mut AnyClient) {
         if let Some(staged) = self.claim {
@@ -155,6 +165,7 @@ fn lane(raw: u32) -> Result<Lane, Failure> {
 /// [`Status::HandlesExhausted`], with the publication released.
 pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, Failure> {
     clients().with(client, |entry| {
+        entry.usable()?;
         let lanes = entry
             .client
             .add_publication(uri, karyos_client::StreamId::new(stream_id))?;
@@ -163,6 +174,7 @@ pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, F
             .collect();
         let publication = Entry {
             client,
+            driver: entry.driver,
             lanes,
             staged,
             claim: None,
@@ -192,6 +204,7 @@ pub(crate) fn offer(
 ) -> Result<Accepted, Failure> {
     let lane = lane(lane_raw)?;
     table().with(publication, |entry| {
+        entry.usable()?;
         entry
             .lanes
             .offer_on(lane, payload)
@@ -214,6 +227,7 @@ pub(crate) fn claim(
 ) -> Result<(Handle, *mut u8), Failure> {
     let lane = lane(lane_raw)?;
     table().with(publication, |entry| {
+        entry.usable()?;
         if entry.claim.is_some() {
             return Err(Status::ClaimOutstanding.into());
         }
@@ -273,6 +287,7 @@ fn retryable(error: &OfferError) -> bool {
 pub(crate) fn commit(claim: Handle) -> Result<Accepted, Failure> {
     let publication = claims().with(claim, |publication| *publication)?;
     table().with(publication, |entry| {
+        entry.usable()?;
         let staged = entry
             .claim
             .filter(|staged| staged.handle == claim)

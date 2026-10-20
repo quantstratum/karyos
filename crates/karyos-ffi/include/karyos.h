@@ -47,7 +47,19 @@ extern "C" {
 /** The most claims outstanding at once: one per publication. */
 #define KARYOS_MAX_CLAIMS 4096
 
-/** Idle strategies of a control call's wait (karyos_client_options). */
+/** The most embedded drivers open at once. */
+#define KARYOS_MAX_DRIVERS 8
+
+/**
+ * The protocol version an embedded client and its driver speak: both come
+ * from this library's build.
+ */
+#define KARYOS_PROTOCOL_VERSION 2
+
+/**
+ * Idle strategies of a control call's wait (karyos_client_options) and of
+ * a driver's own thread (karyos_driver_start).
+ */
 #define KARYOS_IDLE_BUSY_SPIN 0
 #define KARYOS_IDLE_YIELD 1
 #define KARYOS_IDLE_SLEEP 2
@@ -191,6 +203,38 @@ typedef struct karyos_accepted {
 } karyos_accepted;
 
 /**
+ * An embedded driver's options, copied by karyos_driver_create. Fill it
+ * with karyos_driver_options_init, which sets size and the driver's
+ * defaults; every setting it does not carry is the driver's default. A
+ * struct from an older header of the same major version is accepted: the
+ * fields it lacks take their defaults. A size below that of its first
+ * version is KARYOS_E_INVALID_ARGUMENT.
+ */
+typedef struct karyos_driver_options {
+    uint32_t size;
+    /* Clients admitted at once. */
+    uint32_t max_clients;
+    /* Streams configured at once. */
+    uint32_t max_streams;
+    /* Pending requests per client. */
+    uint32_t max_pending_per_client;
+    /* Bytes of each client's command ring, a power of two. */
+    uint32_t ring_capacity;
+    /* Bytes of the broadcast buffer. */
+    uint32_t broadcast_capacity;
+    /* Cells of the counters region. */
+    uint32_t counters_capacity;
+    /* Zero. */
+    uint32_t reserved;
+    /* How often the driver advances its heartbeat, in nanoseconds. */
+    uint64_t heartbeat_interval_ns;
+    /* How long a client's heartbeat may stay unchanged, in nanoseconds. */
+    uint64_t client_liveness_timeout_ns;
+    /* How long a handle has to move to a successor mapping, in ns. */
+    uint64_t cutover_deadline_ns;
+} karyos_driver_options;
+
+/**
  * Writes the ABI version this library implements. Returns KARYOS_OK, or
  * KARYOS_E_INVALID_ARGUMENT with nothing written when a pointer is null or
  * misaligned.
@@ -282,6 +326,60 @@ int32_t karyos_claim_abort(uint64_t claim);
  * nothing is closed while the client handle is in use.
  */
 int32_t karyos_publication_close(uint64_t publication);
+
+/**
+ * Fills options with the driver's defaults and its size.
+ * KARYOS_E_INVALID_ARGUMENT for a null or misaligned pointer.
+ */
+int32_t karyos_driver_options_init(karyos_driver_options *options);
+
+/**
+ * Creates an embedded driver and writes its handle. Its caller drives it
+ * with karyos_driver_do_work until karyos_driver_start gives it a thread.
+ * A failed create creates nothing and fills detail (may be null):
+ * KARYOS_E_SYSTEM carries errno in value, or the descriptors needed in
+ * code and the soft limit in value.
+ */
+int32_t karyos_driver_create(const karyos_driver_options *options, uint64_t *driver,
+                             karyos_detail *detail);
+
+/**
+ * Runs one duty cycle and writes its work count. KARYOS_E_BUSY while the
+ * driver runs on its own thread; KARYOS_E_INTERNAL once a panic poisoned
+ * it.
+ */
+int32_t karyos_driver_do_work(uint64_t driver, uint32_t *work);
+
+/**
+ * Gives the driver a thread of its own, which runs its duty cycle and
+ * idles by idle_strategy (KARYOS_IDLE_*; idle_sleep_ns for
+ * KARYOS_IDLE_SLEEP) after a cycle without work. KARYOS_E_BUSY when it
+ * already has one.
+ */
+int32_t karyos_driver_start(uint64_t driver, uint32_t idle_strategy, uint64_t idle_sleep_ns);
+
+/**
+ * Stops the driver's thread and gives the driver back to its caller.
+ * KARYOS_E_BUSY when it has none; KARYOS_E_INTERNAL when a panic on it
+ * poisoned the driver.
+ */
+int32_t karyos_driver_stop(uint64_t driver);
+
+/**
+ * Opens a client of the driver in this process and writes its handle. The
+ * client follows its driver: KARYOS_E_INTERNAL once the driver is
+ * poisoned, KARYOS_E_CLOSED once it is closed. A failed connect opens
+ * nothing and fills detail (may be null).
+ */
+int32_t karyos_driver_connect(uint64_t driver, uint64_t *client, karyos_detail *detail);
+
+/**
+ * Closes the driver, stopping its thread first. Its clients stay open,
+ * answer KARYOS_E_CLOSED, and are closed with karyos_client_close. A
+ * handle in use answers KARYOS_E_BUSY or KARYOS_E_REENTRANT, and nothing
+ * is closed.
+ */
+int32_t karyos_driver_close(uint64_t driver);
 
 #ifdef __cplusplus
 }

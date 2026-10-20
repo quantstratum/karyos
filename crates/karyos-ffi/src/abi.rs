@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use crate::api;
 use crate::api::client;
+use crate::api::driver;
 use crate::boundary::{drop_payload, guard};
 use crate::handles::Handle;
 use crate::status::{Failure, Status, UNKNOWN_CODE};
@@ -555,6 +556,259 @@ pub extern "C" fn karyos_publication_close(publication: u64) -> i32 {
             Err(status) => status,
         },
     )
+}
+
+/// `karyos_driver_options`: an embedded driver's options, copied by
+/// `karyos_driver_create`. `size` comes first; every setting it does not
+/// carry is the driver's default.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DriverOptions {
+    /// The struct's size in bytes.
+    pub size: u32,
+    /// Clients admitted at once.
+    pub max_clients: u32,
+    /// Streams configured at once.
+    pub max_streams: u32,
+    /// Pending requests per client.
+    pub max_pending_per_client: u32,
+    /// Bytes of each client's command ring, a power of two.
+    pub ring_capacity: u32,
+    /// Bytes of the broadcast buffer.
+    pub broadcast_capacity: u32,
+    /// Cells of the counters region.
+    pub counters_capacity: u32,
+    /// Zero.
+    pub reserved: u32,
+    /// How often the driver advances its heartbeat, in nanoseconds.
+    pub heartbeat_interval_ns: u64,
+    /// How long a client's heartbeat may stay unchanged, in nanoseconds.
+    pub client_liveness_timeout_ns: u64,
+    /// How long a handle has to move to a successor mapping, in
+    /// nanoseconds.
+    pub cutover_deadline_ns: u64,
+}
+
+/// The size of `karyos_driver_options` in the first ABI version that has
+/// it: the smallest a caller passes (as `CLIENT_OPTIONS_SIZE_0_1`).
+const DRIVER_OPTIONS_SIZE_0_1: u32 = 56;
+
+/// `karyos_driver_options` with the driver's defaults and this version's
+/// size.
+fn default_driver_options() -> DriverOptions {
+    let defaults = driver::Options::defaults();
+    DriverOptions {
+        size: size_of_u32::<DriverOptions>(),
+        max_clients: defaults.max_clients,
+        max_streams: defaults.max_streams,
+        max_pending_per_client: defaults.max_pending_per_client,
+        ring_capacity: defaults.ring_capacity,
+        broadcast_capacity: defaults.broadcast_capacity,
+        counters_capacity: defaults.counters_capacity,
+        reserved: 0,
+        heartbeat_interval_ns: defaults.heartbeat_interval_ns,
+        client_liveness_timeout_ns: defaults.client_liveness_timeout_ns,
+        cutover_deadline_ns: defaults.cutover_deadline_ns,
+    }
+}
+
+/// Fills `options` with the driver's defaults and `size`.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable `karyos_driver_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_options_init(options: *mut DriverOptions) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        let filled = default_driver_options();
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable `karyos_driver_options`.
+        unsafe { options.write(filled) };
+        Status::Ok
+    })
+}
+
+/// Creates an embedded driver, driven by its caller
+/// (`karyos_driver_do_work`) until `karyos_driver_start` gives it a
+/// thread, and writes its handle through `driver`. The options are copied.
+///
+/// On failure nothing is created, and `detail`, when not null and its
+/// `size` covers `karyos_detail`, receives the failure's detail
+/// (`KARYOS_E_SYSTEM`: an `errno`, or the descriptors needed in `code` and
+/// the soft limit in `value`).
+///
+/// # Safety
+///
+/// `options` points to a readable `karyos_driver_options` whose `size` is
+/// set; `driver` points to a writable `uint64_t`; `detail` is null or
+/// points to a writable `karyos_detail` whose `size` is set. A null or
+/// misaligned `options` or `driver`, or a `size` below the first
+/// version's, returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_create(
+    options: *const DriverOptions,
+    driver: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !(readable(options) && writable(driver)) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `options` is non-null and aligned, and points to a
+        // `karyos_driver_options` (the caller's contract), whose first
+        // field is the `uint32_t` size.
+        let size = unsafe { options.cast::<u32>().read() };
+        if size < DRIVER_OPTIONS_SIZE_0_1 {
+            return Status::InvalidArgument;
+        }
+        // Fields an older caller's struct lacks keep their defaults.
+        let mut raw = default_driver_options();
+        let length = prefix(size, size_of_u32::<DriverOptions>());
+        // SAFETY: the caller's struct is at least `size` readable bytes
+        // (its contract), `length` is at most `size` and at most the size
+        // of `raw`, a local that does not overlap it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                options.cast::<u8>(),
+                (&raw mut raw).cast::<u8>(),
+                length,
+            );
+        };
+        let options = driver::Options {
+            max_clients: raw.max_clients,
+            max_streams: raw.max_streams,
+            max_pending_per_client: raw.max_pending_per_client,
+            ring_capacity: raw.ring_capacity,
+            broadcast_capacity: raw.broadcast_capacity,
+            counters_capacity: raw.counters_capacity,
+            heartbeat_interval_ns: raw.heartbeat_interval_ns,
+            client_liveness_timeout_ns: raw.client_liveness_timeout_ns,
+            cutover_deadline_ns: raw.cutover_deadline_ns,
+        };
+        match driver::create(&options) {
+            Ok(handle) => {
+                // SAFETY: `driver` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { driver.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Runs one duty cycle of `driver` and writes its work count through
+/// `work`. `KARYOS_E_BUSY` while the driver runs on its own thread.
+///
+/// # Safety
+///
+/// `work` points to a writable `uint32_t`; null or misaligned returns
+/// `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_do_work(driver: u64, work: *mut u32) -> i32 {
+    guard(|| {
+        if !writable(work) {
+            return Status::InvalidArgument;
+        }
+        match driver::do_work(Handle::from_raw(driver)) {
+            Ok(count) => {
+                // SAFETY: `work` is non-null and aligned, and the caller's
+                // contract makes it a writable `uint32_t`.
+                unsafe { work.write(count) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Moves `driver` to a thread of its own, which runs its duty cycle and,
+/// when one did no work, idles by `idle_strategy` (`KARYOS_IDLE_*`;
+/// `idle_sleep_ns` for `KARYOS_IDLE_SLEEP`) until `karyos_driver_stop` or
+/// the close. `KARYOS_E_BUSY` when it already runs on one.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_driver_start(driver: u64, idle_strategy: u32, idle_sleep_ns: u64) -> i32 {
+    guard(|| {
+        let idle = driver::Idle {
+            strategy: idle_strategy,
+            sleep_ns: idle_sleep_ns,
+        };
+        match driver::start(Handle::from_raw(driver), idle) {
+            Ok(()) => Status::Ok,
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Stops `driver`'s thread and gives the driver back to its caller.
+/// `KARYOS_E_BUSY` when it does not run on one; `KARYOS_E_INTERNAL` when a
+/// panic on its thread poisoned it.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_driver_stop(driver: u64) -> i32 {
+    guard(|| match driver::stop(Handle::from_raw(driver)) {
+        Ok(()) => Status::Ok,
+        Err(status) => status,
+    })
+}
+
+/// Opens a client of `driver` in this process and writes its handle
+/// through `client`. The client follows its driver: `KARYOS_E_INTERNAL`
+/// once the driver is poisoned, `KARYOS_E_CLOSED` once it is closed.
+///
+/// On failure nothing is opened, and `detail` receives the failure's
+/// detail as for `karyos_client_connect`.
+///
+/// # Safety
+///
+/// `client` points to a writable `uint64_t`; `detail` is null or points to
+/// a writable `karyos_detail` whose `size` is set. A null or misaligned
+/// `client` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_connect(
+    driver: u64,
+    client: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(client) {
+            return Status::InvalidArgument;
+        }
+        match client::connect_embedded(Handle::from_raw(driver)) {
+            Ok(handle) => {
+                // SAFETY: `client` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { client.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Closes `driver`, stopping its thread first. Its clients stay open, to
+/// be closed, and answer `KARYOS_E_CLOSED` meanwhile. A handle in use
+/// answers `KARYOS_E_BUSY` or `KARYOS_E_REENTRANT` (nothing is closed
+/// then).
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_driver_close(driver: u64) -> i32 {
+    guard(|| match driver::close(Handle::from_raw(driver)) {
+        Ok(()) => Status::Ok,
+        Err(status) => status,
+    })
 }
 
 #[cfg(test)]

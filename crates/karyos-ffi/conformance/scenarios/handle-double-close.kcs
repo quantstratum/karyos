@@ -1,0 +1,19 @@
+# A second close of a handle answers KARYOS_E_CLOSED and closes nothing
+# (SPEC.md §13, C ABI boundary).
+format 1
+id handle.double.close
+abi 0.1
+covers "double close"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_client_close client=$client
+expect KARYOS_E_CLOSED
+call karyos_driver_close driver=$driver
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_E_CLOSED

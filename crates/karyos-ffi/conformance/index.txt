@@ -5,12 +5,12 @@
 # karyos/design/ffi-gap-analysis.md that brings them.
 
 abi version: abi.version
-typed status codes: abi.version.null status.text
-use after close: pending F5 (a client needs a driver the ABI can start)
-double close: pending F5 (a client needs a driver the ABI can start)
+typed status codes: abi.version.null status.text handle.wrong.kind
+use after close: handle.use.after.close
+double close: handle.double.close
 older protocol version refused at admission: pending a driver the suite can start (F5 or a test driver); tests/connect.rs covers it on Linux
 reentrant poll: pending F4
 bounded poll stops on callback failure: pending F4
 kept fragment pointer never refers to a shared mapping: pending F4
-panic poisons the handle and does not unwind: pending F5
+panic poisons the handle and does not unwind: pending a fault hook, since no call can make libkaryos panic (the Rust tests of boundary.rs and api/driver cover it)
 older minor ABI client against a newer library: pending the ABI manifest test of the first released header

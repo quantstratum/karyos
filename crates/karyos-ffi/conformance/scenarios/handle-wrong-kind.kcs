@@ -1,0 +1,15 @@
+# A handle of another kind, or the null handle, is refused with a typed
+# status, never used (SPEC.md §13, C ABI boundary).
+format 1
+id handle.wrong.kind
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_client_poll client=$driver
+expect KARYOS_E_INVALID_HANDLE
+call karyos_driver_do_work driver=0
+expect KARYOS_E_INVALID_HANDLE
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

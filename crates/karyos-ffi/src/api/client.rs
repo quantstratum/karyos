@@ -17,6 +17,7 @@ use karyos_client::{Client, ClientConductor, ClientError, Context, IdleStrategy,
 
 use crate::api::publication::Lanes;
 
+use crate::api::driver;
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
 
@@ -36,13 +37,6 @@ pub(crate) enum AnyClient {
     #[cfg(target_os = "linux")]
     Remote(Client<karyos_client::ipc::RemoteClient>),
     /// Over a conductor of an embedded driver.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "built by the tests until F5 exports the embedded driver"
-        )
-    )]
     Embedded(Client<ClientConductor>),
 }
 
@@ -98,6 +92,22 @@ pub(crate) struct ClientEntry {
     pub(crate) client: AnyClient,
     /// Its open publications.
     pub(crate) publications: Vec<Handle>,
+    /// The embedded driver whose conductor it is over, when the C ABI
+    /// created that driver (F5): the client follows its failure and its
+    /// close ([`driver::usable`]).
+    pub(crate) driver: Option<Handle>,
+}
+
+impl ClientEntry {
+    /// Whether the client may act; see [`driver::usable`].
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Internal`] once its driver is poisoned,
+    /// [`Status::Closed`] once it is closed.
+    pub(crate) fn usable(&self) -> Result<(), Status> {
+        self.driver.map_or(Ok(()), driver::usable)
+    }
 }
 
 /// The table of clients, allocated on first use.
@@ -106,18 +116,13 @@ pub(crate) fn clients() -> &'static Table<ClientEntry> {
     CLIENTS.get_or_init(|| Table::new(Kind::Client, MAX_CLIENTS))
 }
 
-/// A client's entry for its table.
-#[cfg_attr(
-    not(any(test, target_os = "linux")),
-    expect(
-        dead_code,
-        reason = "only a remote client or a test's embedded one has an entry until F5"
-    )
-)]
-fn entry(client: AnyClient) -> ClientEntry {
+/// A client's entry for its table, over `driver` when the C ABI created
+/// it.
+fn entry(client: AnyClient, driver: Option<Handle>) -> ClientEntry {
     ClientEntry {
         client,
         publications: Vec::new(),
+        driver,
     }
 }
 
@@ -202,7 +207,7 @@ pub(crate) fn connect(options: &Options) -> Result<Handle, Failure> {
 #[cfg(target_os = "linux")]
 fn connect_with(context: Context) -> Result<Handle, Failure> {
     let client = Client::connect(context).map_err(|error| Failure::from(&error))?;
-    Ok(clients().insert(entry(AnyClient::Remote(client)))?)
+    Ok(clients().insert(entry(AnyClient::Remote(client), None))?)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -217,7 +222,22 @@ fn connect_with(_context: Context) -> Result<Handle, Failure> {
 /// [`Status::HandlesExhausted`].
 #[cfg(test)]
 pub(crate) fn insert_embedded(client: Client<ClientConductor>) -> Result<Handle, Status> {
-    clients().insert(entry(AnyClient::Embedded(client)))
+    clients().insert(entry(AnyClient::Embedded(client), None))
+}
+
+/// Opens a client handle over a new conductor of the embedded driver
+/// `owner`, with the facade's default context.
+///
+/// # Errors
+///
+/// The driver's refusal, the context's, and the table's.
+pub(crate) fn connect_embedded(owner: Handle) -> Result<Handle, Failure> {
+    let conductor = driver::conductor(owner)?;
+    let context = Context::builder()
+        .build()
+        .map_err(|error| Failure::from(&error))?;
+    let client = Client::with_conductor(conductor, context);
+    Ok(clients().insert(entry(AnyClient::Embedded(client), Some(owner)))?)
 }
 
 /// Serves `client` once; whether anything was served.
@@ -226,7 +246,10 @@ pub(crate) fn insert_embedded(client: Client<ClientConductor>) -> Result<Handle,
 ///
 /// As [`Table::with`].
 pub(crate) fn poll(client: Handle) -> Result<bool, Status> {
-    clients().with(client, |entry| entry.client.poll())
+    clients().with(client, |entry| {
+        entry.usable()?;
+        Ok(entry.client.poll())
+    })?
 }
 
 /// Closes `entry`'s children, all or none, releasing each to its client:

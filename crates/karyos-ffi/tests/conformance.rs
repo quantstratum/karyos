@@ -260,6 +260,35 @@ fn nulls(step: &Step, names: &[&str], at: &str) -> Vec<bool> {
         .collect()
 }
 
+/// The handle argument `name`, the step's only one.
+fn handle_argument(step: &Step, name: &str, at: &str) -> u64 {
+    let value = integer_argument(step, name, at);
+    u64::try_from(value).unwrap_or_else(|_| panic!("{at}: `{name}` is not a uint64_t"))
+}
+
+/// A handle as a scenario value.
+fn handle_value(handle: u64, at: &str) -> Value {
+    Value::Integer(
+        i64::try_from(handle).unwrap_or_else(|_| panic!("{at}: a handle beyond 64-bit signed")),
+    )
+}
+
+/// What a function that writes one handle returned.
+fn with_handle(status: i32, name: &str, handle: u64, at: &str) -> Returned {
+    Returned {
+        status: Some(status),
+        results: BTreeMap::from([(name.to_owned(), handle_value(handle, at))]),
+    }
+}
+
+/// What a function that writes one count returned.
+fn with_count(status: i32, name: &str, count: u32) -> Returned {
+    Returned {
+        status: Some(status),
+        results: BTreeMap::from([(name.to_owned(), Value::Integer(i64::from(count)))]),
+    }
+}
+
 fn integer_argument(step: &Step, name: &str, at: &str) -> i64 {
     assert_eq!(step.arguments.len(), 1, "{at}: one argument, `{name}`");
     match step.arguments.get(name) {
@@ -297,6 +326,31 @@ fn call(step: &Step, at: &str) -> Returned {
                 )]),
             }
         }
+        "karyos_driver_create" => {
+            assert!(step.arguments.is_empty(), "{at}: no arguments");
+            let (status, driver) = abi::driver_create();
+            with_handle(status, "driver", driver, at)
+        }
+        "karyos_driver_connect" => {
+            let (status, client) = abi::driver_connect(handle_argument(step, "driver", at));
+            with_handle(status, "client", client, at)
+        }
+        "karyos_driver_do_work" => {
+            let (status, work) = abi::driver_do_work(handle_argument(step, "driver", at));
+            with_count(status, "work", work)
+        }
+        "karyos_driver_close" => Returned {
+            status: Some(abi::driver_close(handle_argument(step, "driver", at))),
+            results: BTreeMap::new(),
+        },
+        "karyos_client_poll" => {
+            let (status, served) = abi::client_poll(handle_argument(step, "client", at));
+            with_count(status, "served", served)
+        }
+        "karyos_client_close" => Returned {
+            status: Some(abi::client_close(handle_argument(step, "client", at))),
+            results: BTreeMap::new(),
+        },
         other => panic!("{at}: this runner does not know `{other}`"),
     }
 }
@@ -331,7 +385,14 @@ fn run(scenario: &Scenario, statuses: &BTreeMap<String, i32>, library: (u32, u32
                 );
             }
         }
-        let returned = call(step, &at);
+        // A call takes its variables' values.
+        let mut bound = step.clone();
+        for argument in bound.arguments.values_mut() {
+            if let Value::Variable(variable) = argument {
+                *argument = variables[variable.as_str()].clone();
+            }
+        }
+        let returned = call(&bound, &at);
         match (&step.status, returned.status) {
             (Some(expected), Some(got)) => {
                 let code = *statuses

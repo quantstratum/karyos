@@ -32,6 +32,7 @@ fn c_struct(rust: &str) -> &'static str {
         "ClientOptions" => "karyos_client_options",
         "Detail" => "karyos_detail",
         "Accepted" => "karyos_accepted",
+        "DriverOptions" => "karyos_driver_options",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -52,6 +53,8 @@ fn c_type(rust: &str) -> String {
         "*mut Detail" => "karyos_detail *",
         "*mut Accepted" => "karyos_accepted *",
         "*mut *mut u8" => "uint8_t **",
+        "*const DriverOptions" => "const karyos_driver_options *",
+        "*mut DriverOptions" => "karyos_driver_options *",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -304,5 +307,19 @@ fn the_header_states_the_publication_constants() {
     assert_eq!(
         defines["KARYOS_MAX_CLAIMS"],
         i64::from(publication::MAX_CLAIMS)
+    );
+}
+
+#[test]
+fn the_header_states_the_driver_constants() {
+    use crate::api::driver;
+    let defines = header_defines();
+    assert_eq!(
+        defines["KARYOS_MAX_DRIVERS"],
+        i64::from(driver::MAX_DRIVERS)
+    );
+    assert_eq!(
+        defines["KARYOS_PROTOCOL_VERSION"],
+        i64::try_from(driver::PROTOCOL_VERSION).unwrap()
     );
 }
