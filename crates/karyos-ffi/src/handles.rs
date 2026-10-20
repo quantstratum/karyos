@@ -21,8 +21,9 @@
 //! retired, never reused. A handle of another copy in the same process
 //! (two static copies, BIND-CPP-Q12) therefore names a slot at another
 //! generation and answers [`Status::Closed`], except with probability
-//! 2^-32 per call: a copy cannot tell a foreign handle from a stale one. The generation is an atomic read before
-//! the mutex is tried, so a stale handle never disturbs a live one. One
+//! 2^-32 per call: a copy cannot tell a foreign handle from a stale one.
+//! The generation is an atomic read before the mutex is tried, so a stale
+//! handle never disturbs a live one. One
 //! narrow window is left: a call that read the generation just before a
 //! concurrent close and a reuse of the slot holds the mutex for a moment,
 //! and a call on the new handle at that instant answers [`Status::Busy`].
@@ -204,12 +205,21 @@ pub(crate) fn copy_base() -> u32 {
     static BASE: OnceLock<u32> = OnceLock::new();
     *BASE.get_or_init(|| {
         static ANCHOR: u8 = 0;
-        let address = core::ptr::from_ref(&ANCHOR).addr() as u64;
+        // The address's bytes, folded into a `u64` with no cast.
+        let address = core::ptr::from_ref(&ANCHOR)
+            .addr()
+            .to_le_bytes()
+            .iter()
+            .rev()
+            .fold(0_u64, |folded, byte| {
+                folded.rotate_left(8) ^ u64::from(*byte)
+            });
         nonzero(mix(address))
     })
 }
 
-/// SplitMix64's finalizer: every input bit reaches every output bit.
+/// SplitMix64's finalizer: every input bit reaches every output bit. The
+/// wrapping multiplications are modular hashing, not quantities.
 const fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -217,10 +227,11 @@ const fn mix(mut value: u64) -> u64 {
 }
 
 /// The high 32 bits of `value`, or 1 if they are 0.
-const fn nonzero(value: u64) -> u32 {
-    match (value >> 32) as u32 {
-        0 => 1,
-        high => high,
+fn nonzero(value: u64) -> u32 {
+    // The high 32 bits always fit.
+    match u32::try_from(value >> 32) {
+        Ok(0) | Err(_) => 1,
+        Ok(high) => high,
     }
 }
 

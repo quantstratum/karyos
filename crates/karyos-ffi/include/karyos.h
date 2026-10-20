@@ -16,10 +16,9 @@
  *   the same process (two static copies), except with probability 2^-32
  *   per call: each copy draws its own base generation, and a copy cannot
  *   tell a foreign handle from a stale one. A handle in use by another
- *   thread answers
- *   KARYOS_E_BUSY, and one reentered from its own callback answers
- *   KARYOS_E_REENTRANT. A call never waits for another call on its
- *   handle; two bounded waits are listed under Threads below.
+ *   thread answers KARYOS_E_BUSY, and one reentered from its own callback
+ *   answers KARYOS_E_REENTRANT. A call never waits for another call on
+ *   its handle; two bounded waits are listed under Threads below.
  * - A panic inside Karyos returns KARYOS_E_INTERNAL and poisons the handle
  *   it held.
  * - Callbacks must return normally: an exception, a panic or a longjmp
