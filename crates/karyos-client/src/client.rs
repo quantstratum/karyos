@@ -2362,6 +2362,10 @@ mod tests {
         let stream = |subscription| Subscription {
             kind: Kind::Stream(Box::new(subscription)),
         };
+        // A subscription that closes on an overrun: the rejoin sets that
+        // policy aside.
+        let mut named = named;
+        let _ = named.replace_rejoin(crate::subscription::RejoinPolicy::Close);
         let rejoining = stream(named)
             .rejoin_with(Box::new(Never), Secondary::RejoinAtHead)
             .unwrap();
@@ -2369,7 +2373,14 @@ mod tests {
         assert!(!rejoining.is_recovering());
         assert_eq!(rejoining.merge_failure(), None);
         let back = rejoining.into_subscription().unwrap();
-        assert!(matches!(back.kind, Kind::Stream(_)));
+        // Its own policy, set aside while it rejoined, comes back.
+        let Kind::Stream(mut back) = back.kind else {
+            panic!("not a stream");
+        };
+        assert!(matches!(
+            back.replace_rejoin(crate::subscription::RejoinPolicy::RejoinAtHead),
+            crate::subscription::RejoinPolicy::Close
+        ));
 
         let refused = stream(image(2, 2).subscription)
             .rejoin_with(Box::new(Never), Secondary::RejoinAtHead)

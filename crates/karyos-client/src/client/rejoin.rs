@@ -38,8 +38,11 @@ impl<T: TermBytes> Subscription<T> {
     /// This subscription, its overruns recovered from `provider`'s replays
     /// of its publication and merged back into the live stream, with
     /// `secondary` applied when no replay covers a gap
-    /// ([`ReplayRejoin`]). Its own rejoin policy is set aside until
-    /// [`RejoiningSubscription::into_subscription`] gives it back.
+    /// ([`ReplayRejoin`]). Its own rejoin policy (`RejoinPolicy::Close`,
+    /// a snapshot or any other) is set aside while it rejoins: the rejoin
+    /// recovers every overrun, and `secondary` replaces that policy when no
+    /// replay covers a gap. [`RejoiningSubscription::into_subscription`]
+    /// gives the policy back with the subscription.
     ///
     /// # Errors
     ///
@@ -139,12 +142,13 @@ impl<T: TermBytes> RejoiningSubscription<T> {
     }
 
     /// Gives the subscription back, with its own rejoin policy and loss
-    /// reports: a gap asked for is withdrawn and a merge under way stopped
-    /// (`ReplayRejoin::into_live`). Remove it with
+    /// reports, at any time: a gap asked for is withdrawn and a merge under
+    /// way stopped (`ReplayRejoin::into_live`), and after a merge failure
+    /// the live reader comes back too. Remove it with
     /// [`super::Client::remove_subscription`]. `None` only after a panic
-    /// between two states, where the live reader was lost; dropping a
-    /// rejoining subscription ends its reader as dropping a subscription
-    /// does.
+    /// in the middle of a state change, where the live reader was lost;
+    /// never during a recovery or after a failure. Dropping a rejoining
+    /// subscription ends its reader as dropping a subscription does.
     #[must_use]
     pub fn into_subscription(self) -> Option<Subscription<T>> {
         self.inner.into_live().map(|live| Subscription {

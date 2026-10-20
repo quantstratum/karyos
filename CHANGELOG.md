@@ -582,6 +582,10 @@ release may break APIs, wire formats and shared-memory layouts.
   `is_recovering`, `merge_failure`, `source` and `into_subscription`
   complete it. A network subscription, or one with no publication
   identity, is refused as `NotRejoinable`, the subscription handed back.
+  The subscription's own rejoin policy is set aside while it rejoins and
+  comes back with `into_subscription`. Public client surface under owner
+  item 57: `Subscription::rejoin_with`, `RejoiningSubscription` and
+  `NotRejoinable`.
 
 - `karyos-catalog list DIR [--json]` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H4a): an archive directory's
@@ -2197,6 +2201,11 @@ release may break APIs, wire formats and shared-memory layouts.
   position stays within each required member's edge.
 
 ### Fixed
+
+- A rejoin's outcome reported alone (`RejoinOutcome::Replayed` with no
+  overrun, abort, skip or close in the same poll) reaches the facade
+  caller of a `RejoiningSubscription`: the facade's poll report kept a
+  summary only when it stopped (F9-0b, karyos#532).
 
 - One driver can hold both ends of a `karyos:udp` endpoint (karyos#490;
   quantstratum-docs: `karyos/design/per-source-images.md`, D2-1 and
