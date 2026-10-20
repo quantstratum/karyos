@@ -11,6 +11,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- karyos-archive's `client::connection` (quantstratum-docs:
+  `karyos/design/ffi-archive.md`, F9-0): a requester's control streams to
+  an Archive over a facade client. `ArchiveConnection::open(&mut client,
+  ControlStreams::new(requests, responses))` takes a concurrent publication
+  on the shared request stream and a subscription on the response stream
+  (`karyos:ipc`). `into_transports` gives the `Requests` and `Responses`
+  an `ArchiveClient` or a `RecordingLister` takes. An answer longer than
+  the caller's buffer is skipped. The management agent's catalog uses it
+  in place of its private adapters, and so do `karyos-catalog list --live`
+  (H4b) and `karyos-replay start` (H6). Public surface, under owner items
+  57 and 41.
+
 - The Archive's host over a driver (quantstratum-docs:
   `karyos/design/archive-host.md`, H2).
   - `karyos_tools::archive::DriverHost<T>` implements
