@@ -46,6 +46,15 @@ extern "C" {
 #define KARYOS_MAX_PUBLICATIONS 4096
 /** The most claims outstanding at once: one per publication. */
 #define KARYOS_MAX_CLAIMS 4096
+/**
+ * The most subscriptions open at once. Each holds a private copy buffer of
+ * the largest message it can deliver, at most the stream's term length / 8.
+ */
+#define KARYOS_MAX_SUBSCRIPTIONS 4096
+
+/** karyos_message_info flags. */
+#define KARYOS_MESSAGE_END_OF_STREAM 1
+#define KARYOS_MESSAGE_TRACED 2
 
 /** Idle strategies of a control call's wait (karyos_client_options). */
 #define KARYOS_IDLE_BUSY_SPIN 0
@@ -282,6 +291,91 @@ int32_t karyos_claim_abort(uint64_t claim);
  * nothing is closed while the client handle is in use.
  */
 int32_t karyos_publication_close(uint64_t publication);
+
+/**
+ * What the poll knows of a message, valid during the handler's call. size
+ * is the library's sizeof(karyos_message_info): read only the fields it
+ * covers.
+ */
+typedef struct karyos_message_info {
+    uint32_t size;
+    uint32_t lane;
+    uint64_t position;
+    int64_t reserved_value;
+    uint32_t extent;
+    int32_t session_id;
+    uint32_t flags;
+    uint32_t reserved;
+} karyos_message_info;
+
+/** An image of a network subscription attached (available 1) or retired. */
+typedef struct karyos_image_change {
+    uint32_t size;
+    int32_t session_id;
+    uint64_t image_id;
+    uint32_t lane;
+    uint32_t available;
+} karyos_image_change;
+
+/**
+ * Called once per message with the caller's context, the message's length
+ * bytes at data (a private copy, never a term or a shared mapping, valid
+ * only during the call) and its info. It must return normally.
+ */
+typedef void (*karyos_message_handler)(void *context, const uint8_t *data,
+                                       size_t length,
+                                       const karyos_message_info *info);
+
+/**
+ * Adds the subscription of stream_id on the channel uri (karyos:ipc or
+ * karyos:udp) to the client and writes its handle. A control call: it
+ * waits for the driver up to the client's timeout and holds the client
+ * handle meanwhile. A failure opens nothing and fills detail (may be
+ * null).
+ */
+int32_t karyos_client_add_subscription(uint64_t client, const char *uri,
+                                       int32_t stream_id,
+                                       uint64_t *subscription,
+                                       karyos_detail *detail);
+
+/**
+ * Delivers at most limit messages to handler, each from a private copy,
+ * and writes their count through delivered (may be null), also when it
+ * fails: a failed poll's status follows the messages delivered before it.
+ * Never waits; it allocates only when a newly attached image or mapping
+ * has a larger message than any before (KARYOS_E_SYSTEM when it cannot,
+ * before anything of that round is delivered: the count covers earlier
+ * rounds). From the handler, polling or closing this subscription, or
+ * closing its client, returns KARYOS_E_REENTRANT. To stop
+ * after a failed handler (ADR-0067), poll with a limit of 1 in a loop and
+ * stop calling: the failed message is acknowledged, the later ones are
+ * not delivered.
+ */
+int32_t karyos_subscription_poll(uint64_t subscription,
+                                 karyos_message_handler handler,
+                                 void *context, uint32_t limit,
+                                 uint32_t *delivered);
+
+/**
+ * Takes the oldest queued image change into change and sets has to 1, or
+ * sets has to 0 when none is queued. The queue is bounded. change points
+ * to a karyos_image_change whose size is set: a null one, or one smaller
+ * than this version's first, returns KARYOS_E_INVALID_ARGUMENT and takes
+ * nothing.
+ */
+int32_t karyos_subscription_next_image_change(uint64_t subscription,
+                                              karyos_image_change *change,
+                                              uint32_t *has);
+
+/** Writes the image changes a full queue dropped through lost. */
+int32_t karyos_subscription_image_changes_lost(uint64_t subscription,
+                                               uint64_t *lost);
+
+/**
+ * Closes the subscription through its client; nothing is closed while the
+ * client handle is in use.
+ */
+int32_t karyos_subscription_close(uint64_t subscription);
 
 #ifdef __cplusplus
 }
