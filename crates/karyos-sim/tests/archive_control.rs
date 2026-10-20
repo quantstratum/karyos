@@ -1024,7 +1024,8 @@ fn a_facade_subscription_recovers_its_gap_through_the_archive() {
 /// client without blocking. A target not there yet is refused and asked
 /// again; once it exists the grant comes through the client's polls. A
 /// grant withdrawn before it was taken is released by the client: the
-/// target's single reader slot is free again.
+/// target's single reader slot is free again; so is one left to a
+/// subscriber when it is dropped.
 #[test]
 fn a_replay_target_is_subscribed_through_the_facade_client_without_blocking() {
     use karyos_client::{Client, Context, ReplayTargetSubscriber};
@@ -1080,6 +1081,18 @@ fn a_replay_target_is_subscribed_through_the_facade_client_without_blocking() {
     // The slot is free: the target is granted again.
     let again = granted(&mut rig, &mut client, &mut targets);
     drop(again);
+    // A subscriber dropped with a grant never taken: the client releases
+    // it, and the slot is free once more.
+    let mut other = client.replay_targets();
+    assert!(other.subscribe(SOLO, 1).is_none());
+    for _ in 0..50 {
+        serve(&mut rig, &mut client);
+    }
+    drop(other);
+    for _ in 0..50 {
+        serve(&mut rig, &mut client);
+    }
+    drop(granted(&mut rig, &mut client, &mut targets));
 }
 
 /// F9b: a facade subscription whose Archive client is built only from the

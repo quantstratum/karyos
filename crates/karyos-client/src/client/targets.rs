@@ -46,19 +46,23 @@ impl<T: TermBytes> core::fmt::Debug for ReplayTargetSubscriber<T> {
     }
 }
 
-/// What a subscriber and its client share.
+/// What a subscriber and its client share. The client holds it until the
+/// subscriber is dropped and nothing of its own is left in flight or to
+/// release.
 #[derive(Debug)]
 pub(super) struct Target<T: TermBytes> {
     /// The target asked for.
     wanted: Option<StreamKey>,
     /// Whether the client is to submit a request for `wanted`.
     ask: bool,
-    /// Whether a request for `wanted` is in flight.
+    /// Whether a request of this subscriber is in flight.
     pending: bool,
     /// The grant for `wanted`, not taken yet.
     granted: Option<ClientSubscription<T>>,
     /// Grants withdrawn, for the client to release.
     discarded: Vec<ClientSubscription<T>>,
+    /// The subscriber was dropped.
+    dropped: bool,
 }
 
 /// A request for a target, in flight.
@@ -92,7 +96,6 @@ impl<T: TermBytes> ReplayTargetSubscriber<T> {
                 target.discarded.push(withdrawn);
             }
             target.wanted = Some(stream);
-            target.pending = false;
         }
         if let Some(granted) = target.granted.take() {
             target.wanted = None;
@@ -106,9 +109,13 @@ impl<T: TermBytes> ReplayTargetSubscriber<T> {
 }
 
 impl<T: TermBytes> Drop for ReplayTargetSubscriber<T> {
+    /// Withdraws the target asked for: a grant not taken, or one that
+    /// comes later, is released by the client's next poll, which holds
+    /// what the two share until then.
     fn drop(&mut self) {
         let mut target = lock(&self.shared);
         target.wanted = None;
+        target.dropped = true;
         if let Some(withdrawn) = target.granted.take() {
             target.discarded.push(withdrawn);
         }
@@ -126,21 +133,18 @@ impl<C: Connection> Client<C> {
             pending: false,
             granted: None,
             discarded: Vec::new(),
+            dropped: false,
         }));
-        self.targets.push(Arc::downgrade(&shared));
+        self.targets.push(Arc::clone(&shared));
         ReplayTargetSubscriber { shared }
     }
 
     /// Submits the targets asked for and releases those withdrawn; forgets
-    /// subscribers that are gone, once nothing of theirs is left.
+    /// a dropped subscriber once nothing of its own is left in flight.
     pub(super) fn serve_targets(&mut self) {
         let mut index = 0;
-        while let Some(weak) = self.targets.get(index) {
-            let Some(shared) = weak.upgrade() else {
-                let _ = self.targets.swap_remove(index);
-                continue;
-            };
-            let (asked, discarded) = {
+        while let Some(shared) = self.targets.get(index).map(Arc::clone) {
+            let (asked, discarded, gone) = {
                 let mut target = lock(&shared);
                 let asked = match (target.ask, target.wanted) {
                     (true, Some(stream)) => {
@@ -149,12 +153,17 @@ impl<C: Connection> Client<C> {
                     }
                     _ => None,
                 };
-                (asked, std::mem::take(&mut target.discarded))
+                let gone = target.dropped && !target.pending;
+                (asked, std::mem::take(&mut target.discarded), gone)
             };
             for withdrawn in discarded {
                 if !self.connection.release_subscription(withdrawn) {
                     super::bump(&mut self.subscription_releases_failed);
                 }
+            }
+            if gone {
+                let _ = self.targets.swap_remove(index);
+                continue;
             }
             // A request not submitted now (the ring full) is asked again
             // on the subscriber's next call.
@@ -175,8 +184,8 @@ impl<C: Connection> Client<C> {
     }
 
     /// Completes a target's request, if `sequence` is one: its grant goes
-    /// to the subscriber still asking for it, and is released otherwise.
-    /// Returns the outcome back when it is no target's.
+    /// to the subscriber still asking for it and holding none, and is
+    /// released otherwise. Returns the outcome back when it is no target's.
     pub(super) fn target_completed(&mut self, sequence: u64, outcome: Outcome) -> Option<Outcome> {
         let Some(index) = self
             .target_asks
@@ -186,21 +195,27 @@ impl<C: Connection> Client<C> {
             return Some(outcome);
         };
         let ask = self.target_asks.swap_remove(index);
-        let shared = ask.target.upgrade();
-        let wanted = shared
-            .as_ref()
-            .is_some_and(|shared| lock(shared).wanted == Some(ask.stream));
-        let Some(shared) = shared.filter(|_| wanted) else {
-            // Withdrawn, or its subscriber gone: released.
+        let Some(shared) = ask.target.upgrade() else {
             let _ = self.connection.release(outcome);
             return None;
         };
-        let granted = self.connection.subscription(outcome).ok();
+        // Another request of this subscriber may still be in flight.
+        let pending = self
+            .target_asks
+            .iter()
+            .any(|other| Weak::ptr_eq(&other.target, &ask.target));
         let mut target = lock(&shared);
-        target.pending = false;
+        target.pending = pending;
+        if target.wanted != Some(ask.stream) || target.granted.is_some() {
+            // Withdrawn, its subscriber dropped, or granted already by an
+            // earlier request: released.
+            drop(target);
+            let _ = self.connection.release(outcome);
+            return None;
+        }
         // A refusal (the target not there yet) is asked again by the
         // subscriber's next call.
-        target.granted = granted;
+        target.granted = self.connection.subscription(outcome).ok();
         None
     }
 }

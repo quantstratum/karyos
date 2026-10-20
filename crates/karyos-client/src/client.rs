@@ -1036,7 +1036,7 @@ pub struct Client<C: Connection> {
     /// that announce its first images.
     adding: Option<(SubscriberRole, RejoinPolicy)>,
     /// The replay-target subscribers made by [`Client::replay_targets`].
-    targets: Vec<Weak<Mutex<targets::Target<C::Terms>>>>,
+    targets: Vec<Arc<Mutex<targets::Target<C::Terms>>>>,
     /// Their requests in flight.
     target_asks: Vec<targets::TargetAsk<C::Terms>>,
 }
