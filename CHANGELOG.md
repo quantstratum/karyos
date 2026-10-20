@@ -421,6 +421,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyosd --network <on|off>` (off by default; quantstratum-docs:
+  `karyos/design/observability-and-tools.md`, `karyosd`): `on` runs the
+  driver's network agents with `NetworkConfig::default()` (dedicated
+  threads), so clients create `karyos:udp` publications and subscriptions
+  by URI, whose `term-length`, `mtu` and `lanes` keys override the stream
+  defaults; the start log says whether the network runs. The rest of the
+  network configuration is not on the command line yet: the agents' rings
+  and session limits, the threading mode, the image template, the stream
+  defaults, the NAK control groups and the per-client limit. Tested end to
+  end through two `karyosd` processes on loopback.
+
 - Guard operations through the management agent (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M10b2). The agent's
   socket takes `guard-close DIR GUARD [REASON]`, `guard-reopen DIR GUARD

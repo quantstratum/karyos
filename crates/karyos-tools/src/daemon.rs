@@ -247,6 +247,7 @@ impl Daemon {
             instance = ?self.driver.instance().map(|instance| format!("{instance:032x}")),
             streams = self.streams.len(),
             max_clients = options.driver.max_clients,
+            network = options.driver.network.is_some(),
             shutdown_linger_ms = u64::try_from(options.shutdown_linger.as_millis()).unwrap_or(u64::MAX),
             "karyosd started"
         );
