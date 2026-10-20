@@ -244,7 +244,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         .streams
                         .iter()
                         .find(|found| {
+                            // The local stream's lanes: an image of the
+                            // same key may live beside it (karyos#490).
                             !found.retiring
+                                && found.source.is_none()
                                 && (found.stream_id, found.session_id)
                                     == (stream.stream_id, stream.session_id)
                         })
@@ -342,6 +345,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Whether `client` may own one more network resource
     /// (`NetworkConfig::max_owned_per_client`); a refusal is counted.
+    /// Whether `client` owns a live network subscription of `stream_id`.
+    pub(crate) fn owns_network_subscription(&self, client: u64, stream_id: i32) -> bool {
+        self.net_owned.iter().any(|owned| {
+            owned.client == client
+                && matches!(owned.owned, Owned::Subscription { handle, .. }
+                    if handle.stream_id() == stream_id)
+        })
+    }
+
     fn may_own(&mut self, client: u64) -> bool {
         let cap = self
             .config

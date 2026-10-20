@@ -486,6 +486,9 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// a network publication's lane and a replay target
     /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-1).
     pub(crate) source: Option<crate::net::ImageSource>,
+    /// A replay target's lane: no source, and its key is its own while it
+    /// lives, retiring included (#283 P3; karyos#490).
+    pub(crate) replay: bool,
     /// The aggregate this lane belongs to.
     pub(crate) aggregate: Aggregate,
     pub(crate) retiring: bool,
@@ -961,15 +964,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// the image's terms as for a local stream.
     ///
     /// A network image comes with its `source`: images of one alias from
-    /// different sources are each exposed, and the alias is refused only
-    /// when it is the key of a stream that is not a network image (as a
-    /// local stream over an image's key is refused). A replay target has
-    /// no source and is refused for any stream of its key. Returns `None`,
-    /// with nothing added, for a refused key, a full stream table or an
-    /// aggregate that cannot be built (its quanta, its profile, its
-    /// registrations or a conductor already issued). A retiring stream
-    /// keeps its key until it frees, so an image of that alias installed
-    /// meanwhile stays unexposed for its whole life (#283 P3).
+    /// different sources are each exposed, and an image is exposed beside
+    /// a local stream of its key too, such as this driver's own network
+    /// publication whose loopback image it receives (karyos#490). Key
+    /// lookups prefer the local stream; an image is reached by its
+    /// registration, or by its alias from a network subscription
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-4). A
+    /// replay target has no source and is refused for any stream of its
+    /// key, and an image is refused over a replay target's key. Returns
+    /// `None`, with nothing added, for a refused key, a full stream table or
+    /// an aggregate that cannot be built (its quanta, its profile, its
+    /// registrations or a conductor already issued). A retiring replay
+    /// target keeps its key until it frees, so an image of that alias
+    /// installed meanwhile stays unexposed for its whole life (#283 P3).
     pub(crate) fn add_image_aggregate(
         &mut self,
         lanes: &[Arc<LogBuffer<T>>],
@@ -978,14 +985,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let first = lanes.first()?.config();
         let key = (first.stream_id, first.session_id);
         let count = u8::try_from(lanes.len()).ok()?;
-        if self.streams.iter().any(|stream| {
-            (stream.stream_id, stream.session_id) == key
-                && (source.is_none() || stream.source.is_none())
-        }) || self
-            .streams
-            .len()
-            .checked_add(lanes.len())
-            .is_none_or(|total| total > self.config.max_streams)
+        // A replay target (no source) is refused over any stream of its key;
+        // an image only over a replay target's.
+        let taken = self.streams.iter().any(|stream| {
+            (stream.stream_id, stream.session_id) == key && (source.is_none() || stream.replay)
+        });
+        if taken
+            || self
+                .streams
+                .len()
+                .checked_add(lanes.len())
+                .is_none_or(|total| total > self.config.max_streams)
         {
             return None;
         }
@@ -1025,6 +1035,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             staged.push(Stream {
                 id,
                 source,
+                replay: source.is_none(),
                 aggregate,
                 retiring: false,
                 buffer: Arc::clone(buffer),
@@ -2189,12 +2200,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let count = u8::try_from(lanes.len()).map_err(|_| DriverError::InvalidConfig)?;
         let profile = DrrConfig::new(quanta, largest_charge(&config)?)
             .map_err(|_| DriverError::InvalidConfig)?;
-        // A key in use (active or retiring) is reported before the quota.
+        // A key in use (active or retiring) is reported before the quota. A
+        // network image of the key is not in the way: the two coexist, key
+        // lookups preferring the local stream (karyos#490).
         let key = (config.buffer.stream_id, config.buffer.session_id);
         if self
             .streams
             .iter()
-            .any(|s| (s.stream_id, s.session_id) == key)
+            .any(|s| (s.stream_id, s.session_id) == key && s.source.is_none())
         {
             return Err(DriverError::DuplicateStream {
                 stream_id: key.0,
@@ -2335,6 +2348,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(Stream {
             id,
             source: None,
+            replay: false,
             aggregate,
             retiring: false,
             buffer,
