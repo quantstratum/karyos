@@ -53,7 +53,11 @@
 //! the client itself), and the parameters digest is
 //! [`guard_parameters`] over what was asked (`quantstratum-docs:
 //! karyos/design/management-agent-gap-analysis.md`, M10 and owner item 6);
-//! both go to the audit record as given. The driver answers `GuardState` with the guard's word after
+//! both go to the audit record as given. The operator uid is asserted by
+//! the admitted client, not verified by the driver: the driver knows only
+//! the client, whose uid admission proved equal to its own (G1), and the
+//! tool that sets the operator (the management agent) authenticates its
+//! own caller. The driver answers `GuardState` with the guard's word after
 //! the transition, or `Error` with `UnknownGuard`, `GuardNotClosedAt`
 //! (detail: the current guard word), `GuardExhausted` or `NotAuthorized`.
 //!
@@ -869,7 +873,9 @@ pub fn guard_parameters(
         .flat_map(|word| word.to_le_bytes())
         .chain(reason.iter().copied())
         .fold(OFFSET, |hash, byte| {
-            // FNV-1a multiplies modulo 2^64 by definition.
+            // FNV-1a multiplies modulo 2^64 by definition. ADR-0007's rule
+            // against wrapping covers positions, lengths and counters, whose
+            // overflow is an error; a hash has no overflow to report.
             (hash ^ u64::from(byte)).wrapping_mul(PRIME)
         })
 }
