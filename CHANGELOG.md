@@ -11,6 +11,24 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The conformance suite gains format 2 (ADR-0073, owner item 46,
+  decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged;
+  format 1's `karyos_driver_start` now defaults its `idle_strategy` to
+  the ABI's declared default, `KARYOS_IDLE_YIELD_THEN_SLEEP` (3), in
+  place of `KARYOS_IDLE_YIELD` (1), which changes no result.
+  Format 2 adds a semantic layer of ops that a binding runs through its
+  public API, with a binding's close rules (a second close is `ok`; an
+  op on a closed object or a closed parent's child answers `closed`)
+  and outcomes named by header status; values from -2^63 to 2^64 - 1;
+  `since`, the binding SPEC step that requires a scenario; `feature`;
+  bounds on files, lines, steps and variables; and a pinning line with
+  the SHA-256 of the suite and header and the core's identity. The
+  reference runner runs the ops through a semantic adapter over the C
+  ABI and reports each scenario passed, skipped, unsupported or later.
+  Twelve scenarios: the claim semantics every binding shares (BIND-S3:
+  one outstanding claim, a retryable commit that keeps the claim, a
+  one-shot claim that leaves none), the close rules, concurrent
+  publication, conflated views, outcome streams and the clocks.
 - `karyos-ffi`'s default idle strategy is `KARYOS_IDLE_YIELD_THEN_SLEEP`
   (ADR-0066): `karyos_client_options_init` now fills it in place of
   `KARYOS_IDLE_YIELD`, and `karyos_driver_start` takes it. The new
@@ -625,6 +643,19 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos-ffi` asserts at compile time that each
   kind's object is `Send` and its table `Sync`
   (`src/threads.rs`), and `abi::tests::threads` checks the runtime rules.
+- The libkaryos package carries `lib/pkgconfig/karyos-static.pc` for a
+  static link: `karyos.pc`'s `-lkaryos` makes the linker pick the shared
+  library even under `pkg-config --static` (macOS ld, and GNU ld without
+  `-Bstatic`), so `karyos-static.pc` names `lib/libkaryos.a` itself, with
+  the archive's system libraries from rustc's `native-static-libs` in
+  `Libs` (cgo's `#cgo pkg-config:` reads `--libs` without `--static`).
+  Static means libkaryos only: the system libraries, `libgcc_s` on Linux
+  included, stay dynamic.
+  The MANIFEST lists both files (`pkg_config=`). `make
+  libkaryos-static-check` links a C program of a few lines through it,
+  with and without `--static`, runs `karyos_abi_version` and checks with
+  `otool -L` or `ldd` that no libkaryos is loaded. It compiles C, so it
+  is not part of pre-push, and the package script still compiles none.
 
 - Conformance scenarios for the C ABI added since batch 1
   (quantstratum-docs: `karyos/design/ffi-gap-analysis.md`, F6; SPEC §13).

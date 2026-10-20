@@ -1,0 +1,23 @@
+# The outcome stream of a publication: nothing on a fresh one, a lane it
+# does not have refused, closed after its close (outcomes.typed.statuses).
+format 2
+id op.outcomes
+abi 0.1
+covers "typed status codes"
+since B1
+feature guarded-publication
+
+op client.connect driver=$driver
+expect ok client=$client
+op publication.add client=$client stream_id=10
+expect ok publication=$publication
+op publication.poll_outcomes publication=$publication limit=8
+expect ok delivered=0
+op publication.poll_outcomes publication=$publication lane=1 limit=8
+expect status=invalid_lane
+op publication.close publication=$publication
+expect ok
+op publication.poll_outcomes publication=$publication
+expect status=closed
+op client.close client=$client
+expect ok

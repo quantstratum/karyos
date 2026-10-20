@@ -25,6 +25,7 @@ const INVALID_HANDLE: i32 = 101;
 const BUSY: i32 = 109;
 const CLOSED: i32 = 200;
 const IDLE_YIELD: u32 = 1;
+const IDLE_SLEEP: u32 = 2;
 
 #[test]
 fn the_options_carry_their_size_and_the_drivers_defaults() {
@@ -131,6 +132,39 @@ fn a_stream_is_added_and_removed_through_the_abi() {
     small.size = 64;
     assert_eq!(abi::driver_add_stream(driver, &small).0, OK);
     assert_eq!(abi::driver_close(driver), OK);
+}
+
+/// The conformance runner's claim fill (`publication_claim_filled`, the
+/// test support's write into a staged claim's buffer) under Miri: the
+/// caller's bytes go into the buffer the claim lent, and the claim stays
+/// staged through a retryable commit until its abort.
+#[test]
+fn a_claim_filled_by_its_caller_is_staged_until_its_abort() {
+    let (_, driver) = abi::driver_create();
+    let (_, options) = abi::stream_options(9);
+    assert_eq!(abi::driver_add_stream(driver, &options).0, OK);
+    let (_, client) = abi::driver_connect(driver);
+    // Under Miri the driver's thread sleeps between idle cycles, so the
+    // test's own thread runs (MIRI.md, The profile).
+    let (idle, sleep_ns) = if cfg!(miri) {
+        (IDLE_SLEEP, 1_000_000)
+    } else {
+        (IDLE_YIELD, 0)
+    };
+    assert_eq!(abi::driver_start(driver, idle, sleep_ns), OK);
+    let (status, publication) = abi::client_add_ipc_publication(client, 9);
+    assert_eq!(status, OK);
+    let (status, claim) = abi::publication_claim_filled(publication, 0, 5, b"hello");
+    assert_eq!(status, OK);
+    // No subscriber: the commit is retryable and keeps the claim staged.
+    assert_eq!(abi::claim_commit(claim, 16).0, NOT_CONNECTED);
+    assert_eq!(abi::claim_abort(claim), OK);
+    // A message of another length than the claim's is not written.
+    let (status, claim) = abi::publication_claim_filled(publication, 0, 4, b"hello");
+    assert_eq!(status, OK);
+    assert_eq!(abi::claim_abort(claim), OK);
+    assert_eq!(abi::driver_close(driver), OK);
+    assert_eq!(abi::client_close(client), OK);
 }
 
 #[test]

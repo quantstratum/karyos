@@ -1,0 +1,31 @@
+# One claim, fill and commit (BIND-S3): a retryable status returns with
+# no claim left outstanding, so the next attempt answers the same; with a
+# subscriber the claimed message is delivered.
+format 2
+id op.claim.published
+abi 0.1
+covers "staged claims"
+since B1
+
+op client.connect driver=$driver
+expect ok client=$client
+op publication.add client=$client stream_id=4
+expect ok publication=$lonely
+op publication.publish_claimed publication=$lonely length=8
+expect status=not_connected
+op publication.publish_claimed publication=$lonely payload="again"
+expect status=not_connected
+op subscription.add client=$client stream_id=5
+expect ok subscription=$subscription
+op publication.add client=$client stream_id=5
+expect ok publication=$publication
+op publication.publish_claimed publication=$publication payload="claimed"
+expect ok lane=0 position=$first
+op publication.offer publication=$publication payload="offered"
+expect ok lane=0 position>=$first
+op subscription.poll subscription=$subscription limit=1
+expect ok delivered=1 last="claimed"
+op subscription.poll subscription=$subscription limit=8
+expect ok delivered=1 last="offered"
+op client.close client=$client
+expect ok

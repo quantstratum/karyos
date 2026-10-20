@@ -1,0 +1,27 @@
+# A closed parent closes its children: their ops answer closed, and their
+# own close afterwards is ok, as a deferred close or a destructor runs it
+# (FORMAT.md, Close; BIND-GO-CLOSE).
+format 2
+id op.parent.close
+abi 0.1
+covers "use after close"
+since B1
+
+op client.connect driver=$driver
+expect ok client=$client
+op subscription.add client=$client stream_id=3
+expect ok subscription=$subscription
+op publication.add client=$client stream_id=3
+expect ok publication=$publication
+op publication.offer publication=$publication payload="a"
+expect ok
+op client.close client=$client
+expect ok
+op publication.offer publication=$publication payload="b"
+expect status=closed
+op subscription.poll subscription=$subscription
+expect status=closed
+op subscription.close subscription=$subscription
+expect ok
+op publication.close publication=$publication
+expect ok
