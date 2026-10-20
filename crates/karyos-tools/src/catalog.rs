@@ -280,6 +280,12 @@ fn stopped_json(stop: &Stop) -> String {
 /// listing and closed after it, whatever the outcome. The whole listing is
 /// waited for up to `timeout`.
 ///
+/// The lister's requester id is this process's id, as `karyos-replay`'s
+/// correlation ids are: run one listing at a time per process. Two at
+/// once, or a retry while a timed-out listing's answers are still in
+/// flight, share that id and its correlation ids, and could read each
+/// other's answers.
+///
 /// # Errors
 ///
 /// [`LiveError::Connect`] when the control streams cannot be reached,
