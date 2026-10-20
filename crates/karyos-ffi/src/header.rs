@@ -39,6 +39,7 @@ fn c_struct(rust: &str) -> &'static str {
         "MessageInfo" => "karyos_message_info",
         "ImageChange" => "karyos_image_change",
         "Outcome" => "karyos_outcome",
+        "SubscriptionOptions" => "karyos_subscription_options",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -67,6 +68,8 @@ fn c_type(rust: &str) -> String {
         "*mut c_void" => "void *",
         "*const MessageInfo" => "const karyos_message_info *",
         "*mut ImageChange" => "karyos_image_change *",
+        "*const SubscriptionOptions" => "const karyos_subscription_options *",
+        "*mut SubscriptionOptions" => "karyos_subscription_options *",
         "MessageHandler" => "karyos_message_handler",
         "*const Outcome" => "const karyos_outcome *",
         "OutcomeHandler" => "karyos_outcome_handler",
@@ -461,4 +464,18 @@ fn the_header_states_the_outcome_kinds() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn the_header_states_the_subscription_option_constants() {
+    use crate::abi::{REJOIN_AT_HEAD, REJOIN_CLOSE, ROLE_OBSERVER, ROLE_OPTIONAL, ROLE_REQUIRED};
+    let defines = header_defines();
+    assert_eq!(defines["KARYOS_ROLE_REQUIRED"], i64::from(ROLE_REQUIRED));
+    assert_eq!(defines["KARYOS_ROLE_OPTIONAL"], i64::from(ROLE_OPTIONAL));
+    assert_eq!(defines["KARYOS_ROLE_OBSERVER"], i64::from(ROLE_OBSERVER));
+    assert_eq!(defines["KARYOS_REJOIN_AT_HEAD"], i64::from(REJOIN_AT_HEAD));
+    assert_eq!(defines["KARYOS_REJOIN_CLOSE"], i64::from(REJOIN_CLOSE));
+    // The wire codes of the roles (karyos_protocol::cnc), which the C codes
+    // keep.
+    assert_eq!([ROLE_REQUIRED, ROLE_OPTIONAL, ROLE_OBSERVER], [0, 1, 2]);
 }

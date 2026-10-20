@@ -102,6 +102,16 @@ pub struct Accepted {
     pub position: u64,
 }
 
+/// `karyos_subscription_options`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubscriptionOptions {
+    pub size: u32,
+    pub role: u32,
+    pub rejoin: u32,
+    pub reserved: u32,
+}
+
 unsafe extern "C" {
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
@@ -172,6 +182,16 @@ unsafe extern "C" {
     fn karyos_claim_commit(claim: u64, accepted: *mut core::ffi::c_void) -> i32;
     safe fn karyos_claim_abort(claim: u64) -> i32;
     safe fn karyos_publication_close(publication: u64) -> i32;
+    fn karyos_subscription_options_init(options: *mut SubscriptionOptions) -> i32;
+    fn karyos_client_add_subscription_with(
+        client: u64,
+        uri: *const c_char,
+        stream_id: i32,
+        options: *const SubscriptionOptions,
+        subscription: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
+    safe fn karyos_subscription_close(subscription: u64) -> i32;
 }
 
 /// The byte every part of a [`SizedStruct`] the caller did not set holds:
@@ -353,6 +373,45 @@ pub fn client_add_publication(
         )
     };
     (status, publication, detail)
+}
+
+/// `karyos_subscription_options_init`: the status and the options.
+pub fn subscription_options() -> (i32, SubscriptionOptions) {
+    let mut options = SubscriptionOptions::default();
+    // SAFETY: a live, aligned, writable `SubscriptionOptions`.
+    let status = unsafe { karyos_subscription_options_init(&mut options) };
+    (status, options)
+}
+
+/// `karyos_client_add_subscription_with` of `stream_id` on `uri`, with
+/// `options` sized as `size`: the status and the handle.
+pub fn client_add_subscription_with(
+    client: u64,
+    uri: &CStr,
+    stream_id: i32,
+    options: &SubscriptionOptions,
+    size: u32,
+) -> (i32, u64) {
+    let options = SizedStruct::new(Some(options), size);
+    let mut subscription = 0;
+    // SAFETY: a live C string, options of at least `size` readable bytes,
+    // a live, aligned `u64`; a null detail is allowed.
+    let status = unsafe {
+        karyos_client_add_subscription_with(
+            client,
+            uri.as_ptr(),
+            stream_id,
+            options.as_ptr(),
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, subscription)
+}
+
+/// `karyos_subscription_close`.
+pub fn subscription_close(subscription: u64) -> i32 {
+    karyos_subscription_close(subscription)
 }
 
 /// `karyos_publication_offer` of `data` on `lane`, with an accepted sized

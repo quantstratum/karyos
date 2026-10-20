@@ -1,0 +1,33 @@
+# karyos_subscription_options of ABI 0.1.0 is 16 bytes, the smallest
+# accepted: below it karyos_client_add_subscription_with answers
+# KARYOS_E_INVALID_ARGUMENT and opens nothing. A newer caller's larger
+# struct is read by its 0.1.0 prefix (SPEC.md §10.2, §13, C ABI boundary).
+format 1
+id struct.size.subscription.options
+abi 0.1
+covers "struct sizes of another minor version"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=5
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_subscription_with client=$client stream_id=5 size=0
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_subscription_with client=$client stream_id=5 size=12
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_subscription_with client=$client stream_id=5 size=16
+expect KARYOS_OK subscription=$exact
+call karyos_subscription_close subscription=$exact
+expect KARYOS_OK
+call karyos_client_add_subscription_with client=$client stream_id=5 size=32 role=1 rejoin=1
+expect KARYOS_OK subscription=$newer
+call karyos_subscription_close subscription=$newer
+expect KARYOS_OK
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK
