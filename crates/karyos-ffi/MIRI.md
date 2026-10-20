@@ -74,6 +74,7 @@ test-only unsafe of the integration tests.
 | Subscription options of two layouts (16 and 40 bytes), refused between them; the Archive rejoin's fields read by prefix (F9b) | `karyos_subscription_options_init`, `karyos_client_add_subscription_with` | `abi::tests::subscription_options_init_fills_the_defaults_and_the_size`, `add_with_refuses_bad_options_and_opens_nothing` (a rejoin with a driver is native only: `abi::tests::rejoin::a_rejoining_subscription_reads_live_and_reports_its_state`) |
 | The rejoin state: `size` read first, nothing written on refusal, the sized write by the caller's size (F9b) | `karyos_subscription_rejoin_state` (`write_rejoin_state`) | `abi::tests::rejoin::the_rejoin_state_is_written_by_the_callers_size` (no driver) |
 | A caller's sized struct of another minor version (test support: `SizedStruct` in `tests/support/abi.rs`) | the conformance runner | `tests/conformance.rs` `the_sized_struct_checks_see_writes`; the library's side is `a_struct_from_a_newer_header_is_read_and_written_by_its_prefix` |
+| The conformance runner's message handler: the message slice read, and a poll of its own subscription from inside it (test support: `keep_message` and `ignore` in `tests/support/abi.rs`) | the conformance runner | none under Miri: the conformance scenarios are native only (below). The library's side of both is covered: `abi::tests::a_subscription_delivers_each_message_from_its_private_copy` and `abi::tests::a_handler_that_reenters_its_subscription_is_refused` |
 
 ## What Miri does not cover
 

@@ -1,0 +1,32 @@
+# A subscription's poll refuses to be reentered from its handler (SPEC.md
+# §10.2, §13 "reentrant poll"): the handler, given a message, polls its
+# own subscription again and gets KARYOS_E_REENTRANT, while the outer
+# poll delivers that message and succeeds.
+format 1
+id subscription.poll.reentrant
+abi 0.1
+covers "reentrant poll"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=5
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_subscription_with client=$client stream_id=5
+expect KARYOS_OK subscription=$subscription
+call karyos_client_add_publication client=$client stream_id=5
+expect KARYOS_OK publication=$publication
+call karyos_publication_offer publication=$publication payload="a"
+expect KARYOS_OK
+call karyos_subscription_poll subscription=$subscription limit=1 handler="reenter"
+expect KARYOS_OK delivered=1 last="a" reentered="KARYOS_E_REENTRANT"
+# Outside the handler the subscription polls again as usual.
+call karyos_subscription_poll subscription=$subscription limit=1
+expect KARYOS_OK delivered=0
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

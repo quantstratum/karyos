@@ -775,6 +775,29 @@ fn call(step: &Step, at: &str) -> Returned {
             assert_eq!(delivered, counted, "{at}: the count is the handler's calls");
             with_count(status, "delivered", delivered)
         }
+        "karyos_client_add_conflated_subscription" => {
+            let arguments = Arguments::new(step, &["client", "stream_id", "uri"], at);
+            let uri = std::ffi::CString::new(
+                arguments
+                    .text("uri")
+                    .unwrap_or_else(|| "karyos:ipc".to_owned()),
+            )
+            .unwrap_or_else(|_| panic!("{at}: `uri` holds a NUL"));
+            let stream_id = arguments
+                .integer("stream_id")
+                .map(|_| arguments.narrow("stream_id", 0))
+                .unwrap_or_else(|| panic!("{at}: `stream_id` is required"));
+            let (status, conflated) =
+                abi::client_add_conflated_subscription(arguments.handle("client"), &uri, stream_id);
+            if status == 0 {
+                with_handle(status, "conflated", conflated, at)
+            } else {
+                Returned {
+                    status: Some(status),
+                    results: BTreeMap::new(),
+                }
+            }
+        }
         "karyos_conflated_close" => Returned {
             status: Some(abi::conflated_close(handle_argument(step, "conflated", at))),
             results: BTreeMap::new(),
@@ -825,6 +848,56 @@ fn call(step: &Step, at: &str) -> Returned {
             status: Some(abi::archive_close(handle_argument(step, "archive", at))),
             results: BTreeMap::new(),
         },
+        "karyos_subscription_poll" => {
+            let arguments = Arguments::new(step, &["subscription", "limit", "handler"], at);
+            let on_message = match arguments.text("handler").as_deref() {
+                None | Some("keep") => abi::OnMessage::Keep,
+                Some("reenter") => abi::OnMessage::Reenter,
+                Some(other) => panic!("{at}: `handler` is \"keep\" or \"reenter\", not {other:?}"),
+            };
+            let (status, delivered, messages, reentered) = abi::subscription_poll(
+                arguments.handle("subscription"),
+                arguments.narrow("limit", 1),
+                on_message,
+            );
+            assert_eq!(
+                usize::try_from(delivered).unwrap(),
+                messages.len(),
+                "{at}: the count is the handler's calls"
+            );
+            let mut returned = with_count(status, "delivered", delivered);
+            if let Some(last) = messages.last() {
+                let text = String::from_utf8(last.clone())
+                    .unwrap_or_else(|_| panic!("{at}: a message that is not UTF-8"));
+                returned
+                    .results
+                    .insert("last".to_owned(), Value::Text(text));
+            }
+            if let Some(code) = reentered {
+                let name = statuses()
+                    .into_iter()
+                    .find_map(|(name, value)| (value == code).then_some(name))
+                    .unwrap_or_else(|| panic!("{at}: status {code} is not in the header"));
+                returned
+                    .results
+                    .insert("reentered".to_owned(), Value::Text(name));
+            }
+            returned
+        }
+        "karyos_publication_poll_outcomes" => {
+            let arguments = Arguments::new(step, &["publication", "lane", "limit"], at);
+            let (status, delivered, records) = abi::publication_poll_outcomes(
+                arguments.handle("publication"),
+                arguments.narrow("lane", 0),
+                arguments.narrow("limit", 1),
+            );
+            assert_eq!(
+                usize::try_from(delivered).unwrap(),
+                records.len(),
+                "{at}: the count is the handler's calls"
+            );
+            with_count(status, "delivered", delivered)
+        }
         "karyos_driver_close" => Returned {
             status: Some(abi::driver_close(handle_argument(step, "driver", at))),
             results: BTreeMap::new(),
