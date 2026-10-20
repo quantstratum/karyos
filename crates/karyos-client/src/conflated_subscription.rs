@@ -162,6 +162,118 @@ struct CounterSink {
     budgets_exhausted: ClientCounterHandle,
 }
 
+/// What a remote conflated view accepts of its table's configuration,
+/// checked before anything is mapped or allocated for it: the reader's
+/// private state grows with the key count and the value capacity, and its
+/// copy buffer with the journal capacity (`quantstratum-docs:
+/// karyos/design/conflation-end-to-end.md`, Cross-process views).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConflatedLimits {
+    /// Most keys.
+    pub max_keys: u32,
+    /// Largest value capacity in bytes.
+    pub max_value_capacity: usize,
+    /// Largest journal capacity in bytes.
+    pub max_journal_capacity: usize,
+}
+
+impl Default for ConflatedLimits {
+    /// 2^20 keys, 64 KiB values and a 64 MiB journal: provisional
+    /// defaults, to be calibrated before the release (coordinator
+    /// decision, ACS 14545); a view passes its own limits to
+    /// `RemoteClient::take_conflated`.
+    fn default() -> Self {
+        Self {
+            max_keys: 1 << 20,
+            max_value_capacity: 1 << 16,
+            max_journal_capacity: 1 << 26,
+        }
+    }
+}
+
+impl ConflatedLimits {
+    /// At most `max_keys` keys, values of `max_value_capacity` bytes and a
+    /// journal of `max_journal_capacity` bytes.
+    #[must_use]
+    pub const fn new(
+        max_keys: u32,
+        max_value_capacity: usize,
+        max_journal_capacity: usize,
+    ) -> Self {
+        Self {
+            max_keys,
+            max_value_capacity,
+            max_journal_capacity,
+        }
+    }
+
+    /// The configuration of `fetchable`, if it is within these limits.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote views exist only on Linux")
+    )]
+    pub(crate) fn admit(&self, fetchable: &crate::FetchableConflated) -> Option<ConflationConfig> {
+        let config = ConflationConfig {
+            keys: fetchable.keys,
+            value_capacity: usize::try_from(fetchable.value_capacity).ok()?,
+            journal_capacity: usize::try_from(fetchable.journal_capacity).ok()?,
+        };
+        (config.keys <= self.max_keys
+            && config.value_capacity <= self.max_value_capacity
+            && config.journal_capacity <= self.max_journal_capacity)
+            .then_some(config)
+    }
+}
+
+/// How a facade client's remote view reads its table
+/// (`Client::add_conflated_subscription_with`): the budget of each poll
+/// and the limits its table's configuration must be within. The default
+/// is the driver's own view budget (1024 keys, 3 retries) and
+/// [`ConflatedLimits::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConflatedOptions {
+    /// The budget of each poll.
+    pub budget: Budget,
+    /// The largest table the view accepts.
+    pub limits: ConflatedLimits,
+}
+
+impl Default for ConflatedOptions {
+    fn default() -> Self {
+        Self {
+            budget: Budget {
+                keys: 1024,
+                retries: 3,
+            },
+            limits: ConflatedLimits::default(),
+        }
+    }
+}
+
+impl ConflatedOptions {
+    /// The default options.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// These options with the budget of each poll.
+    #[must_use]
+    pub const fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// These options with the limits of the table.
+    #[must_use]
+    pub const fn with_limits(mut self, limits: ConflatedLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
 /// A bounded reader of the latest coherent value for each changed key.
 ///
 /// The reader's private buffers are allocated when it is created. A handler

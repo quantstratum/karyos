@@ -164,6 +164,13 @@ unsafe extern "C" {
         delivered: *mut u32,
     ) -> i32;
     safe fn karyos_conflated_close(conflated: u64) -> i32;
+    fn karyos_client_add_conflated_subscription(
+        client: u64,
+        uri: *const c_char,
+        stream_id: i32,
+        conflated: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
     fn karyos_client_add_publication(
         client: u64,
         uri: *const c_char,
@@ -634,6 +641,23 @@ pub fn conflated_poll(conflated: u64, key_budget: u32) -> (i32, u32, u32) {
         )
     };
     (status, delivered, counted)
+}
+
+/// `karyos_client_add_conflated_subscription` of `stream_id` on `uri`:
+/// the status and the handle.
+pub fn client_add_conflated_subscription(client: u64, uri: &CStr, stream_id: i32) -> (i32, u64) {
+    let mut conflated = 0;
+    // SAFETY: a live C string and a live, aligned `u64`; no detail.
+    let status = unsafe {
+        karyos_client_add_conflated_subscription(
+            client,
+            uri.as_ptr(),
+            stream_id,
+            &mut conflated,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, conflated)
 }
 
 /// `karyos_conflated_close`.

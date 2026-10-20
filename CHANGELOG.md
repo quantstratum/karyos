@@ -539,6 +539,33 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Remote conflated views through the facade and the C ABI (F7b-2c-1;
+  quantstratum-docs: `karyos/design/ffi-gap-analysis.md`,
+  `conflation-end-to-end.md`, owner item 57):
+  - `Client::add_conflated_subscription(uri, stream_id)` and
+    `Client::add_conflated_subscription_with(uri, stream_id,
+    ConflatedOptions)`: a view of a `karyos:ipc` stream's conflation table.
+    A client attached to a driver in another process takes it; a client
+    of a driver in this process is refused by its driver
+    (`ClientError::Refused`), which gives in-process views itself
+    (`EmbeddedDriver::subscribe_conflated`). Another channel is
+    `ClientError::UnsupportedChannel`, before anything is requested.
+  - `ConflatedOptions { budget, limits }` (`#[non_exhaustive]`; the
+    default is the driver's view budget, 1024 keys and 3 retries, and the
+    default limits), re-exported with `ConflatedLimits` and
+    `ConflatedBudget` from the facade. `ConflatedLimits` moves from
+    `karyos_client::ipc` to the crate root, on every platform
+    (`ipc::ConflatedLimits` stays as a re-export), and gains `new`.
+  - `karyos_client_add_conflated_subscription(client, uri, stream_id,
+    *conflated, *detail)`: a client's view, closed with its client, after
+    which its handle answers `KARYOS_E_CLOSED`. It takes the default
+    retries and limits; the key budget is each poll's.
+  - `AddConflatedSubscription` with session 0 names the stream a
+    `karyos:ipc` URI of the id names, when there is one (the key is exact
+    otherwise), and `RemoteClient::take_conflated` takes the grant's
+    session for such a request, checking the stream id, as a request by
+    URI does (W7).
+
 - Conflated subscriptions over the C ABI (F7b-2b; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md`, `conflation-end-to-end.md`):
   - `karyos_stream_options` grows `conflation_keys`,
@@ -2187,6 +2214,11 @@ release may break APIs, wire formats and shared-memory layouts.
   position stays within each required member's edge.
 
 ### Fixed
+
+- A remote conflated grant that arrived after its request timed out was
+  not released: `Connection::release` ignored `FetchableConflated`, so the
+  grant stayed held until the client ended. It is now taken and dropped,
+  which sends its `Detach`.
 
 - One driver can hold both ends of a `karyos:udp` endpoint (karyos#490;
   quantstratum-docs: `karyos/design/per-source-images.md`, D2-1 and

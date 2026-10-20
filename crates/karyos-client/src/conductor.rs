@@ -981,10 +981,6 @@ impl<T: TermBytes> ClientConductor<T> {
     /// # Errors
     ///
     /// See [`ConductorError`]; nothing is submitted on error.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "remote clients exist only on Linux")
-    )]
     pub(crate) fn add_conflated_subscription(
         &mut self,
         stream: StreamKey,
