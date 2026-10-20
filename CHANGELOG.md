@@ -11,6 +11,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `EmbeddedDriver::recording_reader` works on every driver, not only a
+  heap one: `RecordingReader` is generic over the driver's terms
+  (`RecordingReader<T = HeapTerms>`, its parts `LaneReader<T>` and
+  `GenerationLink<T>`), so `karyosd`'s shared-terms driver can record its
+  streams (quantstratum-docs: `karyos/design/archive-host.md`, H1). Code
+  that names `RecordingReader` keeps its meaning through the default.
+
 - A timed lane's handle is granted over the control path (quantstratum-docs:
   `karyos/design/timed-tx.md`, section 11, T-x2): `AddPublication` no longer
   refuses a timed lane. A `Monotonic` lane goes to a remote client only when

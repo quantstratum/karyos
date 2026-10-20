@@ -13,7 +13,6 @@ use karyos_sys::log_buffer::{
 };
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
-use karyos_sys::term_bytes::HeapTerms;
 
 use super::*;
 use crate::embedded::StreamConfig;
@@ -44,9 +43,9 @@ fn stream() -> StreamConfig {
 
 /// Offers until the publication stops accepting, running the driver
 /// between offers; returns how many it accepted.
-fn offer_until_refused(
-    driver: &mut EmbeddedDriver<HeapTerms>,
-    publication: &mut ClientPublication,
+fn offer_until_refused<T: StreamTerms>(
+    driver: &mut EmbeddedDriver<T>,
+    publication: &mut ClientPublication<T>,
     most: usize,
 ) -> usize {
     let mut accepted = 0;
@@ -65,7 +64,7 @@ fn offer_until_refused(
 }
 
 /// Reads and acknowledges everything committed.
-fn drain(reader: &mut LaneReader) -> u64 {
+fn drain<T: StreamTerms>(reader: &mut LaneReader<T>) -> u64 {
     let mut out = vec![0u8; usize::try_from(MIN_TERM_LENGTH).unwrap()];
     loop {
         let from = reader.position();
@@ -118,7 +117,10 @@ fn a_recording_reader_admits_only_required_and_optional() {
 /// acknowledges; dropping it frees the publisher.
 #[test]
 fn a_required_recording_bounds_the_publisher() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    required_bounds_the_publisher(&mut EmbeddedDriver::new().unwrap());
+}
+
+fn required_bounds_the_publisher<T: StreamTerms>(driver: &mut EmbeddedDriver<T>) {
     let handle = driver.add_stream(stream()).unwrap();
     let (mut reader, lease) = driver
         .recording_reader(handle, Role::Required)
@@ -126,26 +128,26 @@ fn a_required_recording_bounds_the_publisher() {
         .into_parts();
     let mut publication = driver.publication(handle).unwrap();
     let most = 4 * usize::try_from(MIN_TERM_LENGTH).unwrap() / MESSAGE;
-    let first = offer_until_refused(&mut driver, &mut publication, most);
+    let first = offer_until_refused(driver, &mut publication, most);
     assert!(first > 0 && first < most, "bounded: {first} of {most}");
     // Reading and acknowledging opens the window again.
     assert!(drain(&mut reader) > 0);
     driver.do_work().unwrap();
-    assert!(offer_until_refused(&mut driver, &mut publication, most) > 0);
+    assert!(offer_until_refused(driver, &mut publication, most) > 0);
     // Dropped, it no longer bounds anything.
     drop((reader, lease));
     driver.do_work().unwrap();
-    assert_eq!(
-        offer_until_refused(&mut driver, &mut publication, most),
-        most
-    );
+    assert_eq!(offer_until_refused(driver, &mut publication, most), most);
 }
 
 /// An optional recording never bounds the publisher: lapped, its read is
 /// `Unavailable`, and it rejoins at the head and reads what follows.
 #[test]
 fn an_optional_recording_is_lapped_and_rejoins_at_the_head() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    optional_is_lapped_and_rejoins(&mut EmbeddedDriver::new().unwrap());
+}
+
+fn optional_is_lapped_and_rejoins<T: StreamTerms>(driver: &mut EmbeddedDriver<T>) {
     let handle = driver.add_stream(stream()).unwrap();
     let (mut reader, _lease) = driver
         .recording_reader(handle, Role::Optional)
@@ -153,10 +155,7 @@ fn an_optional_recording_is_lapped_and_rejoins_at_the_head() {
         .into_parts();
     let mut publication = driver.publication(handle).unwrap();
     let most = 5 * usize::try_from(MIN_TERM_LENGTH).unwrap() / MESSAGE;
-    assert_eq!(
-        offer_until_refused(&mut driver, &mut publication, most),
-        most
-    );
+    assert_eq!(offer_until_refused(driver, &mut publication, most), most);
     let mut out = vec![0u8; usize::try_from(MIN_TERM_LENGTH).unwrap()];
     let from = reader.position();
     assert!(matches!(
@@ -184,14 +183,17 @@ fn an_optional_recording_is_lapped_and_rejoins_at_the_head() {
 /// freed only once the reader and the lease are dropped.
 #[test]
 fn a_recording_reader_keeps_a_removed_stream_to_its_seal() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    keeps_a_removed_stream_to_its_seal(&mut EmbeddedDriver::new().unwrap());
+}
+
+fn keeps_a_removed_stream_to_its_seal<T: StreamTerms>(driver: &mut EmbeddedDriver<T>) {
     let handle = driver.add_stream(stream()).unwrap();
     let (mut reader, lease) = driver
         .recording_reader(handle, Role::Required)
         .unwrap()
         .into_parts();
     let mut publication = driver.publication(handle).unwrap();
-    assert_eq!(offer_until_refused(&mut driver, &mut publication, 3), 3);
+    assert_eq!(offer_until_refused(driver, &mut publication, 3), 3);
     drop(publication);
     driver.remove_stream(handle).unwrap();
     for _ in 0..4 {
@@ -316,4 +318,88 @@ fn a_required_recording_reads_across_the_term_id_wrap() {
     let wrapped = record_four_terms(u32::MAX - 1);
     assert_eq!(wrapped, record_four_terms(7));
     assert!(wrapped.1 > 3 * u64::from(MIN_TERM_LENGTH));
+}
+
+/// The same recordings on a shared-terms driver, as `karyosd` runs
+/// (quantstratum-docs: karyos/design/archive-host.md, H1): the stream's
+/// log lives in a shared region, and the recording reads it there.
+#[cfg(target_os = "linux")]
+mod shared {
+    use karyos_sys::term_bytes::SharedTerms;
+
+    use super::*;
+    use crate::admission::IpcConfig;
+    use crate::clock::SystemClock;
+    use crate::embedded::{DriverConfig, sealed};
+
+    /// A driver whose streams live in shared regions, admitting on a
+    /// directory of its own; removed with it.
+    struct Ipc {
+        driver: EmbeddedDriver<SharedTerms>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Ipc {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn ipc(name: &str) -> Ipc {
+        let dir = std::env::temp_dir().join(format!("karyos-h1-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let timeout = 5_000_000_000;
+        let driver = EmbeddedDriver::<SharedTerms>::with_ipc(
+            DriverConfig::default(),
+            IpcConfig {
+                dir: dir.clone(),
+                max_pending_hellos: 2,
+                hello_timeout: timeout,
+                max_outbound_per_client: 8,
+                fetch_deadline: timeout,
+                max_exports_per_client: 16,
+                max_fetches_per_client: 4,
+                max_regions_per_fetch: 4,
+                max_fetch_bytes: 1 << 30,
+                max_tools: crate::admission::DEFAULT_MAX_TOOLS,
+            },
+            Box::new(SystemClock::new()),
+        )
+        .unwrap();
+        Ipc { driver, dir }
+    }
+
+    /// The recorded stream's log is a shared region, not heap terms.
+    #[test]
+    fn a_shared_stream_is_recorded_from_its_region() {
+        let mut ipc = ipc("region");
+        let handle = ipc.driver.add_stream(stream()).unwrap();
+        assert!(
+            <SharedTerms as sealed::Create>::region(&ipc.driver.stream(handle).unwrap().buffer)
+                .is_some()
+        );
+        let (mut reader, _lease) = ipc
+            .driver
+            .recording_reader(handle, Role::Required)
+            .unwrap()
+            .into_parts();
+        let mut publication = ipc.driver.publication(handle).unwrap();
+        assert_eq!(offer_until_refused(&mut ipc.driver, &mut publication, 3), 3);
+        assert!(drain(&mut reader) > 0);
+    }
+
+    #[test]
+    fn a_required_recording_bounds_a_shared_publisher() {
+        required_bounds_the_publisher(&mut ipc("required").driver);
+    }
+
+    #[test]
+    fn an_optional_recording_of_a_shared_stream_rejoins_at_the_head() {
+        optional_is_lapped_and_rejoins(&mut ipc("optional").driver);
+    }
+
+    #[test]
+    fn a_recording_reader_keeps_a_removed_shared_stream_to_its_seal() {
+        keeps_a_removed_stream_to_its_seal(&mut ipc("removed").driver);
+    }
 }
