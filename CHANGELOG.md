@@ -650,6 +650,26 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos:udp` URI with the new `ClientError::InvalidOptions` before
   anything is requested. The facade re-exports `SubscriptionOptions`,
   `SubscriberRole`, `RejoinPolicy`, `Secondary` and `SnapshotSource`.
+- The C ABI lists an Archive's catalog (quantstratum-docs:
+  `karyos/design/ffi-archive.md`, F9a; owner item 57).
+  `karyos_archive_connect(client, options, archive, detail)` opens a
+  connection over the control streams `karyos_archive_options` names
+  (`requests`, `responses`, a `client_id` of at most 32 bits, a
+  `deadline_ns`); the connection is its client's, which closes it.
+  `karyos_archive_list(archive, after_id, limit, handler, context,
+  delivered, detail)` is a control call: it waits for the page of at most
+  `limit` recordings after `after_id`, then hands each to the
+  `karyos_recording_handler` in id order as a `karyos_recording` (state,
+  `KARYOS_STOP_*` reason, position, start time in nanoseconds since the
+  Archive agent started, and the channel's bytes). Fewer than `limit`
+  ends the catalog. A page that does not arrive in time is
+  `KARYOS_E_TIMEOUT`, and an Archive's refusal `KARYOS_E_REFUSED` with
+  its response code in the detail. `karyos_archive_close` removes the
+  connection's streams from its client. karyos-archive's
+  `RecordingLister::start_from(from_id, count)` begins such a bounded
+  listing, whose pages ask for no more than are left to keep. The
+  conformance format gains the three calls, with the scenario
+  `archive.typed.statuses`.
 - The C ABI's scheduled offer (quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §6, F7a-3):
   `karyos_publication_offer_at(publication, lane, data, length, tx_time,

@@ -61,6 +61,8 @@ pub(crate) enum Kind {
     ConflatedSubscription = 7,
     /// The outcome stream of a guarded publication.
     OutcomeStream = 8,
+    /// A connection to an Archive (F9a).
+    Archive = 9,
 }
 
 /// A handle's parts.
