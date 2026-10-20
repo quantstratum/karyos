@@ -297,3 +297,231 @@ fn each_merge_failure_has_its_code() {
     );
     assert_eq!(merge_code(&MergeError::Live(ClientError::Timeout)), 9);
 }
+
+/// The Archive's control streams as a real Archive's server reads and
+/// writes them (#549).
+mod real {
+    use karyos_archive::server::{RequestSource, ResponseSink};
+    use karyos_client::{ClientPublication, ClientSubscription, MessageLimit, OfferOutcome};
+
+    /// The request stream as the server reads it.
+    pub(super) struct Reading(pub(super) ClientSubscription);
+
+    impl RequestSource for Reading {
+        fn next(&mut self, out: &mut [u8]) -> Option<usize> {
+            let mut length = None;
+            let _ = self.0.poll(
+                |bytes, _| {
+                    if let Some(into) = out.get_mut(..bytes.len()) {
+                        into.copy_from_slice(bytes);
+                        length = Some(bytes.len());
+                    }
+                },
+                MessageLimit::new(1),
+            );
+            length
+        }
+    }
+
+    /// The response stream as the server writes it.
+    pub(super) struct Writing(pub(super) ClientPublication);
+
+    impl ResponseSink for Writing {
+        fn send(&mut self, message: &[u8]) -> bool {
+            matches!(self.0.offer(message), Ok(OfferOutcome::Accepted { .. }))
+        }
+    }
+}
+
+/// A lapped subscription added with `KARYOS_REJOIN_ARCHIVE` recovers its
+/// gap through a real Archive (#549): the production host (karyos-tools'
+/// `DriverHost`, which holds a replay until its target's first reader),
+/// the control server and an agent on a temporary directory. The stream
+/// is recorded from its start; the optional reader, never polled, is
+/// lapped by five terms; then, polled through the C ABI with
+/// `karyos_client_poll`, it reports the recovery
+/// (`karyos_subscription_rejoin_state`), ends it with no merge failure,
+/// and delivers every message once, in order, byte-exact, at its
+/// position.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_lapped_subscription_recovers_its_gap_through_a_real_archive() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use karyos_archive::agent::{AgentConfig, ArchiveHandle};
+    use karyos_archive::control::{self, ControlMessage, ResponseCode};
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::recorder::Mode;
+    use karyos_archive::segment::SyncPolicy;
+    use karyos_archive::server::{ControlServer, MAX_REQUEST};
+    use karyos_client::{ConcurrentOfferOutcome, MessageLimit, OfferOutcome};
+    use karyos_sys::log_buffer::{PublicationMode, Role};
+    use karyos_sys::sizing::MIN_TERM_LENGTH;
+    use karyos_tools::archive::DriverHost;
+
+    let dir = std::env::temp_dir().join(format!("karyos-ffi-rejoin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
+        client_liveness_timeout: 3_600_000_000_000,
+        ..karyos_driver::DriverConfig::default()
+    })
+    .unwrap();
+    let roomy = |stream_id| {
+        let mut config = stream_config(stream_id);
+        config.buffer.spare_slots = 6;
+        config.buffer.max_subscribers = 8;
+        config
+    };
+    let data = driver.add_stream(roomy(DATA)).unwrap();
+    let mut shared = roomy(REQUESTS);
+    shared.buffer.publication = PublicationMode::Concurrent {
+        publishers: 4,
+        allow_non_lse: true,
+    };
+    let requests = driver.add_stream(shared).unwrap();
+    let responses = driver.add_stream(roomy(RESPONSES)).unwrap();
+    // The test's own requester, to start the recording.
+    let mut asking = driver.concurrent_publication(requests).unwrap();
+    let mut answers = driver.subscribe(responses, Role::Required).unwrap();
+    let reading = real::Reading(driver.subscribe(requests, Role::Required).unwrap());
+    let writing = real::Writing(driver.publication(responses).unwrap());
+    let mut publication = driver.publication(data).unwrap();
+    let conductor = driver.connect().unwrap();
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    let mut server = ControlServer::new(agent, DriverHost::new(driver), reading, writing);
+    let cycle = |server: &mut ControlServer<
+        DriverHost<karyos_sys::term_bytes::HeapTerms>,
+        real::Reading,
+        real::Writing,
+    >| {
+        let _ = server.host_mut().driver_mut().do_work().unwrap();
+        let _ = server.duty();
+        let _ = server.host_mut().finish_ended();
+    };
+
+    // Record the data stream from its start.
+    let start = control::StartRecording {
+        correlation_id: 1,
+        stream_id: DATA,
+        session_id: 1,
+        mode: Mode::Required,
+        sync_policy: SyncPolicy::PerSegment,
+        segment_length: 0,
+        channel: "karyos:ipc",
+    };
+    let mut out = vec![0u8; MAX_REQUEST];
+    let length = ControlMessage::StartRecording(start)
+        .encode(&mut out)
+        .unwrap();
+    while !matches!(
+        asking.offer(&out[..length]),
+        Ok(ConcurrentOfferOutcome::Accepted { .. })
+    ) {
+        cycle(&mut server);
+    }
+    let begun = Instant::now();
+    let mut started = None;
+    while started.is_none() {
+        assert!(begun.elapsed() < Duration::from_secs(20), "no answer");
+        cycle(&mut server);
+        let _ = answers.poll(
+            |bytes, _| {
+                if let Ok(ControlMessage::ControlResponse(response)) = ControlMessage::decode(bytes)
+                    && response.correlation_id == 1
+                {
+                    started = Some(response.code);
+                }
+            },
+            MessageLimit::new(16),
+        );
+    }
+    assert_eq!(started, Some(ResponseCode::Ok));
+    drop(answers);
+    drop(asking);
+
+    // The C client, its Archive handle and the rejoining subscription:
+    // control calls that wait for the driver, which this thread runs.
+    let (client, archive, subscription) = std::thread::scope(|scope| {
+        let adding = scope.spawn(move || {
+            let (client, archive) = client_and_archive(conductor);
+            let (status, subscription) = add(client, &rejoining(archive));
+            assert_eq!(status, Status::Ok.code());
+            (client, archive, subscription)
+        });
+        while !adding.is_finished() {
+            cycle(&mut server);
+        }
+        adding.join().unwrap()
+    });
+
+    // Lap the subscription, which is not polled: five terms of messages
+    // of several sizes, some fragmented, each with its sequence first.
+    let mut sent: Vec<(u64, Vec<u8>)> = Vec::new();
+    let goal = 5 * u64::from(MIN_TERM_LENGTH);
+    let begun = Instant::now();
+    while sent.last().is_none_or(|(position, _)| *position < goal) {
+        assert!(begun.elapsed() < Duration::from_secs(20), "not published");
+        let sequence = u32::try_from(sent.len()).unwrap();
+        let length = [100usize, 1400, 3000][sent.len() % 3];
+        let mut message = vec![u8::try_from(sequence % 251).unwrap(); length];
+        message[..4].copy_from_slice(&sequence.to_le_bytes());
+        if let Ok(OfferOutcome::Accepted { position, .. }) = publication.offer(&message) {
+            sent.push((position, message));
+        }
+        cycle(&mut server);
+    }
+
+    // Poll through the C ABI on a thread of its own, while this one runs
+    // the driver, the server and the host.
+    let polling = AtomicBool::new(true);
+    let (seen, recovered) = std::thread::scope(|scope| {
+        let poller = scope.spawn(|| {
+            let mut seen = Seen::default();
+            let mut recovered = false;
+            let begun = Instant::now();
+            loop {
+                assert!(
+                    begun.elapsed() < Duration::from_secs(60),
+                    "{} of {}, recovered {recovered}",
+                    seen.messages.len(),
+                    sent.len()
+                );
+                let _ = poll(client);
+                let (status, _) = poll_into(subscription, &mut seen, 64);
+                assert_eq!(status, Status::Ok.code());
+                let (status, read) = state(subscription);
+                assert_eq!(status, Status::Ok.code());
+                assert_eq!(read.merge_failure, MERGE_NONE, "a failed merge");
+                recovered |= read.recovering == 1;
+                if seen.messages.len() >= sent.len() && read.recovering == 0 {
+                    polling.store(false, Ordering::Release);
+                    return (seen, recovered);
+                }
+                std::thread::yield_now();
+            }
+        });
+        while polling.load(Ordering::Acquire) && !poller.is_finished() {
+            cycle(&mut server);
+            std::thread::yield_now();
+        }
+        poller.join().unwrap()
+    });
+    assert!(recovered, "the subscription was never lapped");
+    let delivered: Vec<(u64, Vec<u8>)> = seen
+        .infos
+        .iter()
+        .map(|info| info.position)
+        .zip(seen.messages)
+        .collect();
+    assert!(
+        delivered == sent,
+        "every message once, in order, byte-exact, at its position"
+    );
+    assert_eq!(karyos_archive_close(archive), Status::Ok.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+    drop(publication);
+    let _ = server.shutdown_into_host();
+    let _ = std::fs::remove_dir_all(&dir);
+}

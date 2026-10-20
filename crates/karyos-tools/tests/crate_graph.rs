@@ -92,3 +92,19 @@ fn the_agent_stays_outside_the_driver_and_the_client() {
         );
     }
 }
+
+/// The C ABI (#549): karyos-ffi's tests use the production Archive host
+/// (karyos-tools' `DriverHost`) as a dev-dependency only. The published
+/// crate never depends on karyos-tools, which sits above it.
+#[test]
+fn the_c_abi_depends_on_the_tools_for_its_tests_only() {
+    let tree = dependencies("karyos-ffi");
+    assert!(
+        tree.lines().any(|line| line.starts_with("karyos-ffi")),
+        "{tree}"
+    );
+    assert!(
+        !tree.lines().any(|line| line.starts_with("karyos-tools ")),
+        "karyos-ffi depends on karyos-tools:\n{tree}"
+    );
+}
