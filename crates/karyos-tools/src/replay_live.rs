@@ -20,7 +20,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use karyos_archive::client::connection::{ArchiveConnection, ControlStreams};
+use karyos_archive::client::connection::{ArchiveConnection, ControlStreams, Requests, Responses};
 use karyos_archive::client::{ControlRequests, ControlResponses};
 use karyos_archive::control::{self, ControlMessage, ControlResponse, ReplayRate, ResponseCode};
 use karyos_archive::server::{MAX_ANSWER, MAX_REQUEST, replay_session_id};
@@ -239,7 +239,8 @@ fn correlation(sequence: u32) -> u64 {
 
 /// Sends `message` over `streams` through `client` and waits for the
 /// answer to its `correlation_id`: the answer's id on `Ok`. Answers to
-/// other requests are skipped.
+/// other requests are skipped. The connection is opened for this request
+/// and closed after it, whatever the outcome.
 ///
 /// # Errors
 ///
@@ -252,19 +253,41 @@ pub fn request<C: Connection>(
     timeout: Duration,
 ) -> Result<u64, LiveError>
 where
-    karyos_archive::client::connection::Requests<C::Terms>: ControlRequests,
-    karyos_archive::client::connection::Responses<C::Terms>: ControlResponses,
+    Requests<C::Terms>: ControlRequests,
+    Responses<C::Terms>: ControlResponses,
 {
-    let (mut requests, mut responses) = ArchiveConnection::open(client, streams)
-        .map_err(|error| LiveError::Connect(error.to_string()))?
-        .into_transports();
     let mut out = vec![0u8; MAX_REQUEST];
     let length = message
         .encode(&mut out)
         .map_err(|error| LiveError::Connect(format!("encode: {error}")))?;
     out.truncate(length);
+    let (mut requests, mut responses) = ArchiveConnection::open(client, streams)
+        .map_err(|error| LiveError::Connect(error.to_string()))?
+        .into_transports();
+    let answered = exchange(
+        client,
+        &mut requests,
+        &mut responses,
+        &out,
+        correlation_id,
+        timeout,
+    );
+    requests.close(client);
+    responses.close(client);
+    answered
+}
+
+/// Sends `request` and waits for the answer to `correlation_id`.
+fn exchange<C: Connection>(
+    client: &mut Client<C>,
+    requests: &mut impl ControlRequests,
+    responses: &mut impl ControlResponses,
+    request: &[u8],
+    correlation_id: u64,
+    timeout: Duration,
+) -> Result<u64, LiveError> {
     let start = Instant::now();
-    while !requests.send(&out) {
+    while !requests.send(request) {
         if start.elapsed() >= timeout {
             return Err(LiveError::NotSent);
         }
