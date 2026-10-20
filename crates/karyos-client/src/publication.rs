@@ -372,6 +372,15 @@ impl<T: TermBytes> ClientPublication<T> {
     /// Reads up to `limit` outcome records of a guarded handle in sequence
     /// order (see [`GuardBinding::poll_outcomes`]); 0 for an unguarded one.
     ///
+    /// A guarded handle whose admission is not open (gated, lost or back
+    /// pressured) first releases if its buffer is sealed, as an offer
+    /// would (`quantstratum-docs: karyos/design/publication-seal.md`,
+    /// release points), resolving a forgotten claim before it: a handle
+    /// gated by the guard word before the close's seal landed, which then
+    /// only waits for its `Ended` record, releases here, so the seal
+    /// positions and the walker reaches it (karyos #526). An open handle
+    /// reads its records only.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Outcomes`] for a corrupt record.
@@ -380,10 +389,13 @@ impl<T: TermBytes> ClientPublication<T> {
         limit: usize,
         handler: impl FnMut(u64, karyos_sys::outcome_ring::Record),
     ) -> Result<usize, ClientError> {
-        match &mut self.guard {
-            Some(binding) => binding.poll_outcomes(limit, handler),
-            None => Ok(0),
+        let Some(binding) = &mut self.guard else {
+            return Ok(0);
+        };
+        if binding.admission() != Admission::Open {
+            let _ = self.inner.close_if_sealed();
         }
+        binding.poll_outcomes(limit, handler)
     }
 
     /// Binds keyed conflation limits to this publication, in place of the
@@ -1727,6 +1739,95 @@ mod tests {
             // gated.
             assert_eq!(guard::reopen(&driver.guard.words()[1], 3), Ok(4));
             assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::Gated);
+        }
+
+        /// Whether the buffer's seal is positioned: every publisher released.
+        fn positioned(driver: &mut Driver) -> Option<u64> {
+            let _ = driver.conductor.duty_cycle().unwrap();
+            match driver.conductor.seal_state() {
+                karyos_sys::log_buffer::SealState::Positioned { position }
+                | karyos_sys::log_buffer::SealState::Retired { position } => Some(position),
+                _ => None,
+            }
+        }
+
+        /// karyos #526: a handle gated by the guard word before the close's
+        /// seal landed releases when it polls its outcomes, with no further
+        /// offer, so the seal positions; later attempts stay `Gated`
+        /// (GC-8).
+        #[test]
+        fn a_handle_gated_before_the_seal_releases_when_it_polls_outcomes() {
+            let (mut driver, mut publication) = guarded();
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert_eq!(
+                guard::close(&driver.guard.words()[1]),
+                Ok(guard::Closed::Now { epoch: 3 })
+            );
+            // The early check gates; no seal exists to release at.
+            assert_eq!(publication.offer(b"b").unwrap(), OfferOutcome::Gated);
+            driver
+                .conductor
+                .seal_with_reason(karyos_sys::log_buffer::SealReason::GuardClosed)
+                .unwrap();
+            assert_eq!(positioned(&mut driver), None, "released before the seal");
+            // Only the outcome poll runs.
+            let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+            let position = positioned(&mut driver);
+            assert!(position.is_some(), "the poll did not release");
+            assert_eq!(publication.offer(b"c").unwrap(), OfferOutcome::Gated);
+            assert!(matches!(publication.try_claim(8), Ok(ClaimOutcome::Gated)));
+            let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+            assert_eq!(positioned(&mut driver), position);
+        }
+
+        /// An open handle's poll does not release at a seal: an attempt
+        /// does (publication-seal.md).
+        #[test]
+        fn an_open_handle_polls_without_releasing() {
+            let (mut driver, mut publication) = guarded();
+            driver
+                .conductor
+                .seal_with_reason(karyos_sys::log_buffer::SealReason::GuardClosed)
+                .unwrap();
+            let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+            assert_eq!(positioned(&mut driver), None);
+            assert_eq!(publication.offer(b"a").unwrap(), OfferOutcome::Gated);
+            assert!(positioned(&mut driver).is_some());
+        }
+
+        /// The releasing poll resolves a forgotten claim first, once: the
+        /// seal positions above its aborted block, and a later attempt
+        /// resolves nothing again.
+        #[test]
+        fn a_releasing_poll_resolves_a_forgotten_claim_once() {
+            let (mut driver, mut publication) = guarded();
+            let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
+                panic!("not claimed");
+            };
+            core::mem::forget(claim);
+            assert_eq!(
+                guard::close(&driver.guard.words()[1]),
+                Ok(guard::Closed::Now { epoch: 3 })
+            );
+            driver
+                .conductor
+                .seal_with_reason(karyos_sys::log_buffer::SealReason::GuardClosed)
+                .unwrap();
+            let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+            // Resolved: the claim record is clear, nothing for the
+            // conductor to abort.
+            assert!(matches!(
+                driver.conductor.abort_admitted_claim().unwrap(),
+                karyos_sys::log_buffer::ClaimDeadline::Idle
+            ));
+            let position = positioned(&mut driver);
+            assert!(
+                position.is_some_and(|position| position > 0),
+                "{position:?}"
+            );
+            assert_eq!(publication.offer(b"a").unwrap(), OfferOutcome::Gated);
+            let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+            assert_eq!(positioned(&mut driver), position);
         }
 
         #[test]
