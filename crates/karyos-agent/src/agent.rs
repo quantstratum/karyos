@@ -383,7 +383,7 @@ impl Driver {
             .collect();
         self.alerts.update_guard_acks(&acks, host_monotonic_ns());
         match tool.driver_closed() {
-            Ok(false) => {}
+            Ok(false) => return,
             Ok(true) => {
                 self.tool = None;
                 self.state = DriverState::Closed;
@@ -394,6 +394,13 @@ impl Driver {
                     reason: error.to_string(),
                 };
             }
+        }
+        // The driver it was attached to went away: its catalog's session
+        // ends now, not at its deadline (M11). An attach that fails later
+        // does not signal, as the driver may be alive with its tool slots
+        // taken.
+        if let Some(catalog) = &self.catalog {
+            catalog.driver_gone();
         }
     }
 
