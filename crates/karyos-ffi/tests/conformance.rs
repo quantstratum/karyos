@@ -137,8 +137,8 @@ const OPS: &[Op] = &[
     ),
     op(
         "driver.start",
-        &["driver", "idle_strategy"],
-        &["idle_sleep_ns"],
+        &["driver"],
+        &["idle_strategy", "idle_sleep_ns"],
         &[],
         EMBEDDED,
     ),
@@ -454,7 +454,10 @@ fn check_op(step: &Step, features: &BTreeSet<String>, names: &BTreeSet<String>, 
     // feature (FORMAT.md, Ops).
     for (name, allowed) in [
         ("domain", &["monotonic", "tai"][..]),
-        ("idle_strategy", &["busy_spin", "yield", "sleep"][..]),
+        (
+            "idle_strategy",
+            &["busy_spin", "yield", "sleep", "yield_then_sleep"][..],
+        ),
     ] {
         if let Some(value) = step.arguments.get(name) {
             assert!(
@@ -861,7 +864,7 @@ fn call(step: &Step, at: &str) -> Returned {
             Returned {
                 status: Some(abi::driver_start(
                     arguments.handle("driver"),
-                    arguments.narrow("idle_strategy", 1),
+                    arguments.narrow("idle_strategy", 3),
                     arguments.narrow("idle_sleep_ns", 0),
                 )),
                 results: BTreeMap::new(),
@@ -2144,11 +2147,15 @@ fn the_pinned_identities_are_sha_256_over_a_framed_suite() {
         sha256::hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
     );
-    let million = vec![b'a'; 1_000_000];
-    assert_eq!(
-        sha256::hex(&million),
-        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
-    );
+    // The multi-block vector, natively: it holds no unsafe, and a million
+    // interpreted bytes would take Miri most of an hour.
+    if !cfg!(miri) {
+        let million = vec![b'a'; 1_000_000];
+        assert_eq!(
+            sha256::hex(&million),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
     let suite = |files: &[(&str, &str)]| {
         let files: Vec<(String, Vec<u8>)> = files
             .iter()

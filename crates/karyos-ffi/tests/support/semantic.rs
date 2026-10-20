@@ -87,7 +87,8 @@ impl Adapter {
             let (status, _) = abi::driver_add_stream(driver, &options);
             assert_eq!(status, 0, "the provided driver: stream {stream_id}");
         }
-        assert_eq!(abi::driver_start(driver, 1, 0), 0, "the provided driver");
+        // The ABI's declared default idle strategy, yield then sleep.
+        assert_eq!(abi::driver_start(driver, 3, 0), 0, "the provided driver");
         self.insert(Kind::Driver, driver, None)
     }
 
@@ -233,13 +234,13 @@ impl Adapter {
                 if let Some(answer) = self.open(driver, Kind::Driver, at) {
                     return answer;
                 }
+                // Left out, the ABI's declared default (FORMAT.md, Ops).
                 let idle = match args.text("idle_strategy").as_deref() {
                     Some("busy_spin") => 0,
                     Some("yield") => 1,
                     Some("sleep") => 2,
-                    other => panic!(
-                        "{at}: `idle_strategy` is \"busy_spin\", \"yield\" or \"sleep\", not {other:?}"
-                    ),
+                    Some("yield_then_sleep") | None => 3,
+                    other => panic!("{at}: `idle_strategy` {other:?} is no idle strategy"),
                 };
                 let sleep = args.narrow("idle_sleep_ns", Some(0));
                 self.plain(

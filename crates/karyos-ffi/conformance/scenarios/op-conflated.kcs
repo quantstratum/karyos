@@ -12,7 +12,8 @@ op driver.create
 expect ok driver=$driver
 op driver.add_stream driver=$driver stream_id=9 conflation_keys=4 conflation_value_capacity=64 conflation_journal_capacity=4096
 expect ok
-op driver.start driver=$driver idle_strategy="yield"
+# Without idle_strategy: the ABI's declared default, yield then sleep.
+op driver.start driver=$driver
 expect ok
 op driver.subscribe_conflated driver=$driver stream_id=9
 expect ok conflated=$view

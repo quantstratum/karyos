@@ -85,7 +85,7 @@ The arguments and results of each function are those of the header:
 | `karyos_abi_version` | `major`, `minor`, `patch` (`null` only) | status, `major`, `minor`, `patch` |
 | `karyos_status_message` | `status` (required) | `text` (no status) |
 | `karyos_driver_create` | `size`, `reserved`: the options of `karyos_driver_options_init`, with `reserved` set when given | status, `driver` |
-| `karyos_driver_start` | `driver` (required), `idle_strategy` (default `KARYOS_IDLE_YIELD`, 1), `idle_sleep_ns` (default 0) | status |
+| `karyos_driver_start` | `driver` (required), `idle_strategy` (default `KARYOS_IDLE_YIELD_THEN_SLEEP`, 3, the ABI's declared default), `idle_sleep_ns` (default 0) | status |
 | `karyos_driver_stop` | `driver` (required) | status |
 | `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `schedule_capacity`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`, `publication_mode`, `publishers`, `size`: the options of `karyos_stream_options_init` otherwise | status |
 | `karyos_driver_subscribe_conflated` | `driver` and `stream_id` (required) | status, `conflated` (on `KARYOS_OK`) |
@@ -263,7 +263,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `clock.now` | `domain`: `"monotonic"` or `"tai"` | `now` | `tai-clock` for `"tai"` |
 | `driver.create` | none | `driver` | `embedded-driver` |
 | `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none | `embedded-driver` |
-| `driver.start` | `driver`, `idle_strategy`: `"busy_spin"`, `"yield"` or `"sleep"`, [`idle_sleep_ns`] | none | `embedded-driver` |
+| `driver.start` | `driver`, [`idle_strategy`: `"busy_spin"`, `"yield"`, `"sleep"` or `"yield_then_sleep"`, default `"yield_then_sleep"`, the ABI's declared default; `idle_sleep_ns`] | none | `embedded-driver` |
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
 | `driver.subscribe_conflated` | `driver`, `stream_id` | `conflated` | `embedded-driver`, `conflation` |
 | `driver.close` | `driver` | none | `embedded-driver` |
@@ -291,9 +291,6 @@ is checked when the scenario is read, so a value outside its set fails
 even in a scenario reported `skipped`, `later` or `unsupported`; so
 does `clock.now` with `domain="tai"` in a scenario without `feature
 tai-clock`.
-
-`idle_strategy` is required until the ABI defines a default idle
-strategy (R-CORE-37); then it becomes optional with that default.
 
 `publication.publish_claimed` is one claim, fill and commit through the
 binding's claim API (BIND-S3): on a retryable status it returns that
