@@ -2488,6 +2488,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `a_call_on_a_busy_spinning_driver_waits_for_one_cycle` failed once at
+  a load of 16 ("a call waited through 3 cycles"): a caller preempted
+  between reading the thread's cycle count and announcing itself counted
+  cycles the thread ran before it could see the caller. The count now
+  starts after the announcement, so the bound of 2 holds at any load.
+  Test-only code in `api/driver.rs`; DESIGN found and diagnosed it.
 - `karyos_driver_add_stream_with` answered `KARYOS_E_SYSTEM` for a
   `schedule_capacity` the driver refuses: not a power of two, above
   `1 << 20`, or on a concurrent stream (TT-1, GC-7). It now answers
