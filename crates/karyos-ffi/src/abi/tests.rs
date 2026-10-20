@@ -637,3 +637,534 @@ fn a_commit_that_finds_no_subscriber_keeps_its_claim_staged() {
     assert_eq!(commit(staged).0, Status::Closed.code());
     assert_eq!(karyos_client_close(client), Status::Ok.code());
 }
+
+// Subscriptions and their poll (F4).
+
+/// `karyos_client_add_subscription` of `stream` on `karyos:ipc`.
+fn add_subscription_of(client: u64, stream: i32) -> (i32, u64) {
+    let mut subscription = 0;
+    // SAFETY: a C string literal, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_subscription(
+            client,
+            c"karyos:ipc".as_ptr(),
+            stream,
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, subscription)
+}
+
+/// What a test handler saw and did, through its context.
+#[derive(Default)]
+struct Seen {
+    messages: Vec<Vec<u8>>,
+    infos: Vec<MessageInfo>,
+    data: Vec<usize>,
+    /// The subscription and client the handler reenters, when nonzero.
+    reenter: (u64, u64),
+    reentered: Vec<i32>,
+    /// The message number at which the handler "fails", as a binding's
+    /// handler that throws: 0 for none.
+    fail_at: usize,
+    failed: bool,
+}
+
+/// A `karyos_message_handler` that records into its `Seen`.
+///
+/// # Safety
+///
+/// `context` is a live `Seen`; `data` holds `length` bytes and `info` a
+/// `karyos_message_info`, both during the call.
+unsafe extern "C" fn record(
+    context: *mut c_void,
+    data: *const u8,
+    length: usize,
+    info: *const MessageInfo,
+) {
+    // SAFETY: the function's contract.
+    let seen = unsafe { &mut *context.cast::<Seen>() };
+    // SAFETY: as above.
+    let bytes = unsafe { core::slice::from_raw_parts(data, length) };
+    seen.messages.push(bytes.to_vec());
+    // SAFETY: as above.
+    seen.infos.push(unsafe { info.read() });
+    seen.data.push(data as usize);
+    let (subscription, client) = seen.reenter;
+    if subscription != 0 {
+        let mut delivered = 0;
+        // SAFETY: a live `uint32_t`, and this very handler.
+        seen.reentered.push(unsafe {
+            karyos_subscription_poll(
+                subscription,
+                Some(record),
+                core::ptr::null_mut(),
+                1,
+                &mut delivered,
+            )
+        });
+        seen.reentered.push(karyos_subscription_close(subscription));
+        seen.reentered.push(karyos_client_close(client));
+    }
+    if seen.fail_at == seen.messages.len() {
+        seen.failed = true;
+    }
+}
+
+/// `karyos_subscription_poll` with [`record`] into `seen`.
+fn poll_into(subscription: u64, seen: &mut Seen, limit: u32) -> (i32, u32) {
+    let mut delivered = u32::MAX;
+    // SAFETY: `record` has the handler's signature; `seen` is a live
+    // `Seen` for the call; `delivered` is a live `uint32_t`.
+    let status = unsafe {
+        karyos_subscription_poll(
+            subscription,
+            Some(record),
+            (&raw mut *seen).cast(),
+            limit,
+            &mut delivered,
+        )
+    };
+    (status, delivered)
+}
+
+/// Polls with `limit` until `seen` holds `count` messages.
+fn poll_until(subscription: u64, client: u64, seen: &mut Seen, limit: u32, count: usize) {
+    let start = std::time::Instant::now();
+    while seen.messages.len() < count {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3600),
+            "{}",
+            seen.messages.len()
+        );
+        let _ = poll(client);
+        let (status, delivered) = poll_into(subscription, seen, limit);
+        assert_eq!(status, Status::Ok.code());
+        assert!(delivered <= limit);
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn a_subscription_delivers_each_message_from_its_private_copy() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let (status, subscription) = add_subscription_of(client, STREAM);
+    assert_eq!(status, Status::Ok.code());
+    // The copy is the stream's largest message, allocated at the add.
+    let copy = api::subscription::copy_length(Handle::from_raw(subscription)).unwrap();
+    assert!(copy >= 8000, "{copy}");
+    let (status, publication) = add_publication(client);
+    assert_eq!(status, Status::Ok.code());
+    let largest = vec![7u8; copy];
+    for payload in [&b"one"[..], &b"two"[..], &largest[..]] {
+        assert_eq!(offer(publication, payload).0, Status::Ok.code());
+    }
+    let mut seen = Seen::default();
+    poll_until(subscription, client, &mut seen, 2, 3);
+    assert_eq!(seen.messages, [b"one".to_vec(), b"two".to_vec(), largest]);
+    // Every message came from the one private copy, which never grew.
+    assert!(seen.data.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(
+        api::subscription::copy_length(Handle::from_raw(subscription)),
+        Some(copy)
+    );
+    let info = seen.infos[1];
+    assert_eq!(info.size, size_of_u32::<MessageInfo>());
+    assert_eq!((info.lane, info.session_id, info.flags), (0, 1, 0));
+    assert!(info.position > seen.infos[0].position);
+    assert!(info.extent >= 32);
+    // A limit of 0 delivers nothing; a stale handle is closed.
+    assert_eq!(
+        poll_into(subscription, &mut seen, 0),
+        (Status::Ok.code(), 0)
+    );
+    assert_eq!(karyos_subscription_close(subscription), Status::Ok.code());
+    assert_eq!(
+        poll_into(subscription, &mut seen, 1).0,
+        Status::Closed.code()
+    );
+    assert_eq!(
+        karyos_subscription_close(subscription),
+        Status::Closed.code()
+    );
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// ADR-0067: a binding stops a poll after a failed handler with the
+/// bounded poll, a limit of 1 in a loop and no call after the failure.
+/// The failed message is acknowledged; the ones after it stay undelivered
+/// and are the next poll's.
+#[test]
+fn the_bounded_poll_stops_after_a_failed_handler() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let (_, subscription) = add_subscription_of(client, STREAM);
+    let (_, publication) = add_publication(client);
+    for payload in [b"m1", b"m2", b"m3", b"m4"] {
+        assert_eq!(offer(publication, payload).0, Status::Ok.code());
+    }
+    let mut seen = Seen {
+        fail_at: 2,
+        ..Seen::default()
+    };
+    // The binding's loop: one message per call, until a handler fails.
+    let start = std::time::Instant::now();
+    while !seen.failed {
+        assert!(start.elapsed() < std::time::Duration::from_secs(3600));
+        let _ = poll(client);
+        let (status, delivered) = poll_into(subscription, &mut seen, 1);
+        assert_eq!(status, Status::Ok.code());
+        assert!(delivered <= 1);
+    }
+    assert_eq!(seen.messages, [b"m1".to_vec(), b"m2".to_vec()]);
+    // Resumed later: m2 was acknowledged, m3 is next.
+    let mut after = Seen::default();
+    poll_until(subscription, client, &mut after, 1, 1);
+    assert_eq!(after.messages, [b"m3".to_vec()]);
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// From its handler, polling or closing the subscription, or closing its
+/// client, answers REENTRANT and closes nothing: the subscription and the
+/// client's publication still work afterwards.
+#[test]
+fn a_handler_that_reenters_its_subscription_is_refused() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let (_, subscription) = add_subscription_of(client, STREAM);
+    let (_, publication) = add_publication(client);
+    assert_eq!(offer(publication, b"first").0, Status::Ok.code());
+    let mut seen = Seen {
+        reenter: (subscription, client),
+        ..Seen::default()
+    };
+    poll_until(subscription, client, &mut seen, 1, 1);
+    assert_eq!(seen.reentered, [Status::Reentrant.code(); 3]);
+    // Nothing was closed.
+    assert_eq!(offer(publication, b"second").0, Status::Ok.code());
+    let mut after = Seen::default();
+    poll_until(subscription, client, &mut after, 4, 1);
+    assert_eq!(after.messages, [b"second".to_vec()]);
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+    // The client's close closed its subscription and its publication.
+    assert_eq!(
+        poll_into(subscription, &mut after, 1).0,
+        Status::Closed.code()
+    );
+    assert_eq!(offer(publication, b"x").0, Status::Closed.code());
+}
+
+/// A handler that holds its subscription on one thread makes another
+/// thread's poll answer BUSY, and the client's close answer BUSY with
+/// nothing closed; both work once it returns.
+#[test]
+fn a_subscription_held_by_another_thread_is_busy() {
+    use std::sync::{Arc, Barrier};
+
+    struct Hold {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+    unsafe extern "C" fn holding(
+        context: *mut c_void,
+        _data: *const u8,
+        _length: usize,
+        _info: *const MessageInfo,
+    ) {
+        // SAFETY: the context is a live `Hold` for the call.
+        let hold = unsafe { &*context.cast::<Hold>() };
+        let _ = hold.entered.wait();
+        let _ = hold.release.wait();
+    }
+
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let (_, subscription) = add_subscription_of(client, STREAM);
+    let (_, publication) = add_publication(client);
+    assert_eq!(offer(publication, b"held").0, Status::Ok.code());
+    let (entered, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let holder = {
+        let mut hold = Hold {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            loop {
+                assert!(start.elapsed() < std::time::Duration::from_secs(3600));
+                let _ = poll(client);
+                let mut delivered = 0;
+                // SAFETY: `hold` has the handler's signature, `hold` the
+                // context it reads, `delivered` a live `uint32_t`.
+                let status = unsafe {
+                    karyos_subscription_poll(
+                        subscription,
+                        Some(holding),
+                        (&raw mut hold).cast(),
+                        1,
+                        &mut delivered,
+                    )
+                };
+                assert_eq!(status, Status::Ok.code());
+                if delivered == 1 {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+    let _ = entered.wait();
+    let mut seen = Seen::default();
+    assert_eq!(poll_into(subscription, &mut seen, 1).0, Status::Busy.code());
+    assert_eq!(karyos_client_close(client), Status::Busy.code());
+    let _ = release.wait();
+    holder.join().unwrap();
+    assert_eq!(poll_into(subscription, &mut seen, 1).0, Status::Ok.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// A `karyos:ipc` subscription has no image change; arguments are checked
+/// before anything else.
+#[test]
+fn image_changes_and_bad_arguments() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let (_, subscription) = add_subscription_of(client, STREAM);
+    let mut change = ImageChange {
+        size: size_of_u32::<ImageChange>(),
+        session_id: 0,
+        image_id: 0,
+        lane: 0,
+        available: 0,
+    };
+    let (mut has, mut lost) = (u32::MAX, u64::MAX);
+    // SAFETY: live, aligned out-parameters.
+    let status =
+        unsafe { karyos_subscription_next_image_change(subscription, &mut change, &mut has) };
+    assert_eq!((status, has), (Status::Ok.code(), 0));
+    // SAFETY: a live `uint64_t`.
+    let status = unsafe { karyos_subscription_image_changes_lost(subscription, &mut lost) };
+    assert_eq!((status, lost), (Status::Ok.code(), 0));
+    // Each block: a null pointer is refused before any use; the other
+    // pointers are live.
+    // SAFETY: as stated.
+    let status = unsafe {
+        karyos_subscription_next_image_change(subscription, &mut change, core::ptr::null_mut())
+    };
+    assert_eq!(status, Status::InvalidArgument.code());
+    // SAFETY: as above.
+    let status =
+        unsafe { karyos_subscription_image_changes_lost(subscription, core::ptr::null_mut()) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    // SAFETY: as above.
+    let status = unsafe {
+        karyos_subscription_poll(
+            subscription,
+            None,
+            core::ptr::null_mut(),
+            1,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::InvalidArgument.code());
+    let mut added = 0;
+    // SAFETY: as above.
+    let status = unsafe {
+        karyos_client_add_subscription(
+            client,
+            core::ptr::null(),
+            STREAM,
+            &mut added,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::InvalidArgument.code());
+    // SAFETY: as above.
+    let status = unsafe {
+        karyos_client_add_subscription(
+            client,
+            c"karyos:ipc".as_ptr(),
+            STREAM,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::InvalidArgument.code());
+    // A handle of another kind, and a stream that does not exist.
+    assert_eq!(
+        poll_into(client, &mut Seen::default(), 1).0,
+        Status::InvalidHandle.code()
+    );
+    assert_ne!(add_subscription_of(client, 9999).0, Status::Ok.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// A copy that cannot grow answers SYSTEM before anything is delivered:
+/// nothing is acknowledged, and the next poll delivers the message, with
+/// the copy grown to the stream's largest message.
+#[test]
+fn a_copy_that_cannot_grow_delivers_nothing_and_loses_nothing() {
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let (_, subscription) = add_subscription_of(client, STREAM);
+    let handle = Handle::from_raw(subscription);
+    let largest = api::subscription::copy_length(handle).unwrap();
+    let (_, publication) = add_publication(client);
+    assert_eq!(offer(publication, b"kept").0, Status::Ok.code());
+    api::subscription::empty_copy(handle);
+    api::subscription::REFUSE_GROWTH.with(|refuse| refuse.set(true));
+    let mut seen = Seen::default();
+    let start = std::time::Instant::now();
+    // The message reaches the subscription; every poll fails before it.
+    for _ in 0..64 {
+        assert!(start.elapsed() < std::time::Duration::from_secs(3600));
+        let _ = poll(client);
+        assert_eq!(
+            poll_into(subscription, &mut seen, 8),
+            (Status::System.code(), 0)
+        );
+        std::thread::yield_now();
+    }
+    api::subscription::REFUSE_GROWTH.with(|refuse| refuse.set(false));
+    assert!(seen.messages.is_empty());
+    poll_until(subscription, client, &mut seen, 8, 1);
+    assert_eq!(seen.messages, [b"kept".to_vec()]);
+    assert_eq!(api::subscription::copy_length(handle), Some(largest));
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// A driven driver with a network (Shared threading) and `N` conductors.
+fn driven_network<const N: usize>() -> (Driven, [karyos_client::ClientConductor; N]) {
+    let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
+        client_liveness_timeout: 3_600_000_000_000,
+        network: Some(karyos_driver::net::NetworkConfig {
+            threading: karyos_driver::agents::ThreadingMode::Shared,
+            ..karyos_driver::net::NetworkConfig::default()
+        }),
+        ..karyos_driver::DriverConfig::default()
+    })
+    .unwrap();
+    let conductors = core::array::from_fn(|_| driver.connect().unwrap());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        while !flag.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = driver.do_work().unwrap();
+            std::thread::yield_now();
+        }
+    });
+    (
+        Driven {
+            stop,
+            thread: Some(thread),
+        },
+        conductors,
+    )
+}
+
+/// DESIGN's sizing rule for the copy: a network subscription starts with
+/// no image and a copy of 0; its first image grows the copy to that
+/// image's largest message, a second image of a larger term grows it once
+/// more, and a message of exactly the largest length is delivered.
+#[test]
+#[cfg_attr(miri, ignore = "UDP sockets")]
+fn a_network_subscription_grows_its_copy_with_a_larger_image() {
+    // The subscriber on one driver, the two publishers on another.
+    let (_reading, [ours]) = driven_network::<1>();
+    let (_writing, [small, large]) = driven_network::<2>();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let uri = std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{port}")).unwrap();
+    let mut subscription = 0;
+    // SAFETY: a live C string, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_subscription(
+            client,
+            uri.as_ptr(),
+            8,
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::Ok.code());
+    let handle = Handle::from_raw(subscription);
+    assert_eq!(api::subscription::copy_length(handle), Some(0));
+    let publish = |conductor, term: u32| {
+        let mut publisher = Client::with_conductor(conductor, test_context());
+        let publication = publisher
+            .add_exclusive_publication(
+                &format!(
+                    "karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1|term-length={term}"
+                ),
+                karyos_client::StreamId::new(8),
+            )
+            .unwrap();
+        (publisher, publication)
+    };
+    let (mut first, mut one) = publish(small, 65536);
+    let mut seen = Seen::default();
+    // Polls until the copy reaches `length`, offering `payload` on `on`.
+    let grow_to = |seen: &mut Seen,
+                   on: &mut karyos_client::Publication<karyos_sys::term_bytes::HeapTerms>,
+                   publisher: &mut Client<karyos_client::ClientConductor>,
+                   payload: &[u8]| {
+        let start = std::time::Instant::now();
+        let before = seen.messages.len();
+        while seen.messages.len() == before {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(60),
+                "nothing"
+            );
+            let _ = (publisher.poll(), poll(client));
+            let _ = on.offer(payload);
+            let (status, _) = poll_into(subscription, seen, 1);
+            assert_eq!(status, Status::Ok.code());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    let small_max = one
+        .max_message_length(karyos_sys::frame::Lane::ZERO)
+        .unwrap() as usize;
+    grow_to(&mut seen, &mut one, &mut first, b"small");
+    assert_eq!(api::subscription::copy_length(handle), Some(small_max));
+    let (mut second, mut two) = publish(large, 262_144);
+    let large_max = two
+        .max_message_length(karyos_sys::frame::Lane::ZERO)
+        .unwrap() as usize;
+    assert!(large_max > small_max);
+    let largest = vec![5u8; large_max];
+    let start = std::time::Instant::now();
+    while !seen
+        .messages
+        .iter()
+        .any(|message| message.len() == large_max)
+    {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "no large"
+        );
+        grow_to(&mut seen, &mut two, &mut second, &largest);
+    }
+    assert_eq!(api::subscription::copy_length(handle), Some(large_max));
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}

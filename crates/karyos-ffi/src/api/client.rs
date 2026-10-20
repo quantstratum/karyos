@@ -16,6 +16,7 @@ use std::time::Duration;
 use karyos_client::{Client, ClientConductor, ClientError, Context, IdleStrategy, StreamId};
 
 use crate::api::publication::Lanes;
+use crate::api::subscription::Reader;
 
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
@@ -77,6 +78,42 @@ impl AnyClient {
         }
     }
 
+    /// The subscription of `stream_id` on `uri` (a control call: it waits
+    /// for the driver up to the context's timeout).
+    pub(crate) fn add_subscription(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+    ) -> Result<Reader, Failure> {
+        let failure = |error: ClientError| Failure::from(&error);
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(client) => client
+                .add_subscription(uri, stream_id)
+                .map(Reader::Remote)
+                .map_err(failure),
+            Self::Embedded(client) => client
+                .add_subscription(uri, stream_id)
+                .map(Reader::Embedded)
+                .map_err(failure),
+        }
+    }
+
+    /// Releases `reader`, granted to this client.
+    pub(crate) fn remove_subscription(&mut self, reader: Reader) {
+        match (self, reader) {
+            #[cfg(target_os = "linux")]
+            (Self::Remote(client), Reader::Remote(reader)) => client.remove_subscription(reader),
+            (Self::Embedded(client), Reader::Embedded(reader)) => {
+                client.remove_subscription(reader);
+            }
+            // A subscription always has its client's connection; another
+            // one is only dropped.
+            #[cfg(target_os = "linux")]
+            (_, reader) => drop(reader),
+        }
+    }
+
     /// Releases `lanes`, granted to this client.
     pub(crate) fn remove_publication(&mut self, lanes: Lanes) {
         match (self, lanes) {
@@ -98,6 +135,8 @@ pub(crate) struct ClientEntry {
     pub(crate) client: AnyClient,
     /// Its open publications.
     pub(crate) publications: Vec<Handle>,
+    /// Its open subscriptions.
+    pub(crate) subscriptions: Vec<Handle>,
 }
 
 /// The table of clients, allocated on first use.
@@ -118,6 +157,7 @@ fn entry(client: AnyClient) -> ClientEntry {
     ClientEntry {
         client,
         publications: Vec::new(),
+        subscriptions: Vec::new(),
     }
 }
 
@@ -237,11 +277,18 @@ pub(crate) fn poll(client: Handle) -> Result<bool, Status> {
 ///
 /// As [`Table::remove_all`].
 pub(crate) fn close_entry(entry: &mut ClientEntry) -> Result<(), Status> {
-    let publications = crate::api::publication::table().remove_all(&entry.publications)?;
-    for publication in publications {
+    // Every child of both tables is taken before any is closed, so while
+    // one is in use nothing is.
+    let publications = crate::api::publication::table().take_all(&entry.publications)?;
+    let subscriptions = crate::api::subscription::table().take_all(&entry.subscriptions)?;
+    for publication in publications.close()? {
         publication.release(&mut entry.client);
     }
+    for subscription in subscriptions.close()? {
+        subscription.release(&mut entry.client);
+    }
     entry.publications.clear();
+    entry.subscriptions.clear();
     Ok(())
 }
 

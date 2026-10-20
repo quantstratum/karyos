@@ -7,10 +7,12 @@
 //!
 //! It reads both files as text and covers the constructs the ABI uses: one
 //! `#define NAME VALUE` per constant, `typedef struct` declarations with one
-//! field per statement, prototypes without function pointer parameters,
-//! and the `extern "C" fn` items and `pub struct` items of `abi.rs` whose
-//! types the tables in [`c_type`] and [`c_struct`] know. Anything else
-//! fails the test.
+//! field per statement, `typedef void (*name)(...)` callback types matched
+//! with the `pub type Name = Option<unsafe extern "C" fn(...)>` aliases of
+//! `abi.rs`, prototypes whose function pointer parameters use such a
+//! typedef, and the `extern "C" fn` items and `pub struct` items of
+//! `abi.rs` whose types the tables in [`c_type`] and [`c_struct`] know.
+//! Anything else fails the test.
 
 use std::collections::BTreeMap;
 
@@ -32,6 +34,8 @@ fn c_struct(rust: &str) -> &'static str {
         "ClientOptions" => "karyos_client_options",
         "Detail" => "karyos_detail",
         "Accepted" => "karyos_accepted",
+        "MessageInfo" => "karyos_message_info",
+        "ImageChange" => "karyos_image_change",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -52,6 +56,11 @@ fn c_type(rust: &str) -> String {
         "*mut Detail" => "karyos_detail *",
         "*mut Accepted" => "karyos_accepted *",
         "*mut *mut u8" => "uint8_t **",
+        "i64" => "int64_t",
+        "*mut c_void" => "void *",
+        "*const MessageInfo" => "const karyos_message_info *",
+        "*mut ImageChange" => "karyos_image_change *",
+        "MessageHandler" => "karyos_message_handler",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -152,9 +161,58 @@ fn rust_structs() -> BTreeMap<String, Fields> {
     structs
 }
 
+/// The prefix of a callback type's typedef.
+const HANDLER_TYPEDEF: &str = "typedef void (*";
+
+/// The header's code without comments, structs and callback typedefs, and
+/// the callback types it declares: each name with its parameter types.
+fn header_handlers() -> (String, BTreeMap<String, Vec<String>>) {
+    let mut code = header_structs().0;
+    let mut handlers = BTreeMap::new();
+    while let Some(start) = code.find(HANDLER_TYPEDEF) {
+        let end = start + code[start..].find(';').expect("a typedef's end");
+        let typedef = code[start + HANDLER_TYPEDEF.len()..end].to_owned();
+        let (name, rest) = typedef.split_once(')').expect("the typedef's name");
+        let parameters = rest
+            .trim()
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            .expect("the typedef's parameters")
+            .split(',')
+            .map(|parameter| split_name(parameter).0)
+            .collect();
+        handlers.insert(name.trim().to_owned(), parameters);
+        code.replace_range(start..=end, "");
+    }
+    (code, handlers)
+}
+
+/// The `pub type` callback aliases of `abi.rs`: each C name with its
+/// parameter types.
+fn rust_handlers() -> BTreeMap<String, Vec<String>> {
+    let mut handlers = BTreeMap::new();
+    let mut rest = ABI;
+    while let Some(at) = rest.find("\npub type ") {
+        rest = &rest[at + "\npub type ".len()..];
+        let end = rest.find(';').expect("an alias's end");
+        let alias = rest[..end].split_whitespace().collect::<Vec<_>>().join(" ");
+        let (name, target) = alias.split_once('=').expect("name = type");
+        let parameters = target
+            .trim()
+            .strip_prefix("Option<unsafe extern \"C\" fn(")
+            .and_then(|target| target.strip_suffix(")>"))
+            .expect("a callback alias: Option<unsafe extern \"C\" fn(...)>")
+            .split(',')
+            .map(|parameter| normalize(&c_type(parameter)))
+            .collect();
+        handlers.insert(c_type(name), parameters);
+    }
+    handlers
+}
+
 /// The header's prototypes.
 fn header_functions() -> BTreeMap<String, Signature> {
-    let code: String = header_structs()
+    let code: String = header_handlers()
         .0
         .lines()
         .map(str::trim)
@@ -219,6 +277,13 @@ fn the_header_declares_every_exported_function_with_its_types() {
     let rust = rust_functions();
     assert!(rust.contains_key("karyos_abi_version"));
     assert_eq!(header_functions(), rust);
+}
+
+#[test]
+fn the_header_declares_every_callback_type_with_its_parameters() {
+    let rust = rust_handlers();
+    assert!(rust.contains_key("karyos_message_handler"));
+    assert_eq!(header_handlers().1, rust);
 }
 
 #[test]
@@ -305,4 +370,20 @@ fn the_header_states_the_publication_constants() {
         defines["KARYOS_MAX_CLAIMS"],
         i64::from(publication::MAX_CLAIMS)
     );
+}
+
+#[test]
+fn the_header_states_the_subscription_constants() {
+    use crate::abi::{MESSAGE_END_OF_STREAM, MESSAGE_TRACED};
+    use crate::api::subscription;
+    let defines = header_defines();
+    assert_eq!(
+        defines["KARYOS_MAX_SUBSCRIPTIONS"],
+        i64::from(subscription::MAX_SUBSCRIPTIONS)
+    );
+    assert_eq!(
+        defines["KARYOS_MESSAGE_END_OF_STREAM"],
+        i64::from(MESSAGE_END_OF_STREAM)
+    );
+    assert_eq!(defines["KARYOS_MESSAGE_TRACED"], i64::from(MESSAGE_TRACED));
 }

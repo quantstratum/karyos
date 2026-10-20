@@ -421,6 +421,24 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Subscriptions over the C ABI (F4; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md` §4.4, ADR-0067):
+  `karyos_client_add_subscription`, `karyos_subscription_poll` (a
+  `karyos_message_handler` callback, a `MessageLimit` as `limit`, the
+  count delivered also on failure), `karyos_subscription_next_image_change`,
+  `karyos_subscription_image_changes_lost` and `karyos_subscription_close`,
+  with `karyos_message_info`, `karyos_image_change` and
+  `KARYOS_MAX_SUBSCRIPTIONS`. Each message reaches the handler from a
+  private copy owned by `libkaryos`, never a term or a shared mapping:
+  allocated at the add with the largest message the subscription can
+  deliver, grown only when a newly adopted image or mapping has a larger
+  one (`KARYOS_E_SYSTEM`, before anything is delivered, when it cannot).
+  The handler runs with the subscription held, so reentering it or closing
+  its client returns `KARYOS_E_REENTRANT`, and another thread gets
+  `KARYOS_E_BUSY`. A client's close takes every publication and
+  subscription before it closes any. The header checker reads callback
+  typedefs.
+
 - karyos-client's `Subscription` gains `adopt()`, `max_message_length()`
   and `poll_adopted(handler, limit)` (owner item 57; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §4.4), so a caller can size a copy

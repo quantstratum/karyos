@@ -5,3 +5,4 @@
 
 pub(crate) mod client;
 pub(crate) mod publication;
+pub(crate) mod subscription;

@@ -162,6 +162,27 @@ pub(crate) struct Table<T> {
     free: Mutex<Vec<u32>>,
 }
 
+/// Slots [`Table::take_all`] holds for a close.
+pub(crate) struct TakenAll<'a, T> {
+    table: &'a Table<T>,
+    taken: Vec<(Handle, &'a Slot<T>, Taken<'a, T>)>,
+}
+
+impl<T> TakenAll<'_, T> {
+    /// Closes every handle taken and returns their objects.
+    ///
+    /// # Errors
+    ///
+    /// As [`Table::remove`] once its slot is taken.
+    pub(crate) fn close(self) -> Result<Vec<T>, Status> {
+        let mut values = Vec::with_capacity(self.taken.len());
+        for (handle, slot, held) in self.taken {
+            values.push(self.table.close(slot, handle, held)?);
+        }
+        Ok(values)
+    }
+}
+
 impl<T> Table<T> {
     /// A table of `capacity` slots, at most [`MAX_CAPACITY`].
     pub(crate) fn new(kind: Kind, capacity: u32) -> Self {
@@ -319,6 +340,20 @@ impl<T> Table<T> {
     ///
     /// [`Status::Reentrant`] or [`Status::Busy`] for a held one.
     pub(crate) fn remove_all(&self, handles: &[Handle]) -> Result<Vec<T>, Status> {
+        self.take_all(handles)?.close()
+    }
+
+    /// Takes the slot of every handle of `handles` for a close, all or
+    /// none, and holds them: [`TakenAll::close`] closes them, and dropping
+    /// the result lets them go with nothing closed. So a close that ends
+    /// handles of several tables takes every table first and closes none
+    /// while one is held (a client's publications and subscriptions).
+    /// Stale handles are skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Reentrant`] or [`Status::Busy`] for a held one.
+    pub(crate) fn take_all(&self, handles: &[Handle]) -> Result<TakenAll<'_, T>, Status> {
         let mut taken = Vec::with_capacity(handles.len());
         for (at, &handle) in handles.iter().enumerate() {
             if handles.get(..at).is_some_and(|seen| seen.contains(&handle)) {
@@ -333,11 +368,7 @@ impl<T> Table<T> {
                 Err(status) => return Err(status),
             }
         }
-        let mut values = Vec::with_capacity(taken.len());
-        for (handle, slot, held) in taken {
-            values.push(self.close(slot, handle, held)?);
-        }
-        Ok(values)
+        Ok(TakenAll { table: self, taken })
     }
 
     /// The slot `handle` names, if it is one of this table and its handle
