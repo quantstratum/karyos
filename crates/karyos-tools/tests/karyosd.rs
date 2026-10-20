@@ -219,11 +219,7 @@ fn karyosd_with_the_network_carries_a_udp_pair() {
 
     use karyos_client::{Client, Context, MessageLimit, OfferError, StreamId};
 
-    let port = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = test_port();
     let context = |dir: &Path| {
         Context::builder()
             .dir(dir)
@@ -313,11 +309,7 @@ fn karyosd_logs_an_endpoints_capabilities_when_it_appears() {
 
     use karyos_client::{Client, Context, StreamId};
 
-    let port = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = test_port();
     let dir = dir("capabilities");
     let log = std::env::temp_dir().join(format!("karyosd-{}-capabilities.log", std::process::id()));
     let file = std::fs::File::create(&log).unwrap();
@@ -393,4 +385,24 @@ fn karyosd_logs_an_endpoints_capabilities_when_it_appears() {
         "{text}"
     );
     let _ = std::fs::remove_file(&log);
+}
+
+/// A loopback UDP port no socket holds now, picked below every ephemeral
+/// range (Linux 32768 to 60999, macOS 49152 to 65535), so no bind to port
+/// 0 can take it before the driver binds it (karyos#520). As karyos-driver's
+/// `test_ports`: a process starts at its own offset and walks the range,
+/// skipping ports it cannot bind.
+fn test_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    const FIRST: u32 = 20_000;
+    const COUNT: u32 = 12_000;
+    let start = std::process::id().wrapping_mul(2_654_435_761) % COUNT;
+    loop {
+        let taken = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(taken < COUNT, "no free test port left in the range");
+        let port = u16::try_from(FIRST + (start + taken) % COUNT).unwrap();
+        if std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
 }

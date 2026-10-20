@@ -868,13 +868,10 @@ fn a_publication_holds_a_send_endpoint_per_path() {
     );
 }
 
-/// A port no socket holds now, for a group or destination of a test.
+/// A port no socket holds now, for a group or destination of a test,
+/// outside the ephemeral range (karyos#520, [`crate::test_ports`]).
 fn free_port() -> u16 {
-    UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    crate::test_ports::test_port()
 }
 
 /// A driver whose agents hold `publications` sessions and `commands` ring

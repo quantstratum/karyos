@@ -121,10 +121,11 @@ fn silent() -> UdpSocket {
     UdpSocket::bind(SocketAddr::new(LOOPBACK, 0)).unwrap()
 }
 
-/// A port for a multicast group, free a moment ago: a group's port is
-/// named before any bind, so it cannot be read back from one.
+/// A port for a multicast group or a destination: it is named before any
+/// bind, so it cannot be read back from one. Picked outside the ephemeral
+/// range (karyos#520, [`crate::test_ports`]).
 fn free_port() -> u16 {
-    silent().local_addr().unwrap().port()
+    crate::test_ports::test_port()
 }
 
 /// Runs every driver until `done`, at most about four seconds.

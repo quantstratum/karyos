@@ -33,11 +33,11 @@ fn driver() -> EmbeddedDriver {
     .unwrap()
 }
 
-/// A loopback port free a moment ago, for a client's subscription: a
-/// channel URI refuses port 0, so a client cannot bind on any port and
-/// read it back.
+/// A loopback port for a client's subscription: a channel URI refuses
+/// port 0, so a client cannot bind on any port and read it back. Picked
+/// outside the ephemeral range (karyos#520, [`crate::test_ports`]).
 fn port() -> u16 {
-    silent().local_addr().unwrap().port()
+    crate::test_ports::test_port()
 }
 
 /// A loopback socket nobody reads, for a publication with no receiver to
