@@ -59,6 +59,10 @@ pub struct GapView {
     pub from: u64,
     /// The start of the agent that recorded it.
     pub to: u64,
+    /// Why it was recorded: `request_without_outcome`, `torn_tail`,
+    /// `unclean_stop` or `journal_replaced`, so an administrator tells a
+    /// crash from a lost operation before acknowledging it.
+    pub reason: &'static str,
 }
 
 /// One configured driver.

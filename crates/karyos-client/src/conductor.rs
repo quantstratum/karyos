@@ -302,6 +302,10 @@ pub struct Fetchable {
     /// the stream, so the request's session id is not known and the
     /// grant's is taken.
     pub by_uri: bool,
+    /// The request named a network image by its registration
+    /// (`AddImageSubscription`): a close of the local stream of the same
+    /// key does not close it (karyos#490).
+    pub image: bool,
 }
 
 /// A remote client's view of a conflated stream's table, ready to fetch.
@@ -415,6 +419,8 @@ struct Pending {
     journal: Option<JournalLayout>,
     /// The request named its stream by channel URI.
     by_uri: bool,
+    /// The request named a network image by its registration.
+    image: bool,
 }
 
 /// A client's conductor (not `Clone`). Dropping it closes the client: the
@@ -946,14 +952,23 @@ impl<T: TermBytes> ClientConductor<T> {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         let request = Request::Subscription { stream, lane, role };
-        self.submit(Kind::AddSubscription, Some(request), |sequence| {
+        let sequence = self.submit(Kind::AddSubscription, Some(request), |sequence| {
             Command::AddImageSubscription {
                 sequence,
                 image,
                 lane,
                 role,
             }
-        })
+        })?;
+        // Its grant is an image's: a local close of the alias spares it.
+        if let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|pending| pending.sequence == sequence)
+        {
+            pending.image = true;
+        }
+        Ok(sequence)
     }
 
     /// Requests a view of a conflated stream's table (a remote client;
@@ -1517,6 +1532,7 @@ impl<T: TermBytes> ClientConductor<T> {
                     request,
                     journal,
                     by_uri,
+                    image: false,
                 });
                 Ok(sequence)
             }
@@ -1686,6 +1702,7 @@ impl<T: TermBytes> ClientConductor<T> {
                         registration,
                         request,
                         by_uri: pending.by_uri,
+                        image: pending.image,
                     });
                 }
                 _ => {}

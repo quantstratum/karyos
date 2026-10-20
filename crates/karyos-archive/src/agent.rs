@@ -286,6 +286,24 @@ impl NewGroup {
     }
 }
 
+/// What a recording reads, as its host knows it (karyos#490): a local
+/// stream, the publication side of a stream this host publishes, or a
+/// network image of one. A host recording its own `karyos:udp`
+/// publication beside that publication's loopback image has two
+/// recordings of one stream, session and lane, with the same channel and
+/// source incarnation: only this tells them apart. It is not kept in the
+/// catalog: it serves the live lookup of a recording's word only, and a
+/// host restarting a recording hands it over again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RecordedFrom {
+    /// A local stream: the stream itself, on its publication side.
+    #[default]
+    Local,
+    /// A network image of the stream.
+    Image,
+}
+
 /// A recording to start, with its source.
 #[non_exhaustive]
 pub struct StartRecording {
@@ -305,6 +323,9 @@ pub struct StartRecording {
     pub format: StreamFormat,
     /// The lane's reader, positioned at the recording's start.
     pub source: Box<dyn FrameSource + Send>,
+    /// What the source reads; a local stream unless the host says
+    /// otherwise.
+    pub origin: RecordedFrom,
 }
 
 impl StartRecording {
@@ -331,7 +352,15 @@ impl StartRecording {
             mode,
             format,
             source,
+            origin: RecordedFrom::Local,
         }
+    }
+
+    /// The same, recording `origin` (karyos#490).
+    #[must_use]
+    pub fn with_origin(mut self, origin: RecordedFrom) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
@@ -921,7 +950,8 @@ impl ArchiveHandle {
     /// The word of the `required` recording of stream `stream_id`, session
     /// `session_id`, lane `lane` this Archive records, if any: recordings
     /// are per lane, and a word for another lane would place references
-    /// into the wrong frames. A recording group Gateway's source reads it
+    /// into the wrong frames. A recording of the local stream answers
+    /// before one of an image of the same key ([`RecordedFrom`]). A recording group Gateway's source reads it
     /// to place payloads by reference. It names
     /// the recording and its start while it records, and is cleared when
     /// the recording stops, ends or fails. Configuration path only.
@@ -1172,6 +1202,9 @@ struct Active<D: Disk> {
     /// to place payloads by reference; cleared when the recording leaves
     /// the active set, however it stopped, ended or failed.
     word: Option<WordGuard>,
+    /// What it reads: a recording of a local stream answers its key's
+    /// word before one of an image of the same key.
+    origin: RecordedFrom,
 }
 
 /// Clears a recording's word when the recording leaves the active set.
@@ -1753,15 +1786,22 @@ impl<D: Disk + Clone> State<D> {
                 lane,
                 reply,
             } => {
-                let word = self
-                    .active
-                    .iter()
-                    .filter(|active| {
-                        active.stream_id == stream_id
-                            && active.session_id == session_id
-                            && active.lane == lane
-                    })
-                    .find_map(|active| active.word.as_ref().map(|guard| Arc::clone(&guard.0)));
+                // A local stream's recording first: a host recording its own
+                // network publication and that publication's loopback image
+                // has both of one key (karyos#490); never a silent pick.
+                let word_of = |from: RecordedFrom| {
+                    self.active
+                        .iter()
+                        .filter(|active| {
+                            active.stream_id == stream_id
+                                && active.session_id == session_id
+                                && active.lane == lane
+                                && (active.origin == RecordedFrom::Local)
+                                    == (from == RecordedFrom::Local)
+                        })
+                        .find_map(|active| active.word.as_ref().map(|guard| Arc::clone(&guard.0)))
+                };
+                let word = word_of(RecordedFrom::Local).or_else(|| word_of(RecordedFrom::Image));
                 let _ = reply.send(Ok(word));
             }
             Command::Snapshot {
@@ -2264,6 +2304,7 @@ impl<D: Disk + Clone> State<D> {
                     session_id: start.session_id,
                     lane: start.format.lane,
                     word,
+                    origin: start.origin,
                 });
                 Ok(id)
             }

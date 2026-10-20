@@ -244,7 +244,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         .streams
                         .iter()
                         .find(|found| {
+                            // The local stream's lanes: an image of the
+                            // same key may live beside it (karyos#490).
                             !found.retiring
+                                && found.source.is_none()
                                 && (found.stream_id, found.session_id)
                                     == (stream.stream_id, stream.session_id)
                         })
