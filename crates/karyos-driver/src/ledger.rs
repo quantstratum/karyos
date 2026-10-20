@@ -42,6 +42,24 @@ pub(crate) enum Participant {
     /// table outlives mapping generations, so a cutover neither moves nor
     /// fences the grant, and it charges no generation.
     Conflation,
+    /// No log buffer participant: one region of a guarded publication's
+    /// binding (`quantstratum-docs: karyos/design/guards-and-abort.md`,
+    /// "The binding across processes"), granted with the publication's log
+    /// buffer under the same key. Its region outlives mapping generations,
+    /// so a cutover neither moves nor fences it.
+    Binding { region: BindingRegion },
+}
+
+/// Which region of a guarded publication's binding a grant carries, in
+/// the order its manifest lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BindingRegion {
+    /// The handle's outcome ring, read-only.
+    Outcomes,
+    /// The handle's consumed cell, writable by its client alone.
+    Consumed,
+    /// The driver's guard words, read-only.
+    Guards,
 }
 
 /// One grant.
@@ -112,7 +130,15 @@ impl Ledger {
 
     /// Whether a new grant would exceed the client's bound.
     pub(crate) fn full(&self) -> bool {
-        self.grants.len() >= self.limit
+        !self.has_room(1)
+    }
+
+    /// Whether `grants` more grants fit the client's bound.
+    pub(crate) fn has_room(&self, grants: usize) -> bool {
+        self.grants
+            .len()
+            .checked_add(grants)
+            .is_some_and(|total| total <= self.limit)
     }
 
     /// The most grants it holds at once, `max_exports_per_client`.
@@ -193,15 +219,45 @@ impl Ledger {
         self.grants.iter().any(|grant| grant.stream == stream)
     }
 
-    /// The `Held` grant whose response carried `key`.
+    /// The `Held` grant whose response carried `key`; for a guarded
+    /// publication, its log buffer's ([`Ledger::held_binding`] has the
+    /// rest).
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "remote clients are admitted only on Linux")
     )]
     pub(crate) fn held(&self, key: u64) -> Option<&Grant> {
-        self.grants
+        self.grants.iter().find(|grant| {
+            grant.key == key
+                && grant.state == GrantState::Held
+                && !matches!(grant.participant, Participant::Binding { .. })
+        })
+    }
+
+    /// The `Held` binding grants that share `key` with a guarded
+    /// publication's grant, in manifest order: the outcome ring, the
+    /// consumed cell and the guard region. Sorted, because removals
+    /// reorder the ledger.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn held_binding(&self, key: u64) -> Vec<Grant> {
+        let mut held = self
+            .grants
             .iter()
-            .find(|grant| grant.key == key && grant.state == GrantState::Held)
+            .filter(|grant| {
+                grant.key == key
+                    && grant.state == GrantState::Held
+                    && matches!(grant.participant, Participant::Binding { .. })
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        held.sort_by_key(|grant| match grant.participant {
+            Participant::Binding { region } => Some(region),
+            _ => None,
+        });
+        held
     }
 
     /// Moves the grant of `export` to `state`.

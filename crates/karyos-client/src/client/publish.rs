@@ -255,6 +255,26 @@ impl<T: TermBytes> Publication<T> {
     ) -> Result<Claim<'_, T>, OfferError> {
         claimed(self.lane(lane)?.try_claim(length.get())?)
     }
+
+    /// Delivers up to `limit` outcome records of `lane`'s guarded handle
+    /// to `handler`, in sequence order, each with its sequence
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, "The
+    /// outcome stream", G5); a lane that is not guarded has none. Returns
+    /// how many were delivered.
+    ///
+    /// # Errors
+    ///
+    /// [`OfferError::InvalidLane`] for a lane the stream does not
+    /// configure, and the outcome stream's errors, such as
+    /// [`ClientError::OutcomesLost`], as [`OfferError::Client`].
+    pub fn poll_outcomes_on(
+        &mut self,
+        lane: Lane,
+        limit: usize,
+        handler: impl FnMut(u64, karyos_sys::outcome_ring::Record),
+    ) -> Result<usize, OfferError> {
+        Ok(self.lane(lane)?.poll_outcomes(limit, handler)?)
+    }
 }
 
 /// A claimed frame of a [`Publication`]. It mutably borrows the

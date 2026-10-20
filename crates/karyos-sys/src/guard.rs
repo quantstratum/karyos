@@ -113,6 +113,11 @@ pub fn admits(word: &AtomicU64, epoch: u64) -> bool {
         .is_some_and(|open| word.load(Ordering::Acquire) == open)
 }
 
+/// The guard region's layout version (`quantstratum-docs:
+/// karyos/design/guards-and-abort.md`, "The binding across processes"):
+/// one word per guard, at the guard's index, from word 0 of the structure.
+pub const GUARD_REGION_LAYOUT_VERSION: u64 = 1;
+
 /// [`load`] over word `index` of a view that may be read-only, such as a
 /// client's mapping of the driver's guard region.
 ///

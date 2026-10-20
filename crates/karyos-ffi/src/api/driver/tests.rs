@@ -374,3 +374,28 @@ fn the_stream_defaults_are_a_valid_heap_stream() {
     assert!(!config.allow_unconnected);
     assert!(config.conflation.is_none());
 }
+
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_subscription_follows_its_clients_driver() {
+    use crate::api::subscription;
+    let _serial = serial();
+    let driver = created();
+    add_stream(driver, &stream(17)).unwrap();
+    let client = client::connect_embedded(driver).unwrap();
+    // The driver's thread serves the control call.
+    start(driver, YIELD).unwrap();
+    let opened = subscription::add(client, "karyos:ipc", 17).unwrap();
+    let mut ignore = |_: &[u8], _: &karyos_client::MessageInfo| {};
+    assert!(subscription::poll(opened, 1, &mut ignore).is_ok());
+    close(driver).unwrap();
+    assert_eq!(
+        subscription::poll(opened, 1, &mut ignore).map_err(|(failure, _)| failure.status),
+        Err(Status::Closed)
+    );
+    assert_eq!(
+        subscription::add(client, "karyos:ipc", 17).map_err(|failure| failure.status),
+        Err(Status::Closed)
+    );
+    client::close(client).unwrap();
+}

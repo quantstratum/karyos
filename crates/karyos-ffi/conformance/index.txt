@@ -9,8 +9,8 @@ typed status codes: abi.version.null status.text handle.wrong.kind
 use after close: handle.use.after.close
 double close: handle.double.close
 older protocol version refused at admission: pending a driver the suite can start (F5 or a test driver); tests/connect.rs covers it on Linux
-reentrant poll: pending F4
-bounded poll stops on callback failure: pending F4
-kept fragment pointer never refers to a shared mapping: pending F4
+reentrant poll: pending F6 (the runner calls no subscription yet); src/abi/tests.rs a_handler_that_reenters_its_subscription_is_refused covers it
+bounded poll stops on callback failure: pending F6 (the runner calls no subscription yet); src/abi/tests.rs the_bounded_poll_stops_after_a_failed_handler covers it
+kept fragment pointer never refers to a shared mapping: pending F6 (the runner calls no subscription yet); src/abi/tests.rs a_subscription_delivers_each_message_from_its_private_copy covers it
 panic poisons the handle and does not unwind: pending a fault hook, since no call can make libkaryos panic (the Rust tests of boundary.rs and api/driver cover it)
 older minor ABI client against a newer library: pending the ABI manifest test of the first released header

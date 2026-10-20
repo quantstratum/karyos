@@ -107,7 +107,14 @@
 //! `ToolAdmitted` record, and the guard binding's kinds `GuardRegion`,
 //! `OutcomeRing` and `ConsumedCell` (codes 12 to 14 on both sides,
 //! `quantstratum-docs: karyos/design/guards-and-abort.md`, "The binding
-//! across processes", G-x1), which no grant carries yet.
+//! across processes", G-x1). A guarded exclusive publication's grant
+//! (G-x2) carries them after its log buffer record, exactly
+//! `OutcomeRing`, `ConsumedCell`, `GuardRegion` in that order, each with
+//! capability none, lane 0 and the log buffer's ids, and its manifest
+//! carries a base like a log buffer's; the binding's kinds appear in no
+//! other manifest. This is an in-place change of the manifest rule under
+//! the unreleased version 2, as owner item 54 allowed for the guard
+//! commands.
 //!
 //! **Instance.** The instance of `Admitted` is the driver's 128-bit
 //! `driver_id` (SPEC.md §4), the one id per driver instance (ACS 13555).
@@ -613,7 +620,8 @@ fn records_from(header: usize, words: &[u64]) -> Result<Vec<Record>, AdmissionEr
 /// carries a nonzero stream registration and incarnation; journal records
 /// never share a manifest with others; a base is below 2^63, and nonzero
 /// only for log buffer records, the only regions that start at a stream
-/// position.
+/// position, or for a guarded grant ([`guarded_grant`]). The guard
+/// binding's kinds appear only in a guarded grant.
 fn check_manifest_identity(
     records: &[Record],
     stream_registration: u64,
@@ -629,15 +637,55 @@ fn check_manifest_identity(
     } else {
         journals == records.len() && stream_registration == 0 && incarnation == 0 && base == 0
     };
-    let positioned = !records.is_empty()
-        && records
-            .iter()
-            .all(|record| record.kind == RegionKind::LogBuffer);
-    if valid && base >> 63 == 0 && (base == 0 || positioned) {
+    let log_buffers = |records: &[Record]| {
+        !records.is_empty()
+            && records
+                .iter()
+                .all(|record| record.kind == RegionKind::LogBuffer)
+    };
+    let guarded = guarded_grant(records);
+    let binding_kinds = records.iter().any(|record| {
+        matches!(
+            record.kind,
+            RegionKind::GuardRegion | RegionKind::OutcomeRing | RegionKind::ConsumedCell
+        )
+    });
+    let positioned = log_buffers(records) || guarded;
+    if valid && base >> 63 == 0 && (base == 0 || positioned) && (guarded || !binding_kinds) {
         Ok(())
     } else {
         Err(AdmissionError::Reserved)
     }
+}
+
+/// Whether `records` are a guarded publication grant (`quantstratum-docs:
+/// karyos/design/guards-and-abort.md`, "The binding across processes"):
+/// one or more log buffer records, then exactly an `OutcomeRing`, a
+/// `ConsumedCell` and a `GuardRegion` record in that order, each of the
+/// three with capability none, lane 0 and the stream and session ids of
+/// the log buffers.
+fn guarded_grant(records: &[Record]) -> bool {
+    let Some(split) = records.len().checked_sub(3) else {
+        return false;
+    };
+    let (buffers, binding) = records.split_at(split);
+    let Some(first) = buffers.first() else {
+        return false;
+    };
+    buffers
+        .iter()
+        .all(|record| record.kind == RegionKind::LogBuffer)
+        && binding.iter().map(|record| record.kind).eq([
+            RegionKind::OutcomeRing,
+            RegionKind::ConsumedCell,
+            RegionKind::GuardRegion,
+        ])
+        && binding.iter().all(|record| {
+            record.capability == Capability::None
+                && record.lane == 0
+                && record.stream_id == first.stream_id
+                && record.session_id == first.session_id
+        })
 }
 
 impl Message {
@@ -1305,6 +1353,78 @@ mod tests {
         );
     }
 
+    /// A guarded grant (G-x2): log buffer records, then exactly an outcome
+    /// ring, a consumed cell and the guard region, capability none, lane 0
+    /// and the log buffers' ids; it carries a base. Any other place for the
+    /// binding's kinds is refused, both ways.
+    #[test]
+    fn a_guarded_grant_follows_its_record_order() {
+        let binding = |kind, export| Record {
+            kind,
+            lane: 0,
+            ..record(export, Capability::None)
+        };
+        let buffer = record(1, Capability::ExclusivePublication);
+        let ring = binding(RegionKind::OutcomeRing, 2);
+        let cell = binding(RegionKind::ConsumedCell, 3);
+        let guards = binding(RegionKind::GuardRegion, 4);
+        let manifest = |records: Vec<Record>, base| Message::Manifest {
+            fetch: 1,
+            key: 2,
+            registration: 3,
+            stream_registration: 4,
+            incarnation: 1,
+            base,
+            records,
+        };
+        round_trip(&manifest(vec![buffer, ring, cell, guards], 4096));
+        round_trip(&manifest(vec![buffer, ring, cell, guards], 0));
+        let other_stream = Record {
+            stream_id: 6,
+            ..cell
+        };
+        let granted = Record {
+            capability: Capability::ExclusivePublication,
+            ..guards
+        };
+        let laned = Record { lane: 1, ..ring };
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        for refused in [
+            // No GuardRegion, the wrong order, no log buffer.
+            manifest(vec![buffer, ring, cell], 4096),
+            manifest(vec![buffer, cell, ring, guards], 4096),
+            manifest(vec![ring, cell, guards], 0),
+            // A binding kind alone, or after another kind.
+            manifest(vec![guards], 0),
+            manifest(vec![buffer, ring, cell, guards, buffer], 0),
+            // Another stream, a capability, a lane.
+            manifest(vec![buffer, ring, other_stream, guards], 4096),
+            manifest(vec![buffer, ring, cell, granted], 4096),
+            manifest(vec![buffer, laned, cell, guards], 4096),
+        ] {
+            assert_eq!(
+                refused.encode(&mut out),
+                Err(AdmissionError::Reserved),
+                "{refused:?}"
+            );
+        }
+        // Decoding refuses it too: a binding kind after the guard region.
+        let length = manifest(vec![buffer, ring, cell, guards], 0)
+            .encode(&mut out)
+            .unwrap();
+        let mut words = words_of(&out[..length]);
+        let kinds: Vec<usize> = (0..words.len())
+            .filter(|&index| words[index] & 0xFF == RegionKind::GuardRegion.code())
+            .collect();
+        assert!(!kinds.is_empty());
+        let last = *kinds.last().unwrap();
+        words[last] = (words[last] & !0xFF) | RegionKind::OutcomeRing.code();
+        assert_eq!(
+            Message::decode(&bytes_of(&words)),
+            Err(AdmissionError::Reserved)
+        );
+    }
+
     /// A journal grant's manifest: journal records only, the journal number
     /// as registration, zero stream registration and incarnation; anything
     /// else with a journal record is refused, both ways.
@@ -1867,6 +1987,20 @@ mod properties {
                         journal,
                         base,
                     )| {
+                        // The binding's kinds appear only in a guarded
+                        // grant, whose shape a unit test covers.
+                        if valid {
+                            for record in &mut records {
+                                if matches!(
+                                    record.kind,
+                                    RegionKind::GuardRegion
+                                        | RegionKind::OutcomeRing
+                                        | RegionKind::ConsumedCell
+                                ) {
+                                    record.kind = RegionKind::LogBuffer;
+                                }
+                            }
+                        }
                         let positioned = !records.is_empty()
                             && records
                                 .iter()

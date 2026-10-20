@@ -929,6 +929,10 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// fails, as a walker short of a spare slot does.
     #[cfg(test)]
     pub(crate) guard_lane_fault: Option<usize>,
+    /// The outcome ring or consumed cell of each binding grant not ended
+    /// yet, by export: what its fetch grants. The walker's bound holds
+    /// the same words until its last outcome record is written.
+    pub(crate) binding_exports: Vec<(u64, Arc<crate::shared_words::Words>)>,
     /// The network agents and their tables, when configured.
     pub(crate) net: Option<crate::net::Network<T>>,
     /// Each guard's word gauge (M4).
@@ -1294,6 +1298,28 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         #[cfg(not(target_os = "linux"))]
         let guard_ring =
             karyos_sys::diag::guard_audit(audit_records).map_err(|_| DriverError::InvalidConfig)?;
+        // The guard words, one per guard: a driver-only region in IPC mode,
+        // which every guarded grant carries read-only (`quantstratum-docs:
+        // karyos/design/guards-and-abort.md`, "The binding across
+        // processes").
+        #[cfg(target_os = "linux")]
+        let guard_words = match admission.as_mut() {
+            Some(admission) => {
+                let (_, region) = admission.next_region()?;
+                crate::shared_words::Words::region(
+                    crate::admission::instance_of(driver_id),
+                    region,
+                    karyos_sys::ipc::RegionKind::GuardRegion,
+                    karyos_sys::guard::GUARD_REGION_LAYOUT_VERSION,
+                    config.max_guards,
+                    true,
+                )
+                .map_err(|_| DriverError::InvalidConfig)?
+            }
+            None => crate::shared_words::Words::heap(config.max_guards),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let guard_words = crate::shared_words::Words::heap(config.max_guards);
         // The network agents' cells, allocated before any agent starts.
         let network_cells = config
             .network
@@ -1348,6 +1374,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guards: crate::guards::Guards::new(
                 id,
                 config.max_guards,
+                guard_words,
                 config.guard_audit_records,
                 guard_ring,
             ),
@@ -1358,6 +1385,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
             #[cfg(test)]
             guard_lane_fault: None,
+            binding_exports: Vec::new(),
             // Validated above: the product fits.
             net_owned: Vec::with_capacity(config.network.map_or(0, |network| {
                 crate::net::client::owned_capacity(&network, config.max_clients).unwrap_or(0)
@@ -2410,7 +2438,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.reincarnate_if_reopened(stream)?;
         // A guarded handle's binding is prepared first, so a refusal takes
         // nothing.
-        let binding = match self.prepare_guard_binding(stream) {
+        let binding = match self.prepare_guard_binding(stream, crate::guard_streams::Place::Heap) {
             Ok(binding) => binding,
             Err(error) => {
                 let guard = self
@@ -2920,12 +2948,56 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(handle)
     }
 
+    /// The bound of a guarded publication about to be granted to a remote
+    /// client (G-x2), after the steps `publication()` takes first: the
+    /// fresh incarnation after a guard reopen, then the binding, its ring
+    /// and consumed cell in the regions `ring` and `cell` of `instance`.
+    /// `None` for a stream that is not guarded. Nothing is registered on
+    /// error.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_remote_guard(
+        &mut self,
+        stream: u64,
+        instance: u128,
+        ring: u64,
+        cell: u64,
+    ) -> Result<Option<crate::guard_streams::Bound>, DriverError> {
+        let handle = StreamHandle {
+            driver: self.id,
+            stream,
+        };
+        self.reincarnate_if_reopened(handle)?;
+        let place = crate::guard_streams::Place::Regions {
+            instance,
+            ring,
+            cell,
+        };
+        // The client binds its own handle from the granted regions (G-x3).
+        Ok(self
+            .prepare_guard_binding(handle, place)?
+            .map(|(_, bound)| bound))
+    }
+
+    /// Hands `bound` to the walker of guarded stream `stream`, once its
+    /// grant is recorded.
+    pub(crate) fn bind_remote_guard(&mut self, stream: u64, bound: crate::guard_streams::Bound) {
+        if let Some(guarded) = self
+            .streams
+            .iter_mut()
+            .find(|found| found.id == stream)
+            .and_then(|found| found.guarded.as_mut())
+        {
+            guarded.bind(bound);
+        }
+    }
+
     /// The guard binding of a handle about to be issued on a guarded
     /// stream: refused on a stream a guard close sealed (its incarnation is
     /// final, G-d2 brings the fresh one) and while the guard is not open.
     fn prepare_guard_binding(
         &self,
         stream: StreamHandle,
+        place: crate::guard_streams::Place,
     ) -> Result<Option<(karyos_client::GuardBinding, crate::guard_streams::Bound)>, DriverError>
     {
         let found = self.stream_ref(stream)?;
@@ -2943,12 +3015,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if found.conductor.seal_reason() == Some(SealReason::GuardClosed) {
             return Err(DriverError::GuardSealed { stream: found.id });
         }
-        let (ring, writer) = crate::guard_streams::new_ring(guarded.messages, state.epoch)
-            .map_err(DriverError::Outcomes)?;
-        let consumed = Arc::new(karyos_sys::sync::AtomicU64::new(0));
+        // The handle, the gate and the ring's header all name the guard by
+        // its index in the guard words.
+        let (words, index) = self.guards.view(guarded.guard)?;
+        let (ring, consumed, writer) =
+            crate::guard_streams::new_ring(guarded.messages, state.epoch, index, place)?;
         let client = karyos_client::GuardBinding::new(
-            self.guards.view(guarded.guard)?,
-            0,
+            words,
+            index,
             state.epoch,
             Arc::clone(&ring) as Arc<dyn karyos_client::SharedWords>,
             Arc::clone(&consumed) as Arc<dyn karyos_client::ConsumedCell>,

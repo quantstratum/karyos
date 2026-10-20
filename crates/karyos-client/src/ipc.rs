@@ -89,6 +89,7 @@ use crate::conductor::{
 use crate::conflated_subscription::ConflatedSubscription;
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Successor};
+use crate::guarded::GuardBinding;
 use crate::journal::{ClientJournal, FetchableJournal};
 use crate::link::{ClientLink, Export, Owner};
 use crate::loss::{LossReporter, LossReports};
@@ -435,6 +436,109 @@ struct Fetched {
     incarnation: u64,
     /// The stream position where the buffer starts (G-d2c).
     base: u64,
+    /// A guarded publication's binding regions, not mapped yet (G-x3).
+    binding: Option<BindingFds>,
+}
+
+/// A binding region's descriptor whose export is live: dropped, it closes
+/// the descriptor, then detaches the export.
+#[derive(Debug)]
+struct BindingFd {
+    record: Record,
+    fd: OwnedFd,
+    detach: Detach,
+}
+
+/// The descriptors of a guarded publication's binding (`quantstratum-docs:
+/// karyos/design/guards-and-abort.md`, "The binding across processes"),
+/// in manifest order.
+#[derive(Debug)]
+struct BindingFds {
+    ring: BindingFd,
+    cell: BindingFd,
+    guards: BindingFd,
+}
+
+/// A region mapped read-only, holding its export: dropped, it unmaps, then
+/// detaches. The words of a guarded binding's ring or guard words.
+#[derive(Debug)]
+struct MappedWords {
+    region: ReadOnlyRegion,
+    _detach: Detach,
+}
+
+impl karyos_sys::load_words::LoadWords for MappedWords {
+    fn len(&self) -> usize {
+        self.region.structure().len()
+    }
+
+    fn load(&self, index: usize) -> Option<u64> {
+        self.region.structure().load(index)
+    }
+
+    fn load_acquire(&self, index: usize) -> Option<u64> {
+        self.region.structure().load_acquire(index)
+    }
+}
+
+/// A guarded binding's consumed cell, mapped writable for this client
+/// alone and holding its export: dropped, it unmaps, then detaches.
+#[derive(Debug)]
+struct MappedCell {
+    region: Region,
+    _detach: Detach,
+}
+
+impl crate::guarded::ConsumedCell for MappedCell {
+    fn cell(&self) -> &karyos_sys::sync::AtomicU64 {
+        // Attach checked the region against its record, whose structure is
+        // a nonzero multiple of the header stride: word 0 exists.
+        self.region
+            .structure()
+            .as_slice()
+            .first()
+            .unwrap_or_else(|| unreachable!("a mapped consumed cell holds a word"))
+    }
+}
+
+impl BindingFds {
+    /// Maps the binding's regions and binds a handle on `lanes` lanes to
+    /// them: the ring and the guard words read-only, the cell writable. The
+    /// ring's header names the guard's index and the admission epoch, which
+    /// must be open and fall within the guard words.
+    fn bind(self, instance: u128, lanes: u8) -> Result<GuardBinding, AttachError> {
+        let read_only = |part: BindingFd| -> Result<MappedWords, AttachError> {
+            let expected = fetched_region(instance, &part.record)?;
+            let region = ReadOnlyRegion::attach(part.fd, expected, SealProfile::DriverOnly)?;
+            Ok(MappedWords {
+                region,
+                _detach: part.detach,
+            })
+        };
+        let ring = read_only(self.ring)?;
+        let guards = read_only(self.guards)?;
+        let expected = fetched_region(instance, &self.cell.record)?;
+        let cell = MappedCell {
+            region: Region::attach(self.cell.fd, expected)?,
+            _detach: self.cell.detach,
+        };
+        let binding = karyos_sys::outcome_ring::binding(
+            &ring.region.structure(),
+            guards.region.structure().len(),
+        )
+        .map_err(|_| AttachError::Protocol)?;
+        let index = usize::try_from(binding.guard_index).map_err(|_| AttachError::Protocol)?;
+        GuardBinding::new(
+            Arc::new(guards),
+            index,
+            binding.epoch,
+            Arc::new(ring),
+            Arc::new(cell),
+            lanes,
+            binding.messages,
+        )
+        .map_err(|_| AttachError::Protocol)
+    }
 }
 
 /// One received message, with its descriptor.
@@ -1294,11 +1398,27 @@ impl RemoteClient {
         else {
             return Err(AttachError::Protocol);
         };
+        let instance = self.session.as_ref().ok_or(AttachError::Protocol)?.instance;
         self.take(fetchable, |fetched, export| {
+            // A guarded publication binds its granted regions first, so a
+            // refusal takes nothing (G-x3).
+            let lanes = fetched
+                .record
+                .lane
+                .checked_add(1)
+                .ok_or(AttachError::Protocol)?;
+            let guard = match fetched.binding.take() {
+                Some(binding) => Some(binding.bind(instance, lanes)?),
+                None => None,
+            };
             let inner = prepare_publication(fetched, export)?
                 .activate()
                 .map_err(|refused| AttachError::Sys(refused.error))?;
-            Ok(ClientPublication::new(inner, allow_unconnected))
+            let publication = ClientPublication::new(inner, allow_unconnected);
+            Ok(match guard {
+                Some(guard) => publication.with_guard(guard),
+                None => publication,
+            })
         })
     }
 
@@ -1370,13 +1490,13 @@ impl RemoteClient {
     fn take<H>(
         &self,
         fetchable: &Fetchable,
-        adopt: impl FnOnce(&Fetched, u64) -> Result<H, AttachError>,
+        adopt: impl FnOnce(&mut Fetched, u64) -> Result<H, AttachError>,
     ) -> Result<H, AttachError>
     where
         H: WithExport,
     {
         let session = self.session.as_ref().ok_or(AttachError::Protocol)?;
-        let fetched = fetch(session, fetchable)?;
+        let mut fetched = fetch(session, fetchable)?;
         let export = fetched.record.export;
         let generation = fetched.record.generation;
         let publication = (fetched.stream_registration, fetched.incarnation);
@@ -1388,7 +1508,11 @@ impl RemoteClient {
         } else {
             fetchable.request
         };
-        let built = check(&fetched, &request).and_then(|()| adopt(&fetched, export));
+        // Only a publication is granted a binding; it takes it in `adopt`.
+        let bindable = fetched.binding.is_none() || matches!(request, Request::Publication { .. });
+        let built = check(&fetched, &request)
+            .and_then(|()| bindable.then_some(()).ok_or(AttachError::Protocol))
+            .and_then(|()| adopt(&mut fetched, export));
         match built {
             Ok(handle) => {
                 drop(fetched);
@@ -1596,14 +1720,33 @@ fn prepare_successor(
 /// registration of the `Ready` response, and carry one log buffer record;
 /// the region is attached against that record and the session's full
 /// instance.
-fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachError> {
-    let fetched = fetch_region(
+fn fetch(session: &Arc<Session>, fetchable: &Fetchable) -> Result<Fetched, AttachError> {
+    let mut fetched = fetch_region(
         session,
         fetchable.key,
         fetchable.registration,
         WireKind::LogBuffer,
     )?;
     let export = fetched.record.export;
+    // A guarded publication's binding: each descriptor holds its export,
+    // so any failure from here detaches it.
+    let parts = core::mem::take(&mut fetched.binding);
+    let held: Vec<BindingFd> = parts
+        .into_iter()
+        .map(|(record, fd)| BindingFd {
+            record,
+            fd,
+            detach: Detach {
+                session: Arc::clone(session),
+                export: record.export,
+            },
+        })
+        .collect();
+    let binding = match <[BindingFd; 3]>::try_from(held) {
+        Ok([ring, cell, guards]) => Some(BindingFds { ring, cell, guards }),
+        // No binding; any other count was refused by the manifest check.
+        Err(_) => None,
+    };
     match LogBuffer::attach(fetched.region) {
         Ok(buffer) => Ok(Fetched {
             record: fetched.record,
@@ -1611,6 +1754,7 @@ fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachErro
             stream_registration: fetched.stream_registration,
             incarnation: fetched.incarnation,
             base: fetched.base,
+            binding,
         }),
         Err(error) => {
             session.detach(export);
@@ -1627,6 +1771,9 @@ struct FetchedRegion {
     stream_registration: u64,
     incarnation: u64,
     base: u64,
+    /// A guarded publication's binding records and descriptors, their
+    /// exports live.
+    binding: Vec<(Record, OwnedFd)>,
 }
 
 /// [`fetch_descriptor`], then the region attached writable against the
@@ -1649,9 +1796,14 @@ fn fetch_region(
             stream_registration: fetched.stream_registration,
             incarnation: fetched.incarnation,
             base: fetched.base,
+            binding: fetched.binding,
         }),
         Err(error) => {
             session.detach(record.export);
+            for (part, fd) in fetched.binding {
+                drop(fd);
+                session.detach(part.export);
+            }
             Err(error)
         }
     }
@@ -1665,12 +1817,16 @@ struct FetchedDescriptor {
     stream_registration: u64,
     incarnation: u64,
     base: u64,
+    /// A guarded publication's binding, after a log buffer record.
+    binding: Vec<(Record, OwnedFd)>,
 }
 
-/// Sends `Fetch { key }` and receives its `Manifest` and its one `Region`:
-/// the manifest must answer this fetch, with `key` and `registration`, and
-/// carry one record of `kind`. From the arrival of the descriptor the
-/// export is live.
+/// Sends `Fetch { key }` and receives its `Manifest` and one `Region` per
+/// record: the manifest must answer this fetch, with `key` and
+/// `registration`, and carry one record of `kind`, followed for a log
+/// buffer by a guarded publication's binding (the decoder checked its
+/// order and ids). From the arrival of each descriptor its export is
+/// live.
 fn fetch_descriptor(
     session: &Session,
     key: u64,
@@ -1691,7 +1847,7 @@ fn fetch_descriptor(
         fetch
     };
     send(&session.socket, &Message::Fetch { fetch, key }, None)?;
-    let (record, stream_registration, incarnation, base) = match receive(&session.socket)? {
+    let (records, stream_registration, incarnation, base) = match receive(&session.socket)? {
         (Message::Refused { fetch: got, code }, None) if got == fetch => {
             return Err(AttachError::Refused { code });
         }
@@ -1708,9 +1864,17 @@ fn fetch_descriptor(
             None,
         ) if got == fetch => {
             let expected = got_key == key && got_registration == registration;
-            match records[..] {
-                [record] if expected && record.kind == kind => {
-                    (record, stream_registration, incarnation, base)
+            let binding = records.get(1..).unwrap_or_default();
+            let shape = binding.is_empty()
+                || (kind == WireKind::LogBuffer
+                    && binding.iter().map(|record| record.kind).eq([
+                        WireKind::OutcomeRing,
+                        WireKind::ConsumedCell,
+                        WireKind::GuardRegion,
+                    ]));
+            match records.first() {
+                Some(record) if expected && record.kind == kind && shape => {
+                    (records, stream_registration, incarnation, base)
                 }
                 // Not the grant requested: the fetch is aborted, but its
                 // regions still follow; each descriptor is closed and its
@@ -1727,31 +1891,47 @@ fn fetch_descriptor(
             return Err(AttachError::Protocol);
         }
     };
-    let received = receive(&session.socket)?;
-    let (
-        Message::Region {
-            fetch: got,
-            index: 0,
-        },
-        Some(fd),
-    ) = received
-    else {
-        session.state().broken = true;
+    let mut fds = Vec::with_capacity(records.len());
+    for (index, record) in (0u64..).zip(&records) {
+        let received = receive(&session.socket);
+        let fd = match received {
+            Ok((
+                Message::Region {
+                    fetch: got,
+                    index: at,
+                },
+                Some(fd),
+            )) if got == fetch && at == index => fd,
+            _ => {
+                // Out of step: the descriptors that arrived are closed and
+                // their exports detached.
+                session.state().broken = true;
+                for (part, fd) in records.iter().zip(fds) {
+                    drop(fd);
+                    session.detach(part.export);
+                }
+                return match received {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(AttachError::Protocol),
+                };
+            }
+        };
+        // The descriptor arrived: from here the export is charged and must
+        // be detached.
+        session.state().live.push(record.export);
+        fds.push(fd);
+    }
+    let mut parts = records.into_iter().zip(fds);
+    let Some((record, fd)) = parts.next() else {
         return Err(AttachError::Protocol);
     };
-    if got != fetch {
-        session.state().broken = true;
-        return Err(AttachError::Protocol);
-    }
-    // The descriptor arrived: from here the export is charged and must be
-    // detached.
-    session.state().live.push(record.export);
     Ok(FetchedDescriptor {
         record,
         fd,
         stream_registration,
         incarnation,
         base,
+        binding: parts.collect(),
     })
 }
 
@@ -1779,12 +1959,17 @@ fn abort(session: &Session, fetch: u64, records: &[Record]) {
     }
 }
 
-/// The region header a fetched record describes: a log buffer, a journal
-/// or a conflation table.
+/// The region header a fetched record describes: a log buffer, a journal,
+/// a conflation table, or a region of a guarded publication's binding.
 fn fetched_region(instance: u128, record: &Record) -> Result<RegionRecord, AttachError> {
     if !matches!(
         record.kind,
-        WireKind::LogBuffer | WireKind::Journal | WireKind::ConflationTable
+        WireKind::LogBuffer
+            | WireKind::Journal
+            | WireKind::ConflationTable
+            | WireKind::OutcomeRing
+            | WireKind::ConsumedCell
+            | WireKind::GuardRegion
     ) {
         return Err(AttachError::Protocol);
     }
