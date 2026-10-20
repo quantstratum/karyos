@@ -62,8 +62,8 @@ test-only unsafe of the integration tests.
 | Driver out-parameters and detail (F5) | `karyos_driver_create`, `_do_work`, `_connect`, `_add_stream` | `tests/driver.rs` `a_struct_below_the_first_size_is_refused`, `a_refused_configuration_fills_nothing_but_the_status`, `a_client_of_the_driver_is_served_and_follows_its_close`, `a_stream_is_added_and_removed_through_the_abi` |
 | The outcome handler call: a local `karyos_outcome`, valid for the call; reentry refused (F7a-2) | `karyos_publication_poll_outcomes` | `abi::tests::outcomes::records_reach_the_handler_which_cannot_reenter_its_publication` |
 | The outcome poll's arguments and `delivered` write, checked before the handle (F7a-2) | `karyos_publication_poll_outcomes` | `abi::tests::outcomes::the_arguments_are_checked_before_the_handle` |
-| The timed offer's payload slice (F7a-3) | `karyos_publication_offer_at` | the `timed_offer_checks` tests of `abi::tests` |
-| The clock's `now` write; nothing written on refusal (F7a-3) | `karyos_clock_now` | the `clock` tests of `abi::tests` (Monotonic; a TAI read is native only) |
+| The timed offer's payload slice (F7a-3) | `karyos_publication_offer_at` | `abi::tests::a_timed_offer_checks_its_arguments_first` |
+| The clock's `now` write; nothing written on refusal (F7a-3) | `karyos_clock_now` | `abi::tests::the_clock_reads_the_monotonic_domain_and_refuses_bad_arguments` (a TAI read is native only) |
 | A caller's sized struct of another minor version (test support: `SizedStruct` in `tests/support/abi.rs`) | the conformance runner | `tests/conformance.rs` `the_sized_struct_checks_see_writes`; the library's side is `a_struct_from_a_newer_header_is_read_and_written_by_its_prefix` |
 
 ## What Miri does not cover
@@ -76,7 +76,9 @@ test-only unsafe of the integration tests.
   of `karyos-client`, `karyos-driver` and `tests/connect.rs` cover them.
 - **Network images** (UDP sockets):
   `a_network_subscription_grows_its_copy_with_a_larger_image` runs
-  natively.
+  natively, and so does the image change's populated write (`has` = 1,
+  through `write_sized`), which only a network image produces; under
+  Miri only `has` = 0 runs.
 - **Real C callers.** Miri calls the exports from Rust. The header check
   (`src/header.rs`) and the conformance runner (`tests/conformance.rs`)
   cover the C declarations; a binding's own runner covers its language.
