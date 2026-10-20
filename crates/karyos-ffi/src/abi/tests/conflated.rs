@@ -372,3 +372,33 @@ fn an_embedded_client_is_refused_a_view() {
     assert_eq!(add_publication_of(client, STREAM).0, Status::Ok.code());
     assert_eq!(karyos_client_close(client), Status::Ok.code());
 }
+
+/// A conflated view has no thread affinity (`karyos.h`, "Threads"): one
+/// subscribed on a thread is polled on another and closed on a third.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_view_moves_between_threads() {
+    let driver = c_driver();
+    let keyed = StreamOptions {
+        allow_unconnected: 1,
+        ..with_table(stream_options_of(KEYED))
+    };
+    assert_eq!(add_stream(driver, &keyed), Status::Ok.code());
+    let view = std::thread::spawn(move || {
+        let (status, view) = subscribe(driver, KEYED);
+        assert_eq!(status, Status::Ok.code());
+        view
+    })
+    .join()
+    .unwrap();
+    std::thread::spawn(move || {
+        let mut values = Values::default();
+        assert_eq!(poll_values(view, &mut values, 8), (Status::Ok.code(), 0));
+    })
+    .join()
+    .unwrap();
+    std::thread::spawn(move || assert_eq!(karyos_conflated_close(view), Status::Ok.code()))
+        .join()
+        .unwrap();
+    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+}

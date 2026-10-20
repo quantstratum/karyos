@@ -14,7 +14,8 @@
  * - Objects are 64-bit handles, never pointers. A closed handle answers
  *   KARYOS_E_CLOSED; a handle in use by another thread answers
  *   KARYOS_E_BUSY, and one reentered from its own callback answers
- *   KARYOS_E_REENTRANT. Calls never block on a handle.
+ *   KARYOS_E_REENTRANT. A call never waits for another call on its
+ *   handle; two bounded waits are listed under Threads below.
  * - A panic inside Karyos returns KARYOS_E_INTERNAL and poisons the handle
  *   it held.
  * - Callbacks must return normally: an exception, a panic or a longjmp
@@ -24,6 +25,38 @@
  *   the workspace version. Before 1.0 a caller accepts exactly the 0.y
  *   it targets with at least its minimum 0.y.z, and refuses any other
  *   version.
+ *
+ * Threads (karyos/design/embedded-api.md, "Requirements for the C ABI"):
+ * - No handle has thread affinity. A driver, client, publication, claim,
+ *   subscription, conflated view or Archive handle may be created, used,
+ *   moved and closed on any thread, a claim committed or aborted on a
+ *   thread other than the one that claimed it.
+ * - Calls on one handle are refused, never serialized: while one call
+ *   holds the handle, a call on it from another thread answers
+ *   KARYOS_E_BUSY at once, and one from the same thread (a callback that
+ *   reenters it) answers KARYOS_E_REENTRANT. Neither is undefined; retry
+ *   the BUSY one.
+ * - Calls on different handles run concurrently. A data-path call
+ *   (offer, claim, commit, abort and the polls of a publication,
+ *   subscription or conflated view) holds only its own handle, and its
+ *   publication's for a claim; a control call (adding a child, closing
+ *   one, karyos_client_poll, karyos_archive_connect and an Archive
+ *   listing) also holds the client, and an add with KARYOS_REJOIN_ARCHIVE
+ *   the Archive handle after it.
+ * - Callbacks run on the calling thread, inside the call, and the
+ *   handles the call holds stay held until they return. A started
+ *   driver's own thread (karyos_driver_start) runs duty cycles only and
+ *   never calls back.
+ * - Two waits are bounded. A driver call on a started driver waits for
+ *   the thread's current duty cycle: the thread yields the driver to a
+ *   waiting call before its next cycle. A commit, an abort or a close
+ *   that ends a claim holds the publication and waits for the claim's
+ *   handle, which a call holds only to read the publication it names,
+ *   taking nothing else meanwhile. Every other handle acquisition is a
+ *   try, so no call waits on a holder that waits in turn.
+ * - While a driver's own thread runs, karyos_driver_do_work and a second
+ *   karyos_driver_start answer KARYOS_E_BUSY; karyos_driver_stop and the
+ *   close work from any thread, and the close joins the thread.
  */
 
 #ifndef KARYOS_H

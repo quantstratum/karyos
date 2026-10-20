@@ -421,3 +421,56 @@ fn a_subscription_follows_its_clients_driver() {
     );
     client::close(client).unwrap();
 }
+
+/// A call on a started driver waits for about one duty cycle, not for as
+/// long as the thread keeps winning the driver's lock (`karyos.h`,
+/// "Threads"). Against a busy-spinning thread, which takes the lock back
+/// at once after each cycle, 32 adds and removes of streams each wait
+/// through at most the cycle in progress and the one that may start
+/// before the call announces itself: the thread's own cycle count, not a
+/// clock, so a loaded machine cannot fail it.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_call_on_a_busy_spinning_driver_waits_for_one_cycle() {
+    let _serial = serial();
+    let driver = created();
+    start(
+        driver,
+        Idle {
+            strategy: IDLE_BUSY_SPIN,
+            sleep_ns: 0,
+        },
+    )
+    .unwrap();
+    let cycles = || {
+        drivers()
+            .with(driver, |slot| match &slot.mode {
+                Mode::Threaded(threaded) => (
+                    threaded.cycles.done.load(Ordering::Acquire),
+                    threaded.cycles.most.load(Ordering::Acquire),
+                ),
+                _ => panic!("not started"),
+            })
+            .unwrap()
+    };
+    // The thread is spinning before the first call: on a loaded machine it
+    // may not have run yet.
+    let begun = std::time::Instant::now();
+    while cycles().0 == 0 {
+        assert!(
+            begun.elapsed() < std::time::Duration::from_secs(60),
+            "the thread never ran"
+        );
+        std::thread::yield_now();
+    }
+    for id in 1000..1032 {
+        add_stream(driver, &stream(id)).unwrap();
+        remove_stream(driver, id).unwrap();
+    }
+    let (done, most) = cycles();
+    close(driver).unwrap();
+    assert!(
+        most <= 2,
+        "a call waited through {most} cycles ({done} in all)"
+    );
+}

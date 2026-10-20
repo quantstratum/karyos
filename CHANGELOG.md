@@ -627,6 +627,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The C ABI's thread rules per handle kind (BIND-S2; quantstratum-docs:
+  `karyos/design/embedded-api.md`, "Requirements for the C ABI"), in a
+  "Threads" section of `karyos.h`. No handle has thread affinity: every
+  kind may be created, used, moved and closed on any thread, and a claim
+  committed on another thread. Concurrent calls on one handle are refused
+  with `KARYOS_E_BUSY`, never serialized, and calls on different handles
+  run concurrently: a data-path call holds only its handle, while a
+  control call also holds the client. Two waits are bounded: a call on a
+  started driver waits for one duty cycle, and ending a claim waits for
+  the claim's slot. A started driver's thread now yields the driver to a
+  waiting call before its next cycle, so a call waits through at most
+  the cycle in progress: before, under busy-spin or sustained work, the
+  thread could take its unfair lock back for an unbounded time.
+  `karyos-ffi` asserts at compile time that each
+  kind's object is `Send` and its table `Sync`
+  (`src/threads.rs`), and `abi::tests::threads` checks the runtime rules.
 - `karyos_archive::client::replay` (B6; quantstratum-docs:
   `karyos/design/archive-replay-control.md`): a `Replayer` that starts and
   stops replays over the Archive's control streams for a requester that
