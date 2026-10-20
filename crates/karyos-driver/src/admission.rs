@@ -449,6 +449,15 @@ impl<T: StreamTerms> Admission<T> {
             .map(|remote| crate::trace_journals::time_namespace_of(&remote.pidfd))
     }
 
+    /// The process id of admitted client `client`, as its pidfd proves;
+    /// `None` for a client that is not admitted with an open socket.
+    pub(crate) fn pid(&self, client: u64) -> Option<u32> {
+        self.remotes
+            .iter()
+            .find(|remote| remote.client == client)
+            .and_then(|remote| u32::try_from(remote.pidfd.pid()).ok())
+    }
+
     /// Takes `count` consecutive ids from a checked counter.
     /// The driver instance and a fresh region id for a stream's log buffer
     /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Terms in the
