@@ -116,3 +116,49 @@ fn a_close_while_the_journal_is_down_then_a_crash_leaves_an_unclean_stop() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A journal that cannot be opened at start is an unknown interval the
+/// journal can never record (#497): the view shows it with its alert
+/// until an administrator acknowledges it, in memory only.
+#[test]
+fn a_journal_that_cannot_open_is_an_alert_until_acknowledged() {
+    let dir = std::env::temp_dir().join(format!("karyos-agent-unopened-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A file where the journal directory should be: the open fails.
+    let journal_dir = dir.join("journal");
+    std::fs::write(&journal_dir, b"not a directory").unwrap();
+    let config = AgentConfig::new(Vec::new()).with_journal(journal_dir);
+    let mut agent = Agent::new(config);
+    let journal = agent.view().journal.unwrap();
+    assert!(journal.unavailable);
+    assert!(journal.error.is_some());
+    let gap = journal.gap.unwrap();
+    assert_eq!(gap.reason, "journal_unavailable_at_start");
+    assert_eq!(gap.position, UNOPENED_POSITION);
+    assert!(gap.to > 0);
+    assert!(
+        journal
+            .alerts
+            .iter()
+            .any(|alert| alert.kind == AlertKind::JournalGap && alert.participant == gap.position)
+    );
+    // Only its own position acknowledges it.
+    assert!(matches!(
+        agent.acknowledge_gap(0, 0),
+        Err(JournalError::NoGap)
+    ));
+    agent.acknowledge_gap(UNOPENED_POSITION, 0).unwrap();
+    let journal = agent.view().journal.unwrap();
+    assert_eq!(journal.gap, None);
+    assert!(journal.alerts.is_empty());
+    // Still unavailable, and still why.
+    assert!(journal.unavailable);
+    assert!(journal.error.is_some());
+    assert!(matches!(
+        agent.acknowledge_gap(UNOPENED_POSITION, 0),
+        Err(JournalError::NoGap)
+    ));
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+}
