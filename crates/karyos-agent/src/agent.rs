@@ -381,6 +381,8 @@ fn read_rings(
             requester: record.requester,
             outcome: record.outcome,
             refusal: record.refusal,
+            operator: record.operator,
+            parameters: record.parameters,
         });
     });
     guards.cursor = cursor;

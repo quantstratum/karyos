@@ -266,14 +266,19 @@ pub struct GuardEntry {
     pub after: u64,
     /// The requester's operation id.
     pub operation: u64,
-    /// 0 the in-process caller, 1 an admitted client.
+    /// 0 the in-process caller, 1 an admitted client, 2 an operator
+    /// through an admitted client (M10).
     pub requester_kind: u8,
-    /// The client id for a client, else 0.
+    /// The client id for a client or an operator's client, else 0.
     pub requester: u64,
     /// 1 closed, 2 already closed, 3 reopened, 4 refused.
     pub outcome: u8,
     /// The control error code of a refusal, else 0.
     pub refusal: u16,
+    /// The operator's uid (`requester_kind` 2), else 0 (M10).
+    pub operator: u64,
+    /// The command's parameters digest, 0 when none was given (M10).
+    pub parameters: u64,
 }
 
 /// One publication lane's latencies within the trace window: the pairs of

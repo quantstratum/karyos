@@ -11,6 +11,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `GuardClose` and `GuardReopen` carry the operator a client acts for and
+  a parameters digest (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M10 and owner item 6),
+  in place under admission `VERSION` 2, which is unreleased: `GuardClose`
+  grows from 3 to 5 words and `GuardReopen` from 4 to 6.
+  `karyos_protocol::cnc::guard_parameters` is the digest, 64-bit FNV-1a
+  over the guard, the expected epoch (0 for a close), the operation id and
+  the operator uid, then the operator's reason: a correlation aid, not a
+  security digest. The driver audits a command naming an operator as
+  `Requester::Operator { client, uid }`, and every record carries the
+  digest (`AuditRecord::parameters`). The guard audit ring of
+  `karyos_sys::diag` writes the operator uid and the digest into words 8
+  and 9 of its record, zero before, with `requester_kind` 2 for an
+  operator; the record's size is unchanged. The management agent's guard
+  feed and API v1's JSON append `operator` and `parameters` to each
+  record.
+
 - karyos-client's public enums and report structs are `#[non_exhaustive]`
   before alpha.2 (quantstratum-docs:
   `karyos/testing/public-api-audit-alpha2.md`), so later minor releases can
@@ -405,6 +422,15 @@ release may break APIs, wire formats and shared-memory layouts.
   a refresh reads nothing; a read that may mix passes changes nothing,
   and a new close of the guard starts it over. The driver's
   `guard_ack_timeout` is the bound: the rule has no option of its own.
+
+- Guard close and reopen for a client (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M10):
+  `ClientConductor::guard_close(guard, operation, operator, reason)` and
+  `guard_reopen(guard, expected, operation, operator, reason)`, and the same
+  on `RemoteClient`, complete as `Outcome::GuardState { guard, state }` or
+  are refused as the driver documents. They compute the parameters digest
+  from the request; a reopen naming an epoch that cannot be closed is
+  refused before submission (`ConductorError::InvalidGuardEpoch`).
 
 - Guard close acknowledgements for tools (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M4b). While a guard is
