@@ -263,3 +263,39 @@ fn a_page_short_of_a_left_out_recording_does_not_end_the_listing() {
     rig.page(third, &[]);
     assert_eq!(ids(&rig.lister.poll()), [1, 3, 4, 5, 6]);
 }
+
+/// F9a (ffi-archive.md): a bounded listing starts at its id, asks for no
+/// more than it has left to keep, and ends once it kept its count, with
+/// no page asked for past it; a page short of it goes on, as a full
+/// listing's does. A count of 0 lists nothing.
+#[test]
+fn a_bounded_listing_asks_for_no_more_than_its_count() {
+    let mut rig = rig(2, 100);
+    rig.lister.start_from(4, 3);
+    assert_eq!(rig.lister.poll(), ListPoll::Pending);
+    let (first, from, count) = rig.request();
+    assert_eq!((from, count), (4, 2));
+    rig.page(first, &[4, 6]);
+    assert_eq!(rig.lister.poll(), ListPoll::Pending);
+    // One left: a page of one, from the id after the last.
+    let (second, from, count) = rig.request();
+    assert_eq!((from, count), (7, 1));
+    rig.page(second, &[9]);
+    let done = rig.lister.poll();
+    assert_eq!(ids(&done), [4, 6, 9]);
+    assert!(
+        rig.sent.lock().unwrap().is_empty(),
+        "no page past the count"
+    );
+    // An Archive that sends more than asked: only the count is kept.
+    rig.lister.start_from(0, 1);
+    assert_eq!(rig.lister.poll(), ListPoll::Pending);
+    let (third, _, count) = rig.request();
+    assert_eq!(count, 1);
+    rig.page(third, &[1, 2]);
+    assert_eq!(ids(&rig.lister.poll()), [1]);
+    // Nothing to list.
+    rig.lister.start_from(0, 0);
+    assert_eq!(rig.lister.poll(), ListPoll::Idle);
+    assert!(rig.sent.lock().unwrap().is_empty());
+}
