@@ -89,8 +89,10 @@ use crate::subscription::{
 };
 
 mod publish;
+mod rejoin;
 
 pub use publish::{Accepted, Claim, MessageLength, OfferError, OfferOptions, Publication};
+pub use rejoin::{NotRejoinable, RejoiningSubscription};
 
 /// Default wait of a control call.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2430,5 +2432,87 @@ mod tests {
         assert!(!poll.stopped_at_seal);
         let stop = poll.stopped.unwrap();
         assert!(stop.summary.closed.is_some(), "{stop:?}");
+    }
+
+    /// A provider that never answers: what `rejoin_with` takes.
+    struct Never;
+
+    impl crate::merge::ReplayProvider for Never {
+        fn replay(&mut self, _: &crate::merge::ReplayRequest) -> crate::merge::ReplayStatus {
+            crate::merge::ReplayStatus::Pending
+        }
+
+        fn cancel(&mut self) {}
+    }
+
+    /// F9-0 (ffi-archive.md): a stream subscription that names its
+    /// publication becomes a rejoin of that source, and is given back
+    /// unchanged by `into_subscription`; one that names none, and a
+    /// network subscription, are refused and handed back.
+    #[test]
+    fn a_subscription_rejoins_only_with_a_source_of_its_own() {
+        use crate::subscription::Secondary;
+
+        let source = karyos_protocol::trace_hook::PublicationIdentity {
+            driver: [7, 8],
+            registration: 9,
+            stream_id: 2,
+            session_id: 1,
+            incarnation: 1,
+        };
+        let named = image(1, 1)
+            .subscription
+            .with_loss_reports(crate::loss::LossReporter {
+                publication: source,
+                registration: 10,
+                reports: Arc::new(crate::loss::LossReports::default()),
+            });
+        let stream = |subscription| Subscription {
+            kind: Kind::Stream(Box::new(subscription)),
+        };
+        // A subscription that closes on an overrun: the rejoin sets that
+        // policy aside.
+        let mut named = named;
+        let _ = named.replace_rejoin(crate::subscription::RejoinPolicy::Close);
+        let rejoining = stream(named)
+            .rejoin_with(Box::new(Never), Secondary::RejoinAtHead)
+            .unwrap();
+        assert_eq!(*rejoining.source(), source);
+        assert!(!rejoining.is_recovering());
+        assert_eq!(rejoining.merge_failure(), None);
+        let back = rejoining.into_subscription().unwrap();
+        // Its own policy, set aside while it rejoined, comes back.
+        let Kind::Stream(mut back) = back.kind else {
+            panic!("not a stream");
+        };
+        assert!(matches!(
+            back.replace_rejoin(crate::subscription::RejoinPolicy::RejoinAtHead),
+            crate::subscription::RejoinPolicy::Close
+        ));
+
+        let refused = stream(image(2, 2).subscription)
+            .rejoin_with(Box::new(Never), Secondary::RejoinAtHead)
+            .unwrap_err();
+        assert!(matches!(refused.error, ClientError::InvalidOptions { .. }));
+        assert!(matches!(refused.subscription.kind, Kind::Stream(_)));
+
+        let network = Subscription {
+            kind: Kind::Images(Images {
+                registration: 1,
+                inbox: Arc::new(Inbox::new(1)),
+                released: Arc::new(Mutex::new(Vec::new())),
+                images: Vec::new(),
+                next: 0,
+                closed: None,
+                changes: std::collections::VecDeque::new(),
+                max_changes: 3,
+                changes_lost: 0,
+            }),
+        };
+        let refused = network
+            .rejoin_with(Box::new(Never), Secondary::RejoinAtHead)
+            .unwrap_err();
+        assert!(matches!(refused.error, ClientError::InvalidOptions { .. }));
+        assert!(matches!(refused.subscription.kind, Kind::Images(_)));
     }
 }

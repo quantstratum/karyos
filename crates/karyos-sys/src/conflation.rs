@@ -125,6 +125,8 @@ impl ConflationConfig {
     /// its largest value (a capacity past `u32`, which no message reaches,
     /// counts as `u32::MAX`).
     #[must_use]
+    // Loom builds leave `log_buffer` out, and model no publication.
+    #[cfg(not(loom))]
     pub fn shape(&self) -> crate::log_buffer::ConflationShape {
         crate::log_buffer::ConflationShape::new(
             self.keys,
@@ -142,6 +144,7 @@ impl ConflationConfig {
     /// # Errors
     ///
     /// As [`ConflationShape::validate_publication`].
+    #[cfg(not(loom))]
     pub fn validate_publication(
         &self,
         reserved_value: i64,
