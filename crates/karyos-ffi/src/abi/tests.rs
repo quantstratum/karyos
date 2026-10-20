@@ -1780,7 +1780,7 @@ fn an_older_headers_subscription_options_are_filled_within_their_size() {
     let status = unsafe {
         karyos_subscription_options_init_sized(
             (&raw mut older).cast(),
-            widen(SUBSCRIPTION_OPTIONS_SIZE_0_1 - 4),
+            usize::try_from(SUBSCRIPTION_OPTIONS_SIZE_0_1 - 4).unwrap(),
         )
     };
     assert_eq!(status, Status::InvalidArgument.code());
@@ -1848,7 +1848,7 @@ fn an_older_headers_stream_options_are_filled_within_their_size() {
             unsafe { karyos_stream_options_init(options) }
         } else {
             // SAFETY: `room` is more than `size` writable bytes.
-            unsafe { karyos_stream_options_init_sized(options, widen(size)) }
+            unsafe { karyos_stream_options_init_sized(options, usize::try_from(size).unwrap()) }
         };
         assert_eq!(status, Status::Ok.code());
         let written = if legacy {
