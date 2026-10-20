@@ -114,7 +114,9 @@ trap 'rm -f "$static_log"; rm -rf "$stage"' EXIT
 "$cargo" rustc -p karyos-ffi --lib --release --locked --crate-type staticlib \
     -- --print native-static-libs 2>"$static_log" ||
     { cat "$static_log" >&2; fail "the staticlib build failed"; }
+# Cargo replays the note when the staticlib is fresh.
 native="$(sed -n 's/^note: native-static-libs: //p' "$static_log" | tail -n 1)"
+[ -n "$native" ] || fail "rustc printed no native-static-libs for the staticlib"
 "$cargo" rustc -p karyos-ffi --lib --release --locked --crate-type cdylib \
     -- "${id_args[@]}"
 
