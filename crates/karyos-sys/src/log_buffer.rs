@@ -2746,6 +2746,11 @@ pub enum SealReason {
     /// (publication-seal.md). The clean end of an image; a reader that met
     /// a loss on the way (a replay's local gap) still has no clean EOS.
     EndOfStream,
+    /// A timed lane's publisher breached the schedule ring's protocol
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`, section 11, TT-6):
+    /// the sender's checks of the words it copied failed. Reported as
+    /// [`AppendOutcome::Gated`], as a missed deadline is.
+    ScheduleViolation,
 }
 
 impl SealReason {
@@ -2762,6 +2767,7 @@ impl SealReason {
             Self::DeadlineMissed => 6,
             Self::ImageRetired => 7,
             Self::EndOfStream => 8,
+            Self::ScheduleViolation => 9,
         }
     }
 
@@ -2769,7 +2775,10 @@ impl SealReason {
     /// than `Closed` (guards-and-abort.md, GC-8).
     #[must_use]
     pub const fn is_gate(self) -> bool {
-        matches!(self, Self::GuardClosed | Self::DeadlineMissed)
+        matches!(
+            self,
+            Self::GuardClosed | Self::DeadlineMissed | Self::ScheduleViolation
+        )
     }
 
     /// The reason a code names; an unknown code is `Unspecified`.
@@ -2784,6 +2793,7 @@ impl SealReason {
             6 => Self::DeadlineMissed,
             7 => Self::ImageRetired,
             8 => Self::EndOfStream,
+            9 => Self::ScheduleViolation,
             _ => Self::Unspecified,
         }
     }
@@ -5232,9 +5242,11 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
 /// a cutover seal. Version 3 adds the schedule capacity to the
 /// configuration block and, for a timed lane, the schedule ring section
 /// before the terms (`quantstratum-docs: karyos/design/timed-tx.md`,
-/// TT-1); version 1 and 2 regions are refused at attach (only version 1
-/// shipped, in v0.1.0-alpha.1).
-pub const LAYOUT_VERSION: u64 = 3;
+/// TT-1). Version 4 grows the schedule ring's header from three words to
+/// eight, with the lane's binding (timed-tx.md section 11, TT-6b). Regions
+/// of versions 1 to 3 are refused at attach (only version 1 shipped, in
+/// v0.1.0-alpha.1).
+pub const LAYOUT_VERSION: u64 = 4;
 
 /// Bit 0 of an image's capabilities word (`image_capabilities`, the word
 /// after `join` in the configuration block): the image may hold local gap
@@ -5600,7 +5612,8 @@ mod region_tests {
         for (index, value) in [
             (0, 1),
             (0, 2),
-            (0, 4),
+            (0, 3),
+            (0, 5),
             (18, 3),
             (18, 8),
             (19, 1),
@@ -5663,8 +5676,8 @@ mod region_tests {
         let attached = attach(&creator).unwrap();
         assert_eq!(attached.config().schedule_capacity, 8);
         let seen = attached.schedule_ring().unwrap();
-        let reader = crate::schedule_ring::ScheduleReader::attach(seen).unwrap();
-        assert_eq!(reader.peek(seen), Ok(Some(entry)));
+        let mut reader = crate::schedule_ring::ScheduleReader::attach(seen).unwrap();
+        assert_eq!(reader.peek(seen, 0, u64::MAX), Ok(Some(entry)));
     }
 
     /// Rings of capacity 1 and 2 round to the same region length, so a
@@ -5708,18 +5721,19 @@ mod region_tests {
     }
 
     /// A region of an older layout version, 1 (shipped in v0.1.0-alpha.1,
-    /// before the seal word's successor bit, ADR-0061) or 2 (before the
-    /// schedule ring, TT-1), is refused at attach with `LayoutVersion`, by
+    /// before the seal word's successor bit, ADR-0061), 2 (before the
+    /// schedule ring, TT-1) or 3 (before the ring's eight word header,
+    /// TT-6b), is refused at attach with `LayoutVersion`, by
     /// its record and by its configuration block, so a mixed build never
     /// misreads a seal or a ring.
     #[test]
     fn attach_refuses_an_older_region() {
-        assert_eq!(LAYOUT_VERSION, 3);
+        assert_eq!(LAYOUT_VERSION, 4);
         let creator =
             LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
         let record = creator.region().unwrap().record();
         let source = creator.region().unwrap().structure();
-        for (record_layout, block_version) in [(1, 1), (2, 2), (2, 3), (3, 2), (3, 1)] {
+        for (record_layout, block_version) in [(1, 1), (2, 2), (3, 3), (3, 4), (4, 3), (4, 1)] {
             let old = Region::create(RegionRecord {
                 region: 9,
                 layout: record_layout,

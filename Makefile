@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos deny deps-inventory deps-check lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -70,6 +70,13 @@ miri:
 
 build-release:
 	RUSTFLAGS="-D warnings" $(CARGO) build --workspace --release --locked
+
+# libkaryos packaged for the language bindings (include, lib, pkg-config,
+# the conformance suite and a MANIFEST) into LIBKARYOS_DIR, by default
+# target/libkaryos (quantstratum-docs: karyos/design/bindings-plan.md, B1).
+# Not part of pre-push.
+libkaryos:
+	CARGO="$(CARGO)" scripts/package-libkaryos.sh $(LIBKARYOS_DIR)
 
 deny:
 	$(CARGO) deny check

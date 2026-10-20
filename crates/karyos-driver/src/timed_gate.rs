@@ -82,14 +82,20 @@ pub struct LatePolicy {
     /// Abort the lane when a head misses its time plus the tolerance,
     /// instead of sending it late.
     pub cancel_on_deadline: bool,
+    /// The sender's own horizon: an entry whose time is past the sender's
+    /// clock plus it breaches the schedule ring's protocol (timed-tx.md
+    /// section 11, TT-6).
+    pub max_horizon: u64,
 }
 
 impl Default for LatePolicy {
-    /// The provisional defaults (TT-3): 1 ms of tolerance, sent late.
+    /// The provisional defaults (TT-3): 1 ms of tolerance, sent late, and a
+    /// horizon of 1 s.
     fn default() -> Self {
         Self {
             tolerance: 1_000_000,
             cancel_on_deadline: false,
+            max_horizon: 1_000_000_000,
         }
     }
 }

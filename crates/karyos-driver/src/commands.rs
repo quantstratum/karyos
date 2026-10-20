@@ -5552,12 +5552,12 @@ mod tests {
         let ring = driver.streams[0].buffer.schedule_ring().unwrap();
         let mut sender = karyos_sys::schedule_ring::ScheduleReader::attach(ring).unwrap();
         for (position, time) in accepted {
-            let entry = sender.peek(ring).unwrap().unwrap();
+            let entry = sender.peek(ring, 0, u64::MAX).unwrap().unwrap();
             assert_eq!((entry.position, entry.time), (position, time));
-            sender.advance(ring).unwrap();
+            sender.advance().unwrap();
             sender.release(ring).unwrap();
         }
-        assert_eq!(sender.peek(ring).unwrap(), None);
+        assert_eq!(sender.peek(ring, 0, u64::MAX).unwrap(), None);
         assert!(matches!(
             publication.offer_at(b"timed", 41).unwrap(),
             karyos_client::OfferOutcome::Accepted { .. }

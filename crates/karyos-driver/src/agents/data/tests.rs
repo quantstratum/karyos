@@ -808,6 +808,125 @@ fn a_tail_dropped_by_a_reset_is_not_drained() {
     }
 }
 
+/// T-x1 (timed-tx.md section 11, TT-6): an entry whose time is past the
+/// sender's clock plus its own horizon is the publisher's violation. The
+/// sender counts it once in `schedule_faults` and stages nothing more of
+/// the lane (interim, until T-x2 seals it with `ScheduleViolation`).
+#[test]
+fn a_schedule_violation_stops_the_lane_counted_once() {
+    use karyos_sys::log_buffer::ScheduledOutcome;
+
+    use super::testing::outbound_timed;
+    use crate::timed_gate::LatePolicy;
+
+    let socket = ScriptedSocket::new();
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (mut path, mut log) = outbound_timed(EndpointId(1), alias, destination, term, 4);
+    let policy = LatePolicy {
+        max_horizon: 10,
+        ..LatePolicy::default()
+    };
+    path.set_timed(&[policy], vec![None], 0).unwrap();
+    // The append path does not check the horizon: the sender must.
+    for time in [5, 100, 100] {
+        assert!(matches!(
+            log.publications[0]
+                .append_scheduled(&[1; 100], AppendOptions::default(), time)
+                .unwrap(),
+            ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+        ));
+    }
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    for now in 1..5 {
+        let _ = path.serve(&mut tx, budget, None, now).unwrap();
+    }
+    assert_eq!(path.counters().staged, 1, "only the entry in reach");
+    assert_eq!(path.counters().schedule_faults, 1, "counted once");
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while !matches!(
+        endpoint.retire(&mut report),
+        karyos_io::sockets::endpoint::Retired::Complete { .. }
+    ) {
+        while report.pop_front().is_some() {}
+    }
+}
+
+/// T-x1 review P2 (timed-tx.md section 11, TT-6): an entry's position is
+/// checked against its frame, and a forged one is the publisher's breach
+/// like a ring violation: counted once in `schedule_faults`, and the lane
+/// stages nothing more, on every later duty.
+#[test]
+fn a_forged_entry_position_stops_the_lane_counted_once() {
+    use karyos_sys::log_buffer::ScheduledOutcome;
+    use karyos_sys::schedule_ring::HEADER_WORDS;
+    use karyos_sys::sync::Ordering;
+
+    use super::testing::outbound_timed;
+    use crate::timed_gate::LatePolicy;
+
+    let socket = ScriptedSocket::new();
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (mut path, mut log) = outbound_timed(EndpointId(1), alias, destination, term, 4);
+    path.set_timed(&[LatePolicy::default()], vec![None], 0)
+        .unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            log.publications[0]
+                .append_scheduled(&[1; 100], AppendOptions::default(), 0)
+                .unwrap(),
+            ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+        ));
+    }
+    // The first entry's position, forged: no frame lies there.
+    let ring = log.lanes[0].schedule_ring().unwrap();
+    ring[HEADER_WORDS].store(999, Ordering::Relaxed);
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    for now in 1..5 {
+        let _ = path.serve(&mut tx, budget, None, now).unwrap();
+    }
+    assert_eq!(path.counters().staged, 0);
+    assert_eq!(path.counters().schedule_faults, 1, "counted once");
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while !matches!(
+        endpoint.retire(&mut report),
+        karyos_io::sockets::endpoint::Retired::Complete { .. }
+    ) {
+        while report.pop_front().is_some() {}
+    }
+}
+
 /// #404 re-check P3: a timed message whose last fragment never reached its
 /// queue frees its own schedule entry, the newest read: an older message
 /// still staged keeps its slot, so the publisher's ring stays full until

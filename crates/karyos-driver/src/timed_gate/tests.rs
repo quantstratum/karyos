@@ -432,6 +432,7 @@ fn cancel() -> LatePolicy {
     LatePolicy {
         tolerance: TOLERANCE,
         cancel_on_deadline: true,
+        max_horizon: u64::MAX,
     }
 }
 
@@ -489,6 +490,7 @@ fn without_cancel_late_heads_are_sent_and_counted() {
     let policy = LatePolicy {
         tolerance: TOLERANCE,
         cancel_on_deadline: false,
+        max_horizon: u64::MAX,
     };
     let mut f = Fixture::with_policy(1, None, policy);
     f.stage(0, Some(NOW));

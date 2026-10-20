@@ -478,9 +478,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     Vec::with_capacity(usize::from(handle.lanes())),
                 )
             });
+            let options = found.schedule.unwrap_or_default();
             policies.push(crate::timed_gate::LatePolicy {
-                tolerance: found.schedule.unwrap_or_default().lateness_tolerance,
+                tolerance: options.lateness_tolerance,
                 cancel_on_deadline: false,
+                max_horizon: options.max_horizon,
             });
             counters.push(cells);
         }

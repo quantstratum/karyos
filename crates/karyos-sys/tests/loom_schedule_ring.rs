@@ -39,6 +39,11 @@
 //! sender that observes the committed block finds its entry (review of the
 //! T1 step 3b design, ACS 15421). Its control publishes the block first.
 //!
+//! A fourth model has a hostile publisher rewrite an entry's time after
+//! pushing it (timed-tx.md section 11, TT-6): the sender reads the entry
+//! again after a rewind and finds its copy, never the rewrite. Its control
+//! reads the shared words again instead of the copy.
+//!
 //! Run with `make loom`.
 
 #![cfg(loom)]
@@ -52,7 +57,7 @@
 use karyos_sys::frame::{Flags, FrameType, Lane, Word0};
 use karyos_sys::publication::{observe_block, publish_block};
 use karyos_sys::schedule_ring::{
-    Entry, SchedulePublisher, ScheduleReader, Witness, init, ring_words,
+    Entry, HEADER_WORDS, SchedulePublisher, ScheduleReader, Witness, init, ring_words,
 };
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::cell::UnsafeCell;
@@ -106,7 +111,7 @@ fn model(variant: Variant) {
                     let early = if variant == Variant::ReleaseFirst {
                         None
                     } else {
-                        reader.peek(&ring).unwrap()
+                        reader.peek(&ring, 0, u64::MAX).unwrap()
                     };
                     if let Some(early) = early {
                         assert_eq!(early, entry(next), "stale entry");
@@ -117,11 +122,11 @@ fn model(variant: Variant) {
                         }
                         // Retried after the commit, never consumed early.
                         let read = reader
-                            .peek(&ring)
+                            .peek(&ring, 0, u64::MAX)
                             .unwrap()
                             .unwrap_or_else(|| panic!("entry missing for message {next}"));
                         assert_eq!(read, entry(next), "torn entry");
-                        reader.advance(&ring).unwrap();
+                        reader.advance().unwrap();
                         if variant != Variant::ReleaseFirst {
                             reader.release(&ring).unwrap();
                         }
@@ -207,10 +212,10 @@ fn commit_model(block_first: bool) {
                 }
             })
         };
-        let reader = ScheduleReader::attach(&ring).unwrap();
+        let mut reader = ScheduleReader::attach(&ring).unwrap();
         if observe_block(&block) != 0 {
             let read = reader
-                .peek(&ring)
+                .peek(&ring, 0, u64::MAX)
                 .unwrap()
                 .unwrap_or_else(|| panic!("entry missing for a committed block"));
             assert_eq!(read, entry(0));
@@ -234,16 +239,15 @@ fn control_the_block_committed_before_its_entry() {
 /// messages wrap a ring of two. With `past_cursor`, the negative control
 /// releases one entry beyond what it read.
 fn read_ahead_model(past_cursor: bool) {
-    read_ahead_model_with(past_cursor, None, false);
+    read_ahead_model_with(past_cursor, false, false);
 }
 
 /// The read-ahead model, with a rewind after each release when `rewind`
-/// is set (`Some(true)` rewinds past `head`, the control): a rewind to
-/// `head` reads again only entries still the ones written, whatever the
-/// publisher does meanwhile, because a slot not released is never reused.
-/// With `before_release`, it also rewinds right after reading ahead, with
-/// nothing released since the last pass.
-fn read_ahead_model_with(past_cursor: bool, rewind: Option<bool>, before_release: bool) {
+/// is set: a rewind to `head` reads again the copies of the entries
+/// written, whatever the publisher does meanwhile. With `before_release`,
+/// it also rewinds right after reading ahead, with nothing released since
+/// the last pass.
+fn read_ahead_model_with(past_cursor: bool, rewind: bool, before_release: bool) {
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(3);
     builder.check(move || {
@@ -260,23 +264,20 @@ fn read_ahead_model_with(past_cursor: bool, rewind: Option<bool>, before_release
                 if past_cursor {
                     reader = reader.with_unchecked_release();
                 }
-                if rewind == Some(true) {
-                    reader = reader.with_rewind_past_head();
-                }
                 let mut read = 0;
                 while reader.released() < AHEAD {
                     // Read ahead while entries are there.
-                    while let Some(found) = reader.peek(&ring).unwrap() {
+                    while let Some(found) = reader.peek(&ring, 0, u64::MAX).unwrap() {
                         assert_eq!(found, entry(read), "torn entry");
-                        reader.advance(&ring).unwrap();
+                        reader.advance().unwrap();
                         read += 1;
                     }
                     if before_release && reader.read() > reader.released() {
                         reader.rewind_to_released();
                         read = reader.read();
-                        while let Some(found) = reader.peek(&ring).unwrap() {
+                        while let Some(found) = reader.peek(&ring, 0, u64::MAX).unwrap() {
                             assert_eq!(found, entry(read), "torn entry");
-                            reader.advance(&ring).unwrap();
+                            reader.advance().unwrap();
                             read += 1;
                         }
                     }
@@ -285,7 +286,7 @@ fn read_ahead_model_with(past_cursor: bool, rewind: Option<bool>, before_release
                     let limit = reader.read() + u64::from(past_cursor);
                     if reader.released() < limit && reader.released() < AHEAD {
                         reader.release(&ring).unwrap();
-                        if rewind.is_some() {
+                        if rewind {
                             // A reliable sender's reset: read again from
                             // the oldest entry not released.
                             reader.rewind_to_released();
@@ -322,16 +323,59 @@ fn control_reading_ahead_with_a_release_past_the_cursor() {
 
 #[test]
 fn a_rewind_reads_only_entries_never_reused() {
-    read_ahead_model_with(false, Some(false), false);
+    read_ahead_model_with(false, true, false);
 }
 
 #[test]
 fn a_rewind_after_reading_ahead_with_no_release_reads_the_same_entries() {
-    read_ahead_model_with(false, Some(false), true);
+    read_ahead_model_with(false, true, true);
+}
+
+/// A hostile publisher rewrites an entry's time after pushing it
+/// (timed-tx.md section 11, TT-6): the sender, which copied the entry
+/// once, reads the same entry again after a rewind, whatever the rewrite's
+/// timing. With `reread`, the negative control reads the shared words
+/// again instead of its copy, and sees the rewrite.
+fn rewrite_model(reread: bool) {
+    loom::model(move || {
+        let words = ring_words(usize::try_from(CAPACITY).unwrap()).unwrap();
+        let ring: Arc<Vec<AtomicU64>> = Arc::new((0..words).map(|_| AtomicU64::new(0)).collect());
+        init(&ring, CAPACITY).unwrap();
+        let publisher = {
+            let ring = Arc::clone(&ring);
+            thread::spawn(move || {
+                let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+                assert!(publisher.has_room(&ring).unwrap());
+                publisher.push(&ring, entry(0)).unwrap();
+                // Slot 0's time word, rewritten below the entry's time.
+                ring[HEADER_WORDS + 1].store(1, Ordering::Relaxed);
+            })
+        };
+        let mut reader = ScheduleReader::attach(&ring).unwrap();
+        if reread {
+            reader = reader.with_reread();
+        }
+        let first = loop {
+            if let Some(found) = reader.peek(&ring, 0, u64::MAX).unwrap() {
+                break found;
+            }
+            thread::yield_now();
+        };
+        reader.advance().unwrap();
+        reader.rewind_to_released();
+        let again = reader.peek(&ring, 0, u64::MAX).unwrap();
+        assert_eq!(again, Some(first), "rewritten entry");
+        publisher.join().unwrap();
+    });
 }
 
 #[test]
-#[should_panic(expected = "Causality violation")]
-fn control_a_rewind_past_head() {
-    read_ahead_model_with(false, Some(true), false);
+fn an_entry_read_again_is_its_copy() {
+    rewrite_model(false);
+}
+
+#[test]
+#[should_panic(expected = "rewritten entry")]
+fn control_an_entry_read_again_from_the_ring() {
+    rewrite_model(true);
 }

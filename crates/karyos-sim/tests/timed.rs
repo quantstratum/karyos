@@ -352,7 +352,9 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
         .map_err(|error| setup(format!("{error:?}")))?;
     let mut consumer = ring(&driver, handle)
         .ok_or_else(|| "no schedule ring".to_owned())
-        .and_then(|words| ScheduleConsumer::new(words).map_err(|error| format!("{error:?}")))
+        .and_then(|words| {
+            ScheduleConsumer::new(words, u64::MAX).map_err(|error| format!("{error:?}"))
+        })
         .map_err(setup)?;
     let mut wire = Wire::open().map_err(setup)?;
     let mut sender = DrrConfig::new(&[256, 256], 256)
@@ -366,6 +368,7 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
     let policy = LatePolicy {
         tolerance: TOLERANCE,
         cancel_on_deadline: scenario.cancel_on_deadline,
+        max_horizon: u64::MAX,
     };
     let mut gate = TimedGate::new(
         Recorder {
