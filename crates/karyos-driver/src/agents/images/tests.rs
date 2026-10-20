@@ -5434,6 +5434,7 @@ mod shared {
                     generation: 2,
                 },
                 complete: false,
+                cells: None,
             });
         }
         chain.poll(&mut LaneSource::regions(RegionIds::new(

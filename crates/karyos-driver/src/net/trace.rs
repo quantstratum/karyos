@@ -131,6 +131,20 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// Hands `cells` to the receiver for the installed image at `slot`
+    /// (M2b); `false` when the ring has no room or the agent is gone: the
+    /// cells drop, and the allocator reuses them.
+    pub(crate) fn post_image_cells(
+        &self,
+        slot: crate::sessions::receive::SlotRef,
+        cells: crate::agents::AgentCells,
+    ) -> bool {
+        self.links
+            .receiver
+            .post(|reply| crate::agents::AgentCommand::AttachImageCells { reply, slot, cells })
+            .is_ok()
+    }
+
     /// Hands `hook` to the agent of `side`; the hook comes back when the
     /// ring has no room. A gone agent drops it.
     pub(crate) fn post_trace_hook(
