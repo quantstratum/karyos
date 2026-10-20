@@ -661,11 +661,8 @@ fn a_removed_two_path_publication_ends_at_its_eos_on_both_paths() {
         );
         return;
     }
-    // The group's port: one the OS just handed out on loopback.
-    let port = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-        .and_then(|socket| socket.local_addr())
-        .unwrap()
-        .port();
+    // The group's port, outside the ephemeral range (karyos#520).
+    let port = crate::test_ports::test_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), port);
     let channel = UdpConfig {
         destination: Destination::Multicast { group, ttl: None },

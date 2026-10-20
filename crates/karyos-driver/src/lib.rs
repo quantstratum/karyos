@@ -45,6 +45,9 @@ pub mod spin;
 pub mod timed_gate;
 mod trace_journals;
 
+#[cfg(test)]
+pub(crate) mod test_ports;
+
 /// The lib tests count allocations where a test arms the counter (the
 /// trace drain path); unarmed, it is the system allocator.
 #[cfg(test)]

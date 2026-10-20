@@ -367,11 +367,7 @@ fn a_key_names_the_local_stream_for_a_network_subscriber_too() {
     use karyos_protocol::cnc::{StreamKey, SubscriberRole};
     let mut b = driver(ThreadingMode::Shared);
     let mut client = b.connect().unwrap();
-    let port = UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let address = SocketAddr::new(LOOPBACK, port);
     let complete =
         |b: &mut EmbeddedDriver, client: &mut karyos_client::ClientConductor, sequence| {
@@ -729,13 +725,10 @@ fn the_receivers_subscription_table_is_mirrored() {
     assert_eq!(b.network_subscription_refusals(), 0);
 }
 
-/// A free port, for a multicast group endpoint.
+/// A free port, for a multicast group endpoint, outside the ephemeral
+/// range (karyos#520, [`crate::test_ports`]).
 fn free_port() -> u16 {
-    UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    crate::test_ports::test_port()
 }
 
 /// RC-15 interim table (ACS 16103): an invalid control group table is

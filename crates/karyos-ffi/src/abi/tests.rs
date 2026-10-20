@@ -1358,11 +1358,7 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
     let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
         .unwrap()
         .raw();
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = test_port();
     let uri = std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{port}")).unwrap();
     let mut subscription = 0;
     // SAFETY: a live C string, a live `u64`, no detail.
@@ -2089,4 +2085,25 @@ fn a_concurrent_offer_refuses_a_key_outside_its_table() {
     assert_eq!(status, Status::Ok.code());
     assert_eq!((first.lane, first.position), (0, 0));
     assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// A loopback UDP port no socket holds now, picked below every ephemeral
+/// range (Linux 32768 to 60999, macOS 49152 to 65535), so no bind to port
+/// 0 can take it before the driver binds it (karyos#520). As karyos-driver's
+/// `test_ports`: a process starts at its own offset and walks the range,
+/// skipping ports it cannot bind. Owner item 26 (an `endpoint=host:0`
+/// subscription that reports its port) would remove the race.
+fn test_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    const FIRST: u32 = 20_000;
+    const COUNT: u32 = 12_000;
+    let start = std::process::id().wrapping_mul(2_654_435_761) % COUNT;
+    loop {
+        let taken = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(taken < COUNT, "no free test port left in the range");
+        let port = u16::try_from(FIRST + (start + taken) % COUNT).unwrap();
+        if std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
 }
