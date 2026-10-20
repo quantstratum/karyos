@@ -126,6 +126,7 @@ fn start(source: Chunks) -> StartRecording {
         mode: Mode::Required,
         format: format(),
         source: Box::new(source),
+        origin: RecordedFrom::Local,
     }
 }
 
@@ -1083,6 +1084,33 @@ mod groups {
             })
             .unwrap();
         assert!(agent.recording_word(10, 3, Lane::ZERO).unwrap().is_none());
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// karyos#490: a host recording its own network publication beside
+    /// that publication's loopback image has two `required` recordings of
+    /// one stream, session and lane, with the same channel and format. The
+    /// local stream's word answers, whichever started first; with only the
+    /// image's recording, its word answers.
+    #[test]
+    fn a_local_recording_answers_its_key_before_an_image() {
+        use karyos_sys::frame::Lane;
+        let dir = temp_dir("group-word-origin");
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let image = agent
+            .start(start(chunks(3000, false, &drained)).with_origin(RecordedFrom::Image))
+            .unwrap();
+        let word = agent.recording_word(10, 3, Lane::ZERO).unwrap().unwrap();
+        assert_eq!(word.read(), Some((image, 0)), "only the image's");
+        let second = Arc::new(AtomicBool::new(false));
+        let local = agent.start(start(chunks(3000, false, &second))).unwrap();
+        let word = agent.recording_word(10, 3, Lane::ZERO).unwrap().unwrap();
+        assert_eq!(word.read(), Some((local, 0)), "the local stream's first");
+        agent.stop(local).unwrap();
+        let word = agent.recording_word(10, 3, Lane::ZERO).unwrap().unwrap();
+        assert_eq!(word.read(), Some((image, 0)), "the image's again");
         agent.shutdown().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }

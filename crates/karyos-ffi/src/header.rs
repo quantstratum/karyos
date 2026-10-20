@@ -31,6 +31,7 @@ fn c_struct(rust: &str) -> &'static str {
     match rust {
         "ClientOptions" => "karyos_client_options",
         "Detail" => "karyos_detail",
+        "Accepted" => "karyos_accepted",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -49,6 +50,8 @@ fn c_type(rust: &str) -> String {
         "*const ClientOptions" => "const karyos_client_options *",
         "*mut ClientOptions" => "karyos_client_options *",
         "*mut Detail" => "karyos_detail *",
+        "*mut Accepted" => "karyos_accepted *",
+        "*mut *mut u8" => "uint8_t **",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -141,7 +144,7 @@ fn rust_structs() -> BTreeMap<String, Fields> {
                     .trim_end_matches(',')
                     .split_once(':')
                     .expect("name: type");
-                (name.trim().to_owned(), c_type(rust))
+                (name.trim().to_owned(), normalize(&c_type(rust)))
             })
             .collect();
         structs.insert(name, fields);
@@ -198,14 +201,14 @@ fn rust_functions() -> BTreeMap<String, Signature> {
             .filter(|parameter| !parameter.is_empty())
             .map(|parameter| {
                 let (_, rust) = parameter.split_once(':').expect("name: type");
-                c_type(rust)
+                normalize(&c_type(rust))
             })
             .collect();
         let body = rest[close..].find('{').expect("a body");
         let returns = rest[close + 1..close + body]
             .trim()
             .strip_prefix("->")
-            .map_or_else(|| "void".to_owned(), c_type);
+            .map_or_else(|| "void".to_owned(), |rust| normalize(&c_type(rust)));
         functions.insert(name, (returns, parameters));
     }
     functions
@@ -288,4 +291,18 @@ fn the_header_states_the_client_constants() {
     );
     assert_eq!(defines["KARYOS_IDLE_YIELD"], i64::from(client::IDLE_YIELD));
     assert_eq!(defines["KARYOS_IDLE_SLEEP"], i64::from(client::IDLE_SLEEP));
+}
+
+#[test]
+fn the_header_states_the_publication_constants() {
+    use crate::api::publication;
+    let defines = header_defines();
+    assert_eq!(
+        defines["KARYOS_MAX_PUBLICATIONS"],
+        i64::from(publication::MAX_PUBLICATIONS)
+    );
+    assert_eq!(
+        defines["KARYOS_MAX_CLAIMS"],
+        i64::from(publication::MAX_CLAIMS)
+    );
 }

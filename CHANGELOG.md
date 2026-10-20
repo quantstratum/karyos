@@ -435,6 +435,33 @@ release may break APIs, wire formats and shared-memory layouts.
   and `PollSummary`. `poll` is unchanged: it adopts, and moves within
   the poll. The C ABI's subscription poll (F4) builds on it.
 
+- The operations journal records how each agent run ends (DESIGN, a
+  follow-up of M10b): `agent started` (kind 8) is written durably when
+  the journal opens and `agent stopped` (kind 7) by `Agent::stop` /
+  `Journal::stop`, the agent's one clean stop. A start whose journal does
+  not end with a clean stop records an unknown interval, so a guard close
+  made while the journal was down and lost in a crash is never silent.
+  Each unknown interval carries its reason (`GapReason`, the record's
+  code, and `reason` in API v1's `gap`): `request_without_outcome`,
+  `torn_tail`, `unclean_stop` or `journal_replaced`, so an administrator
+  tells a crash from a lost operation before acknowledging it. Until
+  karyos-agent may catch signals (owner item 55), a signal stop of the
+  binary is recorded as an unclean stop.
+
+- `karyos_archive::agent::RecordedFrom { Local, Image }` (karyos#490b;
+  quantstratum-docs: `karyos/design/per-source-images.md`, D2-2): what a
+  recording reads, as its host knows it. `HostRecording::with_origin` and
+  `StartRecording::with_origin` set it; `new` means `Local`, so existing
+  hosts are unchanged. A host recording its own `karyos:udp` publication
+  beside that publication's loopback image has two recordings of one
+  stream, session and lane, with the same channel and source
+  incarnation: `ArchiveHandle::recording_word` now answers the local
+  stream's recording first, and an image's only when it is the one
+  recorded, never a silent pick. It is not kept in the catalog, as the
+  word is live only. A Gateway's network subscription beside a local
+  source of its stream stays refused, `DuplicateSource`, in either
+  order.
+
 - Per-stream network counters in the CnC (phase 5, M2b; quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`). Each network
   publication has `network frames sent`, `network bytes sent`, `network
@@ -782,6 +809,24 @@ release may break APIs, wire formats and shared-memory layouts.
   denied in the crate and expected only on `mod abi` and in the tests'
   `support::abi`; `make lint-sync` checks that, the clippy set, and that no
   profile sets `panic = "abort"`. `make miri` also runs the crate's tests.
+- `karyos-ffi` publications and staged claims (batch F3; D1 ruled reserve
+  at commit): `karyos_client_add_publication` (`karyos:ipc` or
+  `karyos:udp`), `karyos_publication_offer` on a lane, and the staged
+  claim `karyos_publication_claim`, `karyos_claim_commit` and
+  `karyos_claim_abort`, with `karyos_publication_close` and the sized
+  `karyos_accepted`. A claim's buffer belongs to `karyos-ffi`, never a
+  term or a shared mapping; the commit claims in the term, copies and
+  commits in one call. A commit that meets back pressure, no subscriber, an
+  administrative action, the rate limit or a closed guard keeps the claim
+  staged for a retry; one claim per publication
+  (`KARYOS_E_CLAIM_OUTSTANDING`). Closing a client closes its publications
+  and their claims, all or nothing: while one is in use nothing closes.
+  Tests over an embedded driver run under Miri and on macOS.
+- `karyos-ffi` handle tables: a stale handle no longer touches its slot's
+  mutex. Its slot's generation is now an atomic checked first, and a close
+  moves it on at once, so a stale handle answers `KARYOS_E_CLOSED` and
+  never makes a live handle's call on another thread answer
+  `KARYOS_E_BUSY` (seen as a flake when the tests share the tables).
 - `karyos-ffi` clients (batch F2): `karyos_client_options_init`,
   `karyos_client_connect`, `karyos_client_poll` and `karyos_client_close`,
   with the sized `karyos_client_options` (copied, nothing consumed) and
@@ -1732,6 +1777,23 @@ release may break APIs, wire formats and shared-memory layouts.
   position stays within each required member's edge.
 
 ### Fixed
+
+- One driver can hold both ends of a `karyos:udp` endpoint (karyos#490;
+  quantstratum-docs: `karyos/design/per-source-images.md`, D2-1 and
+  D2-4). A driver's own network publication's loopback image shares the
+  publication's key, and was installed but never exposed, so a
+  subscription of the same driver never got an image. A network image and
+  a local stream of the same key now coexist, in either order: key
+  lookups (`AddPublication`, `AddSubscription`, the `karyos:ipc` URI
+  paths, conflated views, a URI's lane check) take the local stream for
+  every client, so local behaviour is unchanged; a network subscription
+  attaches its images by registration (`AddImageSubscription`), and a key
+  with no local stream still resolves to its oldest image. A replay
+  target keeps its
+  key to itself while it lives, retiring included (#283 P3). A client's
+  `PublicationClosed` naming no image closes only its local links of the
+  key and lane, never an image's. The Archive's lookups by (stream,
+  session, lane) follow in karyos#490b.
 
 - An IPC driver no longer keeps the images a connected remote subscriber
   read. A registration kept its stream from freeing, and a remote client

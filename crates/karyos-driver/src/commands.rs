@@ -716,10 +716,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// the lane that carries the aggregate's registration (lane 0, or the
     /// only lane of a stream added with `add_stream`).
     ///
-    /// A live key names a local stream or images, never both
-    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-2):
-    /// images of one alias resolve to the oldest, the lowest registration.
-    fn find_stream(&self, stream: StreamKey, lane: Option<Lane>) -> Option<usize> {
+    /// A live key may name a local stream (a network publication's lane
+    /// included) and images of the same alias at once, such as a driver's
+    /// own network publication and its loopback image (karyos#490;
+    /// `quantstratum-docs: karyos/design/per-source-images.md`, D2-2): a
+    /// key names the local stream whenever there is one, for every client,
+    /// so a local lookup never switches to an image; a network
+    /// subscription attaches its images by registration
+    /// (`AddImageSubscription`, D2-3). A key with no local stream resolves
+    /// to its oldest image, the lowest registration.
+    pub(crate) fn find_stream(&self, stream: StreamKey, lane: Option<Lane>) -> Option<usize> {
+        self.find_keyed(stream, lane, false)
+            .or_else(|| self.find_keyed(stream, lane, true))
+    }
+
+    /// The oldest live lane of `stream` on `lane` that is an image, or that
+    /// is not one.
+    fn find_keyed(&self, stream: StreamKey, lane: Option<Lane>, image: bool) -> Option<usize> {
         // Commands bind by wire key at execution; retiring streams accept
         // nothing new.
         self.streams
@@ -727,6 +740,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .enumerate()
             .filter(|(_, s)| {
                 !s.retiring
+                    && s.source.is_some() == image
                     && s.stream_id == stream.stream_id
                     && s.session_id == stream.session_id
                     && lane.map_or(s.id == s.aggregate.registration, |lane| {

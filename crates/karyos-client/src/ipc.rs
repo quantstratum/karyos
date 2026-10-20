@@ -217,6 +217,8 @@ struct RemoteLink {
     /// successor grant must carry the same.
     publication: (u64, u64),
     request: Request,
+    /// The grant is a network image's (karyos#490).
+    image: bool,
     /// The generation of the latest mapping offered or taken.
     generation: u64,
     link: Weak<GenerationLink<SharedTerms>>,
@@ -275,7 +277,8 @@ impl Session {
                 // an image closes only that image's links, by the
                 // aggregate registration each grant carried: images of one
                 // alias share their stream key (per-source-images.md,
-                // D2-3).
+                // D2-3). A close of a local stream closes only local links:
+                // an image of the same key may live beside it (karyos#490).
                 Event::PublicationClosed {
                     stream,
                     lane,
@@ -285,7 +288,11 @@ impl Session {
                     self.close_where(|entry| {
                         entry.request.stream() == stream
                             && entry.request.lane() == Some(lane)
-                            && (image == 0 || entry.publication.0 == image)
+                            && if image == 0 {
+                                !entry.image
+                            } else {
+                                entry.publication.0 == image
+                            }
                     });
                 }
                 _ => {}
@@ -324,9 +331,9 @@ impl Session {
                 entry
                     .link
                     .upgrade()
-                    .map(|link| (entry.request, entry.publication, link))
+                    .map(|link| (entry.request, entry.publication, entry.image, link))
             });
-        let Some((request, publication, link)) = target else {
+        let Some((request, publication, image, link)) = target else {
             return;
         };
         let fetchable = Fetchable {
@@ -334,6 +341,7 @@ impl Session {
             registration,
             request,
             by_uri: false,
+            image,
         };
         let Ok(fetched) = fetch(self, &fetchable) else {
             return;
@@ -1364,6 +1372,7 @@ impl RemoteClient {
                     registration: fetchable.registration,
                     publication,
                     request,
+                    image: fetchable.image,
                     generation,
                     link: Arc::downgrade(&link),
                 });
@@ -1808,6 +1817,7 @@ mod tests {
             registration,
             publication: (1, 1),
             request,
+            image: false,
             generation: 0,
             link: Arc::downgrade(&link),
         });
@@ -1936,8 +1946,10 @@ mod tests {
     /// Two images of one alias share their stream key (`quantstratum-docs:
     /// karyos/design/per-source-images.md`, D2-3): a `PublicationClosed`
     /// naming one image closes only that image's link on the lane, by the
-    /// aggregate registration its grant carried; a close naming no image
-    /// closes by stream and lane, both.
+    /// aggregate registration its grant carried. A close naming no image is
+    /// a local stream's: it closes the local link of the key and lane, and
+    /// no image's (karyos#490: a driver's own network publication and its
+    /// loopback image share their key).
     #[test]
     fn an_image_close_leaves_the_other_images_link_open() {
         let (session, _peer) = session();
@@ -1946,17 +1958,19 @@ mod tests {
             lane: Lane::ZERO,
             role: SubscriberRole::Required,
         };
-        let image = |registration: u64, image: u64| {
+        let link_of = |registration: u64, publication: u64, image: bool| {
             let link = GenerationLink::new_remote();
             session.links().push(RemoteLink {
                 registration,
-                publication: (image, 1),
+                publication: (publication, 1),
                 request,
+                image,
                 generation: 0,
                 link: Arc::downgrade(&link),
             });
             link
         };
+        let image = |registration, publication| link_of(registration, publication, true);
         let (first, second) = (image(1, 40), image(2, 41));
         let close = |image| Event::PublicationClosed {
             stream: STREAM,
@@ -1967,10 +1981,12 @@ mod tests {
         session.serve_cutovers(vec![close(40)], false);
         assert_eq!(first.status(), LinkStatus::Closed);
         assert_eq!(second.status(), LinkStatus::Current, "the other image");
-        let third = image(3, 42);
+        let local = link_of(3, 30, false);
         session.serve_cutovers(vec![close(0)], false);
+        assert_eq!(local.status(), LinkStatus::Closed);
+        assert_eq!(second.status(), LinkStatus::Current, "an image's link");
+        session.serve_cutovers(vec![close(41)], false);
         assert_eq!(second.status(), LinkStatus::Closed);
-        assert_eq!(third.status(), LinkStatus::Closed);
     }
 
     /// A link whose handle is gone is forgotten at the next service.

@@ -1567,6 +1567,69 @@ fn a_concurrent_publication_is_taken_by_uri() {
     });
 }
 
+/// karyos#490: one driver holds both ends of a `karyos:udp` endpoint. Its
+/// own network publication's loopback image shares the publication's key,
+/// and is exposed beside it: a subscription of the driver reads what a
+/// publication of the same driver offers. Dropping the publication retires
+/// the image (its EOS), and the subscription lets it go.
+#[test]
+fn one_driver_carries_its_own_udp_publication_to_its_subscription() {
+    let (_driver, mut conductors) = driven(2, Some(500_000_000));
+    let mut subscriber = Client::with_conductor(conductors.remove(0), context());
+    let mut publisher = Client::with_conductor(conductors.remove(0), context());
+    let port = port();
+    let mut reading = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    let mut publication = publisher
+        .add_exclusive_publication(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    until(&mut [&mut subscriber, &mut publisher], || {
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        reading.image_count() == 1
+    });
+    let (mut sent, mut seen) = (0u32, 0u32);
+    let start = Instant::now();
+    while seen < 64 {
+        assert!(start.elapsed() < Duration::from_secs(20), "seen {seen}");
+        let _ = publisher.poll();
+        let _ = subscriber.poll();
+        while sent < 64 {
+            match publication.offer(&sent.to_le_bytes()) {
+                Ok(_) => sent += 1,
+                Err(
+                    OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected,
+                ) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let _ = reading
+            .poll(
+                |bytes, _| {
+                    assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                    seen += 1;
+                },
+                MessageLimit::new(16),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert_eq!(reading.images_refused(), 0);
+    // The local publication goes: its loopback image retires and leaves
+    // the subscription, which stays usable.
+    drop(publication);
+    until(&mut [&mut subscriber, &mut publisher], || {
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(16));
+        reading.image_count() == 0
+    });
+}
+
 /// Item 57 (FFI F4): a reader that polls as the C ABI does (`adopt`, then
 /// `poll_adopted`, and one more round when it stopped at a seal) follows
 /// a cutover to a larger term within its calls: every message arrives in

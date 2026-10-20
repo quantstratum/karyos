@@ -1380,6 +1380,28 @@ fn an_image_loss_is_in_its_session() {
     assert_eq!(losses, [3]);
 }
 
+/// karyos#490b: a network subscription beside a local source of its
+/// stream is refused, typed, whichever came first (the case of a host
+/// recording its own network publication and that publication's loopback
+/// image): never a silent pick between the two.
+#[test]
+fn a_fan_in_beside_a_local_source_is_refused() {
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let buffer = log_of(1, Lane::ZERO, 64 * 1024);
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let image = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+    let fan_in = Images {
+        images: vec![image],
+        next: 0,
+        changes: Arc::default(),
+    };
+    assert!(matches!(
+        rig.gateway
+            .add_subscription(Box::new(fan_in), IDENTITY, Arc::new(RecordingWord::new())),
+        Err(GatewayError::DuplicateSource { stream_id: 2, .. })
+    ));
+}
+
 /// #445 review P1-b: a network subscription is its stream's only source.
 #[test]
 fn a_fan_in_is_its_streams_only_source() {
