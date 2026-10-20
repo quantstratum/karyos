@@ -11,6 +11,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-ffi`'s Miri profile (owner item 45): `crates/karyos-ffi/MIRI.md`
+  maps every unsafe site class of `src/abi.rs` and the test support to
+  the test that runs it under Miri, and lists what Miri does not cover.
+  Under Miri the tests' driver threads and waits sleep instead of
+  yielding, so a driver test takes about a minute instead of an hour;
+  driver integration tests that add no unsafe site are native only
+  (`driver integration; covered natively`). A PR touching `src/abi.rs`
+  or the test support runs Miri per that file on its head.
 - The Archive's host over a driver (quantstratum-docs:
   `karyos/design/archive-host.md`, H2).
   - `karyos_tools::archive::DriverHost<T>` implements

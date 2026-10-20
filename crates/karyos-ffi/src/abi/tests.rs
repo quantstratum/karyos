@@ -11,11 +11,25 @@ use super::*;
 
 /// A client context whose control calls wait long enough for a driver
 /// thread under Miri, whose clock runs fast against its slow execution.
+/// Under Miri its waits sleep: a thread that sleeps is not interpreted,
+/// while one that yields spins through the interpreter.
 fn test_context() -> Context {
-    Context::builder()
-        .timeout(std::time::Duration::from_secs(3600))
-        .build()
-        .unwrap()
+    let builder = Context::builder().timeout(std::time::Duration::from_secs(3600));
+    #[cfg(miri)]
+    let builder = builder.idle_strategy(karyos_client::IdleStrategy::Sleep(
+        std::time::Duration::from_millis(1),
+    ));
+    builder.build().unwrap()
+}
+
+/// Waits a little in a test's loop: a millisecond's sleep under Miri, so
+/// the interpreter runs the thread that has work instead of the one that
+/// waits (the Miri profile, MIRI.md); a yield natively.
+fn idle() {
+    #[cfg(miri)]
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    #[cfg(not(miri))]
+    std::thread::yield_now();
 }
 
 /// Options from `karyos_client_options_init`.
@@ -325,8 +339,10 @@ fn driven() -> (
     let flag = std::sync::Arc::clone(&stop);
     let thread = std::thread::spawn(move || {
         while !flag.load(std::sync::atomic::Ordering::Acquire) {
-            let _ = driver.do_work().unwrap();
-            std::thread::yield_now();
+            let work = driver.do_work().unwrap();
+            if work == 0 {
+                idle();
+            }
         }
     });
     (
@@ -470,7 +486,7 @@ fn read(
             |bytes, _| seen.push(bytes.to_vec()),
             karyos_client::MessageLimit::new(16),
         );
-        std::thread::yield_now();
+        idle();
     }
     seen
 }
@@ -588,6 +604,7 @@ fn a_publication_offers_and_commits_staged_claims() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn closing_a_client_closes_its_publications_and_their_claims() {
     let (_driven, ours, _theirs) = driven();
     let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
@@ -656,6 +673,7 @@ fn add_publication_refuses_bad_arguments() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_commit_that_finds_no_subscriber_keeps_its_claim_staged() {
     let (_driven, ours, theirs) = driven();
     let context = test_context();
@@ -689,7 +707,7 @@ fn a_commit_that_finds_no_subscriber_keeps_its_claim_staged() {
         }
         assert_eq!(status, Status::NotConnected.code());
         let _ = subscriber.poll();
-        std::thread::yield_now();
+        idle();
     }
     assert_eq!(read(&mut subscriber, &mut reading, 1), [b"abc".to_vec()]);
     assert_eq!(commit(staged).0, Status::Closed.code());
@@ -757,6 +775,7 @@ fn an_older_structs_missing_tail_keeps_the_defaults() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn concurrent_handles_share_a_stream_on_lane_0() {
     let (_driven, ours, theirs) = driven();
     let context = test_context();
@@ -944,7 +963,7 @@ fn poll_until(subscription: u64, client: u64, seen: &mut Seen, limit: u32, count
         let (status, delivered) = poll_into(subscription, seen, limit);
         assert_eq!(status, Status::Ok.code());
         assert!(delivered <= limit);
-        std::thread::yield_now();
+        idle();
     }
 }
 
@@ -979,6 +998,24 @@ fn a_subscription_delivers_each_message_from_its_private_copy() {
     assert_eq!((info.lane, info.session_id, info.flags), (0, 1, 0));
     assert!(info.position > seen.infos[0].position);
     assert!(info.extent >= 32);
+    // A `karyos:ipc` subscription has no image changes: `has` and `lost`
+    // are written as 0 and `change` is left alone (the Miri path of both
+    // writes, MIRI.md).
+    let mut change = ImageChange {
+        size: size_of_u32::<ImageChange>(),
+        session_id: 7,
+        image_id: 7,
+        lane: 7,
+        available: 7,
+    };
+    let (mut has, mut lost) = (u32::MAX, u64::MAX);
+    // SAFETY: live, aligned out-parameters.
+    let status =
+        unsafe { karyos_subscription_next_image_change(subscription, &mut change, &mut has) };
+    assert_eq!((status, has, change.image_id), (Status::Ok.code(), 0, 7));
+    // SAFETY: a live, aligned `u64`.
+    let status = unsafe { karyos_subscription_image_changes_lost(subscription, &mut lost) };
+    assert_eq!((status, lost), (Status::Ok.code(), 0));
     // A limit of 0 delivers nothing; a stale handle is closed.
     assert_eq!(
         poll_into(subscription, &mut seen, 0),
@@ -1123,7 +1160,7 @@ fn a_subscription_held_by_another_thread_is_busy() {
                 if delivered == 1 {
                     return;
                 }
-                std::thread::yield_now();
+                idle();
             }
         })
     };
@@ -1243,7 +1280,7 @@ fn a_copy_that_cannot_grow_delivers_nothing_and_loses_nothing() {
             poll_into(subscription, &mut seen, 8),
             (Status::System.code(), 0)
         );
-        std::thread::yield_now();
+        idle();
     }
     api::subscription::REFUSE_GROWTH.with(|refuse| refuse.set(false));
     assert!(seen.messages.is_empty());
@@ -1269,8 +1306,10 @@ fn driven_network<const N: usize>() -> (Driven, [karyos_client::ClientConductor;
     let flag = std::sync::Arc::clone(&stop);
     let thread = std::thread::spawn(move || {
         while !flag.load(std::sync::atomic::Ordering::Acquire) {
-            let _ = driver.do_work().unwrap();
-            std::thread::yield_now();
+            let work = driver.do_work().unwrap();
+            if work == 0 {
+                idle();
+            }
         }
     });
     (
@@ -1423,7 +1462,7 @@ fn a_panic_in_the_poll_poisons_the_subscription() {
         if status != Status::Ok.code() {
             break status;
         }
-        std::thread::yield_now();
+        idle();
     };
     api::subscription::PANIC_IN_POLL.with(|panics| panics.set(false));
     assert_eq!(status, Status::Internal.code());
