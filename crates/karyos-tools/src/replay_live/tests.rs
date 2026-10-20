@@ -226,6 +226,19 @@ fn served(
     Client<karyos_client::ClientConductor>,
     ClientPublication,
 ) {
+    served_with(name, true)
+}
+
+/// As [`served`]; without `answering`, the driver runs but the Archive
+/// never serves its control streams: requests are taken, never answered.
+fn served_with(
+    name: &str,
+    answering: bool,
+) -> (
+    Served,
+    Client<karyos_client::ClientConductor>,
+    ClientPublication,
+) {
     let mut driver = EmbeddedDriver::with_config(DriverConfig {
         client_liveness_timeout: 3_600_000_000_000,
         ..DriverConfig::default()
@@ -265,8 +278,10 @@ fn served(
         );
         while !flag.load(Ordering::Acquire) {
             let _ = server.host_mut().driver_mut().do_work().unwrap();
-            let _ = server.duty();
-            let _ = server.host_mut().finish_ended();
+            if answering {
+                let _ = server.duty();
+                let _ = server.host_mut().finish_ended();
+            }
             std::thread::yield_now();
         }
         let (mut host, stopped) = server.shutdown_into_host();
@@ -404,11 +419,11 @@ fn start_and_stop_a_replay_through_the_control_streams() {
     ));
 }
 
-/// With nothing serving the request stream, the answer never comes.
+/// A request the Archive takes but never answers ends in `NoAnswer` once
+/// its timeout passes, and not long after.
 #[test]
-fn no_archive_means_no_answer_within_the_timeout() {
-    let (served, mut client, _publication) = served("silent");
-    drop(served);
+fn an_archive_that_never_answers_ends_in_no_answer_within_the_timeout() {
+    let (_served, mut client, _publication) = served_with("silent", false);
     let started = Instant::now();
     let answered = stop(
         &mut client,
@@ -418,12 +433,11 @@ fn no_archive_means_no_answer_within_the_timeout() {
             timeout: Duration::from_millis(200),
         },
     );
+    assert!(matches!(answered, Err(LiveError::NoAnswer)), "{answered:?}");
+    let took = started.elapsed();
+    // The two streams' opens, each a control call, then the 200 ms wait.
     assert!(
-        matches!(
-            answered,
-            Err(LiveError::NoAnswer | LiveError::NotSent | LiveError::Connect(_))
-        ),
-        "{answered:?}"
+        took >= Duration::from_millis(200) && took < Duration::from_secs(10),
+        "{took:?}"
     );
-    assert!(started.elapsed() < Duration::from_secs(40));
 }

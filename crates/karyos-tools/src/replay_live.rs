@@ -31,8 +31,10 @@ use crate::args::{ArgsError, LiveArchive, parse_live};
 /// The exit status of an error: as `karyos-catalog`'s, unlike `diff`'s.
 pub const EXIT_ERROR: u8 = 2;
 
-/// How long a command waits by default for the driver and for the
-/// Archive's answer.
+/// How long each step of a command waits by default: connecting to the
+/// driver, opening each control stream, then the request and its answer.
+/// A bound per step, not overall: a command against a driver that never
+/// answers can take up to about three times as long.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `karyos-replay start`'s arguments.
@@ -50,7 +52,7 @@ pub struct StartArgs {
     pub stream: i32,
     /// The target channel.
     pub channel: String,
-    /// How long to wait for the driver and the answer.
+    /// How long each step waits ([`DEFAULT_TIMEOUT`]).
     pub timeout: Duration,
 }
 
@@ -61,7 +63,7 @@ pub struct StopArgs {
     pub live: LiveArchive,
     /// The replay.
     pub replay: u64,
-    /// How long to wait for the driver and the answer.
+    /// How long each step waits ([`DEFAULT_TIMEOUT`]).
     pub timeout: Duration,
 }
 
@@ -383,13 +385,21 @@ where
     .map(drop)
 }
 
+/// What `--timeout-ms` bounds, in both usages.
+const TIMEOUT_HELP: &str = "\
+--timeout-ms N bounds each step, not the whole command (5000 by default):
+connecting to the driver, opening each control stream, then the request and
+its answer.
+";
+
 /// The usage of `command`, `karyos-replay start` or `stop`.
 fn help(command: &str) -> String {
     if command.ends_with("stop") {
         format!(
             "Usage: {command} --live DIR=REQ,RESP --replay ID [--timeout-ms N]\n\n\
              Stops a replay of the Archive whose control streams are REQ and RESP on the\n\
-             driver in DIR. Exit status 0, or {EXIT_ERROR} on any error.\n"
+             driver in DIR. Exit status 0, or {EXIT_ERROR} on any error.\n\n\
+             {TIMEOUT_HELP}"
         )
     } else {
         format!(
@@ -400,7 +410,8 @@ fn help(command: &str) -> String {
              (channel karyos:ipc). Prints `replay=ID stream=S session=N`: subscribe to\n\
              stream S, session N, to read it. The Archive holds the replay until its first\n\
              reader joins, up to its attach deadline. Exit status 0, or {EXIT_ERROR} on any\n\
-             error.\n"
+             error.\n\n\
+             {TIMEOUT_HELP}"
         )
     }
 }

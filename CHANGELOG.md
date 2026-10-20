@@ -11,18 +11,6 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
-- `karyos-replay start` and `stop` (quantstratum-docs:
-  `karyos/design/archive-host.md`, H6): ask a running Archive to replay a
-  recording into a stream, or to stop a replay, over its control streams.
-  `start --live DIR=REQ,RESP --recording ID --to-stream S [--from POS]
-  [--length BYTES] [--channel URI] [--timeout-ms N]` prints `replay=ID
-  stream=S session=N` for the reader, which the Archive waits for (H2b).
-  `stop --live DIR=REQ,RESP --replay ID`. Exit status 2 on any error, the
-  Archive's refusal included. They connect through `ArchiveConnection`
-  (Linux), one connection per request, closed after it.
-  `karyos_tools::args::parse_live` parses `--live` for these and for
-  `karyos-catalog list --live`. `tests/karyosd_replay.rs` runs both
-  against `karyosd --archive` (Linux).
 - karyos-tools: `replay::HELP` is replaced by `replay::help(command)`,
   which names the command the diff was invoked as (`karyos-replay diff` or
   its alias `karyos-tools replay diff`; H5, #521).
@@ -567,6 +555,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyos-replay start` and `stop` (quantstratum-docs:
+  `karyos/design/archive-host.md`, H6): ask a running Archive to replay a
+  recording into a stream, or to stop a replay, over its control streams.
+  `start --live DIR=REQ,RESP --recording ID --to-stream S [--from POS]
+  [--length BYTES] [--channel URI] [--timeout-ms N]` prints `replay=ID
+  stream=S session=N` for the reader, which the Archive waits for (H2b).
+  `stop --live DIR=REQ,RESP --replay ID`. Exit status 2 on any error, the
+  Archive's refusal included. They connect through `ArchiveConnection`
+  (Linux), one connection per request, closed after it.
+  `karyos_tools::args::parse_live` parses `--live` for these and for
+  `karyos-catalog list --live`. `tests/karyosd_replay.rs` runs both
+  against `karyosd --archive` (Linux). `--timeout-ms` (5000 by default)
+  bounds each step: connecting, opening each control stream, then the
+  request and its answer.
 - Remote conflated views through the facade and the C ABI (F7b-2c-1;
   quantstratum-docs: `karyos/design/ffi-gap-analysis.md`,
   `conflation-end-to-end.md`, owner item 57):
