@@ -761,6 +761,52 @@ fn call(step: &Step, at: &str) -> Returned {
             status: Some(abi::conflated_close(handle_argument(step, "conflated", at))),
             results: BTreeMap::new(),
         },
+        "karyos_archive_connect" => {
+            let arguments = Arguments::new(
+                step,
+                &[
+                    "client",
+                    "requests",
+                    "responses",
+                    "client_id",
+                    "reserved",
+                    "deadline_ns",
+                    "size",
+                ],
+                at,
+            );
+            let options = abi::ArchiveOptions {
+                size: size_argument::<abi::ArchiveOptions>(&arguments, "size"),
+                reserved: arguments.narrow("reserved", 0),
+                requests: arguments.narrow("requests", 0),
+                responses: arguments.narrow("responses", 0),
+                client_id: arguments.narrow("client_id", 1),
+                deadline_ns: arguments.narrow("deadline_ns", 0),
+            };
+            let (status, archive) = abi::archive_connect(arguments.handle("client"), &options);
+            if status == 0 {
+                with_handle(status, "archive", archive, at)
+            } else {
+                Returned {
+                    status: Some(status),
+                    results: BTreeMap::new(),
+                }
+            }
+        }
+        "karyos_archive_list" => {
+            let arguments = Arguments::new(step, &["archive", "after_id", "limit"], at);
+            let (status, delivered, counted) = abi::archive_list(
+                arguments.handle("archive"),
+                arguments.narrow("after_id", 0),
+                arguments.narrow("limit", 1),
+            );
+            assert_eq!(delivered, counted, "{at}: the count is the handler's calls");
+            with_count(status, "delivered", delivered)
+        }
+        "karyos_archive_close" => Returned {
+            status: Some(abi::archive_close(handle_argument(step, "archive", at))),
+            results: BTreeMap::new(),
+        },
         "karyos_driver_close" => Returned {
             status: Some(abi::driver_close(handle_argument(step, "driver", at))),
             results: BTreeMap::new(),
