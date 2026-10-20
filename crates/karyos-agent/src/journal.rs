@@ -77,6 +77,14 @@ pub enum Kind {
     /// An administrator acknowledged the unknown interval recorded at
     /// position `expected`.
     GapAcknowledged,
+    /// The agent stopped cleanly: [`Journal::stop`] wrote it durably, last.
+    /// A start whose journal does not end with it records an unknown
+    /// interval.
+    AgentStopped,
+    /// The agent started: [`Journal::open`] writes it durably, so every run
+    /// leaves a record, and one that ends without [`Kind::AgentStopped`]
+    /// shows, even when nothing else was written.
+    AgentStarted,
 }
 
 impl Kind {
@@ -88,6 +96,8 @@ impl Kind {
             Self::ReopenOutcome => 4,
             Self::UnknownInterval => 5,
             Self::GapAcknowledged => 6,
+            Self::AgentStopped => 7,
+            Self::AgentStarted => 8,
         }
     }
 
@@ -99,6 +109,8 @@ impl Kind {
             4 => Self::ReopenOutcome,
             5 => Self::UnknownInterval,
             6 => Self::GapAcknowledged,
+            7 => Self::AgentStopped,
+            8 => Self::AgentStarted,
             _ => return None,
         })
     }
@@ -208,12 +220,60 @@ impl JournalRecord {
     }
 }
 
+/// Why the journal records an unknown interval: an administrator tells a
+/// crash from a lost operation before acknowledging it. Carried in the
+/// unknown-interval record's `code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GapReason {
+    /// The last record was a request with no outcome after it: the
+    /// operation may have taken effect unrecorded.
+    RequestWithoutOutcome,
+    /// Recovery cut a torn tail: records after the cut are lost.
+    TornTail,
+    /// The last run did not end with [`Kind::AgentStopped`]: a crash, a
+    /// kill, a signal stop (until karyos-agent catches signals, owner item
+    /// 55) or a stop that could not be written. A close made while the
+    /// journal was down then has no record at all.
+    UncleanStop,
+    /// The journal recording was stopped by another hand, and a new one
+    /// begins.
+    JournalReplaced,
+}
+
+impl GapReason {
+    /// The code an unknown-interval record carries.
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::RequestWithoutOutcome => 1,
+            Self::TornTail => 2,
+            Self::UncleanStop => 3,
+            Self::JournalReplaced => 4,
+        }
+    }
+
+    /// The reason of `code`; an unknown one reads as an unclean stop, the
+    /// most general.
+    #[must_use]
+    pub const fn from_code(code: u64) -> Self {
+        match code {
+            1 => Self::RequestWithoutOutcome,
+            2 => Self::TornTail,
+            4 => Self::JournalReplaced,
+            _ => Self::UncleanStop,
+        }
+    }
+}
+
 /// An unknown interval no administrator has acknowledged yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Gap {
     /// Its record's position in the journal.
     pub position: u64,
+    /// Why it was recorded.
+    pub reason: GapReason,
     /// The interval's start: the last record's time before it, 0 when
     /// none was readable.
     pub from: u64,
@@ -316,20 +376,34 @@ impl Journal {
             failed_at: None,
             gap: scan.gap,
         };
-        let pending = scan
-            .last
-            .as_ref()
-            .is_some_and(|last| last.kind.is_request());
-        if cut || pending || earlier {
+        let last = scan.last.as_ref().map(|last| last.kind);
+        let reason = if cut {
+            Some(GapReason::TornTail)
+        } else if earlier {
+            Some(GapReason::JournalReplaced)
+        } else if last.is_some_and(Kind::is_request) {
+            Some(GapReason::RequestWithoutOutcome)
+        } else if last.is_some_and(|kind| kind != Kind::AgentStopped) {
+            Some(GapReason::UncleanStop)
+        } else {
+            // An empty journal, or one that ends with a clean stop.
+            None
+        };
+        if let Some(reason) = reason {
             let mut record = JournalRecord::new(Kind::UnknownInterval, now);
             record.expected = scan.last.map_or(0, |last| last.time);
+            record.code = reason.code();
             let position = journal.append_durable(&record, now)?;
             journal.gap = Some(Gap {
                 position,
+                reason,
                 from: record.expected,
                 to: now,
             });
         }
+        // This run's first record: from here on, a run that does not end
+        // with a clean stop is seen as one.
+        let _ = journal.append_durable(&JournalRecord::new(Kind::AgentStarted, now), now)?;
         Ok(journal)
     }
 
@@ -443,6 +517,21 @@ impl Journal {
         result
     }
 
+    /// Records the agent's clean stop, durably, as its last record: the
+    /// next start then records no unknown interval for this run. The one
+    /// stop of the journal; a signal handler calls it once karyos-agent
+    /// may catch signals (owner item 55).
+    ///
+    /// # Errors
+    ///
+    /// As [`Journal::append_durable`]: a journal already unavailable
+    /// cannot record its stop, and the next start records the unclean
+    /// stop, which is then exactly right.
+    pub fn stop(&mut self, now: u64) -> Result<(), JournalError> {
+        let _ = self.append_durable(&JournalRecord::new(Kind::AgentStopped, now), now)?;
+        Ok(())
+    }
+
     /// Tests: the journal as an append failure leaves it.
     #[cfg(test)]
     pub(crate) fn break_recorder(&mut self) {
@@ -539,6 +628,7 @@ fn scan(store: &mut SegmentStore<StdDisk>) -> Result<Scan, JournalError> {
                     Kind::UnknownInterval => {
                         found.gap = Some(Gap {
                             position,
+                            reason: GapReason::from_code(record.code),
                             from: record.expected,
                             to: record.time,
                         });

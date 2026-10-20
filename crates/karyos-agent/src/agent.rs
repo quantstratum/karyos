@@ -16,7 +16,7 @@ use crate::api::{
     GapView, GuardEntry, JournalView, LossEntry, Sample,
 };
 use crate::catalog::{CatalogConfig, CatalogWatch};
-use crate::journal::{Journal, JournalError};
+use crate::journal::{GapReason, Journal, JournalError};
 use crate::model::{self, Cell, Follower};
 use crate::operations::{self, GuardAnswer};
 use crate::trace_window::{TraceWindow, WindowConfig};
@@ -242,6 +242,23 @@ impl Agent {
         operations::guard_command(self.journal.as_mut(), &command)
     }
 
+    /// Stops the agent's journal cleanly: its `agent stopped` record, durable
+    /// and last, so the next start records no unknown interval for this
+    /// run (karyos#490 follow-up, kind 7). The agent's one clean stop; the
+    /// binary's signal handling calls it once karyos-agent may catch
+    /// signals (owner item 55); until then a signal stop is an unclean one.
+    ///
+    /// # Errors
+    ///
+    /// The journal's: a journal that failed cannot record its stop, and
+    /// the next start records the unclean stop.
+    pub fn stop(&mut self) -> Result<(), JournalError> {
+        match self.journal.as_mut() {
+            Some(journal) => journal.stop(host_monotonic_ns()),
+            None => Ok(()),
+        }
+    }
+
     /// Records administrator `uid`'s acknowledgement of the open unknown
     /// interval at `position` (M10b).
     ///
@@ -271,6 +288,12 @@ impl Agent {
                 position: gap.position,
                 from: gap.from,
                 to: gap.to,
+                reason: match gap.reason {
+                    GapReason::RequestWithoutOutcome => "request_without_outcome",
+                    GapReason::TornTail => "torn_tail",
+                    GapReason::JournalReplaced => "journal_replaced",
+                    _ => "unclean_stop",
+                },
             }),
             // An unknown interval stays an alert until it is acknowledged;
             // a journal that failed is one from its failure on, until the
@@ -558,3 +581,6 @@ fn read_rings(
     guards.count(scan.delivered, scan.overwritten);
     kept.into_iter().for_each(|entry| guards.push(entry));
 }
+
+#[cfg(test)]
+mod tests;

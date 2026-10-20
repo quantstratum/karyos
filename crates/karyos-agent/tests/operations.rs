@@ -165,6 +165,8 @@ fn a_risk_officer_reopens_and_closes_a_guard_journalled() {
     let journal = view.journal.unwrap();
     assert_eq!((journal.failed_appends, journal.gap), (0, None));
     assert!(!journal.unavailable && journal.unsealed);
+    // A clean stop (kind 7): the next start records no unknown interval.
+    agent.stop().unwrap();
     drop(agent);
     // Four records, each request answered: no unknown interval at start.
     let reopened = Journal::open(&dir.join("journal"), 1).unwrap();

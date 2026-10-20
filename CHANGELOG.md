@@ -421,6 +421,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The operations journal records how each agent run ends (DESIGN, a
+  follow-up of M10b): `agent started` (kind 8) is written durably when
+  the journal opens and `agent stopped` (kind 7) by `Agent::stop` /
+  `Journal::stop`, the agent's one clean stop. A start whose journal does
+  not end with a clean stop records an unknown interval, so a guard close
+  made while the journal was down and lost in a crash is never silent.
+  Each unknown interval carries its reason (`GapReason`, the record's
+  code, and `reason` in API v1's `gap`): `request_without_outcome`,
+  `torn_tail`, `unclean_stop` or `journal_replaced`, so an administrator
+  tells a crash from a lost operation before acknowledging it. Until
+  karyos-agent may catch signals (owner item 55), a signal stop of the
+  binary is recorded as an unclean stop.
+
 - `karyosd`'s startup capability log (SPEC §11, "logged at startup";
   quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`,
   M3b). With the network on, the daemon reads its own CnC at most every
