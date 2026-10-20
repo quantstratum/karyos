@@ -1839,12 +1839,12 @@ impl<T: TermBytes> Images<T> {
         }
     }
 
+    /// Polls the adopted images; adopts none. With `hold`, an image at a
+    /// seal does not move to its successor.
     #[expect(
         clippy::result_large_err,
         reason = "the error carries the image's poll error by value, as ClientSubscription::poll does, so a failed poll reports its progress"
     )]
-    /// Polls the adopted images; adopts none. With `hold`, an image at a
-    /// seal does not move to its successor.
     fn poll(
         &mut self,
         handler: &mut impl FnMut(&[u8], MessageInfo),
@@ -2053,6 +2053,7 @@ mod tests {
         );
         assert_eq!(images.changes_lost, 0);
     }
+
     /// A network subscription of no image yet, and its client's inbox.
     fn network() -> (
         Subscription<karyos_sys::term_bytes::HeapTerms>,
@@ -2130,5 +2131,35 @@ mod tests {
             .unwrap();
         assert!(!poll.stopped_at_seal);
         assert_eq!(seen, [max as usize]);
+    }
+
+    /// DESIGN's P1 on #499, for an image: a fenced cutover of an image held
+    /// at its seal is reported as that image's close by the next
+    /// `poll_adopted` after an adoption, which no longer stops at the seal.
+    #[test]
+    fn an_image_whose_cutover_was_fenced_is_reported_closed() {
+        let (mut subscription, _inbox) = network();
+        let (held, later) = crate::subscription::testing::at_seal();
+        if let Kind::Images(images) = &mut subscription.kind {
+            images.images.push(Image {
+                id: 1,
+                session_id: 1,
+                lane: Lane::ZERO,
+                subscription: held,
+            });
+        }
+        subscription.adopt();
+        let poll = subscription
+            .poll_adopted(|_, _| {}, MessageLimit::new(8))
+            .unwrap();
+        assert!(poll.stopped_at_seal);
+        later.fence();
+        subscription.adopt();
+        let poll = subscription
+            .poll_adopted(|_, _| {}, MessageLimit::new(8))
+            .unwrap();
+        assert!(!poll.stopped_at_seal);
+        let stop = poll.stopped.unwrap();
+        assert!(stop.summary.closed.is_some(), "{stop:?}");
     }
 }

@@ -439,6 +439,10 @@ pub struct ClientSubscription<T: TermBytes = HeapTerms> {
     /// A holding poll stopped at the mapping's seal without moving to its
     /// successor: [`ClientSubscription::advance`] moves.
     at_seal: bool,
+    /// [`ClientSubscription::advance`] found that no successor will come
+    /// (the cutover was fenced, or its activation refused): the next poll
+    /// reports the close instead of holding at the seal again.
+    ended: bool,
     /// The trace hook, identities and delivery boundary, for a traced
     /// subscription.
     trace: Option<DeliveryTrace>,
@@ -482,6 +486,7 @@ impl<T: TermBytes> ClientSubscription<T> {
             link: None,
             base: 0,
             at_seal: false,
+            ended: false,
             trace: None,
             invalid_extensions: InvalidExtensions::default(),
             loss: None,
@@ -705,8 +710,18 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// is offered (the facade's `adopt`); otherwise the handle stays at its
     /// seal for a later call.
     pub(crate) fn advance(&mut self) {
-        if self.at_seal && self.after_end() != Some(false) {
-            self.at_seal = false;
+        if !self.at_seal {
+            return;
+        }
+        match self.after_end() {
+            Some(true) => self.at_seal = false,
+            // Still pending: the hold stays.
+            Some(false) => {}
+            // No successor will come: the next poll reports the close.
+            None => {
+                self.at_seal = false;
+                self.ended = true;
+            }
         }
     }
 
@@ -839,6 +854,7 @@ impl<T: TermBytes> ClientSubscription<T> {
                 // A holding poll leaves a successor for the next advance.
                 PollOutcome::Closed { .. }
                     if hold
+                        && !self.ended
                         && self.link.is_some()
                         && self
                             .inner
@@ -1102,6 +1118,12 @@ pub(crate) mod testing {
     }
 
     impl Later {
+        /// Fences the cutover, as the driver's deadline does: no successor
+        /// will come.
+        pub(crate) fn fence(&self) {
+            let _ = self.link.fence();
+        }
+
         /// Offers the successor, of twice the term, holding one message of
         /// its largest length, and returns that length.
         pub(crate) fn offer(&mut self) -> u32 {
@@ -1531,6 +1553,7 @@ mod tests {
         drop(link.take_retired());
         assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
+
     /// A holding poll never moves to a successor offered after the caller
     /// read the largest message: it stops at the seal, delivers nothing,
     /// and `advance` moves, after which the largest message grew and a
@@ -1570,5 +1593,33 @@ mod tests {
             .unwrap();
         assert!(!summary.stopped_at_seal);
         assert_eq!(seen, [max as usize]);
+    }
+
+    /// DESIGN's P1 on #499: a cutover fenced after a holding poll stopped
+    /// at its seal ends the subscription; the next holding poll reports
+    /// the close, and never holds at that seal again.
+    #[test]
+    fn a_fenced_cutover_is_reported_closed_by_the_holding_poll() {
+        let (mut subscription, later) = testing::at_seal();
+        let summary = subscription
+            .poll_holding(|_, _| {}, MessageLimit::new(8))
+            .unwrap();
+        assert!(summary.stopped_at_seal);
+        later.fence();
+        subscription.advance();
+        let summary = subscription
+            .poll_holding(|_, _| {}, MessageLimit::new(8))
+            .unwrap();
+        assert!(!summary.stopped_at_seal);
+        assert!(summary.closed.is_some(), "{summary:?}");
+        assert!(summary.close_reason.is_some());
+        // Every later poll reports it again, and still never holds.
+        let again = subscription
+            .poll_holding(|_, _| {}, MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(
+            (again.closed, again.stopped_at_seal),
+            (summary.closed, false)
+        );
     }
 }
