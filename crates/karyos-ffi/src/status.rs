@@ -83,6 +83,7 @@ statuses! {
     Busy = 109, "KARYOS_E_BUSY", c"the handle is in use by another thread";
     Conflation = 110, "KARYOS_E_CONFLATION", c"conflation error";
     Unsupported = 111, "KARYOS_E_UNSUPPORTED", c"not supported on this platform";
+    ClaimOutstanding = 112, "KARYOS_E_CLAIM_OUTSTANDING", c"the publication has a claim outstanding; commit or abort it first";
     Closed = 200, "KARYOS_E_CLOSED", c"closed";
     ClosedByOverrun = 201, "KARYOS_E_CLOSED_BY_OVERRUN", c"the subscription was closed by its rejoin policy";
     PositionsExhausted = 202, "KARYOS_E_POSITIONS_EXHAUSTED", c"the stream position range is exhausted";

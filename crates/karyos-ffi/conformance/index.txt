@@ -6,9 +6,9 @@
 
 abi version: abi.version
 typed status codes: abi.version.null status.text
-use after close: pending F2
-double close: pending F2
-older protocol version refused at admission: pending F2
+use after close: pending F5 (a client needs a driver the ABI can start)
+double close: pending F5 (a client needs a driver the ABI can start)
+older protocol version refused at admission: pending a driver the suite can start (F5 or a test driver); tests/connect.rs covers it on Linux
 reentrant poll: pending F4
 bounded poll stops on callback failure: pending F4
 kept fragment pointer never refers to a shared mapping: pending F4
