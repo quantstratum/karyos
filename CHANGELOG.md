@@ -394,6 +394,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Guard close acknowledgements for tools (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M4b). While a guard is
+  closed by a close, the conductor counts that close's registered senders
+  as `close_guard_ack` reports them, at every duty cycle and without
+  allocating: `guard senders applied`, `guard senders in flight`, `guard
+  senders pending` and `guard senders overdue`, with `guard ack epoch`
+  (0 while no close is in effect), gauges keyed by `KIND_GUARD` and the
+  guard id, written inside a pass on `guard ack pass` and allocated all
+  together or not at all. `karyos_client::guard_acks::guard_acks` reads
+  them, and `karyos_client::groups::read_groups` reads any such group
+  (`capabilities` now uses it). A guard may not be named after one of the
+  six labels, as its word gauge shares their keys (`InvalidConfig`).
+
 - karyos-archive's recording lister (phase 5, M11; quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`):
   `client::list::RecordingLister` reads the whole catalog over the control

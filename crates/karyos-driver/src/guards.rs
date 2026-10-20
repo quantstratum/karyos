@@ -202,6 +202,11 @@ impl Guards {
         self.ring.reader()
     }
 
+    /// Each guard's id, in registry order.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.iter().map(|entry| entry.id)
+    }
+
     /// Each guard's id, name and current word.
     fn words(&self) -> impl Iterator<Item = (u64, &str, u64)> + '_ {
         self.entries
@@ -212,6 +217,12 @@ impl Guards {
     /// Adds a guard, created closed at epoch 1.
     pub(crate) fn add(&mut self, name: &str) -> Result<GuardHandle, DriverError> {
         if name.is_empty() || name.len() > MAX_GUARD_NAME {
+            return Err(DriverError::InvalidConfig);
+        }
+        // The guard's word gauge is labelled with its name beside its
+        // acknowledgement group (M4b), which readers pick by label: a name
+        // equal to one of the group's labels would join the group.
+        if crate::guard_ack::is_ack_label(name) {
             return Err(DriverError::InvalidConfig);
         }
         if self.entries.iter().any(|entry| entry.name == name) {

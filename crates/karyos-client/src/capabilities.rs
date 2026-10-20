@@ -4,17 +4,14 @@
 //! (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
 //! M3 and M6b): the gauges of one endpoint are written together inside a
 //! sampling pass on its `capability pass` cell, so they are read as one
-//! with [`read_pass`] over that cell, or reported inconsistent after a few
-//! attempts. Never waits. It lives here, beside the tool attach, so both
+//! with `read_pass` over that cell ([`crate::groups`]), or reported
+//! inconsistent after a few attempts. Never waits. It lives here, beside the tool attach, so both
 //! `karyos-tools` and the management agent read the groups the same way.
 
-use karyos_sys::counters::{CellRead, CountersReader, KIND_ENDPOINT, PassRead, read_pass};
+use karyos_sys::counters::{CountersReader, KIND_ENDPOINT};
 
 /// The label of an endpoint's pass cell, as the driver writes it.
 pub const PASS_LABEL: &str = "capability pass";
-
-/// Reads of a group before it is reported inconsistent.
-const ATTEMPTS: usize = 8;
 
 /// One endpoint's capability gauges.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,80 +28,17 @@ pub struct EndpointCapabilities {
     pub gauges: Vec<(String, u64)>,
 }
 
-/// One endpoint's cells as the scan finds them.
-struct Group {
-    endpoint: u64,
-    pass: Option<usize>,
-    cells: Vec<(usize, String)>,
-}
-
 /// Every endpoint's capability gauges in `reader`, in the order of their
 /// first cells.
 #[must_use]
 pub fn endpoint_capabilities(reader: &CountersReader) -> Vec<EndpointCapabilities> {
-    // Per endpoint: its pass cell and its gauges' cells with their labels.
-    let mut groups: Vec<Group> = Vec::new();
-    for index in 0..reader.capacity() {
-        let CellRead::Allocated { metadata, .. } = reader.read(index) else {
-            continue;
-        };
-        if metadata.keys.kind != KIND_ENDPOINT {
-            continue;
-        }
-        let endpoint = metadata.keys.participant;
-        let label = String::from_utf8_lossy(metadata.label()).into_owned();
-        if !groups.iter().any(|group| group.endpoint == endpoint) {
-            groups.push(Group {
-                endpoint,
-                pass: None,
-                cells: Vec::new(),
-            });
-        }
-        let Some(group) = groups.iter_mut().find(|group| group.endpoint == endpoint) else {
-            continue;
-        };
-        if label == PASS_LABEL {
-            group.pass = Some(index);
-        } else {
-            group.cells.push((index, label));
-        }
-    }
-    groups
+    crate::groups::read_groups(reader, KIND_ENDPOINT, PASS_LABEL, |_| true)
         .into_iter()
-        .map(
-            |Group {
-                 endpoint,
-                 pass,
-                 cells,
-             }| {
-                let values = || {
-                    cells
-                        .iter()
-                        .map(|(index, label)| {
-                            (label.clone(), reader.load_value(*index).unwrap_or(0))
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let (consistent, gauges) = match pass {
-                    // An unreadable pass cell reads odd: never consistent. The
-                    // pass value read with the gauges tells a completed pass
-                    // (even and nonzero) from none yet (0).
-                    Some(pass) => {
-                        let epoch = || reader.load_value(pass).unwrap_or(1);
-                        match read_pass(epoch, || (epoch(), values()), ATTEMPTS) {
-                            PassRead::Consistent((passes, gauges)) => (passes > 0, gauges),
-                            PassRead::Inconsistent((_, gauges)) => (false, gauges),
-                        }
-                    }
-                    None => (false, values()),
-                };
-                EndpointCapabilities {
-                    endpoint,
-                    consistent,
-                    gauges,
-                }
-            },
-        )
+        .map(|group| EndpointCapabilities {
+            endpoint: group.participant,
+            consistent: group.consistent,
+            gauges: group.gauges,
+        })
         .collect()
 }
 
