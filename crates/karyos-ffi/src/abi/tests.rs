@@ -1151,6 +1151,32 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
         .unwrap() as usize;
     grow_to(&mut seen, &mut one, &mut first, b"small");
     assert_eq!(api::subscription::copy_length(handle), Some(small_max));
+    // DESIGN's P2-1 on #503: the first image's change is queued. A null or
+    // too small `change` is refused and takes nothing; a valid one gets it.
+    let mut has = u32::MAX;
+    // SAFETY: a null `change` is refused before any use; `has` is live.
+    let status = unsafe {
+        karyos_subscription_next_image_change(subscription, core::ptr::null_mut(), &mut has)
+    };
+    assert_eq!((status, has), (Status::InvalidArgument.code(), u32::MAX));
+    let mut change = ImageChange {
+        size: IMAGE_CHANGE_SIZE_0_1 - 1,
+        session_id: 0,
+        image_id: 0,
+        lane: u32::MAX,
+        available: 0,
+    };
+    // SAFETY: live, aligned out-parameters.
+    let status =
+        unsafe { karyos_subscription_next_image_change(subscription, &mut change, &mut has) };
+    assert_eq!((status, has), (Status::InvalidArgument.code(), u32::MAX));
+    change.size = size_of_u32::<ImageChange>();
+    // SAFETY: as above.
+    let status =
+        unsafe { karyos_subscription_next_image_change(subscription, &mut change, &mut has) };
+    assert_eq!((status, has), (Status::Ok.code(), 1));
+    assert_eq!((change.available, change.lane), (1, 0));
+    assert_ne!(change.image_id, 0);
     let (mut second, mut two) = publish(large, 262_144);
     let large_max = two
         .max_message_length(karyos_sys::frame::Lane::ZERO)

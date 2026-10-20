@@ -688,7 +688,8 @@ pub unsafe extern "C" fn karyos_client_add_subscription(
 /// before it. A `limit` of 0 delivers nothing. A data-path call: it never
 /// waits, and allocates only when a newly adopted image or mapping has a
 /// larger message than any before (`KARYOS_E_SYSTEM` when it cannot,
-/// before anything is delivered). The handler runs while the subscription
+/// before anything of that round is delivered: the count covers earlier
+/// rounds). The handler runs while the subscription
 /// is held: from it, polling or closing this subscription, or closing its
 /// client, returns `KARYOS_E_REENTRANT`.
 ///
@@ -744,11 +745,14 @@ pub unsafe extern "C" fn karyos_subscription_poll(
 /// `karyos_subscription_image_changes_lost` counts what a full queue
 /// dropped.
 ///
+/// A null or misaligned `change` or `has`, or a `change` whose `size` is
+/// below this ABI's first `karyos_image_change`, returns
+/// `KARYOS_E_INVALID_ARGUMENT` and takes nothing from the queue.
+///
 /// # Safety
 ///
-/// `change` is null or a `karyos_image_change` whose `size` is set; `has`
-/// points to a writable `uint32_t`. A null or misaligned `has` returns
-/// `KARYOS_E_INVALID_ARGUMENT`.
+/// `change` points to a writable `karyos_image_change` whose `size` is set;
+/// `has` points to a writable `uint32_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_subscription_next_image_change(
     subscription: u64,
@@ -756,7 +760,15 @@ pub unsafe extern "C" fn karyos_subscription_next_image_change(
     has: *mut u32,
 ) -> i32 {
     guard(|| {
-        if !writable(has) {
+        if !(writable(has) && writable(change)) {
+            return Status::InvalidArgument;
+        }
+        // Checked before the change is taken, so a struct that cannot hold
+        // it never loses one.
+        // SAFETY: `change` is non-null and aligned, and the caller's
+        // contract makes it a `karyos_image_change` whose first field is
+        // the `uint32_t` size it set.
+        if unsafe { change.cast::<u32>().read() } < IMAGE_CHANGE_SIZE_0_1 {
             return Status::InvalidArgument;
         }
         match api::subscription::next_image_change(Handle::from_raw(subscription)) {

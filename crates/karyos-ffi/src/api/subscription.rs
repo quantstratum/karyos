@@ -17,8 +17,9 @@
 //! the buffer: what arrives meanwhile waits for the next poll. A handle that
 //! stopped at a mapping's seal gets one more round in the same call, so a
 //! cutover never costs the caller an empty poll. A buffer that cannot grow
-//! answers [`Status::System`] before anything is delivered, so nothing is
-//! acknowledged and the next poll tries again.
+//! answers [`Status::System`] before anything of that round is delivered
+//! (the count covers earlier rounds), so nothing of it is acknowledged and
+//! the next poll tries again.
 //!
 //! The handler runs while the subscription's slot is held: a handler that
 //! polls or closes its own subscription, or closes its client, gets
@@ -207,19 +208,35 @@ pub(crate) fn poll(
                 reader.adopt();
                 fit(copy, reader.max_message_length())
                     .map_err(|status| (Failure::from(status), delivered))?;
+                // Messages handed over, and whether one did not fit: the
+                // adoption above makes that impossible, so a miss is a
+                // broken invariant, reported rather than acknowledged
+                // silently.
+                let (mut handed, mut missed) = (0u32, false);
                 let polled = reader.poll_adopted(
                     |bytes, info| {
                         #[cfg(test)]
                         if PANIC_IN_POLL.with(core::cell::Cell::get) {
                             std::panic::resume_unwind(Box::new("a panic in the poll"));
                         }
+                        debug_assert!(bytes.len() <= copy.len(), "a message past the copy");
                         if let Some(copied) = copy.get_mut(..bytes.len()) {
                             copied.copy_from_slice(bytes);
                             handler(copied, &info);
+                            // At most `limit` messages: never past a u32.
+                            if let Some(next) = handed.checked_add(1) {
+                                handed = next;
+                            }
+                        } else {
+                            missed = true;
                         }
                     },
                     MessageLimit::new(remaining),
                 );
+                if missed {
+                    let delivered = delivered.checked_add(handed).unwrap_or(limit);
+                    return Err((Failure::from(Status::Internal), delivered));
+                }
                 match polled {
                     Ok(poll) => {
                         delivered = delivered.checked_add(poll.delivered).unwrap_or(limit);
@@ -280,12 +297,12 @@ pub(crate) fn copy_length(subscription: Handle) -> Option<usize> {
 ///
 /// The handle's failures, its client's included.
 pub(crate) fn close(subscription: Handle) -> Result<(), Status> {
-    // A poisoned handle is closed too, and released like any other: its
-    // client, written at the add and never changed, is read regardless
-    // (`Table::read_even_poisoned`); the table hands the poisoned object
-    // over, and it is released to the client (`remove_subscription`). What a release touches cannot be left invalid by a
-    // panic inside a call: at worst it releases what that call left
-    // half-done, as a drop would.
+    // A poisoned handle is closed too, and released like any other: its client,
+    // written at the add and never changed, is read regardless
+    // (`Table::read_even_poisoned`); the table hands the poisoned object over,
+    // and it is released to the client (`remove_subscription`). What a release
+    // touches cannot be left invalid by a panic inside a call: at worst it
+    // releases what that call left half-done, as a drop would.
     let client = table().read_even_poisoned(subscription, |entry| entry.client)?;
     clients().with(client, |entry| {
         let removed = table().remove(subscription)?;

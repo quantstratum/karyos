@@ -344,8 +344,9 @@ int32_t karyos_client_add_subscription(uint64_t client, const char *uri,
  * fails: a failed poll's status follows the messages delivered before it.
  * Never waits; it allocates only when a newly attached image or mapping
  * has a larger message than any before (KARYOS_E_SYSTEM when it cannot,
- * before anything is delivered). From the handler, polling or closing this
- * subscription, or closing its client, returns KARYOS_E_REENTRANT. To stop
+ * before anything of that round is delivered: the count covers earlier
+ * rounds). From the handler, polling or closing this subscription, or
+ * closing its client, returns KARYOS_E_REENTRANT. To stop
  * after a failed handler (ADR-0067), poll with a limit of 1 in a loop and
  * stop calling: the failed message is acknowledged, the later ones are
  * not delivered.
@@ -357,7 +358,10 @@ int32_t karyos_subscription_poll(uint64_t subscription,
 
 /**
  * Takes the oldest queued image change into change and sets has to 1, or
- * sets has to 0 when none is queued. The queue is bounded.
+ * sets has to 0 when none is queued. The queue is bounded. change points
+ * to a karyos_image_change whose size is set: a null one, or one smaller
+ * than this version's first, returns KARYOS_E_INVALID_ARGUMENT and takes
+ * nothing.
  */
 int32_t karyos_subscription_next_image_change(uint64_t subscription,
                                               karyos_image_change *change,
