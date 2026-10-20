@@ -81,6 +81,7 @@ use crate::concurrent::ClientConcurrentPublication;
 use crate::conductor::{
     ClientConductor, Completion, ConductorError, ConductorPoll, EVENT_QUEUE, Outcome,
 };
+use crate::conflated_subscription::{ConflatedOptions, ConflatedSubscription};
 use crate::error::ClientError;
 use crate::publication::ClientPublication;
 use crate::subscription::{
@@ -89,7 +90,7 @@ use crate::subscription::{
 
 mod publish;
 
-pub use publish::{Accepted, Claim, MessageLength, OfferError, Publication};
+pub use publish::{Accepted, Claim, MessageLength, OfferError, OfferOptions, Publication};
 
 /// Default wait of a control call.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -497,6 +498,20 @@ pub trait Connection: sealed::Sealed {
         outcome: Outcome,
     ) -> Result<ClientSubscription<Self::Terms>, ClientError>;
 
+    /// Requests a view of `stream`'s conflation table. An in-process
+    /// conductor submits it too, and its driver refuses it: an in-process
+    /// view comes from the driver (`EmbeddedDriver::subscribe_conflated`).
+    #[doc(hidden)]
+    fn add_conflated_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError>;
+
+    /// Takes the view a conflated request granted.
+    #[doc(hidden)]
+    fn conflated_subscription(
+        &self,
+        outcome: Outcome,
+        options: ConflatedOptions,
+    ) -> Result<ConflatedSubscription, ClientError>;
+
     /// Releases what a late answer granted; whether it granted anything.
     #[doc(hidden)]
     fn release(&mut self, outcome: Outcome) -> bool;
@@ -626,6 +641,18 @@ impl Connection for ClientConductor {
             Outcome::Subscription(subscription) => Ok(subscription),
             other => Err(refusal(&other)),
         }
+    }
+
+    fn add_conflated_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
+        ClientConductor::add_conflated_subscription(self, stream)
+    }
+
+    fn conflated_subscription(
+        &self,
+        outcome: Outcome,
+        _: ConflatedOptions,
+    ) -> Result<ConflatedSubscription, ClientError> {
+        Err(refusal(&outcome))
     }
 
     fn release(&mut self, outcome: Outcome) -> bool {
@@ -770,6 +797,23 @@ impl Connection for crate::ipc::RemoteClient {
         }
     }
 
+    fn add_conflated_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
+        crate::ipc::RemoteClient::add_conflated_subscription(self, stream)
+    }
+
+    fn conflated_subscription(
+        &self,
+        outcome: Outcome,
+        options: ConflatedOptions,
+    ) -> Result<ConflatedSubscription, ClientError> {
+        match outcome {
+            Outcome::FetchableConflated(fetchable) => {
+                Ok(self.take_conflated(&fetchable, options.budget, options.limits)?)
+            }
+            other => Err(refusal(&other)),
+        }
+    }
+
     fn release(&mut self, outcome: Outcome) -> bool {
         match outcome {
             // Taken, then released: a publication is removed, as a
@@ -806,6 +850,15 @@ impl Connection for crate::ipc::RemoteClient {
             },
             Outcome::NetworkSubscription { registration } => {
                 crate::ipc::RemoteClient::remove_network_subscription(self, registration).is_ok()
+            }
+            // Taken and dropped: the view's drop unmaps the table and sends
+            // the grant's `Detach`, which ends its export. A take that
+            // fails, a table past the default limits included, detaches
+            // the grant itself: either way it is released.
+            Outcome::FetchableConflated(fetchable) => {
+                let options = ConflatedOptions::default();
+                let _ = self.take_conflated(&fetchable, options.budget, options.limits);
+                true
             }
             _ => false,
         }
@@ -1319,6 +1372,61 @@ impl<C: Connection> Client<C> {
                     changes_lost: 0,
                 }),
             }),
+        }
+    }
+
+    /// A view of the conflation table of the `karyos:ipc` stream
+    /// `stream_id`, with the default [`ConflatedOptions`]: each poll hands
+    /// over the latest value of the keys changed since the last one
+    /// (SPEC.md §7.1, §10; `quantstratum-docs:
+    /// karyos/design/conflation-end-to-end.md`, Cross-process views).
+    ///
+    /// A client attached to a driver in another process takes it; a
+    /// client of a driver in this process is refused by its driver, which
+    /// gives in-process views itself (`EmbeddedDriver::subscribe_conflated`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::add_conflated_subscription_with`].
+    pub fn add_conflated_subscription(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+    ) -> Result<ConflatedSubscription, ClientError> {
+        self.add_conflated_subscription_with(uri, stream_id, ConflatedOptions::default())
+    }
+
+    /// As [`Client::add_conflated_subscription`], with the view's poll
+    /// budget and the limits its table must be within.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::UnsupportedChannel`] for a URI other than
+    /// `karyos:ipc`, before anything is requested;
+    /// [`ClientError::Conductor`] for a request that cannot be submitted,
+    /// [`ClientError::Timeout`], [`ClientError::Refused`] (a stream without
+    /// a table, or an in-process client), and on Linux
+    /// `ClientError::Attach` (a table past the limits included).
+    pub fn add_conflated_subscription_with(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+        options: ConflatedOptions,
+    ) -> Result<ConflatedSubscription, ClientError> {
+        if !uri.starts_with("karyos:ipc") {
+            return Err(ClientError::UnsupportedChannel { detail: 0 });
+        }
+        // Session 0: the driver resolves the stream, as for an IPC
+        // subscription.
+        let stream = StreamKey {
+            stream_id: stream_id.get(),
+            session_id: 0,
+        };
+        let sequence = self.connection.add_conflated_subscription(stream)?;
+        match self.wait(sequence)? {
+            Found::Outcome(outcome) => self.connection.conflated_subscription(*outcome, options),
+            // Only a network subscription's grant is one.
+            Found::Network(..) => Err(ClientError::Unknown),
         }
     }
 

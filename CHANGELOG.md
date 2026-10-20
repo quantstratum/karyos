@@ -11,6 +11,37 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- karyos-tools: `replay::HELP` is replaced by `replay::help(command)`,
+  which names the command the diff was invoked as (`karyos-replay diff` or
+  its alias `karyos-tools replay diff`; H5, #521).
+- A publication a client is granted through the command ring of a driver
+  in its process binds its stream's conflation table, as the driver's own
+  publication does: an offer with a key outside the table, or a value
+  larger than its capacity, is refused before it appends
+  (`ClientError::Conflation`), where until now it was appended and the
+  driver's feeder dropped it from the conflated view and counted it as a
+  rejected key. The low-level `ClientPublication` taken from such a grant
+  was the earlier route to that gap. karyos-client's `HandOverEntry` gains
+  `conflation` and `with_conflation`. A client attached to a driver in
+  another process is not checked yet (F7b-2c).
+
+- karyos-archive's `client::connection` (quantstratum-docs:
+  `karyos/design/ffi-archive.md`, F9-0): a requester's control streams to
+  an Archive over a facade client. `ArchiveConnection::open(&mut client,
+  ControlStreams::new(requests, responses))` takes a concurrent publication
+  on the shared request stream and an optional subscription, rejoining at
+  the head, on the shared response stream (`karyos:ipc`): a requester that
+  stops reading is lapped instead of holding back everyone's answers. It
+  answers `OpenError` naming the stream it could not take, and a failed
+  open removes the publication it took. `into_transports` gives the
+  `Requests` and `Responses` an `ArchiveClient` or a `RecordingLister`
+  takes; `close`, `Requests::close` and `Responses::close` remove them
+  from the client, and `RecordingLister::into_transports` gives them back.
+  An answer longer than the caller's buffer is dropped and counted
+  (`Responses::oversized`). The management agent's catalog uses it in
+  place of its private adapters, and so do `karyos-catalog list --live`
+  (H4b) and `karyos-replay start` (H6). Public surface, under owner items
+  57 and 41.
 - A replay waits for its target's first reader (quantstratum-docs:
   `karyos/design/archive-host.md`, H2b), so a requester that subscribes
   after the `Replay` answer reads it from its first position.
@@ -508,6 +539,67 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Remote conflated views through the facade and the C ABI (F7b-2c-1;
+  quantstratum-docs: `karyos/design/ffi-gap-analysis.md`,
+  `conflation-end-to-end.md`, owner item 57):
+  - `Client::add_conflated_subscription(uri, stream_id)` and
+    `Client::add_conflated_subscription_with(uri, stream_id,
+    ConflatedOptions)`: a view of a `karyos:ipc` stream's conflation table.
+    A client attached to a driver in another process takes it; a client
+    of a driver in this process is refused by its driver
+    (`ClientError::Refused`), which gives in-process views itself
+    (`EmbeddedDriver::subscribe_conflated`). Another channel is
+    `ClientError::UnsupportedChannel`, before anything is requested.
+  - `ConflatedOptions { budget, limits }` (`#[non_exhaustive]`; the
+    default is the driver's view budget, 1024 keys and 3 retries, and the
+    default limits), re-exported with `ConflatedLimits` and
+    `ConflatedBudget` from the facade. `ConflatedLimits` moves from
+    `karyos_client::ipc` to the crate root, on every platform
+    (`ipc::ConflatedLimits` stays as a re-export), and gains `new`.
+  - `karyos_client_add_conflated_subscription(client, uri, stream_id,
+    *conflated, *detail)`: a client's view, closed with its client, after
+    which its handle answers `KARYOS_E_CLOSED`. It takes the default
+    retries and limits; the key budget is each poll's.
+  - `AddConflatedSubscription` with session 0 names the stream a
+    `karyos:ipc` URI of the id names, when there is one (the key is exact
+    otherwise), and `RemoteClient::take_conflated` takes the grant's
+    session for such a request, checking the stream id, as a request by
+    URI does (W7).
+
+- Conflated subscriptions over the C ABI (F7b-2b; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md`, `conflation-end-to-end.md`):
+  - `karyos_stream_options` grows `conflation_keys`,
+    `conflation_value_capacity` (u32) and `conflation_journal_capacity`
+    (u64): an ABI addition, 80 bytes. All three 0 means no table; a
+    partial set, or a table the driver cannot build, is
+    `KARYOS_E_INVALID_ARGUMENT`. A 64-byte struct of the first layout is
+    still accepted, with no table; a size between 64 and 80 is refused.
+    `karyos_stream_options_init` now writes 80.
+  - `karyos_driver_subscribe_conflated`, `karyos_conflated_poll` (a
+    `karyos_conflated_handler` gets the key, the value from the reader's
+    private copy, its version and its freshness: `KARYOS_FRESH` or the
+    stale start) and `karyos_conflated_close`, with
+    `KARYOS_MAX_CONFLATED_SUBSCRIPTIONS`. A stream without a table is
+    `KARYOS_E_CONFLATION`; a closed view, or one of a closed driver,
+    answers `KARYOS_E_CLOSED`.
+  - Conformance: `conflated.typed.statuses`; `struct.size.stream.options`
+    covers both layouts; the runner's three new calls and the stream's
+    conflation arguments.
+
+- Per-offer options (F7b-2a; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md`): the facade's
+  `Publication::offer_on_with(lane, payload, OfferOptions)`, with
+  `OfferOptions { reserved_value }` (`#[non_exhaustive]`; `Default`,
+  `new`, `with_reserved_value`), and over the C ABI the new struct
+  `karyos_offer_options` (`size`, `reserved`, `reserved_value`; read by
+  prefix, 16 bytes in 0.1.0), `karyos_offer_options_init` and
+  `karyos_publication_offer_with`. The reserved value is every fragment's
+  header value, which subscribers read as `reserved_value`, and a
+  conflated stream's key. A null options, a short size or a nonzero
+  `reserved` is `KARYOS_E_INVALID_ARGUMENT`; a key or value the
+  publication refuses is `KARYOS_E_CONFLATION`, with nothing reserved.
+  Claims do not take options yet.
+
 - `karyos-catalog list DIR [--json]` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H4a): an archive directory's
   recordings, read offline through the new
@@ -571,6 +663,21 @@ release may break APIs, wire formats and shared-memory layouts.
   `KARYOS_E_UNSUPPORTED`. The conformance format gains both calls and the
   `schedule_capacity` argument of `karyos_driver_add_stream`, with the
   scenario `publication.timed.offer`.
+- `karyosd` runs the Archive (quantstratum-docs:
+  `karyos/design/archive-host.md`, H3). `--archive DIR` starts the agent
+  with its catalog in `DIR`, and `--archive-control REQ,RESP` names the
+  control streams, which the daemon adds (REQ concurrent). `--record
+  id:session[:sync]` (repeatable; sync `none`, `segment` or a duration)
+  starts a recording at boot through the control path, and a shutdown
+  stops it, then the agent. `--archive-min-free` (default 1 GiB) refuses a
+  recording while the archive's file system has less free space,
+  measured by the new `karyos_sys::fs::free_bytes` (Linux). Under
+  same-uid admission every admitted client may control the Archive: the
+  trust boundary is the daemon's uid, and per-client authorization comes
+  with owner item 43. The audit trail (target
+  `karyos::archive::audit`) names each grant on the control streams, each
+  request and each answer, through the driver's new
+  `EmbeddedDriver::audit_grants` and `drain_grant_audits`.
 
 - `Publication::offer_at_on(lane, payload, tx_time)` on the client facade
   (quantstratum-docs: `karyos/design/timed-tx.md`; owner item 57): a timed
@@ -2107,6 +2214,23 @@ release may break APIs, wire formats and shared-memory layouts.
   position stays within each required member's edge.
 
 ### Fixed
+
+- `karyosd --archive` admits remote `ArchiveConnection`s again. Their
+  response reader is optional (#524), and an optional reader takes a
+  spare-slot credit; the response stream had the default three spare
+  slots, whose one free credit the daemon's own requester held, so every
+  remote open was refused (`ResourcesUnavailable`). The response stream
+  now has `RESPONSE_READERS` (8, as many as the request stream's
+  publishers) readers and `RESPONSE_SPARE_SLOTS` spare slots, and
+  `karyosd_admits_as_many_archive_connections_as_request_publishers`
+  opens them all beside a boot recording. The management agent's
+  catalog, which had stopped listing a karyosd Archive, lists it again
+  (`the_management_agent_lists_a_karyosd_archive`; karyos-tools now has
+  karyos-agent as a dev-dependency for it).
+- A remote conflated grant that arrived after its request timed out was
+  not released: `Connection::release` ignored `FetchableConflated`, so the
+  grant stayed held until the client ended. It is now taken and dropped,
+  which sends its `Detach`.
 
 - One driver can hold both ends of a `karyos:udp` endpoint (karyos#490;
   quantstratum-docs: `karyos/design/per-source-images.md`, D2-1 and

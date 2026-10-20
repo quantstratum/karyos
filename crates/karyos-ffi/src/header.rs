@@ -40,6 +40,7 @@ fn c_struct(rust: &str) -> &'static str {
         "ImageChange" => "karyos_image_change",
         "Outcome" => "karyos_outcome",
         "SubscriptionOptions" => "karyos_subscription_options",
+        "OfferOptions" => "karyos_offer_options",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -69,8 +70,11 @@ fn c_type(rust: &str) -> String {
         "*const MessageInfo" => "const karyos_message_info *",
         "*mut ImageChange" => "karyos_image_change *",
         "*const SubscriptionOptions" => "const karyos_subscription_options *",
+        "*const OfferOptions" => "const karyos_offer_options *",
+        "*mut OfferOptions" => "karyos_offer_options *",
         "*mut SubscriptionOptions" => "karyos_subscription_options *",
         "MessageHandler" => "karyos_message_handler",
+        "ConflatedHandler" => "karyos_conflated_handler",
         "*const Outcome" => "const karyos_outcome *",
         "OutcomeHandler" => "karyos_outcome_handler",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
@@ -109,6 +113,9 @@ fn header_defines() -> BTreeMap<String, i64> {
             let name = parts.next()?;
             let value = parts.next()?;
             assert!(parts.next().is_none(), "`{define}` is not NAME VALUE");
+            // `UINT64_MAX` is no `i64`: its defines are checked by name
+            // (`the_header_states_the_conflation_constants`).
+            (value != "UINT64_MAX").then_some(())?;
             name.starts_with("KARYOS_").then(|| {
                 let value = value.parse().unwrap_or_else(|_| panic!("`{define}`"));
                 (name.to_owned(), value)
@@ -438,6 +445,21 @@ fn the_header_states_the_subscription_constants() {
         i64::from(MESSAGE_END_OF_STREAM)
     );
     assert_eq!(defines["KARYOS_MESSAGE_TRACED"], i64::from(MESSAGE_TRACED));
+}
+
+#[test]
+fn the_header_states_the_conflation_constants() {
+    use crate::api::conflated;
+    assert_eq!(
+        header_defines()["KARYOS_MAX_CONFLATED_SUBSCRIPTIONS"],
+        i64::from(conflated::MAX_CONFLATED_SUBSCRIPTIONS)
+    );
+    assert_eq!(conflated::FRESH, u64::MAX);
+    assert!(
+        header_code()
+            .lines()
+            .any(|line| line.trim() == "#define KARYOS_FRESH UINT64_MAX")
+    );
 }
 
 #[test]

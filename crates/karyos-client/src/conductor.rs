@@ -981,10 +981,6 @@ impl<T: TermBytes> ClientConductor<T> {
     /// # Errors
     ///
     /// See [`ConductorError`]; nothing is submitted on error.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "remote clients exist only on Linux")
-    )]
     pub(crate) fn add_conflated_subscription(
         &mut self,
         stream: StreamKey,
@@ -1765,6 +1761,7 @@ impl<T: TermBytes> ClientConductor<T> {
                         lease: entry.lease,
                     };
                     let generation = entry.generation;
+                    let conflation = entry.conflation;
                     let outcome = match (kind, entry.capability) {
                         (
                             Kind::AddPublication,
@@ -1777,13 +1774,13 @@ impl<T: TermBytes> ClientConductor<T> {
                             // the ring (timed-tx.md section 11); a binding
                             // this build does not know would be a driver
                             // defect, and the handle is dropped.
-                            match ClientPublication::from_hand_over(
-                                inner,
-                                allow_unconnected,
-                                origin,
-                            )
-                            .with_ring_schedule()
-                            {
+                            let publication =
+                                ClientPublication::from_hand_over(inner, allow_unconnected, origin);
+                            let publication = match conflation {
+                                Some(config) => publication.with_conflation(config),
+                                None => publication,
+                            };
+                            match publication.with_ring_schedule() {
                                 Ok(publication) => Outcome::Publication(publication),
                                 Err(_) => Outcome::Unknown,
                             }
@@ -1794,13 +1791,17 @@ impl<T: TermBytes> ClientConductor<T> {
                                 inner,
                                 allow_unconnected,
                             },
-                        ) => Outcome::ConcurrentPublication(
-                            ClientConcurrentPublication::from_hand_over(
+                        ) => {
+                            let publication = ClientConcurrentPublication::from_hand_over(
                                 inner,
                                 allow_unconnected,
                                 origin,
-                            ),
-                        ),
+                            );
+                            Outcome::ConcurrentPublication(match conflation {
+                                Some(config) => publication.with_conflation(config),
+                                None => publication,
+                            })
+                        }
                         (Kind::AddSubscription, Capability::Subscription(inner)) => {
                             let subscription = ClientSubscription::from_hand_over(inner, origin);
                             Outcome::Subscription(match entry.publication {
@@ -1983,6 +1984,7 @@ mod tests {
             lease: Lease::acquire(&leases, &Arc::new(LeaseEnd::default())),
             generation: None,
             publication: None,
+            conflation: None,
         });
         let response = Response::PublicationReady {
             request: RequestId {

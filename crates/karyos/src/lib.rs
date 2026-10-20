@@ -54,10 +54,11 @@
 //! their outcome enums. The Archive and Cluster APIs do not exist yet.
 
 pub use karyos_client::{
-    Accepted, Claim, Client, ClientError, ConflatedSubscription, ConflatedValue, Connection,
-    Context, ContextBuilder, Freshness, IdleStrategy, ImageStop, Lane, MessageInfo, MessageLength,
-    MessageLimit, OfferError, PollError, PollSummary, Publication, RejoinPolicy, Secondary,
-    SnapshotSource, StreamId, SubscriberRole, Subscription, SubscriptionError, SubscriptionOptions,
+    Accepted, Claim, Client, ClientError, ConflatedBudget, ConflatedLimits, ConflatedOptions,
+    ConflatedSubscription, ConflatedValue, Connection, Context, ContextBuilder, Freshness,
+    IdleStrategy, ImageStop, Lane, MessageInfo, MessageLength, MessageLimit, OfferError,
+    OfferOptions, PollError, PollSummary, Publication, RejoinPolicy, Secondary, SnapshotSource,
+    StreamId, SubscriberRole, Subscription, SubscriptionError, SubscriptionOptions,
     SubscriptionPoll, ViewClosed,
 };
 

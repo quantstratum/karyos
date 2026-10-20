@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 
 use karyos_client::ClientConductor;
 use karyos_driver::{DriverConfig, DriverError, EmbeddedDriver, StreamConfig, StreamHandle};
+use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     DEFAULT_CLAIM_DEADLINE, LogBufferConfig, LossPolicy, PublicationMode,
@@ -121,8 +122,8 @@ pub(crate) const LOSS_CONTINUE: u32 = 1;
 pub(crate) const LOSS_ABORT: u32 = 2;
 
 /// A stream's options, as `karyos_stream_options` carries them: the
-/// fields of the Rust `StreamConfig` and its `LogBufferConfig`, with no
-/// conflation (SPEC.md §4).
+/// fields of the Rust `StreamConfig`, its `LogBufferConfig` and its
+/// conflation table (SPEC.md §4, §7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamOptions {
     /// The wire stream id.
@@ -153,6 +154,12 @@ pub(crate) struct StreamOptions {
     pub(crate) on_required_loss: u32,
     /// How long a claim may stay open, in nanoseconds.
     pub(crate) claim_deadline_ns: u64,
+    /// Keys of the conflation table; 0, with the two below, for none.
+    pub(crate) conflation_keys: u32,
+    /// The table's largest value, in bytes.
+    pub(crate) conflation_value_capacity: u32,
+    /// Bytes of the table's update journal.
+    pub(crate) conflation_journal_capacity: u64,
 }
 
 impl StreamOptions {
@@ -173,6 +180,29 @@ impl StreamOptions {
             schedule_capacity: 0,
             on_required_loss: LOSS_HOLD,
             claim_deadline_ns: DEFAULT_CLAIM_DEADLINE,
+            conflation_keys: 0,
+            conflation_value_capacity: 0,
+            conflation_journal_capacity: 0,
+        }
+    }
+
+    /// The conflation table: none when all three fields are 0; a partial
+    /// set, or sizes this target cannot hold, is refused. The driver
+    /// checks the rest when it adds the stream.
+    fn conflation(&self) -> Result<Option<ConflationConfig>, Failure> {
+        let invalid = |code: u64| Failure::with(Status::InvalidArgument, code, 0);
+        match (
+            self.conflation_keys,
+            self.conflation_value_capacity,
+            self.conflation_journal_capacity,
+        ) {
+            (0, 0, 0) => Ok(None),
+            (0, _, _) | (_, 0, _) | (_, _, 0) => Err(invalid(0)),
+            (keys, value, journal) => Ok(Some(ConflationConfig {
+                keys,
+                value_capacity: usize::try_from(value).map_err(|_| invalid(u64::from(value)))?,
+                journal_capacity: usize::try_from(journal).map_err(|_| invalid(journal))?,
+            })),
         }
     }
 
@@ -218,7 +248,7 @@ impl StreamOptions {
             },
             allow_unconnected,
             on_required_loss,
-            conflation: None,
+            conflation: self.conflation()?,
         })
     }
 }
@@ -569,8 +599,10 @@ pub(crate) fn stop(driver: Handle) -> Result<(), Status> {
 /// The options' and the driver's refusals: a stream id the driver already
 /// has, in any session, is [`Status::InvalidArgument`] with the stream id
 /// and the session id it has (the C ABI keys a driver's streams by stream
-/// id alone, while the driver keys them by stream and session);
-/// [`Status::Internal`] for a lost driver, and the table's errors.
+/// id alone, while the driver keys them by stream and session); a
+/// partial conflation table, or one the driver cannot build, is
+/// [`Status::InvalidArgument`]; [`Status::Internal`] for a lost driver,
+/// and the table's errors.
 pub(crate) fn add_stream(driver: Handle, options: &StreamOptions) -> Result<(), Failure> {
     let config = options.config()?;
     with_slot(driver, |slot| {
@@ -582,7 +614,11 @@ pub(crate) fn add_stream(driver: Handle, options: &StreamOptions) -> Result<(), 
             ));
         }
         let added = slot.with_driver(|driver| driver.add_stream(config))?;
-        let stream = added.map_err(|error| Failure::from(&error))?;
+        let stream = added.map_err(|error| match error {
+            // A conflation table the driver cannot build from the options.
+            DriverError::Conflation(_) => Failure::from(Status::InvalidArgument),
+            error => Failure::from(&error),
+        })?;
         let _ = slot
             .streams
             .insert(options.stream_id, (stream, options.session_id));
@@ -613,6 +649,33 @@ pub(crate) fn remove_stream(driver: Handle, stream_id: i32) -> Result<(), Failur
         Ok(())
     })
     .map_err(Failure::from)?
+}
+
+/// Runs `f` on `driver`'s embedded driver and its stream `stream_id`, and
+/// returns its result with the state the driver's dependants follow.
+///
+/// # Errors
+///
+/// [`Status::InvalidArgument`] for a stream id the driver does not have,
+/// the driver's state ([`DriverState::usable`]), [`Status::Internal`] for
+/// a lost driver, and the table's errors.
+pub(crate) fn with_stream<R>(
+    driver: Handle,
+    stream_id: i32,
+    f: impl FnOnce(&mut EmbeddedDriver, StreamHandle) -> R,
+) -> Result<(R, DriverState), Failure> {
+    with_slot(driver, |slot| {
+        slot.state.usable()?;
+        let (stream, _) = slot.streams.get(&stream_id).copied().ok_or_else(|| {
+            Failure::with(
+                Status::InvalidArgument,
+                u64::from(stream_id.unsigned_abs()),
+                0,
+            )
+        })?;
+        let result = slot.with_driver(|driver| f(driver, stream))?;
+        Ok((result, slot.state.clone()))
+    })?
 }
 
 /// A conductor of `driver` for a new client, and the state the client

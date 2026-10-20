@@ -448,6 +448,9 @@ fn call(step: &Step, at: &str) -> Returned {
                     "stream_id",
                     "allow_unconnected",
                     "schedule_capacity",
+                    "conflation_keys",
+                    "conflation_value_capacity",
+                    "conflation_journal_capacity",
                     "size",
                 ],
                 at,
@@ -462,6 +465,15 @@ fn call(step: &Step, at: &str) -> Returned {
                 arguments.narrow("allow_unconnected", options.allow_unconnected);
             options.schedule_capacity =
                 arguments.narrow("schedule_capacity", options.schedule_capacity);
+            options.conflation_keys = arguments.narrow("conflation_keys", options.conflation_keys);
+            options.conflation_value_capacity = arguments.narrow(
+                "conflation_value_capacity",
+                options.conflation_value_capacity,
+            );
+            options.conflation_journal_capacity = arguments.narrow(
+                "conflation_journal_capacity",
+                options.conflation_journal_capacity,
+            );
             let size = size_argument::<abi::StreamOptions>(&arguments, "size");
             Returned {
                 status: Some(abi::driver_add_stream_sized(
@@ -537,6 +549,35 @@ fn call(step: &Step, at: &str) -> Returned {
                 arguments.handle("publication"),
                 arguments.narrow("lane", 0),
                 &arguments.message(),
+                size_argument::<abi::Accepted>(&arguments, "accepted_size"),
+            );
+            with_accepted(status, &accepted)
+        }
+        "karyos_publication_offer_with" => {
+            let arguments = Arguments::new(
+                step,
+                &[
+                    "publication",
+                    "lane",
+                    "payload",
+                    "length",
+                    "size",
+                    "reserved",
+                    "reserved_value",
+                    "accepted_size",
+                ],
+                at,
+            );
+            let (status, mut options) = abi::offer_options();
+            assert_eq!(status, 0, "{at}: karyos_offer_options_init");
+            options.reserved = arguments.narrow("reserved", options.reserved);
+            options.reserved_value = arguments.narrow("reserved_value", options.reserved_value);
+            let (status, accepted) = abi::publication_offer_with(
+                arguments.handle("publication"),
+                arguments.narrow("lane", 0),
+                &arguments.message(),
+                &options,
+                size_argument::<abi::OfferOptions>(&arguments, "size"),
                 size_argument::<abi::Accepted>(&arguments, "accepted_size"),
             );
             with_accepted(status, &accepted)
@@ -690,6 +731,36 @@ fn call(step: &Step, at: &str) -> Returned {
             let (status, work) = abi::driver_do_work(handle_argument(step, "driver", at));
             with_count(status, "work", work)
         }
+        "karyos_driver_subscribe_conflated" => {
+            let arguments = Arguments::new(step, &["driver", "stream_id"], at);
+            let stream_id = arguments
+                .integer("stream_id")
+                .map(|_| arguments.narrow("stream_id", 0))
+                .unwrap_or_else(|| panic!("{at}: `stream_id` is required"));
+            let (status, conflated) =
+                abi::driver_subscribe_conflated(arguments.handle("driver"), stream_id);
+            if status == 0 {
+                with_handle(status, "conflated", conflated, at)
+            } else {
+                Returned {
+                    status: Some(status),
+                    results: BTreeMap::new(),
+                }
+            }
+        }
+        "karyos_conflated_poll" => {
+            let arguments = Arguments::new(step, &["conflated", "key_budget"], at);
+            let (status, delivered, counted) = abi::conflated_poll(
+                arguments.handle("conflated"),
+                arguments.narrow("key_budget", 1),
+            );
+            assert_eq!(delivered, counted, "{at}: the count is the handler's calls");
+            with_count(status, "delivered", delivered)
+        }
+        "karyos_conflated_close" => Returned {
+            status: Some(abi::conflated_close(handle_argument(step, "conflated", at))),
+            results: BTreeMap::new(),
+        },
         "karyos_driver_close" => Returned {
             status: Some(abi::driver_close(handle_argument(step, "driver", at))),
             results: BTreeMap::new(),

@@ -167,6 +167,13 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
         }
     }
 
+    /// The transports back, dropping a listing under way: to close them
+    /// (`connection::Requests::close`).
+    #[must_use]
+    pub fn into_transports(self) -> (Q, R) {
+        (self.requests, self.responses)
+    }
+
     /// Begins a listing from the first recording, dropping one under way.
     pub fn start(&mut self) {
         self.kept.clear();
