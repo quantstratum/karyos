@@ -618,7 +618,11 @@ release may break APIs, wire formats and shared-memory layouts.
   run concurrently: a data-path call holds only its handle, while a
   control call also holds the client. Two waits are bounded: a call on a
   started driver waits for one duty cycle, and ending a claim waits for
-  the claim's slot. `karyos-ffi` asserts at compile time that each
+  the claim's slot. A started driver's thread now yields the driver to a
+  waiting call before its next cycle, so a call waits through at most
+  the cycle in progress: before, under busy-spin or sustained work, the
+  thread could take its unfair lock back for an unbounded time.
+  `karyos-ffi` asserts at compile time that each
   kind's object is `Send` and its table `Sync`
   (`src/threads.rs`), and `abi::tests::threads` checks the runtime rules.
 

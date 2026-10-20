@@ -48,11 +48,12 @@
  *   driver's own thread (karyos_driver_start) runs duty cycles only and
  *   never calls back.
  * - Two waits are bounded. A driver call on a started driver waits for
- *   the thread's current duty cycle. A commit, an abort or a close that
- *   ends a claim holds the publication and waits for the claim's handle,
- *   which a call holds only to read the publication it names, taking
- *   nothing else meanwhile. Every other acquisition is a try, so no call
- *   waits on a holder that waits in turn.
+ *   the thread's current duty cycle: the thread yields the driver to a
+ *   waiting call before its next cycle. A commit, an abort or a close
+ *   that ends a claim holds the publication and waits for the claim's
+ *   handle, which a call holds only to read the publication it names,
+ *   taking nothing else meanwhile. Every other handle acquisition is a
+ *   try, so no call waits on a holder that waits in turn.
  * - While a driver's own thread runs, karyos_driver_do_work and a second
  *   karyos_driver_start answer KARYOS_E_BUSY; karyos_driver_stop and the
  *   close work from any thread, and the close joins the thread.

@@ -17,7 +17,7 @@
 //!   and speak the protocol version this library was built with,
 //!   [`PROTOCOL_VERSION`], asserted at compile time (ADR-0053).
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -305,10 +305,27 @@ impl Idle {
 struct Threaded {
     /// The driver, shared with the thread.
     shared: Arc<Mutex<EmbeddedDriver>>,
+    /// The callers waiting for `shared`: the thread yields to them between
+    /// cycles, so a caller waits for one cycle, not for as long as the
+    /// thread keeps winning an unfair lock (`karyos.h`, "Threads").
+    waiting: Arc<AtomicU32>,
+    /// The thread's duty cycles, and the most a caller waited through:
+    /// the test of the bound (`tests::a_call_on_a_busy_spinning_driver_waits_for_one_cycle`).
+    #[cfg(test)]
+    cycles: Arc<Waited>,
     /// Asks the thread to stop.
     stop: Arc<AtomicBool>,
     /// The thread, until it is joined.
     thread: Option<JoinHandle<()>>,
+}
+
+/// A started driver's duty cycles and the most a caller waited through
+/// (tests only).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Waited {
+    done: std::sync::atomic::AtomicU64,
+    most: std::sync::atomic::AtomicU64,
 }
 
 impl Threaded {
@@ -415,11 +432,21 @@ impl Driver {
         match &mut self.mode {
             Mode::Invoker(driver) => Ok(f(driver)),
             // The thread holds it only for one duty cycle at a time.
-            Mode::Threaded(threaded) => threaded
-                .shared
-                .lock()
-                .map(|mut driver| f(&mut driver))
-                .map_err(|_| Status::Internal),
+            Mode::Threaded(threaded) => {
+                #[cfg(test)]
+                let before = threaded.cycles.done.load(Ordering::Acquire);
+                threaded.waiting.fetch_add(1, Ordering::AcqRel);
+                let locked = threaded.shared.lock();
+                threaded.waiting.fetch_sub(1, Ordering::AcqRel);
+                #[cfg(test)]
+                threaded.cycles.most.fetch_max(
+                    threaded.cycles.done.load(Ordering::Acquire) - before,
+                    Ordering::AcqRel,
+                );
+                locked
+                    .map(|mut driver| f(&mut driver))
+                    .map_err(|_| Status::Internal)
+            }
             Mode::Lost => Err(Status::Internal),
         }
     }
@@ -533,18 +560,37 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
         };
         let shared = Arc::new(Mutex::new(*owned));
         let stop = Arc::new(AtomicBool::new(false));
+        let waiting = Arc::new(AtomicU32::new(0));
+        #[cfg(test)]
+        let cycles = Arc::new(Waited::default());
         let spawned = {
             let shared = Arc::clone(&shared);
             let stop = Arc::clone(&stop);
+            let waiting = Arc::clone(&waiting);
+            #[cfg(test)]
+            let cycles = Arc::clone(&cycles);
             let state = slot.state.clone();
             std::thread::Builder::new()
                 .name("karyos-driver".to_owned())
-                .spawn(move || run(&shared, &stop, idle, state))
+                .spawn(move || {
+                    run(
+                        &shared,
+                        &stop,
+                        &waiting,
+                        idle,
+                        state,
+                        #[cfg(test)]
+                        &cycles,
+                    );
+                })
         };
         match spawned {
             Ok(thread) => {
                 slot.mode = Mode::Threaded(Threaded {
                     shared,
+                    waiting,
+                    #[cfg(test)]
+                    cycles,
                     stop,
                     thread: Some(thread),
                 });
@@ -569,7 +615,14 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
 
 /// The driver's thread: duty cycles until asked to stop. A panic in one
 /// poisons the shared driver and ends the thread.
-fn run(shared: &Mutex<EmbeddedDriver>, stop: &AtomicBool, idle: Idle, state: DriverState) {
+fn run(
+    shared: &Mutex<EmbeddedDriver>,
+    stop: &AtomicBool,
+    waiting: &AtomicU32,
+    idle: Idle,
+    state: DriverState,
+    #[cfg(test)] cycles: &Waited,
+) {
     let watch = Watch(state);
     let mut backoff = YieldThenSleep::default();
     while !stop.load(Ordering::Acquire) {
@@ -582,6 +635,14 @@ fn run(shared: &Mutex<EmbeddedDriver>, stop: &AtomicBool, idle: Idle, state: Dri
             // A duty cycle's error is not fatal: the next one runs.
             driver.do_work().unwrap_or(0)
         };
+        #[cfg(test)]
+        cycles.done.fetch_add(1, Ordering::AcqRel);
+        // A caller waiting for the driver takes it before the next cycle:
+        // the lock is not fair, and this thread would otherwise take it
+        // back at once (a busy-spin or busy driver).
+        while waiting.load(Ordering::Acquire) > 0 && !stop.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
         idle.idle(work, &mut backoff);
     }
 }
