@@ -35,7 +35,8 @@ use std::collections::VecDeque;
 use karyos_codec::CodecError;
 
 use crate::agent::{
-    self, AgentError, ArchiveHandle, Described, Event, Posted, PrepareReplay, Prepared, ReplaySink,
+    self, AgentError, ArchiveHandle, Described, Event, Posted, PrepareReplay, Prepared,
+    ReplayOutcome, ReplaySink,
 };
 use crate::catalog::{Recording, StreamFormat};
 use crate::control::{
@@ -228,6 +229,7 @@ pub struct ControlServer<H, Q, R> {
     pending: VecDeque<Vec<u8>>,
     dropped_signals: u64,
     unencoded: u64,
+    unattended: u64,
 }
 
 impl<H, Q, R> core::fmt::Debug for ControlServer<H, Q, R> {
@@ -253,6 +255,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             pending: VecDeque::new(),
             dropped_signals: 0,
             unencoded: 0,
+            unattended: 0,
         }
     }
 
@@ -304,6 +307,14 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
         self.agent.dropped_events()
     }
 
+    /// Replays that ended with no reader on their target by the agent's
+    /// attach deadline ([`ReplayOutcome::NoSubscriber`]), having written
+    /// nothing (`quantstratum-docs: karyos/design/archive-host.md`, H2b).
+    #[must_use]
+    pub const fn unattended(&self) -> u64 {
+        self.unattended
+    }
+
     /// Messages that did not encode, which a correct server never builds;
     /// they are dropped rather than sent malformed.
     #[must_use]
@@ -324,9 +335,14 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             self.collect();
             self.signal(&event);
         }
-        // No version 1 signal: a replay's target's seal says it ended.
-        while self.agent.try_replay_ended().is_some() {
+        // No version 1 signal: a replay's target's seal says it ended. One
+        // whose target had no reader by the attach deadline is counted:
+        // its requester sees only that the target retired unjoined.
+        while let Some(ended) = self.agent.try_replay_ended() {
             worked = true;
+            if ended.outcome == ReplayOutcome::NoSubscriber {
+                count(&mut self.unattended);
+            }
         }
         worked |= self.flush();
         if self.waiting.is_none()

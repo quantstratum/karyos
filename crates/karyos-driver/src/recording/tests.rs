@@ -226,9 +226,12 @@ fn keeps_a_removed_stream_to_its_seal<T: StreamTerms>(driver: &mut EmbeddedDrive
 /// stream position.
 #[test]
 fn a_recorded_stream_cuts_over_and_offers_the_reader_a_successor() {
+    cuts_over_and_offers_a_successor(&mut EmbeddedDriver::new().unwrap());
+}
+
+fn cuts_over_and_offers_a_successor<T: StreamTerms>(driver: &mut EmbeddedDriver<T>) {
     use karyos_client::{LinkStatus, Next, Successor};
 
-    let mut driver = EmbeddedDriver::new().unwrap();
     let handle = driver.add_stream(stream()).unwrap();
     let reconfiguration = crate::generations::Reconfiguration {
         term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
@@ -288,11 +291,17 @@ fn a_recorded_stream_cuts_over_and_offers_the_reader_a_successor() {
 /// A required recording of a stream starting at `initial_term_id` reads
 /// about four terms; returns the messages accepted and where it read to.
 fn record_four_terms(initial_term_id: u32) -> (usize, u64) {
-    let mut driver = EmbeddedDriver::with_config(crate::embedded::DriverConfig {
-        initial_term_id: Some(initial_term_id),
-        ..crate::embedded::DriverConfig::default()
-    })
-    .unwrap();
+    record_four_terms_on(
+        &mut EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+            initial_term_id: Some(initial_term_id),
+            ..crate::embedded::DriverConfig::default()
+        })
+        .unwrap(),
+    )
+}
+
+/// As [`record_four_terms`], on `driver`.
+fn record_four_terms_on<T: StreamTerms>(driver: &mut EmbeddedDriver<T>) -> (usize, u64) {
     let handle = driver.add_stream(stream()).unwrap();
     let (mut reader, _lease) = driver
         .recording_reader(handle, Role::Required)
@@ -303,7 +312,7 @@ fn record_four_terms(initial_term_id: u32) -> (usize, u64) {
     let mut accepted = 0;
     let mut position = 0;
     while accepted < most {
-        accepted += offer_until_refused(&mut driver, &mut publication, most - accepted);
+        accepted += offer_until_refused(driver, &mut publication, most - accepted);
         position = drain(&mut reader);
         driver.do_work().unwrap();
     }
@@ -346,11 +355,15 @@ mod shared {
     }
 
     fn ipc(name: &str) -> Ipc {
+        ipc_with(name, DriverConfig::default())
+    }
+
+    fn ipc_with(name: &str, config: DriverConfig) -> Ipc {
         let dir = std::env::temp_dir().join(format!("karyos-h1-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let timeout = 5_000_000_000;
         let driver = EmbeddedDriver::<SharedTerms>::with_ipc(
-            DriverConfig::default(),
+            config,
             IpcConfig {
                 dir: dir.clone(),
                 max_pending_hellos: 2,
@@ -401,5 +414,33 @@ mod shared {
     #[test]
     fn a_recording_reader_keeps_a_removed_shared_stream_to_its_seal() {
         keeps_a_removed_stream_to_its_seal(&mut ipc("removed").driver);
+    }
+
+    /// A cutover of a shared stream offers its recording a successor
+    /// (IMPLEMENT's P3 on #516).
+    #[test]
+    fn a_recorded_shared_stream_cuts_over_and_offers_a_successor() {
+        cuts_over_and_offers_a_successor(&mut ipc("cutover").driver);
+    }
+
+    /// A shared stream's recording reads across the term id wrap exactly
+    /// what it reads from a stream starting at 7 (IMPLEMENT's P3 on #516).
+    #[test]
+    fn a_required_recording_of_a_shared_stream_reads_across_the_term_id_wrap() {
+        let at = |name, initial_term_id| {
+            record_four_terms_on(
+                &mut ipc_with(
+                    name,
+                    DriverConfig {
+                        initial_term_id: Some(initial_term_id),
+                        ..DriverConfig::default()
+                    },
+                )
+                .driver,
+            )
+        };
+        let wrapped = at("wrap", u32::MAX - 1);
+        assert_eq!(wrapped, at("seven", 7));
+        assert!(wrapped.1 > 3 * u64::from(MIN_TERM_LENGTH));
     }
 }
