@@ -411,6 +411,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyosd`'s startup capability log (SPEC §11, "logged at startup";
+  quantstratum-docs: `karyos/design/management-agent-gap-analysis.md`,
+  M3b). With the network on, the daemon reads its own CnC at most every
+  250 ms (`daemon::CAPABILITY_CHECK`) and logs each network endpoint's
+  capability gauges (M3) at info, once when the endpoint first appears
+  and again at each new capability epoch: `endpoint capabilities` with
+  the endpoint, the epoch and `capabilities`, one field per gauge naming
+  the capability and its state, with its reason and detail
+  (`gso=unavailable(library_api)`, `send_buffer=fallback(below_request,
+  212992)`). `karyos_tools::capability_log::line` formats it; a code or
+  gauge it does not know is kept by number.
+
 - `karyosd --network <on|off>` (off by default; quantstratum-docs:
   `karyos/design/observability-and-tools.md`, `karyosd`): `on` runs the
   driver's network agents with `NetworkConfig::default()` (dedicated
