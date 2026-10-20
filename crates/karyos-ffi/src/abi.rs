@@ -1636,11 +1636,24 @@ pub struct StreamOptions {
     pub on_required_loss: u32,
     /// How long a claim may stay open, in nanoseconds.
     pub claim_deadline_ns: u64,
+    /// Keys of the stream's conflation table; 0, with the two below, for
+    /// none (F7b-2b).
+    pub conflation_keys: u32,
+    /// The largest value of the table, in bytes.
+    pub conflation_value_capacity: u32,
+    /// Bytes of the table's update journal.
+    pub conflation_journal_capacity: u64,
 }
 
-/// The size of `karyos_stream_options` in the first ABI version that has
-/// it (as `CLIENT_OPTIONS_SIZE_0_1`).
+/// The smallest size of `karyos_stream_options` accepted: that of the
+/// first ABI version that has it (as `CLIENT_OPTIONS_SIZE_0_1`), with no
+/// conflation fields. Such a caller's stream has no conflation table.
 const STREAM_OPTIONS_SIZE_0_1: u32 = 64;
+
+/// The size of `karyos_stream_options` with its conflation fields (F7b-2b).
+/// A size between [`STREAM_OPTIONS_SIZE_0_1`] and this one comes from no
+/// header, and could cut a field: it is refused.
+const STREAM_OPTIONS_SIZE_CONFLATION: u32 = 80;
 
 /// `karyos_stream_options` with the defaults and this version's size.
 fn default_stream_options() -> StreamOptions {
@@ -1661,6 +1674,9 @@ fn default_stream_options() -> StreamOptions {
         schedule_capacity: defaults.schedule_capacity,
         on_required_loss: defaults.on_required_loss,
         claim_deadline_ns: defaults.claim_deadline_ns,
+        conflation_keys: defaults.conflation_keys,
+        conflation_value_capacity: defaults.conflation_value_capacity,
+        conflation_journal_capacity: defaults.conflation_journal_capacity,
     }
 }
 
@@ -1697,8 +1713,9 @@ pub unsafe extern "C" fn karyos_stream_options_init(options: *mut StreamOptions)
 ///
 /// `options` points to a readable `karyos_stream_options` whose `size` is
 /// set; `detail` is null or a `karyos_detail` whose `size` is set. A null
-/// or misaligned `options`, or a `size` below the first version's,
-/// returns `KARYOS_E_INVALID_ARGUMENT`.
+/// or misaligned `options`, a `size` below the first version's (64), or a
+/// `size` between it and that of the conflation fields (80), returns
+/// `KARYOS_E_INVALID_ARGUMENT`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_driver_add_stream(
     driver: u64,
@@ -1713,6 +1730,11 @@ pub unsafe extern "C" fn karyos_driver_add_stream(
                 Ok(raw) => raw,
                 Err(status) => return status,
             };
+        // The copy above went only to a local; a size no header produces is
+        // refused before anything is used.
+        if raw.size > STREAM_OPTIONS_SIZE_0_1 && raw.size < STREAM_OPTIONS_SIZE_CONFLATION {
+            return Status::InvalidArgument;
+        }
         let options = driver::StreamOptions {
             stream_id: raw.stream_id,
             term_length: raw.term_length,
@@ -1728,6 +1750,9 @@ pub unsafe extern "C" fn karyos_driver_add_stream(
             schedule_capacity: raw.schedule_capacity,
             on_required_loss: raw.on_required_loss,
             claim_deadline_ns: raw.claim_deadline_ns,
+            conflation_keys: raw.conflation_keys,
+            conflation_value_capacity: raw.conflation_value_capacity,
+            conflation_journal_capacity: raw.conflation_journal_capacity,
         };
         match driver::add_stream(Handle::from_raw(driver), &options) {
             Ok(()) => Status::Ok,
@@ -1749,6 +1774,117 @@ pub extern "C" fn karyos_driver_remove_stream(driver: u64, stream_id: i32) -> i3
         || match driver::remove_stream(Handle::from_raw(driver), stream_id) {
             Ok(()) => Status::Ok,
             Err(failure) => failure.status,
+        },
+    )
+}
+
+/// `karyos_conflated_handler`: called once per delivered key with the
+/// caller's `context`, the `key`, its latest value's `length` bytes at
+/// `data` (the reader's private copy, valid only during the call), the
+/// value's `version` and its `freshness` (`KARYOS_FRESH`, or the start of
+/// the gap that made it stale). It must return normally.
+pub type ConflatedHandler =
+    Option<unsafe extern "C" fn(*mut c_void, u32, *const u8, usize, u64, u64)>;
+
+/// Subscribes to the conflation table of `driver`'s stream `stream_id` and
+/// writes the conflated subscription's handle through `conflated`.
+/// `KARYOS_E_INVALID_ARGUMENT` for a stream id the driver does not have,
+/// `KARYOS_E_CONFLATION` for a stream without a conflation table,
+/// `KARYOS_E_CLOSED` for a stream being removed or a closed driver; on
+/// failure nothing is opened.
+///
+/// # Safety
+///
+/// `conflated` points to a writable `uint64_t`; a null or misaligned one
+/// returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_subscribe_conflated(
+    driver: u64,
+    stream_id: i32,
+    conflated: *mut u64,
+) -> i32 {
+    guard(|| {
+        if !writable(conflated) {
+            return Status::InvalidArgument;
+        }
+        match api::conflated::subscribe(Handle::from_raw(driver), stream_id) {
+            Ok(handle) => {
+                // SAFETY: `conflated` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { conflated.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Delivers the latest value of at most `key_budget` changed keys of
+/// `conflated` to `handler`, and writes how many through `delivered` (may
+/// be null), also on failure. Intermediate versions may be skipped; a
+/// `key_budget` of 0 delivers nothing. A data-path call: it never waits
+/// and never allocates. Once the table published a terminal invalidation
+/// the view is closed: that poll and every later one return
+/// `KARYOS_E_CLOSED`. The handler runs while the view is held: from it,
+/// polling or closing this view returns `KARYOS_E_REENTRANT`.
+///
+/// # Safety
+///
+/// `handler` is null or a function of the `karyos_conflated_handler`
+/// signature that returns normally; `context` is passed to it untouched;
+/// `delivered` is null or points to a writable `uint32_t`. A null
+/// `handler` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_conflated_poll(
+    conflated: u64,
+    handler: ConflatedHandler,
+    context: *mut c_void,
+    key_budget: u32,
+    delivered: *mut u32,
+) -> i32 {
+    guard(|| {
+        let Some(handler) = handler else {
+            return Status::InvalidArgument;
+        };
+        if !delivered.is_null() && !delivered.is_aligned() {
+            return Status::InvalidArgument;
+        }
+        let mut call = |key: u32, value: &[u8], version: u64, freshness: u64| {
+            // SAFETY: `handler` has the handler's signature and returns
+            // normally (the caller's contract); `value` outlives the call,
+            // which only reads it.
+            unsafe {
+                handler(
+                    context,
+                    key,
+                    value.as_ptr(),
+                    value.len(),
+                    version,
+                    freshness,
+                )
+            };
+        };
+        let (status, count) =
+            match api::conflated::poll(Handle::from_raw(conflated), key_budget, &mut call) {
+                Ok(count) => (Status::Ok, count),
+                Err((failure, count)) => (failure.status, count),
+            };
+        if !delivered.is_null() {
+            // SAFETY: `delivered` is non-null and aligned, and the caller's
+            // contract makes it a writable `uint32_t`.
+            unsafe { delivered.write(count) };
+        }
+        status
+    })
+}
+
+/// Closes `conflated`.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_conflated_close(conflated: u64) -> i32 {
+    guard(
+        || match api::conflated::close(Handle::from_raw(conflated)) {
+            Ok(()) => Status::Ok,
+            Err(status) => status,
         },
     )
 }

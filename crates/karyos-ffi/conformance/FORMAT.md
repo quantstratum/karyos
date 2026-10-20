@@ -76,7 +76,10 @@ The arguments and results of each function are those of the header:
 | `karyos_driver_create` | `size`, `reserved`: the options of `karyos_driver_options_init`, with `reserved` set when given | status, `driver` |
 | `karyos_driver_start` | `driver` (required), `idle_strategy` (default `KARYOS_IDLE_YIELD`, 1), `idle_sleep_ns` (default 0) | status |
 | `karyos_driver_stop` | `driver` (required) | status |
-| `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `schedule_capacity`, `size`: the options of `karyos_stream_options_init` otherwise | status |
+| `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `schedule_capacity`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`, `size`: the options of `karyos_stream_options_init` otherwise | status |
+| `karyos_driver_subscribe_conflated` | `driver` and `stream_id` (required) | status, `conflated` (on `KARYOS_OK`) |
+| `karyos_conflated_poll` | `conflated` (required), `key_budget` (default 1): a handler that counts the values | status, `delivered` (the count written, checked against the handler's calls) |
+| `karyos_conflated_close` | `conflated` (required) | status |
 | `karyos_driver_connect` | `driver` (required) | status, `client` |
 | `karyos_driver_do_work` | `driver` (required) | status, `work` |
 | `karyos_driver_close` | `driver` (required) | status |
