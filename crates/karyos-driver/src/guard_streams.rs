@@ -39,15 +39,16 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use karyos_client::HeapWords;
+use karyos_client::ConsumedCell;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SealReason, Subscription};
 use karyos_sys::outcome_ring::{Kind, LOST_UNKNOWN, OutcomeError, OutcomeWriter, Produced, Record};
 use karyos_sys::submission_frontier::{Final, SubmissionFrontier};
-use karyos_sys::sync::AtomicU64;
 use karyos_sys::term_bytes::TermBytes;
 
+use crate::error::DriverError;
 use crate::guards::GuardHandle;
+use crate::shared_words::Words;
 
 /// `AbortReason::GUARD_CLOSED` (guards-and-abort.md, G4).
 pub(crate) const REASON_GUARD_CLOSED: u64 = 1;
@@ -67,8 +68,13 @@ pub(crate) struct Bound {
     /// writes records for blocks at or after it here.
     pub(crate) from: u64,
     pub(crate) epoch: u64,
-    pub(crate) ring: Arc<HeapWords>,
-    pub(crate) consumed: Arc<AtomicU64>,
+    /// The ring the walker writes. Held until its last record is
+    /// written, which can be after the handle is gone; a granted ring's
+    /// region is unmapped by the driver when the bound drops, and its
+    /// memory freed once the client has detached it too.
+    pub(crate) ring: Arc<Words>,
+    /// The client's consumed count, in word 0; held as the ring is.
+    pub(crate) consumed: Arc<Words>,
     pub(crate) writer: OutcomeWriter,
 }
 
@@ -351,7 +357,7 @@ impl<T: TermBytes> GuardedStream<T> {
                     };
                     match bound
                         .writer
-                        .produce(bound.ring.words(), &bound.consumed, record)
+                        .produce(bound.ring.words(), bound.consumed.cell(), record)
                         .map_err(crate::error::DriverError::Outcomes)?
                     {
                         Produced::Written(_) => walked.written += 1,
@@ -385,32 +391,82 @@ pub(crate) const fn end_reason(seal: SealReason) -> u64 {
     }
 }
 
-/// The ring and writer of a new handle admitted under open epoch
-/// `epoch`: `C_m` message records plus the one local `Ended` record. Its
-/// header names guard word 0, the handle's one-word view of the guard in
-/// process (the guard region's index comes with G-x2).
+/// Where a handle's outcome ring and consumed cell live.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Place {
+    /// On the heap, for an in-process handle.
+    Heap,
+    /// In two new regions of driver instance `instance` (Linux), for a
+    /// grant: the ring driver-only, the cell writable by its client.
+    #[cfg(target_os = "linux")]
+    Regions {
+        /// The driver instance.
+        instance: u128,
+        /// The ring's region id.
+        ring: u64,
+        /// The cell's region id.
+        cell: u64,
+    },
+}
+
+/// The outcome ring, consumed cell and writer of a new handle bound to
+/// guard word `guard_index` and admitted under open epoch `epoch`: `C_m`
+/// message records plus the one local `Ended` record. The ring's header
+/// names its binding before anything can read it.
 ///
 /// # Errors
 ///
-/// [`OutcomeError::Layout`] when `messages` is too large to size.
+/// [`DriverError::Outcomes`] with [`OutcomeError::Layout`] when
+/// `messages` is too large to size, and the regions' errors.
 pub(crate) fn new_ring(
     messages: u64,
     epoch: u64,
-) -> Result<(Arc<HeapWords>, OutcomeWriter), OutcomeError> {
+    guard_index: usize,
+    place: Place,
+) -> Result<(Arc<Words>, Arc<Words>, OutcomeWriter), DriverError> {
+    let layout = |_| DriverError::Outcomes(OutcomeError::Layout);
     let binding = karyos_sys::outcome_ring::Binding {
         messages,
         ranges: 1,
-        guard_index: 0,
+        guard_index: u64::try_from(guard_index).map_err(layout)?,
         epoch,
     };
-    let capacity = binding.capacity().ok_or(OutcomeError::Layout)?;
+    let capacity = binding
+        .capacity()
+        .ok_or(DriverError::Outcomes(OutcomeError::Layout))?;
     let words = usize::try_from(capacity)
         .ok()
         .and_then(karyos_sys::outcome_ring::ring_words)
-        .ok_or(OutcomeError::Layout)?;
-    let ring = Arc::new(HeapWords::zeroed(words));
-    karyos_sys::outcome_ring::init(ring.words(), &binding)?;
-    Ok((ring, OutcomeWriter::new(capacity)?))
+        .ok_or(DriverError::Outcomes(OutcomeError::Layout))?;
+    let (ring, consumed) = match place {
+        Place::Heap => (Words::heap(words), Words::heap(1)),
+        #[cfg(target_os = "linux")]
+        Place::Regions {
+            instance,
+            ring,
+            cell,
+        } => (
+            Words::region(
+                instance,
+                ring,
+                karyos_sys::ipc::RegionKind::OutcomeRing,
+                karyos_sys::outcome_ring::OUTCOME_LAYOUT_VERSION,
+                words,
+                true,
+            )?,
+            Words::region(
+                instance,
+                cell,
+                karyos_sys::ipc::RegionKind::ConsumedCell,
+                karyos_sys::outcome_ring::CONSUMED_CELL_LAYOUT_VERSION,
+                1,
+                false,
+            )?,
+        ),
+    };
+    karyos_sys::outcome_ring::init(ring.words(), &binding).map_err(DriverError::Outcomes)?;
+    let writer = OutcomeWriter::new(capacity).map_err(DriverError::Outcomes)?;
+    Ok((Arc::new(ring), Arc::new(consumed), writer))
 }
 
 #[cfg(test)]
@@ -447,8 +503,7 @@ mod tests {
             guard: 1,
         };
         let mut guarded = GuardedStream::new(guard, 2, None, walker, 64);
-        let (ring, writer) = new_ring(2, 2).unwrap();
-        let consumed = Arc::new(AtomicU64::new(0));
+        let (ring, consumed, writer) = new_ring(2, 2, 0, Place::Heap).unwrap();
         guarded.bind(Bound {
             from: 0,
             epoch: 2,
@@ -473,14 +528,14 @@ mod tests {
         assert_eq!(
             bound
                 .writer
-                .produce(bound.ring.words(), &bound.consumed, record)
+                .produce(bound.ring.words(), bound.consumed.cell(), record)
                 .unwrap(),
             Produced::Lost
         );
         let mut reader = OutcomeReader::attach(&*ring, 1).unwrap();
         let mut seen = Vec::new();
         let _ = reader
-            .poll(&*ring, &consumed, 8, |_, record| seen.push(record))
+            .poll(&*ring, consumed.cell(), 8, |_, record| seen.push(record))
             .unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(
