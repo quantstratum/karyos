@@ -1573,3 +1573,66 @@ fn a_middle_range_gap_before_to_is_not_comparable() {
         report.text()
     );
 }
+
+/// `karyos-replay diff` and its alias `karyos-tools replay diff` run the
+/// same command (archive-host.md, H5): the same report and exit status for
+/// the same journals, help under each name, and an argument error naming
+/// the command it came through.
+#[test]
+fn both_names_run_the_same_diff() {
+    let scratch = Scratch::new();
+    let (left, right) = (scratch.side("left"), scratch.side("right"));
+    let records = recorded();
+    write(&left, &header(Capture::Strict, b"m"), &records);
+    write(&right, &header(Capture::Strict, b"m"), &records);
+    let args = || {
+        [
+            left.as_os_str().to_owned(),
+            OsString::from("1"),
+            right.as_os_str().to_owned(),
+            OsString::from("1"),
+        ]
+    };
+    let run = |command: &str, args: Vec<OsString>| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let status = run_diff(command, args, &mut out, &mut err);
+        (
+            status,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    };
+    let replay = run("karyos-replay diff", args().to_vec());
+    let alias = run("karyos-tools replay diff", args().to_vec());
+    assert_eq!(replay, alias);
+    assert_eq!(
+        replay,
+        (
+            0,
+            "identical: group_seq 1 to 3, 3 events\n".to_owned(),
+            String::new()
+        )
+    );
+    let (status, out, _) = run("karyos-replay diff", vec![OsString::from("--help")]);
+    assert_eq!(status, 0);
+    assert!(
+        out.starts_with("karyos-replay diff: the first difference"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Usage: karyos-replay diff <left-dir>"),
+        "{out}"
+    );
+    let (status, out, _) = run("karyos-tools replay diff", vec![OsString::from("-h")]);
+    assert_eq!(status, 0);
+    assert!(
+        out.contains("Usage: karyos-tools replay diff <left-dir>"),
+        "{out}"
+    );
+    let (status, _, err) = run("karyos-replay diff", vec![OsString::from("--bogus")]);
+    assert_eq!(status, EXIT_ERROR);
+    assert_eq!(
+        err,
+        "karyos-replay: unknown option --bogus (karyos-replay diff --help for the usage)\n"
+    );
+}

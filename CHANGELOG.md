@@ -526,6 +526,12 @@ release may break APIs, wire formats and shared-memory layouts.
 - Conformance: `struct.size.subscription.options` and
   `subscription.options.typed.statuses`, and the runner's
   `karyos_client_add_subscription_with` and `karyos_subscription_close`.
+- `karyos-replay` (SPEC §11; quantstratum-docs:
+  `karyos/design/archive-host.md`, H5), the replay and output diff
+  binary: `karyos-replay diff` is the recording group journal diff, and
+  `karyos-tools replay diff` stays as its alias, running the same code
+  (`replay::run_diff`, with the usage text named after the command it came
+  through). Replaying into a stream (`karyos-replay to`) is H6.
 - `Client::add_subscription_with(uri, stream_id, SubscriptionOptions)`
   (owner item 57; quantstratum-docs: `karyos/design/ffi-gap-analysis.md`
   D3, F7b): the reader's role (`SubscriberRole::{Required, Optional,
