@@ -224,6 +224,10 @@ fn a_tail_that_goes_back_is_a_violation() {
     reader.advance().unwrap();
     assert_eq!(peek(&mut reader, &ring), Ok(Some(entry(1))));
     reader.advance().unwrap();
+    // The next slot holds a valid entry, so only the tail check refuses.
+    let base = HEADER_WORDS + 2 * ENTRY_WORDS;
+    ring[base].store(entry(2).position, Ordering::Relaxed);
+    ring[base + 1].store(entry(2).time, Ordering::Relaxed);
     ring[TAIL].store(1, Ordering::Release);
     assert_eq!(peek(&mut reader, &ring), Err(ScheduleError::Violation));
     ring[TAIL].store(2, Ordering::Release);
@@ -444,7 +448,11 @@ mod arbitrary {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(512))]
+        #![proptest_config(if cfg!(miri) {
+            crate::receive::tests_config()
+        } else {
+            ProptestConfig::with_cases(512)
+        })]
 
         /// Whatever the publisher writes, every entry the sender reads
         /// passed its checks when copied, an entry read again is the same

@@ -59,27 +59,56 @@ fn fragments_carry_the_time_and_the_entry_is_released_when_the_message_left() {
 }
 
 /// A first fragment needs the next entry at its own position; anything
-/// else is corruption, never a guessed time.
+/// else is corruption, never a guessed time, and the publisher's breach
+/// (timed-tx.md section 11, TT-6): the consumer refuses every later frame.
 #[test]
 fn a_first_fragment_without_its_entry_is_corrupt() {
-    let ring = ring(4);
-    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
-    // No entry at all.
-    assert!(corrupt(consumer.frame(&ring, data(0, true, true))));
-    push(&ring, &mut publisher, 64, 5);
-    // An entry at another position.
-    assert!(corrupt(consumer.frame(&ring, data(0, true, true))));
-    // A continuation outside a message.
-    assert!(corrupt(consumer.frame(&ring, data(64, false, true))));
-    // The matching frame still reads it: the refusals consumed nothing.
-    assert_eq!(consumer.frame(&ring, data(64, true, false)), Ok(Some(5)));
-    // Inside a message: a new first fragment, padding or an aborted block.
-    assert!(corrupt(consumer.frame(&ring, data(128, true, true))));
-    assert!(corrupt(consumer.frame(&ring, LaneFrame::Pad)));
-    assert!(corrupt(
-        consumer.frame(&ring, LaneFrame::Aborted { position: 128 })
-    ));
+    let fresh = |entries: &[(u64, u64)], before: &[LaneFrame]| {
+        let ring = ring(4);
+        let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+        for &(position, time) in entries {
+            push(&ring, &mut publisher, position, time);
+        }
+        let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
+        for frame in before {
+            assert!(consumer.frame(&ring, *frame).unwrap().is_some());
+        }
+        (ring, consumer)
+    };
+    let violation = Err(ScheduleConsumerError::Ring(ScheduleError::Violation));
+    let cases = [
+        // No entry at all.
+        (&[][..], &[][..], data(0, true, true)),
+        // An entry at another position.
+        (&[(64, 5)][..], &[][..], data(0, true, true)),
+        // A continuation outside a message.
+        (&[(64, 5)][..], &[][..], data(64, false, true)),
+        // Inside a message: a new first fragment, padding or an aborted
+        // block.
+        (
+            &[(64, 5)][..],
+            &[data(64, true, false)][..],
+            data(128, true, true),
+        ),
+        (&[(64, 5)][..], &[data(64, true, false)][..], LaneFrame::Pad),
+        (
+            &[(64, 5)][..],
+            &[data(64, true, false)][..],
+            LaneFrame::Aborted { position: 128 },
+        ),
+    ];
+    for (entries, before, frame) in cases {
+        let (ring, mut consumer) = fresh(entries, before);
+        assert!(!consumer.violated());
+        assert!(corrupt(consumer.frame(&ring, frame)), "{frame:?}");
+        assert!(consumer.violated());
+        // Sealed: even the frame its entries would match is refused.
+        assert_eq!(consumer.frame(&ring, data(64, true, true)), violation);
+        assert_eq!(
+            consumer.frame_scheduled(&ring, data(64, true, true)),
+            Err(ScheduleConsumerError::Ring(ScheduleError::Violation))
+        );
+    }
 }
 
 /// Padding takes no entry; an aborted block takes the next entry only at

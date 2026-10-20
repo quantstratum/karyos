@@ -28,6 +28,9 @@ release may break APIs, wire formats and shared-memory layouts.
   the new `ScheduleError::Violation`, for good. `SealReason` gains
   `ScheduleViolation` (code 9), a gate reason reported as `Gated`.
   `LatePolicy` gains `max_horizon`, and `ScheduleConsumer::new` takes it.
+  The driver's `ScheduleConsumer` checks each entry's position against its
+  frame: a frame its entries contradict (`CorruptTerm`) is the publisher's
+  breach too, and every later frame is refused as a `Violation`.
   Interim until T-x2: the sender counts a violation once in
   `schedule_faults` and stages nothing more of the lane; T-x2 seals it
   with `ScheduleViolation` and retires the client.

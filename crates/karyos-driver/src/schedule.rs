@@ -79,6 +79,11 @@ pub struct ScheduleConsumer {
     max_horizon: u64,
     /// The sender's clock at its last duty ([`Self::set_now`]).
     now: u64,
+    /// A frame and the entries disagreed ([`ScheduleConsumerError::
+    /// CorruptTerm`] from [`Self::frame`]): the lane's publisher wrote both,
+    /// so it breached the protocol (timed-tx.md section 11, TT-6), for
+    /// good, as a [`ScheduleError::Violation`] of the ring is.
+    breached: bool,
 }
 
 /// A frame's message: its requested time, and whether it was read before
@@ -112,6 +117,7 @@ impl ScheduleConsumer {
             resuming: false,
             max_horizon,
             now: 0,
+            breached: false,
         })
     }
 
@@ -121,13 +127,31 @@ impl ScheduleConsumer {
         self.now = now;
     }
 
-    /// Whether the lane's publisher breached the ring's protocol
-    /// ([`ScheduleError::Violation`]): every later read is refused, so the
+    /// Whether the lane's publisher breached the ring's protocol: a
+    /// [`ScheduleError::Violation`] of the ring, or a frame its entries
+    /// contradict (an entry's position is checked against its frame,
+    /// timed-tx.md section 11, TT-6). Every later frame is refused, so the
     /// sender stages nothing more of the lane. Until the lane is sealed
     /// with `ScheduleViolation` (T-x2), that is the whole reaction.
     #[must_use]
     pub fn violated(&self) -> bool {
-        self.reader.violated()
+        self.breached || self.reader.violated()
+    }
+
+    /// Runs one frame's step, refused after a breach; a frame its entries
+    /// contradict is a breach, for good.
+    fn checked<T>(
+        &mut self,
+        step: impl FnOnce(&mut Self) -> Result<T, ScheduleConsumerError>,
+    ) -> Result<T, ScheduleConsumerError> {
+        if self.violated() {
+            return Err(ScheduleError::Violation.into());
+        }
+        let result = step(self);
+        if matches!(result, Err(ScheduleConsumerError::CorruptTerm { .. })) {
+            self.breached = true;
+        }
+        result
     }
 
     /// A reliable lane's log was rewound to a position no message of an
@@ -179,6 +203,14 @@ impl ScheduleConsumer {
         ring: &[AtomicU64],
         frame: LaneFrame,
     ) -> Result<Option<Scheduled>, ScheduleConsumerError> {
+        self.checked(|consumer| consumer.scheduled_step(ring, frame))
+    }
+
+    fn scheduled_step(
+        &mut self,
+        ring: &[AtomicU64],
+        frame: LaneFrame,
+    ) -> Result<Option<Scheduled>, ScheduleConsumerError> {
         let resuming = std::mem::take(&mut self.resuming);
         // A rewind inside a message: its continuation takes the entry at
         // `head`, the message's own, which starts below the frame.
@@ -211,7 +243,7 @@ impl ScheduleConsumer {
         }
         let index = self.reader.read();
         let first = matches!(frame, LaneFrame::Data { begin: true, .. });
-        let time = self.frame(ring, frame)?;
+        let time = self.frame_step(ring, frame)?;
         if first {
             self.current_replayed = index < self.replay_to;
         }
@@ -232,9 +264,18 @@ impl ScheduleConsumer {
     ///
     /// # Errors
     ///
-    /// [`ScheduleConsumerError::CorruptTerm`] when a rule fails, and ring
-    /// errors.
+    /// [`ScheduleConsumerError::CorruptTerm`] when a rule fails, which is
+    /// the publisher's breach: from then on, as after a ring violation,
+    /// every frame is [`ScheduleError::Violation`]. Ring errors.
     pub fn frame(
+        &mut self,
+        ring: &[AtomicU64],
+        frame: LaneFrame,
+    ) -> Result<Option<u64>, ScheduleConsumerError> {
+        self.checked(|consumer| consumer.frame_step(ring, frame))
+    }
+
+    fn frame_step(
         &mut self,
         ring: &[AtomicU64],
         frame: LaneFrame,
