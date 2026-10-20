@@ -41,10 +41,22 @@
  *   subscription or conflated view, and karyos_subscription_end_state) holds
  *   only its own handle, and its publication's for a claim; a control
  *   call (adding a child, karyos_client_add_replay_subscription
- *   included, closing one, karyos_client_poll, karyos_archive_connect, an
- *   Archive listing, and a replay's start or stop) also holds the client,
- *   and an add with KARYOS_REJOIN_ARCHIVE, a listing and a replay's start
- *   or stop the Archive handle after it.
+ *   included, karyos_client_poll, karyos_archive_connect, an Archive
+ *   listing, and a replay's start or stop) also holds the client, and an
+ *   add with KARYOS_REJOIN_ARCHIVE, a listing and a replay's start or stop
+ *   the Archive handle after it.
+ * - A child's close (publication, subscription, a replay subscription
+ *   included, conflated view, Archive connection) never waits for its
+ *   client nor answers BUSY for it. With the client free it releases the
+ *   child at once; while another call holds the client, on another thread
+ *   or by a callback, it ends the child at once (the close answers
+ *   KARYOS_OK and the handle is stale) and the client releases it at its
+ *   next call or its close. A client with no further calls holds the
+ *   released resources (a publisher slot, lanes, streams) until its next
+ *   call or close. KARYOS_E_BUSY and KARYOS_E_REENTRANT from a child's
+ *   close mean the child itself is in use. A child's close racing its
+ *   client's close may answer KARYOS_E_CLOSED: the client's close closed
+ *   it, so treat it as already closed, not as an error.
  * - Callbacks run on the calling thread, inside the call, and the
  *   handles the call holds stay held until they return. A started
  *   driver's own thread (karyos_driver_start) runs duty cycles only and
@@ -639,8 +651,9 @@ int32_t karyos_claim_commit(uint64_t claim, karyos_accepted *accepted);
 int32_t karyos_claim_abort(uint64_t claim);
 
 /**
- * Closes the publication through its client, with its outstanding claim;
- * nothing is closed while the client handle is in use.
+ * Closes the publication, with its outstanding claim, and releases it to
+ * its client, at once or at the client's next call while another call
+ * holds the client (Threads, above).
  */
 int32_t karyos_publication_close(uint64_t publication);
 
@@ -707,14 +720,33 @@ typedef struct karyos_message_info {
     uint32_t reserved;
 } karyos_message_info;
 
-/** An image of a network subscription attached (available 1) or retired. */
+/**
+ * An image of a network subscription attached (available 1) or retired.
+ * A retired image's end follows: a KARYOS_END_* code (defined with
+ * karyos_subscription_end), its seal position and the raw seal reason.
+ * KARYOS_END_END_OF_STREAM is a clean end, KARYOS_END_IMAGE_RETIRED one
+ * without (its publisher timed out, or a lane lost a frame on the way);
+ * KARYOS_END_NONE for an attached image, and for one released unsealed
+ * when its client closed. Set size to sizeof(karyos_image_change): a
+ * caller built against the first version sets 24 and gets no end fields,
+ * one built with them sets at least KARYOS_IMAGE_CHANGE_SIZE_ENDS.
+ */
 typedef struct karyos_image_change {
     uint32_t size;
     int32_t session_id;
     uint64_t image_id;
     uint32_t lane;
     uint32_t available;
+    uint32_t end_reason;
+    uint32_t reserved;
+    /* 0 with no end, for a seal not positioned yet, and for a seal at
+       position 0: 0 alone does not tell them apart. */
+    uint64_t end_position;
+    uint64_t seal_code;
 } karyos_image_change;
+
+/** The size of karyos_image_change with its end fields. */
+#define KARYOS_IMAGE_CHANGE_SIZE_ENDS 48
 
 /**
  * Called once per message with the caller's context, the message's length
@@ -887,8 +919,9 @@ int32_t karyos_subscription_image_changes_lost(uint64_t subscription,
                                                uint64_t *lost);
 
 /**
- * Closes the subscription through its client; nothing is closed while the
- * client handle is in use.
+ * Closes the subscription and releases it to its client, at once or at
+ * the client's next call while another call holds the client (Threads,
+ * above).
  */
 int32_t karyos_subscription_close(uint64_t subscription);
 
@@ -991,9 +1024,9 @@ int32_t karyos_conflated_poll(uint64_t conflated,
                               uint32_t *delivered);
 
 /**
- * Closes the conflated subscription. A client's view is closed through its
- * client: while that is in use (KARYOS_E_BUSY, KARYOS_E_REENTRANT) nothing
- * is closed.
+ * Closes the conflated subscription. A client's view is released to its
+ * client, at once or at the client's next call while another call holds
+ * the client (Threads, above).
  */
 int32_t karyos_conflated_close(uint64_t conflated);
 
@@ -1096,8 +1129,8 @@ int32_t karyos_archive_list(uint64_t archive, uint64_t after_id,
 
 /**
  * Closes the Archive connection: its two streams are removed from its
- * client. While the client is in use (KARYOS_E_BUSY, KARYOS_E_REENTRANT)
- * nothing is closed.
+ * client, at once or at the client's next call while another call holds
+ * the client (Threads, above).
  */
 int32_t karyos_archive_close(uint64_t archive);
 

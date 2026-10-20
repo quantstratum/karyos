@@ -825,9 +825,7 @@ impl<T: TermBytes> LogBuffer<T> {
     /// cutover seal, which is not terminal (the stream continues in a
     /// successor mapping).
     pub(crate) fn terminal_seal_reason(&self) -> Option<SealReason> {
-        let raw = self.seal().load(Ordering::Acquire);
-        (raw & SEAL_SEALED != 0 && !crate::publication::seal_has_successor(raw))
-            .then(|| SealReason::from_code(seal_reason(self.seal_reason_word())))
+        self.terminal_seal().map(|(reason, _)| reason)
     }
 
     fn publication_taken(&self) -> &AtomicU64 {
@@ -923,6 +921,27 @@ impl<T: TermBytes> LogBuffer<T> {
     #[must_use]
     pub fn sealed_with_successor(&self) -> bool {
         crate::publication::seal_has_successor(self.seal().load(Ordering::Acquire))
+    }
+
+    /// The buffer's terminal seal (Acquire): its reason and, once the seal
+    /// is positioned, its position in this mapping. `None` while active,
+    /// and for a cutover seal, which is not terminal.
+    #[must_use]
+    pub fn terminal_seal(&self) -> Option<(SealReason, Option<u64>)> {
+        let raw = self.seal().load(Ordering::Acquire);
+        if raw & SEAL_SEALED == 0 || crate::publication::seal_has_successor(raw) {
+            return None;
+        }
+        let position = match decode_seal(raw) {
+            SealWord::Positioned(position) => Some(position),
+            SealWord::Active | SealWord::Sealed => None,
+        };
+        // The reason is stored before the seal word, which the load above
+        // acquired.
+        Some((
+            SealReason::from_code(seal_reason(self.seal_reason_word())),
+            position,
+        ))
     }
 
     /// Largest message without the trace extension.

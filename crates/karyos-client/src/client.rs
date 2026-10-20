@@ -375,6 +375,36 @@ pub struct ImageChange {
     pub lane: karyos_sys::frame::Lane,
     /// Attached (`true`) or retired (`false`).
     pub available: bool,
+    /// How a retired image's stream ended, when it ended with a terminal
+    /// seal: `None` for an attached image, and for one released unsealed
+    /// (its client closed first).
+    pub end: Option<ImageEnd>,
+}
+
+/// How a retired image's stream ended: its terminal seal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImageEnd {
+    /// Why: [`SealReason::EndOfStream`] for a clean end (the source's
+    /// EOS reached through a complete prefix),
+    /// [`SealReason::ImageRetired`] for an image retired without one (its
+    /// publisher timed out, or a lane lost a frame on the way).
+    ///
+    /// [`SealReason::EndOfStream`]: karyos_sys::log_buffer::SealReason::EndOfStream
+    /// [`SealReason::ImageRetired`]: karyos_sys::log_buffer::SealReason::ImageRetired
+    pub reason: karyos_sys::log_buffer::SealReason,
+    /// The seal's stream position: nothing is committed at or after it.
+    /// `None` while the seal is not positioned yet.
+    pub position: Option<u64>,
+}
+
+impl ImageEnd {
+    /// An end for `reason` at `position`: for sources other than a
+    /// client's, and tests.
+    #[must_use]
+    pub const fn new(reason: karyos_sys::log_buffer::SealReason, position: Option<u64>) -> Self {
+        Self { reason, position }
+    }
 }
 
 impl ImageChange {
@@ -392,7 +422,15 @@ impl ImageChange {
             session_id,
             lane,
             available,
+            end: None,
         }
+    }
+
+    /// The change with a retired image's `end`.
+    #[must_use]
+    pub const fn with_end(mut self, end: Option<ImageEnd>) -> Self {
+        self.end = end;
+        self
     }
 }
 
@@ -2109,6 +2147,11 @@ impl<T: TermBytes> Images<T> {
                 session_id: image.session_id,
                 lane: image.lane,
                 available,
+                end: if available {
+                    None
+                } else {
+                    image.subscription.terminal_seal()
+                },
             });
         }
     }
@@ -2349,6 +2392,16 @@ mod tests {
 
     /// An image of attach id `id`, session `session`, over its own log.
     fn image(id: u64, session: i32) -> Image<karyos_sys::term_bytes::HeapTerms> {
+        sealed_image(id, session, None)
+    }
+
+    /// [`image`], its log sealed for `seal`'s reason when given, as the
+    /// driver seals a retiring image's, and its seal positioned.
+    fn sealed_image(
+        id: u64,
+        session: i32,
+        seal: Option<karyos_sys::log_buffer::SealReason>,
+    ) -> Image<karyos_sys::term_bytes::HeapTerms> {
         let buffer = Arc::new(
             LogBuffer::new(LogBufferConfig {
                 term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
@@ -2368,6 +2421,10 @@ mod tests {
         );
         let mut conductor = buffer.conductor_owned().unwrap();
         let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        if let Some(reason) = seal {
+            conductor.seal_with_reason(reason).unwrap();
+            let _ = conductor.duty_cycle().unwrap();
+        }
         Image {
             id,
             session_id: session,
@@ -2420,6 +2477,77 @@ mod tests {
             ]
         );
         assert_eq!(images.changes_lost, 0);
+        assert!(images.changes.iter().all(|change| change.end.is_none()));
+    }
+
+    /// A retired image's change carries its stream's terminal seal: the
+    /// clean end, the unclean one, and none for an unsealed image and for
+    /// an arrival.
+    #[test]
+    fn a_retired_images_change_carries_its_end() {
+        use karyos_sys::log_buffer::SealReason;
+        let max_images = 4;
+        let inbox = Arc::new(Inbox::new(max_images));
+        let mut images = Images {
+            registration: 1,
+            inbox: Arc::clone(&inbox),
+            released: Arc::new(Mutex::new(Vec::with_capacity(4 * max_images))),
+            images: Vec::with_capacity(max_images),
+            next: 0,
+            closed: None,
+            changes: std::collections::VecDeque::with_capacity(3 * max_images),
+            max_changes: 3 * max_images,
+            changes_lost: 0,
+        };
+        images
+            .images
+            .push(sealed_image(1, 1, Some(SealReason::EndOfStream)));
+        images
+            .images
+            .push(sealed_image(2, 2, Some(SealReason::ImageRetired)));
+        images.images.push(image(3, 3));
+        inbox.update(|state| {
+            state.retired.extend([1, 2, 3]);
+            state
+                .arrived
+                .push(sealed_image(4, 4, Some(SealReason::EndOfStream)));
+        });
+        images.adopt();
+        let seen: Vec<(u64, bool, Option<ImageEnd>)> = images
+            .changes
+            .iter()
+            .map(|change| (change.image_id, change.available, change.end))
+            .collect();
+        // No publisher ever took the logs, so each seal positions at 0.
+        assert_eq!(
+            seen,
+            [
+                (
+                    1,
+                    false,
+                    Some(ImageEnd::new(SealReason::EndOfStream, Some(0)))
+                ),
+                (
+                    2,
+                    false,
+                    Some(ImageEnd::new(SealReason::ImageRetired, Some(0)))
+                ),
+                (3, false, None),
+                (4, true, None),
+            ]
+        );
+        // A close drains what is left with its seal too.
+        inbox.update(|state| state.closed = Some(ClientError::EmptyMessage));
+        images.adopt();
+        let drained = images.changes.back().unwrap();
+        assert_eq!(
+            (drained.image_id, drained.available, drained.end),
+            (
+                4,
+                false,
+                Some(ImageEnd::new(SealReason::EndOfStream, Some(0)))
+            )
+        );
     }
 
     /// A network subscription of no image yet, and its client's inbox.

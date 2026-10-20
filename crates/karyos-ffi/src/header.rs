@@ -586,6 +586,10 @@ fn the_header_states_the_replay_rates_and_end_codes() {
         ("KARYOS_END_REVOKED", END_REVOKED),
         ("KARYOS_END_CLOSED_BY_OVERRUN", END_CLOSED_BY_OVERRUN),
         ("KARYOS_END_OTHER", END_OTHER),
+        (
+            "KARYOS_IMAGE_CHANGE_SIZE_ENDS",
+            crate::abi::IMAGE_CHANGE_SIZE_ENDS,
+        ),
     ] {
         assert_eq!(defines[name], i64::from(value), "{name}");
     }

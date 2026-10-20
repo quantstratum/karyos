@@ -25,7 +25,7 @@ use karyos_driver::{DriverConfig, DriverError};
 use karyos_sys::conflation::Budget;
 use karyos_sys::freshness::Freshness;
 
-use crate::api::client::clients;
+use crate::api::client::{Ended, with_client};
 use crate::api::driver::{self, DriverState};
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
@@ -109,7 +109,7 @@ pub(crate) fn subscribe(driver: Handle, stream_id: i32) -> Result<Handle, Failur
 /// embedded driver is refused by the driver: [`Status::Refused`]), and
 /// [`Status::HandlesExhausted`], with the view released.
 pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, Failure> {
-    clients().with(client, |entry| {
+    with_client(client, |entry| {
         entry.usable()?;
         let view = entry
             .client
@@ -188,12 +188,11 @@ pub(crate) fn close(conflated: Handle) -> Result<(), Status> {
     // client, written at the add and never changed, is read even from a
     // poisoned handle, as a subscription's is.
     match table().read_even_poisoned(conflated, |entry| entry.client)? {
-        Some(client) => clients().with(client, |entry| {
-            let removed = table().remove(conflated)?;
-            entry.conflated.retain(|handle| *handle != conflated);
-            drop(removed);
-            Ok(())
-        })?,
+        Some(client) => {
+            crate::api::client::close_child(client, table(), conflated, |handle, entry| {
+                Ended::Conflated(handle, Box::new(entry))
+            })
+        }
         None => {
             let _ = table().remove(conflated)?;
             Ok(())

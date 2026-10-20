@@ -951,6 +951,18 @@ impl<T: TermBytes> ClientSubscription<T> {
             .map_or(0, |inner| inner.buffer().max_message_length())
     }
 
+    /// The terminal seal of the mapping it reads, as an image's end: its
+    /// reason and its stream position, once positioned. `None` while the
+    /// stream is open, at a cutover seal, and once the rejoin policy
+    /// closed it.
+    pub(crate) fn terminal_seal(&self) -> Option<crate::ImageEnd> {
+        let (reason, position) = self.inner.as_ref()?.buffer().terminal_seal()?;
+        Some(crate::ImageEnd {
+            reason,
+            position: position.and_then(|position| self.base.checked_add(position)),
+        })
+    }
+
     /// The acknowledged stream position.
     #[inline]
     #[must_use]
