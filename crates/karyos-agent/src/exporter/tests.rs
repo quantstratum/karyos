@@ -90,6 +90,14 @@ fn view() -> AgentView {
             value: 1024,
             since: 50,
         }],
+        catalog: Some(Catalog {
+            recordings: Vec::new(),
+            left_out: 2,
+            listed_at: Some(90),
+            listings: 3,
+            failures: 1,
+            last_error: None,
+        }),
     };
     let closed = DriverView {
         dir: PathBuf::from("/run/karyos/c"),
@@ -103,6 +111,7 @@ fn view() -> AgentView {
         latencies: Vec::new(),
         trace: TraceCounts::default(),
         alerts: Vec::new(),
+        catalog: None,
     };
     AgentView {
         version: API_VERSION,
@@ -252,6 +261,18 @@ fn the_exposition_parses_and_each_counter_keeps_its_type() {
         (Some("lag"), Some("5"), 1024.0)
     );
     assert_eq!(families["karyos_alert_since_ns"].1[0].1, 50.0);
+    // The catalog (M11): only for a driver configured with an Archive.
+    for (family, kind, value) in [
+        ("karyos_archive_recordings", "gauge", 2.0),
+        ("karyos_archive_listings_total", "counter", 3.0),
+        ("karyos_archive_listing_failures_total", "counter", 1.0),
+        ("karyos_archive_listed_at_ns", "gauge", 90.0),
+    ] {
+        let (found, samples) = &families[family];
+        assert_eq!(found, kind, "{family}");
+        assert_eq!(samples.len(), 1, "{family}");
+        assert_eq!(samples[0].1, value, "{family}");
+    }
     // The closed driver: attached 0, closed 1.
     let closed = |family: &str| {
         families[family]
