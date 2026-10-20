@@ -403,6 +403,42 @@ release may break APIs, wire formats and shared-memory layouts.
   rest; answers to other requesters are skipped. The management agent's
   catalog view builds on it.
 
+- API v1's JSON carries each driver's trace window (M6c): `latencies`, one
+  object per lane with `p50`, `p90`, `p99`, `p999` and `max` as `null` or
+  `{"low","high"}` bounds, and `trace`, the window's counts. They come
+  after `guards` and before `alerts`, in `DriverView`'s declaration order
+  (quantstratum-docs: `karyos/design/agent-api-v1.md`).
+
+- The Prometheus exporter (phase 5, M8; ADR-0055; SPEC.md §11
+  `karyos-exporter`; owner item 51, interim 4). `karyos_agent::exporter`
+  renders an `AgentView` in the Prometheus text format (0.0.4): the CnC
+  cells by type (events and spin time as counters, gauges, positions and
+  timestamps as gauges), lane positions, headroom and subscriber lag, ring
+  read and overwrite counts, error occurrences by code, and the trace
+  window's latency quantile bounds and counts. It answers `GET /metrics`
+  only, on a loopback address only, at most 16 connections per poll, with
+  100 ms I/O timeouts. The `karyos-exporter` binary, in karyos-agent, runs
+  it as its own process: `--listen ADDRESS:PORT --driver DIR...
+  [--refresh-ms MS]`; a non-loopback address is refused. No TLS, no
+  authentication and no new dependency. It exports M9's alerts as
+  `karyos_alerts_firing` per driver and each alert's `karyos_alert_value`
+  and `karyos_alert_since_ns`, and takes one of each driver's tool slots
+  while attached.
+
+- Alerts in the management agent (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M9). `AlertRules`
+  (`AgentConfig::with_alerts`; `karyos-agent --lag-bytes --lag-refreshes
+  --loss-quiet`) are evaluated at every refresh: a subscriber lagging
+  `lag_bytes` or more over `lag_refreshes` consecutive consistent samples
+  (8 MiB and 3 by default; a mixed sample changes nothing), and a loss
+  report that grew (read or overwritten), cleared after `loss_quiet`
+  refreshes without a new loss (10). `DriverView::alerts` (`Alert`,
+  `AlertKind::{Lag, Loss}`) lists those firing, with the time each began;
+  API v1's JSON appends `alerts` to each driver. The agent's command line
+  refuses a uid given two roles, and one poll serves at most 16
+  connections (`server::MAX_ACCEPTS`). The guard pending-acknowledgement
+  rule follows M4b.
+
 - The management agent's trace latency window (phase 5, M6c;
   quantstratum-docs: `karyos/design/agent-trace-window.md`). Per driver, a
   follower of the trace mirror pairs each `Publish` with its

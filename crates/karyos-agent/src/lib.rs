@@ -25,6 +25,10 @@
 //!   window of the agent's time, from a follower of the driver's trace
 //!   mirror whose memory is bounded by [`WindowConfig`]; never trace
 //!   verdicts (quantstratum-docs: karyos/design/agent-trace-window.md).
+//! - **Exporter** (M8): [`exporter`] renders the view in the Prometheus
+//!   text format and answers `GET /metrics` on a loopback address only;
+//!   the `karyos-exporter` binary runs it as its own process (owner item
+//!   51, interim 4).
 //! - **Not yet.** An endpoint's capability gauges read as one group in
 //!   the view (M6b's `karyos_client::capabilities` reads them), and the
 //!   trace latencies in the JSON encoding.
@@ -35,8 +39,17 @@
 //! The attach is Linux only, as the tool attach is; [`api`] builds
 //! everywhere.
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "the attach that evaluates the rules is Linux only"
+    )
+)]
+pub mod alerts;
 pub mod api;
 pub mod cli;
+pub mod exporter;
 pub mod json;
 #[cfg_attr(
     not(target_os = "linux"),

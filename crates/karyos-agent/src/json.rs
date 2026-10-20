@@ -13,13 +13,14 @@
 //! - **Strings.** UTF-8, with `"`, `\` and the control characters escaped;
 //!   a path that is not UTF-8 is written lossily.
 //! - **Enums.** [`DriverState`] is an object with a `state` field
-//!   (`"attached"`, `"closed"`, `"unavailable"`) and its variant's fields.
+//!   (`"attached"`, `"closed"`, `"unavailable"`) and its variant's fields;
+//!   an [`AlertKind`] is a string (`"lag"`, `"loss"`).
 
 use std::fmt::Write;
 
 use crate::api::{
-    AgentView, Counter, DriverState, DriverView, ErrorEntry, Feed, GuardEntry, Lane, LossEntry,
-    Sample, Subscriber,
+    AgentView, Alert, AlertKind, Counter, DriverState, DriverView, ErrorEntry, Feed, GuardEntry,
+    Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
 };
 
 /// A JSON value being written into a string.
@@ -170,6 +171,82 @@ fn driver_view(out: &mut Out<'_>, driver: &DriverView) {
         feed(fields.key("errors"), &driver.errors, error_entry);
         feed(fields.key("losses"), &driver.losses, loss_entry);
         feed(fields.key("guards"), &driver.guards, guard_entry);
+        fields
+            .key("latencies")
+            .array(&driver.latencies, |out, latency| lane_latency(out, latency));
+        trace_counts(fields.key("trace"), &driver.trace);
+        fields
+            .key("alerts")
+            .array(&driver.alerts, |out, alert| alert_json(out, alert));
+    });
+}
+
+/// One lane's trace window: observed latencies, never verdicts (M6c).
+fn lane_latency(out: &mut Out<'_>, latency: &LaneLatency) {
+    out.object(|fields| {
+        fields.number("stream", latency.stream);
+        fields.number("incarnation", latency.incarnation);
+        fields.number("lane", latency.lane);
+        fields.number("available", latency.available);
+        fields.number("unavailable", latency.unavailable);
+        fields.key("incomplete").bool(latency.incomplete);
+        for (key, bounds) in [
+            ("p50", latency.p50),
+            ("p90", latency.p90),
+            ("p99", latency.p99),
+            ("p999", latency.p999),
+            ("max", latency.max),
+        ] {
+            fields.key(key).option(bounds, |out, bounds| {
+                out.object(|fields| {
+                    fields
+                        .key("low")
+                        .option(bounds.low, |out, low| out.number(low));
+                    fields
+                        .key("high")
+                        .option(bounds.high, |out, high| out.number(high));
+                });
+            });
+        }
+    });
+}
+
+fn trace_counts(out: &mut Out<'_>, counts: &TraceCounts) {
+    out.object(|fields| {
+        for (key, value) in [
+            ("records", counts.records),
+            ("malformed", counts.malformed),
+            ("unknown_journal", counts.unknown_journal),
+            ("network_ignored", counts.network_ignored),
+            ("points_ignored", counts.points_ignored),
+            ("duplicates", counts.duplicates),
+            ("journals_dropped", counts.journals_dropped),
+            ("pending_dropped", counts.pending_dropped),
+            ("polls_dropped", counts.polls_dropped),
+            ("lanes_dropped", counts.lanes_dropped),
+            ("aged_out", counts.aged_out),
+            ("mirror_overwritten", counts.mirror_overwritten),
+            ("pending", counts.pending),
+        ] {
+            fields.number(key, value);
+        }
+    });
+}
+
+fn alert_json(out: &mut Out<'_>, alert: &Alert) {
+    out.object(|fields| {
+        fields.string(
+            "kind",
+            match alert.kind {
+                AlertKind::Lag => "lag",
+                AlertKind::Loss => "loss",
+            },
+        );
+        fields.number("stream", alert.stream);
+        fields.number("lane", alert.lane);
+        fields.number("participant", alert.participant);
+        fields.number("value", alert.value);
+        fields.number("since", alert.since);
     });
 }
 
