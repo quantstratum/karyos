@@ -252,7 +252,6 @@ pub fn request<C: Connection>(
     timeout: Duration,
 ) -> Result<u64, LiveError>
 where
-    ArchiveConnection<C::Terms>: Sized,
     karyos_archive::client::connection::Requests<C::Terms>: ControlRequests,
     karyos_archive::client::connection::Responses<C::Terms>: ControlResponses,
 {
@@ -263,8 +262,9 @@ where
     let length = message
         .encode(&mut out)
         .map_err(|error| LiveError::Connect(format!("encode: {error}")))?;
+    out.truncate(length);
     let start = Instant::now();
-    while !requests.send(&out[..length]) {
+    while !requests.send(&out) {
         if start.elapsed() >= timeout {
             return Err(LiveError::NotSent);
         }

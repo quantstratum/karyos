@@ -11,6 +11,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-replay start` and `stop` (quantstratum-docs:
+  `karyos/design/archive-host.md`, H6): ask a running Archive to replay a
+  recording into a stream, or to stop a replay, over its control streams.
+  `start --live DIR=REQ,RESP --recording ID --to-stream S [--from POS]
+  [--length BYTES] [--channel URI] [--timeout-ms N]` prints `replay=ID
+  stream=S session=N` for the reader, which the Archive waits for (H2b).
+  `stop --live DIR=REQ,RESP --replay ID`. Exit status 2 on any error, the
+  Archive's refusal included. They connect through `ArchiveConnection`
+  (Linux). `karyos_tools::args::parse_live` parses `--live` for these and
+  for `karyos-catalog list --live`.
+
 - karyos-archive's `client::connection` (quantstratum-docs:
   `karyos/design/ffi-archive.md`, F9-0): a requester's control streams to
   an Archive over a facade client. `ArchiveConnection::open(&mut client,
