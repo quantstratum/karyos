@@ -311,7 +311,10 @@ impl Idle {
         match self.strategy {
             IDLE_BUSY_SPIN => std::hint::spin_loop(),
             // Parked, not slept: a stop or a close unparks the thread, so
-            // neither waits out a long idle sleep (`karyos.h`, Threads).
+            // neither waits out a long idle sleep (`karyos.h`, Threads). A
+            // park may also return early (a spurious wake), so an idle
+            // sleep is at most `sleep_ns`, not exactly it: harmless for an
+            // idle strategy, which only runs the next cycle sooner.
             IDLE_SLEEP => std::thread::park_timeout(Duration::from_nanos(self.sleep_ns)),
             _ => std::thread::yield_now(),
         }
