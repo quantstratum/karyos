@@ -229,6 +229,14 @@ fn driver_errors_map_to_statuses() {
         Failure::from(&limit),
         Failure::with(Status::System, 300, 256)
     );
+    // A schedule the buffer refuses is an invalid argument, not SYSTEM.
+    let capacity = DriverError::Sys(ScheduleError::Capacity { capacity: 3 }.into());
+    assert_eq!(
+        Failure::from(&capacity),
+        Failure::with(Status::InvalidArgument, 3, 0)
+    );
+    let mode = DriverError::Sys(SysError::InvalidPublicationMode { reason: "GC-7" });
+    assert_eq!(Failure::from(&mode).status, Status::InvalidArgument);
 }
 
 #[test]
