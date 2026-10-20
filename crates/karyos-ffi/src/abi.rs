@@ -1626,7 +1626,7 @@ pub struct StreamOptions {
     pub initial_term_id: u32,
     /// The lane; 0 in this version.
     pub lane: u32,
-    /// `KARYOS_PUBLICATION_*`; exclusive in this version.
+    /// `KARYOS_PUBLICATION_*`.
     pub publication_mode: u32,
     /// Offers allowed with no subscriber attached: 0 or 1.
     pub allow_unconnected: u32,
@@ -1643,6 +1643,11 @@ pub struct StreamOptions {
     pub conflation_value_capacity: u32,
     /// Bytes of the table's update journal.
     pub conflation_journal_capacity: u64,
+    /// Concurrent handles at once, at least 1 for
+    /// `KARYOS_PUBLICATION_CONCURRENT`, 0 for exclusive (from 88 bytes).
+    pub publishers: u32,
+    /// Zero.
+    pub reserved: u32,
 }
 
 /// The smallest size of `karyos_stream_options` accepted: that of the
@@ -1654,6 +1659,11 @@ const STREAM_OPTIONS_SIZE_0_1: u32 = 64;
 /// A size between [`STREAM_OPTIONS_SIZE_0_1`] and this one comes from no
 /// header, and could cut a field: it is refused.
 const STREAM_OPTIONS_SIZE_CONFLATION: u32 = 80;
+
+/// The size of `karyos_stream_options` with its publishers field. A size
+/// between [`STREAM_OPTIONS_SIZE_CONFLATION`] and this one comes from no
+/// header either: it is refused.
+const STREAM_OPTIONS_SIZE_CONCURRENT: u32 = 88;
 
 /// `karyos_stream_options` with the defaults and this version's size.
 fn default_stream_options() -> StreamOptions {
@@ -1677,6 +1687,8 @@ fn default_stream_options() -> StreamOptions {
         conflation_keys: defaults.conflation_keys,
         conflation_value_capacity: defaults.conflation_value_capacity,
         conflation_journal_capacity: defaults.conflation_journal_capacity,
+        publishers: defaults.publishers,
+        reserved: 0,
     }
 }
 
@@ -1713,9 +1725,9 @@ pub unsafe extern "C" fn karyos_stream_options_init(options: *mut StreamOptions)
 ///
 /// `options` points to a readable `karyos_stream_options` whose `size` is
 /// set; `detail` is null or a `karyos_detail` whose `size` is set. A null
-/// or misaligned `options`, a `size` below the first version's (64), or a
-/// `size` between it and that of the conflation fields (80), returns
-/// `KARYOS_E_INVALID_ARGUMENT`.
+/// or misaligned `options`, a `size` below the first version's (64), a
+/// `size` between two layouts (64, 80 and 88), or a nonzero `reserved`,
+/// returns `KARYOS_E_INVALID_ARGUMENT`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn karyos_driver_add_stream(
     driver: u64,
@@ -1732,7 +1744,14 @@ pub unsafe extern "C" fn karyos_driver_add_stream(
             };
         // The copy above went only to a local; a size no header produces is
         // refused before anything is used.
-        if raw.size > STREAM_OPTIONS_SIZE_0_1 && raw.size < STREAM_OPTIONS_SIZE_CONFLATION {
+        let between = |low: u32, high: u32| raw.size > low && raw.size < high;
+        if between(STREAM_OPTIONS_SIZE_0_1, STREAM_OPTIONS_SIZE_CONFLATION)
+            || between(
+                STREAM_OPTIONS_SIZE_CONFLATION,
+                STREAM_OPTIONS_SIZE_CONCURRENT,
+            )
+            || raw.reserved != 0
+        {
             return Status::InvalidArgument;
         }
         let options = driver::StreamOptions {
@@ -1753,6 +1772,7 @@ pub unsafe extern "C" fn karyos_driver_add_stream(
             conflation_keys: raw.conflation_keys,
             conflation_value_capacity: raw.conflation_value_capacity,
             conflation_journal_capacity: raw.conflation_journal_capacity,
+            publishers: raw.publishers,
         };
         match driver::add_stream(Handle::from_raw(driver), &options) {
             Ok(()) => Status::Ok,

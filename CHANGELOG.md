@@ -11,6 +11,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-ffi` stream options take a concurrent publication mode:
+  `KARYOS_PUBLICATION_CONCURRENT` with `publishers` (1 to 255), in an
+  88-byte `karyos_stream_options` read by prefix (64, 80 and 88 bytes are
+  accepted; a size between two layouts, or a nonzero `reserved`, is
+  `KARYOS_E_INVALID_ARGUMENT`). An exclusive stream takes `publishers` 0.
+  A C caller's embedded driver can now host a concurrent stream, so
+  concurrent handles and an Archive's request stream are reachable from
+  the C ABI alone. The driver's default refuses a concurrent stream on
+  aarch64 without LSE atomics (ADR-0012). Conformance gains
+  `publication.concurrent` and the 88-byte layout.
 - `karyos-ffi`'s Miri profile (owner item 45): `crates/karyos-ffi/MIRI.md`
   maps every unsafe site class of `src/abi.rs` and the test support to
   the test that runs it under Miri, and lists what Miri does not cover.

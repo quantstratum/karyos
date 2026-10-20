@@ -107,19 +107,22 @@ fn poll_values(conflated: u64, values: &mut Values, key_budget: u32) -> (i32, u3
     (status, delivered)
 }
 
-/// The conflation fields are read when the struct has them: 64 bytes is
-/// the first layout, with no table; a size between it and 80 is refused
-/// before anything is used; 80 and more are read by their 80-byte prefix.
+/// The fields are read when the struct has them: 64 bytes is the first
+/// layout, with no table; 80 adds the conflation fields; 88 the
+/// publishers. A size between two layouts, or a nonzero `reserved`, is
+/// refused before anything is used; 88 and more are read by their 88-byte
+/// prefix.
 /// No driver: the size checks come first, and an accepted size reaches the
 /// handle check (a Miri test of the stream options' prefix read).
 #[test]
-fn stream_options_take_two_layouts_and_nothing_between() {
+fn stream_options_take_three_layouts_and_nothing_between() {
     assert_eq!(
         size_of_u32::<StreamOptions>(),
-        STREAM_OPTIONS_SIZE_CONFLATION
+        STREAM_OPTIONS_SIZE_CONCURRENT
     );
     let options = stream_options_of(KEYED);
-    assert_eq!(options.size, STREAM_OPTIONS_SIZE_CONFLATION);
+    assert_eq!(options.size, STREAM_OPTIONS_SIZE_CONCURRENT);
+    assert_eq!((options.publishers, options.reserved), (0, 0));
     assert_eq!(
         (
             options.conflation_keys,
@@ -152,12 +155,24 @@ fn stream_options_take_two_layouts_and_nothing_between() {
         // SAFETY: `given` is live and at least `size` bytes; no detail.
         unsafe { karyos_driver_add_stream(0, (&raw const given).cast(), core::ptr::null_mut()) }
     };
-    for refused in [60, 65, 72, 76, 79] {
+    for refused in [60, 65, 72, 76, 79, 81, 84, 87] {
         assert_eq!(sized(refused), Status::InvalidArgument.code(), "{refused}");
     }
-    for accepted in [64, 80, size_of_u32::<Newer>()] {
+    for accepted in [64, 80, 88, size_of_u32::<Newer>()] {
         assert_eq!(sized(accepted), Status::InvalidHandle.code(), "{accepted}");
     }
+    // A nonzero `reserved` is refused before the handle.
+    let reserved = Newer {
+        options: StreamOptions {
+            reserved: 1,
+            ..newer.options
+        },
+        later: u64::MAX,
+    };
+    // SAFETY: `reserved` is live and of its size; no detail.
+    let status =
+        unsafe { karyos_driver_add_stream(0, (&raw const reserved).cast(), core::ptr::null_mut()) };
+    assert_eq!(status, Status::InvalidArgument.code());
 }
 
 /// The subscribe and poll arguments are checked before any handle is

@@ -451,6 +451,8 @@ fn call(step: &Step, at: &str) -> Returned {
                     "conflation_keys",
                     "conflation_value_capacity",
                     "conflation_journal_capacity",
+                    "publication_mode",
+                    "publishers",
                     "size",
                 ],
                 at,
@@ -474,6 +476,9 @@ fn call(step: &Step, at: &str) -> Returned {
                 "conflation_journal_capacity",
                 options.conflation_journal_capacity,
             );
+            options.publication_mode =
+                arguments.narrow("publication_mode", options.publication_mode);
+            options.publishers = arguments.narrow("publishers", options.publishers);
             let size = size_argument::<abi::StreamOptions>(&arguments, "size");
             Returned {
                 status: Some(abi::driver_add_stream_sized(
@@ -495,7 +500,7 @@ fn call(step: &Step, at: &str) -> Returned {
                 results: BTreeMap::new(),
             }
         }
-        "karyos_client_add_publication" => {
+        "karyos_client_add_publication" | "karyos_client_add_concurrent_publication" => {
             let arguments =
                 Arguments::new(step, &["client", "stream_id", "uri", "detail_size"], at);
             let uri = std::ffi::CString::new(
@@ -508,11 +513,12 @@ fn call(step: &Step, at: &str) -> Returned {
                 .integer("stream_id")
                 .map(|_| arguments.narrow("stream_id", 0))
                 .unwrap_or_else(|| panic!("{at}: `stream_id` is required"));
-            let (status, publication, detail) = abi::client_add_publication(
+            let (status, publication, detail) = abi::client_add_publication_of(
                 arguments.handle("client"),
                 &uri,
                 stream_id,
                 size_argument::<abi::Detail>(&arguments, "detail_size"),
+                step.function == "karyos_client_add_concurrent_publication",
             );
             let mut results =
                 BTreeMap::from([("detail_tail".to_owned(), tail(detail.tail_intact()))]);
