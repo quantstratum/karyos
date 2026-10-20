@@ -679,6 +679,10 @@ fn call(step: &Step, at: &str) -> Returned {
                     "role",
                     "rejoin",
                     "reserved",
+                    "archive",
+                    "archive_client_id",
+                    "replay_stream_id",
+                    "secondary",
                 ],
                 at,
             );
@@ -697,6 +701,14 @@ fn call(step: &Step, at: &str) -> Returned {
             options.role = arguments.narrow("role", options.role);
             options.rejoin = arguments.narrow("rejoin", options.rejoin);
             options.reserved = arguments.narrow("reserved", options.reserved);
+            options.archive = arguments
+                .integer("archive")
+                .map_or(options.archive, |_| arguments.handle("archive"));
+            options.archive_client_id =
+                arguments.narrow("archive_client_id", options.archive_client_id);
+            options.replay_stream_id =
+                arguments.narrow("replay_stream_id", options.replay_stream_id);
+            options.secondary = arguments.narrow("secondary", options.secondary);
             let (status, subscription) = abi::client_add_subscription_with(
                 arguments.handle("client"),
                 &uri,

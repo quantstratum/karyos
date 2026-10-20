@@ -85,6 +85,24 @@ pub(crate) struct Entry {
     /// How long a listing waits: the options' deadline, or the client's
     /// timeout.
     deadline: Duration,
+    /// The Archive's control streams, which a rejoin opens again for
+    /// itself (F9b).
+    streams: ControlStreams,
+    /// The requester id the next rejoin made from this handle takes when
+    /// its caller leaves the choice to the library: this connection's id
+    /// plus one, and up from there; `None` once past `u32::MAX`.
+    next_client_id: Option<u32>,
+}
+
+/// What a rejoin made from an Archive handle takes of it (F9b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RejoinSource {
+    /// The Archive's control streams.
+    pub(crate) streams: ControlStreams,
+    /// The rejoin's own requester id.
+    pub(crate) client_id: u32,
+    /// How long a replay request waits.
+    pub(crate) deadline: Duration,
 }
 
 impl Entry {
@@ -144,6 +162,7 @@ pub(crate) struct Options {
 pub(crate) fn connect(client: Handle, options: Options) -> Result<Handle, Failure> {
     let client_id = u32::try_from(options.client_id).map_err(|_| Status::InvalidArgument)?;
     let config = ListerConfig::new(client_id);
+    let next_client_id = client_id.checked_add(1);
     let streams = ControlStreams::new(options.requests, options.responses);
     clients().with(client, |entry| {
         entry.usable()?;
@@ -152,25 +171,17 @@ pub(crate) fn connect(client: Handle, options: Options) -> Result<Handle, Failur
         } else {
             Duration::from_nanos(options.deadline_ns)
         };
-        let opened = |error: karyos_archive::client::connection::OpenError| {
-            let (karyos_archive::client::connection::OpenError::Requests(error)
-            | karyos_archive::client::connection::OpenError::Responses(error)) = error
-            else {
-                return Failure::from(Status::Internal);
-            };
-            Failure::from(&error)
-        };
         let lister = match &mut entry.client {
             #[cfg(target_os = "linux")]
             AnyClient::Remote(remote) => {
                 let (requests, responses) = ArchiveConnection::open(remote, streams)
-                    .map_err(opened)?
+                    .map_err(open_failure)?
                     .into_transports();
                 Lister::Remote(Box::new(RecordingLister::new(config, requests, responses)))
             }
             AnyClient::Embedded(embedded) => {
                 let (requests, responses) = ArchiveConnection::open(embedded, streams)
-                    .map_err(opened)?
+                    .map_err(open_failure)?
                     .into_transports();
                 Lister::Embedded(Box::new(RecordingLister::new(config, requests, responses)))
             }
@@ -179,6 +190,8 @@ pub(crate) fn connect(client: Handle, options: Options) -> Result<Handle, Failur
             client: Some(client),
             lister,
             deadline,
+            streams,
+            next_client_id,
         }) {
             Ok(handle) => {
                 entry.archives.push(handle);
@@ -289,6 +302,54 @@ fn response_code(code: ResponseCode) -> u64 {
     }
 }
 
+/// The failure of an [`ArchiveConnection::open`]: the client's failure
+/// on the stream it could not take.
+pub(crate) fn open_failure(error: karyos_archive::client::connection::OpenError) -> Failure {
+    let (karyos_archive::client::connection::OpenError::Requests(error)
+    | karyos_archive::client::connection::OpenError::Responses(error)) = error
+    else {
+        return Failure::from(Status::Internal);
+    };
+    Failure::from(&error)
+}
+
+/// What a rejoin of `client`'s subscription takes of `archive` (F9b): its
+/// control streams, a requester id and the wait. A `client_id` of 0 leaves
+/// the id to the library, which hands out this connection's id plus one
+/// and up; another value is the caller's, which keeps it unique among the
+/// Archive's requesters. Called with `client`'s entry held, so the lock
+/// order is the client's, then the Archive's, as for a listing.
+///
+/// # Errors
+///
+/// [`Status::InvalidArgument`] for an Archive of another client, a
+/// `client_id` above `u32::MAX`, or ids the library has run out of; the
+/// handle's failures.
+pub(crate) fn rejoin_source(
+    archive: Handle,
+    client: Handle,
+    client_id: u64,
+) -> Result<RejoinSource, Status> {
+    let chosen = u32::try_from(client_id).map_err(|_| Status::InvalidArgument)?;
+    table().with(archive, |entry| {
+        if entry.client != Some(client) {
+            return Err(Status::InvalidArgument);
+        }
+        let client_id = if chosen != 0 {
+            chosen
+        } else {
+            let assigned = entry.next_client_id.ok_or(Status::InvalidArgument)?;
+            entry.next_client_id = assigned.checked_add(1);
+            assigned
+        };
+        Ok(RejoinSource {
+            streams: entry.streams,
+            client_id,
+            deadline: entry.deadline,
+        })
+    })?
+}
+
 /// Closes `archive`: its handles are removed from its client.
 ///
 /// # Errors
@@ -325,6 +386,8 @@ pub(crate) fn insert_memory(
             responses,
         ))),
         deadline,
+        streams: ControlStreams::new(0, 0),
+        next_client_id: Some(2),
     })
 }
 

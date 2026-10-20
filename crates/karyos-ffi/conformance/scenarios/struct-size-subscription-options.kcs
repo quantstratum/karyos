@@ -1,7 +1,8 @@
 # karyos_subscription_options of ABI 0.1.0 is 16 bytes, the smallest
-# accepted: below it karyos_client_add_subscription_with answers
+# accepted, and 40 with the Archive rejoin's fields (F9b): below 16, or
+# between the two layouts, karyos_client_add_subscription_with answers
 # KARYOS_E_INVALID_ARGUMENT and opens nothing. A newer caller's larger
-# struct is read by its 0.1.0 prefix (SPEC.md §10.2, §13, C ABI boundary).
+# struct is read by its prefix (SPEC.md §10.2, §13, C ABI boundary).
 format 1
 id struct.size.subscription.options
 abi 0.1
@@ -23,7 +24,13 @@ call karyos_client_add_subscription_with client=$client stream_id=5 size=16
 expect KARYOS_OK subscription=$exact
 call karyos_subscription_close subscription=$exact
 expect KARYOS_OK
-call karyos_client_add_subscription_with client=$client stream_id=5 size=32 role=1 rejoin=1
+call karyos_client_add_subscription_with client=$client stream_id=5 size=24 role=1 rejoin=1
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_subscription_with client=$client stream_id=5 size=40 role=1 rejoin=1
+expect KARYOS_OK subscription=$archive_layout
+call karyos_subscription_close subscription=$archive_layout
+expect KARYOS_OK
+call karyos_client_add_subscription_with client=$client stream_id=5 size=48 role=1 rejoin=1
 expect KARYOS_OK subscription=$newer
 call karyos_subscription_close subscription=$newer
 expect KARYOS_OK

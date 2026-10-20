@@ -1112,6 +1112,9 @@ pub(crate) const REJOIN_AT_HEAD: u32 = 0;
 /// `KARYOS_REJOIN_CLOSE`: an overrun closes the subscription, whose polls
 /// then return `KARYOS_E_CLOSED_BY_OVERRUN`.
 pub(crate) const REJOIN_CLOSE: u32 = 1;
+/// `KARYOS_REJOIN_ARCHIVE`: an overrun's gap is recovered from the Archive
+/// the options name, then merged back into the live stream (F9b).
+pub(crate) const REJOIN_ARCHIVE: u32 = 2;
 
 /// `karyos_subscription_options`: a subscription's role and rejoin policy
 /// (`quantstratum-docs: karyos/design/rejoin-policies.md`), read by
@@ -1128,11 +1131,27 @@ pub struct SubscriptionOptions {
     pub rejoin: u32,
     /// Zero.
     pub reserved: u32,
+    /// For `KARYOS_REJOIN_ARCHIVE`: the Archive handle, of the same
+    /// client; 0 otherwise.
+    pub archive: u64,
+    /// For `KARYOS_REJOIN_ARCHIVE`: the rejoin's requester id, at most
+    /// `UINT32_MAX`, or 0 for one the library assigns; 0 otherwise.
+    pub archive_client_id: u64,
+    /// For `KARYOS_REJOIN_ARCHIVE`: the stream replays are asked onto; 0
+    /// otherwise.
+    pub replay_stream_id: i32,
+    /// For `KARYOS_REJOIN_ARCHIVE`: `KARYOS_REJOIN_AT_HEAD` or
+    /// `KARYOS_REJOIN_CLOSE`, the policy after a failed merge; 0
+    /// otherwise.
+    pub secondary: u32,
 }
 
 /// The size of `karyos_subscription_options` in ABI 0.1.0, the smallest a
 /// caller passes.
 const SUBSCRIPTION_OPTIONS_SIZE_0_1: u32 = 16;
+
+/// The size with the Archive rejoin's fields (F9b).
+const SUBSCRIPTION_OPTIONS_SIZE_ARCHIVE: u32 = 40;
 
 /// `karyos_subscription_options` with the defaults (a required reader that
 /// rejoins at the head) and this version's size.
@@ -1142,16 +1161,31 @@ fn default_subscription_options() -> SubscriptionOptions {
         role: ROLE_REQUIRED,
         rejoin: REJOIN_AT_HEAD,
         reserved: 0,
+        archive: 0,
+        archive_client_id: 0,
+        replay_stream_id: 0,
+        secondary: 0,
     }
 }
 
-/// The client options of `options`: an unknown role or policy, or a
-/// nonzero `reserved`, is [`Status::InvalidArgument`].
+/// The client options of `options`, and the Archive rejoin it asks for:
+/// an unknown role, policy or secondary, a nonzero `reserved`, a size
+/// between the two layouts, an Archive rejoin in the smaller one, or an
+/// Archive field set for another policy is [`Status::InvalidArgument`].
 fn subscription_options(
     options: SubscriptionOptions,
-) -> Result<karyos_client::SubscriptionOptions, Status> {
+) -> Result<
+    (
+        karyos_client::SubscriptionOptions,
+        Option<api::subscription::ArchiveRejoin>,
+    ),
+    Status,
+> {
     use karyos_client::{RejoinPolicy, SubscriberRole};
-    if options.reserved != 0 {
+    if options.reserved != 0
+        || (options.size > SUBSCRIPTION_OPTIONS_SIZE_0_1
+            && options.size < SUBSCRIPTION_OPTIONS_SIZE_ARCHIVE)
+    {
         return Err(Status::InvalidArgument);
     }
     let role = match options.role {
@@ -1160,12 +1194,37 @@ fn subscription_options(
         ROLE_OBSERVER => SubscriberRole::Observer,
         _ => return Err(Status::InvalidArgument),
     };
-    let rejoin = match options.rejoin {
-        REJOIN_AT_HEAD => RejoinPolicy::RejoinAtHead,
-        REJOIN_CLOSE => RejoinPolicy::Close,
+    let archive_fields = options.archive != 0
+        || options.archive_client_id != 0
+        || options.replay_stream_id != 0
+        || options.secondary != 0;
+    let (rejoin, archive) = match options.rejoin {
+        REJOIN_AT_HEAD | REJOIN_CLOSE if archive_fields => {
+            return Err(Status::InvalidArgument);
+        }
+        REJOIN_AT_HEAD => (RejoinPolicy::RejoinAtHead, None),
+        REJOIN_CLOSE => (RejoinPolicy::Close, None),
+        REJOIN_ARCHIVE if options.size >= SUBSCRIPTION_OPTIONS_SIZE_ARCHIVE => {
+            let close_on_failure = match options.secondary {
+                REJOIN_AT_HEAD => false,
+                REJOIN_CLOSE => true,
+                _ => return Err(Status::InvalidArgument),
+            };
+            // The live reader's own policy is set aside while it rejoins.
+            let archive = api::subscription::ArchiveRejoin {
+                archive: Handle::from_raw(options.archive),
+                client_id: options.archive_client_id,
+                replay_stream_id: options.replay_stream_id,
+                close_on_failure,
+            };
+            (RejoinPolicy::RejoinAtHead, Some(archive))
+        }
         _ => return Err(Status::InvalidArgument),
     };
-    Ok(karyos_client::SubscriptionOptions::new(role, rejoin))
+    Ok((
+        karyos_client::SubscriptionOptions::new(role, rejoin),
+        archive,
+    ))
 }
 
 /// Fills `options` with the defaults (`KARYOS_ROLE_REQUIRED`,
@@ -1198,8 +1257,28 @@ pub unsafe extern "C" fn karyos_subscription_options_init(
 /// Each image of a `karyos:udp` subscription takes the role and the policy.
 /// The options are copied; a struct from an older header of the same major
 /// version is read by its prefix. A null `options`, a `size` below that of
-/// ABI 0.1.0, an unknown role or policy, or a nonzero `reserved` returns
+/// ABI 0.1.0 or between it and that of the Archive fields (40), an unknown
+/// role or policy, or a nonzero `reserved` returns
 /// `KARYOS_E_INVALID_ARGUMENT` and opens nothing.
+///
+/// `KARYOS_REJOIN_ARCHIVE` (F9b) recovers an overrun's gap from the
+/// Archive handle `archive`, of the same client, and merges it back into
+/// the live stream, with `secondary` after a failed merge. The Archive
+/// handle lends only its control streams and an id: the rejoin takes its
+/// own request publication and response subscription, which the
+/// subscription owns and its close releases by their drop, so closing the
+/// Archive handle leaves the rejoin working. Each rejoin takes one of the
+/// request stream's publisher slots (`KARYOS_E_REFUSED` when none is
+/// free). An `archive_client_id` of 0 lets the library assign the
+/// requester id; a caller that chooses one keeps it unique among the
+/// Archive's requesters. Replays are asked onto `replay_stream_id`. While
+/// a gap is recovered the caller keeps calling `karyos_client_poll`, so
+/// the replay target's grant completes; `karyos_subscription_rejoin_state`
+/// tells the recovery and a failed merge. A network subscription is
+/// `KARYOS_E_UNSUPPORTED_CHANNEL`, one that names no publication to
+/// recover, an Archive of another client, an Archive field set for
+/// another policy, or a `secondary` other than the two above is
+/// `KARYOS_E_INVALID_ARGUMENT`; nothing stays open.
 ///
 /// # Safety
 ///
@@ -1227,7 +1306,7 @@ pub unsafe extern "C" fn karyos_client_add_subscription_with(
                 default_subscription_options(),
             )
         };
-        let options = match read.and_then(subscription_options) {
+        let (options, archive) = match read.and_then(subscription_options) {
             Ok(options) => options,
             Err(status) => return status,
         };
@@ -1236,7 +1315,13 @@ pub unsafe extern "C" fn karyos_client_add_subscription_with(
             Ok(uri) => uri,
             Err(status) => return status,
         };
-        match api::subscription::add_with(Handle::from_raw(client), uri, stream_id, options) {
+        match api::subscription::add_rejoining(
+            Handle::from_raw(client),
+            uri,
+            stream_id,
+            options,
+            archive,
+        ) {
             Ok(handle) => {
                 // SAFETY: `subscription` is non-null and aligned, and the
                 // caller's contract makes it a writable `uint64_t`.
@@ -1250,6 +1335,111 @@ pub unsafe extern "C" fn karyos_client_add_subscription_with(
             }
         }
     })
+}
+
+/// `KARYOS_MERGE_NONE`: no merge failed.
+pub(crate) const MERGE_NONE: u32 = 0;
+/// `KARYOS_MERGE_OTHER`: a failure a newer library knows and this ABI
+/// version names no code for.
+pub(crate) const MERGE_OTHER: u32 = 255;
+
+/// The `KARYOS_MERGE_*` code of a merge failure: 1 an epoch change, 2 a
+/// replay that ended short, 3 a mismatch at the cutover, 4 another lane,
+/// 5 the replay overrun, 6 the replay revoked, 7 the replay's failure, 8
+/// the live reader overrun, 9 the live reader's failure.
+pub(crate) fn merge_code(error: &karyos_client::MergeError) -> u32 {
+    use karyos_client::MergeError;
+    match error {
+        MergeError::EpochChanged { .. } => 1,
+        MergeError::ReplayShort { .. } => 2,
+        MergeError::Mismatch { .. } => 3,
+        MergeError::Lane { .. } => 4,
+        MergeError::ReplayOverrun(_) => 5,
+        MergeError::ReplayRevoked { .. } => 6,
+        MergeError::Replay(_) => 7,
+        MergeError::LiveOverrun(_) => 8,
+        MergeError::Live(_) => 9,
+        _ => MERGE_OTHER,
+    }
+}
+
+/// `karyos_subscription_rejoin`: where a subscription's Archive rejoin
+/// stands (F9b). `size` is the caller's `sizeof`: the library writes the
+/// fields it knows of, no more than `size` bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SubscriptionRejoin {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// 1 while a gap is asked for or merged, 0 otherwise.
+    pub recovering: u32,
+    /// The last merge failure's `KARYOS_MERGE_*` code.
+    pub merge_failure: u32,
+    /// Zero.
+    pub reserved: u32,
+}
+
+/// The size of `karyos_subscription_rejoin` in its first version.
+const SUBSCRIPTION_REJOIN_SIZE_0_1: u32 = 16;
+
+/// Writes where `subscription`'s Archive rejoin stands through `state`:
+/// whether it recovers a gap, and its last merge failure. A subscription
+/// that does not rejoin from an Archive reads 0 and
+/// `KARYOS_MERGE_NONE`. A data-path call: it never waits.
+///
+/// # Safety
+///
+/// `state` points to a writable `karyos_subscription_rejoin` whose `size`
+/// is set; a null or misaligned one, or a `size` below 16, returns
+/// `KARYOS_E_INVALID_ARGUMENT` with nothing written.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_subscription_rejoin_state(
+    subscription: u64,
+    state: *mut SubscriptionRejoin,
+) -> i32 {
+    guard(|| {
+        if !writable(state) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `state` is non-null and aligned, and points to the
+        // caller's struct (its contract), whose first field is the size.
+        if unsafe { state.cast::<u32>().read() } < SUBSCRIPTION_REJOIN_SIZE_0_1 {
+            return Status::InvalidArgument;
+        }
+        let (recovering, failure) =
+            match api::subscription::rejoin_state(Handle::from_raw(subscription)) {
+                Ok(Some((recovering, failure))) => (recovering, failure),
+                Ok(None) => (false, None),
+                Err(status) => return status,
+            };
+        // SAFETY: the caller's contract on `state`, whose size was read
+        // above.
+        unsafe { write_rejoin_state(state, recovering, failure.as_ref()) };
+        Status::Ok
+    })
+}
+
+/// Writes `recovering` and `failure` through `state` by its size: the
+/// sized write of `karyos_subscription_rejoin_state`, apart so that it
+/// runs under Miri with no driver.
+///
+/// # Safety
+///
+/// `state` is non-null, aligned and points to a writable
+/// `karyos_subscription_rejoin` of at least its `size` bytes.
+unsafe fn write_rejoin_state(
+    state: *mut SubscriptionRejoin,
+    recovering: bool,
+    failure: Option<&karyos_client::MergeError>,
+) {
+    let filled = SubscriptionRejoin {
+        size: size_of_u32::<SubscriptionRejoin>(),
+        recovering: u32::from(recovering),
+        merge_failure: failure.map_or(MERGE_NONE, merge_code),
+        reserved: 0,
+    };
+    // SAFETY: the caller's contract on `state`.
+    unsafe { write_sized(state, SUBSCRIPTION_REJOIN_SIZE_0_1, |_| filled) };
 }
 
 /// Delivers at most `limit` messages of `subscription` to `handler`, each
