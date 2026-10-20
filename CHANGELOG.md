@@ -421,6 +421,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- karyos-client's `Subscription` gains `adopt()`, `max_message_length()`
+  and `poll_adopted(handler, limit)` (owner item 57; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md` §4.4), so a caller can size a copy
+  of each message before it polls. `adopt` takes the images a network
+  subscription's client has attached or retired, and moves every handle
+  a previous `poll_adopted` left at a mapping's seal to its successor;
+  `max_message_length` is the largest message of the stream, or of the
+  adopted images, and changes only at an adoption; `poll_adopted` is the
+  same poll that never adopts and never moves, so an image or a
+  successor offered meanwhile waits for the next adoption, and a handle
+  stopped at a seal sets the new `stopped_at_seal` of `SubscriptionPoll`
+  and `PollSummary`. `poll` is unchanged: it adopts, and moves within
+  the poll. The C ABI's subscription poll (F4) builds on it.
+
 - `Client::remove_concurrent_publication`, the removal matching
   `Client::add_concurrent_publication` (#484): the driver frees the
   handle's publisher slot when it serves it, so the stream's `publishers`

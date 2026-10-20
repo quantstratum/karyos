@@ -283,6 +283,10 @@ pub struct SubscriptionPoll {
     /// The first image whose poll reported more than deliveries (an
     /// overrun, an abort, a skip, a seal or a revocation).
     pub stopped: Option<ImageStop>,
+    /// A handle stopped at its mapping's seal without moving to its
+    /// successor ([`Subscription::poll_adopted`] only): adopt, then poll
+    /// again.
+    pub stopped_at_seal: bool,
 }
 
 /// An image of a network subscription attached or retired, as
@@ -1623,6 +1627,7 @@ impl<T: TermBytes> Subscription<T> {
             Kind::Stream(subscription) => match subscription.poll_taking(&mut handler, limit) {
                 Ok(summary) => Ok(SubscriptionPoll {
                     delivered: summary.delivered,
+                    stopped_at_seal: summary.stopped_at_seal,
                     stopped: stopped(&summary).then_some(ImageStop {
                         session_id: None,
                         lane: None,
@@ -1641,7 +1646,9 @@ impl<T: TermBytes> Subscription<T> {
 
     /// Delivers at most `limit` messages in all to `handler`. A network
     /// subscription polls its images in turn, starting after the image the
-    /// last poll ended at, so none starves.
+    /// last poll ended at, so none starves. It first adopts the images that
+    /// have arrived, and moves to a successor mapping at a seal within the
+    /// poll.
     ///
     /// # Errors
     ///
@@ -1653,16 +1660,106 @@ impl<T: TermBytes> Subscription<T> {
     )]
     pub fn poll<H>(
         &mut self,
-        mut handler: H,
+        handler: H,
         limit: MessageLimit,
     ) -> Result<SubscriptionPoll, SubscriptionError>
     where
         H: FnMut(&[u8], MessageInfo),
     {
+        self.poll_with(handler, limit, false)
+    }
+
+    /// Adopts what the subscription's handles have been offered since the
+    /// last adoption: for a network subscription, the images its client has
+    /// attached or retired (as every [`Subscription::poll`] does first),
+    /// whose changes queue for [`Subscription::next_image_change`]; and for
+    /// every handle that [`Subscription::poll_adopted`] left at a mapping's
+    /// seal, its successor mapping, when offered
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`). Never
+    /// allocates.
+    pub fn adopt(&mut self) {
         match &mut self.kind {
-            Kind::Stream(subscription) => match subscription.poll(&mut handler, limit) {
+            Kind::Stream(subscription) => subscription.advance(),
+            Kind::Images(images) => {
+                images.adopt();
+                for image in &mut images.images {
+                    image.subscription.advance();
+                }
+            }
+        }
+    }
+
+    /// The largest message the subscription can deliver: its stream's for
+    /// a `karyos:ipc` subscription; for a network one, the largest of its
+    /// adopted images', 0 with none. It changes only at an adoption
+    /// ([`Subscription::adopt`]), so a caller that adopts, reads it and
+    /// then polls with [`Subscription::poll_adopted`] never sees a larger
+    /// message in that poll (quantstratum-docs:
+    /// karyos/design/ffi-gap-analysis.md §4.4, the C ABI's private copy).
+    #[must_use]
+    pub fn max_message_length(&self) -> u32 {
+        match &self.kind {
+            Kind::Stream(subscription) => subscription.max_message_length(),
+            Kind::Images(images) => images
+                .images
+                .iter()
+                .map(|image| image.subscription.max_message_length())
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    /// [`Subscription::poll`] without adopting: it polls only the images
+    /// already adopted and never moves to a successor mapping, so neither
+    /// an image that arrives meanwhile nor a successor offered meanwhile
+    /// is read before the next [`Subscription::adopt`]. A handle at the
+    /// seal of a mapping with a successor stops there and sets
+    /// `stopped_at_seal`: adopt, then poll again. The same handler and the
+    /// same acknowledgement as [`Subscription::poll`]; no message is
+    /// declined.
+    ///
+    /// # Errors
+    ///
+    /// As [`Subscription::poll`].
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error carries the image's poll error by value, as ClientSubscription::poll does, so a failed poll reports its progress"
+    )]
+    pub fn poll_adopted<H>(
+        &mut self,
+        handler: H,
+        limit: MessageLimit,
+    ) -> Result<SubscriptionPoll, SubscriptionError>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        self.poll_with(handler, limit, true)
+    }
+
+    /// The poll: with `hold`, [`Subscription::poll_adopted`]'s; otherwise
+    /// [`Subscription::poll`]'s, which adopts first and moves.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error carries the image's poll error by value, as ClientSubscription::poll does, so a failed poll reports its progress"
+    )]
+    fn poll_with<H>(
+        &mut self,
+        mut handler: H,
+        limit: MessageLimit,
+        hold: bool,
+    ) -> Result<SubscriptionPoll, SubscriptionError>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        match &mut self.kind {
+            Kind::Stream(subscription) => match if hold {
+                subscription.poll_holding(&mut handler, limit)
+            } else {
+                subscription.poll(&mut handler, limit)
+            } {
                 Ok(summary) => Ok(SubscriptionPoll {
                     delivered: summary.delivered,
+                    stopped_at_seal: summary.stopped_at_seal,
                     stopped: stopped(&summary).then_some(ImageStop {
                         session_id: None,
                         lane: None,
@@ -1675,7 +1772,12 @@ impl<T: TermBytes> Subscription<T> {
                     error,
                 }),
             },
-            Kind::Images(images) => images.poll(&mut handler, limit),
+            Kind::Images(images) => {
+                if !hold {
+                    images.adopt();
+                }
+                images.poll(&mut handler, limit, hold)
+            }
         }
     }
 }
@@ -1779,6 +1881,8 @@ impl<T: TermBytes> Images<T> {
         }
     }
 
+    /// Polls the adopted images; adopts none. With `hold`, an image at a
+    /// seal does not move to its successor.
     #[expect(
         clippy::result_large_err,
         reason = "the error carries the image's poll error by value, as ClientSubscription::poll does, so a failed poll reports its progress"
@@ -1787,11 +1891,15 @@ impl<T: TermBytes> Images<T> {
         &mut self,
         handler: &mut impl FnMut(&[u8], MessageInfo),
         limit: MessageLimit,
+        hold: bool,
     ) -> Result<SubscriptionPoll, SubscriptionError> {
         self.poll_each(limit, |image, limit| {
-            image
-                .poll(&mut *handler, limit)
-                .map(|summary| (summary, false))
+            if hold {
+                image.poll_holding(&mut *handler, limit)
+            } else {
+                image.poll(&mut *handler, limit)
+            }
+            .map(|summary| (summary, false))
         })
     }
 
@@ -1804,6 +1912,7 @@ impl<T: TermBytes> Images<T> {
         handler: &mut impl FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
     ) -> Result<SubscriptionPoll, SubscriptionError> {
+        self.adopt();
         self.poll_each(limit, |image, limit| {
             let mut declined = false;
             image
@@ -1834,7 +1943,7 @@ impl<T: TermBytes> Images<T> {
             MessageLimit,
         ) -> Result<(PollSummary, bool), PollError>,
     ) -> Result<SubscriptionPoll, SubscriptionError> {
-        self.adopt();
+        // The callers adopt first, or not (`poll_adopted`).
         if let Some(error) = self.closed {
             return Err(SubscriptionError::Closed(error));
         }
@@ -1874,6 +1983,7 @@ impl<T: TermBytes> Images<T> {
                     if let Some(delivered) = result.delivered.checked_add(summary.delivered) {
                         result.delivered = delivered;
                     }
+                    result.stopped_at_seal |= summary.stopped_at_seal;
                     if result.stopped.is_none() && stopped(&summary) {
                         result.stopped = Some(ImageStop {
                             session_id: Some(*session_id),
@@ -1984,5 +2094,114 @@ mod tests {
             ]
         );
         assert_eq!(images.changes_lost, 0);
+    }
+
+    /// A network subscription of no image yet, and its client's inbox.
+    fn network() -> (
+        Subscription<karyos_sys::term_bytes::HeapTerms>,
+        Arc<Inbox<karyos_sys::term_bytes::HeapTerms>>,
+    ) {
+        let inbox = Arc::new(Inbox::new(2));
+        let subscription = Subscription {
+            kind: Kind::Images(Images {
+                registration: 1,
+                inbox: Arc::clone(&inbox),
+                released: Arc::new(Mutex::new(Vec::with_capacity(8))),
+                images: Vec::with_capacity(2),
+                next: 0,
+                closed: None,
+                changes: std::collections::VecDeque::with_capacity(6),
+                max_changes: 6,
+                changes_lost: 0,
+            }),
+        };
+        (subscription, inbox)
+    }
+
+    /// Item 57 (FFI F4): an image that arrives between `adopt` and
+    /// `poll_adopted` is not read by that poll, and its size does not count
+    /// before it is adopted; the next adoption takes it.
+    #[test]
+    fn an_image_arriving_after_adopt_waits_for_the_next() {
+        let (mut subscription, inbox) = network();
+        subscription.adopt();
+        assert_eq!(subscription.max_message_length(), 0);
+        let arrived = image(1, 1);
+        let max = arrived.subscription.max_message_length();
+        inbox.update(|state| state.arrived.push(arrived));
+        let poll = subscription
+            .poll_adopted(|_, _| {}, MessageLimit::new(8))
+            .unwrap();
+        assert_eq!((poll.delivered, poll.stopped_at_seal), (0, false));
+        assert_eq!(subscription.image_count(), 0, "not adopted by the poll");
+        assert_eq!(subscription.max_message_length(), 0);
+        subscription.adopt();
+        assert_eq!(subscription.image_count(), 1);
+        assert_eq!(subscription.max_message_length(), max);
+    }
+
+    /// Item 57 (FFI F4): an image's successor of a larger term, offered
+    /// after `adopt`, is not read by `poll_adopted`, which stops at the
+    /// seal; the next adoption moves the image, the largest message grows,
+    /// and a message of exactly that length is delivered.
+    #[test]
+    fn an_image_successor_offered_after_adopt_waits_for_the_next() {
+        let (mut subscription, _inbox) = network();
+        let (held, mut later) = crate::subscription::testing::at_seal();
+        if let Kind::Images(images) = &mut subscription.kind {
+            images.images.push(Image {
+                id: 1,
+                session_id: 1,
+                lane: Lane::ZERO,
+                subscription: held,
+            });
+        }
+        subscription.adopt();
+        let before = subscription.max_message_length();
+        let max = later.offer();
+        let mut seen = Vec::new();
+        let poll = subscription
+            .poll_adopted(|bytes, _| seen.push(bytes.len()), MessageLimit::new(8))
+            .unwrap();
+        assert!(poll.stopped_at_seal);
+        assert_eq!(poll.delivered, 0);
+        assert_eq!(subscription.max_message_length(), before);
+        subscription.adopt();
+        assert_eq!(subscription.max_message_length(), max);
+        let poll = subscription
+            .poll_adopted(|bytes, _| seen.push(bytes.len()), MessageLimit::new(8))
+            .unwrap();
+        assert!(!poll.stopped_at_seal);
+        assert_eq!(seen, [max as usize]);
+    }
+
+    /// DESIGN's P1 on #499, for an image: a fenced cutover of an image held
+    /// at its seal is reported as that image's close by the next
+    /// `poll_adopted` after an adoption, which no longer stops at the seal.
+    #[test]
+    fn an_image_whose_cutover_was_fenced_is_reported_closed() {
+        let (mut subscription, _inbox) = network();
+        let (held, later) = crate::subscription::testing::at_seal();
+        if let Kind::Images(images) = &mut subscription.kind {
+            images.images.push(Image {
+                id: 1,
+                session_id: 1,
+                lane: Lane::ZERO,
+                subscription: held,
+            });
+        }
+        subscription.adopt();
+        let poll = subscription
+            .poll_adopted(|_, _| {}, MessageLimit::new(8))
+            .unwrap();
+        assert!(poll.stopped_at_seal);
+        later.fence();
+        subscription.adopt();
+        let poll = subscription
+            .poll_adopted(|_, _| {}, MessageLimit::new(8))
+            .unwrap();
+        assert!(!poll.stopped_at_seal);
+        let stop = poll.stopped.unwrap();
+        assert!(stop.summary.closed.is_some(), "{stop:?}");
     }
 }
