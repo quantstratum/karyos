@@ -31,6 +31,10 @@ release may break APIs, wire formats and shared-memory layouts.
     `ConflationShape`, `LogBuffer::conflation`), and read back at attach.
     `ClientPublication::new` and `ClientConcurrentPublication::new` bind
     it, so in-process and remote grants bind it the same way.
+  - The check is `ConflationShape::validate_publication`: a publication
+    holds the shape alone, not a table configuration with a journal it
+    does not have. `ConflationConfig::shape` gives a configuration's, and
+    `ConflationConfig::validate_publication` delegates to it.
   - The log buffer's `LAYOUT_VERSION` goes to 5; regions of versions 1 to
     4 are refused at attach. A configuration block with half a shape, or
     one the buffer cannot carry, is refused (`SysError::InvalidRegion`);
