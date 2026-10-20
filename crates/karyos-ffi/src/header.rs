@@ -417,6 +417,10 @@ fn the_header_states_the_client_constants() {
     );
     assert_eq!(defines["KARYOS_IDLE_YIELD"], i64::from(client::IDLE_YIELD));
     assert_eq!(defines["KARYOS_IDLE_SLEEP"], i64::from(client::IDLE_SLEEP));
+    assert_eq!(
+        defines["KARYOS_IDLE_YIELD_THEN_SLEEP"],
+        i64::from(client::IDLE_YIELD_THEN_SLEEP)
+    );
 }
 
 #[test]

@@ -70,7 +70,8 @@ fn poll(client: u64) -> (i32, u32) {
 fn options_init_fills_the_defaults_and_the_size() {
     let options = defaults();
     assert_eq!(options.size, size_of_u32::<ClientOptions>());
-    assert_eq!(options.idle_strategy, client::IDLE_YIELD);
+    // ADR-0066: the agents' default.
+    assert_eq!(options.idle_strategy, client::IDLE_YIELD_THEN_SLEEP);
     assert!(options.dir.is_null());
     assert_eq!(options.timeout_ns, 10_000_000_000);
     assert_eq!(options.max_pending, 64);
@@ -107,11 +108,13 @@ fn connect_refuses_bad_arguments_and_writes_nothing() {
     };
     assert_eq!(connect(&bad_dir).0, Status::InvalidArgument.code());
 
-    let bad_idle = ClientOptions {
-        idle_strategy: 9,
-        ..options
-    };
-    assert_eq!(connect(&bad_idle).0, Status::InvalidArgument.code());
+    for unknown in [4, 9] {
+        let bad_idle = ClientOptions {
+            idle_strategy: unknown,
+            ..options
+        };
+        assert_eq!(connect(&bad_idle).0, Status::InvalidArgument.code());
+    }
 }
 
 #[test]

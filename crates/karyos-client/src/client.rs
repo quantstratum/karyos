@@ -148,14 +148,46 @@ pub enum IdleStrategy {
     Yield,
     /// Sleep for the period.
     Sleep(Duration),
+    /// Yield for the first 64 consecutive idle waits, then sleep 1 ms per
+    /// wait; a service that served anything starts the count again. The
+    /// driver agents' default (`quantstratum-docs: karyos/adr/0066`) and
+    /// the C ABI's.
+    YieldThenSleep,
+}
+
+/// The consecutive idle waits [`IdleStrategy::YieldThenSleep`] yields
+/// before it sleeps, as the driver's agents do.
+const YIELDS_BEFORE_SLEEP: u32 = 64;
+
+/// The sleep of [`IdleStrategy::YieldThenSleep`] after its yields.
+const YIELD_THEN_SLEEP_PERIOD: Duration = Duration::from_millis(1);
+
+/// What one idle wait does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pause {
+    Spin,
+    Yield,
+    Sleep(Duration),
 }
 
 impl IdleStrategy {
-    fn idle(self) {
+    /// The wait that follows `idle` earlier consecutive idle waits.
+    fn pause(self, idle: u32) -> Pause {
         match self {
-            Self::BusySpin => core::hint::spin_loop(),
-            Self::Yield => std::thread::yield_now(),
-            Self::Sleep(period) => std::thread::sleep(period),
+            Self::BusySpin => Pause::Spin,
+            Self::Yield => Pause::Yield,
+            Self::Sleep(period) => Pause::Sleep(period),
+            Self::YieldThenSleep if idle < YIELDS_BEFORE_SLEEP => Pause::Yield,
+            Self::YieldThenSleep => Pause::Sleep(YIELD_THEN_SLEEP_PERIOD),
+        }
+    }
+
+    /// Waits once, after `idle` earlier consecutive idle waits.
+    fn idle(self, idle: u32) {
+        match self.pause(idle) {
+            Pause::Spin => core::hint::spin_loop(),
+            Pause::Yield => std::thread::yield_now(),
+            Pause::Sleep(period) => std::thread::sleep(period),
         }
     }
 }
@@ -177,7 +209,7 @@ impl Context {
         ContextBuilder {
             context: Self {
                 dir: None,
-                idle: IdleStrategy::Yield,
+                idle: IdleStrategy::YieldThenSleep,
                 timeout: DEFAULT_TIMEOUT,
                 max_pending: DEFAULT_MAX_PENDING,
                 max_images: DEFAULT_MAX_IMAGES,
@@ -230,7 +262,8 @@ impl ContextBuilder {
         self
     }
 
-    /// How a control call waits ([`IdleStrategy::Yield`] by default).
+    /// How a control call waits ([`IdleStrategy::YieldThenSleep`] by default,
+    /// ADR-0066).
     #[must_use]
     pub fn idle_strategy(mut self, idle: IdleStrategy) -> Self {
         self.context.idle = idle;
@@ -1452,14 +1485,20 @@ impl<C: Connection> Client<C> {
     /// Serves until request `sequence` completes or the timeout passes.
     fn wait(&mut self, sequence: u64) -> Result<Found<C::Terms>, ClientError> {
         let start = Instant::now();
+        let mut idle = 0u32;
         loop {
-            if let (_, Some(found)) = self.service(Some(sequence)) {
+            let (served, found) = self.service(Some(sequence));
+            if let Some(found) = found {
                 return Ok(found);
             }
             if start.elapsed() >= self.context.timeout {
                 return Err(ClientError::Timeout);
             }
-            self.context.idle.idle();
+            if served {
+                idle = 0;
+            }
+            self.context.idle.idle(idle);
+            idle = idle.saturating_add(1);
         }
     }
 
@@ -2260,6 +2299,37 @@ impl<T: TermBytes> Images<T> {
 mod tests {
     use super::*;
     use karyos_sys::frame::Lane;
+
+    /// `YieldThenSleep` yields for 64 consecutive idle waits and sleeps
+    /// 1 ms from the 65th, as the driver's agents do (ADR-0066); the other
+    /// strategies ignore the count. It is the context's default.
+    #[test]
+    fn yield_then_sleep_yields_64_times_then_sleeps() {
+        assert_eq!(
+            Context::builder().build().unwrap().idle_strategy(),
+            IdleStrategy::YieldThenSleep
+        );
+        let strategy = IdleStrategy::YieldThenSleep;
+        for idle in 0..64 {
+            assert_eq!(strategy.pause(idle), Pause::Yield, "{idle}");
+        }
+        for idle in [64, 65, u32::MAX] {
+            assert_eq!(
+                strategy.pause(idle),
+                Pause::Sleep(Duration::from_millis(1)),
+                "{idle}"
+            );
+        }
+        for idle in [0, 64, u32::MAX] {
+            assert_eq!(IdleStrategy::BusySpin.pause(idle), Pause::Spin);
+            assert_eq!(IdleStrategy::Yield.pause(idle), Pause::Yield);
+            let period = Duration::from_micros(5);
+            assert_eq!(
+                IdleStrategy::Sleep(period).pause(idle),
+                Pause::Sleep(period)
+            );
+        }
+    }
     use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig, Role};
     use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
     use karyos_sys::term::TermId;
