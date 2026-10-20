@@ -349,8 +349,14 @@ A scenario fails, and is reported as failed, on any of these:
 
 ## Versions
 
-A runner compares each scenario's `abi` with `karyos_abi_version()` of
-the library. A scenario runs when the major versions are equal and:
+The ABI version is independent of the workspace version. A runner calls
+`karyos_abi_version` first, before any other call. This suite needs ABI
+0.1.0 or a later 0.1.z: before 1.0 a runner accepts exactly the 0.y the
+suite targets, with at least its minimum 0.y.z, and checks it once,
+before any scenario; a library outside it fails the run.
+
+A runner then compares each scenario's `abi` with the library's. A
+scenario runs when the major versions are equal and:
 
 - before 1.0 (major 0), the minor versions are equal, because a `0.y`
   minor may break (ffi-gap-analysis.md §4.5);

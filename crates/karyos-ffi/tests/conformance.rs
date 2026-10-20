@@ -29,6 +29,22 @@ use support::{abi, semantic, sha256};
 /// The format versions this runner reads.
 const FORMATS: [&str; 2] = ["1", "2"];
 
+/// The lowest ABI version this suite needs (FORMAT.md, Versions).
+const MINIMUM_ABI: [u32; 3] = [0, 1, 0];
+
+/// Whether a library of ABI `library` can run this suite (FORMAT.md,
+/// Versions): before 1.0 exactly the suite's 0.y, at least its 0.y.z;
+/// from 1.0 the same major and at least its minor and patch.
+fn suite_runs_on(library: [u32; 3]) -> bool {
+    let [major, minor, _] = MINIMUM_ABI;
+    let same = if major == 0 {
+        library[..2] == [major, minor]
+    } else {
+        library[0] == major
+    };
+    same && library >= MINIMUM_ABI
+}
+
 /// The binding SPECs' delivery steps a format 2 `since` names, in order
 /// (FORMAT.md, Format 2).
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
@@ -1671,6 +1687,10 @@ fn every_scenario_passes_at_the_library_abi_version() {
     let (status, [major, minor, patch]) = abi::abi_version_with([false; 3]);
     assert_eq!(status, statuses["KARYOS_OK"]);
     let (major, minor, patch) = (major.unwrap(), minor.unwrap(), patch.unwrap());
+    assert!(
+        suite_runs_on([major, minor, patch]),
+        "ABI {major}.{minor}.{patch} is outside this suite's (FORMAT.md, Versions)"
+    );
     // The run's identities come first (FORMAT.md, Pinning).
     println!("{}", pinning([major, minor, patch]));
     let runner = Runner::reference();
@@ -2008,6 +2028,12 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert!(runs((1, 3), (1, 3)));
     assert!(!runs((1, 4), (1, 3)));
     assert!(!runs((2, 0), (1, 3)));
+    // The suite as a whole needs 0.1.0 or a later 0.1.z.
+    assert!(suite_runs_on([0, 1, 0]));
+    assert!(suite_runs_on([0, 1, 7]));
+    assert!(!suite_runs_on([0, 2, 0]));
+    assert!(!suite_runs_on([0, 0, 9]));
+    assert!(!suite_runs_on([1, 1, 0]));
     // A binding at step B1 that offers only an embedded driver.
     let b1 = Runner::new(
         1,
