@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::frame::Lane;
+use karyos_sys::log_buffer::ConflationShape;
 use karyos_sys::log_buffer::{
     AppendOptions, CommitOutcome as SysCommitOutcome, ConcurrentClaim,
     ConcurrentClaimOutcome as SysClaimOutcome, ConcurrentOfferOutcome as SysOfferOutcome,
@@ -194,7 +195,7 @@ pub struct ClientConcurrentPublication<T: TermBytes = HeapTerms> {
     /// The trace hook and publication identity, for a traced handle.
     trace: Option<PublishTrace>,
     /// Limits for the stream's conflated view, when configured by the driver.
-    conflation: Option<ConflationConfig>,
+    conflation: Option<ConflationShape>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -219,6 +220,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
     /// read from the buffer the handle publishes to.
     #[must_use]
     pub fn new(inner: ConcurrentPublication<Arc<LogBuffer<T>>>, allow_unconnected: bool) -> Self {
+        let conflation = inner.buffer().conflation();
         Self {
             inner,
             allow_unconnected,
@@ -226,18 +228,19 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             link: None,
             base: 0,
             trace: None,
-            conflation: None,
+            conflation,
             _lease: None,
             _export: None,
         }
     }
 
-    /// Binds the stream's keyed conflation limits to this publication.
-    /// The driver calls this while issuing a publication for a conflated
-    /// stream; callers should normally obtain handles from the driver.
+    /// Binds keyed conflation limits to this publication, in place of the
+    /// table its buffer carries: every publication of a conflated stream
+    /// already reads its stream's from the buffer (F7b-2c-2), in process
+    /// or attached, so this is for tests and for buffers built without one.
     #[must_use]
     pub fn with_conflation(mut self, config: ConflationConfig) -> Self {
-        self.conflation = Some(config);
+        self.conflation = Some(config.shape());
         self
     }
 
@@ -349,8 +352,8 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             }
             return Ok(ConcurrentOfferOutcome::NotConnected);
         }
-        if let Some(config) = self.conflation {
-            config.validate_publication(options.reserved_value, payload.len())?;
+        if let Some(shape) = self.conflation {
+            shape.validate_publication(options.reserved_value, payload.len())?;
         }
         let lane = self.inner.buffer().lane();
         match offer_outcome(self.inner.offer(payload, options)?, lane, self.base) {
@@ -480,14 +483,14 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         if self.inner.is_closed() {
             return Ok(self.after_end().concurrent_claim());
         }
-        if let Some(config) = self.conflation {
+        if let Some(shape) = self.conflation {
             let value_length = usize::try_from(length).map_err(|_| {
                 ClientError::from(karyos_sys::conflation::ConflationError::ValueTooLarge {
                     length: usize::MAX,
-                    max: config.value_capacity,
+                    max: usize::try_from(shape.value_capacity).unwrap_or(usize::MAX),
                 })
             })?;
-            config.validate_publication(options.reserved_value, value_length)?;
+            shape.validate_publication(options.reserved_value, value_length)?;
         }
         let lane = self.inner.buffer().lane();
         let base = self.base;

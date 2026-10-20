@@ -15,7 +15,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
 use karyos_sys::record_journal::JournalWriter;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
@@ -234,19 +233,13 @@ pub struct HandOverEntry<T: TermBytes = HeapTerms> {
     /// karyos/design/observability-and-tools.md`, "Loss reports from
     /// clients"); `None` reports nothing.
     pub publication: Option<PublicationIdentity>,
-    /// The stream's conflation table shape, which a delivered publication
-    /// checks its keys against before it appends
-    /// (`quantstratum-docs: karyos/design/conflation-end-to-end.md`);
-    /// `None` checks nothing.
-    pub conflation: Option<ConflationConfig>,
 }
 
 impl<T: TermBytes> HandOverEntry<T> {
     /// The entry of hand-over `key` for `capability` and its `lease`,
-    /// with no generation link, no publication identity and no conflation
-    /// table: add them with [`HandOverEntry::with_generation`],
-    /// [`HandOverEntry::with_publication`] and
-    /// [`HandOverEntry::with_conflation`].
+    /// with no generation link and no publication identity: add them with
+    /// [`HandOverEntry::with_generation`] and
+    /// [`HandOverEntry::with_publication`].
     #[must_use]
     pub const fn new(key: u64, capability: Capability<T>, lease: Lease) -> Self {
         Self {
@@ -255,7 +248,6 @@ impl<T: TermBytes> HandOverEntry<T> {
             lease,
             generation: None,
             publication: None,
-            conflation: None,
         }
     }
 
@@ -271,14 +263,6 @@ impl<T: TermBytes> HandOverEntry<T> {
     #[must_use]
     pub const fn with_publication(mut self, publication: PublicationIdentity) -> Self {
         self.publication = Some(publication);
-        self
-    }
-
-    /// The stream's conflation table shape, when the stream has one: a
-    /// delivered publication refuses a key outside it.
-    #[must_use]
-    pub const fn with_conflation(mut self, conflation: Option<ConflationConfig>) -> Self {
-        self.conflation = conflation;
         self
     }
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::frame::Lane;
+use karyos_sys::log_buffer::ConflationShape;
 use karyos_sys::log_buffer::{
     AppendOptions, AppendOutcome, Claim, ClaimOutcome as SysClaimOutcome,
     CommitOutcome as SysCommitOutcome, LogBuffer, Publication,
@@ -249,7 +250,7 @@ pub struct ClientPublication<T: TermBytes = HeapTerms> {
     /// The trace hook and publication identity, for a traced handle.
     trace: Option<PublishTrace>,
     /// Limits for the stream's conflated view, when configured by the driver.
-    conflation: Option<ConflationConfig>,
+    conflation: Option<ConflationShape>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -281,6 +282,7 @@ impl<T: TermBytes> ClientPublication<T> {
     /// are read from the buffer the publication itself appends to.
     #[must_use]
     pub fn new(inner: Publication<Arc<LogBuffer<T>>>, allow_unconnected: bool) -> Self {
+        let conflation = inner.buffer().conflation();
         Self {
             inner,
             allow_unconnected,
@@ -288,7 +290,7 @@ impl<T: TermBytes> ClientPublication<T> {
             link: None,
             base: 0,
             trace: None,
-            conflation: None,
+            conflation,
             _lease: None,
             guard: None,
             schedule: None,
@@ -382,12 +384,13 @@ impl<T: TermBytes> ClientPublication<T> {
         }
     }
 
-    /// Binds the stream's keyed conflation limits to this publication.
-    /// The driver calls this while issuing a publication for a conflated
-    /// stream; callers should normally obtain handles from the driver.
+    /// Binds keyed conflation limits to this publication, in place of the
+    /// table its buffer carries: every publication of a conflated stream
+    /// already reads its stream's from the buffer (F7b-2c-2), in process
+    /// or attached, so this is for tests and for buffers built without one.
     #[must_use]
     pub fn with_conflation(mut self, config: ConflationConfig) -> Self {
-        self.conflation = Some(config);
+        self.conflation = Some(config.shape());
         self
     }
 
@@ -653,8 +656,8 @@ impl<T: TermBytes> ClientPublication<T> {
             }
             return Ok(OfferOutcome::NotConnected);
         }
-        if let Some(config) = self.conflation {
-            config.validate_publication(options.reserved_value, payload.len())?;
+        if let Some(shape) = self.conflation {
+            shape.validate_publication(options.reserved_value, payload.len())?;
         }
         // The rate copy is asked last, so it refuses only a message that
         // would otherwise be appended; a sealed handle reports its seal
@@ -787,14 +790,14 @@ impl<T: TermBytes> ClientPublication<T> {
             }
             return Ok(self.after_end().claim());
         }
-        if let Some(config) = self.conflation {
+        if let Some(shape) = self.conflation {
             let value_length = usize::try_from(length).map_err(|_| {
                 ClientError::from(karyos_sys::conflation::ConflationError::ValueTooLarge {
                     length: usize::MAX,
-                    max: config.value_capacity,
+                    max: usize::try_from(shape.value_capacity).unwrap_or(usize::MAX),
                 })
             })?;
-            config.validate_publication(options.reserved_value, value_length)?;
+            shape.validate_publication(options.reserved_value, value_length)?;
         }
         if let Some(binding) = &mut self.guard
             && !binding.rate_admits()

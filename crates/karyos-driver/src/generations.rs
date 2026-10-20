@@ -572,8 +572,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if maximum >= 1 << 63 {
             return Err(DriverError::PositionsExhausted);
         }
+        let shape = target
+            .conflation
+            .map(crate::embedded::conflation_shape)
+            .transpose()?;
         let successor = Arc::new(<T as crate::embedded::sealed::Create>::create(
-            self, config, generation,
+            self, config, generation, shape,
         )?);
         let conductor = successor
             .conductor_owned()

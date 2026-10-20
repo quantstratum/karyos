@@ -593,10 +593,11 @@ fn an_image_configuration_round_trips() {
         &buffer.config,
         buffer.generation,
         buffer.max_message_length,
+        buffer.conflation,
     );
-    let (config, generation, max) = crate::log_buffer::parse_config(&words).unwrap();
+    let parsed = crate::log_buffer::parse_config(&words).unwrap();
     assert_eq!(
-        (config, generation, max),
+        (parsed.config, parsed.generation, parsed.max_message_length),
         (buffer.config, buffer.generation, buffer.max_message_length)
     );
 }
@@ -1370,9 +1371,10 @@ fn the_capability_is_in_the_configuration_block() {
         &buffer.config,
         buffer.generation,
         buffer.max_message_length,
+        buffer.conflation,
     );
-    let (config, _, _) = crate::log_buffer::parse_config(&words).unwrap();
-    assert_eq!(config.publication, buffer.config.publication);
+    let parsed = crate::log_buffer::parse_config(&words).unwrap();
+    assert_eq!(parsed.config.publication, buffer.config.publication);
     // The word after `join`.
     assert_eq!(words[17], 1);
     let mut unknown = words;

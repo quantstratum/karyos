@@ -500,6 +500,43 @@ fn apply(options: &mut Options, option: &str, value: &str) -> Option<()> {
     Some(())
 }
 
+/// A live Archive, as `--live DIR=REQ,RESP` names it: the driver's
+/// directory and the Archive's request and response streams there
+/// (`quantstratum-docs: karyos/design/archive-host.md`, H4b and H6; the
+/// shape of karyos-agent's `--archive`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveArchive {
+    /// The driver's directory.
+    pub dir: PathBuf,
+    /// The Archive's request stream.
+    pub requests: i32,
+    /// The Archive's response stream.
+    pub responses: i32,
+}
+
+/// Parses `value`, the value of `--live`, as `DIR=REQ,RESP`.
+///
+/// # Errors
+///
+/// [`ArgsError::InvalidValue`] for a value without `=` or `,`, an empty
+/// directory, or a stream id that is not an `i32`.
+pub fn parse_live(value: &str) -> Result<LiveArchive, ArgsError> {
+    let invalid = || ArgsError::InvalidValue {
+        option: "--live",
+        value: value.to_owned(),
+    };
+    let (dir, streams) = value.rsplit_once('=').ok_or_else(invalid)?;
+    let (requests, responses) = streams.split_once(',').ok_or_else(invalid)?;
+    if dir.is_empty() {
+        return Err(invalid());
+    }
+    Ok(LiveArchive {
+        dir: PathBuf::from(dir),
+        requests: requests.trim().parse().map_err(|_| invalid())?,
+        responses: responses.trim().parse().map_err(|_| invalid())?,
+    })
+}
+
 /// The command line of a diagnostic tool (`karyos-stat`,
 /// `karyos-errors`): `--dir <path>` (required), `--interval <duration>`
 /// (default 1 s, at least 1 ms) and one flag without a value.

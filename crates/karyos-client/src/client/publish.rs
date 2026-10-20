@@ -296,12 +296,11 @@ impl<T: TermBytes> Publication<T> {
     ///
     /// On a conflated stream the driver is authoritative: a key outside
     /// the table never enters the conflated view, and the driver counts it
-    /// as a rejected key. A publication whose grant carries the table also
-    /// refuses such a key, or a value larger than the capacity, before it
-    /// appends. A client of a driver in this process checks; a client
-    /// attached to a driver in another process does not yet. Conflation is
-    /// a view over the log, not a filter on it: an appended message
-    /// reaches the stream's subscribers whatever its key.
+    /// as a rejected key. Every publication also refuses such a key, or a
+    /// value larger than the capacity, before it appends: the table's shape
+    /// comes with the log buffer it publishes to, in process or attached.
+    /// Conflation is a view over the log, not a filter on it: an appended
+    /// message reaches the stream's subscribers whatever its key.
     ///
     /// # Errors
     ///
