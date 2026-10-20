@@ -668,12 +668,17 @@ fn the_first_final_seal_decides_the_reason_and_a_cutover_seal_has_none() {
     assert_eq!(conductor.seal_reason(), None);
 }
 
-/// A guard close or a missed deadline seals with a gate reason: the
+/// A guard close, a missed deadline or a schedule violation seals with a
+/// gate reason: the
 /// publication reports `Gated`, never `Closed`, on every later attempt, and
 /// `close_if_sealed` returns the reason (guards-and-abort.md, GC-8).
 #[test]
 fn a_gate_seal_reports_gated() {
-    for reason in [SealReason::GuardClosed, SealReason::DeadlineMissed] {
+    for reason in [
+        SealReason::GuardClosed,
+        SealReason::DeadlineMissed,
+        SealReason::ScheduleViolation,
+    ] {
         let buffer = new_buffer(config(3, 2)).unwrap();
         let mut conductor = buffer.conductor().unwrap();
         let _subscription = conductor.subscribe(Role::Optional).unwrap();
@@ -729,13 +734,15 @@ fn seal_reason_codes_round_trip() {
         (SealReason::DeadlineMissed, 6),
         (SealReason::ImageRetired, 7),
         (SealReason::EndOfStream, 8),
+        (SealReason::ScheduleViolation, 9),
     ] {
         assert_eq!(reason.code(), code);
         assert_eq!(SealReason::from_code(code), reason);
     }
     assert!(!SealReason::ImageRetired.is_gate());
     assert!(!SealReason::EndOfStream.is_gate());
-    assert_eq!(SealReason::from_code(9), SealReason::Unspecified);
+    assert!(SealReason::ScheduleViolation.is_gate());
+    assert_eq!(SealReason::from_code(10), SealReason::Unspecified);
 }
 
 /// A guard close aborts the admitted claim at once, whatever its deadline
@@ -831,7 +838,7 @@ fn a_claim_admitted_after_the_close_is_aborted_by_the_repeat() {
 /// with no claim of a clean end.
 #[test]
 fn an_unknown_seal_reason_reads_as_unspecified() {
-    for code in [9, 200, u64::MAX] {
+    for code in [10, 200, u64::MAX] {
         assert_eq!(SealReason::from_code(code), SealReason::Unspecified);
     }
     let buffer = new_buffer(config(3, 2)).unwrap();

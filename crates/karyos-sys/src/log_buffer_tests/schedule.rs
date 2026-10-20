@@ -17,14 +17,14 @@ fn a_timed_buffer_carries_its_schedule_ring() {
     let ring = timed.schedule_ring().unwrap();
     assert_eq!(ring.len(), crate::schedule_ring::ring_words(4).unwrap());
     let mut publisher = crate::schedule_ring::SchedulePublisher::attach(ring).unwrap();
-    let reader = crate::schedule_ring::ScheduleReader::attach(ring).unwrap();
+    let mut reader = crate::schedule_ring::ScheduleReader::attach(ring).unwrap();
     assert_eq!(publisher.has_room(ring), Ok(true));
     let entry = crate::schedule_ring::Entry {
         position: 0,
         time: 42,
     };
     publisher.push(ring, entry).unwrap();
-    assert_eq!(reader.peek(ring), Ok(Some(entry)));
+    assert_eq!(reader.peek(ring, 0, u64::MAX), Ok(Some(entry)));
 }
 
 /// A schedule capacity is a power of two up to the bound, on an exclusive
@@ -149,12 +149,12 @@ fn the_entry_is_visible_before_the_block_is_committed() {
     let mut subscription = conductor.subscribe(Role::Required).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     let ring = buffer.schedule_ring().unwrap();
-    let reader = crate::schedule_ring::ScheduleReader::attach(ring).unwrap();
+    let mut reader = crate::schedule_ring::ScheduleReader::attach(ring).unwrap();
     let mut paused = false;
     let outcome = publication
         .append_scheduled_pausing(b"a", AppendOptions::default(), 7, &mut || {
             paused = true;
-            assert_eq!(reader.peek(ring).unwrap().map(|entry| entry.time), Some(7));
+            assert_eq!(reader.peek(ring, 0, u64::MAX).unwrap().map(|entry| entry.time), Some(7));
             assert!(poll_message(&mut subscription).is_none(), "committed early");
         })
         .unwrap();
@@ -164,7 +164,7 @@ fn the_entry_is_visible_before_the_block_is_committed() {
         panic!("{outcome:?}");
     };
     assert_eq!(
-        reader.peek(ring).unwrap(),
+        reader.peek(ring, 0, u64::MAX).unwrap(),
         Some(crate::schedule_ring::Entry { position, time: 7 })
     );
     assert!(poll_message(&mut subscription).is_some());
@@ -212,9 +212,9 @@ fn scheduled_appends_keep_the_ring_in_step_with_the_log() {
                  reader: &mut crate::schedule_ring::ScheduleReader,
                  seen: &mut Vec<(u64, u64)>| {
         while poll_message(subscription).is_some() {}
-        while let Some(entry) = reader.peek(ring).unwrap() {
+        while let Some(entry) = reader.peek(ring, 0, u64::MAX).unwrap() {
             seen.push((entry.position, entry.time));
-            reader.advance(ring).unwrap();
+            reader.advance().unwrap();
             reader.release(ring).unwrap();
         }
     };

@@ -11,6 +11,27 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The schedule ring's sender trusts no word its publisher writes
+  (quantstratum-docs: `karyos/design/timed-tx.md`, section 11, TT-6;
+  T-x1). The ring's header grows from three words to eight, with the
+  lane's binding in words 3 to 6 (domain, `max_horizon`,
+  `lateness_tolerance`, flags; bit 0 `cancel_on_deadline`):
+  `schedule_ring::write_binding` for the driver at creation and
+  `schedule_ring::binding` for the publisher. The log buffer's
+  `LAYOUT_VERSION` moves from 3 to 4, so version 3 regions are refused at
+  attach. `ScheduleReader` keeps its head privately and copies each entry
+  once, sized to the ring's capacity at attach (16 bytes per entry); it
+  checks the tail copy (at least the last, at most `head + capacity`) and
+  each entry's time (at least the last, at most the sender's `now +
+  max_horizon`), and serves rewinds from the copies. `peek` takes `&mut
+  self`, `now` and `max_horizon`; `advance` takes no ring. A breach is
+  the new `ScheduleError::Violation`, for good. `SealReason` gains
+  `ScheduleViolation` (code 9), a gate reason reported as `Gated`.
+  `LatePolicy` gains `max_horizon`, and `ScheduleConsumer::new` takes it.
+  Interim until T-x2: the sender counts a violation once in
+  `schedule_faults` and stages nothing more of the lane; T-x2 seals it
+  with `ScheduleViolation` and retires the client.
+
 - A guard command's "no operator" word is `NO_OPERATOR` (`u64::MAX`), not
   0, so root's uid 0 is audited as an operator (M10b; a defect of M10a
   that M10b's end-to-end test found as root), changed in place under

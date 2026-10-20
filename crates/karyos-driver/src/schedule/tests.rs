@@ -36,7 +36,7 @@ fn corrupt(result: Result<Option<u64>, ScheduleConsumerError>) -> bool {
 fn fragments_carry_the_time_and_the_entry_is_released_when_the_message_left() {
     let ring = ring(2);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     push(&ring, &mut publisher, 0, 10);
     push(&ring, &mut publisher, 96, 20);
     assert_eq!(publisher.has_room(&ring), Ok(false));
@@ -64,7 +64,7 @@ fn fragments_carry_the_time_and_the_entry_is_released_when_the_message_left() {
 fn a_first_fragment_without_its_entry_is_corrupt() {
     let ring = ring(4);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     // No entry at all.
     assert!(corrupt(consumer.frame(&ring, data(0, true, true))));
     push(&ring, &mut publisher, 64, 5);
@@ -88,7 +88,7 @@ fn a_first_fragment_without_its_entry_is_corrupt() {
 fn padding_takes_no_entry_and_an_aborted_message_takes_its_own() {
     let ring = ring(4);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     push(&ring, &mut publisher, 0, 1);
     push(&ring, &mut publisher, 32, 2);
     push(&ring, &mut publisher, 96, 3);
@@ -121,7 +121,7 @@ fn padding_takes_no_entry_and_an_aborted_message_takes_its_own() {
 fn an_aborted_message_with_nothing_ahead_is_released_at_once() {
     let ring = ring(1);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     push(&ring, &mut publisher, 0, 1);
     assert_eq!(publisher.has_room(&ring), Ok(false));
     assert_eq!(
@@ -137,7 +137,7 @@ fn an_aborted_message_with_nothing_ahead_is_released_at_once() {
 fn the_consumer_follows_the_ring_across_a_wrap() {
     let ring = ring(2);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     for round in 0..5u64 {
         let position = round * 32;
         push(&ring, &mut publisher, position, round);
@@ -155,7 +155,7 @@ fn the_consumer_follows_the_ring_across_a_wrap() {
 fn a_ring_that_is_not_one_is_refused() {
     let words: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
     assert_eq!(
-        ScheduleConsumer::new(&words).err(),
+        ScheduleConsumer::new(&words, u64::MAX).err(),
         Some(ScheduleConsumerError::Ring(ScheduleError::Layout))
     );
 }
@@ -166,7 +166,7 @@ fn a_ring_that_is_not_one_is_refused() {
 fn a_lost_message_frees_its_own_entry() {
     let ring = ring(2);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     push(&ring, &mut publisher, 0, 10);
     push(&ring, &mut publisher, 64, 20);
     let _ = consumer.frame(&ring, data(0, true, true)).unwrap();
@@ -188,7 +188,7 @@ fn a_rewind_replays_the_unreleased_messages() {
 
     let ring = ring(4);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     for (position, time) in [(0, 10), (64, 20), (128, 30)] {
         push(&ring, &mut publisher, position, time);
     }
@@ -231,7 +231,7 @@ fn a_rewind_inside_a_message_resumes_it() {
 
     let ring = ring(4);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     push(&ring, &mut publisher, 0, 10);
     let _ = consumer.frame(&ring, data(0, true, false)).unwrap();
     let _ = consumer.frame(&ring, data(1408, false, false)).unwrap();
@@ -253,7 +253,7 @@ fn a_rewind_inside_a_message_resumes_it() {
     // An entry at or past the fragment is no message it continues.
     let ring = super::tests::ring(4);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     push(&ring, &mut publisher, 4096, 10);
     consumer.rewind(0).unwrap();
     assert!(matches!(
@@ -271,7 +271,7 @@ fn a_rewind_replays_only_the_messages_sent() {
 
     let ring = ring(4);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, u64::MAX).unwrap();
     for (position, time) in [(0, 10), (64, 20), (128, 30)] {
         push(&ring, &mut publisher, position, time);
     }
@@ -291,4 +291,30 @@ fn a_rewind_replays_only_the_messages_sent() {
             Ok(Some(Scheduled { time, replayed }))
         );
     }
+}
+
+/// An entry whose time is past the sender's clock plus its own horizon is
+/// the publisher's violation (timed-tx.md section 11, TT-6): refused, and
+/// every later frame of the lane with it, whatever the ring holds then.
+#[test]
+fn an_entry_past_the_senders_horizon_is_a_violation_for_good() {
+    let ring = ring(4);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring, 100).unwrap();
+    consumer.set_now(50);
+    push(&ring, &mut publisher, 0, 150);
+    push(&ring, &mut publisher, 64, 151);
+    assert_eq!(consumer.frame(&ring, data(0, true, true)), Ok(Some(150)));
+    assert!(!consumer.violated());
+    assert_eq!(
+        consumer.frame(&ring, data(64, true, true)),
+        Err(ScheduleConsumerError::Ring(ScheduleError::Violation))
+    );
+    assert!(consumer.violated());
+    // A later clock would admit it: the reader is sealed all the same.
+    consumer.set_now(1_000);
+    assert_eq!(
+        consumer.frame(&ring, data(64, true, true)),
+        Err(ScheduleConsumerError::Ring(ScheduleError::Violation))
+    );
 }

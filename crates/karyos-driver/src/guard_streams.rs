@@ -380,13 +380,15 @@ impl<T: TermBytes> GuardedStream<T> {
 /// seal that ended it: `GUARD_CLOSED` (1) for a guard close,
 /// `DEADLINE_MISSED` (2) for cancel-on-deadline, `DRIVER_SHUTDOWN` (5) for
 /// a removal or an image's end of stream (orderly ends that cannot drain),
-/// and `PUBLICATION_FAULT` (4) for any other seal. Code 0 is reserved and
-/// never written.
+/// and `PUBLICATION_FAULT` (4) for a schedule violation (its publisher
+/// breached the ring's protocol, timed-tx.md section 11) and any other
+/// seal. Code 0 is reserved and never written.
 pub(crate) const fn end_reason(seal: SealReason) -> u64 {
     match seal {
         SealReason::GuardClosed => REASON_GUARD_CLOSED,
         SealReason::DeadlineMissed => REASON_DEADLINE_MISSED,
         SealReason::StreamRemoved | SealReason::EndOfStream => REASON_DRIVER_SHUTDOWN,
+        SealReason::ScheduleViolation => REASON_PUBLICATION_FAULT,
         _ => REASON_PUBLICATION_FAULT,
     }
 }
@@ -680,5 +682,6 @@ mod tests {
         assert_eq!(end_reason(SealReason::StreamRemoved), 5);
         assert_eq!(end_reason(SealReason::EndOfStream), 5);
         assert_eq!(end_reason(SealReason::Unspecified), 4);
+        assert_eq!(end_reason(SealReason::ScheduleViolation), 4);
     }
 }

@@ -1211,9 +1211,12 @@ impl<T: StreamTerms> Outbound<T> {
         now: u64,
     ) -> Result<(), OutboundError> {
         let mut consumers = Vec::with_capacity(self.readers.len());
-        for reader in &self.readers {
+        for (lane, reader) in self.readers.iter().enumerate() {
+            let max_horizon = policies.get(lane).copied().unwrap_or_default().max_horizon;
             let consumer = match reader.subscription().buffer().schedule_ring() {
-                Some(ring) => Some(ScheduleConsumer::new(ring).map_err(|_| OutboundError::Lanes)?),
+                Some(ring) => Some(
+                    ScheduleConsumer::new(ring, max_horizon).map_err(|_| OutboundError::Lanes)?,
+                ),
                 None => None,
             };
             consumers.push(consumer);
@@ -1290,6 +1293,13 @@ impl<T: StreamTerms> Outbound<T> {
             return Ok(0);
         }
         let (limits, held) = self.limits(now);
+        // The schedule checks read the sender's clock (timed-tx.md section
+        // 11, TT-6).
+        if let Some(timed) = self.timed.as_deref_mut() {
+            for consumer in timed.consumers.iter_mut().flatten() {
+                consumer.set_now(now);
+            }
+        }
         let mut work = 0u32;
         for lane in 0..self.readers.len() {
             let limit = limits.get(lane).copied().unwrap_or(Limit::Held);
@@ -1654,6 +1664,19 @@ impl<T: StreamTerms> Outbound<T> {
                 .guard
                 .as_deref()
                 .is_some_and(|guard| guard.aborting(lane))
+            {
+                break;
+            }
+            // Nor does a timed lane whose publisher breached the schedule
+            // ring's protocol, counted once in `schedule_faults` when it was
+            // found. Interim: T-x2 seals the lane with `ScheduleViolation`
+            // and retires the client (timed-tx.md section 11).
+            if self
+                .timed
+                .as_deref()
+                .and_then(|timed| timed.consumers.get(lane))
+                .and_then(Option::as_ref)
+                .is_some_and(ScheduleConsumer::violated)
             {
                 break;
             }
