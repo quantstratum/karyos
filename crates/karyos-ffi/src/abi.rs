@@ -805,9 +805,9 @@ pub extern "C" fn karyos_claim_abort(claim: u64) -> i32 {
     })
 }
 
-/// Closes `publication` through its client, with its outstanding claim.
-/// It needs the client handle too: while that is in use
-/// (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`) nothing is closed.
+/// Closes `publication`, with its outstanding claim, and releases it to
+/// its client, at once or at the client's next call while another call
+/// holds the client (`karyos.h`, Threads).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_publication_close(publication: u64) -> i32 {
     guard(
@@ -1588,9 +1588,9 @@ pub unsafe extern "C" fn karyos_subscription_image_changes_lost(
     })
 }
 
-/// Closes `subscription` through its client. It needs the client handle
-/// too: while that is in use (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`)
-/// nothing is closed.
+/// Closes `subscription` and releases it to its client, at once or at
+/// the client's next call while another call holds the client
+/// (`karyos.h`, Threads).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_subscription_close(subscription: u64) -> i32 {
     guard(
@@ -2150,9 +2150,9 @@ pub unsafe extern "C" fn karyos_conflated_poll(
     })
 }
 
-/// Closes `conflated`. A client's view is closed through its client: while
-/// that is in use (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`) nothing is
-/// closed.
+/// Closes `conflated`. A client's view is released to its client, at once
+/// or at the client's next call while another call holds the client
+/// (`karyos.h`, Threads).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_conflated_close(conflated: u64) -> i32 {
     guard(
@@ -2466,9 +2466,9 @@ pub unsafe extern "C" fn karyos_archive_list(
     })
 }
 
-/// Closes `archive`: its two streams are removed from its client. While
-/// the client is in use (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`) nothing is
-/// closed.
+/// Closes `archive`: its two streams are removed from its client, at once
+/// or at the client's next call while another call holds the client
+/// (`karyos.h`, Threads).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_archive_close(archive: u64) -> i32 {
     guard(|| match api::archive::close(Handle::from_raw(archive)) {

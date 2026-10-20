@@ -87,7 +87,9 @@ fn handles_move_between_threads() {
 
 /// While a control call holds a client, its children's data-path calls
 /// run, and the client's own calls, which hold it too, answer `BUSY` with
-/// nothing done; they run once it returns.
+/// nothing done; they run once it returns. A child's close does not wait
+/// for the client: it ends the child at once, and the client releases it
+/// at its next call (`karyos.h`, Threads).
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_held_client_refuses_its_control_calls_not_its_childrens_data_path() {
@@ -107,18 +109,19 @@ fn a_held_client_refuses_its_control_calls_not_its_childrens_data_path() {
     assert_eq!(commit(claimed).0, Status::Ok.code());
     let mut seen = Seen::default();
     assert_eq!(poll_into(subscription, &mut seen, 4).0, Status::Ok.code());
-    // The client's own calls, and a child's close, hold the client.
+    // The client's own calls hold the client.
     assert_eq!(poll(client).0, Status::Busy.code());
     assert_eq!(add_publication(client).0, Status::Busy.code());
-    assert_eq!(karyos_publication_close(publication), Status::Busy.code());
     assert_eq!(karyos_client_close(client), Status::Busy.code());
+    // A child's close ends it now; its release waits for the client.
+    assert_eq!(karyos_publication_close(publication), Status::Ok.code());
+    assert_eq!(offer(publication, b"c").0, Status::Closed.code());
     let _ = release.wait();
     holder.join().unwrap();
-    // Nothing was done: the publication is still open.
-    assert_eq!(offer(publication, b"c").0, Status::Ok.code());
-    poll_until(subscription, client, &mut seen, 4, 3);
-    assert_eq!(seen.messages, [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
-    assert_eq!(karyos_publication_close(publication), Status::Ok.code());
+    // The client's calls were refused with nothing done, and run now.
+    poll_until(subscription, client, &mut seen, 4, 2);
+    assert_eq!(seen.messages, [b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(karyos_publication_close(publication), Status::Closed.code());
     assert_eq!(karyos_client_close(client), Status::Ok.code());
 }
 

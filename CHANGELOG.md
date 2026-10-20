@@ -15,6 +15,21 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos_detail`, `karyos_accepted` and the image change do: it wrote
   the library's 16 back into a newer caller's struct before. The new
   `karyos_subscription_end_state` (F9c) follows the same rule.
+- `karyos-ffi`: a child's close (publication, subscription, conflated
+  view, Archive connection) no longer answers `KARYOS_E_BUSY` because
+  another call holds its client. With the client free it releases the
+  child at once, as before; while another call holds the client, on
+  another thread or by a callback, it ends the child at once (the close
+  answers `KARYOS_OK` and the handle is stale) and the client releases it
+  at its next call or its close. A client with no further calls holds the
+  released resources (a publisher slot, lanes, streams) until its next
+  call or close. `KARYOS_E_BUSY` and `KARYOS_E_REENTRANT` from a child's
+  close now mean the child itself is in use, so binding destructors, which
+  may not retry (BIND-Q6), no longer leak sibling handles destroyed on
+  several threads at once (found by karyos-cpp's C-THREAD-RULES test).
+  `karyos.h` Threads and the four closes' docs state it
+  (`api::client::tests`, `abi::tests::threads`).
+
 - The conformance suite gains format 2 (ADR-0073, owner item 46,
   decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged;
   format 1's `karyos_driver_start` now defaults its `idle_strategy` to
