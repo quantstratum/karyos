@@ -297,6 +297,96 @@ fn integer_argument(step: &Step, name: &str, at: &str) -> i64 {
     }
 }
 
+/// A step's arguments, checked against the names a function takes.
+struct Arguments<'a> {
+    step: &'a Step,
+    at: &'a str,
+}
+
+impl<'a> Arguments<'a> {
+    /// The arguments of `step`, every one of them among `names`.
+    fn new(step: &'a Step, names: &[&str], at: &'a str) -> Self {
+        for name in step.arguments.keys() {
+            assert!(
+                names.contains(&name.as_str()),
+                "{at}: unknown argument `{name}`"
+            );
+        }
+        Self { step, at }
+    }
+
+    fn integer(&self, name: &str) -> Option<i64> {
+        match self.step.arguments.get(name) {
+            None => None,
+            Some(Value::Integer(value)) => Some(*value),
+            Some(other) => panic!("{}: `{name}` must be an integer, got {other:?}", self.at),
+        }
+    }
+
+    /// An integer argument that fits `T`, or `default`.
+    fn narrow<T: TryFrom<i64>>(&self, name: &str, default: T) -> T {
+        self.integer(name).map_or(default, |value| {
+            T::try_from(value)
+                .unwrap_or_else(|_| panic!("{}: `{name}` does not fit its C type", self.at))
+        })
+    }
+
+    /// A required handle argument.
+    fn handle(&self, name: &str) -> u64 {
+        let value = self
+            .integer(name)
+            .unwrap_or_else(|| panic!("{}: `{name}` is required", self.at));
+        u64::try_from(value).unwrap_or_else(|_| panic!("{}: `{name}` is not a uint64_t", self.at))
+    }
+
+    fn text(&self, name: &str) -> Option<String> {
+        match self.step.arguments.get(name) {
+            None => None,
+            Some(Value::Text(text)) => Some(text.clone()),
+            Some(other) => panic!("{}: `{name}` must be a string, got {other:?}", self.at),
+        }
+    }
+
+    /// The message an offer passes: `payload`'s bytes, or `length` zero
+    /// bytes; one of them is required.
+    fn message(&self) -> Vec<u8> {
+        match (self.text("payload"), self.integer("length")) {
+            (Some(payload), None) => payload.into_bytes(),
+            (None, Some(_)) => vec![0; self.narrow::<usize>("length", 0)],
+            _ => panic!("{}: `payload` or `length`, one of them", self.at),
+        }
+    }
+}
+
+/// The size a sized struct argument names, or `T`'s.
+fn size_argument<T>(arguments: &Arguments<'_>, name: &str) -> u32 {
+    let own = u32::try_from(size_of::<T>()).unwrap();
+    arguments.narrow(name, own)
+}
+
+/// What a call that writes a `karyos_accepted` returned: its status, the
+/// lane and position when they were written, and whether the struct's tail
+/// past this header's size is intact.
+fn with_accepted(status: i32, accepted: &abi::SizedStruct<abi::Accepted>) -> Returned {
+    let mut results = BTreeMap::from([("tail".to_owned(), tail(accepted.tail_intact()))]);
+    if let Some((lane, position)) = abi::accepted_fields(accepted) {
+        results.insert("lane".to_owned(), Value::Integer(i64::from(lane)));
+        results.insert(
+            "position".to_owned(),
+            Value::Integer(i64::try_from(position).unwrap()),
+        );
+    }
+    Returned {
+        status: Some(status),
+        results,
+    }
+}
+
+/// A sized struct's tail as a result.
+fn tail(intact: bool) -> Value {
+    Value::Text(if intact { "intact" } else { "changed" }.to_owned())
+}
+
 /// Calls the step's function through the C ABI.
 fn call(step: &Step, at: &str) -> Returned {
     match step.function.as_str() {
@@ -327,10 +417,162 @@ fn call(step: &Step, at: &str) -> Returned {
             }
         }
         "karyos_driver_create" => {
-            assert!(step.arguments.is_empty(), "{at}: no arguments");
-            let (status, driver) = abi::driver_create();
+            let arguments = Arguments::new(step, &["size", "reserved"], at);
+            let (status, mut options) = abi::driver_options();
+            assert_eq!(status, 0, "{at}: karyos_driver_options_init");
+            options.reserved = arguments.narrow("reserved", options.reserved);
+            let size = size_argument::<abi::DriverOptions>(&arguments, "size");
+            let (status, driver) = abi::driver_create_sized(&options, size);
             with_handle(status, "driver", driver, at)
         }
+        "karyos_driver_start" => {
+            let arguments = Arguments::new(step, &["driver", "idle_strategy", "idle_sleep_ns"], at);
+            Returned {
+                status: Some(abi::driver_start(
+                    arguments.handle("driver"),
+                    arguments.narrow("idle_strategy", 1),
+                    arguments.narrow("idle_sleep_ns", 0),
+                )),
+                results: BTreeMap::new(),
+            }
+        }
+        "karyos_driver_stop" => Returned {
+            status: Some(abi::driver_stop(handle_argument(step, "driver", at))),
+            results: BTreeMap::new(),
+        },
+        "karyos_driver_add_stream" => {
+            let arguments = Arguments::new(
+                step,
+                &["driver", "stream_id", "allow_unconnected", "size"],
+                at,
+            );
+            let stream_id = arguments
+                .integer("stream_id")
+                .map(|_| arguments.narrow("stream_id", 0))
+                .unwrap_or_else(|| panic!("{at}: `stream_id` is required"));
+            let (status, mut options) = abi::stream_options(stream_id);
+            assert_eq!(status, 0, "{at}: karyos_stream_options_init");
+            options.allow_unconnected =
+                arguments.narrow("allow_unconnected", options.allow_unconnected);
+            let size = size_argument::<abi::StreamOptions>(&arguments, "size");
+            Returned {
+                status: Some(abi::driver_add_stream_sized(
+                    arguments.handle("driver"),
+                    &options,
+                    size,
+                )),
+                results: BTreeMap::new(),
+            }
+        }
+        "karyos_client_connect" => {
+            let arguments = Arguments::new(step, &["size"], at);
+            let size = arguments
+                .integer("size")
+                .map(|_| size_argument::<abi::ClientOptions>(&arguments, "size"))
+                .unwrap_or_else(|| panic!("{at}: `size` is required"));
+            Returned {
+                status: Some(abi::client_connect_sized(size)),
+                results: BTreeMap::new(),
+            }
+        }
+        "karyos_client_add_publication" => {
+            let arguments =
+                Arguments::new(step, &["client", "stream_id", "uri", "detail_size"], at);
+            let uri = std::ffi::CString::new(
+                arguments
+                    .text("uri")
+                    .unwrap_or_else(|| "karyos:ipc".to_owned()),
+            )
+            .unwrap_or_else(|_| panic!("{at}: `uri` holds a NUL"));
+            let stream_id = arguments
+                .integer("stream_id")
+                .map(|_| arguments.narrow("stream_id", 0))
+                .unwrap_or_else(|| panic!("{at}: `stream_id` is required"));
+            let (status, publication, detail) = abi::client_add_publication(
+                arguments.handle("client"),
+                &uri,
+                stream_id,
+                size_argument::<abi::Detail>(&arguments, "detail_size"),
+            );
+            let mut results =
+                BTreeMap::from([("detail_tail".to_owned(), tail(detail.tail_intact()))]);
+            if status == 0 {
+                results.insert("publication".to_owned(), handle_value(publication, at));
+            }
+            let written = abi::detail_fields(&detail);
+            results.insert(
+                "detail_written".to_owned(),
+                Value::Integer(i64::from(written.is_some())),
+            );
+            if let Some((code, value)) = written {
+                results.insert(
+                    "code".to_owned(),
+                    Value::Integer(i64::try_from(code).unwrap()),
+                );
+                results.insert(
+                    "value".to_owned(),
+                    Value::Integer(i64::try_from(value).unwrap()),
+                );
+            }
+            Returned {
+                status: Some(status),
+                results,
+            }
+        }
+        "karyos_publication_offer" => {
+            let arguments = Arguments::new(
+                step,
+                &["publication", "lane", "payload", "length", "accepted_size"],
+                at,
+            );
+            let (status, accepted) = abi::publication_offer_on(
+                arguments.handle("publication"),
+                arguments.narrow("lane", 0),
+                &arguments.message(),
+                size_argument::<abi::Accepted>(&arguments, "accepted_size"),
+            );
+            with_accepted(status, &accepted)
+        }
+        "karyos_publication_claim" => {
+            let arguments = Arguments::new(step, &["publication", "lane", "length"], at);
+            let length = arguments
+                .integer("length")
+                .map(|_| arguments.narrow("length", 0))
+                .unwrap_or_else(|| panic!("{at}: `length` is required"));
+            let (status, claim) = abi::publication_claim(
+                arguments.handle("publication"),
+                arguments.narrow("lane", 0),
+                length,
+            );
+            if status == 0 {
+                with_handle(status, "claim", claim, at)
+            } else {
+                Returned {
+                    status: Some(status),
+                    results: BTreeMap::new(),
+                }
+            }
+        }
+        "karyos_claim_commit" => {
+            let arguments = Arguments::new(step, &["claim", "accepted_size"], at);
+            let (status, accepted) = abi::claim_commit(
+                arguments.handle("claim"),
+                size_argument::<abi::Accepted>(&arguments, "accepted_size"),
+            );
+            with_accepted(status, &accepted)
+        }
+        "karyos_claim_abort" => Returned {
+            status: Some(abi::claim_abort(handle_argument(step, "claim", at))),
+            results: BTreeMap::new(),
+        },
+        "karyos_publication_close" => Returned {
+            status: Some(abi::publication_close(handle_argument(
+                step,
+                "publication",
+                at,
+            ))),
+            results: BTreeMap::new(),
+        },
         "karyos_driver_connect" => {
             let (status, client) = abi::driver_connect(handle_argument(step, "driver", at));
             with_handle(status, "client", client, at)
@@ -662,4 +904,24 @@ fn a_scenario_of_another_abi_version_is_skipped() {
     assert!(runs((1, 3), (1, 3)));
     assert!(!runs((1, 4), (1, 3)));
     assert!(!runs((2, 0), (1, 3)));
+}
+
+/// The sized struct checks see what they claim to (FORMAT.md, Sized
+/// structs): an output left alone reports nothing written and its tail
+/// intact; a field written is reported, and a byte written past the
+/// header's size changes the tail.
+#[test]
+fn the_sized_struct_checks_see_writes() {
+    let mut accepted = abi::accepted(40);
+    assert_eq!(abi::accepted_fields(&accepted), None);
+    assert!(accepted.tail_intact());
+    // The lane and the position, as a library writes them.
+    for offset in 4..16 {
+        accepted.poke(offset, 0);
+    }
+    assert_eq!(abi::accepted_fields(&accepted), Some((0, 0)));
+    assert!(accepted.tail_intact());
+    // One byte past the 0.1.0 struct.
+    accepted.poke(size_of::<abi::Accepted>(), 0);
+    assert!(!accepted.tail_intact());
 }

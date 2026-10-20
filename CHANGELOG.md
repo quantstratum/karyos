@@ -445,6 +445,36 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The C ABI conformance suite covers more of SPEC.md §13's C ABI
+  boundary row (F6; `crates/karyos-ffi/conformance/`): a closed
+  publication and a closed or ended claim answer `KARYOS_E_CLOSED`
+  (`publication.use.after.close`, `claim.use.after.close`,
+  `claim.double.commit`); one claim per publication; a claim's typed
+  refusals and an offer with no subscriber
+  (`publication.typed.statuses`); and the struct size rule of both minor
+  directions for the driver, stream and client options and
+  `karyos_detail` (`struct.size.*`), and a nonzero `reserved` in the
+  driver options refused (`struct.reserved.driver.options`). The
+  interim format 1 gains the driver's thread and streams, the
+  publication and claim calls, and sized structs whose unset bytes hold
+  a sentinel, so a write past a struct is seen. A runner that meets a function or argument it does not
+  know fails the scenario.
+- `make libkaryos` packages the C ABI for the language bindings
+  (quantstratum-docs: `karyos/design/bindings-plan.md`, B1) into
+  `LIBKARYOS_DIR`, by default `target/libkaryos`: `include/karyos.h`,
+  `lib/libkaryos.a`, the shared library (`libkaryos.so.0.1` on Linux,
+  `@rpath/libkaryos.0.1.dylib` with compatibility version 0.1 on macOS:
+  MAJOR.MINOR of the ABI before 1.0, owner item 48's proposal), a
+  relocatable `lib/pkgconfig/karyos.pc`, the conformance suite's format,
+  index and scenarios, a `MANIFEST` of the ABI, protocol and core
+  versions, commit and build, and `LICENSE.md`. The script
+  (`scripts/package-libkaryos.sh`) compiles no C. It checks that the
+  shared library exports exactly the functions the header declares, that
+  the static library defines them, the soname or install name, no RPATH,
+  RUNPATH or LC_RPATH, and the `.pc` where `pkg-config` is installed. It
+  builds for the host only, marks a dirty tree in the MANIFEST and
+  refuses one under `KARYOS_PACKAGE_REQUIRE_CLEAN=1`. Not part of
+  `make pre-push`.
 - Subscriptions over the C ABI (F4; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §4.4, ADR-0067):
   `karyos_client_add_subscription`, `karyos_subscription_poll` (a

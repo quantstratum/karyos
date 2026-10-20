@@ -1,0 +1,36 @@
+# A closed publication answers KARYOS_E_CLOSED from every call that names
+# it, a second close included, and its client stays usable (SPEC.md §13,
+# C ABI boundary; SPEC.md §10.2).
+format 1
+id publication.use.after.close
+abi 0.1
+covers "use after close"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=7
+expect KARYOS_OK
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_publication client=$client stream_id=7
+expect KARYOS_OK publication=$publication
+# No subscriber yet: the offer is refused, typed, and nothing changes.
+call karyos_publication_offer publication=$publication payload="first"
+expect KARYOS_E_NOT_CONNECTED
+call karyos_publication_close publication=$publication
+expect KARYOS_OK
+call karyos_publication_offer publication=$publication payload="late"
+expect KARYOS_E_CLOSED
+call karyos_publication_claim publication=$publication length=8
+expect KARYOS_E_CLOSED
+call karyos_publication_close publication=$publication
+expect KARYOS_E_CLOSED
+# The client is untouched.
+call karyos_client_poll client=$client
+expect KARYOS_OK
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

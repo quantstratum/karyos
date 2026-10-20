@@ -1,0 +1,22 @@
+# A struct's size field says which header built it. The 0.1.0 size of
+# karyos_driver_options (56 bytes) is the smallest accepted: below it the
+# call answers KARYOS_E_INVALID_ARGUMENT and creates nothing. A newer
+# caller's larger struct is read by its 0.1.0 prefix, and the call
+# succeeds as at that size (SPEC.md §10.2, §13, C ABI boundary).
+format 1
+id struct.size.driver.options
+abi 0.1
+covers "struct sizes of another minor version"
+
+call karyos_driver_create size=0
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_create size=52
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_create size=56
+expect KARYOS_OK driver=$exact
+call karyos_driver_close driver=$exact
+expect KARYOS_OK
+call karyos_driver_create size=72
+expect KARYOS_OK driver=$newer
+call karyos_driver_close driver=$newer
+expect KARYOS_OK
