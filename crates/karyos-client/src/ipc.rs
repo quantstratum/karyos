@@ -791,6 +791,25 @@ impl RemoteClient {
             .add_network_publication(uri, stream_id, allow_unconnected)
     }
 
+    /// Requests a concurrent publication handle on lane 0 of the
+    /// `karyos:ipc` stream of `stream_id`, as
+    /// [`ClientConductor::add_network_concurrent_publication`]; its grant
+    /// completes as [`Outcome::Fetchable`](crate::Outcome::Fetchable) with
+    /// `by_uri` set.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_network_concurrent_publication`].
+    pub fn add_network_concurrent_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_network_concurrent_publication(uri, stream_id, allow_unconnected)
+    }
+
     /// Subscribes `stream_id` on the channel `uri`, as
     /// [`ClientConductor::add_network_subscription`]: a `karyos:ipc` grant
     /// completes as [`Outcome::Fetchable`](crate::Outcome::Fetchable) with

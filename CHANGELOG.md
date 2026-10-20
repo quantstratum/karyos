@@ -394,6 +394,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `Client::add_concurrent_publication(uri, stream_id)` in karyos-client
+  (M11): a concurrent handle on lane 0 of the only `karyos:ipc` stream of
+  the id, shared with its other publishers, as the Archive's request
+  stream is by its requesters. The CnC command `AddNetworkPublication`
+  (0x0F) gains flag bit 1, concurrent, in place under admission
+  `VERSION` 2; a driver that does not know the bit refuses the command.
+  The driver refuses an exclusive stream with `InvalidPublicationMode`
+  and a `karyos:udp` channel with `UnsupportedChannel`.
+
 - API v1's JSON carries each driver's trace window (M6c): `latencies`, one
   object per lane with `p50`, `p90`, `p99`, `p999` and `max` as `null` or
   `{"low","high"}` bounds, and `trace`, the window's counts. They come

@@ -30,7 +30,7 @@
 //! | `0x0C` | `AddConflatedSubscription` | sequence | stream and session as above | | |
 //! | `0x0D` | `GuardClose` | sequence | guard | operation id | |
 //! | `0x0E` | `GuardReopen` | sequence | guard | expected closed epoch | operation id |
-//! | `0x0F` | `AddNetworkPublication` | sequence | stream id (low 32; high 32 zero) | flags as `AddPublication` | channel URI length |
+//! | `0x0F` | `AddNetworkPublication` | sequence | stream id (low 32; high 32 zero) | flags: as `AddPublication`, and bit 1 concurrent | channel URI length |
 //! | `0x10` | `AddNetworkSubscription` | sequence | stream id (low 32; high 32 zero) | role as `AddSubscription` | channel URI length |
 //! | `0x11` | `AddImageSubscription` | sequence | image registration (nonzero) | role as `AddSubscription` | lane as `AddPublication` |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
@@ -98,6 +98,13 @@
 //! configured receiver identity differs from its key's existing one.
 //! `LaneMismatch` (code 16) answers an exclusive publication whose URI
 //! names `lanes` other than the stream configures, granting nothing.
+//! Bit 1 of `AddNetworkPublication`'s flags asks for a concurrent handle
+//! on lane 0 instead of the exclusive publication (M11; added in place
+//! under admission `VERSION` 2, which no release has used): a
+//! `karyos:ipc` URI only, so the stream is shared with its other
+//! publishers. A `karyos:udp` one is refused with `UnsupportedChannel`,
+//! an exclusive stream with `InvalidPublicationMode`; a driver that does
+//! not know the bit refuses the command as reserved.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -254,6 +261,8 @@ const IMAGE_AVAILABLE: u32 = 0xC6;
 const IMAGE_UNAVAILABLE: u32 = 0xC7;
 
 const ALLOW_UNCONNECTED: u64 = 1;
+/// `AddNetworkPublication`'s flag for a concurrent handle (M11).
+const CONCURRENT: u64 = 2;
 
 // Every command fits the bound.
 const _: () = assert!(REPORT_LOSS_WORDS * 8 <= MAX_COMMAND_LENGTH);
@@ -671,7 +680,8 @@ pub enum Command {
         role: SubscriberRole,
     },
     /// Create an exclusive publication of `stream_id` on the channel `uri`
-    /// (W5): the driver draws its session id.
+    /// (W5): the driver draws its session id. With `concurrent`, a
+    /// concurrent handle on lane 0 of the `karyos:ipc` stream instead.
     AddNetworkPublication {
         /// Request sequence.
         sequence: u64,
@@ -679,6 +689,8 @@ pub enum Command {
         stream_id: i32,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
+        /// A concurrent handle rather than the exclusive publication.
+        concurrent: bool,
         /// The channel.
         uri: ChannelUri,
     },
@@ -1305,12 +1317,13 @@ impl Command {
                 sequence,
                 stream_id,
                 allow_unconnected,
+                concurrent,
                 uri,
             } => write_uri_command(
                 [
                     sequence,
                     u64::from(stream_id.cast_unsigned()),
-                    u64::from(allow_unconnected),
+                    u64::from(allow_unconnected) | if concurrent { CONCURRENT } else { 0 },
                     u64::from(uri.length),
                 ],
                 &uri,
@@ -1547,13 +1560,14 @@ impl Command {
                     .map_err(|_| CncError::Reserved { type_id })?
                     .cast_signed();
                 if type_id == ADD_NETWORK_PUBLICATION {
-                    if flags & !ALLOW_UNCONNECTED != 0 {
+                    if flags & !(ALLOW_UNCONNECTED | CONCURRENT) != 0 {
                         return Err(CncError::Reserved { type_id });
                     }
                     Ok(Self::AddNetworkPublication {
                         sequence,
                         stream_id,
-                        allow_unconnected: flags == ALLOW_UNCONNECTED,
+                        allow_unconnected: flags & ALLOW_UNCONNECTED != 0,
+                        concurrent: flags & CONCURRENT != 0,
                         uri,
                     })
                 } else {
@@ -2493,6 +2507,14 @@ mod tests {
                     sequence: 3,
                     stream_id: -9,
                     allow_unconnected: true,
+                    concurrent: false,
+                    uri,
+                },
+                Command::AddNetworkPublication {
+                    sequence: 4,
+                    stream_id: 9,
+                    allow_unconnected: false,
+                    concurrent: true,
                     uri,
                 },
                 Command::AddNetworkSubscription {
@@ -2524,6 +2546,7 @@ mod tests {
             sequence: 1,
             stream_id: 10,
             allow_unconnected: false,
+            concurrent: false,
             uri: ChannelUri::new("karyos:udp?endpoint=127.0.0.1:1").unwrap(),
         };
         let type_id = command.type_id();
@@ -2536,10 +2559,22 @@ mod tests {
         let mut session = good.clone();
         session[12] = 1;
         assert_eq!(decode(&session), reserved);
-        // A reserved flag.
-        let mut flags = good.clone();
-        flags[16] = 2;
-        assert_eq!(decode(&flags), reserved);
+        // A reserved flag: bit 2 and above (bit 1 is concurrent, M11).
+        for bit in [4u8, 8, 0x80] {
+            let mut flags = good.clone();
+            flags[16] = bit;
+            assert_eq!(decode(&flags), reserved);
+        }
+        let mut concurrent = good.clone();
+        concurrent[16] = 3;
+        assert!(matches!(
+            decode(&concurrent),
+            Ok(Command::AddNetworkPublication {
+                allow_unconnected: true,
+                concurrent: true,
+                ..
+            })
+        ));
         // A length of 0, or above the cap.
         for bad in [0u64, MAX_COMMAND_URI as u64 + 1] {
             let mut length = good.clone();
@@ -4140,14 +4175,23 @@ mod properties {
                     registration,
                 }
             }),
-            (any::<u64>(), any::<i32>(), any::<bool>(), "[ -~]{1,512}").prop_map(
-                |(sequence, stream_id, allow_unconnected, uri)| Command::AddNetworkPublication {
-                    sequence,
-                    stream_id,
-                    allow_unconnected,
-                    uri: ChannelUri::new(&uri).unwrap(),
-                }
-            ),
+            (
+                any::<u64>(),
+                any::<i32>(),
+                any::<(bool, bool)>(),
+                "[ -~]{1,512}"
+            )
+                .prop_map(
+                    |(sequence, stream_id, (allow_unconnected, concurrent), uri)| {
+                        Command::AddNetworkPublication {
+                            sequence,
+                            stream_id,
+                            allow_unconnected,
+                            concurrent,
+                            uri: ChannelUri::new(&uri).unwrap(),
+                        }
+                    }
+                ),
             (any::<u64>(), 1..=u64::MAX, lane(), role.clone()).prop_map(
                 |(sequence, image, lane, role)| Command::AddImageSubscription {
                     sequence,
