@@ -18,6 +18,7 @@ use crate::subscription::{MessageInfo, MessageLimit, Secondary};
 /// A subscription [`Subscription::rejoin_with`] could not turn into a
 /// rejoin, given back with the reason.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct NotRejoinable<T: TermBytes> {
     /// The subscription, unchanged.
     pub subscription: Subscription<T>,
