@@ -1402,7 +1402,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// bounds, identities), then the effects, which cannot fail: the grant
     /// is `Held` under a fresh export and its fetch carries the table's
     /// region reopened read-only. An in-process client takes its view with
-    /// `subscribe_conflated` instead, so it is refused here.
+    /// `subscribe_conflated` instead, so it is refused here. Session 0
+    /// names the stream a `karyos:ipc` URI of the id names, when there is
+    /// one, as a facade client asks (F7b-2c); otherwise the key is exact.
     fn add_conflated(&mut self, client: u64, request: RequestId, stream: StreamKey) -> Response {
         let refuse = |code: ErrorCode, detail: u64| Response::Error {
             request,
@@ -1410,6 +1412,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             detail,
         };
         let detail = u64::from(stream.stream_id.cast_unsigned());
+        let stream = match stream.session_id {
+            0 => self.ipc_stream(stream.stream_id).unwrap_or(stream),
+            _ => stream,
+        };
         let Some(target) = self
             .find_stream(stream, None)
             .and_then(|index| self.streams.get(index))

@@ -318,7 +318,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// carries no session id: the one active aggregate of the id that is
     /// not the network's (a network publication or an image). Its lanes
     /// count once. `None` when there is none or more than one.
-    fn ipc_stream(&self, stream_id: i32) -> Option<StreamKey> {
+    pub(crate) fn ipc_stream(&self, stream_id: i32) -> Option<StreamKey> {
         let net = self.net.as_ref();
         let mut found: Option<StreamKey> = None;
         for stream in &self.streams {

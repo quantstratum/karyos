@@ -168,3 +168,124 @@ fn a_driver_admits_the_client_until_it_is_closed() {
     let _ = driver.do_work().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Runs the control call `call` on another thread while this one serves
+/// `driver`.
+fn serve(
+    driver: &mut EmbeddedDriver<SharedTerms>,
+    call: &(dyn Fn() -> (i32, u64) + Sync),
+) -> (i32, u64) {
+    std::thread::scope(|scope| {
+        let calling = scope.spawn(call);
+        let start = Instant::now();
+        while !calling.is_finished() {
+            assert!(start.elapsed() < Duration::from_secs(30), "stuck");
+            let _ = driver.do_work().unwrap();
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        calling.join().unwrap()
+    })
+}
+
+/// F7b-2c: a remote client's conflated view over the C ABI reads the
+/// table's latest values; it is the client's, so the client's close
+/// closes it (its handle then answers `KARYOS_E_CLOSED`) and sends its
+/// `Detach`, which ends the grant.
+#[test]
+fn a_remote_client_reads_a_conflated_view_until_its_close() {
+    let _serial = serial();
+    let dir = dir("conflated");
+    let config = IpcConfig {
+        dir: dir.clone(),
+        max_pending_hellos: 4,
+        hello_timeout: 5_000_000_000,
+        max_outbound_per_client: 8,
+        fetch_deadline: 5_000_000_000,
+        max_exports_per_client: 16,
+        max_fetches_per_client: 4,
+        max_regions_per_fetch: 4,
+        max_fetch_bytes: 1 << 30,
+        max_tools: 1,
+    };
+    let mut driver: EmbeddedDriver<SharedTerms> = EmbeddedDriver::with_ipc(
+        DriverConfig::default(),
+        config,
+        Box::new(SystemClock::new()),
+    )
+    .unwrap();
+    let mut stream = karyos_driver::StreamConfig {
+        buffer: karyos_sys::log_buffer::LogBufferConfig {
+            term_length: karyos_sys::sizing::TermLength::try_new(
+                karyos_sys::sizing::MIN_TERM_LENGTH,
+            )
+            .unwrap(),
+            spare_slots: 3,
+            max_subscribers: 4,
+            mtu: karyos_sys::sizing::DEFAULT_MTU,
+            max_reserved: karyos_sys::sizing::MIN_TERM_LENGTH / 8,
+            initial_term_id: karyos_sys::term::TermId::new(7),
+            lane: karyos_sys::frame::Lane::ZERO,
+            session_id: 1,
+            stream_id: 5,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: karyos_driver::LossPolicy::Hold,
+        conflation: Some(karyos_sys::conflation::ConflationConfig {
+            keys: 4,
+            value_capacity: 8,
+            journal_capacity: 1024,
+        }),
+    };
+    let handle = driver.add_stream(stream).unwrap();
+    stream.buffer.stream_id = 6;
+    stream.conflation = None;
+    let _ = driver.add_stream(stream).unwrap();
+    let path = c_path(&dir);
+    let (status, client) = serve(&mut driver, &|| {
+        let (status, client, _) = abi::client_connect(&path);
+        (status, client)
+    });
+    assert_eq!(status, 0);
+    // A stream without a table is refused (KARYOS_E_REFUSED).
+    let (status, _) = serve(&mut driver, &|| {
+        abi::client_add_conflated_subscription(client, c"karyos:ipc", 6)
+    });
+    assert_eq!(status, 304);
+    let (status, view) = serve(&mut driver, &|| {
+        abi::client_add_conflated_subscription(client, c"karyos:ipc", 5)
+    });
+    assert_eq!(status, 0);
+    let mut publication = driver.publication(handle).unwrap();
+    let options = karyos_sys::log_buffer::AppendOptions {
+        reserved_value: 2,
+        ..karyos_sys::log_buffer::AppendOptions::default()
+    };
+    let start = Instant::now();
+    while !matches!(
+        publication.offer_with(b"two", options).unwrap(),
+        karyos_client::OfferOutcome::Accepted { .. }
+    ) {
+        assert!(start.elapsed() < Duration::from_secs(5), "never accepted");
+        let _ = driver.do_work().unwrap();
+    }
+    let mut delivered = 0;
+    while delivered == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "nothing delivered"
+        );
+        let _ = driver.do_work().unwrap();
+        let (status, count, counted) = abi::conflated_poll(view, 8);
+        assert_eq!((status, count), (0, counted));
+        delivered = count;
+    }
+    assert_eq!(delivered, 1);
+    assert_eq!(abi::client_close(client), 0);
+    assert_eq!(abi::conflated_poll(view, 8).0, CLOSED);
+    assert_eq!(abi::conflated_close(view), CLOSED);
+    let _ = driver.do_work().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

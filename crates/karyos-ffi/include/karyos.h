@@ -609,6 +609,26 @@ typedef void (*karyos_message_handler)(void *context, const uint8_t *data,
                                        const karyos_message_info *info);
 
 /**
+ * Adds a view of the conflation table of the karyos:ipc stream stream_id
+ * to the client and writes its handle. A client attached to a driver in
+ * another process takes it; a client of a driver in this process is
+ * refused by its driver (KARYOS_E_REFUSED): take that view with
+ * karyos_driver_subscribe_conflated. The view is the client's: closing the
+ * client closes it, and its handle then answers KARYOS_E_CLOSED. There is
+ * no options struct: its poll reads with the default retries, its table
+ * must be within the default limits (2^20 keys, 64 KiB values, a 64 MiB
+ * journal), and the key budget is each poll's. A control call: it waits
+ * for the driver up to the client's timeout and holds the client handle
+ * meanwhile. A failure opens nothing and fills detail (may be null);
+ * another channel is KARYOS_E_UNSUPPORTED_CHANNEL.
+ */
+int32_t karyos_client_add_conflated_subscription(uint64_t client,
+                                                 const char *uri,
+                                                 int32_t stream_id,
+                                                 uint64_t *conflated,
+                                                 karyos_detail *detail);
+
+/**
  * Adds the subscription of stream_id on the channel uri (karyos:ipc or
  * karyos:udp) to the client and writes its handle. A control call: it
  * waits for the driver up to the client's timeout and holds the client
@@ -775,10 +795,12 @@ typedef void (*karyos_conflated_handler)(void *context, uint32_t key,
 
 /**
  * Subscribes to the conflation table of the driver's stream and writes
- * the conflated subscription's handle. KARYOS_E_INVALID_ARGUMENT for a
- * stream id the driver does not have, KARYOS_E_CONFLATION for a stream
- * without a table, KARYOS_E_CLOSED for a stream being removed or a closed
- * driver; a failure opens nothing.
+ * the conflated subscription's handle. The view follows its driver: once
+ * the driver is closed it answers KARYOS_E_CLOSED, and is still closed
+ * with karyos_conflated_close. KARYOS_E_INVALID_ARGUMENT for a stream id
+ * the driver does not have, KARYOS_E_CONFLATION for a stream without a
+ * table, KARYOS_E_CLOSED for a stream being removed or a closed driver; a
+ * failure opens nothing.
  */
 int32_t karyos_driver_subscribe_conflated(uint64_t driver, int32_t stream_id,
                                           uint64_t *conflated);
@@ -797,7 +819,11 @@ int32_t karyos_conflated_poll(uint64_t conflated,
                               void *context, uint32_t key_budget,
                               uint32_t *delivered);
 
-/** Closes the conflated subscription. */
+/**
+ * Closes the conflated subscription. A client's view is closed through its
+ * client: while that is in use (KARYOS_E_BUSY, KARYOS_E_REENTRANT) nothing
+ * is closed.
+ */
 int32_t karyos_conflated_close(uint64_t conflated);
 
 /**
