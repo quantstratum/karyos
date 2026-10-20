@@ -183,14 +183,15 @@ pub(crate) fn valid_network(network: &crate::net::NetworkConfig, max_clients: us
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
-    /// Serves `AddNetworkPublication` (W5b).
+    /// Serves `AddNetworkPublication` (W5b): with `concurrent`, a
+    /// concurrent handle on lane 0 of a `karyos:ipc` stream (M11).
     pub(crate) fn serve_network_publication(
         &mut self,
         client: u64,
         link: &Arc<ClientLink<T>>,
         request: RequestId,
         stream_id: i32,
-        allow_unconnected: bool,
+        (allow_unconnected, concurrent): (bool, bool),
         uri: &str,
     ) -> Response {
         let refuse = |code: ErrorCode, detail: u64| Response::Error {
@@ -220,6 +221,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let Some(stream) = self.ipc_stream(stream_id) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
+                // A concurrent handle shares lane 0 with the stream's other
+                // publishers; an exclusive stream refuses it with
+                // `InvalidPublicationMode` (M11).
+                if concurrent {
+                    return self.execute(
+                        client,
+                        link,
+                        Command::AddConcurrentPublication {
+                            sequence: request.sequence,
+                            stream,
+                            lane: Lane::ZERO,
+                            allow_unconnected,
+                        },
+                    );
+                }
                 // A URI that names `lanes` must name the stream's: checked
                 // before lane 0 is granted, as an exclusive publication is
                 // granted once per incarnation (W8).
@@ -240,6 +256,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }
                 }
                 return grant(self, stream);
+            }
+            // A network publication is exclusive: its session is drawn
+            // for this publisher alone.
+            Media::Udp(_) if concurrent => {
+                return refuse(ErrorCode::UnsupportedChannel, detail);
             }
             Media::Udp(udp) => udp,
         };

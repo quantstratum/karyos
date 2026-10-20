@@ -742,6 +742,44 @@ impl<T: TermBytes> ClientConductor<T> {
                 sequence,
                 stream_id,
                 allow_unconnected,
+                concurrent: false,
+                uri,
+            }
+        })
+    }
+
+    /// Requests a concurrent publication handle on lane 0 of the
+    /// `karyos:ipc` stream of `stream_id` (M11), as
+    /// [`add_network_publication`](Self::add_network_publication) resolves
+    /// the stream; returns the request sequence. It completes as
+    /// [`Outcome::ConcurrentPublication`]. The driver refuses a
+    /// `karyos:udp` URI with `UnsupportedChannel` and an exclusive stream
+    /// with `InvalidPublicationMode`.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_network_publication`](Self::add_network_publication).
+    pub fn add_network_concurrent_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        let (uri, _) = channel_uri(uri)?;
+        let request = Request::ConcurrentPublication {
+            stream: StreamKey {
+                stream_id,
+                session_id: 0,
+            },
+            lane: Lane::ZERO,
+            allow_unconnected,
+        };
+        self.submit_uri(Kind::AddConcurrentPublication, request, |sequence| {
+            Command::AddNetworkPublication {
+                sequence,
+                stream_id,
+                allow_unconnected,
+                concurrent: true,
                 uri,
             }
         })
