@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check deny deps-inventory deps-check lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -77,6 +77,11 @@ build-release:
 # Not part of pre-push.
 libkaryos:
 	CARGO="$(CARGO)" scripts/package-libkaryos.sh $(LIBKARYOS_DIR)
+
+# A C program linked statically through the package's karyos-static.pc.
+# It compiles C, so it is not part of pre-push.
+libkaryos-static-check: libkaryos
+	scripts/check-libkaryos-static.sh $(LIBKARYOS_DIR)
 
 deny:
 	$(CARGO) deny check
