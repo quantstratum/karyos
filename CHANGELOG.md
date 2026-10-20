@@ -2269,6 +2269,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- Three conversions in karyos-sys saturated to `u32::MAX`, a form SPEC §14
+  excludes; each is now bounded by type, with no conversion left to fail:
+  - the conflation reader's queue length is a `u32`: the queue holds each
+    of the table's `keys` (a `u32`) at most once, so `PollReport::pending`
+    and a poll's served count come from it directly;
+  - `LogBuffer::attached_subscribers` counts only the buffer's subscriber
+    cells (`max_subscribers`, a `u8`), and its doc states that bound.
+
 - A conflation table's value capacity past `u32` was saturated to
   `u32::MAX` when its shape was taken (#535), a form SPEC §14 excludes.
   `ConflationConfig::shape` now returns `Result<ConflationShape,
