@@ -41,6 +41,11 @@ struct Ended<T: StreamTerms> {
     handle: AggregateHandle,
     feed: ReplayFeed<T>,
     to: u64,
+    /// The replay.
+    id: u64,
+    /// Its target had a reader and the replay wrote; one that never did
+    /// is finished at once, without the linger.
+    started: bool,
 }
 
 /// How long a replay that ended keeps its target by default: the
@@ -116,7 +121,20 @@ impl<T: StreamTerms> DriverHost<T> {
     fn finish_after(&mut self, linger: Duration) -> usize {
         let now = Instant::now();
         while let Ok(ended) = self.ended.1.try_recv() {
-            self.lingering.push((ended, now));
+            if ended.started {
+                self.lingering.push((ended, now));
+            } else {
+                // Unattended: no reader by the attach deadline, nothing
+                // written. Retired at once, so a reader racing the deadline
+                // finds the target gone, or empty and retired, never part
+                // of a replay (archive-host.md, H2b).
+                tracing::warn!(
+                    replay = ended.id,
+                    "a replay's target had no reader by the attach deadline"
+                );
+                self.lingering
+                    .push((ended, now.checked_sub(linger).unwrap_or(now)));
+            }
         }
         let mut finished = 0usize;
         let mut kept = Vec::with_capacity(self.lingering.len());
@@ -239,6 +257,8 @@ where
             feed: Some(feed),
             handle,
             to,
+            id: replay_id,
+            started: false,
             ended: self.ended.0.clone(),
         }))
     }
@@ -250,6 +270,9 @@ struct Sink<T: StreamTerms> {
     feed: Option<ReplayFeed<T>>,
     handle: AggregateHandle,
     to: u64,
+    id: u64,
+    /// The target had its first reader: the replay writes from then on.
+    started: bool,
     ended: Sender<Ended<T>>,
 }
 
@@ -286,8 +309,19 @@ where
                 handle: self.handle,
                 feed,
                 to: self.to,
+                id: self.id,
+                started: self.started,
             });
         }
+    }
+
+    /// Ready once the target has its first reader, which then joins at the
+    /// replay's first position and reads it all; the agent holds the
+    /// replay until then, up to its attach deadline (archive-host.md,
+    /// H2b).
+    fn ready(&mut self) -> bool {
+        self.started = self.feed.as_ref().is_some_and(ReplayFeed::has_subscriber);
+        self.started
     }
 }
 

@@ -11,6 +11,22 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A replay waits for its target's first reader (quantstratum-docs:
+  `karyos/design/archive-host.md`, H2b), so a requester that subscribes
+  after the `Replay` answer reads it from its first position.
+  - karyos-archive's `ReplaySink` gains `ready()` (true by default). The
+    agent steps nothing into a sink that is not ready.
+  - A replay still not ready past the new `AgentConfig::attach_deadline`
+    (default 5 s) ends with the new `ReplayOutcome::NoSubscriber`,
+    having written nothing. `ControlServer::unattended()` counts these.
+  - karyos-driver's `ReplayFeed::has_subscriber()` reports whether the
+    target has an attached reader. `DriverHost`'s sink is ready once it
+    has one, and an unattended replay's target is retired at once,
+    without the linger, and logged with its replay id.
+  - Version 1 has no replay-end message: the requester sees only that
+    the target retired unjoined (`ArchiveClient`: `Unavailable`). A
+    typed end signal is a version 2 message, for later.
+
 - The Archive's host over a driver (quantstratum-docs:
   `karyos/design/archive-host.md`, H2).
   - `karyos_tools::archive::DriverHost<T>` implements
