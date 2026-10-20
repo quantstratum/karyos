@@ -2540,10 +2540,13 @@ release may break APIs, wire formats and shared-memory layouts.
   - a growing struct needs only its leading `uint32_t` aligned: the
     first `karyos_subscription_options` (four `uint32_t`, aligned to 4)
     was refused as misaligned.
-  A binary built against a header from after a struct grew but before
-  this fix gets the 0.1.0 prefix from the legacy symbol, so the newer
-  fields it sets afterwards are not read; rebuilding against this header
-  fixes it. The ABI version moves to 0.1.1, so a binding states 0.1.1 as
+  Binaries built against a 0.1.0 header after the stream or subscription
+  options grew must be rebuilt against 0.1.1: the legacy symbol gives
+  them the 0.1.0 prefix, so the newer fields they set afterwards (the
+  conflation table, publishers, an Archive rejoin) are not read. Capping
+  the legacy symbol higher would overrun binaries built before those
+  fields (COORDINATOR's ruling; owner item 48's note records it). The
+  ABI version moves to 0.1.1, so a binding states 0.1.1 as
   its minimum and refuses an unfixed library at bootstrap (BIND-Q8). The
   `abi.version` scenario no longer pins the patch. `karyos.h`'s Rules
   state the init rule for every later growth.
