@@ -1,0 +1,31 @@
+# A replay at a millionth of the recorded pace holds the recording's
+# second half (published 5 ms after the first) for about 5000 s, so it can
+# only end by its stop: the target then seals as an image retired, not a
+# clean end, and a second stop finds no such replay (code 3).
+format 2
+id op.replay.stopped
+abi 0.1
+covers "archive replays"
+since B3
+feature archive-replay
+
+op archive.connect client=$archive_client
+expect ok archive=$archive
+op archive.replay archive=$archive recording=$recording target_stream_id=1041 length=$recording_end rate="scaled" scale_ppm=1
+expect ok replay=$replay session=$session
+op replay.subscribe client=$archive_client stream_id=1041 session=$session
+expect ok subscription=$subscription
+op subscription.poll subscription=$subscription limit=16
+expect ok
+op archive.stop_replay archive=$archive replay=$replay
+expect ok
+op subscription.poll_to_end subscription=$subscription
+expect ok
+op subscription.end subscription=$subscription
+expect ok reason="image_retired"
+op archive.stop_replay archive=$archive replay=$replay
+expect status=refused code=3
+op subscription.close subscription=$subscription
+expect ok
+op archive.close archive=$archive
+expect ok
