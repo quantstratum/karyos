@@ -249,7 +249,9 @@ impl Agent {
                 from: gap.from,
                 to: gap.to,
             }),
-            // An unknown interval stays an alert until it is acknowledged.
+            // An unknown interval stays an alert until it is acknowledged;
+            // a journal that failed is one from its failure on, until the
+            // restart that records it (DESIGN's P3 on #485).
             alerts: gap
                 .map(|gap| Alert {
                     kind: AlertKind::JournalGap,
@@ -260,6 +262,14 @@ impl Agent {
                     since: gap.to,
                 })
                 .into_iter()
+                .chain(journal.and_then(Journal::failed_at).map(|since| Alert {
+                    kind: AlertKind::JournalGap,
+                    stream: 0,
+                    lane: 0,
+                    participant: u64::MAX,
+                    value: journal.map_or(0, Journal::failed_appends),
+                    since,
+                }))
                 .collect(),
         })
     }

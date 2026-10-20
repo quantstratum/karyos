@@ -105,7 +105,10 @@ pub enum AlertKind {
     GuardAck,
     /// The operations journal holds an unknown interval no administrator
     /// acknowledged (M10b): `participant` is its position, `value` its
-    /// length in nanoseconds, `since` its end.
+    /// length in nanoseconds, `since` its end. Or the journal failed an
+    /// append, so operations go unrecorded until the agent restarts:
+    /// `participant` is `u64::MAX`, `value` the failed appends, `since` the
+    /// first failure.
     JournalGap,
 }
 
