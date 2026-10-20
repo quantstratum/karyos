@@ -113,18 +113,14 @@ mod watch {
     use std::time::{Duration, Instant};
 
     use karyos_archive::catalog::{FailKind, StopReason};
+    use karyos_archive::client::connection::{ArchiveConnection, ControlStreams};
     use karyos_archive::client::list::{
         ListPoll, ListedRecording, ListerConfig, Listing, RecordingLister,
     };
-    use karyos_archive::client::{ControlRequests, ControlResponses};
     use karyos_archive::control::RecordingState;
     use karyos_client::ipc::RemoteClient;
-    use karyos_client::{
-        Client, ClientConcurrentPublication, ConcurrentOfferOutcome, Context, MessageLimit,
-        StreamId, Subscription,
-    };
+    use karyos_client::{Client, Context};
     use karyos_sys::host_clock::host_monotonic_ns;
-    use karyos_sys::term_bytes::SharedTerms;
 
     use super::CatalogConfig;
     use crate::api::{Catalog, CatalogRecording};
@@ -133,38 +129,6 @@ mod watch {
     const TICK: Duration = Duration::from_millis(1);
     /// How long it sleeps between polls of the connection while it waits.
     const IDLE_TICK: Duration = Duration::from_millis(10);
-
-    /// The request stream, through the agent's concurrent handle.
-    struct Requests(ClientConcurrentPublication<SharedTerms>);
-
-    impl ControlRequests for Requests {
-        fn send(&mut self, message: &[u8]) -> bool {
-            matches!(
-                self.0.offer(message),
-                Ok(ConcurrentOfferOutcome::Accepted { .. })
-            )
-        }
-    }
-
-    /// The response stream, through the agent's subscription.
-    struct Responses(Subscription<SharedTerms>);
-
-    impl ControlResponses for Responses {
-        fn next(&mut self, out: &mut [u8]) -> Option<usize> {
-            let mut length = None;
-            let _ = self.0.poll(
-                |bytes, _| {
-                    // A message longer than `out` is dropped.
-                    if let Some(to) = out.get_mut(..bytes.len()) {
-                        to.copy_from_slice(bytes);
-                        length = Some(bytes.len());
-                    }
-                },
-                MessageLimit::new(1),
-            );
-            length
-        }
-    }
 
     /// What the agent tells the thread.
     #[derive(Debug, Default)]
@@ -363,17 +327,14 @@ mod watch {
             .build()
             .map_err(|error| format!("context: {error}"))?;
         let mut client = Client::connect(context).map_err(|error| format!("connect: {error}"))?;
-        let requests = client
-            .add_concurrent_publication("karyos:ipc", StreamId::new(config.streams.requests))
-            .map_err(|error| format!("request stream: {error}"))?;
-        let responses = client
-            .add_subscription("karyos:ipc", StreamId::new(config.streams.responses))
-            .map_err(|error| format!("response stream: {error}"))?;
-        let mut lister = RecordingLister::new(
-            ListerConfig::new(config.client_id),
-            Requests(requests),
-            Responses(responses),
-        );
+        let (requests, responses) = ArchiveConnection::open(
+            &mut client,
+            ControlStreams::new(config.streams.requests, config.streams.responses),
+        )
+        .map_err(|error| error.to_string())?
+        .into_transports();
+        let mut lister =
+            RecordingLister::new(ListerConfig::new(config.client_id), requests, responses);
         loop {
             lister.start();
             let start = Instant::now();

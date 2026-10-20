@@ -25,6 +25,23 @@ release may break APIs, wire formats and shared-memory layouts.
   `conflation` and `with_conflation`. A client attached to a driver in
   another process is not checked yet (F7b-2c).
 
+- karyos-archive's `client::connection` (quantstratum-docs:
+  `karyos/design/ffi-archive.md`, F9-0): a requester's control streams to
+  an Archive over a facade client. `ArchiveConnection::open(&mut client,
+  ControlStreams::new(requests, responses))` takes a concurrent publication
+  on the shared request stream and an optional subscription, rejoining at
+  the head, on the shared response stream (`karyos:ipc`): a requester that
+  stops reading is lapped instead of holding back everyone's answers. It
+  answers `OpenError` naming the stream it could not take, and a failed
+  open removes the publication it took. `into_transports` gives the
+  `Requests` and `Responses` an `ArchiveClient` or a `RecordingLister`
+  takes; `close`, `Requests::close` and `Responses::close` remove them
+  from the client, and `RecordingLister::into_transports` gives them back.
+  An answer longer than the caller's buffer is dropped and counted
+  (`Responses::oversized`). The management agent's catalog uses it in
+  place of its private adapters, and so do `karyos-catalog list --live`
+  (H4b) and `karyos-replay start` (H6). Public surface, under owner items
+  57 and 41.
 - A replay waits for its target's first reader (quantstratum-docs:
   `karyos/design/archive-host.md`, H2b), so a requester that subscribes
   after the `Replay` answer reads it from its first position.
@@ -646,6 +663,21 @@ release may break APIs, wire formats and shared-memory layouts.
   `KARYOS_E_UNSUPPORTED`. The conformance format gains both calls and the
   `schedule_capacity` argument of `karyos_driver_add_stream`, with the
   scenario `publication.timed.offer`.
+- `karyosd` runs the Archive (quantstratum-docs:
+  `karyos/design/archive-host.md`, H3). `--archive DIR` starts the agent
+  with its catalog in `DIR`, and `--archive-control REQ,RESP` names the
+  control streams, which the daemon adds (REQ concurrent). `--record
+  id:session[:sync]` (repeatable; sync `none`, `segment` or a duration)
+  starts a recording at boot through the control path, and a shutdown
+  stops it, then the agent. `--archive-min-free` (default 1 GiB) refuses a
+  recording while the archive's file system has less free space,
+  measured by the new `karyos_sys::fs::free_bytes` (Linux). Under
+  same-uid admission every admitted client may control the Archive: the
+  trust boundary is the daemon's uid, and per-client authorization comes
+  with owner item 43. The audit trail (target
+  `karyos::archive::audit`) names each grant on the control streams, each
+  request and each answer, through the driver's new
+  `EmbeddedDriver::audit_grants` and `drain_grant_audits`.
 
 - `Publication::offer_at_on(lane, payload, tx_time)` on the client facade
   (quantstratum-docs: `karyos/design/timed-tx.md`; owner item 57): a timed
