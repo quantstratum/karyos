@@ -72,6 +72,11 @@ fn start(dir: &Path, linger: &str) -> Daemon {
 
 /// As [`start`], with `extra` arguments.
 fn start_with(dir: &Path, linger: &str, extra: &[&str]) -> Daemon {
+    start_logging(dir, linger, extra, Stdio::null())
+}
+
+/// As [`start_with`], its log on `stderr`.
+fn start_logging(dir: &Path, linger: &str, extra: &[&str], stderr: Stdio) -> Daemon {
     let child = Command::new(env!("CARGO_BIN_EXE_karyosd"))
         .arg("--dir")
         .arg(dir)
@@ -88,7 +93,7 @@ fn start_with(dir: &Path, linger: &str, extra: &[&str]) -> Daemon {
         .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .unwrap();
     Daemon(child)
@@ -298,4 +303,94 @@ fn karyosd_with_the_network_carries_a_udp_pair() {
     drop(client);
     daemon.terminate();
     assert_eq!(daemon.wait(Duration::from_secs(10)).code(), Some(0));
+}
+
+/// M3b: with the network on, `karyosd` logs an endpoint's capabilities
+/// when it first appears: one line naming every capability and its state.
+#[test]
+fn karyosd_logs_an_endpoints_capabilities_when_it_appears() {
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+
+    use karyos_client::{Client, Context, StreamId};
+
+    let port = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dir = dir("capabilities");
+    let log = std::env::temp_dir().join(format!("karyosd-{}-capabilities.log", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    let mut daemon = start_logging(
+        &dir,
+        "1s",
+        &["--network", "on", "--log-level", "info"],
+        Stdio::from(file),
+    );
+    drop(attach_when_ready(&dir));
+    let context = Context::builder()
+        .dir(&dir)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut client = Client::connect(context).unwrap();
+    let reading = client
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    let began = Instant::now();
+    let line = loop {
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "no capability log"
+        );
+        let _ = client.poll();
+        let text = std::fs::read_to_string(&log).unwrap();
+        if let Some(line) = text
+            .lines()
+            .find(|line| line.contains("endpoint capabilities"))
+        {
+            break line.to_owned();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for capability in [
+        "epoch=1",
+        "platform=linux",
+        "copy_mode=staged",
+        "queue_assignment=kernel_selected",
+        "max_datagram=",
+        "observation_points=",
+        "clock_granularity=",
+        "send_buffer_bytes=",
+        "recv_buffer_bytes=",
+        "dont_fragment=",
+        "tx_batch=",
+        "rx_batch=",
+        "gso=unavailable(library_api)",
+        "gro=",
+        "kernel_stamps=",
+        "hardware_stamps=",
+        "busy_poll=",
+        "user_observations=active",
+        "send_buffer=",
+        "recv_buffer=",
+    ] {
+        assert!(line.contains(capability), "{capability} not in {line}");
+    }
+    drop((reading, client));
+    daemon.terminate();
+    assert_eq!(daemon.wait(Duration::from_secs(10)).code(), Some(0));
+    // Logged once: the endpoint did not reopen.
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("endpoint capabilities"))
+            .count(),
+        1,
+        "{text}"
+    );
+    let _ = std::fs::remove_file(&log);
 }
