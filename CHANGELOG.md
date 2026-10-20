@@ -11,6 +11,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- karyos-archive's `client::connection` (quantstratum-docs:
+  `karyos/design/ffi-archive.md`, F9-0): a requester's control streams to
+  an Archive over a facade client. `ArchiveConnection::open(&mut client,
+  ControlStreams::new(requests, responses))` takes a concurrent publication
+  on the shared request stream and an optional subscription, rejoining at
+  the head, on the shared response stream (`karyos:ipc`): a requester that
+  stops reading is lapped instead of holding back everyone's answers. It
+  answers `OpenError` naming the stream it could not take, and a failed
+  open removes the publication it took. `into_transports` gives the
+  `Requests` and `Responses` an `ArchiveClient` or a `RecordingLister`
+  takes; `close`, `Requests::close` and `Responses::close` remove them
+  from the client, and `RecordingLister::into_transports` gives them back.
+  An answer longer than the caller's buffer is dropped and counted
+  (`Responses::oversized`). The management agent's catalog uses it in
+  place of its private adapters, and so do `karyos-catalog list --live`
+  (H4b) and `karyos-replay start` (H6). Public surface, under owner items
+  57 and 41.
 - A replay waits for its target's first reader (quantstratum-docs:
   `karyos/design/archive-host.md`, H2b), so a requester that subscribes
   after the `Replay` answer reads it from its first position.
