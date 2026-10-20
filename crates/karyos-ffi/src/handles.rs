@@ -271,6 +271,32 @@ impl<T> Table<T> {
         Ok(f(value))
     }
 
+    /// Reads the object `handle` names even when a panic poisoned its slot,
+    /// for what a close needs before it takes the slot: a field set when
+    /// the object was created and never changed (the client a publication
+    /// or a subscription belongs to), which a panic cannot have left
+    /// half-written.
+    ///
+    /// # Errors
+    ///
+    /// As [`Table::with`], except that a poisoned slot is not an error.
+    pub(crate) fn read_even_poisoned<R>(
+        &self,
+        handle: Handle,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, Status> {
+        let slot = self.current(handle)?;
+        let entry = match slot.entry.try_lock() {
+            Ok(entry) => entry,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(Self::contended(slot, handle)),
+        };
+        if slot.generation.load(Ordering::Acquire) != handle.generation() {
+            return Err(Status::Closed);
+        }
+        entry.as_ref().map(f).ok_or(Status::Closed)
+    }
+
     /// Closes `handle` and returns its object. A poisoned slot is closed
     /// too, and its object returned.
     ///

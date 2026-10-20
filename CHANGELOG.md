@@ -437,7 +437,9 @@ release may break APIs, wire formats and shared-memory layouts.
   its client returns `KARYOS_E_REENTRANT`, and another thread gets
   `KARYOS_E_BUSY`. A client's close takes every publication and
   subscription before it closes any. The header checker reads callback
-  typedefs.
+  typedefs. A publication or subscription whose handle a panic poisoned is
+  now closed by its close (`karyos_publication_close` answered
+  `KARYOS_E_INTERNAL` and kept it).
 
 - The guard binding's region kinds and outcome header (G-x1;
   quantstratum-docs: `karyos/design/guards-and-abort.md`, "The binding

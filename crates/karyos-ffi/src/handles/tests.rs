@@ -140,7 +140,14 @@ fn a_panic_poisons_the_handle_until_it_is_closed() {
     assert_eq!(table.with(handle, |value| *value), Err(Status::Internal));
     // The holder was cleared by the unwinding: not reentrant, poisoned.
     assert_eq!(table.with(handle, |value| *value), Err(Status::Internal));
+    // A close still reads what it needs (the client of a publication or a
+    // subscription) from the poisoned slot.
+    assert_eq!(table.read_even_poisoned(handle, |value| *value), Ok(1));
     assert_eq!(table.remove(handle), Ok(1));
+    assert_eq!(
+        table.read_even_poisoned(handle, |value| *value),
+        Err(Status::Closed)
+    );
     let next = table.insert(2_u32).unwrap();
     assert_eq!(table.with(next, |value| *value), Ok(2));
 }
