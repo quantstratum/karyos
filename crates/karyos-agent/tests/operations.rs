@@ -257,3 +257,37 @@ fn an_administrator_acknowledges_the_unknown_interval() {
     let journal = agent.view().journal.unwrap();
     assert_eq!((journal.gap, journal.alerts.len()), (None, 0));
 }
+
+/// A reason longer than the journal keeps is cut once, before the digest:
+/// the driver audits the digest of the 128 bytes the journal holds, so the
+/// record can be verified against the audit (DESIGN's P2 on #487).
+#[test]
+fn a_long_reason_is_cut_before_its_digest() {
+    let _serial = serial();
+    let dir = dir("reason");
+    let mut driver = driver(&dir.join("driver"));
+    let guard = driver.add_guard("orders").unwrap().id();
+    let mut agent = agent(&dir, true);
+    let mut server = Server::bind(ApiConfig::new(
+        dir.join("api"),
+        vec![(own(), Role::Operator)],
+    ))
+    .unwrap();
+    let reason = "r".repeat(129);
+    let request = format!(
+        "KARYOS-AGENT 1 guard-close {} {guard} {reason}\n",
+        dir.join("driver").display()
+    );
+    let (answer, _) = ask(&mut driver, &mut server, &mut agent, &request);
+    assert!(answer.contains(r#""open":false"#), "{answer}");
+    let audit = driver.guard_audit();
+    let record = audit.records.last().unwrap();
+    let cut = karyos_protocol::cnc::guard_parameters(
+        guard,
+        0,
+        record.operation,
+        u64::from(own()),
+        &reason.as_bytes()[..128],
+    );
+    assert_eq!(record.parameters, cut);
+}

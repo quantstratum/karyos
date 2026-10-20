@@ -76,6 +76,8 @@ pub(crate) struct Command<'a> {
     pub(crate) operation: u64,
     /// The operator's uid: the peer that asked.
     pub(crate) operator: u32,
+    /// The reason, cut to [`MAX_REASON`] bytes once, by [`cut_reason`]:
+    /// the digest, the driver and the journal all see the same bytes.
     pub(crate) reason: &'a [u8],
     pub(crate) timeout: Duration,
 }
@@ -94,13 +96,14 @@ impl Command<'_> {
             u64::from(self.operator),
             self.reason,
         );
-        record.reason = self
-            .reason
-            .get(..MAX_REASON)
-            .unwrap_or(self.reason)
-            .to_vec();
+        record.reason = self.reason.to_vec();
         record
     }
+}
+
+/// `reason` cut to the [`MAX_REASON`] bytes a journal record keeps.
+pub(crate) fn cut_reason(reason: &[u8]) -> &[u8] {
+    reason.get(..MAX_REASON).unwrap_or(reason)
 }
 
 /// Makes `command`, journalled in `journal` when there is one.

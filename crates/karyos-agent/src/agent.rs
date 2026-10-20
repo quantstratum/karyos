@@ -213,7 +213,9 @@ impl Agent {
             reopen,
             operation,
             operator: uid,
-            reason,
+            // Cut once, so the digest covers what is journalled (DESIGN's
+            // P2 on #487).
+            reason: operations::cut_reason(reason),
             timeout: self.config.guard_timeout,
         };
         operations::guard_command(self.journal.as_mut(), &command)
