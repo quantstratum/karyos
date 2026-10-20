@@ -631,6 +631,11 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The facade `karyos` crate re-exports `ImageChange`, `ImageEnd` and
+  `SealReason`, and `karyos-client` re-exports `SealReason` at its root:
+  a facade user drains a network subscription's image changes and reads
+  each retired image's end without naming `karyos-client` or
+  `karyos-sys` (owner item 57).
 - A retired image's change carries how its stream ended (owner item
   57). In `karyos-client`, `ImageChange.end` is an `ImageEnd`, the
   stream's terminal seal: its `SealReason` and its stream position.

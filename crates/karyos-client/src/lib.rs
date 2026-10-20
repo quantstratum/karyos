@@ -70,6 +70,8 @@ pub use karyos_protocol::trace_hook::PublicationIdentity;
 pub use karyos_sys::conflation::Budget as ConflatedBudget;
 pub use karyos_sys::frame::Lane;
 pub use karyos_sys::freshness::Freshness;
+/// Why a stream sealed, as a retired image's end reports it ([`ImageEnd`]).
+pub use karyos_sys::log_buffer::SealReason;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
 pub use merge::{
     LiveMerge, MergeError, MergeFailed, MergePoll, Replay, ReplayProvider, ReplayRejoin,
