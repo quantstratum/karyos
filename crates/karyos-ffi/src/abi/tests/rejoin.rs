@@ -208,6 +208,22 @@ fn the_rejoin_state_is_written_by_the_callers_size() {
     // SAFETY: `exact` is live, aligned and its stated size.
     unsafe { write_rejoin_state(&mut exact, false, None) };
     assert_eq!((exact.recovering, exact.merge_failure), (0, MERGE_NONE));
+    // The arguments are checked before the handle: a null or short struct
+    // is refused with nothing written, whatever the handle.
+    // SAFETY: a null pointer, refused before any use.
+    let status = unsafe { karyos_subscription_rejoin_state(0, core::ptr::null_mut()) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    let mut short = SubscriptionRejoin {
+        size: 12,
+        recovering: 7,
+        merge_failure: 7,
+        reserved: 7,
+    };
+    // SAFETY: a live struct; its size is below the first version's.
+    let status = unsafe { karyos_subscription_rejoin_state(0, &mut short) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    assert_eq!((short.recovering, short.merge_failure), (7, 7));
+    assert_eq!(state(0).0, Status::InvalidHandle.code());
 }
 
 /// The state's arguments are checked first, and its struct is written by
