@@ -357,7 +357,7 @@ impl Report {
 }
 
 /// `text` as a JSON string.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     out.push('"');
     for c in text.chars() {

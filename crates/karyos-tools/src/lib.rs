@@ -13,11 +13,14 @@
 //! karyos/design/trace-tool.md`), whose command line, mirror reader,
 //! output and run loop live in [`trace`]; and `karyos-tools replay diff`
 //! (`quantstratum-docs: karyos/design/recording-group-replay.md` section
-//! 10), which compares two recording group journals ([`replay`]).
+//! 10), which compares two recording group journals ([`replay`]); and
+//! `karyos-catalog list` (`karyos/design/archive-host.md`, H4), which lists
+//! an archive directory's catalog read only ([`catalog`]).
 
 pub mod archive;
 pub mod args;
 pub mod capability_log;
+pub mod catalog;
 pub mod daemon;
 pub mod errors;
 pub mod idle;

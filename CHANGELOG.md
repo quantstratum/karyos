@@ -492,6 +492,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyos-catalog list DIR [--json]` (SPEC §11; quantstratum-docs:
+  `karyos/design/archive-host.md`, H4a): an archive directory's
+  recordings, read offline through the new
+  `karyos_archive::catalog::list`, which never writes. It leaves a
+  compaction's leftover file and does not cut a torn last record: it lists
+  up to it and reports the listing as maybe behind (an Archive appending,
+  or a crash its next open cuts), never as an error. A directory with no
+  catalog lists nothing; a damaged catalog, another format version or a
+  missing directory exit 2. Listing a running Archive (`--live`) is H4b,
+  after H3.
 - `Client::add_subscription_with(uri, stream_id, SubscriptionOptions)`
   (owner item 57; quantstratum-docs: `karyos/design/ffi-gap-analysis.md`
   D3, F7b): the reader's role (`SubscriberRole::{Required, Optional,
