@@ -421,6 +421,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A remote client binds a guarded exclusive publication (G-x3;
+  quantstratum-docs: `karyos/design/guards-and-abort.md`, "The binding
+  across processes"). `RemoteClient::take_publication` maps the grant's
+  outcome ring and guard words read-only and its consumed cell writable,
+  reads the guard's index and admission epoch from the ring's header, and
+  binds the handle: it is gated by the guard word it was granted and reads
+  its outcome records with `poll_outcomes`. Each binding region holds its
+  own export, detached when the handle drops, never at a mapping cutover.
+  The control path now issues guarded publications to remote clients;
+  clients of the in-process command ring and timed lanes are still
+  refused (`InvalidPublicationMode`). The facade's `Publication` gains
+  `poll_outcomes_on(lane, limit, handler)`.
 - The driver grants a guarded exclusive publication's binding over the
   control path (G-x2; quantstratum-docs:
   `karyos/design/guards-and-abort.md`, "The binding across processes"),

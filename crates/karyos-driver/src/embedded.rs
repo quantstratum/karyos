@@ -933,11 +933,6 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// yet, by export: what its fetch grants. The walker's bound holds
     /// the same words until its last outcome record is written.
     pub(crate) binding_exports: Vec<(u64, Arc<crate::shared_words::Words>)>,
-    /// Test only: the control path issues guarded publications with their
-    /// binding's regions (G-x2), which it refuses until the client can
-    /// bind them (G-x3).
-    #[cfg(test)]
-    pub(crate) guarded_grants: bool,
     /// The network agents and their tables, when configured.
     pub(crate) net: Option<crate::net::Network<T>>,
     /// Each guard's word gauge (M4).
@@ -1391,8 +1386,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             #[cfg(test)]
             guard_lane_fault: None,
             binding_exports: Vec::new(),
-            #[cfg(test)]
-            guarded_grants: false,
             // Validated above: the product fits.
             net_owned: Vec::with_capacity(config.network.map_or(0, |network| {
                 crate::net::client::owned_capacity(&network, config.max_clients).unwrap_or(0)

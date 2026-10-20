@@ -981,14 +981,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
                 // A guarded stream's publications are bound to the guard's
-                // open epoch with an outcome ring. The driver can grant that
-                // binding (G-x2), but the control path issues none until a
-                // client can bind it (G-x3); tests lift it.
+                // open epoch with an outcome ring: a remote client is granted
+                // the binding's regions (G-x2) and binds them (G-x3); a
+                // client of the in-process command ring has no such grant,
+                // so it is issued none.
                 // A timed lane's handle needs its schedule binding, in
                 // process only for now (timed-tx.md, T1).
+                let remote = self.ledger(client).is_some();
                 if matches!(command, Command::AddPublication { .. })
                     && self.streams.get(index).is_some_and(|found| {
-                        (found.guarded.is_some() && !self.issues_guarded_grants())
+                        (found.guarded.is_some() && !remote)
                             || found.buffer.schedule_ring().is_some()
                     })
                 {
@@ -1966,18 +1968,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 registration,
                 key: registration,
             },
-        }
-    }
-
-    /// Whether the control path issues guarded publications: in tests that
-    /// lift it, until the client binds them (G-x3).
-    const fn issues_guarded_grants(&self) -> bool {
-        #[cfg(test)]
-        return self.guarded_grants;
-        #[cfg(not(test))]
-        {
-            let _ = self;
-            false
         }
     }
 
@@ -5608,38 +5598,53 @@ mod tests {
         );
     }
 
+    /// A guarded stream issues no publication without its binding: a
+    /// client of the in-process command ring has no grant to carry it, and
+    /// a remote client of a driver without shared regions cannot be
+    /// granted them. Nothing is reserved either way.
     #[test]
-    fn a_guarded_stream_refuses_cnc_publications() {
+    fn a_guarded_stream_issues_no_publication_without_its_binding() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
         driver.guard_stream(stream, guard, 4, None).unwrap();
         let mut observer = driver.broadcast.receiver();
+        let (ring_client, mut ring_producer, _link) = raw_client(&mut driver);
         let (client, mut producer) = remote_client(&mut driver, 4);
-        write(
-            &mut producer,
-            Command::AddPublication {
-                sequence: 1,
-                stream: KEY,
-                allow_unconnected: true,
-                lane: Lane::ZERO,
-            },
-        );
+        let add = Command::AddPublication {
+            sequence: 1,
+            stream: KEY,
+            allow_unconnected: true,
+            lane: Lane::ZERO,
+        };
+        write(&mut ring_producer, add);
+        write(&mut producer, add);
         let mut answers = Vec::new();
         for _ in 0..3 {
             let _ = driver.do_work().unwrap();
             answers.extend(responses(&mut observer));
         }
+        let refused = |who: u64, why: ErrorCode| {
+            answers.iter().any(|answer| {
+                matches!(
+                    answer,
+                    Response::Error {
+                        request: RequestId { client: c, sequence: 1 },
+                        code,
+                        ..
+                    } if *c == who && *code == why
+                )
+            })
+        };
         assert!(
-            answers.iter().any(|answer| matches!(
-                answer,
-                Response::Error {
-                    request: RequestId { client: c, sequence: 1 },
-                    code: ErrorCode::InvalidPublicationMode,
-                    ..
-                } if *c == client
-            )),
+            refused(ring_client, ErrorCode::InvalidPublicationMode),
             "{answers:?}"
         );
+        assert!(
+            refused(client, ErrorCode::ResourcesUnavailable),
+            "{answers:?}"
+        );
+        assert!(ledger(&driver, client).is_empty());
+        assert!(driver.binding_exports.is_empty());
     }
 
     /// The guard counters count what the walker did.
