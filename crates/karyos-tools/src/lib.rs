@@ -15,6 +15,7 @@
 //! (`quantstratum-docs: karyos/design/recording-group-replay.md` section
 //! 10), which compares two recording group journals ([`replay`]).
 
+pub mod archive;
 pub mod args;
 pub mod capability_log;
 pub mod daemon;

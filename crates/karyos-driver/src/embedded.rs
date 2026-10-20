@@ -3761,6 +3761,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.driver_id
     }
 
+    /// The handle of the active local stream of `key`: one this driver
+    /// added or a replay target, never a network image of the key (key
+    /// lookups prefer the local stream, karyos#490) nor a removed stream
+    /// still retiring. `None` when there is none. A host finds a stream by
+    /// the key its requesters name, as the Archive's `StartRecording` does
+    /// (`quantstratum-docs: karyos/design/archive-host.md`, H2).
+    #[must_use]
+    pub fn stream_handle(&self, key: StreamKey) -> Option<StreamHandle> {
+        self.streams
+            .iter()
+            .find(|s| s.key() == key && s.source.is_none() && !s.retiring)
+            .map(|s| StreamHandle {
+                driver: self.id,
+                stream: s.id,
+            })
+    }
+
     /// The publication identity trace records of `stream` carry
     /// (`quantstratum-docs: karyos/design/trace-data-path.md`; SPEC.md §5,
     /// `(driver_id, registration_id, incarnation)`): this driver's
@@ -4955,6 +4972,35 @@ mod tests {
         let second = EmbeddedDriver::new().unwrap();
         assert_ne!(first.driver_id(), [0, 0]);
         assert_ne!(first.driver_id(), second.driver_id());
+    }
+
+    /// A host finds an active local stream by its key; another key, and a
+    /// removed stream still retiring, are not found (archive-host.md, H2).
+    #[test]
+    fn a_local_stream_is_found_by_its_key_until_it_is_removed() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let stream = driver.add_stream(config(42)).unwrap();
+        let key = |stream_id| StreamKey {
+            stream_id,
+            session_id: 1,
+        };
+        assert_eq!(driver.stream_handle(key(42)), Some(stream));
+        assert_eq!(driver.stream_handle(key(43)), None);
+        assert_eq!(
+            driver.stream_handle(StreamKey {
+                stream_id: 42,
+                session_id: 2
+            }),
+            None
+        );
+        // A subscriber keeps the removed stream retiring: it is no longer
+        // found.
+        let held = driver.subscribe(stream, Role::Required).unwrap();
+        driver.remove_stream(stream).unwrap();
+        assert_eq!(driver.stream_handle(key(42)), None);
+        drop(held);
+        driver.do_work().unwrap();
+        assert_eq!(driver.stream_handle(key(42)), None);
     }
 
     #[test]
