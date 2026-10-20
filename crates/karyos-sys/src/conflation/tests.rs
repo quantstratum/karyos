@@ -82,6 +82,37 @@ fn publication_config_rejects_invalid_keys_and_oversized_values() {
     );
 }
 
+/// SPEC §14: a value capacity past `u32`, which no message carries, has no
+/// shape: it is refused, never saturated to `u32::MAX`, and a publication
+/// check of such a table fails with that refusal. The capacity `u32::MAX`
+/// itself still has one.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn a_capacity_past_u32_has_no_shape() {
+    let largest = usize::try_from(u32::MAX).unwrap();
+    let past = largest + 1;
+    let config = ConflationConfig {
+        keys: 3,
+        value_capacity: past,
+        journal_capacity: 1024,
+    };
+    let refused = ConflationError::ValueTooLarge {
+        length: past,
+        max: largest,
+    };
+    assert_eq!(config.shape(), Err(refused));
+    assert_eq!(config.validate_publication(0, 1), Err(refused));
+    let largest_config = ConflationConfig {
+        value_capacity: largest,
+        ..config
+    };
+    assert_eq!(
+        largest_config.shape(),
+        Ok(crate::log_buffer::ConflationShape::new(3, u32::MAX))
+    );
+    assert_eq!(largest_config.validate_publication(0, largest), Ok(()));
+}
+
 #[test]
 fn every_length_round_trips_and_shorter_values_leave_no_stale_bytes() {
     let mut writer = conflation(2, 40, 1024).unwrap();
