@@ -73,6 +73,26 @@ pub struct Detail {
     pub value: u64,
 }
 
+/// `karyos_outcome`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Outcome {
+    pub size: u32,
+    pub kind: u32,
+    pub lane: u32,
+    pub receiver: u32,
+    pub sequence: u64,
+    pub incarnation: u64,
+    pub start: u64,
+    pub end: u64,
+    pub epoch: u64,
+    pub reason: u64,
+    pub lost: u64,
+}
+
+/// `karyos_outcome_handler`.
+type OutcomeHandler = unsafe extern "C" fn(*mut core::ffi::c_void, *const Outcome);
+
 /// `karyos_accepted`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -124,6 +144,14 @@ unsafe extern "C" {
         data: *const u8,
         length: usize,
         accepted: *mut core::ffi::c_void,
+    ) -> i32;
+    fn karyos_publication_poll_outcomes(
+        publication: u64,
+        lane: u32,
+        handler: Option<OutcomeHandler>,
+        context: *mut core::ffi::c_void,
+        limit: u32,
+        delivered: *mut u32,
     ) -> i32;
     fn karyos_publication_claim(
         publication: u64,
@@ -606,4 +634,36 @@ pub fn status_message(status: i32) -> String {
     // SAFETY: the function returns a NUL-terminated static string.
     let text = unsafe { CStr::from_ptr(text) };
     text.to_string_lossy().into_owned()
+}
+
+/// Appends each record to the `Vec<Outcome>` at `context`.
+unsafe extern "C" fn collect(context: *mut core::ffi::c_void, outcome: *const Outcome) {
+    // SAFETY: the library hands a live `Outcome` for the call.
+    let outcome = unsafe { *outcome };
+    // SAFETY: `publication_poll_outcomes` passes a live `Vec<Outcome>`.
+    unsafe { (*context.cast::<Vec<Outcome>>()).push(outcome) };
+}
+
+/// `karyos_publication_poll_outcomes` of `lane`: the status, the count
+/// written and the records handed to the handler.
+pub fn publication_poll_outcomes(
+    publication: u64,
+    lane: u32,
+    limit: u32,
+) -> (i32, u32, Vec<Outcome>) {
+    let mut records = Vec::new();
+    let mut delivered = u32::MAX;
+    // SAFETY: `collect` returns normally and reads the live `records`;
+    // `delivered` is a live, aligned `u32`.
+    let status = unsafe {
+        karyos_publication_poll_outcomes(
+            publication,
+            lane,
+            Some(collect),
+            core::ptr::from_mut(&mut records).cast(),
+            limit,
+            &mut delivered,
+        )
+    };
+    (status, delivered, records)
 }

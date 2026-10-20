@@ -545,6 +545,11 @@ impl<T: TermBytes> ClientPublication<T> {
         self.inner.buffer().max_message_length()
     }
 
+    /// The lane the handle publishes to.
+    pub(crate) fn lane(&self) -> Lane {
+        self.inner.buffer().lane()
+    }
+
     /// The stream and session the handle publishes to.
     #[must_use]
     pub fn stream(&self) -> karyos_protocol::cnc::StreamKey {
