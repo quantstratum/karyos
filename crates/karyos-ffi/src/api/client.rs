@@ -106,6 +106,26 @@ impl AnyClient {
         }
     }
 
+    /// A view of the conflation table of the `karyos:ipc` stream
+    /// `stream_id` (F7b-2c): a remote client takes it; an embedded one is
+    /// refused by its driver, which gives views itself. A control call.
+    pub(crate) fn add_conflated_subscription(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+    ) -> Result<karyos_client::ConflatedSubscription, Failure> {
+        let failure = |error: ClientError| Failure::from(&error);
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(client) => client
+                .add_conflated_subscription(uri, stream_id)
+                .map_err(failure),
+            Self::Embedded(client) => client
+                .add_conflated_subscription(uri, stream_id)
+                .map_err(failure),
+        }
+    }
+
     /// Releases `reader`, granted to this client.
     pub(crate) fn remove_subscription(&mut self, reader: Reader) {
         match (self, reader) {
@@ -151,6 +171,8 @@ pub(crate) struct ClientEntry {
     pub(crate) publications: Vec<Handle>,
     /// Its open subscriptions.
     pub(crate) subscriptions: Vec<Handle>,
+    /// Its open conflated subscriptions (F7b-2c).
+    pub(crate) conflated: Vec<Handle>,
     /// The state of the embedded driver whose conductor it is over, when
     /// the C ABI created that driver (F5): the client follows its failure
     /// and its close ([`driver::DriverState::usable`]).
@@ -184,6 +206,7 @@ fn entry(client: AnyClient, driver: Option<driver::DriverState>) -> ClientEntry 
         client,
         publications: Vec::new(),
         subscriptions: Vec::new(),
+        conflated: Vec::new(),
         driver,
     }
 }
@@ -333,18 +356,23 @@ pub(crate) fn poll(client: Handle) -> Result<bool, Status> {
 ///
 /// As [`Table::remove_all`].
 pub(crate) fn close_entry(entry: &mut ClientEntry) -> Result<(), Status> {
-    // Every child of both tables is taken before any is closed, so while
-    // one is in use nothing is.
+    // Every child of all three tables is taken before any is closed, so
+    // while one is in use nothing is.
     let publications = crate::api::publication::table().take_all(&entry.publications)?;
     let subscriptions = crate::api::subscription::table().take_all(&entry.subscriptions)?;
+    let conflated = crate::api::conflated::table().take_all(&entry.conflated)?;
     for publication in publications.close()? {
         publication.release(&mut entry.client);
     }
     for subscription in subscriptions.close()? {
         subscription.release(&mut entry.client);
     }
+    // A view is released by its drop: it unmaps its table and sends its
+    // grant's `Detach`.
+    drop(conflated.close()?);
     entry.publications.clear();
     entry.subscriptions.clear();
+    entry.conflated.clear();
     Ok(())
 }
 
