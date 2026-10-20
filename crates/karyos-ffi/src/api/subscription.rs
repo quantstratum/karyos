@@ -94,6 +94,37 @@ impl Reader {
     fn image_changes_lost(&self) -> u64 {
         reader!(self, subscription => subscription.image_changes_lost())
     }
+
+    /// Whether it reads the images of a network subscription.
+    fn is_network(&self) -> bool {
+        reader!(self, subscription => subscription.registration().is_some())
+    }
+}
+
+/// The status a poll's stop gives a stream subscription (F7b), which every
+/// later poll gives again, as the facade reports these stops again:
+///
+/// | Stop | Status |
+/// | --- | --- |
+/// | its rejoin policy closed it (`closed_by_overrun`) | `ClosedByOverrun` |
+/// | the stream's seal reached (`closed`) | `Closed` |
+/// | revoked with its client's loss (`revoked`) | `Closed` |
+/// | an overrun it rejoined after, an abort or a skip | none (`Ok`): the next poll goes on |
+///
+/// A network subscription's stops are its images': one image's end does not
+/// end the subscription, whose image changes report it, so they give none.
+fn stop_status(poll: &SubscriptionPoll, network: bool) -> Option<Status> {
+    let summary = &poll.stopped.as_ref()?.summary;
+    if network {
+        return None;
+    }
+    if summary.closed_by_overrun.is_some() {
+        Some(Status::ClosedByOverrun)
+    } else if summary.closed.is_some() || summary.revoked.is_some() {
+        Some(Status::Closed)
+    } else {
+        None
+    }
 }
 
 /// A subscription handle's object.
@@ -159,11 +190,31 @@ fn fit(copy: &mut Vec<u8>, length: u32) -> Result<(), Status> {
 /// the copy buffer cannot be allocated, and [`Status::HandlesExhausted`],
 /// with the subscription released.
 pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, Failure> {
+    add_with(
+        client,
+        uri,
+        stream_id,
+        karyos_client::SubscriptionOptions::default(),
+    )
+}
+
+/// As [`add`], with the reader's role and rejoin policy.
+///
+/// # Errors
+///
+/// As [`add`]; [`Status::InvalidArgument`] for options the channel cannot
+/// take (`ClientError::InvalidOptions`).
+pub(crate) fn add_with(
+    client: Handle,
+    uri: &str,
+    stream_id: i32,
+    options: karyos_client::SubscriptionOptions,
+) -> Result<Handle, Failure> {
     clients().with(client, |entry| {
         entry.usable()?;
         let reader = entry
             .client
-            .add_subscription(uri, StreamId::new(stream_id))?;
+            .add_subscription_with(uri, StreamId::new(stream_id), options)?;
         let mut copy = Vec::new();
         if let Err(status) = fit(&mut copy, reader.max_message_length()) {
             entry.client.remove_subscription(reader);
@@ -251,6 +302,9 @@ pub(crate) fn poll(
                 match polled {
                     Ok(poll) => {
                         delivered = delivered.checked_add(poll.delivered).unwrap_or(limit);
+                        if let Some(status) = stop_status(&poll, reader.is_network()) {
+                            return Err((Failure::from(status), delivered));
+                        }
                         if !poll.stopped_at_seal {
                             break;
                         }

@@ -84,22 +84,23 @@ impl AnyClient {
         }
     }
 
-    /// The subscription of `stream_id` on `uri` (a control call: it waits
-    /// for the driver up to the context's timeout).
-    pub(crate) fn add_subscription(
+    /// The subscription of `stream_id` on `uri` with `options` (a control
+    /// call: it waits for the driver up to the context's timeout).
+    pub(crate) fn add_subscription_with(
         &mut self,
         uri: &str,
         stream_id: StreamId,
+        options: karyos_client::SubscriptionOptions,
     ) -> Result<Reader, Failure> {
         let failure = |error: ClientError| Failure::from(&error);
         match self {
             #[cfg(target_os = "linux")]
             Self::Remote(client) => client
-                .add_subscription(uri, stream_id)
+                .add_subscription_with(uri, stream_id, options)
                 .map(Reader::Remote)
                 .map_err(failure),
             Self::Embedded(client) => client
-                .add_subscription(uri, stream_id)
+                .add_subscription_with(uri, stream_id, options)
                 .map(Reader::Embedded)
                 .map_err(failure),
         }

@@ -199,6 +199,7 @@ impl From<&ClientError> for Failure {
             ClientError::InvalidContext { .. } | ClientError::NoDirectory => {
                 Status::InvalidContext.into()
             }
+            ClientError::InvalidOptions { .. } => Status::InvalidArgument.into(),
             #[cfg(target_os = "linux")]
             ClientError::Attach(error) => error.into(),
             ClientError::Conductor(error) => error.into(),

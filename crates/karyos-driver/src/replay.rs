@@ -126,6 +126,8 @@ pub struct ReplayFeed<T: StreamTerms> {
     finished: bool,
     /// Set when dropped unfinished: the driver retires the target.
     dropped: Arc<AtomicBool>,
+    /// The target's lane, whose subscribers the feed counts.
+    target: Arc<LogBuffer<T>>,
 }
 
 /// The session id's offset in a frame header; the stream id follows it.
@@ -142,6 +144,17 @@ enum Taken {
 }
 
 impl<T: StreamTerms> ReplayFeed<T> {
+    /// Whether the target has an attached subscriber. A host holds the
+    /// replay until it has its first one, so that subscriber joins at the
+    /// replay's first position and reads it all (quantstratum-docs:
+    /// `karyos/design/archive-host.md`, H2b). Advisory, as
+    /// [`LogBuffer::attached_subscribers`] is: it can change right after it
+    /// is read.
+    #[must_use]
+    pub fn has_subscriber(&self) -> bool {
+        self.target.attached_subscribers() > 0
+    }
+
     /// Where the target is written up to: the end of its contiguous
     /// prefix.
     #[must_use]
@@ -397,6 +410,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let scratch = vec![0; usize::try_from(config.mtu).map_err(|_| DriverError::InvalidConfig)?];
         let lane = Arc::new(self.replay_lane(buffer)?);
         let owner = ReceiveOwner::new(params, vec![Arc::clone(&lane)])?;
+        let target = Arc::clone(&lane);
         let handle =
             self.add_image_aggregate(&[lane], None)
                 .ok_or(DriverError::DuplicateStream {
@@ -415,6 +429,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             source: (config.source_stream_id, config.source_session_id),
             finished: false,
             dropped,
+            target,
         };
         Ok((handle, feed))
     }

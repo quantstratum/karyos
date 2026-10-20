@@ -1578,3 +1578,236 @@ fn a_timed_lane_takes_a_timed_offer() {
 }
 
 mod outcomes;
+
+// Subscription options (F7b).
+
+/// Options from `karyos_subscription_options_init`.
+fn subscription_defaults() -> SubscriptionOptions {
+    let mut options = core::mem::MaybeUninit::<SubscriptionOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `SubscriptionOptions`.
+    let status = unsafe { karyos_subscription_options_init(options.as_mut_ptr()) };
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: `karyos_subscription_options_init` wrote every field.
+    unsafe { options.assume_init() }
+}
+
+/// `karyos_client_add_subscription_with` of `stream` on `karyos:ipc`: the
+/// status and the handle written (`u64::MAX` when none was).
+///
+/// # Safety
+///
+/// `options` is null or a readable struct of at least its `size` bytes.
+unsafe fn add_subscription_with(
+    client: u64,
+    stream: i32,
+    options: *const SubscriptionOptions,
+) -> (i32, u64) {
+    let mut subscription = u64::MAX;
+    // SAFETY: a C string literal, a live `u64`, no detail; `options` per
+    // the function's contract.
+    let status = unsafe {
+        karyos_client_add_subscription_with(
+            client,
+            c"karyos:ipc".as_ptr(),
+            stream,
+            options,
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, subscription)
+}
+
+#[test]
+fn subscription_options_init_fills_the_defaults_and_the_size() {
+    let options = subscription_defaults();
+    assert_eq!(options.size, size_of_u32::<SubscriptionOptions>());
+    assert_eq!(options.size, SUBSCRIPTION_OPTIONS_SIZE_0_1);
+    assert_eq!(
+        (options.role, options.rejoin, options.reserved),
+        (ROLE_REQUIRED, REJOIN_AT_HEAD, 0)
+    );
+    // SAFETY: a null pointer is refused before any use.
+    let status = unsafe { karyos_subscription_options_init(core::ptr::null_mut()) };
+    assert_eq!(status, Status::InvalidArgument.code());
+}
+
+/// Bad options are refused before the client is looked up: nothing is
+/// opened and the out-parameter is not written.
+#[test]
+fn add_with_refuses_bad_options_and_opens_nothing() {
+    let refused = |options: *const SubscriptionOptions| {
+        // SAFETY: null, or a live local of its stated size.
+        let (status, subscription) = unsafe { add_subscription_with(0, STREAM, options) };
+        assert_eq!(status, Status::InvalidArgument.code());
+        assert_eq!(subscription, u64::MAX, "nothing written");
+    };
+    refused(core::ptr::null());
+    let short = SubscriptionOptions {
+        size: SUBSCRIPTION_OPTIONS_SIZE_0_1 - 4,
+        ..subscription_defaults()
+    };
+    refused(&short);
+    for options in [
+        SubscriptionOptions {
+            role: 3,
+            ..subscription_defaults()
+        },
+        SubscriptionOptions {
+            rejoin: 2,
+            ..subscription_defaults()
+        },
+        SubscriptionOptions {
+            reserved: 1,
+            ..subscription_defaults()
+        },
+    ] {
+        refused(&options);
+    }
+    // The ABI's role codes are the wire's (karyos_protocol::cnc).
+    let role = |code| {
+        subscription_options(SubscriptionOptions {
+            role: code,
+            ..subscription_defaults()
+        })
+        .map(|options| options.role)
+    };
+    assert_eq!(
+        role(ROLE_REQUIRED),
+        Ok(karyos_client::SubscriberRole::Required)
+    );
+    assert_eq!(
+        role(ROLE_OPTIONAL),
+        Ok(karyos_client::SubscriberRole::Optional)
+    );
+    assert_eq!(
+        role(ROLE_OBSERVER),
+        Ok(karyos_client::SubscriberRole::Observer)
+    );
+}
+
+/// An optional reader under `KARYOS_REJOIN_CLOSE`, added from a struct of
+/// a newer header (read by its prefix), does not hold its publisher back;
+/// lapped, its poll answers CLOSED_BY_OVERRUN, and so does every later
+/// one. The one driver test of F7b under Miri: it reaches the options'
+/// prefix read, the add's out-parameter and the poll's stop status.
+#[test]
+fn an_optional_reader_under_close_is_closed_by_its_overrun() {
+    /// `karyos_subscription_options` of a newer header: one more field.
+    #[repr(C)]
+    struct Newer {
+        options: SubscriptionOptions,
+        later: u64,
+    }
+    let (_driven, ours, _theirs) = driven();
+    let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+        .unwrap()
+        .raw();
+    let newer = Newer {
+        options: SubscriptionOptions {
+            size: size_of_u32::<Newer>(),
+            role: ROLE_OPTIONAL,
+            rejoin: REJOIN_CLOSE,
+            reserved: 0,
+        },
+        later: u64::MAX,
+    };
+    // SAFETY: `newer` is live and its stated size.
+    let (status, subscription) =
+        unsafe { add_subscription_with(client, STREAM, (&raw const newer).cast()) };
+    assert_eq!(status, Status::Ok.code());
+    assert_ne!(subscription, u64::MAX);
+    let (_, publication) = add_publication(client);
+    // Four terms of the largest messages, none read: the publisher's limit
+    // moves on without the optional reader.
+    let message = vec![7u8; 8000];
+    let terms = karyos_sys::sizing::MIN_TERM_LENGTH as usize * 4;
+    let start = std::time::Instant::now();
+    for _ in 0..terms / message.len() {
+        while offer(publication, &message).0 != Status::Ok.code() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(3600));
+            std::thread::yield_now();
+        }
+    }
+    let mut seen = Seen::default();
+    let (status, delivered) = poll_into(subscription, &mut seen, 64);
+    assert_eq!(status, Status::ClosedByOverrun.code(), "{delivered}");
+    assert_eq!(
+        poll_into(subscription, &mut seen, 64),
+        (Status::ClosedByOverrun.code(), 0),
+        "sticky"
+    );
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// A `karyos:ipc` subscription's stream sealed (the driver removed it):
+/// the poll delivers what came before, then answers CLOSED, and so does
+/// every later poll.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_sealed_stream_closes_its_subscription() {
+    const SEALED: i32 = 1010;
+    let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `DriverOptions`.
+    let status = unsafe { karyos_driver_options_init(options.as_mut_ptr()) };
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: `karyos_driver_options_init` wrote every field.
+    let options = unsafe { options.assume_init() };
+    let mut driver = 0;
+    // SAFETY: live, aligned pointers; no detail.
+    let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    let mut stream = core::mem::MaybeUninit::<StreamOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `StreamOptions`.
+    let status = unsafe { karyos_stream_options_init(stream.as_mut_ptr()) };
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: `karyos_stream_options_init` wrote every field.
+    let mut stream = unsafe { stream.assume_init() };
+    stream.stream_id = SEALED;
+    // SAFETY: live, aligned pointers; no detail.
+    let status = unsafe { karyos_driver_add_stream(driver, &stream, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(
+        karyos_driver_start(driver, client::IDLE_YIELD, 0),
+        Status::Ok.code()
+    );
+    let mut client = 0;
+    // SAFETY: a live, aligned `u64`; no detail.
+    let status = unsafe { karyos_driver_connect(driver, &mut client, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    let (status, subscription) = add_subscription_of(client, SEALED);
+    assert_eq!(status, Status::Ok.code());
+    let (status, publication) = add_publication_of(client, SEALED);
+    assert_eq!(status, Status::Ok.code());
+    let start = std::time::Instant::now();
+    while offer(publication, b"last").0 != Status::Ok.code() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(60));
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        karyos_driver_remove_stream(driver, SEALED),
+        Status::Ok.code()
+    );
+    // The live publication's next attempt finds the stream closed and
+    // releases it, which completes the seal (EmbeddedDriver::remove_stream).
+    assert_ne!(offer(publication, b"after").0, Status::Ok.code());
+    let mut seen = Seen::default();
+    let status = loop {
+        assert!(start.elapsed() < std::time::Duration::from_secs(60));
+        let _ = poll(client);
+        let (status, _) = poll_into(subscription, &mut seen, 8);
+        if status != Status::Ok.code() {
+            break status;
+        }
+        std::thread::yield_now();
+    };
+    assert_eq!(status, Status::Closed.code());
+    assert_eq!(seen.messages, [b"last".to_vec()]);
+    assert_eq!(
+        poll_into(subscription, &mut seen, 8),
+        (Status::Closed.code(), 0),
+        "sticky"
+    );
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+}
