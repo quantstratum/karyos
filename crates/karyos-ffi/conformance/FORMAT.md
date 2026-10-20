@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- conformance-formats: 1 2 -->
 
 # Conformance scenarios, formats 1 and 2
 
@@ -16,6 +17,11 @@ runs the ops as a minimal binding over the C ABI.
 
 ## Files
 
+- This file's second line, `<!-- conformance-formats: 1 2 -->`, lists
+  the formats the suite holds, ascending. Tools read it, not the title:
+  `scripts/conformance-formats.sh` prints it, the libkaryos package
+  records it in its MANIFEST, and `make lint-sync` fails when it differs
+  from the reference runner's formats.
 - `scenarios/*.kcs`: one scenario per file, UTF-8, read line by line. A
   file in `scenarios/` with another extension is a failure.
 - `index.txt`: the coverage map from the §13 contract rows to scenario

@@ -7,7 +7,9 @@
 # denies unsafe_code, the only `expect(unsafe_code)` attributes are the one
 # on `mod abi` in src/lib.rs and the one of tests/support/abi.rs, nothing
 # allows unsafe_code, and no workspace profile sets panic = "abort" (the
-# boundary catches panics only if libkaryos unwinds).
+# boundary catches panics only if libkaryos unwinds). Also fail unless the
+# conformance formats of FORMAT.md's marker line, which the package script
+# reads, equal the reference runner's FORMATS.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 workspace_lints="$(awk '/^\[workspace.lints.clippy\]/{f=1;next} /^\[/{f=0} f && /=/' "$root/Cargo.toml" | sed 's/ //g')"
@@ -43,6 +45,20 @@ if ! perl -0ne 'exit(/#\[expect\(\s*unsafe_code,\s*reason\s*=\s*"[^"]+",?\s*\)\]
 fi
 if grep -rqE 'allow\(\s*unsafe_code' "$ffi/src" "$ffi/tests"; then
     echo 'karyos-ffi must not allow unsafe_code' >&2
+    status=1
+fi
+# The conformance formats: FORMAT.md's marker, which the package script
+# reads, must name exactly the formats the reference runner accepts
+# (FORMATS in tests/conformance.rs), so a retitled or extended FORMAT.md
+# cannot break `make libkaryos` unseen.
+if marker="$("$root/scripts/conformance-formats.sh")"; then
+    runner="$(sed -n 's/^const FORMATS: \[&str; [0-9]*\] = \[\(.*\)\];$/\1/p' "$ffi/tests/conformance.rs" |
+        tr -d '" ' | tr ',' ' ')"
+    if [ -z "$runner" ] || [ "$marker" != "$runner" ]; then
+        echo "conformance formats differ: FORMAT.md's marker '$marker', tests/conformance.rs FORMATS '$runner'" >&2
+        status=1
+    fi
+else
     status=1
 fi
 if grep -qE '^[[:space:]]*panic[[:space:]]*=[[:space:]]*"abort"' "$root/Cargo.toml"; then
