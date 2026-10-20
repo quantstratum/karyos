@@ -51,6 +51,8 @@ use crate::control::{
 };
 use crate::server::{MAX_ANSWER, MAX_REQUEST, replay_session_id};
 
+pub mod list;
+
 #[cfg(test)]
 mod tests;
 

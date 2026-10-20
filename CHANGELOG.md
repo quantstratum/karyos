@@ -420,6 +420,29 @@ release may break APIs, wire formats and shared-memory layouts.
   from the request; a reopen naming an epoch that cannot be closed is
   refused before submission (`ConductorError::InvalidGuardEpoch`).
 
+- Guard close acknowledgements for tools (quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`, M4b). While a guard is
+  closed by a close, the conductor counts that close's registered senders
+  as `close_guard_ack` reports them, at every duty cycle and without
+  allocating: `guard senders applied`, `guard senders in flight`, `guard
+  senders pending` and `guard senders overdue`, with `guard ack epoch`
+  (0 while no close is in effect), gauges keyed by `KIND_GUARD` and the
+  guard id, written inside a pass on `guard ack pass` and allocated all
+  together or not at all. `karyos_client::guard_acks::guard_acks` reads
+  them, and `karyos_client::groups::read_groups` reads any such group
+  (`capabilities` now uses it). A guard may not be named after one of the
+  six labels, as its word gauge shares their keys (`InvalidConfig`).
+
+- karyos-archive's recording lister (phase 5, M11; quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`):
+  `client::list::RecordingLister` reads the whole catalog over the control
+  streams, page by page, never blocking. A page that delivered any
+  recording asks for the next one from the id after its last, since the
+  Archive leaves out a recording it cannot describe; the listing ends at an
+  empty page or a refusal. It keeps at most `ListerConfig::max_recordings`
+  and counts the rest; answers to other requesters are skipped. The
+  management agent's catalog view builds on it.
+
 - API v1's JSON carries each driver's trace window (M6c): `latencies`, one
   object per lane with `p50`, `p90`, `p99`, `p999` and `max` as `null` or
   `{"low","high"}` bounds, and `trace`, the window's counts. They come
