@@ -71,6 +71,18 @@ pub const REQUEST_MAX_RESERVED: u32 = 2048;
 /// headroom.
 pub const REQUEST_SPARE_SLOTS: u8 = REQUEST_PUBLISHERS + karyos_sys::log_buffer::CLEANING_HEADROOM;
 
+/// Readers of the response stream at once. Every requester, the daemon's
+/// own included, holds one handle on each control stream, so as many as
+/// the request stream's publishers.
+pub const RESPONSE_READERS: u8 = REQUEST_PUBLISHERS;
+
+/// The response stream's spare slots. Each reader is optional
+/// (`ArchiveConnection`, quantstratum-docs: karyos/design/ffi-archive.md),
+/// so it takes a spare-slot credit, as the exclusive publication does;
+/// plus the cleaning headroom.
+pub const RESPONSE_SPARE_SLOTS: u8 =
+    1 + RESPONSE_READERS + karyos_sys::log_buffer::CLEANING_HEADROOM;
+
 const _: () = assert!(MAX_REQUEST + 32 <= REQUEST_MAX_RESERVED as usize);
 const _: () = assert!(
     REQUEST_PUBLISHERS as u32 * REQUEST_MAX_RESERVED <= karyos_sys::sizing::MIN_TERM_LENGTH / 2
@@ -436,6 +448,8 @@ impl DaemonArchive {
         let mut responses_config = control_config(terms, control(options.responses))?;
         // An answer nobody reads is not held.
         responses_config.allow_unconnected = true;
+        responses_config.buffer.max_subscribers = RESPONSE_READERS;
+        responses_config.buffer.spare_slots = RESPONSE_SPARE_SLOTS;
         let requests = driver
             .add_stream(requests_config)
             .map_err(ArchiveStartError::Stream)?;

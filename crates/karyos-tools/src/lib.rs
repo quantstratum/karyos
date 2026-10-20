@@ -29,5 +29,6 @@ pub mod daemon_archive;
 pub mod errors;
 pub mod idle;
 pub mod replay;
+pub mod replay_live;
 pub mod stat;
 pub mod trace;
