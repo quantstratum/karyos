@@ -1308,21 +1308,66 @@ fn runs(wanted: (u32, u32), library: (u32, u32)) -> bool {
 /// it offers (FORMAT.md, Reporting).
 struct Runner {
     step: usize,
-    features: BTreeSet<&'static str>,
+    offered: BTreeSet<&'static str>,
+    absent: BTreeSet<&'static str>,
 }
 
 impl Runner {
+    /// A runner at `step` that declares each feature of [`FEATURES`]
+    /// either offered or absent: a feature in neither list, or in both,
+    /// is a failure (ADR-0073: the coverage map tells applicable, missing
+    /// and unsupported features apart).
+    fn new(step: usize, offered: &[&'static str], absent: &[&'static str]) -> Self {
+        let offered: BTreeSet<&'static str> = offered.iter().copied().collect();
+        let absent: BTreeSet<&'static str> = absent.iter().copied().collect();
+        assert!(
+            offered.is_disjoint(&absent),
+            "a feature both offered and absent"
+        );
+        let declared: BTreeSet<&str> = offered.union(&absent).copied().collect();
+        assert_eq!(
+            declared,
+            BTreeSet::from(FEATURES),
+            "every feature is declared offered or absent"
+        );
+        Self {
+            step,
+            offered,
+            absent,
+        }
+    }
+
     /// The reference runner: every step, and every feature but a TAI clock
     /// where the library has none (Linux only).
     fn reference() -> Self {
-        let features = FEATURES
+        let tai: &[&'static str] = if cfg!(target_os = "linux") {
+            &[]
+        } else {
+            &["tai-clock"]
+        };
+        let offered: Vec<&'static str> = FEATURES
             .into_iter()
-            .filter(|feature| cfg!(target_os = "linux") || *feature != "tai-clock")
+            .filter(|feature| !tai.contains(feature))
             .collect();
-        Self {
-            step: STEPS.len() - 1,
-            features,
-        }
+        Self::new(STEPS.len() - 1, &offered, tai)
+    }
+
+    /// The line a run prints after its pinning line (FORMAT.md,
+    /// Reporting): its step and its declared features.
+    fn declaration(&self) -> String {
+        let list = |features: &BTreeSet<&str>| {
+            if features.is_empty() {
+                "none".to_owned()
+            } else {
+                features.iter().copied().collect::<Vec<_>>().join(" ")
+            }
+        };
+        format!(
+            "step {} offers {} absent {}",
+            STEPS[self.step],
+            list(&self.offered),
+            list(&self.absent)
+        )
     }
 }
 
@@ -1363,12 +1408,17 @@ fn run(
     if scenario.since.is_some_and(|since| since > runner.step) {
         return Outcome::Later;
     }
-    if let Some(absent) = scenario
+    if let Some(missing) = scenario
         .features
         .iter()
-        .find(|feature| !runner.features.contains(feature.as_str()))
+        .find(|feature| !runner.offered.contains(feature.as_str()))
     {
-        return Outcome::Unsupported(absent.clone());
+        // Only a feature the runner declared absent is unsupported.
+        assert!(
+            runner.absent.contains(missing.as_str()),
+            "{name}: `{missing}` is neither offered nor declared absent"
+        );
+        return Outcome::Unsupported(missing.clone());
     }
     let mut adapter = semantic::Adapter::new(statuses);
     let mut variables: BTreeMap<String, Value> = BTreeMap::new();
@@ -1623,9 +1673,10 @@ fn every_scenario_passes_at_the_library_abi_version() {
     let (major, minor, patch) = (major.unwrap(), minor.unwrap(), patch.unwrap());
     // The run's identities come first (FORMAT.md, Pinning).
     println!("{}", pinning([major, minor, patch]));
+    let runner = Runner::reference();
+    println!("{}", runner.declaration());
     let scenarios = scenarios();
     assert!(!scenarios.is_empty());
-    let runner = Runner::reference();
     for scenario in &scenarios {
         let outcome = run(scenario, &statuses, (major, minor), &runner);
         println!("{} {outcome}", scenario.id);
@@ -1957,11 +2008,23 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert!(runs((1, 3), (1, 3)));
     assert!(!runs((1, 4), (1, 3)));
     assert!(!runs((2, 0), (1, 3)));
-    // A binding at step B1 without claim retry.
-    let b1 = Runner {
-        step: 1,
-        features: BTreeSet::from(["embedded-driver"]),
-    };
+    // A binding at step B1 that offers only an embedded driver.
+    let b1 = Runner::new(
+        1,
+        &["embedded-driver"],
+        &[
+            "claim-retry",
+            "concurrent-publication",
+            "conflation",
+            "guarded-publication",
+            "tai-clock",
+        ],
+    );
+    assert_eq!(
+        b1.declaration(),
+        "step B1 offers embedded-driver absent claim-retry concurrent-publication \
+         conflation guarded-publication tai-clock"
+    );
     assert_eq!(
         run(&scenario((0, 1), Some(3), None), (0, 1), &b1),
         Outcome::Later
@@ -1974,6 +2037,23 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
         run(&scenario((0, 1), Some(1), None), (0, 1), &b1),
         Outcome::Passed
     );
+    // A feature neither offered nor declared absent, or both, is refused.
+    let undeclared = std::panic::catch_unwind(|| Runner::new(1, &["embedded-driver"], &[]));
+    assert!(undeclared.is_err());
+    let both = std::panic::catch_unwind(|| Runner::new(1, &FEATURES, &["tai-clock"]));
+    assert!(both.is_err());
+    // A runner whose lists were edited past `new` cannot pass an
+    // undeclared feature off as unsupported.
+    let mut edited = Runner::reference();
+    edited.offered.remove("claim-retry");
+    let run_edited = std::panic::catch_unwind(|| {
+        run(
+            &scenario((0, 1), Some(1), Some("claim-retry")),
+            (0, 1),
+            &edited,
+        )
+    });
+    assert!(run_edited.is_err());
 }
 
 /// The identities a run pins (FORMAT.md, Pinning): SHA-256 matches its

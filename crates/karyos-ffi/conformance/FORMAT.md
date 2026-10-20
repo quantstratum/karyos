@@ -361,15 +361,23 @@ Any other scenario is skipped, never reported as passed.
 
 ## Reporting
 
-A runner prints the pinning line first (Format 2, Pinning), then every
-scenario id with one outcome, and for a failure the file and line of
-the step that failed:
+A runner prints the pinning line first (Format 2, Pinning), then the
+step it targets and its declared features,
+
+```text
+step <step> offers <feature ...|none> absent <feature ...|none>
+```
+
+in which every feature of Format 2, Features appears once, offered or
+absent, then every scenario id with one outcome, and for a failure the
+file and line of the step that failed:
 
 - `passed`;
 - `failed`;
 - `skipped`: its `abi` does not run against the library (Versions);
-- `unsupported <feature>`: it needs a feature the runner does not
-  offer;
+- `unsupported <feature>`: it needs a feature the runner declared
+  absent. A feature the runner neither offers nor declares absent is a
+  failure, never `unsupported`;
 - `later`: its `since` step comes after the runner's step.
 
 A scenario is required when its `abi` runs, its `since` is the runner's
@@ -379,9 +387,11 @@ requires no failure, no skip at the ABI version it targets and no
 `later` at the step it releases (SPEC.md §13). Each `unsupported` is
 one of the features its binding SPEC lets it lack at that step, and the
 binding's runner states which features it offers and why it lacks the
-others; the coverage map of a run is its rows with each scenario's
-outcome, so applicable, missing and unsupported features are told
-apart.
+others. The declaration line lets a release gate check the absent
+features against the binding SPEC from the run's output alone. The
+coverage map of a run is its rows with each scenario's outcome, so
+applicable, missing and unsupported features are told apart
+(ADR-0073, Coverage).
 
 ## Index
 
