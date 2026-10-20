@@ -707,6 +707,10 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// message: the poll then stops, and a required reader's message is
     /// not acknowledged, so the next poll delivers it again. An optional
     /// or observer reader acknowledges on copy: what it declines is gone.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientSubscription::poll`].
     #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
     pub fn poll_taking<H>(
         &mut self,

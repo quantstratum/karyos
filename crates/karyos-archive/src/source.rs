@@ -169,6 +169,9 @@ pub struct Following<T: TermBytes = HeapTerms> {
 }
 
 /// A host's answer to a fenced reader that asks to rejoin its stream.
+/// Hosts build every variant; a later version may add one (alpha.2 API
+/// audit), so a match outside this crate needs a wildcard arm.
+#[non_exhaustive]
 #[expect(
     clippy::large_enum_variant,
     reason = "made once per rejoin, a control-path event, and moved once to the source; boxing the member would only add an allocation"
