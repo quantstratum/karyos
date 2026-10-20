@@ -315,6 +315,12 @@ pub(crate) const ACK_LABELS: [&str; 5] = [
 /// written inside a sampling pass on it, so a tool reads them as one.
 pub(crate) const ACK_PASS_LABEL: &str = "guard ack pass";
 
+/// Whether `name` is one of the acknowledgement group's labels, which a
+/// guard may not take as its name.
+pub(crate) fn is_ack_label(name: &str) -> bool {
+    name == ACK_PASS_LABEL || ACK_LABELS.contains(&name)
+}
+
 /// One guard's acknowledgement gauges.
 #[derive(Debug)]
 struct AckCells {

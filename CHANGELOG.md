@@ -404,7 +404,8 @@ release may break APIs, wire formats and shared-memory layouts.
   guard id, written inside a pass on `guard ack pass` and allocated all
   together or not at all. `karyos_client::guard_acks::guard_acks` reads
   them, and `karyos_client::groups::read_groups` reads any such group
-  (`capabilities` now uses it).
+  (`capabilities` now uses it). A guard may not be named after one of the
+  six labels, as its word gauge shares their keys (`InvalidConfig`).
 
 - The Prometheus exporter (phase 5, M8; ADR-0055; SPEC.md §11
   `karyos-exporter`; owner item 51, interim 4). `karyos_agent::exporter`

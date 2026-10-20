@@ -383,3 +383,19 @@ fn a_close_acknowledgement_reaches_the_cnc() {
     let _ = driver.do_work().unwrap();
     assert_eq!(values(&ack_gauges(&driver, guard).0), [0; 5]);
 }
+
+/// DESIGN's P2 on #479: a guard's word gauge carries its name beside its
+/// acknowledgement group, so a name equal to a group label is refused,
+/// whatever readers would make of it; other names are not.
+#[test]
+fn a_guard_may_not_take_an_acknowledgement_label_as_its_name() {
+    let (mut driver, _, _) = driver(DriverConfig::default());
+    for name in ACK_LABELS.iter().chain([&ACK_PASS_LABEL]) {
+        assert_eq!(
+            driver.add_guard(name),
+            Err(DriverError::InvalidConfig),
+            "{name}"
+        );
+    }
+    assert!(driver.add_guard("guard ack").is_ok());
+}
