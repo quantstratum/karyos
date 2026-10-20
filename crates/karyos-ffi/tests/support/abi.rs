@@ -124,6 +124,36 @@ pub struct OfferOptions {
     pub reserved_value: i64,
 }
 
+/// `karyos_archive_options`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArchiveOptions {
+    pub size: u32,
+    pub reserved: u32,
+    pub requests: i32,
+    pub responses: i32,
+    pub client_id: u64,
+    pub deadline_ns: u64,
+}
+
+/// `karyos_recording`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Recording {
+    pub size: u32,
+    pub state: u32,
+    pub stop_reason: u32,
+    pub incomplete: u32,
+    pub stream_id: i32,
+    pub session_id: i32,
+    pub id: u64,
+    pub start: u64,
+    pub start_time_ns: u64,
+    pub position: u64,
+    pub channel: *const c_char,
+    pub channel_length: usize,
+}
+
 unsafe extern "C" {
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
@@ -164,6 +194,22 @@ unsafe extern "C" {
         delivered: *mut u32,
     ) -> i32;
     safe fn karyos_conflated_close(conflated: u64) -> i32;
+    fn karyos_archive_connect(
+        client: u64,
+        options: *const ArchiveOptions,
+        archive: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
+    fn karyos_archive_list(
+        archive: u64,
+        after_id: u64,
+        limit: u32,
+        handler: Option<unsafe extern "C" fn(*mut core::ffi::c_void, *const Recording)>,
+        context: *mut core::ffi::c_void,
+        delivered: *mut u32,
+        detail: *mut Detail,
+    ) -> i32;
+    safe fn karyos_archive_close(archive: u64) -> i32;
     fn karyos_client_add_conflated_subscription(
         client: u64,
         uri: *const c_char,
@@ -663,6 +709,51 @@ pub fn client_add_conflated_subscription(client: u64, uri: &CStr, stream_id: i32
 /// `karyos_conflated_close`.
 pub fn conflated_close(conflated: u64) -> i32 {
     karyos_conflated_close(conflated)
+}
+
+/// `karyos_archive_connect` of `options`: the status and the handle.
+pub fn archive_connect(client: u64, options: &ArchiveOptions) -> (i32, u64) {
+    let mut archive = 0;
+    // SAFETY: a live, aligned struct of its stated size and a live,
+    // aligned `u64`; no detail.
+    let status =
+        unsafe { karyos_archive_connect(client, options, &mut archive, core::ptr::null_mut()) };
+    (status, archive)
+}
+
+/// A recording handler that counts its calls in its `u32` context.
+unsafe extern "C" fn count_recording(
+    context: *mut core::ffi::c_void,
+    _recording: *const Recording,
+) {
+    // SAFETY: the context is the live `u32` of `archive_list`.
+    let counted = unsafe { &mut *context.cast::<u32>() };
+    *counted = counted.checked_add(1).unwrap_or(u32::MAX);
+}
+
+/// `karyos_archive_list` of `limit` recordings after `after_id`: the
+/// status, the count written and the handler's calls.
+pub fn archive_list(archive: u64, after_id: u64, limit: u32) -> (i32, u32, u32) {
+    let (mut delivered, mut counted) = (0u32, 0u32);
+    // SAFETY: a handler of the signature that returns normally, its live
+    // `u32` context, and a live, aligned `u32`; no detail.
+    let status = unsafe {
+        karyos_archive_list(
+            archive,
+            after_id,
+            limit,
+            Some(count_recording),
+            (&raw mut counted).cast(),
+            &mut delivered,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, delivered, counted)
+}
+
+/// `karyos_archive_close`.
+pub fn archive_close(archive: u64) -> i32 {
+    karyos_archive_close(archive)
 }
 
 /// `karyos_driver_remove_stream`.

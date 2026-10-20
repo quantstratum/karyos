@@ -1640,6 +1640,7 @@ fn a_timed_lane_takes_a_timed_offer() {
     assert_eq!(read(&mut subscriber, &mut reading, 1), [b"timed".to_vec()]);
 }
 
+mod archive;
 mod conflated;
 mod outcomes;
 

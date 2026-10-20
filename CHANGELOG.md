@@ -635,6 +635,20 @@ release may break APIs, wire formats and shared-memory layouts.
   `reserved` is `KARYOS_E_INVALID_ARGUMENT`; a key or value the
   publication refuses is `KARYOS_E_CONFLATION`, with nothing reserved.
   Claims do not take options yet.
+- `Subscription::rejoin_with(provider, secondary)` on the client facade
+  (quantstratum-docs: `karyos/design/ffi-archive.md`, F9-0; owner item
+  57): a stream subscription becomes a `RejoiningSubscription` whose
+  overruns are recovered from a `ReplayProvider`'s replays of its own
+  publication and merged back into the live stream (`ReplayRejoin`),
+  falling back to `secondary`. Its poll reports as `Subscription::poll`
+  does, with a rejoin's outcome also reported on its own;
+  `is_recovering`, `merge_failure`, `source` and `into_subscription`
+  complete it. A network subscription, or one with no publication
+  identity, is refused as `NotRejoinable`, the subscription handed back.
+  The subscription's own rejoin policy is set aside while it rejoins and
+  comes back with `into_subscription`. Public client surface under owner
+  item 57: `Subscription::rejoin_with`, `RejoiningSubscription` and
+  `NotRejoinable`.
 
 - `karyos-catalog list DIR [--json]` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H4a): an archive directory's
@@ -644,8 +658,20 @@ release may break APIs, wire formats and shared-memory layouts.
   up to it and reports the listing as maybe behind (an Archive appending,
   or a crash its next open cuts), never as an error. A directory with no
   catalog lists nothing; a damaged catalog, another format version or a
-  missing directory exit 2. Listing a running Archive (`--live`) is H4b,
-  after H3.
+  missing directory exit 2.
+- `karyos-catalog list --live DIR=REQ,RESP [--timeout-ms N] [--json]`
+  (quantstratum-docs: `karyos/design/archive-host.md`, H4b): a running
+  Archive's recordings, listed over its control streams on the driver in
+  DIR with a `RecordingLister` (Linux), each still recording with the
+  position written so far, or where and why it stopped. The connection is
+  opened for the listing and closed after it, so it holds none of the
+  Archive's requester slots; `--timeout-ms` bounds the wait for the driver
+  and then for the whole listing (default 5 s). An Archive that cannot be
+  reached, or refuses, exits 2. `karyos_tools::catalog::list_live` is the
+  same listing over any facade client; `ListArgs` names its source
+  (`Source::Offline` or `Source::Live`). `tests/karyosd_catalog.rs` lists
+  a `karyosd --archive` recording live and offline beside it, then
+  offline once the daemon stopped.
 - `karyos-replay` (SPEC §11; quantstratum-docs:
   `karyos/design/archive-host.md`, H5), the replay and output diff
   binary: `karyos-replay diff` is the recording group journal diff, and
@@ -686,6 +712,26 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos:udp` URI with the new `ClientError::InvalidOptions` before
   anything is requested. The facade re-exports `SubscriptionOptions`,
   `SubscriberRole`, `RejoinPolicy`, `Secondary` and `SnapshotSource`.
+- The C ABI lists an Archive's catalog (quantstratum-docs:
+  `karyos/design/ffi-archive.md`, F9a; owner item 57).
+  `karyos_archive_connect(client, options, archive, detail)` opens a
+  connection over the control streams `karyos_archive_options` names
+  (`requests`, `responses`, a `client_id` of at most 32 bits, a
+  `deadline_ns`); the connection is its client's, which closes it.
+  `karyos_archive_list(archive, after_id, limit, handler, context,
+  delivered, detail)` is a control call: it waits for the page of at most
+  `limit` recordings after `after_id`, then hands each to the
+  `karyos_recording_handler` in id order as a `karyos_recording` (state,
+  `KARYOS_STOP_*` reason, position, start time in nanoseconds since the
+  Archive agent started, and the channel's bytes). Fewer than `limit`
+  ends the catalog. A page that does not arrive in time is
+  `KARYOS_E_TIMEOUT`, and an Archive's refusal `KARYOS_E_REFUSED` with
+  its response code in the detail. `karyos_archive_close` removes the
+  connection's streams from its client. karyos-archive's
+  `RecordingLister::start_from(from_id, count)` begins such a bounded
+  listing, whose pages ask for no more than are left to keep. The
+  conformance format gains the three calls, with the scenario
+  `archive.typed.statuses`.
 - The C ABI's scheduled offer (quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §6, F7a-3):
   `karyos_publication_offer_at(publication, lane, data, length, tx_time,
@@ -2251,6 +2297,26 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A conflation table's value capacity past `u32` was saturated to
+  `u32::MAX` when its shape was taken (#535), a form SPEC §14 excludes.
+  `ConflationConfig::shape` now returns `Result<ConflationShape,
+  ConflationError>` and refuses such a capacity with `ValueTooLarge`;
+  `ConflationConfig::validate_publication` passes the refusal on, and a
+  publication given such a table by `with_conflation` fails every keyed
+  offer and claim with it. The shape's own check and a claim's length
+  conversion refuse with `InvalidConfig` where they saturated before (a
+  target whose `usize` is narrower than 32 bits).
+- `karyos.h`: `karyos_publication_claim`'s doc comment held a stray `/**`
+  and a repeated line, which merge `fc3be2c2` (F7a-3) left. C compilers
+  warned (`-Wcomment`, "'/*' within block comment"), and so did a cgo
+  build's `go vet`. `header.rs` now checks that no comment of the header
+  opens another (`no_comment_of_the_header_opens_another`, with a negative
+  control).
+
+- A rejoin's outcome reported alone (`RejoinOutcome::Replayed` with no
+  overrun, abort, skip or close in the same poll) reaches the facade
+  caller of a `RejoiningSubscription`: the facade's poll report kept a
+  summary only when it stopped (F9-0b, karyos#532).
 - `karyosd --archive` admits remote `ArchiveConnection`s again. Their
   response reader is optional (#524), and an optional reader takes a
   spare-slot credit; the response stream had the default three spare

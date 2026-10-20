@@ -5348,9 +5348,10 @@ impl ConflationShape {
     ///
     /// # Errors
     ///
-    /// [`InvalidConfig`] for a table with no keys or an empty value,
-    /// [`KeyOutOfRange`] for a key outside `0..keys`, and [`ValueTooLarge`]
-    /// for a value past the capacity.
+    /// [`InvalidConfig`] for a table with no keys or an empty value (or a
+    /// capacity this target's `usize` cannot hold), [`KeyOutOfRange`] for a
+    /// key outside `0..keys`, and [`ValueTooLarge`] for a value past the
+    /// capacity.
     ///
     /// [`InvalidConfig`]: crate::conflation::ConflationError::InvalidConfig
     /// [`KeyOutOfRange`]: crate::conflation::ConflationError::KeyOutOfRange
@@ -5373,7 +5374,9 @@ impl ConflationShape {
                 key: reserved_value,
             });
         }
-        let max = usize::try_from(self.value_capacity).unwrap_or(usize::MAX);
+        // A u32 capacity a target's usize cannot hold is no table it serves.
+        let max =
+            usize::try_from(self.value_capacity).map_err(|_| ConflationError::InvalidConfig)?;
         if value_length > max {
             return Err(ConflationError::ValueTooLarge {
                 length: value_length,

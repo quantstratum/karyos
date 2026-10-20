@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use karyos_sys::conflation::ConflationConfig;
+use karyos_sys::conflation::{ConflationConfig, ConflationError};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::ConflationShape;
 use karyos_sys::log_buffer::{
@@ -250,7 +250,9 @@ pub struct ClientPublication<T: TermBytes = HeapTerms> {
     /// The trace hook and publication identity, for a traced handle.
     trace: Option<PublishTrace>,
     /// Limits for the stream's conflated view, when configured by the driver.
-    conflation: Option<ConflationShape>,
+    /// The table's shape, or why the one `with_conflation` was given has
+    /// none: every keyed offer and claim then fails with it.
+    conflation: Option<Result<ConflationShape, ConflationError>>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -282,7 +284,7 @@ impl<T: TermBytes> ClientPublication<T> {
     /// are read from the buffer the publication itself appends to.
     #[must_use]
     pub fn new(inner: Publication<Arc<LogBuffer<T>>>, allow_unconnected: bool) -> Self {
-        let conflation = inner.buffer().conflation();
+        let conflation = inner.buffer().conflation().map(Ok);
         Self {
             inner,
             allow_unconnected,
@@ -388,6 +390,8 @@ impl<T: TermBytes> ClientPublication<T> {
     /// table its buffer carries: every publication of a conflated stream
     /// already reads its stream's from the buffer (F7b-2c-2), in process
     /// or attached, so this is for tests and for buffers built without one.
+    /// A `config` whose value capacity has no shape (past `u32`) is kept as
+    /// its refusal: every later offer and claim fails with it.
     #[must_use]
     pub fn with_conflation(mut self, config: ConflationConfig) -> Self {
         self.conflation = Some(config.shape());
@@ -657,7 +661,7 @@ impl<T: TermBytes> ClientPublication<T> {
             return Ok(OfferOutcome::NotConnected);
         }
         if let Some(shape) = self.conflation {
-            shape.validate_publication(options.reserved_value, payload.len())?;
+            shape?.validate_publication(options.reserved_value, payload.len())?;
         }
         // The rate copy is asked last, so it refuses only a message that
         // would otherwise be appended; a sealed handle reports its seal
@@ -791,12 +795,11 @@ impl<T: TermBytes> ClientPublication<T> {
             return Ok(self.after_end().claim());
         }
         if let Some(shape) = self.conflation {
-            let value_length = usize::try_from(length).map_err(|_| {
-                ClientError::from(karyos_sys::conflation::ConflationError::ValueTooLarge {
-                    length: usize::MAX,
-                    max: usize::try_from(shape.value_capacity).unwrap_or(usize::MAX),
-                })
-            })?;
+            let shape = shape?;
+            // A claim length no usize of this target holds is no value it
+            // can carry.
+            let value_length =
+                usize::try_from(length).map_err(|_| ConflationError::InvalidConfig)?;
             shape.validate_publication(options.reserved_value, value_length)?;
         }
         if let Some(binding) = &mut self.guard
@@ -1162,6 +1165,36 @@ mod tests {
             publication.try_claim(DEFAULT_MTU),
             Err(ClientError::MessageTooLarge { .. })
         ));
+    }
+
+    /// A table given to `with_conflation` whose value capacity has no
+    /// shape (past `u32`) is kept as its refusal: keyed offers and claims
+    /// fail with it, and nothing is reserved.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_table_with_no_shape_refuses_every_keyed_offer() {
+        let (_buffer, mut conductor, publication) = setup(true);
+        let past = usize::try_from(u32::MAX).unwrap() + 1;
+        let mut publication = publication.with_conflation(ConflationConfig {
+            keys: 2,
+            value_capacity: past,
+            journal_capacity: 1024,
+        });
+        let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        let refused =
+            ClientError::Conflation(karyos_sys::conflation::ConflationError::ValueTooLarge {
+                length: past,
+                max: usize::try_from(u32::MAX).unwrap(),
+            });
+        assert_eq!(
+            publication.offer_with(b"x", AppendOptions::default()),
+            Err(refused)
+        );
+        assert!(matches!(
+            publication.try_claim_with(1, AppendOptions::default()),
+            Err(error) if error == refused
+        ));
+        assert_eq!(subscription.position(), 0);
     }
 
     #[test]
