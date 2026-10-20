@@ -223,8 +223,9 @@ impl StreamOptions {
             .and_then(|lane| Lane::try_new(lane).ok())
             .ok_or_else(|| Failure::with(Status::InvalidLane, u64::from(self.lane), 0))?;
         // A concurrent stream's handles reserve with one `fetch_add`; on a
-        // target where that is not a single instruction (aarch64 without
-        // LSE) the driver refuses the stream, as its default is (ADR-0012).
+        // CPU where that is not a single instruction (aarch64 without LSE,
+        // detected at run time by karyos-sys) the driver refuses the
+        // stream, as its default is (ADR-0012).
         let publication = match (self.publication_mode, self.publishers) {
             (PUBLICATION_EXCLUSIVE, 0) => PublicationMode::Exclusive,
             (PUBLICATION_CONCURRENT, publishers) if publishers > 0 => PublicationMode::Concurrent {

@@ -377,7 +377,8 @@ typedef struct karyos_stream_options {
      * Concurrent handles at once (from 88 bytes): 1 to 255 with
      * KARYOS_PUBLICATION_CONCURRENT, 0 with KARYOS_PUBLICATION_EXCLUSIVE;
      * anything else is KARYOS_E_INVALID_ARGUMENT. Each handle reserves with
-     * one atomic fetch_add: on aarch64 without LSE atomics the driver
+     * one atomic fetch_add: on an aarch64 CPU without LSE atomics, as
+     * detected at run time (not the build's target features), the driver
      * refuses a concurrent stream, its default.
      */
     uint32_t publishers;
