@@ -23,7 +23,23 @@ enum Kind {
     Subscription,
     Conflated,
     Claim,
+    /// An Archive connection (`archive-replay`).
+    Archive,
 }
+
+/// The Archive's control streams a runner's karyosd serves
+/// (FORMAT.md, Archive replays).
+const ARCHIVE_REQUESTS: i32 = 1030;
+const ARCHIVE_RESPONSES: i32 = 1031;
+/// How long an Archive connection, and a replay subscription's grant,
+/// waits: the suite's constant (FORMAT.md, Archive replays).
+const ARCHIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// The next Archive connection's requester id: 100, 200 and up, so no
+/// connection's id, nor its replayer's (one more), meets another's.
+static NEXT_ARCHIVE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100);
+/// How long `subscription.poll_to_end` polls for the end: past a replay
+/// target's linger (FORMAT.md, Ops).
+const END_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// An object a scenario holds: its C handle, its parent and whether its
 /// own close succeeded.
@@ -33,6 +49,9 @@ struct Object {
     handle: u64,
     parent: Option<usize>,
     closed: bool,
+    /// The runner's, not the scenario's: its close only ends its use in
+    /// the scenario.
+    provided: bool,
 }
 
 /// The answer of an op: `ok` with its results, or a status name.
@@ -40,6 +59,8 @@ struct Object {
 pub enum Answer {
     Ok(BTreeMap<String, Value>),
     Status(String),
+    /// A status with results: an Archive's refusal and its response code.
+    StatusWith(String, BTreeMap<String, Value>),
 }
 
 /// The statuses a commit answers while its claim stays staged
@@ -56,6 +77,9 @@ const RETRYABLE: [&str; 5] = [
 pub struct Adapter {
     objects: Vec<Object>,
     names: BTreeMap<i32, String>,
+    /// The replays the scenario started and did not see stop: its
+    /// Archive connection's object, and the replay id.
+    replays: Vec<(usize, u64)>,
 }
 
 impl Adapter {
@@ -71,7 +95,19 @@ impl Adapter {
         Self {
             objects: Vec::new(),
             names,
+            replays: Vec::new(),
         }
+    }
+
+    /// The client of an Archive-hosting driver a runner offering
+    /// `archive-replay` provides (FORMAT.md, Archive replays): the
+    /// runner's, which the scenario uses but does not close.
+    pub fn provided_client(&mut self, client: u64) -> Value {
+        let value = self.insert(Kind::Client, client, None);
+        if let Some(object) = self.objects.last_mut() {
+            object.provided = true;
+        }
+        value
     }
 
     /// The driver a runner without `embedded-driver` provides: started,
@@ -95,8 +131,15 @@ impl Adapter {
     /// Closes the objects a scenario left open, children first, so the
     /// next scenario starts from nothing.
     pub fn close_all(&mut self) {
+        // The replays it started and did not see stop are stopped first:
+        // closing an Archive connection leaves its replays running.
+        for (archive, replay_id) in std::mem::take(&mut self.replays) {
+            if !self.is_closed(archive) {
+                let _ = abi::archive_stop_replay(self.objects[archive].handle, replay_id);
+            }
+        }
         for index in (0..self.objects.len()).rev() {
-            if self.is_closed(index) {
+            if self.is_closed(index) || self.objects[index].provided {
                 continue;
             }
             let handle = self.objects[index].handle;
@@ -107,6 +150,7 @@ impl Adapter {
                 Kind::Subscription => abi::subscription_close(handle),
                 Kind::Conflated => abi::conflated_close(handle),
                 Kind::Claim => abi::claim_abort(handle),
+                Kind::Archive => abi::archive_close(handle),
             };
             self.objects[index].closed = true;
         }
@@ -118,6 +162,7 @@ impl Adapter {
             handle,
             parent,
             closed: false,
+            provided: false,
         });
         Value::Object(self.objects.len() - 1)
     }
@@ -458,14 +503,179 @@ impl Adapter {
                 assert_eq!(delivered, counted, "{at}: the count is the handler's calls");
                 self.counted(status, "delivered", delivered, at)
             }
+            "archive.connect" => {
+                let client = args.object("client");
+                if let Some(answer) = self.open(client, Kind::Client, at) {
+                    return answer;
+                }
+                let client_id =
+                    NEXT_ARCHIVE_ID.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+                let options = abi::ArchiveOptions {
+                    size: u32::try_from(size_of::<abi::ArchiveOptions>()).unwrap(),
+                    reserved: 0,
+                    requests: ARCHIVE_REQUESTS,
+                    responses: ARCHIVE_RESPONSES,
+                    client_id,
+                    deadline_ns: u64::try_from(ARCHIVE_DEADLINE.as_nanos()).unwrap(),
+                };
+                let (status, archive) = abi::archive_connect(self.objects[client].handle, &options);
+                if status != 0 {
+                    return Answer::Status(self.name(status, at));
+                }
+                let archive = self.insert(Kind::Archive, archive, Some(client));
+                Answer::Ok(results([("archive", archive)]))
+            }
+            "archive.replay" => {
+                let archive = args.object("archive");
+                if let Some(answer) = self.open(archive, Kind::Archive, at) {
+                    return answer;
+                }
+                let (status, mut options) = abi::replay_options();
+                assert_eq!(status, 0, "{at}: karyos_replay_options_init");
+                options.recording_id = args.narrow("recording", None);
+                options.target_stream_id = args.narrow("target_stream_id", None);
+                options.position = args.narrow("position", Some(options.position));
+                options.length = args.narrow("length", Some(options.length));
+                options.rate = match args.text("rate").as_deref() {
+                    None | Some("full") => 1,
+                    Some("as_recorded") => 2,
+                    Some("scaled") => 3,
+                    other => panic!("{at}: `rate` {other:?} is no replay rate"),
+                };
+                options.scale_ppm = args.narrow("scale_ppm", Some(0));
+                let (status, replay_id, session_id, code) =
+                    abi::archive_replay(self.objects[archive].handle, &options);
+                if status != 0 {
+                    return self.archive_failure(status, code, at);
+                }
+                self.replays.push((archive, replay_id));
+                Answer::Ok(results([
+                    ("replay", Value::Integer(i128::from(replay_id))),
+                    ("session", Value::Integer(i128::from(session_id))),
+                ]))
+            }
+            "archive.stop_replay" => {
+                let archive = args.object("archive");
+                if let Some(answer) = self.open(archive, Kind::Archive, at) {
+                    return answer;
+                }
+                let replay_id: u64 = args.narrow("replay", None);
+                let (status, code) =
+                    abi::archive_stop_replay(self.objects[archive].handle, replay_id);
+                if status != 0 {
+                    return self.archive_failure(status, code, at);
+                }
+                self.replays
+                    .retain(|started| *started != (archive, replay_id));
+                Answer::Ok(BTreeMap::new())
+            }
+            "replay.subscribe" => {
+                let client = args.object("client");
+                if let Some(answer) = self.open(client, Kind::Client, at) {
+                    return answer;
+                }
+                let handle = self.objects[client].handle;
+                let (stream_id, session_id) =
+                    (args.narrow("stream_id", None), args.narrow("session", None));
+                // Serves the client until the target's grant, up to the
+                // suite's deadline (FORMAT.md, Archive replays).
+                let start = std::time::Instant::now();
+                loop {
+                    let _ = abi::client_poll(handle);
+                    let (status, subscription) =
+                        abi::client_add_replay_subscription(handle, stream_id, session_id);
+                    match status {
+                        0 => {
+                            let subscription =
+                                self.insert(Kind::Subscription, subscription, Some(client));
+                            return Answer::Ok(results([("subscription", subscription)]));
+                        }
+                        status if self.name(status, at) == "not_connected" => {
+                            if start.elapsed() >= ARCHIVE_DEADLINE {
+                                return Answer::Status("timeout".to_owned());
+                            }
+                            std::thread::yield_now();
+                        }
+                        status => return Answer::Status(self.name(status, at)),
+                    }
+                }
+            }
+            "subscription.poll_to_end" => {
+                let subscription = args.object("subscription");
+                if let Some(answer) = self.open(subscription, Kind::Subscription, at) {
+                    return answer;
+                }
+                let handle = self.objects[subscription].handle;
+                let client = self.objects[subscription]
+                    .parent
+                    .map(|parent| self.objects[parent].handle);
+                let limit = args.narrow("limit", Some(16));
+                // Polls, serving its client, until the subscription ends.
+                let (mut delivered, mut last) = (0u32, None);
+                let start = std::time::Instant::now();
+                loop {
+                    if let Some(client) = client {
+                        let _ = abi::client_poll(client);
+                    }
+                    let (status, count, messages, _) =
+                        abi::subscription_poll(handle, limit, abi::OnMessage::Keep);
+                    delivered = delivered.checked_add(count).unwrap();
+                    if let Some(message) = messages.last() {
+                        last = Some(
+                            String::from_utf8(message.clone())
+                                .unwrap_or_else(|_| panic!("{at}: a message that is not UTF-8")),
+                        );
+                    }
+                    match self.name_or_ok(status, at).as_deref() {
+                        None => {}
+                        Some("closed" | "closed_by_overrun") => break,
+                        Some(other) => return Answer::Status(other.to_owned()),
+                    }
+                    if start.elapsed() >= END_DEADLINE {
+                        return Answer::Status("timeout".to_owned());
+                    }
+                    std::thread::yield_now();
+                }
+                let mut answer = results([("delivered", Value::Integer(i128::from(delivered)))]);
+                if let Some(last) = last {
+                    answer.insert("last".to_owned(), Value::Text(last));
+                }
+                Answer::Ok(answer)
+            }
+            "subscription.end" => {
+                let subscription = args.object("subscription");
+                assert_eq!(self.objects[subscription].kind, Kind::Subscription, "{at}");
+                if self.is_closed(subscription) {
+                    return Answer::Status("closed".to_owned());
+                }
+                let (status, end) = abi::subscription_end_state(self.objects[subscription].handle);
+                if status != 0 {
+                    return Answer::Status(self.name(status, at));
+                }
+                let reason = match end.reason {
+                    0 => "none",
+                    1 => "end_of_stream",
+                    2 => "image_retired",
+                    3 => "stream_removed",
+                    4 => "revoked",
+                    5 => "closed_by_overrun",
+                    _ => "other",
+                };
+                Answer::Ok(results([
+                    ("reason", Value::Text(reason.to_owned())),
+                    ("position", Value::Integer(i128::from(end.position))),
+                    ("seal_code", Value::Integer(i128::from(end.seal_code))),
+                ]))
+            }
             "driver.close" | "client.close" | "publication.close" | "subscription.close"
-            | "conflated.close" | "claim.abort" => {
+            | "conflated.close" | "claim.abort" | "archive.close" => {
                 let (name, kind) = match op {
                     "driver.close" => ("driver", Kind::Driver),
                     "client.close" => ("client", Kind::Client),
                     "publication.close" => ("publication", Kind::Publication),
                     "subscription.close" => ("subscription", Kind::Subscription),
                     "conflated.close" => ("conflated", Kind::Conflated),
+                    "archive.close" => ("archive", Kind::Archive),
                     _ => ("claim", Kind::Claim),
                 };
                 let index = args.object(name);
@@ -496,6 +706,12 @@ impl Adapter {
                 Answer::Ok(BTreeMap::new())
             };
         }
+        // A provided object stays open for the runner: its close ends its
+        // use in this scenario only.
+        if self.objects[index].provided {
+            self.objects[index].closed = true;
+            return Answer::Ok(BTreeMap::new());
+        }
         let handle = self.objects[index].handle;
         let status = match kind {
             Kind::Driver => abi::driver_close(handle),
@@ -504,11 +720,47 @@ impl Adapter {
             Kind::Subscription => abi::subscription_close(handle),
             Kind::Conflated => abi::conflated_close(handle),
             Kind::Claim => abi::claim_abort(handle),
+            Kind::Archive => {
+                // Its replays are stopped first: a close leaves them
+                // running (FORMAT.md, Archive replays).
+                self.stop_replays_of(index);
+                abi::archive_close(handle)
+            }
         };
         if status == 0 {
             self.objects[index].closed = true;
         }
         self.plain(status, at)
+    }
+
+    /// `None` for `KARYOS_OK`, else the status's name.
+    fn name_or_ok(&self, code: i32, at: &str) -> Option<String> {
+        (code != 0).then(|| self.name(code, at))
+    }
+
+    /// Stops the replays the scenario started on Archive connection
+    /// `archive` and did not see stop.
+    fn stop_replays_of(&mut self, archive: usize) {
+        let handle = self.objects[archive].handle;
+        self.replays.retain(|(started, replay_id)| {
+            if *started == archive {
+                let _ = abi::archive_stop_replay(handle, *replay_id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// An Archive call's failure: a refusal carries the Archive's response
+    /// code (FORMAT.md, Outcomes).
+    fn archive_failure(&self, status: i32, code: u64, at: &str) -> Answer {
+        let name = self.name(status, at);
+        if name == "refused" {
+            Answer::StatusWith(name, results([("code", Value::Integer(i128::from(code)))]))
+        } else {
+            Answer::Status(name)
+        }
     }
 
     fn counted(&self, status: i32, name: &str, count: u32, at: &str) -> Answer {

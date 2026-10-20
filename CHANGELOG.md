@@ -646,6 +646,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The conformance suite gains the `archive-replay` feature (B6-3; ADR-0073
+  format 2): ops `archive.connect`, `archive.replay`,
+  `archive.stop_replay`, `archive.close` and `replay.subscribe`, the
+  feature-free `subscription.poll_to_end` and `subscription.end`, and an
+  Archive refusal's `code=` after `status=refused`. A runner provides
+  the Archive with no Rust: it starts the pinned core's karyosd (the
+  conformance test kit's, or one built with cargo) with an Archive that
+  records stream 20 from boot, connects `$archive_client`, seeds
+  "r0" to "r9" and binds `$recording` and `$recording_end`; Linux only.
+  Three scenarios: a complete replay ends `end_of_stream` at its end; a
+  stopped one `image_retired`; refusals carry codes 2 and 3, and a
+  mismatched rate is refused locally.
 - `karyos-ffi` replays an Archive's recordings from C (F9c, B6;
   quantstratum-docs: `karyos/design/archive-replay-control.md`):
   `karyos_archive_replay` (with `karyos_replay_options`, read by prefix)
