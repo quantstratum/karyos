@@ -1996,5 +1996,269 @@ pub extern "C" fn karyos_driver_close(driver: u64) -> i32 {
     })
 }
 
+// Archive connections and their catalog listing (F9a; quantstratum-docs:
+// karyos/design/ffi-archive.md).
+
+/// `KARYOS_RECORDING_RECORDING`: the recording still records.
+pub(crate) const RECORDING_RECORDING: u32 = 0;
+/// `KARYOS_RECORDING_STOPPED`: the recording stopped.
+pub(crate) const RECORDING_STOPPED: u32 = 1;
+
+/// The size of the first `karyos_archive_options`.
+const ARCHIVE_OPTIONS_SIZE_0_1: u32 = 32;
+
+/// `karyos_archive_options`: the control streams of an Archive and how a
+/// connection to it waits. `size` is the caller's
+/// `sizeof(karyos_archive_options)`; the library reads the fields it
+/// knows of a newer struct, and the defaults past an older one.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveOptions {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// Must be 0.
+    pub reserved: u32,
+    /// The Archive's request stream.
+    pub requests: i32,
+    /// The Archive's response stream.
+    pub responses: i32,
+    /// This requester's id, at most `UINT32_MAX`, unique among the
+    /// Archive's requesters.
+    pub client_id: u64,
+    /// How long a listing waits, in nanoseconds; 0 for the client's
+    /// timeout.
+    pub deadline_ns: u64,
+}
+
+/// `karyos_recording`: one recording of a listing, handed to the handler
+/// for the call only. `size` is this version's `sizeof(karyos_recording)`:
+/// a handler built against an older header reads only the fields it
+/// knows.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Recording {
+    /// The struct's size in bytes, set by the library.
+    pub size: u32,
+    /// `KARYOS_RECORDING_RECORDING` or `KARYOS_RECORDING_STOPPED`.
+    pub state: u32,
+    /// A `KARYOS_STOP_*` reason when stopped; 0 while it records.
+    pub stop_reason: u32,
+    /// 1 when the recording lost ranges, 0 otherwise.
+    pub incomplete: u32,
+    /// The recorded stream.
+    pub stream_id: i32,
+    /// The recorded session.
+    pub session_id: i32,
+    /// The recording's id, never 0.
+    pub id: u64,
+    /// Its first position.
+    pub start: u64,
+    /// When it started, in nanoseconds since the Archive agent started.
+    pub start_time_ns: u64,
+    /// The position written so far, or where it stopped.
+    pub position: u64,
+    /// The channel's bytes, not NUL-terminated, valid during the call.
+    pub channel: *const c_char,
+    /// The channel's length in bytes.
+    pub channel_length: usize,
+}
+
+/// `karyos_recording_handler`: called once per recording with the
+/// caller's `context` and the recording, valid only during the call. It
+/// must return normally.
+pub type RecordingHandler = Option<unsafe extern "C" fn(*mut c_void, *const Recording)>;
+
+/// The `KARYOS_STOP_*` code of `reason`.
+pub(crate) fn stop_reason(reason: karyos_archive::catalog::StopReason) -> u32 {
+    use karyos_archive::catalog::{FailKind, StopReason};
+    match reason {
+        StopReason::Normal => 1,
+        StopReason::Recovered => 2,
+        StopReason::Empty => 3,
+        StopReason::Lapped => 4,
+        StopReason::Stopped => 5,
+        StopReason::Shutdown => 6,
+        StopReason::Failed(FailKind::Source) => 7,
+        StopReason::Failed(FailKind::RequiredLapped) => 8,
+        StopReason::Failed(FailKind::Invalid) => 9,
+    }
+}
+
+/// `listed` as the C ABI hands it to a handler; its channel borrows
+/// `listed`'s.
+fn recording(listed: &karyos_archive::client::list::ListedRecording) -> Recording {
+    use karyos_archive::control::RecordingState;
+    let (state, stop, incomplete, position) = match listed.state {
+        RecordingState::Recording {
+            written,
+            incomplete,
+        } => (RECORDING_RECORDING, 0, incomplete, written),
+        RecordingState::Stopped(stop) => (
+            RECORDING_STOPPED,
+            stop_reason(stop.reason),
+            stop.incomplete,
+            stop.position,
+        ),
+    };
+    Recording {
+        size: size_of_u32::<Recording>(),
+        state,
+        stop_reason: stop,
+        incomplete: u32::from(incomplete),
+        stream_id: listed.stream_id,
+        session_id: listed.session_id,
+        id: listed.recording_id,
+        start: listed.start,
+        start_time_ns: listed.start_time_ns,
+        position,
+        channel: listed.channel.as_ptr().cast::<c_char>(),
+        channel_length: listed.channel.len(),
+    }
+}
+
+/// Opens a connection of `client` to the Archive whose control streams
+/// `options` names, and writes its handle through `archive`: a concurrent
+/// publication on its request stream and an optional subscription on its
+/// response stream, both the client's. The connection is the client's:
+/// closing the client closes it. A control call: it waits for the driver
+/// up to the client's timeout, and holds the client handle meanwhile. On
+/// failure nothing is opened and `detail` (may be null) receives the
+/// failure's detail; a `client_id` above `UINT32_MAX` or a nonzero
+/// `reserved` is `KARYOS_E_INVALID_ARGUMENT`.
+///
+/// # Safety
+///
+/// `options` points to a readable `karyos_archive_options` whose `size` is
+/// set; `archive` points to a writable `uint64_t`; `detail` is null or a
+/// `karyos_detail` whose `size` is set. A null or misaligned `options` or
+/// `archive`, or a `size` below the first version's (32), returns
+/// `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_archive_connect(
+    client: u64,
+    options: *const ArchiveOptions,
+    archive: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(archive) {
+            return Status::InvalidArgument;
+        }
+        let defaults = ArchiveOptions {
+            size: size_of_u32::<ArchiveOptions>(),
+            reserved: 0,
+            requests: 0,
+            responses: 0,
+            client_id: 0,
+            deadline_ns: 0,
+        };
+        // SAFETY: the caller's contract on `options`.
+        let raw = match unsafe { read_sized(options, ARCHIVE_OPTIONS_SIZE_0_1, defaults) } {
+            Ok(raw) => raw,
+            Err(status) => return status,
+        };
+        if raw.reserved != 0 {
+            return Status::InvalidArgument;
+        }
+        let options = api::archive::Options {
+            requests: raw.requests,
+            responses: raw.responses,
+            client_id: raw.client_id,
+            deadline_ns: raw.deadline_ns,
+        };
+        match api::archive::connect(Handle::from_raw(client), options) {
+            Ok(handle) => {
+                // SAFETY: `archive` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { archive.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Lists the recordings of `archive`'s catalog whose id is above
+/// `after_id`, at most `limit`, handing each to `handler` in id order, and
+/// writes how many through `delivered` (may be null), also on failure.
+/// Fewer than `limit` means the catalog has no more; the next page starts
+/// after the last id delivered. A `limit` of 0 delivers nothing.
+///
+/// A control call: it serves the client and waits for the whole page up
+/// to the connection's deadline (its options' `deadline_ns`, or the
+/// client's timeout), then hands it over; it allocates at most `limit`
+/// recordings. A page that does not arrive in time is
+/// `KARYOS_E_TIMEOUT` with nothing delivered; an Archive's refusal is
+/// `KARYOS_E_REFUSED` with its response code in `detail`'s `code` (1 an
+/// error, 2 an unknown recording, 3 an unknown replay, 4 an invalid
+/// request, 5 an unsupported schema). The handler runs while the
+/// connection and its client are held: from it, any call on either
+/// returns `KARYOS_E_REENTRANT`, and another thread's `KARYOS_E_BUSY`.
+///
+/// # Safety
+///
+/// `handler` is null or a function of the `karyos_recording_handler`
+/// signature that returns normally; `context` is passed to it untouched;
+/// `delivered` is null or points to a writable `uint32_t`; `detail` is
+/// null or a `karyos_detail` whose `size` is set. A null `handler`
+/// returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_archive_list(
+    archive: u64,
+    after_id: u64,
+    limit: u32,
+    handler: RecordingHandler,
+    context: *mut c_void,
+    delivered: *mut u32,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        let Some(handler) = handler else {
+            return Status::InvalidArgument;
+        };
+        if !delivered.is_null() && !delivered.is_aligned() {
+            return Status::InvalidArgument;
+        }
+        let mut call = |listed: &karyos_archive::client::list::ListedRecording| {
+            let recording = recording(listed);
+            // SAFETY: `handler` has the handler's signature and returns
+            // normally (the caller's contract); `recording` and the
+            // channel it points into outlive the call, which only reads
+            // them.
+            unsafe { handler(context, &raw const recording) };
+        };
+        let (status, count) =
+            match api::archive::list(Handle::from_raw(archive), after_id, limit, &mut call) {
+                Ok(count) => (Status::Ok, count),
+                Err(failure) => {
+                    // SAFETY: the caller's contract on `detail`.
+                    unsafe { write_detail(detail, failure) };
+                    (failure.status, 0)
+                }
+            };
+        if !delivered.is_null() {
+            // SAFETY: `delivered` is non-null and aligned, and the caller's
+            // contract makes it a writable `uint32_t`.
+            unsafe { delivered.write(count) };
+        }
+        status
+    })
+}
+
+/// Closes `archive`: its two streams are removed from its client. While
+/// the client is in use (`KARYOS_E_BUSY`, `KARYOS_E_REENTRANT`) nothing is
+/// closed.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_archive_close(archive: u64) -> i32 {
+    guard(|| match api::archive::close(Handle::from_raw(archive)) {
+        Ok(()) => Status::Ok,
+        Err(status) => status,
+    })
+}
+
 #[cfg(test)]
 mod tests;

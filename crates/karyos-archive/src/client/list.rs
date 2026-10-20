@@ -146,6 +146,10 @@ pub struct RecordingLister<Q, R> {
     step: Step,
     kept: Vec<ListedRecording>,
     left_out: u64,
+    /// The recordings a bounded listing has left to keep
+    /// ([`RecordingLister::start_from`]): no page is asked for past them.
+    /// `None` lists to the end.
+    left: Option<usize>,
     request: Vec<u8>,
     answer: Vec<u8>,
 }
@@ -162,6 +166,7 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
             step: Step::Idle,
             kept: Vec::new(),
             left_out: 0,
+            left: None,
             request: vec![0; MAX_REQUEST],
             answer: vec![0; MAX_ANSWER],
         }
@@ -176,12 +181,31 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
 
     /// Begins a listing from the first recording, dropping one under way.
     pub fn start(&mut self) {
+        self.begin(0, None);
+    }
+
+    /// Begins a bounded listing, dropping one under way: the recordings
+    /// from id `from_id` on, in id order, at most `count` (and at most
+    /// [`ListerConfig::max_recordings`]). Its pages ask the Archive for no
+    /// more than are left to list, and none is asked for once `count` are
+    /// kept, so a page of a large catalog costs `count` recordings, not
+    /// the whole catalog. A `count` of 0 lists nothing.
+    pub fn start_from(&mut self, from_id: u64, count: usize) {
+        self.begin(from_id, Some(count));
+    }
+
+    fn begin(&mut self, from_id: u64, bound: Option<usize>) {
         self.kept.clear();
         self.left_out = 0;
+        self.left = bound.map(|count| count.min(self.config.max_recordings));
+        if self.left == Some(0) {
+            self.step = Step::Idle;
+            return;
+        }
         let correlation_id = self.correlation_id();
         self.step = Step::Sending {
             correlation_id,
-            from_id: 0,
+            from_id,
         };
     }
 
@@ -202,10 +226,15 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
         else {
             return None;
         };
+        // A bounded listing asks for no more than it has left to keep.
+        let page = match self.left.map(u32::try_from) {
+            Some(Ok(left)) => self.config.page.min(left),
+            _ => self.config.page,
+        };
         let message = ControlMessage::ListRecordings(ListRecordings {
             correlation_id,
             from_id,
-            max_count: self.config.page.clamp(1, MAX_LIST_COUNT),
+            max_count: page.clamp(1, MAX_LIST_COUNT),
         });
         let Ok(length) = message.encode(&mut self.request) else {
             self.step = Step::Idle;
@@ -254,7 +283,13 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
                     if descriptor.correlation_id == correlation_id =>
                 {
                     last = Some(descriptor.recording_id);
-                    if self.kept.len() < self.config.max_recordings {
+                    if self.kept.len() < self.config.max_recordings && self.left != Some(0) {
+                        // Not 0 here: one fewer is left to keep.
+                        if let Some(left) = self.left.as_mut()
+                            && let Some(fewer) = left.checked_sub(1)
+                        {
+                            *left = fewer;
+                        }
                         self.kept.push(ListedRecording {
                             recording_id: descriptor.recording_id,
                             start: descriptor.start,
@@ -296,6 +331,8 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
             // A page that delivered a recording: the next one, from the id
             // after its last, goes out now. No answer of its can have come
             // yet, so this poll stops there.
+            // A bounded listing that kept its count is done.
+            Some(Ok(_)) if self.left == Some(0) => self.done(),
             Some(Ok(_)) => match last.and_then(|last| last.checked_add(1)) {
                 Some(from_id) => {
                     let correlation_id = self.correlation_id();

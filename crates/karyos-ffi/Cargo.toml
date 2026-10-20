@@ -18,6 +18,9 @@ publish.workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+# The Archive's control transports and catalog listing (F9a;
+# quantstratum-docs: karyos/design/ffi-archive.md).
+karyos-archive.workspace = true
 karyos-client.workspace = true
 # The embedded driver the C ABI exports (F5; SPEC.md §14 crate table).
 karyos-driver.workspace = true

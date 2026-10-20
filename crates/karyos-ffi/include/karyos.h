@@ -55,6 +55,27 @@ extern "C" {
 /** The most conflated subscriptions open at once. */
 #define KARYOS_MAX_CONFLATED_SUBSCRIPTIONS 4096
 
+/** The most Archive connections open at once. */
+#define KARYOS_MAX_ARCHIVES 64
+
+/** karyos_recording states. */
+#define KARYOS_RECORDING_RECORDING 0
+#define KARYOS_RECORDING_STOPPED 1
+
+/**
+ * karyos_recording stop reasons; 0 while it records. A newer library may
+ * add reasons.
+ */
+#define KARYOS_STOP_NORMAL 1
+#define KARYOS_STOP_RECOVERED 2
+#define KARYOS_STOP_EMPTY 3
+#define KARYOS_STOP_LAPPED 4
+#define KARYOS_STOP_STOPPED 5
+#define KARYOS_STOP_SHUTDOWN 6
+#define KARYOS_STOP_SOURCE_FAILED 7
+#define KARYOS_STOP_REQUIRED_LAPPED 8
+#define KARYOS_STOP_INVALID_SOURCE 9
+
 /**
  * The freshness of a conflated value no committed gap covers; any other
  * freshness is the start of the gap that made the value stale.
@@ -500,12 +521,11 @@ int32_t karyos_publication_offer_at(uint64_t publication, uint32_t lane,
 int32_t karyos_clock_now(uint32_t domain, uint64_t *now);
 
 /**
- * Stages a claim of length bytes on the lane: writes its handle and a/**
  * Stages a claim of length bytes on the lane: writes its handle and a
  * pointer to length zeroed bytes to fill. The pointer is valid until the
  * commit releases the claim, its abort, or the close of the publication or
- * of its client, and never points into a term or a shared mapping. One claim per publication
- * (KARYOS_E_CLAIM_OUTSTANDING).
+ * of its client, and never points into a term or a shared mapping. One
+ * claim per publication (KARYOS_E_CLAIM_OUTSTANDING).
  */
 int32_t karyos_publication_claim(uint64_t publication, uint32_t lane,
                                  uint32_t length, uint64_t *claim,
@@ -841,6 +861,94 @@ int32_t karyos_driver_connect(uint64_t driver, uint64_t *client, karyos_detail *
  * is closed.
  */
 int32_t karyos_driver_close(uint64_t driver);
+
+/**
+ * The control streams of an Archive and how a connection to it waits.
+ * size is the caller's sizeof(karyos_archive_options); the library reads
+ * the fields it knows of a newer struct, and the defaults past an older
+ * one. reserved must be 0. client_id is this requester's id, at most
+ * UINT32_MAX and unique among the Archive's requesters. deadline_ns is how
+ * long a listing waits; 0 for the client's timeout.
+ */
+typedef struct karyos_archive_options {
+    uint32_t size;
+    uint32_t reserved;
+    int32_t requests;
+    int32_t responses;
+    uint64_t client_id;
+    uint64_t deadline_ns;
+} karyos_archive_options;
+
+/**
+ * One recording of a listing, valid only during the handler call. size is
+ * this version's sizeof(karyos_recording): a handler built against an
+ * older header reads only the fields it knows. state is a
+ * KARYOS_RECORDING_* value; stop_reason a KARYOS_STOP_* reason when
+ * stopped, 0 while it records; incomplete 1 when the recording lost
+ * ranges. start_time_ns is in nanoseconds since the Archive agent
+ * started. position is the position written so far, or where it stopped.
+ * channel holds channel_length bytes, not NUL-terminated.
+ */
+typedef struct karyos_recording {
+    uint32_t size;
+    uint32_t state;
+    uint32_t stop_reason;
+    uint32_t incomplete;
+    int32_t stream_id;
+    int32_t session_id;
+    uint64_t id;
+    uint64_t start;
+    uint64_t start_time_ns;
+    uint64_t position;
+    const char *channel;
+    size_t channel_length;
+} karyos_recording;
+
+/**
+ * Called once per recording with the caller's context and the recording,
+ * valid only during the call. It must return normally.
+ */
+typedef void (*karyos_recording_handler)(void *context,
+                                         const karyos_recording *recording);
+
+/**
+ * Opens a connection of the client to the Archive whose control streams
+ * options names, and writes its handle: a concurrent publication on its
+ * request stream and an optional subscription on its response stream,
+ * both the client's. Closing the client closes it. A control call: it
+ * waits for the driver up to the client's timeout. A failed connect opens
+ * nothing and fills detail (may be null); a client_id above UINT32_MAX or
+ * a nonzero reserved is KARYOS_E_INVALID_ARGUMENT.
+ */
+int32_t karyos_archive_connect(uint64_t client,
+                               const karyos_archive_options *options,
+                               uint64_t *archive, karyos_detail *detail);
+
+/**
+ * Lists the recordings of the Archive's catalog whose id is above
+ * after_id, at most limit, handing each to handler in id order, and
+ * writes how many through delivered (may be null), also on failure. Fewer
+ * than limit means the catalog has no more; the next page starts after
+ * the last id delivered. A limit of 0 delivers nothing. A control call: it
+ * waits for the whole page up to the connection's deadline, then hands it
+ * over. A page that does not arrive in time is KARYOS_E_TIMEOUT with
+ * nothing delivered; an Archive's refusal is KARYOS_E_REFUSED with its
+ * response code in detail's code (1 an error, 2 an unknown recording, 3
+ * an unknown replay, 4 an invalid request, 5 an unsupported schema). From
+ * the handler, any call on the connection or its client returns
+ * KARYOS_E_REENTRANT; another thread's returns KARYOS_E_BUSY.
+ */
+int32_t karyos_archive_list(uint64_t archive, uint64_t after_id,
+                            uint32_t limit, karyos_recording_handler handler,
+                            void *context, uint32_t *delivered,
+                            karyos_detail *detail);
+
+/**
+ * Closes the Archive connection: its two streams are removed from its
+ * client. While the client is in use (KARYOS_E_BUSY, KARYOS_E_REENTRANT)
+ * nothing is closed.
+ */
+int32_t karyos_archive_close(uint64_t archive);
 
 #ifdef __cplusplus
 }
