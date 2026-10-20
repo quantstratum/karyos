@@ -151,6 +151,14 @@ fn every_field() -> AgentView {
                 value: 15,
                 since: 60,
             },
+            Alert {
+                kind: AlertKind::GuardAck,
+                stream: 0,
+                lane: 0,
+                participant: 2,
+                value: 1,
+                since: 70,
+            },
         ],
     };
     let unavailable = DriverView {
@@ -199,7 +207,7 @@ const V1: &str = concat!(
     r#""guards":{"records":[{"seq":1,"time":40,"guard":1,"before":2,"after":3,"operation":42,"requester_kind":2,"requester":6,"outcome":4,"refusal":9,"operator":1000,"parameters":77}],"delivered":2,"overwritten":0}"#,
     r#","latencies":[{"stream":3,"incarnation":1,"lane":1,"available":10,"unavailable":2,"incomplete":false,"p50":{"low":480,"high":520},"p90":{"low":900,"high":null},"p99":null,"p999":null,"max":{"low":-5,"high":1000}}],"#,
     r#""trace":{"records":1,"malformed":2,"unknown_journal":3,"network_ignored":4,"points_ignored":5,"duplicates":6,"journals_dropped":7,"pending_dropped":8,"polls_dropped":9,"lanes_dropped":10,"aged_out":11,"mirror_overwritten":12,"pending":13},"#,
-    r#""alerts":[{"kind":"lag","stream":3,"lane":1,"participant":5,"value":1024,"since":50},{"kind":"loss","stream":0,"lane":0,"participant":0,"value":15,"since":60}]},"#,
+    r#""alerts":[{"kind":"lag","stream":3,"lane":1,"participant":5,"value":1024,"since":50},{"kind":"loss","stream":0,"lane":0,"participant":0,"value":15,"since":60},{"kind":"guard_ack","stream":0,"lane":0,"participant":2,"value":1,"since":70}]},"#,
     r#"{"dir":"/run/karyos/b","state":{"state":"unavailable","reason":"no socket"},"instance":null,"sample":null,"client_counters":[],"#,
     r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0},"#,
     r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0},"alerts":[]},"#,

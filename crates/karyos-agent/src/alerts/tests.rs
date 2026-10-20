@@ -133,3 +133,64 @@ fn a_detached_driver_clears_lags_and_quiets_losses() {
     alerts.detached(&rules);
     assert!(alerts.firing().is_empty());
 }
+
+fn ack(guard: u64, consistent: bool, epoch: u64, overdue: u64) -> AckRead {
+    AckRead {
+        guard,
+        consistent,
+        epoch,
+        overdue,
+    }
+}
+
+fn guard_alerts(alerts: &Alerts) -> Vec<(u64, u64, u64)> {
+    alerts
+        .firing()
+        .iter()
+        .filter(|alert| alert.kind == AlertKind::GuardAck)
+        .map(|alert| (alert.participant, alert.value, alert.since))
+        .collect()
+}
+
+/// A close with senders overdue fires per guard, keeps its start while
+/// the same close stays overdue, starts over at a new close, and clears
+/// when none is overdue or the guard is gone. A read that may mix passes
+/// changes nothing.
+#[test]
+fn a_guard_with_senders_overdue_fires_and_clears() {
+    let mut alerts = Alerts::default();
+    // Pending within the timeout, or open: nothing fires.
+    alerts.update_guard_acks(&[ack(1, true, 3, 0), ack(2, true, 0, 0)], 10);
+    assert!(guard_alerts(&alerts).is_empty());
+    alerts.update_guard_acks(&[ack(1, true, 3, 2), ack(2, true, 0, 0)], 20);
+    assert_eq!(guard_alerts(&alerts), [(1, 2, 20)]);
+    // One applied: the count follows, the start stays.
+    alerts.update_guard_acks(&[ack(1, true, 3, 1)], 30);
+    assert_eq!(guard_alerts(&alerts), [(1, 1, 20)]);
+    // An inconsistent read keeps the last state, whatever it holds.
+    alerts.update_guard_acks(&[ack(1, false, 0, 0)], 40);
+    assert_eq!(guard_alerts(&alerts), [(1, 1, 20)]);
+    // A new close of the same guard starts over.
+    alerts.update_guard_acks(&[ack(1, true, 5, 1)], 50);
+    assert_eq!(guard_alerts(&alerts), [(1, 1, 50)]);
+    // None overdue clears; so does the guard gone.
+    alerts.update_guard_acks(&[ack(1, true, 5, 0)], 60);
+    assert!(guard_alerts(&alerts).is_empty());
+    alerts.update_guard_acks(&[ack(1, true, 5, 3)], 70);
+    alerts.update_guard_acks(&[], 80);
+    assert!(guard_alerts(&alerts).is_empty());
+    // An inconsistent read of a guard not firing does not fire it.
+    alerts.update_guard_acks(&[ack(1, false, 5, 3)], 90);
+    assert!(guard_alerts(&alerts).is_empty());
+}
+
+/// A refresh that reads nothing clears the guard alerts, as it does lags.
+#[test]
+fn a_detached_driver_clears_guard_alerts() {
+    let rules = rules();
+    let mut alerts = Alerts::default();
+    alerts.update_guard_acks(&[ack(4, true, 3, 1)], 10);
+    assert_eq!(guard_alerts(&alerts), [(4, 1, 10)]);
+    alerts.detached(&rules);
+    assert!(guard_alerts(&alerts).is_empty());
+}
