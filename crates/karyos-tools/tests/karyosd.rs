@@ -67,6 +67,11 @@ impl Daemon {
 
 /// Starts `karyosd` on `dir` with one stream and `linger`.
 fn start(dir: &Path, linger: &str) -> Daemon {
+    start_with(dir, linger, &[])
+}
+
+/// As [`start`], with `extra` arguments.
+fn start_with(dir: &Path, linger: &str, extra: &[&str]) -> Daemon {
     let child = Command::new(env!("CARGO_BIN_EXE_karyosd"))
         .arg("--dir")
         .arg(dir)
@@ -80,6 +85,7 @@ fn start(dir: &Path, linger: &str) -> Daemon {
             "--log-level",
             "warn",
         ])
+        .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -195,4 +201,101 @@ fn karyosd_exits_2_on_a_startup_error() {
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.starts_with("karyosd: "), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--network on`: through two `karyosd` processes, a client of one creates
+/// a `karyos:udp` subscription and a client of the other an exclusive
+/// publication, by URI, on loopback, and the subscriber reads what the
+/// publisher offers (SPEC §10). Without the flag a network subscription is
+/// refused: the daemon runs no network agents.
+#[test]
+fn karyosd_with_the_network_carries_a_udp_pair() {
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+
+    use karyos_client::{Client, Context, MessageLimit, OfferError, StreamId};
+
+    let port = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let context = |dir: &Path| {
+        Context::builder()
+            .dir(dir)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+    };
+    let (receiving, sending) = (dir("network-rx"), dir("network-tx"));
+    let mut receiver = start_with(&receiving, "1s", &["--network", "on"]);
+    let mut sender = start_with(&sending, "1s", &["--network", "on"]);
+    drop(attach_when_ready(&receiving));
+    drop(attach_when_ready(&sending));
+    let mut subscriber = Client::connect(context(&receiving)).unwrap();
+    let mut publisher = Client::connect(context(&sending)).unwrap();
+    let mut reading = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    let mut publication = publisher
+        .add_exclusive_publication(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    // The image joins where it attaches: offers before it are not seen.
+    let began = Instant::now();
+    while reading.image_count() == 0 {
+        assert!(began.elapsed() < Duration::from_secs(20), "no image");
+        let _ = (subscriber.poll(), publisher.poll());
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (mut sent, mut seen) = (0u32, 0u32);
+    while seen < 16 {
+        assert!(began.elapsed() < Duration::from_secs(30), "seen {seen}");
+        let _ = (subscriber.poll(), publisher.poll());
+        while sent < 16 {
+            match publication.offer(&sent.to_le_bytes()) {
+                Ok(_) => sent += 1,
+                Err(
+                    OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected,
+                ) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let _ = reading
+            .poll(
+                |bytes, _| {
+                    assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                    seen += 1;
+                },
+                MessageLimit::new(16),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop((reading, publication, subscriber, publisher));
+    for daemon in [&mut receiver, &mut sender] {
+        daemon.terminate();
+        assert_eq!(daemon.wait(Duration::from_secs(10)).code(), Some(0));
+    }
+    // Off, the default: a network subscription is refused.
+    let dir = self::dir("no-network");
+    let mut daemon = start(&dir, "1s");
+    drop(attach_when_ready(&dir));
+    let mut client = Client::connect(context(&dir)).unwrap();
+    assert!(
+        client
+            .add_subscription(
+                &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+                StreamId::new(7),
+            )
+            .is_err()
+    );
+    drop(client);
+    daemon.terminate();
+    assert_eq!(daemon.wait(Duration::from_secs(10)).code(), Some(0));
 }
