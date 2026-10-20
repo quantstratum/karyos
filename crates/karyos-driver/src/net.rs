@@ -448,6 +448,46 @@ impl NetworkViewCounters {
 /// channel URI allows four paths (karyos-protocol `channel.rs`).
 pub(crate) const LATER_PATHS: usize = 3;
 
+/// A timed lane whose publisher breached its schedule ring's protocol, as
+/// its sender reported it (`AgentEvent::ScheduleViolated`) for the live
+/// publication, for the conductor to seal (`quantstratum-docs:
+/// karyos/design/timed-tx.md`, section 11, TT-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScheduleViolation {
+    /// The aggregate's registration.
+    pub(crate) registration: u64,
+    /// The incarnation the sender served.
+    pub(crate) incarnation: u64,
+    /// The lane.
+    pub(crate) lane: u8,
+}
+
+/// Schedule violations for the conductor to apply, drained every serve:
+/// at most one per lane of each tracked publication (allocated at start).
+/// One past that, or a report that names no live publication, is dropped
+/// and counted.
+#[derive(Debug)]
+struct ScheduleViolations {
+    pending: Vec<ScheduleViolation>,
+    dropped: u64,
+}
+
+impl ScheduleViolations {
+    fn push(&mut self, violation: ScheduleViolation) {
+        if self.pending.len() < self.pending.capacity() {
+            self.pending.push(violation);
+        } else {
+            self.drop_one();
+        }
+    }
+
+    fn drop_one(&mut self) {
+        if let Some(count) = self.dropped.checked_add(1) {
+            self.dropped = count;
+        }
+    }
+}
+
 /// Guard senders released for the conductor to deregister: at most one
 /// per tracked publication (allocated at start). One past that is dropped
 /// and counted, which the allocation makes unreachable.
@@ -583,6 +623,8 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// the conductor to deregister (at most one per tracked publication,
     /// allocated at start).
     released_guards: ReleasedGuards,
+    /// Schedule violations the senders reported, for the conductor.
+    schedule_violations: ScheduleViolations,
     /// Guard senders the conductor failed to deregister (an unknown id):
     /// counted, never retried.
     guard_deregister_failures: u64,
@@ -674,6 +716,16 @@ impl<T: StreamTerms> Network<T> {
             clock: karyos_sys::host_clock::host_monotonic_ns,
             released_guards: ReleasedGuards {
                 ids: Vec::with_capacity(config.agents.publications),
+                dropped: 0,
+            },
+            schedule_violations: ScheduleViolations {
+                pending: Vec::with_capacity(
+                    config
+                        .agents
+                        .publications
+                        .checked_mul(karyos_protocol::network::MAX_LANES)
+                        .unwrap_or(config.agents.publications),
+                ),
                 dropped: 0,
             },
             guard_deregister_failures: 0,
@@ -1561,6 +1613,25 @@ impl<T: StreamTerms> Network<T> {
     }
 
     /// A released guard sender to deregister, each once.
+    /// The next schedule violation a sender reported, for the conductor to
+    /// apply (timed-tx.md section 11, TT-6).
+    pub(crate) fn pop_schedule_violation(&mut self) -> Option<ScheduleViolation> {
+        self.schedule_violations.pending.pop()
+    }
+
+    /// Schedule violation reports dropped: past the bound, or naming no
+    /// live publication or incarnation.
+    #[cfg(test)]
+    pub(crate) fn schedule_violations_dropped(&self) -> u64 {
+        self.schedule_violations.dropped
+    }
+
+    /// A report the conductor found stale: its lane is gone, or in another
+    /// incarnation.
+    pub(crate) fn count_stale_schedule_violation(&mut self) {
+        self.schedule_violations.drop_one();
+    }
+
     pub(crate) fn pop_released_guard(&mut self) -> Option<crate::guard_ack::GuardSenderId> {
         self.released_guards.ids.pop()
     }
@@ -1888,6 +1959,7 @@ impl<T: StreamTerms> Network<T> {
         #[cfg(test)]
         let mut reopened = Some(self.reopened);
         let mut refusals = self.subscription_refusals;
+        let violations = &mut self.schedule_violations;
         let (publications, send_endpoints, released, trace_events, reincarnations, cells) = (
             &mut self.publications,
             &mut self.send_endpoints,
@@ -1958,7 +2030,7 @@ impl<T: StreamTerms> Network<T> {
                     publications,
                     send_endpoints,
                     &mut stale,
-                    (released, cells),
+                    (released, cells, &mut *violations),
                     (reincarnations, clock),
                     event,
                 );
@@ -2467,7 +2539,11 @@ fn publication_answer<T: StreamTerms>(
     publications: &mut Vec<NetPublication>,
     send_endpoints: &mut [SendEndpoint],
     stale: &mut Stale<'_>,
-    (released, cells): (&mut ReleasedGuards, &mut Vec<Counter>),
+    (released, cells, violations): (
+        &mut ReleasedGuards,
+        &mut Vec<Counter>,
+        &mut ScheduleViolations,
+    ),
     (reincarnations, clock): (&mut [Reincarnation], fn() -> u64),
     event: AgentEvent<OsSocket, T>,
 ) {
@@ -2553,6 +2629,30 @@ fn publication_answer<T: StreamTerms>(
                 && entry.state == NetworkPublicationState::Removing
             {
                 entry.drained = true;
+            }
+        }
+        // A timed lane's publisher breached its ring: applied by the
+        // conductor if it names the live publication.
+        AgentEvent::ScheduleViolated {
+            endpoint,
+            alias,
+            registration,
+            incarnation,
+            lane,
+        } => {
+            let live = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get(index))
+                .is_some_and(|entry| {
+                    entry.state == NetworkPublicationState::Active && lane < entry.lanes
+                });
+            if live {
+                violations.push(ScheduleViolation {
+                    registration,
+                    incarnation,
+                    lane,
+                });
+            } else {
+                violations.drop_one();
             }
         }
         AgentEvent::PublicationRemoved {

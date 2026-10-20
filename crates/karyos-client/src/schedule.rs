@@ -28,6 +28,27 @@ pub enum ClockDomain {
 }
 
 impl ClockDomain {
+    /// Its code in a schedule ring's binding (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`, section 11, TT-6b).
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Monotonic => 0,
+            Self::Tai => 1,
+        }
+    }
+
+    /// The domain a binding's code names; `None` for a code this build does
+    /// not know.
+    #[must_use]
+    pub const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Monotonic),
+            1 => Some(Self::Tai),
+            _ => None,
+        }
+    }
+
     /// The domain's name in counter labels.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -140,6 +161,60 @@ impl ScheduleOptions {
         self.cancel_on_deadline = cancel_on_deadline;
         self
     }
+}
+
+impl ScheduleOptions {
+    /// These options as a schedule ring's binding, which the driver writes
+    /// when it creates the lane (timed-tx.md section 11, TT-6b).
+    #[must_use]
+    pub const fn binding(self) -> karyos_sys::schedule_ring::Binding {
+        karyos_sys::schedule_ring::Binding {
+            domain: self.domain.code(),
+            max_horizon: self.max_horizon,
+            lateness_tolerance: self.lateness_tolerance,
+            cancel_on_deadline: self.cancel_on_deadline,
+        }
+    }
+
+    /// The options a binding names: `None` for a domain this build does not
+    /// know or a zero horizon, which the driver never writes.
+    #[must_use]
+    pub const fn from_binding(binding: karyos_sys::schedule_ring::Binding) -> Option<Self> {
+        let Some(domain) = ClockDomain::from_code(binding.domain) else {
+            return None;
+        };
+        if binding.max_horizon == 0 {
+            return None;
+        }
+        Some(Self {
+            domain,
+            max_horizon: binding.max_horizon,
+            lateness_tolerance: binding.lateness_tolerance,
+            cancel_on_deadline: binding.cancel_on_deadline,
+        })
+    }
+}
+
+/// The schedule binding of a handle on the timed lane whose ring is
+/// `ring`, read from the binding its driver wrote into the ring's header
+/// (timed-tx.md section 11, TT-6b), checked against the host clock of its
+/// domain. A handle that does not share the driver's process reads it so.
+///
+/// # Errors
+///
+/// [`ClientError::InvalidSchedule`] for a binding this build does not
+/// know (an unknown flag or domain, or a zero horizon) and as
+/// [`ClockDomain::clock`].
+pub fn ring_binding(ring: &[karyos_sys::sync::AtomicU64]) -> Result<ScheduleBinding, ClientError> {
+    let unknown = ClientError::InvalidSchedule {
+        reason: "a schedule binding this build does not know",
+    };
+    let binding = karyos_sys::schedule_ring::binding(ring).map_err(|_| unknown)?;
+    let options = ScheduleOptions::from_binding(binding).ok_or(unknown)?;
+    Ok(ScheduleBinding::new(
+        options,
+        ScheduleClock::host(options.domain)?,
+    ))
 }
 
 /// The clock a timed lane's offers are checked against, in its domain:
@@ -400,5 +475,54 @@ mod tests {
     fn the_tai_domain_is_linux_only() {
         assert!(now(ClockDomain::Monotonic).is_ok());
         assert_eq!(now(ClockDomain::Tai).is_ok(), cfg!(target_os = "linux"));
+    }
+
+    /// T-x2 (timed-tx.md section 11, TT-6b): a handle reads its options
+    /// from the binding its driver wrote; an unknown domain, an unknown
+    /// flag or a zero horizon is refused, never guessed.
+    #[test]
+    fn a_handle_reads_its_schedule_from_the_ring_binding() {
+        use karyos_sys::schedule_ring::{Binding, init, ring_words, write_binding};
+        use karyos_sys::sync::{AtomicU64, Ordering};
+
+        let ring: Vec<AtomicU64> = (0..ring_words(2).unwrap())
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        init(&ring, 2).unwrap();
+        let options = ScheduleOptions::default()
+            .with_max_horizon(42)
+            .with_lateness_tolerance(9)
+            .with_cancel_on_deadline(true);
+        write_binding(&ring, options.binding()).unwrap();
+        assert_eq!(ring_binding(&ring).unwrap().options(), options);
+        assert_eq!(
+            ScheduleOptions::from_binding(options.binding()),
+            Some(options)
+        );
+        for domain in [ClockDomain::Monotonic, ClockDomain::Tai] {
+            assert_eq!(ClockDomain::from_code(domain.code()), Some(domain));
+        }
+        let refused = |binding: Binding| {
+            write_binding(&ring, binding).unwrap();
+            matches!(
+                ring_binding(&ring),
+                Err(ClientError::InvalidSchedule { .. })
+            )
+        };
+        assert!(refused(Binding {
+            domain: 2,
+            ..options.binding()
+        }));
+        assert!(refused(Binding {
+            max_horizon: 0,
+            ..options.binding()
+        }));
+        write_binding(&ring, options.binding()).unwrap();
+        // Flags word: bit 1 is unknown.
+        ring[6].store(2, Ordering::Release);
+        assert!(matches!(
+            ring_binding(&ring),
+            Err(ClientError::InvalidSchedule { .. })
+        ));
     }
 }

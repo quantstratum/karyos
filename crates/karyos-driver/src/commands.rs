@@ -271,6 +271,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// The client that holds the publication of lane stream `stream`, and
+    /// whether it is remote; `None` for one the driver issued itself.
+    pub(crate) fn publication_holder(&self, stream: u64) -> Option<(u64, bool)> {
+        self.registrations
+            .iter()
+            .find(|registration| {
+                registration.stream == stream && registration.kind == Kind::Publication
+            })
+            .map(|registration| {
+                let client = registration.client;
+                (client, self.ledger(client).is_some())
+            })
+    }
+
     /// Liveness (quantstratum-docs:
     /// `karyos/design/required-participant-loss.md`): while clients are
     /// admitted, advances the driver heartbeat once per heartbeat interval
@@ -985,16 +999,24 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // the binding's regions (G-x2) and binds them (G-x3); a
                 // client of the in-process command ring has no such grant,
                 // so it is issued none.
-                // A timed lane's handle needs its schedule binding, in
-                // process only for now (timed-tx.md, T1).
                 let remote = self.ledger(client).is_some();
                 if matches!(command, Command::AddPublication { .. })
-                    && self.streams.get(index).is_some_and(|found| {
-                        (found.guarded.is_some() && !remote)
-                            || found.buffer.schedule_ring().is_some()
-                    })
+                    && self
+                        .streams
+                        .get(index)
+                        .is_some_and(|found| found.guarded.is_some() && !remote)
                 {
                     return refuse(ErrorCode::InvalidPublicationMode, detail);
+                }
+                // A timed lane's handle reads its schedule from the ring's
+                // binding (timed-tx.md section 11), granted in process or
+                // not, but a `Monotonic` lane only within the driver's time
+                // namespace (TT-6a interim): the detail is then the
+                // client's namespace code.
+                if matches!(command, Command::AddPublication { .. })
+                    && let Err(namespace) = self.timed_grantable(client, index)
+                {
+                    return refuse(ErrorCode::InvalidPublicationMode, namespace);
                 }
                 let remote = self.remote_full(client);
                 match remote {
@@ -1021,6 +1043,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // (quantstratum-docs: karyos/design/mapping-generations.md).
                 if target.issuing().is_err() {
                     return refuse(ErrorCode::ResourcesUnavailable, detail);
+                }
+                // A timed lane's settings are fixed, and written for the
+                // handle to read, before it is issued (TT-6b).
+                if matches!(command, Command::AddPublication { .. })
+                    && target.fix_schedule().is_err()
+                {
+                    return refuse(ErrorCode::InvalidPublicationMode, detail);
                 }
                 let occupant = self.next_export;
                 let mut subscriber = None;
@@ -1612,6 +1641,32 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// Whether `client` may hold a handle of the stream at `index` for its
+    /// clock domain (`quantstratum-docs: karyos/design/timed-tx.md`,
+    /// section 11, TT-6a interim): a lane that is not timed, a `Tai` lane,
+    /// or a `Monotonic` lane for a client in the driver's time namespace
+    /// (an in-process one, or a remote one proven so). Otherwise the
+    /// client's [`TimeNamespace`] code: `Monotonic` is offset per Linux
+    /// time namespace, so times on another scale are never scheduled.
+    fn timed_grantable(&self, client: u64, index: usize) -> Result<(), u64> {
+        let Some(found) = self.streams.get(index) else {
+            return Ok(());
+        };
+        if found.buffer.schedule_ring().is_none() {
+            return Ok(());
+        }
+        let domain = found.schedule.unwrap_or_default().domain;
+        if domain != karyos_client::schedule::ClockDomain::Monotonic
+            || self.ledger(client).is_none()
+        {
+            return Ok(());
+        }
+        match self.time_namespace(client) {
+            TimeNamespace::Same => Ok(()),
+            namespace => Err(namespace.code()),
+        }
+    }
+
     /// The time namespace of `client` against the driver's (T2): the same
     /// for an in-process client, compared through the pidfd-proven process
     /// for a remote one.
@@ -1849,6 +1904,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // A spare publication is the driver's own issuance.
                 if target.spare.is_some() {
                     return refuse(ErrorCode::PublicationTaken, detail);
+                }
+                // A timed lane's settings are fixed, and written into the
+                // ring for the remote publisher to read, before it is
+                // registered (TT-6b).
+                if target.fix_schedule().is_err() {
+                    return refuse(ErrorCode::InvalidPublicationMode, detail);
                 }
                 match target.conductor.register_publication(export) {
                     Ok(true) => Participant::Exclusive,
@@ -5564,15 +5625,15 @@ mod tests {
         ));
     }
 
-    /// A timed lane's handle needs its schedule binding, issued in process
-    /// only for now (timed-tx.md, T1): a CnC publication is refused.
-    #[test]
-    fn a_timed_stream_refuses_cnc_publications() {
-        let (mut driver, _stream) = driver_with_timed_stream();
+    /// The answer to `client`'s `AddPublication` of [`KEY`] after a few
+    /// duties.
+    fn add_timed_publication(
+        driver: &mut EmbeddedDriver,
+        producer: &mut RingProducer,
+    ) -> Vec<Response> {
         let mut observer = driver.broadcast.receiver();
-        let (client, mut producer) = remote_client(&mut driver, 4);
         write(
-            &mut producer,
+            producer,
             Command::AddPublication {
                 sequence: 1,
                 stream: KEY,
@@ -5585,16 +5646,100 @@ mod tests {
             let _ = driver.do_work().unwrap();
             answers.extend(responses(&mut observer));
         }
+        answers
+    }
+
+    /// T-x2 (timed-tx.md section 11): a timed lane's handle is granted over
+    /// the control path to a client of the in-process command ring, its
+    /// settings fixed and written into the ring's binding first, so the
+    /// handle reads them and they no longer change.
+    #[test]
+    fn a_timed_stream_grants_cnc_publications_with_their_binding() {
+        let (mut driver, stream) = driver_with_timed_stream();
+        let options = karyos_client::schedule::ScheduleOptions::default()
+            .with_max_horizon(5_000)
+            .with_lateness_tolerance(7);
+        driver.schedule_stream(stream, options).unwrap();
+        let (client, mut producer, _link) = raw_client(&mut driver);
+        let answers = add_timed_publication(&mut driver, &mut producer);
+        assert!(
+            answers.iter().any(|answer| matches!(
+                answer,
+                Response::PublicationReady {
+                    request: RequestId { client: c, sequence: 1 },
+                    ..
+                } if *c == client
+            )),
+            "{answers:?}"
+        );
+        let ring = driver.schedule_ring(stream).unwrap().unwrap();
+        assert_eq!(
+            karyos_sys::schedule_ring::binding(ring),
+            Ok(options.binding())
+        );
+        // Fixed from the grant on.
+        assert!(matches!(
+            driver.schedule_stream(stream, karyos_client::schedule::ScheduleOptions::default()),
+            Err(DriverError::InvalidConfig)
+        ));
+    }
+
+    /// T-x2 (timed-tx.md section 11, TT-6a interim): a `Monotonic` lane is
+    /// granted to a remote client only in the driver's time namespace; one
+    /// the driver cannot prove so is refused with `InvalidPublicationMode`,
+    /// the detail its namespace code, and nothing is fixed.
+    #[test]
+    fn a_monotonic_timed_stream_refuses_a_remote_client_outside_its_namespace() {
+        let (mut driver, stream) = driver_with_timed_stream();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let answers = add_timed_publication(&mut driver, &mut producer);
+        let unknown = TimeNamespace::Unknown.code();
         assert!(
             answers.iter().any(|answer| matches!(
                 answer,
                 Response::Error {
                     request: RequestId { client: c, sequence: 1 },
                     code: ErrorCode::InvalidPublicationMode,
+                    detail,
+                } if *c == client && *detail == unknown
+            )),
+            "{answers:?}"
+        );
+        // Nothing was fixed: the settings still change.
+        driver
+            .schedule_stream(stream, karyos_client::schedule::ScheduleOptions::default())
+            .unwrap();
+    }
+
+    /// T-x2 (TT-6a): a `Tai` lane is one clock for the whole host, granted
+    /// to a remote client whatever its time namespace (Linux, where the
+    /// kernel reads `CLOCK_TAI`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tai_timed_stream_grants_a_remote_client() {
+        if karyos_sys::host_clock::host_tai_ns().is_none() {
+            return;
+        }
+        let (mut driver, stream) = driver_with_timed_stream();
+        let options = karyos_client::schedule::ScheduleOptions::default()
+            .with_domain(karyos_client::schedule::ClockDomain::Tai);
+        driver.schedule_stream(stream, options).unwrap();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let answers = add_timed_publication(&mut driver, &mut producer);
+        assert!(
+            answers.iter().any(|answer| matches!(
+                answer,
+                Response::PublicationReady {
+                    request: RequestId { client: c, sequence: 1 },
                     ..
                 } if *c == client
             )),
             "{answers:?}"
+        );
+        let ring = driver.schedule_ring(stream).unwrap().unwrap();
+        assert_eq!(
+            karyos_sys::schedule_ring::binding(ring),
+            Ok(options.binding())
         );
     }
 

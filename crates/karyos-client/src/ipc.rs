@@ -1414,7 +1414,12 @@ impl RemoteClient {
             let inner = prepare_publication(fetched, export)?
                 .activate()
                 .map_err(|refused| AttachError::Sys(refused.error))?;
-            let publication = ClientPublication::new(inner, allow_unconnected);
+            // A timed lane's handle reads its schedule from the ring's
+            // header (timed-tx.md section 11, TT-6b): a binding this build
+            // does not know is a protocol error, and nothing is granted.
+            let publication = ClientPublication::new(inner, allow_unconnected)
+                .with_ring_schedule()
+                .map_err(|_| AttachError::Protocol)?;
             Ok(match guard {
                 Some(guard) => publication.with_guard(guard),
                 None => publication,

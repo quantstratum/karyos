@@ -857,6 +857,31 @@ impl<T: StreamTerms> Stream<T> {
             .map(|retained| (&retained.buffer, retained.base))
     }
 
+    /// Fixes a timed lane's settings as a handle of it is issued, or as its
+    /// sender is added: they are written once into the ring's binding
+    /// words, which a publisher in another process reads (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`, section 11, TT-6b), and do not change
+    /// for the incarnation. A lane that is not timed, or whose settings are
+    /// already fixed, is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Sys`] for a ring that is not one (a broken
+    /// invariant).
+    pub(crate) fn fix_schedule(&mut self) -> Result<(), DriverError> {
+        if self.schedule_issued {
+            return Ok(());
+        }
+        let Some(ring) = self.buffer.schedule_ring() else {
+            return Ok(());
+        };
+        let binding = self.schedule.unwrap_or_default().binding();
+        karyos_sys::schedule_ring::write_binding(ring, binding)
+            .map_err(|error| DriverError::Sys(error.into()))?;
+        self.schedule_issued = true;
+        Ok(())
+    }
+
     /// Refuses issuance while a cutover is pending.
     pub(crate) fn issuing(&self) -> Result<(), DriverError> {
         match &self.cutover {
@@ -915,6 +940,11 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// The admission socket and its connections (IPC mode).
     #[cfg(target_os = "linux")]
     pub(crate) admission: Option<crate::admission::Admission<T>>,
+    /// Remote clients the conductor found faulty outside admission (a
+    /// timed lane's schedule violation), for admission to retire with its
+    /// socket and pidfd at its next step.
+    #[cfg(target_os = "linux")]
+    pub(crate) faulty_pending: Vec<u64>,
     /// The error log and the loss report.
     pub(crate) diagnostics: crate::diagnostics::Diagnostics,
     /// The client trace journals and the trace mirror.
@@ -1363,6 +1393,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             positions: crate::positions::Positions::default(),
             #[cfg(target_os = "linux")]
             admission,
+            #[cfg(target_os = "linux")]
+            faulty_pending: Vec::new(),
             diagnostics,
             trace_journals: crate::trace_journals::TraceJournals::new(
                 mirror,
@@ -2494,8 +2526,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guarded.bind(bound);
         }
         if let Some(schedule) = schedule {
+            stream.fix_schedule()?;
             publication = publication.with_schedule(schedule);
-            stream.schedule_issued = true;
         }
         self.update_stream_gauges();
         Ok(publication)
@@ -3863,6 +3895,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // The guarded publications the sender refused or returned: their
         // gates are gone, so their senders leave the close acknowledgement.
         self.deregister_released_guards();
+        self.apply_schedule_violations();
         served
     }
 
@@ -4217,6 +4250,66 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // The agents stopped with their hooks: no network journal stays open.
         self.close_network_tracing();
         Some(shutdown)
+    }
+
+    /// Applies the schedule violations the senders reported
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`, section 11, TT-6):
+    /// each lane still in the incarnation its sender served is sealed with
+    /// `SealReason::ScheduleViolation` (a lane already sealed keeps its
+    /// first reason), counted, and logged with its holder; a remote holder
+    /// is retired as faulty, an in-process one gets only the seal. A report
+    /// for a lane gone or reincarnated since is dropped and counted.
+    /// Returns how many lanes it sealed.
+    fn apply_schedule_violations(&mut self) -> usize {
+        let mut sealed = 0usize;
+        while let Some(violation) = self
+            .net
+            .as_mut()
+            .and_then(crate::net::Network::pop_schedule_violation)
+        {
+            let lane = karyos_sys::frame::Lane::try_new(violation.lane).ok();
+            let stream = self
+                .aggregate_of(violation.registration)
+                .ok()
+                .zip(lane)
+                .and_then(|(aggregate, lane)| aggregate.lane(lane));
+            let found = stream.and_then(|stream| self.active_stream(stream).ok());
+            let Some(found) = found.filter(|found| found.incarnation == violation.incarnation)
+            else {
+                if let Some(net) = &mut self.net {
+                    net.count_stale_schedule_violation();
+                }
+                continue;
+            };
+            let id = found.id;
+            if found.conductor.seal_state() == karyos_sys::log_buffer::SealState::Active
+                && found
+                    .conductor
+                    .seal_with_reason(karyos_sys::log_buffer::SealReason::ScheduleViolation)
+                    .is_err()
+            {
+                continue;
+            }
+            self.counters
+                .add(crate::counters::Event::ScheduleViolations, 1);
+            if let Some(count) = sealed.checked_add(1) {
+                sealed = count;
+            }
+            let holder = self.publication_holder(id);
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::ClientProtocolViolation,
+                [holder.map_or(0, |(client, _)| client), id],
+                "a timed lane's publisher breached its schedule ring; the lane is sealed",
+            );
+            #[cfg(target_os = "linux")]
+            if let Some((client, true)) = holder
+                && !self.faulty_pending.contains(&client)
+            {
+                self.faulty_pending.push(client);
+            }
+        }
+        sealed
     }
 
     /// Deregisters the guard senders the network released (their

@@ -783,6 +783,25 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// Its registration.
         registration: u64,
     },
+    /// Posted unsolicited, once per lane, into a free slot and again each
+    /// cycle until posted: the publisher of a timed lane breached its
+    /// schedule ring's protocol (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`, section 11, TT-6), and the sender stages
+    /// nothing more of the lane. The conductor seals the lane with
+    /// `SealReason::ScheduleViolation` if the identity still names the live
+    /// publication, and drops the event otherwise.
+    ScheduleViolated {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// The incarnation the sender serves.
+        incarnation: u64,
+        /// The lane.
+        lane: u8,
+    },
     /// The sender stopped the publication; `outbound` is its data path,
     /// `None` when it held no such publication.
     PublicationRemoved {
@@ -1340,6 +1359,8 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         // A drained publication's report; a full ring asks again next
         // cycle.
         role.report_drained(|event| events.try_post(event).is_ok());
+        // A schedule violation's report, likewise.
+        role.report_violations(|event| events.try_post(event).is_ok());
         served
             .checked_add(work)
             .ok_or(AgentError::CountOverflow(AgentKind::Sender))
