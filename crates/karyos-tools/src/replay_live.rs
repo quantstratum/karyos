@@ -483,7 +483,7 @@ pub enum Command {
 
 /// A client of the driver in `live`'s directory (Linux).
 #[cfg(target_os = "linux")]
-fn connect(
+pub(crate) fn connect(
     live: &LiveArchive,
     timeout: Duration,
 ) -> Result<Client<karyos_client::ipc::RemoteClient>, LiveError> {
@@ -497,7 +497,7 @@ fn connect(
 
 /// A client of another process's driver needs Linux.
 #[cfg(not(target_os = "linux"))]
-fn connect(
+pub(crate) fn connect(
     _live: &LiveArchive,
     _timeout: Duration,
 ) -> Result<Client<karyos_client::ClientConductor>, LiveError> {

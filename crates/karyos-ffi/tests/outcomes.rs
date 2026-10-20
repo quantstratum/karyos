@@ -123,15 +123,25 @@ fn serve(
     thread
 }
 
-/// Polls `publication`'s lane 0 until `done` holds of the records.
+/// How long one wait may take: generous, as a loaded runner can starve the
+/// driver's thread (karyos #526); each wait ends when its condition holds.
+const WAIT: Duration = Duration::from_secs(30);
+
+/// Polls `publication`'s lane 0 until `done` holds of the records;
+/// `phase` names the wait in a failure.
 fn outcomes_until(
     publication: u64,
+    phase: &str,
     mut done: impl FnMut(&[abi::Outcome]) -> bool,
 ) -> Vec<abi::Outcome> {
     let mut records = Vec::new();
     let start = Instant::now();
     while !done(&records) {
-        assert!(start.elapsed() < Duration::from_secs(10), "saw {records:?}");
+        assert!(
+            start.elapsed() < WAIT,
+            "{phase}: after {:?}, saw {records:?}",
+            start.elapsed()
+        );
         let (status, delivered, mut polled) = abi::publication_poll_outcomes(publication, 0, 64);
         assert_eq!(status, 0);
         assert_eq!(usize::try_from(delivered).unwrap(), polled.len());
@@ -158,7 +168,7 @@ fn a_remote_guarded_publication_reads_its_outcomes_over_the_c_abi() {
     for payload in [b"a", b"b", b"c"] {
         assert_eq!(abi::publication_offer(publication, payload), 0);
     }
-    let records = outcomes_until(publication, |records| records.len() >= 3);
+    let records = outcomes_until(publication, "three SUBMITTED", |records| records.len() >= 3);
     assert_eq!(records.len(), 3, "{records:?}");
     for (record, sequence) in records.iter().zip(1..) {
         assert_eq!(record.size, 72);
@@ -184,10 +194,14 @@ fn a_remote_guarded_publication_reads_its_outcomes_over_the_c_abi() {
             0 => accepted += 1,
             _ => {}
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "never gated");
+        assert!(
+            start.elapsed() < WAIT,
+            "never gated: after {:?}, {accepted} accepted",
+            start.elapsed()
+        );
         std::thread::sleep(Duration::from_micros(200));
     }
-    let records = outcomes_until(publication, |records| {
+    let records = outcomes_until(publication, "ENDED", |records| {
         records.iter().any(|record| record.kind == ENDED)
     });
     let submitted = records
