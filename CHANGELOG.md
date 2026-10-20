@@ -421,6 +421,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `Client::remove_concurrent_publication`, the removal matching
+  `Client::add_concurrent_publication` (#484): the driver frees the
+  handle's publisher slot when it serves it, so the stream's `publishers`
+  bound counts it no more. A removal that cannot be sent drops the handle
+  and counts in `publication_releases_failed`. `RemoteClient` gains
+  `remove_concurrent_publication`, and `Connection` a hidden
+  `release_concurrent_publication`. Needed by the C ABI's concurrent
+  publications (quantstratum-docs: karyos/design/ffi-gap-analysis.md,
+  F7a-1); owner item 57 lists it for the alpha.2 audit.
+
 - The operations journal records how each agent run ends (DESIGN, a
   follow-up of M10b): `agent started` (kind 8) is written durably when
   the journal opens and `agent stopped` (kind 7) by `Agent::stop` /
