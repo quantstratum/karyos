@@ -33,8 +33,8 @@
 )]
 
 use karyos_sys::outcome_ring::{
-    HEADER_WORDS, Kind, OutcomeReader, OutcomeWriter, Produced, RECORD_WORDS, Record, Witness,
-    init, ring_words,
+    Binding, HEADER_WORDS, Kind, OutcomeReader, OutcomeWriter, Produced, RECORD_WORDS, Record,
+    Witness, init, ring_words,
 };
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::cell::UnsafeCell;
@@ -106,7 +106,13 @@ fn model(variant: Variant) {
     builder.check(move || {
         let words = ring_words(usize::try_from(CAPACITY).unwrap()).unwrap();
         let ring: Arc<Vec<AtomicU64>> = Arc::new((0..words).map(|_| AtomicU64::new(0)).collect());
-        init(&ring, CAPACITY).unwrap();
+        let binding = Binding {
+            messages: CAPACITY - 1,
+            ranges: 0,
+            guard_index: 0,
+            epoch: 2,
+        };
+        init(&ring, &binding).unwrap();
         let consumed = Arc::new(AtomicU64::new(0));
         let witness: Witness = Arc::new((0..CAPACITY).map(|_| UnsafeCell::new(0)).collect());
         let client = {

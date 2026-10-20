@@ -104,7 +104,10 @@
 //! kind. Under the same rule it gains the `GuardAudit` kind (code 11 on
 //! both sides, `quantstratum-docs:
 //! karyos/design/management-agent-gap-analysis.md`, M4) and a sixth
-//! `ToolAdmitted` record.
+//! `ToolAdmitted` record, and the guard binding's kinds `GuardRegion`,
+//! `OutcomeRing` and `ConsumedCell` (codes 12 to 14 on both sides,
+//! `quantstratum-docs: karyos/design/guards-and-abort.md`, "The binding
+//! across processes", G-x1), which no grant carries yet.
 //!
 //! **Instance.** The instance of `Admitted` is the driver's 128-bit
 //! `driver_id` (SPEC.md §4), the one id per driver instance (ACS 13555).
@@ -251,6 +254,15 @@ pub enum RegionKind {
     ConflationTable,
     /// The guard audit ring, which only the driver writes (tools only).
     GuardAudit,
+    /// The guard region, which only the driver writes; a client with a
+    /// guarded handle maps it read-only.
+    GuardRegion,
+    /// A guarded handle's outcome ring, which only the driver writes; its
+    /// client maps it read-only.
+    OutcomeRing,
+    /// A guarded handle's consumed cell, which its own client alone maps
+    /// writable to publish its consumed count.
+    ConsumedCell,
 }
 
 impl RegionKind {
@@ -267,6 +279,9 @@ impl RegionKind {
             Self::TraceMirror => 9,
             Self::ConflationTable => 10,
             Self::GuardAudit => 11,
+            Self::GuardRegion => 12,
+            Self::OutcomeRing => 13,
+            Self::ConsumedCell => 14,
         }
     }
 
@@ -283,6 +298,9 @@ impl RegionKind {
             9 => Some(Self::TraceMirror),
             10 => Some(Self::ConflationTable),
             11 => Some(Self::GuardAudit),
+            12 => Some(Self::GuardRegion),
+            13 => Some(Self::OutcomeRing),
+            14 => Some(Self::ConsumedCell),
             _ => None,
         }
     }
@@ -296,7 +314,7 @@ impl RegionKind {
 /// so the wire numbers the later kinds after it. Each side keeps its own
 /// codes; only this table relates them.
 #[cfg(target_os = "linux")]
-pub const SYS_KINDS: [(RegionKind, karyos_sys::ipc::RegionKind); 11] = {
+pub const SYS_KINDS: [(RegionKind, karyos_sys::ipc::RegionKind); 14] = {
     use karyos_sys::ipc::RegionKind as Sys;
     [
         (RegionKind::CommandRing, Sys::CommandRing),
@@ -310,6 +328,9 @@ pub const SYS_KINDS: [(RegionKind, karyos_sys::ipc::RegionKind); 11] = {
         (RegionKind::TraceMirror, Sys::TraceMirror),
         (RegionKind::ConflationTable, Sys::ConflationTable),
         (RegionKind::GuardAudit, Sys::GuardAudit),
+        (RegionKind::GuardRegion, Sys::GuardRegion),
+        (RegionKind::OutcomeRing, Sys::OutcomeRing),
+        (RegionKind::ConsumedCell, Sys::ConsumedCell),
     ]
 };
 
@@ -1021,7 +1042,7 @@ mod tests {
         ));
         // A record with export 0, an unknown kind, an unknown capability or
         // an index on a capability without one.
-        for (offset, value) in [(72, 0u8), (80, 12), (113, 7), (120, 1)] {
+        for (offset, value) in [(72, 0u8), (80, 15), (113, 7), (120, 1)] {
             let mut bad = encode(&Message::Manifest {
                 fetch: 1,
                 key: 2,
@@ -1175,11 +1196,11 @@ mod tests {
             assert_eq!(wire.to_sys(), sys);
             assert_eq!(RegionKind::from_sys(sys), wire);
         }
-        for code in 1..=11 {
+        for code in 1..=14 {
             let wire = RegionKind::from_code(code).unwrap();
             assert_eq!(RegionKind::from_sys(wire.to_sys()), wire);
         }
-        assert_eq!(RegionKind::from_code(12), None);
+        assert_eq!(RegionKind::from_code(15), None);
     }
 
     /// The protocol version is 2 (ACS 13677): the trace journal kinds.
@@ -1475,7 +1496,7 @@ mod tests {
         let first = 40;
         for (offset, value) in [
             (first + 8, 0u8),
-            (first + 16, 12),
+            (first + 16, 15),
             (first + 49, 1),
             (first + 49, 3),
             (first + 49, 5),
@@ -1745,6 +1766,9 @@ mod properties {
                 RegionKind::TraceMirror,
                 RegionKind::ConflationTable,
                 RegionKind::GuardAudit,
+                RegionKind::GuardRegion,
+                RegionKind::OutcomeRing,
+                RegionKind::ConsumedCell,
             ][..],
         );
         let capability = prop_oneof![
