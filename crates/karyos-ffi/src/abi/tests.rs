@@ -70,7 +70,8 @@ fn poll(client: u64) -> (i32, u32) {
 fn options_init_fills_the_defaults_and_the_size() {
     let options = defaults();
     assert_eq!(options.size, size_of_u32::<ClientOptions>());
-    assert_eq!(options.idle_strategy, client::IDLE_YIELD);
+    // ADR-0066: the agents' default.
+    assert_eq!(options.idle_strategy, client::IDLE_YIELD_THEN_SLEEP);
     assert!(options.dir.is_null());
     assert_eq!(options.timeout_ns, 10_000_000_000);
     assert_eq!(options.max_pending, 64);
@@ -107,11 +108,13 @@ fn connect_refuses_bad_arguments_and_writes_nothing() {
     };
     assert_eq!(connect(&bad_dir).0, Status::InvalidArgument.code());
 
-    let bad_idle = ClientOptions {
-        idle_strategy: 9,
-        ..options
-    };
-    assert_eq!(connect(&bad_idle).0, Status::InvalidArgument.code());
+    for unknown in [4, 9] {
+        let bad_idle = ClientOptions {
+            idle_strategy: unknown,
+            ..options
+        };
+        assert_eq!(connect(&bad_idle).0, Status::InvalidArgument.code());
+    }
 }
 
 #[test]
@@ -1640,6 +1643,7 @@ mod archive;
 mod concurrent;
 mod conflated;
 mod outcomes;
+mod rejoin;
 
 // Subscription options (F7b).
 
@@ -1684,10 +1688,19 @@ unsafe fn add_subscription_with(
 fn subscription_options_init_fills_the_defaults_and_the_size() {
     let options = subscription_defaults();
     assert_eq!(options.size, size_of_u32::<SubscriptionOptions>());
-    assert_eq!(options.size, SUBSCRIPTION_OPTIONS_SIZE_0_1);
+    assert_eq!(options.size, SUBSCRIPTION_OPTIONS_SIZE_ARCHIVE);
     assert_eq!(
         (options.role, options.rejoin, options.reserved),
         (ROLE_REQUIRED, REJOIN_AT_HEAD, 0)
+    );
+    assert_eq!(
+        (
+            options.archive,
+            options.archive_client_id,
+            options.replay_stream_id,
+            options.secondary
+        ),
+        (0, 0, 0, 0)
     );
     // SAFETY: a null pointer is refused before any use.
     let status = unsafe { karyos_subscription_options_init(core::ptr::null_mut()) };
@@ -1716,11 +1729,39 @@ fn add_with_refuses_bad_options_and_opens_nothing() {
             ..subscription_defaults()
         },
         SubscriptionOptions {
-            rejoin: 2,
+            rejoin: 3,
             ..subscription_defaults()
         },
         SubscriptionOptions {
             reserved: 1,
+            ..subscription_defaults()
+        },
+        // A size between the two layouts.
+        SubscriptionOptions {
+            size: SUBSCRIPTION_OPTIONS_SIZE_ARCHIVE - 8,
+            ..subscription_defaults()
+        },
+        // The Archive rejoin in the smaller layout.
+        SubscriptionOptions {
+            size: SUBSCRIPTION_OPTIONS_SIZE_0_1,
+            rejoin: REJOIN_ARCHIVE,
+            ..subscription_defaults()
+        },
+        // An Archive field for another policy.
+        SubscriptionOptions {
+            archive: 7,
+            ..subscription_defaults()
+        },
+        SubscriptionOptions {
+            rejoin: REJOIN_CLOSE,
+            replay_stream_id: 9,
+            ..subscription_defaults()
+        },
+        // A secondary that is not a fallback policy.
+        SubscriptionOptions {
+            rejoin: REJOIN_ARCHIVE,
+            archive: 7,
+            secondary: REJOIN_ARCHIVE,
             ..subscription_defaults()
         },
     ] {
@@ -1732,7 +1773,7 @@ fn add_with_refuses_bad_options_and_opens_nothing() {
             role: code,
             ..subscription_defaults()
         })
-        .map(|options| options.role)
+        .map(|options| options.0.role)
     };
     assert_eq!(
         role(ROLE_REQUIRED),
@@ -1770,7 +1811,7 @@ fn an_optional_reader_under_close_is_closed_by_its_overrun() {
             size: size_of_u32::<Newer>(),
             role: ROLE_OPTIONAL,
             rejoin: REJOIN_CLOSE,
-            reserved: 0,
+            ..subscription_defaults()
         },
         later: u64::MAX,
     };

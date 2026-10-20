@@ -43,6 +43,7 @@ fn c_struct(rust: &str) -> &'static str {
         "OfferOptions" => "karyos_offer_options",
         "ArchiveOptions" => "karyos_archive_options",
         "Recording" => "karyos_recording",
+        "SubscriptionRejoin" => "karyos_subscription_rejoin",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -82,6 +83,7 @@ fn c_type(rust: &str) -> String {
         "*const ArchiveOptions" => "const karyos_archive_options *",
         "*const Recording" => "const karyos_recording *",
         "RecordingHandler" => "karyos_recording_handler",
+        "*mut SubscriptionRejoin" => "karyos_subscription_rejoin *",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -415,6 +417,10 @@ fn the_header_states_the_client_constants() {
     );
     assert_eq!(defines["KARYOS_IDLE_YIELD"], i64::from(client::IDLE_YIELD));
     assert_eq!(defines["KARYOS_IDLE_SLEEP"], i64::from(client::IDLE_SLEEP));
+    assert_eq!(
+        defines["KARYOS_IDLE_YIELD_THEN_SLEEP"],
+        i64::from(client::IDLE_YIELD_THEN_SLEEP)
+    );
 }
 
 #[test]
@@ -548,6 +554,41 @@ fn the_header_states_the_archive_constants() {
             i64::from(crate::abi::stop_reason(reason)),
             "{name}"
         );
+    }
+}
+
+#[test]
+fn the_header_states_the_rejoin_and_merge_codes() {
+    use crate::abi::{MERGE_NONE, MERGE_OTHER, REJOIN_ARCHIVE, merge_code};
+    use karyos_client::MergeError;
+    let defines = header_defines();
+    assert_eq!(defines["KARYOS_REJOIN_ARCHIVE"], i64::from(REJOIN_ARCHIVE));
+    assert_eq!(defines["KARYOS_MERGE_NONE"], i64::from(MERGE_NONE));
+    assert_eq!(defines["KARYOS_MERGE_OTHER"], i64::from(MERGE_OTHER));
+    let overrun = || karyos_client::Overrun::new(0, 1, 1);
+    let error = || karyos_client::ClientError::Timeout;
+    for (name, failure) in [
+        (
+            "KARYOS_MERGE_REPLAY_OVERRUN",
+            MergeError::ReplayOverrun(overrun()),
+        ),
+        ("KARYOS_MERGE_REPLAY", MergeError::Replay(error())),
+        (
+            "KARYOS_MERGE_LIVE_OVERRUN",
+            MergeError::LiveOverrun(overrun()),
+        ),
+        ("KARYOS_MERGE_LIVE", MergeError::Live(error())),
+    ] {
+        assert_eq!(defines[name], i64::from(merge_code(&failure)), "{name}");
+    }
+    for (name, code) in [
+        ("KARYOS_MERGE_EPOCH_CHANGED", 1),
+        ("KARYOS_MERGE_REPLAY_SHORT", 2),
+        ("KARYOS_MERGE_MISMATCH", 3),
+        ("KARYOS_MERGE_LANE", 4),
+        ("KARYOS_MERGE_REPLAY_REVOKED", 6),
+    ] {
+        assert_eq!(defines[name], code, "{name}");
     }
 }
 

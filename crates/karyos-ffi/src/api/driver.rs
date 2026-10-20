@@ -25,6 +25,7 @@ use std::time::Duration;
 use std::collections::BTreeMap;
 
 use karyos_client::ClientConductor;
+use karyos_driver::agents::{IdleStrategy as _, YieldThenSleep};
 use karyos_driver::{DriverConfig, DriverError, EmbeddedDriver, StreamConfig, StreamHandle};
 use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::frame::Lane;
@@ -34,7 +35,7 @@ use karyos_sys::log_buffer::{
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
-use crate::api::client::{IDLE_BUSY_SPIN, IDLE_SLEEP, IDLE_YIELD};
+use crate::api::client::{IDLE_BUSY_SPIN, IDLE_SLEEP, IDLE_YIELD, IDLE_YIELD_THEN_SLEEP};
 use crate::boundary::drop_payload;
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
@@ -281,8 +282,14 @@ pub(crate) struct Idle {
 }
 
 impl Idle {
-    /// Waits after a duty cycle that did `work`.
-    fn idle(self, work: u32) {
+    /// Waits after a duty cycle that did `work`; `backoff` is the thread's
+    /// `KARYOS_IDLE_YIELD_THEN_SLEEP` state, the driver agents' own
+    /// strategy (ADR-0066).
+    fn idle(self, work: u32, backoff: &mut YieldThenSleep) {
+        if self.strategy == IDLE_YIELD_THEN_SLEEP {
+            backoff.idle(work);
+            return;
+        }
         if work > 0 {
             return;
         }
@@ -505,7 +512,14 @@ pub(crate) fn do_work(driver: Handle) -> Result<u32, Failure> {
 /// [`Status::Internal`] for a lost one, the table's errors, and the
 /// thread's spawn as [`Status::System`] (the driver stays its caller's).
 pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
-    if ![IDLE_BUSY_SPIN, IDLE_YIELD, IDLE_SLEEP].contains(&idle.strategy) {
+    if ![
+        IDLE_BUSY_SPIN,
+        IDLE_YIELD,
+        IDLE_SLEEP,
+        IDLE_YIELD_THEN_SLEEP,
+    ]
+    .contains(&idle.strategy)
+    {
         return Err(Status::InvalidArgument.into());
     }
     with_slot(driver, |slot| {
@@ -557,6 +571,7 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
 /// poisons the shared driver and ends the thread.
 fn run(shared: &Mutex<EmbeddedDriver>, stop: &AtomicBool, idle: Idle, state: DriverState) {
     let watch = Watch(state);
+    let mut backoff = YieldThenSleep::default();
     while !stop.load(Ordering::Acquire) {
         let work = {
             let Ok(mut driver) = shared.lock() else {
@@ -567,7 +582,7 @@ fn run(shared: &Mutex<EmbeddedDriver>, stop: &AtomicBool, idle: Idle, state: Dri
             // A duty cycle's error is not fatal: the next one runs.
             driver.do_work().unwrap_or(0)
         };
-        idle.idle(work);
+        idle.idle(work, &mut backoff);
     }
 }
 

@@ -17,6 +17,12 @@ use std::process::Command;
 
 /// The normal dependencies of `package`, one crate per line.
 fn dependencies(package: &str) -> String {
+    cargo_tree(package, "normal")
+}
+
+/// The dependencies of `package` along `edges` (`cargo tree -e`), one
+/// crate per line.
+fn cargo_tree(package: &str, edges: &str) -> String {
     // The cargo running the tests, at run time; every feature, so no
     // feature can bring the crate in. The host target only: `--target all`
     // needs other targets' dependencies, which an offline build does not
@@ -28,7 +34,7 @@ fn dependencies(package: &str) -> String {
             "-p",
             package,
             "-e",
-            "normal",
+            edges,
             "--all-features",
             "--prefix",
             "none",
@@ -91,4 +97,26 @@ fn the_agent_stays_outside_the_driver_and_the_client() {
             "karyos-agent depends on {crate_name}:\n{agent}"
         );
     }
+}
+
+/// The C ABI (#549): karyos-ffi's tests use the production Archive host
+/// (karyos-tools' `DriverHost`) as a dev-dependency only. The published
+/// crate never depends on karyos-tools, which sits above it.
+#[test]
+fn the_c_abi_depends_on_the_tools_for_its_tests_only() {
+    let tree = dependencies("karyos-ffi");
+    assert!(
+        tree.lines().any(|line| line.starts_with("karyos-ffi")),
+        "{tree}"
+    );
+    assert!(
+        !tree.lines().any(|line| line.starts_with("karyos-tools ")),
+        "karyos-ffi depends on karyos-tools:\n{tree}"
+    );
+    // The check sees the crate when it is there: as a dev-dependency.
+    let dev = cargo_tree("karyos-ffi", "dev");
+    assert!(
+        dev.lines().any(|line| line.starts_with("karyos-tools ")),
+        "{dev}"
+    );
 }

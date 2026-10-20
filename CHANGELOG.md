@@ -11,6 +11,25 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-ffi`'s default idle strategy is `KARYOS_IDLE_YIELD_THEN_SLEEP`
+  (ADR-0066): `karyos_client_options_init` now fills it in place of
+  `KARYOS_IDLE_YIELD`, and `karyos_driver_start` takes it. The new
+  constant (3) yields for the first 64 consecutive idle waits, then sleeps
+  1 ms per wait, and starts again after a wait that found work; the driver
+  thread uses the agents' own `YieldThenSleep`. Busy-spin stays an
+  explicit choice.
+- `karyos_client::Context`'s default idle strategy is the new
+  `IdleStrategy::YieldThenSleep` (ADR-0066), in place of `Yield`, so a
+  client's control-call wait yields for 64 idle waits and then sleeps
+  1 ms per wait. The ABI's default is the facade's. `BusySpin`, `Yield`
+  and `Sleep` stay explicit choices.
+- `karyos.h` states the ABI version rule of decision BIND-Q8 in place of
+  "a different major is incompatible": call `karyos_abi_version` first,
+  before any other call and before using newer symbols or layouts; the
+  ABI version is independent of the workspace version; before 1.0 a
+  caller accepts exactly the `0.y` it targets with at least its minimum
+  `0.y.z`.
+
 - The alpha.2 public API audit's refresh (quantstratum-docs:
   `karyos/testing/public-api-audit-alpha2.md`, 2026-10-20):
   `karyos_archive::source::Rejoin` is `#[non_exhaustive]`, so a match
@@ -789,6 +808,23 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos:udp` URI with the new `ClientError::InvalidOptions` before
   anything is requested. The facade re-exports `SubscriptionOptions`,
   `SubscriberRole`, `RejoinPolicy`, `Secondary` and `SnapshotSource`.
+- The C ABI's Archive-backed rejoin (quantstratum-docs:
+  `karyos/design/ffi-archive.md`, F9b; owner item 57).
+  `karyos_subscription_options` grows to 40 bytes (16 still accepted,
+  sizes between refused) with `archive`, `archive_client_id`,
+  `replay_stream_id` and `secondary`, for the new policy
+  `KARYOS_REJOIN_ARCHIVE`: an overrun's gap is recovered from the
+  Archive handle's recording and merged back into the live stream, with
+  `secondary` (`KARYOS_REJOIN_AT_HEAD` or `KARYOS_REJOIN_CLOSE`) after a
+  failed merge. The Archive handle lends its control streams and an id;
+  each rejoin takes its own request publication and response
+  subscription, released by their drop at the subscription's close. An
+  `archive_client_id` of 0 lets the library assign the id.
+  `karyos_subscription_rejoin_state` writes a sized
+  `karyos_subscription_rejoin` (recovering, and the last failure's
+  `KARYOS_MERGE_*` code, `KARYOS_MERGE_OTHER` for one the ABI does not
+  name). The poll is unchanged. The conformance runner takes the Archive
+  fields.
 - The C ABI lists an Archive's catalog (quantstratum-docs:
   `karyos/design/ffi-archive.md`, F9a; owner item 57).
   `karyos_archive_connect(client, options, archive, detail)` opens a
