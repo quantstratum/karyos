@@ -571,7 +571,10 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
             | WireKind::LossReport
             | WireKind::TraceMirror
             | WireKind::ConflationTable
-            | WireKind::GuardAudit => {
+            | WireKind::GuardAudit
+            | WireKind::GuardRegion
+            | WireKind::OutcomeRing
+            | WireKind::ConsumedCell => {
                 return Err(AttachError::Protocol);
             }
         };
@@ -849,6 +852,39 @@ impl RemoteClient {
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?
             .remove_network_subscription(registration)
+    }
+
+    /// Removes a concurrent handle this client took, as
+    /// [`RemoteClient::remove_publication`] does an exclusive one: the
+    /// driver frees its publisher slot when it serves the removal.
+    ///
+    /// # Errors
+    ///
+    /// The handle back, with [`ConductorError::ForeignHandle`] for one this
+    /// client did not take, or the error that kept the removal from being
+    /// submitted.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the handle is returned intact so the caller can retry; boxing it would allocate on every Full"
+    )]
+    pub fn remove_concurrent_publication(
+        &mut self,
+        publication: ClientConcurrentPublication<SharedTerms>,
+    ) -> Result<u64, (ClientConcurrentPublication<SharedTerms>, ConductorError)> {
+        let Some(registration) = self.taken_registration(publication.generation_link()) else {
+            return Err((publication, ConductorError::ForeignHandle));
+        };
+        let submitted = match self.conductor_mut() {
+            Ok(conductor) => conductor.remove_publication_registration(registration),
+            Err(error) => Err(error),
+        };
+        match submitted {
+            Ok(sequence) => {
+                drop(publication);
+                Ok(sequence)
+            }
+            Err(error) => Err((publication, error)),
+        }
     }
 
     /// Removes a publication taken from this client's grant, as

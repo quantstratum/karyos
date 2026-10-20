@@ -112,6 +112,16 @@ pub enum RegionKind {
     /// tools (`quantstratum-docs:
     /// karyos/design/management-agent-gap-analysis.md`, M4).
     GuardAudit,
+    /// The guard region (driver only): every guard's word, which a client
+    /// with a guarded handle maps read-only (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, "The binding across processes").
+    GuardRegion,
+    /// A guarded handle's outcome ring (driver only), which its client
+    /// maps read-only.
+    OutcomeRing,
+    /// A guarded handle's consumed cell: its own client writes the count
+    /// and the driver reads it, so the region keeps the size seals only.
+    ConsumedCell,
 }
 
 impl RegionKind {
@@ -128,6 +138,9 @@ impl RegionKind {
             Self::TraceMirror => 9,
             Self::ConflationTable => 10,
             Self::GuardAudit => 11,
+            Self::GuardRegion => 12,
+            Self::OutcomeRing => 13,
+            Self::ConsumedCell => 14,
         }
     }
 }

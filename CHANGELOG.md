@@ -439,6 +439,19 @@ release may break APIs, wire formats and shared-memory layouts.
   subscription before it closes any. The header checker reads callback
   typedefs.
 
+- The guard binding's region kinds and outcome header (G-x1;
+  quantstratum-docs: `karyos/design/guards-and-abort.md`, "The binding
+  across processes"). `RegionKind` gains `GuardRegion` (12),
+  `OutcomeRing` (13) and `ConsumedCell` (14), with the same codes in
+  `karyos-sys` and on the wire, under the unreleased admission version
+  2; no grant carries them yet, and the control path still refuses
+  guarded streams. The outcome ring's layout version moves to 2
+  (unreleased): `outcome_ring::init` takes a `Binding` and writes
+  `C_m`, `C_r`, the guard's word index and the admission epoch in header
+  words 2 to 5, and `outcome_ring::binding` reads them back for a
+  client, refusing a slot count other than `C_m + C_r + 1`, an index
+  past the client's guard words, or an epoch that is not open.
+
 - karyos-client's `Subscription` gains `adopt()`, `max_message_length()`
   and `poll_adopted(handler, limit)` (owner item 57; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md` §4.4), so a caller can size a copy
@@ -452,6 +465,16 @@ release may break APIs, wire formats and shared-memory layouts.
   stopped at a seal sets the new `stopped_at_seal` of `SubscriptionPoll`
   and `PollSummary`. `poll` is unchanged: it adopts, and moves within
   the poll. The C ABI's subscription poll (F4) builds on it.
+
+- `Client::remove_concurrent_publication`, the removal matching
+  `Client::add_concurrent_publication` (#484): the driver frees the
+  handle's publisher slot when it serves it, so the stream's `publishers`
+  bound counts it no more. A removal that cannot be sent drops the handle
+  and counts in `publication_releases_failed`. `RemoteClient` gains
+  `remove_concurrent_publication`, and `Connection` a hidden
+  `release_concurrent_publication`. Needed by the C ABI's concurrent
+  publications (quantstratum-docs: karyos/design/ffi-gap-analysis.md,
+  F7a-1); owner item 57 lists it for the alpha.2 audit.
 
 - A journal that cannot be opened at the agent's start raises the
   `journal_gap` alert (karyos#497; quantstratum-docs:
