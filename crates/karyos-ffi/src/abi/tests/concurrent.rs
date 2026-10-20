@@ -77,7 +77,23 @@ fn a_stream_mode_takes_only_its_publishers() {
             "{refused:?}"
         );
     }
-    // Nothing was added: the stream id is still free.
+    // Each concurrent publisher takes one spare slot of the stream's term
+    // ring, which keeps one for cleaning: with the default 3 spare slots
+    // at most 2 publishers fit, and 3 is refused as unavailable resources.
+    assert_eq!(exclusive.spare_slots, 3);
+    assert_eq!(
+        add_stream(driver, &concurrent(exclusive, 3)),
+        Status::ResourcesUnavailable.code()
+    );
+    // One more spare slot fits a third publisher (another stream id: a
+    // removed stream's id stays taken while it retires).
+    let roomier = StreamOptions {
+        stream_id: SHARED + 1,
+        spare_slots: 4,
+        ..concurrent(exclusive, 3)
+    };
+    assert_eq!(add_stream(driver, &roomier), Status::Ok.code());
+    // Nothing was added by a refusal: the stream id is still free.
     assert_eq!(
         add_stream(driver, &concurrent(exclusive, 2)),
         Status::Ok.code()

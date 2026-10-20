@@ -376,7 +376,18 @@ typedef struct karyos_stream_options {
     /*
      * Concurrent handles at once (from 88 bytes): 1 to 255 with
      * KARYOS_PUBLICATION_CONCURRENT, 0 with KARYOS_PUBLICATION_EXCLUSIVE;
-     * anything else is KARYOS_E_INVALID_ARGUMENT. Each handle reserves with
+     * anything else is KARYOS_E_INVALID_ARGUMENT. Each publisher, like
+     * each optional or observer reader, takes one spare-slot credit for the
+     * stream's life, and one spare slot is kept for cleaning: publishers +
+     * optional and observer readers <= spare_slots - 1 (an exclusive
+     * stream counts 1 publisher). Past it the stream is refused
+     * (KARYOS_E_RESOURCES_UNAVAILABLE), or later the reader is. With the
+     * default 3 spare slots, 2 publishers leave room for no optional
+     * reader: raise spare_slots for a concurrent stream that also has
+     * optional readers, such as an Archive's request stream. A concurrent
+     * handle's offer needs a connected subscriber (KARYOS_E_NOT_CONNECTED
+     * otherwise): allow_unconnected applies to exclusive publications
+     * only. Each handle reserves with
      * one atomic fetch_add: on an aarch64 CPU without LSE atomics, as
      * detected at run time (not the build's target features), the driver
      * refuses a concurrent stream, its default.

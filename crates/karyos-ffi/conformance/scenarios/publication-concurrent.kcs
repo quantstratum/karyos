@@ -13,6 +13,10 @@ call karyos_driver_add_stream driver=$driver stream_id=7 publication_mode=1 publ
 expect KARYOS_E_INVALID_ARGUMENT
 call karyos_driver_add_stream driver=$driver stream_id=7 publishers=2
 expect KARYOS_E_INVALID_ARGUMENT
+# Each publisher takes a spare-slot credit and one slot stays for
+# cleaning: 3 publishers do not fit the default 3 spare slots.
+call karyos_driver_add_stream driver=$driver stream_id=7 publication_mode=1 publishers=3
+expect KARYOS_E_RESOURCES_UNAVAILABLE
 call karyos_driver_add_stream driver=$driver stream_id=7 publication_mode=1 publishers=2
 expect KARYOS_OK
 call karyos_driver_start driver=$driver
