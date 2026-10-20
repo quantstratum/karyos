@@ -89,7 +89,7 @@ use crate::subscription::{
 
 mod publish;
 
-pub use publish::{Accepted, Claim, MessageLength, OfferError, Publication};
+pub use publish::{Accepted, Claim, MessageLength, OfferError, OfferOptions, Publication};
 
 /// Default wait of a control call.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);

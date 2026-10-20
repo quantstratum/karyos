@@ -44,7 +44,7 @@ pub mod trace;
 pub use client::{
     Accepted, Claim, Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES,
     DEFAULT_MAX_PENDING, DEFAULT_TIMEOUT, IdleStrategy, ImageChange, ImageStop, MessageLength,
-    OfferError, Publication, Subscription, SubscriptionError, SubscriptionOptions,
+    OfferError, OfferOptions, Publication, Subscription, SubscriptionError, SubscriptionOptions,
     SubscriptionPoll,
 };
 pub use concurrent::{
