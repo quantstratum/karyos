@@ -60,8 +60,9 @@ use karyos_archive::server::{
 use karyos_archive::source::Guarded;
 use karyos_client::aggregate::LaneEnd;
 use karyos_client::{
-    ClientPublication, ClientSubscription, MessageLimit, OfferOutcome, PollSummary, RejoinOutcome,
-    RejoinPolicy, ReplayFallbackReason, ReplayRejoin, Secondary, SecondaryOutcome,
+    ClientConcurrentPublication, ClientPublication, ClientSubscription, ConcurrentOfferOutcome,
+    MessageLimit, OfferOutcome, PollSummary, RejoinOutcome, RejoinPolicy, ReplayFallbackReason,
+    ReplayRejoin, Secondary, SecondaryOutcome,
 };
 use karyos_driver::DriverError;
 use karyos_driver::embedded::{AggregateHandle, EmbeddedDriver, StreamConfig, StreamHandle};
@@ -82,6 +83,10 @@ const RESPONSES: i32 = 101;
 const TARGET: i32 = 200;
 /// The stream the Archive's client asks its replays onto (A6d).
 const REPLAYS: i32 = 201;
+/// The stream replays are written to for a facade client, which subscribes
+/// to each target itself (`Client::replay_targets`): the host only opens
+/// it, and its replay waits for that reader.
+const FACADE_REPLAYS: i32 = 202;
 /// The Archive's client's id, the high half of its correlation ids.
 const ARCHIVE_CLIENT: u32 = 0xA6;
 /// This client's correlation ids: its own id in the high 32 bits, so they
@@ -238,7 +243,9 @@ impl ArchiveHost for Host {
             .map_err(|error| HostRefusal(error.to_string()))?;
         self.opened
             .push((request.target_stream_id, replay_session_id(replay_id)));
-        let subscribed = if request.target_stream_id == REPLAYS {
+        let subscribed = if request.target_stream_id == FACADE_REPLAYS {
+            Ok(())
+        } else if request.target_stream_id == REPLAYS {
             // The Archive's client's: lane 0's reader, which it finds by
             // the target's stream and session.
             let key = (request.target_stream_id, replay_session_id(replay_id));
@@ -265,6 +272,7 @@ impl ArchiveHost for Host {
             handle,
             to,
             ended: self.ended.0.clone(),
+            gated: request.target_stream_id == FACADE_REPLAYS,
         }))
     }
 }
@@ -276,6 +284,9 @@ struct Sink {
     handle: AggregateHandle,
     to: u64,
     ended: Sender<Ended>,
+    /// Whether the replay waits for its target's first reader (H2b), as a
+    /// target its requester subscribes itself needs.
+    gated: bool,
 }
 
 impl Sink {
@@ -285,6 +296,10 @@ impl Sink {
 }
 
 impl ReplaySink for Sink {
+    fn ready(&mut self) -> bool {
+        !self.gated || self.feed.as_ref().is_some_and(ReplayFeed::has_subscriber)
+    }
+
     fn frames(&mut self, position: u64, bytes: &[u8]) -> Result<bool, SinkClosed> {
         self.feed()?.frames(position, bytes).map_err(|_| SinkClosed)
     }
@@ -356,15 +371,22 @@ impl ResponseSink for Writing {
     }
 }
 
-impl ControlRequests for Writing {
+/// A requester's handle on the shared request stream, concurrent as
+/// archive-control-codec.md §7a has the host configure it.
+struct Asking(ClientConcurrentPublication);
+
+impl ControlRequests for Asking {
     fn send(&mut self, message: &[u8]) -> bool {
-        self.write(message)
+        matches!(
+            self.0.offer(message),
+            Ok(ConcurrentOfferOutcome::Accepted { .. })
+        )
     }
 }
 
 /// The client: requests out, answers in.
 struct Client {
-    requests: ClientPublication,
+    requests: ClientConcurrentPublication,
     responses: ClientSubscription,
 }
 
@@ -396,14 +418,19 @@ impl Rig {
         })
         .unwrap();
         let data = driver.add_stream(stream(DATA, initial_term_id)).unwrap();
-        let requests = driver
-            .add_stream(stream(REQUESTS, INITIAL_TERM_ID))
-            .unwrap();
+        // Shared by every requester (§7a): the rig's own, and a facade
+        // client's `ArchiveConnection`.
+        let mut shared = stream(REQUESTS, INITIAL_TERM_ID);
+        shared.buffer.publication = PublicationMode::Concurrent {
+            publishers: 4,
+            allow_non_lse: true,
+        };
+        let requests = driver.add_stream(shared).unwrap();
         let responses = driver
             .add_stream(stream(RESPONSES, INITIAL_TERM_ID))
             .unwrap();
         let client = Client {
-            requests: driver.publication(requests).unwrap(),
+            requests: driver.concurrent_publication(requests).unwrap(),
             responses: driver.subscribe(responses, Role::Required).unwrap(),
         };
         let server_requests = Reading(driver.subscribe(requests, Role::Required).unwrap());
@@ -441,7 +468,7 @@ impl Rig {
         let length = message.encode(&mut out).unwrap();
         loop {
             let requests = &mut self.client.as_mut().unwrap().requests;
-            if let Ok(OfferOutcome::Accepted { .. }) = requests.offer(&out[..length]) {
+            if let Ok(ConcurrentOfferOutcome::Accepted { .. }) = requests.offer(&out[..length]) {
                 return;
             }
             self.cycle();
@@ -492,7 +519,7 @@ impl Rig {
     /// The Archive's client, on the rig's request and response streams,
     /// asking its replays onto [`REPLAYS`]: the rig sends no more requests
     /// of its own.
-    fn archive_client(&mut self) -> ArchiveClient<Writing, Reading, Replays> {
+    fn archive_client(&mut self) -> ArchiveClient<Asking, Reading, Replays> {
         let Client {
             requests,
             responses,
@@ -500,7 +527,7 @@ impl Rig {
         let mut config = ClientConfig::new(ARCHIVE_CLIENT, REPLAYS);
         config.deadline = Duration::from_secs(10);
         let replays = self.server.host().replays.clone();
-        ArchiveClient::new(config, Writing(requests), Reading(responses), replays).unwrap()
+        ArchiveClient::new(config, Asking(requests), Reading(responses), replays).unwrap()
     }
 }
 
@@ -993,6 +1020,181 @@ fn a_facade_subscription_recovers_its_gap_through_the_archive() {
     drop(publication);
 }
 
+/// F9b (ffi-archive.md): a replay target subscribed through a facade
+/// client without blocking. A target not there yet is refused and asked
+/// again; once it exists the grant comes through the client's polls. A
+/// grant withdrawn before it was taken is released by the client: the
+/// target's single reader slot is free again; so is one left to a
+/// subscriber when it is dropped.
+#[test]
+fn a_replay_target_is_subscribed_through_the_facade_client_without_blocking() {
+    use karyos_client::{Client, Context, ReplayTargetSubscriber};
+
+    const SOLO: i32 = 300;
+    let mut rig = Rig::new(INITIAL_TERM_ID);
+    let conductor = rig.driver().connect().unwrap();
+    let mut client = Client::with_conductor(
+        conductor,
+        Context::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap(),
+    );
+    let mut targets = client.replay_targets();
+    let serve = |rig: &mut Rig, client: &mut Client<_>| {
+        rig.cycle();
+        let _ = client.poll();
+    };
+    // Not there yet: refused, and asked again on each call.
+    for _ in 0..20 {
+        assert!(targets.subscribe(SOLO, 1).is_none());
+        serve(&mut rig, &mut client);
+    }
+    // One reader at most.
+    let mut solo = stream(SOLO, INITIAL_TERM_ID);
+    solo.buffer.max_subscribers = 1;
+    let _ = rig.driver().add_stream(solo).unwrap();
+    let granted =
+        |rig: &mut Rig, client: &mut Client<_>, targets: &mut ReplayTargetSubscriber<_>| {
+            let start = Instant::now();
+            loop {
+                assert!(start.elapsed() < Duration::from_secs(10), "never granted");
+                if let Some(subscription) = targets.subscribe(SOLO, 1) {
+                    return subscription;
+                }
+                serve(rig, client);
+            }
+        };
+    let first = granted(&mut rig, &mut client, &mut targets);
+    assert_eq!(first.lane(), Some(Lane::ZERO));
+    drop(first);
+    // Asked for, granted, never taken, then withdrawn by asking for another
+    // target: the client releases the grant.
+    assert!(targets.subscribe(SOLO, 1).is_none());
+    for _ in 0..50 {
+        serve(&mut rig, &mut client);
+    }
+    assert!(targets.subscribe(SOLO + 1, 1).is_none());
+    for _ in 0..50 {
+        serve(&mut rig, &mut client);
+    }
+    // The slot is free: the target is granted again.
+    let again = granted(&mut rig, &mut client, &mut targets);
+    drop(again);
+    // A subscriber dropped with a grant never taken: the client releases
+    // it, and the slot is free once more.
+    let mut other = client.replay_targets();
+    assert!(other.subscribe(SOLO, 1).is_none());
+    for _ in 0..50 {
+        serve(&mut rig, &mut client);
+    }
+    drop(other);
+    for _ in 0..50 {
+        serve(&mut rig, &mut client);
+    }
+    drop(granted(&mut rig, &mut client, &mut targets));
+    // Every withdrawn grant went through the client's release, none failed.
+    assert_eq!(client.subscription_releases_failed(), 0);
+}
+
+/// F9b: a facade subscription whose Archive client is built only from the
+/// facade client (`ArchiveConnection` and `Client::replay_targets`)
+/// recovers its gap, polled as the C ABI polls: adopt, read the largest
+/// message, then `poll_adopted`. No message is longer than what the
+/// adoption said, and every message comes once, in order, byte-exact.
+#[test]
+fn a_facade_rejoin_recovers_through_its_own_archive_client_polled_adopted() {
+    use karyos_archive::client::connection::{ArchiveConnection, ControlStreams};
+    use karyos_client::{Client, Context, StreamId, SubscriberRole, SubscriptionOptions};
+
+    let mut rig = Rig::new(INITIAL_TERM_ID);
+    let data = rig.server.host().data;
+    let mut publication = rig.driver().publication(data).unwrap();
+    let conductor = rig.driver().connect().unwrap();
+    let mut client = Client::with_conductor(
+        conductor,
+        Context::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap(),
+    );
+    // The adds wait for the driver, which this thread runs meanwhile.
+    let (subscription, connection) = std::thread::scope(|scope| {
+        let adding = scope.spawn(|| {
+            let subscription = client
+                .add_subscription_with(
+                    "karyos:ipc",
+                    StreamId::new(DATA),
+                    SubscriptionOptions::new(SubscriberRole::Optional, RejoinPolicy::RejoinAtHead),
+                )
+                .unwrap();
+            let connection =
+                ArchiveConnection::open(&mut client, ControlStreams::new(REQUESTS, RESPONSES))
+                    .unwrap();
+            (subscription, connection)
+        });
+        while !adding.is_finished() {
+            rig.cycle();
+        }
+        adding.join().unwrap()
+    });
+    let _ = rig.start_recording(Mode::Required);
+    let (requests, responses) = connection.into_transports();
+    let mut config = ClientConfig::new(ARCHIVE_CLIENT + 1, FACADE_REPLAYS);
+    config.deadline = Duration::from_secs(10);
+    let archive = ArchiveClient::new(config, requests, responses, client.replay_targets()).unwrap();
+    let mut rejoin = subscription
+        .rejoin_with(Box::new(archive), Secondary::RejoinAtHead)
+        .unwrap();
+
+    let mut sent = Vec::new();
+    publish(
+        &mut rig,
+        &mut publication,
+        &mut sent,
+        5 * u64::from(MIN_TERM_LENGTH),
+        0,
+    );
+    let mut seen: Vec<Sent> = Vec::new();
+    let mut outcomes = Vec::new();
+    let round = |rig: &mut Rig,
+                 client: &mut Client<_>,
+                 rejoin: &mut karyos_client::RejoiningSubscription<_>,
+                 seen: &mut Vec<Sent>| {
+        rig.cycle();
+        let _ = client.poll();
+        rejoin.adopt();
+        let largest = rejoin.max_message_length() as usize;
+        let poll = rejoin
+            .poll_adopted(
+                |bytes, info| {
+                    assert!(bytes.len() <= largest, "{} > {largest}", bytes.len());
+                    seen.push((info.position, bytes.to_vec()));
+                },
+                MessageLimit::new(64),
+            )
+            .unwrap();
+        poll.stopped.and_then(|stop| stop.summary.rejoin)
+    };
+    let start = Instant::now();
+    while !matches!(outcomes.last(), Some(RejoinOutcome::Replayed { .. })) {
+        assert!(start.elapsed() < Duration::from_secs(20), "{outcomes:?}");
+        if let Some(outcome) = round(&mut rig, &mut client, &mut rejoin, &mut seen) {
+            outcomes.push(outcome);
+        }
+    }
+    assert_eq!(outcomes[0], RejoinOutcome::Replaying);
+    assert_eq!(rejoin.merge_failure(), None);
+    let start = Instant::now();
+    while seen.len() < sent.len() {
+        assert!(start.elapsed() < Duration::from_secs(20), "{}", seen.len());
+        let _ = round(&mut rig, &mut client, &mut rejoin, &mut seen);
+    }
+    assert!(seen == sent, "once, in order, byte-exact, at its position");
+    drop(rejoin);
+    drop(publication);
+}
+
 /// A gap in the recording: its reader was lapped before the agent read
 /// it, so the recording holds a gap from the stream's start. A lapped
 /// reader's replay reports the gap as its local gap and merges what
@@ -1141,7 +1343,7 @@ fn the_catalog_is_listed_page_by_page_through_the_control_streams() {
     } = rig.client.take().unwrap();
     let mut lister = RecordingLister::new(
         ListerConfig::new(0xA7).with_bounds(1, 16),
-        Writing(requests),
+        Asking(requests),
         Reading(responses),
     );
     lister.start();

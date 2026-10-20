@@ -104,24 +104,51 @@ impl<T: TermBytes> RejoiningSubscription<T> {
     where
         H: FnMut(&[u8], MessageInfo),
     {
-        match self.inner.poll(&mut handler, limit) {
-            Ok(summary) => Ok(SubscriptionPoll {
-                delivered: summary.delivered,
-                stopped_at_seal: summary.stopped_at_seal,
-                // A rejoin's outcome alone is reported too: it may come
-                // in a poll with nothing else (the replay merged).
-                stopped: (stopped(&summary) || summary.rejoin.is_some()).then_some(ImageStop {
-                    session_id: None,
-                    lane: None,
-                    summary,
-                }),
-            }),
-            Err(error) => Err(SubscriptionError::Poll {
-                session_id: None,
-                delivered: error.summary.delivered,
-                error,
-            }),
-        }
+        report(self.inner.poll(&mut handler, limit))
+    }
+
+    /// Adopts what the subscription's readers have been offered since the
+    /// last adoption, as [`Subscription::adopt`] does: a successor mapping
+    /// of the live reader, or of a replay being merged, that
+    /// [`RejoiningSubscription::poll_adopted`] stopped before, and a replay
+    /// handed out since. Never allocates.
+    pub fn adopt(&mut self) {
+        self.inner.adopt();
+    }
+
+    /// The largest message the subscription can deliver until the next
+    /// [`RejoiningSubscription::adopt`]: the live stream's, and while a
+    /// replay is merged, the larger of that and the replay's stream's. It
+    /// changes only at an adoption, as [`Subscription::max_message_length`]
+    /// does.
+    #[must_use]
+    pub fn max_message_length(&self) -> u32 {
+        self.inner.max_message_length()
+    }
+
+    /// [`RejoiningSubscription::poll`] without adopting, as
+    /// [`Subscription::poll_adopted`]: no reader moves to a successor
+    /// mapping, and a replay handed out during the poll is read only after
+    /// the next [`RejoiningSubscription::adopt`]. A caller that adopts,
+    /// reads [`RejoiningSubscription::max_message_length`] and then polls
+    /// this way never sees a longer message in that poll.
+    ///
+    /// # Errors
+    ///
+    /// As [`RejoiningSubscription::poll`].
+    #[expect(
+        clippy::result_large_err,
+        reason = "as Subscription::poll: the error carries the poll error by value"
+    )]
+    pub fn poll_adopted<H>(
+        &mut self,
+        mut handler: H,
+        limit: MessageLimit,
+    ) -> Result<SubscriptionPoll, SubscriptionError>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        report(self.inner.poll_adopted(&mut handler, limit))
     }
 
     /// Whether a gap is being recovered: asked for, or merging.
@@ -155,5 +182,33 @@ impl<T: TermBytes> RejoiningSubscription<T> {
         self.inner.into_live().map(|live| Subscription {
             kind: Kind::Stream(Box::new(live)),
         })
+    }
+}
+
+/// A rejoin's poll, reported as [`Subscription::poll`] reports.
+#[expect(
+    clippy::result_large_err,
+    reason = "as Subscription::poll: the error carries the poll error by value"
+)]
+fn report(
+    polled: Result<crate::subscription::PollSummary, crate::subscription::PollError>,
+) -> Result<SubscriptionPoll, SubscriptionError> {
+    match polled {
+        Ok(summary) => Ok(SubscriptionPoll {
+            delivered: summary.delivered,
+            stopped_at_seal: summary.stopped_at_seal,
+            // A rejoin's outcome alone is reported too: it may come
+            // in a poll with nothing else (the replay merged).
+            stopped: (stopped(&summary) || summary.rejoin.is_some()).then_some(ImageStop {
+                session_id: None,
+                lane: None,
+                summary,
+            }),
+        }),
+        Err(error) => Err(SubscriptionError::Poll {
+            session_id: None,
+            delivered: error.summary.delivered,
+            error,
+        }),
     }
 }
