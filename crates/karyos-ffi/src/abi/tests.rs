@@ -1811,7 +1811,11 @@ fn a_16_byte_struct_is_read_by_its_size() {
     // check of this version's alignment would refuse them.
     let mut words = [0_u32; 6];
     let at = usize::from(words.as_ptr().addr() % 8 == 0);
-    let small = (&raw mut words[at]).cast::<SubscriptionOptions>();
+    // From the array's pointer, whose provenance covers the 16 bytes.
+    let small = words
+        .as_mut_ptr()
+        .wrapping_add(at)
+        .cast::<SubscriptionOptions>();
     assert_eq!(small.addr() % 8, 4);
     // SAFETY: `words` holds the 0.1.0 size from `at` on.
     let status = unsafe { karyos_subscription_options_init(small) };
