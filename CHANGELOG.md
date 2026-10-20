@@ -407,6 +407,22 @@ release may break APIs, wire formats and shared-memory layouts.
   (`capabilities` now uses it). A guard may not be named after one of the
   six labels, as its word gauge shares their keys (`InvalidConfig`).
 
+- karyos-archive's recording lister (phase 5, M11; quantstratum-docs:
+  `karyos/design/management-agent-gap-analysis.md`):
+  `client::list::RecordingLister` reads the whole catalog over the control
+  streams, page by page, never blocking. A page that delivered any
+  recording asks for the next one from the id after its last, since the
+  Archive leaves out a recording it cannot describe; the listing ends at an
+  empty page or a refusal. It keeps at most `ListerConfig::max_recordings`
+  and counts the rest; answers to other requesters are skipped. The
+  management agent's catalog view builds on it.
+
+- API v1's JSON carries each driver's trace window (M6c): `latencies`, one
+  object per lane with `p50`, `p90`, `p99`, `p999` and `max` as `null` or
+  `{"low","high"}` bounds, and `trace`, the window's counts. They come
+  after `guards` and before `alerts`, in `DriverView`'s declaration order
+  (quantstratum-docs: `karyos/design/agent-api-v1.md`).
+
 - The Prometheus exporter (phase 5, M8; ADR-0055; SPEC.md §11
   `karyos-exporter`; owner item 51, interim 4). `karyos_agent::exporter`
   renders an `AgentView` in the Prometheus text format (0.0.4): the CnC
