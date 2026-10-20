@@ -25,6 +25,9 @@
 //!   reported as the replay's local gap, and what follows it merges. With
 //!   no recording of the stream, the secondary policy applies, with
 //!   `NoRecording`.
+//! - A replayer (B6) starts and stops replays over the control streams;
+//!   a reader learns a replay's end from its target's seal, `EndOfStream`
+//!   when it ran to its requested end, `ImageRetired` when it was stopped.
 
 #![allow(
     clippy::unwrap_used,
@@ -44,6 +47,7 @@ use std::time::{Duration, Instant};
 use karyos_archive::agent::{AgentConfig, ArchiveHandle, ReplaySink, SinkClosed};
 use karyos_archive::catalog::{Recording, SourceIncarnation, StopReason, StreamFormat};
 use karyos_archive::client::list::{ListPoll, ListerConfig, RecordingLister};
+use karyos_archive::client::replay::{ReplaySpec, Replayer, ReplayerConfig, ReplayerEvent};
 use karyos_archive::client::{
     ArchiveClient, ClientConfig, ControlRequests, ControlResponses, ReplayTargets,
 };
@@ -1364,4 +1368,131 @@ fn the_catalog_is_listed_page_by_page_through_the_control_streams() {
     assert_eq!(recording.recording_id, recording_id);
     assert_eq!((recording.stream_id, recording.session_id), (DATA, 1));
     assert_eq!(recording.channel, "karyos:ipc");
+}
+
+/// Polls `replayer`, cycling the rig, until it reports an event.
+fn replayer_event(rig: &mut Rig, replayer: &mut Replayer<Asking, Reading>) -> ReplayerEvent {
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(10), "no event");
+        rig.cycle();
+        if let Some(event) = replayer.poll(Instant::now()) {
+            return event;
+        }
+    }
+}
+
+/// B6: a replayer starts and stops replays over the control streams, and
+/// a reader learns each replay's end from its target's seal, the only end
+/// signal version 1 has: `EndOfStream` at the requested end of a replay
+/// that ran to it, `ImageRetired` for one that was stopped.
+#[test]
+fn a_replayers_replays_end_at_their_targets_seal() {
+    let mut rig = Rig::new(INITIAL_TERM_ID);
+    let data = rig.server.host().data;
+    let mut publication = rig.driver().publication(data).unwrap();
+    let recording_id = rig.start_recording(Mode::Required);
+    let mut sent = Vec::new();
+    // Two batches 5 ms apart: a replay at a millionth of the recorded
+    // pace holds the second for about 5 000 s, so it can only end by a
+    // stop.
+    for batch in 0..2 {
+        if batch > 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        publish(&mut rig, &mut publication, &mut sent, 0, 6);
+        // The recording catches up with what was published.
+        let (last, message) = sent.last().cloned().unwrap();
+        let published = last + u64::try_from(message.len()).unwrap();
+        let start = Instant::now();
+        while rig.server.agent().describe(recording_id).unwrap().end < published {
+            assert!(start.elapsed() < Duration::from_secs(10), "not recorded");
+            rig.cycle();
+        }
+    }
+    rig.request(&ControlMessage::StopRecording(control::StopRecording {
+        correlation_id: CLIENT + 2,
+        recording_id,
+    }));
+    let answers = rig.answers(CLIENT + 2, 2);
+    assert_eq!(response(&answers[0]).code, ResponseCode::Ok);
+    let end = signal(&answers[1]).position;
+
+    let Client {
+        requests,
+        responses,
+    } = rig.client.take().unwrap();
+    let mut config = ReplayerConfig::new(0xB6);
+    config.deadline = Duration::from_secs(10);
+    let mut replayer = Replayer::new(config, Asking(requests), Reading(responses));
+
+    // A replay of the whole recording runs to its end: a clean EOS there.
+    let request = replayer
+        .start(&ReplaySpec::new(recording_id, 0, TARGET), Instant::now())
+        .unwrap();
+    let ReplayerEvent::Started {
+        request: started,
+        replay_id,
+        session_id,
+    } = replayer_event(&mut rig, &mut replayer)
+    else {
+        panic!("not started")
+    };
+    assert_eq!(
+        (started, session_id),
+        (request, replay_session_id(replay_id))
+    );
+    assert_eq!(rig.server.host().opened.last(), Some(&(TARGET, session_id)));
+    let (messages, lane_end, clean) = read_target(&mut rig);
+    assert_eq!(messages.len(), sent.len());
+    assert_eq!(
+        lane_end,
+        LaneEnd::Closed {
+            position: end,
+            reason: SealReason::EndOfStream
+        }
+    );
+    assert!(clean);
+
+    // A slow replay stopped by request: its target retires, not clean.
+    let mut spec = ReplaySpec::new(recording_id, 0, TARGET);
+    spec.rate = ReplayRate::Scaled { ppm: 1 };
+    replayer.start(&spec, Instant::now()).unwrap();
+    let ReplayerEvent::Started { replay_id, .. } = replayer_event(&mut rig, &mut replayer) else {
+        panic!("not started")
+    };
+    let mut reader = rig.server.host_mut().targets.pop().unwrap();
+    for _ in 0..8 {
+        rig.cycle();
+        let _ = reader.poll(|_, _, _| {}, BUDGET);
+    }
+    let stop = replayer.stop(replay_id, Instant::now()).unwrap();
+    assert_eq!(
+        replayer_event(&mut rig, &mut replayer),
+        ReplayerEvent::Stopped {
+            request: stop,
+            replay_id
+        }
+    );
+    let start = Instant::now();
+    let (lane_end, clean) = loop {
+        assert!(start.elapsed() < Duration::from_secs(20), "no terminal");
+        rig.cycle();
+        let poll = reader.poll(|_, _, _| {}, BUDGET);
+        if let Some(terminal) = poll.terminal {
+            break (poll.lanes[0].end.unwrap(), terminal.clean);
+        }
+    };
+    assert!(
+        matches!(
+            lane_end,
+            LaneEnd::Closed {
+                reason: SealReason::ImageRetired,
+                ..
+            }
+        ),
+        "{lane_end:?}"
+    );
+    assert!(!clean);
+    drop(publication);
 }
