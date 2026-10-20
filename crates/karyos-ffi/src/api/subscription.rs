@@ -101,6 +101,10 @@ impl Reader {
 pub(crate) struct Entry {
     /// The client handle it belongs to.
     client: Handle,
+    /// Its client's embedded driver's state, if the C ABI created it: the
+    /// subscription follows its failure and its close
+    /// (`crate::api::driver::DriverState::usable`), with no lock.
+    driver: Option<crate::api::driver::DriverState>,
     reader: Reader,
     /// The private copy each message is handed from; its length is the
     /// largest message the subscription delivered or can deliver.
@@ -156,6 +160,7 @@ fn fit(copy: &mut Vec<u8>, length: u32) -> Result<(), Status> {
 /// with the subscription released.
 pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, Failure> {
     clients().with(client, |entry| {
+        entry.usable()?;
         let reader = entry
             .client
             .add_subscription(uri, StreamId::new(stream_id))?;
@@ -166,6 +171,7 @@ pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, F
         }
         let subscription = Entry {
             client,
+            driver: entry.driver.clone(),
             reader,
             copy,
         };
@@ -197,6 +203,11 @@ pub(crate) fn poll(
 ) -> Result<u32, (Failure, u32)> {
     table()
         .with(subscription, |entry| {
+            if let Some(driver) = &entry.driver {
+                driver
+                    .usable()
+                    .map_err(|status| (Failure::from(status), 0))?;
+            }
             let Entry { reader, copy, .. } = entry;
             let mut delivered = 0u32;
             for _ in 0..ROUNDS {

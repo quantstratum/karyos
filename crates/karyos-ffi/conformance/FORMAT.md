@@ -73,6 +73,16 @@ The arguments and results of each function are those of the header:
 | --- | --- | --- |
 | `karyos_abi_version` | `major`, `minor`, `patch` (`null` only) | status, `major`, `minor`, `patch` |
 | `karyos_status_message` | `status` (required) | `text` (no status) |
+| `karyos_driver_create` | none: the options of `karyos_driver_options_init` | status, `driver` |
+| `karyos_driver_connect` | `driver` (required) | status, `client` |
+| `karyos_driver_do_work` | `driver` (required) | status, `work` |
+| `karyos_driver_close` | `driver` (required) | status |
+| `karyos_client_poll` | `client` (required) | status, `served` |
+| `karyos_client_close` | `client` (required) | status |
+
+A handle is an integer value, bound from a result (`expect KARYOS_OK
+driver=$driver`) and passed back (`call karyos_driver_do_work
+driver=$driver`).
 
 A result named in an `expect` that the call did not write is a failure.
 

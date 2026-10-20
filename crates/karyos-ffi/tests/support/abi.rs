@@ -25,6 +25,44 @@ pub struct ClientOptions {
     pub max_images: u32,
 }
 
+/// `karyos_driver_options`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DriverOptions {
+    pub size: u32,
+    pub max_clients: u32,
+    pub max_streams: u32,
+    pub max_pending_per_client: u32,
+    pub ring_capacity: u32,
+    pub broadcast_capacity: u32,
+    pub counters_capacity: u32,
+    pub reserved: u32,
+    pub heartbeat_interval_ns: u64,
+    pub client_liveness_timeout_ns: u64,
+    pub cutover_deadline_ns: u64,
+}
+
+/// `karyos_stream_options`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StreamOptions {
+    pub size: u32,
+    pub stream_id: i32,
+    pub term_length: u32,
+    pub mtu: u32,
+    pub max_reserved: u32,
+    pub spare_slots: u32,
+    pub max_subscribers: u32,
+    pub session_id: i32,
+    pub initial_term_id: u32,
+    pub lane: u32,
+    pub publication_mode: u32,
+    pub allow_unconnected: u32,
+    pub schedule_capacity: u32,
+    pub on_required_loss: u32,
+    pub claim_deadline_ns: u64,
+}
+
 /// `karyos_detail`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,6 +84,162 @@ unsafe extern "C" {
     ) -> i32;
     fn karyos_client_poll(client: u64, served: *mut u32) -> i32;
     safe fn karyos_client_close(client: u64) -> i32;
+    fn karyos_driver_options_init(options: *mut DriverOptions) -> i32;
+    fn karyos_driver_create(
+        options: *const DriverOptions,
+        driver: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
+    fn karyos_driver_do_work(driver: u64, work: *mut u32) -> i32;
+    safe fn karyos_driver_start(driver: u64, idle_strategy: u32, idle_sleep_ns: u64) -> i32;
+    safe fn karyos_driver_stop(driver: u64) -> i32;
+    fn karyos_driver_connect(driver: u64, client: *mut u64, detail: *mut Detail) -> i32;
+    safe fn karyos_driver_close(driver: u64) -> i32;
+    fn karyos_stream_options_init(options: *mut StreamOptions) -> i32;
+    fn karyos_driver_add_stream(
+        driver: u64,
+        options: *const StreamOptions,
+        detail: *mut Detail,
+    ) -> i32;
+    safe fn karyos_driver_remove_stream(driver: u64, stream_id: i32) -> i32;
+    fn karyos_client_add_publication(
+        client: u64,
+        uri: *const c_char,
+        stream_id: i32,
+        publication: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
+    fn karyos_publication_offer(
+        publication: u64,
+        lane: u32,
+        data: *const u8,
+        length: usize,
+        accepted: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+/// `karyos_stream_options_init` with `stream_id` set: the status and the
+/// options.
+pub fn stream_options(stream_id: i32) -> (i32, StreamOptions) {
+    let mut options = core::mem::MaybeUninit::<StreamOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `StreamOptions`.
+    let status = unsafe { karyos_stream_options_init(options.as_mut_ptr()) };
+    // SAFETY: zeroed, then written in full on success; every field is an
+    // integer, so the zeroes are a value too.
+    let mut options = unsafe { options.assume_init() };
+    options.stream_id = stream_id;
+    (status, options)
+}
+
+/// `karyos_driver_add_stream`: the status and the detail.
+pub fn driver_add_stream(driver: u64, options: &StreamOptions) -> (i32, Detail) {
+    let mut detail = Detail {
+        size: u32::try_from(size_of::<Detail>()).unwrap_or(u32::MAX),
+        ..Detail::default()
+    };
+    // SAFETY: live, aligned pointers.
+    let status = unsafe { karyos_driver_add_stream(driver, options, &mut detail) };
+    (status, detail)
+}
+
+/// `karyos_driver_remove_stream`.
+pub fn driver_remove_stream(driver: u64, stream_id: i32) -> i32 {
+    karyos_driver_remove_stream(driver, stream_id)
+}
+
+/// `karyos_client_add_publication` of `stream_id` on `karyos:ipc`: the
+/// status and the handle.
+pub fn client_add_ipc_publication(client: u64, stream_id: i32) -> (i32, u64) {
+    let mut publication = 0;
+    // SAFETY: a static C string and a live, aligned `u64`; a null detail
+    // is allowed.
+    let status = unsafe {
+        karyos_client_add_publication(
+            client,
+            c"karyos:ipc".as_ptr(),
+            stream_id,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, publication)
+}
+
+/// `karyos_publication_offer` of `data` on lane 0, without the accepted
+/// position.
+pub fn publication_offer(publication: u64, data: &[u8]) -> i32 {
+    // SAFETY: `data` is live for the call; a null `accepted` is allowed.
+    unsafe {
+        karyos_publication_offer(
+            publication,
+            0,
+            data.as_ptr(),
+            data.len(),
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// `karyos_driver_options_init`: the status and the options.
+pub fn driver_options() -> (i32, DriverOptions) {
+    let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `DriverOptions`.
+    let status = unsafe { karyos_driver_options_init(options.as_mut_ptr()) };
+    // SAFETY: zeroed, then written in full on success; every field is an
+    // integer, so the zeroes are a value too.
+    (status, unsafe { options.assume_init() })
+}
+
+/// `karyos_driver_create` of `options`: the status, the handle and the
+/// detail.
+pub fn driver_create_with(options: &DriverOptions) -> (i32, u64, Detail) {
+    let mut driver = 0;
+    let mut detail = Detail {
+        size: u32::try_from(size_of::<Detail>()).unwrap_or(u32::MAX),
+        ..Detail::default()
+    };
+    // SAFETY: live, aligned pointers.
+    let status = unsafe { karyos_driver_create(options, &mut driver, &mut detail) };
+    (status, driver, detail)
+}
+
+/// `karyos_driver_create` with the defaults: the status and the handle.
+pub fn driver_create() -> (i32, u64) {
+    let (status, options) = driver_options();
+    assert_eq!(status, 0);
+    let (status, driver, _) = driver_create_with(&options);
+    (status, driver)
+}
+
+/// `karyos_driver_do_work`: the status and the work count.
+pub fn driver_do_work(driver: u64) -> (i32, u32) {
+    let mut work = u32::MAX;
+    // SAFETY: a live, aligned `u32`.
+    let status = unsafe { karyos_driver_do_work(driver, &mut work) };
+    (status, work)
+}
+
+/// `karyos_driver_start`.
+pub fn driver_start(driver: u64, idle_strategy: u32, idle_sleep_ns: u64) -> i32 {
+    karyos_driver_start(driver, idle_strategy, idle_sleep_ns)
+}
+
+/// `karyos_driver_stop`.
+pub fn driver_stop(driver: u64) -> i32 {
+    karyos_driver_stop(driver)
+}
+
+/// `karyos_driver_connect`: the status and the client handle.
+pub fn driver_connect(driver: u64) -> (i32, u64) {
+    let mut client = 0;
+    // SAFETY: a live, aligned `u64`; a null detail is allowed.
+    let status = unsafe { karyos_driver_connect(driver, &mut client, core::ptr::null_mut()) };
+    (status, client)
+}
+
+/// `karyos_driver_close`.
+pub fn driver_close(driver: u64) -> i32 {
+    karyos_driver_close(driver)
 }
 
 /// `karyos_client_connect` to the driver in `dir`, with the defaults

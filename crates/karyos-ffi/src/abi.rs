@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use crate::api;
 use crate::api::client;
+use crate::api::driver;
 use crate::boundary::{drop_payload, guard};
 use crate::handles::Handle;
 use crate::status::{Failure, Status, UNKNOWN_CODE};
@@ -181,6 +182,43 @@ unsafe fn read_str<'a>(text: *const c_char) -> Result<&'a str, Status> {
 /// caller's `size` and this version's.
 fn prefix(size: u32, ours: u32) -> usize {
     usize::try_from(size.min(ours)).unwrap_or(0)
+}
+
+/// Reads a growing struct the caller passes at `input`: the prefix both
+/// versions know copied over `defaults`, so the fields an older caller's
+/// struct lacks keep their defaults.
+///
+/// # Errors
+///
+/// [`Status::InvalidArgument`] for a null or misaligned `input`, or a
+/// `size` below `min`.
+///
+/// # Safety
+///
+/// `input` is null or points to a readable struct whose first field is
+/// the `uint32_t` size the caller set, and which is at least that size.
+/// `T` must be valid for every bit pattern (integers and raw pointers
+/// only: no `bool`, enum or reference), since its bytes come from the
+/// caller: `DriverOptions` and `StreamOptions` are.
+unsafe fn read_sized<T: Copy>(input: *const T, min: u32, defaults: T) -> Result<T, Status> {
+    if !readable(input) {
+        return Err(Status::InvalidArgument);
+    }
+    // SAFETY: `input` is non-null and aligned, and points to the caller's
+    // struct (its contract), whose first field is the `uint32_t` size.
+    let size = unsafe { input.cast::<u32>().read() };
+    if size < min {
+        return Err(Status::InvalidArgument);
+    }
+    let mut read = defaults;
+    let length = prefix(size, size_of_u32::<T>());
+    // SAFETY: the caller's struct is at least `size` readable bytes (its
+    // contract), `length` is at most `size` and at most the size of
+    // `read`, a local that does not overlap it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(input.cast::<u8>(), (&raw mut read).cast::<u8>(), length);
+    };
+    Ok(read)
 }
 
 /// `karyos_client_options` with the defaults and this version's size.
@@ -872,6 +910,403 @@ pub extern "C" fn karyos_subscription_close(subscription: u64) -> i32 {
             Err(status) => status,
         },
     )
+}
+
+/// `karyos_driver_options`: an embedded driver's options, copied by
+/// `karyos_driver_create`. `size` comes first; every setting it does not
+/// carry is the driver's default.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DriverOptions {
+    /// The struct's size in bytes.
+    pub size: u32,
+    /// Clients admitted at once.
+    pub max_clients: u32,
+    /// Streams configured at once.
+    pub max_streams: u32,
+    /// Pending requests per client.
+    pub max_pending_per_client: u32,
+    /// Bytes of each client's command ring, a power of two.
+    pub ring_capacity: u32,
+    /// Bytes of the broadcast buffer.
+    pub broadcast_capacity: u32,
+    /// Cells of the counters region.
+    pub counters_capacity: u32,
+    /// Zero; anything else is refused (a later minor may use it).
+    pub reserved: u32,
+    /// How often the driver advances its heartbeat, in nanoseconds.
+    pub heartbeat_interval_ns: u64,
+    /// How long a client's heartbeat may stay unchanged, in nanoseconds.
+    pub client_liveness_timeout_ns: u64,
+    /// How long a handle has to move to a successor mapping, in
+    /// nanoseconds.
+    pub cutover_deadline_ns: u64,
+}
+
+/// The size of `karyos_driver_options` in the first ABI version that has
+/// it: the smallest a caller passes (as `CLIENT_OPTIONS_SIZE_0_1`).
+const DRIVER_OPTIONS_SIZE_0_1: u32 = 56;
+
+/// `karyos_driver_options` with the driver's defaults and this version's
+/// size.
+fn default_driver_options() -> DriverOptions {
+    let defaults = driver::Options::defaults();
+    DriverOptions {
+        size: size_of_u32::<DriverOptions>(),
+        max_clients: defaults.max_clients,
+        max_streams: defaults.max_streams,
+        max_pending_per_client: defaults.max_pending_per_client,
+        ring_capacity: defaults.ring_capacity,
+        broadcast_capacity: defaults.broadcast_capacity,
+        counters_capacity: defaults.counters_capacity,
+        reserved: 0,
+        heartbeat_interval_ns: defaults.heartbeat_interval_ns,
+        client_liveness_timeout_ns: defaults.client_liveness_timeout_ns,
+        cutover_deadline_ns: defaults.cutover_deadline_ns,
+    }
+}
+
+/// Fills `options` with the driver's defaults and `size`.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable `karyos_driver_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_options_init(options: *mut DriverOptions) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        let filled = default_driver_options();
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable `karyos_driver_options`.
+        unsafe { options.write(filled) };
+        Status::Ok
+    })
+}
+
+/// Creates an embedded driver, driven by its caller
+/// (`karyos_driver_do_work`) until `karyos_driver_start` gives it a
+/// thread, and writes its handle through `driver`. The options are copied.
+///
+/// On failure nothing is created, and `detail`, when not null and its
+/// `size` covers `karyos_detail`, receives the failure's detail
+/// (`KARYOS_E_SYSTEM`: an `errno`, or the descriptors needed in `code` and
+/// the soft limit in `value`).
+///
+/// # Safety
+///
+/// `options` points to a readable `karyos_driver_options` whose `size` is
+/// set; `driver` points to a writable `uint64_t`; `detail` is null or
+/// points to a writable `karyos_detail` whose `size` is set. A null or
+/// misaligned `options` or `driver`, or a `size` below the first
+/// version's, returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_create(
+    options: *const DriverOptions,
+    driver: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(driver) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `options`.
+        let raw =
+            match unsafe { read_sized(options, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) }
+            {
+                Ok(raw) => raw,
+                Err(status) => return status,
+            };
+        // A later minor may give it a meaning: refused, not ignored.
+        if raw.reserved != 0 {
+            return Status::InvalidArgument;
+        }
+        let options = driver::Options {
+            max_clients: raw.max_clients,
+            max_streams: raw.max_streams,
+            max_pending_per_client: raw.max_pending_per_client,
+            ring_capacity: raw.ring_capacity,
+            broadcast_capacity: raw.broadcast_capacity,
+            counters_capacity: raw.counters_capacity,
+            heartbeat_interval_ns: raw.heartbeat_interval_ns,
+            client_liveness_timeout_ns: raw.client_liveness_timeout_ns,
+            cutover_deadline_ns: raw.cutover_deadline_ns,
+        };
+        match driver::create(&options) {
+            Ok(handle) => {
+                // SAFETY: `driver` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { driver.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Runs one duty cycle of `driver` and writes its work count through
+/// `work`. `KARYOS_E_BUSY` while the driver runs on its own thread.
+///
+/// # Safety
+///
+/// `work` points to a writable `uint32_t`; null or misaligned returns
+/// `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_do_work(driver: u64, work: *mut u32) -> i32 {
+    guard(|| {
+        if !writable(work) {
+            return Status::InvalidArgument;
+        }
+        match driver::do_work(Handle::from_raw(driver)) {
+            Ok(count) => {
+                // SAFETY: `work` is non-null and aligned, and the caller's
+                // contract makes it a writable `uint32_t`.
+                unsafe { work.write(count) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Moves `driver` to a thread of its own, which runs its duty cycle and,
+/// when one did no work, idles by `idle_strategy` (`KARYOS_IDLE_*`;
+/// `idle_sleep_ns` for `KARYOS_IDLE_SLEEP`) until `karyos_driver_stop` or
+/// the close. `KARYOS_E_BUSY` when it already runs on one.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_driver_start(driver: u64, idle_strategy: u32, idle_sleep_ns: u64) -> i32 {
+    guard(|| {
+        let idle = driver::Idle {
+            strategy: idle_strategy,
+            sleep_ns: idle_sleep_ns,
+        };
+        match driver::start(Handle::from_raw(driver), idle) {
+            Ok(()) => Status::Ok,
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// Stops `driver`'s thread and gives the driver back to its caller.
+/// `KARYOS_E_BUSY` when it does not run on one; `KARYOS_E_INTERNAL` when a
+/// panic on its thread poisoned it.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_driver_stop(driver: u64) -> i32 {
+    guard(|| match driver::stop(Handle::from_raw(driver)) {
+        Ok(()) => Status::Ok,
+        Err(status) => status,
+    })
+}
+
+/// `karyos_stream_options`: a stream's options, copied by
+/// `karyos_driver_add_stream`: the fields of the Rust `StreamConfig` and
+/// its log buffer, without conflation. `size` comes first.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StreamOptions {
+    /// The struct's size in bytes.
+    pub size: u32,
+    /// The wire stream id.
+    pub stream_id: i32,
+    /// Bytes of each term, a power of two.
+    pub term_length: u32,
+    /// The largest frame, header included.
+    pub mtu: u32,
+    /// The most bytes one claim reserves.
+    pub max_reserved: u32,
+    /// Term slots beyond the three in use.
+    pub spare_slots: u32,
+    /// Subscribers at once.
+    pub max_subscribers: u32,
+    /// The session alias.
+    pub session_id: i32,
+    /// The first term's id.
+    pub initial_term_id: u32,
+    /// The lane; 0 in this version.
+    pub lane: u32,
+    /// `KARYOS_PUBLICATION_*`; exclusive in this version.
+    pub publication_mode: u32,
+    /// Offers allowed with no subscriber attached: 0 or 1.
+    pub allow_unconnected: u32,
+    /// Entries of the stream's schedule ring; 0 for none.
+    pub schedule_capacity: u32,
+    /// `KARYOS_LOSS_*`: what a lost required subscriber does.
+    pub on_required_loss: u32,
+    /// How long a claim may stay open, in nanoseconds.
+    pub claim_deadline_ns: u64,
+}
+
+/// The size of `karyos_stream_options` in the first ABI version that has
+/// it (as `CLIENT_OPTIONS_SIZE_0_1`).
+const STREAM_OPTIONS_SIZE_0_1: u32 = 64;
+
+/// `karyos_stream_options` with the defaults and this version's size.
+fn default_stream_options() -> StreamOptions {
+    let defaults = driver::StreamOptions::defaults();
+    StreamOptions {
+        size: size_of_u32::<StreamOptions>(),
+        stream_id: defaults.stream_id,
+        term_length: defaults.term_length,
+        mtu: defaults.mtu,
+        max_reserved: defaults.max_reserved,
+        spare_slots: defaults.spare_slots,
+        max_subscribers: defaults.max_subscribers,
+        session_id: defaults.session_id,
+        initial_term_id: defaults.initial_term_id,
+        lane: defaults.lane,
+        publication_mode: defaults.publication_mode,
+        allow_unconnected: defaults.allow_unconnected,
+        schedule_capacity: defaults.schedule_capacity,
+        on_required_loss: defaults.on_required_loss,
+        claim_deadline_ns: defaults.claim_deadline_ns,
+    }
+}
+
+/// Fills `options` with a stream's defaults (stream id 0, the smallest
+/// term) and `size`.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable `karyos_stream_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_stream_options_init(options: *mut StreamOptions) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        let filled = default_stream_options();
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable `karyos_stream_options`.
+        unsafe { options.write(filled) };
+        Status::Ok
+    })
+}
+
+/// Adds a stream to `driver`, which lives until
+/// `karyos_driver_remove_stream` or the driver's close. The options are
+/// copied. On failure nothing is added, and `detail` receives the
+/// failure's detail (a duplicate stream id: `KARYOS_E_INVALID_ARGUMENT`
+/// with the stream id in `code` and the session id in `value`).
+///
+/// # Safety
+///
+/// `options` points to a readable `karyos_stream_options` whose `size` is
+/// set; `detail` is null or a `karyos_detail` whose `size` is set. A null
+/// or misaligned `options`, or a `size` below the first version's,
+/// returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_add_stream(
+    driver: u64,
+    options: *const StreamOptions,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        // SAFETY: the caller's contract on `options`.
+        let raw =
+            match unsafe { read_sized(options, STREAM_OPTIONS_SIZE_0_1, default_stream_options()) }
+            {
+                Ok(raw) => raw,
+                Err(status) => return status,
+            };
+        let options = driver::StreamOptions {
+            stream_id: raw.stream_id,
+            term_length: raw.term_length,
+            mtu: raw.mtu,
+            max_reserved: raw.max_reserved,
+            spare_slots: raw.spare_slots,
+            max_subscribers: raw.max_subscribers,
+            session_id: raw.session_id,
+            initial_term_id: raw.initial_term_id,
+            lane: raw.lane,
+            publication_mode: raw.publication_mode,
+            allow_unconnected: raw.allow_unconnected,
+            schedule_capacity: raw.schedule_capacity,
+            on_required_loss: raw.on_required_loss,
+            claim_deadline_ns: raw.claim_deadline_ns,
+        };
+        match driver::add_stream(Handle::from_raw(driver), &options) {
+            Ok(()) => Status::Ok,
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Removes `driver`'s stream `stream_id`: its publication closes, and its
+/// subscribers read up to its seal. `KARYOS_E_INVALID_ARGUMENT` for a
+/// stream id the driver does not have.
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_driver_remove_stream(driver: u64, stream_id: i32) -> i32 {
+    guard(
+        || match driver::remove_stream(Handle::from_raw(driver), stream_id) {
+            Ok(()) => Status::Ok,
+            Err(failure) => failure.status,
+        },
+    )
+}
+
+/// Opens a client of `driver` in this process and writes its handle
+/// through `client`. The client follows its driver: `KARYOS_E_INTERNAL`
+/// once the driver is poisoned, `KARYOS_E_CLOSED` once it is closed.
+///
+/// On failure nothing is opened, and `detail` receives the failure's
+/// detail as for `karyos_client_connect`.
+///
+/// # Safety
+///
+/// `client` points to a writable `uint64_t`; `detail` is null or points to
+/// a writable `karyos_detail` whose `size` is set. A null or misaligned
+/// `client` returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_connect(
+    driver: u64,
+    client: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(client) {
+            return Status::InvalidArgument;
+        }
+        match client::connect_embedded(Handle::from_raw(driver)) {
+            Ok(handle) => {
+                // SAFETY: `client` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { client.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Closes `driver`, stopping its thread first. Its clients stay open, to
+/// be closed, and answer `KARYOS_E_CLOSED` meanwhile. A handle in use
+/// answers `KARYOS_E_BUSY` or `KARYOS_E_REENTRANT` (nothing is closed
+/// then).
+#[unsafe(no_mangle)]
+pub extern "C" fn karyos_driver_close(driver: u64) -> i32 {
+    guard(|| match driver::close(Handle::from_raw(driver)) {
+        Ok(()) => Status::Ok,
+        Err(status) => status,
+    })
 }
 
 #[cfg(test)]

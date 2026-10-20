@@ -1,0 +1,26 @@
+# A closed handle answers KARYOS_E_CLOSED from every call that names it,
+# and a client of a closed driver answers it too (SPEC.md §13, C ABI
+# boundary; SPEC.md §10.2).
+format 1
+id handle.use.after.close
+abi 0.1
+covers "use after close"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_poll client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK
+call karyos_client_poll client=$client
+expect KARYOS_E_CLOSED
+call karyos_driver_do_work driver=$driver
+expect KARYOS_E_CLOSED
+call karyos_driver_connect driver=$driver
+expect KARYOS_E_CLOSED
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_client_poll client=$client
+expect KARYOS_E_CLOSED

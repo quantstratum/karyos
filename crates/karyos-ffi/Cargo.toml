@@ -19,11 +19,10 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 karyos-client.workspace = true
+# The embedded driver the C ABI exports (F5; SPEC.md §14 crate table).
+karyos-driver.workspace = true
 karyos-protocol.workspace = true
 karyos-sys.workspace = true
-
-[dev-dependencies]
-karyos-driver.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The admission socket of the connect tests' fake driver.

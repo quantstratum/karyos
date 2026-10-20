@@ -938,6 +938,32 @@ release may break APIs, wire formats and shared-memory layouts.
   that brings them. The Rust runner (`tests/conformance.rs`) runs every
   scenario through the exported symbols and checks the map. First
   scenarios: the ABI version, null out-parameters and status texts.
+- `karyos-ffi` embedded drivers (batch F5): `karyos_driver_options_init`,
+  `karyos_driver_create`, `karyos_driver_do_work` (the caller drives it),
+  `karyos_driver_start` and `karyos_driver_stop` (a thread of its own
+  drives it under an idle strategy; `KARYOS_E_BUSY` to the caller
+  meanwhile), `karyos_driver_add_stream` and `karyos_driver_remove_stream`
+  (the sized `karyos_stream_options` with `karyos_stream_options_init`:
+  the fields of the Rust `StreamConfig` and its log buffer without
+  conflation; lane 0 and exclusive publications only in this version, so
+  later minors only widen what is taken; streams are keyed by stream id
+  alone, so a second session of one is refused), `karyos_driver_connect` (a
+  client in this process over a conductor of the driver) and
+  `karyos_driver_close`, with the sized
+  `karyos_driver_options` (a subset of `DriverConfig`, the rest its
+  defaults; an older header's smaller struct is read by its prefix). A
+  client of an embedded driver follows it: `KARYOS_E_INTERNAL` once a
+  panic poisoned the driver (in a called duty cycle or on its thread),
+  `KARYOS_E_CLOSED` once it is closed, and so do its publications, by
+  one load of the driver's state, without its lock. A nonzero `reserved`
+  word in `karyos_driver_options` is refused.
+  Closing a driver leaves its clients open, to be closed. `KARYOS_MAX_DRIVERS`,
+  `KARYOS_PUBLICATION_EXCLUSIVE`, `KARYOS_LOSS_*` and
+  `KARYOS_PROTOCOL_VERSION` (asserted at compile time against
+  karyos-protocol's) join the header. `karyos-driver` becomes a dependency
+  of `karyos-ffi` (SPEC.md §14). The conformance runner gains the driver
+  and client calls and variable arguments; new scenarios cover use after
+  close, double close and a handle of the wrong kind.
 - `karyos_protocol::cnc::ErrorCode::code` is public: the wire value of a
   refusal code, which the C ABI reports as a detail.
 - Client deduplication in karyos-cluster (phase 4, C7a; quantstratum-docs:
