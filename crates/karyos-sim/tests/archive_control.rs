@@ -1143,9 +1143,9 @@ fn a_facade_rejoin_recovers_through_its_own_archive_client_polled_adopted() {
     let mut seen: Vec<Sent> = Vec::new();
     let mut outcomes = Vec::new();
     let round = |rig: &mut Rig,
-                     client: &mut Client<_>,
-                     rejoin: &mut karyos_client::RejoiningSubscription<_>,
-                     seen: &mut Vec<Sent>| {
+                 client: &mut Client<_>,
+                 rejoin: &mut karyos_client::RejoiningSubscription<_>,
+                 seen: &mut Vec<Sent>| {
         rig.cycle();
         let _ = client.poll();
         rejoin.adopt();
