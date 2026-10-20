@@ -2467,6 +2467,11 @@ release may break APIs, wire formats and shared-memory layouts.
   fails when the marker is missing, malformed or differs from the
   reference runner's `FORMATS`, so a retitled or extended FORMAT.md
   cannot break the package unseen. The bindings read neither key.
+- `karyos_message_info.extent` is documented as the facade defines it:
+  the bytes the message takes in the stream, its frames and their
+  alignment, ending at `position + extent`; a pad, an abort or a gap may
+  follow before the next message. `abi.rs` said "to the next one", and
+  `karyos.h` said nothing.
 
 - A guarded client publication gated by the guard word before the
   close's seal landed never released, so the seal never positioned and

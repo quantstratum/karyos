@@ -998,7 +998,9 @@ pub struct MessageInfo {
     pub position: u64,
     /// The publisher's reserved value.
     pub reserved_value: i64,
-    /// The bytes from the message to the next one.
+    /// The bytes the message takes in the stream, its frames and their
+    /// alignment: its frames end at `position + extent` (a pad, an abort or
+    /// a gap may follow before the next message).
     pub extent: u32,
     /// The image's session id; the stream's for a `karyos:ipc` one.
     pub session_id: i32,
