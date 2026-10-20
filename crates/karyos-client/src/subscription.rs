@@ -390,6 +390,12 @@ pub struct PollSummary {
     /// The lost range, when the rejoin policy closed the subscription:
     /// every later poll reports the same, touching no buffer or link.
     pub closed_by_overrun: Option<Overrun>,
+    /// A poll that does not move to a successor mapping
+    /// (`Subscription::poll_adopted`) stopped at its mapping's seal: the
+    /// next adoption moves, and a poll after it reads the successor
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`). Never
+    /// set by a poll that moves.
+    pub stopped_at_seal: bool,
 }
 
 /// A poll that failed after possibly delivering messages: `summary` reports
@@ -430,6 +436,9 @@ pub struct ClientSubscription<T: TermBytes = HeapTerms> {
     link: Option<Arc<GenerationLink<T>>>,
     /// The stream position where this handle's mapping starts.
     base: u64,
+    /// A holding poll stopped at the mapping's seal without moving to its
+    /// successor: [`ClientSubscription::advance`] moves.
+    at_seal: bool,
     /// The trace hook, identities and delivery boundary, for a traced
     /// subscription.
     trace: Option<DeliveryTrace>,
@@ -472,6 +481,7 @@ impl<T: TermBytes> ClientSubscription<T> {
             origin: None,
             link: None,
             base: 0,
+            at_seal: false,
             trace: None,
             invalid_extensions: InvalidExtensions::default(),
             loss: None,
@@ -659,8 +669,54 @@ impl<T: TermBytes> ClientSubscription<T> {
     #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
     pub fn poll_taking<H>(
         &mut self,
+        handler: H,
+        message_limit: MessageLimit,
+    ) -> Result<PollSummary, PollError>
+    where
+        H: FnMut(&[u8], MessageInfo) -> bool,
+    {
+        self.poll_with(handler, message_limit, false)
+    }
+
+    /// [`ClientSubscription::poll`] that never moves to a successor
+    /// mapping: at the seal of one with a successor it stops, reports
+    /// `stopped_at_seal`, and leaves the move to
+    /// [`ClientSubscription::advance`] (the facade's `poll_adopted`).
+    #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
+    pub(crate) fn poll_holding<H>(
+        &mut self,
         mut handler: H,
         message_limit: MessageLimit,
+    ) -> Result<PollSummary, PollError>
+    where
+        H: FnMut(&[u8], MessageInfo),
+    {
+        self.poll_with(
+            |bytes, info| {
+                handler(bytes, info);
+                true
+            },
+            message_limit,
+            true,
+        )
+    }
+
+    /// Moves to the successor mapping a holding poll stopped before, if it
+    /// is offered (the facade's `adopt`); otherwise the handle stays at its
+    /// seal for a later call.
+    pub(crate) fn advance(&mut self) {
+        if self.at_seal && self.after_end() != Some(false) {
+            self.at_seal = false;
+        }
+    }
+
+    /// The poll; with `hold`, it stops at a seal instead of moving.
+    #[expect(clippy::result_large_err, reason = "as ClientSubscription::poll")]
+    fn poll_with<H>(
+        &mut self,
+        mut handler: H,
+        message_limit: MessageLimit,
+        hold: bool,
     ) -> Result<PollSummary, PollError>
     where
         H: FnMut(&[u8], MessageInfo) -> bool,
@@ -780,10 +836,23 @@ impl<T: TermBytes> ClientSubscription<T> {
                     });
                     break;
                 }
+                // A holding poll leaves a successor for the next advance.
+                PollOutcome::Closed { .. }
+                    if hold
+                        && self.link.is_some()
+                        && self
+                            .inner
+                            .as_ref()
+                            .is_some_and(|inner| inner.buffer().sealed_with_successor()) =>
+                {
+                    self.at_seal = true;
+                    summary.stopped_at_seal = true;
+                    break;
+                }
                 PollOutcome::Closed { position, reason } => match self.after_end() {
                     // Moved: the successor's first message is next, in the
-                    // same poll and budget.
-                    Some(true) => {}
+                    // same poll and budget; an earlier hold is over.
+                    Some(true) => self.at_seal = false,
                     // A cutover is pending: nothing to deliver yet.
                     Some(false) => break,
                     None => {
@@ -800,6 +869,15 @@ impl<T: TermBytes> ClientSubscription<T> {
             }
         }
         Ok(summary)
+    }
+
+    /// The largest message its stream accepts, and so delivers; 0 once it
+    /// is closed.
+    #[must_use]
+    pub fn max_message_length(&self) -> u32 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.buffer().max_message_length())
     }
 
     /// The acknowledged stream position.
@@ -980,6 +1058,109 @@ pub(crate) fn rebuild(source: &mut dyn SnapshotSource, overrun: &Overrun) -> Sec
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.rebuild(overrun))) {
         Ok(Ok(())) => SecondaryOutcome::SnapshotRebuilt,
         Ok(Err(SnapshotFailed)) | Err(_) => SecondaryOutcome::SnapshotFailed,
+    }
+}
+
+/// A subscription at the seal of its mapping, whose successor of a larger
+/// term is offered only later (tests of the facade's `poll_adopted`).
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{AppendOptions, LogBufferConfig, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    fn buffer(term_length: u32) -> Arc<LogBuffer> {
+        Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(term_length).unwrap(),
+                spare_slots: 2,
+                max_subscribers: 2,
+                mtu: DEFAULT_MTU,
+                max_reserved: term_length / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// The successor's base.
+    pub(crate) const BASE: u64 = 1 << 20;
+
+    /// What offers the successor: its link, and the handles that keep both
+    /// mappings' writers alive.
+    pub(crate) struct Later {
+        link: Arc<GenerationLink>,
+        kept: Vec<Box<dyn core::any::Any>>,
+    }
+
+    impl Later {
+        /// Offers the successor, of twice the term, holding one message of
+        /// its largest length, and returns that length.
+        pub(crate) fn offer(&mut self) -> u32 {
+            let successor = buffer(MIN_TERM_LENGTH * 2);
+            let mut conductor = successor.conductor_owned().unwrap();
+            let inner = conductor.subscribe(Role::Required).unwrap();
+            let max = successor.max_message_length();
+            let mut publication = successor.publication_owned().unwrap().unwrap();
+            let _ = publication
+                .append(&vec![9u8; max as usize], AppendOptions::default())
+                .unwrap();
+            let scratch = vec![0u8; max as usize].into_boxed_slice();
+            assert!(
+                self.link
+                    .offer(BASE, Successor::Subscription { inner, scratch })
+                    .is_ok()
+            );
+            self.kept.push(Box::new(conductor));
+            self.kept.push(Box::new(publication));
+            max
+        }
+    }
+
+    /// A subscription that read `before` and stands at its mapping's seal,
+    /// with no successor offered yet.
+    pub(crate) fn at_seal() -> (ClientSubscription, Later) {
+        let predecessor = buffer(MIN_TERM_LENGTH);
+        let mut conductor = predecessor.conductor_owned().unwrap();
+        let link = GenerationLink::new();
+        let mut subscription =
+            ClientSubscription::new(conductor.subscribe(Role::Required).unwrap())
+                .with_generation(Arc::clone(&link), 0)
+                .unwrap();
+        let mut publication = predecessor.publication_owned().unwrap().unwrap();
+        let _ = publication
+            .append(b"before", AppendOptions::default())
+            .unwrap();
+        conductor.seal_for_cutover().unwrap();
+        // The writer sees the seal, which completes it.
+        assert_eq!(
+            publication
+                .append(b"late", AppendOptions::default())
+                .unwrap(),
+            karyos_sys::log_buffer::AppendOutcome::Closed
+        );
+        // The cutover started: the driver's step before its offer.
+        assert!(link.set_pending());
+        let _ = conductor.duty_cycle().unwrap();
+        let mut seen = Vec::new();
+        let _ = subscription
+            .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(seen, vec![b"before".to_vec()]);
+        let kept: Vec<Box<dyn core::any::Any>> = vec![
+            Box::new(conductor),
+            Box::new(publication),
+            Box::new(predecessor),
+        ];
+        (subscription, Later { link, kept })
     }
 }
 
@@ -1349,5 +1530,45 @@ mod tests {
         assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 0);
         drop(link.take_retired());
         assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+    /// A holding poll never moves to a successor offered after the caller
+    /// read the largest message: it stops at the seal, delivers nothing,
+    /// and `advance` moves, after which the largest message grew and a
+    /// message of exactly that length is delivered (item 57, FFI F4).
+    #[test]
+    fn a_holding_poll_leaves_a_larger_successor_to_advance() {
+        let (mut subscription, mut later) = testing::at_seal();
+        let before = subscription.max_message_length();
+        let max = later.offer();
+        assert!(max > before);
+        let mut seen = Vec::new();
+        let summary = subscription
+            .poll_holding(|bytes, _| seen.push(bytes.len()), MessageLimit::new(8))
+            .unwrap();
+        assert!(summary.stopped_at_seal);
+        assert_eq!((summary.delivered, summary.closed), (0, None));
+        assert!(seen.is_empty());
+        assert_eq!(subscription.max_message_length(), before, "not moved");
+        subscription.advance();
+        assert_eq!(subscription.max_message_length(), max);
+        let summary = subscription
+            .poll_holding(|bytes, _| seen.push(bytes.len()), MessageLimit::new(8))
+            .unwrap();
+        assert!(!summary.stopped_at_seal);
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(seen, [max as usize]);
+    }
+
+    /// A moving poll still moves within the poll, as before.
+    #[test]
+    fn a_moving_poll_still_moves_at_the_seal() {
+        let (mut subscription, mut later) = testing::at_seal();
+        let max = later.offer();
+        let mut seen = Vec::new();
+        let summary = subscription
+            .poll(|bytes, _| seen.push(bytes.len()), MessageLimit::new(8))
+            .unwrap();
+        assert!(!summary.stopped_at_seal);
+        assert_eq!(seen, [max as usize]);
     }
 }
