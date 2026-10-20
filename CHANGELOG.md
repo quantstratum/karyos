@@ -421,6 +421,26 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The driver grants a guarded exclusive publication's binding over the
+  control path (G-x2; quantstratum-docs:
+  `karyos/design/guards-and-abort.md`, "The binding across processes"),
+  behind a test-only switch: the control path still refuses guarded
+  streams until the client binds the regions (G-x3). The grant carries,
+  under one key, the log buffer, then the handle's outcome ring
+  (driver-only), its consumed cell (writable by its client alone) and the
+  guard region (driver-only), each its own export and ledger entry,
+  checked against `max_exports_per_client` and the fetch bounds before
+  anything is reserved. Every guard's word now lives in one array of
+  `max_guards` words, a driver-only region in IPC mode; a guard's index
+  is never reused, and the ring's header names it. The walker's bound
+  holds the ring and the cell until its last outcome record, after the
+  handle or its grants are gone. Concurrent guarded publications follow
+  when GC-7 lifts. The admission manifest rule changes in place under
+  the unreleased version 2: a guarded grant's manifest lists exactly
+  `OutcomeRing`, `ConsumedCell`, `GuardRegion` after its log buffer
+  records and carries a base; the binding's kinds appear in no other
+  manifest. `outcome_ring::init` also zeroes the reserved header words
+  (DESIGN's P3 on #501).
 - The guard binding's region kinds and outcome header (G-x1;
   quantstratum-docs: `karyos/design/guards-and-abort.md`, "The binding
   across processes"). `RegionKind` gains `GuardRegion` (12),

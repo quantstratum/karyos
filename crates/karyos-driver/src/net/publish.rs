@@ -340,7 +340,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let _ = lane;
             self.guard_stream(stream, guard.guard, guard.messages, guard.rate)?;
         }
-        let word = self.guards.view(guard.guard)?;
+        // The gate reads word 0: the guard's word in the guard words.
+        let (words, index) = self.guards.view(guard.guard)?;
+        let word = Arc::new(crate::shared_words::WordAt::new(words, index))
+            as Arc<dyn karyos_client::SharedWords>;
         let epoch = self.guards.state(guard.guard)?.epoch;
         // The walker records each lane's outcomes by its sender gate's
         // submissions, not at commit.
