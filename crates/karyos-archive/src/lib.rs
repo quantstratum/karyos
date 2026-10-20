@@ -19,6 +19,7 @@ pub mod disk;
 #[cfg(test)]
 mod fault;
 pub mod group;
+pub mod queue;
 pub mod recorder;
 pub mod segment;
 pub mod server;

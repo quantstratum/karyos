@@ -28,9 +28,9 @@
 //! | `0x0A` | `CloseJournal` | sequence | journal number (nonzero) | final delivery boundary | |
 //! | `0x0B` | `QueryCutover` | sequence | registration | | |
 //! | `0x0C` | `AddConflatedSubscription` | sequence | stream and session as above | | |
-//! | `0x0D` | `GuardClose` | sequence | guard | operation id | |
-//! | `0x0E` | `GuardReopen` | sequence | guard | expected closed epoch | operation id |
-//! | `0x0F` | `AddNetworkPublication` | sequence | stream id (low 32; high 32 zero) | flags as `AddPublication` | channel URI length |
+//! | `0x0D` | `GuardClose` | sequence | guard | operation id | operator uid, then the parameters digest |
+//! | `0x0E` | `GuardReopen` | sequence | guard | expected closed epoch | operation id, operator uid, then the parameters digest |
+//! | `0x0F` | `AddNetworkPublication` | sequence | stream id (low 32; high 32 zero) | flags: as `AddPublication`, and bit 1 concurrent | channel URI length |
 //! | `0x10` | `AddNetworkSubscription` | sequence | stream id (low 32; high 32 zero) | role as `AddSubscription` | channel URI length |
 //! | `0x11` | `AddImageSubscription` | sequence | image registration (nonzero) | role as `AddSubscription` | lane as `AddPublication` |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
@@ -49,7 +49,15 @@
 //! closes a guard, or reopens one closed at the epoch it names, on the
 //! driver's control path, authorized by the calling process's credentials
 //! (G1). The operation id is the requester's own id for the audit record
-//! (Audit A). The driver answers `GuardState` with the guard's word after
+//! (Audit A). The operator uid names the person a tool acts for (0: none,
+//! the client itself), and the parameters digest is
+//! [`guard_parameters`] over what was asked (`quantstratum-docs:
+//! karyos/design/management-agent-gap-analysis.md`, M10 and owner item 6);
+//! both go to the audit record as given. The operator uid is asserted by
+//! the admitted client, not verified by the driver: the driver knows only
+//! the client, whose uid admission proved equal to its own (G1), and the
+//! tool that sets the operator (the management agent) authenticates its
+//! own caller. The driver answers `GuardState` with the guard's word after
 //! the transition, or `Error` with `UnknownGuard`, `GuardNotClosedAt`
 //! (detail: the current guard word), `GuardExhausted` or `NotAuthorized`.
 //!
@@ -98,6 +106,14 @@
 //! configured receiver identity differs from its key's existing one.
 //! `LaneMismatch` (code 16) answers an exclusive publication whose URI
 //! names `lanes` other than the stream configures, granting nothing.
+//! Bit 1 of `AddNetworkPublication`'s flags asks for a concurrent handle
+//! on lane 0 instead of the exclusive publication (M11; added in place
+//! under admission `VERSION` 2, which no release has used): a
+//! `karyos:ipc` URI only, so the stream is shared with its other
+//! publishers. A `karyos:udp` one is refused with `UnsupportedChannel`,
+//! an exclusive stream with `InvalidPublicationMode`. A driver that does
+//! not know the bit fails to decode the command and retires the client as
+//! faulty (`ClientProtocolViolation`), with no response.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -254,6 +270,8 @@ const IMAGE_AVAILABLE: u32 = 0xC6;
 const IMAGE_UNAVAILABLE: u32 = 0xC7;
 
 const ALLOW_UNCONNECTED: u64 = 1;
+/// `AddNetworkPublication`'s flag for a concurrent handle (M11).
+const CONCURRENT: u64 = 2;
 
 // Every command fits the bound.
 const _: () = assert!(REPORT_LOSS_WORDS * 8 <= MAX_COMMAND_LENGTH);
@@ -671,7 +689,8 @@ pub enum Command {
         role: SubscriberRole,
     },
     /// Create an exclusive publication of `stream_id` on the channel `uri`
-    /// (W5): the driver draws its session id.
+    /// (W5): the driver draws its session id. With `concurrent`, a
+    /// concurrent handle on lane 0 of the `karyos:ipc` stream instead.
     AddNetworkPublication {
         /// Request sequence.
         sequence: u64,
@@ -679,6 +698,8 @@ pub enum Command {
         stream_id: i32,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
+        /// A concurrent handle rather than the exclusive publication.
+        concurrent: bool,
         /// The channel.
         uri: ChannelUri,
     },
@@ -822,6 +843,10 @@ pub enum Command {
         guard: u64,
         /// The requester's operation id, for the audit record.
         operation: u64,
+        /// The operator uid the requester acts for; 0 for none.
+        operator: u64,
+        /// [`guard_parameters`] of the request, for the audit record.
+        parameters: u64,
     },
     /// Reopen a guard closed at `expected` (local control, G1).
     GuardReopen {
@@ -833,7 +858,39 @@ pub enum Command {
         expected: u64,
         /// The requester's operation id, for the audit record.
         operation: u64,
+        /// The operator uid the requester acts for; 0 for none.
+        operator: u64,
+        /// [`guard_parameters`] of the request, for the audit record.
+        parameters: u64,
     },
+}
+
+/// The parameters digest of a guard command: 64-bit FNV-1a over the guard,
+/// the expected epoch (0 for a close), the operation id and the operator
+/// uid, each as eight little-endian bytes, then the operator's reason.
+/// It binds the audit record to what was asked, and is nonzero even with
+/// no reason; it is a correlation aid, not a security digest
+/// (authenticated audit waits on ADR-0035).
+#[must_use]
+pub fn guard_parameters(
+    guard: u64,
+    expected: u64,
+    operation: u64,
+    operator: u64,
+    reason: &[u8],
+) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    [guard, expected, operation, operator]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .chain(reason.iter().copied())
+        .fold(OFFSET, |hash, byte| {
+            // FNV-1a multiplies modulo 2^64 by definition. ADR-0007's rule
+            // against wrapping covers positions, lengths and counters, whose
+            // overflow is an error; a hash has no overflow to report.
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
 }
 
 /// Why the driver refused a command.
@@ -1287,30 +1344,38 @@ impl Command {
                 sequence,
                 guard,
                 operation,
-            } => write_words(&[sequence, guard, operation], out),
+                operator,
+                parameters,
+            } => write_words(&[sequence, guard, operation, operator, parameters], out),
             Self::GuardReopen {
                 sequence,
                 guard,
                 expected,
                 operation,
+                operator,
+                parameters,
             } => {
                 if !closed_epoch(expected) {
                     return Err(CncError::Reserved {
                         type_id: GUARD_REOPEN,
                     });
                 }
-                write_words(&[sequence, guard, expected, operation], out)
+                write_words(
+                    &[sequence, guard, expected, operation, operator, parameters],
+                    out,
+                )
             }
             Self::AddNetworkPublication {
                 sequence,
                 stream_id,
                 allow_unconnected,
+                concurrent,
                 uri,
             } => write_uri_command(
                 [
                     sequence,
                     u64::from(stream_id.cast_unsigned()),
-                    u64::from(allow_unconnected),
+                    u64::from(allow_unconnected) | if concurrent { CONCURRENT } else { 0 },
                     u64::from(uri.length),
                 ],
                 &uri,
@@ -1520,15 +1585,19 @@ impl Command {
                 })
             }
             GUARD_CLOSE => {
-                let [sequence, guard, operation] = read_words::<3>(type_id, bytes)?;
+                let [sequence, guard, operation, operator, parameters] =
+                    read_words::<5>(type_id, bytes)?;
                 Ok(Self::GuardClose {
                     sequence,
                     guard,
                     operation,
+                    operator,
+                    parameters,
                 })
             }
             GUARD_REOPEN => {
-                let [sequence, guard, expected, operation] = read_words::<4>(type_id, bytes)?;
+                let [sequence, guard, expected, operation, operator, parameters] =
+                    read_words::<6>(type_id, bytes)?;
                 // Only a closed epoch can be reopened: odd, 1 to MAX_EPOCH.
                 if !closed_epoch(expected) {
                     return Err(CncError::Reserved { type_id });
@@ -1538,6 +1607,8 @@ impl Command {
                     guard,
                     expected,
                     operation,
+                    operator,
+                    parameters,
                 })
             }
             ADD_NETWORK_PUBLICATION | ADD_NETWORK_SUBSCRIPTION => {
@@ -1547,13 +1618,14 @@ impl Command {
                     .map_err(|_| CncError::Reserved { type_id })?
                     .cast_signed();
                 if type_id == ADD_NETWORK_PUBLICATION {
-                    if flags & !ALLOW_UNCONNECTED != 0 {
+                    if flags & !(ALLOW_UNCONNECTED | CONCURRENT) != 0 {
                         return Err(CncError::Reserved { type_id });
                     }
                     Ok(Self::AddNetworkPublication {
                         sequence,
                         stream_id,
-                        allow_unconnected: flags == ALLOW_UNCONNECTED,
+                        allow_unconnected: flags & ALLOW_UNCONNECTED != 0,
+                        concurrent: flags & CONCURRENT != 0,
                         uri,
                     })
                 } else {
@@ -2493,6 +2565,14 @@ mod tests {
                     sequence: 3,
                     stream_id: -9,
                     allow_unconnected: true,
+                    concurrent: false,
+                    uri,
+                },
+                Command::AddNetworkPublication {
+                    sequence: 4,
+                    stream_id: 9,
+                    allow_unconnected: false,
+                    concurrent: true,
                     uri,
                 },
                 Command::AddNetworkSubscription {
@@ -2524,6 +2604,7 @@ mod tests {
             sequence: 1,
             stream_id: 10,
             allow_unconnected: false,
+            concurrent: false,
             uri: ChannelUri::new("karyos:udp?endpoint=127.0.0.1:1").unwrap(),
         };
         let type_id = command.type_id();
@@ -2536,10 +2617,22 @@ mod tests {
         let mut session = good.clone();
         session[12] = 1;
         assert_eq!(decode(&session), reserved);
-        // A reserved flag.
-        let mut flags = good.clone();
-        flags[16] = 2;
-        assert_eq!(decode(&flags), reserved);
+        // A reserved flag: bit 2 and above (bit 1 is concurrent, M11).
+        for bit in [4u8, 8, 0x80] {
+            let mut flags = good.clone();
+            flags[16] = bit;
+            assert_eq!(decode(&flags), reserved);
+        }
+        let mut concurrent = good.clone();
+        concurrent[16] = 3;
+        assert!(matches!(
+            decode(&concurrent),
+            Ok(Command::AddNetworkPublication {
+                allow_unconnected: true,
+                concurrent: true,
+                ..
+            })
+        ));
         // A length of 0, or above the cap.
         for bad in [0u64, MAX_COMMAND_URI as u64 + 1] {
             let mut length = good.clone();
@@ -3598,6 +3691,8 @@ mod journal_tests {
             sequence: 5,
             guard: 3,
             operation: 77,
+            operator: 1000,
+            parameters: 0xFEED,
         };
         let length = close.encode(&mut out).unwrap();
         assert_eq!(close.type_id(), 0x0D);
@@ -3605,7 +3700,8 @@ mod journal_tests {
         assert_eq!(
             &out[..length],
             &[
-                5, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0,
+                5, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0, 0xE8, 3,
+                0, 0, 0, 0, 0, 0, 0xED, 0xFE, 0, 0, 0, 0, 0, 0,
             ]
         );
         assert_eq!(Command::decode(0x0D, &out[..length]), Ok(close));
@@ -3614,10 +3710,12 @@ mod journal_tests {
             guard: 3,
             expected: 1,
             operation: 78,
+            operator: 1000,
+            parameters: 9,
         };
         let length = reopen.encode(&mut out).unwrap();
         assert_eq!(reopen.type_id(), 0x0E);
-        assert_eq!(words_of(&out[..length]), [6, 3, 1, 78]);
+        assert_eq!(words_of(&out[..length]), [6, 3, 1, 78, 1000, 9]);
         assert_eq!(Command::decode(0x0E, &out[..length]), Ok(reopen));
         let request = RequestId {
             client: 2,
@@ -3656,12 +3754,31 @@ mod journal_tests {
         assert_eq!(ErrorCode::from_code(17), None);
     }
 
+    /// The digest is 64-bit FNV-1a over the four words, little endian,
+    /// then the reason: a reference value pins it, and each input moves it.
+    #[test]
+    fn the_guard_parameters_digest_is_fnv_1a_over_the_request() {
+        let digest = guard_parameters(3, 0, 77, 1000, b"drill");
+        assert_eq!(digest, 0x9886_bd28_db8b_bca7);
+        for other in [
+            guard_parameters(4, 0, 77, 1000, b"drill"),
+            guard_parameters(3, 1, 77, 1000, b"drill"),
+            guard_parameters(3, 0, 78, 1000, b"drill"),
+            guard_parameters(3, 0, 77, 1001, b"drill"),
+            guard_parameters(3, 0, 77, 1000, b"drilL"),
+            guard_parameters(3, 0, 77, 1000, b""),
+        ] {
+            assert_ne!(other, digest);
+            assert_ne!(other, 0);
+        }
+    }
+
     #[test]
     fn a_reopen_of_an_impossible_epoch_is_refused() {
         // Epoch 0, an open (even) epoch, and one above MAX_EPOCH.
         for expected in [0, 2, karyos_sys::guard::MAX_EPOCH + 1, u64::MAX] {
             assert_eq!(
-                Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, expected, 7])),
+                Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, expected, 7, 0, 0])),
                 Err(CncError::Reserved {
                     type_id: GUARD_REOPEN
                 }),
@@ -3674,6 +3791,8 @@ mod journal_tests {
                     guard: 3,
                     expected,
                     operation: 7,
+                    operator: 0,
+                    parameters: 0,
                 }
                 .encode(&mut out),
                 Err(CncError::Reserved {
@@ -3682,7 +3801,7 @@ mod journal_tests {
             );
         }
         let last = karyos_sys::guard::MAX_EPOCH;
-        assert!(Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, last, 7])).is_ok());
+        assert!(Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, last, 7, 0, 0])).is_ok());
     }
 
     #[test]
@@ -4140,14 +4259,23 @@ mod properties {
                     registration,
                 }
             }),
-            (any::<u64>(), any::<i32>(), any::<bool>(), "[ -~]{1,512}").prop_map(
-                |(sequence, stream_id, allow_unconnected, uri)| Command::AddNetworkPublication {
-                    sequence,
-                    stream_id,
-                    allow_unconnected,
-                    uri: ChannelUri::new(&uri).unwrap(),
-                }
-            ),
+            (
+                any::<u64>(),
+                any::<i32>(),
+                any::<(bool, bool)>(),
+                "[ -~]{1,512}"
+            )
+                .prop_map(
+                    |(sequence, stream_id, (allow_unconnected, concurrent), uri)| {
+                        Command::AddNetworkPublication {
+                            sequence,
+                            stream_id,
+                            allow_unconnected,
+                            concurrent,
+                            uri: ChannelUri::new(&uri).unwrap(),
+                        }
+                    }
+                ),
             (any::<u64>(), 1..=u64::MAX, lane(), role.clone()).prop_map(
                 |(sequence, image, lane, role)| Command::AddImageSubscription {
                     sequence,
@@ -4216,25 +4344,31 @@ mod properties {
             (any::<u64>(), stream()).prop_map(|(sequence, stream)| {
                 Command::AddConflatedSubscription { sequence, stream }
             }),
-            any::<(u64, u64, u64)>().prop_map(|(sequence, guard, operation)| {
-                Command::GuardClose {
+            any::<(u64, u64, u64, u64, u64)>().prop_map(
+                |(sequence, guard, operation, operator, parameters)| Command::GuardClose {
                     sequence,
                     guard,
                     operation,
+                    operator,
+                    parameters,
                 }
-            }),
+            ),
             (
-                any::<(u64, u64, u64)>(),
+                any::<(u64, u64, u64, u64, u64)>(),
                 0..=(karyos_sys::guard::MAX_EPOCH >> 1)
             )
-                .prop_map(|((sequence, guard, operation), half)| {
-                    Command::GuardReopen {
-                        sequence,
-                        guard,
-                        expected: half * 2 + 1,
-                        operation,
+                .prop_map(
+                    |((sequence, guard, operation, operator, parameters), half)| {
+                        Command::GuardReopen {
+                            sequence,
+                            guard,
+                            expected: half * 2 + 1,
+                            operation,
+                            operator,
+                            parameters,
+                        }
                     }
-                }),
+                ),
         ]
     }
 
@@ -4428,8 +4562,8 @@ mod properties {
                     (CLOSE_JOURNAL, 3),
                     (QUERY_CUTOVER, 2),
                     (ADD_CONFLATED_SUBSCRIPTION, 2),
-                    (GUARD_CLOSE, 3),
-                    (GUARD_REOPEN, 4),
+                    (GUARD_CLOSE, 5),
+                    (GUARD_REOPEN, 6),
                     (ADD_IMAGE_SUBSCRIPTION, 4),
                 ],
             ),

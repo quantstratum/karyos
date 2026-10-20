@@ -366,6 +366,7 @@ fn render_alerts(families: &mut Families, dir: &str, alerts: &[Alert]) {
                 match alert.kind {
                     AlertKind::Lag => "lag",
                     AlertKind::Loss => "loss",
+                    AlertKind::GuardAck => "guard_ack",
                 }
                 .to_owned(),
             ),

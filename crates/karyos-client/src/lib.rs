@@ -25,6 +25,8 @@ pub mod conflated_subscription;
 pub mod counter;
 pub mod error;
 pub mod generation;
+pub mod groups;
+pub mod guard_acks;
 pub mod guarded;
 #[cfg(target_os = "linux")]
 pub mod ipc;

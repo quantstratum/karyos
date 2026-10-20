@@ -14,6 +14,17 @@ use karyos_sys::counters::{CellRead, KIND_GUARD};
 use karyos_sys::diag::GuardAuditRecord;
 
 /// The gauges of kind guard: (guard id, label, value).
+/// The labels of a guard's acknowledgement cells (M4b), beside its word.
+const ACK_CELLS: [&str; 6] = [
+    "guard ack pass",
+    "guard ack epoch",
+    "guard senders applied",
+    "guard senders in flight",
+    "guard senders pending",
+    "guard senders overdue",
+];
+
+/// Each guard's word gauge: (guard id, label, value).
 fn guard_gauges(driver: &EmbeddedDriver) -> Vec<(u64, String, u64)> {
     let reader = driver.counters();
     (0..reader.capacity())
@@ -27,6 +38,7 @@ fn guard_gauges(driver: &EmbeddedDriver) -> Vec<(u64, String, u64)> {
             )),
             _ => None,
         })
+        .filter(|(_, label, _)| !ACK_CELLS.contains(&label.as_str()))
         .collect()
 }
 

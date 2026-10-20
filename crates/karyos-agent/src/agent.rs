@@ -10,7 +10,7 @@ use karyos_client::tool::{RemoteTool, attach_tool};
 use karyos_sys::counters::{CellRead, CountersReader, PassRead, read_pass};
 use karyos_sys::host_clock::host_monotonic_ns;
 
-use crate::alerts::{AlertRules, Alerts};
+use crate::alerts::{AckRead, AlertRules, Alerts};
 use crate::api::{
     API_VERSION, AgentView, Counter, DriverState, DriverView, ErrorEntry, GuardEntry, LossEntry,
     Sample,
@@ -211,6 +211,16 @@ impl Driver {
             reported.unwrap_or(losses.delivered),
             host_monotonic_ns(),
         );
+        let acks: Vec<AckRead> = karyos_client::guard_acks::guard_acks(tool.counters())
+            .iter()
+            .map(|ack| AckRead {
+                guard: ack.guard,
+                consistent: ack.consistent,
+                epoch: ack.epoch,
+                overdue: ack.overdue,
+            })
+            .collect();
+        self.alerts.update_guard_acks(&acks, host_monotonic_ns());
         match tool.driver_closed() {
             Ok(false) => {}
             Ok(true) => {
@@ -371,6 +381,8 @@ fn read_rings(
             requester: record.requester,
             outcome: record.outcome,
             refusal: record.refusal,
+            operator: record.operator,
+            parameters: record.parameters,
         });
     });
     guards.cursor = cursor;

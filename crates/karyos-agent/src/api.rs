@@ -51,8 +51,8 @@ pub struct DriverView {
 }
 
 /// What an alert watches (SPEC §11, alerting; management-agent-gap-analysis.md,
-/// M9). Guard pending acknowledgement comes with M4b, replication lag and
-/// clock divergence with the Cluster and the Archive's retention work.
+/// M9). Replication lag and clock divergence come with the Cluster and the
+/// Archive's retention work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AlertKind {
@@ -60,6 +60,9 @@ pub enum AlertKind {
     Lag,
     /// The driver reported unrecoverable losses (its loss report grew).
     Loss,
+    /// A guard's close is in effect and senders have not applied it past
+    /// the driver's `guard_ack_timeout` (M4b's acknowledgements).
+    GuardAck,
 }
 
 /// One alert firing.
@@ -72,10 +75,12 @@ pub struct Alert {
     pub stream: u64,
     /// The lane (`Lag`).
     pub lane: u8,
-    /// The subscriber's registration (`Lag`); 0 when none.
+    /// The subscriber's registration (`Lag`) or the guard id
+    /// (`GuardAck`); 0 when none.
     pub participant: u64,
     /// `Lag`: the lag in bytes at the last consistent sample. `Loss`: the
     /// loss records reported since it began firing, read or overwritten.
+    /// `GuardAck`: the senders overdue at the last consistent read.
     pub value: u64,
     /// Host `CLOCK_MONOTONIC` nanoseconds of the refresh it began firing.
     pub since: u64,
@@ -261,14 +266,19 @@ pub struct GuardEntry {
     pub after: u64,
     /// The requester's operation id.
     pub operation: u64,
-    /// 0 the in-process caller, 1 an admitted client.
+    /// 0 the in-process caller, 1 an admitted client, 2 an operator
+    /// through an admitted client (M10).
     pub requester_kind: u8,
-    /// The client id for a client, else 0.
+    /// The client id for a client or an operator's client, else 0.
     pub requester: u64,
     /// 1 closed, 2 already closed, 3 reopened, 4 refused.
     pub outcome: u8,
     /// The control error code of a refusal, else 0.
     pub refusal: u16,
+    /// The operator's uid (`requester_kind` 2), else 0 (M10).
+    pub operator: u64,
+    /// The command's parameters digest, 0 when none was given (M10).
+    pub parameters: u64,
 }
 
 /// One publication lane's latencies within the trace window: the pairs of

@@ -791,6 +791,25 @@ impl RemoteClient {
             .add_network_publication(uri, stream_id, allow_unconnected)
     }
 
+    /// Requests a concurrent publication handle on lane 0 of the
+    /// `karyos:ipc` stream of `stream_id`, as
+    /// [`ClientConductor::add_network_concurrent_publication`]; its grant
+    /// completes as [`Outcome::Fetchable`](crate::Outcome::Fetchable) with
+    /// `by_uri` set.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_network_concurrent_publication`].
+    pub fn add_network_concurrent_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_network_concurrent_publication(uri, stream_id, allow_unconnected)
+    }
+
     /// Subscribes `stream_id` on the channel `uri`, as
     /// [`ClientConductor::add_network_subscription`]: a `karyos:ipc` grant
     /// completes as [`Outcome::Fetchable`](crate::Outcome::Fetchable) with
@@ -979,6 +998,42 @@ impl RemoteClient {
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?
             .allocate_counter(type_id, label, stream, participant)
+    }
+
+    /// Closes guard `guard` on behalf of `operator`, as
+    /// [`ClientConductor::guard_close`]; it completes as
+    /// [`Outcome::GuardState`](crate::Outcome::GuardState).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::guard_close`].
+    pub fn guard_close(
+        &mut self,
+        guard: u64,
+        operation: u64,
+        operator: u64,
+        reason: &[u8],
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .guard_close(guard, operation, operator, reason)
+    }
+
+    /// Reopens guard `guard` closed at `expected`, as
+    /// [`ClientConductor::guard_reopen`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::guard_reopen`].
+    pub fn guard_reopen(
+        &mut self,
+        guard: u64,
+        expected: u64,
+        operation: u64,
+        operator: u64,
+        reason: &[u8],
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .guard_reopen(guard, expected, operation, operator, reason)
     }
 
     /// Requests a trace journal of `layout` observing `registration` with
