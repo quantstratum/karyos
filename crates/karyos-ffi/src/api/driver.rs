@@ -32,6 +32,7 @@ use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     DEFAULT_CLAIM_DEADLINE, LogBufferConfig, LossPolicy, PublicationMode,
 };
+use karyos_sys::schedule_ring::MAX_CAPACITY;
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
@@ -151,7 +152,8 @@ pub(crate) struct StreamOptions {
     pub(crate) publication_mode: u32,
     /// Offers allowed with no subscriber attached: 0 or 1.
     pub(crate) allow_unconnected: u32,
-    /// Entries of the stream's schedule ring; 0 for none.
+    /// Entries of the stream's schedule ring: 0 for none, or a power of
+    /// two up to [`MAX_CAPACITY`] on an exclusive stream.
     pub(crate) schedule_capacity: u32,
     /// `KARYOS_LOSS_*`: what a lost required subscriber does.
     pub(crate) on_required_loss: u32,
@@ -238,6 +240,18 @@ impl StreamOptions {
             }
             (mode, _) => return Err(invalid(u64::from(mode))),
         };
+        // A timed lane's schedule (TT-1, GC-7): the driver refuses any
+        // other as a system failure, so it is refused here first.
+        let schedule_capacity = match self.schedule_capacity {
+            0 => 0,
+            capacity if !capacity.is_power_of_two() || capacity > MAX_CAPACITY => {
+                return Err(invalid(u64::from(capacity)));
+            }
+            _ if publication != PublicationMode::Exclusive => {
+                return Err(invalid(u64::from(self.publication_mode)));
+            }
+            capacity => capacity,
+        };
         let allow_unconnected = match self.allow_unconnected {
             0 => false,
             1 => true,
@@ -263,7 +277,7 @@ impl StreamOptions {
                 stream_id: self.stream_id,
                 claim_deadline: self.claim_deadline_ns,
                 publication,
-                schedule_capacity: self.schedule_capacity,
+                schedule_capacity,
             },
             allow_unconnected,
             on_required_loss,

@@ -1825,7 +1825,8 @@ pub struct StreamOptions {
     pub publication_mode: u32,
     /// Offers allowed with no subscriber attached: 0 or 1.
     pub allow_unconnected: u32,
-    /// Entries of the stream's schedule ring; 0 for none.
+    /// Entries of the stream's schedule ring: 0 for none, or a power of
+    /// two up to `1 << 20` on an exclusive stream.
     pub schedule_capacity: u32,
     /// `KARYOS_LOSS_*`: what a lost required subscriber does.
     pub on_required_loss: u32,

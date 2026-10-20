@@ -2464,6 +2464,11 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `karyos_driver_add_stream_with` answered `KARYOS_E_SYSTEM` for a
+  `schedule_capacity` the driver refuses: not a power of two, above
+  `1 << 20`, or on a concurrent stream (TT-1, GC-7). It now answers
+  `KARYOS_E_INVALID_ARGUMENT`, as for the other stream options, and
+  `karyos.h` states the rule. The Go binding's fuzz test found it.
 - `make libkaryos` failed on main after #555 ("no format version in
   conformance/FORMAT.md"): the package script read the format from
   FORMAT.md's title, which #555 retitled. FORMAT.md now carries a marker
