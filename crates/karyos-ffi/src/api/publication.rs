@@ -442,4 +442,46 @@ mod tests {
             assert!(!retryable(&released), "{released:?}");
         }
     }
+
+    /// Each concurrent offer outcome and commit outcome maps to its
+    /// exclusive counterpart, so a concurrent handle answers as an
+    /// exclusive one does (REVIEWER-01's P3 on #504).
+    #[test]
+    fn concurrent_outcomes_map_to_their_exclusive_counterparts() {
+        let lane = Lane::ZERO;
+        let placed = Placed { lane, position: 9 };
+        assert_eq!(
+            concurrent_offered(ConcurrentOfferOutcome::Accepted { lane, position: 9 }).ok(),
+            Some(placed)
+        );
+        let offered = |outcome| concurrent_offered(outcome).unwrap_err();
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::BackPressured),
+            OfferError::BackPressured
+        ));
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::AdminAction),
+            OfferError::AdminAction
+        ));
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::NotConnected),
+            OfferError::NotConnected
+        ));
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::Aborted { lane, position: 9 }),
+            OfferError::Aborted { position: 9, .. }
+        ));
+        assert!(matches!(
+            offered(ConcurrentOfferOutcome::Closed),
+            OfferError::Closed
+        ));
+        assert_eq!(
+            committed(CommitOutcome::Accepted { lane, position: 9 }).ok(),
+            Some(placed)
+        );
+        assert!(matches!(
+            committed(CommitOutcome::Aborted { lane, position: 9 }),
+            Err(OfferError::Aborted { position: 9, .. })
+        ));
+    }
 }
