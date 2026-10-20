@@ -1,0 +1,32 @@
+# A conflated view of an embedded driver's stream: polled, closed twice
+# and closed for use (FORMAT.md, Close; conflated.client.view).
+format 2
+id op.conflated
+abi 0.1
+covers "double close"
+since B1
+feature embedded-driver
+feature conflation
+
+op driver.create
+expect ok driver=$driver
+op driver.add_stream driver=$driver stream_id=9 conflation_keys=4 conflation_value_capacity=64 conflation_journal_capacity=4096
+expect ok
+op driver.start driver=$driver idle_strategy="yield"
+expect ok
+op driver.subscribe_conflated driver=$driver stream_id=9
+expect ok conflated=$view
+op conflated.poll conflated=$view key_budget=4
+expect ok delivered=0
+op conflated.close conflated=$view
+expect ok
+op conflated.close conflated=$view
+expect ok
+op conflated.poll conflated=$view
+expect status=closed
+op client.connect driver=$driver
+expect ok client=$client
+op conflated.add client=$client stream_id=9 uri="karyos:udp?endpoint=127.0.0.1:1"
+expect status=unsupported_channel
+op driver.close driver=$driver
+expect ok

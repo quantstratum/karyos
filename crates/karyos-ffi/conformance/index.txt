@@ -4,10 +4,10 @@
 # `pending` and the batch of quantstratum-docs:
 # karyos/design/ffi-gap-analysis.md that brings them.
 
-abi version: abi.version
-typed status codes: abi.version.null status.text handle.wrong.kind publication.typed.statuses publication.timed.offer subscription.options.typed.statuses offer.options.typed.statuses conflated.typed.statuses archive.typed.statuses publication.concurrent outcomes.typed.statuses conflated.client.view
-use after close: handle.use.after.close publication.use.after.close claim.use.after.close
-double close: handle.double.close claim.double.commit
+abi version: abi.version op.library.version
+typed status codes: abi.version.null status.text handle.wrong.kind publication.typed.statuses publication.timed.offer subscription.options.typed.statuses offer.options.typed.statuses conflated.typed.statuses archive.typed.statuses publication.concurrent outcomes.typed.statuses conflated.client.view op.publication.concurrent op.outcomes
+use after close: handle.use.after.close publication.use.after.close claim.use.after.close op.use.after.close op.parent.close
+double close: handle.double.close claim.double.commit op.double.close op.conflated
 older protocol version refused at admission: pending a driver the suite can start (F5 or a test driver); tests/connect.rs covers it on Linux
 reentrant poll: subscription.poll.reentrant
 bounded poll stops on callback failure: subscription.poll.bounded
@@ -18,3 +18,8 @@ older minor ABI client against a newer library: pending the ABI manifest test of
 # of minor compatibility rest on. karyos_accepted's sizes follow F4: an
 # accepted offer needs a subscriber.
 struct sizes of another minor version: struct.size.driver.options struct.size.stream.options struct.size.client.options struct.size.detail struct.reserved.driver.options struct.size.subscription.options struct.size.offer.options
+# Not §13 rows of their own: the claim semantics every binding shares
+# (BIND-S3 in quantstratum-docs: reviews/2026-10-20-product-open-questions.md)
+# and the clocks of scheduled offers (F7a-3).
+staged claims: claim.outstanding op.claim.published op.claim.retry
+clocks: op.clock.monotonic op.clock.tai

@@ -1,0 +1,30 @@
+# Any op but a close on a closed object answers closed, whatever the C
+# ABI answers for the stale handle (FORMAT.md, Close).
+format 2
+id op.use.after.close
+abi 0.1
+covers "use after close"
+since B1
+
+op client.connect driver=$driver
+expect ok client=$client
+op publication.add client=$client stream_id=2
+expect ok publication=$publication
+op subscription.add client=$client stream_id=2
+expect ok subscription=$subscription
+op publication.close publication=$publication
+expect ok
+op publication.offer publication=$publication payload="a"
+expect status=closed
+op publication.publish_claimed publication=$publication length=8
+expect status=closed
+op subscription.close subscription=$subscription
+expect ok
+op subscription.poll subscription=$subscription
+expect status=closed
+op client.close client=$client
+expect ok
+op client.poll client=$client
+expect status=closed
+op publication.add client=$client stream_id=2
+expect status=closed

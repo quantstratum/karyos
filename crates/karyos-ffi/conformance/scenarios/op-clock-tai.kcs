@@ -1,0 +1,13 @@
+# The TAI clock, where the platform has one (Linux): it never goes
+# backwards either. Elsewhere a runner reports it unsupported.
+format 2
+id op.clock.tai
+abi 0.1
+covers "clocks"
+since B2
+feature tai-clock
+
+op clock.now domain="tai"
+expect ok now=$first
+op clock.now domain="tai"
+expect ok now>=$first

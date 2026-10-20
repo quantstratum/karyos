@@ -1,14 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Conformance scenarios, interim format 1
+# Conformance scenarios, formats 1 and 2
 
-The language-neutral conformance suite of the C ABI (SPEC.md §10.2, §13;
-ADR-0053, ADR-0067) lives here, beside `karyos-ffi`. Its final format is
-an owner decision (owner item 46); this is the interim format the
-`karyos-ffi` runner and the bindings use until then (quantstratum-docs:
-`karyos/design/ffi-gap-analysis.md`, F6). A binding's runner can be
-written from this file alone, with its language's standard library; the
-Rust runner, `../tests/conformance.rs`, is the reference.
+The language-neutral conformance suite of the C ABI and the bindings
+(SPEC.md §10.2, §13; ADR-0053, ADR-0067) lives here, beside
+`karyos-ffi`. ADR-0073 settles its format (owner item 46, decision
+BIND-Q2): format 1 tests the C ABI through its functions and is kept;
+format 2 adds a semantic layer of ops that every binding runs through
+its public API, full 64-bit values, the steps that require a scenario,
+the features it needs, and the identities a run pins. A binding's
+runner can be written from this file alone, with its language's
+standard library; the Rust runner, `../tests/conformance.rs`, is the
+reference, and its semantic adapter (`../tests/support/semantic.rs`)
+runs the ops as a minimal binding over the C ABI.
 
 ## Files
 
@@ -37,24 +41,31 @@ inside a string, is a failure. So `text="a # b"` is one token, the name
 
 | Keyword | Tokens | Meaning |
 | --- | --- | --- |
-| `format` | `1` | The format version; the first line that is not blank |
+| `format` | `1` or `2` | The format version; the first line that is not blank |
 | `id` | a name without whitespace | The scenario's id, unique in the suite |
 | `abi` | `MAJOR.MINOR` | The ABI version the scenario needs |
 | `covers` | one quoted string | The §13 contract row it checks, as `index.txt` names it |
 | `call` | a function name, then `name=value` arguments | Calls the C function |
 | `expect` | an optional status name, then `name=value` results | Checks the last call |
+| `since` | a step | Format 2 only, and required there (Format 2) |
+| `feature` | a feature name | Format 2 only; repeatable (Format 2) |
+| `op` | an op name, then `name=value` arguments | Format 2 only: runs the op (Format 2) |
 
-`format`, `id`, `abi` and `covers` come once each, in any order after
-`format`, and all before the first `call`. Every `call` is followed by
-exactly one `expect`, before the next `call`. A scenario has at least one
-`call`. A `name=value` token splits at its first `=`, and a name given
+`format`, `id`, `abi`, `covers` and `since` come once each, and
+`feature` once per feature, in any order after `format` and all before
+the first step. A step is a `call` or an `op`; every step is followed by
+exactly one `expect`, before the next step. A scenario has at least one
+step. A `name=value` token splits at its first `=`, and a name given
 twice in one line is a failure.
 
 ## Values
 
-- An integer: decimal, optionally negative, within 64-bit signed range
-  (`108`, `-1`). An argument whose C type is narrower (such as the
-  `int32_t` `status`) and that does not fit it is a failure.
+- An integer: decimal, optionally negative. In format 1 it lies within
+  64-bit signed range (`108`, `-1`); in format 2 from -2^63 to 2^64 - 1,
+  so a `uint64_t` handle or position past the signed range can be
+  written (`18446744073709551615`). An argument whose type is narrower
+  (such as the `int32_t` `status`) and that does not fit it is a
+  failure.
 - `null`: a null pointer, for a pointer argument.
 - A quoted string.
 - `$name`: a variable. Variables live for one scenario and carry across
@@ -140,18 +151,195 @@ out, it is the size of the struct in the header the runner reads.
   `"intact"` when every byte past the header's size still holds the
   sentinel, `"changed"` otherwise.
 
+## Format 2
+
+A format 2 scenario uses the lines, tokens and values above, with the
+additions of this section. Format 1 scenarios run unchanged.
+
+### Layers
+
+A format 2 scenario's steps are all `call`, or all `op`; mixing them is
+a failure.
+
+- **The ABI layer** (`call`): the functions, arguments and results of
+  Calls and Sized structs, with format 2 values. The runners that drive
+  the C ABI run it.
+- **The semantic layer** (`op`): ops that a binding runs through its
+  public API, with no private shortcut, and the outcomes and close rules
+  below. Its expectations are those of a binding, which need not equal
+  the raw C answers: a second close is `ok` where the C ABI answers
+  `KARYOS_E_CLOSED`. Every runner runs it, the reference runner through
+  its adapter.
+
+### Steps
+
+`since` names the delivery step from which a scenario is required:
+`B0` to `B5`, as each binding SPEC numbers its steps in its steps table
+(quantstratum-docs: `karyos/design/bindings-plan.md` §2). It names a
+binding SPEC's step, never a batch of that plan's §7, whose numbers
+differ. A runner declares the step it targets. Where the binding SPECs
+place one surface at different steps, a scenario carries a `feature`
+for it rather than a `since` that one binding would get wrong.
+
+### Features
+
+A scenario names with `feature` each feature its ops need; an op used
+without its feature is a failure. A runner declares the features it
+offers. The features are:
+
+| Feature | What it needs |
+| --- | --- |
+| `claim-retry` | A claim held across calls: `publication.claim`, `claim.commit`, `claim.abort` (the C++ and Go object APIs) |
+| `concurrent-publication` | `publication.add_concurrent` |
+| `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
+| `embedded-driver` | A driver the scenario creates: `driver.*` |
+| `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
+| `tai-clock` | `clock.now` of the TAI domain, which some platforms lack |
+
+A new feature is added here; a feature name not in this table is a
+failure.
+
+### The provided driver
+
+A semantic scenario without `embedded-driver` creates no driver. Before
+its first step the runner binds `$driver` to a driver it provides,
+started and serving streams 1 to 15 with the default stream options:
+an embedded driver of its own, or a driver it starts or attaches to
+where the binding has no embedded one. The reference runner provides
+an embedded driver, closed after the scenario.
+
+### Outcomes
+
+An `op` is followed by an `expect` that starts with its outcome:
+
+- `ok`, then the results it checks as `name=value`;
+- `status=<name>`, with no results: a failure, named by its header
+  status in lower case without `KARYOS_E_` (`not_connected`,
+  `claim_outstanding`, `closed`). A binding maps its own results to
+  these names through the one mapping it already has (BIND-S1); the
+  class follows the header's range, and whether the binding returns or
+  raises it is the binding's own policy. A name the header does not
+  define is a failure, and so is `invalid_handle`, which no op answers
+  (Close).
+
+A result checked as `name>=value` (format 2, either layer) holds an
+integer at least `value`; `value` is a literal or a bound variable.
+
+Objects (the arguments named `driver`, `client`, `publication`,
+`subscription`, `conflated` and `claim`) are opaque: an op's result
+binds one to a variable, and an op takes it only as a variable. A
+result an op does not have, or an argument it does not take, is a
+failure; so is a required argument left out.
+
+### Close
+
+- A close after the object's successful close is `ok` and closes
+  nothing more.
+- Closing a parent closes its children: a driver its clients and views,
+  a client its publications, subscriptions and views, a publication its
+  claim. A child's close after its parent's close is `ok`, as a
+  deferred close or a destructor runs it.
+- Any other op on a closed object, or on a child of a closed parent,
+  answers `status=closed`, whatever the C ABI answers for its stale
+  handle.
+- A close that answers `busy` or `reentrant` closes nothing: the object
+  stays usable and the close may be retried.
+- A claim ends at a successful commit, at an abort, or at a commit that
+  answers a status other than the five retryable ones
+  (`back_pressured`, `not_connected`, `admin_action`, `rate_limited`,
+  `gated`), which keep it staged. An ended claim answers `closed` to
+  both `claim.commit` and `claim.abort`.
+
+### Ops
+
+Arguments in brackets are optional; `payload` or `length`, one of them,
+gives a message as in Calls. `->` lists the results of `ok`.
+
+| Op | Arguments | Results | Feature |
+| --- | --- | --- | --- |
+| `library.version` | none | `major`, `minor`, `patch` | |
+| `clock.now` | `domain`: `"monotonic"` or `"tai"` | `now` | `tai-clock` for `"tai"` |
+| `driver.create` | none | `driver` | `embedded-driver` |
+| `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none | `embedded-driver` |
+| `driver.start` | `driver`, `idle_strategy`: `"busy_spin"`, `"yield"` or `"sleep"`, [`idle_sleep_ns`] | none | `embedded-driver` |
+| `driver.do_work` | `driver` | `work` | `embedded-driver` |
+| `driver.subscribe_conflated` | `driver`, `stream_id` | `conflated` | `embedded-driver`, `conflation` |
+| `driver.close` | `driver` | none | `embedded-driver` |
+| `client.connect` | `driver` | `client` | |
+| `client.poll` | `client` | `served` | |
+| `client.close` | `client` | none | |
+| `publication.add` | `client`, `stream_id`, [`uri`, default `"karyos:ipc"`] | `publication` | |
+| `publication.add_concurrent` | as `publication.add` | `publication` | `concurrent-publication` |
+| `publication.offer` | `publication`, [`lane`], `payload` or `length` | `lane`, `position` | |
+| `publication.publish_claimed` | `publication`, [`lane`], `payload` or `length` | `lane`, `position` | |
+| `publication.claim` | `publication`, `length`, [`lane`] | `claim` | `claim-retry` |
+| `claim.commit` | `claim` | `lane`, `position` | `claim-retry` |
+| `claim.abort` | `claim` | none | `claim-retry` |
+| `publication.poll_outcomes` | `publication`, [`lane`, `limit` (default 1)] | `delivered` | `guarded-publication` |
+| `publication.close` | `publication` | none | |
+| `subscription.add` | `client`, `stream_id`, [`uri`, `role`, `rejoin`: the values of the header's subscription options] | `subscription` | |
+| `subscription.poll` | `subscription`, [`limit` (default 1)] | `delivered`, `last` (the last message as UTF-8 text, when there is one) | |
+| `subscription.close` | `subscription` | none | |
+| `conflated.add` | `client`, `stream_id`, [`uri`] | `conflated` | `conflation` |
+| `conflated.poll` | `conflated`, [`key_budget` (default 1)] | `delivered` | `conflation` |
+| `conflated.close` | `conflated` | none | `conflation` |
+
+`idle_strategy` is required until the ABI defines a default idle
+strategy (R-CORE-37); then it becomes optional with that default.
+
+`publication.publish_claimed` is one claim, fill and commit through the
+binding's claim API (BIND-S3): on a retryable status it returns that
+status with no claim left outstanding, so the next attempt starts
+afresh. An object API runs it as a claim, a commit and, on a retryable
+status, an abort; a fill-callback API as its one commit attempt. Every
+binding offers it, so it needs no feature.
+
+### Bounds
+
+A runner refuses, as a failure, a scenario file over 64 KiB, a line
+over 4096 bytes or 64 tokens, a scenario over 1024 steps or 256
+variables, and a suite over 4096 scenarios. Integers are bounded as in
+Values; a runner holds them in a type that carries the whole range.
+
+### Pinning
+
+A run prints, before any outcome, the identities it ran with:
+
+```text
+suite <sha256> header <sha256> core <major.minor.patch> <library id>
+```
+
+- `suite`: SHA-256 over the suite's files, `FORMAT.md`, `index.txt`
+  and `scenarios/*.kcs`, sorted by their path under this directory as
+  bytes, each hashed as its path in UTF-8, a NUL byte, its length as
+  8 bytes big-endian, then its bytes.
+- `header`: SHA-256 of the `karyos.h` the runner was compiled against,
+  not one installed beside the library.
+- `core`: the library's `karyos_abi_version`, then its identity: the
+  SHA-256 of the `libkaryos` file the runner links, or for the
+  reference runner `karyos-ffi` and the crate's version.
+
+The Python binding wraps the Rust crates, not the C ABI: it prints the
+suite, then its semantic target in place of the header and core,
+`core <release> protocol <version>`, the core release and the protocol
+version it was built against.
+
 ## Failures
 
 A scenario fails, and is reported as failed, on any of these:
 
-- an unknown `format`, keyword, function, argument or status name (a
-  status name the header does not define). A runner that meets a
-  function or argument it does not know fails the scenario, never skips
-  it, so an older runner never passes a newer scenario by ignoring part
-  of it;
-- a header line repeated, missing, or after a `call`;
-- a `call` without its `expect`, an `expect` without a `call`, or no
-  `call` at all;
+- an unknown `format`, keyword, function, op, argument, result, step,
+  feature or status name (a status name the header does not define). A
+  runner that meets a function, op or argument it does not know fails
+  the scenario, never skips it, so an older runner never passes a newer
+  scenario by ignoring part of it;
+- a header line repeated, missing, or after a step; `since` missing in
+  format 2; `since`, `feature`, `op` or `>=` in format 1;
+- a step without its `expect`, an `expect` without a step, no step at
+  all, or `call` and `op` in one scenario;
+- an op used without the feature it needs, or an object argument not
+  passed as a variable;
+- a breach of the bounds (Format 2, Bounds);
 - a malformed token or value (Lines and tokens, Values);
 - an unbound variable in a `call`;
 - a status that differs from the `expect`'s, an `expect` with a status
@@ -173,10 +361,27 @@ Any other scenario is skipped, never reported as passed.
 
 ## Reporting
 
-A runner reports every scenario id with one outcome: passed, failed or
-skipped, and for a failure the file and line of the step that failed.
-A binding release requires no failure and no skip at the ABI version it
-targets (SPEC.md §13).
+A runner prints the pinning line first (Format 2, Pinning), then every
+scenario id with one outcome, and for a failure the file and line of
+the step that failed:
+
+- `passed`;
+- `failed`;
+- `skipped`: its `abi` does not run against the library (Versions);
+- `unsupported <feature>`: it needs a feature the runner does not
+  offer;
+- `later`: its `since` step comes after the runner's step.
+
+A scenario is required when its `abi` runs, its `since` is the runner's
+step or earlier, and the runner offers its features; a required
+scenario passes or fails, and is never skipped. A binding release
+requires no failure, no skip at the ABI version it targets and no
+`later` at the step it releases (SPEC.md §13). Each `unsupported` is
+one of the features its binding SPEC lets it lack at that step, and the
+binding's runner states which features it offers and why it lacks the
+others; the coverage map of a run is its rows with each scenario's
+outcome, so applicable, missing and unsupported features are told
+apart.
 
 ## Index
 
@@ -192,6 +397,10 @@ The row name is the text before the first `:`, trimmed, not empty and
 without `#`; rows are unique. After the `:` comes either one or more
 scenario ids separated by whitespace, or `pending` followed by the
 batch of ffi-gap-analysis.md (or the reason) that will cover the row.
+A row lists scenarios of either format and layer.
+
+Scenario ids are stable: a scenario keeps its id when it changes, and
+an id once used is never given to another scenario.
 
 The map is checked both ways, and any breach is a failure:
 

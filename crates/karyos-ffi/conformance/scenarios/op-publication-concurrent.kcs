@@ -1,0 +1,32 @@
+# Concurrent publication handles share a stream up to its publishers
+# (karyos_driver_add_stream; publication.concurrent at the ABI layer).
+format 2
+id op.publication.concurrent
+abi 0.1
+covers "typed status codes"
+since B1
+feature embedded-driver
+feature concurrent-publication
+
+op driver.create
+expect ok driver=$driver
+op driver.add_stream driver=$driver stream_id=8 publication_mode=1 publishers=2
+expect ok
+op driver.start driver=$driver idle_strategy="yield"
+expect ok
+op client.connect driver=$driver
+expect ok client=$client
+op publication.add_concurrent client=$client stream_id=8
+expect ok publication=$first
+op publication.add_concurrent client=$client stream_id=8
+expect ok publication=$second
+op publication.add_concurrent client=$client stream_id=8
+expect status=refused
+op publication.add client=$client stream_id=8
+expect status=refused
+op client.close client=$client
+expect ok
+op driver.close driver=$driver
+expect ok
+op driver.close driver=$driver
+expect ok
