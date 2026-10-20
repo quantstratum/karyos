@@ -303,8 +303,10 @@ fn the_exporter_renders_an_attached_driver() {
 /// M11 end to end: the agent lists the Archive catalog of a driver given
 /// one, over its control streams: it connects as an IPC client, takes a
 /// concurrent handle on the request stream the host configured concurrent
-/// and reads the response stream. A fake Archive on this thread answers
-/// each page from a catalog of three recordings, two per page.
+/// and reads the response stream. A fake Archive on this thread refuses
+/// the first page, then answers each page from a catalog of three
+/// recordings, two per page; the refusal is counted and the agent lists
+/// again on the same connection.
 #[test]
 fn the_agent_lists_the_archive_catalog_of_a_driver() {
     use karyos_agent::catalog::{ArchiveStreams, CatalogConfig};
@@ -407,6 +409,9 @@ fn the_agent_lists_the_archive_catalog_of_a_driver() {
             let _ = driver.do_work().unwrap();
         }
     };
+    let mut refused = false;
+    let mut seen_refusal = false;
+    let mut after_refusal = None;
     let start = Instant::now();
     let catalog = loop {
         assert!(start.elapsed() < Duration::from_secs(30), "no listing");
@@ -421,6 +426,21 @@ fn the_agent_lists_the_archive_catalog_of_a_driver() {
             MessageLimit::new(8),
         );
         for (correlation_id, from_id, max_count) in pages {
+            // REVIEWER-02's P3-1 on #488: the first page is refused.
+            if !refused {
+                refused = true;
+                answer(
+                    &ControlMessage::ControlResponse(ControlResponse {
+                        correlation_id,
+                        id: 0,
+                        code: ResponseCode::Error,
+                        message: "catalog busy",
+                    }),
+                    &mut driver,
+                );
+                continue;
+            }
+            after_refusal.get_or_insert(correlation_id);
             // Two per page at most, as an Archive may answer fewer.
             let ids: Vec<u64> = (from_id.max(1)..=3)
                 .take(max_count.min(2) as usize)
@@ -442,6 +462,10 @@ fn the_agent_lists_the_archive_catalog_of_a_driver() {
             );
         }
         let catalog = agent.view().drivers[0].catalog.clone().unwrap();
+        seen_refusal |= catalog
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("refused"));
         if catalog.listings > 0 {
             break catalog;
         }
@@ -451,6 +475,12 @@ fn the_agent_lists_the_archive_catalog_of_a_driver() {
     assert_eq!(ids, [1, 2, 3], "{catalog:?}");
     assert_eq!(catalog.left_out, 0);
     assert!(catalog.listed_at.is_some());
+    // The refusal was counted, and the listing that followed cleared it.
+    assert!(seen_refusal);
+    assert_eq!(catalog.failures, 1);
+    // On the same connection: its lister's next correlation id (a new
+    // connection's would start at 1 again).
+    assert_eq!(after_refusal.unwrap() & 0xFFFF_FFFF, 2);
     assert_eq!(catalog.last_error, None);
     let (stopped, live) = (&catalog.recordings[0], &catalog.recordings[2]);
     assert!(!stopped.recording);
@@ -496,4 +526,91 @@ fn the_agent_lists_the_archive_catalog_of_a_driver() {
 
 fn agent_without_archive(dir: &Path) -> Agent {
     Agent::new(AgentConfig::new(vec![dir.to_path_buf()]))
+}
+
+/// REVIEWER-02's P3-2 on #488: when the agent's refresh finds the driver
+/// gone, the catalog's session ends at once and is counted, rather than
+/// at its listing deadline (here a minute).
+#[test]
+fn a_driver_that_closes_ends_its_catalog_session_at_once() {
+    use karyos_agent::catalog::{ArchiveStreams, CatalogConfig};
+    use karyos_client::MessageLimit;
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    let stream = |stream_id, publication| StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 6,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    };
+    let _serial = serial();
+    let dir = dir("catalog-gone");
+    let mut driver = driver(&dir, DriverConfig::default(), 4);
+    let requests = driver
+        .add_stream(stream(
+            100,
+            PublicationMode::Concurrent {
+                publishers: 2,
+                allow_non_lse: true,
+            },
+        ))
+        .unwrap();
+    let _ = driver
+        .add_stream(stream(101, PublicationMode::Exclusive))
+        .unwrap();
+    let mut reading = driver.subscribe(requests, Role::Optional).unwrap();
+    let mut agent = Agent::new(
+        AgentConfig::new(vec![dir.clone()])
+            .with_attach_timeout(Duration::from_secs(5))
+            .with_archive(
+                dir.clone(),
+                CatalogConfig::new(ArchiveStreams::new(100, 101)).with_timing(
+                    Duration::from_secs(2),
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                ),
+            ),
+    );
+    refresh_serving(&mut driver, &mut agent);
+    // The session is up once its first page is asked for; nobody answers.
+    let start = Instant::now();
+    let mut asked = 0;
+    while asked == 0 {
+        assert!(start.elapsed() < Duration::from_secs(30), "no request");
+        let _ = driver.do_work().unwrap();
+        let _ = reading.poll(|_, _| asked += 1, MessageLimit::new(8));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(reading);
+    drop(driver);
+    agent.refresh();
+    assert_eq!(agent.view().drivers[0].state, DriverState::Closed);
+    let start = Instant::now();
+    loop {
+        // Well within the minute the listing deadline would take.
+        assert!(start.elapsed() < Duration::from_secs(10), "not ended");
+        let catalog = agent.view().drivers[0].catalog.clone().unwrap();
+        if catalog.failures > 0 {
+            assert_eq!(catalog.last_error.as_deref(), Some("the driver closed"));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }

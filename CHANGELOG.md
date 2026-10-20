@@ -428,6 +428,11 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos_archive_listed_at_ns`. It costs one client slot of that driver.
   The crate graph test checks that karyos-archive never depends on the
   agent.
+- The agent's catalog thread (M11) ends its session as soon as the
+  agent's refresh finds the driver closed, counting it ("the driver
+  closed") instead of waiting out the listing deadline; a refusal is
+  tested to be counted and followed by a listing on the same connection
+  (REVIEWER-02's P3s on #488).
 
 - The management agent's operations journal (quantstratum-docs:
   `karyos/design/management-agent-gap-analysis.md`, M10b, owner item 7
