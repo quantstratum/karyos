@@ -539,6 +539,26 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Conflated subscriptions over the C ABI (F7b-2b; quantstratum-docs:
+  `karyos/design/ffi-gap-analysis.md`, `conflation-end-to-end.md`):
+  - `karyos_stream_options` grows `conflation_keys`,
+    `conflation_value_capacity` (u32) and `conflation_journal_capacity`
+    (u64): an ABI addition, 80 bytes. All three 0 means no table; a
+    partial set, or a table the driver cannot build, is
+    `KARYOS_E_INVALID_ARGUMENT`. A 64-byte struct of the first layout is
+    still accepted, with no table; a size between 64 and 80 is refused.
+    `karyos_stream_options_init` now writes 80.
+  - `karyos_driver_subscribe_conflated`, `karyos_conflated_poll` (a
+    `karyos_conflated_handler` gets the key, the value from the reader's
+    private copy, its version and its freshness: `KARYOS_FRESH` or the
+    stale start) and `karyos_conflated_close`, with
+    `KARYOS_MAX_CONFLATED_SUBSCRIPTIONS`. A stream without a table is
+    `KARYOS_E_CONFLATION`; a closed view, or one of a closed driver,
+    answers `KARYOS_E_CLOSED`.
+  - Conformance: `conflated.typed.statuses`; `struct.size.stream.options`
+    covers both layouts; the runner's three new calls and the stream's
+    conflation arguments.
+
 - Per-offer options (F7b-2a; quantstratum-docs:
   `karyos/design/ffi-gap-analysis.md`): the facade's
   `Publication::offer_on_with(lane, payload, OfferOptions)`, with

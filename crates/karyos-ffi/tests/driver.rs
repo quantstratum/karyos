@@ -105,7 +105,8 @@ fn a_stream_is_added_and_removed_through_the_abi() {
     let (_, driver) = abi::driver_create();
     let (status, options) = abi::stream_options(5);
     assert_eq!(status, OK);
-    assert_eq!(options.size, 64);
+    // The init writes the layout with the conflation fields (F7b-2b).
+    assert_eq!(options.size, 80);
     assert_eq!(options.term_length, 64 * 1024);
     assert_eq!(abi::driver_add_stream(driver, &options).0, OK);
     // A duplicate names the stream and the session.
@@ -121,6 +122,12 @@ fn a_stream_is_added_and_removed_through_the_abi() {
     small.size = 63;
     small.stream_id = 6;
     assert_eq!(abi::driver_add_stream(driver, &small).0, INVALID_ARGUMENT);
+    // The first layout, 64 bytes, is still accepted (with no conflation
+    // table); a size between it and 80 is refused.
+    small.size = 72;
+    assert_eq!(abi::driver_add_stream(driver, &small).0, INVALID_ARGUMENT);
+    small.size = 64;
+    assert_eq!(abi::driver_add_stream(driver, &small).0, OK);
     assert_eq!(abi::driver_close(driver), OK);
 }
 

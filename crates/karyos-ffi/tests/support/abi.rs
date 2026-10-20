@@ -61,6 +61,9 @@ pub struct StreamOptions {
     pub schedule_capacity: u32,
     pub on_required_loss: u32,
     pub claim_deadline_ns: u64,
+    pub conflation_keys: u32,
+    pub conflation_value_capacity: u32,
+    pub conflation_journal_capacity: u64,
 }
 
 /// `karyos_detail`.
@@ -150,6 +153,17 @@ unsafe extern "C" {
         detail: *mut Detail,
     ) -> i32;
     safe fn karyos_driver_remove_stream(driver: u64, stream_id: i32) -> i32;
+    fn karyos_driver_subscribe_conflated(driver: u64, stream_id: i32, conflated: *mut u64) -> i32;
+    fn karyos_conflated_poll(
+        conflated: u64,
+        handler: Option<
+            unsafe extern "C" fn(*mut core::ffi::c_void, u32, *const u8, usize, u64, u64),
+        >,
+        context: *mut core::ffi::c_void,
+        key_budget: u32,
+        delivered: *mut u32,
+    ) -> i32;
+    safe fn karyos_conflated_close(conflated: u64) -> i32;
     fn karyos_client_add_publication(
         client: u64,
         uri: *const c_char,
@@ -579,6 +593,52 @@ pub fn driver_add_stream(driver: u64, options: &StreamOptions) -> (i32, Detail) 
     // SAFETY: live, aligned pointers.
     let status = unsafe { karyos_driver_add_stream(driver, options, &mut detail) };
     (status, detail)
+}
+
+/// `karyos_driver_subscribe_conflated` of `stream_id`: the status and the
+/// handle.
+pub fn driver_subscribe_conflated(driver: u64, stream_id: i32) -> (i32, u64) {
+    let mut conflated = 0;
+    // SAFETY: a live, aligned `u64`.
+    let status = unsafe { karyos_driver_subscribe_conflated(driver, stream_id, &mut conflated) };
+    (status, conflated)
+}
+
+/// Counts the values a conflated poll delivers into its `u32` context.
+unsafe extern "C" fn count_value(
+    context: *mut core::ffi::c_void,
+    _key: u32,
+    _data: *const u8,
+    _length: usize,
+    _version: u64,
+    _freshness: u64,
+) {
+    // SAFETY: the context is the live `u32` of `conflated_poll`.
+    let counted = unsafe { &mut *context.cast::<u32>() };
+    *counted = counted.saturating_add(1);
+}
+
+/// `karyos_conflated_poll` of at most `key_budget` keys: the status, the
+/// count it wrote and the count of handler calls.
+pub fn conflated_poll(conflated: u64, key_budget: u32) -> (i32, u32, u32) {
+    let (mut delivered, mut counted) = (0u32, 0u32);
+    // SAFETY: a handler of the signature that returns normally, its live
+    // `u32` context, and a live, aligned `u32`.
+    let status = unsafe {
+        karyos_conflated_poll(
+            conflated,
+            Some(count_value),
+            (&raw mut counted).cast(),
+            key_budget,
+            &mut delivered,
+        )
+    };
+    (status, delivered, counted)
+}
+
+/// `karyos_conflated_close`.
+pub fn conflated_close(conflated: u64) -> i32 {
+    karyos_conflated_close(conflated)
 }
 
 /// `karyos_driver_remove_stream`.
