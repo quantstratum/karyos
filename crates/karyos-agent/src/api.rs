@@ -60,8 +60,11 @@ pub struct GapView {
     /// The start of the agent that recorded it.
     pub to: u64,
     /// Why it was recorded: `request_without_outcome`, `torn_tail`,
-    /// `unclean_stop` or `journal_replaced`, so an administrator tells a
-    /// crash from a lost operation before acknowledging it.
+    /// `unclean_stop`, `journal_replaced` or
+    /// `journal_unavailable_at_start`, so an administrator tells a crash
+    /// from a lost operation before acknowledging it. The last is held in
+    /// memory at [`UNOPENED_POSITION`](crate::journal::UNOPENED_POSITION),
+    /// never recorded.
     pub reason: &'static str,
 }
 
