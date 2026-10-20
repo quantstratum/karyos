@@ -15,6 +15,9 @@
 //! helper: each process starts at an offset of its own and walks the range
 //! once, skipping ports it cannot bind. A port is still only checked, not
 //! held, before the driver binds it: a near certainty, not a guarantee.
+//! The race goes away only when a subscription can take `endpoint=host:0`
+//! and report the port it bound, owner item 26 (quantstratum-docs:
+//! `karyos/design/ephemeral-subscription-port.md`, docs#181).
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};

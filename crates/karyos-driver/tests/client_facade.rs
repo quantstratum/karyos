@@ -91,7 +91,8 @@ fn port() -> u16 {
 /// range (Linux 32768 to 60999, macOS 49152 to 65535), so no bind to port
 /// 0 can take it before the driver binds it (karyos#520). As karyos-driver's
 /// `test_ports`: a process starts at its own offset and walks the range,
-/// skipping ports it cannot bind.
+/// skipping ports it cannot bind. Owner item 26 (an `endpoint=host:0`
+/// subscription that reports its port) would remove the race.
 fn test_port() -> u16 {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     const FIRST: u32 = 20_000;
