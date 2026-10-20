@@ -30,7 +30,7 @@ use karyos_archive::client::replay::{
 use karyos_archive::client::{ControlRequests, ControlResponses};
 use karyos_archive::control::ResponseCode;
 
-use crate::api::client::{AnyClient, clients};
+use crate::api::client::{AnyClient, Ended, with_client};
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
 
@@ -254,7 +254,7 @@ pub(crate) fn connect(client: Handle, options: Options) -> Result<Handle, Failur
     let config = ListerConfig::new(client_id);
     let next_client_id = client_id.checked_add(1);
     let streams = ControlStreams::new(options.requests, options.responses);
-    clients().with(client, |entry| {
+    with_client(client, |entry| {
         entry.usable()?;
         let deadline = if options.deadline_ns == 0 {
             entry.timeout
@@ -317,7 +317,7 @@ pub(crate) fn list(
 ) -> Result<u32, Failure> {
     let client = table().with(archive, |entry| entry.client)?;
     match client {
-        Some(client) => clients().with(client, |client_entry| {
+        Some(client) => with_client(client, |client_entry| {
             client_entry.usable()?;
             table().with(archive, |entry| {
                 list_entry(
@@ -492,7 +492,7 @@ pub(crate) fn stop_replay(archive: Handle, replay_id: u64) -> Result<(), Failure
 fn replay_call(archive: Handle, call: &ReplayCall<'_>) -> Result<Answered, Failure> {
     let client = table().with(archive, |entry| entry.client)?;
     match client {
-        Some(client) => clients().with(client, |client_entry| {
+        Some(client) => with_client(client, |client_entry| {
             client_entry.usable()?;
             table().with(archive, |entry| {
                 replay_entry(entry, Some(&mut client_entry.client), call)
@@ -605,12 +605,11 @@ fn replay_entry(
 /// The handles' failures.
 pub(crate) fn close(archive: Handle) -> Result<(), Status> {
     match table().read_even_poisoned(archive, |entry| entry.client)? {
-        Some(client) => clients().with(client, |entry| {
-            let removed = table().remove(archive)?;
-            entry.archives.retain(|handle| *handle != archive);
-            removed.release(&mut entry.client);
-            Ok(())
-        })?,
+        Some(client) => {
+            crate::api::client::close_child(client, table(), archive, |handle, entry| {
+                Ended::Archive(handle, Box::new(entry))
+            })
+        }
         None => {
             let _ = table().remove(archive)?;
             Ok(())

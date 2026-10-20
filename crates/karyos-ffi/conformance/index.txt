@@ -23,3 +23,6 @@ struct sizes of another minor version: struct.size.driver.options struct.size.st
 # and the clocks of scheduled offers (F7a-3).
 staged claims: claim.outstanding op.claim.published op.claim.retry op.claim.parent.close
 clocks: op.clock.monotonic op.clock.tai
+# Not a §13 row: the Archive replays of B6 (quantstratum-docs:
+# karyos/design/archive-replay-control.md), Linux only.
+archive replays: op.replay.complete op.replay.stopped op.replay.refused

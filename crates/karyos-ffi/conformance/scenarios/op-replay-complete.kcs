@@ -1,0 +1,26 @@
+# A replay of the provided recording, "r0" to "r9", read through its
+# replay target to its end: every message, then the target's seal, a clean
+# end of stream at the replay's end (FORMAT.md, Archive replays; B6).
+format 2
+id op.replay.complete
+abi 0.1
+covers "archive replays"
+since B3
+feature archive-replay
+
+op archive.connect client=$archive_client
+expect ok archive=$archive
+op archive.replay archive=$archive recording=$recording target_stream_id=1041 length=$recording_end
+expect ok replay=$replay session=$session
+op replay.subscribe client=$archive_client stream_id=1041 session=$session
+expect ok subscription=$subscription
+op subscription.end subscription=$subscription
+expect ok reason="none"
+op subscription.poll_to_end subscription=$subscription
+expect ok delivered=10 last="r9"
+op subscription.end subscription=$subscription
+expect ok reason="end_of_stream" position=$recording_end
+op subscription.close subscription=$subscription
+expect ok
+op archive.close archive=$archive
+expect ok

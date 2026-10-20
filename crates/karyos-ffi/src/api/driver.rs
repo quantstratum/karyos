@@ -448,9 +448,11 @@ impl Driver {
             Mode::Invoker(driver) => Ok(f(driver)),
             // The thread holds it only for one duty cycle at a time.
             Mode::Threaded(threaded) => {
+                threaded.waiting.fetch_add(1, Ordering::AcqRel);
+                // Counted from the announcement: cycles the thread ran
+                // before it could see a caller waiting are not the wait.
                 #[cfg(test)]
                 let before = threaded.cycles.done.load(Ordering::Acquire);
-                threaded.waiting.fetch_add(1, Ordering::AcqRel);
                 let locked = threaded.shared.lock();
                 threaded.waiting.fetch_sub(1, Ordering::AcqRel);
                 #[cfg(test)]
