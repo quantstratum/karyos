@@ -44,6 +44,9 @@ fn c_struct(rust: &str) -> &'static str {
         "ArchiveOptions" => "karyos_archive_options",
         "Recording" => "karyos_recording",
         "SubscriptionRejoin" => "karyos_subscription_rejoin",
+        "ReplayOptions" => "karyos_replay_options",
+        "ReplaySubscriptionOptions" => "karyos_replay_subscription_options",
+        "SubscriptionEnd" => "karyos_subscription_end",
         other => panic!("no C struct for the Rust struct `{other}`; extend the table"),
     }
 }
@@ -84,6 +87,12 @@ fn c_type(rust: &str) -> String {
         "*const Recording" => "const karyos_recording *",
         "RecordingHandler" => "karyos_recording_handler",
         "*mut SubscriptionRejoin" => "karyos_subscription_rejoin *",
+        "*const ReplayOptions" => "const karyos_replay_options *",
+        "*mut ReplayOptions" => "karyos_replay_options *",
+        "*mut i32" => "int32_t *",
+        "*const ReplaySubscriptionOptions" => "const karyos_replay_subscription_options *",
+        "*mut ReplaySubscriptionOptions" => "karyos_replay_subscription_options *",
+        "*mut SubscriptionEnd" => "karyos_subscription_end *",
         other => panic!("no C type for the Rust type `{other}`; extend the table"),
     };
     c.to_owned()
@@ -554,6 +563,31 @@ fn the_header_states_the_archive_constants() {
             i64::from(crate::abi::stop_reason(reason)),
             "{name}"
         );
+    }
+}
+
+/// The replay rates and the subscription end codes (F9c): the header's
+/// defines are the library's, and the rates are the control wire's.
+#[test]
+fn the_header_states_the_replay_rates_and_end_codes() {
+    use crate::abi::{
+        END_CLOSED_BY_OVERRUN, END_END_OF_STREAM, END_IMAGE_RETIRED, END_NONE, END_OTHER,
+        END_REVOKED, END_STREAM_REMOVED, REPLAY_AS_RECORDED, REPLAY_FULL, REPLAY_SCALED,
+    };
+    let defines = header_defines();
+    for (name, value) in [
+        ("KARYOS_REPLAY_FULL", REPLAY_FULL),
+        ("KARYOS_REPLAY_AS_RECORDED", REPLAY_AS_RECORDED),
+        ("KARYOS_REPLAY_SCALED", REPLAY_SCALED),
+        ("KARYOS_END_NONE", END_NONE),
+        ("KARYOS_END_END_OF_STREAM", END_END_OF_STREAM),
+        ("KARYOS_END_IMAGE_RETIRED", END_IMAGE_RETIRED),
+        ("KARYOS_END_STREAM_REMOVED", END_STREAM_REMOVED),
+        ("KARYOS_END_REVOKED", END_REVOKED),
+        ("KARYOS_END_CLOSED_BY_OVERRUN", END_CLOSED_BY_OVERRUN),
+        ("KARYOS_END_OTHER", END_OTHER),
+    ] {
+        assert_eq!(defines[name], i64::from(value), "{name}");
     }
 }
 

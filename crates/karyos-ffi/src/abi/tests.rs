@@ -1644,6 +1644,7 @@ mod concurrent;
 mod conflated;
 mod outcomes;
 mod rejoin;
+mod replay;
 mod threads;
 
 // Subscription options (F7b).
@@ -1912,6 +1913,11 @@ fn a_sealed_stream_closes_its_subscription() {
         (Status::Closed.code(), 0),
         "sticky"
     );
+    // How it ended (F9c): the stream's removal, at its seal.
+    let (status, end) = replay::subscription_end(subscription);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!((end.reason, end.seal_code), (END_STREAM_REMOVED, 3));
+    assert!(end.position > 0);
     assert_eq!(karyos_client_close(client), Status::Ok.code());
     assert_eq!(karyos_driver_close(driver), Status::Ok.code());
 }

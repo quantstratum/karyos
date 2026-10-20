@@ -8,7 +8,8 @@
 //! its [`RequestId`]; each [`Replayer::poll`] sends what it can, reads the
 //! answers there are, and reports one answered or expired request as a
 //! [`ReplayerEvent`]. It never blocks. At most [`MAX_PENDING`] requests
-//! wait at once, and nothing grows after [`Replayer::new`].
+//! and unpolled events wait at once, and no table grows after
+//! [`Replayer::new`]; a refusal's message is copied into its event.
 //!
 //! A started replay's target is a replay target (stream
 //! [`ReplaySpec::target_stream_id`], session
@@ -400,7 +401,8 @@ impl<Q: ControlRequests, R: ControlResponses> Replayer<Q, R> {
     }
 
     /// Sends what it can, reads at most [`ANSWERS_PER_CALL`] answers, and
-    /// reports one answered or expired request, oldest first.
+    /// reports one answered or expired request, in the order they were
+    /// answered or expired (not by the requests' age).
     pub fn poll(&mut self, now: Instant) -> Option<ReplayerEvent> {
         self.send();
         let mut answer = std::mem::take(&mut self.answer);

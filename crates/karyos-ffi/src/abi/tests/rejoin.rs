@@ -300,12 +300,12 @@ fn each_merge_failure_has_its_code() {
 
 /// The Archive's control streams as a real Archive's server reads and
 /// writes them (#549).
-mod real {
+pub(super) mod real {
     use karyos_archive::server::{RequestSource, ResponseSink};
     use karyos_client::{ClientPublication, ClientSubscription, MessageLimit, OfferOutcome};
 
     /// The request stream as the server reads it.
-    pub(super) struct Reading(pub(super) ClientSubscription);
+    pub(crate) struct Reading(pub(crate) ClientSubscription);
 
     impl RequestSource for Reading {
         fn next(&mut self, out: &mut [u8]) -> Option<usize> {
@@ -324,7 +324,7 @@ mod real {
     }
 
     /// The response stream as the server writes it.
-    pub(super) struct Writing(pub(super) ClientPublication);
+    pub(crate) struct Writing(pub(crate) ClientPublication);
 
     impl ResponseSink for Writing {
         fn send(&mut self, message: &[u8]) -> bool {

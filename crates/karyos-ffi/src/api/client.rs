@@ -227,6 +227,9 @@ pub(crate) struct ClientEntry {
     pub(crate) conflated: Vec<Handle>,
     /// Its open Archive connections (F9a).
     pub(crate) archives: Vec<Handle>,
+    /// Its subscriber of replay targets, opened by its first replay
+    /// subscription (F9c): one target is asked for at a time.
+    pub(crate) replay_target: Option<ReplayTarget>,
     /// The longest wait of its control calls, as its context set it.
     pub(crate) timeout: Duration,
     /// The state of the embedded driver whose conductor it is over, when
@@ -264,8 +267,58 @@ fn entry(client: AnyClient, driver: Option<driver::DriverState>, timeout: Durati
         subscriptions: Vec::new(),
         conflated: Vec::new(),
         archives: Vec::new(),
+        replay_target: None,
         timeout,
         driver,
+    }
+}
+
+/// A client's subscriber of replay targets (F9c), of either connection.
+pub(crate) enum ReplayTarget {
+    /// Of a client attached to a driver in another process.
+    #[cfg(target_os = "linux")]
+    Remote(karyos_client::ReplayTargetSubscriber<karyos_sys::term_bytes::SharedTerms>),
+    /// Of a client over an embedded driver's conductor.
+    Embedded(karyos_client::ReplayTargetSubscriber<karyos_sys::term_bytes::HeapTerms>),
+}
+
+impl AnyClient {
+    /// The replay target at `stream_id` and `session_id` as a reader, once
+    /// a poll of this client has the grant; `None` until then. `target` is
+    /// the client's subscriber, opened here on first use. Asking for
+    /// another target withdraws the one asked for before, whose grant,
+    /// taken or not, the client releases on its next poll.
+    pub(crate) fn replay_target(
+        &mut self,
+        target: &mut Option<ReplayTarget>,
+        stream_id: i32,
+        session_id: i32,
+    ) -> Option<Reader> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(client) => {
+                if !matches!(target, Some(ReplayTarget::Remote(_))) {
+                    *target = Some(ReplayTarget::Remote(client.replay_targets()));
+                }
+                let Some(ReplayTarget::Remote(subscriber)) = target else {
+                    return None;
+                };
+                subscriber
+                    .subscribe(stream_id, session_id)
+                    .map(|granted| Reader::Remote(granted.into()))
+            }
+            Self::Embedded(client) => {
+                if !matches!(target, Some(ReplayTarget::Embedded(_))) {
+                    *target = Some(ReplayTarget::Embedded(client.replay_targets()));
+                }
+                let Some(ReplayTarget::Embedded(subscriber)) = target else {
+                    return None;
+                };
+                subscriber
+                    .subscribe(stream_id, session_id)
+                    .map(|granted| Reader::Embedded(granted.into()))
+            }
+        }
     }
 }
 

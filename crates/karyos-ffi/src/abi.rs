@@ -2473,5 +2473,435 @@ pub extern "C" fn karyos_archive_close(archive: u64) -> i32 {
     })
 }
 
+// Archive replays and how a subscription ended (F9c, B6; quantstratum-docs:
+// karyos/design/archive-replay-control.md).
+
+/// `KARYOS_REPLAY_FULL`: as fast as the target takes it.
+pub(crate) const REPLAY_FULL: u32 = 1;
+/// `KARYOS_REPLAY_AS_RECORDED`: at the recorded pace.
+pub(crate) const REPLAY_AS_RECORDED: u32 = 2;
+/// `KARYOS_REPLAY_SCALED`: the recorded pace scaled by `scale_ppm`.
+pub(crate) const REPLAY_SCALED: u32 = 3;
+
+/// The size of the first `karyos_replay_options`.
+const REPLAY_OPTIONS_SIZE_0_1: u32 = 48;
+
+/// `karyos_replay_options`: what to replay, and where. `size` is the
+/// caller's `sizeof(karyos_replay_options)`; the library reads the fields
+/// it knows of a newer struct, and the defaults past an older one.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayOptions {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// `KARYOS_REPLAY_FULL`, `_AS_RECORDED` or `_SCALED`.
+    pub rate: u32,
+    /// For `KARYOS_REPLAY_SCALED`, the scale in parts per million of the
+    /// recorded pace, 1 to 100 000 000; 0 otherwise.
+    pub scale_ppm: u32,
+    /// The target stream.
+    pub target_stream_id: i32,
+    /// The recording, never 0.
+    pub recording_id: u64,
+    /// The first position replayed.
+    pub position: u64,
+    /// Bytes; `UINT64_MAX` to the recording's end.
+    pub length: u64,
+    /// The target channel, NUL-terminated UTF-8 of 1 to 1024 bytes, read
+    /// during the call; null for `karyos:ipc`.
+    pub target_channel: *const c_char,
+}
+
+/// The defaults of `karyos_replay_options`: the whole recording from 0 at
+/// full rate onto stream 0 over `karyos:ipc`.
+fn default_replay_options() -> ReplayOptions {
+    ReplayOptions {
+        size: size_of_u32::<ReplayOptions>(),
+        rate: REPLAY_FULL,
+        scale_ppm: 0,
+        target_stream_id: 0,
+        recording_id: 0,
+        position: 0,
+        length: u64::MAX,
+        target_channel: core::ptr::null(),
+    }
+}
+
+/// Fills `options` with the defaults (`KARYOS_REPLAY_FULL`, the whole
+/// recording from position 0, `karyos:ipc`) and its size; the caller sets
+/// the recording and the target stream.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable `karyos_replay_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_replay_options_init(options: *mut ReplayOptions) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable `karyos_replay_options`.
+        unsafe { options.write(default_replay_options()) };
+        Status::Ok
+    })
+}
+
+/// The replay spec `raw` asks for; its channel is read during the call.
+///
+/// # Safety
+///
+/// `raw.target_channel` is null or a NUL-terminated string.
+unsafe fn replay_spec(
+    raw: &ReplayOptions,
+) -> Result<karyos_archive::client::replay::ReplaySpec, Status> {
+    use karyos_archive::control::{MAX_CHANNEL, MAX_SCALE_PPM, ReplayRate};
+    let rate = match (raw.rate, raw.scale_ppm) {
+        (REPLAY_FULL, 0) => ReplayRate::Full,
+        (REPLAY_AS_RECORDED, 0) => ReplayRate::AsRecorded,
+        (REPLAY_SCALED, ppm) if (1..=MAX_SCALE_PPM).contains(&ppm) => ReplayRate::Scaled { ppm },
+        _ => return Err(Status::InvalidArgument),
+    };
+    if raw.recording_id == 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let mut spec = karyos_archive::client::replay::ReplaySpec::new(
+        raw.recording_id,
+        raw.position,
+        raw.target_stream_id,
+    );
+    spec.length = raw.length;
+    spec.rate = rate;
+    if !raw.target_channel.is_null() {
+        // SAFETY: the caller's contract on the channel.
+        let channel = unsafe { read_str(raw.target_channel) }?;
+        if channel.is_empty() || channel.len() > MAX_CHANNEL {
+            return Err(Status::InvalidArgument);
+        }
+        channel.clone_into(&mut spec.target_channel);
+    }
+    Ok(spec)
+}
+
+/// Starts a replay on `archive` of what `options` names, and writes its id
+/// through `replay_id` and its target's session id through `session_id`.
+/// The target is a replay target at `options`' `target_stream_id` and that
+/// session, exclusive to its first reader:
+/// `karyos_client_add_replay_subscription` takes it. A replay's end is its
+/// target's seal, which `karyos_subscription_end_state` reads; no answer tells
+/// the requester.
+///
+/// A control call: it serves the client and waits for the Archive's
+/// answer up to the connection's deadline, and holds the client, then the
+/// Archive handle, meanwhile. The handle's first replay call opens control
+/// streams of its own, with the next requester id the handle hands out: a
+/// host with no publisher left on its request stream refuses it
+/// (`KARYOS_E_REFUSED`).
+///
+/// An Archive's refusal is `KARYOS_E_REFUSED` with its response code in
+/// `detail`'s `code` (as `karyos_archive_list`'s); no answer in time is
+/// `KARYOS_E_TIMEOUT`, and a replay the late answer started is stopped;
+/// 16 requests of the handle waiting is `KARYOS_E_BUSY`. A recording id
+/// of 0, a rate and scale that do not match, or a channel that is not
+/// UTF-8 of 1 to 1024 bytes is `KARYOS_E_INVALID_ARGUMENT`.
+///
+/// # Safety
+///
+/// `options` points to a readable `karyos_replay_options` whose `size` is
+/// set and whose `target_channel` is null or NUL-terminated; `replay_id`
+/// points to a writable `uint64_t` and `session_id` to a writable
+/// `int32_t`; `detail` is null or a `karyos_detail` whose `size` is set. A
+/// null or misaligned `options`, `replay_id` or `session_id`, or a `size`
+/// below the first version's (48), returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_archive_replay(
+    archive: u64,
+    options: *const ReplayOptions,
+    replay_id: *mut u64,
+    session_id: *mut i32,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(replay_id) || !writable(session_id) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `options`.
+        let raw =
+            match unsafe { read_sized(options, REPLAY_OPTIONS_SIZE_0_1, default_replay_options()) }
+            {
+                Ok(raw) => raw,
+                Err(status) => return status,
+            };
+        // SAFETY: the caller's contract on the channel.
+        let spec = match unsafe { replay_spec(&raw) } {
+            Ok(spec) => spec,
+            Err(status) => return status,
+        };
+        match api::archive::replay(Handle::from_raw(archive), &spec) {
+            Ok((id, session)) => {
+                // SAFETY: `replay_id` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { replay_id.write(id) };
+                // SAFETY: `session_id` is non-null and aligned, and the
+                // caller's contract makes it a writable `int32_t`.
+                unsafe { session_id.write(session) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// Stops replay `replay_id` on `archive`; its target seals
+/// `ImageRetired`. A control call, as `karyos_archive_replay`: a replay
+/// the Archive does not run (ended, or never started) is
+/// `KARYOS_E_REFUSED` with code 3 (an unknown replay) in `detail`.
+///
+/// # Safety
+///
+/// `detail` is null or a `karyos_detail` whose `size` is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_archive_stop_replay(
+    archive: u64,
+    replay_id: u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if replay_id == 0 {
+            return Status::InvalidArgument;
+        }
+        match api::archive::stop_replay(Handle::from_raw(archive), replay_id) {
+            Ok(()) => Status::Ok,
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// The size of the first `karyos_replay_subscription_options`.
+const REPLAY_SUBSCRIPTION_OPTIONS_SIZE_0_1: u32 = 8;
+
+/// `karyos_replay_subscription_options`: a replay subscription's options;
+/// at ABI 0.1 only its size and a reserved word, so that later fields grow
+/// it without a new function.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ReplaySubscriptionOptions {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// Must be 0.
+    pub reserved: u32,
+}
+
+/// Fills `options` with the defaults and its size.
+///
+/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
+/// misaligned pointer.
+///
+/// # Safety
+///
+/// `options` is null or points to a writable
+/// `karyos_replay_subscription_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_replay_subscription_options_init(
+    options: *mut ReplaySubscriptionOptions,
+) -> i32 {
+    guard(|| {
+        if !writable(options) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `options` is non-null and aligned, and the caller's
+        // contract makes it a writable struct.
+        unsafe {
+            options.write(ReplaySubscriptionOptions {
+                size: size_of_u32::<ReplaySubscriptionOptions>(),
+                reserved: 0,
+            });
+        };
+        Status::Ok
+    })
+}
+
+/// Adds the subscription of the replay target at `stream_id` and
+/// `session_id` (the stream and session `karyos_archive_replay` named) to
+/// `client`, and writes its handle through `subscription`.
+/// `KARYOS_E_NOT_CONNECTED` until the target's grant: a
+/// `karyos_client_poll` completes it, in both driver modes (a started
+/// embedded driver never polls a client), and the caller then calls again.
+/// One target is asked for at a time per client: asking for another
+/// withdraws the one asked for before. The subscription is the client's
+/// and polls as any other; `karyos_subscription_end_state` reads how it ended.
+/// A control call: it holds the client handle.
+///
+/// # Safety
+///
+/// `options` is null (the defaults) or points to a readable
+/// `karyos_replay_subscription_options` whose `size` is set (at least 8,
+/// `reserved` 0); `subscription` points to a writable `uint64_t`.
+/// Anything else returns `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_replay_subscription(
+    client: u64,
+    stream_id: i32,
+    session_id: i32,
+    options: *const ReplaySubscriptionOptions,
+    subscription: *mut u64,
+) -> i32 {
+    guard(|| {
+        if !writable(subscription) {
+            return Status::InvalidArgument;
+        }
+        if !options.is_null() {
+            let defaults = ReplaySubscriptionOptions {
+                size: size_of_u32::<ReplaySubscriptionOptions>(),
+                reserved: 0,
+            };
+            // SAFETY: the caller's contract on `options`.
+            match unsafe { read_sized(options, REPLAY_SUBSCRIPTION_OPTIONS_SIZE_0_1, defaults) } {
+                Ok(raw) if raw.reserved == 0 => {}
+                Ok(_) => return Status::InvalidArgument,
+                Err(status) => return status,
+            }
+        }
+        match api::subscription::add_replay(Handle::from_raw(client), stream_id, session_id) {
+            Ok(handle) => {
+                // SAFETY: `subscription` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { subscription.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => failure.status,
+        }
+    })
+}
+
+/// `KARYOS_END_NONE`: the subscription has not ended.
+pub(crate) const END_NONE: u32 = 0;
+/// `KARYOS_END_END_OF_STREAM`: its stream ended cleanly (a replay that
+/// reached its end, a remote publication's EOS).
+pub(crate) const END_END_OF_STREAM: u32 = 1;
+/// `KARYOS_END_IMAGE_RETIRED`: its image retired without a complete end
+/// (a stopped or failed replay).
+pub(crate) const END_IMAGE_RETIRED: u32 = 2;
+/// `KARYOS_END_STREAM_REMOVED`: its stream was removed.
+pub(crate) const END_STREAM_REMOVED: u32 = 3;
+/// `KARYOS_END_REVOKED`: revoked with its client's loss.
+pub(crate) const END_REVOKED: u32 = 4;
+/// `KARYOS_END_CLOSED_BY_OVERRUN`: closed by its rejoin policy.
+pub(crate) const END_CLOSED_BY_OVERRUN: u32 = 5;
+/// `KARYOS_END_OTHER`: any other end, a reason a later core adds
+/// included; `seal_code` keeps the raw seal reason.
+pub(crate) const END_OTHER: u32 = 255;
+
+/// The size of the first `karyos_subscription_end`.
+const SUBSCRIPTION_END_SIZE_0_1: u32 = 24;
+
+/// `karyos_subscription_end`: how a subscription ended. `size` is the
+/// caller's `sizeof`: the library writes the fields it knows of, no more
+/// than `size` bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SubscriptionEnd {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// A `KARYOS_END_*` code.
+    pub reason: u32,
+    /// The seal's position, a revoked reader's position, or an overrun's
+    /// first position not delivered; 0 while it has not ended.
+    pub position: u64,
+    /// The seal's raw reason code, for a sealed end; 0 otherwise.
+    pub seal_code: u64,
+}
+
+/// The `KARYOS_END_*` code, position and seal code of `end`.
+pub(crate) fn end_fields(end: Option<api::subscription::End>) -> (u32, u64, u64) {
+    use api::subscription::End;
+    use karyos_sys::log_buffer::SealReason;
+    match end {
+        None => (END_NONE, 0, 0),
+        Some(End::Sealed { reason, position }) => {
+            let code = match reason {
+                SealReason::EndOfStream => END_END_OF_STREAM,
+                SealReason::ImageRetired => END_IMAGE_RETIRED,
+                SealReason::StreamRemoved => END_STREAM_REMOVED,
+                _ => END_OTHER,
+            };
+            (code, position, reason.code())
+        }
+        Some(End::Revoked { position }) => (END_REVOKED, position, 0),
+        Some(End::ClosedByOverrun { position }) => (END_CLOSED_BY_OVERRUN, position, 0),
+    }
+}
+
+/// Writes how `subscription` ended through `end`: `KARYOS_END_NONE` while
+/// it has not, else the end a poll saw when it answered `KARYOS_E_CLOSED`
+/// or `KARYOS_E_CLOSED_BY_OVERRUN`. A stream ending cleanly also flags its
+/// last message `KARYOS_MESSAGE_END_OF_STREAM`; this call gives the reason
+/// and position of every end, one no message carries (`ImageRetired`)
+/// included. A network subscription outlives its images, whose ends its
+/// image changes report, and reads `KARYOS_END_NONE`. A data-path call: it
+/// never waits.
+///
+/// # Safety
+///
+/// `end` points to a writable `karyos_subscription_end` whose `size` is
+/// set; a null or misaligned one, or a `size` below 24, returns
+/// `KARYOS_E_INVALID_ARGUMENT` with nothing written.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_subscription_end_state(
+    subscription: u64,
+    end: *mut SubscriptionEnd,
+) -> i32 {
+    guard(|| {
+        if !writable(end) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `end` is non-null and aligned, and points to the caller's
+        // struct (its contract), whose first field is the size.
+        if unsafe { end.cast::<u32>().read() } < SUBSCRIPTION_END_SIZE_0_1 {
+            return Status::InvalidArgument;
+        }
+        let fields = match api::subscription::end(Handle::from_raw(subscription)) {
+            Ok(ended) => end_fields(ended),
+            Err(status) => return status,
+        };
+        // SAFETY: the caller's contract on `end`, whose size was read above.
+        unsafe { write_subscription_end(end, fields) };
+        Status::Ok
+    })
+}
+
+/// Writes `fields` through `end` by its size: the sized write of
+/// `karyos_subscription_end_state`, apart so that it runs under Miri with no
+/// driver.
+///
+/// # Safety
+///
+/// `end` is non-null, aligned and points to a writable
+/// `karyos_subscription_end` of at least its `size` bytes.
+unsafe fn write_subscription_end(
+    end: *mut SubscriptionEnd,
+    (reason, position, seal_code): (u32, u64, u64),
+) {
+    let filled = SubscriptionEnd {
+        size: size_of_u32::<SubscriptionEnd>(),
+        reason,
+        position,
+        seal_code,
+    };
+    // SAFETY: the caller's contract on `end`.
+    unsafe { write_sized(end, SUBSCRIPTION_END_SIZE_0_1, |_| filled) };
+}
+
 #[cfg(test)]
 mod tests;

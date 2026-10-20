@@ -37,12 +37,14 @@
  *   reenters it) answers KARYOS_E_REENTRANT. Neither is undefined; retry
  *   the BUSY one.
  * - Calls on different handles run concurrently. A data-path call
- *   (offer, claim, commit, abort and the polls of a publication,
- *   subscription or conflated view) holds only its own handle, and its
- *   publication's for a claim; a control call (adding a child, closing
- *   one, karyos_client_poll, karyos_archive_connect and an Archive
- *   listing) also holds the client, and an add with KARYOS_REJOIN_ARCHIVE
- *   the Archive handle after it.
+ *   (offer, claim, commit, abort, the polls of a publication,
+ *   subscription or conflated view, and karyos_subscription_end_state) holds
+ *   only its own handle, and its publication's for a claim; a control
+ *   call (adding a child, karyos_client_add_replay_subscription
+ *   included, closing one, karyos_client_poll, karyos_archive_connect, an
+ *   Archive listing, and a replay's start or stop) also holds the client,
+ *   and an add with KARYOS_REJOIN_ARCHIVE, a listing and a replay's start
+ *   or stop the Archive handle after it.
  * - Callbacks run on the calling thread, inside the call, and the
  *   handles the call holds stay held until they return. A started
  *   driver's own thread (karyos_driver_start) runs duty cycles only and
@@ -1094,6 +1096,164 @@ int32_t karyos_archive_list(uint64_t archive, uint64_t after_id,
  * nothing is closed.
  */
 int32_t karyos_archive_close(uint64_t archive);
+
+/*
+ * Archive replays (F9c): a replay's start and stop on an Archive
+ * connection, the subscription of its target, and how a subscription
+ * ended.
+ */
+
+/**
+ * Replay rates: as fast as the target takes it; at the recorded pace; the
+ * recorded pace scaled by scale_ppm (parts per million, 1 to 100000000).
+ */
+#define KARYOS_REPLAY_FULL 1
+#define KARYOS_REPLAY_AS_RECORDED 2
+#define KARYOS_REPLAY_SCALED 3
+
+/**
+ * What to replay, and where. Set size to sizeof(karyos_replay_options);
+ * karyos_replay_options_init fills it and the defaults (the whole
+ * recording from position 0 at full rate over karyos:ipc). The rule of
+ * karyos_detail applies to its size.
+ */
+typedef struct karyos_replay_options {
+    uint32_t size;
+    /* KARYOS_REPLAY_FULL, _AS_RECORDED or _SCALED. */
+    uint32_t rate;
+    /* For KARYOS_REPLAY_SCALED, 1 to 100000000; 0 otherwise. */
+    uint32_t scale_ppm;
+    /* The target stream. */
+    int32_t target_stream_id;
+    /* The recording, never 0. */
+    uint64_t recording_id;
+    /* The first position replayed. */
+    uint64_t position;
+    /* Bytes; UINT64_MAX to the recording's end. */
+    uint64_t length;
+    /* NUL-terminated UTF-8 of 1 to 1024 bytes, read during the call; NULL
+       for karyos:ipc. */
+    const char *target_channel;
+} karyos_replay_options;
+
+/** Fills options with the defaults and its size. */
+int32_t karyos_replay_options_init(karyos_replay_options *options);
+
+/**
+ * Starts a replay on the Archive connection of what options names, and
+ * writes its id and its target's session id. The target is a replay
+ * target at options' target_stream_id and that session, exclusive to its
+ * first reader: karyos_client_add_replay_subscription takes it. A
+ * replay's end is its target's seal, which karyos_subscription_end_state reads;
+ * no answer tells the requester.
+ *
+ * A control call (Threads, above): it serves the client and waits for the
+ * Archive's answer up to the connection's deadline, holding the client,
+ * then the Archive handle. From a subscription's poll handler, which
+ * holds only its subscription, it is allowed but blocks that poll up to
+ * the deadline, so avoid it. The connection's first replay call opens
+ * control streams of its own, with the next requester id the connection
+ * hands out: a host with no publisher left on its request stream refuses
+ * it (KARYOS_E_REFUSED).
+ *
+ * An Archive's refusal is KARYOS_E_REFUSED with its response code in
+ * detail's code (as karyos_archive_list's); no answer in time is
+ * KARYOS_E_TIMEOUT, and a replay its late answer started is stopped; 16
+ * of the connection's requests waiting is KARYOS_E_BUSY, as a held handle
+ * is (poll the client and call again). A recording_id of 0, a rate and
+ * scale_ppm that do not match, or a channel that is not UTF-8 of 1 to
+ * 1024 bytes is KARYOS_E_INVALID_ARGUMENT.
+ */
+int32_t karyos_archive_replay(uint64_t archive,
+                              const karyos_replay_options *options,
+                              uint64_t *replay_id, int32_t *session_id,
+                              karyos_detail *detail);
+
+/**
+ * Stops the replay; its target seals as an image retired. A control call,
+ * as karyos_archive_replay: a replay the Archive does not run (ended, or
+ * never started) is KARYOS_E_REFUSED with code 3 (an unknown replay) in
+ * detail.
+ */
+int32_t karyos_archive_stop_replay(uint64_t archive, uint64_t replay_id,
+                                   karyos_detail *detail);
+
+/**
+ * A replay subscription's options: at ABI 0.1 only its size and a
+ * reserved word, so later fields grow it without a new function. Set size
+ * to sizeof(karyos_replay_subscription_options);
+ * karyos_replay_subscription_options_init fills it.
+ */
+typedef struct karyos_replay_subscription_options {
+    uint32_t size;
+    /* Must be 0. */
+    uint32_t reserved;
+} karyos_replay_subscription_options;
+
+/** Fills options with the defaults and its size. */
+int32_t karyos_replay_subscription_options_init(
+    karyos_replay_subscription_options *options);
+
+/**
+ * Adds the subscription of the replay target at stream_id and session_id
+ * (as karyos_archive_replay named them) to the client and writes its
+ * handle. KARYOS_E_NOT_CONNECTED until the target's grant: a
+ * karyos_client_poll completes it, in both driver modes (a started
+ * embedded driver never polls a client), and the caller then calls
+ * again. One target is asked for at a time per client: asking for
+ * another withdraws the one asked for before. options may be NULL for the
+ * defaults. The subscription is the client's and polls as any other. A
+ * control call: it holds the client handle.
+ */
+int32_t karyos_client_add_replay_subscription(
+    uint64_t client, int32_t stream_id, int32_t session_id,
+    const karyos_replay_subscription_options *options,
+    uint64_t *subscription);
+
+/**
+ * How a subscription ended: not yet; its stream ended cleanly (a replay
+ * that reached its end, a remote publication's EOS); its image retired
+ * without a complete end (a stopped or failed replay); its stream was
+ * removed; revoked with its client's loss; closed by its rejoin policy.
+ * KARYOS_END_OTHER is any other end, a reason a newer library adds
+ * included, with the raw seal reason in seal_code. A binding keeps an end
+ * code its header does not define, as it keeps a status code.
+ */
+#define KARYOS_END_NONE 0
+#define KARYOS_END_END_OF_STREAM 1
+#define KARYOS_END_IMAGE_RETIRED 2
+#define KARYOS_END_STREAM_REMOVED 3
+#define KARYOS_END_REVOKED 4
+#define KARYOS_END_CLOSED_BY_OVERRUN 5
+#define KARYOS_END_OTHER 255
+
+/**
+ * How a subscription ended. Set size to sizeof(karyos_subscription_end);
+ * the rule of karyos_detail applies.
+ */
+typedef struct karyos_subscription_end {
+    uint32_t size;
+    /* A KARYOS_END_* code. */
+    uint32_t reason;
+    /* The seal's position, a revoked reader's position, or an overrun's
+       first position not delivered; 0 while it has not ended. */
+    uint64_t position;
+    /* The seal's raw reason code for a sealed end; 0 otherwise. */
+    uint64_t seal_code;
+} karyos_subscription_end;
+
+/**
+ * Writes how the subscription ended: KARYOS_END_NONE while it has not,
+ * else the end a poll saw when it answered KARYOS_E_CLOSED or
+ * KARYOS_E_CLOSED_BY_OVERRUN. A stream that ends cleanly also flags its
+ * last message KARYOS_MESSAGE_END_OF_STREAM; this call gives the reason
+ * and position of every end, one no message carries (an image retired)
+ * included. A network subscription outlives its images, whose ends its
+ * image changes report, and reads KARYOS_END_NONE. A data-path call: it
+ * never waits. A size below 24 is KARYOS_E_INVALID_ARGUMENT.
+ */
+int32_t karyos_subscription_end_state(uint64_t subscription,
+                                karyos_subscription_end *end);
 
 #ifdef __cplusplus
 }
