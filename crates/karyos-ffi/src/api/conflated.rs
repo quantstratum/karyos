@@ -20,11 +20,12 @@
 
 use std::sync::OnceLock;
 
-use karyos_client::{ClientError, ConflatedSubscription};
+use karyos_client::{ClientError, ConflatedOptions, ConflatedSubscription, StreamId};
 use karyos_driver::{DriverConfig, DriverError};
 use karyos_sys::conflation::Budget;
 use karyos_sys::freshness::Freshness;
 
+use crate::api::client::clients;
 use crate::api::driver::{self, DriverState};
 use crate::handles::{Handle, Kind, Table};
 use crate::status::{Failure, Status};
@@ -39,15 +40,18 @@ pub(crate) const FRESH: u64 = u64::MAX;
 
 /// A conflated subscription handle's object.
 pub(crate) struct Entry {
-    /// Its driver's state: the view follows its failure and its close.
-    driver: DriverState,
+    /// An embedded driver's view (F7b-2b): the driver's state, whose
+    /// failure and close it follows.
+    driver: Option<DriverState>,
+    /// A remote client's view (F7b-2c): the client, whose close closes it.
+    client: Option<Handle>,
     view: ConflatedSubscription,
     /// Read attempts per served key: the driver's.
     retries: u32,
 }
 
 /// The table of conflated subscriptions, allocated on first use.
-fn table() -> &'static Table<Entry> {
+pub(crate) fn table() -> &'static Table<Entry> {
     static CONFLATED: OnceLock<Table<Entry>> = OnceLock::new();
     CONFLATED.get_or_init(|| Table::new(Kind::ConflatedSubscription, MAX_CONFLATED_SUBSCRIPTIONS))
 }
@@ -88,10 +92,44 @@ pub(crate) fn subscribe(driver: Handle, stream_id: i32) -> Result<Handle, Failur
         .conflated_subscription_budget
         .retries;
     Ok(table().insert(Entry {
-        driver: state,
+        driver: Some(state),
+        client: None,
         view,
         retries,
     })?)
+}
+
+/// Adds a view of the conflation table of the `karyos:ipc` stream
+/// `stream_id` to `client` (F7b-2c), tracked by the client, whose close
+/// closes it.
+///
+/// # Errors
+///
+/// The client's handle and control call failures (a client of an
+/// embedded driver is refused by the driver: [`Status::Refused`]), and
+/// [`Status::HandlesExhausted`], with the view released.
+pub(crate) fn add(client: Handle, uri: &str, stream_id: i32) -> Result<Handle, Failure> {
+    clients().with(client, |entry| {
+        entry.usable()?;
+        let view = entry
+            .client
+            .add_conflated_subscription(uri, StreamId::new(stream_id))?;
+        let retries = ConflatedOptions::default().budget.retries;
+        let added = table().insert_or_return(Entry {
+            driver: None,
+            client: Some(client),
+            view,
+            retries,
+        });
+        match added {
+            Ok(handle) => {
+                entry.conflated.push(handle);
+                Ok(handle)
+            }
+            // Dropping the view releases it.
+            Err((status, _)) => Err(status.into()),
+        }
+    })?
 }
 
 /// Delivers the latest value of at most `key_budget` changed keys of
@@ -109,10 +147,11 @@ pub(crate) fn poll(
 ) -> Result<u32, (Failure, u32)> {
     table()
         .with(conflated, |entry| {
-            entry
-                .driver
-                .usable()
-                .map_err(|status| (Failure::from(status), 0))?;
+            if let Some(driver) = &entry.driver {
+                driver
+                    .usable()
+                    .map_err(|status| (Failure::from(status), 0))?;
+            }
             let budget = Budget {
                 keys: key_budget,
                 retries: entry.retries,
@@ -145,6 +184,19 @@ pub(crate) fn poll(
 ///
 /// The handle's failures.
 pub(crate) fn close(conflated: Handle) -> Result<(), Status> {
-    let _ = table().remove(conflated)?;
-    Ok(())
+    // A remote view is closed through its client, which forgets it; its
+    // client, written at the add and never changed, is read even from a
+    // poisoned handle, as a subscription's is.
+    match table().read_even_poisoned(conflated, |entry| entry.client)? {
+        Some(client) => clients().with(client, |entry| {
+            let removed = table().remove(conflated)?;
+            entry.conflated.retain(|handle| *handle != conflated);
+            drop(removed);
+            Ok(())
+        })?,
+        None => {
+            let _ = table().remove(conflated)?;
+            Ok(())
+        }
+    }
 }
