@@ -256,12 +256,13 @@ what is partial.
   outside the isolation boundary; deployment permissions must prevent
   that access. The Archive's trust boundary is the daemon's uid: every
   admitted client may control it.
-- A remote client maps driver-only regions (its guard words, its outcome
-  ring) read only, and its own consumed cell writable. TODO: confirm
-  what alpha.1's "regions writable by every admitted process" still
-  covers.
-- Hosted CI is not running; the gates are run locally. TODO: confirm
-  for `.github/workflows/ci.yml` at the release head.
+- A remote client maps the regions only the driver writes (its outcome
+  ring, its guard words and the counters) read only. The log buffer
+  regions of a stream stay writable by every client admitted to it, as
+  the loan and position protocol requires, so the admission rules bound
+  who can write them.
+- Hosted CI is configured, but its jobs do not start (no step runs), so
+  the gates are run locally; the Evidence table records them.
 - The netem tests are `#[ignore]` and run only through
   `scripts/netem-test.sh`; several multicast tests are Linux only and
   return early when the host's multicast probe fails.
