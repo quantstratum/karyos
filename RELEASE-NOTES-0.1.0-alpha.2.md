@@ -347,7 +347,7 @@ head and what changed since.
 | Release gate `scripts/linux-test.sh --workspace --all-features --locked --no-fail-fast` | Docker `rust:1.99`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 4331 passed, 0 failed, 17 ignored; 255 s |
 | Release gate `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Docker `rust:1.99`, aarch64 | tree `c0517039` | Exit 0, no warnings, 16 crates |
 | Release gate `scripts/netem-test.sh` (`limit 100000 loss 2% reorder 10% 50% delay 1ms duplicate 1%`; N3 at 5% duplicates, N7 a 100% loss blackout) | Docker, `--cap-add NET_ADMIN`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 10 passed, 0 failed (N1 to N9 and `netem_shapes_the_loopback`); 30 s |
-| Release gate `make libkaryos`, `libkaryos-static-check`, `libkaryos-copies-check` | macOS arm64 and Linux aarch64 | TODO | TODO |
+| Release gate `make libkaryos`, `libkaryos-static-check`, `libkaryos-copies-check` | macOS arm64 | tree `c0517039` | Exit 0 each: libkaryos 0.1.1, soname `@rpath/libkaryos.0.1.dylib`, protocol 2, 56 functions, pkg-config checked; links statically through `karyos-static.pc`; two loaded copies refuse each other's handles with `KARYOS_E_CLOSED` |
 | Release gate conformance (`scripts/linux-test.sh -p karyos-ffi --all-features --locked --test conformance`; features `archive-replay`, `remote-driver`, `incompatible-driver`) | Docker `rust:1.99`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 8 passed, including `every_scenario_passes_at_the_library_abi_version` |
 | Linux x86_64, kernels 6.9 and later | none | Not run for this alpha | Not claimed |
 
