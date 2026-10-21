@@ -70,11 +70,24 @@ fn agent<C: TraceClock>(
     domain: u64,
     subscriber_join: Option<u64>,
 ) -> (Agent<C>, JournalId) {
+    ranged_agent(report, number, capacity, 4, clock, domain, subscriber_join)
+}
+
+/// An agent whose journal keeps `drop_ranges` drop-range entries.
+fn ranged_agent<C: TraceClock>(
+    report: &mut TraceReport,
+    number: u64,
+    capacity: usize,
+    drop_ranges: usize,
+    clock: C,
+    domain: u64,
+    subscriber_join: Option<u64>,
+) -> (Agent<C>, JournalId) {
     let observer = ObserverId {
         driver: IDENTITY.driver,
         journal: number,
     };
-    let (writer, collector) = trace_journal(capacity, 4, observer, domain).unwrap();
+    let (writer, collector) = trace_journal(capacity, drop_ranges, observer, domain).unwrap();
     let provenance = clock.provenance();
     let ids = BufferedIds::new(64, OsRandom).unwrap();
     let agent = TraceAgent::new(Sampling::All, ids, clock, writer);
@@ -1391,4 +1404,182 @@ fn a_network_journal_closed_without_a_boundary_is_lost() {
         report.trace([1, 1]),
         TraceAnswer::Final(Verdict::Incomplete)
     );
+}
+
+// Journal loss attribution end to end (SPEC.md §13, "Journal loss
+// attribution"): a subscriber's one-record journal held full while its
+// polls are dropped.
+
+/// Attribution with a finite span, so a loss within one epoch reaches only
+/// the traces near it.
+const NEAR: AttributionConfig = AttributionConfig {
+    span: 10,
+    ..ATTRIBUTION
+};
+
+/// An application clock whose time and epoch the test sets.
+struct Settable(std::sync::Arc<std::sync::Mutex<(u64, u64)>>, u64);
+
+impl TraceClock for Settable {
+    fn now(&mut self) -> ObservedTime {
+        let (time, epoch) = *self.0.lock().unwrap();
+        ObservedTime {
+            time,
+            clock: self.1,
+            epoch,
+            uncertainty: 1,
+        }
+    }
+}
+
+/// A publisher and a subscriber whose journal holds one record and two
+/// drop ranges, its clock set through the returned cell.
+struct Lossy {
+    report: TraceReport,
+    publisher: Agent<MonotonicClock>,
+    pub_id: JournalId,
+    subscriber: Agent<Settable>,
+    sub_id: JournalId,
+    clock: std::sync::Arc<std::sync::Mutex<(u64, u64)>>,
+    next: u64,
+}
+
+impl Lossy {
+    fn new() -> Self {
+        let mut report = TraceReport::new(NEAR, HISTOGRAM);
+        let (publisher, pub_id) = std_agent(&mut report, 1, 64, None);
+        let clock = std::sync::Arc::new(std::sync::Mutex::new((1000, 1)));
+        let (subscriber, sub_id) = ranged_agent(
+            &mut report,
+            2,
+            1,
+            2,
+            Settable(std::sync::Arc::clone(&clock), 2),
+            2,
+            Some(0),
+        );
+        Self {
+            report,
+            publisher,
+            pub_id,
+            subscriber,
+            sub_id,
+            clock,
+            next: 0,
+        }
+    }
+
+    /// Publishes and delivers one message at the subscriber's `(time,
+    /// epoch)`; returns its trace.
+    fn message(&mut self, time: u64, epoch: u64) -> [u64; 2] {
+        *self.clock.lock().unwrap() = (time, epoch);
+        let ext = publish(&mut self.publisher, self.next);
+        deliver(&mut self.subscriber, &ext, 9, self.next);
+        self.next += 64;
+        ext.trace_id
+    }
+
+    fn close(&mut self) {
+        self.publisher.close();
+        self.subscriber.close();
+        self.report.closed(self.pub_id, None);
+        self.report.closed(self.sub_id, Some(self.next));
+        self.report.drain().unwrap();
+    }
+}
+
+/// Polls of traces 1 to 4 at positions 0 to 192, the second lost: a
+/// sequence gap between the first poll, in epoch 1, and the third, in
+/// `epoch_after`; the fourth is far later in time. Returns the report.
+fn a_gap_then_a_later_trace(epoch_after: u64) -> TraceReport {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let mut report = TraceReport::new(NEAR, HISTOGRAM);
+    let publishes: Vec<_> = (0..4)
+        .map(|n| observation(Point::Publish, 64 * n, n + 1, 1000))
+        .collect();
+    report
+        .add_publisher_source(recorded(1, 0, &publishes, CLOSED), host(true), key)
+        .unwrap();
+    let mut polls = recorded(2, 0, &[], closed_at(193));
+    for (sequence, trace, time, epoch) in [
+        (0, 1, 1000, 1),
+        (2, 3, 1000, epoch_after),
+        (3, 4, 1_000_000, epoch_after),
+    ] {
+        let mut record = observation(Point::SubscriberPoll, 64 * (trace - 1), trace, time);
+        record.observed.epoch = epoch;
+        polls.items.push_back(Collected::Record {
+            sequence,
+            gap: (sequence == 2).then_some((1, 2)),
+            record,
+            collected: karyos_protocol::journal::Stamp {
+                time,
+                clock: record.observed.clock,
+                epoch,
+            },
+        });
+    }
+    polls.attempted = 4;
+    report
+        .add_subscriber_source(polls, host(true), key, 0)
+        .unwrap();
+    report.drain().unwrap();
+    report
+}
+
+#[test]
+fn a_loss_within_one_epoch_marks_only_the_traces_near_it() {
+    let report = a_gap_then_a_later_trace(1);
+    for trace in 1..4 {
+        assert_eq!(
+            report.trace([trace, 1]),
+            TraceAnswer::Final(Verdict::Incomplete)
+        );
+    }
+    assert_eq!(report.trace([4, 1]), TraceAnswer::Final(Verdict::Complete));
+}
+
+#[test]
+fn a_loss_across_an_epoch_change_marks_the_whole_cohort() {
+    let report = a_gap_then_a_later_trace(2);
+    // Times of different epochs are not comparable: every trace of the
+    // journal, the one far later included.
+    for trace in 1..5 {
+        assert_eq!(
+            report.trace([trace, 1]),
+            TraceAnswer::Final(Verdict::Incomplete)
+        );
+    }
+}
+
+/// A drop-range overflow loses no attribution. The report attributes loss
+/// from sequence gaps and the loss snapshot's horizon and stored count,
+/// never from the ring or its `lost_before` watermark, so a trace whose range
+/// was evicted is still marked. The watermark itself is checked in
+/// `karyos-sys`: `range_ring_overflow_raises_the_watermark`. In one thread,
+/// a record is dropped only while the journal is full and only a drain frees
+/// it, so every loss is a tail loss at that drain and marks the cohort.
+#[test]
+fn a_drop_range_overflow_loses_no_attribution() {
+    let mut lossy = Lossy::new();
+    let mut traces = vec![lossy.message(1000, 1)];
+    // The one record stays held while four polls are dropped, each in its
+    // own epoch: four drop ranges for a ring of two, so the oldest are
+    // folded into the journal's lost-before watermark.
+    for epoch in 2..6 {
+        traces.push(lossy.message(1000, epoch));
+    }
+    assert_eq!(lossy.subscriber.counts().dropped, 4);
+    lossy.report.drain().unwrap();
+    traces.push(lossy.message(1_000_000, 6));
+    lossy.report.drain().unwrap();
+    traces.push(lossy.message(2_000_000, 6));
+    lossy.close();
+    assert_eq!(lossy.subscriber.counts().dropped, 4);
+    for trace in traces {
+        assert_eq!(
+            lossy.report.trace(trace),
+            TraceAnswer::Final(Verdict::Incomplete)
+        );
+    }
 }
