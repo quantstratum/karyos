@@ -657,6 +657,95 @@ fn conflated_values_are_events() {
     );
 }
 
+/// A view's value as the handler saw it: key, version, freshness, value.
+type Observed = (u32, u64, Freshness, Vec<u8>);
+
+/// Each conflated value is recorded exactly as the handler saw it, its
+/// key, version, freshness and value bytes, with its stream and session
+/// (§8.3), and replay hands the handler the same values in the same order
+/// (contract-traceability-phase-3.md, plan item 1).
+#[test]
+fn conflated_values_are_recorded_as_seen_and_replayed() {
+    use crate::group::prefix::recover;
+    use crate::group::replay::gateway::{GatewayConfig, ReplayGateway};
+    use crate::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
+
+    let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
+    let (mut writer, view) = view(64);
+    rig.gateway.add_conflated(Box::new(view), 5, 1).unwrap();
+    let observe = |event: &Event<'_>| match event {
+        Event::Conflated {
+            key,
+            version,
+            freshness,
+            value,
+            ..
+        } => Some((*key, *version, *freshness, value.to_vec())),
+        _ => None,
+    };
+    let mut live: Vec<Observed> = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| live.extend(observe(event));
+    // Two keys, then a newer version of the first: three distinct values.
+    writer.write(2, b"two").unwrap();
+    writer.write(3, b"three").unwrap();
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+    writer.write(2, b"two again").unwrap();
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+    assert_eq!(live.len(), 3, "{live:?}");
+    let first = live.iter().find(|seen| seen.0 == 2).unwrap().1;
+    let again = live.iter().rfind(|seen| seen.0 == 2).unwrap();
+    assert!(again.1 > first, "the newer value has a newer version");
+    assert_eq!(again.3, b"two again");
+    let bytes = records(rig.job, &rig.disk);
+    let recorded: Vec<Observed> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Conflated(event) => {
+                assert_eq!((event.stream_id, event.session_id), (5, 1));
+                Some((event.key, event.version, event.freshness, event.value.to_vec()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recorded, live, "recorded as the handler saw them");
+    // Replay hands the handler the recorded values.
+    let mut journal = GroupJournal::recover(rig.disk.clone(), Path::new("/g"), 1, journal_config())
+        .unwrap()
+        .journal;
+    let recovery = recover(&mut journal, &NoRecordings, 64).unwrap();
+    let cursor = ReplayCursor::open(
+        journal,
+        &recovery,
+        &ReplayConfig {
+            manifest: b"m",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 4 * MAX_RECORD,
+            records: 8,
+        },
+    )
+    .unwrap();
+    let mut replay = ReplayGateway::new(
+        cursor,
+        &GatewayConfig {
+            publications: &[],
+            subscriptions: &[(2, 1, Lane::ZERO)],
+            network: &[],
+            conflated: &[(5, 1)],
+            max_claim: 0,
+            max_payload: 0,
+            present_unavailable: false,
+        },
+        None,
+    )
+    .unwrap();
+    let mut replayed: Vec<Observed> = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| replayed.extend(observe(event));
+    while let Ok(Dispatched::Event { .. }) = replay.dispatch(&mut handler) {}
+    assert_eq!(replayed, live, "replayed as recorded");
+}
+
 /// Strict polls a view only when an event can be admitted: with the ring
 /// full its value stays in the table, and comes once there is room.
 #[test]
