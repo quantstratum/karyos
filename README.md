@@ -56,7 +56,7 @@ each claim: [RELEASE-NOTES-0.1.0-alpha.2.md](RELEASE-NOTES-0.1.0-alpha.2.md).
 
 | Platform | What runs | Evidence for this alpha |
 | --- | --- | --- |
-| Linux, aarch64 | All alpha features, including cross-process IPC, the UDP transport, the Archive in `karyosd` and the conformance suite's Linux scenarios | Docker (`rust:1.99`) on kernel TODO(M7) aarch64: the workspace tests, the netem tests and the conformance suite with the test kit pass (release notes, Evidence) |
+| Linux, aarch64 | All alpha features, including cross-process IPC, the UDP transport, the Archive in `karyosd` and the conformance suite's Linux scenarios | Docker (`rust:1.99`) on kernel 6.8.0-117-generic aarch64: the workspace tests, the netem tests and the conformance suite with the test kit pass (release notes, Evidence) |
 | Linux, x86_64 | All alpha features | Not run for this alpha |
 | macOS, arm64 | Embedded driver, the UDP transport and `libkaryos`; cross-process IPC and the Archive daemon are Linux only | Apple M5 Max: `make pre-push`, Loom models, and Miri on `karyos-sys` and `karyos-ffi` pass (release notes, Evidence) |
 

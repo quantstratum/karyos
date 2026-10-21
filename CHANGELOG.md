@@ -9,7 +9,7 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ## [Unreleased]
 
-## [0.1.0-alpha.2]: TODO(release): release date
+## [0.1.0-alpha.2]: 2026-10-21
 
 Second alpha: cross-process data streams on Linux, the UDP transport, the
 Archive with replay and recording groups, the management agent and tools, and

@@ -328,9 +328,10 @@ The rows with a head other than the release head are historical evidence
 for that commit, recorded during development by the author and the
 reviewer of each change. The release-gate rows were run on tree
 `c0517039` (#611 `b6e7e527` over main `2ccefd0a`). The tagged head
-differs from that tree only in `RELEASE-NOTES-0.1.0-alpha.2.md` and in
-the `//!` documentation of `crates/karyos-ffi/src/lib.rs`, plus the
-changelog date. A row marked "not run at the release head" names its own
+differs from that tree only in `RELEASE-NOTES-0.1.0-alpha.2.md`, the
+`//!` documentation of `crates/karyos-ffi/src/lib.rs`, the kernel
+version in `README.md`'s platform table and the changelog date in
+`CHANGELOG.md`. A row marked "not run at the release head" names its own
 head and what changed since.
 
 | Check | Platform | Head | Result |
@@ -340,10 +341,10 @@ head and what changed since.
 | `scripts/linux-test.sh`, `make pre-push`, `loom_schedule_ring` | Docker (Linux run); kernel not recorded | `9faba3ee` | 117 suites, 3320 passed, 0 failed; pre-push green; 11 of 11 |
 | `scripts/linux-test.sh`, clippy, `make pre-push` | Docker (Linux run), aarch64; kernel not recorded | `05b628e1` | 151 suites, 0 failed; clippy clean; pre-push green |
 | Release gate `make pre-push`: fmt-check, lint-sync, deps-check, lint, doc (`-D warnings`), test, loom, build-release, timing-build-check | macOS arm64 | tree `c0517039` | Exit 0: 4234 passed, 0 failed, 15 ignored over 199 binaries; 922 s |
-| Release gate `make miri`, `karyos-sys` (`--lib`), sharded one per core | macOS arm64 | TODO | TODO |
+| Release gate `make miri`, `karyos-sys`: `cargo +nightly-2026-10-11 miri test -p karyos-sys --lib --locked`, 16 parallel shards of `--exact` names | macOS arm64 | tree `c0517039` | 935 passed, 0 failed, 0 ignored; 1551 s wall, warm build |
 | `karyos-ffi` Miri per `crates/karyos-ffi/MIRI.md` (10 lib shards and the integration tests), not run at the release head | macOS arm64 | `f365ac26` (merge base with main `5bf2423b`) | Lib, 10 shards: 103 passed, 0 failed, 48 ignored (shards 07 and 09 from reruns after an outside SIGTERM); integration: abi 4/0, conformance 3/0 (5 native only), driver 6/0 (3 ignored); 4843 s wall for the first run under heavy host load. Since that run, `karyos-ffi` changed in #610 (the cross-copy handle documentation), #613 (`abi.rs`, `api/archive.rs`, `handles.rs` and `header.rs`: unknown archive values refused), #614's later commits (a test's port and the conformance runner) and this release's crate documentation; none adds or changes an `unsafe` line; its dependencies changed in #615 (the CnC 0xC6 address encoding), #616 (`#[non_exhaustive]` enums) and #617 (`fc` refusal) |
 | Release gate `make loom` (in `make pre-push`) | macOS arm64 | tree `c0517039` | 451 passed, 0 failed, 1 ignored over 115 binaries; the ignored model, `a_transferred_gauge_is_never_mixed`, runs only in `make loom-full`, not run at the release head |
-| Release gate `make sim` | macOS arm64 | TODO | TODO |
+| Release gate `make sim`: `KARYOS_SIM_SEEDS=2000 cargo test -p karyos-sim --release --locked --test scenarios` (seeds 1 to 2000) | macOS arm64 | tree `c0517039` | 12 passed, 0 failed, 0 ignored; 24 s |
 | Release gate `scripts/linux-test.sh --workspace --all-features --locked --no-fail-fast` | Docker `rust:1.99`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 4331 passed, 0 failed, 17 ignored; 255 s |
 | Release gate `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Docker `rust:1.99`, aarch64 | tree `c0517039` | Exit 0, no warnings, 16 crates |
 | Release gate `scripts/netem-test.sh` (`limit 100000 loss 2% reorder 10% 50% delay 1ms duplicate 1%`; N3 at 5% duplicates, N7 a 100% loss blackout) | Docker, `--cap-add NET_ADMIN`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 10 passed, 0 failed (N1 to N9 and `netem_shapes_the_loopback`); 30 s |
