@@ -447,9 +447,8 @@ typedef struct karyos_stream_options {
     uint32_t publication_mode;
     /*
      * Offers allowed with no subscriber attached: 0 or 1. It applies to
-     * every publication of the stream, exclusive or concurrent; an
-     * in-process client honours it, a remote (karyosd) client does not
-     * yet.
+     * every publication of the stream, exclusive or concurrent, an
+     * in-process or a remote client's.
      */
     uint32_t allow_unconnected;
     /* Entries of the stream's schedule ring: 0 for none, or a power of

@@ -1362,6 +1362,9 @@ impl RemoteClient {
         };
         let instance = self.session.as_ref().ok_or(AttachError::Protocol)?.instance;
         self.take(fetchable, |fetched, export| {
+            // The request's policy or its stream's, from the grant
+            // (ipc-admission.md, Unconnected offers).
+            let allow_unconnected = allow_unconnected || fetched.record.allow_unconnected;
             // A guarded publication binds its granted regions first, so a
             // refusal takes nothing (G-x3).
             let lanes = fetched
@@ -1406,6 +1409,9 @@ impl RemoteClient {
             return Err(AttachError::Protocol);
         };
         self.take(fetchable, |fetched, export| {
+            // The request's policy or its stream's, from the grant
+            // (ipc-admission.md, Unconnected offers).
+            let allow_unconnected = allow_unconnected || fetched.record.allow_unconnected;
             let inner = prepare_concurrent(fetched, export)?
                 .activate()
                 .map_err(|refused| AttachError::Sys(refused.error))?;
