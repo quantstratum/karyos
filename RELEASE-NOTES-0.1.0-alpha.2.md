@@ -272,12 +272,14 @@ what is partial.
 - The netem tests are `#[ignore]` and run only through
   `scripts/netem-test.sh`; several multicast tests are Linux only and
   return early when the host's multicast probe fails.
-- TODO(M3, item 65): timed lanes. An IPC or local stream refuses
-  `schedule_capacity` above 0; timed sends need a network publication,
-  configured in `karyosd` with `--timed-network`. No timed lane uses the
-  `Tai` domain: the network route refuses it and IPC streams refuse
-  schedule rings. A `Monotonic` lane is granted only to a client in the
-  driver's time namespace. Check the wording against M3 when it lands.
+- Timed sends need a network publication. A driver's local or IPC
+  stream refuses a schedule ring (`schedule_capacity` above 0) with
+  `InvalidConfig`, `KARYOS_E_INVALID_ARGUMENT` from the C ABI: nothing
+  there would release it (karyos#614). A client gets timed network
+  publications by URI on the streams `karyosd --timed-network` names, at
+  most 8. No timed lane uses the `Tai` domain: the network route refuses
+  it, and local streams refuse schedule rings. A `Monotonic` lane is
+  granted only to a client in the driver's time namespace.
 - A conflated view closed at `barrier_ack_timeout` is recreated with
   every key stale; no test asserts that recreation yet, and
   `barrier_ack_timeout` is checked only against its 10 ms floor, not
