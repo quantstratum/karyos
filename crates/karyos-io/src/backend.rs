@@ -952,6 +952,7 @@ pub struct CancelOutcome {
 /// slots stay charged to their queue, so the pool runs dry only after
 /// retirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ClaimError {
     /// `len` is 0.
     #[error("claim of 0 bytes")]
@@ -991,6 +992,7 @@ pub enum ClaimError {
 
 /// Why a commit was rejected; the frame comes back with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum CommitError {
     /// The committed length is 0.
     #[error("commit of 0 bytes")]
@@ -1016,6 +1018,7 @@ pub enum CommitError {
 
 /// A per datagram send failure; the datagram was not handed off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum SendError {
     /// `EMSGSIZE`.
     #[error("datagram too large for the path")]
@@ -1070,6 +1073,7 @@ pub enum BackendFailure {
 
 /// Why a queue operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum QueueError {
     /// The queue is closed or the handle is stale.
     #[error("unknown tx queue")]
@@ -1109,6 +1113,7 @@ pub enum QueueError {
 
 /// Why a route operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum RouteError {
     /// Every route entry of the endpoint is in use.
     #[error("route limit reached")]
@@ -1150,6 +1155,7 @@ pub enum RouteError {
 
 /// Why an endpoint could not open, reopen or retire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum OpenError {
     /// A configuration value is outside its range.
     #[error("invalid configuration {field} = {value}")]

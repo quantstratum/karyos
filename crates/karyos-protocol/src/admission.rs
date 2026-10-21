@@ -209,6 +209,7 @@ const PROFILE_FLAGS: u64 = 0b11;
 
 /// Errors decoding or encoding admission messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum AdmissionError {
     /// No type word, or an unknown type.
     #[error("unknown admission message")]

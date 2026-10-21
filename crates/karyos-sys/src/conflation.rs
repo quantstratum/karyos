@@ -67,6 +67,7 @@ const WORD_BYTES: usize = 8;
 
 /// Errors of the conflation table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConflationError {
     /// A size is zero or does not fit the address space.
     #[error("invalid conflation table configuration")]
@@ -1009,6 +1010,7 @@ mod owned {
 
     /// Why [`ConflationWriter::record_loss`] recorded nothing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+    #[non_exhaustive]
     pub enum LossError {
         /// The table has no loss barrier ([`conflation`], or a region).
         #[error("the table has no loss barrier")]

@@ -91,6 +91,7 @@ pub struct ReplayTargetConfig {
 
 /// Why a write into a replay target failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReplayFeedError {
     /// The bytes are not whole, valid frames of the target.
     #[error("invalid replay frames at {position}: {reason}")]

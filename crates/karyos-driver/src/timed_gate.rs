@@ -176,6 +176,7 @@ struct TimedLane {
 
 /// Why [`TimedGate::stage`] refused a head; nothing is recorded on error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TimedStageError<E> {
     /// No such lane.
     #[error("no timed lane {lane}")]

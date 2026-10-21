@@ -196,6 +196,7 @@ impl SkipReport {
 
 /// Why a [`SkipPolicy`] could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SkipConfigError {
     /// `reorder_timeout_ns` above [`MAX_REORDER_TIMEOUT_NS`].
     #[error("reorder timeout {0} ns above the 1 s limit")]

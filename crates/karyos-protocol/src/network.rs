@@ -107,6 +107,7 @@ pub mod reason {
 /// Errors decoding or encoding a network datagram. These are local
 /// categories, not wire reason codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ControlError {
     /// Fewer bytes than the common word, a record header or `frame_length`
     /// requires.

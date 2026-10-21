@@ -92,7 +92,8 @@ fn receive_route(
     let interface = match first_path.as_ref().or(channel.interface.as_ref()) {
         None => None,
         Some(Interface::Address(ip)) => Some(*ip),
-        Some(Interface::Name(_)) => return Err(DriverError::UnsupportedChannel),
+        // A name, or an interface form a later protocol version parses.
+        Some(_) => return Err(DriverError::UnsupportedChannel),
     };
     match &channel.destination {
         Destination::Unicast(address) => Ok((*address, None)),
@@ -114,7 +115,9 @@ fn receive_route(
                 )),
             ))
         }
-        Destination::MultiDestination { .. } => Err(DriverError::UnsupportedChannel),
+        // Multi-destination, or a destination a later protocol version
+        // parses: not served.
+        _ => Err(DriverError::UnsupportedChannel),
     }
 }
 
@@ -294,6 +297,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Some(match &channel.destination {
             Destination::Multicast { group, .. } => SocketAddr::new(group.ip(), local.port()),
             Destination::Unicast(_) | Destination::MultiDestination { .. } => local,
+            // A form a later protocol version parses is refused before a
+            // subscription exists (`receive_route`); the socket's own
+            // address stands.
+            _ => local,
         })
     }
 

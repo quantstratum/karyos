@@ -65,6 +65,7 @@ const READ_ATTEMPTS: usize = 4;
 
 /// Errors of the record journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum JournalError {
     /// A size is zero, overflows, or the capacity is not a power of two.
     #[error("invalid record journal configuration")]

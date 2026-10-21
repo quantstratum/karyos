@@ -44,6 +44,7 @@ pub const MAX_INTERFACE_NAME: usize = 15;
 
 /// Why a channel URI was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChannelError {
     /// The URI is longer than [`MAX_URI_LENGTH`].
     #[error("channel URI of {length} bytes exceeds {MAX_URI_LENGTH}")]
@@ -128,6 +129,7 @@ impl ChannelError {
 
 /// A local interface: an address to bind, or a name the driver resolves.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Interface {
     /// An address.
     Address(IpAddr),
@@ -137,6 +139,7 @@ pub enum Interface {
 
 /// Message tracing (SPEC.md §7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Trace {
     /// No tracing.
     #[default]
@@ -149,6 +152,7 @@ pub enum Trace {
 
 /// Flow control of a multicast or multi-destination channel (SPEC.md §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FlowControl {
     /// The slowest receiver bounds the sender.
     Min,
@@ -161,6 +165,7 @@ pub enum FlowControl {
 /// A channel's protection class (SPEC.md §5). Only [`Security::Trusted`]
 /// parses in Phase 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Security {
     /// No authentication or encryption.
     #[default]
@@ -169,6 +174,7 @@ pub enum Security {
 
 /// How a multi-destination channel learns its receivers (ADR-0056).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlMode {
     /// Only the configured destinations.
     Manual,
@@ -178,6 +184,7 @@ pub enum ControlMode {
 
 /// Where a UDP channel sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Destination {
     /// One unicast receiver.
     Unicast(SocketAddr),
@@ -244,6 +251,7 @@ pub struct ChannelConfig {
 
 /// A channel's media.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Media {
     /// Shared memory on this host.
     Ipc,

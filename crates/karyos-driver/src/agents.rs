@@ -84,6 +84,7 @@ pub enum ThreadingMode {
 
 /// Errors of the network agents and their runner.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum AgentError {
     /// A configuration value is outside its range.
     #[error("invalid agent configuration: {0}")]

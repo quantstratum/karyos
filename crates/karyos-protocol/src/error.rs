@@ -7,6 +7,7 @@ use thiserror::Error;
 
 /// Errors raised while validating frame layouts and sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ProtocolError {
     /// A frame layout or sizing rule from `karyos_sys` failed.
     #[error(transparent)]

@@ -71,6 +71,7 @@ const HEAD_LOAD: Ordering = Ordering::Acquire;
 
 /// Why a ring operation was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ScheduleError {
     /// The words do not hold a ring of the declared capacity, or the
     /// capacity is not a power of two.

@@ -47,6 +47,7 @@ pub struct Disconnected;
 
 /// Why [`RingSender::post`] returned its item.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PostError<T> {
     /// The consumer is gone.
     Gone(T),

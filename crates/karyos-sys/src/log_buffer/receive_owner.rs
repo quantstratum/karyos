@@ -83,6 +83,7 @@ pub enum Received {
 /// A frame the owner refused because it breaks a protocol rule, or an
 /// internal failure. The image is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReceiveError {
     /// The frame differs from, or overlaps, a committed frame.
     #[error(

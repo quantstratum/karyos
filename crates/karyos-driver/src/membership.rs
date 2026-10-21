@@ -211,6 +211,7 @@ impl MembershipConfig {
 
 /// Why a [`MembershipConfig`] or [`Roles`] was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum MembershipConfigError {
     /// No entry or event slot, or more pending entries than entries.
     #[error("no entry or event slot, or more pending entries than entries")]

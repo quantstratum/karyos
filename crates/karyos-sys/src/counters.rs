@@ -223,6 +223,7 @@ pub enum CellRead {
 
 /// Errors of counter operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CounterError {
     /// The increment would exceed `u64::MAX`; the value is unchanged.
     #[error("counter increment would exceed u64::MAX; the value is unchanged")]

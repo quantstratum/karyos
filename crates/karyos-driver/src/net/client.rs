@@ -268,6 +268,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 return refuse(ErrorCode::UnsupportedChannel, detail);
             }
             Media::Udp(udp) => udp,
+            // A medium a later protocol version parses: not served.
+            _ => return refuse(ErrorCode::UnsupportedChannel, detail),
         };
         let Some(defaults) = self.config.network.map(|network| network.stream_defaults) else {
             return refuse(ErrorCode::UnsupportedChannel, detail);
@@ -438,6 +440,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 media: Media::Udp(udp),
                 ..
             }) => udp,
+            // A medium a later protocol version parses: not served.
+            Ok(_) => return refuse(ErrorCode::UnsupportedChannel, detail),
         };
         if self.config.network.is_none() {
             return refuse(ErrorCode::UnsupportedChannel, detail);

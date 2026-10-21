@@ -19,6 +19,7 @@ pub struct SkewDeadline {
 
 /// Why no deadline exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SkewError {
     /// Detection time plus the window does not fit the clock: never a
     /// wrapped deadline.

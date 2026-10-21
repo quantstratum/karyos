@@ -87,6 +87,7 @@ pub struct Staged {
 
 /// Why [`LaneSender::staged`] refused a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StageError {
     /// No such lane.
     #[error("no lane {lane}")]

@@ -110,6 +110,18 @@ release may break APIs, wire formats and shared-memory layouts.
   subscription). Port 0 stays refused in every channel URI; the C ABI is
   unchanged.
 
+- The channel URI enums (`ChannelError`, `Interface`, `Trace`,
+  `FlowControl`, `Security`, `ControlMode`, `Destination`, `Media`) and
+  the public error enums of the library crates (`karyos-sys`,
+  `karyos-protocol`, `karyos-codec`, `karyos-io`, `karyos-trace`,
+  `karyos-driver`, `karyos-cluster` and the `karyos` facade) are
+  `#[non_exhaustive]` (owner item 41): a later version can add a URI
+  form or an error without breaking a downstream exhaustive `match`.
+  The driver refuses a URI form it does not serve as
+  `UnsupportedChannel`, as it does a form not wired yet.
+  `karyos_sys::log_buffer::ReadError` stays exhaustive for now: the
+  Archive's source classifies each of its variants, and an unknown one
+  needs a design choice.
 - `ImageAvailable` (CnC `0xC6`) encodes its source address exactly as
   `NetworkSubscriptionReady` (`0x8A`) encodes its bound address, aligned
   in place under admission `VERSION` 2 before its freeze, so the version

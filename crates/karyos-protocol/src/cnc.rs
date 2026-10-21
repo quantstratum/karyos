@@ -332,6 +332,7 @@ const _: () = assert!(REPORT_LOSS_WORDS * 8 <= MAX_COMMAND_LENGTH);
 
 /// Errors decoding or encoding CnC messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum CncError {
     /// The record type is not a message of this direction.
     #[error("unknown message type {type_id:#x}")]

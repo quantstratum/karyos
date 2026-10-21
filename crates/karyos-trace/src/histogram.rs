@@ -21,6 +21,7 @@ const MAX_DIGITS: u8 = 5;
 
 /// Errors of histograms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum HistogramError {
     /// The digits or the highest magnitude are out of range, or the table
     /// does not fit or cannot be allocated.

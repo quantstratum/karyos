@@ -58,6 +58,7 @@ pub struct SmDue {
 
 /// Why an [`SmSchedule`] was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SmScheduleError {
     /// `sm_interval` is 0.
     #[error("sm_interval is 0")]

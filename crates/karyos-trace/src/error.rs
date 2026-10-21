@@ -7,6 +7,7 @@ use thiserror::Error;
 
 /// Errors of trace records and trace journals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum TraceError {
     /// The record layout version is not supported.
     #[error("unsupported trace record version {version}")]

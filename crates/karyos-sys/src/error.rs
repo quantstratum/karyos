@@ -6,6 +6,7 @@ use thiserror::Error;
 
 /// Errors raised by the term identity, slot descriptor and loan protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum SysError {
     /// A term count reached the `2^31` limit of a publication incarnation.
     #[error("term count {count} reached the limit of 2^31; close the incarnation")]
@@ -187,6 +188,7 @@ pub enum SysError {
 
 /// Errors raised while validating frame layout and sizing (SPEC.md §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum LayoutError {
     /// Reserved flag bits 6 and 7 are set.
     #[error("frame flags {flags:#04x} set reserved bits")]
