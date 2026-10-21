@@ -1798,12 +1798,7 @@ fn a_timed_lane_takes_a_timed_offer() {
         stop,
         thread: Some(thread),
     };
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}");
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{}", test_port());
     let context = test_context();
     let client = client::insert_embedded(Client::with_conductor(ours, context.clone()))
         .unwrap()

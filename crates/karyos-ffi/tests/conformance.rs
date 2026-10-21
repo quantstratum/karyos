@@ -187,7 +187,7 @@ const OPS: &[Op] = &[
         "publication.offer_at",
         &["publication"],
         &["lane", "payload", "length", "tx_time", "delay_ns"],
-        ACCEPTED,
+        &["lane", "position", "tx_time"],
         &[],
     ),
     op(
@@ -224,7 +224,7 @@ const OPS: &[Op] = &[
     op(
         "subscription.poll",
         &["subscription"],
-        &["limit", "until"],
+        &["limit", "until", "not_before"],
         &["delivered", "last"],
         &[],
     ),

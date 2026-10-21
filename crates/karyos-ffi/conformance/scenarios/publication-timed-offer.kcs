@@ -2,7 +2,7 @@
 # C ABI boundary; FORMAT.md, Remote driver): the runner's karyosd makes
 # the network publications of stream 25 timed, and a subscription on the
 # loopback endpoint receives them. A timed offer half a second ahead is
-# not delivered before its time, then is; a plain offer on the timed lane,
+# delivered, and not before its time; a plain offer on the timed lane,
 # a time below the lane's last, one past its horizon and a timed offer on
 # a lane that is not timed are refused with typed statuses.
 format 2
@@ -17,10 +17,8 @@ expect ok subscription=$reading
 op publication.add client=$remote_client stream_id=25 uri=$loopback_uri
 expect ok publication=$timed
 op publication.offer_at publication=$timed payload="timed" delay_ns=500000000
-expect ok
-op subscription.poll subscription=$reading limit=8
-expect ok delivered=0
-op subscription.poll subscription=$reading limit=8 until=1
+expect ok tx_time=$at
+op subscription.poll subscription=$reading limit=8 until=1 not_before=$at
 expect ok delivered=1 last="timed"
 op publication.offer publication=$timed payload="plain"
 expect status=invalid_schedule

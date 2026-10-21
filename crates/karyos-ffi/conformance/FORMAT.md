@@ -294,7 +294,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `publication.add` | `client`, `stream_id`, [`uri`, default `"karyos:ipc"`] | `publication` | |
 | `publication.add_concurrent` | as `publication.add` | `publication` | `concurrent-publication` |
 | `publication.offer` | `publication`, [`lane`, `reserved_value`], `payload` or `length` | `lane`, `position` | |
-| `publication.offer_at` | `publication`, [`lane`], `payload` or `length`, `tx_time` or `delay_ns`: `karyos_publication_offer_at` at `tx_time`, or at `delay_ns` after the runner's `karyos_clock_now` of the monotonic domain, read at each attempt | `lane`, `position` | |
+| `publication.offer_at` | `publication`, [`lane`], `payload` or `length`, `tx_time` or `delay_ns`: `karyos_publication_offer_at` at `tx_time`, or at `delay_ns` after the runner's `karyos_clock_now` of the monotonic domain, read at each attempt | `lane`, `position`, `tx_time` (the time offered) | |
 | `publication.publish_claimed` | `publication`, [`lane`], `payload` or `length` | `lane`, `position` | |
 | `publication.claim` | `publication`, `length`, [`lane`] | `claim` | `claim-retry` |
 | `claim.commit` | `claim` | `lane`, `position` | `claim-retry` |
@@ -302,7 +302,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `publication.poll_outcomes` | `publication`, [`lane`, `limit` (default 1), `until`] | `delivered` | `guarded-publication` |
 | `publication.close` | `publication` | none | |
 | `subscription.add` | `client`, `stream_id`, [`uri`, `role`, `rejoin`: the values of the header's subscription options] | `subscription` | |
-| `subscription.poll` | `subscription`, [`limit` (default 1), `until` (Remote driver)] | `delivered`, `last` (the last message as UTF-8 text, when there is one) | |
+| `subscription.poll` | `subscription`, [`limit` (default 1), `until` (Remote driver), `not_before`: a monotonic time, the runner's `karyos_clock_now` read after a poll that delivered must not be below it] | `delivered`, `last` (the last message as UTF-8 text, when there is one) | |
 | `subscription.close` | `subscription` | none | |
 | `conflated.add` | `client`, `stream_id`, [`uri`] | `conflated` | `conflation` |
 | `conflated.poll` | `conflated`, [`key_budget` (default 1), `until`] | `delivered` | `conflation` |

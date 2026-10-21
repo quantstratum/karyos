@@ -481,17 +481,24 @@ impl Adapter {
                     fixed.is_none() || !args.arguments.contains_key("delay_ns"),
                     "{at}: `tx_time` or `delay_ns`, not both"
                 );
-                // A delay reads the monotonic clock at each attempt.
+                // A delay reads the monotonic clock at each attempt; the
+                // last attempt's time is the answer's `tx_time`.
+                let mut sent_at = 0;
                 let offer = || {
                     let tx_time = fixed.unwrap_or_else(|| {
                         let (status, now) = abi::clock_now(0);
                         assert_eq!(status, 0, "{at}: karyos_clock_now");
                         now.unwrap().checked_add(delay).unwrap()
                     });
+                    sent_at = tx_time;
                     abi::publication_offer_at(handle, lane, &args.message(), tx_time, accepted_size)
                 };
                 let (status, accepted) = self.offer_remote(publication, offer, at);
-                self.accepted(status, &accepted, at)
+                let mut answer = self.accepted(status, &accepted, at);
+                if let Answer::Ok(results) = &mut answer {
+                    results.insert("tx_time".to_owned(), Value::Integer(i128::from(sent_at)));
+                }
+                answer
             }
             "publication.publish_claimed" => {
                 let publication = args.object("publication");
@@ -620,6 +627,17 @@ impl Adapter {
                     },
                     at,
                 );
+                // `not_before`: a delivery read before that monotonic time
+                // fails the scenario (FORMAT.md, Remote driver).
+                if delivered > 0 && args.arguments.contains_key("not_before") {
+                    let not_before = args.narrow::<u64>("not_before", None);
+                    let (status, now) = abi::clock_now(0);
+                    assert_eq!(status, 0, "{at}: karyos_clock_now");
+                    assert!(
+                        now.unwrap() >= not_before,
+                        "{at}: delivered at {now:?}, before its time {not_before}"
+                    );
+                }
                 let mut answer = self.counted(status, "delivered", delivered, at);
                 if let (Answer::Ok(results), Some(last)) = (&mut answer, last.as_ref()) {
                     let text = String::from_utf8(last.clone())
