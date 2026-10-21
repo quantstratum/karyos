@@ -1519,6 +1519,69 @@ mod tests {
         }
     }
 
+    /// A sender's control over one receiver at `peer`, its socket
+    /// nonblocking as `send_child` sets it.
+    fn sender_control(peer: SocketAddr) -> SenderControl {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        SenderControl {
+            socket,
+            nonce: 7,
+            peers: vec![peer],
+            completed: vec![Cell::new(0)],
+            heard: vec![Cell::new(false)],
+            stops: vec![Cell::new(None)],
+            failed: Cell::new(false),
+            total: 100,
+            last_hello: Cell::new(None),
+            hellos_to_drop: Cell::new(0),
+        }
+    }
+
+    /// Pumps until the receiver's STOP is read, whatever the load: the
+    /// datagram's arrival is not what the tests below measure.
+    fn read_stop(control: &SenderControl) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while control.stops[0].get().is_none() {
+            assert!(Instant::now() < deadline, "the STOP never arrived");
+            control.pump();
+            std::thread::yield_now();
+        }
+    }
+
+    /// karyos#602: a receiver's STOP ends the sender's R1 wait at once as
+    /// `Stopped`, neither as `TimedOut` nor only after `ACK_TIMEOUT`, and
+    /// a STOP that counts the awaited message completes it. The STOP is
+    /// read before any wait is timed, so the datagram's travel under host
+    /// load is not measured.
+    #[test]
+    fn a_stop_ends_the_wait_without_an_ack_timeout() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tracker = sender_control(receiver.local_addr().unwrap());
+        let sender = tracker.socket.local_addr().unwrap();
+        // The receiver stopped with messages 0 to 4 completed.
+        receiver.send_to(&control(STOP, 7, 5), sender).unwrap();
+        read_stop(&tracker);
+        // Stopped on the STOP itself, not once ACK_TIMEOUT passed: a wait
+        // that reads the stop only after its timeout takes at least
+        // ACK_TIMEOUT every time, so one prompt answer in five tells the
+        // two apart under any load, where a single timed answer would not.
+        let prompt = (0..5).any(|_| {
+            let started = Instant::now();
+            assert_eq!(tracker.wait(5), Wait::Stopped);
+            started.elapsed() < ACK_TIMEOUT
+        });
+        assert!(
+            prompt,
+            "every wait took ACK_TIMEOUT: the stop was read late"
+        );
+        assert_eq!(tracker.wait(9), Wait::Stopped);
+        assert!(tracker.stopped());
+        // A receiver that stopped after the awaited message is no stop for
+        // it.
+        assert_eq!(tracker.wait(4), Wait::Completed);
+    }
+
     #[test]
     fn groups_are_organisation_local_and_follow_every_bit_of_the_nonce() {
         assert_eq!(group_of(0x1234), Ipv4Addr::new(239, 255, 0x12, 0x34));

@@ -909,13 +909,16 @@ fn a_finished_receiver_stops_the_sender() {
         rx_deadline_ms: Some(300),
         ..Faults::default()
     };
-    // A million R1 messages take far longer than 300 ms.
-    let (error, took) = faulty_run("wire-finish", 1_000_000, finish, None);
+    // A million R1 messages take far longer than 300 ms. The sender fails
+    // by itself, so on the notice, before the parent's OUTLIVE ends it.
+    // That it reads the notice at once rather than after an acknowledgement
+    // timeout is `wire::process`'s `a_stop_ends_the_wait_without_an_ack_timeout`
+    // (karyos#602): a wall-clock bound here also timed two process starts
+    // and failed under host load.
+    let (error, _) = faulty_run("wire-finish", 1_000_000, finish, None);
     let error = error.unwrap_or_default();
     assert!(error.contains("tx child failed"), "{error}");
-    // The sender stops on the notice, not after an acknowledgement
-    // timeout: 300 ms of receiving plus ACK_TIMEOUT is the bound.
-    assert!(took < std::time::Duration::from_millis(1_300), "{took:?}");
+    assert!(!error.contains("outlived"), "{error}");
     let (error, took) = faulty_run(
         "wire-no-stop",
         1_000_000,
