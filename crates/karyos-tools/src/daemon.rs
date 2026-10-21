@@ -753,6 +753,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `--guard` opens each named guard once at start, audited: two
+    /// streams under one guard give one guard and one `Reopened` record,
+    /// in process, operation 0, from the closed epoch 1 to the open 2.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_guard_is_opened_once_at_start_and_audited() {
+        use karyos_driver::{AuditOutcome, Requester};
+
+        let dir = std::env::temp_dir().join(format!("karyosd-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut options = Options::new(dir.clone());
+        options.terms.term_length = karyos_sys::sizing::MIN_TERM_LENGTH;
+        options.streams.push(STREAM);
+        options.streams.push(StreamOption {
+            stream_id: 11,
+            ..STREAM
+        });
+        for stream_id in [10, 11] {
+            options.guards.push(crate::args::GuardOption {
+                name: "orders".to_owned(),
+                stream_id,
+                session_id: 1,
+                messages: 4,
+            });
+        }
+        let daemon = Daemon::start(&options).unwrap();
+        let audit = daemon.driver().guard_audit();
+        assert_eq!(audit.records.len(), 1, "{audit:?}");
+        let record = audit.records[0];
+        assert_eq!(record.outcome, AuditOutcome::Reopened);
+        assert_eq!(record.requester, Requester::InProcess);
+        assert_eq!(record.operation, 0);
+        let state = |word| karyos_sys::guard::decode(word).map(|state| (state.epoch, state.open));
+        assert_eq!(
+            (state(record.before), state(record.after)),
+            (Ok((1, false)), Ok((2, true)))
+        );
+        let stop = AtomicBool::new(true);
+        assert_eq!(daemon.run(&stop), Shutdown::Clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_duplicate_stream_fails_the_start() {

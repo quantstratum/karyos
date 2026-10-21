@@ -90,8 +90,9 @@ Streams:
   --guard <name>:<stream_id>:<session_id>:<messages>
                                     guard a configured stream with guard name (one
                                     guard however many streams name it), its outcome
-                                    records holding messages; the guard stays open;
-                                    repeatable
+                                    records holding messages; the guard is opened once
+                                    at start (audited); closing it remains an operator
+                                    action (owner item 59); repeatable
   --term-length <size>              term length of every stream [1m]
   --mtu <n>                         frame bytes per fragment [1408]
   --max-reserved <size>             bytes one message may reserve [term length / 8]
