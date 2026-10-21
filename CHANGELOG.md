@@ -686,9 +686,10 @@ release may break APIs, wire formats and shared-memory layouts.
   a replay's `uint64_t` arguments past the signed range, as runners parse
   and pass them. The length 2^64 - 1, the ABI's "to the end", delivers
   the whole recording, and a position or a length of 2^63 is refused as
-  an invalid request (code 4). FORMAT.md's Values says why no ABI result
-  reaches 2^63, so each binding's own tests check that it reads such a
-  `uint64_t` result as unsigned.
+  an invalid request (code 4). FORMAT.md's Values says which results
+  cross 2^63: no position nor `karyos_detail` value does, while about
+  half of all handles do (their generation comes from a random base per
+  copy), so each binding's own tests pin its unsigned reading.
 - The facade `karyos` crate re-exports `ImageChange`, `ImageEnd` and
   `SealReason`, and `karyos-client` re-exports `SealReason` at its root:
   a facade user drains a network subscription's image changes and reads

@@ -71,12 +71,14 @@ twice in one line is a failure.
   so a `uint64_t` handle or position past the signed range can be
   written (`18446744073709551615`). An argument whose type is narrower
   (such as the `int32_t` `status`) and that does not fit it is a
-  failure. No result of the ABI reaches 2^63: a position is at most a
-  term count below 2^31 times a term of at most 2^30 bytes, and every
-  `karyos_detail` code and value is far below. So the suite checks the
-  `uint64_t` range on arguments only (`op.replay.u64`), and a binding's
-  own tests check that it reads a `uint64_t` result past the signed
-  range as unsigned.
+  failure. Positions never reach 2^63 (a term count below 2^31 times a
+  term of at most 2^30 bytes), nor do `karyos_detail` codes and values.
+  Handles do: a handle's high 32 bits are its generation, drawn from a
+  random base per copy of the library, so about half of all handles are
+  at least 2^63, and every scenario's handle variables cross the signed
+  range in about half the runs. The suite also checks the range on
+  arguments (`op.replay.u64`). A binding's own tests pin both
+  deterministically, since one run's handles may all fall below 2^63.
 - `null`: a null pointer, for a pointer argument.
 - A quoted string.
 - `$name`: a variable. Variables live for one scenario and carry across

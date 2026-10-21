@@ -2,8 +2,8 @@
 # parses and passes them: the length 2^64 - 1 is the ABI's "to the end",
 # so the replay delivers the whole recording; a position of 2^63 and a
 # length of 2^63 lie past the recording's end, and the Archive refuses
-# both as an invalid request (code 4). No result of the ABI reaches 2^63
-# (FORMAT.md, Values), so this scenario checks arguments only.
+# both as an invalid request (code 4). Arguments only: of the results,
+# only handles cross 2^63, about half of them (FORMAT.md, Values).
 format 2
 id op.replay.u64
 abi 0.1
