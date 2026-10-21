@@ -970,7 +970,8 @@ fn child() {
                     SubscriberRole::Required,
                 )
                 .unwrap();
-            let Outcome::NetworkSubscription { registration } = next_outcome(&mut client) else {
+            let Outcome::NetworkSubscription { registration, .. } = next_outcome(&mut client)
+            else {
                 panic!("no network subscription");
             };
             report(&format!("subscribed {registration}"));

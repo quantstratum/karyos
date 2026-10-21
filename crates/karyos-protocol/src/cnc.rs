@@ -42,7 +42,43 @@
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
 //! | `0x88` | `ConflatedReady` | client | sequence | registration | hand-over key |
 //! | `0x89` | `GuardState` | client | sequence | guard | guard word (`karyos_sys::guard`) |
-//! | `0x8A` | `NetworkSubscriptionReady` | client | sequence | registration | |
+//! | `0x8A` | `NetworkSubscriptionReady` | client | sequence | registration | bound family, port and scope (see below) |
+//!
+//! `NetworkSubscriptionReady` is exactly six words: client, sequence,
+//! registration, then the subscription's bound local address in words 3
+//! to 5 (decision row 26; added in place under admission `VERSION` 2,
+//! which no release has used, so the three word layout before it has
+//! another length and strict decoding refuses it):
+//!
+//! | Word | Bits | Meaning |
+//! | --- | --- | --- |
+//! | 3 | 15 to 0 | port |
+//! | 3 | 23 to 16 | family: 0 none, 4 IPv4, 6 IPv6; any other value is refused |
+//! | 3 | 31 to 24 | reserved, zero |
+//! | 3 | 63 to 32 | IPv6 scope id; zero for IPv4 and for family 0 |
+//! | 4 | 63 to 0 | address, high word: IPv6 octets 0 to 7 in network order (octet 0 in bits 63 to 56); zero for IPv4 |
+//! | 5 | 63 to 0 | address, low word: IPv6 octets 8 to 15 likewise; IPv4 octets 0 to 3 in bits 31 to 0 (octet 0 in bits 31 to 24), bits 63 to 32 zero |
+//!
+//! The address is the one the driver's socket reports for the
+//! subscription after its bind, not the URI's text. A multicast
+//! subscription reports the group address and the bound port, not the
+//! interface. The IPv6 flow information is not carried: it decodes as
+//! zero. Family 0 means no address, and its port, scope and both address
+//! words are zero. Any other bit set is refused as reserved.
+//!
+//! Two vectors, each the whole message in hex, one group of eight bytes
+//! per word (client 1, sequence 2, registration 3), each word
+//! little-endian as everywhere in the CnC:
+//!
+//! - `127.0.0.1:40123`: words `1, 2, 3, 0x0000_0000_0004_9CBB, 0,
+//!   0x0000_0000_7F00_0001`:
+//!   `0100000000000000 0200000000000000 0300000000000000
+//!   BB9C040000000000 0000000000000000 0100007F00000000`.
+//! - `[fe80::1%3]:40123`, scope id 3: words `1, 2, 3,
+//!   0x0000_0003_0006_9CBB, 0xFE80_0000_0000_0000,
+//!   0x0000_0000_0000_0001`:
+//!   `0100000000000000 0200000000000000 0300000000000000
+//!   BB9C060003000000 00000000000080FE 0100000000000000`.
 //!
 //! `GuardClose` and `GuardReopen` (`quantstratum-docs:
 //! karyos/design/guards-and-abort.md`, local guards): a local operator
@@ -194,7 +230,7 @@
 //! `PublicationClosed` names the image registration when the closed lane
 //! is an image's, and 0 for any other stream.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::SealReason;
@@ -230,6 +266,8 @@ pub const MAX_RESPONSE_LENGTH: usize = CONFLATED_READY_WORDS * 8;
 pub const MAX_EVENT_LENGTH: usize = IMAGE_AVAILABLE_WORDS * 8;
 /// Words of an encoded `ImageAvailable`.
 const IMAGE_AVAILABLE_WORDS: usize = 6;
+/// Words of an encoded `NetworkSubscriptionReady`.
+const NETWORK_SUBSCRIPTION_READY_WORDS: usize = 6;
 
 const ADD_PUBLICATION: u32 = 0x01;
 const ADD_SUBSCRIPTION: u32 = 0x02;
@@ -1034,6 +1072,11 @@ pub enum Response {
         request: RequestId,
         /// The new registration.
         registration: u64,
+        /// The subscription's bound local address as its socket reports
+        /// it (a multicast subscription's group and bound port), or
+        /// `None` when the driver reports none. An IPv6 address keeps its
+        /// scope id; its flow information is not carried.
+        bound: Option<SocketAddr>,
     },
     /// The command succeeded and returns nothing.
     OperationSucceeded {
@@ -1734,6 +1777,62 @@ fn source_from([word, first, second]: [u64; 3]) -> Option<SocketAddr> {
     }
 }
 
+/// The three words of a bound address (`NetworkSubscriptionReady`): the
+/// family, port and scope word, then the address's high and low words.
+fn bound_words(bound: Option<SocketAddr>) -> [u64; 3] {
+    match bound {
+        None => [0, 0, 0],
+        Some(SocketAddr::V4(address)) => [
+            u64::from(address.port()) | FAMILY_V4 << 16,
+            0,
+            u64::from(u32::from_be_bytes(address.ip().octets())),
+        ],
+        Some(SocketAddr::V6(address)) => {
+            let bits = u128::from_be_bytes(address.ip().octets());
+            // The high and low halves of the address.
+            let high = u64::try_from(bits >> 64).unwrap_or(0);
+            let low = u64::try_from(bits & u128::from(u64::MAX)).unwrap_or(0);
+            [
+                u64::from(address.port()) | FAMILY_V6 << 16 | u64::from(address.scope_id()) << 32,
+                high,
+                low,
+            ]
+        }
+    }
+}
+
+/// The bound address of its three words: `Some(None)` for family 0,
+/// `None` for another family or a reserved bit set.
+fn bound_from([word, high, low]: [u64; 3]) -> Option<Option<SocketAddr>> {
+    let port = u16::try_from(word & 0xFFFF).ok()?;
+    let family = (word >> 16) & 0xFF;
+    let reserved = (word >> 24) & 0xFF;
+    let scope = u32::try_from(word >> 32).ok()?;
+    if reserved != 0 {
+        return None;
+    }
+    match family {
+        0 if word == 0 && high == 0 && low == 0 => Some(None),
+        FAMILY_V4 if scope == 0 && high == 0 => {
+            let ip = u32::try_from(low).ok()?;
+            Some(Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(ip),
+                port,
+            ))))
+        }
+        FAMILY_V6 => {
+            let bits = u128::from(high) << 64 | u128::from(low);
+            Some(Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(bits),
+                port,
+                0,
+                scope,
+            ))))
+        }
+        _ => None,
+    }
+}
+
 /// Writes a command's four words and its channel URI, padded to a word.
 fn write_uri_command(
     words: [u64; URI_COMMAND_WORDS],
@@ -1853,7 +1952,21 @@ impl Response {
             Self::NetworkSubscriptionReady {
                 request,
                 registration,
-            } => write_words(&[request.client, request.sequence, registration], out),
+                bound,
+            } => {
+                let [family_port, high, low] = bound_words(bound);
+                write_words(
+                    &[
+                        request.client,
+                        request.sequence,
+                        registration,
+                        family_port,
+                        high,
+                        low,
+                    ],
+                    out,
+                )
+            }
             Self::Error {
                 request,
                 code,
@@ -1949,10 +2062,13 @@ impl Response {
                 })
             }
             NETWORK_SUBSCRIPTION_READY => {
-                let [client, sequence, registration] = read_words::<3>(type_id, bytes)?;
+                let [client, sequence, registration, family_port, high, low] =
+                    read_words::<NETWORK_SUBSCRIPTION_READY_WORDS>(type_id, bytes)?;
                 Ok(Self::NetworkSubscriptionReady {
                     request: RequestId { client, sequence },
                     registration,
+                    bound: bound_from([family_port, high, low])
+                        .ok_or(CncError::Reserved { type_id })?,
                 })
             }
             ERROR => {
@@ -2781,6 +2897,116 @@ mod tests {
         assert_eq!(decode(&good), Ok(command));
     }
 
+    /// Decision row 26: the documented `NetworkSubscriptionReady` vectors
+    /// decode to their addresses and re-encode identically.
+    #[test]
+    fn network_subscription_ready_vectors() {
+        let request = RequestId {
+            client: 1,
+            sequence: 2,
+        };
+        for (text, hex) in [
+            (
+                "127.0.0.1:40123",
+                "0100000000000000 0200000000000000 0300000000000000 \
+                 BB9C040000000000 0000000000000000 0100007F00000000",
+            ),
+            (
+                "[fe80::1%3]:40123",
+                "0100000000000000 0200000000000000 0300000000000000 \
+                 BB9C060003000000 00000000000080FE 0100000000000000",
+            ),
+        ] {
+            let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
+            let bytes: Vec<u8> = digits
+                .chunks(2)
+                .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            assert_eq!(bytes.len(), 48);
+            let expected = Response::NetworkSubscriptionReady {
+                request,
+                registration: 3,
+                bound: Some(text.parse().unwrap()),
+            };
+            assert_eq!(
+                Response::decode(NETWORK_SUBSCRIPTION_READY, &bytes),
+                Ok(expected)
+            );
+            let mut out = [0u8; MAX_RESPONSE_LENGTH];
+            let length = expected.encode(&mut out).unwrap();
+            assert_eq!(&out[..length], &bytes[..]);
+        }
+        let SocketAddr::V6(scoped) = "[fe80::1%3]:40123".parse::<SocketAddr>().unwrap() else {
+            panic!("an IPv6 address");
+        };
+        assert_eq!(scoped.scope_id(), 3);
+    }
+
+    /// Decision row 26: decoding `NetworkSubscriptionReady` is strict.
+    #[test]
+    fn network_subscription_ready_is_decoded_strictly() {
+        let type_id = NETWORK_SUBSCRIPTION_READY;
+        let words = |family_port: u64, high: u64, low: u64| -> Vec<u8> {
+            [1u64, 2, 3, family_port, high, low]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect()
+        };
+        let decode = |bytes: &[u8]| Response::decode(type_id, bytes);
+        let reserved = Err(CncError::Reserved { type_id });
+        let v4 = 40123 | 4 << 16;
+        let v6 = 40123 | 6 << 16;
+        assert!(decode(&words(v4, 0, 0x7F00_0001)).is_ok());
+        assert!(decode(&words(v6 | 3 << 32, 0xFE80 << 48, 1)).is_ok());
+        assert!(matches!(
+            decode(&words(0, 0, 0)),
+            Ok(Response::NetworkSubscriptionReady { bound: None, .. })
+        ));
+        // Reserved bits 24 to 31, for each family.
+        for family_port in [v4, v6, 0] {
+            for bit in 24..32 {
+                assert_eq!(decode(&words(family_port | 1 << bit, 0, 1)), reserved);
+            }
+        }
+        // An unknown family.
+        for family in [1u64, 2, 3, 5, 7, 0x10, 0xFF] {
+            assert_eq!(decode(&words(40123 | family << 16, 0, 1)), reserved);
+        }
+        // IPv4: the high bits of the low word, the high word, a scope id.
+        assert_eq!(decode(&words(v4, 0, 1 << 32 | 1)), reserved);
+        assert_eq!(decode(&words(v4, 0, u64::MAX)), reserved);
+        assert_eq!(decode(&words(v4, 1, 1)), reserved);
+        assert_eq!(decode(&words(v4 | 1 << 32, 0, 1)), reserved);
+        assert_eq!(
+            decode(&words(v4 | u64::from(u32::MAX) << 32, 0, 1)),
+            reserved
+        );
+        // Family 0 with any other field nonzero.
+        for (family_port, high, low) in [
+            (1, 0, 0),
+            (0xFFFF, 0, 0),
+            (1 << 32, 0, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+        ] {
+            assert_eq!(decode(&words(family_port, high, low)), reserved);
+        }
+        // Any other length: the three word layout before row 26 included.
+        let good = words(v4, 0, 0x7F00_0001);
+        for length in [0, 8, 24, 40, 47, 49, 56] {
+            let mut bytes = good.clone();
+            bytes.resize(length, 0);
+            assert_eq!(
+                decode(&bytes),
+                Err(CncError::WrongLength {
+                    type_id,
+                    length,
+                    expected: 48,
+                })
+            );
+        }
+    }
+
     /// W5: the network subscription grant, the image events and the two
     /// error codes round-trip.
     #[test]
@@ -2793,6 +3019,22 @@ mod tests {
             Response::NetworkSubscriptionReady {
                 request,
                 registration: 77,
+                bound: Some("127.0.0.1:40123".parse().unwrap()),
+            },
+            Response::NetworkSubscriptionReady {
+                request,
+                registration: 77,
+                bound: Some("[fe80::1%3]:40123".parse().unwrap()),
+            },
+            Response::NetworkSubscriptionReady {
+                request,
+                registration: 77,
+                bound: Some("[2001:db8::1]:1".parse().unwrap()),
+            },
+            Response::NetworkSubscriptionReady {
+                request,
+                registration: 77,
+                bound: None,
             },
             Response::Error {
                 request,
@@ -4276,6 +4518,19 @@ mod properties {
         })
     }
 
+    /// A bound address: none, IPv4, or IPv6 with any scope id (flow
+    /// information is not carried, so it stays zero).
+    fn bound() -> impl Strategy<Value = Option<SocketAddr>> {
+        prop_oneof![
+            Just(None),
+            (any::<u32>(), any::<u16>())
+                .prop_map(|(ip, port)| Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port))),
+            (any::<u128>(), any::<u16>(), any::<u32>()).prop_map(|(ip, port, scope)| Some(
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, scope))
+            )),
+        ]
+    }
+
     /// A source address as `ImageAvailable` carries it: no scope or flow
     /// label.
     fn source() -> impl Strategy<Value = SocketAddr> {
@@ -4626,10 +4881,11 @@ mod properties {
                     },
                 }
             ),
-            (request(), any::<u64>()).prop_map(|(request, registration)| {
+            (request(), any::<u64>(), bound()).prop_map(|(request, registration, bound)| {
                 Response::NetworkSubscriptionReady {
                     request,
                     registration,
+                    bound,
                 }
             }),
         ]

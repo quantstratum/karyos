@@ -68,6 +68,7 @@
 //! granted, which stays held until the client leaves.
 //! `ClientError::Attach` exists on Linux only, where remote clients do.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -739,7 +740,7 @@ impl Connection for ClientConductor {
                 self.remove_concurrent_publication(publication).is_ok()
             }
             Outcome::Subscription(subscription) => self.remove_subscription(subscription).is_ok(),
-            Outcome::NetworkSubscription { registration } => {
+            Outcome::NetworkSubscription { registration, .. } => {
                 ClientConductor::remove_network_subscription(self, registration).is_ok()
             }
             _ => false,
@@ -923,7 +924,7 @@ impl Connection for crate::ipc::RemoteClient {
                 }
                 _ => false,
             },
-            Outcome::NetworkSubscription { registration } => {
+            Outcome::NetworkSubscription { registration, .. } => {
                 crate::ipc::RemoteClient::remove_network_subscription(self, registration).is_ok()
             }
             // Taken and dropped: the view's drop unmaps the table and sends
@@ -1079,7 +1080,7 @@ type Released<T> = Arc<Mutex<Vec<ClientSubscription<T>>>>;
 /// What a waited request found.
 enum Found<T: TermBytes> {
     Outcome(Box<Outcome>),
-    Network(u64, Arc<Inbox<T>>, Released<T>),
+    Network(u64, Option<SocketAddr>, Arc<Inbox<T>>, Released<T>),
 }
 
 /// The application's client (SPEC §10): see the module docs.
@@ -1440,9 +1441,10 @@ impl<C: Connection> Client<C> {
                     kind: Kind::Stream(Box::new(subscription)),
                 })
             }
-            Found::Network(registration, inbox, released) => Ok(Subscription {
+            Found::Network(registration, bound, inbox, released) => Ok(Subscription {
                 kind: Kind::Images(Images {
                     registration,
+                    bound,
                     inbox,
                     released,
                     images: Vec::with_capacity(self.context.max_images),
@@ -1591,7 +1593,10 @@ impl<C: Connection> Client<C> {
 
     fn found(&mut self, outcome: Outcome) -> Found<C::Terms> {
         match outcome {
-            Outcome::NetworkSubscription { registration } => {
+            Outcome::NetworkSubscription {
+                registration,
+                bound,
+            } => {
                 // Registered before the events of this service, which may
                 // announce its first images.
                 let inbox = Arc::new(Inbox::new(self.context.max_images));
@@ -1609,7 +1614,7 @@ impl<C: Connection> Client<C> {
                     role,
                     rejoin,
                 });
-                Found::Network(registration, inbox, released)
+                Found::Network(registration, bound, inbox, released)
             }
             other => Found::Outcome(Box::new(other)),
         }
@@ -1841,6 +1846,8 @@ enum Kind<T: TermBytes> {
 #[derive(Debug)]
 struct Images<T: TermBytes> {
     registration: u64,
+    /// The bound local address the driver reported in the grant.
+    bound: Option<SocketAddr>,
     inbox: Arc<Inbox<T>>,
     /// Where it hands the image handles it lets go of to the client.
     released: Released<T>,
@@ -1879,6 +1886,20 @@ impl<T: TermBytes> Subscription<T> {
         match &self.kind {
             Kind::Stream(_) => None,
             Kind::Images(images) => Some(images.registration),
+        }
+    }
+
+    /// The network subscription's bound local address, as the driver's
+    /// socket reports it after the bind: a unicast subscription's
+    /// endpoint, a multicast one's group address with the bound port (not
+    /// the interface). An IPv6 address keeps its scope id; its flow
+    /// information is not carried. `None` for a stream, or when the driver
+    /// reports none.
+    #[must_use]
+    pub fn bound_address(&self) -> Option<SocketAddr> {
+        match &self.kind {
+            Kind::Stream(_) => None,
+            Kind::Images(images) => images.bound,
         }
     }
 
@@ -2442,6 +2463,7 @@ mod tests {
         let inbox = Arc::new(Inbox::new(max_images));
         let mut images = Images {
             registration: 1,
+            bound: None,
             inbox: Arc::clone(&inbox),
             released: Arc::new(Mutex::new(Vec::with_capacity(4 * max_images))),
             images: Vec::with_capacity(max_images),
@@ -2490,6 +2512,7 @@ mod tests {
         let inbox = Arc::new(Inbox::new(max_images));
         let mut images = Images {
             registration: 1,
+            bound: None,
             inbox: Arc::clone(&inbox),
             released: Arc::new(Mutex::new(Vec::with_capacity(4 * max_images))),
             images: Vec::with_capacity(max_images),
@@ -2559,6 +2582,7 @@ mod tests {
         let subscription = Subscription {
             kind: Kind::Images(Images {
                 registration: 1,
+                bound: None,
                 inbox: Arc::clone(&inbox),
                 released: Arc::new(Mutex::new(Vec::with_capacity(8))),
                 images: Vec::with_capacity(2),
@@ -2724,6 +2748,7 @@ mod tests {
         let network = Subscription {
             kind: Kind::Images(Images {
                 registration: 1,
+                bound: None,
                 inbox: Arc::new(Inbox::new(1)),
                 released: Arc::new(Mutex::new(Vec::new())),
                 images: Vec::new(),

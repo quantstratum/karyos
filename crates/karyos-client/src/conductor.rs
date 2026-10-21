@@ -171,6 +171,10 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     NetworkSubscription {
         /// The network subscription's registration.
         registration: u64,
+        /// Its bound local address as the driver's socket reports it (a
+        /// multicast subscription's group address and bound port), or
+        /// `None` when the driver reports none.
+        bound: Option<std::net::SocketAddr>,
     },
     /// A guard's word after a guard close or reopen (M10).
     GuardState {
@@ -1825,8 +1829,15 @@ impl<T: TermBytes> ClientConductor<T> {
             }
             (
                 Kind::AddNetworkSubscription,
-                Response::NetworkSubscriptionReady { registration, .. },
-            ) => Outcome::NetworkSubscription { registration },
+                Response::NetworkSubscriptionReady {
+                    registration,
+                    bound,
+                    ..
+                },
+            ) => Outcome::NetworkSubscription {
+                registration,
+                bound,
+            },
             // The writer waits in the hand-over table under its key.
             (Kind::TraceJournal, Response::JournalReady { journal, key, .. }) => {
                 match self.link.take_journal(key) {

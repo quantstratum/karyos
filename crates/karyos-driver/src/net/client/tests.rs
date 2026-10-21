@@ -114,7 +114,7 @@ fn clients_exchange_messages_by_channel_uri() {
             image.is_some()
         },
     );
-    let Outcome::NetworkSubscription { registration } = take_of(&mut outcomes, 1, subscribed)
+    let Outcome::NetworkSubscription { registration, .. } = take_of(&mut outcomes, 1, subscribed)
     else {
         panic!("not a network subscription");
     };
@@ -562,6 +562,7 @@ fn each_subscription_learns_of_an_image_once_either_way() {
         .unwrap();
     let Outcome::NetworkSubscription {
         registration: first,
+        ..
     } = complete(&mut b, &mut subscriber, before)
     else {
         panic!("not a network subscription");
@@ -594,7 +595,7 @@ fn each_subscription_learns_of_an_image_once_either_way() {
         &mut outcomes,
         |outcomes, clients| {
             if second.is_none()
-                && let Some((_, _, Outcome::NetworkSubscription { registration })) =
+                && let Some((_, _, Outcome::NetworkSubscription { registration, .. })) =
                     outcomes.iter().find(|(_, s, _)| *s == after)
             {
                 let registration = *registration;
@@ -693,7 +694,8 @@ fn only_its_client_removes_a_network_subscription() {
             SubscriberRole::Required,
         )
         .unwrap();
-    let Outcome::NetworkSubscription { registration } = complete(&mut driver, &mut owner, sequence)
+    let Outcome::NetworkSubscription { registration, .. } =
+        complete(&mut driver, &mut owner, sequence)
     else {
         panic!("not a network subscription");
     };
@@ -919,7 +921,7 @@ fn a_subscription_made_in_the_installing_cycle_learns_of_the_image_once() {
             publication = Some(handle);
         });
         let _ = subscriber.poll(usize::MAX, |completion| {
-            let Outcome::NetworkSubscription { registration } = completion.outcome else {
+            let Outcome::NetworkSubscription { registration, .. } = completion.outcome else {
                 panic!("not a network subscription: {:?}", completion.outcome);
             };
             counts.push((registration, 0, 0));
@@ -935,7 +937,7 @@ fn a_subscription_made_in_the_installing_cycle_learns_of_the_image_once() {
         let _ = a.do_work().unwrap();
         let _ = b.do_work().unwrap();
         let _ = subscriber.poll(usize::MAX, |completion| {
-            if let Outcome::NetworkSubscription { registration } = completion.outcome {
+            if let Outcome::NetworkSubscription { registration, .. } = completion.outcome {
                 counts.push((registration, 0, 0));
             }
         });
@@ -1310,4 +1312,84 @@ fn a_silent_sender_still_back_pressures_the_publisher() {
         publication.offer(&payload).unwrap(),
         OfferOutcome::BackPressured | OfferOutcome::AdminAction
     ));
+}
+
+/// Subscribes `uri` on a fresh driver through a client and returns the
+/// grant's outcome.
+fn subscribe_outcome(uri: &str) -> Outcome {
+    let mut driver = driver();
+    let mut client = driver.connect().unwrap();
+    let sequence = client
+        .add_network_subscription(uri, 10, SubscriberRole::Required)
+        .unwrap();
+    let mut outcomes = Vec::new();
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |outcomes, _| outcomes.iter().any(|(_, found, _)| *found == sequence),
+    );
+    take(&mut outcomes, sequence)
+}
+
+/// Decision row 26: `NetworkSubscriptionReady` carries the subscription's
+/// bound address, here a unicast IPv4 endpoint: exactly the address and
+/// port of the URI.
+#[test]
+fn a_network_subscription_reports_its_bound_ipv4_address() {
+    let port = port();
+    let outcome = subscribe_outcome(&format!("karyos:udp?endpoint=127.0.0.1:{port}"));
+    let Outcome::NetworkSubscription { bound, .. } = outcome else {
+        panic!("not a network subscription: {outcome:?}");
+    };
+    assert_eq!(bound, Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port))));
+}
+
+/// Decision row 26 over IPv6 loopback, where the host has it: the bound
+/// address is `[::1]` and the port of the URI, scope id 0.
+#[test]
+fn a_network_subscription_reports_its_bound_ipv6_address() {
+    let loopback = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0));
+    if UdpSocket::bind(loopback).is_err() {
+        // Skipped: no IPv6 loopback on this host.
+        return;
+    }
+    let port = loop {
+        let port = port();
+        if UdpSocket::bind(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))).is_ok() {
+            break port;
+        }
+    };
+    let outcome = subscribe_outcome(&format!("karyos:udp?endpoint=[::1]:{port}"));
+    let Outcome::NetworkSubscription { bound, .. } = outcome else {
+        panic!("not a network subscription: {outcome:?}");
+    };
+    let Some(SocketAddr::V6(bound)) = bound else {
+        panic!("not an IPv6 address: {bound:?}");
+    };
+    assert_eq!(*bound.ip(), std::net::Ipv6Addr::LOCALHOST);
+    assert_eq!(bound.port(), port);
+    assert_eq!(bound.scope_id(), 0);
+}
+
+/// Decision row 26: a multicast subscription reports its group address
+/// and the bound port, not the interface nor the wildcard it binds. Hosts
+/// that cannot join a group on the loopback refuse the subscription, and
+/// the test is skipped there.
+#[test]
+fn a_multicast_subscription_reports_its_group_and_port() {
+    let port = port();
+    let outcome = subscribe_outcome(&format!(
+        "karyos:udp?group=239.255.0.26:{port}|interface=127.0.0.1"
+    ));
+    match outcome {
+        Outcome::NetworkSubscription { bound, .. } => assert_eq!(
+            bound,
+            Some(SocketAddr::from((Ipv4Addr::new(239, 255, 0, 26), port)))
+        ),
+        // Skipped: the host cannot join the group on the loopback, and the
+        // driver refused the subscription.
+        Outcome::Refused { .. } => {}
+        other => panic!("not a network subscription: {other:?}"),
+    }
 }
