@@ -1119,10 +1119,26 @@ pub struct ImageChange {
     pub lane: u32,
     /// 1 when it was attached, 0 when it was retired.
     pub available: u32,
+    /// A retired image's end, a `KARYOS_END_*` code: `KARYOS_END_NONE` for
+    /// an attached image, and for one released unsealed.
+    pub end_reason: u32,
+    /// Zero.
+    pub reserved: u32,
+    /// The end's seal position; 0 with no end, for a seal not positioned
+    /// yet, and for a seal at position 0: 0 alone does not tell them apart.
+    pub end_position: u64,
+    /// The seal's raw reason code; 0 with no end.
+    pub seal_code: u64,
 }
 
 /// The size of `karyos_image_change` in ABI 0.1.0.
 const IMAGE_CHANGE_SIZE_0_1: u32 = 24;
+
+/// The size of `karyos_image_change` with its end fields
+/// (`KARYOS_IMAGE_CHANGE_SIZE_ENDS`): the header's, checked by its tests;
+/// the library writes by the caller's size and needs no constant.
+#[cfg(test)]
+pub(crate) const IMAGE_CHANGE_SIZE_ENDS: u32 = 48;
 
 /// `karyos_message_handler`: called once per message with the caller's
 /// `context`, the message's `length` bytes at `data` (a private copy, valid
@@ -1653,16 +1669,9 @@ pub unsafe extern "C" fn karyos_subscription_next_image_change(
         match api::subscription::next_image_change(Handle::from_raw(subscription)) {
             Ok(next) => {
                 if let Some(next) = next {
-                    // SAFETY: the caller's contract on `change`.
-                    unsafe {
-                        write_sized(change, IMAGE_CHANGE_SIZE_0_1, |size| ImageChange {
-                            size,
-                            session_id: next.session_id,
-                            image_id: next.image_id,
-                            lane: u32::from(next.lane.get()),
-                            available: u32::from(next.available),
-                        });
-                    };
+                    // SAFETY: the caller's contract on `change`, whose
+                    // size was read above.
+                    unsafe { write_image_change(change, &next) };
                 }
                 // SAFETY: `has` is non-null and aligned, and the caller's
                 // contract makes it a writable `uint32_t`.
@@ -1672,6 +1681,36 @@ pub unsafe extern "C" fn karyos_subscription_next_image_change(
             Err(status) => status,
         }
     })
+}
+
+/// Writes `next` through `change` by its size: the sized write of
+/// `karyos_subscription_next_image_change`, apart so that it runs under
+/// Miri with no driver. A 24-byte struct takes no end fields.
+///
+/// # Safety
+///
+/// `change` is non-null, aligned and points to a writable
+/// `karyos_image_change` of at least its `size` bytes.
+unsafe fn write_image_change(change: *mut ImageChange, next: &karyos_client::ImageChange) {
+    let ended = next.end.map(|end| api::subscription::End::Sealed {
+        reason: end.reason,
+        position: end.position.unwrap_or(0),
+    });
+    let (end_reason, end_position, seal_code) = end_fields(ended);
+    // The caller's size stays, as every sized output's does.
+    let filled = |size| ImageChange {
+        size,
+        session_id: next.session_id,
+        image_id: next.image_id,
+        lane: u32::from(next.lane.get()),
+        available: u32::from(next.available),
+        end_reason,
+        reserved: 0,
+        end_position,
+        seal_code,
+    };
+    // SAFETY: the caller's contract on `change`.
+    unsafe { write_sized(change, IMAGE_CHANGE_SIZE_0_1, filled) };
 }
 
 /// Writes through `lost` the image changes `subscription`'s full queue

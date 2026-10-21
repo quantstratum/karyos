@@ -1038,6 +1038,10 @@ fn a_subscription_delivers_each_message_from_its_private_copy() {
         image_id: 7,
         lane: 7,
         available: 7,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
     };
     let (mut has, mut lost) = (u32::MAX, u64::MAX);
     // SAFETY: live, aligned out-parameters.
@@ -1221,6 +1225,10 @@ fn image_changes_and_bad_arguments() {
         image_id: 0,
         lane: 0,
         available: 0,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
     };
     let (mut has, mut lost) = (u32::MAX, u64::MAX);
     // SAFETY: live, aligned out-parameters.
@@ -1323,11 +1331,18 @@ fn a_copy_that_cannot_grow_delivers_nothing_and_loses_nothing() {
 
 /// A driven driver with a network (Shared threading) and `N` conductors.
 fn driven_network<const N: usize>() -> (Driven, [karyos_client::ClientConductor; N]) {
+    driven_network_with(karyos_driver::net::NetworkConfig::default())
+}
+
+/// [`driven_network`] over `network`, its threading Shared.
+fn driven_network_with<const N: usize>(
+    network: karyos_driver::net::NetworkConfig,
+) -> (Driven, [karyos_client::ClientConductor; N]) {
     let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
         client_liveness_timeout: 3_600_000_000_000,
         network: Some(karyos_driver::net::NetworkConfig {
             threading: karyos_driver::agents::ThreadingMode::Shared,
-            ..karyos_driver::net::NetworkConfig::default()
+            ..network
         }),
         ..karyos_driver::DriverConfig::default()
     })
@@ -1433,6 +1448,10 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
         image_id: 0,
         lane: u32::MAX,
         available: 0,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
     };
     // SAFETY: live, aligned out-parameters.
     let status =
@@ -1465,6 +1484,139 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
     }
     assert_eq!(api::subscription::copy_length(handle), Some(large_max));
     assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// A retired image's change carries its end: a removed publication's EOS
+/// ends the image cleanly at its seal (`KARYOS_END_END_OF_STREAM`), and a
+/// publisher whose driver stopped sends none, so its image retires at its
+/// liveness timeout (`KARYOS_END_IMAGE_RETIRED`). The linger and the
+/// timeout are short and real: each case takes a few seconds at most.
+#[test]
+#[cfg_attr(miri, ignore = "UDP sockets")]
+fn a_retired_images_change_carries_its_end() {
+    use karyos_sys::log_buffer::SealReason;
+    const MS: u64 = 1_000_000;
+    let network = || karyos_driver::net::NetworkConfig {
+        agents: karyos_driver::agents::AgentConfig {
+            image_liveness_timeout: 1_000 * MS,
+            ..karyos_driver::agents::AgentConfig::default()
+        },
+        stream_defaults: karyos_driver::net::NetworkStreamDefaults {
+            publication_linger: 50 * MS,
+            ..karyos_driver::net::NetworkStreamDefaults::default()
+        },
+        ..karyos_driver::net::NetworkConfig::default()
+    };
+    for removed in [true, false] {
+        let (_reading, [ours]) = driven_network_with::<1>(network());
+        let (writing, [theirs]) = driven_network_with::<1>(network());
+        let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+            .unwrap()
+            .raw();
+        let port = test_port();
+        let uri = std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{port}")).unwrap();
+        let mut subscription = 0;
+        // SAFETY: a live C string, a live `u64`, no detail.
+        let status = unsafe {
+            karyos_client_add_subscription(
+                client,
+                uri.as_ptr(),
+                8,
+                &mut subscription,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, Status::Ok.code());
+        let mut publisher = Client::with_conductor(theirs, test_context());
+        let mut publication = publisher
+            .add_exclusive_publication(
+                &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+                karyos_client::StreamId::new(8),
+            )
+            .unwrap();
+        let mut seen = Seen::default();
+        let start = std::time::Instant::now();
+        while seen.messages.is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(60),
+                "nothing"
+            );
+            let _ = (publisher.poll(), poll(client));
+            let _ = publication.offer(b"end");
+            assert_eq!(poll_into(subscription, &mut seen, 1).0, Status::Ok.code());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Takes the next change, polling both clients meanwhile.
+        let mut next = |publisher: Option<&mut Client<karyos_client::ClientConductor>>| {
+            let mut change = ImageChange {
+                size: size_of_u32::<ImageChange>(),
+                session_id: 0,
+                image_id: 0,
+                lane: 7,
+                available: 7,
+                end_reason: 7,
+                reserved: 7,
+                end_position: 7,
+                seal_code: 7,
+            };
+            let mut publisher = publisher;
+            let start = std::time::Instant::now();
+            loop {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(60),
+                    "no change"
+                );
+                if let Some(publisher) = publisher.as_deref_mut() {
+                    let _ = publisher.poll();
+                }
+                let _ = poll(client);
+                assert_eq!(poll_into(subscription, &mut seen, 8).0, Status::Ok.code());
+                let mut has = 0;
+                // SAFETY: live, aligned out-parameters.
+                let status = unsafe {
+                    karyos_subscription_next_image_change(subscription, &mut change, &mut has)
+                };
+                assert_eq!(status, Status::Ok.code());
+                if has == 1 {
+                    return change;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let attached = next(Some(&mut publisher));
+        assert_eq!(
+            (attached.available, attached.end_reason, attached.reserved),
+            (1, END_NONE, 0)
+        );
+        assert_eq!((attached.end_position, attached.seal_code), (0, 0));
+        let retired = if removed {
+            publisher.remove_publication(publication);
+            next(Some(&mut publisher))
+        } else {
+            drop(publication);
+            drop(writing);
+            next(None)
+        };
+        assert_eq!(
+            (retired.image_id, retired.available, retired.reserved),
+            (attached.image_id, 0, 0)
+        );
+        let (reason, code) = if removed {
+            (END_END_OF_STREAM, SealReason::EndOfStream.code())
+        } else {
+            (END_IMAGE_RETIRED, SealReason::ImageRetired.code())
+        };
+        assert_eq!(
+            (retired.end_reason, retired.seal_code),
+            (reason, code),
+            "{removed}"
+        );
+        if removed {
+            // The clean end is positioned after what was delivered.
+            assert!(retired.end_position > 0);
+        }
+        assert_eq!(karyos_client_close(client), Status::Ok.code());
+    }
 }
 
 /// A panic inside the poll, while it holds the subscription, returns
@@ -1525,6 +1677,10 @@ fn next_image_change_checks_its_struct_before_its_handle() {
         image_id: 7,
         lane: 7,
         available: 7,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
     };
     // SAFETY: live, aligned out-parameters.
     let status = unsafe { karyos_subscription_next_image_change(stale, &mut change, &mut has) };
@@ -1641,6 +1797,117 @@ fn a_timed_lane_takes_a_timed_offer() {
     assert_eq!(status, Status::Ok.code());
     assert_eq!(offer_at(concurrent, b"x", now).0, schedule);
     assert_eq!(read(&mut subscriber, &mut reading, 1), [b"timed".to_vec()]);
+}
+
+/// `karyos_image_change`'s write is by the caller's size: a 24-byte struct
+/// of the first header takes no end fields and keeps what follows it; a
+/// 48-byte one takes a retired image's end, or `KARYOS_END_NONE` for an
+/// arrival; a newer, longer one keeps its tail. The caller's size stays.
+#[test]
+fn an_image_change_is_written_by_the_callers_size() {
+    use karyos_sys::log_buffer::SealReason;
+    let lane = karyos_sys::frame::Lane::try_new(3).unwrap();
+    let retired = karyos_client::ImageChange::new(9, 5, lane, false).with_end(Some(
+        karyos_client::ImageEnd::new(SealReason::ImageRetired, Some(4096)),
+    ));
+    let filled = |size| ImageChange {
+        size,
+        session_id: 7,
+        image_id: 7,
+        lane: 7,
+        available: 7,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
+    };
+    // The first header's struct: the end fields are past its size.
+    let mut first = filled(IMAGE_CHANGE_SIZE_0_1);
+    // SAFETY: `first` is live, aligned and larger than its size.
+    unsafe { write_image_change(&raw mut first, &retired) };
+    assert_eq!(
+        (
+            first.size,
+            first.session_id,
+            first.image_id,
+            first.lane,
+            first.available
+        ),
+        (24, 5, 9, 3, 0)
+    );
+    assert_eq!(
+        (
+            first.end_reason,
+            first.reserved,
+            first.end_position,
+            first.seal_code
+        ),
+        (7, 7, 7, 7)
+    );
+    // This header's: the end.
+    let mut current = filled(IMAGE_CHANGE_SIZE_ENDS);
+    // SAFETY: `current` is live, aligned and of its size.
+    unsafe { write_image_change(&raw mut current, &retired) };
+    assert_eq!(
+        (
+            current.size,
+            current.end_reason,
+            current.reserved,
+            current.end_position,
+            current.seal_code
+        ),
+        (
+            48,
+            END_IMAGE_RETIRED,
+            0,
+            4096,
+            SealReason::ImageRetired.code()
+        )
+    );
+    assert_eq!(size_of_u32::<ImageChange>(), IMAGE_CHANGE_SIZE_ENDS);
+    // A clean end, an end whose seal is not positioned, and an arrival.
+    for (change, fields) in [
+        (
+            karyos_client::ImageChange::new(1, 1, lane, false).with_end(Some(
+                karyos_client::ImageEnd::new(SealReason::EndOfStream, Some(64)),
+            )),
+            (END_END_OF_STREAM, 64, SealReason::EndOfStream.code()),
+        ),
+        (
+            karyos_client::ImageChange::new(1, 1, lane, false).with_end(Some(
+                karyos_client::ImageEnd::new(SealReason::ImageRetired, None),
+            )),
+            (END_IMAGE_RETIRED, 0, SealReason::ImageRetired.code()),
+        ),
+        (
+            karyos_client::ImageChange::new(1, 1, lane, true),
+            (END_NONE, 0, 0),
+        ),
+    ] {
+        let mut written = filled(IMAGE_CHANGE_SIZE_ENDS);
+        // SAFETY: `written` is live, aligned and of its size.
+        unsafe { write_image_change(&raw mut written, &change) };
+        assert_eq!(
+            (written.end_reason, written.end_position, written.seal_code),
+            fields
+        );
+    }
+    // A struct of a newer header, 8 bytes longer: its tail stays.
+    #[repr(C)]
+    struct Newer {
+        change: ImageChange,
+        tail: u64,
+    }
+    let mut newer = Newer {
+        change: filled(56),
+        tail: 0xA5A5,
+    };
+    // SAFETY: `newer` is live, aligned and 56 bytes, its size.
+    unsafe { write_image_change(&raw mut newer.change, &retired) };
+    assert_eq!(
+        (newer.change.size, newer.change.end_position, newer.tail),
+        (56, 4096, 0xA5A5)
+    );
 }
 
 mod archive;

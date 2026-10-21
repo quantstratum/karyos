@@ -11,6 +11,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The conformance seeding of the `archive-replay` feature waits until
+  `"r0"` to `"r4"` are recorded before it pauses (now 50 ms) and
+  publishes `"r5"` to `"r9"`. Record times are per recorder duty, so a
+  duty that copied all ten messages stamped them alike, and
+  `op.replay.stopped`'s 1 ppm replay could end before its stop.
+
 - `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
   `karyos_detail`, `karyos_accepted` and the image change do: it wrote
   the library's 16 back into a newer caller's struct before. The new
@@ -646,6 +652,25 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The facade `karyos` crate re-exports `ImageChange`, `ImageEnd` and
+  `SealReason`, and `karyos-client` re-exports `SealReason` at its root:
+  a facade user drains a network subscription's image changes and reads
+  each retired image's end without naming `karyos-client` or
+  `karyos-sys` (owner item 57).
+- A retired image's change carries how its stream ended (owner item
+  57). In `karyos-client`, `ImageChange.end` is an `ImageEnd`, the
+  stream's terminal seal: its `SealReason` and its stream position.
+  `EndOfStream` means the source's EOS was reached through a complete
+  prefix. `ImageRetired` means the image retired without one: its
+  publisher timed out, or a lane lost a frame. It is `None` for an
+  arrival and for an image released unsealed. `ImageChange::with_end`
+  sets it. `karyos-sys` gains `LogBuffer::terminal_seal`. In C,
+  `karyos_image_change` grows from 24 to 48 bytes
+  (`KARYOS_IMAGE_CHANGE_SIZE_ENDS`) with `end_reason` (a `KARYOS_END_*`
+  code), `reserved`, `end_position` and `seal_code`, written by the
+  caller's size: a caller of the 24-byte struct gets what it got before.
+  The struct grew within the unreleased ABI 0.1.0, so the ABI version
+  stays 0.1.0, with no patch bump (BIND-Q8), as F9b and F9c did.
 - The conformance suite gains the `archive-replay` feature (B6-3; ADR-0073
   format 2): ops `archive.connect`, `archive.replay`,
   `archive.stop_replay`, `archive.close` and `replay.subscribe`, the
@@ -684,8 +709,9 @@ release may break APIs, wire formats and shared-memory layouts.
   subscription ended: `KARYOS_END_*`, with `END_OF_STREAM` for a replay
   that reached its end, `IMAGE_RETIRED` for one stopped,
   `STREAM_REMOVED`, `REVOKED`, `CLOSED_BY_OVERRUN`, and `OTHER` for any
-  other reason, a newer core's included, with the raw seal code. A network subscription reads `KARYOS_END_NONE`: its images'
-  ends come through its image changes.
+  other reason, a newer core's included, with the raw seal code. A
+  network subscription reads `KARYOS_END_NONE`: its images' ends come
+  through its image changes.
 - `karyos_client`: `From<ClientSubscription<T>> for Subscription<T>`, so a
   replay target granted by `Client::replay_targets` polls and is released
   (`Client::remove_subscription`) as any stream subscription.
@@ -2551,6 +2577,14 @@ release may break APIs, wire formats and shared-memory layouts.
   `abi.version` scenario no longer pins the patch. `karyos.h`'s Rules
   state the init rule for every later growth.
 
+- `karyos_driver_stop` and `karyos_driver_close` of a started driver
+  whose idle strategy is `KARYOS_IDLE_SLEEP` waited out the thread's idle
+  sleep, which is unbounded: with `sleep_ns` near `UINT64_MAX` they never
+  returned once the thread had gone idle. The Go binding's
+  `FuzzDurations` seed hung its Linux gate this way. The thread now parks
+  for its idle sleep, and a stop or a close unparks it after asking it to
+  stop, so neither waits on any idle strategy
+  (`no_idle_strategy_holds_a_stop_or_a_close`).
 - `a_call_on_a_busy_spinning_driver_waits_for_one_cycle` failed once at
   a load of 16 ("a call waited through 3 cycles"): a caller preempted
   between reading the thread's cycle count and announcing itself counted
