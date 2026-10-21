@@ -33,20 +33,26 @@ pub(super) fn require_netem() {
     );
 }
 
-/// The job's own check: datagrams over the shaped loopback are lost,
-/// reordered or duplicated, so the driver's tests here really run under
-/// faults.
-#[test]
-#[ignore = "runs under scripts/netem-test.sh"]
-fn netem_shapes_the_loopback() {
-    require_netem();
+/// What the shaped loopback did to a probe of datagrams.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Shaping {
+    pub(super) sent: u32,
+    pub(super) received: u32,
+    pub(super) lost: u32,
+    pub(super) duplicates: u32,
+    pub(super) reordered: u32,
+}
+
+/// Sends `sent` numbered datagrams over the loopback and counts what
+/// arrives: lost, duplicated and reordered under the netem profile in
+/// place.
+pub(super) fn probe_loopback(sent: u32) -> Shaping {
     let receiver = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
     receiver
         .set_read_timeout(Some(Duration::from_millis(5)))
         .unwrap();
     let sender = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
     let to = receiver.local_addr().unwrap();
-    let sent = 2000u32;
     let mut seen = BTreeSet::new();
     let (mut received, mut duplicates, mut reordered, mut last) = (0u32, 0u32, 0u32, None);
     let mut buffer = [0u8; 16];
@@ -81,6 +87,29 @@ fn netem_shapes_the_loopback() {
         count(u32::from_le_bytes(buffer[..len.min(4)].try_into().unwrap()));
     }
     let lost = sent - u32::try_from(seen.len()).unwrap();
+    Shaping {
+        sent,
+        received,
+        lost,
+        duplicates,
+        reordered,
+    }
+}
+
+/// The job's own check: datagrams over the shaped loopback are lost,
+/// reordered or duplicated, so the driver's tests here really run under
+/// faults.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn netem_shapes_the_loopback() {
+    require_netem();
+    let Shaping {
+        sent,
+        received,
+        lost,
+        duplicates,
+        reordered,
+    } = probe_loopback(2000);
     println!(
         "netem: sent {sent}, received {received}, lost {lost}, duplicated {duplicates}, reordered {reordered}"
     );

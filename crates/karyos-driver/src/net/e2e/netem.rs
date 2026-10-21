@@ -144,13 +144,17 @@ fn n1_an_unreliable_channel_reports_every_loss_as_a_gap() {
 /// Two drivers and a reliable channel: every one of `count` messages
 /// reaches a required subscriber exactly once and in order (`exchange`
 /// asserts it), with no loss reported on the lane. Prints what the faults
-/// cost.
-fn reliable_delivery(label: &str, count: u32) {
-    reliable_delivery_in(label, ThreadingMode::Shared, count);
+/// cost. Returns the two drivers, sender first.
+fn reliable_delivery(label: &str, count: u32) -> (EmbeddedDriver, EmbeddedDriver) {
+    reliable_delivery_in(label, ThreadingMode::Shared, count)
 }
 
 /// [`reliable_delivery`] with both drivers in `threading`.
-fn reliable_delivery_in(label: &str, threading: ThreadingMode, count: u32) {
+fn reliable_delivery_in(
+    label: &str,
+    threading: ThreadingMode,
+    count: u32,
+) -> (EmbeddedDriver, EmbeddedDriver) {
     let (mut a, mut b) = (driver(threading), driver(threading));
     let (publication, image) = connected(&mut a, &mut b, true, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
@@ -162,6 +166,7 @@ fn reliable_delivery_in(label: &str, threading: ThreadingMode, count: u32) {
     println!("{label}: {count} delivered in order exactly once");
     println!("{label} sender side: {}", counters(&a));
     println!("{label} receiver side: {}", counters(&b));
+    (a, b)
 }
 
 /// N2: over loss, reordering and duplication a reliable channel delivers
@@ -171,7 +176,10 @@ fn reliable_delivery_in(label: &str, threading: ThreadingMode, count: u32) {
 #[ignore = "runs under scripts/netem-test.sh"]
 fn n2_a_reliable_channel_delivers_exactly_once_in_order() {
     super::super::netem::require_netem();
-    reliable_delivery("N2", 2000);
+    let (a, b) = reliable_delivery("N2", 2000);
+    let (naks, repairs) = repair_work(&a, &b);
+    println!("N2: {naks} NAKs, {repairs} repairs");
+    assert!(naks > 0 && repairs > 0, "no repair: netem idle?");
 }
 
 /// The job's netem profile with `duplicate` raised for one test; the
@@ -223,13 +231,30 @@ fn tc(profile: &[String]) {
 }
 
 /// N3: N2 with 5% of the datagrams duplicated: repairs and duplicates
-/// together still deliver every message exactly once and in order.
+/// together still deliver every message exactly once and in order. A probe
+/// over the same profile shows that the path duplicates; the receiver
+/// dropped frames it had already committed or could not take, and the
+/// sender repaired.
 #[test]
 #[ignore = "runs under scripts/netem-test.sh"]
 fn n3_a_reliable_channel_survives_five_percent_duplicates() {
     super::super::netem::require_netem();
     let _profile = Profile::duplicate(5);
-    reliable_delivery("N3", 2000);
+    let shaping = super::super::netem::probe_loopback(2000);
+    println!("N3 probe: {shaping:?}");
+    assert!(shaping.duplicates > 0, "the profile duplicated nothing");
+    let (a, b) = reliable_delivery("N3", 2000);
+    let (naks, repairs) = repair_work(&a, &b);
+    let dropped = b
+        .net
+        .as_ref()
+        .unwrap()
+        .receiver_counters()
+        .unwrap()
+        .data_dropped;
+    println!("N3: {naks} NAKs, {repairs} repairs, {dropped} DATA frames dropped");
+    assert!(naks > 0 && repairs > 0, "no repair: netem idle?");
+    assert!(dropped > 0, "no copy reached the receiver to be dropped");
 }
 
 /// The NAKs B's receiver sent and the repairs A's sender made, in Shared
@@ -248,7 +273,7 @@ fn repair_work(a: &EmbeddedDriver, b: &EmbeddedDriver) -> (u64, u64) {
 #[ignore = "runs under scripts/netem-test.sh"]
 fn n4_a_reliable_channel_in_dedicated_mode_delivers_exactly_once_in_order() {
     super::super::netem::require_netem();
-    reliable_delivery_in("N4", ThreadingMode::Dedicated, 2000);
+    let _ = reliable_delivery_in("N4", ThreadingMode::Dedicated, 2000);
 }
 
 /// N5 (T4): a reliable publication of two lanes under the job's faults:
