@@ -1,0 +1,12 @@
+# A driver that refuses the client's protocol version at admission
+# (SPEC.md §10.2, §13 "C ABI boundary"; FORMAT.md, Incompatible driver):
+# the connect answers incompatible_driver and binds no client.
+format 2
+id op.connect.refused
+abi 0.1
+covers "older protocol version refused at admission"
+since B1
+feature incompatible-driver
+
+op client.connect dir=$refusing_dir
+expect status=incompatible_driver

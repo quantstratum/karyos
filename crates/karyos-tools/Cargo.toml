@@ -30,6 +30,10 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 karyos-agent.workspace = true
 
+[features]
+# Test-kit binaries (`karyos-admission-stub`), never in the product build.
+test-hooks = []
+
 [[bin]]
 name = "karyosd"
 path = "src/bin/karyosd.rs"
@@ -53,6 +57,13 @@ path = "src/bin/karyos-errors.rs"
 [[bin]]
 name = "karyos-tools"
 path = "src/bin/karyos-tools.rs"
+
+# The conformance suite's incompatible driver (FORMAT.md, Incompatible
+# driver): a test-kit binary only.
+[[bin]]
+name = "karyos-admission-stub"
+path = "src/bin/karyos-admission-stub.rs"
+required-features = ["test-hooks"]
 
 # Not documented: its rustdoc output would collide with the karyos-trace
 # library's (target/doc/karyos_trace); its logic is documented in the

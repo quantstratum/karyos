@@ -208,6 +208,7 @@ offers. The features are:
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
+| `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded and plain streams (Remote driver, below; Linux only) |
 | `tai-clock` | `clock.now` of the TAI domain, which some platforms lack |
 
@@ -287,7 +288,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
 | `driver.subscribe_conflated` | `driver`, `stream_id` | `conflated` | `embedded-driver`, `conflation` |
 | `driver.close` | `driver` | none | `embedded-driver` |
-| `client.connect` | `driver` | `client` | |
+| `client.connect` | `driver`, or `dir`: an admission directory, a string (Incompatible driver) | `client` | |
 | `client.poll` | `client` | `served` | |
 | `client.close` | `client` | none | |
 | `publication.add` | `client`, `stream_id`, [`uri`, default `"karyos:ipc"`] | `publication` | |
@@ -440,6 +441,38 @@ provided client (`$remote_client` or `$archive_client`, one karyosd
 client) while it answers either, serving the client, and answers the
 first other status, or the last one at 10 s. A scenario does not retry
 offers itself.
+
+### Incompatible driver
+
+Feature `incompatible-driver`: SPEC.md §13's "older protocol version
+refused at admission", as the C ABI reports it. The runner provides two
+admission directories, each served by `karyos-admission-stub`, which
+answers every client's `Hello` with the admission codec of the pinned
+core and nothing else:
+
+- **`$refusing_dir`:** `Refused` with `INCOMPATIBLE_VERSION`.
+- **`$other_version_dir`:** `Admitted` at the protocol version after the
+  core's, `VERSION + 1`: a newer driver, which an older client meets.
+
+`client.connect dir=…` connects there with `karyos_client_connect` and
+answers `status=incompatible_driver` (`KARYOS_E_INCOMPATIBLE_DRIVER`),
+binding no client. The stub is
+`KARYOS_ADMISSION_STUB` when set, else `bin/karyos-admission-stub` of
+the conformance test kit, else one built with `cargo build --release
+--locked -p karyos-tools --features test-hooks --bin
+karyos-admission-stub` from the pinned core; it is a test-kit binary
+only, never in a product build. The runner starts one per directory,
+each in a directory of its own:
+
+```text
+karyos-admission-stub --dir <directory> --mode refuse
+karyos-admission-stub --dir <directory> --mode version
+```
+
+It waits until each directory's admission socket exists, and stops the
+stubs after the scenarios. Linux only, as the admission socket is; a
+runner elsewhere, or one without the provisioning, declares the feature
+absent.
 
 ### Bounds
 

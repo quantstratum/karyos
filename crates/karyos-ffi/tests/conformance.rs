@@ -50,13 +50,14 @@ fn suite_runs_on(library: [u32; 3]) -> bool {
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
 
 /// The features a format 2 scenario may need (FORMAT.md, Features).
-const FEATURES: [&str; 8] = [
+const FEATURES: [&str; 9] = [
     "archive-replay",
     "claim-retry",
     "concurrent-publication",
     "conflation",
     "embedded-driver",
     "guarded-publication",
+    "incompatible-driver",
     "remote-driver",
     "tai-clock",
 ];
@@ -154,7 +155,9 @@ const OPS: &[Op] = &[
         &["embedded-driver", "conflation"],
     ),
     op("driver.close", &["driver"], &[], &[], EMBEDDED),
-    op("client.connect", &["driver"], &[], &["client"], &[]),
+    // A provided driver's client, or one connected to `dir`'s admission
+    // socket (FORMAT.md, Incompatible driver).
+    op("client.connect", &[], &["driver", "dir"], &["client"], &[]),
     op("client.poll", &["client"], &[], &["served"], &[]),
     op("client.close", &["client"], &[], &[], &[]),
     op(
@@ -1420,6 +1423,8 @@ struct Runner {
     absent: BTreeSet<&'static str>,
     /// What it provides for `archive-replay`, when it offers it.
     archive: Option<archive_host::Provided>,
+    /// What it provides for `incompatible-driver`, when it offers it.
+    incompatible: Option<incompatible_host::Provided>,
 }
 
 impl Runner {
@@ -1445,6 +1450,7 @@ impl Runner {
             offered,
             absent,
             archive: None,
+            incompatible: None,
         }
     }
 
@@ -1452,9 +1458,14 @@ impl Runner {
     /// where the library has none (Linux only).
     fn reference() -> Self {
         let absent: &[&'static str] = if cfg!(target_os = "linux") {
-            &["archive-replay", "remote-driver"]
+            &["archive-replay", "incompatible-driver", "remote-driver"]
         } else {
-            &["archive-replay", "remote-driver", "tai-clock"]
+            &[
+                "archive-replay",
+                "incompatible-driver",
+                "remote-driver",
+                "tai-clock",
+            ]
         };
         let offered: Vec<&'static str> = FEATURES
             .into_iter()
@@ -1475,6 +1486,11 @@ impl Runner {
                 runner.offered.insert(feature);
             }
             runner.archive = Some(provided);
+        }
+        if let Some(provided) = incompatible_host::provide() {
+            runner.absent.remove("incompatible-driver");
+            runner.offered.insert("incompatible-driver");
+            runner.incompatible = Some(provided);
         }
         runner
     }
@@ -1564,6 +1580,20 @@ fn run(
         variables.insert(
             "remote_client".to_owned(),
             adapter.provided_client(provided.client),
+        );
+    }
+    if scenario.features.contains("incompatible-driver") {
+        let provided = runner
+            .incompatible
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: incompatible-driver offered with nothing provided"));
+        variables.insert(
+            "refusing_dir".to_owned(),
+            Value::Text(provided.refusing.clone()),
+        );
+        variables.insert(
+            "other_version_dir".to_owned(),
+            Value::Text(provided.other_version.clone()),
         );
     }
     if scenario.features.contains("archive-replay") {
@@ -1854,7 +1884,13 @@ fn every_scenario_passes_at_the_library_abi_version() {
             Outcome::Passed => {}
             // Off Linux, the TAI clock and the Archive replays are absent.
             Outcome::Unsupported(feature)
-                if ["tai-clock", "archive-replay", "remote-driver"].contains(&feature.as_str())
+                if [
+                    "tai-clock",
+                    "archive-replay",
+                    "incompatible-driver",
+                    "remote-driver",
+                ]
+                .contains(&feature.as_str())
                     && !cfg!(target_os = "linux") => {}
             other => panic!("{}: {other}", scenario.id),
         }
@@ -2242,6 +2278,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
             "concurrent-publication",
             "conflation",
             "guarded-publication",
+            "incompatible-driver",
             "remote-driver",
             "tai-clock",
         ],
@@ -2249,7 +2286,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert_eq!(
         b1.declaration(),
         "step B1 offers embedded-driver absent archive-replay claim-retry concurrent-publication \
-         conflation guarded-publication remote-driver tai-clock"
+         conflation guarded-publication incompatible-driver remote-driver tai-clock"
     );
     assert_eq!(
         run(&scenario((0, 1), Some(3), None), (0, 1), &b1),
@@ -2336,6 +2373,131 @@ fn the_sized_struct_checks_see_writes() {
     // One byte past the 0.1.0 struct.
     accepted.poke(size_of::<abi::Accepted>(), 0);
     assert!(!accepted.tail_intact());
+}
+
+/// What a runner offering `incompatible-driver` provides (FORMAT.md,
+/// Incompatible driver): two `karyos-admission-stub`s, one refusing every
+/// client's version and one admitting it at `VERSION + 1`, and their
+/// admission directories. Linux only, as the admission socket is.
+mod incompatible_host {
+    /// The two directories; dropping it stops both stubs.
+    pub(crate) struct Provided {
+        pub(crate) refusing: String,
+        pub(crate) other_version: String,
+        #[cfg(target_os = "linux")]
+        _stubs: [linux::Stub; 2],
+    }
+
+    /// The provisioning, or `None` where `incompatible-driver` is absent.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn provide() -> Option<Provided> {
+        None
+    }
+
+    /// The provisioning; a stub that does not start fails the run.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn provide() -> Option<Provided> {
+        let root = std::env::temp_dir().join(format!(
+            "karyos-conformance-incompatible-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // Each stub creates its own private directory inside.
+        std::fs::create_dir_all(&root).unwrap();
+        let refusing = linux::Stub::start(&root, "refuse");
+        let other_version = linux::Stub::start(&root, "version");
+        Some(Provided {
+            refusing: refusing.dir(),
+            other_version: other_version.dir(),
+            _stubs: [refusing, other_version],
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        /// A running stub: killed and waited for when dropped.
+        pub(crate) struct Stub {
+            child: Child,
+            dir: PathBuf,
+        }
+
+        /// The stub binary: `KARYOS_ADMISSION_STUB`, else the one this
+        /// workspace built beside the test, else built now with cargo in
+        /// the test's own profile, with the `test-hooks` feature it needs.
+        fn binary() -> PathBuf {
+            if let Ok(path) = std::env::var("KARYOS_ADMISSION_STUB") {
+                return PathBuf::from(path);
+            }
+            let exe = std::env::current_exe().unwrap();
+            let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
+            let built = profile.join("karyos-admission-stub");
+            if !built.exists() {
+                // Cargo names the dev profile's directory `debug`.
+                let name = match profile.file_name().and_then(|name| name.to_str()) {
+                    Some("debug") | None => "dev",
+                    Some(name) => name,
+                };
+                let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+                let status = Command::new(cargo)
+                    .args([
+                        "build",
+                        "--locked",
+                        "-p",
+                        "karyos-tools",
+                        "--features",
+                        "test-hooks",
+                        "--bin",
+                        "karyos-admission-stub",
+                        "--profile",
+                        name,
+                    ])
+                    .env("CARGO_TARGET_DIR", profile.parent().unwrap())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "karyos-admission-stub did not build");
+            }
+            built
+        }
+
+        impl Stub {
+            pub(crate) fn start(root: &Path, mode: &str) -> Self {
+                let dir = root.join(mode);
+                let child = Command::new(binary())
+                    .arg("--dir")
+                    .arg(&dir)
+                    .args(["--mode", mode])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap();
+                // Listening once its socket exists.
+                let start = Instant::now();
+                while !dir.join(karyos_sys::ipc::SOCKET_NAME).exists() {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(10),
+                        "karyos-admission-stub --mode {mode} did not listen"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Self { child, dir }
+            }
+
+            pub(crate) fn dir(&self) -> String {
+                self.dir.to_str().unwrap().to_owned()
+            }
+        }
+
+        impl Drop for Stub {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
 }
 
 /// What a runner offering `archive-replay` provides (FORMAT.md, Archive

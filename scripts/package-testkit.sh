@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Builds the conformance test kit beside a libkaryos package
 # (scripts/package-libkaryos.sh): the driver daemon the suite's
-# `archive-replay` scenarios start (conformance/FORMAT.md), from the same
-# core commit as the package, so a binding's runner needs no Rust
+# `archive-replay` scenarios start, and the admission stub its
+# `incompatible-driver` scenarios start (conformance/FORMAT.md), from the
+# same core commit as the package, so a binding's runner needs no Rust
 # toolchain. Not part of the release package, whose contents are owner
 # item 44's: a separate directory, DEST-testkit,
 #
 #   bin/karyosd
-#   share/karyos-testkit/MANIFEST   (role, commit, the binary's SHA-256)
+#   bin/karyos-admission-stub       (built with karyos-tools' test-hooks)
+#   share/karyos-testkit/MANIFEST   (role, commit, the binaries' SHA-256)
 #
 # The kit refuses a package of another commit or tree state, and builds
 # for the host only. It is not rebuilt with its package: a later
@@ -63,17 +65,24 @@ cd "$root"
 binary="$target_dir/release/karyosd"
 [ -x "$binary" ] || fail "cargo built no $binary"
 "$binary" --help >/dev/null || fail "$binary --help failed"
+# A test-kit binary only: the product karyosd never carries a test path.
+"$cargo" build -p karyos-tools --features test-hooks --bin karyos-admission-stub --release --locked
+stub="$target_dir/release/karyos-admission-stub"
+[ -x "$stub" ] || fail "cargo built no $stub"
 
 stage="$dest.partial.$$"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/bin" "$stage/share/karyos-testkit"
 cp "$binary" "$stage/bin/karyosd"
+cp "$stub" "$stage/bin/karyos-admission-stub"
 sha="$(sha256sum "$stage/bin/karyosd" | cut -d ' ' -f 1)"
+stub_sha="$(sha256sum "$stage/bin/karyos-admission-stub" | cut -d ' ' -f 1)"
 cat >"$stage/share/karyos-testkit/MANIFEST" <<EOF
 role=conformance test kit, not for release
 core_commit=$commit
 core_dirty=$dirty
 karyosd_sha256=$sha
+admission_stub_sha256=$stub_sha
 target=$(rustc -vV | sed -n 's/^host: //p')
 rustc=$(rustc -V)
 profile=release
@@ -81,4 +90,4 @@ EOF
 
 rm -rf "$dest"
 mv "$stage" "$dest"
-echo "test kit for core $commit in $dest: bin/karyosd (sha256 $sha)"
+echo "test kit for core $commit in $dest: bin/karyosd (sha256 $sha), bin/karyos-admission-stub (sha256 $stub_sha)"
