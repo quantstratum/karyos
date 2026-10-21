@@ -109,6 +109,12 @@ release may break APIs, wire formats and shared-memory layouts.
   `bound_address() -> Option<SocketAddr>` (`None` for a stream
   subscription). Port 0 stays refused in every channel URI; the C ABI is
   unchanged.
+- A network publication whose channel asks for `fc=max` or
+  `fc=tagged:<group>` is refused with `DriverError::UnsupportedChannel`
+  (a client's add by URI: `ErrorCode::UnsupportedChannel`), instead of
+  running `min` silently (owner item 7): the driver parsed the key but
+  never wired it to the sender's membership. `fc=min`, what every
+  publication runs, is taken.
 
 - The channel URI enums (`ChannelError`, `Interface`, `Trace`,
   `FlowControl`, `Security`, `ControlMode`, `Destination`, `Media`) and

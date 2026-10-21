@@ -234,7 +234,9 @@ pub struct UdpConfig {
     pub paths: Vec<Interface>,
     /// `false` for gap-tolerant delivery without NAKs.
     pub reliable: bool,
-    /// Flow control; multicast and multi-destination only.
+    /// Flow control; multicast and multi-destination only. A driver runs
+    /// `min` on every publication and refuses `max` and `tagged` on one
+    /// (`UnsupportedChannel`, owner item 7) until they are wired.
     pub flow_control: Option<FlowControl>,
     /// The protection class.
     pub security: Security,

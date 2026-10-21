@@ -190,6 +190,31 @@ fn unsupported_channels_are_refused_before_any_stream() {
         driver.add_network_publication(aggregate(10, 1), &named),
         Err(DriverError::UnsupportedChannel)
     );
+    // Owner item 7: flow control other than `min` is not wired to the
+    // sender's membership, so `max` and `tagged` are refused rather than
+    // run as `min`; `min` is taken.
+    let group = Destination::Multicast {
+        group: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 9)), 40_001),
+        ttl: None,
+    };
+    for fc in [
+        karyos_protocol::channel::FlowControl::Max,
+        karyos_protocol::channel::FlowControl::Tagged(7),
+    ] {
+        let mut flow = channel(group.clone());
+        flow.flow_control = Some(fc);
+        assert_eq!(
+            driver.add_network_publication(aggregate(10, 1), &flow),
+            Err(DriverError::UnsupportedChannel),
+            "{fc:?}"
+        );
+    }
+    let mut min = channel(Destination::Unicast(SocketAddr::new(LOOPBACK, 40_000)));
+    min.flow_control = Some(karyos_protocol::channel::FlowControl::Min);
+    let taken = driver
+        .add_network_publication(aggregate(11, 1), &min)
+        .unwrap();
+    driver.remove_aggregate(&taken).unwrap();
     // Nothing was configured: the stream key is still free.
     assert!(driver.add_aggregate(aggregate(10, 1)).is_ok());
     let mut plain = EmbeddedDriver::new().unwrap();
