@@ -46,6 +46,15 @@ release may break APIs, wire formats and shared-memory layouts.
   publishes `"r5"` to `"r9"`. Record times are per recorder duty, so a
   duty that copied all ten messages stamped them alike, and
   `op.replay.stopped`'s 1 ppm replay could end before its stop.
+- `make lint-sync` runs shellcheck over `scripts/*.sh` where shellcheck
+  is installed (and says so where it is not), so the scripts stay clean.
+  The three findings on main are deliberate and now carry their reason as
+  a directive: perl's `$ARGV` inside a single-quoted program
+  (`check-lint-sync.sh`), a function only the trap calls
+  (`sim-arch-compare.sh`, SC2329 and, before shellcheck 0.11, SC2317),
+  and Markdown code spans in the report's `printf` formats
+  (`unsafe-report.sh`). `package-libkaryos.sh`'s version check is an `if`,
+  which shellcheck 0.9 (Debian bookworm, Ubuntu 24.04) also accepts.
 
 - `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
   `karyos_detail`, `karyos_accepted` and the image change do: it wrote
