@@ -1353,10 +1353,6 @@ impl<T: StreamTerms> Network<T> {
     /// Makes the sender drop every NAK unread (`true`) or read them again
     /// (`false`) (tests, Shared mode only).
     #[cfg(test)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "used by the Linux multicast test (T9)")
-    )]
     pub(crate) fn sender_ignores_naks(&mut self, ignore: bool) {
         if let Agents::Shared(agents) = &mut self.agents {
             if ignore {
