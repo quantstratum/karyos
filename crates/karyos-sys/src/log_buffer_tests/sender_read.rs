@@ -2368,3 +2368,45 @@ fn a_silent_senders_hold_keeps_the_floor() {
     assert_eq!(conductor.floor(), sent - 4 * 1024);
     assert_eq!(conductor.limit(), sent + u64::from(MIN_TERM_LENGTH / 2));
 }
+
+/// A hold admitted after the publisher moved past the reader's join is
+/// lowered to its registered position when the reader takes it, so the
+/// order `hold <= restart <= registered` holds by construction (DESIGN's
+/// P3 on karyos#594); dropping the reader frees the hold's cell, and the
+/// floor rises past where the hold kept it.
+#[test]
+fn a_late_hold_starts_at_the_registered_position_and_its_drop_lets_the_floor_rise() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..4 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    // Admitted at the head, above the reader's registered position, 0.
+    let hold = conductor.admit_hold(2).unwrap();
+    let cell = hold.cell;
+    reader.with_hold(hold).unwrap();
+    assert_eq!(reader.hold_position(), Some(0));
+    assert_eq!(reader.restart_position(), 0);
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    assert_eq!(reader.sent_position(), 4 * 1024);
+    assert_eq!(reader.hold_at(1024), Some(1024));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.floor(), 1024);
+    drop(reader);
+    assert_eq!(
+        buffer.cell(cell).unwrap().state.load(Ordering::Acquire),
+        participant::CELL_FREE
+    );
+    // With no reader left the floor follows the head a window behind
+    // (SPEC.md §4): past the freed hold once the head is a window on.
+    for _ in 0..48 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    assert!(conductor.floor() > 1024, "floor {}", conductor.floor());
+}

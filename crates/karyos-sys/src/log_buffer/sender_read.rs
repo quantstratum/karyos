@@ -614,6 +614,17 @@ impl<O: BufferOwner> SenderRead<O> {
                 reason: "a retention hold of this buffer's conductor, one per sender reader",
             });
         }
+        // Admitted at the head, which is at or above this reader's join: not
+        // past its registered position, so `hold <= restart <= registered`
+        // holds by construction, whatever was published in between. Lowering
+        // it is safe: the floor never decreases, and the registered position
+        // holds the floor at or below it already.
+        if let Ok(cell) = self.subscription.buffer.cell(hold.cell) {
+            let registered = self.subscription.cursor.acknowledged;
+            if cell.position.load(Ordering::Relaxed) > registered {
+                cell.position.store(registered, Ordering::Release);
+            }
+        }
         self.hold = Some(hold);
         Ok(())
     }
