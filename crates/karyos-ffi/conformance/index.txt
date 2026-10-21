@@ -15,8 +15,8 @@ kept fragment pointer never refers to a shared mapping: pending a runner that ca
 panic poisons the handle and does not unwind: pending a fault hook, since no call can make libkaryos panic and the ABI exports none (DESIGN); the Rust tests of boundary.rs, the handle tables' poison and api/driver cover it
 older minor ABI client against a newer library: pending the ABI manifest test of the first released header
 # Not a §13 row of its own: the size rule of SPEC.md §10.2 that both halves
-# of minor compatibility rest on. karyos_accepted's sizes follow F4: an
-# accepted offer needs a subscriber.
+# of minor compatibility rest on. karyos_accepted's sizes need an
+# accepted offer: a subscriber, on a stream without allow_unconnected.
 struct sizes of another minor version: struct.size.driver.options struct.size.stream.options struct.size.client.options struct.size.detail struct.reserved.driver.options struct.size.subscription.options struct.size.offer.options
 # Not §13 rows of their own: the claim semantics every binding shares
 # (BIND-S3 in quantstratum-docs: reviews/2026-10-20-product-open-questions.md)

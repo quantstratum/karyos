@@ -445,7 +445,12 @@ typedef struct karyos_stream_options {
     uint32_t lane;
     /* KARYOS_PUBLICATION_*. */
     uint32_t publication_mode;
-    /* Offers allowed with no subscriber attached: 0 or 1. */
+    /*
+     * Offers allowed with no subscriber attached: 0 or 1. It applies to
+     * every publication of the stream, exclusive or concurrent; an
+     * in-process client honours it, a remote (karyosd) client does not
+     * yet.
+     */
     uint32_t allow_unconnected;
     /* Entries of the stream's schedule ring: 0 for none, or a power of
        two up to 1 << 20 on an exclusive stream. */
@@ -476,11 +481,10 @@ typedef struct karyos_stream_options {
      * reader: raise spare_slots for a concurrent stream that also has
      * optional readers, such as an Archive's request stream. A concurrent
      * handle's offer needs a connected subscriber (KARYOS_E_NOT_CONNECTED
-     * otherwise): allow_unconnected applies to exclusive publications
-     * only. Each handle reserves with
-     * one atomic fetch_add: on an aarch64 CPU without LSE atomics, as
-     * detected at run time (not the build's target features), the driver
-     * refuses a concurrent stream, its default.
+     * otherwise) unless the stream allows unconnected offers. Each handle
+     * reserves with one atomic fetch_add: on an aarch64 CPU without LSE
+     * atomics, as detected at run time (not the build's target features),
+     * the driver refuses a concurrent stream, its default.
      */
     uint32_t publishers;
     /* Zero. */

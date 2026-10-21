@@ -1447,7 +1447,11 @@ fn a_publication_holds_every_lane_of_its_aggregate() {
     use karyos_sys::frame::Lane;
 
     let mut driver = EmbeddedDriver::new().unwrap();
-    let aggregate = driver.add_aggregate(heap_aggregate(2, 2)).unwrap();
+    // Not allow_unconnected: a client's publication takes the stream's
+    // policy, and lane 1 must report that it has no subscriber.
+    let mut config = heap_aggregate(2, 2);
+    config.stream.allow_unconnected = false;
+    let aggregate = driver.add_aggregate(config).unwrap();
     let mut client = Client::with_conductor(driver.connect().unwrap(), context());
     let publication = serve(&mut driver, || {
         // A subscriber on lane 0 only.
