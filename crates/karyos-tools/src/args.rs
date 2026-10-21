@@ -83,6 +83,15 @@ Streams:
                                     configure a stream at start; allow-unconnected lets
                                     its publications, a remote client's included, offer
                                     with no subscriber attached; repeatable
+  --conflation <stream_id>:<session_id>:<keys>:<value_capacity>:<journal_capacity>
+                                    a conflation table on a configured stream: an
+                                    offer's reserved value is its key, below keys;
+                                    the capacities are sizes; repeatable
+  --guard <name>:<stream_id>:<session_id>:<messages>
+                                    guard a configured stream with guard name (one
+                                    guard however many streams name it), its outcome
+                                    records holding messages; the guard stays open;
+                                    repeatable
   --term-length <size>              term length of every stream [1m]
   --mtu <n>                         frame bytes per fragment [1408]
   --max-reserved <size>             bytes one message may reserve [term length / 8]
@@ -188,6 +197,38 @@ pub struct StreamOption {
     pub allow_unconnected: bool,
 }
 
+/// A configured stream's conflation table (`--conflation`), fed by its
+/// publication: an offer's reserved value is its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflationOption {
+    /// The stream's wire stream id.
+    pub stream_id: i32,
+    /// Its session alias.
+    pub session_id: i32,
+    /// Dense keys, `0..keys`.
+    pub keys: u32,
+    /// The largest value, in bytes.
+    pub value_capacity: u64,
+    /// The update journal's capacity, in bytes.
+    pub journal_capacity: u64,
+}
+
+/// A configured stream guarded at start (`--guard`): its publication's
+/// messages go through guard `name`'s gate and outcome records. The guard
+/// opens at start; closing it is an operator action outside the daemon
+/// (owner item 59).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardOption {
+    /// The guard's name, created once however many streams name it.
+    pub name: String,
+    /// The stream's wire stream id.
+    pub stream_id: i32,
+    /// Its session alias.
+    pub session_id: i32,
+    /// Messages the guard's outcome records hold open at once.
+    pub messages: u64,
+}
+
 /// A recording the daemon starts at boot (`--record`), through the
 /// Archive's control path like any requester's `StartRecording`
 /// (`quantstratum-docs: karyos/design/archive-host.md`, H3).
@@ -247,6 +288,10 @@ pub struct Options {
     pub terms: TermOptions,
     /// The streams configured at start, in command-line order.
     pub streams: Vec<StreamOption>,
+    /// The conflation tables of configured streams (`--conflation`).
+    pub conflations: Vec<ConflationOption>,
+    /// The guarded configured streams (`--guard`).
+    pub guards: Vec<GuardOption>,
     /// How long the shutdown waits for clients to leave.
     pub shutdown_linger: Duration,
     /// The control-path log verbosity.
@@ -282,6 +327,8 @@ impl Options {
                 claim_deadline: DEFAULT_CLAIM_DEADLINE,
             },
             streams: Vec::new(),
+            conflations: Vec::new(),
+            guards: Vec::new(),
             shutdown_linger: DEFAULT_SHUTDOWN_LINGER,
             log_level: LogLevel::Info,
             archive: None,
@@ -387,6 +434,7 @@ where
         })?;
     }
     options.admission.dir = dir.ok_or(ArgsError::Missing("--dir"))?;
+    configured(&options)?;
     options.archive = archive.finish()?;
     Ok(Command::Run(Box::new(options)))
 }
@@ -429,6 +477,8 @@ const OPTIONS: &[&str] = &[
     "--log-level",
     "--network",
     "--stream",
+    "--conflation",
+    "--guard",
     "--term-length",
     "--mtu",
     "--max-reserved",
@@ -496,6 +546,8 @@ fn apply(options: &mut Options, option: &str, value: &str) -> Option<()> {
             };
         }
         "--stream" => options.streams.push(stream(value)?),
+        "--conflation" => options.conflations.push(conflation(value)?),
+        "--guard" => options.guards.push(guard(value)?),
         "--term-length" => terms.term_length = u32::try_from(size(value)?).ok()?,
         "--mtu" => terms.mtu = value.parse().ok()?,
         "--max-reserved" => terms.max_reserved = Some(u32::try_from(size(value)?).ok()?),
@@ -613,6 +665,74 @@ where
         interval,
         flag: flagged,
     }))
+}
+
+/// `<stream_id>:<session_id>:<keys>:<value_capacity>:<journal_capacity>`,
+/// the capacities sizes; none of the three is 0.
+fn conflation(value: &str) -> Option<ConflationOption> {
+    let mut parts = value.split(':');
+    let option = ConflationOption {
+        stream_id: parts.next()?.parse().ok()?,
+        session_id: parts.next()?.parse().ok()?,
+        keys: parts.next()?.parse().ok().filter(|keys| *keys > 0)?,
+        value_capacity: size(parts.next()?).filter(|size| *size > 0)?,
+        journal_capacity: size(parts.next()?).filter(|size| *size > 0)?,
+    };
+    parts.next().is_none().then_some(option)
+}
+
+/// `<name>:<stream_id>:<session_id>:<messages>`, a nonempty name and a
+/// nonzero count.
+fn guard(value: &str) -> Option<GuardOption> {
+    let mut parts = value.split(':');
+    let option = GuardOption {
+        name: parts.next().filter(|name| !name.is_empty())?.to_owned(),
+        stream_id: parts.next()?.parse().ok()?,
+        session_id: parts.next()?.parse().ok()?,
+        messages: parts
+            .next()?
+            .parse()
+            .ok()
+            .filter(|messages| *messages > 0)?,
+    };
+    parts.next().is_none().then_some(option)
+}
+
+/// Each `--conflation` and `--guard` names a stream a `--stream`
+/// configures, and names it once.
+fn configured(options: &Options) -> Result<(), ArgsError> {
+    let streams: Vec<(i32, i32)> = options
+        .streams
+        .iter()
+        .map(|stream| (stream.stream_id, stream.session_id))
+        .collect();
+    let named = options
+        .conflations
+        .iter()
+        .map(|table| ("--conflation", (table.stream_id, table.session_id)))
+        .chain(
+            options
+                .guards
+                .iter()
+                .map(|guard| ("--guard", (guard.stream_id, guard.session_id))),
+        );
+    let mut seen: Vec<(&'static str, (i32, i32))> = Vec::new();
+    for (option, key) in named {
+        if !streams.contains(&key) {
+            return Err(ArgsError::Needs {
+                option,
+                needs: "a --stream of that stream and session",
+            });
+        }
+        if seen.contains(&(option, key)) {
+            return Err(ArgsError::InvalidValue {
+                option,
+                value: format!("{}:{} named twice", key.0, key.1),
+            });
+        }
+        seen.push((option, key));
+    }
+    Ok(())
 }
 
 /// A decimal count.
@@ -1068,6 +1188,87 @@ mod tests {
             .to_string(),
             "option --record needs --archive"
         );
+    }
+
+    /// `--conflation` and `--guard` parse into their configured stream's
+    /// table and guard, and are refused for a malformed value, a stream no
+    /// `--stream` configures, or a stream named twice.
+    #[test]
+    fn the_conflation_and_guard_options_parse_and_are_checked() {
+        let base = ["--dir", "d", "--stream", "10:1", "--stream", "11:1"];
+        let with = |extra: &[&str]| run(&[&base[..], extra].concat());
+        let parsed = options(
+            &[
+                &base[..],
+                &[
+                    "--conflation",
+                    "10:1:4:16:4k",
+                    "--guard=orders:10:1:4",
+                    "--guard",
+                    "orders:11:1:8",
+                ],
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            parsed.conflations,
+            [ConflationOption {
+                stream_id: 10,
+                session_id: 1,
+                keys: 4,
+                value_capacity: 16,
+                journal_capacity: 4096,
+            }]
+        );
+        assert_eq!(
+            parsed
+                .guards
+                .iter()
+                .map(|guard| (guard.name.as_str(), guard.stream_id, guard.messages))
+                .collect::<Vec<_>>(),
+            [("orders", 10, 4), ("orders", 11, 8)]
+        );
+        for (option, value) in [
+            ("--conflation", "10:1"),
+            ("--conflation", "10:1:0:16:4k"),
+            ("--conflation", "10:1:4:0:4k"),
+            ("--conflation", "10:1:4:16:0"),
+            ("--conflation", "10:1:4:16:4k:x"),
+            ("--guard", ":10:1:4"),
+            ("--guard", "orders:10:1:0"),
+            ("--guard", "orders:10:1"),
+            ("--guard", "orders:10:1:4:x"),
+        ] {
+            assert_eq!(
+                with(&[option, value]),
+                Err(ArgsError::InvalidValue {
+                    option,
+                    value: value.to_owned()
+                }),
+                "{option} {value}"
+            );
+        }
+        let unconfigured = Err(ArgsError::Needs {
+            option: "--guard",
+            needs: "a --stream of that stream and session",
+        });
+        assert_eq!(with(&["--guard", "orders:12:1:4"]), unconfigured);
+        assert_eq!(
+            with(&["--conflation", "10:2:4:16:4k"]),
+            Err(ArgsError::Needs {
+                option: "--conflation",
+                needs: "a --stream of that stream and session",
+            })
+        );
+        assert_eq!(
+            with(&["--guard", "a:10:1:4", "--guard", "b:10:1:4"]),
+            Err(ArgsError::InvalidValue {
+                option: "--guard",
+                value: "10:1 named twice".to_owned()
+            })
+        );
+        // A table and a guard may name the same stream.
+        assert!(with(&["--conflation", "10:1:4:16:4k", "--guard", "a:10:1:4"]).is_ok());
     }
 }
 

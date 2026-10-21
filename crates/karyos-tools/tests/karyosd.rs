@@ -134,6 +134,155 @@ fn publish_once(client: &mut RemoteClient) {
     drop(publication);
 }
 
+/// The next completion's outcome, within a bounded wait.
+fn completion(client: &mut RemoteClient) -> Outcome {
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(10), "no completion");
+        let mut outcome = None;
+        let _ = client.poll(usize::MAX, |completion| outcome = Some(completion.outcome));
+        if let Some(outcome) = outcome {
+            return outcome;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// `key`'s publication, taken through a grant with `allow_unconnected`.
+fn publication_of(
+    client: &mut RemoteClient,
+    key: StreamKey,
+) -> karyos_client::ClientPublication<karyos_sys::term_bytes::SharedTerms> {
+    let _ = client.add_publication(key, true).unwrap();
+    match completion(client) {
+        Outcome::Fetchable(grant) => client.take_publication(&grant).unwrap(),
+        other => panic!("expected a grant, got {other:?}"),
+    }
+}
+
+/// `--conflation` gives a configured stream its table: a remote view of it
+/// reads each key's latest value, an offer's reserved value its key, and a
+/// stream without one refuses the view.
+#[test]
+fn karyosd_conflation_gives_a_stream_its_table() {
+    use karyos_client::OfferOutcome;
+    use karyos_client::ipc::ConflatedLimits;
+    use karyos_sys::conflation::Budget;
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let dir = dir("conflation");
+    let table = StreamKey {
+        stream_id: 3,
+        session_id: 1,
+    };
+    let mut daemon = start_with(
+        &dir,
+        "5s",
+        &["--stream", "3:1", "--conflation", "3:1:4:16:4k"],
+    );
+    let mut client = attach_when_ready(&dir);
+    let _ = client.add_conflated_subscription(table).unwrap();
+    let Outcome::FetchableConflated(fetchable) = completion(&mut client) else {
+        panic!("no view of the conflated stream");
+    };
+    let mut view = client
+        .take_conflated(
+            &fetchable,
+            Budget {
+                keys: 16,
+                retries: 4,
+            },
+            ConflatedLimits::default(),
+        )
+        .unwrap();
+    let mut publication = publication_of(&mut client, table);
+    for (key, value) in [(1, b"a"), (1, b"b"), (2, b"c")] {
+        let options = AppendOptions {
+            reserved_value: key,
+            ..AppendOptions::default()
+        };
+        let start = Instant::now();
+        while !matches!(
+            publication.offer_with(value, options).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ) {
+            assert!(start.elapsed() < Duration::from_secs(10), "never accepted");
+            let _ = client.poll(usize::MAX, |_| {});
+        }
+    }
+    let mut latest: Vec<(u32, Vec<u8>)> = Vec::new();
+    let start = Instant::now();
+    while latest != [(1, b"b".to_vec()), (2, b"c".to_vec())] {
+        assert!(start.elapsed() < Duration::from_secs(10), "saw {latest:?}");
+        let _ = view.poll_changed(|key, value| {
+            latest.retain(|(seen, _)| *seen != key);
+            latest.push((key, value.payload().to_vec()));
+            latest.sort();
+        });
+        std::thread::yield_now();
+    }
+    // A stream with no table refuses the view.
+    let _ = client.add_conflated_subscription(KEY).unwrap();
+    assert!(
+        matches!(completion(&mut client), Outcome::Refused { .. }),
+        "a plain stream gave a view"
+    );
+    drop((view, publication, client));
+    daemon.terminate();
+    let status = daemon.wait(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--guard` guards a configured stream at start: a remote publication of
+/// it is granted with its guard's binding and reads a `Submitted` record
+/// per offer under the open guard, and a plain stream's has no binding.
+#[test]
+fn karyosd_guard_guards_a_stream() {
+    use karyos_client::OfferOutcome;
+    use karyos_sys::outcome_ring::Kind;
+
+    let dir = dir("guard");
+    let guarded = StreamKey {
+        stream_id: 4,
+        session_id: 1,
+    };
+    let mut daemon = start_with(&dir, "5s", &["--stream", "4:1", "--guard", "orders:4:1:4"]);
+    let mut client = attach_when_ready(&dir);
+    let mut publication = publication_of(&mut client, guarded);
+    assert!(publication.guard().is_some(), "no guard binding");
+    let mut accepted = Vec::new();
+    for value in [b"a", b"b"] {
+        match publication.offer(value).unwrap() {
+            OfferOutcome::Accepted { position, .. } => accepted.push(position),
+            other => panic!("not accepted: {other:?}"),
+        }
+    }
+    let mut records = Vec::new();
+    let start = Instant::now();
+    while records.len() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(10), "saw {records:?}");
+        let _ = publication
+            .poll_outcomes(64, |_, record| records.push(record))
+            .unwrap();
+        std::thread::yield_now();
+    }
+    for (record, position) in records.iter().zip(&accepted) {
+        assert_eq!(record.kind, Kind::Submitted);
+        assert_eq!(record.start, *position);
+    }
+    let plain = publication_of(&mut client, KEY);
+    assert!(
+        plain.guard().is_none(),
+        "a plain stream's publication guarded"
+    );
+    drop((publication, plain, client));
+    daemon.terminate();
+    let status = daemon.wait(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Takes `key`'s publication through a grant, its request without
 /// `allow_unconnected`, and offers once with no subscriber attached.
 fn offer_alone(client: &mut RemoteClient, key: StreamKey) -> karyos_client::OfferOutcome {
