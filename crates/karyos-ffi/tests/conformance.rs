@@ -50,13 +50,14 @@ fn suite_runs_on(library: [u32; 3]) -> bool {
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
 
 /// The features a format 2 scenario may need (FORMAT.md, Features).
-const FEATURES: [&str; 7] = [
+const FEATURES: [&str; 8] = [
     "archive-replay",
     "claim-retry",
     "concurrent-publication",
     "conflation",
     "embedded-driver",
     "guarded-publication",
+    "remote-driver",
     "tai-clock",
 ];
 
@@ -173,7 +174,7 @@ const OPS: &[Op] = &[
     op(
         "publication.offer",
         &["publication"],
-        MESSAGE,
+        &["lane", "payload", "length", "reserved_value"],
         ACCEPTED,
         &[],
     ),
@@ -196,7 +197,7 @@ const OPS: &[Op] = &[
     op(
         "publication.poll_outcomes",
         &["publication"],
-        &["lane", "limit"],
+        &["lane", "limit", "until"],
         &["delivered"],
         &["guarded-publication"],
     ),
@@ -226,7 +227,7 @@ const OPS: &[Op] = &[
     op(
         "conflated.poll",
         &["conflated"],
-        &["key_budget"],
+        &["key_budget", "until"],
         &["delivered"],
         &["conflation"],
     ),
@@ -1451,9 +1452,9 @@ impl Runner {
     /// where the library has none (Linux only).
     fn reference() -> Self {
         let absent: &[&'static str] = if cfg!(target_os = "linux") {
-            &["archive-replay"]
+            &["archive-replay", "remote-driver"]
         } else {
-            &["archive-replay", "tai-clock"]
+            &["archive-replay", "remote-driver", "tai-clock"]
         };
         let offered: Vec<&'static str> = FEATURES
             .into_iter()
@@ -1468,8 +1469,11 @@ impl Runner {
     fn reference_with_archive() -> Self {
         let mut runner = Self::reference();
         if let Some(provided) = archive_host::provide() {
-            runner.absent.remove("archive-replay");
-            runner.offered.insert("archive-replay");
+            // The same karyosd serves both (FORMAT.md, Remote driver).
+            for feature in ["archive-replay", "remote-driver"] {
+                runner.absent.remove(feature);
+                runner.offered.insert(feature);
+            }
             runner.archive = Some(provided);
         }
         runner
@@ -1551,6 +1555,16 @@ fn run(
         .is_some_and(|step| step.layer == Layer::Semantic);
     if semantic && !scenario.features.contains("embedded-driver") {
         variables.insert("driver".to_owned(), adapter.provided_driver());
+    }
+    if scenario.features.contains("remote-driver") {
+        let provided = runner
+            .archive
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: remote-driver offered with nothing provided"));
+        variables.insert(
+            "remote_client".to_owned(),
+            adapter.provided_client(provided.client),
+        );
     }
     if scenario.features.contains("archive-replay") {
         let provided = runner
@@ -1840,7 +1854,7 @@ fn every_scenario_passes_at_the_library_abi_version() {
             Outcome::Passed => {}
             // Off Linux, the TAI clock and the Archive replays are absent.
             Outcome::Unsupported(feature)
-                if ["tai-clock", "archive-replay"].contains(&feature.as_str())
+                if ["tai-clock", "archive-replay", "remote-driver"].contains(&feature.as_str())
                     && !cfg!(target_os = "linux") => {}
             other => panic!("{}: {other}", scenario.id),
         }
@@ -2228,13 +2242,14 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
             "concurrent-publication",
             "conflation",
             "guarded-publication",
+            "remote-driver",
             "tai-clock",
         ],
     );
     assert_eq!(
         b1.declaration(),
         "step B1 offers embedded-driver absent archive-replay claim-retry concurrent-publication \
-         conflation guarded-publication tai-clock"
+         conflation guarded-publication remote-driver tai-clock"
     );
     assert_eq!(
         run(&scenario((0, 1), Some(3), None), (0, 1), &b1),
@@ -2378,6 +2393,12 @@ mod archive_host {
         /// (FORMAT.md, Archive replays). The replay target's stream, 1041,
         /// is not configured: each replay opens its own target there.
         const RECORDED: i32 = 20;
+        /// The remote driver's conflated stream (FORMAT.md, Remote driver).
+        const CONFLATED: i32 = 22;
+        /// The remote driver's guarded stream.
+        const GUARDED: i32 = 23;
+        /// The remote driver's plain stream, neither conflated nor guarded.
+        const PLAIN: i32 = 24;
         const REQUESTS: i32 = 1030;
         const RESPONSES: i32 = 1031;
 
@@ -2445,6 +2466,13 @@ mod archive_host {
                     .arg("--dir")
                     .arg(&dir)
                     .args(["--stream", &format!("{RECORDED}:1")])
+                    // The remote driver's streams (FORMAT.md, Remote driver):
+                    // a conflated one and a guarded one.
+                    .args(["--stream", &format!("{CONFLATED}:1")])
+                    .args(["--conflation", &format!("{CONFLATED}:1:4:64:4k")])
+                    .args(["--stream", &format!("{GUARDED}:1:allow-unconnected")])
+                    .args(["--guard", &format!("orders:{GUARDED}:1:4")])
+                    .args(["--stream", &format!("{PLAIN}:1:allow-unconnected")])
                     .arg("--archive")
                     .arg(&archive)
                     .args(["--archive-control", &format!("{REQUESTS},{RESPONSES}")])
