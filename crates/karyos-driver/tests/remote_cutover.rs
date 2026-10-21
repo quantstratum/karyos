@@ -691,6 +691,86 @@ fn a_required_subscriber_fenced_while_stopped_does_not_hold_the_successor_back()
     drop(client);
 }
 
+/// SPEC.md §13 "Cutover with backlog" across processes (phase 1 plan
+/// item 5): two required remote subscribers lag behind a backlog when the
+/// mapping is sealed. One keeps polling: it drains the backlog to the seal
+/// and moves. The other stops (its client never polls again). The writer is
+/// accepted on the successor at the seal before the stopped subscriber's
+/// deadline passes, so the paused participant never delays the cutover; at
+/// the deadline the stopped one is fenced, and the draining one reads every
+/// backlog message, then the successor's, at the seal position.
+#[test]
+fn a_remote_backlog_drains_to_the_seal_and_a_stopped_subscriber_never_delays_the_cutover() {
+    const DEADLINE: Duration = Duration::from_secs(2);
+    let dir = dir("remote-backlog");
+    let mut driver = driver(&dir, u64::try_from(DEADLINE.as_nanos()).unwrap());
+    let stream = driver
+        .add_stream(stream_config(PublicationMode::Exclusive))
+        .unwrap();
+    let (client, mut draining) = subscriber_grant(&mut driver, &dir);
+    let (stopped_client, stopped) = subscriber_grant(&mut driver, &dir);
+    let mut publication = driver.publication(stream).unwrap();
+    let backlog: Vec<Vec<u8>> = (0..6u8).map(|index| vec![index; 100]).collect();
+    let mut positions = Vec::new();
+    for message in &backlog {
+        let OfferOutcome::Accepted { position, .. } = publication.offer(message).unwrap() else {
+            panic!("a backlog message was not accepted");
+        };
+        positions.push(position);
+    }
+    let sealed_at = Instant::now();
+    reconfigure(&mut driver, stream);
+    let mut client = client;
+    let (moved, seen) = serve_while(&mut driver, || {
+        // The writer moves to the successor and publishes there, the
+        // stopped subscriber having staged nothing.
+        let mut moved = None;
+        let mut seen: Vec<(u64, Vec<u8>)> = Vec::new();
+        let start = Instant::now();
+        while moved.is_none() || seen.last().is_none_or(|(_, bytes)| bytes != b"new") {
+            assert!(start.elapsed() < Duration::from_secs(10), "never moved");
+            let _ = client.poll(usize::MAX, |_| {});
+            if moved.is_none()
+                && let OfferOutcome::Accepted { position, .. } = publication.offer(b"new").unwrap()
+            {
+                moved = Some((position, sealed_at.elapsed()));
+            }
+            let _ = draining
+                .poll(
+                    |bytes, info| seen.push((info.position, bytes.to_vec())),
+                    MessageLimit::new(8),
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        (moved.unwrap(), seen)
+    });
+    let (at, after) = moved;
+    // An exclusive stream is sealed at the writer's next call after the
+    // reconfiguration.
+    let end = driver.generations(stream).unwrap()[0].seal.unwrap();
+    assert_eq!(
+        at, end,
+        "the writer's first successor message is at the seal"
+    );
+    assert!(
+        after < DEADLINE,
+        "the writer moved only after {after:?}, past the stopped subscriber's deadline"
+    );
+    // The stopped subscriber is fenced at its deadline.
+    serve_until(&mut driver, |driver| counter(driver, "grants fenced") == 1);
+    let mut expected: Vec<(u64, Vec<u8>)> = positions.into_iter().zip(backlog).collect();
+    expected.push((end, b"new".to_vec()));
+    assert_eq!(
+        seen, expected,
+        "the draining subscriber's backlog, then the successor"
+    );
+    drop(stopped);
+    drop(stopped_client);
+    drop(draining);
+    drop(client);
+}
+
 /// A moved handle's predecessor grant is detached late, by the control
 /// path's next poll: that `Detach` ends only the old generation's grant,
 /// and the handle keeps reading its successor afterwards.

@@ -263,6 +263,9 @@ fn claims_drain_by_commit_or_deadline_and_a_paused_handle_never_delays_the_cutov
             ConcurrentOfferOutcome::AdminAction
         );
     }
+    // The paused handle never delays the cutover: before its deadline
+    // passes, a responsive handle is accepted on the successor at the seal.
+    assert_eq!(concurrent_accepted(on_time.offer(b"new").unwrap()), end);
     let mut seen = Vec::new();
     let first = lagging
         .poll(
@@ -275,7 +278,6 @@ fn claims_drain_by_commit_or_deadline_and_a_paused_handle_never_delays_the_cutov
     clock.set(CLAIM_DEADLINE + DEADLINE - 30);
     let _ = driver.do_work().unwrap();
     assert_eq!(paused.offer(b"x").unwrap(), ConcurrentOfferOutcome::Closed);
-    assert_eq!(concurrent_accepted(on_time.offer(b"new").unwrap()), end);
     // The lagging reader drains the backlog, the commit, the abort, then
     // continues on the successor.
     let mut aborted = None;
@@ -420,6 +422,9 @@ fn a_paused_required_subscriber_is_fenced_and_a_draining_one_is_admitted() {
         writer.offer(b"x").unwrap(),
         ConcurrentOfferOutcome::AdminAction
     );
+    // The paused subscriber never delays the cutover: before its deadline
+    // passes, the writer is accepted on the successor at the seal.
+    assert_eq!(concurrent_accepted(writer.offer(b"new").unwrap()), end);
     // The draining subscriber reads one message per cycle; each read
     // renews its lease, across several deadlines.
     for step in 1..=6 {
@@ -433,9 +438,13 @@ fn a_paused_required_subscriber_is_fenced_and_a_draining_one_is_admitted() {
     let (seen, summary) = read(&mut paused);
     assert_eq!(seen.len(), 6);
     assert_eq!(summary.closed, Some(end));
-    assert_eq!(concurrent_accepted(writer.offer(b"new").unwrap()), end);
+    let after = concurrent_accepted(writer.offer(b"after").unwrap());
+    assert!(after > end);
     let (seen, summary) = read(&mut draining);
-    assert_eq!(seen, vec![(end, b"new".to_vec())]);
+    assert_eq!(
+        seen,
+        vec![(end, b"new".to_vec()), (after, b"after".to_vec())]
+    );
     assert_eq!(summary.closed, None);
 }
 
