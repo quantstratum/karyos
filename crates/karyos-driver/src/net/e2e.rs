@@ -2137,6 +2137,41 @@ fn optional_receiver_closes(
             std::thread::sleep(Duration::from_micros(100));
         }
         assert!(a.net.as_ref().unwrap().reopened() >= 1, "reset");
+        // The reset resends up to `retransmit_window` at once. Let it
+        // drain before going on: a datagram B is later told to lose must
+        // be new data, not one of these copies, which B drops as
+        // duplicates (karyos#603). Drained once B's DATA frames, committed
+        // or dropped, stop arriving (heartbeats are counted apart).
+        let data_frames = |b: &EmbeddedDriver| {
+            let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+            receiver
+                .data_committed
+                .checked_add(receiver.data_dropped)
+                .unwrap()
+        };
+        let (mut last, mut quiet) = (data_frames(&b), 0u32);
+        for _ in 0..40_000 {
+            offer_and_read(
+                [&mut a, &mut b],
+                &mut lane,
+                &mut reader,
+                (&mut sent, &mut seen),
+                total,
+            );
+            let _ = c.do_work().unwrap();
+            let now = data_frames(&b);
+            quiet = if now == last {
+                quiet.checked_add(1).unwrap()
+            } else {
+                0
+            };
+            last = now;
+            if quiet >= 200 {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        assert!(quiet >= 200, "the reset's resend never drained");
     }
     // NAKs flow again: C's hole is below the floor.
     a.net.as_mut().unwrap().sender_ignores_naks(false);
