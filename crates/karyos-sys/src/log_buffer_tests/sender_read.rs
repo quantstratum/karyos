@@ -2209,3 +2209,128 @@ fn a_retention_hold_at_half_a_term_keeps_the_live_range_within_a_term() {
     }
     assert!(reader.sent_position() >= 3 * u64::from(MIN_TERM_LENGTH));
 }
+
+/// The restart position (docs#336, (a')): the hold raises it to a block
+/// start at or above the hold; the receivers' consumption moves it to the
+/// highest kept boundary at or below that consumption, never past the
+/// registered position and never back; and a rewind reads from it, strictly
+/// between the hold and the registered position.
+#[test]
+fn a_restart_sits_between_the_hold_and_the_registered_position_and_a_rewind_reads_from_it() {
+    // Two readers, each with its hold.
+    let buffer = new_buffer(config(4, 4)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    reader.with_hold(conductor.admit_hold(2).unwrap()).unwrap();
+    let mut between = sr_reader_with_hold(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..8 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    assert_eq!(reader.sent_position(), 8 * 1024);
+    // A hold keeps the boundaries above the restart: it starts at the join.
+    assert_eq!(reader.restart_position(), 0);
+    assert_eq!(reader.hold_at(1024), Some(1024));
+    assert_eq!(reader.restart_position(), 1024);
+    assert_eq!(reader.restart_at(5 * 1024), 5 * 1024);
+    // Never back, never past the registered position.
+    assert_eq!(reader.restart_at(2 * 1024), 5 * 1024);
+    assert_eq!(reader.restart_at(64 * 1024), 8 * 1024);
+    assert_eq!(reader.counters().restart_raised, 0);
+    // Strictly between: rewind there and read the sixth frame again.
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut between, &mut out) {}
+    sr_sent(&mut between);
+    let _ = between.hold_at(1024);
+    assert_eq!(between.restart_at(5 * 1024), 5 * 1024);
+    between.rewind().unwrap();
+    assert_eq!(between.position(), 5 * 1024);
+    assert!(matches!(
+        sr_read(&mut between, &mut out),
+        Ok(ReadOutcome::Copied { next, .. }) if next == 6 * 1024
+    ));
+    // The registered position is unchanged, and never moves back.
+    assert_eq!(between.sent_position(), 8 * 1024);
+    assert_eq!(between.sent(5 * 1024), Err(ReadError::Invariant));
+}
+
+/// A second reserved required reader of `conductor`'s buffer (occupant
+/// 3), as [`sr_reader`], with its own retention hold (occupant 4).
+fn sr_reader_with_hold<'a>(
+    conductor: &mut Conductor<&'a LogBuffer<Terms>>,
+) -> SenderRead<&'a LogBuffer<Terms>> {
+    let mut reader = SenderRead::new(
+        conductor.subscribe_as(Role::Required, true, 3).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+    )
+    .unwrap();
+    reader.with_hold(conductor.admit_hold(4).unwrap()).unwrap();
+    reader
+}
+
+/// Without a hold, the restart is the registered position: a rewind reads
+/// from there, as before docs#336, and the consumption moves nothing.
+#[test]
+fn without_a_hold_the_restart_is_the_registered_position() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..4 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    assert_eq!(reader.restart_position(), 4 * 1024);
+    assert_eq!(reader.restart_at(1024), 4 * 1024);
+    reader.rewind().unwrap();
+    assert_eq!(reader.position(), 4 * 1024);
+}
+
+/// A full boundary ring, thinned, may keep no boundary at the hold: the
+/// restart then rises to the oldest kept boundary above it, counted, and
+/// what lies between stays retained for a NAK (docs#336, (a'), condition
+/// 3). The order `floor <= hold <= restart <= registered` holds.
+#[test]
+fn a_thinned_ring_raises_the_restart_past_the_hold_and_counts_it() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    reader.with_hold(conductor.admit_hold(2).unwrap()).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // 64-byte frames, one per read: 300 reads overfill the 256 boundaries.
+    let data = sized_message(1, 32);
+    let mut out = vec![0u8; 64];
+    for _ in 0..300 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+        assert!(matches!(
+            sr_read(&mut reader, &mut out),
+            Ok(ReadOutcome::Copied { .. })
+        ));
+    }
+    sr_sent(&mut reader);
+    let registered = reader.sent_position();
+    assert_eq!(registered, 300 * 64);
+    // Thinning kept every second boundary, the second frame's end first:
+    // the third frame's end is gone.
+    let hold = 3 * 64;
+    assert_eq!(reader.hold_at(hold), Some(hold));
+    let restart = reader.restart_position();
+    assert!(hold < restart && restart <= registered, "restart {restart}");
+    assert_eq!(reader.counters().restart_raised, 1);
+    let _ = conductor.duty_cycle().unwrap();
+    let floor = conductor.floor();
+    assert!(floor <= hold, "floor {floor}");
+    // Between the hold and the restart, a NAK still reads.
+    let mut nak_out = sr_out();
+    let (result, _) = sr_nak(&mut reader, hold, restart, 1 << 20, &mut nak_out);
+    assert!(
+        matches!(result, Ok(ReadOutcome::Copied { .. })),
+        "{result:?}"
+    );
+}
