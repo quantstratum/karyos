@@ -257,7 +257,7 @@ fn an_unreliable_reset_frees_the_ring_of_held_heads() {
 /// karyos/testing/contract-traceability-phase-2.md`; SPEC.md's "no silent
 /// hole"): an unreliable reset that drops held timed heads leaves a hole
 /// in the lane, and the remote reader reports it as a loss. A message is
-/// read before the reset; four heads held 4 s ahead are dropped by it;
+/// read before the reset; four heads held 1.5 s ahead are dropped by it;
 /// two messages offered after it are read, and the reader skips exactly
 /// the dropped range as a local gap, its start the lane's first loss.
 #[test]
