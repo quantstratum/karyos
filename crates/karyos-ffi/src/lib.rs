@@ -12,10 +12,9 @@
 //! bounded handle tables and the panic boundary (F1); clients (F2).
 //! Publications and subscriptions come with F3 and F4.
 //!
-//! Internal to the Karyos workspace and unstable in alpha, with no
-//! compatibility promise. The supported API is the `karyos` facade,
-//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
-//! under its own `0.y.z` rule.
+//! Its Rust items are internal to the Karyos workspace and unstable in
+//! alpha, with no compatibility promise; its C ABI is supported under its
+//! own `0.y.z` rule.
 
 #![deny(unsafe_code)]
 

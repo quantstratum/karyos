@@ -313,10 +313,12 @@ says so in its crate documentation.
 - A thread pidfd must not count as an exit proof. Karyos's refusal of a
   real thread pidfd needs kernel 6.9 or later, which was not run.
 - The `test-hooks` Cargo features of `karyos-sys` (`test_pause`,
-  `alloc_count`, fault injectors) and `karyos-io`
-  (`sockets::scripted`) are test support for this workspace's tests, not
-  public API: they carry no compatibility promise and are never enabled
-  outside dev-dependencies here.
+  `alloc_count`, fault injectors), `karyos-io` (`sockets::scripted`),
+  `karyos-protocol`, `karyos-bench` and `karyos-tools` are test support,
+  not public API, with no compatibility promise. They are enabled only by
+  this workspace's tests, benchmarks (the `alloc-count` and `synthetic`
+  features of `karyos-bench`) and test binaries (`karyos-tools`'
+  `karyos-admission-stub`).
 
 ## Evidence
 
@@ -368,7 +370,8 @@ on disk:
   `ClientSubscription`, `ClientClaim`, `OfferOutcome`, `ClaimOutcome`,
   `CommitOutcome`, `Completion`, `ConductorError`, `ConductorPoll`,
   `Outcome`, `Overrun`, `Aborted`): change the `use` paths. `karyos::Error`
-  gains the `Offer` and `Subscription` variants.
+  is `#[non_exhaustive]` and gains the `Offer` and `Subscription`
+  variants, so a `match` on it needs a wildcard arm.
 - The C ABI is new in this release, at version 0.1.1. A caller accepts
   exactly the `0.y` it targets with at least its minimum `0.y.z`.
 
