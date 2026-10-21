@@ -271,6 +271,123 @@ fn test_stall_isolation_optional_observer_claim() {
     }
 }
 
+/// SPEC.md §13 "Stall isolation and capacity", the sender part (phase 1
+/// plan item 1): optional readers and an observer paused inside their
+/// copies, while a publisher runs ten terms and a network sender's reader
+/// keeps up, reading every committed frame and registering it as sent; with
+/// `hold`, a reliable lane's retention hold rides `sent - window` behind it.
+/// The sender's cursor never holds the publisher back: no
+/// `BackPressured` and no `ResourcesUnavailable`, pinned slots within `S`,
+/// no earlier term left `ACTIVE` or `READY`, and the sender reads up to the
+/// head, so it missed nothing.
+fn stall_isolation_with_a_sender_kept_up(hold: bool) {
+    // A publication, two optional readers, an observer and the sender's
+    // reader: five credits of six spares; one more cell for the hold.
+    let buffer = new_buffer(config(6, 5)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let readers: Vec<_> = [Role::Optional, Role::Optional, Role::Observer]
+        .into_iter()
+        .map(|role| conductor.subscribe(role).unwrap())
+        .collect();
+    let mut sender = sr_reader(&mut conductor);
+    if hold {
+        let at = sender.sent_position();
+        sender
+            .with_hold(conductor.admit_hold(2, at).unwrap())
+            .unwrap();
+    }
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // Something committed in term 0, under every paused reader's loan.
+    let first = message(1);
+    while !matches!(
+        publication.append(&first, AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { .. }
+    ) {
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    for reader in &readers {
+        hold_loan(&buffer, reader.cell());
+    }
+    let window = TERM / 2;
+    let data = vec![9u8; 6000];
+    let mut out = sr_out();
+    let mut appended = 0u64;
+    let mut cycles = 0u32;
+    let mut most_pinned = 0usize;
+    while appended < 10 * TERM {
+        match publication.append(&data, AppendOptions::default()).unwrap() {
+            AppendOutcome::Appended { .. } => appended += data.len() as u64,
+            AppendOutcome::BackPressured => panic!("back-pressured with the sender kept up"),
+            AppendOutcome::AdminAction => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        // The sender keeps up: it reads every committed frame and registers
+        // what it read; the hold follows a window behind.
+        while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut sender, &mut out) {}
+        sr_sent(&mut sender);
+        if hold {
+            let sent = sender.sent_position();
+            let _ = sender.hold_at(sent.max(window) - window);
+        }
+        let _ = conductor.duty_cycle().unwrap();
+        cycles += 1;
+        assert!(cycles < 100_000, "the publisher made no progress");
+        let active = buffer.active_count().load(Ordering::Acquire) as u32;
+        let mut pinned = 0usize;
+        let mut pinned_live = 0usize;
+        for slot in 0..buffer.slots {
+            let descriptor =
+                Descriptor::decode(buffer.descriptor(slot).unwrap().load(Ordering::Acquire))
+                    .unwrap();
+            if descriptor.state() == SlotState::Free {
+                continue;
+            }
+            let count = descriptor
+                .term_id()
+                .count_from(buffer.initial_term_id)
+                .unwrap()
+                .get();
+            if count + 1 < active || count > active + 1 {
+                pinned += 1;
+                if matches!(descriptor.state(), SlotState::Active | SlotState::Ready) {
+                    pinned_live += 1;
+                }
+            }
+        }
+        assert!(
+            pinned <= usize::from(buffer.spare_slots),
+            "{pinned} slots pinned ({pinned_live} ACTIVE or READY), S = {}",
+            buffer.spare_slots
+        );
+        assert_eq!(pinned_live, 0, "an earlier term stayed ACTIVE or READY");
+        most_pinned = most_pinned.max(pinned);
+    }
+    assert!(most_pinned >= 1, "no slot was ever pinned");
+    // The sender read everything the publisher committed, up to the head.
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut sender, &mut out) {}
+    assert_eq!(
+        sender.position(),
+        conductor.head().unwrap(),
+        "the sender's cursor stopped short of the head"
+    );
+    // The paused readers still hold their loans; dropping the sender frees
+    // its hold.
+    for reader in &readers {
+        let loan = &buffer.cells().get(reader.cell()).unwrap().loan;
+        assert_ne!(loan.load(Ordering::Acquire), 0, "a paused reader's loan was lost");
+    }
+}
+
+#[test]
+fn test_stall_isolation_a_kept_up_sender_never_holds_the_publisher() {
+    stall_isolation_with_a_sender_kept_up(false);
+}
+
+#[test]
+fn test_stall_isolation_a_kept_up_reliable_sender_and_its_hold_never_hold_the_publisher() {
+    stall_isolation_with_a_sender_kept_up(true);
+}
+
 /// Under Miri's data race detector: a publisher, an observer and the
 /// conductor's duty cycle on three threads. The observer delivers a
 /// contiguous run of the published messages or reports an overrun, and
