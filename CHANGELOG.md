@@ -703,6 +703,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The conformance suite gains feature `remote-driver` (Linux): the
+  runner's karyosd gains a conflated stream (22), a guarded one (23) and
+  a plain one (24) (karyos#585), and `$remote_client` is its client.
+  `op.remote.conflated` reads a remote conflated view, and
+  `op.remote.outcomes` a remote guarded publication's `Submitted`
+  records. `publication.offer` takes an optional `reserved_value` (a
+  conflated stream's key), and `conflated.poll` and
+  `publication.poll_outcomes` an optional `until`, a count to poll for
+  within 10 s, since a remote driver answers after the offer.
 - `karyosd --conflation <stream>:<session>:<keys>:<value>:<journal>`
   (the value and journal capacities are sizes) gives a configured stream
   a conflation table (an offer's reserved value

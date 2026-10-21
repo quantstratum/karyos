@@ -208,6 +208,7 @@ offers. The features are:
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
+| `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded and plain streams (Remote driver, below; Linux only) |
 | `tai-clock` | `clock.now` of the TAI domain, which some platforms lack |
 
 A new feature is added here; a feature name not in this table is a
@@ -291,18 +292,18 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `client.close` | `client` | none | |
 | `publication.add` | `client`, `stream_id`, [`uri`, default `"karyos:ipc"`] | `publication` | |
 | `publication.add_concurrent` | as `publication.add` | `publication` | `concurrent-publication` |
-| `publication.offer` | `publication`, [`lane`], `payload` or `length` | `lane`, `position` | |
+| `publication.offer` | `publication`, [`lane`, `reserved_value`], `payload` or `length` | `lane`, `position` | |
 | `publication.publish_claimed` | `publication`, [`lane`], `payload` or `length` | `lane`, `position` | |
 | `publication.claim` | `publication`, `length`, [`lane`] | `claim` | `claim-retry` |
 | `claim.commit` | `claim` | `lane`, `position` | `claim-retry` |
 | `claim.abort` | `claim` | none | `claim-retry` |
-| `publication.poll_outcomes` | `publication`, [`lane`, `limit` (default 1)] | `delivered` | `guarded-publication` |
+| `publication.poll_outcomes` | `publication`, [`lane`, `limit` (default 1), `until`] | `delivered` | `guarded-publication` |
 | `publication.close` | `publication` | none | |
 | `subscription.add` | `client`, `stream_id`, [`uri`, `role`, `rejoin`: the values of the header's subscription options] | `subscription` | |
 | `subscription.poll` | `subscription`, [`limit` (default 1)] | `delivered`, `last` (the last message as UTF-8 text, when there is one) | |
 | `subscription.close` | `subscription` | none | |
 | `conflated.add` | `client`, `stream_id`, [`uri`] | `conflated` | `conflation` |
-| `conflated.poll` | `conflated`, [`key_budget` (default 1)] | `delivered` | `conflation` |
+| `conflated.poll` | `conflated`, [`key_budget` (default 1), `until`] | `delivered` | `conflation` |
 | `conflated.close` | `conflated` | none | `conflation` |
 | `subscription.poll_to_end` | `subscription`, [`limit` (default 16)] | `delivered` (the count of every poll), `last` | |
 | `subscription.end` | `subscription` | `reason`: `"none"`, `"end_of_stream"`, `"image_retired"`, `"stream_removed"`, `"revoked"`, `"closed_by_overrun"` or `"other"`; `position`; `seal_code` | |
@@ -356,10 +357,14 @@ declares the feature absent.
   ```text
   karyosd --dir <private directory> --stream 20:1 --archive <empty directory>
           --archive-control 1030,1031 --record 20:1
+          --stream 22:1 --conflation 22:1:4:64:4k
+          --stream 23:1:allow-unconnected --guard orders:23:1:4
+          --stream 24:1:allow-unconnected
   ```
 
   Stream 20 is recorded from boot; 1030 and 1031 are the Archive's
-  request and response streams. Stream 1041, the replay target's, is
+  request and response streams; 22, 23 and 24 are the remote driver's
+  (Remote driver, below). Stream 1041, the replay target's, is
   not configured: each replay opens its own target there. Its output
   goes to a file the runner prints when the provisioning or a scenario
   fails; after the scenarios the runner sends it SIGTERM, waits at most
@@ -401,6 +406,31 @@ declares the feature absent.
   runner stops every replay the scenario started and did not stop
   (their answers ignored), since closing a connection leaves its
   replays running, then closes what the scenario left open.
+
+### Remote driver
+
+Feature `remote-driver` (karyos#585): a client of the karyosd that
+Archive replays provisions, `$remote_client`, bound to the same client
+as `$archive_client`, Linux only. A runner offers it with
+`archive-replay`'s provisioning, and declares it absent elsewhere. Its
+streams:
+
+- **22:** a conflation table of 4 keys and 64-byte values. An offer's
+  `reserved_value` is its key.
+- **23:** guarded by guard `orders` (4 messages), which karyosd opens at
+  start; offers need no subscriber.
+- **24:** plain, neither conflated nor guarded; offers need no
+  subscriber.
+
+A scenario uses each exclusive stream's publication at most once: a
+remote publication is released asynchronously after its close, so a
+second `publication.add` of the same stream may be refused.
+
+The driver works in another process, so a conflated view's values and a
+guarded publication's outcome records arrive after the offer.
+`conflated.poll` and `publication.poll_outcomes` take `until`: the
+runner polls, serving the object's client, until the `delivered` total
+reaches `until`, and answers that total, or fails at 10 s.
 
 ### Bounds
 
