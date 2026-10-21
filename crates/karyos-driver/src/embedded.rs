@@ -518,7 +518,10 @@ pub(crate) struct Stream<T: StreamTerms> {
     pub(crate) buffer: Arc<LogBuffer<T>>,
     pub(crate) conductor: Conductor<Arc<LogBuffer<T>>>,
     pub(crate) leases: Arc<StreamLeases>,
-    allow_unconnected: bool,
+    /// Its configuration's `allow_unconnected`: every exclusive or
+    /// concurrent publication of the stream offers with no subscriber, an
+    /// in-process client's included (SPEC.md §4).
+    pub(crate) allow_unconnected: bool,
     /// The stream's `on_required_loss` policy.
     pub(crate) policy: LossPolicy,
     pub(crate) stream_id: i32,

@@ -9,6 +9,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ## [Unreleased]
 
+### Fixed
+
+- A stream configured `allow_unconnected` (`StreamConfig`,
+  `karyos_stream_options`) now grants it to every publication an
+  in-process client adds, exclusive or concurrent, as the driver's own
+  handles already got it (SPEC.md §4). The driver had used only the
+  client's request, which the client facade always sent without it, so
+  a C caller's offer on such a stream answered `KARYOS_E_NOT_CONNECTED`
+  until a subscriber attached (REVIEWER-01's finding from the .NET
+  binding, B1b). A remote (karyosd) client still decides by its own
+  request: the CnC response carries no such flag yet.
+
 ### Changed
 
 - The conformance seeding of the `archive-replay` feature waits until
