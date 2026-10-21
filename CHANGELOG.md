@@ -691,6 +691,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `make libkaryos-copies-check` (C-LINKAGE, not part of pre-push): two
+  file copies of the package's shared library, loaded in one process with
+  `RTLD_LOCAL`, each answer `KARYOS_E_CLOSED` to the other's driver and
+  client handles (a use and a close), and keep their own usable. It
+  prints both copies' base generations, so a 2^-32 collision is
+  diagnosable. It passes on macOS and Linux; with a constant base it
+  fails.
+
 - The facade `karyos` crate re-exports `ImageChange`, `ImageEnd` and
   `SealReason`, and `karyos-client` re-exports `SealReason` at its root:
   a facade user drains a network subscription's image changes and reads
