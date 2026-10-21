@@ -339,15 +339,16 @@ head and what changed since.
 | `scripts/netem-test.sh` (`loss 2% reorder 10% 50% delay 1ms duplicate 1%`) | Docker, kernel 6.8 aarch64 | `38ccc6d7` | 9 passed, 0 failed |
 | `scripts/linux-test.sh`, `make pre-push`, `loom_schedule_ring` | Docker (Linux run); kernel not recorded | `9faba3ee` | 117 suites, 3320 passed, 0 failed; pre-push green; 11 of 11 |
 | `scripts/linux-test.sh`, clippy, `make pre-push` | Docker (Linux run), aarch64; kernel not recorded | `05b628e1` | 151 suites, 0 failed; clippy clean; pre-push green |
-| Release gate `make pre-push` | macOS arm64 | TODO | TODO |
+| Release gate `make pre-push`: fmt-check, lint-sync, deps-check, lint, doc (`-D warnings`), test, loom, build-release, timing-build-check | macOS arm64 | tree `c0517039` | Exit 0: 4234 passed, 0 failed, 15 ignored over 199 binaries; 922 s |
 | Release gate `make miri`, `karyos-sys` (`--lib`), sharded one per core | macOS arm64 | TODO | TODO |
 | `karyos-ffi` Miri per `crates/karyos-ffi/MIRI.md` (10 lib shards and the integration tests), not run at the release head | macOS arm64 | `f365ac26` (merge base with main `5bf2423b`) | Lib shards 00 to 06 and 08: 84 passed, 0 failed, 37 ignored; shards 07 and 09: TODO; integration: abi 4/0, conformance 3/0 (5 native only), driver 6/0 (3 ignored), all passed; 4843 s wall for the shards and integration tests, under heavy host load. Since that run, `karyos-ffi` changed in #610 (the cross-copy handle documentation), #613 (`abi.rs`, `api/archive.rs`, `handles.rs` and `header.rs`: unknown archive values refused), #614's later commits (a test's port and the conformance runner) and this release's crate documentation; none adds or changes an `unsafe` line; its dependencies changed in #615 (the CnC 0xC6 address encoding), #616 (`#[non_exhaustive]` enums) and #617 (`fc` refusal) |
-| Release gate `make loom` | macOS arm64 | TODO | TODO |
+| Release gate `make loom` (in `make pre-push`) | macOS arm64 | tree `c0517039` | 451 passed, 0 failed, 1 ignored over 115 binaries; the ignored model, `a_transferred_gauge_is_never_mixed`, runs only in `make loom-full`, not run at the release head |
 | Release gate `make sim` | macOS arm64 | TODO | TODO |
-| Release gate `scripts/linux-test.sh --workspace --all-features --locked` | Docker `rust:1.99`, kernel TODO aarch64 | TODO | TODO |
-| Release gate `make netem` | Docker, kernel TODO aarch64 | TODO | TODO |
+| Release gate `scripts/linux-test.sh --workspace --all-features --locked --no-fail-fast` | Docker `rust:1.99`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 4331 passed, 0 failed, 17 ignored; 255 s |
+| Release gate `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Docker `rust:1.99`, aarch64 | tree `c0517039` | Exit 0, no warnings, 16 crates |
+| Release gate `scripts/netem-test.sh` (`limit 100000 loss 2% reorder 10% 50% delay 1ms duplicate 1%`; N3 at 5% duplicates, N7 a 100% loss blackout) | Docker, `--cap-add NET_ADMIN`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 10 passed, 0 failed (N1 to N9 and `netem_shapes_the_loopback`); 30 s |
 | Release gate `make libkaryos`, `libkaryos-static-check`, `libkaryos-copies-check` | macOS arm64 and Linux aarch64 | TODO | TODO |
-| Release gate conformance suite with the test kit (`archive-replay`, `remote-driver`, `incompatible-driver`) | Linux aarch64 | TODO | TODO |
+| Release gate conformance (`scripts/linux-test.sh -p karyos-ffi --all-features --locked --test conformance`; features `archive-replay`, `remote-driver`, `incompatible-driver`) | Docker `rust:1.99`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 8 passed, including `every_scenario_passes_at_the_library_abi_version` |
 | Linux x86_64, kernels 6.9 and later | none | Not run for this alpha | Not claimed |
 
 ## Upgrading
