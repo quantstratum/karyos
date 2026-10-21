@@ -2291,6 +2291,133 @@ fn a_fragmented_writer_aborted_mid_copy_reaches_a_remote_reader_as_one_extent() 
     });
 }
 
+/// Plan item 8 (contract-traceability-phase-2.md, "Aborts over the
+/// network"; SPEC §13): T2 for a concurrent writer. Of two concurrent
+/// writers on a reliable channel, the first stops in the middle of its
+/// copy and the second commits behind it; the commit deadline aborts the
+/// first block, and the ABORTED datagram is lost. The receiver NAKs the
+/// hole, the sender's repair resends the aborted record, and the subscriber
+/// of the image is told the aborted range, then reads the second writer's
+/// message whole; every NAK names exactly the aborted extent, none past it.
+#[test]
+fn a_concurrent_writers_lost_aborted_record_is_repaired_and_never_naked_past() {
+    use karyos_sys::log_buffer::{
+        AppendOptions, ConcurrentOfferOutcome, DEFAULT_CLAIM_DEADLINE, PollOutcome, Role,
+    };
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        concurrent: Some(2),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let log = rig.log.as_mut().unwrap();
+    let mut handles = std::mem::take(&mut log.concurrent[0]);
+    let mut second = handles.pop().unwrap();
+    let mut first = handles.pop().unwrap();
+    let tagged =
+        |tag: u8, length: usize| -> Vec<u8> { (0..length).map(|i| tag ^ (i as u8)).collect() };
+    let first_data = tagged(1, 4000);
+    let second_data = tagged(2, 900);
+    /// Lets the stopped writer go on when dropped, so a failed assertion
+    /// fails the test instead of leaving the writer waiting.
+    struct Release(std::sync::mpsc::SyncSender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            first
+                .offer_pausing_after_fragment(&first_data, AppendOptions::default(), 0, &mut || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+                .unwrap()
+        });
+        paused_rx.recv().unwrap();
+        let release = Release(resume_tx);
+        let ConcurrentOfferOutcome::Appended { position: behind } = second
+            .offer(&second_data, AppendOptions::default())
+            .unwrap()
+        else {
+            panic!("the second writer did not commit");
+        };
+        for _ in 0..20 {
+            rig.round(true);
+        }
+        // The deadline aborts the first block; its ABORTED datagram, the
+        // sender's next DATA datagram, is lost.
+        let before = rig.agents.receiver.role.posted_naks().len();
+        rig.agents.receiver.role.drop_data(&[0]);
+        let now = rig.now;
+        let conductor = &mut rig.log.as_mut().unwrap().conductors[0];
+        assert!(conductor.service_deadlines(&mut || now).unwrap().waiting);
+        let report = conductor
+            .service_deadlines(&mut || now + DEFAULT_CLAIM_DEADLINE + 1)
+            .unwrap();
+        assert_eq!(
+            (report.aborted, report.aborted_bytes),
+            (1, behind),
+            "{report:?}"
+        );
+        let extent = u32::try_from(behind).unwrap();
+        assert_eq!(
+            next_outcome(&mut rig, &mut subscriber),
+            PollOutcome::Aborted {
+                position: 0,
+                extent,
+            }
+        );
+        let mut out = vec![0u8; 8192];
+        let PollOutcome::Message {
+            position, length, ..
+        } = (loop {
+            match subscriber.poll(&mut out).unwrap() {
+                PollOutcome::Pending => rig.round(true),
+                outcome => break outcome,
+            }
+        })
+        else {
+            panic!("the second message is not delivered");
+        };
+        assert_eq!((position, length), (behind, 900));
+        assert_eq!(&out[..900], &second_data[..]);
+        drop(release);
+        assert_eq!(
+            writer.join().unwrap(),
+            ConcurrentOfferOutcome::Aborted { position: 0 }
+        );
+        for _ in 0..50 {
+            rig.round(true);
+        }
+        let posted = &rig.agents.receiver.role.posted_naks()[before..];
+        assert!(
+            !posted.is_empty(),
+            "the lost ABORTED record was never NAKed"
+        );
+        for nak in posted {
+            assert_eq!(
+                (nak.range.start, nak.range.length),
+                (0, extent),
+                "a NAK of another range than the aborted extent: {nak:?}"
+            );
+        }
+        let counters = rig.agents.receiver.role.loss_counters(slot).unwrap();
+        assert_eq!(
+            (counters.detected, counters.repaired),
+            (1, 1),
+            "{counters:?}"
+        );
+        assert!(rig.agents.sender.counters().repairs >= 1);
+    });
+}
+
 /// Phase 6 wiring: a RANGE_UNAVAILABLE that echoes the outstanding NAK
 /// proves the hole unrecoverable; under the default `on_unrecoverable =
 /// close` the image closes and is retired.
