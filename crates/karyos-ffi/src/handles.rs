@@ -19,9 +19,15 @@
 //! ([`copy_base`]), and counts on from it, skipping 0; a slot whose next
 //! generation would come back to the base has cycled all 2^32 - 1 and is
 //! retired, never reused. A handle of another copy in the same process
-//! (two static copies, BIND-CPP-Q12) therefore names a slot at another
-//! generation and answers [`Status::Closed`], except with probability
-//! 2^-32 per call: a copy cannot tell a foreign handle from a stale one.
+//! (two static copies, BIND-CPP-Q12) therefore normally names a slot at
+//! another generation and answers [`Status::Closed`]; a copy cannot tell a
+//! foreign handle from a stale one. The model is per pair of copies, not
+//! per call: their bases differ by a fixed amount, and a foreign handle
+//! is accepted when the two slots' generation counts have drifted apart
+//! by exactly that amount, which slot reuse can bring about
+//! deterministically; a pair whose bases are equal accepts each other's
+//! handles for slots at equal counts. This defends against accidental
+//! misuse, not a security boundary or a global uniqueness guarantee.
 //! The generation is an atomic read before the mutex is tried, so a stale
 //! handle never disturbs a live one. One
 //! narrow window is left: a call that read the generation just before a
@@ -197,8 +203,9 @@ impl<T> TakenAll<'_, T> {
 
 /// This copy of the library's base generation: drawn once, never 0, from
 /// the address of a static of this copy. Two copies in one process hold
-/// their statics at different addresses, so their bases differ except
-/// with probability 2^-32 (the module). No clock or process id: an
+/// their statics at different addresses, so their bases normally differ;
+/// equal bases are possible (the module states what follows). No clock or
+/// process id: an
 /// address is what tells copies apart, and it is read without a system
 /// call, as Miri's isolation requires.
 pub(crate) fn copy_base() -> u32 {

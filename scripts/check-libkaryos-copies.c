@@ -9,7 +9,7 @@
  *
  * A handle carries its slot's generation in its high 32 bits, so the
  * first handle of a fresh table carries its copy's base. Two bases that
- * collide (probability 2^-32) fail the run with both printed.
+ * collide fail the run with both printed.
  */
 #include <dlfcn.h>
 #include <inttypes.h>
@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
     /* Both copies' first driver sits in slot 0 of the same kind, so only
      * the generation tells them apart. */
     if ((a.driver >> 32) == (b.driver >> 32)) {
-        fprintf(stderr, "bases collide (probability 2^-32): A %#" PRIx64
+        fprintf(stderr, "bases collide: A %#" PRIx64
                         ", B %#" PRIx64 "\n",
                 a.driver >> 32, b.driver >> 32);
         return 1;

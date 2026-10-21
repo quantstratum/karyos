@@ -12,10 +12,14 @@
  *   results through out-parameters. There is no global or thread-local
  *   error state.
  * - Objects are 64-bit handles, never pointers. A closed handle answers
- *   KARYOS_E_CLOSED. So does a handle of another copy of this library in
- *   the same process (two static copies), except with probability 2^-32
- *   per call: each copy draws its own base generation, and a copy cannot
- *   tell a foreign handle from a stale one. A handle in use by another
+ *   KARYOS_E_CLOSED. A handle of another copy of this library in the
+ *   same process (two static copies) normally does too: each copy draws
+ *   its own base generation, and a copy cannot tell a foreign handle from
+ *   a stale one. This defends against accidental misuse only. It is no
+ *   security boundary, no global uniqueness and no per-call probability:
+ *   two copies whose bases are equal accept each other's handles for
+ *   slots at equal generation counts, and slot reuse can bring two
+ *   copies' generations into line. A handle in use by another
  *   thread answers KARYOS_E_BUSY, and one reentered from its own callback
  *   answers KARYOS_E_REENTRANT. A call never waits for another call on
  *   its handle; two bounded waits are listed under Threads below.

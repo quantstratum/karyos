@@ -68,10 +68,12 @@ release may break APIs, wire formats and shared-memory layouts.
   for its handles, once, from the address of one of its statics (never
   0; no clock or process id, so it runs under Miri's isolation). A handle
   of another copy in the same process (two static copies, BIND-CPP-Q12)
-  then names a slot at another generation and answers `KARYOS_E_CLOSED`,
-  except with
-  probability 2^-32 per call, instead of acting on that copy's object; a
-  copy cannot tell a foreign handle from a stale one. A slot's generation
+  then normally names a slot at another generation and answers
+  `KARYOS_E_CLOSED`, instead of acting on that copy's object; a copy
+  cannot tell a foreign handle from a stale one. This defends against
+  accidental misuse only, per pair of copies, not per call: equal bases,
+  or generation counts drifted apart by the bases' difference, let a
+  foreign handle through (owner item 62). A slot's generation
   counts on from the base, skipping 0, and the slot is retired only once
   it would come back to the base, after all 2^32 - 1 generations (it was
   retired at u32::MAX before). The handle's layout and the ABI are
@@ -778,9 +780,8 @@ release may break APIs, wire formats and shared-memory layouts.
   file copies of the package's shared library, loaded in one process with
   `RTLD_LOCAL`, each answer `KARYOS_E_CLOSED` to the other's driver and
   client handles (a use and a close), and keep their own usable. It
-  prints both copies' base generations, so a 2^-32 collision is
-  diagnosable. It passes on macOS and Linux; with a constant base it
-  fails.
+  prints both copies' base generations, so a collision is diagnosable.
+  It passes on macOS and Linux; with a constant base it fails.
 
 - The facade `karyos` crate re-exports `ImageChange`, `ImageEnd` and
   `SealReason`, and `karyos-client` re-exports `SealReason` at its root:
