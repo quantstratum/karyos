@@ -2541,6 +2541,73 @@ fn a_tail_lost_at_a_reset_with_an_idle_publisher_is_recovered() {
     exchange_from(&mut a, &mut b, &mut lane, &mut reader, 67, 67..128);
 }
 
+/// A fragmented message straddling an endpoint reset (karyos#594: a reset
+/// re-reads from the restart position, a block start at or below the
+/// receivers' consumption): B, a lone optional unicast receiver, gets the
+/// first of a 3000-byte message's three DATA datagrams and loses the other
+/// two; the endpoint resets with nothing more offered. The sender holds
+/// NAKs back throughout, so only the reset's resend at once can deliver the
+/// message: the restart never lands inside it, and B reads it once and
+/// whole, then the messages after it, in order.
+#[test]
+fn a_fragmented_message_straddling_a_reset_is_read_once_and_whole() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..8);
+    let sender = |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().sender_counters().unwrap();
+    let before = sender(&a).sent;
+    // The message's second and third DATA datagrams never reach B, and no
+    // NAK repairs them.
+    a.net.as_mut().unwrap().sender_ignores_naks(true);
+    b.net.as_mut().unwrap().drop_receiver_data(&[1, 2]);
+    let mut large = vec![0u8; 3000];
+    large[..4].copy_from_slice(&8u32.to_le_bytes());
+    for (index, byte) in large.iter_mut().enumerate().skip(4) {
+        *byte = u8::try_from(index % 251).unwrap();
+    }
+    let mut offered = false;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        if !offered {
+            offered = matches!(lane.offer(&large).unwrap(), OfferOutcome::Accepted { .. });
+        }
+        offered && sender(drivers[0]).sent >= before + 3
+    });
+    let mut copies = 0u32;
+    // B holds at the message: a part of it only.
+    for _ in 0..200 {
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+        let _ = reader.poll(|_, _, _| copies += 1, BUDGET);
+    }
+    assert_eq!(copies, 0, "B read a message it does not hold whole");
+    force_reset(&a, &publication);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let _ = reader.poll(
+            |bytes, _, _| {
+                assert_eq!(bytes, &large[..], "the message whole");
+                copies += 1;
+            },
+            BUDGET,
+        );
+        drivers[0].net.as_ref().unwrap().reopened() >= 1 && copies >= 1
+    });
+    assert_eq!(copies, 1, "read once");
+    a.net.as_mut().unwrap().sender_ignores_naks(false);
+    let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert_eq!(
+        (
+            receiver.images_closed_unrecoverable,
+            receiver.images_closed_cannot_resume
+        ),
+        (0, 0)
+    );
+    exchange_from(&mut a, &mut b, &mut lane, &mut reader, 9, 9..64);
+}
+
 /// rp-w4b2c: a publication over two paths reaches a subscription over the
 /// same two paths, with the isolated-paths switch assumed on both drivers
 /// (owner item 12 keeps it off on real sockets): every message once, in
