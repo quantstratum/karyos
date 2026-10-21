@@ -325,7 +325,9 @@ impl<T: TermBytes> Publication<T> {
     /// time `tx_time`, in the lane's clock domain (`quantstratum-docs:
     /// karyos/design/timed-tx.md`). The lane's handle checks the time
     /// first, before anything is reserved; on a network route the driver's
-    /// sender holds the message until its time.
+    /// sender holds the message until its time, and local readers read it
+    /// at its commit. On an IPC stream nothing sends, so the lane takes only
+    /// its `schedule_capacity` timed offers, then back pressures for good.
     ///
     /// # Errors
     ///

@@ -11,6 +11,18 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A timed lane on a driver's IPC stream wedges, and the docs now say so:
+  only a network sender releases schedule ring entries, so a
+  `karyos_driver_add_stream` (or `EmbeddedDriver::add_stream`) stream
+  with `schedule_capacity` N takes N timed offers, then answers
+  `BACK_PRESSURED` for good, whatever its subscribers read (found by
+  REVIEWER-01 in karyos-dotnet B2a). Timed lanes are meant for network
+  publications. karyos.h, `LogBufferConfig::schedule_capacity`,
+  `offer_at`, `offer_at_on` and `schedule_stream` state it, and that a
+  timed lane answers `INVALID_SCHEDULE` to a plain offer, an offer with
+  options and a claim's commit. Refusing `schedule_capacity` on an IPC
+  stream follows once a karyosd timed scenario exists.
+
 - A stream configured `allow_unconnected` (`StreamConfig`,
   `karyos_stream_options`) now grants it to every publication an
   in-process client adds, exclusive or concurrent, as the driver's own

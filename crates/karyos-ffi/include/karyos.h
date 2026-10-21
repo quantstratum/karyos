@@ -451,8 +451,15 @@ typedef struct karyos_stream_options {
      * in-process or a remote client's.
      */
     uint32_t allow_unconnected;
-    /* Entries of the stream's schedule ring: 0 for none, or a power of
-       two up to 1 << 20 on an exclusive stream. */
+    /*
+     * Entries of the stream's schedule ring, which makes its lane timed
+     * (karyos_publication_offer_at): 0 for none, or a power of two up to
+     * 1 << 20 on an exclusive stream. Timed lanes are meant for network
+     * publications, whose sender releases each entry once its message is
+     * sent. On a stream added here nothing sends, so nothing releases the
+     * ring: the lane takes schedule_capacity timed offers, then answers
+     * KARYOS_E_BACK_PRESSURED for good, whatever its subscribers read.
+     */
     uint32_t schedule_capacity;
     /* KARYOS_LOSS_*: what a lost required subscriber does. */
     uint32_t on_required_loss;
@@ -569,7 +576,8 @@ int32_t karyos_client_add_concurrent_publication(uint64_t client,
 /**
  * Offers length bytes at data on the lane, copied before it returns; data
  * may be null when length is 0. On KARYOS_OK, accepted (may be null)
- * receives the lane and position. Never waits.
+ * receives the lane and position. KARYOS_E_INVALID_SCHEDULE on a timed
+ * lane, which takes karyos_publication_offer_at only. Never waits.
  */
 int32_t karyos_publication_offer(uint64_t publication, uint32_t lane,
                                  const uint8_t *data, size_t length,
@@ -608,7 +616,8 @@ static inline int32_t karyos_offer_options_init(
 /**
  * As karyos_publication_offer, with options: the reserved value every
  * fragment's header carries. A null options, a size below that of ABI
- * 0.1.0, or a nonzero reserved returns KARYOS_E_INVALID_ARGUMENT.
+ * 0.1.0, or a nonzero reserved returns KARYOS_E_INVALID_ARGUMENT, and a
+ * timed lane KARYOS_E_INVALID_SCHEDULE.
  *
  * On a conflated stream the driver is authoritative: a key outside the
  * table never enters the conflated view, and the driver counts it as a
@@ -629,7 +638,10 @@ int32_t karyos_publication_offer_with(uint64_t publication, uint32_t lane,
  * not-before time tx_time in the lane's clock domain (karyos_clock_now
  * reads it), copied before it returns; data may be null when length is 0.
  * The lane's handle checks the time before anything is reserved; on a
- * network route the driver's sender holds the message until its time.
+ * network route the driver's sender holds the message until its time,
+ * and local readers read it at its commit. On a stream of
+ * karyos_driver_add_stream nothing sends, so the lane takes only its
+ * schedule_capacity timed offers (karyos_stream_options).
  * KARYOS_E_INVALID_SCHEDULE for a lane that is not timed, a time below the
  * lane's last, one past the horizon or an overflowing deadline. On
  * KARYOS_OK, accepted (may be null) receives the lane and position. Never
@@ -656,7 +668,8 @@ int32_t karyos_clock_now(uint32_t domain, uint64_t *now);
  * pointer to length zeroed bytes to fill. The pointer is valid until the
  * commit releases the claim, its abort, or the close of the publication or
  * of its client, and never points into a term or a shared mapping. One
- * claim per publication (KARYOS_E_CLAIM_OUTSTANDING).
+ * claim per publication (KARYOS_E_CLAIM_OUTSTANDING). A claim on a timed
+ * lane is staged, and its commit answers KARYOS_E_INVALID_SCHEDULE.
  */
 int32_t karyos_publication_claim(uint64_t publication, uint32_t lane,
                                  uint32_t length, uint64_t *claim,
@@ -668,7 +681,7 @@ int32_t karyos_publication_claim(uint64_t publication, uint32_t lane,
  * (may be null). KARYOS_E_BACK_PRESSURED, KARYOS_E_NOT_CONNECTED,
  * KARYOS_E_ADMIN_ACTION, KARYOS_E_RATE_LIMITED and KARYOS_E_GATED keep it
  * staged and its buffer valid, to retry or abort; any other failure
- * releases it.
+ * releases it, such as KARYOS_E_INVALID_SCHEDULE on a timed lane.
  */
 int32_t karyos_claim_commit(uint64_t claim, karyos_accepted *accepted);
 
