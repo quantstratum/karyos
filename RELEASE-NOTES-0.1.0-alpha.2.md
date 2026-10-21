@@ -323,11 +323,13 @@ says so in its crate documentation.
 Functional evidence only. Docker and virtual machines say nothing about
 latency on physical hosts.
 
-The rows with a head other than the release head are historical
-evidence for that commit, recorded during development by the author and
-the reviewer of each change. The release-gates rows are run at tagging
-on the release head; the tagged commit adds only these notes and the
-changelog date on top of it.
+The rows with a head other than the release head are historical evidence
+for that commit, recorded during development by the author and the
+reviewer of each change. The release-gate rows are run on the release
+tree: this branch merged over main `2ccefd0a` (tree `c0517039`); the
+tagged commit adds only these notes and the changelog date on top of it.
+A row marked "not run at the release head" names its own head and what
+changed since.
 
 | Check | Platform | Head | Result |
 | --- | --- | --- | --- |
@@ -336,7 +338,8 @@ changelog date on top of it.
 | `scripts/linux-test.sh`, `make pre-push`, `loom_schedule_ring` | Docker (Linux run); kernel not recorded | `9faba3ee` | 117 suites, 3320 passed, 0 failed; pre-push green; 11 of 11 |
 | `scripts/linux-test.sh`, clippy, `make pre-push` | Docker (Linux run), aarch64; kernel not recorded | `05b628e1` | 151 suites, 0 failed; clippy clean; pre-push green |
 | Release gate `make pre-push` | macOS arm64 | TODO | TODO |
-| Release gate `make miri` (`karyos-sys` and `karyos-ffi`, per `crates/karyos-ffi/MIRI.md`) | macOS arm64 | TODO | TODO |
+| Release gate `make miri`, `karyos-sys` (`--lib`), sharded one per core | macOS arm64 | TODO | TODO |
+| `karyos-ffi` Miri per `crates/karyos-ffi/MIRI.md` (10 lib shards and the integration tests), not run at the release head | macOS arm64 | `f365ac26` (base `37c9a6d2`) | Lib shards 00 to 06 and 08: 84 passed, 0 failed, 37 ignored; shards 07 and 09: TODO; integration: abi 4/0, conformance 3/0. Since that head, `karyos-ffi` changed only in #614's later commits (a test's port and the conformance runner; no `unsafe`) and in this release's crate documentation; its dependencies changed in #615 (the CnC 0xC6 address encoding), #616 (`#[non_exhaustive]` enums) and #617 (`fc` refusal) |
 | Release gate `make loom` | macOS arm64 | TODO | TODO |
 | Release gate `make sim` | macOS arm64 | TODO | TODO |
 | Release gate `scripts/linux-test.sh --workspace --all-features --locked` | Docker `rust:1.99`, kernel TODO aarch64 | TODO | TODO |
