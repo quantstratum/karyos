@@ -107,8 +107,6 @@ what is partial.
 - **Conflation freshness for network images.** A lost update marks the
   view's values stale, and each key turns fresh again with its own next
   update. Refresh and snapshot markers are a separate capability (below).
-  TODO(M7): the test of a view recreated after `barrier_ack_timeout`
-  starting with every key stale, if it lands before the tag.
 
 ### Archive and replay
 
@@ -272,6 +270,10 @@ what is partial.
   `Tai` domain: the network route refuses it and IPC streams refuse
   schedule rings. A `Monotonic` lane is granted only to a client in the
   driver's time namespace. Check the wording against M3 when it lands.
+- A conflated view closed at `barrier_ack_timeout` is recreated with
+  every key stale; no test asserts that recreation yet, and
+  `barrier_ack_timeout` is checked only against its 10 ms floor, not
+  against the conductor's duty period.
 - A replay replays lane 0 only, and a network publication refuses a
   mapping cutover.
 - `karyosd --network on` runs the agents with the default network
