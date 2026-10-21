@@ -976,3 +976,274 @@ fn replay_from_a_checkpoint_reaches_the_live_state() {
     assert_eq!(events, (AT + 1..=MESSAGES).collect::<Vec<_>>());
     assert_eq!(replayed, live);
 }
+
+/// A loopback UDP port no socket holds now, picked below every ephemeral
+/// range (Linux 32768 to 60999, macOS 49152 to 65535), so no bind to port
+/// 0 can take it before the driver binds it (karyos#520). As karyos-driver's
+/// `test_ports` (#552): a process starts at its own offset and walks the
+/// range, skipping ports it cannot bind.
+fn test_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    const FIRST: u32 = 20_000;
+    const COUNT: u32 = 12_000;
+    let start = std::process::id().wrapping_mul(2_654_435_761) % COUNT;
+    loop {
+        let taken = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(taken < COUNT, "no free test port left in the range");
+        let port = u16::try_from(FIRST + (start + taken) % COUNT).unwrap();
+        if std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// A driver with a network, its agents run by the caller's duty cycles,
+/// its positions sampled every cycle.
+fn network_driver() -> EmbeddedDriver {
+    EmbeddedDriver::with_config(karyos_driver::DriverConfig {
+        network: Some(karyos_driver::net::NetworkConfig {
+            threading: karyos_driver::agents::ThreadingMode::Shared,
+            ..karyos_driver::net::NetworkConfig::default()
+        }),
+        position_sample_interval: 1,
+        ..karyos_driver::DriverConfig::default()
+    })
+    .unwrap()
+}
+
+/// A reliable loopback channel to `port`.
+fn loopback(port: u16) -> karyos_protocol::channel::UdpConfig {
+    use karyos_protocol::channel::{Destination, Interface, Security, UdpConfig};
+    use std::net::{Ipv4Addr, SocketAddr};
+    UdpConfig {
+        destination: Destination::Unicast(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+        interface: Some(Interface::Address(Ipv4Addr::LOCALHOST.into())),
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    }
+}
+
+/// How long the replay's "nothing reaches the network" is watched after
+/// the replay ended, the drivers' duty cycles running throughout: far past
+/// a loopback round trip and the sender's idle heartbeat.
+const SETTLE: Duration = Duration::from_millis(500);
+
+/// Isolation of external effects over the network (SPEC §15, phase 3;
+/// contract-traceability-phase-3.md, the row's minor): a group whose
+/// handler answers each message on a network publication of driver A is
+/// recorded live while driver B's network subscription reads every
+/// answer; then the group is replayed over the same two drivers, running.
+/// Replay answers from the record, so nothing reaches the network: B's
+/// reader receives nothing new over [`SETTLE`], and neither A's stream
+/// heads nor B's subscriber positions move. The live phase is the control:
+/// the same answers do cross the network.
+#[test]
+fn a_replayed_group_reaches_no_network_output() {
+    use karyos_archive::group::record::MAX_RECORD;
+    use karyos_archive::group::replay::gateway::{GatewayConfig, ReplayGateway};
+    use karyos_archive::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
+    use karyos_protocol::lanes::drr::Budget;
+
+    /// Every payload is inline: no recording vouches for a reference.
+    struct Inline;
+    impl Coverage for Inline {
+        fn positions(&self, _: u64) -> Option<(u64, u64)> {
+            None
+        }
+        fn ended(&self, _: u64) -> Option<u64> {
+            None
+        }
+    }
+    let budget = Budget {
+        work: 256,
+        bytes: 1 << 20,
+    };
+    let work = |a: &mut EmbeddedDriver, b: &mut EmbeddedDriver| {
+        a.do_work().unwrap();
+        b.do_work().unwrap();
+    };
+
+    let dir = TempDir::new("network-isolation");
+    let groups = dir.path().join("groups");
+    std::fs::create_dir_all(&groups).unwrap();
+    let mut driver = network_driver();
+    let mut remote = network_driver();
+    let archive = ArchiveHandle::spawn(StdDisk, dir.path(), AgentConfig::default()).unwrap();
+    let input = driver.add_stream(stream()).unwrap();
+    // The handler's output: a network publication of A, read by B.
+    let port = test_port();
+    let _ = remote
+        .add_network_subscription(OUT, &loopback(port))
+        .unwrap();
+    let output = driver
+        .add_network_publication(
+            karyos_driver::AggregateConfig {
+                stream: StreamConfig {
+                    buffer: LogBufferConfig {
+                        stream_id: OUT,
+                        ..stream().buffer
+                    },
+                    ..stream()
+                },
+                quanta: vec![u64::from(DEFAULT_MTU) * 4],
+            },
+            &loopback(port),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let image = loop {
+        work(&mut driver, &mut remote);
+        if let Some(image) = remote.network_image(OUT, 1) {
+            break image;
+        }
+        assert!(Instant::now() < deadline, "no image of the output on B");
+    };
+    let mut out_reader = remote.subscribe_aggregate(&image, Role::Required).unwrap();
+    let sender = archive
+        .start_group({
+            let mut value = StartGroup::new(
+                1,
+                groups.clone(),
+                JOURNAL,
+                CaptureConfig::new(1 << 16, 4096, 64),
+            );
+            value.new = Some(NewGroup::new(1, 4096, Capture::Strict, b"net".to_vec()));
+            value
+        })
+        .unwrap();
+    let waiter = sender.waiter();
+    let started = Instant::now();
+    let clock = move || u64::try_from(started.elapsed().as_nanos()).unwrap();
+    let real: Shared = std::sync::Arc::new(std::sync::Mutex::new(
+        driver
+            .publication(output.lane(Lane::ZERO).unwrap())
+            .unwrap(),
+    ));
+    let port = DriverPort(std::sync::Arc::clone(&real));
+    let mut gateway = Gateway::new(port, clock, sender, Capture::Strict, 1, 4096, 4).unwrap();
+    let identity = SourceIdentity::new(1, STREAM, 1, Lane::ZERO);
+    let word = archive
+        .recording_word(STREAM, 1, Lane::ZERO)
+        .unwrap()
+        .unwrap_or_default();
+    let _ = gateway
+        .add_subscription(
+            Box::new(driver.subscribe(input, Role::Required).unwrap()),
+            identity,
+            word,
+        )
+        .unwrap();
+    let mut publication = driver.publication(input).unwrap();
+
+    // Live: the handler's answers cross the network, two per message.
+    let (mut published, mut dispatched, mut answered) = (0, 0, 0u64);
+    let mut handler = answer;
+    while dispatched < MESSAGES || answered < 2 * MESSAGES {
+        if published < MESSAGES
+            && let OfferOutcome::Accepted { .. } = publication.offer(&payload(published)).unwrap()
+        {
+            published += 1;
+        }
+        work(&mut driver, &mut remote);
+        if let Ok(Dispatched::Event { .. }) = gateway.dispatch(&mut handler) {
+            dispatched += 1;
+        }
+        let _ = out_reader.poll(|_, _, _| answered += 1, budget);
+        assert!(Instant::now() < deadline, "live: {dispatched} {answered}");
+    }
+    assert_eq!(
+        answered,
+        2 * MESSAGES,
+        "the live answers crossed the network"
+    );
+    let durable = loop {
+        work(&mut driver, &mut remote);
+        match waiter.wait_durable(MESSAGES, Duration::from_millis(20)) {
+            Ok(durable) => break durable,
+            Err(_) => assert!(Instant::now() < deadline, "never durable"),
+        }
+    };
+    assert_eq!(durable, MESSAGES);
+    archive.stop_group(1).unwrap();
+    drop(publication);
+    drop(gateway);
+    archive.shutdown().unwrap();
+
+    // Replay over the same drivers, running; the network output and B's
+    // reader stay. The drivers settle first, so their positions are stable.
+    for _ in 0..100 {
+        work(&mut driver, &mut remote);
+    }
+    let heads = driver_counter(&driver_cells(&driver), "stream head");
+    let positions = driver_counter(&driver_cells(&remote), "subscriber position");
+    let mut journal = GroupJournal::recover(StdDisk, &groups, 1, JOURNAL)
+        .unwrap()
+        .journal;
+    let recovery = recover(&mut journal, &Inline, 64).unwrap();
+    let cursor = ReplayCursor::open(
+        journal,
+        &recovery,
+        &ReplayConfig::new(b"net"),
+        CursorConfig::new(8 * MAX_RECORD, 8),
+    )
+    .unwrap();
+    let mut replay = ReplayGateway::new(
+        cursor,
+        &GatewayConfig::new()
+            .with_publications(&[(OUT, 1)])
+            .with_subscriptions(&[(STREAM, 1, Lane::ZERO)])
+            .with_max_claim(8)
+            .with_max_payload(4096),
+        None,
+    )
+    .unwrap();
+    let mut replayed = 0u64;
+    loop {
+        work(&mut driver, &mut remote);
+        match replay.dispatch(&mut handler) {
+            Ok(Dispatched::Event { .. }) => replayed += 1,
+            Ok(Dispatched::End) => break,
+            other => panic!("replay: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "replay never ended");
+    }
+    assert_eq!(replayed, MESSAGES);
+    // Nothing reaches B over the settle window, the drivers running.
+    let mut extra = 0u64;
+    let settled = Instant::now() + SETTLE;
+    while Instant::now() < settled {
+        work(&mut driver, &mut remote);
+        let _ = out_reader.poll(|_, _, _| extra += 1, budget);
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    assert_eq!(extra, 0, "replay published on the network");
+    assert_eq!(
+        driver_counter(&driver_cells(&driver), "stream head"),
+        heads,
+        "a stream head of A moved during replay"
+    );
+    assert_eq!(
+        driver_counter(&driver_cells(&remote), "subscriber position"),
+        positions,
+        "a subscriber position of B moved during replay"
+    );
+    // The control: the same output still reaches B, so the silence above
+    // is the replay's, not a dead path.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        real.lock().unwrap().offer(&[7u8; 8]).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ) {
+        work(&mut driver, &mut remote);
+        assert!(Instant::now() < deadline, "the output refused an offer");
+    }
+    let mut after = 0u64;
+    while after == 0 {
+        work(&mut driver, &mut remote);
+        let _ = out_reader.poll(|_, _, _| after += 1, budget);
+        assert!(Instant::now() < deadline, "the output no longer reaches B");
+    }
+    drop(real);
+}
