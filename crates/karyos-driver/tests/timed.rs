@@ -3,7 +3,11 @@
 //! Timed transmission through the embedded driver (`quantstratum-docs:
 //! karyos/design/timed-tx.md`; P2.11 T1, step 3b): a timed lane's handle
 //! takes `offer_at` only, checked before anything is reserved, and every
-//! accepted message leaves its entry in the lane's schedule ring.
+//! accepted message leaves its entry in the lane's schedule ring. A timed
+//! lane is a network publication's (owner item 65): each test's lane is
+//! one, reliable, towards a loopback port nothing reads, and its driver
+//! runs no cycle unless the test does, so the sender releases nothing; a
+//! local stream refuses a ring.
 
 #![allow(
     clippy::unwrap_used,
@@ -18,7 +22,13 @@ use karyos_client::schedule::{
     CLOCK_UNAVAILABLE, ClockDomain, ScheduleClock, ScheduleOptions, now,
 };
 use karyos_client::{ClientError, OfferOutcome};
-use karyos_driver::{DriverError, EmbeddedDriver, StreamConfig, StreamHandle};
+use karyos_driver::agents::ThreadingMode;
+use karyos_driver::net::NetworkConfig;
+use karyos_driver::{
+    AggregateConfig, AggregateHandle, DriverConfig, DriverError, EmbeddedDriver, StreamConfig,
+    StreamHandle,
+};
+use karyos_protocol::channel::{Destination, Interface, Security, UdpConfig};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
@@ -26,15 +36,20 @@ use karyos_sys::term::TermId;
 
 const SECOND: u64 = 1_000_000_000;
 
-fn stream(driver: &mut EmbeddedDriver, schedule_capacity: u32) -> StreamHandle {
-    try_stream(driver, schedule_capacity).unwrap()
+/// A network-enabled driver whose agents run only in the test's cycles.
+fn driver() -> EmbeddedDriver {
+    EmbeddedDriver::with_config(DriverConfig {
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap()
 }
 
-fn try_stream(
-    driver: &mut EmbeddedDriver,
-    schedule_capacity: u32,
-) -> Result<StreamHandle, DriverError> {
-    driver.add_stream(StreamConfig {
+fn config(schedule_capacity: u32) -> StreamConfig {
+    StreamConfig {
         buffer: LogBufferConfig {
             term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
             spare_slots: 3,
@@ -52,24 +67,101 @@ fn try_stream(
         allow_unconnected: true,
         on_required_loss: LossPolicy::Hold,
         conflation: None,
-    })
+    }
+}
+
+/// A reliable channel towards a loopback port nothing reads; the socket
+/// holding the port is leaked for the test's life.
+fn channel() -> UdpConfig {
+    let unread = Box::leak(Box::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()));
+    UdpConfig {
+        destination: Destination::Unicast(unread.local_addr().unwrap()),
+        interface: Some(Interface::Address(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ))),
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    }
+}
+
+/// A network publication of one lane with `schedule_capacity` entries,
+/// timed with `options` (and `clock`) when that is above 0, and its lane.
+fn try_publication(
+    driver: &mut EmbeddedDriver,
+    schedule_capacity: u32,
+    options: ScheduleOptions,
+    clock: Option<ScheduleClock>,
+) -> Result<(AggregateHandle, StreamHandle), DriverError> {
+    let aggregate = AggregateConfig {
+        stream: config(schedule_capacity),
+        quanta: vec![u64::from(DEFAULT_MTU) * 4],
+    };
+    let channel = channel();
+    let publication = match (schedule_capacity, clock) {
+        (0, _) => driver.add_network_publication(aggregate, &channel),
+        (_, None) => driver.add_timed_network_publication(aggregate, &channel, None, options),
+        (_, Some(clock)) => driver
+            .add_timed_network_publication_with_clock(aggregate, &channel, None, options, clock),
+    }?;
+    let lane = publication.lane(Lane::ZERO).unwrap();
+    Ok((publication, lane))
+}
+
+fn stream(driver: &mut EmbeddedDriver, schedule_capacity: u32) -> StreamHandle {
+    stream_with(driver, schedule_capacity, ScheduleOptions::default())
+}
+
+fn stream_with(
+    driver: &mut EmbeddedDriver,
+    schedule_capacity: u32,
+    options: ScheduleOptions,
+) -> StreamHandle {
+    try_publication(driver, schedule_capacity, options, None)
+        .unwrap()
+        .1
+}
+
+/// Owner item 65: a local stream has no sender to release a schedule
+/// ring, so the driver refuses one there, for a stream and for an
+/// aggregate, with `InvalidConfig`; nothing is added. A ring of 0 is a
+/// plain stream.
+#[test]
+fn a_local_stream_refuses_a_schedule_ring() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    assert_eq!(
+        driver.add_stream(config(4)).err(),
+        Some(DriverError::InvalidConfig)
+    );
+    assert_eq!(
+        driver
+            .add_aggregate(AggregateConfig {
+                stream: config(4),
+                quanta: vec![u64::from(DEFAULT_MTU) * 4],
+            })
+            .err(),
+        Some(DriverError::InvalidConfig)
+    );
+    // Nothing was added: the key is free.
+    assert!(driver.add_stream(config(0)).is_ok());
 }
 
 /// The driver refuses a schedule capacity that is not a power of two up
 /// to the bound with the schedule's own error, not a publication mode one.
 #[test]
 fn a_schedule_capacity_is_bounded() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = driver();
     let max = karyos_sys::schedule_ring::MAX_CAPACITY;
     for capacity in [3, max * 2] {
         assert_eq!(
-            try_stream(&mut driver, capacity).err(),
+            try_publication(&mut driver, capacity, ScheduleOptions::default(), None).err(),
             Some(DriverError::Sys(karyos_sys::error::SysError::Schedule(
                 karyos_sys::schedule_ring::ScheduleError::Capacity { capacity }
             ))),
         );
     }
-    assert!(try_stream(&mut driver, max).is_ok());
+    assert!(try_publication(&mut driver, max, ScheduleOptions::default(), None).is_ok());
 }
 
 fn invalid(result: Result<OfferOutcome, ClientError>) -> bool {
@@ -78,7 +170,7 @@ fn invalid(result: Result<OfferOutcome, ClientError>) -> bool {
 
 #[test]
 fn a_lane_that_is_not_timed_refuses_offer_at() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = driver();
     let handle = stream(&mut driver, 0);
     assert!(matches!(
         driver.schedule_stream(handle, ScheduleOptions::default()),
@@ -93,11 +185,12 @@ fn a_lane_that_is_not_timed_refuses_offer_at() {
 /// (the entries are checked against the ring in the driver's unit tests).
 #[test]
 fn a_timed_lane_takes_timed_offers_in_order() {
-    let mut driver = EmbeddedDriver::new().unwrap();
-    let handle = stream(&mut driver, 4);
-    driver
-        .schedule_stream(handle, ScheduleOptions::default().with_max_horizon(SECOND))
-        .unwrap();
+    let mut driver = driver();
+    let handle = stream_with(
+        &mut driver,
+        4,
+        ScheduleOptions::default().with_max_horizon(SECOND),
+    );
     let mut publication = driver.publication(handle).unwrap();
     assert_eq!(
         publication.schedule().unwrap().options().max_horizon,
@@ -132,7 +225,7 @@ fn a_timed_lane_takes_timed_offers_in_order() {
 /// released.
 #[test]
 fn a_full_schedule_backpressures_the_offer() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = driver();
     let handle = stream(&mut driver, 2);
     let mut publication = driver.publication(handle).unwrap();
     for time in [1, 2] {
@@ -152,37 +245,44 @@ fn a_full_schedule_backpressures_the_offer() {
     );
 }
 
+/// A network lane's settings are fixed at its creation: `schedule_stream`
+/// is refused at once, before any handle, and after one. The software
+/// route refuses the `Tai` domain, so no timed lane is `Tai` (the IPC
+/// lanes that were are refused since owner item 65).
 #[test]
-fn the_schedule_is_set_before_any_handle() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+fn the_schedule_is_fixed_at_creation() {
+    let mut driver = driver();
     let handle = stream(&mut driver, 4);
+    assert_eq!(
+        driver.schedule_stream(handle, ScheduleOptions::default()),
+        Err(DriverError::InvalidConfig)
+    );
     let _publication = driver.publication(handle).unwrap();
     assert_eq!(
         driver.schedule_stream(handle, ScheduleOptions::default()),
         Err(DriverError::InvalidConfig)
     );
-    if !cfg!(target_os = "linux") {
-        let other = {
-            let mut driver = EmbeddedDriver::new().unwrap();
-            let handle = stream(&mut driver, 4);
-            driver.schedule_stream(
-                handle,
-                ScheduleOptions::default().with_domain(ClockDomain::Tai),
-            )
-        };
-        assert!(matches!(
-            other,
-            Err(DriverError::Client(ClientError::InvalidSchedule { .. }))
-        ));
-    }
+    let mut other = self::driver();
+    assert!(matches!(
+        try_publication(
+            &mut other,
+            4,
+            ScheduleOptions::default().with_domain(ClockDomain::Tai),
+            None,
+        ),
+        Err(DriverError::TimedNetworkUnsupported { .. })
+    ));
 }
 
 /// A timed lane takes no cutover: its ring belongs to one buffer, and the
-/// handle's publisher would not follow a successor (#234 P1). Nothing
-/// changes on the refusal: the lane keeps its mapping and its offers.
+/// handle's publisher would not follow a successor (#234 P1). A timed lane
+/// is a network publication's, whose cutover is refused first until its
+/// sender follows successors (W2, `NetworkCutover`); `TimedCutover` then
+/// still refuses it. Nothing changes on the refusal: the lane keeps its
+/// mapping and its offers.
 #[test]
 fn a_timed_lane_refuses_a_cutover() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = driver();
     let handle = stream(&mut driver, 4);
     let mut publication = driver.publication(handle).unwrap();
     assert!(matches!(
@@ -197,16 +297,16 @@ fn a_timed_lane_refuses_a_cutover() {
                 spare_slots: 3,
             },
         ),
-        Err(DriverError::TimedCutover { .. })
+        Err(DriverError::NetworkCutover { .. })
     ));
     assert_eq!(driver.generations(handle).unwrap().len(), 1);
     assert!(matches!(
         publication.offer_at(b"m", 2).unwrap(),
         OfferOutcome::Accepted { .. }
     ));
-    // A lane that is not timed still takes one.
+    // A local stream, not timed, still takes one.
     let mut other = EmbeddedDriver::new().unwrap();
-    let plain = stream(&mut other, 0);
+    let plain = other.add_stream(config(0)).unwrap();
     assert!(
         other
             .reconfigure_stream(
@@ -224,10 +324,14 @@ fn a_timed_lane_refuses_a_cutover() {
 /// clock alone (#234 P3).
 #[test]
 fn a_zero_horizon_is_refused() {
-    let mut driver = EmbeddedDriver::new().unwrap();
-    let handle = stream(&mut driver, 4);
+    let mut driver = driver();
     assert!(matches!(
-        driver.schedule_stream(handle, ScheduleOptions::default().with_max_horizon(0),),
+        try_publication(
+            &mut driver,
+            4,
+            ScheduleOptions::default().with_max_horizon(0),
+            None,
+        ),
         Err(DriverError::Client(ClientError::InvalidSchedule { .. }))
     ));
 }
@@ -236,7 +340,7 @@ fn a_zero_horizon_is_refused() {
 /// also after it is dropped: its entries stay in the ring (#234 P3).
 #[test]
 fn the_schedule_stays_fixed_after_a_handle_is_dropped() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = driver();
     let handle = stream(&mut driver, 4);
     let mut publication = driver.publication(handle).unwrap();
     assert!(matches!(
@@ -255,15 +359,16 @@ fn the_schedule_stays_fixed_after_a_handle_is_dropped() {
 /// refusal does and as sys does (#234 P3).
 #[test]
 fn a_sealed_handle_reports_the_seal_before_a_refused_time() {
-    let mut driver = EmbeddedDriver::new().unwrap();
-    let handle = stream(&mut driver, 4);
+    let mut driver = driver();
+    let (aggregate, handle) =
+        try_publication(&mut driver, 4, ScheduleOptions::default(), None).unwrap();
     let mut publication = driver.publication(handle).unwrap();
     assert!(matches!(
         publication.offer_at(b"m", 10).unwrap(),
         OfferOutcome::Accepted { .. }
     ));
     assert!(invalid(publication.offer_at(b"m", 5)));
-    driver.remove_stream(handle).unwrap();
+    driver.remove_aggregate(&aggregate).unwrap();
     assert_eq!(publication.offer_at(b"m", 5).unwrap(), OfferOutcome::Closed);
     assert_eq!(publication.offer_at(b"m", 5).unwrap(), OfferOutcome::Closed);
 }
@@ -285,23 +390,22 @@ fn counter(driver: &EmbeddedDriver, label: &str) -> u64 {
 /// section 6; ACS 15462).
 #[test]
 fn timed_offers_are_counted_against_the_injected_clock() {
-    let mut driver = EmbeddedDriver::new().unwrap();
-    let handle = stream(&mut driver, 2);
+    let mut driver = driver();
     let virtual_now = Arc::new(AtomicU64::new(1_000));
     let clock = {
         let virtual_now = Arc::clone(&virtual_now);
         ScheduleClock::new(move || virtual_now.load(Ordering::Relaxed))
     };
-    driver
-        .schedule_stream_with_clock(
-            handle,
-            ScheduleOptions::default().with_max_horizon(100),
-            clock,
-        )
-        .unwrap();
-    assert!(driver.timed_counters(handle).unwrap().is_none());
-    let mut publication = driver.publication(handle).unwrap();
+    let (_aggregate, handle) = try_publication(
+        &mut driver,
+        2,
+        ScheduleOptions::default().with_max_horizon(100),
+        Some(clock),
+    )
+    .unwrap();
+    // A network lane's counters exist from its creation.
     assert!(driver.timed_counters(handle).unwrap().is_some());
+    let mut publication = driver.publication(handle).unwrap();
     // The horizon is read from the injected clock: 1_100 is the limit.
     assert!(matches!(
         publication.offer_at(b"m", 1_101),
@@ -338,19 +442,18 @@ fn timed_offers_are_counted_against_the_injected_clock() {
 
 /// A clock that cannot read the time refuses every offer with
 /// `ScheduleOverflow`, counted, whatever the horizon (ACS 15475; a zero
-/// horizon is refused at `schedule_stream`).
+/// horizon is refused at creation).
 #[test]
 fn an_unavailable_clock_refuses_the_offer() {
     for max_horizon in [1, SECOND] {
-        let mut driver = EmbeddedDriver::new().unwrap();
-        let handle = stream(&mut driver, 2);
-        driver
-            .schedule_stream_with_clock(
-                handle,
-                ScheduleOptions::default().with_max_horizon(max_horizon),
-                ScheduleClock::new(|| CLOCK_UNAVAILABLE),
-            )
-            .unwrap();
+        let mut driver = driver();
+        let (_aggregate, handle) = try_publication(
+            &mut driver,
+            2,
+            ScheduleOptions::default().with_max_horizon(max_horizon),
+            Some(ScheduleClock::new(|| CLOCK_UNAVAILABLE)),
+        )
+        .unwrap();
         let mut publication = driver.publication(handle).unwrap();
         for time in [0, 1_000, u64::MAX - SECOND] {
             assert!(matches!(
@@ -361,4 +464,37 @@ fn an_unavailable_clock_refuses_the_offer() {
         assert_eq!(counter(&driver, "timed rejections overflow (monotonic)"), 3);
         assert_eq!(counter(&driver, "timed scheduled offers (monotonic)"), 0);
     }
+}
+
+/// The timed network streams a driver configures
+/// (`NetworkStreamDefaults::timed`) are checked at start: a capacity of 0
+/// or a stream given twice refuses the driver with `InvalidConfig`.
+#[test]
+fn invalid_timed_network_streams_refuse_the_driver() {
+    use karyos_driver::net::TimedNetworkStream;
+
+    let with = |timed: [Option<TimedNetworkStream>; 2]| {
+        let mut network = NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        };
+        network.stream_defaults.timed[..2].copy_from_slice(&timed);
+        EmbeddedDriver::with_config(DriverConfig {
+            network: Some(network),
+            ..DriverConfig::default()
+        })
+        .err()
+    };
+    let one = |stream_id, schedule_capacity| {
+        Some(TimedNetworkStream {
+            stream_id,
+            schedule_capacity,
+        })
+    };
+    assert_eq!(with([one(3, 0), None]), Some(DriverError::InvalidConfig));
+    assert_eq!(
+        with([one(3, 4), one(3, 8)]),
+        Some(DriverError::InvalidConfig)
+    );
+    assert_eq!(with([one(3, 4), one(4, 8)]), None);
 }

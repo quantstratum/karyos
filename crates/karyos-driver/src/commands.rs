@@ -2440,30 +2440,70 @@ mod tests {
         (driver, stream)
     }
 
-    /// As [`driver_with_stream`], on a timed lane.
+    /// A network-enabled driver with a timed network publication of the
+    /// same key as [`driver_with_stream`]'s, and its lane's stream: a timed
+    /// lane is a network publication's (owner item 65). It sends towards a
+    /// loopback port nothing reads.
     fn driver_with_timed_stream() -> (EmbeddedDriver, StreamHandle) {
-        let mut driver = EmbeddedDriver::new().unwrap();
-        let stream = driver
-            .add_stream(StreamConfig {
-                buffer: LogBufferConfig {
-                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
-                    spare_slots: 3,
-                    max_subscribers: 4,
-                    mtu: DEFAULT_MTU,
-                    max_reserved: MIN_TERM_LENGTH / 8,
-                    initial_term_id: TermId::new(7),
-                    lane: Lane::ZERO,
-                    session_id: 1,
-                    stream_id: 2,
-                    claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
-                    publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
-                    schedule_capacity: 4,
+        driver_with_timed_stream_scheduled(karyos_client::schedule::ScheduleOptions::default())
+    }
+
+    /// As [`driver_with_timed_stream`], its schedule `options`: a network
+    /// publication takes them at creation.
+    fn driver_with_timed_stream_scheduled(
+        options: karyos_client::schedule::ScheduleOptions,
+    ) -> (EmbeddedDriver, StreamHandle) {
+        use karyos_protocol::channel::{Destination, Interface, Security, UdpConfig};
+
+        let mut driver = EmbeddedDriver::with_config(crate::DriverConfig {
+            network: Some(crate::net::NetworkConfig {
+                threading: crate::agents::ThreadingMode::Shared,
+                ..crate::net::NetworkConfig::default()
+            }),
+            ..crate::DriverConfig::default()
+        })
+        .unwrap();
+        let unread = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let channel = UdpConfig {
+            destination: Destination::Unicast(unread.local_addr().unwrap()),
+            interface: Some(Interface::Address(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::LOCALHOST,
+            ))),
+            paths: Vec::new(),
+            reliable: true,
+            flow_control: None,
+            security: Security::Trusted,
+        };
+        let publication = driver
+            .add_timed_network_publication(
+                crate::embedded::AggregateConfig {
+                    stream: StreamConfig {
+                        buffer: LogBufferConfig {
+                            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                            spare_slots: 3,
+                            max_subscribers: 4,
+                            mtu: DEFAULT_MTU,
+                            max_reserved: MIN_TERM_LENGTH / 8,
+                            initial_term_id: TermId::new(7),
+                            lane: Lane::ZERO,
+                            session_id: 1,
+                            stream_id: 2,
+                            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                            publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                            schedule_capacity: 4,
+                        },
+                        allow_unconnected: false,
+                        on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                        conflation: None,
+                    },
+                    quanta: vec![u64::from(DEFAULT_MTU) * 4],
                 },
-                allow_unconnected: false,
-                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
-                conflation: None,
-            })
+                &channel,
+                None,
+                options,
+            )
             .unwrap();
+        let stream = publication.lane(Lane::ZERO).unwrap();
         (driver, stream)
     }
 
@@ -5798,11 +5838,10 @@ mod tests {
     /// handle reads them and they no longer change.
     #[test]
     fn a_timed_stream_grants_cnc_publications_with_their_binding() {
-        let (mut driver, stream) = driver_with_timed_stream();
         let options = karyos_client::schedule::ScheduleOptions::default()
             .with_max_horizon(5_000)
             .with_lateness_tolerance(7);
-        driver.schedule_stream(stream, options).unwrap();
+        let (mut driver, stream) = driver_with_timed_stream_scheduled(options);
         let (client, mut producer, _link) = raw_client(&mut driver);
         let answers = add_timed_publication(&mut driver, &mut producer);
         assert!(
@@ -5834,6 +5873,10 @@ mod tests {
     #[test]
     fn a_monotonic_timed_stream_refuses_a_remote_client_outside_its_namespace() {
         let (mut driver, stream) = driver_with_timed_stream();
+        let ring = |driver: &EmbeddedDriver| {
+            karyos_sys::schedule_ring::binding(driver.schedule_ring(stream).unwrap().unwrap())
+        };
+        let before = ring(&driver);
         let (client, mut producer) = remote_client(&mut driver, 4);
         let answers = add_timed_publication(&mut driver, &mut producer);
         let unknown = TimeNamespace::Unknown.code();
@@ -5848,10 +5891,8 @@ mod tests {
             )),
             "{answers:?}"
         );
-        // Nothing was fixed: the settings still change.
-        driver
-            .schedule_stream(stream, karyos_client::schedule::ScheduleOptions::default())
-            .unwrap();
+        // Nothing was written: the ring's binding is as before.
+        assert_eq!(ring(&driver), before);
     }
 
     /// T-x2 (TT-6a): a `Tai` lane is one clock for the whole host, granted
@@ -5863,10 +5904,9 @@ mod tests {
         if karyos_sys::host_clock::host_tai_ns().is_none() {
             return;
         }
-        let (mut driver, stream) = driver_with_timed_stream();
         let options = karyos_client::schedule::ScheduleOptions::default()
             .with_domain(karyos_client::schedule::ClockDomain::Tai);
-        driver.schedule_stream(stream, options).unwrap();
+        let (mut driver, stream) = driver_with_timed_stream_scheduled(options);
         let (client, mut producer) = remote_client(&mut driver, 4);
         let answers = add_timed_publication(&mut driver, &mut producer);
         assert!(

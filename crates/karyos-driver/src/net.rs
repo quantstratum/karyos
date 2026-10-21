@@ -158,6 +158,55 @@ pub struct NetworkStreamDefaults {
     /// control path for each publication (SPEC §4, initial state; §5).
     #[doc(hidden)]
     pub initial_term_id: Option<u32>,
+    /// The streams whose network publications a client creates by URI are
+    /// timed: each lane gets a schedule ring of that many entries, which
+    /// the sender releases as it sends (karyosd `--timed-network`; owner
+    /// item 65). A driver stream never is: [`EmbeddedDriver::add_stream`]
+    /// refuses a schedule ring, which nothing would release. At most
+    /// [`MAX_TIMED_NETWORK_STREAMS`]; a capacity of 0 or a stream given
+    /// twice is refused at start as `InvalidConfig`.
+    ///
+    /// [`EmbeddedDriver::add_stream`]: crate::EmbeddedDriver::add_stream
+    pub timed: [Option<TimedNetworkStream>; MAX_TIMED_NETWORK_STREAMS],
+}
+
+/// A stream whose network publications are timed
+/// ([`NetworkStreamDefaults::timed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedNetworkStream {
+    /// The wire stream id.
+    pub stream_id: i32,
+    /// Schedule ring entries of each lane, at least 1.
+    pub schedule_capacity: u32,
+}
+
+/// The most timed network streams a driver configures.
+pub const MAX_TIMED_NETWORK_STREAMS: usize = 8;
+
+impl NetworkStreamDefaults {
+    /// The schedule capacity of `stream_id`'s network publications, `None`
+    /// for an untimed stream.
+    #[must_use]
+    pub fn timed_capacity(&self, stream_id: i32) -> Option<u32> {
+        self.timed
+            .iter()
+            .flatten()
+            .find(|timed| timed.stream_id == stream_id)
+            .map(|timed| timed.schedule_capacity)
+    }
+
+    /// Whether the timed streams are valid: every capacity at least 1 and
+    /// no stream twice.
+    fn timed_valid(&self) -> bool {
+        let timed: Vec<&TimedNetworkStream> = self.timed.iter().flatten().collect();
+        timed.iter().enumerate().all(|(index, one)| {
+            one.schedule_capacity > 0
+                && timed
+                    .iter()
+                    .take(index)
+                    .all(|other| other.stream_id != one.stream_id)
+        })
+    }
 }
 
 /// The longest `publication_linger` a network accepts (ns): 60 s. A
@@ -175,6 +224,7 @@ impl Default for NetworkStreamDefaults {
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
             publication_linger: 5_000_000_000,
             initial_term_id: None,
+            timed: [None; MAX_TIMED_NETWORK_STREAMS],
         }
     }
 }
@@ -657,7 +707,8 @@ impl<T: StreamTerms> Network<T> {
     /// # Errors
     ///
     /// [`DriverError::InvalidConfig`] for an agent configuration the agents
-    /// refuse or a `publication_linger` above [`MAX_PUBLICATION_LINGER`];
+    /// refuse, a `publication_linger` above [`MAX_PUBLICATION_LINGER`] or
+    /// invalid timed streams ([`NetworkStreamDefaults::timed`]);
     /// [`DriverError::NetworkStart`] when a thread cannot start.
     pub(crate) fn start(
         config: &NetworkConfig,
@@ -666,7 +717,9 @@ impl<T: StreamTerms> Network<T> {
     where
         T: 'static,
     {
-        if config.stream_defaults.publication_linger > MAX_PUBLICATION_LINGER {
+        if config.stream_defaults.publication_linger > MAX_PUBLICATION_LINGER
+            || !config.stream_defaults.timed_valid()
+        {
             return Err(DriverError::InvalidConfig);
         }
         control_group::validate(&config.nak_control_groups)?;

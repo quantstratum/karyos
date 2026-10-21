@@ -491,6 +491,19 @@ pub enum StreamState {
     Freed,
 }
 
+/// A local stream (`add_stream`, `add_aggregate`) refuses a schedule ring:
+/// it has no sender to release one, so a timed lane there would take
+/// `schedule_capacity` offers and then back pressure for good (owner item
+/// 65). Timed lanes are network publications'
+/// (`add_timed_network_publication`, or a timed network stream of
+/// `NetworkStreamDefaults::timed`).
+fn local_schedule(config: &StreamConfig) -> Result<(), DriverError> {
+    if config.buffer.schedule_capacity > 0 {
+        return Err(DriverError::InvalidConfig);
+    }
+    Ok(())
+}
+
 /// The largest charged frame of a lane of `config` (aggregate-lanes.md,
 /// charged bytes): a frame never exceeds the MTU, aligned to 32 bytes.
 fn largest_charge(config: &StreamConfig) -> Result<u64, DriverError> {
@@ -2152,9 +2165,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// Returns configuration and allocation errors; no stream is added on
-    /// error, and the refusal is recorded in the error log.
-    /// [`DriverError::Sys`] when the random source fails, before anything
-    /// is validated; it is logged too.
+    /// error, and the refusal is recorded in the error log. That includes
+    /// [`DriverError::InvalidConfig`] for a schedule ring
+    /// (`schedule_capacity` above 0): a local stream has no sender to
+    /// release it (owner item 65), so timed lanes are network
+    /// publications'. [`DriverError::Sys`] when the random source fails,
+    /// before anything else is validated; it is logged too.
     pub fn add_stream(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
         // The first term id, drawn on the control path before the stream
         // exists (SPEC §4, initial state); a failed draw refuses the add.
@@ -2166,8 +2182,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // One lane, the configured one, with a quantum of the largest frame:
         // exactly today's stream.
         let lane = config.buffer.lane;
-        let added = self
-            .draw_initial_term_id(self.config.initial_term_id)
+        let added = local_schedule(&config)
+            .and_then(|()| self.draw_initial_term_id(self.config.initial_term_id))
             .and_then(|drawn| {
                 config.buffer.initial_term_id = drawn;
                 largest_charge(&config)
@@ -2203,9 +2219,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         config: AggregateConfig,
     ) -> Result<AggregateHandle, DriverError> {
         // As for a stream, one draw shared by every lane; a failed draw is
-        // logged as any other refusal.
+        // logged as any other refusal, as is a schedule ring.
         let mut config = config;
-        match self.draw_initial_term_id(self.config.initial_term_id) {
+        match local_schedule(&config.stream)
+            .and_then(|()| self.draw_initial_term_id(self.config.initial_term_id))
+        {
             Ok(drawn) => {
                 config.stream.buffer.initial_term_id = drawn;
                 self.add_aggregate_drawn(config)

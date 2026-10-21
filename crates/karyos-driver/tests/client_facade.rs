@@ -1429,30 +1429,50 @@ fn offers_and_claims_have_the_spec_shape() {
 /// the in-process command ring is bound to the schedule its driver wrote,
 /// so the facade offers on it with a time. A plain offer, a time below the
 /// lane's last, one past the horizon and an unconfigured lane are refused
-/// before anything is reserved; the accepted message is delivered.
+/// before anything is reserved; the accepted message is delivered. Since
+/// owner item 65 a timed lane is a network publication's: the client adds
+/// one by URI on a stream the driver configures timed
+/// (`NetworkStreamDefaults::timed`), and reads it back over loopback.
 #[test]
 fn a_timed_lane_is_offered_at_its_time() {
     use karyos_client::schedule::{ClockDomain, ScheduleOptions, now};
+    use karyos_driver::net::TimedNetworkStream;
     use karyos_sys::frame::Lane;
 
-    const HORIZON: u64 = 1_000_000_000;
-    let mut driver = EmbeddedDriver::new().unwrap();
-    let mut config = heap_stream(3);
-    config.buffer.schedule_capacity = 4;
-    let stream = driver.add_stream(config).unwrap();
-    driver
-        .schedule_stream(stream, ScheduleOptions::default().with_max_horizon(HORIZON))
-        .unwrap();
+    let horizon = ScheduleOptions::default().max_horizon;
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.stream_defaults.timed[0] = Some(TimedNetworkStream {
+        stream_id: 3,
+        schedule_capacity: 4,
+    });
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{}", port());
     let mut client = Client::with_conductor(driver.connect().unwrap(), context());
     serve(&mut driver, || {
-        let mut reading = client
-            .add_subscription("karyos:ipc", StreamId::new(3))
-            .unwrap();
+        let mut reading = client.add_subscription(&uri, StreamId::new(3)).unwrap();
         let mut publication = client
-            .add_exclusive_publication("karyos:ipc", StreamId::new(3))
+            .add_exclusive_publication(&uri, StreamId::new(3))
             .unwrap();
-        let at = now(ClockDomain::Monotonic).unwrap();
-        let accepted = publication.offer_at_on(Lane::ZERO, b"timed", at).unwrap();
+        // Accepted once the loopback receiver's status messages connect it.
+        let start = Instant::now();
+        let (at, accepted) = loop {
+            let at = now(ClockDomain::Monotonic).unwrap();
+            match publication.offer_at_on(Lane::ZERO, b"timed", at) {
+                Err(OfferError::NotConnected) => {
+                    assert!(start.elapsed() < Duration::from_secs(10), "never connected");
+                    let _ = client.poll();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                other => break (at, other.unwrap()),
+            }
+        };
         assert_eq!(accepted.lane(), Lane::ZERO);
         assert!(matches!(
             publication.offer_on(Lane::ZERO, b"plain"),
@@ -1463,7 +1483,7 @@ fn a_timed_lane_is_offered_at_its_time() {
             Err(OfferError::InvalidSchedule { .. })
         ));
         assert!(matches!(
-            publication.offer_at_on(Lane::ZERO, b"far", at + 10 * HORIZON),
+            publication.offer_at_on(Lane::ZERO, b"far", at + 10 * horizon),
             Err(OfferError::Client(ClientError::ScheduleTooFar { .. }))
         ));
         assert_eq!(

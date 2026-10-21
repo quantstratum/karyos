@@ -281,7 +281,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Ok(session_id) => session_id,
             Err(code) => return refuse(code, detail),
         };
-        let config = match aggregate(
+        let mut config = match aggregate(
             &defaults,
             &channel.common,
             stream_id,
@@ -291,7 +291,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Ok(config) => config,
             Err(error) => return refuse(refusal(error), detail),
         };
-        let handle = match self.add_network_publication(config, &udp) {
+        // A timed stream's publication: a schedule ring on each lane,
+        // released by the sender (`NetworkStreamDefaults::timed`).
+        let added = match defaults.timed_capacity(stream_id) {
+            Some(capacity) => {
+                config.stream.buffer.schedule_capacity = capacity;
+                self.add_timed_network_publication(
+                    config,
+                    &udp,
+                    None,
+                    karyos_client::schedule::ScheduleOptions::default(),
+                )
+            }
+            None => self.add_network_publication(config, &udp),
+        };
+        let handle = match added {
             Ok(handle) => handle,
             Err(error) => return refuse(refusal(error), detail),
         };
