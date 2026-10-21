@@ -9,8 +9,38 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ## [Unreleased]
 
+### Fixed
+
+- A stream configured `allow_unconnected` (`StreamConfig`,
+  `karyos_stream_options`) now grants it to every publication an
+  in-process client adds, exclusive or concurrent, as the driver's own
+  handles already got it (SPEC.md §4). The driver had used only the
+  client's request, which the client facade always sent without it, so
+  a C caller's offer on such a stream answered `KARYOS_E_NOT_CONNECTED`
+  until a subscriber attached (REVIEWER-01's finding from the .NET
+  binding, B1b). A remote (karyosd) client gets it too, from its grant:
+  bit 16 of a manifest record's word 6 says the stream allows offers
+  with no subscriber, valid only with an exclusive or concurrent
+  publication's capability and reserved otherwise (quantstratum-docs:
+  `karyos/design/ipc-admission.md`, Unconnected offers). This is in
+  place under the unreleased admission version 2, so a version 2 client
+  built before it refuses such a grant rather than ignore the policy.
+  `karyos_protocol::admission::Record` gains `allow_unconnected`.
+
 ### Changed
 
+- `karyos-ffi`: each copy of the library draws its own base generation
+  for its handles, once, from the address of one of its statics (never
+  0; no clock or process id, so it runs under Miri's isolation). A handle
+  of another copy in the same process (two static copies, BIND-CPP-Q12)
+  then names a slot at another generation and answers `KARYOS_E_CLOSED`,
+  except with
+  probability 2^-32 per call, instead of acting on that copy's object; a
+  copy cannot tell a foreign handle from a stale one. A slot's generation
+  counts on from the base, skipping 0, and the slot is retired only once
+  it would come back to the base, after all 2^32 - 1 generations (it was
+  retired at u32::MAX before). The handle's layout and the ABI are
+  unchanged (`handles::tests`).
 - The conformance seeding of the `archive-replay` feature waits until
   `"r0"` to `"r4"` are recorded before it pauses (now 50 ms) and
   publishes `"r5"` to `"r9"`. Record times are per recorder duty, so a

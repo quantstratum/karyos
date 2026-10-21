@@ -124,10 +124,14 @@
 //!
 //! A record is eight words: region id; export id; kind (bits 0..8) and
 //! layout version (bits 8..40); structure length; generation; stream id
-//! (low 32) and session id (high 32); lane (bits 0..8) and capability
+//! (low 32) and session id (high 32); lane (bits 0..8), capability
 //! (bits 8..16: 0 none, 1 required subscriber, 2 optional subscriber, 3
-//! exclusive publication, 4 concurrent publication); the cell or publisher
-//! slot the capability names (0 when none).
+//! exclusive publication, 4 concurrent publication, 5 observer subscriber)
+//! and, in bit 16, whether the stream allows offers with no subscriber
+//! attached (SPEC.md §4 `allow_unconnected`; set only with capability 3 or
+//! 4, reserved otherwise, as bits 17..64 are; quantstratum-docs:
+//! karyos/design/ipc-admission.md, Unconnected offers); the cell or
+//! publisher slot the capability names (0 when none).
 
 use thiserror::Error;
 
@@ -135,6 +139,9 @@ use thiserror::Error;
 pub const VERSION: u64 = 2;
 /// Most records in one manifest.
 pub const MAX_RECORDS: usize = 16;
+/// The bit of a record's word 6 that says its stream allows offers with
+/// no subscriber attached.
+const UNCONNECTED_BIT: u32 = 16;
 /// Words of one record.
 pub const RECORD_WORDS: usize = 8;
 /// Largest encoded message, in bytes: `Manifest` with [`MAX_RECORDS`]
@@ -405,6 +412,15 @@ impl Capability {
         }
     }
 
+    /// Whether it is a publication's: the capabilities a record's
+    /// unconnected-offers bit may come with.
+    const fn is_publication(self) -> bool {
+        matches!(
+            self,
+            Self::ExclusivePublication | Self::ConcurrentPublication { .. }
+        )
+    }
+
     const fn from_words(code: u64, index: u64) -> Option<Self> {
         match (code, index) {
             (0, 0) => Some(Self::None),
@@ -442,6 +458,10 @@ pub struct Record {
     pub lane: u8,
     /// The capability granted.
     pub capability: Capability,
+    /// The stream allows offers with no subscriber attached (SPEC.md §4):
+    /// carried for a publication's capability only, and ignored with any
+    /// other.
+    pub allow_unconnected: bool,
 }
 
 impl Record {
@@ -455,7 +475,10 @@ impl Record {
             self.generation,
             u64::from(self.stream_id.cast_unsigned())
                 | (u64::from(self.session_id.cast_unsigned()) << 32),
-            u64::from(self.lane) | (capability << 8),
+            u64::from(self.lane)
+                | (capability << 8)
+                | (u64::from(self.allow_unconnected && self.capability.is_publication())
+                    << UNCONNECTED_BIT),
             index,
         ]
     }
@@ -474,7 +497,13 @@ impl Record {
         else {
             return Err(AdmissionError::Reserved);
         };
-        if export == 0 || kind >> 40 != 0 || lane >> 16 != 0 {
+        if export == 0 || kind >> 40 != 0 || lane >> (UNCONNECTED_BIT + 1) != 0 {
+            return Err(AdmissionError::Reserved);
+        }
+        let capability =
+            Capability::from_words((lane >> 8) & 0xFF, index).ok_or(AdmissionError::Reserved)?;
+        let allow_unconnected = lane >> UNCONNECTED_BIT != 0;
+        if allow_unconnected && !capability.is_publication() {
             return Err(AdmissionError::Reserved);
         }
         Ok(Self {
@@ -487,7 +516,8 @@ impl Record {
             stream_id: (identity as u32).cast_signed(),
             session_id: ((identity >> 32) as u32).cast_signed(),
             lane: (lane & 0xFF) as u8,
-            capability: Capability::from_words(lane >> 8, index).ok_or(AdmissionError::Reserved)?,
+            capability,
+            allow_unconnected,
         })
     }
 }
@@ -957,6 +987,7 @@ mod tests {
             session_id: 77,
             lane: 3,
             capability,
+            allow_unconnected: false,
         }
     }
 
@@ -1665,6 +1696,57 @@ mod tests {
         );
     }
 
+    /// A record's bit 16 (ipc-admission.md, Unconnected offers): it
+    /// round-trips with an exclusive or a concurrent publication's
+    /// capability, is refused with any other and above it, and is never
+    /// encoded with a capability that is not a publication's.
+    #[test]
+    fn the_unconnected_bit_comes_with_a_publications_capability_only() {
+        for capability in [
+            Capability::ExclusivePublication,
+            Capability::ConcurrentPublication { slot: 2 },
+        ] {
+            let allowing = Record {
+                allow_unconnected: true,
+                ..record(7, capability)
+            };
+            let words = allowing.words();
+            assert_eq!(words[6] >> UNCONNECTED_BIT, 1, "{capability:?}");
+            assert_eq!(Record::from_words(&words), Ok(allowing));
+            let plain = record(7, capability);
+            assert_eq!(plain.words()[6] >> UNCONNECTED_BIT, 0);
+            assert_eq!(Record::from_words(&plain.words()), Ok(plain));
+            // Bits above it stay reserved.
+            let mut above = words;
+            above[6] |= 1 << (UNCONNECTED_BIT + 1);
+            assert_eq!(Record::from_words(&above), Err(AdmissionError::Reserved));
+        }
+        for capability in [
+            Capability::None,
+            Capability::RequiredSubscriber { cell: 1 },
+            Capability::OptionalSubscriber { cell: 1 },
+            Capability::ObserverSubscriber { cell: 1 },
+        ] {
+            let index = capability.words().1;
+            let allowing = Record {
+                allow_unconnected: true,
+                ..record(7, capability)
+            };
+            // Never encoded.
+            let words = allowing.words();
+            assert_eq!(words[6] >> UNCONNECTED_BIT, 0, "{capability:?}");
+            assert_eq!(words[7], index);
+            // Refused when set.
+            let mut set = words;
+            set[6] |= 1 << UNCONNECTED_BIT;
+            assert_eq!(
+                Record::from_words(&set),
+                Err(AdmissionError::Reserved),
+                "{capability:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_version_of_any_tool_hello_can_be_read() {
         let mut out = [0u8; MAX_MESSAGE_LENGTH];
@@ -1933,6 +2015,9 @@ mod properties {
                     session_id,
                     lane,
                     capability,
+                    // Set with a publication's capability, for odd lanes:
+                    // both values of the bit round-trip.
+                    allow_unconnected: capability.is_publication() && lane % 2 == 1,
                 },
             )
     }
@@ -2047,6 +2132,8 @@ mod properties {
                     if valid {
                         for record in &mut records {
                             record.capability = Capability::None;
+                            // Carried with a publication's capability only.
+                            record.allow_unconnected = false;
                         }
                     }
                     Message::ToolAdmitted {

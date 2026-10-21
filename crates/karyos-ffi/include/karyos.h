@@ -12,10 +12,13 @@
  *   results through out-parameters. There is no global or thread-local
  *   error state.
  * - Objects are 64-bit handles, never pointers. A closed handle answers
- *   KARYOS_E_CLOSED; a handle in use by another thread answers
- *   KARYOS_E_BUSY, and one reentered from its own callback answers
- *   KARYOS_E_REENTRANT. A call never waits for another call on its
- *   handle; two bounded waits are listed under Threads below.
+ *   KARYOS_E_CLOSED. So does a handle of another copy of this library in
+ *   the same process (two static copies), except with probability 2^-32
+ *   per call: each copy draws its own base generation, and a copy cannot
+ *   tell a foreign handle from a stale one. A handle in use by another
+ *   thread answers KARYOS_E_BUSY, and one reentered from its own callback
+ *   answers KARYOS_E_REENTRANT. A call never waits for another call on
+ *   its handle; two bounded waits are listed under Threads below.
  * - A panic inside Karyos returns KARYOS_E_INTERNAL and poisons the handle
  *   it held.
  * - Callbacks must return normally: an exception, a panic or a longjmp
@@ -442,7 +445,11 @@ typedef struct karyos_stream_options {
     uint32_t lane;
     /* KARYOS_PUBLICATION_*. */
     uint32_t publication_mode;
-    /* Offers allowed with no subscriber attached: 0 or 1. */
+    /*
+     * Offers allowed with no subscriber attached: 0 or 1. It applies to
+     * every publication of the stream, exclusive or concurrent, an
+     * in-process or a remote client's.
+     */
     uint32_t allow_unconnected;
     /* Entries of the stream's schedule ring: 0 for none, or a power of
        two up to 1 << 20 on an exclusive stream. */
@@ -473,11 +480,10 @@ typedef struct karyos_stream_options {
      * reader: raise spare_slots for a concurrent stream that also has
      * optional readers, such as an Archive's request stream. A concurrent
      * handle's offer needs a connected subscriber (KARYOS_E_NOT_CONNECTED
-     * otherwise): allow_unconnected applies to exclusive publications
-     * only. Each handle reserves with
-     * one atomic fetch_add: on an aarch64 CPU without LSE atomics, as
-     * detected at run time (not the build's target features), the driver
-     * refuses a concurrent stream, its default.
+     * otherwise) unless the stream allows unconnected offers. Each handle
+     * reserves with one atomic fetch_add: on an aarch64 CPU without LSE
+     * atomics, as detected at run time (not the build's target features),
+     * the driver refuses a concurrent stream, its default.
      */
     uint32_t publishers;
     /* Zero. */

@@ -167,6 +167,42 @@ fn a_claim_filled_by_its_caller_is_staged_until_its_abort() {
     assert_eq!(abi::client_close(client), OK);
 }
 
+/// A stream added with `allow_unconnected` 1 grants it to a client's
+/// publication, exclusive or concurrent: an offer with no subscriber is
+/// accepted. With 0 it answers NOT_CONNECTED (REVIEWER-01's .NET B1b
+/// finding: the client's own request, always without it, used to decide).
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_streams_allow_unconnected_reaches_a_clients_publication() {
+    let (_, driver) = abi::driver_create();
+    let (_, client) = abi::driver_connect(driver);
+    assert_eq!(abi::driver_start(driver, IDLE_YIELD, 0), OK);
+    let mut stream_id = 20;
+    for concurrent in [false, true] {
+        for allow in [0, 1] {
+            stream_id += 1;
+            let (_, mut options) = abi::stream_options(stream_id);
+            options.allow_unconnected = allow;
+            if concurrent {
+                options.publication_mode = 1;
+                options.publishers = 1;
+            }
+            assert_eq!(abi::driver_add_stream(driver, &options).0, OK);
+            let (status, publication, _) =
+                abi::client_add_publication_of(client, c"karyos:ipc", stream_id, 0, concurrent);
+            assert_eq!(status, OK, "{concurrent} {allow}");
+            let expected = if allow == 1 { OK } else { NOT_CONNECTED };
+            assert_eq!(
+                abi::publication_offer(publication, b"alone"),
+                expected,
+                "concurrent {concurrent}, allow_unconnected {allow}"
+            );
+        }
+    }
+    assert_eq!(abi::driver_close(driver), OK);
+    assert_eq!(abi::client_close(client), OK);
+}
+
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_c_caller_publishes_on_a_stream_of_its_own_driver() {

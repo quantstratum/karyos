@@ -1107,6 +1107,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let occupant = self.next_export;
                 let mut subscriber = None;
                 let mut occupant_used = None;
+                // A stream configured allow_unconnected grants it to every
+                // publication, as its in-process handles get it
+                // (EmbeddedDriver::publication); a client may still ask for
+                // it on a stream without it (SPEC.md §4).
+                let stream_allows = target.allow_unconnected;
                 let (capability, kind) = match command {
                     Command::AddPublication {
                         allow_unconnected, ..
@@ -1114,7 +1119,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         Some(inner) => (
                             Capability::Publication {
                                 inner,
-                                allow_unconnected,
+                                allow_unconnected: allow_unconnected || stream_allows,
                             },
                             Kind::Publication,
                         ),
@@ -1122,7 +1127,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             Ok(Some(inner)) => (
                                 Capability::Publication {
                                     inner,
-                                    allow_unconnected,
+                                    allow_unconnected: allow_unconnected || stream_allows,
                                 },
                                 Kind::Publication,
                             ),
@@ -1136,7 +1141,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         Ok(Some(inner)) => (
                             Capability::ConcurrentPublication {
                                 inner,
-                                allow_unconnected,
+                                allow_unconnected: allow_unconnected || stream_allows,
                             },
                             Kind::Publication,
                         ),
@@ -2388,6 +2393,12 @@ mod tests {
     }
 
     fn driver_with_stream() -> (EmbeddedDriver, StreamHandle) {
+        driver_with_stream_allowing(false)
+    }
+
+    /// As [`driver_with_stream`], its stream configured with
+    /// `allow_unconnected`.
+    fn driver_with_stream_allowing(allow_unconnected: bool) -> (EmbeddedDriver, StreamHandle) {
         let mut driver = EmbeddedDriver::new().unwrap();
         let stream = driver
             .add_stream(StreamConfig {
@@ -2405,7 +2416,7 @@ mod tests {
                     publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
                     schedule_capacity: 0,
                 },
-                allow_unconnected: false,
+                allow_unconnected,
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
                 conflation: None,
             })
@@ -4548,6 +4559,36 @@ mod tests {
             driver.client_counters.owned_by(client.owner().client),
             Some(0)
         );
+    }
+
+    /// A stream configured `allow_unconnected` grants it to an in-process
+    /// client's publication, which asked without it: an offer with no
+    /// subscriber is accepted. On a stream without it the same request's
+    /// publication is not connected (SPEC.md §4).
+    #[test]
+    fn a_streams_allow_unconnected_reaches_a_clients_publication() {
+        for allow in [false, true] {
+            let (mut driver, _stream) = driver_with_stream_allowing(allow);
+            let mut client = driver.connect().unwrap();
+            let _ = client.add_publication(KEY, false).unwrap();
+            let _ = driver.do_work().unwrap();
+            let mut publication = None;
+            let _ = client.poll(usize::MAX, |completion| {
+                if let Outcome::Publication(handle) = completion.outcome {
+                    publication = Some(handle);
+                }
+            });
+            let mut publication = publication.unwrap();
+            let outcome = publication.offer(b"alone").unwrap();
+            if allow {
+                assert!(
+                    matches!(outcome, karyos_client::OfferOutcome::Accepted { .. }),
+                    "{outcome:?}"
+                );
+            } else {
+                assert_eq!(outcome, karyos_client::OfferOutcome::NotConnected);
+            }
+        }
     }
 
     #[test]
