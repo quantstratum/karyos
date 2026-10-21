@@ -39,13 +39,15 @@ impl Coverage for NoRecordings {
     }
 }
 
-/// A port that accepts everything, counting its calls.
+/// A port that accepts everything, counting its calls; an offer answers
+/// the next of `scripted` instead, while any are left.
 #[derive(Default)]
 struct Accepting {
     calls: u32,
     position: u64,
     claimed: Vec<u8>,
     deliveries: u32,
+    scripted: std::collections::VecDeque<Outcome>,
 }
 
 impl Port for Accepting {
@@ -54,6 +56,9 @@ impl Port for Accepting {
     }
     fn offer(&mut self, _: PublicationId, payload: &[u8]) -> Outcome {
         self.calls += 1;
+        if let Some(outcome) = self.scripted.pop_front() {
+            return outcome;
+        }
         self.position += payload.len() as u64;
         Outcome::Accepted {
             lane: Lane::ZERO,
@@ -216,6 +221,55 @@ fn decoded(bytes: &[Vec<u8>]) -> Vec<GroupRecord<'_>> {
 /// order with its index: an offer and a commit with their bytes' length
 /// and crc32c, an abort with the bytes as written, a poll before its
 /// deliveries (an empty one too), timer operations and an external value.
+/// Every outcome an offer can answer is recorded as the handler got it,
+/// those that admit nothing included: back pressure, an admin action, no
+/// subscriber, a sealed stream, the rate limit and a failed call
+/// (contract-traceability-phase-3.md, plan item 2).
+#[test]
+fn every_offer_outcome_is_recorded_as_the_handler_got_it() {
+    let (mut gateway, job, disk, _) = gateway(Capture::Strict, 1 << 16, 4096);
+    let scripted = [
+        Outcome::BackPressured,
+        Outcome::AdminAction,
+        Outcome::NotConnected,
+        Outcome::Closed,
+        Outcome::RateLimited,
+        // A failure the codec admits (record.rs: an error code with no
+        // inner variant and no details).
+        Outcome::Failed {
+            error: crate::group::record::MAX_ERROR_CODE,
+            sub: 0,
+            detail: 0,
+            detail2: 0,
+        },
+    ];
+    gateway.port().scripted.extend(scripted);
+    let mut got = Vec::new();
+    let mut handler = |_: &Event<'_>, effects: &mut dyn Effects| {
+        for _ in 0..scripted.len() {
+            got.push(effects.offer(PublicationId(1), b"hello"));
+        }
+    };
+    assert_eq!(
+        gateway.deliver_external(9, b"in", &mut handler),
+        Ok(Dispatched::Event { group_seq: 1 })
+    );
+    assert_eq!(got, scripted, "the handler got each scripted outcome");
+    let bytes = records(job, &disk);
+    let recorded: Vec<Outcome> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Outcome(observation) => {
+                assert_eq!(observation.operation, Operation::Offer);
+                assert_eq!((observation.stream_id, observation.session_id), (101, 7));
+                Some(observation.outcome)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recorded, got, "recorded as the handler got them");
+}
+
 #[test]
 fn every_observation_is_recorded_as_the_handler_saw_it() {
     let (mut gateway, job, disk, reads) = gateway(Capture::Strict, 1 << 16, 4096);

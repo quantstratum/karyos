@@ -702,7 +702,12 @@ fn conflated_values_are_recorded_as_seen_and_replayed() {
         .filter_map(|record| match record {
             GroupRecord::Conflated(event) => {
                 assert_eq!((event.stream_id, event.session_id), (5, 1));
-                Some((event.key, event.version, event.freshness, event.value.to_vec()))
+                Some((
+                    event.key,
+                    event.version,
+                    event.freshness,
+                    event.value.to_vec(),
+                ))
             }
             _ => None,
         })
