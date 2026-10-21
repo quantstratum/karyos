@@ -61,7 +61,9 @@ pub enum DriverError {
     #[error("no network is configured")]
     NetworkUnavailable,
     /// The channel uses a feature this driver does not wire yet (multi
-    /// destination, redundant paths, an interface name).
+    /// destination, redundant paths, an interface name, or flow control
+    /// other than `min` on a publication: `fc=max` and `fc=tagged:<group>`,
+    /// owner item 7).
     #[error("unsupported network channel")]
     UnsupportedChannel,
     /// A second subscription of one endpoint and stream asks for another

@@ -109,6 +109,12 @@ release may break APIs, wire formats and shared-memory layouts.
   `bound_address() -> Option<SocketAddr>` (`None` for a stream
   subscription). Port 0 stays refused in every channel URI; the C ABI is
   unchanged.
+- A network publication whose channel asks for `fc=max` or
+  `fc=tagged:<group>` is refused with `DriverError::UnsupportedChannel`
+  (a client's add by URI: `ErrorCode::UnsupportedChannel`), instead of
+  running `min` silently (owner item 7): the driver parsed the key but
+  never wired it to the sender's membership. `fc=min`, what every
+  publication runs, is taken.
 
 - `karyos-ffi`: each copy of the library draws its own base generation
   for its handles, once, from the address of one of its statics (never

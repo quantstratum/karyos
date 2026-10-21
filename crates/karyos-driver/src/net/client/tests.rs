@@ -242,6 +242,52 @@ fn ipc_uris_and_refusals() {
     ));
 }
 
+/// Owner item 7: a client's network publication by URI with `fc=max` or
+/// `fc=tagged:<group>` is refused (`UnsupportedChannel`), not run as
+/// `min`; `fc=min` is granted.
+#[test]
+fn unsupported_flow_control_is_refused_by_uri() {
+    let mut driver = driver();
+    let mut client = driver.connect().unwrap();
+    let mut outcomes = Vec::new();
+    let group = |fc: &str| {
+        format!(
+            "karyos:udp?group=239.255.0.9:{}|interface=127.0.0.1|fc={fc}",
+            port()
+        )
+    };
+    let max = client
+        .add_network_publication(&group("max"), 30, true)
+        .unwrap();
+    let tagged = client
+        .add_network_publication(&group("tagged:7"), 31, true)
+        .unwrap();
+    let min = client
+        .add_network_publication(&group("min"), 32, true)
+        .unwrap();
+    let sequences = [max, tagged, min];
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |outcomes, _| {
+            sequences
+                .iter()
+                .all(|sequence| outcomes.iter().any(|(_, found, _)| found == sequence))
+        },
+    );
+    for refused in [max, tagged] {
+        assert!(matches!(
+            take(&mut outcomes, refused),
+            Outcome::Refused {
+                code: ErrorCode::UnsupportedChannel,
+                ..
+            }
+        ));
+    }
+    assert!(matches!(take(&mut outcomes, min), Outcome::Publication(_)));
+}
+
 /// W5b B3: what a client created goes with it: its network publication
 /// and its network subscription are removed once its conductor is gone.
 #[test]

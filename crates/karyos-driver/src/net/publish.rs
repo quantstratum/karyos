@@ -30,7 +30,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::embedded::StreamTerms;
-use karyos_protocol::channel::{Destination, Interface, UdpConfig};
+use karyos_protocol::channel::{Destination, FlowControl, Interface, UdpConfig};
 use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
@@ -244,6 +244,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
         };
+        // A channel's `fc=max` or `fc=tagged:<group>` is not wired to the
+        // sender's membership: refused rather than run as `min` (owner
+        // item 7). `fc=min` is what every publication runs.
+        if matches!(
+            channel.flow_control,
+            Some(FlowControl::Max | FlowControl::Tagged(_))
+        ) {
+            return Err(DriverError::UnsupportedChannel);
+        }
         // Timed lanes (a schedule ring on every lane): what the software
         // route does not support yet is refused before anything exists.
         let timed =
