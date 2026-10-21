@@ -176,6 +176,44 @@ fn connected<T: StreamTerms>(
     (publication, image.unwrap())
 }
 
+/// [`connected`] over a reliable channel whose receiver, B, is required
+/// (receiver 77): its consumption bounds the sender's registered position
+/// (SPEC.md §4, "Sender position"), where an optional one no longer does
+/// (quantstratum-docs: karyos/design/retention-floor-optional-receivers.md).
+fn connected_required<T: StreamTerms>(
+    a: &mut EmbeddedDriver<T>,
+    b: &mut EmbeddedDriver<T>,
+    stream_id: i32,
+) -> (AggregateHandle, AggregateHandle) {
+    use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
+
+    let identity = ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+        group_tag: 0,
+    };
+    let _ = b
+        .add_network_subscription_as(stream_id, &channel(ANY_PORT, true), identity)
+        .unwrap();
+    let address = bound(b, stream_id);
+    let publication = a
+        .add_network_publication_with_roles(
+            aggregate(stream_id, 3, 1),
+            &channel(address, true),
+            PublicationRoles {
+                strategy: Strategy::Min,
+                required: vec![77],
+                tags: Vec::new(),
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [a, b], |drivers| {
+        image = drivers[1].network_image(stream_id, 3);
+        image.is_some()
+    });
+    (publication, image.unwrap())
+}
+
 /// Offers `count` numbered messages on lane 0 of `publication` while
 /// reading `reader` on `b`, until every one arrived in order.
 fn exchange<T: StreamTerms>(
@@ -698,6 +736,65 @@ fn an_endpoint_reset_loses_nothing_on_a_reliable_channel() {
     // The subscriber holds: its consumption, and so the sender's
     // registered position, stays at 64 while 16 more are sent and
     // committed.
+    let committed =
+        |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().receiver_counters().unwrap();
+    let before = committed(&b).data_committed;
+    let mut sent = 64u32;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        while sent < 80 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        committed(drivers[1]).data_committed >= before + 16
+    });
+    let dropped = committed(&b).data_dropped;
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+    // The reset reopens the endpoint and the reliable lane rewinds to its
+    // registered position: what it already sent arrives again, and the
+    // receiver drops those copies as duplicates.
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].net.as_ref().unwrap().reopened() >= 1
+            && committed(drivers[1]).data_dropped > dropped
+    });
+    // The subscriber still reads every message exactly once, in order, and
+    // traffic after the reset flows.
+    exchange_from(&mut a, &mut b, &mut lane, &mut reader, sent, 64..320);
+}
+
+/// E2: a send fault that needs an endpoint reset, end to end: the sender
+/// requests it (#270), the endpoint table resets and reopens the endpoint,
+/// the reliable lane resends from its registered position, and the
+/// subscriber gets every message exactly once, in order, with the
+/// receiver required: its consumption also holds the registered position
+/// (SPEC.md §4, "Sender position").
+#[test]
+fn an_endpoint_reset_loses_nothing_with_a_required_receiver() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected_required(&mut a, &mut b, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..64);
+    // The subscriber holds: its consumption, and so the required
+    // receiver's retention and the sender's registered position, stays at
+    // 64 while 16 more are sent and committed.
     let committed =
         |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().receiver_counters().unwrap();
     let before = committed(&b).data_committed;

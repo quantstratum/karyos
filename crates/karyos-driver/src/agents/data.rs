@@ -31,8 +31,10 @@
 //!   on the first cycle of an endpoint epoch and handed to the lane sender
 //!   with `reopen`, which allocates nothing.
 //! - **Resets.** A new endpoint epoch drops what was staged and not
-//!   submitted. A reliable lane rewinds its reader to the registered
-//!   position, which is only ever a block boundary, and sends it again; an
+//!   submitted. A reliable lane rewinds its reader to its restart
+//!   position, a block boundary between its retention hold and its
+//!   registered position that follows the receivers' consumption, and
+//!   sends from there again; an
 //!   unreliable lane leaves the gap to the receiver's gap policy.
 //! - **Flow control** (multicast-flow-control.md; MC-3, MC-7; ACS 15707).
 //!   With its receivers' [`Membership`] attached, each lane stages a first
@@ -1100,7 +1102,7 @@ impl<T: StreamTerms> Outbound<T> {
         // A timed lane's heads the reset returned. An unreliable lane sends
         // none of them again, so a message whose last fragment was among
         // them is done, and each is counted dropped. A reliable one reads
-        // again from its registered position, below which every entry is
+        // again from its restart position, below which every entry is
         // released, so its consumer rewinds to its oldest entry not
         // released, and nothing is done or dropped. Only the messages that
         // left (in whole, or in part) are resent at once; the ones only
@@ -1153,7 +1155,7 @@ impl<T: StreamTerms> Outbound<T> {
             track.staged.clear();
         }
         // A reset returned what was staged and not submitted. A reliable
-        // lane reads it again from its registered position (a block
+        // lane reads it again from its restart position (a block
         // boundary, never below the floor); an unreliable one leaves the
         // gap to the receiver's gap policy (LaneSender::reopen).
         if self.opened.is_some() && self.reliable {
@@ -1286,8 +1288,8 @@ impl<T: StreamTerms> Outbound<T> {
     /// One cycle: stage what each lane has committed, serve the lanes
     /// within `budget`, and move each reader's registered position.
     /// `consumption` gives, per lane, the least position every bound
-    /// receiver consumed (a reliable channel's bound). Returns the work
-    /// done.
+    /// receiver consumed: a reliable lane's restart position follows it
+    /// (it bounds nothing). Returns the work done.
     ///
     /// # Errors
     ///
@@ -1445,8 +1447,7 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Frees, in order, the entry of every timed message of a reliable lane
-    /// whose end its registered position passed: the receivers consumed
-    /// it, so no reset reads it again.
+    /// whose end its restart position passed: no reset reads it again.
     fn release_acknowledged(&mut self) {
         let Some(timed) = self.timed.as_deref_mut() else {
             return;
@@ -1455,7 +1456,7 @@ impl<T: StreamTerms> Outbound<T> {
             return;
         }
         for (lane, reader) in self.readers.iter().enumerate() {
-            let acknowledged = reader.sent_position();
+            let acknowledged = reader.restart_position();
             let ring = reader.subscription().buffer().schedule_ring();
             let (Some(unacknowledged), Some(Some(consumer)), Some(ring)) = (
                 timed.unacknowledged.get_mut(lane),
@@ -1507,11 +1508,25 @@ impl<T: StreamTerms> Outbound<T> {
         (limits, held)
     }
 
-    /// Moves each lane's registered position from its sent frontier: on a
-    /// reliable channel to the lesser of what was submitted and what the
-    /// bound receivers consumed, on an unreliable one to what was
-    /// submitted; and tells the membership its sent bound.
+    /// Moves each lane's registered position from its sent frontier, the
+    /// publication's limit: to the lesser of what was submitted and what
+    /// the required receivers consumed, or to what was submitted with none
+    /// (`Membership::retention`); and on a reliable channel raises the
+    /// lane's retention hold to `sent - retransmit_window`, lowered by the
+    /// same required receivers (SPEC §4, §6; quantstratum-docs:
+    /// karyos/design/retention-floor-optional-receivers.md). Optional
+    /// receivers bound neither: under `max` a slow one no longer holds the
+    /// publisher, and its holes below the floor are unrecoverable.
+    /// `consumption`, every bound receiver's least, optional ones included,
+    /// only moves a reliable lane's restart position, where a reset reads
+    /// again (`SenderRead::restart_at`), so a reset still resends at once
+    /// what they had not consumed. Tells the membership its sent bound.
     fn advance_registered(&mut self, consumption: Option<&[u64]>) {
+        let retransmit_window = self
+            .repair
+            .as_deref()
+            .filter(|_| self.reliable)
+            .map(|repair| u64::from(repair.retransmit_window()));
         for (lane, (track, reader)) in self.tracks.iter_mut().zip(&mut self.readers).enumerate() {
             let submitted = track.high;
             // The membership's sent frontier (one path: `sent_high`), and
@@ -1524,22 +1539,22 @@ impl<T: StreamTerms> Outbound<T> {
                 let _ = membership.advance_sent(lane, submitted);
                 retention = membership.retention(lane);
             }
-            let target = if let Some(retained) = retention {
-                submitted.min(retained)
-            } else if self.reliable {
-                // No bound receiver: the registered position holds (SPEC §4:
-                // never past what a required receiver consumed).
-                match consumption.and_then(|positions| positions.get(lane)) {
-                    Some(consumed) => submitted.min(*consumed),
-                    None => continue,
-                }
-            } else {
-                submitted
-            };
+            let target = retention.map_or(submitted, |retained| submitted.min(retained));
             // Only a block boundary the reader returned is registered: the
             // registered position is always a valid restart after a reset.
             if let Some(boundary) = reader.boundary_at_or_below(target) {
                 let _ = reader.sent(boundary);
+            }
+            // The hold only grows (`SenderRead::hold_at`); below the
+            // window's first bytes it stays at the publication's start,
+            // where it was admitted.
+            if let Some(held) = retransmit_window.and_then(|window| submitted.checked_sub(window)) {
+                let held = retention.map_or(held, |retained| held.min(retained));
+                let _ = reader.hold_at(held);
+            }
+            // With no bound receiver the restart stays at the hold.
+            if let Some(consumed) = consumption.and_then(|positions| positions.get(lane)) {
+                let _ = reader.restart_at(*consumed);
             }
         }
     }
@@ -2166,7 +2181,8 @@ pub(crate) mod testing {
                     term_length,
                     // A concurrent log holds a credit per publisher.
                     spare_slots: 2 + concurrent.unwrap_or(1),
-                    max_subscribers: 2,
+                    // A reliable lane's retention hold takes a cell.
+                    max_subscribers: if reliable { 3 } else { 2 },
                     mtu: term.mtu,
                     max_reserved: term_length.get() / 8,
                     initial_term_id: TermId::new(term.initial_term_id.cast_unsigned()),
@@ -2204,13 +2220,16 @@ pub(crate) mod testing {
             }
             // A required participant on every channel, with its L_send
             // reservation (S2 2.1).
-            readers.push(
-                SenderRead::new(
-                    conductor.subscribe_as(Role::Required, true, 1).unwrap(),
-                    DEFAULT_CORRUPT_RETRIES,
-                )
-                .unwrap(),
-            );
+            let mut reader = SenderRead::new(
+                conductor.subscribe_as(Role::Required, true, 1).unwrap(),
+                DEFAULT_CORRUPT_RETRIES,
+            )
+            .unwrap();
+            // A reliable lane's retention hold, as the driver admits it.
+            if reliable {
+                reader.with_hold(conductor.admit_hold(2).unwrap()).unwrap();
+            }
+            readers.push(reader);
             log.conductors.push(conductor);
             log.lanes.push(buffer);
         }

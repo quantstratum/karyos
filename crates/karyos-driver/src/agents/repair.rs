@@ -46,7 +46,7 @@ use karyos_io::backend::{
 use karyos_io::lanes::routes::MAX_ROUTES;
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
-use karyos_protocol::frame::Lane;
+use karyos_protocol::frame::{FRAME_ALIGNMENT, Lane};
 use karyos_protocol::lanes::drr::{DrrConfig, Report};
 use karyos_protocol::network::{
     Alias, Identity, Nak, NakRange, NakReply, NakReplyReason, Receiver,
@@ -79,6 +79,16 @@ pub struct RepairConfig {
     pub naks_per_cycle: u32,
     /// Step 8 ERRs a publication holds for sending (default 64).
     pub replies: usize,
+    /// How far below its sent position a reliable publication keeps its
+    /// lanes for repair, in bytes: the retention floor at `sent -
+    /// retransmit_window`, lowered only by required receivers (SPEC §4,
+    /// §6; quantstratum-docs:
+    /// karyos/design/retention-floor-optional-receivers.md). `None`, the
+    /// default, is half a term, which is also the most: a counted
+    /// receiver's window is at most half a term, so its holes stay above
+    /// the floor. A smaller window can lose data even for a counted
+    /// receiver, reported as unrecoverable. No URI key sets it yet.
+    pub retransmit_window: Option<u32>,
 }
 
 impl Default for RepairConfig {
@@ -90,6 +100,7 @@ impl Default for RepairConfig {
             budget: RepairBudget::default(),
             naks_per_cycle: 16,
             replies: 64,
+            retransmit_window: None,
         }
     }
 }
@@ -106,6 +117,10 @@ pub enum RepairConfigError {
     /// No room for a step 8 ERR, or no NAK admitted per cycle.
     #[error("repair replies and naks_per_cycle must be at least 1")]
     Zero,
+    /// A `retransmit_window` of zero, above half the term, or not
+    /// frame-aligned.
+    #[error("retransmit_window must be frame-aligned, nonzero and at most half a term")]
+    RetransmitWindow,
 }
 
 /// What a repair path counted, besides its components' counts.
@@ -194,6 +209,8 @@ pub struct RepairPath {
     max_replies: usize,
     /// The incarnation's term length.
     term_length: u32,
+    /// [`RepairConfig::retransmit_window`], resolved for that term.
+    retransmit_window: u32,
     /// The publication, for its step 8 ERRs.
     alias: Alias,
     identity: Identity,
@@ -229,6 +246,14 @@ impl RepairPath {
         if config.replies == 0 || config.naks_per_cycle == 0 {
             return Err(RepairConfigError::Zero);
         }
+        let half = term_length / 2;
+        let retransmit_window = config.retransmit_window.unwrap_or(half);
+        if retransmit_window == 0
+            || retransmit_window > half
+            || !retransmit_window.is_multiple_of(FRAME_ALIGNMENT)
+        {
+            return Err(RepairConfigError::RetransmitWindow);
+        }
         Ok(Self {
             admission: Admission::new(config.nak_reply_linger, config.err_linger_entries)?,
             jobs: Jobs::new(config.jobs)?,
@@ -243,11 +268,19 @@ impl RepairPath {
             replies: Vec::with_capacity(config.replies),
             max_replies: config.replies,
             term_length,
+            retransmit_window,
             alias,
             identity,
             report: TxReport::new(),
             counts: RepairCounts::default(),
         })
+    }
+
+    /// How far below the sent position its lanes stay repairable
+    /// ([`RepairConfig::retransmit_window`]).
+    #[must_use]
+    pub fn retransmit_window(&self) -> u32 {
+        self.retransmit_window
     }
 
     /// What it counted.

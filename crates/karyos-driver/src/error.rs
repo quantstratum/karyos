@@ -220,6 +220,16 @@ pub enum DriverError {
         /// What is missing.
         reason: WalkerUnavailable,
     },
+    /// A reliable network publication's lane could not admit its retention
+    /// hold, a cell of the stream's registry that holds the retention floor
+    /// at `sent - retransmit_window` (quantstratum-docs:
+    /// karyos/design/retention-floor-optional-receivers.md): every cell is
+    /// taken. Nothing is left configured.
+    #[error("stream {stream}'s retention hold is unavailable")]
+    RetentionHoldUnavailable {
+        /// The stream id.
+        stream: u64,
+    },
     /// A rate limit names a scope other than the publication's, which
     /// Phase 2 does not support (GC-5).
     #[error("rate limits of scope {scope} are not supported")]
