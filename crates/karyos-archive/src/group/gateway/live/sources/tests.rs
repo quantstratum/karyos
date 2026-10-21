@@ -663,7 +663,8 @@ type Observed = (u32, u64, Freshness, Vec<u8>);
 /// Each conflated value is recorded exactly as the handler saw it, its
 /// key, version, freshness and value bytes, with its stream and session
 /// (§8.3), and replay hands the handler the same values in the same order
-/// (contract-traceability-phase-3.md, plan item 1).
+/// (contract-traceability-phase-3.md, plan item 1). A recorded loss makes
+/// the values stale, so both freshnesses are recorded and replayed.
 #[test]
 fn conflated_values_are_recorded_as_seen_and_replayed() {
     use crate::group::prefix::recover;
@@ -671,7 +672,21 @@ fn conflated_values_are_recorded_as_seen_and_replayed() {
     use crate::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
 
     let mut rig = rig(Capture::Strict, 1 << 16, 4096, 64 * 1024);
-    let (mut writer, view) = view(64);
+    // A view with freshness: its writer records losses.
+    let mut writer = karyos_sys::conflation::conflation_fresh(
+        4,
+        64,
+        4096,
+        karyos_sys::freshness::FreshnessLink::new(),
+    )
+    .unwrap();
+    let view = ConflatedSubscription::new(
+        writer.reader(),
+        karyos_sys::conflation::Budget {
+            keys: 4,
+            retries: 4,
+        },
+    );
     rig.gateway.add_conflated(Box::new(view), 5, 1).unwrap();
     let observe = |event: &Event<'_>| match event {
         Event::Conflated {
@@ -685,13 +700,23 @@ fn conflated_values_are_recorded_as_seen_and_replayed() {
     };
     let mut live: Vec<Observed> = Vec::new();
     let mut handler = |event: &Event<'_>, _: &mut dyn Effects| live.extend(observe(event));
-    // Two keys, then a newer version of the first: three distinct values.
-    writer.write(2, b"two").unwrap();
-    writer.write(3, b"three").unwrap();
+    // Two keys, fresh; a loss past them, which makes them stale; then a
+    // newer version of the first.
+    let _ = writer.write_at(2, b"two", 0).unwrap();
+    let _ = writer.write_at(3, b"three", 32).unwrap();
+    writer.passed(64);
     while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
-    writer.write(2, b"two again").unwrap();
+    let _ = writer.record_loss(64, 96).unwrap();
     while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
-    assert_eq!(live.len(), 3, "{live:?}");
+    let _ = writer.write_at(2, b"two again", 96).unwrap();
+    while let Ok(Dispatched::Event { .. }) = rig.gateway.dispatch(&mut handler) {}
+    assert!(
+        live.iter().any(|seen| seen.2 == Freshness::Fresh)
+            && live
+                .iter()
+                .any(|seen| matches!(seen.2, Freshness::Stale { .. })),
+        "both freshnesses seen: {live:?}"
+    );
     let first = live.iter().find(|seen| seen.0 == 2).unwrap().1;
     let again = live.iter().rfind(|seen| seen.0 == 2).unwrap();
     assert!(again.1 > first, "the newer value has a newer version");

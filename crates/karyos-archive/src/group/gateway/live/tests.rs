@@ -217,10 +217,6 @@ fn decoded(bytes: &[Vec<u8>]) -> Vec<GroupRecord<'_>> {
         .collect()
 }
 
-/// Each kind of observation is recorded as the handler saw it, in call
-/// order with its index: an offer and a commit with their bytes' length
-/// and crc32c, an abort with the bytes as written, a poll before its
-/// deliveries (an empty one too), timer operations and an external value.
 /// Every outcome an offer can answer is recorded as the handler got it,
 /// those that admit nothing included: back pressure, an admin action, no
 /// subscriber, a sealed stream, the rate limit and a failed call
@@ -270,6 +266,10 @@ fn every_offer_outcome_is_recorded_as_the_handler_got_it() {
     assert_eq!(recorded, got, "recorded as the handler got them");
 }
 
+/// Each kind of observation is recorded as the handler saw it, in call
+/// order with its index: an offer and a commit with their bytes' length
+/// and crc32c, an abort with the bytes as written, a poll before its
+/// deliveries (an empty one too), timer operations and an external value.
 #[test]
 fn every_observation_is_recorded_as_the_handler_saw_it() {
     let (mut gateway, job, disk, reads) = gateway(Capture::Strict, 1 << 16, 4096);
