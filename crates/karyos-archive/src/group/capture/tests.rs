@@ -87,6 +87,10 @@ fn event(seq: u64, length: usize, recording: Option<u64>) -> Vec<u8> {
     event_at(seq, length, recording, 0, EndOutcome::Complete)
 }
 
+/// The bytes an event of 200 bytes takes in its recording (`event_at`'s
+/// extent), the stride of [`run_referenced`]'s positions.
+const EXTENT: u64 = 256;
+
 /// [`event`] at `position`, ending `outcome`.
 fn event_at(
     seq: u64,
@@ -472,8 +476,6 @@ fn run(disk: &FaultDisk, coverage: &Recordings) -> u64 {
 /// referenced frames the recording lost.
 #[test]
 fn a_referenced_payload_survives_a_crash_of_the_journal_and_its_recording() {
-    // An event of 200 bytes takes 256 in the recording (`event_at`).
-    const EXTENT: u64 = 256;
     let whole = FaultDisk::default();
     let _ = run_referenced(&whole, &Recordings::default());
     let total = whole.used();
@@ -530,7 +532,6 @@ fn a_referenced_payload_survives_a_crash_of_the_journal_and_its_recording() {
 /// durable.
 #[test]
 fn a_damaged_referenced_range_is_not_counted_at_recovery() {
-    const EXTENT: u64 = 256;
     let disk = FaultDisk::default();
     let recording = Recordings::default();
     let seen = run_referenced(&disk, &recording);
@@ -551,7 +552,6 @@ fn a_damaged_referenced_range_is_not_counted_at_recovery() {
 /// and makes them durable when event `n + 2` is sent, `coverage` its
 /// state. A frame written and not yet durable is what a crash loses.
 fn run_referenced(disk: &FaultDisk, coverage: &Recordings) -> u64 {
-    const EXTENT: u64 = 256;
     let Ok(journal) = GroupJournal::create(
         disk.clone(),
         Path::new("/g"),
