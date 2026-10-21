@@ -1912,15 +1912,27 @@ fn offer_and_read(
     );
 }
 
-/// T9 (contract-traceability-phase-2.md, "Retention floor"), end to end on
-/// a reliable multicast publication with B required (receiver 77) and C
-/// optional. While the sender holds NAKs back, C loses a datagram and the
-/// sender, bound by B alone, sends `total` messages, B reading them all;
-/// then NAKs flow. Returns C's closes `(unrecoverable, cannot_resume)`, and
-/// with `repair_b`, checks that B's own hole above the floor is repaired.
-/// `None` without multicast on this host.
+/// The span of A's lane 0 log that is live: from the retention floor to
+/// the head. SPEC.md §4 keeps it within two terms (T9, plan item 6).
 #[cfg(target_os = "linux")]
-fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
+fn live_range(a: &EmbeddedDriver) -> u64 {
+    let conductor = &a.streams[0].conductor;
+    conductor.head().unwrap() - conductor.floor()
+}
+
+/// T9 (contract-traceability-phase-2.md, "Retention floor"), end to end on
+/// a reliable multicast publication with C optional and B, with
+/// `b_required`, required (receiver 77): the sender is then bound by B
+/// alone. Without it no receiver is required, and the sender follows the
+/// fastest member (`Strategy::Max`), B: the floor of optional readers with
+/// no required participant (plan item 6, SPEC.md §6 "Retention"). While the
+/// sender holds NAKs back, C loses a datagram and the sender sends `total`
+/// messages, B reading them all; then NAKs flow. The live range stays
+/// within two terms throughout. Returns C's closes `(unrecoverable,
+/// cannot_resume)`, and with `repair_b`, checks that B's own hole above the
+/// floor is repaired. `None` without multicast on this host.
+#[cfg(target_os = "linux")]
+fn optional_receiver_closes(total: u32, repair_b: bool, b_required: bool) -> Option<(u64, u64)> {
     use std::io::Write as _;
 
     use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
@@ -1948,9 +1960,12 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
         receiver_id: core::num::NonZeroU64::new(77).unwrap(),
         group_tag: 0,
     };
-    let _ = b
-        .add_network_subscription_as(10, &channel, required)
-        .unwrap();
+    let _ = if b_required {
+        b.add_network_subscription_as(10, &channel, required)
+    } else {
+        b.add_network_subscription(10, &channel)
+    }
+    .unwrap();
     let _ = c.add_network_subscription(10, &channel).unwrap();
     let publication = a
         .add_network_publication_with_roles(
@@ -1958,7 +1973,7 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
             &channel,
             PublicationRoles {
                 strategy: Strategy::Max,
-                required: vec![77],
+                required: if b_required { vec![77] } else { Vec::new() },
                 tags: Vec::new(),
             },
         )
@@ -1991,12 +2006,17 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
             total,
         );
         let _ = c.do_work().unwrap();
+        let live = live_range(&a);
+        assert!(
+            live <= 2 * u64::from(MIN_TERM_LENGTH),
+            "a live range of {live} bytes"
+        );
         if seen == total {
             break;
         }
         std::thread::sleep(Duration::from_micros(100));
     }
-    assert_eq!(seen, total, "B is required and reads everything");
+    assert_eq!(seen, total, "B reads everything");
     // NAKs flow again: C's hole is below the floor.
     a.net.as_mut().unwrap().sender_ignores_naks(false);
     let closes = |c: &EmbeddedDriver| {
@@ -2016,6 +2036,11 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
             total,
         );
         let _ = c.do_work().unwrap();
+        let live = live_range(&a);
+        assert!(
+            live <= 2 * u64::from(MIN_TERM_LENGTH),
+            "a live range of {live} bytes"
+        );
         if closes(&c).is_some_and(|(unrecoverable, cannot)| unrecoverable + cannot >= 1) {
             break;
         }
@@ -2038,6 +2063,11 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
                 (&mut sent, &mut seen),
                 more,
             );
+            let live = live_range(&a);
+            assert!(
+                live <= 2 * u64::from(MIN_TERM_LENGTH),
+                "a live range of {live} bytes"
+            );
             if seen == more {
                 break;
             }
@@ -2058,7 +2088,22 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_optional_receivers_hole_below_the_floor_is_unrecoverable() {
-    if let Some(closes) = optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true) {
+    if let Some(closes) = optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true, true) {
+        assert_eq!(closes, (1, 0), "C closed as unrecoverable");
+    }
+}
+
+/// Plan item 6 (contract-traceability-phase-2.md, "Retention floor";
+/// SPEC.md §15's scenario with no required participant): as above, with no
+/// receiver required. The sender follows its fastest member, B, so C, an
+/// optional reader lagging at its hole, falls below the floor: its NAK is
+/// answered RANGE_UNAVAILABLE and its image closes as unrecoverable, while
+/// B's hole above the floor is repaired, and the live range never spans
+/// more than two terms.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lagging_optional_receivers_hole_below_the_floor_with_none_required_is_unrecoverable() {
+    if let Some(closes) = optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true, false) {
         assert_eq!(closes, (1, 0), "C closed as unrecoverable");
     }
 }
@@ -2069,7 +2114,7 @@ fn an_optional_receivers_hole_below_the_floor_is_unrecoverable() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_optional_receivers_hole_past_its_window_cannot_resume() {
-    if let Some(closes) = optional_receiver_closes(3 * (MIN_TERM_LENGTH / 1000) + 8, false) {
+    if let Some(closes) = optional_receiver_closes(3 * (MIN_TERM_LENGTH / 1000) + 8, false, true) {
         assert_eq!(closes, (0, 1), "C closed as GapCannotResume");
     }
 }
