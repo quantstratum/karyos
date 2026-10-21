@@ -4031,18 +4031,20 @@ impl<O: BufferOwner> Conductor<O> {
     /// Admits a reliable network publication's retention hold
     /// ([`participant::CELL_SENDER_HOLD`]; quantstratum-docs:
     /// karyos/design/retention-floor-optional-receivers.md) as occupant
-    /// `occupant`: a free cell that holds the floor at the head, from which
-    /// its owner, the lane's sender reader, only raises it
-    /// ([`SenderRead::with_hold`]). It takes no spare-slot credit: it never
-    /// reads, and its owner keeps it at most `retransmit_window` (at most
-    /// half a term) below the sender's position.
+    /// `occupant`: a free cell that holds the floor at `at`, the owner's
+    /// registered position (a lane's sender reader,
+    /// [`SenderRead::with_hold`]), from which the owner only raises it. It
+    /// takes no spare-slot credit: it never reads, and its owner keeps it at
+    /// most `retransmit_window` (at most half a term) below the sender's
+    /// position.
     ///
     /// # Errors
     ///
     /// [`SysError::ResourcesUnavailable`] with no free cell;
-    /// [`SysError::InvalidPublicationMode`] for an image;
+    /// [`SysError::InvalidPublicationMode`] for an image, or for `at` below
+    /// the floor or above the head;
     /// [`SysError::Protocol`] for an occupant that is not a valid export id.
-    pub fn admit_hold(&mut self, occupant: u64) -> Result<RetentionHold, SysError> {
+    pub fn admit_hold(&mut self, occupant: u64, at: u64) -> Result<RetentionHold, SysError> {
         if !valid_export(occupant) {
             return Err(NOT_GRANTED);
         }
@@ -4050,6 +4052,11 @@ impl<O: BufferOwner> Conductor<O> {
         if buffer.image() {
             return Err(SysError::InvalidPublicationMode {
                 reason: "a retention hold of an image",
+            });
+        }
+        if at < buffer.floor().load(Ordering::Acquire) || at > buffer.conductor_head()? {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "a retention hold between the floor and the head",
             });
         }
         let (index, cell) = buffer
@@ -4062,8 +4069,7 @@ impl<O: BufferOwner> Conductor<O> {
         // The Acquire load observed the previous holder's FREE; a hold takes
         // no loan, and its loan word stays zero.
         debug_assert_eq!(cell.loan.load(Ordering::Relaxed), 0);
-        cell.position
-            .store(buffer.conductor_head()?, Ordering::Relaxed);
+        cell.position.store(at, Ordering::Relaxed);
         participant::admit(
             &cell.state,
             &cell.revoked,
@@ -4075,6 +4081,26 @@ impl<O: BufferOwner> Conductor<O> {
             cell: index,
             occupant,
         })
+    }
+
+    /// Frees `hold`, a retention hold this conductor admitted that no
+    /// reader took ([`SenderRead::with_hold`] handed it back). Returns
+    /// whether it did: a cell in another state or of another occupant is
+    /// left untouched.
+    pub fn release_hold(&mut self, hold: RetentionHold) -> bool {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let Some(cell) = buffer.cells().get(hold.cell) else {
+            return false;
+        };
+        if cell.state.load(Ordering::Acquire) != CELL_SENDER_HOLD
+            || cell.registration.load(Ordering::Acquire) != hold.occupant
+        {
+            return false;
+        }
+        // It took no loan and was never read: the registration is cleared,
+        // then the cell freed, as a subscriber's detach.
+        participant::leave(&cell.state, &cell.registration);
+        true
     }
 
     /// Ends the registration of the subscriber registered in `cell` for

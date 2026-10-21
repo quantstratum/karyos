@@ -448,16 +448,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // A reliable lane's retention hold, the floor at `sent -
             // retransmit_window` (quantstratum-docs:
             // karyos/design/retention-floor-optional-receivers.md), as its
-            // own occupant; an unreliable lane has none. A full registry
-            // refuses the publication; the reader frees the hold on drop.
+            // own occupant, from the reader's registered position; an
+            // unreliable lane has none. A full registry refuses the
+            // publication; the reader frees the hold on drop, and a hold it
+            // refused is freed here.
             let next = if reliable {
                 let hold = target
                     .conductor
-                    .admit_hold(next)
+                    .admit_hold(next, reader.sent_position())
                     .map_err(|_| DriverError::RetentionHoldUnavailable { stream: target.id })?;
-                reader
-                    .with_hold(hold)
-                    .map_err(|_| DriverError::InvalidConfig)?;
+                if let Err((_, hold)) = reader.with_hold(hold) {
+                    let _ = target.conductor.release_hold(hold);
+                    return Err(DriverError::InvalidConfig);
+                }
                 next.checked_add(1).ok_or(DriverError::ExportIdsExhausted)?
             } else {
                 next

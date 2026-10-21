@@ -595,35 +595,33 @@ impl<O: BufferOwner> SenderRead<O> {
     }
 
     /// Takes `hold`, a retention hold the same buffer's conductor admitted
+    /// at or below this reader's registered position
     /// ([`super::Conductor::admit_hold`]), for a reliable lane: from then on
     /// [`SenderRead::hold_at`] keeps the floor there, and dropping the
-    /// reader frees it.
+    /// reader frees it. So `hold <= restart <= registered` holds from the
+    /// start, and the hold only grows.
     ///
     /// # Errors
     ///
     /// [`SysError::InvalidPublicationMode`] for a reader that holds one
-    /// already, or a cell that is not that hold (another state or
-    /// occupant); the hold is left in place.
-    pub fn with_hold(&mut self, hold: RetentionHold) -> Result<(), SysError> {
+    /// already, a cell that is not that hold (another state or occupant),
+    /// or a hold above the registered position; the hold is handed back,
+    /// in place, for its conductor's [`super::Conductor::release_hold`].
+    pub fn with_hold(&mut self, hold: RetentionHold) -> Result<(), (SysError, RetentionHold)> {
+        let registered = self.subscription.cursor.acknowledged;
         let held = self.subscription.buffer.cell(hold.cell).is_ok_and(|cell| {
             cell.state.load(Ordering::Acquire) == participant::CELL_SENDER_HOLD
                 && cell.registration.load(Ordering::Acquire) == hold.occupant
+                && cell.position.load(Ordering::Relaxed) <= registered
         });
         if self.hold.is_some() || !held {
-            return Err(SysError::InvalidPublicationMode {
-                reason: "a retention hold of this buffer's conductor, one per sender reader",
-            });
-        }
-        // Admitted at the head, which is at or above this reader's join: not
-        // past its registered position, so `hold <= restart <= registered`
-        // holds by construction, whatever was published in between. Lowering
-        // it is safe: the floor never decreases, and the registered position
-        // holds the floor at or below it already.
-        if let Ok(cell) = self.subscription.buffer.cell(hold.cell) {
-            let registered = self.subscription.cursor.acknowledged;
-            if cell.position.load(Ordering::Relaxed) > registered {
-                cell.position.store(registered, Ordering::Release);
-            }
+            return Err((
+                SysError::InvalidPublicationMode {
+                    reason: "a retention hold of this buffer's conductor at or below the \
+                             registered position, one per sender reader",
+                },
+                hold,
+            ));
         }
         self.hold = Some(hold);
         Ok(())

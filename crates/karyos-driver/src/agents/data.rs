@@ -2227,7 +2227,9 @@ pub(crate) mod testing {
             .unwrap();
             // A reliable lane's retention hold, as the driver admits it.
             if reliable {
-                reader.with_hold(conductor.admit_hold(2).unwrap()).unwrap();
+                reader
+                    .with_hold(conductor.admit_hold(2, reader.sent_position()).unwrap())
+                    .unwrap();
             }
             readers.push(reader);
             log.conductors.push(conductor);
