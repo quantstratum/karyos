@@ -408,51 +408,66 @@ fn spawn_agent(dir: &Path) -> Child {
 /// answer can come, so no outcome. The agent is killed there. The next
 /// agent on that journal shows a request without an outcome, whatever the
 /// driver made of the close, until an administrator acknowledges it.
+///
+/// The cycle that admits the client may also serve a close written in
+/// time (admission is served before commands), most often under load. The
+/// driver then answers, and the live agent may journal the outcome before
+/// it is killed, so that attempt cannot show the failure: it is set aside
+/// and the scenario starts again on a fresh driver and directory, up to
+/// five times.
 #[test]
 fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
+    const ATTEMPTS: u32 = 5;
+
     let _serial = serial();
-    let dir = dir("killed");
-    let mut driver = driver(&dir.join("driver"));
-    let guard = driver.add_guard("orders").unwrap();
-    let _ = driver.reopen_guard(guard, 1, 1).unwrap();
-    let audited = driver.guard_audit().records.len();
-    let mut child = spawn_agent(&dir);
-    let socket = dir.join("api").join(karyos_agent::server::SOCKET_NAME);
-    let start = Instant::now();
-    let mut stream = loop {
-        let _ = driver.do_work().unwrap();
-        if let Ok(stream) = UnixStream::connect(&socket) {
-            break stream;
+    let mut attempt = 0;
+    let (dir, mut driver, mut stream, audited) = loop {
+        attempt += 1;
+        assert!(
+            attempt <= ATTEMPTS,
+            "every admitting cycle served the close"
+        );
+        let dir = dir(&format!("killed-{attempt}"));
+        let mut driver = driver(&dir.join("driver"));
+        let guard = driver.add_guard("orders").unwrap();
+        let _ = driver.reopen_guard(guard, 1, 1).unwrap();
+        let audited = driver.guard_audit().records.len();
+        let mut child = spawn_agent(&dir);
+        let socket = dir.join("api").join(karyos_agent::server::SOCKET_NAME);
+        let start = Instant::now();
+        let mut stream = loop {
+            let _ = driver.do_work().unwrap();
+            if let Ok(stream) = UnixStream::connect(&socket) {
+                break stream;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "no agent socket");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        // The agent reads the CnC as a tool: not a client.
+        assert_eq!(clients_connected(&driver), 0);
+        let close = format!(
+            "KARYOS-AGENT 1 guard-close {} {}\n",
+            dir.join("driver").display(),
+            guard.id()
+        );
+        stream.write_all(close.as_bytes()).unwrap();
+        let start = Instant::now();
+        while clients_connected(&driver) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "never attached");
+            let _ = driver.do_work().unwrap();
+            std::thread::sleep(Duration::from_micros(200));
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "no agent socket");
-        std::thread::sleep(Duration::from_millis(1));
+        // Attached, so its request record is written. An unchanged audit
+        // proves no answer exists, and with the driver no longer served
+        // none can come, so no outcome. The agent's own child, by its pid.
+        let served = driver.guard_audit().records.len() != audited;
+        child.kill().unwrap();
+        let _ = child.wait().unwrap();
+        if served {
+            continue;
+        }
+        break (dir, driver, stream, audited);
     };
-    // The agent reads the CnC as a tool: not a client.
-    assert_eq!(clients_connected(&driver), 0);
-    let close = format!(
-        "KARYOS-AGENT 1 guard-close {} {}\n",
-        dir.join("driver").display(),
-        guard.id()
-    );
-    stream.write_all(close.as_bytes()).unwrap();
-    let start = Instant::now();
-    while clients_connected(&driver) == 0 {
-        assert!(start.elapsed() < Duration::from_secs(10), "never attached");
-        let _ = driver.do_work().unwrap();
-        std::thread::sleep(Duration::from_micros(200));
-    }
-    // Attached, so its request record is written. The cycle that admitted
-    // it may also serve a close written in time (admission is served
-    // before commands): an unchanged audit proves no answer exists, and
-    // with the driver no longer served none can come, so no outcome. The
-    // agent's own child, by its pid.
-    assert_eq!(
-        driver.guard_audit().records.len(),
-        audited,
-        "the close was served in the admitting cycle"
-    );
-    child.kill().unwrap();
-    let _ = child.wait().unwrap();
     let mut answer = String::new();
     let _ = stream.read_to_string(&mut answer);
     assert_eq!(answer, "", "the killed agent answered");
