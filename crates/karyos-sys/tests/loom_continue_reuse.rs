@@ -228,8 +228,9 @@ enum Clean {
     WithoutTheLoanScan,
 }
 
-/// Set, across Loom's executions, when one cleaned slot 1 while the loan
-/// word named slot 0: the interleaving the pinned model exists for.
+/// Set, across Loom's executions of the correct variant only, when one
+/// cleaned slot 1 while the loan word named slot 0: the interleaving the
+/// pinned model exists for.
 static CLEANED_WHILE_THE_OTHER_WAS_LOANED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -287,7 +288,10 @@ fn pinned_model(variant: Clean) {
                 }
             }
             let cleaning = begin_cleaning(&slot.descriptor, reclaiming).unwrap();
-            if core::ptr::eq(slot, &shared.slots[1])
+            // Only the correct variant's executions count: the control
+            // runs the same model on another test thread.
+            if variant == Clean::Correct
+                && core::ptr::eq(slot, &shared.slots[1])
                 && Loan::decode(shared.loan.load(Ordering::SeqCst))
                     .unwrap()
                     .is_some_and(|loan| loan.slot() == shared.slots[0].target.slot())
