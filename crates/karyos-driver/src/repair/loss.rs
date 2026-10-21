@@ -256,6 +256,7 @@ impl Default for LossConfig {
 
 /// A configuration the component refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LossConfigError {
     /// `range_invalid_limit` is zero.
     #[error("range_invalid_limit is zero")]

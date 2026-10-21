@@ -197,6 +197,7 @@ impl Header {
 
 /// Why the log refuses an operation, or its files.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LogError {
     /// An append that does not start right after the last index.
     #[error("an append at index {got}; the next index is {expected}")]

@@ -107,6 +107,7 @@ impl Default for RepairConfig {
 
 /// Why a repair path could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RepairConfigError {
     /// The ERR linger table is empty.
     #[error("invalid NAK admission settings")]

@@ -95,6 +95,7 @@ impl Head {
 
 /// Why a repair read failed (the NAK origin of `read_committed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RepairReadError {
     /// Not a frame boundary, or beyond the NAK bound: `RANGE_INVALID`.
     BadRequest,

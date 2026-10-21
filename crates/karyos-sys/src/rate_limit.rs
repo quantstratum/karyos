@@ -48,6 +48,7 @@ pub struct RatePolicy {
 
 /// Why a policy was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RatePolicyError {
     /// A rate or a burst of zero would never admit anything.
     #[error("a rate limit needs a nonzero rate and burst")]

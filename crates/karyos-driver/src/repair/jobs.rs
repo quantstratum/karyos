@@ -90,6 +90,7 @@ pub enum Joined {
 
 /// Why a [`Jobs`] table was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum JobsError {
     /// A zero count, or more jobs than a slot number holds.
     #[error("repair_jobs, repair_linger_entries or requesters_per_job is 0, or too many jobs")]

@@ -41,6 +41,7 @@ pub struct GuardState {
 
 /// Why a guard operation was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum GuardError {
     /// A reopen named an epoch the guard is not closed at.
     #[error("the guard is not closed at epoch {expected} (now {current:?})")]

@@ -83,6 +83,7 @@ impl Default for RttConfig {
 
 /// Why an [`RttConfig`] was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RttConfigError {
     /// `rtt_floor <= rtt_initial <= rtt_probe_timeout` does not hold, or
     /// the floor is zero.

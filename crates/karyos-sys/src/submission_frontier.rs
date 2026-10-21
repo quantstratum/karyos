@@ -90,6 +90,7 @@ pub enum Final {
 
 /// Why a final word was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum FinalError {
     /// A reason of 0, or one with the [`SUPERSEDED`] bit.
     #[error("invalid final reason {reason}")]

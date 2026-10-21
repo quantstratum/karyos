@@ -58,6 +58,7 @@ impl Default for PathConfig {
 
 /// Why a [`PathConfig`] was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PathConfigError {
     /// `max_paths` is 0 or above [`MAX_PATHS`].
     #[error("max_paths {value} is not in 1..={MAX_PATHS}")]

@@ -120,6 +120,7 @@ pub struct GateHead {
 
 /// Why a gate could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum GateError {
     /// The policy cannot be enforced: a zero rate or burst, or a byte burst
     /// below the largest datagram the route builds, which would then wait
@@ -136,6 +137,7 @@ pub enum GateError {
 
 /// Why [`GuardGate::stage`] refused a head; nothing is recorded on error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum GateStageError {
     /// No such lane.
     #[error("no gate lane {lane}")]

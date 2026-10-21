@@ -47,6 +47,7 @@ pub enum TimedNetworkUnsupported {
 
 /// Errors returned by the embedded driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum DriverError {
     /// A network agent failed or panicked; fatal for the driver (DN-9).
     #[error("the {agent:?} network agent failed")]

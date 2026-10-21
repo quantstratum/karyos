@@ -260,6 +260,7 @@ impl Calibration {
 
 /// Errors of calibration records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CalibrationError {
     /// The layout version is not supported.
     #[error("unsupported calibration version {version}")]

@@ -50,6 +50,7 @@ pub const MAX_LANES: usize = 4;
 
 /// Errors of lane scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum DrrError {
     /// No lane, more than [`MAX_LANES`], a zero maximum charge, a quantum
     /// below the maximum charge, or a quantum whose deficit bound does not

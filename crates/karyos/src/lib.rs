@@ -75,6 +75,7 @@ use embedded::ConductorError;
 
 /// Every error of the public Karyos API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A client error.
     #[error(transparent)]

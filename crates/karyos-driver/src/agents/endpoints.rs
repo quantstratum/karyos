@@ -51,6 +51,7 @@ use crate::embedded::StreamTerms;
 
 /// Why an endpoint operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum EndpointError {
     /// The table holds `max_endpoints` entries.
     #[error("the endpoint table is full")]

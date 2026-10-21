@@ -199,6 +199,7 @@ struct ErrSent {
 
 /// Why an [`Admission`] was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum AdmissionError {
     /// No ERR linger entry.
     #[error("err_linger_entries is 0")]

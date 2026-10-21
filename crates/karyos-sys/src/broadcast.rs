@@ -51,6 +51,7 @@ const HEARTBEAT: usize = TAIL + 1;
 
 /// Errors of the broadcast buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum BroadcastError {
     /// The message type is reserved.
     #[error("message type {type_id:#x} is reserved")]

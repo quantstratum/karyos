@@ -69,6 +69,7 @@ const RECORD_WORDS: usize = 3;
 
 /// Errors of the loss barrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum FreshnessError {
     /// The words do not hold a barrier of the requested ring size.
     #[error("invalid loss barrier layout")]

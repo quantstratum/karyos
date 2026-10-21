@@ -53,6 +53,7 @@ pub struct Template {
 
 /// A decoding or encoding error, bounded and typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CodecError {
     /// The input or the capacity is shorter than the next read or write.
     Truncated {

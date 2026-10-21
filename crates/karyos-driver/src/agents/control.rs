@@ -254,6 +254,7 @@ impl SenderGate for ControlGate {
 
 /// Why a control was not sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlSendError {
     /// The control did not encode.
     Encode,

@@ -148,6 +148,7 @@ pub struct SendSessions {
 
 /// Why a publication could not be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SendSessionError {
     /// The table holds `capacity` sessions.
     #[error("the sender session table is full")]

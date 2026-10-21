@@ -37,6 +37,7 @@ pub enum LaneFrame {
 
 /// Why the consumer refused a frame or a report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ScheduleConsumerError {
     /// The lane's frames and its entries disagree: a first frame with no
     /// entry at its position, a continuation outside a message, padding

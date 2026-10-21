@@ -114,6 +114,7 @@ impl Binding {
 
 /// Why a ring operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum OutcomeError {
     /// The words are too few for the header and the slot count, or the
     /// slot count is below 2.

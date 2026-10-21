@@ -25,6 +25,7 @@ use crate::term::TermId;
 /// Why a datagram was rejected. `offset` is the byte offset of the offending
 /// frame in the datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ParseError {
     /// The image parameters are invalid.
     #[error("invalid image parameters: {reason}")]

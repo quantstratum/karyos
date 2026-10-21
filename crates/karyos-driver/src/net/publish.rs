@@ -55,6 +55,8 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverErr
         Destination::Unicast(address) => *address,
         Destination::Multicast { group, .. } => *group,
         Destination::MultiDestination { .. } => return Err(DriverError::UnsupportedChannel),
+        // A destination a later protocol version parses: not served.
+        _ => return Err(DriverError::UnsupportedChannel),
     };
     if !channel.paths.is_empty() {
         // Multicast IPv4 only: unicast paths need a destination each.
@@ -75,7 +77,8 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverErr
     }
     let ip = match &channel.interface {
         Some(Interface::Address(ip)) => *ip,
-        Some(Interface::Name(_)) => return Err(DriverError::UnsupportedChannel),
+        // A name, or an interface form a later protocol version parses.
+        Some(_) => return Err(DriverError::UnsupportedChannel),
         None if destination.is_ipv4() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         None => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };

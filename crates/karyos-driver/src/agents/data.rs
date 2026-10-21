@@ -458,6 +458,7 @@ fn messages_started(bytes: &[u8]) -> u64 {
 
 /// Why an outbound publication was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OutboundError {
     /// No reader, more than four, or quanta of another count.
     Lanes,
