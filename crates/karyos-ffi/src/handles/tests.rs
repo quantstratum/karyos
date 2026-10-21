@@ -67,15 +67,59 @@ fn a_full_table_refuses_another_handle() {
 }
 
 #[test]
-fn a_slot_whose_generation_cannot_grow_is_retired() {
-    let table = Table::new(Kind::Client, 1);
-    table.set_generation(0, u32::MAX);
+fn a_slot_that_has_cycled_every_generation_is_retired() {
+    // The slot's last generation is the one before the base: closing it
+    // would come back to the base, so the slot is retired, never reused.
+    let table = Table::with_base(Kind::Client, 1, 7);
+    table.set_generation(0, 6);
     let last = table.insert(1_u32).unwrap();
-    assert_eq!(last.generation(), u32::MAX);
+    assert_eq!(last.generation(), 6);
     table.remove(last).unwrap();
-    // Never reused, so no handle can come back at a wrapped generation.
     assert_eq!(table.insert(2_u32), Err(Status::HandlesExhausted));
     assert_eq!(table.with(last, |value| *value), Err(Status::Closed));
+}
+
+#[test]
+fn a_generation_past_the_top_goes_on_at_1_and_skips_0() {
+    // From u32::MAX the next generation is 1, never 0 (no handle), and
+    // the slot lives on: it has not come back to its base yet.
+    let table = Table::with_base(Kind::Client, 1, 7);
+    table.set_generation(0, u32::MAX);
+    let top = table.insert(1_u32).unwrap();
+    assert_eq!(top.generation(), u32::MAX);
+    table.remove(top).unwrap();
+    let next = table.insert(2_u32).unwrap();
+    assert_eq!(next.generation(), 1);
+    assert_eq!(table.with(top, |value| *value), Err(Status::Closed));
+    assert_eq!(table.with(next, |value| *value), Ok(2));
+}
+
+#[test]
+fn a_handle_of_another_copy_answers_closed() {
+    // Two copies of the library in one process: tables of one kind, each
+    // at its own base. A handle of one names the other's slot at another
+    // generation, so it is refused as stale, never acted on.
+    let ours = Table::with_base(Kind::Publication, 4, 0x1234_5678);
+    let theirs = Table::with_base(Kind::Publication, 4, 0x9abc_def0);
+    let mine = ours.insert(1_u32).unwrap();
+    let foreign = theirs.insert(2_u32).unwrap();
+    assert_eq!(mine.index(), foreign.index());
+    assert_eq!(ours.with(foreign, |value| *value), Err(Status::Closed));
+    assert_eq!(theirs.with(mine, |value| *value), Err(Status::Closed));
+    assert_eq!(ours.remove(foreign), Err(Status::Closed));
+    assert_eq!(ours.with(mine, |value| *value), Ok(1));
+    assert_eq!(theirs.with(foreign, |value| *value), Ok(2));
+}
+
+#[test]
+fn this_copys_base_is_drawn_once_and_never_0() {
+    let base = copy_base();
+    assert_ne!(base, 0);
+    assert_eq!(copy_base(), base);
+    let table = Table::<u32>::new(Kind::Client, 1);
+    assert_eq!(table.insert(1).unwrap().generation(), base);
+    assert_eq!(nonzero(0), 1);
+    assert_eq!(nonzero(5 << 32), 5);
 }
 
 #[test]
