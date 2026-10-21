@@ -2172,6 +2172,32 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// publications'. [`DriverError::Sys`] when the random source fails,
     /// before anything else is validated; it is logged too.
     pub fn add_stream(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
+        self.add_local_stream(config, false)
+    }
+
+    /// [`EmbeddedDriver::add_stream`] whose schedule ring, if any, is
+    /// taken: the caller consumes and releases the stream's schedule ring
+    /// itself (a simulator's `ScheduleConsumer`); without that, the lane
+    /// takes `schedule_capacity` offers and then back pressures for good.
+    /// Not for applications: `add_stream`, the client facade, karyosd and
+    /// the C ABI keep refusing a ring (owner item 65).
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_stream`], but for the schedule ring.
+    #[doc(hidden)]
+    pub fn add_stream_with_external_schedule(
+        &mut self,
+        config: StreamConfig,
+    ) -> Result<StreamHandle, DriverError> {
+        self.add_local_stream(config, true)
+    }
+
+    fn add_local_stream(
+        &mut self,
+        config: StreamConfig,
+        external_schedule: bool,
+    ) -> Result<StreamHandle, DriverError> {
         // The first term id, drawn on the control path before the stream
         // exists (SPEC §4, initial state); a failed draw refuses the add.
         let mut config = config;
@@ -2182,7 +2208,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // One lane, the configured one, with a quantum of the largest frame:
         // exactly today's stream.
         let lane = config.buffer.lane;
-        let added = local_schedule(&config)
+        let schedule = if external_schedule {
+            Ok(())
+        } else {
+            local_schedule(&config)
+        };
+        let added = schedule
             .and_then(|()| self.draw_initial_term_id(self.config.initial_term_id))
             .and_then(|drawn| {
                 config.buffer.initial_term_id = drawn;

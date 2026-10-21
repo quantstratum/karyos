@@ -3,8 +3,11 @@
 //! Timed transmission on virtual time (`quantstratum-docs:
 //! karyos/design/timed-tx.md`, section 8; P2.11 T1 step 6, ACS 15462).
 //!
-//! One timed stream of the embedded driver, its offers checked against the
-//! simulator's clock ([`EmbeddedDriver::schedule_stream_with_clock`]), and
+//! One timed stream of the embedded driver, whose ring this harness
+//! consumes and releases itself (`add_stream_with_external_schedule`; a
+//! plain `add_stream` refuses a ring, owner item 65), its offers checked
+//! against the simulator's clock
+//! ([`EmbeddedDriver::schedule_stream_with_clock`]), and
 //! the sender's side of section 2: a subscription reads the lane's
 //! messages in order, a [`ScheduleConsumer`] gives each its requested time,
 //! and a [`TimedGate`] over a lane sender and the sockets endpoint with the
@@ -327,8 +330,10 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
     let mut driver = EmbeddedDriver::new().map_err(|error| setup(format!("{error:?}")))?;
     let handle: StreamHandle = stream_config()
         .and_then(|config| {
+            // This harness is the stream's sender: its consumer releases
+            // the ring (owner item 65; `add_stream` refuses it).
             driver
-                .add_stream(config)
+                .add_stream_with_external_schedule(config)
                 .map_err(|error| format!("{error:?}"))
         })
         .map_err(setup)?;
@@ -669,4 +674,20 @@ fn a_timed_seed_reproduces_its_run() {
         let other = run_timed(&scenario, 8).unwrap_or_else(|failure| panic!("{failure}"));
         assert_ne!(first.digest, other.digest, "scenario {}", scenario.name);
     }
+}
+
+/// The harness's stream config is refused by a plain `add_stream`: only a
+/// caller that releases the ring itself may take one (owner item 65).
+#[test]
+fn a_plain_add_refuses_the_harness_stream() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    assert_eq!(
+        driver.add_stream(stream_config().unwrap()).err(),
+        Some(karyos_driver::DriverError::InvalidConfig)
+    );
+    assert!(
+        driver
+            .add_stream_with_external_schedule(stream_config().unwrap())
+            .is_ok()
+    );
 }
