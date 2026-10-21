@@ -2087,3 +2087,354 @@ fn an_optional_recording_reader_holds_one_loan_at_most() {
         }
     }
 }
+
+/// A reliable lane's retention hold (docs#336): it holds the floor below
+/// the sender's registered position, which alone bounds the limit; it only
+/// grows; and dropping the reader frees its cell.
+#[test]
+fn a_retention_hold_holds_the_floor_only_grows_and_is_freed() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let hold = conductor.admit_hold(2, 0).unwrap();
+    let cell = hold.cell;
+    reader.with_hold(hold).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..8 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    let sent = reader.sent_position();
+    assert_eq!(sent, 8 * 1024);
+    // The hold below the sent position: the floor follows the hold, the
+    // limit the sent position.
+    assert_eq!(reader.hold_at(3 * 1024), Some(3 * 1024));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.floor(), 3 * 1024);
+    assert_eq!(conductor.limit(), sent + u64::from(MIN_TERM_LENGTH / 2));
+    // It never goes back.
+    assert_eq!(reader.hold_at(1024), Some(3 * 1024));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.floor(), 3 * 1024);
+    // Raised to the sent position, the floor follows.
+    assert_eq!(reader.hold_at(sent), Some(sent));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.floor(), sent);
+    // Dropping the reader frees the hold's cell.
+    assert_eq!(
+        buffer.cell(cell).unwrap().state.load(Ordering::Acquire),
+        participant::CELL_SENDER_HOLD
+    );
+    drop(reader);
+    assert_eq!(
+        buffer.cell(cell).unwrap().state.load(Ordering::Acquire),
+        participant::CELL_FREE
+    );
+}
+
+/// A full registry refuses a hold, and a reader takes one hold, of its own
+/// conductor's admission only.
+#[test]
+fn a_retention_hold_needs_a_free_cell_and_its_own_admission() {
+    let buffer = new_buffer(config(3, 1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    // The sender's reader took the only cell.
+    assert_eq!(conductor.admit_hold(2, 0), Err(SysError::ResourcesUnavailable));
+    let roomy = new_buffer(config(3, 3)).unwrap();
+    let mut other = roomy.conductor().unwrap();
+    let mut other_reader = sr_reader(&mut other);
+    // A hold whose cell this buffer holds as another state, then one that
+    // is this reader's: one per reader.
+    let foreign = other.admit_hold(2, 0).unwrap();
+    let Err((SysError::InvalidPublicationMode { .. }, foreign)) = reader.with_hold(foreign) else {
+        panic!("a foreign hold was taken");
+    };
+    // Handed back, it is freed by its own conductor only.
+    assert!(!conductor.release_hold(RetentionHold {
+        cell: foreign.cell,
+        occupant: foreign.occupant,
+    }));
+    assert!(other.release_hold(foreign));
+    let first = other.admit_hold(3, 0).unwrap();
+    other_reader.with_hold(first).unwrap();
+    let second = other.admit_hold(4, 0).unwrap();
+    let cell = second.cell;
+    let Err((_, second)) = other_reader.with_hold(second) else {
+        panic!("a second hold was taken");
+    };
+    assert!(other.release_hold(second));
+    assert_eq!(
+        roomy.cell(cell).unwrap().state.load(Ordering::Acquire),
+        participant::CELL_FREE
+    );
+    // Outside the floor and the head: refused.
+    assert!(matches!(
+        other.admit_hold(5, 1 << 20),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+    // No hold: `hold_at` answers nothing.
+    assert_eq!(reader.hold_at(64), None);
+}
+
+/// The hold needs no spare-slot credit (docs#336, condition 4): at the
+/// largest `retransmit_window` and window, both half a term, the publisher
+/// runs to its limit while the hold stays half a term below the sender.
+/// The range from the floor to the head never exceeds a term, and the
+/// frames under the hold are still read by a NAK.
+#[test]
+fn a_retention_hold_at_half_a_term_keeps_the_live_range_within_a_term() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let at = reader.sent_position();
+    reader.with_hold(conductor.admit_hold(2, at).unwrap()).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    let half = u64::from(MIN_TERM_LENGTH / 2);
+    let mut out = sr_out();
+    let mut appended = 0u64;
+    while appended < 4 * u64::from(MIN_TERM_LENGTH) / 1024 {
+        match publication.append(&data, AppendOptions::default()).unwrap() {
+            AppendOutcome::Appended { .. } => appended += 1,
+            AppendOutcome::BackPressured | AppendOutcome::AdminAction => {}
+            other => panic!("{other:?}"),
+        }
+        while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+        sr_sent(&mut reader);
+        let sent = reader.sent_position();
+        let _ = reader.hold_at(sent.max(half) - half);
+        let _ = conductor.duty_cycle().unwrap();
+        let head = buffer.reserved_head().load(Ordering::Acquire);
+        let floor = conductor.floor();
+        assert!(
+            head - floor <= u64::from(MIN_TERM_LENGTH),
+            "head {head}, floor {floor}"
+        );
+        // The oldest frame under the hold is still there for a repair.
+        if floor < sent {
+            let (result, _) = sr_nak(&mut reader, floor, sent, 1 << 20, &mut out);
+            assert!(
+                matches!(result, Ok(ReadOutcome::Copied { .. })),
+                "a NAK at the floor {floor}: {result:?}"
+            );
+        }
+    }
+    assert!(reader.sent_position() >= 3 * u64::from(MIN_TERM_LENGTH));
+}
+
+/// The restart position (docs#336, (a')): the hold raises it to a block
+/// start at or above the hold; the receivers' consumption moves it to the
+/// highest kept boundary at or below that consumption, never past the
+/// registered position and never back; and a rewind reads from it, strictly
+/// between the hold and the registered position.
+#[test]
+fn a_restart_sits_between_the_hold_and_the_registered_position_and_a_rewind_reads_from_it() {
+    // Two readers, each with its hold.
+    let buffer = new_buffer(config(4, 4)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let at = reader.sent_position();
+    reader.with_hold(conductor.admit_hold(2, at).unwrap()).unwrap();
+    let mut between = sr_reader_with_hold(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..8 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    assert_eq!(reader.sent_position(), 8 * 1024);
+    // A hold keeps the boundaries above the restart: it starts at the join.
+    assert_eq!(reader.restart_position(), 0);
+    assert_eq!(reader.hold_at(1024), Some(1024));
+    assert_eq!(reader.restart_position(), 1024);
+    assert_eq!(reader.restart_at(5 * 1024), 5 * 1024);
+    // Never back, never past the registered position.
+    assert_eq!(reader.restart_at(2 * 1024), 5 * 1024);
+    assert_eq!(reader.restart_at(64 * 1024), 8 * 1024);
+    assert_eq!(reader.counters().restart_raised, 0);
+    // Strictly between: rewind there and read the sixth frame again.
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut between, &mut out) {}
+    sr_sent(&mut between);
+    let _ = between.hold_at(1024);
+    assert_eq!(between.restart_at(5 * 1024), 5 * 1024);
+    between.rewind().unwrap();
+    assert_eq!(between.position(), 5 * 1024);
+    assert!(matches!(
+        sr_read(&mut between, &mut out),
+        Ok(ReadOutcome::Copied { next, .. }) if next == 6 * 1024
+    ));
+    // The registered position is unchanged, and never moves back.
+    assert_eq!(between.sent_position(), 8 * 1024);
+    assert_eq!(between.sent(5 * 1024), Err(ReadError::Invariant));
+}
+
+/// A second reserved required reader of `conductor`'s buffer (occupant
+/// 3), as [`sr_reader`], with its own retention hold (occupant 4).
+fn sr_reader_with_hold<'a>(
+    conductor: &mut Conductor<&'a LogBuffer<Terms>>,
+) -> SenderRead<&'a LogBuffer<Terms>> {
+    let mut reader = SenderRead::new(
+        conductor.subscribe_as(Role::Required, true, 3).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+    )
+    .unwrap();
+    let at = reader.sent_position();
+    reader.with_hold(conductor.admit_hold(4, at).unwrap()).unwrap();
+    reader
+}
+
+/// Without a hold, the restart is the registered position: a rewind reads
+/// from there, as before docs#336, and the consumption moves nothing.
+#[test]
+fn without_a_hold_the_restart_is_the_registered_position() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..4 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    assert_eq!(reader.restart_position(), 4 * 1024);
+    assert_eq!(reader.restart_at(1024), 4 * 1024);
+    reader.rewind().unwrap();
+    assert_eq!(reader.position(), 4 * 1024);
+}
+
+/// A full boundary ring, thinned, may keep no boundary at the hold: the
+/// restart then rises to the oldest kept boundary above it, counted, and
+/// what lies between stays retained for a NAK (docs#336, (a'), condition
+/// 3). The order `floor <= hold <= restart <= registered` holds.
+#[test]
+fn a_thinned_ring_raises_the_restart_past_the_hold_and_counts_it() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let at = reader.sent_position();
+    reader.with_hold(conductor.admit_hold(2, at).unwrap()).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // 64-byte frames, one per read: 300 reads overfill the 256 boundaries.
+    let data = sized_message(1, 32);
+    let mut out = vec![0u8; 64];
+    for _ in 0..300 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+        assert!(matches!(
+            sr_read(&mut reader, &mut out),
+            Ok(ReadOutcome::Copied { .. })
+        ));
+    }
+    sr_sent(&mut reader);
+    let registered = reader.sent_position();
+    assert_eq!(registered, 300 * 64);
+    // Thinning kept every second boundary, the second frame's end first:
+    // the third frame's end is gone.
+    let hold = 3 * 64;
+    assert_eq!(reader.hold_at(hold), Some(hold));
+    let restart = reader.restart_position();
+    assert!(hold < restart && restart <= registered, "restart {restart}");
+    assert_eq!(reader.counters().restart_raised, 1);
+    let _ = conductor.duty_cycle().unwrap();
+    let floor = conductor.floor();
+    assert!(floor <= hold, "floor {floor}");
+    // Between the hold and the restart, a NAK still reads.
+    let mut nak_out = sr_out();
+    let (result, _) = sr_nak(&mut reader, hold, restart, 1 << 20, &mut nak_out);
+    assert!(
+        matches!(result, Ok(ReadOutcome::Copied { .. })),
+        "{result:?}"
+    );
+}
+
+/// A silent sender (docs#336, condition 5): with no receiver's status
+/// messages live, the sender's reader is `CELL_SENDER_SILENT`, and its
+/// retention hold still holds the floor at `sent - retransmit_window`
+/// while the registered position bounds the limit.
+#[test]
+fn a_silent_senders_hold_keeps_the_floor() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let at = reader.sent_position();
+    reader.with_hold(conductor.admit_hold(2, at).unwrap()).unwrap();
+    assert!(reader.set_receivers_live(false));
+    assert_eq!(
+        buffer
+            .cell(reader.subscription().cell())
+            .unwrap()
+            .state
+            .load(Ordering::Acquire),
+        participant::CELL_SENDER_SILENT
+    );
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..8 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    let sent = reader.sent_position();
+    assert_eq!(reader.hold_at(sent - 4 * 1024), Some(sent - 4 * 1024));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.floor(), sent - 4 * 1024);
+    assert_eq!(conductor.limit(), sent + u64::from(MIN_TERM_LENGTH / 2));
+}
+
+/// A hold admitted above the reader's registered position is refused and
+/// handed back, so the order `hold <= restart <= registered` holds by
+/// construction and the hold never moves down (DESIGN's P3s on
+/// karyos#594); one admitted at the registered position is taken, and
+/// dropping the reader frees its cell, so the floor rises past it.
+#[test]
+fn a_hold_above_the_registered_position_is_refused_and_its_drop_lets_the_floor_rise() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..4 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    // Admitted at the head, above the reader's registered position (0):
+    // refused and handed back, never lowered.
+    let head = 4 * 1024;
+    let above = conductor.admit_hold(2, head).unwrap();
+    let Err((_, above)) = reader.with_hold(above) else {
+        panic!("a hold above the registered position was taken");
+    };
+    assert!(conductor.release_hold(above));
+    // At the registered position: taken.
+    let hold = conductor.admit_hold(2, reader.sent_position()).unwrap();
+    let cell = hold.cell;
+    reader.with_hold(hold).unwrap();
+    assert_eq!(reader.hold_position(), Some(0));
+    assert_eq!(reader.restart_position(), 0);
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    assert_eq!(reader.sent_position(), 4 * 1024);
+    assert_eq!(reader.hold_at(1024), Some(1024));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.floor(), 1024);
+    drop(reader);
+    assert_eq!(
+        buffer.cell(cell).unwrap().state.load(Ordering::Acquire),
+        participant::CELL_FREE
+    );
+    // With no reader left the floor follows the head a window behind
+    // (SPEC.md §4): past the freed hold once the head is a window on.
+    for _ in 0..48 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    assert!(conductor.floor() > 1024, "floor {}", conductor.floor());
+}

@@ -97,8 +97,8 @@ use core::sync::atomic::{Ordering, fence};
 use std::collections::VecDeque;
 
 use super::{
-    BufferOwner, Cursor, LogBuffer, Lookup, Role, SealWord, Subscription, SubscriptionContext,
-    Validated, decode_seal,
+    BufferOwner, Cursor, LogBuffer, Lookup, RetentionHold, Role, SealWord, Subscription,
+    SubscriptionContext, Validated, decode_seal,
 };
 use crate::error::SysError;
 use crate::frame::{Flags, FrameType, HEADER_LENGTH, Word0};
@@ -255,6 +255,12 @@ pub struct SenderReadCounters {
     pub nak_budget: u64,
     /// NAK reads that met a corrupt word 0 (never C-9).
     pub nak_corrupt: u64,
+    /// Restart moves that kept no boundary between the hold and the
+    /// receivers' consumption and rose past that consumption to the
+    /// oldest boundary at or above the hold ([`SenderRead::restart_at`]):
+    /// a reset then resends less at once, and the rest stays repairable by
+    /// NAK above the hold.
+    pub restart_raised: u64,
     /// Word 0 loads spent by NAK scans.
     pub nak_loads: u64,
     /// An increment did not apply.
@@ -411,17 +417,40 @@ pub struct SenderRead<O: BufferOwner> {
     counters: SenderReadCounters,
     /// An interleaving injected by tests; nothing outside them.
     hook: HookSlot,
-    /// The block-boundary `next` values of reads not yet registered, oldest
-    /// first, at most `BOUNDARIES` (allocated at construction), thinned
-    /// when full: the only positions [`SenderRead::sent`] accepts, so the
-    /// registered position is always a block start that
+    /// The block-boundary `next` values of reads above the restart
+    /// position, oldest first, at most `BOUNDARIES` (allocated at
+    /// construction), thinned when full: the only positions
+    /// [`SenderRead::sent`] and [`SenderRead::restart_at`] accept, so the
+    /// registered and the restart positions are always block starts that
     /// [`SenderRead::rewind`] can restart at.
     boundaries: VecDeque<u64>,
+    /// Where [`SenderRead::rewind`] reads again: the registered position
+    /// without a hold; with one, a block start at or between the hold and
+    /// the registered position, from the receivers' consumption
+    /// ([`SenderRead::restart_at`]), so a reset resends at once what they
+    /// had not consumed (quantstratum-docs:
+    /// karyos/design/retention-floor-optional-receivers.md). Only grows.
+    restart: u64,
     /// The NAK checkpoints (S2 2.3).
     checkpoints: Checkpoints,
     /// The last cursor read found the position below the floor: an
     /// optional reader was lapped, and may rejoin at the head.
     lapped: bool,
+    /// A reliable lane's retention hold ([`SenderRead::with_hold`]), freed
+    /// on drop.
+    hold: Option<RetentionHold>,
+}
+
+impl<O: BufferOwner> Drop for SenderRead<O> {
+    fn drop(&mut self) {
+        if let Some(hold) = self.hold.take()
+            && let Ok(cell) = self.subscription.buffer.cell(hold.cell)
+        {
+            // As a subscriber's detach: the registration is cleared before
+            // the cell is freed, and FREE is this holder's last access.
+            participant::leave(&cell.state, &cell.registration);
+        }
+    }
 }
 
 /// Block-boundary read ends a reader remembers until they are registered.
@@ -550,7 +579,6 @@ impl<O: BufferOwner> SenderRead<O> {
             subscription.cursor.position,
         );
         Ok(Self {
-            subscription,
             open: None,
             corrupt: None,
             corrupt_retries,
@@ -558,9 +586,163 @@ impl<O: BufferOwner> SenderRead<O> {
             counters: SenderReadCounters::default(),
             hook: HookSlot::default(),
             boundaries: VecDeque::with_capacity(BOUNDARIES),
+            restart: subscription.cursor.acknowledged,
             checkpoints,
             lapped: false,
+            hold: None,
+            subscription,
         })
+    }
+
+    /// Takes `hold`, a retention hold the same buffer's conductor admitted
+    /// at or below this reader's registered position
+    /// ([`super::Conductor::admit_hold`]), for a reliable lane: from then on
+    /// [`SenderRead::hold_at`] keeps the floor there, and dropping the
+    /// reader frees it. So `hold <= restart <= registered` holds from the
+    /// start, and the hold only grows.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::InvalidPublicationMode`] for a reader that holds one
+    /// already, a cell that is not that hold (another state or occupant),
+    /// or a hold above the registered position; the hold is handed back,
+    /// in place, for its conductor's [`super::Conductor::release_hold`].
+    pub fn with_hold(&mut self, hold: RetentionHold) -> Result<(), (SysError, RetentionHold)> {
+        let registered = self.subscription.cursor.acknowledged;
+        let held = self.subscription.buffer.cell(hold.cell).is_ok_and(|cell| {
+            cell.state.load(Ordering::Acquire) == participant::CELL_SENDER_HOLD
+                && cell.registration.load(Ordering::Acquire) == hold.occupant
+                && cell.position.load(Ordering::Relaxed) <= registered
+        });
+        if self.hold.is_some() || !held {
+            return Err((
+                SysError::InvalidPublicationMode {
+                    reason: "a retention hold of this buffer's conductor at or below the \
+                             registered position, one per sender reader",
+                },
+                hold,
+            ));
+        }
+        self.hold = Some(hold);
+        Ok(())
+    }
+
+    /// Raises the retention hold to `position`, the lane's `sent -
+    /// retransmit_window` lowered by its required receivers: never lowers
+    /// it, so the cell's position only grows, as `reader_minima` requires
+    /// (docs#336, condition 1). Returns the hold, or `None` with none.
+    ///
+    /// The hold never passes the registered position, and the restart
+    /// position rises with it: `hold <= restart <= registered`, so a rewind
+    /// reads only what the floor retains.
+    pub fn hold_at(&mut self, position: u64) -> Option<u64> {
+        let hold = self.hold.as_ref()?;
+        let cell = self.subscription.buffer.cell(hold.cell).ok()?;
+        let position = position.min(self.subscription.cursor.acknowledged);
+        // The only writer: the load reads its own last store.
+        let held = cell.position.load(Ordering::Relaxed);
+        let held = if position > held {
+            cell.position.store(position, Ordering::Release);
+            position
+        } else {
+            held
+        };
+        if self.restart < held {
+            self.raise_restart(held);
+        }
+        self.debug_assert_ordered(held);
+        Some(held)
+    }
+
+    /// The retention hold's position, `None` without one.
+    #[must_use]
+    pub fn hold_position(&self) -> Option<u64> {
+        let hold = self.hold.as_ref()?;
+        let cell = self.subscription.buffer.cell(hold.cell).ok()?;
+        Some(cell.position.load(Ordering::Relaxed))
+    }
+
+    /// The restart position ([`SenderRead::rewind`] reads again from it).
+    #[must_use]
+    pub fn restart_position(&self) -> u64 {
+        self.restart
+    }
+
+    /// Moves the restart position toward `consumption`, the least position
+    /// every receiver consumed, optional ones included (a hint, never a
+    /// bound): to the highest kept boundary at or below it, within the
+    /// hold and the registered position. With no boundary there it stays,
+    /// or, below the hold, rises to the oldest boundary at or above the
+    /// hold (counted `restart_raised`). It never lowers, and without a hold
+    /// it is the registered position. Returns it.
+    pub fn restart_at(&mut self, consumption: u64) -> u64 {
+        let Some(hold) = self.hold_position() else {
+            return self.restart;
+        };
+        let registered = self.subscription.cursor.acknowledged;
+        let target = consumption.max(hold).min(registered);
+        if target <= self.restart {
+            return self.restart;
+        }
+        let restart = self.restart;
+        let chosen = if target == registered {
+            Some(registered)
+        } else {
+            self.boundaries
+                .iter()
+                .rev()
+                .copied()
+                .find(|boundary| *boundary > restart && *boundary <= target)
+        };
+        match chosen {
+            Some(boundary) if boundary >= hold => self.set_restart(boundary),
+            _ if restart < hold => self.raise_restart(hold),
+            _ => {}
+        }
+        self.debug_assert_ordered(hold);
+        self.restart
+    }
+
+    /// Raises the restart position to the oldest kept boundary at or above
+    /// `at_least`, or to the registered position with none.
+    fn raise_restart(&mut self, at_least: u64) {
+        let registered = self.subscription.cursor.acknowledged;
+        let boundary = self
+            .boundaries
+            .iter()
+            .copied()
+            .find(|boundary| *boundary >= at_least && *boundary <= registered)
+            .unwrap_or(registered);
+        if boundary > at_least {
+            self.counters.bump(|c| &mut c.restart_raised, 1);
+        }
+        self.set_restart(boundary);
+    }
+
+    /// Moves the restart position up to `position`, a block start, and
+    /// forgets the boundaries at or below it.
+    fn set_restart(&mut self, position: u64) {
+        if position <= self.restart {
+            return;
+        }
+        self.restart = position;
+        while self
+            .boundaries
+            .front()
+            .is_some_and(|boundary| *boundary <= position)
+        {
+            let _ = self.boundaries.pop_front();
+        }
+    }
+
+    /// `hold <= restart <= registered` (docs#336, (a')).
+    fn debug_assert_ordered(&self, hold: u64) {
+        debug_assert!(
+            hold <= self.restart && self.restart <= self.subscription.cursor.acknowledged,
+            "hold {hold}, restart {}, registered {}",
+            self.restart,
+            self.subscription.cursor.acknowledged
+        );
     }
 
     /// Rejoins an optional reader the publisher lapped at the reserved
@@ -613,6 +795,7 @@ impl<O: BufferOwner> SenderRead<O> {
         let resume = head.max(cursor.position);
         cursor.position = resume;
         cursor.acknowledged = resume;
+        self.restart = resume;
         self.open = None;
         self.boundaries.clear();
         self.checkpoints.last = resume;
@@ -710,13 +893,16 @@ impl<O: BufferOwner> SenderRead<O> {
             .find(|boundary| *boundary > registered && *boundary <= position)
     }
 
-    /// Moves the cursor back to the registered position, dropping what was
+    /// Moves the cursor back to the restart position, dropping what was
     /// read past it and not submitted (an endpoint reset returned it): the
-    /// next read starts there again. The registered position is a block
-    /// start by construction (the join, or a boundary [`SenderRead::sent`]
-    /// accepted). A required reader's is never below the floor, so nothing
-    /// it rereads is reclaimed; an optional recording reader's can fall
-    /// below it, and the read's floor checks then return
+    /// next read starts there again. Without a hold that is the registered
+    /// position; with one, it is at or above the hold, so a reset resends
+    /// at once what the receivers had not consumed. It is a block start by
+    /// construction (the join, or a boundary [`SenderRead::sent`] or
+    /// [`SenderRead::restart_at`] accepted). A required reader's is never
+    /// below the floor, so nothing it rereads is reclaimed; an optional
+    /// recording reader's can fall below it, and the read's floor checks
+    /// then return
     /// [`ReadError::Unavailable`]. The C-9 count is kept: a rewind onto a
     /// corrupt block does not restore its retries.
     ///
@@ -728,11 +914,11 @@ impl<O: BufferOwner> SenderRead<O> {
             return Err(ReadError::Faulted { position });
         }
         let cursor = &mut self.subscription.cursor;
-        cursor.position = cursor.acknowledged;
+        cursor.position = self.restart;
         self.open = None;
         self.boundaries.clear();
         // The rereads record the same boundaries again, from here.
-        self.checkpoints.last = cursor.acknowledged;
+        self.checkpoints.last = self.restart;
         Ok(())
     }
 
@@ -798,7 +984,10 @@ impl<O: BufferOwner> SenderRead<O> {
         if position == self.subscription.cursor.acknowledged {
             return Ok(());
         }
-        if !self.boundaries.contains(&position) {
+        // Kept boundaries can lie below it (above the restart position):
+        // the registered position never moves back.
+        if position < self.subscription.cursor.acknowledged || !self.boundaries.contains(&position)
+        {
             self.counters.bump(|c| &mut c.invariant, 1);
             return Err(ReadError::Invariant);
         }
@@ -808,15 +997,13 @@ impl<O: BufferOwner> SenderRead<O> {
             self.counters.bump(|c| &mut c.invariant, 1);
             return Err(ReadError::Invariant);
         };
-        while self
-            .boundaries
-            .front()
-            .is_some_and(|boundary| *boundary <= position)
-        {
-            let _ = self.boundaries.pop_front();
-        }
         self.subscription.cursor.acknowledged = position;
         cell.position.store(position, Ordering::Release);
+        // Without a hold the restart is the registered position; with one
+        // the boundaries above the restart stay for `restart_at`.
+        if self.hold.is_none() {
+            self.set_restart(position);
+        }
         Ok(())
     }
 

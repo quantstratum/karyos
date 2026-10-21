@@ -29,19 +29,55 @@ fn timed_pair(
     AggregateHandle,
     karyos_client::aggregate::AggregateSubscription<karyos_sys::term_bytes::HeapTerms>,
 ) {
+    timed_pair_with(capacity, options, reliable, false)
+}
+
+/// [`timed_pair`], with B a required receiver (receiver 77) when
+/// `required`: its consumption then holds the sender's registered position
+/// (SPEC.md §4), as an optional receiver's no longer does.
+fn timed_pair_with(
+    capacity: u32,
+    options: ScheduleOptions,
+    reliable: bool,
+    required: bool,
+) -> (
+    EmbeddedDriver,
+    EmbeddedDriver,
+    AggregateHandle,
+    karyos_client::aggregate::AggregateSubscription<karyos_sys::term_bytes::HeapTerms>,
+) {
     let (mut a, mut b) = (
         driver(crate::agents::ThreadingMode::Shared),
         driver(crate::agents::ThreadingMode::Shared),
     );
-    let _ = b
-        .add_network_subscription(10, &channel(ANY_PORT, reliable))
-        .unwrap();
+    let identity = crate::membership::ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+        group_tag: 0,
+    };
+    let _ = if required {
+        b.add_network_subscription_as(10, &channel(ANY_PORT, reliable), identity)
+    } else {
+        b.add_network_subscription(10, &channel(ANY_PORT, reliable))
+    }
+    .unwrap();
     let address = bound(&b, 10);
     let mut config = aggregate(10, 3, 1);
     config.stream.buffer.schedule_capacity = capacity;
-    let publication = a
-        .add_timed_network_publication(config, &channel(address, reliable), None, options)
-        .unwrap();
+    let publication = if required {
+        a.add_timed_network_publication_with_roles(
+            config,
+            &channel(address, reliable),
+            crate::membership::PublicationRoles {
+                strategy: crate::membership::Strategy::Min,
+                required: vec![77],
+                tags: Vec::new(),
+            },
+            options,
+        )
+    } else {
+        a.add_timed_network_publication(config, &channel(address, reliable), None, options)
+    }
+    .unwrap();
     let mut image = None;
     pump(&mut [&mut a, &mut b], |drivers| {
         image = drivers[1].network_image(10, 3);
@@ -667,6 +703,81 @@ fn a_reset_after_part_of_the_window_is_acknowledged() {
 #[test]
 fn a_reliable_reset_resends_timed_messages_outside_the_policy() {
     let (mut a, mut b, publication, mut reader) = timed_pair(16, ScheduleOptions::default(), true);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // The subscriber holds: nothing is acknowledged while 8 are sent.
+    let now = karyos_sys::host_clock::host_monotonic_ns();
+    for index in 0..8u32 {
+        assert!(matches!(
+            lane.offer_at(&index.to_le_bytes(), now).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    pump(&mut [&mut a, &mut b], |drivers| {
+        shared(drivers[0])
+            .sender
+            .outbound_timed_counts(0)
+            .unwrap()
+            .sent
+            == 8
+    });
+    let late = shared(&mut a)
+        .sender
+        .outbound_timed_counts(0)
+        .unwrap()
+        .late_sends;
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].net.as_ref().unwrap().reopened() >= 1
+    });
+    let mut seen = 0u32;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 8
+    });
+    let agents = shared(&mut a);
+    assert_eq!(
+        agents.sender.outbound_counters(0).unwrap().schedule_faults,
+        0
+    );
+    let counts = agents.sender.outbound_timed_counts(0).unwrap();
+    assert!(counts.rewound >= 1, "{counts:?}");
+    assert_eq!(counts.late_sends, late, "a resend is not late: {counts:?}");
+    assert_eq!(counts.dropped, 0, "{counts:?}");
+    assert_clean(&mut a);
+}
+
+/// P2.11 PR1b: a reliable timed lane's endpoint reset rewinds it to its
+/// registered position. The messages above it are read again with their
+/// entries, which were held: resent at once, outside the late policy and
+/// counted `rewound`, never late; the subscriber reads each once, in
+/// order, and the schedule stays consistent (no fault), with the receiver
+/// required: its consumption also holds the registered position (SPEC.md
+/// §4, "Sender position").
+#[test]
+fn a_reliable_reset_resends_timed_messages_with_a_required_receiver() {
+    let (mut a, mut b, publication, mut reader) =
+        timed_pair_with(16, ScheduleOptions::default(), true, true);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();

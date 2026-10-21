@@ -148,6 +148,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.add_network(config, channel, None, Some(Box::new(roles)), None)
     }
 
+    /// [`EmbeddedDriver::add_timed_network_publication`] with `roles`
+    /// (tests: a required receiver holds its registered position).
+    #[cfg(test)]
+    pub(crate) fn add_timed_network_publication_with_roles(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        roles: PublicationRoles,
+        schedule: karyos_client::schedule::ScheduleOptions,
+    ) -> Result<AggregateHandle, DriverError> {
+        self.add_network(config, channel, None, Some(Box::new(roles)), Some(schedule))
+    }
+
     /// [`EmbeddedDriver::add_network_publication`], guarded by `guard`:
     /// every lane stream is guarded before the sender exists, and the
     /// sender runs the guard's gate from its first send. A close is local
@@ -430,8 +443,28 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .conductor
                 .subscribe_as(Role::Required, true, occupant)
                 .map_err(|_| DriverError::InvalidConfig)?;
-            let reader = SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES)
+            let mut reader = SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES)
                 .map_err(|_| DriverError::InvalidConfig)?;
+            // A reliable lane's retention hold, the floor at `sent -
+            // retransmit_window` (quantstratum-docs:
+            // karyos/design/retention-floor-optional-receivers.md), as its
+            // own occupant, from the reader's registered position; an
+            // unreliable lane has none. A full registry refuses the
+            // publication; the reader frees the hold on drop, and a hold it
+            // refused is freed here.
+            let next = if reliable {
+                let hold = target
+                    .conductor
+                    .admit_hold(next, reader.sent_position())
+                    .map_err(|_| DriverError::RetentionHoldUnavailable { stream: target.id })?;
+                if let Err((_, hold)) = reader.with_hold(hold) {
+                    let _ = target.conductor.release_hold(hold);
+                    return Err(DriverError::InvalidConfig);
+                }
+                next.checked_add(1).ok_or(DriverError::ExportIdsExhausted)?
+            } else {
+                next
+            };
             // Unconnected until a receiver's status messages are live
             // (SPEC.md §4): before any client is granted the publication.
             let _ = reader.set_receivers_live(false);

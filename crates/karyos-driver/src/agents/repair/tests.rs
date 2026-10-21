@@ -194,9 +194,11 @@ fn admission_answers_ranges_it_cannot_serve() {
         NakOutcome::Reply(reply) => assert_eq!(reply.reason, NakReplyReason::RangeInvalid),
         other => panic!("{other:?}"),
     }
-    // The sender's registration bounds the floor: register the first
-    // frame as sent and let the conductor raise the floor to it.
-    rig.path.readers_mut()[0].sent(FRAME).unwrap();
+    // The sender's retention hold bounds the floor (its registration
+    // follows what was submitted, with no required receiver): raise the
+    // hold to the first frame and let the conductor raise the floor to it.
+    assert_eq!(rig.path.readers()[0].sent_position(), 2 * FRAME);
+    assert_eq!(rig.path.readers_mut()[0].hold_at(FRAME), Some(FRAME));
     let _ = rig.log.conductors[0].duty_cycle().unwrap();
     assert_eq!(rig.path.readers()[0].floor(), FRAME);
     match rig.nak(0, 1056, 2) {
@@ -323,8 +325,10 @@ fn a_nak_below_the_registered_position_is_served() {
     let mut rig = Rig::new(&RepairConfig::default());
     rig.publish(4);
     let first = rig.datagrams();
-    // Registered at the third frame; no conductor cycle raised the floor.
-    rig.path.readers_mut()[0].sent(3 * FRAME).unwrap();
+    // Registered at what was submitted, the fourth frame's end (no
+    // required receiver); the hold keeps the floor at the start.
+    assert_eq!(rig.path.readers()[0].sent_position(), 4 * FRAME);
+    let _ = rig.log.conductors[0].duty_cycle().unwrap();
     assert_eq!(rig.path.readers()[0].floor(), 0);
     assert_eq!(rig.nak(FRAME, 1056, 1), NakOutcome::Queued);
     rig.scripted(1);

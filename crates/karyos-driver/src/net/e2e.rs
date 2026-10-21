@@ -176,6 +176,44 @@ fn connected<T: StreamTerms>(
     (publication, image.unwrap())
 }
 
+/// [`connected`] over a reliable channel whose receiver, B, is required
+/// (receiver 77): its consumption bounds the sender's registered position
+/// (SPEC.md §4, "Sender position"), where an optional one no longer does
+/// (quantstratum-docs: karyos/design/retention-floor-optional-receivers.md).
+fn connected_required<T: StreamTerms>(
+    a: &mut EmbeddedDriver<T>,
+    b: &mut EmbeddedDriver<T>,
+    stream_id: i32,
+) -> (AggregateHandle, AggregateHandle) {
+    use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
+
+    let identity = ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+        group_tag: 0,
+    };
+    let _ = b
+        .add_network_subscription_as(stream_id, &channel(ANY_PORT, true), identity)
+        .unwrap();
+    let address = bound(b, stream_id);
+    let publication = a
+        .add_network_publication_with_roles(
+            aggregate(stream_id, 3, 1),
+            &channel(address, true),
+            PublicationRoles {
+                strategy: Strategy::Min,
+                required: vec![77],
+                tags: Vec::new(),
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [a, b], |drivers| {
+        image = drivers[1].network_image(stream_id, 3);
+        image.is_some()
+    });
+    (publication, image.unwrap())
+}
+
 /// Offers `count` numbered messages on lane 0 of `publication` while
 /// reading `reader` on `b`, until every one arrived in order.
 fn exchange<T: StreamTerms>(
@@ -698,6 +736,65 @@ fn an_endpoint_reset_loses_nothing_on_a_reliable_channel() {
     // The subscriber holds: its consumption, and so the sender's
     // registered position, stays at 64 while 16 more are sent and
     // committed.
+    let committed =
+        |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().receiver_counters().unwrap();
+    let before = committed(&b).data_committed;
+    let mut sent = 64u32;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        while sent < 80 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        committed(drivers[1]).data_committed >= before + 16
+    });
+    let dropped = committed(&b).data_dropped;
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+    // The reset reopens the endpoint and the reliable lane rewinds to its
+    // registered position: what it already sent arrives again, and the
+    // receiver drops those copies as duplicates.
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].net.as_ref().unwrap().reopened() >= 1
+            && committed(drivers[1]).data_dropped > dropped
+    });
+    // The subscriber still reads every message exactly once, in order, and
+    // traffic after the reset flows.
+    exchange_from(&mut a, &mut b, &mut lane, &mut reader, sent, 64..320);
+}
+
+/// E2: a send fault that needs an endpoint reset, end to end: the sender
+/// requests it (#270), the endpoint table resets and reopens the endpoint,
+/// the reliable lane resends from its registered position, and the
+/// subscriber gets every message exactly once, in order, with the
+/// receiver required: its consumption also holds the registered position
+/// (SPEC.md §4, "Sender position").
+#[test]
+fn an_endpoint_reset_loses_nothing_with_a_required_receiver() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected_required(&mut a, &mut b, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..64);
+    // The subscriber holds: its consumption, and so the required
+    // receiver's retention and the sender's registered position, stays at
+    // 64 while 16 more are sent and committed.
     let committed =
         |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().receiver_counters().unwrap();
     let before = committed(&b).data_committed;
@@ -1884,7 +1981,6 @@ fn a_retired_image_closes_its_view_as_retired() {
 
 /// Offers numbered messages on `lane` up to `until`, runs A and B once and
 /// reads B's `reader`, checking order (T9).
-#[cfg(target_os = "linux")]
 fn offer_and_read(
     [a, b]: [&mut EmbeddedDriver; 2],
     lane: &mut karyos_client::ClientPublication<HeapTerms>,
@@ -1912,15 +2008,31 @@ fn offer_and_read(
     );
 }
 
+/// The span of A's lane 0 log that is live: from the retention floor to
+/// the head. SPEC.md §4 keeps it within two terms (T9, plan item 6).
+fn live_range(a: &EmbeddedDriver) -> u64 {
+    let conductor = &a.streams[0].conductor;
+    conductor.head().unwrap() - conductor.floor()
+}
+
 /// T9 (contract-traceability-phase-2.md, "Retention floor"), end to end on
-/// a reliable multicast publication with B required (receiver 77) and C
-/// optional. While the sender holds NAKs back, C loses a datagram and the
-/// sender, bound by B alone, sends `total` messages, B reading them all;
-/// then NAKs flow. Returns C's closes `(unrecoverable, cannot_resume)`, and
-/// with `repair_b`, checks that B's own hole above the floor is repaired.
-/// `None` without multicast on this host.
+/// a reliable multicast publication with C optional and B, with
+/// `b_required`, required (receiver 77): the sender is then bound by B
+/// alone. Without it no receiver is required, and the sender follows the
+/// fastest member (`Strategy::Max`), B: the floor of optional readers with
+/// no required participant (plan item 6, SPEC.md §6 "Retention"). While the
+/// sender holds NAKs back, C loses a datagram and the sender sends `total`
+/// messages, B reading them all; then NAKs flow. The live range stays
+/// within two terms throughout. Returns C's closes `(unrecoverable,
+/// cannot_resume)`, and with `repair_b`, checks that B's own hole above the
+/// floor is repaired. `None` without multicast on this host.
 #[cfg(target_os = "linux")]
-fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
+fn optional_receiver_closes(
+    total: u32,
+    repair_b: bool,
+    b_required: bool,
+    reset: bool,
+) -> Option<(u64, u64)> {
     use std::io::Write as _;
 
     use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
@@ -1948,9 +2060,12 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
         receiver_id: core::num::NonZeroU64::new(77).unwrap(),
         group_tag: 0,
     };
-    let _ = b
-        .add_network_subscription_as(10, &channel, required)
-        .unwrap();
+    let _ = if b_required {
+        b.add_network_subscription_as(10, &channel, required)
+    } else {
+        b.add_network_subscription(10, &channel)
+    }
+    .unwrap();
     let _ = c.add_network_subscription(10, &channel).unwrap();
     let publication = a
         .add_network_publication_with_roles(
@@ -1958,7 +2073,7 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
             &channel,
             PublicationRoles {
                 strategy: Strategy::Max,
-                required: vec![77],
+                required: if b_required { vec![77] } else { Vec::new() },
                 tags: Vec::new(),
             },
         )
@@ -1991,12 +2106,38 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
             total,
         );
         let _ = c.do_work().unwrap();
+        let live = live_range(&a);
+        assert!(
+            live <= 2 * u64::from(MIN_TERM_LENGTH),
+            "a live range of {live} bytes"
+        );
         if seen == total {
             break;
         }
         std::thread::sleep(Duration::from_micros(100));
     }
-    assert_eq!(seen, total, "B is required and reads everything");
+    assert_eq!(seen, total, "B reads everything");
+    if reset {
+        // An endpoint reset while C lags below the hold: the lane reads
+        // again from its restart position, at the hold, and B drops the
+        // copies; C's loss stays a reported one.
+        force_reset(&a, &publication);
+        for _ in 0..40_000 {
+            offer_and_read(
+                [&mut a, &mut b],
+                &mut lane,
+                &mut reader,
+                (&mut sent, &mut seen),
+                total,
+            );
+            let _ = c.do_work().unwrap();
+            if a.net.as_ref().unwrap().reopened() >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        assert!(a.net.as_ref().unwrap().reopened() >= 1, "reset");
+    }
     // NAKs flow again: C's hole is below the floor.
     a.net.as_mut().unwrap().sender_ignores_naks(false);
     let closes = |c: &EmbeddedDriver| {
@@ -2016,6 +2157,11 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
             total,
         );
         let _ = c.do_work().unwrap();
+        let live = live_range(&a);
+        assert!(
+            live <= 2 * u64::from(MIN_TERM_LENGTH),
+            "a live range of {live} bytes"
+        );
         if closes(&c).is_some_and(|(unrecoverable, cannot)| unrecoverable + cannot >= 1) {
             break;
         }
@@ -2038,6 +2184,11 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
                 (&mut sent, &mut seen),
                 more,
             );
+            let live = live_range(&a);
+            assert!(
+                live <= 2 * u64::from(MIN_TERM_LENGTH),
+                "a live range of {live} bytes"
+            );
             if seen == more {
                 break;
             }
@@ -2058,7 +2209,26 @@ fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_optional_receivers_hole_below_the_floor_is_unrecoverable() {
-    if let Some(closes) = optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true) {
+    if let Some(closes) =
+        optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true, true, false)
+    {
+        assert_eq!(closes, (1, 0), "C closed as unrecoverable");
+    }
+}
+
+/// Plan item 6 (contract-traceability-phase-2.md, "Retention floor";
+/// SPEC.md §15's scenario with no required participant): as above, with no
+/// receiver required. The sender follows its fastest member, B, so C, an
+/// optional reader lagging at its hole, falls below the floor: its NAK is
+/// answered RANGE_UNAVAILABLE and its image closes as unrecoverable, while
+/// B's hole above the floor is repaired, and the live range never spans
+/// more than two terms.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lagging_optional_receivers_hole_below_the_floor_with_none_required_is_unrecoverable() {
+    if let Some(closes) =
+        optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true, false, false)
+    {
         assert_eq!(closes, (1, 0), "C closed as unrecoverable");
     }
 }
@@ -2069,9 +2239,306 @@ fn an_optional_receivers_hole_below_the_floor_is_unrecoverable() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_optional_receivers_hole_past_its_window_cannot_resume() {
-    if let Some(closes) = optional_receiver_closes(3 * (MIN_TERM_LENGTH / 1000) + 8, false) {
+    if let Some(closes) =
+        optional_receiver_closes(3 * (MIN_TERM_LENGTH / 1000) + 8, false, true, false)
+    {
         assert_eq!(closes, (0, 1), "C closed as GapCannotResume");
     }
+}
+
+/// Docs#336 (a'), DESIGN's gap 3: the `max` case of a reset with an
+/// uncounted optional receiver, C, lagging below the hold and no receiver
+/// required. The reset reads again from the restart position, at the
+/// hold; C's hole below the floor is still answered RANGE_UNAVAILABLE and
+/// its image closes as unrecoverable, a reported loss, never a silent one;
+/// B reads every message once and its own later hole is repaired.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reset_under_max_leaves_a_lagging_optional_receivers_loss_reported() {
+    if let Some(closes) =
+        optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true, false, true)
+    {
+        assert_eq!(closes, (1, 0), "C closed as unrecoverable");
+    }
+}
+
+/// Posts an endpoint reset of `publication`'s route on A.
+fn force_reset<T: StreamTerms>(a: &EmbeddedDriver<T>, publication: &AggregateHandle) {
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+}
+
+/// Docs#336's first gate (quantstratum-docs:
+/// karyos/design/retention-floor-optional-receivers.md): a lone unicast
+/// receiver, optional by default, keeps its delivery through the flow
+/// limit. While the sender holds NAKs back, B loses its third DATA
+/// datagram and the sender runs to B's window above the hole, past
+/// `retransmit_window` (half a term) from its start; then NAKs flow and
+/// the hole, at or above the held floor `sent - retransmit_window`, is
+/// repaired. B reads every message once, in order, and the live range
+/// stays within two terms. Against the limit's rule alone (a floor at the
+/// registered position) the NAK is answered RANGE_UNAVAILABLE.
+#[test]
+fn a_lone_optional_unicast_receivers_hole_is_repaired() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let total = MIN_TERM_LENGTH * 3 / 2 / 1000;
+    a.net.as_mut().unwrap().sender_ignores_naks(true);
+    b.net.as_mut().unwrap().drop_receiver_data(&[2]);
+    let (mut sent, mut seen) = (0u32, 0u32);
+    let half = u64::from(MIN_TERM_LENGTH / 2);
+    let mut past_window = false;
+    for _ in 0..4_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        let live = live_range(&a);
+        assert!(
+            live <= 2 * u64::from(MIN_TERM_LENGTH),
+            "a live range of {live} bytes"
+        );
+        past_window |= u64::from(sent) * 1056 > half + 3 * 1056;
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert!(past_window, "sent {sent} past half a term");
+    assert_eq!(seen, 2, "B holds at its hole");
+    assert!(sent < total, "flow control bounds the sender at B's window");
+    a.net.as_mut().unwrap().sender_ignores_naks(false);
+    for _ in 0..40_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        let live = live_range(&a);
+        assert!(
+            live <= 2 * u64::from(MIN_TERM_LENGTH),
+            "a live range of {live} bytes"
+        );
+        if seen == total {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert_eq!(seen, total, "B's hole was repaired");
+    let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert!(receiver.naks >= 1, "{receiver:?}");
+    assert_eq!(
+        (
+            receiver.images_closed_unrecoverable,
+            receiver.images_closed_cannot_resume
+        ),
+        (0, 0)
+    );
+}
+
+/// Docs#336's second gate: a slow optional receiver under `min` (the
+/// multicast default), C, is bounded by flow control and its hole is
+/// repaired. While the sender holds NAKs back, C loses its third DATA
+/// datagram; the sender runs to C's window above it, past
+/// `retransmit_window` from its start, and B, the fast one, reads what is
+/// sent. Then NAKs flow: C's hole, at or above the held floor, is
+/// repaired, both read every message once, in order, and the live range
+/// stays within two terms.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_slow_optional_receiver_under_min_is_bounded_and_repaired() {
+    use std::io::Write as _;
+
+    use crate::membership::{PublicationRoles, Strategy};
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(std::io::stderr(), "SKIPPED docs#336 min gate: {why}");
+        return;
+    }
+    let port = free_port();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), port);
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b, mut c) = (
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    let _ = b.add_network_subscription(10, &channel).unwrap();
+    let _ = c.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication_with_roles(
+            aggregate(10, 3, 1),
+            &channel,
+            PublicationRoles {
+                strategy: Strategy::Min,
+                required: Vec::new(),
+                tags: Vec::new(),
+            },
+        )
+        .unwrap();
+    let mut images = (None, None);
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        images = (
+            drivers[1].network_image(10, 3),
+            drivers[2].network_image(10, 3),
+        );
+        images.0.is_some() && images.1.is_some()
+    });
+    let (Some(on_b), Some(on_c)) = images else {
+        unreachable!("pumped until both exist");
+    };
+    let mut reader = b.subscribe_aggregate(&on_b, Role::Required).unwrap();
+    let mut slow = c.subscribe_aggregate(&on_c, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let total = MIN_TERM_LENGTH * 3 / 2 / 1000;
+    a.net.as_mut().unwrap().sender_ignores_naks(true);
+    c.net.as_mut().unwrap().drop_receiver_data(&[2]);
+    let (mut sent, mut seen, mut seen_c) = (0u32, 0u32, 0u32);
+    let mut read_c = |c: &mut EmbeddedDriver, seen_c: &mut u32| {
+        let _ = c.do_work().unwrap();
+        let _ = slow.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, *seen_c, "C in order, exactly once");
+                *seen_c += 1;
+            },
+            BUDGET,
+        );
+    };
+    let half = u64::from(MIN_TERM_LENGTH / 2);
+    let mut past_window = false;
+    for _ in 0..4_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        read_c(&mut c, &mut seen_c);
+        let live = live_range(&a);
+        assert!(
+            live <= 2 * u64::from(MIN_TERM_LENGTH),
+            "a live range of {live} bytes"
+        );
+        past_window |= u64::from(sent) * 1056 > half + 3 * 1056;
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert!(past_window, "sent {sent} past half a term");
+    assert_eq!(seen_c, 2, "C holds at its hole");
+    assert!(sent < total, "flow control bounds the sender at C's window");
+    a.net.as_mut().unwrap().sender_ignores_naks(false);
+    for _ in 0..40_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        read_c(&mut c, &mut seen_c);
+        let live = live_range(&a);
+        assert!(
+            live <= 2 * u64::from(MIN_TERM_LENGTH),
+            "a live range of {live} bytes"
+        );
+        if seen == total && seen_c == total {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert_eq!((seen, seen_c), (total, total), "C's hole was repaired");
+    let on_c = c.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert!(on_c.naks >= 1, "{on_c:?}");
+    assert_eq!(
+        (
+            on_c.images_closed_unrecoverable,
+            on_c.images_closed_cannot_resume
+        ),
+        (0, 0)
+    );
+}
+
+/// Docs#336 (a'), DESIGN's gap 2: a reset drops the tail and the publisher
+/// then offers nothing. B, a lone optional unicast receiver, loses the
+/// last three DATA datagrams; the endpoint resets with nothing more
+/// offered. The lane reads again from its restart position, at most B's
+/// consumption, and the idle heartbeat tells B the sent position, so B
+/// reads the tail once, in order, with no loss reported; traffic after it
+/// flows.
+#[test]
+fn a_tail_lost_at_a_reset_with_an_idle_publisher_is_recovered() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..64);
+    let sender = |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().sender_counters().unwrap();
+    let before = sender(&a).sent;
+    b.net.as_mut().unwrap().drop_receiver_data(&[0, 1, 2]);
+    let mut sent = 64u32;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        while sent < 67 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        sender(drivers[0]).sent >= before + 3
+    });
+    force_reset(&a, &publication);
+    // Idle: nothing more is offered until B has read the tail.
+    let mut seen = 64u32;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        drivers[0].net.as_ref().unwrap().reopened() >= 1 && seen == 67
+    });
+    let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert_eq!(
+        (
+            receiver.images_closed_unrecoverable,
+            receiver.images_closed_cannot_resume
+        ),
+        (0, 0)
+    );
+    exchange_from(&mut a, &mut b, &mut lane, &mut reader, 67, 67..128);
 }
 
 /// rp-w4b2c: a publication over two paths reaches a subscription over the
