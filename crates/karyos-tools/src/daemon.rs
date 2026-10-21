@@ -137,7 +137,8 @@ impl Shutdown {
 
 /// The configuration of a stream started from `terms`: exclusive
 /// publication, lane 0, initial term id 0, publications refused while no
-/// subscriber is attached, and the `Hold` loss policy.
+/// subscriber is attached unless `stream` allows them, and the `Hold`
+/// loss policy.
 ///
 /// # Errors
 ///
@@ -167,7 +168,7 @@ pub fn stream_config(
             claim_deadline: terms.claim_deadline,
             schedule_capacity: 0,
         },
-        allow_unconnected: false,
+        allow_unconnected: stream.allow_unconnected,
         on_required_loss: LossPolicy::Hold,
         conflation: None,
     })
@@ -529,6 +530,7 @@ mod tests {
     const STREAM: StreamOption = StreamOption {
         stream_id: 10,
         session_id: 1,
+        allow_unconnected: false,
     };
 
     #[test]
@@ -628,6 +630,7 @@ mod tests {
         options.streams.push(StreamOption {
             stream_id: 100,
             session_id: 0,
+            allow_unconnected: false,
         });
         options.archive = Some(crate::args::ArchiveOptions {
             dir: archive.clone(),
