@@ -359,10 +359,15 @@ impl Admission {
             return self.drop(Dropped::ErrTableFull);
         };
         *slot = Some(sent);
-        self.counts.bump(|c| match reason {
-            NakReplyReason::RangeInvalid => &mut c.range_invalid,
-            NakReplyReason::RangeUnavailable { .. } => &mut c.range_unavailable,
-        });
+        match reason {
+            NakReplyReason::RangeInvalid => self.counts.bump(|c| &mut c.range_invalid),
+            NakReplyReason::RangeUnavailable { .. } => {
+                self.counts.bump(|c| &mut c.range_unavailable);
+            }
+            // The driver builds only the two reasons above; a later
+            // protocol version's reason has no counter here.
+            _ => {}
+        }
         Admitted::Reply(NakReply::answering(nak, reason))
     }
 }

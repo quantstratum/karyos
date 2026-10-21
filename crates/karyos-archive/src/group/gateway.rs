@@ -368,8 +368,16 @@ pub enum GatewayError {
     UnknownOutcome,
 }
 
-/// The trait both the live Gateway and `ReplayGateway` implement.
-pub trait GroupGateway {
+/// Seals [`GroupGateway`]: only this crate's gateways implement it, so it
+/// can gain methods without a breaking version (owner item 41).
+pub(crate) mod sealed {
+    /// Implemented by this crate's gateways only.
+    pub trait Sealed {}
+}
+
+/// The trait both the live Gateway and `ReplayGateway` implement. Sealed:
+/// it is implemented in this crate only.
+pub trait GroupGateway: sealed::Sealed {
     /// Takes the next event, if any, and runs `handler` on it.
     fn dispatch(&mut self, handler: &mut dyn Handler) -> Result<Dispatched, GatewayError>;
 

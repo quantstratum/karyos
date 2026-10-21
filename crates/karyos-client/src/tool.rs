@@ -100,6 +100,8 @@ impl Staged {
             | WireKind::GuardRegion
             | WireKind::OutcomeRing
             | WireKind::ConsumedCell => None,
+            // A kind a later protocol version admits (owner item 41).
+            _ => None,
         }
     }
 }

@@ -153,6 +153,8 @@ fn reason(reason: StopReason) -> &'static str {
         StopReason::Failed(FailKind::Source) => "failed: source",
         StopReason::Failed(FailKind::RequiredLapped) => "failed: required lapped",
         StopReason::Failed(FailKind::Invalid) => "failed: invalid",
+        // A reason a later Archive version decodes.
+        _ => "unknown",
     }
 }
 
@@ -341,6 +343,8 @@ fn state_text(recording: &ListedRecording) -> String {
             if *incomplete { ", incomplete" } else { "" }
         ),
         RecordingState::Stopped(stop) => stopped_text(stop),
+        // A state a later Archive version decodes.
+        _ => "unknown".to_owned(),
     }
 }
 
@@ -400,10 +404,13 @@ pub fn live_json(live: &LiveArchive, listing: &LiveListing) -> String {
                 incomplete,
             } => format!("{{\"written\":{written},\"incomplete\":{incomplete}}}"),
             RecordingState::Stopped(stop) => stopped_json(stop),
+            // A state a later Archive version decodes.
+            _ => "\"unknown\"".to_owned(),
         };
         let (recording_state, stop) = match recording.state {
             RecordingState::Recording { .. } => (state, "null".to_owned()),
             RecordingState::Stopped(_) => ("null".to_owned(), state),
+            _ => (state, "null".to_owned()),
         };
         let _ = write!(
             out,

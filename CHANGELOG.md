@@ -64,6 +64,32 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The enums decoded from evolving wire and record schemas are
+  `#[non_exhaustive]` (owner item 41): `karyos-protocol`'s CnC
+  `SubscriberRole`, `RejoinPolicyCode`, `RejoinOutcomeCode`,
+  `FallbackReasonCode`, `Command`, `ErrorCode`, `Response`,
+  `CutoverState`, `LossPolicyCode`, `CloseReason` and `Event`, the
+  admission `Message`, `RegionKind` and `Capability`, and the network
+  `Control`, `ControlKind`, `NakReplyReason`, `RttmKind` and
+  `Datagram`; `karyos-archive`'s control `ResponseCode`,
+  `ControlMessage`, `RecordingState`, `Signal` and `ReplayRate`, the
+  catalog `StopReason` and `FailKind`, the segment `EntryKind` and the
+  group record's `Clock`, `Capture`, `Payload`, `Freshness`,
+  `EndReason`, `LifecycleKind`, `Loss`, `Operation`, `Outcome`,
+  `TimerAction`, `EndOutcome`, `GapReason`, `OverrunOutcome`,
+  `FallbackReason`, `GroupRecord` and `Role`; and `karyos-trace`'s
+  `Point`. A downstream `match` on one of them needs a wildcard arm. No
+  wire code or format changes: an unknown value still decodes to the
+  same typed error. Inside the workspace a value a later version
+  decodes is refused, never given another variant's meaning: the
+  driver treats a command it does not serve as a protocol violation;
+  the C ABI's `karyos_archive_list` refuses a page holding a recording
+  state or stop reason it has no code for, with `KARYOS_E_REFUSED` and
+  response code 5 (unsupported schema), delivering nothing.
+  `GroupGateway` is sealed; `ReplayProvider` gains methods only with
+  default bodies or a breaking version. `OnLap`, `Mode` and both
+  `CommitOutcome` stay closed by design.
+
 - `karyos-ffi`: each copy of the library draws its own base generation
   for its handles, once, from the address of one of its statics (never
   0; no clock or process id, so it runs under Miri's isolation). A handle

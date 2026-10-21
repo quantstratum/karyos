@@ -92,6 +92,7 @@ const FORGOTTEN: u16 = 4;
 
 /// Why a recording stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StopReason {
     /// The recorded stream was sealed, and the recording reached the seal.
     Normal,
@@ -115,6 +116,7 @@ pub enum StopReason {
 
 /// Why a recording's source failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FailKind {
     /// The source reported an error (revoked, faulted, an invariant).
     Source,

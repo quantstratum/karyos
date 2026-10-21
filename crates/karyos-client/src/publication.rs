@@ -105,6 +105,9 @@ pub enum ClaimOutcome<'a, T: TermBytes = HeapTerms> {
 
 /// Result of [`ClientClaim::commit`]. Embedded API, provisional, as
 /// [`ClaimOutcome`].
+///
+/// Closed by design (owner item 41): a new variant comes only with a
+/// breaking version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a commit can lose to an abort"]
 pub enum CommitOutcome {

@@ -297,6 +297,7 @@ fn a_strict_group_records_a_driver_stream_end_to_end() {
                     }
                     Payload::Inline(_) => false,
                     Payload::Unavailable { .. } => panic!("unavailable"),
+                    other => panic!("unexpected {other:?}"),
                 };
                 messages.push((
                     message.group_seq,

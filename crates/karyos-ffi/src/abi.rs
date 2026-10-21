@@ -2479,10 +2479,11 @@ pub struct Recording {
 /// must return normally.
 pub type RecordingHandler = Option<unsafe extern "C" fn(*mut c_void, *const Recording)>;
 
-/// The `KARYOS_STOP_*` code of `reason`.
-pub(crate) fn stop_reason(reason: karyos_archive::catalog::StopReason) -> u32 {
+/// The `KARYOS_STOP_*` code of `reason`; `None` for a reason a later
+/// Archive version decodes, which has no code here (owner item 41).
+pub(crate) fn stop_reason(reason: karyos_archive::catalog::StopReason) -> Option<u32> {
     use karyos_archive::catalog::{FailKind, StopReason};
-    match reason {
+    Some(match reason {
         StopReason::Normal => 1,
         StopReason::Recovered => 2,
         StopReason::Empty => 3,
@@ -2492,12 +2493,19 @@ pub(crate) fn stop_reason(reason: karyos_archive::catalog::StopReason) -> u32 {
         StopReason::Failed(FailKind::Source) => 7,
         StopReason::Failed(FailKind::RequiredLapped) => 8,
         StopReason::Failed(FailKind::Invalid) => 9,
-    }
+        _ => return None,
+    })
+}
+
+/// Whether the C ABI can state `listed`: [`recording`] converts it.
+pub(crate) fn expressible(listed: &karyos_archive::client::list::ListedRecording) -> bool {
+    recording(listed).is_some()
 }
 
 /// `listed` as the C ABI hands it to a handler; its channel borrows
-/// `listed`'s.
-fn recording(listed: &karyos_archive::client::list::ListedRecording) -> Recording {
+/// `listed`'s. `None` for a state or stop reason a later Archive version
+/// decodes, which has no code here (owner item 41).
+fn recording(listed: &karyos_archive::client::list::ListedRecording) -> Option<Recording> {
     use karyos_archive::control::RecordingState;
     let (state, stop, incomplete, position) = match listed.state {
         RecordingState::Recording {
@@ -2506,12 +2514,13 @@ fn recording(listed: &karyos_archive::client::list::ListedRecording) -> Recordin
         } => (RECORDING_RECORDING, 0, incomplete, written),
         RecordingState::Stopped(stop) => (
             RECORDING_STOPPED,
-            stop_reason(stop.reason),
+            stop_reason(stop.reason)?,
             stop.incomplete,
             stop.position,
         ),
+        _ => return None,
     };
-    Recording {
+    Some(Recording {
         size: size_of_u32::<Recording>(),
         state,
         stop_reason: stop,
@@ -2524,7 +2533,7 @@ fn recording(listed: &karyos_archive::client::list::ListedRecording) -> Recordin
         position,
         channel: listed.channel.as_ptr().cast::<c_char>(),
         channel_length: listed.channel.len(),
-    }
+    })
 }
 
 /// Opens a connection of `client` to the Archive whose control streams
@@ -2635,12 +2644,18 @@ pub unsafe extern "C" fn karyos_archive_list(
             return Status::InvalidArgument;
         }
         let mut call = |listed: &karyos_archive::client::list::ListedRecording| {
-            let recording = recording(listed);
+            // `api::archive::list` refuses a page holding a recording the C
+            // ABI cannot state, before delivering any, and refuses the call
+            // if this conversion still fails.
+            let Some(recording) = recording(listed) else {
+                return false;
+            };
             // SAFETY: `handler` has the handler's signature and returns
             // normally (the caller's contract); `recording` and the
             // channel it points into outlive the call, which only reads
             // them.
             unsafe { handler(context, &raw const recording) };
+            true
         };
         let (status, count) =
             match api::archive::list(Handle::from_raw(archive), after_id, limit, &mut call) {

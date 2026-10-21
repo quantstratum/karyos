@@ -935,6 +935,8 @@ fn describe(record: Option<&GroupRecord<'_>>) -> String {
                 Operation::Offer => "offer",
                 Operation::Claim => "claim",
                 Operation::Commit => "commit",
+                // An operation a later Archive version decodes.
+                _ => "unknown operation",
             };
             format!(
                 "{operation}, stream {} session {}, length {}, crc32c {:#010x}, {:?}",
@@ -953,6 +955,8 @@ fn describe(record: Option<&GroupRecord<'_>>) -> String {
                     length,
                 } => format!("by reference to recording {recording_id}, length {length}"),
                 Payload::Unavailable { length } => format!("not captured, length {length}"),
+                // A payload form a later Archive version decodes.
+                _ => "unknown payload".to_owned(),
             };
             let extension = message
                 .extension

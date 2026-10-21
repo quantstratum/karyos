@@ -193,11 +193,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream_id: i32,
         (allow_unconnected, concurrent): (bool, bool),
         uri: &str,
-    ) -> Response {
-        let refuse = |code: ErrorCode, detail: u64| Response::Error {
-            request,
-            code,
-            detail,
+    ) -> Result<Response, &'static str> {
+        let refuse = |code: ErrorCode, detail: u64| {
+            Ok(Response::Error {
+                request,
+                code,
+                detail,
+            })
         };
         let detail = u64::from(stream_id.cast_unsigned());
         let channel = match ChannelConfig::parse(uri) {
@@ -299,7 +301,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             },
         );
         match response {
-            Response::PublicationReady { registration, .. } => {
+            Ok(Response::PublicationReady { registration, .. }) => {
                 self.net_owned.push(OwnedNetwork {
                     registration,
                     client,
@@ -404,11 +406,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream_id: i32,
         role: SubscriberRole,
         uri: &str,
-    ) -> Response {
-        let refuse = |code: ErrorCode, detail: u64| Response::Error {
-            request,
-            code,
-            detail,
+    ) -> Result<Response, &'static str> {
+        let refuse = |code: ErrorCode, detail: u64| {
+            Ok(Response::Error {
+                request,
+                code,
+                detail,
+            })
         };
         let detail = u64::from(stream_id.cast_unsigned());
         let udp = match ChannelConfig::parse(uri) {
@@ -458,10 +462,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 announced: false,
             },
         });
-        Response::NetworkSubscriptionReady {
+        Ok(Response::NetworkSubscriptionReady {
             request,
             registration,
-        }
+        })
     }
 
     /// Removes the network subscription `registration` of `client`;

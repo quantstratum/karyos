@@ -595,6 +595,8 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
     }
 }
 
+impl<P: Port, C: FnMut() -> u64> super::sealed::Sealed for Gateway<P, C> {}
+
 impl<P: Port, C: FnMut() -> u64> GroupGateway for Gateway<P, C> {
     /// Takes the next event, a timer due now or a source's, and delivers
     /// it.

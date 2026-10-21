@@ -122,6 +122,7 @@ fn lane(value: u8) -> Result<Lane, CodecError> {
 
 /// The clock whose readings a journal's logical times are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Clock {
     /// The host's monotonic clock in nanoseconds, read once when an event
     /// is dispatched; a timer event's time is its deadline.
@@ -130,6 +131,7 @@ pub enum Clock {
 
 /// What a group does with an event it cannot capture whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Capture {
     /// Stop admitting events: the loop stops with an incomplete capture.
     Strict,
@@ -285,6 +287,7 @@ impl<'a> JournalHeader<'a> {
 
 /// Where a message's payload is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Payload<'a> {
     /// The payload itself, 0 to [`MAX_INLINE`] bytes.
     Inline(&'a [u8]),
@@ -491,6 +494,7 @@ impl<'a> MessageEvent<'a> {
 
 /// Whether a conflated value was covered by a committed gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Freshness {
     /// No committed gap covered it.
     Fresh,
@@ -607,6 +611,7 @@ impl TimerEvent {
 
 /// Why a subscription ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EndReason {
     /// Its stream ended (end of stream).
     EndOfStream,
@@ -620,6 +625,7 @@ pub enum EndReason {
 
 /// What a lifecycle event announced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LifecycleKind {
     /// An image became available.
     ImageAvailable,
@@ -711,6 +717,7 @@ impl LifecycleEvent {
 /// loss report's applied outcomes, and `replaying` for a
 /// `ReplayRejoin` still recovering the gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OverrunOutcome {
     /// Delivery went on at `resume`.
     ResumedAtHead,
@@ -729,6 +736,7 @@ pub enum OverrunOutcome {
 /// Why `replay` fell back to its secondary policy: the loss report's
 /// reason codes, 1 to 7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FallbackReason {
     /// No Archive.
     NoArchive,
@@ -748,6 +756,7 @@ pub enum FallbackReason {
 
 /// What a source reported instead of a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Loss {
     /// The reader was overrun, and its rejoin policy did `outcome`; a
     /// `replay` that fell back names its reason.
@@ -1007,6 +1016,7 @@ impl<'a> ExternalEvent<'a> {
 
 /// The call whose outcome was observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Operation {
     /// An offer.
     Offer,
@@ -1093,6 +1103,7 @@ fn sub_of(error: u16, sub: u16) -> bool {
 
 /// An operation's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Outcome {
     /// An offer accepted, a claim reserved, or a commit accepted, at
     /// `position` in `lane`.
@@ -1481,6 +1492,7 @@ impl DeliveryObservation {
 
 /// A timer created or cancelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TimerAction {
     /// Created.
     Create,
@@ -1583,6 +1595,7 @@ impl<'a> ExternalObservation<'a> {
 
 /// Whether an event's capture is whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EndOutcome {
     /// Every observation is recorded.
     Complete,
@@ -1636,6 +1649,7 @@ impl EventEnd {
 
 /// Why a best-effort group did not capture events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GapReason {
     /// An event exceeded its capture budget.
     BudgetExceeded,
@@ -1813,6 +1827,7 @@ impl CheckpointRecord {
 
 /// Any record of schema 3, version 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GroupRecord<'a> {
     /// Template 1.
     Header(JournalHeader<'a>),
@@ -1850,6 +1865,7 @@ pub enum GroupRecord<'a> {
 
 /// What a record is within its journal, for the order rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Role {
     /// The journal header: its capture mode and first `group_seq`.
     Header {

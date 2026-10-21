@@ -4428,6 +4428,8 @@ impl<T: StreamTerms> Intake<'_, T> {
                     });
                 }
                 RttmKind::Reply { .. } => self.rttm_reply(source, &rttm),
+                // A kind a later protocol version decodes: not served.
+                _ => self.role.count(|c| &mut c.unhandled),
             },
             Control::NakReply(reply) => self.nak_reply(source, &reply),
             _ => self.role.count(|c| &mut c.unhandled),
@@ -4453,6 +4455,8 @@ impl<T: StreamTerms> RxHandler for Intake<'_, T> {
                     self.data(source, data.alias(), data.bytes());
                 }
             }
+            // A datagram kind a later protocol version decodes: not served.
+            Ok(_) => self.role.count(|c| &mut c.unhandled),
             Err(_) => self.role.count(|c| &mut c.decode_errors),
         }
         ControlFlow::Continue(())

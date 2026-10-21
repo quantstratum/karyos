@@ -156,6 +156,9 @@ pub trait FrameSource {
 }
 
 /// What an async recording does when it is lapped.
+///
+/// Closed by design (owner item 41): a new variant comes only with a
+/// breaking version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnLap {
     /// It records the gap and stops there.
@@ -167,6 +170,9 @@ pub enum OnLap {
 }
 
 /// A recording's mode (SPEC §8.1).
+///
+/// Closed by design (owner item 41): a new variant comes only with a
+/// breaking version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// A required participant: never lapped; it throttles the publisher.
