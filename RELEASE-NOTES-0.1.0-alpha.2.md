@@ -56,7 +56,7 @@ what is partial.
 - **Partial: required set transitions.** The limit follows the required
   set and never decreases under `hold`, `continue` and `abort`; no test
   runs the transition with a required recording as the only required
-  participant. TODO(item 6): re-check at the release head.
+  participant.
 
 ### Network transport
 
@@ -71,20 +71,23 @@ what is partial.
     every message exactly once and in order through NAKs and repairs,
     also with two lanes, multicast, a 500 ms blackout and between two
     IPC drivers (N2 to N8).
-  - Multicast flow control with the `min` strategy and required
-    receivers that bound it (TODO(M4, item 7): state which of `max` and
-    `tagged` work and which are refused, per M4); RTT measurement;
-    NAK admission against the retention floor, coalesced repair jobs and
-    a bounded repair scheduler.
+  - Multicast flow control with the `min` strategy, and required
+    receivers that bound the sender; RTT measurement; NAK admission
+    against the retention floor, coalesced repair jobs and a bounded
+    repair scheduler. A channel URI with `fc=max` or `fc=tagged` is
+    refused as an unsupported channel rather than run as `min` (karyos#617):
+    the `max` and `tagged` strategies exist only inside the driver and its
+    tests, with no public way to request them yet.
   - A slow optional receiver no longer holds a reliable publisher: the
     floor is held at `sent - retransmit_window` while the required
     receivers allow it.
   - Challenge lifecycle, alias collision (every image of an alias is
     exposed, keyed by its source) and one driver holding both ends of a
     `karyos:udp` endpoint.
-  - TODO(M5, item 26): a unicast subscription's ready reply carries its
-    bound address (IPv4, or IPv6 with its scope), exposed as
-    `bound_address()` on the client's network subscription.
+  - A network subscription's ready reply carries its bound address
+    (IPv4, or IPv6 with its scope; a multicast subscription's group and
+    bound port), exposed as `Subscription::bound_address()`; an image's
+    source address uses the same encoding (karyos#612, #615).
   - Aborts and fragmented aborts over the network reach a remote reader
     as one extent and are repaired, never NAKed past.
 - **Lanes**: per-lane deficit round robin with fairness bounds, and
