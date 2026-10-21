@@ -56,7 +56,7 @@ what is partial.
 - **Partial: required set transitions.** The limit follows the required
   set and never decreases under `hold`, `continue` and `abort`; no test
   runs the transition with a required recording as the only required
-  participant.
+  participant. TODO(item 6): re-check at the release head.
 
 ### Network transport
 
@@ -82,6 +82,9 @@ what is partial.
   - Challenge lifecycle, alias collision (every image of an alias is
     exposed, keyed by its source) and one driver holding both ends of a
     `karyos:udp` endpoint.
+  - TODO(M5, item 26): a unicast subscription's ready reply carries its
+    bound address (IPv4, or IPv6 with its scope), exposed as
+    `bound_address()` on the client's network subscription.
   - Aborts and fragmented aborts over the network reach a remote reader
     as one extent and are repaired, never NAKed past.
 - **Lanes**: per-lane deficit round robin with fairness bounds, and
@@ -129,10 +132,11 @@ what is partial.
   prefixes and its checkpoints; capture of every observation as the
   handler saw it, strict or best effort; replay through
   `ReplayGateway`, isolated from a running driver; and the output diff,
-  `karyos-replay diff`. Phase 3's five functional gate items are covered:
+  `karyos-replay diff`. Phase 3's functional gate items are covered:
   torn-write and restart, complete and durable common-prefix recovery,
-  exact captured observations, output diff, and isolation of external
-  effects.
+  exact captured observations, the output diff and isolation of external
+  effects, with one minor test gap tracked as an issue: no test shows
+  that the first of several differences is the one reported.
 - **The Archive in the daemon and its tools**, on Linux: `karyosd
   --archive`, `--archive-control`, `--record` and `--archive-min-free`;
   `karyos-catalog list`, offline and `--live`; `karyos-replay start` and
@@ -261,6 +265,7 @@ what is partial.
   who can write them.
 - Hosted CI is configured, but its jobs do not start (no step runs), so
   the gates are run locally; the Evidence table records them.
+  TODO(M8): re-check at the release head.
 - The netem tests are `#[ignore]` and run only through
   `scripts/netem-test.sh`; several multicast tests are Linux only and
   return early when the host's multicast probe fails.
@@ -273,7 +278,9 @@ what is partial.
 - A conflated view closed at `barrier_ack_timeout` is recreated with
   every key stale; no test asserts that recreation yet, and
   `barrier_ack_timeout` is checked only against its 10 ms floor, not
-  against the conductor's duty period.
+  against the conductor's duty period. Both are tracked as issues.
+- A unicast subscription on port 0 is refused; a bound ephemeral port
+  for a subscription follows in a later release.
 - A replay replays lane 0 only, and a network publication refuses a
   mapping cutover.
 - `karyosd --network on` runs the agents with the default network
