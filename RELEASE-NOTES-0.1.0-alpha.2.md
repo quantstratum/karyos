@@ -13,6 +13,17 @@ since 0.1.0-alpha.1 (TODO: recount at the release head). No phase of the
 delivery plan is complete: each section below says what is covered and
 what is partial.
 
+## Supported API
+
+The supported API of this alpha is the `karyos` facade, `karyos-client`
+and `karyos-archive`, and the C ABI under its own `0.y.z` rule. Every
+other crate (`karyos-sys`, `karyos-protocol`, `karyos-codec`,
+`karyos-io`, `karyos-trace`, `karyos-driver`, `karyos-cluster`,
+`karyos-feed`, `karyos-agent`, `karyos-tools`, `karyos-bench`,
+`karyos-sim`, and the Rust items of `karyos-ffi`) is internal to the
+workspace and unstable in alpha, with no compatibility promise; each
+says so in its crate documentation.
+
 ## What works
 
 ### IPC

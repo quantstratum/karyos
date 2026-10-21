@@ -42,6 +42,10 @@ What the alpha contains:
   log, deduplication, snapshots) without a consensus core, a
   deterministic simulator and a benchmark harness.
 
+Supported API: the `karyos` facade, `karyos-client` and `karyos-archive`,
+and the C ABI under its own `0.y.z` rule. Every other crate is internal
+and unstable in alpha, with no compatibility promise.
+
 Not in this alpha: authenticated or encrypted traffic, `io_uring` and
 AF_XDP backends, the ETF route of timed sends, and a replicated Cluster.
 

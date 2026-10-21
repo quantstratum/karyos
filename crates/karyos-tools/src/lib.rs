@@ -19,6 +19,11 @@
 //! (`karyos/design/archive-host.md`, H4 and H4b), which lists an archive
 //! directory's catalog read only, or a running Archive's recordings over
 //! its control streams ([`catalog`]).
+//!
+//! Internal to the Karyos workspace and unstable in alpha, with no
+//! compatibility promise. The supported API is the `karyos` facade,
+//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
+//! under its own `0.y.z` rule.
 
 pub mod archive;
 pub mod args;

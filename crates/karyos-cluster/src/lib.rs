@@ -10,6 +10,11 @@
 //! replicated session table ([`dedup`]); and C8a's snapshot store, typed
 //! sections published by a manifest ([`snapshot`]). The consensus core,
 //! the service container and guards do not exist yet.
+//!
+//! Internal to the Karyos workspace and unstable in alpha, with no
+//! compatibility promise. The supported API is the `karyos` facade,
+//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
+//! under its own `0.y.z` rule.
 
 pub mod dedup;
 mod file;

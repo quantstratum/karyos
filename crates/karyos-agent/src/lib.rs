@@ -44,6 +44,11 @@
 //!
 //! The attach is Linux only, as the tool attach is; [`api`] builds
 //! everywhere.
+//!
+//! Internal to the Karyos workspace and unstable in alpha, with no
+//! compatibility promise. The supported API is the `karyos` facade,
+//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
+//! under its own `0.y.z` rule.
 
 #[cfg_attr(
     not(target_os = "linux"),

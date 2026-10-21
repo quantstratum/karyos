@@ -19,6 +19,11 @@
 //! scan covers every participant, or that only the driver performs driver
 //! steps. The future capability types that hand out payload references must
 //! enforce those properties; these helpers alone are not that capability.
+//!
+//! Internal to the Karyos workspace and unstable in alpha, with no
+//! compatibility promise. The supported API is the `karyos` facade,
+//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
+//! under its own `0.y.z` rule.
 
 #[cfg(feature = "test-hooks")]
 pub mod alloc_count;

@@ -8,6 +8,11 @@
 //! runs conductor duty when the application calls
 //! [`EmbeddedDriver::do_work`]. The media driver process, the network
 //! sender and receiver, and agent threads do not exist yet.
+//!
+//! Internal to the Karyos workspace and unstable in alpha, with no
+//! compatibility promise. The supported API is the `karyos` facade,
+//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
+//! under its own `0.y.z` rule.
 
 #[cfg(target_os = "linux")]
 pub mod admission;
