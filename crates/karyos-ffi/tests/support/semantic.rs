@@ -316,6 +316,18 @@ impl Adapter {
                 )]))
             }
             "client.connect" => {
+                // A client of the driver behind `dir`'s admission socket
+                // (FORMAT.md, Incompatible driver), or of a provided driver.
+                if let Some(dir) = args.text("dir") {
+                    let dir =
+                        CString::new(dir).unwrap_or_else(|_| panic!("{at}: `dir` holds a NUL"));
+                    let (status, client, _) = abi::client_connect(&dir);
+                    if status != 0 {
+                        return Answer::Status(self.name(status, at));
+                    }
+                    let client = self.insert(Kind::Client, client, None);
+                    return Answer::Ok(results([("client", client)]));
+                }
                 let driver = args.object("driver");
                 if let Some(answer) = self.open(driver, Kind::Driver, at) {
                     return answer;

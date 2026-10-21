@@ -726,6 +726,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The conformance suite gains feature `incompatible-driver` (Linux):
+  SPEC.md §13's "older protocol version refused at admission" as two
+  scenarios, `op.connect.refused` and `op.connect.other.version`. A
+  test-kit binary, `karyos-admission-stub` (karyos-tools, built only
+  with its new `test-hooks` feature), answers every `Hello` with
+  `Refused` (`INCOMPATIBLE_VERSION`) or `Admitted` at the next protocol
+  version, and `client.connect` takes an optional `dir` to connect
+  there; both answer `KARYOS_E_INCOMPATIBLE_DRIVER`. The conformance
+  test kit (`make libkaryos-testkit`) ships the stub beside karyosd,
+  with its SHA-256 in the kit's MANIFEST. A runner without the
+  provisioning declares the feature absent.
 - The conformance suite gains feature `remote-driver` (Linux): the
   runner's karyosd gains a conflated stream (22), a guarded one (23) and
   a plain one (24) (karyos#585), and `$remote_client` is its client.
