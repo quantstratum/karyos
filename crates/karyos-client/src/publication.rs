@@ -344,6 +344,10 @@ impl<T: TermBytes> ClientPublication<T> {
     /// one beyond `now + max_horizon` is `ScheduleTooFar`, an overflowing
     /// deadline `ScheduleOverflow`, and a full schedule ring returns
     /// `BackPressured`. A time already past is accepted and goes at once.
+    /// Only a network sender frees ring slots: on a lane no sender reads
+    /// (an IPC stream) the ring fills after `schedule_capacity` offers and
+    /// back pressures for good. A timed lane takes timed offers only:
+    /// `offer`, `offer_with` and a claim on it are `InvalidSchedule`.
     /// Otherwise as [`ClientPublication::offer`].
     ///
     /// # Errors

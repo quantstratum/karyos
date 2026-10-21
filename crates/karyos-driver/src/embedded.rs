@@ -2701,6 +2701,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// lateness tolerance and cancel-on-deadline. Without it a timed lane
     /// uses [`karyos_client::schedule::ScheduleOptions::default`].
     ///
+    /// Timed lanes are meant for network publications
+    /// ([`EmbeddedDriver::add_timed_network_publication`]), whose sender
+    /// releases each schedule entry once its message is sent. On a stream
+    /// of [`EmbeddedDriver::add_stream`] nothing sends, so nothing releases
+    /// the ring: the lane takes `schedule_capacity` timed offers, then back
+    /// pressures for good.
+    ///
     /// # Errors
     ///
     /// [`DriverError::NotTimed`] for a stream whose buffer has no schedule

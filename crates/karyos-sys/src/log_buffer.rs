@@ -246,7 +246,11 @@ pub struct LogBufferConfig {
     /// Entries of the lane's schedule ring (`quantstratum-docs:
     /// karyos/design/timed-tx.md`, TT-1): 0 for a lane that is not timed,
     /// which has no ring words; otherwise a power of two, on an exclusive
-    /// publication (GC-7).
+    /// publication (GC-7). Only a network sender releases entries, once
+    /// each message is sent: on a lane that no sender reads (a driver's
+    /// IPC stream) the ring takes `schedule_capacity` timed offers, then
+    /// back pressures for good. Timed lanes are meant for network
+    /// publications.
     pub schedule_capacity: u32,
 }
 
