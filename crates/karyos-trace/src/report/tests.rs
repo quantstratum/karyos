@@ -1552,8 +1552,15 @@ fn a_loss_across_an_epoch_change_marks_the_whole_cohort() {
     }
 }
 
+/// A drop-range overflow loses no attribution. The report attributes loss
+/// from sequence gaps and the loss snapshot's horizon and stored count,
+/// never from the ring or its `lost_before` watermark, so a trace whose range
+/// was evicted is still marked. The watermark itself is checked in
+/// `karyos-sys`: `range_ring_overflow_raises_the_watermark`. In one thread,
+/// a record is dropped only while the journal is full and only a drain frees
+/// it, so every loss is a tail loss at that drain and marks the cohort.
 #[test]
-fn a_drop_range_overflow_with_every_record_held_marks_every_trace() {
+fn a_drop_range_overflow_loses_no_attribution() {
     let mut lossy = Lossy::new();
     let mut traces = vec![lossy.message(1000, 1)];
     // The one record stays held while four polls are dropped, each in its
