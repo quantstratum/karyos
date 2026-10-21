@@ -1,0 +1,28 @@
+# A conflated view of a stream of a driver in another process (FORMAT.md,
+# Remote driver): the stream's publication offers one value per key, an
+# offer's reserved value its key, and the view delivers both keys; a
+# stream with no conflation table refuses the view.
+format 2
+id op.remote.conflated
+abi 0.1
+covers "remote driver"
+since B3
+feature remote-driver
+feature conflation
+
+op conflated.add client=$remote_client stream_id=22
+expect ok conflated=$view
+op publication.add client=$remote_client stream_id=22
+expect ok publication=$publication
+op publication.offer publication=$publication payload="one" reserved_value=1
+expect ok
+op publication.offer publication=$publication payload="two" reserved_value=2
+expect ok
+op conflated.poll conflated=$view key_budget=4 until=2
+expect ok delivered=2
+op conflated.close conflated=$view
+expect ok
+op publication.close publication=$publication
+expect ok
+op conflated.add client=$remote_client stream_id=24
+expect status=refused

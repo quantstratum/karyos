@@ -41,6 +41,9 @@ static NEXT_ARCHIVE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// target's linger (FORMAT.md, Ops).
 const END_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long a poll with `until` waits for its count (FORMAT.md, Ops).
+const UNTIL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// An object a scenario holds: its C handle, its parent and whether its
 /// own close succeeded.
 #[derive(Debug)]
@@ -197,6 +200,48 @@ impl Adapter {
         }
     }
 
+    /// One `poll`, or with `until` given, polls (serving `object`'s client)
+    /// until the delivered total reaches it or [`UNTIL_DEADLINE`] passes:
+    /// the first failing status, else the total.
+    fn poll_until(
+        &self,
+        args: &Args<'_>,
+        object: usize,
+        mut poll: impl FnMut() -> (i32, u32),
+        at: &str,
+    ) -> (i32, u32) {
+        let Some(until) = args
+            .arguments
+            .contains_key("until")
+            .then(|| args.narrow::<u32>("until", None))
+        else {
+            return poll();
+        };
+        let client = self.objects[object]
+            .parent
+            .map(|parent| self.objects[parent].handle);
+        let mut total = 0u32;
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(client) = client {
+                let _ = abi::client_poll(client);
+            }
+            let (status, delivered) = poll();
+            if status != 0 {
+                return (status, total);
+            }
+            total = total.checked_add(delivered).unwrap();
+            if total >= until {
+                return (0, total);
+            }
+            assert!(
+                start.elapsed() < UNTIL_DEADLINE,
+                "{at}: {total} of {until} after the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Runs `op` with `arguments` (variables already bound).
     pub fn op(&mut self, op: &str, arguments: &BTreeMap<String, Value>, at: &str) -> Answer {
         let args = Args { arguments, at };
@@ -348,12 +393,25 @@ impl Adapter {
                 if let Some(answer) = self.open(publication, Kind::Publication, at) {
                     return answer;
                 }
-                let (status, accepted) = abi::publication_offer_on(
-                    self.objects[publication].handle,
-                    args.narrow("lane", Some(0)),
-                    &args.message(),
-                    u32::try_from(size_of::<abi::Accepted>()).unwrap(),
-                );
+                let handle = self.objects[publication].handle;
+                let lane = args.narrow("lane", Some(0));
+                let accepted_size = u32::try_from(size_of::<abi::Accepted>()).unwrap();
+                // A reserved value goes through the offer options: a
+                // conflated stream's key (FORMAT.md, Ops).
+                let (status, accepted) = if args.arguments.contains_key("reserved_value") {
+                    let (_, mut options) = abi::offer_options();
+                    options.reserved_value = args.narrow("reserved_value", None);
+                    abi::publication_offer_with(
+                        handle,
+                        lane,
+                        &args.message(),
+                        &options,
+                        options.size,
+                        accepted_size,
+                    )
+                } else {
+                    abi::publication_offer_on(handle, lane, &args.message(), accepted_size)
+                };
                 self.accepted(status, &accepted, at)
             }
             "publication.publish_claimed" => {
@@ -426,12 +484,15 @@ impl Adapter {
                 if let Some(answer) = self.open(publication, Kind::Publication, at) {
                     return answer;
                 }
-                let (status, delivered, records) = abi::publication_poll_outcomes(
-                    self.objects[publication].handle,
-                    args.narrow("lane", Some(0)),
-                    args.narrow("limit", Some(1)),
-                );
-                assert_eq!(usize::try_from(delivered).unwrap(), records.len(), "{at}");
+                let handle = self.objects[publication].handle;
+                let (lane, limit) = (args.narrow("lane", Some(0)), args.narrow("limit", Some(1)));
+                let poll = || {
+                    let (status, delivered, records) =
+                        abi::publication_poll_outcomes(handle, lane, limit);
+                    assert_eq!(usize::try_from(delivered).unwrap(), records.len(), "{at}");
+                    (status, delivered)
+                };
+                let (status, delivered) = self.poll_until(&args, publication, poll, at);
                 self.counted(status, "delivered", delivered, at)
             }
             "subscription.add" => {
@@ -496,11 +557,14 @@ impl Adapter {
                 if let Some(answer) = self.open(conflated, Kind::Conflated, at) {
                     return answer;
                 }
-                let (status, delivered, counted) = abi::conflated_poll(
-                    self.objects[conflated].handle,
-                    args.narrow("key_budget", Some(1)),
-                );
-                assert_eq!(delivered, counted, "{at}: the count is the handler's calls");
+                let handle = self.objects[conflated].handle;
+                let key_budget = args.narrow("key_budget", Some(1));
+                let poll = || {
+                    let (status, delivered, counted) = abi::conflated_poll(handle, key_budget);
+                    assert_eq!(delivered, counted, "{at}: the count is the handler's calls");
+                    (status, delivered)
+                };
+                let (status, delivered) = self.poll_until(&args, conflated, poll, at);
                 self.counted(status, "delivered", delivered, at)
             }
             "archive.connect" => {
