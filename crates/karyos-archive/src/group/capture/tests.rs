@@ -463,6 +463,123 @@ fn run(disk: &FaultDisk, coverage: &Recordings) -> u64 {
     seen
 }
 
+/// Plan item 3 (contract-traceability-phase-3.md): events whose payloads
+/// are references into recording 7, which writes each payload before its
+/// event is sent and makes it durable two events later, crashed together
+/// at every journal write boundary. The recording keeps what was durable,
+/// the journal what recovery finds. The recovered durable prefix keeps
+/// every event the waiter saw durable, and never counts an event whose
+/// referenced frames the recording lost.
+#[test]
+fn a_referenced_payload_survives_a_crash_of_the_journal_and_its_recording() {
+    // An event of 200 bytes takes 256 in the recording (`event_at`).
+    const EXTENT: u64 = 256;
+    let whole = FaultDisk::default();
+    let _ = run_referenced(&whole, &Recordings::default());
+    let total = whole.used();
+    let mut crashed = 0;
+    for budget in 0..=total {
+        let disk = FaultDisk::with_budget(budget);
+        let recording = Recordings::default();
+        let seen = run_referenced(&disk, &recording);
+        if !disk.has_crashed() {
+            continue;
+        }
+        crashed += 1;
+        // The recording crashed too: it keeps only what was durable.
+        let durable = recording
+            .0
+            .borrow()
+            .get(&7)
+            .map_or(0, |(_, durable)| *durable);
+        let kept = Recordings::default();
+        let _ = kept.0.borrow_mut().insert(7, (durable, durable));
+        let restarted = disk.after_crash(Survives::Synced);
+        let Ok(recovered) = GroupJournal::recover(
+            restarted,
+            Path::new("/g"),
+            1,
+            config(SyncPolicy::PerSegment),
+        ) else {
+            assert_eq!(seen, 0, "budget {budget}: nothing was durable");
+            continue;
+        };
+        let mut journal = recovered.journal;
+        let recovery = prefix::recover(&mut journal, &kept, 64).unwrap();
+        let recovered = recovery.tracker.durable_group_seq();
+        assert!(
+            recovered >= seen,
+            "budget {budget}: durable {seen} was lost (recovered {recovered})"
+        );
+        // Event n's frames end at n * EXTENT: none past the recording's
+        // durable end is counted.
+        assert!(
+            recovered * EXTENT <= durable,
+            "budget {budget}: event {recovered} counted past the recording's {durable}"
+        );
+        assert!(recovery.tracker.complete_recording_seq() * EXTENT <= durable);
+    }
+    assert!(crashed > 100, "{crashed}");
+}
+
+/// Plan item 3's damage case: after a whole run, the recording comes back
+/// shorter than what the journal had counted (its tail lost to media
+/// damage, so its durable end is cut at event 3's frames). Recovery counts
+/// no event past what the recording still holds: the prefixes stop at
+/// event 3, and none of the events whose frames were lost is complete or
+/// durable.
+#[test]
+fn a_damaged_referenced_range_is_not_counted_at_recovery() {
+    const EXTENT: u64 = 256;
+    let disk = FaultDisk::default();
+    let recording = Recordings::default();
+    let seen = run_referenced(&disk, &recording);
+    assert_eq!(seen, 10, "two events wait for their frames");
+    let damaged = Recordings::default();
+    let _ = damaged.0.borrow_mut().insert(7, (3 * EXTENT, 3 * EXTENT));
+    let mut journal =
+        GroupJournal::recover(disk, Path::new("/g"), 1, config(SyncPolicy::PerSegment))
+            .unwrap()
+            .journal;
+    let recovery = prefix::recover(&mut journal, &damaged, 64).unwrap();
+    assert_eq!(recovery.tracker.durable_group_seq(), 3);
+    assert_eq!(recovery.tracker.complete_recording_seq(), 3);
+}
+
+/// [`run`] with each event's payload a reference into recording 7, at its
+/// position: the recording writes event `n`'s frames before it is sent
+/// and makes them durable when event `n + 2` is sent, `coverage` its
+/// state. A frame written and not yet durable is what a crash loses.
+fn run_referenced(disk: &FaultDisk, coverage: &Recordings) -> u64 {
+    const EXTENT: u64 = 256;
+    let Ok(journal) = GroupJournal::create(
+        disk.clone(),
+        Path::new("/g"),
+        &header(Capture::Strict),
+        config(SyncPolicy::PerSegment),
+    ) else {
+        return 0;
+    };
+    let Ok((mut sender, mut job)) = capture(settings(65_536, 4096, 64), journal, coverage) else {
+        return 0;
+    };
+    let mut seen = 0;
+    for seq in 1..=12 {
+        let start = (seq - 1) * EXTENT;
+        let durable = if seq >= 2 { (seq - 2) * EXTENT } else { 0 };
+        let _ = coverage.0.borrow_mut().insert(7, (seq * EXTENT, durable));
+        let event = event_at(seq, 200, Some(7), start, EndOutcome::Complete);
+        if sender.admit().is_err() || sender.send(&event, seq).is_err() {
+            break;
+        }
+        if job.duty(0, 16, coverage).is_err() || job.sync(coverage).is_err() {
+            break;
+        }
+        seen = sender.view().durable_group_seq();
+    }
+    seen
+}
+
 #[test]
 fn a_waiter_times_out() {
     let (sender, _job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 8));
