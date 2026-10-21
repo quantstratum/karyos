@@ -11,824 +11,6 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ## [0.1.0-alpha.2]: TODO(release): release date
 
-- A slow optional receiver no longer holds a reliable network
-  publisher (quantstratum-docs:
-  `karyos/design/retention-floor-optional-receivers.md`; REVIEWER-01's
-  phase 2 plan item 6). The sender's registered position, the
-  publication's limit, follows only what was submitted and what the
-  required receivers consumed (SPEC.md §4, "Sender position"). A
-  separate retention hold, a new log buffer cell state
-  (`CELL_SENDER_HOLD`, 11) that holds the floor and never bounds the
-  limit, keeps the floor at `sent - retransmit_window` lowered by the
-  required receivers (SPEC.md §4, "Retention floor"; §6). So a counted
-  receiver's hole stays repairable: a lone unicast receiver, or the
-  slowest under `min`. Under `max`, an optional receiver's hole below
-  the floor is answered `RANGE_UNAVAILABLE` and its image closes as
-  unrecoverable. `retransmit_window` is a driver setting
-  (`RepairConfig::retransmit_window`) of half a term by default and at
-  most; no URI key sets it yet. Each reliable lane takes one more
-  registry cell, and a full registry refuses the publication with
-  `DriverError::RetentionHoldUnavailable`. A reliable endpoint reset
-  still resends at once what the receivers had not consumed: the reader
-  rewinds to a restart position between the hold and the registered
-  position, from every receiver's consumption. The cell state is in
-  place under the unreleased layout.
-
-- A timed lane on a driver's IPC stream wedges, and the docs now say so:
-  only a network sender releases schedule ring entries, so a
-  `karyos_driver_add_stream` (or `EmbeddedDriver::add_stream`) stream
-  with `schedule_capacity` N takes N timed offers, then answers
-  `BACK_PRESSURED` for good, whatever its subscribers read (found by
-  REVIEWER-01 in karyos-dotnet B2a). Timed lanes are meant for network
-  publications. karyos.h, `LogBufferConfig::schedule_capacity`,
-  `offer_at`, `offer_at_on` and `schedule_stream` state it, and that a
-  timed lane answers `INVALID_SCHEDULE` to a plain offer, an offer with
-  options and a claim's commit. Refusing `schedule_capacity` on an IPC
-  stream follows once a karyosd timed scenario exists.
-
-- A stream configured `allow_unconnected` (`StreamConfig`,
-  `karyos_stream_options`) now grants it to every publication an
-  in-process client adds, exclusive or concurrent, as the driver's own
-  handles already got it (SPEC.md §4). The driver had used only the
-  client's request, which the client facade always sent without it, so
-  a C caller's offer on such a stream answered `KARYOS_E_NOT_CONNECTED`
-  until a subscriber attached (REVIEWER-01's finding from the .NET
-  binding, B1b). A remote (karyosd) client gets it too, from its grant:
-  bit 16 of a manifest record's word 6 says the stream allows offers
-  with no subscriber, valid only with an exclusive or concurrent
-  publication's capability and reserved otherwise (quantstratum-docs:
-  `karyos/design/ipc-admission.md`, Unconnected offers). This is in
-  place under the unreleased admission version 2, so a version 2 client
-  built before it refuses such a grant rather than ignore the policy.
-  `karyos_protocol::admission::Record` gains `allow_unconnected`.
-
-### Changed
-
-- The enums decoded from evolving wire and record schemas are
-  `#[non_exhaustive]` (owner item 41): `karyos-protocol`'s CnC
-  `SubscriberRole`, `RejoinPolicyCode`, `RejoinOutcomeCode`,
-  `FallbackReasonCode`, `Command`, `ErrorCode`, `Response`,
-  `CutoverState`, `LossPolicyCode`, `CloseReason` and `Event`, the
-  admission `Message`, `RegionKind` and `Capability`, and the network
-  `Control`, `ControlKind`, `NakReplyReason`, `RttmKind` and
-  `Datagram`; `karyos-archive`'s control `ResponseCode`,
-  `ControlMessage`, `RecordingState`, `Signal` and `ReplayRate`, the
-  catalog `StopReason` and `FailKind`, the segment `EntryKind` and the
-  group record's `Clock`, `Capture`, `Payload`, `Freshness`,
-  `EndReason`, `LifecycleKind`, `Loss`, `Operation`, `Outcome`,
-  `TimerAction`, `EndOutcome`, `GapReason`, `OverrunOutcome`,
-  `FallbackReason`, `GroupRecord` and `Role`; and `karyos-trace`'s
-  `Point`. A downstream `match` on one of them needs a wildcard arm. No
-  wire code or format changes: an unknown value still decodes to the
-  same typed error. Inside the workspace a value a later version
-  decodes is refused, never given another variant's meaning: the
-  driver treats a command it does not serve as a protocol violation;
-  the C ABI's `karyos_archive_list` refuses a page holding a recording
-  state or stop reason it has no code for, with `KARYOS_E_REFUSED` and
-  response code 5 (unsupported schema), delivering nothing.
-  `GroupGateway` is sealed; `ReplayProvider` gains methods only with
-  default bodies or a breaking version. `OnLap`, `Mode` and both
-  `CommitOutcome` stay closed by design.
-- `NetworkSubscriptionReady` (CnC `0x8A`) carries the network
-  subscription's bound local address (decision row 26, alpha.2 M5),
-  changed in place under admission `VERSION` 2, which no release has
-  used: it grows from 3 to exactly 6 words, `client | sequence |
-  registration | family_port | address_hi | address_lo`, and any other
-  length is refused. `family_port` packs the port (bits 15 to 0), the
-  family (bits 23 to 16: 0 none, 4 IPv4, 6 IPv6), reserved bits 31 to 24
-  (zero) and the IPv6 scope id (bits 63 to 32; zero for IPv4 and family
-  0). An IPv6 address fills both address words in network order; an IPv4
-  address sits in bits 31 to 0 of `address_lo`, with `address_hi` zero.
-  Family 0 has every other field zero. The IPv6 flow information is not
-  carried. The address is what the driver's socket reports after the
-  bind; a multicast subscription reports its group address and the bound
-  port, not the interface. The `cnc` module docs give two byte vectors.
-  For the item 41 API list: `Response::NetworkSubscriptionReady` and
-  `karyos_client::Outcome::NetworkSubscription` gain
-  `bound: Option<SocketAddr>`, and `karyos_client::Subscription` gains
-  `bound_address() -> Option<SocketAddr>` (`None` for a stream
-  subscription). Port 0 stays refused in every channel URI; the C ABI is
-  unchanged.
-- A network publication whose channel asks for `fc=max` or
-  `fc=tagged:<group>` is refused with `DriverError::UnsupportedChannel`
-  (a client's add by URI: `ErrorCode::UnsupportedChannel`), instead of
-  running `min` silently (owner item 7): the driver parsed the key but
-  never wired it to the sender's membership. `fc=min`, what every
-  publication runs, is taken.
-
-- The channel URI enums (`ChannelError`, `Interface`, `Trace`,
-  `FlowControl`, `Security`, `ControlMode`, `Destination`, `Media`) and
-  the public error enums of the library crates (`karyos-sys`,
-  `karyos-protocol`, `karyos-codec`, `karyos-io`, `karyos-trace`,
-  `karyos-driver`, `karyos-cluster` and the `karyos` facade) are
-  `#[non_exhaustive]` (owner item 41): a later version can add a URI
-  form or an error without breaking a downstream exhaustive `match`.
-  The driver refuses a URI form it does not serve as
-  `UnsupportedChannel`, as it does a form not wired yet.
-  `karyos_sys::log_buffer::ReadError` stays exhaustive for now: the
-  Archive's source classifies each of its variants, and an unknown one
-  needs a design choice.
-- `ImageAvailable` (CnC `0xC6`) encodes its source address exactly as
-  `NetworkSubscriptionReady` (`0x8A`) encodes its bound address, aligned
-  in place under admission `VERSION` 2 before its freeze, so the version
-  has one address encoding. Its six words stay `stream | registration |
-  image | family_port | address_hi | address_lo`; an IPv4 source moves
-  from word 4 to bits 31 to 0 of `address_lo`, with `address_hi` zero,
-  and strict decoding refuses the old layout. The IPv6 scope id is now
-  carried in bits 63 to 32 of `family_port` (it was dropped); the flow
-  information is still not carried. An image always has a source, so
-  family 0 is refused. The `cnc` module docs give a byte vector with an
-  IPv6 link-local source and its scope. For the item 41 API list: no
-  public signature changes; `Event::ImageAvailable`'s `source` now keeps
-  its IPv6 scope id through the CnC.
-- A schedule ring on a driver's local stream is refused (owner item 65).
-  `EmbeddedDriver::add_stream` and `add_aggregate`, the client facade's
-  local streams, `karyos_driver_add_stream` and karyosd's `--stream`
-  answer `schedule_capacity` above 0 with `DriverError::InvalidConfig` or
-  `KARYOS_E_INVALID_ARGUMENT`: nothing would release such a ring, which
-  took its capacity of timed offers and then back pressured for good. A
-  timed lane is a network publication's. A driver configures timed
-  network streams (`NetworkStreamDefaults::timed`, at most 8, with a
-  capacity of 0 or a stream given twice refused at start; karyosd
-  `--timed-network <stream>:<capacity>`, which needs `--network on` and
-  names no `--stream`). A client's network publication of such a stream,
-  added by URI, is timed with the default schedule; there is no URI key.
-  `EmbeddedDriver::add_timed_network_publication_with_clock` is the
-  network twin of `schedule_stream_with_clock`, its clock fixed for the
-  publication's life. No signature, struct or CnC change. The conformance
-  scenario `publication.timed.offer` now runs against karyosd's timed
-  network stream 25, with a loopback receiver (feature `remote-driver`):
-  a timed offer is not delivered before its time, then is, with the
-  typed refusals as before. The new `stream.schedule.refused` covers the
-  refusal on a driver's stream. The semantic layer gains
-  `publication.offer_at` (answering its `tx_time`) and `until` and
-  `not_before` on `subscription.poll`, and the
-  runner retries a remote offer's `not_connected` too. No `Tai` timed
-  lane exists now: the network route refuses that domain. The frozen
-  bindings keep their pinned suite; their first pin update after the
-  freeze adopts this behaviour and the scenario.
-
-- `karyos-ffi`: each copy of the library draws its own base generation
-  for its handles, once, from the address of one of its statics (never
-  0; no clock or process id, so it runs under Miri's isolation). A handle
-  of another copy in the same process (two static copies, BIND-CPP-Q12)
-  then normally names a slot at another generation and answers
-  `KARYOS_E_CLOSED`, instead of acting on that copy's object; a copy
-  cannot tell a foreign handle from a stale one. This defends against
-  accidental misuse only, per pair of copies, not per call: equal bases,
-  or generation counts drifted apart by the bases' difference, let a
-  foreign handle through (owner item 62). A slot's generation
-  counts on from the base, skipping 0, and the slot is retired only once
-  it would come back to the base, after all 2^32 - 1 generations (it was
-  retired at u32::MAX before). The handle's layout and the ABI are
-  unchanged (`handles::tests`).
-- The conformance seeding of the `archive-replay` feature waits until
-  `"r0"` to `"r4"` are recorded before it pauses (now 50 ms) and
-  publishes `"r5"` to `"r9"`. Record times are per recorder duty, so a
-  duty that copied all ten messages stamped them alike, and
-  `op.replay.stopped`'s 1 ppm replay could end before its stop.
-- `make lint-sync` runs shellcheck over `scripts/*.sh` where shellcheck
-  is installed (and says so where it is not), so the scripts stay clean.
-  The three findings on main are deliberate and now carry their reason as
-  a directive: perl's `$ARGV` inside a single-quoted program
-  (`check-lint-sync.sh`), a function only the trap calls
-  (`sim-arch-compare.sh`, SC2329 and, before shellcheck 0.11, SC2317),
-  and Markdown code spans in the report's `printf` formats
-  (`unsafe-report.sh`). `package-libkaryos.sh`'s version check is an `if`,
-  which shellcheck 0.9 (Debian bookworm, Ubuntu 24.04) also accepts.
-
-- `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
-  `karyos_detail`, `karyos_accepted` and the image change do: it wrote
-  the library's 16 back into a newer caller's struct before. The new
-  `karyos_subscription_end_state` (F9c) follows the same rule.
-- `karyos-ffi`: a child's close (publication, subscription, conflated
-  view, Archive connection) no longer answers `KARYOS_E_BUSY` because
-  another call holds its client. With the client free it releases the
-  child at once, as before; while another call holds the client, on
-  another thread or by a callback, it ends the child at once (the close
-  answers `KARYOS_OK` and the handle is stale) and the client releases it
-  at its next call or its close. A client with no further calls holds the
-  released resources (a publisher slot, lanes, streams) until its next
-  call or close. `KARYOS_E_BUSY` and `KARYOS_E_REENTRANT` from a child's
-  close now mean the child itself is in use, so binding destructors, which
-  may not retry (BIND-Q6), no longer leak sibling handles destroyed on
-  several threads at once (found by karyos-cpp's C-THREAD-RULES test).
-  `karyos.h` Threads and the four closes' docs state it
-  (`api::client::tests`, `abi::tests::threads`).
-
-- The conformance suite gains format 2 (ADR-0073, owner item 46,
-  decision BIND-Q2), beside format 1, whose 27 scenarios run unchanged;
-  format 1's `karyos_driver_start` now defaults its `idle_strategy` to
-  the ABI's declared default, `KARYOS_IDLE_YIELD_THEN_SLEEP` (3), in
-  place of `KARYOS_IDLE_YIELD` (1), which changes no result.
-  Format 2 adds a semantic layer of ops that a binding runs through its
-  public API, with a binding's close rules (a second close is `ok`; an
-  op on a closed object or a closed parent's child answers `closed`)
-  and outcomes named by header status; values from -2^63 to 2^64 - 1;
-  `since`, the binding SPEC step that requires a scenario; `feature`;
-  bounds on files, lines, steps and variables; and a pinning line with
-  the SHA-256 of the suite and header and the core's identity. The
-  reference runner runs the ops through a semantic adapter over the C
-  ABI and reports each scenario passed, skipped, unsupported or later.
-  Twelve scenarios: the claim semantics every binding shares (BIND-S3:
-  one outstanding claim, a retryable commit that keeps the claim, a
-  one-shot claim that leaves none), the close rules, concurrent
-  publication, conflated views, outcome streams and the clocks.
-- `karyos-ffi`'s default idle strategy is `KARYOS_IDLE_YIELD_THEN_SLEEP`
-  (ADR-0066): `karyos_client_options_init` now fills it in place of
-  `KARYOS_IDLE_YIELD`, and `karyos_driver_start` takes it. The new
-  constant (3) yields for the first 64 consecutive idle waits, then sleeps
-  1 ms per wait, and starts again after a wait that found work; the driver
-  thread uses the agents' own `YieldThenSleep`. Busy-spin stays an
-  explicit choice.
-- `karyos_client::Context`'s default idle strategy is the new
-  `IdleStrategy::YieldThenSleep` (ADR-0066), in place of `Yield`, so a
-  client's control-call wait yields for 64 idle waits and then sleeps
-  1 ms per wait. The ABI's default is the facade's. `BusySpin`, `Yield`
-  and `Sleep` stay explicit choices.
-- `karyos.h` states the ABI version rule of decision BIND-Q8 in place of
-  "a different major is incompatible": call `karyos_abi_version` first,
-  before any other call and before using newer symbols or layouts; the
-  ABI version is independent of the workspace version; before 1.0 a
-  caller accepts exactly the `0.y` it targets with at least its minimum
-  `0.y.z`.
-
-- The alpha.2 public API audit's refresh (quantstratum-docs:
-  `karyos/testing/public-api-audit-alpha2.md`, 2026-10-20):
-  `karyos_archive::source::Rejoin` is `#[non_exhaustive]`, so a match
-  outside karyos-archive needs a wildcard arm; hosts still build every
-  variant. `ClientSubscription::poll_taking` documents its errors.
-- `karyos-ffi` stream options take a concurrent publication mode:
-  `KARYOS_PUBLICATION_CONCURRENT` with `publishers` (1 to 255), in an
-  88-byte `karyos_stream_options` read by prefix (64, 80 and 88 bytes are
-  accepted; a size between two layouts, or a nonzero `reserved`, is
-  `KARYOS_E_INVALID_ARGUMENT`). An exclusive stream takes `publishers` 0.
-  A C caller's embedded driver can now host a concurrent stream, so
-  concurrent handles and an Archive's request stream are reachable from
-  the C ABI alone. The driver's default refuses a concurrent stream on
-  aarch64 without LSE atomics (ADR-0012). Conformance gains
-  `publication.concurrent` and the 88-byte layout.
-- `karyos-ffi`'s Miri profile (owner item 45): `crates/karyos-ffi/MIRI.md`
-  maps every unsafe site class of `src/abi.rs` and the test support to
-  the test that runs it under Miri, and lists what Miri does not cover.
-  Under Miri the tests' driver threads and waits sleep instead of
-  yielding, so a driver test takes about a minute instead of an hour;
-  driver integration tests that add no unsafe site are native only
-  (`driver integration; covered natively`). A PR touching `src/abi.rs`
-  or the test support runs Miri per that file on its head.
-- `karyos-replay start` and `stop` (quantstratum-docs:
-  `karyos/design/archive-host.md`, H6): ask a running Archive to replay a
-  recording into a stream, or to stop a replay, over its control streams.
-  `start --live DIR=REQ,RESP --recording ID --to-stream S [--from POS]
-  [--length BYTES] [--channel URI] [--timeout-ms N]` prints `replay=ID
-  stream=S session=N` for the reader, which the Archive waits for (H2b).
-  `stop --live DIR=REQ,RESP --replay ID`. Exit status 2 on any error, the
-  Archive's refusal included. They connect through `ArchiveConnection`
-  (Linux), one connection per request, closed after it.
-  `karyos_tools::args::parse_live` parses `--live` for these and for
-  `karyos-catalog list --live`. `tests/karyosd_replay.rs` runs both
-  against `karyosd --archive` (Linux).
-- karyos-tools: `replay::HELP` is replaced by `replay::help(command)`,
-  which names the command the diff was invoked as (`karyos-replay diff` or
-  its alias `karyos-tools replay diff`; H5, #521).
-- Every publication of a conflated stream checks its key against the
-  stream's table before it appends (#523; F7b-2a, F7b-2c-2): an offer or
-  claim with a key outside the table, or a value larger than its
-  capacity, is refused (`ClientError::Conflation`), whether the
-  publication is the driver's own, granted through the command ring of a
-  driver in the client's process, or taken by a client attached to a
-  driver in another process. Until now only the driver's own publication
-  checked; the others appended such a message and the driver's feeder
-  dropped it from the conflated view and counted it as a rejected key.
-  The low-level `ClientPublication` taken from a grant was the earlier
-  route to that gap. The feeder still counts what a raw writer appends.
-  - The table's shape travels with the log buffer: words 19 (keys) and 20
-    (largest value) of its configuration block, written by the driver
-    before the buffer is shared (`LogBuffer::with_conflation`,
-    `ConflationShape`, `LogBuffer::conflation`), and read back at attach.
-    `ClientPublication::new` and `ClientConcurrentPublication::new` bind
-    it, so in-process and remote grants bind it the same way.
-  - The check is `ConflationShape::validate_publication`: a publication
-    holds the shape alone, not a table configuration with a journal it
-    does not have. `ConflationConfig::shape` gives a configuration's, and
-    `ConflationConfig::validate_publication` delegates to it.
-  - The log buffer's `LAYOUT_VERSION` goes to 5; regions of versions 1 to
-    4 are refused at attach. A configuration block with half a shape, or
-    one the buffer cannot carry, is refused (`SysError::InvalidRegion`);
-    `LogBuffer::with_conflation` refuses such a shape with the new
-    `SysError::InvalidConflationShape`.
-
-- karyos-archive's `client::connection` (quantstratum-docs:
-  `karyos/design/ffi-archive.md`, F9-0): a requester's control streams to
-  an Archive over a facade client. `ArchiveConnection::open(&mut client,
-  ControlStreams::new(requests, responses))` takes a concurrent publication
-  on the shared request stream and an optional subscription, rejoining at
-  the head, on the shared response stream (`karyos:ipc`): a requester that
-  stops reading is lapped instead of holding back everyone's answers. It
-  answers `OpenError` naming the stream it could not take, and a failed
-  open removes the publication it took. `into_transports` gives the
-  `Requests` and `Responses` an `ArchiveClient` or a `RecordingLister`
-  takes; `close`, `Requests::close` and `Responses::close` remove them
-  from the client, and `RecordingLister::into_transports` gives them back.
-  An answer longer than the caller's buffer is dropped and counted
-  (`Responses::oversized`). The management agent's catalog uses it in
-  place of its private adapters, and so do `karyos-catalog list --live`
-  (H4b) and `karyos-replay start` (H6). Public surface, under owner items
-  57 and 41.
-- A replay waits for its target's first reader (quantstratum-docs:
-  `karyos/design/archive-host.md`, H2b), so a requester that subscribes
-  after the `Replay` answer reads it from its first position.
-  - karyos-archive's `ReplaySink` gains `ready()` (true by default). The
-    agent steps nothing into a sink that is not ready.
-  - A replay still not ready past the new `AgentConfig::attach_deadline`
-    (default 5 s) ends with the new `ReplayOutcome::NoSubscriber`,
-    having written nothing. `ControlServer::unattended()` counts these.
-  - karyos-driver's `ReplayFeed::has_subscriber()` reports whether the
-    target has an attached reader. `DriverHost`'s sink is ready once it
-    has one, and an unattended replay's target is retired at once,
-    without the linger, and logged with its replay id.
-  - Version 1 has no replay-end message: the requester sees only that
-    the target retired unjoined (`ArchiveClient`: `Unavailable`). A
-    typed end signal is a version 2 message, for later.
-
-- The Archive's host over a driver (quantstratum-docs:
-  `karyos/design/archive-host.md`, H2).
-  - `karyos_tools::archive::DriverHost<T>` implements
-    `karyos_archive::server::ArchiveHost` over an `EmbeddedDriver<T>` it
-    owns. It opens a recording reader for each `StartRecording` of an
-    active local stream, found by its key (refused as "no such stream"
-    otherwise), and a replay target for each replay.
-  - A replay that ended keeps its target for the host's replay linger
-    (`with_replay_linger`; default 5 s, the interim of owner item 16)
-    before `finish_ended` finishes and retires it. `finish_all_ended` is
-    for shutdown, and `into_driver` returns the driver.
-  - karyos-archive's `ControlServer::shutdown_into_host` stops the agent
-    and hands the host back. karyos-driver gains
-    `EmbeddedDriver::stream_handle(StreamKey)`, the active local stream of
-    a key (never a network image, nor a retiring stream).
-  - The host's loop is the driver's duty, `ControlServer::duty`, then
-    `finish_ended`. Tests run on a heap driver, and on Linux on a
-    shared-terms one.
-  - A subscriber that joins a target after the Replay answer does not
-    read the replay yet: the sink waiting for a first subscriber comes
-    in H2b.
-
-- `EmbeddedDriver::recording_reader` works on every driver, not only a
-  heap one: `RecordingReader` is generic over the driver's terms
-  (`RecordingReader<T = HeapTerms>`, its parts `LaneReader<T>` and
-  `GenerationLink<T>`), so `karyosd`'s shared-terms driver can record its
-  streams (quantstratum-docs: `karyos/design/archive-host.md`, H1). Code
-  that names `RecordingReader` keeps its meaning through the default.
-
-- A timed lane's handle is granted over the control path (quantstratum-docs:
-  `karyos/design/timed-tx.md`, section 11, T-x2): `AddPublication` no longer
-  refuses a timed lane. A `Monotonic` lane goes to a remote client only when
-  admission proves it in the driver's time namespace, and is otherwise
-  `InvalidPublicationMode` with the client's `TimeNamespace` code as the
-  detail; a `Tai` lane goes to any client. The driver writes the lane's
-  binding into the schedule ring when its settings are fixed (the first
-  handle, the sender, or a grant). The client reads it when it takes the
-  handle: `ClockDomain::code` and `from_code`, `ScheduleOptions::binding`
-  and `from_binding`, and `schedule::ring_binding`; a binding it does not
-  know is a protocol error. The sender posts `AgentEvent::ScheduleViolated`
-  once per breached lane; the conductor seals the lane with
-  `ScheduleViolation` if the report names the live incarnation (a stale or
-  over-bound report counts in `schedule violations dropped`), counts it in
-  the new driver counter `schedule violations`, logs a
-  `ClientProtocolViolation` error, and has admission retire a remote holder
-  as faulty. `LatePolicy` and the T-x1 interim stop are unchanged.
-
-- The schedule ring's sender trusts no word its publisher writes
-  (quantstratum-docs: `karyos/design/timed-tx.md`, section 11, TT-6;
-  T-x1). The ring's header grows from three words to eight, with the
-  lane's binding in words 3 to 6 (domain, `max_horizon`,
-  `lateness_tolerance`, flags; bit 0 `cancel_on_deadline`):
-  `schedule_ring::write_binding` for the driver at creation and
-  `schedule_ring::binding` for the publisher. The log buffer's
-  `LAYOUT_VERSION` moves from 3 to 4, so version 3 regions are refused at
-  attach. `ScheduleReader` keeps its head privately and copies each entry
-  once, sized to the ring's capacity at attach (16 bytes per entry); it
-  checks the tail copy (at least the last, at most `head + capacity`) and
-  each entry's time (at least the last, at most the sender's `now +
-  max_horizon`), and serves rewinds from the copies. `peek` takes `&mut
-  self`, `now` and `max_horizon`; `advance` takes no ring. A breach is
-  the new `ScheduleError::Violation`, for good. `SealReason` gains
-  `ScheduleViolation` (code 9), a gate reason reported as `Gated`.
-  `LatePolicy` gains `max_horizon`, and `ScheduleConsumer::new` takes it.
-  The driver's `ScheduleConsumer` checks each entry's position against its
-  frame: a frame its entries contradict (`CorruptTerm`) is the publisher's
-  breach too, and every later frame is refused as a `Violation`.
-  Interim until T-x2: the sender counts a violation once in
-  `schedule_faults` and stages nothing more of the lane; T-x2 seals it
-  with `ScheduleViolation` and retires the client.
-
-- A guard command's "no operator" word is `NO_OPERATOR` (`u64::MAX`), not
-  0, so root's uid 0 is audited as an operator (M10b; a defect of M10a
-  that M10b's end-to-end test found as root), changed in place under
-  admission `VERSION` 2 (owner item 54). Any other word is a 32-bit uid;
-  a word above `u32::MAX` but `NO_OPERATOR` is a reserved value, refused
-  in both directions. `ClientConductor::guard_close` and `guard_reopen`
-  (and `RemoteClient`'s) take `operator: Option<u32>`. The audit ring's
-  readers tell an operator by `requester_kind` 2, never by word 8, which
-  holds 0 for root.
-
-- `GuardClose` and `GuardReopen` carry the operator a client acts for and
-  a parameters digest (quantstratum-docs:
-  `karyos/design/management-agent-gap-analysis.md`, M10 and owner item 6),
-  in place under admission `VERSION` 2, which is unreleased: `GuardClose`
-  grows from 3 to 5 words and `GuardReopen` from 4 to 6.
-  `karyos_protocol::cnc::guard_parameters` is the digest, 64-bit FNV-1a
-  over the guard, the expected epoch (0 for a close), the operation id and
-  the operator uid, then the operator's reason: a correlation aid, not a
-  security digest. The driver audits a command naming an operator as
-  `Requester::Operator { client, uid }`, and every record carries the
-  digest (`AuditRecord::parameters`). The guard audit ring of
-  `karyos_sys::diag` writes the operator uid and the digest into words 8
-  and 9 of its record, zero before, with `requester_kind` 2 for an
-  operator; the record's size is unchanged. The management agent's guard
-  feed and API v1's JSON append `operator` and `parameters` to each
-  record.
-
-- karyos-client's public enums and report structs are `#[non_exhaustive]`
-  before alpha.2 (quantstratum-docs:
-  `karyos/testing/public-api-audit-alpha2.md`), so later minor releases can
-  add variants and fields: errors (`ClientError`, `SubscriptionError`,
-  `OfferError`, `ConductorError`, `MergeError`, `MergeFailed`,
-  `HandOverError`, `AttachError`), outcomes and reports (`OfferOutcome`,
-  `ClaimOutcome`, the concurrent ones, `SubscriptionPoll`, `ImageStop`,
-  `MergePoll`, the aggregate's polls, `LinkStatus`, `LeaseState`,
-  `ViewClosed`, `ReplayStatus`, `ReplayUnavailable`, the conductor's
-  `Outcome`, `Completion`, `Fetchable*` and the counter snapshots) and inputs
-  users build from variants or `Default` (`IdleStrategy`, `RejoinPolicy`,
-  `Secondary`, `ClockDomain`, `Request`, `ScheduleOptions`,
-  `ConflatedLimits`). A match outside the crate needs a wildcard arm, and a
-  struct is built from `Default`: `ScheduleOptions` gains `with_domain`,
-  `with_max_horizon`, `with_lateness_tolerance` and `with_cancel_on_deadline`.
-  `ScheduleCounters` and `link::Capability` stay as they are, closed driver
-  contracts.
-- `karyos-client`: `PollSummary`, `PollError`, `Overrun`, `Skipped`,
-  `Aborted`, `RejoinOutcome`, `SecondaryOutcome` and `ReplayFallbackReason`
-  are `#[non_exhaustive]`. `PollError::new`, `Overrun::new`, `Skipped::new`
-  and `Aborted::new` build them; `PollSummary` is built from `Default`.
-- `karyos-archive`'s public enums and report structs are
-  `#[non_exhaustive]`, as the public API audit lists them (owner note item
-  41's `ControlMessage`, `GroupRecord` and `Role` aside). The inputs gain
-  constructors and are `#[non_exhaustive]` too: `StartGroup::new` (with
-  `with_new` and `with_checkpoints`), `NewGroup::new`,
-  `GroupCheckpoints::new` (with `with_reopen_hold`), `StartRecording::new`,
-  `StartReplay::new`, `PrepareReplay::new`, `HostRecording::new`,
-  `CaptureConfig::new`, `JournalConfig::new`, `ClaimCommit::new`,
-  `SourceIdentity::new`, `CursorConfig::new`, `ReplayConfig::new` (with
-  `accepting_manifest`), `GatewayConfig::new` (with a `with_*` per field),
-  `replay::gateway::Archive::new` and `replay::reference::Recording::new`.
-  A rejoin outcome the Gateway has no record code for is refused
-  (`GatewayError::UnknownOutcome`), never recorded under another's code.
-- `karyos-client`: `ReplayRequest`, `link::Owner` and `link::HandOverEntry`
-  are `#[non_exhaustive]`, built through constructors: `ReplayRequest::new`,
-  `Owner::new` and `HandOverEntry::new` (`with_generation` and
-  `with_publication` add its optional parts).
-- A fenced `async` recording that resumes after a lap rejoins its stream
-  at the head (mapping-generations.md, "Recordings", option B). The host
-  gives `source::Following::rejoining(reader, link, base, hook)` a
-  `RejoinHook`: fenced, the source asks it for a new optional member of
-  the current generation, admitted at its head with
-  `recording_reader(stream, Role::Optional)`, and answered
-  `Rejoin::Joined` (the reader, its link, its base and the lease, kept as
-  the source's guard), `Rejoin::Waiting` or `Rejoin::Refused`. The hook
-  runs on the Archive's thread, so a host whose driver runs elsewhere
-  answers through a channel. The recorder reads the new
-  `Frames::Rejoined { from, to }`, records the plain gap `[from, to)`,
-  marks the recording incomplete and goes on; `Duty::rejoined` reports it
-  and `ArchiveHandle::rejoined_recordings` counts it, beside
-  `fenced_recordings`. A refused rejoin, a source without a hook, `stop`
-  and `required` recordings end at the seal, `Lapped`, as before; a
-  rejoin anywhere else is `Invalid::Rejoin`. No driver API or segment
-  format change.
-- Recordings follow a mapping cutover (mapping-generations.md,
-  "Recordings"). The driver makes a recording reader a member of the
-  stream's cutovers: `recording_reader` registers it with a
-  `GenerationLink` (`RecordingReader::link`, `RecordingReader::base`;
-  `RecordingReader::into_following_parts` returns the reader, the link,
-  the base and the lease), and
-  a cutover offers it a successor recording cell (`Successor::Recording`)
-  under a subscriber's progress lease. `DriverError::RecordingCutover` is
-  removed: a recorded stream can be reconfigured. **A host must wire its
-  recordings through `into_following_parts` and
-  `Guarded::new(Following::new(reader, link, base), lease)`**: a reader
-  taken with `into_parts` has no link, so where a cutover used to be
-  refused, it now fences that reader and its recording ends at the seal,
-  `Lapped`. `karyos-archive`'s
-  `source::Following` reads stream positions across the cutovers: at a
-  seal with a successor it moves and reports `Frames::Cutover`, and the
-  recording goes on with no gap; fenced, it reports `Frames::Fenced`, and
-  the recording ends at the seal, incomplete, with `StopReason::Lapped`,
-  whatever its lap policy. `Duty::fenced` reports it and
-  `ArchiveHandle::fenced_recordings` counts it; the segment format does
-  not change. `karyos-client` exposes `GenerationLink::next` and its
-  `Next` outcome (`#[non_exhaustive]`), and `karyos-sys` adds
-  `SenderRead::buffer` and `SenderRead::sealed_with_successor`.
-- `karyos-archive` recovery gains a dry run: `SegmentStore::verify`
-  returns a `RecoveryPlan` (the kept segment as a `KeptSegment`, the
-  `Cut`, and each removed segment as a `DroppedSegment` with its
-  `DropReason`) and changes nothing on disk. `SegmentStore::recover`
-  applies the same scan's plan, so the two agree. A last segment with a
-  valid index header, no entry and no data file (its creation cut short
-  by a crash that kept only the index's directory entry) is now removed,
-  as `DropReason::CreationGap`, instead of refused with
-  `BadHeader { Incomplete }`; before the last segment it is still
-  refused.
-- A remote client's registrations are capped at `max_exports_per_client`,
-  as its ledger's grants were before. Every add that makes a
-  registration counts: `AddPublication`, `AddConcurrentPublication`,
-  `AddSubscription`, `AddImageSubscription` and a conflated view; past
-  the cap each is refused with `ResourcesUnavailable`, and the client
-  stays served. A remote registration whose last grant ended (detached,
-  or ended unsent) is reclaimed, so a client that only drops its handles
-  never reaches the cap that way; a later `RemoveSubscription` or
-  `RemovePublication` of a reclaimed registration answers
-  `UnknownRegistration`, which the client facade ignores.
-- `Client::remove_subscription` removes a subscription as
-  `Client::remove_publication` removes a publication: a `karyos:ipc` one
-  at the driver, a `karyos:udp` one with every image it reads. A removal
-  that cannot be sent drops the handle and is counted:
-  `Client::subscription_releases_failed`, as the facade counts every
-  image handle it lets go of whose removal could not be sent.
-- A publication released through the client facade whose removal cannot
-  be sent (the command ring full, a handle another connection issued, a
-  closed link) is counted: `Client::publication_releases_failed`. The
-  handle is still dropped; in process that ends its lease, and for a
-  remote client the driver keeps the publication, with no EOS, until the
-  client ends. The doc-hidden `Connection::release_publication` returns
-  whether the removal was sent (#402 review P3).
-- The `replay` rejoin with an Archive (phase 3, A6c; SPEC.md §4).
-  `karyos_client::ReplayRejoin` wraps a subscription: on an overrun the
-  live reader rejoins at the head, the poll reports the overrun as
-  `RejoinOutcome::Replaying`, and a `ReplayProvider` is asked for the gap,
-  across polls; its replay is merged in (`LiveMerge`), and the poll on
-  which the merge settles reports `RejoinOutcome::Replayed { cutover }`.
-  With no replay, or a merge that fails, the secondary policy applies and
-  the poll reports `ReplayFallback` with the reason, which gains
-  `RecordingBehind`, `Refused` and `MergeFailed`. Each overrun is
-  reported to the driver once, when it resolved; a gap given up first,
-  when the rejoin is dropped or its live reader taken back
-  (`into_live`, which gives back the reader's own policy and loss
-  reports), is reported as `Withdrawn`. The loss report gains the outcome
-  code `Replayed` (5, with no reason) and the reasons 4 to 7, in place
-  under admission version 2, and the driver counts `overruns replayed`.
-  A plain `RejoinPolicy::Replay`, with no provider, still falls back with
-  `NoArchive`. `LiveMerge::is_settled` tells when a merge is done.
-- The Archive's client (phase 3, A6b-2).
-  `karyos_archive::client::ArchiveClient` is a `ReplayProvider` over the
-  Archive's control streams (`ControlRequests`, `ControlResponses`): asked
-  for a source's range, it lists the recordings, picks one of that
-  publication and incarnation that covers the range, asks for a replay of
-  exactly that range onto `ClientConfig::target_stream_id`, and hands out
-  the target's subscription, which the host's `ReplayTargets` finds at the
-  replay id's low 32 bits. It never blocks; a recording behind is listed
-  again until `ClientConfig::deadline`. No replay comes as `NoRecording`,
-  `RetentionShort`, `RecordingBehind` or `Refused`. A handed-out replay
-  stops by `StopReplay`, queued when the request stream has no room, and
-  a replay withdrawn before its answer is stopped when the answer comes:
-  `ArchiveClient::duty` does this while no replay is asked for, and a
-  cancel or a drop sends what it can. The constructors refuse a target
-  channel no request can carry (`ConfigError`).
-  `karyos_client` re-exports `PublicationIdentity`, which its merge API
-  names.
-- The Archive's `RecordingDescriptor` (control schema 1, A6b) carries
-  the recorded publication's identity (`source`, a `SourceIncarnation`)
-  and, while it records, the position written so far
-  (`RecordingState::Recording { written, .. }`): its block grows from 70
-  to 110 bytes, and a descriptor whose `written` lies below its start or
-  away from its stop is refused. A replay target's session id is the
-  replay id's low 32 bits (`server::replay_session_id`), and
-  `ArchiveHost::open_replay` takes the replay id. A prepared replay whose
-  sink never comes is dropped after `AgentConfig::prepared_timeout`, so
-  it no longer holds a replay's slot.
-- The live merge (phase 3, A6a; SPEC.md §8.2).
-  `karyos_client::LiveMerge` merges a `Replay` of a recording into the
-  live subscription of the same publication at an explicit cutover: the
-  live reader's position when the merge is made. Below it the replay's
-  messages are delivered, from it the live reader's; the replay's
-  duplicates are dropped by position, and the live reader's first message
-  must match the replay's there in position and length. Every
-  disagreement is a typed, final `MergeError`: an epoch change (another
-  publication or incarnation), a reader of another lane than 0, a replay
-  short of the cutover, a message or term padding across it, a replay or
-  live reader lapped. A required live reader keeps a first message that
-  disagrees pending, for `into_live`. A gap in the
-  recording below the cutover is reported as the replay's local gap. A
-  replay stops through its `ReplayStop` at the cutover, on failure and on
-  drop. `ReplayProvider`, which the Archive's client implements, hands out
-  replays without blocking (`ReplayStatus`, `ReplayUnavailable`).
-- The Archive is controlled over streams (phase 3, A5c).
-  `karyos_archive::server::ControlServer` reads A1's requests from a
-  `RequestSource`, serves them with the agent and answers on a
-  `ResponseSink`, one request at a time and only once the last one's
-  answers are out; a start is signalled with its request's correlation
-  id, a stop or failure with 0. It never blocks: it posts its commands
-  (`ArchiveHandle::post_start`, `post_stop`, `post_list`,
-  `post_prepare_replay`, `post_attach_replay`, `post_stop_replay`) and
-  answers when the agent's `Posted` answer arrives, in a later duty. What
-  touches the driver stays with the host behind `ArchiveHost`: a
-  recorded lane's reader, and a replay's target stream, opened only once
-  the agent prepared the replay and found its range readable. The agent
-  runs replays into the host's `ReplaySink`s, after its recorders and
-  within one shared budget per cycle (`AgentConfig::replay_budget`),
-  taking a step back (`ReplaySource::hold`) when a sink has no room, and
-  describes and stops them (`ArchiveHandle::describe`, `replay`,
-  `stop_replay`). Recordings and replays at once are capped
-  (`max_recordings`, `max_replays`; `AgentError::Full`, counted by
-  `ArchiveHandle::refused`), and so are the server's waiting signals
-  (`ServerConfig`, `dropped_signals`). A replay's end comes on its own
-  queue (`ArchiveHandle::try_replay_ended`), and `Event::Failed` carries
-  the position written. The catalog becomes version 3: a recording's
-  `Started` keeps the recorded stream's lane, initial term id and mtu
-  (nonzero), which its replays need, and the source's incarnation
-  (`SourceIncarnation`: the driver id, registration and incarnation of
-  the publication recorded), which a live merge matches
-  (`StreamFormat`).
-- A guarded network publication's outcome records come from its sender
-  gate's submissions, not from the commit (guards-and-abort.md, "Trusted
-  sockets in Phase 2"). A message is `Submitted` once a backend took
-  every frame of it, `Unknown` when it may have left whole unproven (an
-  `Unknown` report, an exposure a reset or a removal cut short, a
-  position no first send took, which a reliable lane may still repair,
-  or a later route's submission above a position that never left), and
-  `Aborted` when it never leaves whole: its last frame was not sent when
-  a close, a removal or a network close ended the lane (a partial
-  fragmented message is `Aborted`, as the design's kind table says). A message's
-  reservation is therefore released at its network submission, so the
-  publisher holds at most `C_m` messages committed and not yet sent: the
-  effective window is the smaller of the receivers' and `C_m` messages.
-  The close acknowledgement's `positions` are each lane's prefix-closed
-  frontier: below it every message was handed to a backend or is
-  reported `Unknown` (before, the highest position submitted, which an
-  unproven or skipped one could sit below). `GateHead` gains `start`,
-  and `GuardGate::reopen` and `reopen_route` take whether the lane is
-  rewound; `GuardSpec` gains `frontier`. Code that names every field in
-  a struct literal must add them.
-- `RouteCounters` (`karyos-io`) and `PathCounters` (`karyos-driver`)
-  gained the public fields `datagrams` and `bytes` (rp-w9). Neither
-  struct is `#[non_exhaustive]`, so a struct literal that names every
-  field must add them. Both count the lane sender's first sends of DATA
-  only, catch-up copies included: repairs (`repair_route_counts`),
-  PATH_HB and other controls, and `Flushed::Unknown` are not in them.
-- An Archive replay's target stream (phase 3, A5b).
-  `EmbeddedDriver::replay_target(ReplayTargetConfig)` makes a one-lane
-  image with local gaps, joined at the replay's first position and
-  exposed as an aggregate of lane streams as a network image is (n3), on
-  the heap or, on an IPC driver, in a region with a fresh id. Its
-  `ReplayFeed`, the image's only writer, takes a recording's whole frames
-  and PAD or ABORTED records at their recorded positions, each frame's
-  session and stream ids written as the target's, and seals a lost range
-  as a local gap (`GapReason::RangeUnavailable`); a term not ready yet is
-  offered again later. `EmbeddedDriver::finish_replay` seals the target
-  with `EndOfStream` when the feed reached the replay's end, else
-  `ImageRetired`. Only lane 0 is replayed (`DriverError::ReplayLane`).
-  The `EndOfStream` and `ImageRetired` docs now cover a replay's end.
-- The Archive's control messages, version 1, written by hand (phase 3,
-  A1; ADR-0036). `karyos-codec` becomes the runtime of the minimum v1
-  schema: checked little-endian reads and writes, a 12-byte envelope
-  (schema, template, version, block length, message length written
-  last), top-level groups, bounded bytes and UTF-8, and a typed
-  `CodecError`; it drops its unused dependency on `karyos-protocol`.
-  `karyos_archive::control` holds the five requests and three responses
-  of schema 1, validated whole on decode and encoded into the caller's
-  buffer without allocating; an encoding that fails leaves no message
-  in the buffer, not even an earlier one.
-- An Archive recording is read back for replay (phase 3, A5a).
-  `karyos_archive::replay::ReplaySource` reads a recording's range
-  without changing it, through read-only files (`Disk::open_read`):
-  whole frames, fills and gaps in order, from a frame boundary to the
-  last whole frame below the range's end, the end clamped to what the
-  recording held at open. No byte goes out before its entry's CRC holds:
-  an entry not delivered whole in one read is first read whole through
-  the buffer, its CRC and frame lengths checked. A segment missing inside
-  the range is an error, never the recording's end. It paces at full
-  speed, as recorded or scaled (`NonZeroU32` parts per million). The
-  segment index becomes version 2: each entry carries its record time
-  (the Archive's write time on its monotonic clock, 0 when unknown),
-  stamped by `SegmentStore::stamp` each recorder duty; a paced replay of
-  entries without one is refused, and a version 1 index is foreign: an
-  archive directory where an earlier build left a recording open fails
-  every agent start, since each start's settle recovers that recording.
-  A replay's error is final.
-- The driver hands an Archive recording a lane's reader (phase 3,
-  A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
-  reserved required or an optional cell and returns a `RecordingReader`:
-  the reader and a lease on its stream, so a removed stream lives until
-  its seal is positioned and read; while it lives the stream refuses a
-  cutover (`DriverError::RecordingCutover`), since the reader follows
-  one mapping. `karyos_archive::source::Guarded`
-  keeps the lease with the reader and drops the reader first. The host
-  wires the two (SPEC section 14); `karyos-sim` records driver streams end
-  to end.
-- `karyos-bench` measures the Archive's write and sync cost on a real disk
-  (phase 3 follow-up): `archive-append` appends to a segment store that
-  never syncs, `archive-sync` syncs after every append. They run only
-  when named with `--workload`, in a removed temporary directory or under
-  `KARYOS_BENCH_DIR`. Their records name the directory, its filesystem,
-  the policy and whether syncs are `F_FULLFSYNC`, and compare only under
-  the same host and filesystem; no gate reads them.
-- A recording reads a lane's log through the network sender's read
-  capability (phase 3, A4c-1). `SenderRead::for_recording` admits a
-  reserved required cell (a `required` recording) or an optional one (an
-  `async` recording), and `SenderRead::rejoin_at_head` moves a lapped
-  optional reader to the reserved head, a block boundary, as a lapped
-  optional subscription rejoins. `karyos-archive` implements its
-  `FrameSource` for `SenderRead`: a copy is padded to its frames' 32-byte
-  stride, so the segment holds the frames where the log does; a lap is
-  recorded as a gap up to where the reader rejoins, and a source busy at
-  the rejoin is retried on a later duty.
-- `karyos-archive` gains its recorder and agent (phase 3, A4b). A
-  `Recorder` copies a lane's committed frames from a `FrameSource` into
-  its recording's segment store: data, a padding or aborted block as a
-  fill, a lost range as a gap. `Mode::Required` throttles the publisher
-  when the disk stalls (SPEC section 8.1); `Mode::Async` records a lap as a gap
-  and stops there or resumes where its source rejoins. The
-  `ArchiveHandle` agent thread owns the catalog and the recorders, settles
-  the catalog at start, and stops each recording in the catalog once its
-  store is closed with everything durable (`SegmentStore::close_synced`,
-  whatever the policy), at the durable position. A source that fails or
-  returns what a source never may ends its recording with
-  `StopReason::Failed(FailKind)`; a store that fails leaves it open for
-  the next start to settle (`Event::Failed { failure }`). A command stop,
-  the shutdown and the seal record `Stopped`, `Shutdown` and `Normal`.
-  Dropped events are counted (`ArchiveHandle::dropped_events`). A store
-  records at most `MAX_GAPS` lost ranges; an async recording lapped past
-  them ends `Lapped`. The catalog format becomes version 2.
-- The Archive's segment index entries have a kind (phase 3, A4): data, a
-  fill (a padding or aborted block's canonical record, covering its
-  extent) or a gap (a range an async recording lost, refused to reads).
-  `SegmentStore::append_fill`, `append_gap` and `gaps`; an unknown kind is
-  refused at recovery. The catalog's stop gains the reason `Lapped` and an
-  `incomplete` flag, which `settle` sets for a recording with gaps. The
-  `Disk` trait's `truncate` becomes `set_len`, which also extends.
-- `karyos-archive` gains its catalog (phase 3, A3): `catalog.kyc`, an
-  append-only log of CRC-32C checked records (a recording started,
-  stopped or forgotten, and the id watermark), each durable before the
-  call returns. Ids are never reused: a compaction, written to a temporary
-  file and renamed over the catalog, carries the watermark. Opening cuts a
-  torn log and removes a compaction's leftover; `Catalog::settle` stops the
-  recordings a crash left open at their recovered position, with the
-  reason recorded. The `Disk` trait moves to `karyos_archive::disk` and
-  gains `rename`.
-- `karyos-archive` gains its segment store (phase 3, A2): a recording's
-  positions in segment files of a checked multiple of the term length, each
-  with an index of CRC-32C checked writes; written and durable positions,
-  with data then index synced before `durable` advances; no-sync,
-  per-segment and interval policies; and recovery that keeps every whole,
-  checked write in order and reports where it cut. Syncs are `fdatasync` on
-  Linux and `F_FULLFSYNC` on Apple targets (through the standard library),
-  and a new segment's directory entry is synced on Linux. A table-driven
-  CRC-32C (`karyos_archive::crc32c`) needs no dependency. Recovery removes
-  only a last segment whose header is missing or torn (being created);
-  any other bad header is `SegmentError::BadHeader` and removes nothing.
-  The interval policy syncs a finished segment at its next tick, never on
-  the write path.
-- A conflated network view closes on its own. Its image retiring publishes
-  the terminal reason `TERMINAL_IMAGE_RETIRED` (4) with an empty interval;
-  exhausted versions or a feeder that cannot read on publish
-  `TERMINAL_FRESHNESS_EXHAUSTED` or the new `TERMINAL_FEEDER_LOST` (5), and
-  the image lane stays open for its other subscribers.
-  `NetworkViewCounters` splits `unbuilt` into `unbuilt_unexposed` and
-  `unbuilt_failed` with `last_build_failure` (`ViewBuildFailure`), and adds
-  `closed_retired` and `feeders_lost`. A view's configuration is also found
-  for an image on a subscription's later path.
-- `ViewClosed` maps reason 4 to `ImageRetired { since: None }` and reason 5
-  to the new `FeederLost { since }`.
-- A conflation reader that sees its table closed reads the terminal cell
-  again, so a terminal published before the close is in that poll's
-  report. `ConflationWriter::seed_version` is available to dependent
-  crates' tests under `test-hooks`.
-- `AgentConfig::control_capacity` defaults to 512 (was 256). Configuration
-  now refuses a receiver control ring below `max_pending_challenges +
-  max_images × max_paths + 32`, since an image's SM goes on each of its
-  bound paths (redundant paths, RP-7).
-- The receiver counts its control copies on redundant paths:
-  `ReceiverCounters::sm_copies`, `sm_copies_skipped`, `nak_copies`,
-  `nak_copies_skipped` and `nak_copies_uncertain`.
-
-- The admission `Manifest` carries the stream position where the fetched
-  mapping starts (its base), within admission protocol version 2. A remote
-  client maps a grant at that base, so its positions, loss reports and
-  trace records are absolute stream positions after a guard close and
-  reopen, as an in-process handle's are.
-- `EmbeddedDriver::guard_stream` refuses with
-  `DriverError::GuardWalkerUnavailable { stream, reason }` when the stream's
-  walker, which holds one spare-slot credit for the stream's life, finds no
-  credit (`WalkerUnavailable::NoSpareCredit`) or no reader cell
-  (`WalkerUnavailable::NoReaderCell`).
-- Documented image admission: at the default `ImageTemplate::spare_slots`
-  of 5, each image lane admits one optional or observer reader, since the
-  receive owner holds three of its four spare-slot credits; another is
-  refused with `ResourcesUnavailable`. Raising `spare_slots` by one admits
-  one more, at one term per lane of image storage.
-- Driver positions are absolute stream positions after a guard close and
-  reopen: `EmbeddedDriver::seal_state` reports the current mapping's base
-  plus its seal (`DriverError::PositionsExhausted` past the position
-  range), and a revoked required participant's loss record names the base
-  of its incarnation plus its cell position.
 Second alpha: cross-process data streams on Linux, the UDP transport, the
 Archive with replay and recording groups, the management agent and tools, and
 the C ABI (0.1.1) with its conformance suite. See
@@ -2760,6 +1942,96 @@ the C ABI (0.1.1) with its conformance suite. See
 
 ### Changed
 
+- The enums decoded from evolving wire and record schemas are
+  `#[non_exhaustive]`: `karyos-protocol`'s CnC `SubscriberRole`,
+  `RejoinPolicyCode`, `RejoinOutcomeCode`, `FallbackReasonCode`, `Command`,
+  `ErrorCode`, `Response`, `CutoverState`, `LossPolicyCode`, `CloseReason` and
+  `Event`, the admission `Message`, `RegionKind` and `Capability`, and the
+  network `Control`, `ControlKind`, `NakReplyReason`, `RttmKind` and `Datagram`;
+  `karyos-archive`'s control `ResponseCode`, `ControlMessage`, `RecordingState`,
+  `Signal` and `ReplayRate`, the catalog `StopReason` and `FailKind`, the
+  segment `EntryKind` and the group record's `Clock`, `Capture`, `Payload`,
+  `Freshness`, `EndReason`, `LifecycleKind`, `Loss`, `Operation`, `Outcome`,
+  `TimerAction`, `EndOutcome`, `GapReason`, `OverrunOutcome`, `FallbackReason`,
+  `GroupRecord` and `Role`; and `karyos-trace`'s `Point`. A downstream `match`
+  on one of them needs a wildcard arm. No wire code or format changes: an
+  unknown value still decodes to the same typed error. Inside the workspace a
+  value a later version decodes is refused, never given another variant's
+  meaning: the driver treats a command it does not serve as a protocol
+  violation; the C ABI's `karyos_archive_list` refuses a page holding a
+  recording state or stop reason it has no code for, with `KARYOS_E_REFUSED` and
+  response code 5 (unsupported schema), delivering nothing. `GroupGateway` is
+  sealed; `ReplayProvider` gains methods only with default bodies or a breaking
+  version. `OnLap`, `Mode` and both `CommitOutcome` stay closed by design.
+- `NetworkSubscriptionReady` (CnC `0x8A`) carries the network subscription's
+  bound local address, changed in place under admission `VERSION` 2, which no
+  release has used: it grows from 3 to exactly 6 words, `client | sequence |
+  registration | family_port | address_hi | address_lo`, and any other length is
+  refused. `family_port` packs the port (bits 15 to 0), the family (bits 23 to
+  16: 0 none, 4 IPv4, 6 IPv6), reserved bits 31 to 24 (zero) and the IPv6 scope
+  id (bits 63 to 32; zero for IPv4 and family 0). An IPv6 address fills both
+  address words in network order; an IPv4 address sits in bits 31 to 0 of
+  `address_lo`, with `address_hi` zero. Family 0 has every other field zero. The
+  IPv6 flow information is not carried. The address is what the driver's socket
+  reports after the bind; a multicast subscription reports its group address and
+  the bound port, not the interface. The `cnc` module docs give two byte
+  vectors. For the item 41 API list: `Response::NetworkSubscriptionReady` and
+  `karyos_client::Outcome::NetworkSubscription` gain `bound:
+  Option<SocketAddr>`, and `karyos_client::Subscription` gains `bound_address()
+  -> Option<SocketAddr>` (`None` for a stream subscription). Port 0 stays
+  refused in every channel URI; the C ABI is unchanged.
+- A network publication whose channel asks for `fc=max` or `fc=tagged:<group>`
+  is refused with `DriverError::UnsupportedChannel` (a client's add by URI:
+  `ErrorCode::UnsupportedChannel`), instead of running `min` silently: the
+  driver parsed the key but never wired it to the sender's membership. `fc=min`,
+  what every publication runs, is taken.
+- The channel URI enums (`ChannelError`, `Interface`, `Trace`, `FlowControl`,
+  `Security`, `ControlMode`, `Destination`, `Media`) and the public error enums
+  of the library crates (`karyos-sys`, `karyos-protocol`, `karyos-codec`,
+  `karyos-io`, `karyos-trace`, `karyos-driver`, `karyos-cluster` and the
+  `karyos` facade) are `#[non_exhaustive]`: a later version can add a URI form
+  or an error without breaking a downstream exhaustive `match`. The driver
+  refuses a URI form it does not serve as `UnsupportedChannel`, as it does a
+  form not wired yet. `karyos_sys::log_buffer::ReadError` stays exhaustive for
+  now: the Archive's source classifies each of its variants, and an unknown one
+  needs a design choice.
+- `ImageAvailable` (CnC `0xC6`) encodes its source address exactly as
+  `NetworkSubscriptionReady` (`0x8A`) encodes its bound address, aligned in
+  place under admission `VERSION` 2 before its freeze, so the version has one
+  address encoding. Its six words stay `stream | registration | image |
+  family_port | address_hi | address_lo`; an IPv4 source moves from word 4 to
+  bits 31 to 0 of `address_lo`, with `address_hi` zero, and strict decoding
+  refuses the old layout. The IPv6 scope id is now carried in bits 63 to 32 of
+  `family_port` (it was dropped); the flow information is still not carried. An
+  image always has a source, so family 0 is refused. The `cnc` module docs give
+  a byte vector with an IPv6 link-local source and its scope. For the item 41
+  API list: no public signature changes; `Event::ImageAvailable`'s `source` now
+  keeps its IPv6 scope id through the CnC.
+- A schedule ring on a driver's local stream is refused.
+  `EmbeddedDriver::add_stream` and `add_aggregate`, the client facade's local
+  streams, `karyos_driver_add_stream` and karyosd's `--stream` answer
+  `schedule_capacity` above 0 with `DriverError::InvalidConfig` or
+  `KARYOS_E_INVALID_ARGUMENT`: nothing would release such a ring, which took its
+  capacity of timed offers and then back pressured for good. A timed lane is a
+  network publication's. A driver configures timed network streams
+  (`NetworkStreamDefaults::timed`, at most 8, with a capacity of 0 or a stream
+  given twice refused at start; karyosd `--timed-network <stream>:<capacity>`,
+  which needs `--network on` and names no `--stream`). A client's network
+  publication of such a stream, added by URI, is timed with the default
+  schedule; there is no URI key.
+  `EmbeddedDriver::add_timed_network_publication_with_clock` is the network twin
+  of `schedule_stream_with_clock`, its clock fixed for the publication's life.
+  No signature, struct or CnC change. The conformance scenario
+  `publication.timed.offer` now runs against karyosd's timed network stream 25,
+  with a loopback receiver (feature `remote-driver`): a timed offer is not
+  delivered before its time, then is, with the typed refusals as before. The new
+  `stream.schedule.refused` covers the refusal on a driver's stream. The
+  semantic layer gains `publication.offer_at` (answering its `tx_time`) and
+  `until` and `not_before` on `subscription.poll`, and the runner retries a
+  remote offer's `not_connected` too. No `Tai` timed lane exists now: the
+  network route refuses that domain. The frozen bindings keep their pinned
+  suite; their first pin update after the freeze adopts this behaviour and the
+  scenario.
 - Breaking for 0.1.0-alpha.1 users of the `karyos` facade (c52fcc2d, the
   SPEC §10 publication shape): 13 re-exports moved from `karyos::` to
   `karyos::embedded::`: `Aborted`, `ClaimOutcome`, `ClientClaim`,
