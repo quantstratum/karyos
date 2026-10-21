@@ -21,8 +21,10 @@ release may break APIs, wire formats and shared-memory layouts.
   The three findings on main are deliberate and now carry their reason as
   a directive: perl's `$ARGV` inside a single-quoted program
   (`check-lint-sync.sh`), a function only the trap calls
-  (`sim-arch-compare.sh`), and Markdown code spans in the report's
-  `printf` formats (`unsafe-report.sh`).
+  (`sim-arch-compare.sh`, SC2329 and, before shellcheck 0.11, SC2317),
+  and Markdown code spans in the report's `printf` formats
+  (`unsafe-report.sh`). `package-libkaryos.sh`'s version check is an `if`,
+  which shellcheck 0.9 (Debian bookworm, Ubuntu 24.04) also accepts.
 
 - `karyos_subscription_rejoin_state` (F9b) keeps the caller's `size`, as
   `karyos_detail`, `karyos_accepted` and the image change do: it wrote
