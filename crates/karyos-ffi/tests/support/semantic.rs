@@ -267,7 +267,7 @@ impl Adapter {
             let waits = status != 0
                 && matches!(
                     self.name(status, at).as_str(),
-                    "back_pressured" | "admin_action"
+                    "back_pressured" | "admin_action" | "not_connected"
                 );
             if !waits || start.elapsed() >= UNTIL_DEADLINE {
                 return (status, value);
@@ -464,6 +464,42 @@ impl Adapter {
                 let (status, accepted) = self.offer_remote(publication, offer, at);
                 self.accepted(status, &accepted, at)
             }
+            "publication.offer_at" => {
+                let publication = args.object("publication");
+                if let Some(answer) = self.open(publication, Kind::Publication, at) {
+                    return answer;
+                }
+                let handle = self.objects[publication].handle;
+                let lane = args.narrow("lane", Some(0));
+                let accepted_size = u32::try_from(size_of::<abi::Accepted>()).unwrap();
+                let fixed = args
+                    .arguments
+                    .contains_key("tx_time")
+                    .then(|| args.narrow::<u64>("tx_time", None));
+                let delay = args.narrow::<u64>("delay_ns", Some(0));
+                assert!(
+                    fixed.is_none() || !args.arguments.contains_key("delay_ns"),
+                    "{at}: `tx_time` or `delay_ns`, not both"
+                );
+                // A delay reads the monotonic clock at each attempt; the
+                // last attempt's time is the answer's `tx_time`.
+                let mut sent_at = 0;
+                let offer = || {
+                    let tx_time = fixed.unwrap_or_else(|| {
+                        let (status, now) = abi::clock_now(0);
+                        assert_eq!(status, 0, "{at}: karyos_clock_now");
+                        now.unwrap().checked_add(delay).unwrap()
+                    });
+                    sent_at = tx_time;
+                    abi::publication_offer_at(handle, lane, &args.message(), tx_time, accepted_size)
+                };
+                let (status, accepted) = self.offer_remote(publication, offer, at);
+                let mut answer = self.accepted(status, &accepted, at);
+                if let Answer::Ok(results) = &mut answer {
+                    results.insert("tx_time".to_owned(), Value::Integer(i128::from(sent_at)));
+                }
+                answer
+            }
             "publication.publish_claimed" => {
                 let publication = args.object("publication");
                 if let Some(answer) = self.open(publication, Kind::Publication, at) {
@@ -572,14 +608,38 @@ impl Adapter {
                 if let Some(answer) = self.open(subscription, Kind::Subscription, at) {
                     return answer;
                 }
-                let (status, delivered, messages, _) = abi::subscription_poll(
-                    self.objects[subscription].handle,
-                    args.narrow("limit", Some(1)),
-                    abi::OnMessage::Keep,
+                let handle = self.objects[subscription].handle;
+                let limit = args.narrow("limit", Some(1));
+                // With `until`, polled until that many arrived (FORMAT.md,
+                // Remote driver); the last message is the last poll's.
+                let mut last: Option<Vec<u8>> = None;
+                let (status, delivered) = self.poll_until(
+                    &args,
+                    subscription,
+                    || {
+                        let (status, delivered, messages, _) =
+                            abi::subscription_poll(handle, limit, abi::OnMessage::Keep);
+                        assert_eq!(usize::try_from(delivered).unwrap(), messages.len(), "{at}");
+                        if let Some(message) = messages.last() {
+                            last = Some(message.clone());
+                        }
+                        (status, delivered)
+                    },
+                    at,
                 );
-                assert_eq!(usize::try_from(delivered).unwrap(), messages.len(), "{at}");
+                // `not_before`: a delivery read before that monotonic time
+                // fails the scenario (FORMAT.md, Remote driver).
+                if delivered > 0 && args.arguments.contains_key("not_before") {
+                    let not_before = args.narrow::<u64>("not_before", None);
+                    let (status, now) = abi::clock_now(0);
+                    assert_eq!(status, 0, "{at}: karyos_clock_now");
+                    assert!(
+                        now.unwrap() >= not_before,
+                        "{at}: delivered at {now:?}, before its time {not_before}"
+                    );
+                }
                 let mut answer = self.counted(status, "delivered", delivered, at);
-                if let (Answer::Ok(results), Some(last)) = (&mut answer, messages.last()) {
+                if let (Answer::Ok(results), Some(last)) = (&mut answer, last.as_ref()) {
                     let text = String::from_utf8(last.clone())
                         .unwrap_or_else(|_| panic!("{at}: a message that is not UTF-8"));
                     results.insert("last".to_owned(), Value::Text(text));

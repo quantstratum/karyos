@@ -416,12 +416,16 @@ fn stream_options_this_version_does_not_take_are_refused() {
         };
         add_stream(driver, &options).unwrap();
     }
-    // A power of two up to the ring's largest is taken.
+    // Any schedule ring, a valid capacity included, is an invalid argument
+    // on a driver stream: nothing would release it (owner item 65).
     let timed = StreamOptions {
         schedule_capacity: 4,
         ..stream(5)
     };
-    add_stream(driver, &timed).unwrap();
+    assert_eq!(
+        add_stream(driver, &timed).map_err(|failure| failure.status),
+        Err(Status::InvalidArgument)
+    );
     close(driver).unwrap();
 }
 

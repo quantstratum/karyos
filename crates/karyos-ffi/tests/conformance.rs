@@ -181,6 +181,15 @@ const OPS: &[Op] = &[
         ACCEPTED,
         &[],
     ),
+    // A timed lane's offer at `tx_time`, or `delay_ns` after the runner's
+    // monotonic clock reading (FORMAT.md, Ops).
+    op(
+        "publication.offer_at",
+        &["publication"],
+        &["lane", "payload", "length", "tx_time", "delay_ns"],
+        &["lane", "position", "tx_time"],
+        &[],
+    ),
     op(
         "publication.publish_claimed",
         &["publication"],
@@ -215,7 +224,7 @@ const OPS: &[Op] = &[
     op(
         "subscription.poll",
         &["subscription"],
-        &["limit"],
+        &["limit", "until", "not_before"],
         &["delivered", "last"],
         &[],
     ),
@@ -1581,6 +1590,10 @@ fn run(
             "remote_client".to_owned(),
             adapter.provided_client(provided.client),
         );
+        variables.insert(
+            "loopback_uri".to_owned(),
+            Value::Text(provided.loopback_uri.clone()),
+        );
     }
     if scenario.features.contains("incompatible-driver") {
         let provided = runner
@@ -2511,6 +2524,9 @@ mod archive_host {
         pub(crate) client: u64,
         pub(crate) recording: u64,
         pub(crate) end: u64,
+        /// A free loopback endpoint for a network subscription and the
+        /// publication that sends to it (FORMAT.md, Remote driver).
+        pub(crate) loopback_uri: String,
         #[cfg(target_os = "linux")]
         _karyosd: linux::Karyosd,
     }
@@ -2534,10 +2550,16 @@ mod archive_host {
     pub(crate) fn provide() -> Option<Provided> {
         let karyosd = linux::Karyosd::start();
         let (client, recording, end) = karyosd.seed();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         Some(Provided {
             client,
             recording,
             end,
+            loopback_uri: format!("karyos:udp?endpoint=127.0.0.1:{port}"),
             _karyosd: karyosd,
         })
     }
@@ -2561,6 +2583,10 @@ mod archive_host {
         const GUARDED: i32 = 23;
         /// The remote driver's plain stream, neither conflated nor guarded.
         const PLAIN: i32 = 24;
+        /// The remote driver's timed network stream (`--timed-network`).
+        const TIMED: i32 = 25;
+        /// The remote driver's plain stream of the timed scenario.
+        const UNTIMED: i32 = 26;
         const REQUESTS: i32 = 1030;
         const RESPONSES: i32 = 1031;
 
@@ -2635,6 +2661,11 @@ mod archive_host {
                     .args(["--stream", &format!("{GUARDED}:1:allow-unconnected")])
                     .args(["--guard", &format!("orders:{GUARDED}:1:4")])
                     .args(["--stream", &format!("{PLAIN}:1:allow-unconnected")])
+                    // The timed lane's (FORMAT.md, Remote driver): timed
+                    // network publications on TIMED, a plain stream beside.
+                    .args(["--network", "on"])
+                    .args(["--timed-network", &format!("{TIMED}:4")])
+                    .args(["--stream", &format!("{UNTIMED}:1:allow-unconnected")])
                     .arg("--archive")
                     .arg(&archive)
                     .args(["--archive-control", &format!("{REQUESTS},{RESPONSES}")])

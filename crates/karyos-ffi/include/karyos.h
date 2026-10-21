@@ -456,13 +456,14 @@ typedef struct karyos_stream_options {
      */
     uint32_t allow_unconnected;
     /*
-     * Entries of the stream's schedule ring, which makes its lane timed
-     * (karyos_publication_offer_at): 0 for none, or a power of two up to
-     * 1 << 20 on an exclusive stream. Timed lanes are meant for network
-     * publications, whose sender releases each entry once its message is
-     * sent. On a stream added here nothing sends, so nothing releases the
-     * ring: the lane takes schedule_capacity timed offers, then answers
-     * KARYOS_E_BACK_PRESSURED for good, whatever its subscribers read.
+     * Entries of a schedule ring, which would make the lane timed
+     * (karyos_publication_offer_at). Must be 0: karyos_driver_add_stream
+     * refuses any other value with KARYOS_E_INVALID_ARGUMENT, since a
+     * driver's stream has no sender to release the ring, which would take
+     * its capacity of timed offers and then back pressure for good. A
+     * timed lane is a network publication's: a driver configures timed
+     * network streams (karyosd --timed-network), and a client's network
+     * publication of such a stream is timed.
      */
     uint32_t schedule_capacity;
     /* KARYOS_LOSS_*: what a lost required subscriber does. */
@@ -641,11 +642,10 @@ int32_t karyos_publication_offer_with(uint64_t publication, uint32_t lane,
  * Offers length bytes at data on the timed lane with its requested
  * not-before time tx_time in the lane's clock domain (karyos_clock_now
  * reads it), copied before it returns; data may be null when length is 0.
- * The lane's handle checks the time before anything is reserved; on a
- * network route the driver's sender holds the message until its time,
- * and local readers read it at its commit. On a stream of
- * karyos_driver_add_stream nothing sends, so the lane takes only its
- * schedule_capacity timed offers (karyos_stream_options).
+ * The lane's handle checks the time before anything is reserved; the
+ * driver's sender holds the message until its time, and local readers
+ * read it at its commit. A timed lane is a network publication's: a
+ * driver's stream is never timed (karyos_stream_options).
  * KARYOS_E_INVALID_SCHEDULE for a lane that is not timed, a time below the
  * lane's last, one past the horizon or an overflowing deadline. On
  * KARYOS_OK, accepted (may be null) receives the lane and position. Never

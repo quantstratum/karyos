@@ -1,42 +1,38 @@
-# A timed offer at the time karyos_clock_now reads passes the lane's
-# schedule checks and meets the next one (no subscriber: the suite has
-# none). A plain offer on a timed lane, a time past the lane's horizon and
-# a timed offer on a lane that is not timed are refused with typed statuses
-# (SPEC.md §13, C ABI boundary; quantstratum-docs:
-# karyos/design/ffi-gap-analysis.md §6, F7a-3). An unknown clock domain is
-# an invalid argument, and nothing is written.
-format 1
+# A timed lane of a driver in another process (owner item 65; SPEC.md §13,
+# C ABI boundary; FORMAT.md, Remote driver): the runner's karyosd makes
+# the network publications of stream 25 timed, and a subscription on the
+# loopback endpoint receives them. A timed offer half a second ahead is
+# delivered, and not before its time; a plain offer on the timed lane,
+# a time below the lane's last, one past its horizon and a timed offer on
+# a lane that is not timed are refused with typed statuses.
+format 2
 id publication.timed.offer
 abi 0.1
 covers "typed status codes"
+since B3
+feature remote-driver
 
-call karyos_driver_create
-expect KARYOS_OK driver=$driver
-call karyos_driver_add_stream driver=$driver stream_id=7 schedule_capacity=4
-expect KARYOS_OK
-call karyos_driver_add_stream driver=$driver stream_id=8
-expect KARYOS_OK
-call karyos_driver_start driver=$driver
-expect KARYOS_OK
-call karyos_driver_connect driver=$driver
-expect KARYOS_OK client=$client
-call karyos_client_add_publication client=$client stream_id=7
-expect KARYOS_OK publication=$timed
-call karyos_client_add_publication client=$client stream_id=8
-expect KARYOS_OK publication=$plain
-call karyos_clock_now domain=0
-expect KARYOS_OK now=$now
-call karyos_publication_offer_at publication=$timed payload="x" tx_time=$now
-expect KARYOS_E_NOT_CONNECTED
-call karyos_publication_offer publication=$timed payload="x"
-expect KARYOS_E_INVALID_SCHEDULE
-call karyos_publication_offer_at publication=$timed payload="x" tx_time=9223372036854775807
-expect KARYOS_E_INVALID_SCHEDULE
-call karyos_publication_offer_at publication=$plain payload="x" tx_time=$now
-expect KARYOS_E_INVALID_SCHEDULE
-call karyos_clock_now domain=7
-expect KARYOS_E_INVALID_ARGUMENT
-call karyos_client_close client=$client
-expect KARYOS_OK
-call karyos_driver_close driver=$driver
-expect KARYOS_OK
+op subscription.add client=$remote_client stream_id=25 uri=$loopback_uri
+expect ok subscription=$reading
+op publication.add client=$remote_client stream_id=25 uri=$loopback_uri
+expect ok publication=$timed
+op publication.offer_at publication=$timed payload="timed" delay_ns=500000000
+expect ok tx_time=$at
+op subscription.poll subscription=$reading limit=8 until=1 not_before=$at
+expect ok delivered=1 last="timed"
+op publication.offer publication=$timed payload="plain"
+expect status=invalid_schedule
+op publication.offer_at publication=$timed payload="back" tx_time=1
+expect status=invalid_schedule
+op publication.offer_at publication=$timed payload="far" delay_ns=3600000000000
+expect status=invalid_schedule
+op publication.add client=$remote_client stream_id=26
+expect ok publication=$untimed
+op publication.offer_at publication=$untimed payload="x" delay_ns=0
+expect status=invalid_schedule
+op publication.close publication=$untimed
+expect ok
+op publication.close publication=$timed
+expect ok
+op subscription.close subscription=$reading
+expect ok

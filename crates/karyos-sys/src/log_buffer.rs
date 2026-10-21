@@ -260,10 +260,10 @@ pub struct LogBufferConfig {
     /// karyos/design/timed-tx.md`, TT-1): 0 for a lane that is not timed,
     /// which has no ring words; otherwise a power of two, on an exclusive
     /// publication (GC-7). Only a network sender releases entries, once
-    /// each message is sent: on a lane that no sender reads (a driver's
-    /// IPC stream) the ring takes `schedule_capacity` timed offers, then
-    /// back pressures for good. Timed lanes are meant for network
-    /// publications.
+    /// each message is sent, so a timed lane is a network publication's: a
+    /// driver refuses a schedule ring on its local streams (karyos-driver
+    /// `EmbeddedDriver::add_stream`; owner item 65), on which it would take
+    /// `schedule_capacity` timed offers, then back pressure for good.
     pub schedule_capacity: u32,
 }
 

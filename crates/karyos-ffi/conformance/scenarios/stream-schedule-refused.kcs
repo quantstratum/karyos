@@ -1,0 +1,20 @@
+# A schedule ring on a driver's stream is refused: nothing would release
+# it, so it would take its capacity of timed offers and then back
+# pressure for good (owner item 65); a timed lane is a network
+# publication's (publication.timed.offer). An unknown clock domain is an
+# invalid argument, and nothing is written.
+format 1
+id stream.schedule.refused
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_add_stream driver=$driver stream_id=7 schedule_capacity=4
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_add_stream driver=$driver stream_id=7
+expect KARYOS_OK
+call karyos_clock_now domain=7
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

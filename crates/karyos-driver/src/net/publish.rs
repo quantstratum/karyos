@@ -161,7 +161,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         roles: PublicationRoles,
         schedule: karyos_client::schedule::ScheduleOptions,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, Some(Box::new(roles)), Some(schedule))
+        self.add_network(
+            config,
+            channel,
+            None,
+            Some(Box::new(roles)),
+            Some((schedule, None)),
+        )
     }
 
     /// [`EmbeddedDriver::add_network_publication`], guarded by `guard`:
@@ -233,7 +239,31 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if config.stream.buffer.schedule_capacity == 0 {
             return Err(DriverError::InvalidConfig);
         }
-        self.add_network(config, channel, guard, None, Some(schedule))
+        self.add_network(config, channel, guard, None, Some((schedule, None)))
+    }
+
+    /// [`EmbeddedDriver::add_timed_network_publication`] whose lanes check
+    /// offers against `clock`, as
+    /// [`EmbeddedDriver::schedule_stream_with_clock`] does for a stream: a
+    /// network lane takes its settings and its clock at creation, both
+    /// fixed for the publication's life. The sender still times heads on
+    /// the network clock.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_timed_network_publication`].
+    pub fn add_timed_network_publication_with_clock(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        guard: Option<NetworkGuard>,
+        schedule: karyos_client::schedule::ScheduleOptions,
+        clock: karyos_client::schedule::ScheduleClock,
+    ) -> Result<AggregateHandle, DriverError> {
+        if config.stream.buffer.schedule_capacity == 0 {
+            return Err(DriverError::InvalidConfig);
+        }
+        self.add_network(config, channel, guard, None, Some((schedule, Some(clock))))
     }
 
     fn add_network(
@@ -242,7 +272,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         guard: Option<NetworkGuard>,
         roles: Option<Box<PublicationRoles>>,
-        schedule: Option<karyos_client::schedule::ScheduleOptions>,
+        schedule: Option<(
+            karyos_client::schedule::ScheduleOptions,
+            Option<karyos_client::schedule::ScheduleClock>,
+        )>,
     ) -> Result<AggregateHandle, DriverError> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
@@ -258,8 +291,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         // Timed lanes (a schedule ring on every lane): what the software
         // route does not support yet is refused before anything exists.
-        let timed =
-            (config.stream.buffer.schedule_capacity > 0).then(|| schedule.unwrap_or_default());
+        let (options, clock) = schedule.unwrap_or_default();
+        let timed = (config.stream.buffer.schedule_capacity > 0).then_some(options);
         if let Some(options) = timed {
             let liveness = self.config.network.map(|network| {
                 (
@@ -288,7 +321,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         config.stream.buffer.initial_term_id = self.draw_initial_term_id(forced)?;
         let handle = self.add_aggregate_drawn(config)?;
         if let Some(options) = timed
-            && let Err(error) = self.time_lanes(&handle, options)
+            && let Err(error) = self.time_lanes(&handle, options, clock)
         {
             let _ = self.remove_aggregate(&handle);
             return Err(error);
@@ -316,9 +349,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         &mut self,
         handle: &AggregateHandle,
         options: karyos_client::schedule::ScheduleOptions,
+        clock: Option<karyos_client::schedule::ScheduleClock>,
     ) -> Result<(), DriverError> {
         for stream in handle.streams() {
-            self.schedule_stream(stream, options)?;
+            match &clock {
+                Some(clock) => self.schedule_stream_with_clock(stream, options, clock.clone())?,
+                None => self.schedule_stream(stream, options)?,
+            }
             self.ensure_timed_counters(stream)?;
             self.stream(stream)?.fix_schedule()?;
         }
