@@ -302,7 +302,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `publication.poll_outcomes` | `publication`, [`lane`, `limit` (default 1), `until`] | `delivered` | `guarded-publication` |
 | `publication.close` | `publication` | none | |
 | `subscription.add` | `client`, `stream_id`, [`uri`, `role`, `rejoin`: the values of the header's subscription options] | `subscription` | |
-| `subscription.poll` | `subscription`, [`limit` (default 1), `until` (Remote driver), `not_before`: a monotonic time, the runner's `karyos_clock_now` read after a poll that delivered must not be below it] | `delivered`, `last` (the last message as UTF-8 text, when there is one) | |
+| `subscription.poll` | `subscription`, [`limit` (default 1), `until` (Remote driver), `not_before`: a monotonic time; the runner reads `karyos_clock_now` when a poll that delivered returns, and fails if that reading is below it] | `delivered`, `last` (the last message as UTF-8 text, when there is one) | |
 | `subscription.close` | `subscription` | none | |
 | `conflated.add` | `client`, `stream_id`, [`uri`] | `conflated` | `conflation` |
 | `conflated.poll` | `conflated`, [`key_budget` (default 1), `until`] | `delivered` | `conflation` |
