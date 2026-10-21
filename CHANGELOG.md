@@ -2760,6 +2760,16 @@ the C ABI (0.1.1) with its conformance suite. See
 
 ### Changed
 
+- Breaking for 0.1.0-alpha.1 users of the `karyos` facade (c52fcc2d, the
+  SPEC §10 publication shape): 13 re-exports moved from `karyos::` to
+  `karyos::embedded::`: `Aborted`, `ClaimOutcome`, `ClientClaim`,
+  `ClientConductor`, `ClientPublication`, `ClientSubscription`,
+  `CommitOutcome`, `Completion`, `ConductorError`, `ConductorPoll`,
+  `OfferOutcome`, `Outcome` and `Overrun`. `karyos::Error` is
+  `#[non_exhaustive]` and gains the `Offer` and `Subscription` variants,
+  so a `match` on it needs a wildcard arm. `EXTENSION_VERSION` now lives in
+  `karyos_sys::frame`; `karyos_protocol::frame::EXTENSION_VERSION` still
+  resolves through a re-export.
 - `karyos-ffi`: each copy of the library draws its own base generation for its
   handles, once, from the address of one of its statics (never 0; no clock or
   process id, so it runs under Miri's isolation). A handle of another copy in

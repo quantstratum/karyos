@@ -302,6 +302,11 @@ what is partial.
   listen may be refused briefly; the tests retry for up to 2 s.
 - A thread pidfd must not count as an exit proof. Karyos's refusal of a
   real thread pidfd needs kernel 6.9 or later, which was not run.
+- The `test-hooks` Cargo features of `karyos-sys` (`test_pause`,
+  `alloc_count`, fault injectors) and `karyos-io`
+  (`sockets::scripted`) are test support for this workspace's tests, not
+  public API: they carry no compatibility promise and are never enabled
+  outside dev-dependencies here.
 
 ## Evidence
 
@@ -345,6 +350,12 @@ on disk:
   never given another meaning. `GroupGateway` is sealed. Public report
   structs of `karyos-client` and `karyos-archive` are built through
   constructors.
+- The `karyos` facade moved 13 re-exports from `karyos::` to
+  `karyos::embedded::` (`ClientConductor`, `ClientPublication`,
+  `ClientSubscription`, `ClientClaim`, `OfferOutcome`, `ClaimOutcome`,
+  `CommitOutcome`, `Completion`, `ConductorError`, `ConductorPoll`,
+  `Outcome`, `Overrun`, `Aborted`): change the `use` paths. `karyos::Error`
+  gains the `Offer` and `Subscription` variants.
 - The C ABI is new in this release, at version 0.1.1. A caller accepts
   exactly the `0.y` it targets with at least its minimum `0.y.z`.
 
