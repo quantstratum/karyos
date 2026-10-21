@@ -4215,6 +4215,146 @@ fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
     );
 }
 
+/// Plan item 7 (contract-traceability-phase-2.md, "Challenge lifecycle";
+/// SPEC §13: "no join point is lowered ... and no duplicate detection
+/// reset"): a SETUP of the bound image, repeated after binding with its
+/// own identity or another, changes nothing the image knows. Neither is
+/// challenged nor installs an image; the frames already received, replayed
+/// byte for byte, are dropped as duplicates, committed nowhere and never
+/// delivered again; and the next message continues where the stream was,
+/// read once.
+#[test]
+fn a_duplicate_setup_after_binding_keeps_the_images_duplicates_and_join() {
+    use karyos_sys::log_buffer::{AppendOptions, PollOutcome, Role};
+
+    // A frame of 1000 bytes is 1032 bytes, at 32-byte strides.
+    const STRIDE: u64 = 1056;
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let mut out = vec![0u8; 2048];
+    let mut read = |rig: &mut Rig, count: usize| {
+        let mut delivered = Vec::new();
+        for _ in 0..200 {
+            rig.round(true);
+            while let PollOutcome::Message { position, .. } = subscriber.poll(&mut out).unwrap() {
+                subscriber.acknowledge();
+                delivered.push(position);
+            }
+            if delivered.len() >= count {
+                break;
+            }
+        }
+        // Rounds past the last, so a message delivered twice would show.
+        for _ in 0..20 {
+            rig.round(true);
+            while let PollOutcome::Message { position, .. } = subscriber.poll(&mut out).unwrap() {
+                subscriber.acknowledge();
+                delivered.push(position);
+            }
+        }
+        delivered
+    };
+    // Three messages, received and read: positions 0 to 2 * STRIDE.
+    let log = rig.log.as_mut().unwrap();
+    for _ in 0..3 {
+        let _ = log.publications[0]
+            .append(&[7; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    assert_eq!(read(&mut rig, 3), [0, STRIDE, 2 * STRIDE]);
+    let installed = rig
+        .events
+        .iter()
+        .filter(|event| matches!(event, ImageEvent::Installed { .. }))
+        .count();
+    let sessions = rig.agents.receiver.role.session_counters();
+    let committed = rig.agents.receiver.counters().data_committed;
+    let dropped = rig.agents.receiver.counters().data_dropped;
+    // The bound image's SETUP again, with its own identity, then with
+    // another incarnation's.
+    for incarnation in [1, 2] {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            b,
+            source,
+            karyos_protocol::network::Control::SetupAnnounce(SetupAnnounce {
+                identity: Identity {
+                    incarnation,
+                    ..identity()
+                },
+                ..announce(65_536)
+            }),
+            rig.now,
+        );
+        rig.round(true);
+    }
+    assert!(rig.agents.receiver.role.has_image(slot), "the image stays");
+    let after = rig.agents.receiver.role.session_counters();
+    assert_eq!(after.challenges, sessions.challenges, "no SETUP challenged");
+    assert_eq!(after.installed, sessions.installed, "nothing installed");
+    assert_eq!(
+        rig.events
+            .iter()
+            .filter(|event| matches!(event, ImageEvent::Installed { .. }))
+            .count(),
+        installed
+    );
+    // The frames already received, replayed byte for byte.
+    for offset in [0, STRIDE, 2 * STRIDE] {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_data(
+            &receiver.sessions,
+            b,
+            source,
+            alias(),
+            &stale_frame(9, u32::try_from(offset).unwrap(), 1000),
+            rig.now,
+        );
+    }
+    assert_eq!(read(&mut rig, 0), [], "a replayed frame delivered again");
+    assert_eq!(
+        rig.agents.receiver.counters().data_committed,
+        committed,
+        "a replayed frame committed again"
+    );
+    assert!(
+        rig.agents.receiver.counters().data_dropped >= dropped + 3,
+        "the replays dropped as duplicates"
+    );
+    // The control: the same injection one frame on, a position the image
+    // has not seen, is committed and read once, so the replays above met
+    // the image's duplicate detection, not a closed door; and the stream
+    // continues where it was. The publication's own frame there is then
+    // a duplicate in turn.
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_data(
+        &receiver.sessions,
+        b,
+        source,
+        alias(),
+        &stale_frame(9, u32::try_from(3 * STRIDE).unwrap(), 1000),
+        rig.now,
+    );
+    assert_eq!(read(&mut rig, 1), [3 * STRIDE]);
+    assert_eq!(rig.agents.receiver.counters().data_committed, committed + 1);
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&[7; 1000], AppendOptions::default())
+        .unwrap();
+    assert_eq!(
+        read(&mut rig, 0),
+        [],
+        "the publication's frame delivered twice"
+    );
+}
+
 /// A whole DATA frame of `payload` bytes on lane 0 of the rig's alias,
 /// for `term_id` at `term_offset`, as a datagram of any incarnation
 /// carries it: DATA names no incarnation, only the alias and the term.
