@@ -535,6 +535,7 @@ fn test_observer_copy_paused_while_its_slot_is_reclaimed() {
             std::thread::yield_now();
         }
     })));
+    let observer_cell = observer.cell();
     let mut out = vec![0u8; 8192];
     std::thread::scope(|scope| {
         let reclaimer = scope.spawn(|| {
@@ -556,7 +557,12 @@ fn test_observer_copy_paused_while_its_slot_is_reclaimed() {
                     sequence += 1;
                 }
                 if conductor.duty_cycle().unwrap().quarantined > 0 {
-                    quarantined = Some(sequence);
+                    // The slots quarantined, and the slot the observer's
+                    // loan names, compared once the observer goes on.
+                    let word = buffer.cells().get(observer_cell).unwrap();
+                    let loan = Loan::decode(word.loan.load(Ordering::Acquire));
+                    let loaned = loan.ok().flatten().map(|loan| loan.slot().get());
+                    quarantined = Some((sequence, conductor.quarantined.clone(), loaned));
                     break;
                 }
             }
@@ -565,10 +571,12 @@ fn test_observer_copy_paused_while_its_slot_is_reclaimed() {
         });
         let outcome = observer.poll(&mut out).unwrap();
         let quarantined = reclaimer.join().unwrap();
-        assert!(
-            quarantined.is_some_and(|sequence| sequence > 1),
-            "the duty cycle never met the observer's loan"
-        );
+        let (sequence, slots, loaned) =
+            quarantined.expect("the duty cycle never met the observer's loan");
+        assert!(sequence > 1);
+        // The quarantined slot is the one the observer's loan names.
+        let loaned = loaned.expect("the observer's loan is held");
+        assert_eq!(slots, [loaned]);
         match outcome {
             PollOutcome::Message { position, length, .. } => {
                 assert_eq!(position, 0);
