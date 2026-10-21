@@ -4518,8 +4518,6 @@ mod properties {
         })
     }
 
-    /// A source address as `ImageAvailable` carries it: no scope or flow
-    /// label.
     /// A bound address: none, IPv4, or IPv6 with any scope id (flow
     /// information is not carried, so it stays zero).
     fn bound() -> impl Strategy<Value = Option<SocketAddr>> {
@@ -4533,6 +4531,8 @@ mod properties {
         ]
     }
 
+    /// A source address as `ImageAvailable` carries it: no scope or flow
+    /// label.
     fn source() -> impl Strategy<Value = SocketAddr> {
         prop_oneof![
             (any::<u32>(), any::<u16>())
