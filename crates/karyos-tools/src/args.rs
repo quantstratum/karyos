@@ -79,7 +79,10 @@ Network:
                                     driver's default network configuration [off]
 
 Streams:
-  --stream <stream_id>:<session_id> configure a stream at start; repeatable
+  --stream <stream_id>:<session_id>[:allow-unconnected]
+                                    configure a stream at start; allow-unconnected lets
+                                    its publications, a remote client's included, offer
+                                    with no subscriber attached; repeatable
   --term-length <size>              term length of every stream [1m]
   --mtu <n>                         frame bytes per fragment [1408]
   --max-reserved <size>             bytes one message may reserve [term length / 8]
@@ -171,13 +174,18 @@ pub struct TermOptions {
     pub claim_deadline: u64,
 }
 
-/// A stream to configure at start: its wire stream id and session.
+/// A stream to configure at start: its wire stream id and session, and
+/// whether its publications may offer with no subscriber attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamOption {
     /// Wire stream id.
     pub stream_id: i32,
     /// Session alias.
     pub session_id: i32,
+    /// `:allow-unconnected` was given: every publication of the stream,
+    /// a remote client's included, offers with no subscriber attached
+    /// (SPEC.md §4 `allow_unconnected`).
+    pub allow_unconnected: bool,
 }
 
 /// A recording the daemon starts at boot (`--record`), through the
@@ -653,12 +661,20 @@ fn level(value: &str) -> Option<LogLevel> {
     })
 }
 
-/// A `<stream_id>:<session_id>` pair.
+/// `<stream_id>:<session_id>[:allow-unconnected]`.
 fn stream(value: &str) -> Option<StreamOption> {
-    let (stream_id, session_id) = value.split_once(':')?;
+    let mut parts = value.splitn(3, ':');
+    let stream_id = parts.next()?.parse().ok()?;
+    let session_id = parts.next()?.parse().ok()?;
+    let allow_unconnected = match parts.next() {
+        None => false,
+        Some("allow-unconnected") => true,
+        Some(_) => return None,
+    };
     Some(StreamOption {
-        stream_id: stream_id.parse().ok()?,
-        session_id: session_id.parse().ok()?,
+        stream_id,
+        session_id,
+        allow_unconnected,
     })
 }
 
@@ -794,7 +810,7 @@ mod tests {
             "64k",
             "--stream",
             "10:1",
-            "--stream=-2:7",
+            "--stream=-2:7:allow-unconnected",
             "--term-length",
             "128k",
             "--mtu",
@@ -832,11 +848,13 @@ mod tests {
             [
                 StreamOption {
                     stream_id: 10,
-                    session_id: 1
+                    session_id: 1,
+                    allow_unconnected: false,
                 },
                 StreamOption {
                     stream_id: -2,
-                    session_id: 7
+                    session_id: 7,
+                    allow_unconnected: true,
                 },
             ]
         );
@@ -911,6 +929,8 @@ mod tests {
             ("--spare-slots", "300"),
             ("--stream", "10"),
             ("--stream", "10:x"),
+            ("--stream", "10:1:allow"),
+            ("--stream", "10:1:allow-unconnected:x"),
             ("--log-level", "loud"),
             ("--network", "yes"),
         ] {

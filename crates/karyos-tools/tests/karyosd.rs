@@ -134,6 +134,52 @@ fn publish_once(client: &mut RemoteClient) {
     drop(publication);
 }
 
+/// Takes `key`'s publication through a grant, its request without
+/// `allow_unconnected`, and offers once with no subscriber attached.
+fn offer_alone(client: &mut RemoteClient, key: StreamKey) -> karyos_client::OfferOutcome {
+    let _ = client.add_publication(key, false).unwrap();
+    let mut fetchable = None;
+    let start = Instant::now();
+    while fetchable.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no grant");
+        let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+            Outcome::Fetchable(grant) => fetchable = Some(grant),
+            other => panic!("expected a grant, got {other:?}"),
+        });
+        std::thread::yield_now();
+    }
+    let mut publication = client.take_publication(&fetchable.unwrap()).unwrap();
+    publication.offer(b"alone").unwrap()
+}
+
+/// `--stream <id>:<session>:allow-unconnected` reaches a remote client's
+/// publication through its grant: with no subscriber attached, it offers
+/// on that stream, and a stream configured without it is not connected.
+#[test]
+fn karyosd_streams_allow_unconnected_offers_when_asked() {
+    let dir = dir("unconnected");
+    let allowing = StreamKey {
+        stream_id: 3,
+        session_id: 1,
+    };
+    let mut daemon = start_with(&dir, "5s", &["--stream", "3:1:allow-unconnected"]);
+    let mut client = attach_when_ready(&dir);
+    let outcome = offer_alone(&mut client, allowing);
+    assert!(
+        matches!(outcome, karyos_client::OfferOutcome::Accepted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        offer_alone(&mut client, KEY),
+        karyos_client::OfferOutcome::NotConnected
+    );
+    drop(client);
+    daemon.terminate();
+    let status = daemon.wait(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn karyosd_exits_0_on_sigterm_after_the_client_leaves() {
     let dir = dir("clean");

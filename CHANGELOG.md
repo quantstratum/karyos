@@ -703,6 +703,11 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyosd --stream <stream_id>:<session_id>:allow-unconnected` starts a
+  stream whose publications offer with no subscriber attached, a remote
+  client's included (its grant carries the stream's policy, #577).
+  Without the suffix a stream refuses offers until a subscriber attaches,
+  as before. The conformance test kit's karyosd takes the flag as built.
 - The conformance suite gains `op.replay.u64` (feature `archive-replay`):
   a replay's `uint64_t` arguments past the signed range, as runners parse
   and pass them. The length 2^64 - 1, the ABI's "to the end", delivers
