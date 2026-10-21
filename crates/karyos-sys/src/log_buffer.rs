@@ -127,8 +127,12 @@ impl<T: TermBytes> BufferOwner for Arc<LogBuffer<T>> {
 
 /// A reliable network publication's retention hold, admitted by
 /// [`Conductor::admit_hold`] and owned by the lane's sender reader
-/// ([`SenderRead::with_hold`]), which frees its cell when dropped.
+/// ([`SenderRead::with_hold`]), which frees its cell when dropped. One
+/// that no reader took must go back to its conductor
+/// ([`Conductor::release_hold`]): dropped, its cell stays held and pins
+/// the floor for the stream's life.
 #[derive(Debug, PartialEq, Eq)]
+#[must_use = "a retention hold no reader took must be released (`Conductor::release_hold`), or its cell pins the floor"]
 pub struct RetentionHold {
     pub(crate) cell: usize,
     pub(crate) occupant: u64,
