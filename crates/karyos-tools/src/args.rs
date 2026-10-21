@@ -77,6 +77,12 @@ Network:
   --network <on|off>                run the network agents, so clients create karyos:udp
                                     publications and subscriptions by URI, with the
                                     driver's default network configuration [off]
+  --timed-network <stream_id>:<capacity>
+                                    the network publications clients create by URI on
+                                    this stream are timed, a schedule ring of capacity
+                                    entries (a power of two) on each lane; needs
+                                    --network on; not a --stream; at most 8 streams,
+                                    each once; repeatable
 
 Streams:
   --stream <stream_id>:<session_id>[:allow-unconnected]
@@ -293,6 +299,9 @@ pub struct Options {
     pub conflations: Vec<ConflationOption>,
     /// The guarded configured streams (`--guard`).
     pub guards: Vec<GuardOption>,
+    /// The timed network streams (`--timed-network`): stream id and
+    /// schedule capacity, in command-line order.
+    pub timed_networks: Vec<(i32, u32)>,
     /// How long the shutdown waits for clients to leave.
     pub shutdown_linger: Duration,
     /// The control-path log verbosity.
@@ -330,6 +339,7 @@ impl Options {
             streams: Vec::new(),
             conflations: Vec::new(),
             guards: Vec::new(),
+            timed_networks: Vec::new(),
             shutdown_linger: DEFAULT_SHUTDOWN_LINGER,
             log_level: LogLevel::Info,
             archive: None,
@@ -436,6 +446,7 @@ where
     }
     options.admission.dir = dir.ok_or(ArgsError::Missing("--dir"))?;
     configured(&options)?;
+    timed_networks(&mut options)?;
     options.archive = archive.finish()?;
     Ok(Command::Run(Box::new(options)))
 }
@@ -480,6 +491,7 @@ const OPTIONS: &[&str] = &[
     "--stream",
     "--conflation",
     "--guard",
+    "--timed-network",
     "--term-length",
     "--mtu",
     "--max-reserved",
@@ -549,6 +561,7 @@ fn apply(options: &mut Options, option: &str, value: &str) -> Option<()> {
         "--stream" => options.streams.push(stream(value)?),
         "--conflation" => options.conflations.push(conflation(value)?),
         "--guard" => options.guards.push(guard(value)?),
+        "--timed-network" => options.timed_networks.push(timed_network(value)?),
         "--term-length" => terms.term_length = u32::try_from(size(value)?).ok()?,
         "--mtu" => terms.mtu = value.parse().ok()?,
         "--max-reserved" => terms.max_reserved = Some(u32::try_from(size(value)?).ok()?),
@@ -732,6 +745,66 @@ fn configured(options: &Options) -> Result<(), ArgsError> {
             });
         }
         seen.push((option, key));
+    }
+    Ok(())
+}
+
+/// `--timed-network`'s `<stream_id>:<capacity>`: a capacity of at least 1
+/// (the log checks it is a power of two).
+fn timed_network(value: &str) -> Option<(i32, u32)> {
+    let (stream_id, capacity) = value.split_once(':')?;
+    let capacity: u32 = capacity.parse().ok()?;
+    (capacity > 0).then_some((stream_id.parse().ok()?, capacity))
+}
+
+/// Applies `--timed-network` to the network's stream defaults: it needs
+/// `--network on`, names no `--stream` (a configured stream is local, and
+/// refuses a schedule ring), names each stream once and at most
+/// `MAX_TIMED_NETWORK_STREAMS` streams.
+fn timed_networks(options: &mut Options) -> Result<(), ArgsError> {
+    use karyos_driver::net::{MAX_TIMED_NETWORK_STREAMS, TimedNetworkStream};
+
+    if options.timed_networks.is_empty() {
+        return Ok(());
+    }
+    let invalid = |value: String| ArgsError::InvalidValue {
+        option: "--timed-network",
+        value,
+    };
+    let Some(network) = options.driver.network.as_mut() else {
+        return Err(ArgsError::Needs {
+            option: "--timed-network",
+            needs: "--network on",
+        });
+    };
+    if options.timed_networks.len() > MAX_TIMED_NETWORK_STREAMS {
+        return Err(invalid(format!(
+            "{} streams, at most {MAX_TIMED_NETWORK_STREAMS}",
+            options.timed_networks.len()
+        )));
+    }
+    for (index, &(stream_id, schedule_capacity)) in options.timed_networks.iter().enumerate() {
+        if options
+            .streams
+            .iter()
+            .any(|stream| stream.stream_id == stream_id)
+        {
+            return Err(invalid(format!("{stream_id}: also a --stream")));
+        }
+        if options
+            .timed_networks
+            .iter()
+            .take(index)
+            .any(|(other, _)| *other == stream_id)
+        {
+            return Err(invalid(format!("{stream_id}: named twice")));
+        }
+        if let Some(slot) = network.stream_defaults.timed.get_mut(index) {
+            *slot = Some(TimedNetworkStream {
+                stream_id,
+                schedule_capacity,
+            });
+        }
     }
     Ok(())
 }
@@ -1188,6 +1261,85 @@ mod tests {
             }
             .to_string(),
             "option --record needs --archive"
+        );
+    }
+
+    /// `--timed-network` (owner item 65) fills the network's timed streams,
+    /// and is refused without `--network on`, for a malformed or zero
+    /// capacity, a stream `--stream` configures, a stream named twice, or
+    /// more than `MAX_TIMED_NETWORK_STREAMS`.
+    #[test]
+    fn the_timed_network_option_parses_and_is_checked() {
+        use karyos_driver::net::{MAX_TIMED_NETWORK_STREAMS, TimedNetworkStream};
+
+        let parsed = options(&[
+            "--dir",
+            "d",
+            "--timed-network",
+            "25:4",
+            "--network",
+            "on",
+            "--timed-network=26:8",
+        ]);
+        assert_eq!(parsed.timed_networks, [(25, 4), (26, 8)]);
+        let timed = parsed.driver.network.unwrap().stream_defaults.timed;
+        assert_eq!(
+            timed[..3],
+            [
+                Some(TimedNetworkStream {
+                    stream_id: 25,
+                    schedule_capacity: 4
+                }),
+                Some(TimedNetworkStream {
+                    stream_id: 26,
+                    schedule_capacity: 8
+                }),
+                None
+            ]
+        );
+        let base = ["--dir", "d", "--network", "on", "--stream", "10:1"];
+        let with = |extra: &[&str]| run(&[&base[..], extra].concat());
+        for value in ["25", "25:0", "25:x", "x:4", "25:4:1"] {
+            assert_eq!(
+                with(&["--timed-network", value]),
+                Err(ArgsError::InvalidValue {
+                    option: "--timed-network",
+                    value: value.to_owned()
+                }),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            with(&["--timed-network", "10:4"]),
+            Err(ArgsError::InvalidValue {
+                option: "--timed-network",
+                value: "10: also a --stream".to_owned()
+            })
+        );
+        assert_eq!(
+            with(&["--timed-network", "25:4", "--timed-network", "25:8"]),
+            Err(ArgsError::InvalidValue {
+                option: "--timed-network",
+                value: "25: named twice".to_owned()
+            })
+        );
+        let many: Vec<String> = (0..=MAX_TIMED_NETWORK_STREAMS)
+            .flat_map(|stream| ["--timed-network".to_owned(), format!("{}:4", 30 + stream)])
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(matches!(
+            with(&many),
+            Err(ArgsError::InvalidValue {
+                option: "--timed-network",
+                ..
+            })
+        ));
+        assert_eq!(
+            run(&["--dir", "d", "--timed-network", "25:4"]),
+            Err(ArgsError::Needs {
+                option: "--timed-network",
+                needs: "--network on"
+            })
         );
     }
 

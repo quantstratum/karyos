@@ -5895,36 +5895,12 @@ mod tests {
         assert_eq!(ring(&driver), before);
     }
 
-    /// T-x2 (TT-6a): a `Tai` lane is one clock for the whole host, granted
-    /// to a remote client whatever its time namespace (Linux, where the
-    /// kernel reads `CLOCK_TAI`).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_tai_timed_stream_grants_a_remote_client() {
-        if karyos_sys::host_clock::host_tai_ns().is_none() {
-            return;
-        }
-        let options = karyos_client::schedule::ScheduleOptions::default()
-            .with_domain(karyos_client::schedule::ClockDomain::Tai);
-        let (mut driver, stream) = driver_with_timed_stream_scheduled(options);
-        let (client, mut producer) = remote_client(&mut driver, 4);
-        let answers = add_timed_publication(&mut driver, &mut producer);
-        assert!(
-            answers.iter().any(|answer| matches!(
-                answer,
-                Response::PublicationReady {
-                    request: RequestId { client: c, sequence: 1 },
-                    ..
-                } if *c == client
-            )),
-            "{answers:?}"
-        );
-        let ring = driver.schedule_ring(stream).unwrap().unwrap();
-        assert_eq!(
-            karyos_sys::schedule_ring::binding(ring),
-            Ok(options.binding())
-        );
-    }
+    // T-x2 (TT-6a) granted a `Tai` lane to a remote client whatever its
+    // time namespace. Since owner item 65 no `Tai` timed lane exists: a
+    // local stream refuses a schedule ring, and the network route refuses
+    // the `Tai` domain (`TimedNetworkUnsupported`, karyos-driver
+    // tests/timed.rs `the_schedule_is_fixed_at_creation`). The grant rule
+    // returns with the first `Tai` lane the network route takes.
 
     /// H3 (archive-host.md): a grant on an audited stream is recorded with
     /// its client, process, uid and role, for the in-process command ring

@@ -356,9 +356,6 @@ fn driven() -> (
     shared_conflated.conflation = conflated.conflation;
     let _ = driver.add_stream(conflated).unwrap();
     let _ = driver.add_stream(shared_conflated).unwrap();
-    let mut timed = stream_config(STREAM_TIMED);
-    timed.buffer.schedule_capacity = 4;
-    let _ = driver.add_stream(timed).unwrap();
     let ours = driver.connect().unwrap();
     let theirs = driver.connect().unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1753,25 +1750,93 @@ fn a_timed_offer_checks_its_arguments_first() {
     assert_eq!((done.lane, done.position), (u32::MAX, u64::MAX));
 }
 
-/// F7a-3: a timed lane granted over the in-process command ring (T-x2)
-/// takes a timed offer, delivered; a plain offer, a time below the lane's
+/// F7a-3: a timed lane, a network publication the C client creates by URI
+/// on a timed network stream (owner item 65), takes a timed offer,
+/// delivered over loopback; a plain offer, a time below the lane's
 /// last or past its horizon, a lane that is not timed and a concurrent
 /// handle are refused with `KARYOS_E_INVALID_SCHEDULE`, and an unconfigured
 /// lane with `KARYOS_E_INVALID_LANE`.
 #[test]
-#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+#[cfg_attr(miri, ignore = "network sockets, which Miri cannot run")]
 fn a_timed_lane_takes_a_timed_offer() {
-    let (_driven, ours, theirs) = driven();
+    // A timed lane is a network publication's (owner item 65): a driver
+    // whose stream `STREAM_TIMED` is a timed network stream, its local
+    // streams for the plain and concurrent handles, the client's
+    // publication created by URI and read back over loopback.
+    let mut network = karyos_driver::net::NetworkConfig {
+        threading: karyos_driver::agents::ThreadingMode::Shared,
+        ..karyos_driver::net::NetworkConfig::default()
+    };
+    network.stream_defaults.timed[0] = Some(karyos_driver::net::TimedNetworkStream {
+        stream_id: STREAM_TIMED,
+        schedule_capacity: 4,
+    });
+    let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
+        client_liveness_timeout: 3_600_000_000_000,
+        network: Some(network),
+        ..karyos_driver::DriverConfig::default()
+    })
+    .unwrap();
+    let _ = driver.add_stream(stream_config(STREAM)).unwrap();
+    let mut shared = stream_config(STREAM_CONCURRENT);
+    shared.buffer.publication = karyos_sys::log_buffer::PublicationMode::Concurrent {
+        publishers: 2,
+        allow_non_lse: true,
+    };
+    let _ = driver.add_stream(shared).unwrap();
+    let ours = driver.connect().unwrap();
+    let theirs = driver.connect().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        while !flag.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = driver.do_work().unwrap();
+            idle();
+        }
+    });
+    let _driven = Driven {
+        stop,
+        thread: Some(thread),
+    };
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}");
     let context = test_context();
     let client = client::insert_embedded(Client::with_conductor(ours, context.clone()))
         .unwrap()
         .raw();
     let mut subscriber = Client::with_conductor(theirs, context);
     let mut reading = subscriber
-        .add_subscription("karyos:ipc", karyos_client::StreamId::new(STREAM_TIMED))
+        .add_subscription(&uri, karyos_client::StreamId::new(STREAM_TIMED))
         .unwrap();
-    let (status, publication) = add_publication_of(client, STREAM_TIMED);
+    let c_uri = std::ffi::CString::new(uri).unwrap();
+    let mut publication = 0;
+    // SAFETY: a live C string, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_publication(
+            client,
+            c_uri.as_ptr(),
+            STREAM_TIMED,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
     assert_eq!(status, Status::Ok.code());
+    // Offered once the loopback receiver's image of it exists, so the
+    // timed message reaches it.
+    let start = std::time::Instant::now();
+    while reading.image_count() == 0 {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "no image"
+        );
+        let _ = subscriber.poll();
+        let _ = reading.poll(|_, _| {}, karyos_client::MessageLimit::new(0));
+        idle();
+    }
     let (status, now) = clock_now(CLOCK_MONOTONIC);
     assert_eq!(status, Status::Ok.code());
     let (status, done) = offer_at(publication, b"timed", now);
