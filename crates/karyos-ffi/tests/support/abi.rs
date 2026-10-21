@@ -191,7 +191,7 @@ pub struct SubscriptionEnd {
 unsafe extern "C" {
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
-    fn karyos_client_options_init(options: *mut ClientOptions) -> i32;
+    fn karyos_client_options_init_sized(options: *mut ClientOptions, size: usize) -> i32;
     fn karyos_client_connect(
         options: *const ClientOptions,
         client: *mut u64,
@@ -199,7 +199,7 @@ unsafe extern "C" {
     ) -> i32;
     fn karyos_client_poll(client: u64, served: *mut u32) -> i32;
     safe fn karyos_client_close(client: u64) -> i32;
-    fn karyos_driver_options_init(options: *mut DriverOptions) -> i32;
+    fn karyos_driver_options_init_sized(options: *mut DriverOptions, size: usize) -> i32;
     fn karyos_driver_create(
         options: *const DriverOptions,
         driver: *mut u64,
@@ -210,7 +210,7 @@ unsafe extern "C" {
     safe fn karyos_driver_stop(driver: u64) -> i32;
     fn karyos_driver_connect(driver: u64, client: *mut u64, detail: *mut Detail) -> i32;
     safe fn karyos_driver_close(driver: u64) -> i32;
-    fn karyos_stream_options_init(options: *mut StreamOptions) -> i32;
+    fn karyos_stream_options_init_sized(options: *mut StreamOptions, size: usize) -> i32;
     fn karyos_driver_add_stream(
         driver: u64,
         options: *const StreamOptions,
@@ -244,7 +244,7 @@ unsafe extern "C" {
         detail: *mut Detail,
     ) -> i32;
     safe fn karyos_archive_close(archive: u64) -> i32;
-    fn karyos_replay_options_init(options: *mut ReplayOptions) -> i32;
+    fn karyos_replay_options_init_sized(options: *mut ReplayOptions, size: usize) -> i32;
     fn karyos_archive_replay(
         archive: u64,
         options: *const ReplayOptions,
@@ -323,7 +323,10 @@ unsafe extern "C" {
     fn karyos_claim_commit(claim: u64, accepted: *mut core::ffi::c_void) -> i32;
     safe fn karyos_claim_abort(claim: u64) -> i32;
     safe fn karyos_publication_close(publication: u64) -> i32;
-    fn karyos_subscription_options_init(options: *mut SubscriptionOptions) -> i32;
+    fn karyos_subscription_options_init_sized(
+        options: *mut SubscriptionOptions,
+        size: usize,
+    ) -> i32;
     fn karyos_client_add_subscription_with(
         client: u64,
         uri: *const c_char,
@@ -333,7 +336,7 @@ unsafe extern "C" {
         detail: *mut Detail,
     ) -> i32;
     safe fn karyos_subscription_close(subscription: u64) -> i32;
-    fn karyos_offer_options_init(options: *mut OfferOptions) -> i32;
+    fn karyos_offer_options_init_sized(options: *mut OfferOptions, size: usize) -> i32;
     fn karyos_publication_offer_with(
         publication: u64,
         lane: u32,
@@ -491,7 +494,9 @@ pub fn driver_add_stream_sized(driver: u64, options: &StreamOptions, size: u32) 
 pub fn client_connect_sized(size: u32) -> i32 {
     let mut options = core::mem::MaybeUninit::<ClientOptions>::zeroed();
     // SAFETY: a live, aligned, writable `ClientOptions`.
-    let status = unsafe { karyos_client_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_client_options_init_sized(options.as_mut_ptr(), size_of::<ClientOptions>())
+    };
     assert_eq!(status, 0);
     // SAFETY: `karyos_client_options_init` wrote every field.
     let options = SizedStruct::new(Some(&unsafe { options.assume_init() }), size);
@@ -546,7 +551,9 @@ pub fn client_add_publication_of(
 pub fn subscription_options() -> (i32, SubscriptionOptions) {
     let mut options = SubscriptionOptions::default();
     // SAFETY: a live, aligned, writable `SubscriptionOptions`.
-    let status = unsafe { karyos_subscription_options_init(&mut options) };
+    let status = unsafe {
+        karyos_subscription_options_init_sized(&mut options, size_of::<SubscriptionOptions>())
+    };
     (status, options)
 }
 
@@ -608,7 +615,8 @@ pub fn publication_offer_on(
 pub fn offer_options() -> (i32, OfferOptions) {
     let mut options = OfferOptions::default();
     // SAFETY: a live, aligned, writable `OfferOptions`.
-    let status = unsafe { karyos_offer_options_init(&mut options) };
+    let status =
+        unsafe { karyos_offer_options_init_sized(&mut options, size_of::<OfferOptions>()) };
     (status, options)
 }
 
@@ -736,7 +744,9 @@ pub fn publication_close(publication: u64) -> i32 {
 pub fn stream_options(stream_id: i32) -> (i32, StreamOptions) {
     let mut options = core::mem::MaybeUninit::<StreamOptions>::zeroed();
     // SAFETY: a live, aligned, writable `StreamOptions`.
-    let status = unsafe { karyos_stream_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_stream_options_init_sized(options.as_mut_ptr(), size_of::<StreamOptions>())
+    };
     // SAFETY: zeroed, then written in full on success; every field is an
     // integer, so the zeroes are a value too.
     let mut options = unsafe { options.assume_init() };
@@ -879,7 +889,9 @@ pub fn archive_recordings(archive: u64, after_id: u64, limit: u32) -> (i32, Vec<
 pub fn replay_options() -> (i32, ReplayOptions) {
     let mut options = core::mem::MaybeUninit::<ReplayOptions>::zeroed();
     // SAFETY: a live, aligned, writable `ReplayOptions`.
-    let status = unsafe { karyos_replay_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_replay_options_init_sized(options.as_mut_ptr(), size_of::<ReplayOptions>())
+    };
     // SAFETY: zeroed, then written in full on success; a zeroed struct is a
     // value too (a null channel).
     (status, unsafe { options.assume_init() })
@@ -1013,7 +1025,9 @@ pub fn publication_offer(publication: u64, data: &[u8]) -> i32 {
 pub fn driver_options() -> (i32, DriverOptions) {
     let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
     // SAFETY: a live, aligned, writable `DriverOptions`.
-    let status = unsafe { karyos_driver_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_driver_options_init_sized(options.as_mut_ptr(), size_of::<DriverOptions>())
+    };
     // SAFETY: zeroed, then written in full on success; every field is an
     // integer, so the zeroes are a value too.
     (status, unsafe { options.assume_init() })
@@ -1076,7 +1090,9 @@ pub fn driver_close(driver: u64) -> i32 {
 pub fn client_connect(dir: &CStr) -> (i32, u64, Detail) {
     let mut options = core::mem::MaybeUninit::<ClientOptions>::zeroed();
     // SAFETY: a live, aligned, writable `ClientOptions`.
-    let status = unsafe { karyos_client_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_client_options_init_sized(options.as_mut_ptr(), size_of::<ClientOptions>())
+    };
     assert_eq!(status, 0);
     // SAFETY: `karyos_client_options_init` wrote every field.
     let mut options = unsafe { options.assume_init() };

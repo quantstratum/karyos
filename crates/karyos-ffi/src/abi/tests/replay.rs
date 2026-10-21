@@ -112,7 +112,9 @@ fn archive(answer: Answer, deadline: Duration) -> (u64, Arc<Mutex<Vec<Asked>>>) 
 fn options() -> ReplayOptions {
     let mut options = core::mem::MaybeUninit::<ReplayOptions>::zeroed();
     // SAFETY: a live, aligned, writable `ReplayOptions`.
-    let status = unsafe { karyos_replay_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_replay_options_init_sized(options.as_mut_ptr(), size_of::<ReplayOptions>())
+    };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_replay_options_init` wrote every field.
     let mut options = unsafe { options.assume_init() };
@@ -341,17 +343,29 @@ fn the_replay_options_are_initialized_and_checked() {
     );
     assert!(options.target_channel.is_null());
     // SAFETY: a null pointer is the check.
-    let status = unsafe { karyos_replay_options_init(core::ptr::null_mut()) };
+    let status = unsafe {
+        karyos_replay_options_init_sized(core::ptr::null_mut(), size_of::<ReplayOptions>())
+    };
     assert_eq!(status, Status::InvalidArgument.code());
     // SAFETY: a null pointer is the check.
-    let status = unsafe { karyos_replay_subscription_options_init(core::ptr::null_mut()) };
+    let status = unsafe {
+        karyos_replay_subscription_options_init_sized(
+            core::ptr::null_mut(),
+            size_of::<ReplaySubscriptionOptions>(),
+        )
+    };
     assert_eq!(status, Status::InvalidArgument.code());
     let mut sub = ReplaySubscriptionOptions {
         size: 0,
         reserved: 7,
     };
     // SAFETY: a live, aligned struct.
-    let status = unsafe { karyos_replay_subscription_options_init(&mut sub) };
+    let status = unsafe {
+        karyos_replay_subscription_options_init_sized(
+            &mut sub,
+            size_of::<ReplaySubscriptionOptions>(),
+        )
+    };
     assert_eq!((status, sub.size, sub.reserved), (Status::Ok.code(), 8, 0));
     let mut subscription = 0;
     let add = |options: *const ReplaySubscriptionOptions, out: *mut u64| {

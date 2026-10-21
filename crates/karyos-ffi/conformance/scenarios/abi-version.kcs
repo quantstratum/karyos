@@ -1,9 +1,11 @@
 # The library states its ABI version before any other call, so a binding
-# can refuse a different major (SPEC.md §13, C ABI boundary).
+# can refuse a different major (SPEC.md §13, C ABI boundary). The patch
+# is not pinned: the suite's minimum (FORMAT.md, Versions) bounds it, and
+# a library of a later 0.1.z runs the same scenarios.
 format 1
 id abi.version
 abi 0.1
 covers "abi version"
 
 call karyos_abi_version
-expect KARYOS_OK major=0 minor=1 patch=0
+expect KARYOS_OK major=0 minor=1

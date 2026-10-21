@@ -210,6 +210,12 @@ EOF
 declared="$(grep -oE '^(const )?[a-z_0-9]+ \*?karyos_[a-z0-9_]+\(' "$header" |
     sed -E 's/.*(karyos_[a-z0-9_]+)\($/\1/' | sort -u)"
 [ -n "$declared" ] || fail "no function declarations in $header"
+# The `static inline` inits (owner item 48's option A): each wraps a
+# declared `_init_sized`, and its name is also an exported symbol, the one
+# a binary built against an older header calls.
+inline="$(grep -oE '^static inline [a-z_0-9]+ \*?karyos_[a-z0-9_]+\(' "$header" |
+    sed -E 's/.*(karyos_[a-z0-9_]+)\($/\1/' | sort -u)"
+declared="$(printf '%s\n%s\n' "$declared" "$inline" | sed '/^$/d' | sort -u)"
 named="$(grep -vE '^[[:space:]]*(\*|/\*|//)|^typedef' "$header" |
     grep -oE '\bkaryos_[a-z0-9_]+\(' | sed 's/($//' | sort -u)"
 [ "$named" = "$declared" ] ||

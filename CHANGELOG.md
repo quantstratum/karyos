@@ -2552,6 +2552,31 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- `karyos-ffi`, memory safety (owner item 48, F-48; found by REVIEWER-02's
+  older-header run): every `karyos_*_init` wrote the whole current
+  struct, so a caller built against an older header was overrun.
+  `karyos_subscription_options_init` wrote 40 bytes into the first
+  header's 16-byte struct. Interim fix, item 48's option A, for the owner
+  to confirm:
+  - each init is now a `static inline` in `karyos.h` that calls a new
+    exported `karyos_*_init_sized(options, sizeof *options)`, which fills
+    at most the caller's size and sets `size` to the bytes written;
+  - the exported `karyos_*_init` symbols, which binaries built against
+    an older header call, fill only the struct's ABI 0.1.0 size;
+  - a growing struct needs only its leading `uint32_t` aligned: the
+    first `karyos_subscription_options` (four `uint32_t`, aligned to 4)
+    was refused as misaligned.
+  Binaries built against a 0.1.0 header after the stream or subscription
+  options grew must be rebuilt against 0.1.1: the legacy symbol gives
+  them the 0.1.0 prefix, so the newer fields they set afterwards (the
+  conflation table, publishers, an Archive rejoin) are not read. Capping
+  the legacy symbol higher would overrun binaries built before those
+  fields (COORDINATOR's ruling; owner item 48's note records it). The
+  ABI version moves to 0.1.1, so a binding states 0.1.1 as
+  its minimum and refuses an unfixed library at bootstrap (BIND-Q8). The
+  `abi.version` scenario no longer pins the patch. `karyos.h`'s Rules
+  state the init rule for every later growth.
+
 - `karyos_driver_stop` and `karyos_driver_close` of a started driver
   whose idle strategy is `KARYOS_IDLE_SLEEP` waited out the thread's idle
   sleep, which is unbounded: with `sleep_ns` near `UINT64_MAX` they never
