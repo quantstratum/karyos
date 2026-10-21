@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pause points of the publication paths, for multi-process tests that
+//! Pause points of the publication and read paths, for multi-process tests that
 //! kill a writer at an exact step (`quantstratum-docs:
 //! karyos/design/ipc-data-path.md`, Tests: a publisher "killed mid-offer",
 //! "killed while updating its claim record" and "killed after reserving
@@ -18,7 +18,7 @@
 //! executions and tests running in parallel never see each other's
 //! points. A model arms its point at the start of every execution.
 
-/// Where a publication path can pause.
+/// Where a publication or read path can pause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PausePoint {
@@ -33,6 +33,11 @@ pub enum PausePoint {
     /// A rotation attempt (`loan::rotate_to`) activated the next term's
     /// descriptor and has not advanced the active count.
     RotationActivated = 4,
+    /// A subscriber's poll holds its copy's loan, after the floor check,
+    /// before the read (`SubscriptionContext::poll_term`): a reader paused
+    /// inside its copy, for the stall tests across processes (SPEC.md §13,
+    /// Stall isolation and capacity).
+    ReadLoanHeld = 5,
 }
 
 #[cfg(not(loom))]

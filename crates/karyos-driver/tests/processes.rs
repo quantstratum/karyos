@@ -22,6 +22,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use karyos_client::ipc::{RemoteClient, attach};
@@ -32,7 +33,8 @@ use karyos_driver::{
 };
 use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
 use karyos_sys::counters::CellRead;
-use karyos_sys::frame::Lane;
+use karyos_sys::frame::{FRAME_ALIGNMENT, HEADER_LENGTH, Lane};
+use karyos_sys::host_clock::host_monotonic_ns;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
@@ -103,13 +105,23 @@ fn driver_with(dir: &Path, config: DriverConfig) -> IpcDriver {
     }
 }
 
-/// A child process, killed when the test ends however it ends.
-struct Guard(Child);
+/// A child process, killed when the test ends however it ends, with its
+/// scenario and its stderr: a child's panic goes to its stderr, which a
+/// failing test prints, so a child that stops reporting shows its cause.
+struct Guard(Child, String, Arc<Mutex<String>>);
 
 impl Drop for Guard {
+    #[expect(
+        clippy::print_stderr,
+        reason = "a failing test prints its child's stderr to show the cause"
+    )]
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        if std::thread::panicking() {
+            let stderr = self.2.lock().unwrap_or_else(PoisonError::into_inner);
+            eprintln!("child {} stderr:\n{stderr}", self.1);
+        }
     }
 }
 
@@ -122,9 +134,20 @@ fn spawn(scenario: &str, dir: &Path) -> (Guard, Receiver<String>) {
         .env(DIR, dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drained as it comes, so a chatty child never blocks on a full pipe.
+    let stderr = child.stderr.take().unwrap();
+    let errors = Arc::new(Mutex::new(String::new()));
+    let kept = Arc::clone(&errors);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+            kept.push_str(&line);
+            kept.push('\n');
+        }
+    });
     let stdout = child.stdout.take().unwrap();
     let (sender, receiver) = channel();
     std::thread::spawn(move || {
@@ -135,7 +158,7 @@ fn spawn(scenario: &str, dir: &Path) -> (Guard, Receiver<String>) {
             }
         }
     });
-    (Guard(child), receiver)
+    (Guard(child, scenario.to_string(), errors), receiver)
 }
 
 /// Runs duty cycles until the child reports `expected`, or until `limit`.
@@ -637,6 +660,16 @@ fn filler(index: usize) -> Vec<u8> {
     vec![index as u8; 1500]
 }
 
+/// The stall tests' first message.
+const STALL_FIRST: [u8; 64] = [1u8; 64];
+
+/// Reports a reader paused inside its copy, its loan held, and waits for
+/// the parent's go (`PausePoint::ReadLoanHeld`).
+fn hold_here(_: karyos_sys::test_pause::PausePoint) {
+    report("holding");
+    wait_for_go();
+}
+
 /// Reports the pause and waits to be killed.
 fn pause_here(_: karyos_sys::test_pause::PausePoint) {
     report("paused");
@@ -935,6 +968,248 @@ fn test_ipc_driver_restart_new_instance_old_mappings_stay() {
     serve_until_report(&mut second, &reports, &format!("reattached {new:x}"));
     serve_until(&mut second, |driver| driver.clients() == 0);
     assert!(child.0.wait().unwrap().success());
+}
+
+/// The stream of the stall isolation tests: stream 2, exclusive, with
+/// four spare slots (`S`), so the publication, an optional reader and an
+/// observer take every credit (`S - C`).
+fn add_stall_stream(driver: &mut IpcDriver) -> StreamHandle {
+    driver
+        .add_stream(StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: STALL_SPARES,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: KEY.session_id,
+                stream_id: KEY.stream_id,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            },
+            allow_unconnected: false,
+            on_required_loss: LossPolicy::Hold,
+            conflation: None,
+        })
+        .unwrap()
+}
+
+/// The spare slots of the stall isolation stream.
+const STALL_SPARES: u8 = 4;
+
+/// The most conductor cycles that may end, from the start of one continuous
+/// back pressure of the publisher, before a cycle publishes a limit that
+/// admits the refused message, with no required reader. SPEC.md §4
+/// republishes `head_snapshot + window` once per conductor cycle, so a
+/// publisher in another process can outrun a cycle; a cycle under way when
+/// the back pressure begins may have read the head before it, and the next
+/// one gives the credit (SPEC.md §13, Stall isolation and capacity: bounded
+/// in conductor cycles, not a fixed time; owner item 64). Counted on the
+/// driver's side, so a publisher process waiting for the scheduler adds no
+/// cycles.
+const CYCLE_BOUND: usize = 2;
+
+/// The stall stream's message, and its frame.
+const STALL_MESSAGE: usize = 6000;
+const STALL_FRAME: u64 =
+    (HEADER_LENGTH as u64 + STALL_MESSAGE as u64).next_multiple_of(FRAME_ALIGNMENT as u64);
+
+/// A driver whose positions are sampled at every duty cycle, so that each
+/// cycle's published `stream limit` is read.
+fn stall_driver(dir: &Path) -> IpcDriver {
+    driver_with(
+        dir,
+        DriverConfig {
+            position_sample_interval: 1,
+            ..DriverConfig::default()
+        },
+    )
+}
+
+/// Runs duty cycles until `reports` delivers a line, within 30 s, while
+/// `sample` watches the driver; returns the line.
+fn serve_for_report(
+    driver: &mut IpcDriver,
+    reports: &Receiver<String>,
+    mut sample: impl FnMut(&IpcDriver),
+) -> String {
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "no report; clients {}",
+            driver.clients()
+        );
+        let _ = driver.do_work().unwrap();
+        sample(driver);
+        if let Ok(report) = reports.try_recv() {
+            return report;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// `label`'s position cell after a fresh sampling pass: the cells are
+/// sampled every `position_sample_interval` (10 ms), so a reading taken
+/// before the next pass may predate what it should show.
+fn sampled(driver: &mut IpcDriver, label: &str) -> u64 {
+    let pass = counter(driver, "positions sampled at");
+    serve_until(driver, |driver| {
+        counter(driver, "positions sampled at") > pass
+    });
+    counter(driver, label)
+}
+
+/// The publisher's report: its outcome and each continuous back pressure,
+/// as the host monotonic time it began (`karyos_sys::host_clock`, one scale
+/// for every process) and the position the refused message was then
+/// accepted at.
+fn publisher_outcome(report: &str) -> (&str, Vec<(u64, u64)>) {
+    let (outcome, stretches) = report.split_once(" stretches").unwrap();
+    let stretches = stretches
+        .split_whitespace()
+        .map(|stretch| {
+            let (from, position) = stretch.split_once('@').unwrap();
+            (from.parse().unwrap(), position.parse().unwrap())
+        })
+        .collect();
+    (outcome, stretches)
+}
+
+/// The most duty cycles that ended after a back pressure began, up to and
+/// including the first whose published limit admits the refused frame:
+/// `cycles` holds, in order, the host monotonic time each cycle ended and
+/// the `stream limit` it sampled. `usize::MAX` if no cycle admitted it.
+fn most_cycles_to_credit(stretches: &[(u64, u64)], cycles: &[(u64, u64)]) -> usize {
+    stretches
+        .iter()
+        .map(|&(from, position)| {
+            let end = position + STALL_FRAME;
+            let after = &cycles[cycles.partition_point(|&(at, _)| at <= from)..];
+            after
+                .iter()
+                .position(|&(_, limit)| limit >= end)
+                .map_or(usize::MAX, |index| index + 1)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// SPEC.md §13 "Stall isolation and capacity" across processes (phase 1
+/// plan item 2): an optional reader process and an observer process pause
+/// inside their copies of the first message, each holding its copy's loan
+/// (`PausePoint::ReadLoanHeld`), while a publisher process runs ten terms
+/// at full rate. With no required reader the publisher's limit follows its
+/// own head (SPEC.md §4's empty-set rule; the §13 scenario's network sender
+/// at `sent + window` is not part of this variant). Asserted:
+/// - the publisher completes ten terms, its back pressure only the
+///   conductor's pacing, each stretch ending within [`CYCLE_BOUND`]
+///   duty cycles, never held by the readers;
+/// - the published limit keeps advancing while the readers are paused;
+/// - the loans pin at least one slot and never more than `S`
+///   (`slots quarantined`);
+/// - one more admission is refused;
+/// - each reader, resumed, copies the first message intact (its slot was
+///   never reused under its loan), then is lapped.
+#[test]
+fn test_ipc_stall_isolation_paused_optional_and_observer_processes_never_hold_the_publisher() {
+    let dir = dir("stall-isolation");
+    let mut driver = stall_driver(&dir);
+    let stream = add_stall_stream(&mut driver);
+    let (mut optional, optional_reports) = spawn("subscribe-pause-optional", &dir);
+    serve_until_report(&mut driver, &optional_reports, "subscribed");
+    let (mut observer, observer_reports) = spawn("subscribe-pause-observer", &dir);
+    serve_until_report(&mut driver, &observer_reports, "subscribed");
+    let (mut publisher, publisher_reports) = spawn("publish-first-then-ten-terms", &dir);
+    serve_until_report(&mut driver, &publisher_reports, "first");
+    serve_until_report(&mut driver, &optional_reports, "holding");
+    serve_until_report(&mut driver, &observer_reports, "holding");
+    // The publisher runs ten terms while both readers are paused.
+    let limit_before = sampled(&mut driver, "stream limit");
+    release(&mut publisher.0);
+    let mut most_quarantined = 0u64;
+    let mut cycles = Vec::new();
+    let report = serve_for_report(&mut driver, &publisher_reports, |driver| {
+        cycles.push((host_monotonic_ns(), counter(driver, "stream limit")));
+        let quarantined = counter(driver, "slots quarantined");
+        assert!(
+            quarantined <= u64::from(STALL_SPARES),
+            "{quarantined} slots quarantined, S = {STALL_SPARES}"
+        );
+        most_quarantined = most_quarantined.max(quarantined);
+    });
+    let (outcome, stretches) = publisher_outcome(&report);
+    assert_eq!(
+        outcome, "ten terms",
+        "the paused readers held the publisher"
+    );
+    let most = most_cycles_to_credit(&stretches, &cycles);
+    assert!(
+        most <= CYCLE_BOUND,
+        "a back pressure lasted {most} duty cycles, past {CYCLE_BOUND} ({} back pressures over {} cycles)",
+        stretches.len(),
+        cycles.len()
+    );
+    assert!(
+        sampled(&mut driver, "stream limit") > limit_before,
+        "the published limit stood still while the readers were paused"
+    );
+    assert!(most_quarantined >= 1, "the paused loans pinned nothing");
+    // One more admission does not fit the spares.
+    let refused = driver.subscribe(stream, karyos_sys::log_buffer::Role::Optional);
+    assert!(
+        format!("{:?}", refused.err()).contains("ResourcesUnavailable"),
+        "one more admission was not refused for the spares"
+    );
+    // Resumed, each reader copies the first message intact, then is lapped.
+    release(&mut optional.0);
+    release(&mut observer.0);
+    serve_until_report(&mut driver, &optional_reports, "intact");
+    serve_until_report(&mut driver, &observer_reports, "intact");
+    serve_until_report(&mut driver, &optional_reports, "lapped");
+    serve_until_report(&mut driver, &observer_reports, "lapped");
+    for child in [&mut optional, &mut observer, &mut publisher] {
+        release(&mut child.0);
+    }
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    for child in [&mut optional, &mut observer, &mut publisher] {
+        assert!(child.0.wait().unwrap().success());
+    }
+}
+
+/// The control: a required reader process paused the same way bounds the
+/// publisher, which stays back-pressured past the pacing bound (two
+/// seconds, well before the client's liveness timeout); resumed, the reader
+/// copies the first message intact.
+#[test]
+fn test_ipc_stall_isolation_control_a_paused_required_process_back_pressures_the_publisher() {
+    let dir = dir("stall-required");
+    let mut driver = driver(&dir);
+    let _stream = add_stall_stream(&mut driver);
+    let (mut required, required_reports) = spawn("subscribe-pause-required", &dir);
+    serve_until_report(&mut driver, &required_reports, "subscribed");
+    let (mut publisher, publisher_reports) = spawn("publish-first-then-ten-terms", &dir);
+    serve_until_report(&mut driver, &publisher_reports, "first");
+    serve_until_report(&mut driver, &required_reports, "holding");
+    release(&mut publisher.0);
+    let report = serve_for_report(&mut driver, &publisher_reports, |_| {});
+    let (outcome, _) = publisher_outcome(&report);
+    assert_eq!(
+        outcome, "back-pressured",
+        "a paused required reader did not bound the publisher"
+    );
+    release(&mut required.0);
+    serve_until_report(&mut driver, &required_reports, "intact");
+    for child in [&mut required, &mut publisher] {
+        release(&mut child.0);
+    }
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    for child in [&mut required, &mut publisher] {
+        assert!(child.0.wait().unwrap().success());
+    }
 }
 
 // ---- the child side ----
@@ -1576,6 +1851,124 @@ fn child() {
             }
             drop(subscription);
             drop(client);
+        }
+        "subscribe-pause-optional" | "subscribe-pause-observer" | "subscribe-pause-required" => {
+            let role = match scenario.to_str().unwrap() {
+                "subscribe-pause-optional" => SubscriberRole::Optional,
+                "subscribe-pause-observer" => SubscriberRole::Observer,
+                _ => SubscriberRole::Required,
+            };
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let _ = client.add_subscription(KEY, role).unwrap();
+            let mut fetchable = None;
+            let start = Instant::now();
+            while fetchable.is_none() {
+                assert!(start.elapsed() < Duration::from_secs(10), "no grant");
+                let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                    Outcome::Fetchable(grant) => fetchable = Some(grant),
+                    other => panic!("expected a grant, got {other:?}"),
+                });
+                std::thread::yield_now();
+            }
+            let mut subscription = client.take_subscription(&fetchable.unwrap()).unwrap();
+            // The first copy pauses with its loan held, until the parent's go.
+            karyos_sys::test_pause::arm(
+                karyos_sys::test_pause::PausePoint::ReadLoanHeld,
+                hold_here,
+            );
+            report("subscribed");
+            let mut first = None;
+            let start = Instant::now();
+            while first.is_none() {
+                assert!(start.elapsed() < Duration::from_secs(30), "nothing to read");
+                let _ = subscription
+                    .poll(
+                        |payload, _| first = Some(payload.to_vec()),
+                        MessageLimit::new(1),
+                    )
+                    .unwrap();
+                std::thread::yield_now();
+            }
+            // The paused copy read the first message as it was published:
+            // its slot was never reused under the loan.
+            report(if first.unwrap() == STALL_FIRST {
+                "intact"
+            } else {
+                "changed"
+            });
+            // An optional reader or an observer was lapped meanwhile.
+            if role != SubscriberRole::Required {
+                let start = Instant::now();
+                loop {
+                    assert!(start.elapsed() < Duration::from_secs(10), "never lapped");
+                    let summary = subscription.poll(|_, _| {}, MessageLimit::new(64)).unwrap();
+                    if summary.overrun.is_some() {
+                        report("lapped");
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+            drop(subscription);
+            drop(client);
+            wait_for_go();
+        }
+        "publish-first-then-ten-terms" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, false);
+            let mut publication = client.take_publication(&fetchable).unwrap();
+            let start = Instant::now();
+            while !matches!(
+                publication.offer(&STALL_FIRST).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "first not accepted"
+                );
+                std::thread::yield_now();
+            }
+            report("first");
+            wait_for_go();
+            // Ten terms at full rate, timing each continuous back pressure;
+            // one past two seconds ends the run as held back.
+            let data = [9u8; STALL_MESSAGE];
+            let target = 10 * u64::from(MIN_TERM_LENGTH);
+            let mut appended = 0u64;
+            let mut since: Option<u64> = None;
+            let mut stretches = String::new();
+            let start = Instant::now();
+            let outcome = loop {
+                assert!(
+                    start.elapsed() < Duration::from_secs(20),
+                    "stalled at {appended}"
+                );
+                match publication.offer(&data).unwrap() {
+                    OfferOutcome::Accepted { position, .. } => {
+                        if let Some(from) = since.take() {
+                            stretches.push_str(&format!(" {from}@{position}"));
+                        }
+                        appended += data.len() as u64;
+                        if appended >= target {
+                            break "ten terms";
+                        }
+                    }
+                    OfferOutcome::BackPressured => {
+                        let now = host_monotonic_ns();
+                        let from = *since.get_or_insert(now);
+                        if now - from > 2_000_000_000 {
+                            break "back-pressured";
+                        }
+                        std::thread::yield_now();
+                    }
+                    OfferOutcome::AdminAction => std::thread::yield_now(),
+                    other => panic!("unexpected {other:?}"),
+                }
+            };
+            report(&format!("{outcome} stretches{stretches}"));
+            drop(publication);
+            drop(client);
+            wait_for_go();
         }
         "subscribe-stop-read" => {
             let mut client = attach(&dir, timeout, 16).unwrap();

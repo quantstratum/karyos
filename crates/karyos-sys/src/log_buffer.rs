@@ -3305,29 +3305,39 @@ impl<O: BufferOwner> Drop for Subscription<O> {
 }
 
 /// A pause inside a subscriber's copy (tests; the contract traceability
-/// plan, item 9): set on the polling thread, it runs with the copy's loan
-/// held, after the floor check and before the read, so a test can make the
-/// duty cycle meet that loan.
-#[cfg(test)]
+/// plan, items 2 and 9): it runs with the copy's loan held, after the floor
+/// check and before the read, so a test can make the duty cycle meet that
+/// loan. A unit test sets a pause on its polling thread; a test process
+/// arms `PausePoint::ReadLoanHeld` (`test-hooks`) to pause a reader across
+/// processes.
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod copy_pause {
+    #[cfg(test)]
     use core::cell::RefCell;
 
+    #[cfg(test)]
     std::thread_local! {
         static PAUSE: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
     }
 
     /// Sets this thread's pause, or clears it with `None`.
+    #[cfg(test)]
     pub(crate) fn set(pause: Option<Box<dyn FnMut()>>) {
         PAUSE.with(|slot| *slot.borrow_mut() = pause);
     }
 
-    /// Runs this thread's pause, if any.
+    /// Runs this thread's pause, if any, then the armed
+    /// `PausePoint::ReadLoanHeld`, if any.
+    #[inline]
     pub(super) fn run() {
+        #[cfg(test)]
         PAUSE.with(|slot| {
             if let Some(pause) = slot.borrow_mut().as_mut() {
                 pause();
             }
         });
+        #[cfg(feature = "test-hooks")]
+        crate::test_pause::reached(crate::test_pause::PausePoint::ReadLoanHeld);
     }
 }
 
@@ -3396,7 +3406,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             release_loan(&cell.loan);
             return self.overrun();
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         copy_pause::run();
         let result = self.read_block(slot, offset, out);
         release_loan(&cell.loan);
