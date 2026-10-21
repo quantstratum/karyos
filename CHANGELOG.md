@@ -696,6 +696,14 @@ release may break APIs, wire formats and shared-memory layouts.
   client's included (its grant carries the stream's policy, #577).
   Without the suffix a stream refuses offers until a subscriber attaches,
   as before. The conformance test kit's karyosd takes the flag as built.
+- The conformance suite gains `op.replay.u64` (feature `archive-replay`):
+  a replay's `uint64_t` arguments past the signed range, as runners parse
+  and pass them. The length 2^64 - 1, the ABI's "to the end", delivers
+  the whole recording, and a position or a length of 2^63 is refused as
+  an invalid request (code 4). FORMAT.md's Values says which results
+  cross 2^63: no position nor `karyos_detail` value does, while about
+  half of all handles do (their generation comes from a random base per
+  copy), so each binding's own tests pin its unsigned reading.
 - `make libkaryos-copies-check` (C-LINKAGE, not part of pre-push): two
   file copies of the package's shared library, loaded in one process with
   `RTLD_LOCAL`, each answer `KARYOS_E_CLOSED` to the other's driver and
