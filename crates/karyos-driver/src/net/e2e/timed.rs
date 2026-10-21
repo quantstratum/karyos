@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use karyos_client::OfferOutcome;
 use karyos_client::schedule::ScheduleOptions;
 use karyos_sys::frame::Lane;
-use karyos_sys::log_buffer::Role;
+use karyos_sys::log_buffer::{Role, SkipReason};
 
 use super::{ANY_PORT, BUDGET, aggregate, bound, channel, driver, pump, shared};
 use crate::embedded::{AggregateHandle, EmbeddedDriver};
@@ -250,6 +250,117 @@ fn an_unreliable_reset_frees_the_ring_of_held_heads() {
         }
         accepted == 4
     });
+    assert_clean(&mut a);
+}
+
+/// Plan item 9 of the phase 2 traceability (`quantstratum-docs:
+/// karyos/testing/contract-traceability-phase-2.md`; SPEC.md's "no silent
+/// hole"): an unreliable reset that drops held timed heads leaves a hole
+/// in the lane, and the remote reader reports it as a loss. A message is
+/// read before the reset; four heads held 4 s ahead are dropped by it;
+/// two messages offered after it are read, and the reader skips exactly
+/// the dropped range as a local gap, its start the lane's first loss.
+#[test]
+fn an_unreliable_reset_reports_the_dropped_heads_as_a_loss() {
+    let options = ScheduleOptions::default().with_max_horizon(5_000_000_000);
+    let (mut a, mut b, publication, mut reader) = timed_pair(4, options, false);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let accepted = |outcome: OfferOutcome| match outcome {
+        OfferOutcome::Accepted { position, .. } => position,
+        other => panic!("not accepted: {other:?}"),
+    };
+    let mut read: Vec<Vec<u8>> = Vec::new();
+    let mut first_loss = None;
+    let mut skipped = None;
+    let mut poll = |reader: &mut karyos_client::aggregate::AggregateSubscription<_>,
+                    read: &mut Vec<Vec<u8>>| {
+        let polled = reader.poll(|bytes, _, _| read.push(bytes.to_vec()), BUDGET);
+        first_loss = first_loss.or(polled.lanes[0].first_loss);
+        skipped = skipped.or(polled.lanes[0].skipped);
+    };
+    let before = accepted(
+        lane.offer_at(&[0xa0], karyos_sys::host_clock::host_monotonic_ns())
+            .unwrap(),
+    );
+    pump(&mut [&mut a, &mut b], |_| {
+        poll(&mut reader, &mut read);
+        read.len() == 1
+    });
+    // Four heads held 1.5 s ahead, staged, then dropped unsent by the
+    // reset, well before their time.
+    let ahead = karyos_sys::host_clock::host_monotonic_ns() + 1_500_000_000;
+    let dropped: Vec<u64> = (0..4u8)
+        .map(|index| accepted(lane.offer_at(&[0xd0 + index], ahead).unwrap()))
+        .collect();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        shared(drivers[0])
+            .sender
+            .outbound_counters(0)
+            .unwrap()
+            .staged
+            == 5
+    });
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    a.net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].net.as_ref().unwrap().reopened() >= 1
+    });
+    let counts = shared(&mut a).sender.outbound_timed_counts(0).unwrap();
+    assert_eq!((counts.dropped, counts.sent), (4, 1), "{counts:?}");
+    // Two messages after the reset, at the dropped heads' time, since a
+    // lane's times do not go back: the reader reaches them across the hole.
+    let mut after = Vec::new();
+    for message in [[0xb0u8], [0xb1]] {
+        pump(&mut [&mut a, &mut b], |_| {
+            if let Ok(OfferOutcome::Accepted { position, .. }) = lane.offer_at(&message, ahead) {
+                after.push(position);
+                return true;
+            }
+            false
+        });
+    }
+    pump(&mut [&mut a, &mut b], |_| {
+        poll(&mut reader, &mut read);
+        read.len() == 3
+    });
+    assert_eq!(
+        read,
+        [vec![0xa0], vec![0xb0], vec![0xb1]],
+        "the dropped heads are never delivered"
+    );
+    let loss = first_loss.unwrap_or_else(|| {
+        panic!(
+            "a silent hole: no loss reported for the dropped heads at {dropped:?} \
+             (read before at {before}, after at {after:?}; skipped {skipped:?})"
+        )
+    });
+    // The hole is exactly the dropped heads: from the first one's start
+    // to the first message after the reset, a local gap.
+    assert_eq!(loss, dropped[0], "the first loss is the first dropped head");
+    let skipped = skipped.expect("the reader skipped the hole");
+    assert_eq!(
+        (skipped.position, u64::from(skipped.extent)),
+        (dropped[0], after[0] - dropped[0]),
+        "the skipped range is the dropped heads: {skipped:?}, dropped {dropped:?}, \
+         after {after:?}"
+    );
+    assert!(
+        matches!(skipped.reason, SkipReason::LocalGap(_)),
+        "a local gap: {skipped:?}"
+    );
     assert_clean(&mut a);
 }
 
