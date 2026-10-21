@@ -11,6 +11,10 @@
 //! Built so far: the ABI version, the status codes and their text, the
 //! bounded handle tables and the panic boundary (F1); clients (F2).
 //! Publications and subscriptions come with F3 and F4.
+//!
+//! Its Rust items are internal to the Karyos workspace and unstable in
+//! alpha, with no compatibility promise; its C ABI is supported under its
+//! own `0.y.z` rule.
 
 #![deny(unsafe_code)]
 

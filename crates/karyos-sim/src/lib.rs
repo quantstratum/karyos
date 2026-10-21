@@ -22,6 +22,11 @@
 //! C2). The evaluation harness of the Raft cores ([`harness`], C5) runs
 //! them over C4's log. The backend ring models, the Archive and the
 //! Cluster do not exist yet.
+//!
+//! Internal to the Karyos workspace and unstable in alpha, with no
+//! compatibility promise. The supported API is the `karyos` facade,
+//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
+//! under its own `0.y.z` rule.
 
 pub mod clock;
 pub mod cluster;

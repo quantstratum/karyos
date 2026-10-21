@@ -10,39 +10,55 @@ writers is designed first and checked with model checking, Miri and a
 deterministic simulator. `unsafe` code is confined to the two lowest
 crates, and the default build compiles no C.
 
-## Status: 0.1.0-alpha.1
+## Status: 0.1.0-alpha.2
 
 This is an early alpha for evaluation, not for production. APIs, wire
-formats and shared-memory layouts will change without notice. Nothing is
-published to crates.io.
+formats, shared-memory layouts and the C ABI will change without notice.
+Nothing is published to crates.io.
 
 What the alpha contains:
 
 - **Embedded driver (all platforms).** In-process publication and
   subscription over log buffers: exclusive and concurrent publication,
-  claims with a commit deadline, required and optional subscribers with
-  copy delivery, stream sealing and removal, and mapping generations with a
-  cutover.
-- **Cross-process control path (Linux).** Admission of a client process by
-  the driver over a Unix socket, with descriptor passing of sealed
-  shared-memory regions, a version exchange, the command ring, the
-  broadcast buffer and the counters in shared regions, and release of a
-  client by its process exit proof. Cross-process data streams are not in
-  this alpha (planned for 0.1.0-alpha.2).
-- **Building blocks** used by later releases: a keyed conflation table, a
-  bounded record journal, trace records, sampling, clock calibration and
-  latency histograms, a deterministic simulator and a benchmark harness.
+  claims with a commit deadline, required, optional and observer
+  readers with copy delivery, rejoin policies, losing a required
+  participant, stream sealing and removal, and mapping generations with
+  a cutover.
+- **Cross-process IPC (Linux).** Admission of client processes over a
+  Unix socket and cross-process data streams over sealed shared-memory
+  regions, run by the `karyosd` daemon.
+- **UDP transport.** Unicast and multicast channels, reliable and
+  unreliable, with lanes, multicast flow control, guards and timed sends
+  on the software route. Redundant paths work only in the test rig.
+- **Archive and replay.** Recordings, replay and the live merge,
+  recording groups with deterministic replay and an output diff, and
+  the Archive in `karyosd` with `karyos-catalog` and `karyos-replay`.
+  No retention or integrity verification yet.
+- **Management.** The local management agent (`karyos-agent`), its
+  Prometheus exporter and the operator tools.
+- **C ABI.** `libkaryos` at ABI 0.1.1 with a conformance suite. The
+  language bindings are not part of this release.
+- **Building blocks** for later releases: Cluster foundations (durable
+  log, deduplication, snapshots) without a consensus core, a
+  deterministic simulator and a benchmark harness.
+
+Supported API: the `karyos` facade, `karyos-client` and `karyos-archive`,
+and the C ABI under its own `0.y.z` rule. Every other crate is internal
+and unstable in alpha, with no compatibility promise.
+
+Not in this alpha: authenticated or encrypted traffic, `io_uring` and
+AF_XDP backends, the ETF route of timed sends, and a replicated Cluster.
 
 The release notes list what works, what does not, and the evidence behind
-each claim: [RELEASE-NOTES-0.1.0-alpha.1.md](RELEASE-NOTES-0.1.0-alpha.1.md).
+each claim: [RELEASE-NOTES-0.1.0-alpha.2.md](RELEASE-NOTES-0.1.0-alpha.2.md).
 
 ## Platforms
 
 | Platform | What runs | Evidence for this alpha |
 | --- | --- | --- |
-| Linux, aarch64 | All alpha features, including the cross-process control path | Docker (`rust:1.99`) on kernel 6.8.0 aarch64: the workspace tests, including the process and platform tests, pass |
-| Linux, x86_64 | All alpha features, including the cross-process control path | Not run for this alpha |
-| macOS, arm64 | Embedded driver; cross-process IPC is Linux only | Apple M5 Max: Loom models and Miri on `karyos-sys` pass |
+| Linux, aarch64 | All alpha features, including cross-process IPC, the UDP transport, the Archive in `karyosd` and the conformance suite's Linux scenarios | Docker (`rust:1.99`) on kernel 6.8.0-117-generic aarch64: the workspace tests, the netem tests and the conformance suite with the test kit pass (release notes, Evidence) |
+| Linux, x86_64 | All alpha features | Not run for this alpha |
+| macOS, arm64 | Embedded driver, the UDP transport and `libkaryos`; cross-process IPC and the Archive daemon are Linux only | Apple M5 Max: `make pre-push`, Loom models, and Miri on `karyos-sys` and `karyos-ffi` pass (release notes, Evidence) |
 
 Docker and virtual machines give functional evidence only. No latency or
 throughput figure is claimed for this alpha.

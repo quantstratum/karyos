@@ -26,6 +26,11 @@
 //! inventory of the environments README ([`inventory`], `karyos-bench
 //! inventory`), environment classification and decision eligibility
 //! ([`mod@env`]).
+//!
+//! Internal to the Karyos workspace and unstable in alpha, with no
+//! compatibility promise. The supported API is the `karyos` facade,
+//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
+//! under its own `0.y.z` rule.
 
 /// Counts the allocations of this crate's unit tests in the allocation
 /// build (`alloc-count`, M-9), so the zero-allocation stages are tested.

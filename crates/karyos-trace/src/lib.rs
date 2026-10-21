@@ -13,6 +13,11 @@
 //! a tool's reader of the driver's trace mirror, as designed in
 //! `quantstratum-docs: karyos/design/trace-tool.md`. Seals for long-running
 //! journals, clock calibration and histograms do not exist yet.
+//!
+//! Internal to the Karyos workspace and unstable in alpha, with no
+//! compatibility promise. The supported API is the `karyos` facade,
+//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
+//! under its own `0.y.z` rule.
 
 pub mod agent;
 pub mod attribution;
