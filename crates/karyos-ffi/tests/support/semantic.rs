@@ -243,7 +243,8 @@ impl Adapter {
     }
 
     /// Runs `offer` on `publication`. On a remote publication (its client is
-    /// the runner's, FORMAT.md, Remote driver) a `back_pressured` or
+    /// a provided one, `$remote_client` or `$archive_client`; FORMAT.md,
+    /// Remote driver) a `back_pressured` or
     /// `admin_action` answer is retried, serving the client, until the
     /// offer answers anything else or 10 s pass: the driver serves the
     /// remote client in another process, so its first offers may wait.

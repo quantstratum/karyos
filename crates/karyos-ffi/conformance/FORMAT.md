@@ -433,12 +433,13 @@ guarded publication's outcome records arrive after the offer.
 runner polls, serving the object's client, until the `delivered` total
 reaches `until`, and answers that total, or fails at 10 s.
 
-For the same reason a remote publication's first offers may answer
+For the same reason an offer on a remote publication may answer
 `back_pressured` or `admin_action` until its client has been served.
-The runner retries `publication.offer` on a publication of
-`$remote_client` while it answers either, serving the client, and
-answers the first other status, or the last one at 10 s. A scenario
-does not retry offers itself.
+The runner retries every `publication.offer` on a publication of a
+provided client (`$remote_client` or `$archive_client`, one karyosd
+client) while it answers either, serving the client, and answers the
+first other status, or the last one at 10 s. A scenario does not retry
+offers itself.
 
 ### Bounds
 
