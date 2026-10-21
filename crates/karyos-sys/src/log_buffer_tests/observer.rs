@@ -274,20 +274,32 @@ fn test_stall_isolation_optional_observer_claim() {
 /// Under Miri's data race detector: a publisher, an observer and the
 /// conductor's duty cycle on three threads. The observer delivers a
 /// contiguous run of the published messages or reports an overrun, and
-/// resumes after it with later messages.
+/// resumes after it with later messages. The run publishes more terms than
+/// the buffer holds and the observer never bounds, so the duty cycle must
+/// reclaim and clean slots while the observer polls: the test asserts it
+/// did. It does not force a reclaim of the very slot whose copy is under
+/// way (the duty cycle reports none quarantined): that needs a pause inside
+/// the observer's copy, which `Subscription::poll` does not offer.
 #[test]
 fn test_observer_concurrent_publish_and_reclaim_no_data_race() {
     let (total, len): (u32, usize) = if cfg!(miri) { (60, 7000) } else { (3000, 3000) };
     let buffer = new_buffer(config(3, 2)).unwrap();
     let published = AtomicBool::new(false);
     let finished = AtomicBool::new(false);
+    // Set while the observer polls; the duty cycle counts what it cleans
+    // meanwhile.
+    let observing = AtomicBool::new(false);
+    let cleaned = std::sync::atomic::AtomicU32::new(0);
     let mut conductor = buffer.conductor().unwrap();
     let mut observer = conductor.subscribe(Role::Observer).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     std::thread::scope(|scope| {
         let duty = scope.spawn(|| {
             while !finished.load(Ordering::Acquire) {
-                let _ = conductor.duty_cycle().unwrap();
+                let report = conductor.duty_cycle().unwrap();
+                if observing.load(Ordering::Acquire) {
+                    let _ = cleaned.fetch_add(report.cleaned, Ordering::Relaxed);
+                }
                 std::thread::yield_now();
             }
         });
@@ -306,6 +318,7 @@ fn test_observer_concurrent_publish_and_reclaim_no_data_race() {
         let mut out = vec![0u8; 8192];
         let mut last = None::<u32>;
         let mut contiguous = true;
+        observing.store(true, Ordering::Release);
         loop {
             match observer.poll(&mut out).unwrap() {
                 PollOutcome::Message { length, .. } => {
@@ -335,7 +348,12 @@ fn test_observer_concurrent_publish_and_reclaim_no_data_race() {
                 other => panic!("unexpected {other:?}"),
             }
         }
+        observing.store(false, Ordering::Release);
         finished.store(true, Ordering::Release);
         duty.join().unwrap();
     });
+    assert!(
+        cleaned.into_inner() > 0,
+        "no slot was reclaimed while the observer polled"
+    );
 }
