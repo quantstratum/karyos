@@ -1,0 +1,28 @@
+# The outcome stream of a guarded publication of a driver in another
+# process (FORMAT.md, Remote driver): under the open guard, one
+# `Submitted` record per offer; an unguarded stream's publication has
+# none.
+format 2
+id op.remote.outcomes
+abi 0.1
+covers "remote driver"
+since B3
+feature remote-driver
+feature guarded-publication
+
+op publication.add client=$remote_client stream_id=23
+expect ok publication=$guarded
+op publication.offer publication=$guarded payload="a"
+expect ok
+op publication.offer publication=$guarded payload="b"
+expect ok
+op publication.poll_outcomes publication=$guarded limit=8 until=2
+expect ok delivered=2
+op publication.close publication=$guarded
+expect ok
+op publication.add client=$remote_client stream_id=24
+expect ok publication=$plain
+op publication.poll_outcomes publication=$plain limit=8
+expect ok delivered=0
+op publication.close publication=$plain
+expect ok

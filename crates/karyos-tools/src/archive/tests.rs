@@ -363,8 +363,11 @@ fn a_replay_with_no_reader_by_the_deadline_ends_unattended() {
     config.attach_deadline = Duration::from_millis(100);
     let mut rig = Rig::with("unattended", EmbeddedDriver::new().unwrap(), config);
     let (recording, stopped) = record(&mut rig);
-    let target = replay(&mut rig, recording, stopped);
+    // Before the request: the server starts the attach deadline inside
+    // `replay`, so an instant taken after it returns could be late by
+    // however long `replay` took, and the deadline would seem early.
     let started = std::time::Instant::now();
+    let target = replay(&mut rig, recording, stopped);
     while rig.server().unattended() == 0 {
         assert!(started.elapsed() < Duration::from_secs(5), "never ended");
         rig.cycle();
@@ -374,8 +377,11 @@ fn a_replay_with_no_reader_by_the_deadline_ends_unattended() {
         started.elapsed() >= Duration::from_millis(100),
         "held to the deadline"
     );
+    // The retirement is measured from the end it follows, so `replay`'s
+    // own time never counts against the linger.
+    let ended = std::time::Instant::now();
     while rig.driver().stream_handle(target).is_some() {
-        assert!(started.elapsed() < LINGER, "retired without the linger");
+        assert!(ended.elapsed() < LINGER, "retired without the linger");
         rig.cycle();
         std::thread::sleep(Duration::from_millis(1));
     }

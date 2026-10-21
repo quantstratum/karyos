@@ -26,3 +26,6 @@ clocks: op.clock.monotonic op.clock.tai
 # Not a §13 row: the Archive replays of B6 (quantstratum-docs:
 # karyos/design/archive-replay-control.md), Linux only.
 archive replays: op.replay.complete op.replay.stopped op.replay.refused op.replay.u64
+# Not a §13 row: a driver in another process, the runner's karyosd, with a
+# conflated and a guarded stream (karyos#585), Linux only.
+remote driver: op.remote.conflated op.remote.outcomes
