@@ -2057,4 +2057,60 @@ mod tests {
         let _ = client.poll(usize::MAX, |_| {});
         assert_eq!(client.take_events().count(), 0);
     }
+
+    /// An image's IPv6 source keeps its scope id from the driver's
+    /// `ImageAvailable` to the client's events, and an `ImageAvailable` in
+    /// the layout before the address alignment (IPv4 in the high word) is
+    /// skipped as undecoded.
+    #[test]
+    fn an_image_source_keeps_its_scope() {
+        let mut transmitter = broadcast(4096).unwrap();
+        let (producer, _consumer) = command_ring(1024).unwrap();
+        let link = Arc::new(ClientLink::<karyos_sys::term_bytes::HeapTerms>::new());
+        let owner = Owner {
+            driver: 1,
+            client: 1,
+        };
+        let mut client = ClientConductor::new(owner, producer, transmitter.receiver(), link, 4);
+        let available = |source: &str| Event::ImageAvailable {
+            stream: StreamKey {
+                stream_id: 7,
+                session_id: 5,
+            },
+            registration: 2,
+            image: 3,
+            source: source.parse().unwrap(),
+        };
+        let scoped = available("[fe80::1%3]:40123");
+        let mut payload = [0u8; karyos_protocol::cnc::MAX_EVENT_LENGTH];
+        let length = scoped.encode(&mut payload).unwrap();
+        let _ = transmitter
+            .transmit(scoped.type_id(), &payload[..length])
+            .unwrap();
+        let _ = client.poll(usize::MAX, |_| {});
+        let events: Vec<Event> = client.take_events().collect();
+        assert_eq!(events, [scoped]);
+        let [
+            Event::ImageAvailable {
+                source: std::net::SocketAddr::V6(source),
+                ..
+            },
+        ] = events[..]
+        else {
+            panic!("an IPv6 source");
+        };
+        assert_eq!(source.scope_id(), 3);
+        // 127.0.0.1 in the high word, as the layout before the alignment.
+        let v4 = available("127.0.0.1:40123");
+        let length = v4.encode(&mut payload).unwrap();
+        let mut before = payload;
+        before[32..40].copy_from_slice(&0x7F00_0001u64.to_le_bytes());
+        before[40..48].copy_from_slice(&0u64.to_le_bytes());
+        let _ = transmitter
+            .transmit(v4.type_id(), &before[..length])
+            .unwrap();
+        let _ = client.poll(usize::MAX, |_| {});
+        assert_eq!(client.events_undecoded(), 1);
+        assert_eq!(client.take_events().count(), 0);
+    }
 }

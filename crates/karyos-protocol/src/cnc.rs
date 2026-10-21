@@ -210,15 +210,29 @@
 //! | `0xC3` | `PublicationClosed` | stream and session | reason: 1 required participant lost | lane: below 4 | image registration, or 0 | |
 //! | `0xC4` | `SuccessorReady` | stream and session | registration | hand-over key of the successor grant | base position | generation |
 //! | `0xC5` | `Fenced` | stream and session | registration | | | |
-//! | `0xC6` | `ImageAvailable` | stream and session | network subscription registration | image registration (nonzero) | source port (bits 15 to 0) and family (bits 23 to 16: 4 or 6) | source address, first word |
+//! | `0xC6` | `ImageAvailable` | stream and session | network subscription registration | image registration (nonzero) | source family, port and scope (see below) | source address, high word |
 //! | `0xC7` | `ImageUnavailable` | stream and session | network subscription registration | image registration (nonzero) | | |
 //!
 //! `ImageAvailable` continues after its five words with word 5, the
-//! source address's second word: an IPv4 address is its four octets in
-//! network order in bits 31 to 0 of word 4, word 5 zero; an IPv6 address
-//! is octets 0 to 7 in network order in word 4 (octet 0 in bits 63 to
-//! 56) and octets 8 to 15 likewise in word 5. Scope and flow label are
-//! not carried; any other bit set is refused.
+//! source address's low word. Its source in words 3 to 5 has exactly
+//! `NetworkSubscriptionReady`'s address encoding in its words 3 to 5 (one
+//! address encoding under admission `VERSION` 2, aligned before its
+//! freeze; the layout before it put an IPv4 address in word 4 and carried
+//! no scope, and strict decoding refuses it): word 3 is the port (bits 15
+//! to 0), the family (bits 23 to 16: 4 or 6), reserved bits 31 to 24 zero
+//! and the IPv6 scope id (bits 63 to 32, zero for IPv4); word 4 is IPv6
+//! octets 0 to 7 in network order, zero for IPv4; word 5 is IPv6 octets
+//! 8 to 15 likewise, or the IPv4 octets in bits 31 to 0 with bits 63 to
+//! 32 zero. An image always has a source, so family 0 is refused here.
+//! The IPv6 scope id is carried; the flow information is not and decodes
+//! as zero. Any other bit set is refused as reserved.
+//!
+//! One vector, the whole message in hex as above (stream 7 session 5,
+//! registration 2, image 3, source `[fe80::1%3]:40123`, scope id 3):
+//! words `0x0000_0005_0000_0007, 2, 3, 0x0000_0003_0006_9CBB,
+//! 0xFE80_0000_0000_0000, 0x0000_0000_0000_0001`:
+//! `0700000005000000 0200000000000000 0300000000000000
+//! BB9C060003000000 00000000000080FE 0100000000000000`.
 //!
 //! `ImageAvailable` and `ImageUnavailable` (`quantstratum-docs:
 //! karyos/design/per-source-images.md`, D2-3): a remote publication's
@@ -230,7 +244,7 @@
 //! `PublicationClosed` names the image registration when the closed lane
 //! is an image's, and 0 for any other stream.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::SealReason;
@@ -1736,49 +1750,13 @@ const fn role_from(code: u64) -> Option<SubscriberRole> {
     }
 }
 
-/// Address family codes of a source word.
+/// Address family codes of an address word.
 const FAMILY_V4: u64 = 4;
 const FAMILY_V6: u64 = 6;
 
-/// The three words of a source address: the port and family word, then
-/// the address in network order (`ImageAvailable`).
-fn source_words(source: SocketAddr) -> [u64; 3] {
-    let port = u64::from(source.port());
-    match source.ip() {
-        IpAddr::V4(ip) => [
-            port | FAMILY_V4 << 16,
-            u64::from(u32::from_be_bytes(ip.octets())),
-            0,
-        ],
-        IpAddr::V6(ip) => {
-            let bits = u128::from_be_bytes(ip.octets());
-            // The high and low halves of the address.
-            let high = u64::try_from(bits >> 64).unwrap_or(0);
-            let low = u64::try_from(bits & u128::from(u64::MAX)).unwrap_or(0);
-            [port | FAMILY_V6 << 16, high, low]
-        }
-    }
-}
-
-/// The source address of its three words; `None` for another family or a
-/// reserved bit set.
-fn source_from([word, first, second]: [u64; 3]) -> Option<SocketAddr> {
-    let port = u16::try_from(word & 0xFFFF).ok()?;
-    match word >> 16 {
-        FAMILY_V4 if second == 0 => {
-            let ip = u32::try_from(first).ok()?;
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port))
-        }
-        FAMILY_V6 => {
-            let bits = u128::from(first) << 64 | u128::from(second);
-            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(bits)), port))
-        }
-        _ => None,
-    }
-}
-
-/// The three words of a bound address (`NetworkSubscriptionReady`): the
-/// family, port and scope word, then the address's high and low words.
+/// The three words of an address (`NetworkSubscriptionReady`'s bound
+/// address, `ImageAvailable`'s source): the family, port and scope word,
+/// then the address's high and low words; `None` is family 0.
 fn bound_words(bound: Option<SocketAddr>) -> [u64; 3] {
     match bound {
         None => [0, 0, 0],
@@ -1801,8 +1779,8 @@ fn bound_words(bound: Option<SocketAddr>) -> [u64; 3] {
     }
 }
 
-/// The bound address of its three words: `Some(None)` for family 0,
-/// `None` for another family or a reserved bit set.
+/// The address of its three words: `Some(None)` for family 0, `None` for
+/// another family or a reserved bit set.
 fn bound_from([word, high, low]: [u64; 3]) -> Option<Option<SocketAddr>> {
     let port = u16::try_from(word & 0xFFFF).ok()?;
     let family = (word >> 16) & 0xFF;
@@ -2418,15 +2396,15 @@ impl Event {
                 image,
                 source,
             } => {
-                let [port, first, second] = source_words(source);
+                let [family_port, high, low] = bound_words(Some(source));
                 write_words(
                     &[
                         stream_word(stream),
                         registration,
                         image,
-                        port,
-                        first,
-                        second,
+                        family_port,
+                        high,
+                        low,
                     ],
                     out,
                 )
@@ -2495,16 +2473,18 @@ impl Event {
                 })
             }
             IMAGE_AVAILABLE => {
-                let [stream, registration, image, port, first, second] =
+                let [stream, registration, image, family_port, high, low] =
                     read_words::<IMAGE_AVAILABLE_WORDS>(type_id, bytes)?;
                 if image == 0 {
                     return Err(CncError::Reserved { type_id });
                 }
+                // An image always has a source: family 0 is refused.
                 Ok(Self::ImageAvailable {
                     stream: stream_from(stream),
                     registration,
                     image,
-                    source: source_from([port, first, second])
+                    source: bound_from([family_port, high, low])
+                        .flatten()
                         .ok_or(CncError::Reserved { type_id })?,
                 })
             }
@@ -3085,8 +3065,9 @@ mod tests {
 
     /// Per-source images (`quantstratum-docs:
     /// karyos/design/per-source-images.md`, D2-3): `ImageAvailable` names
-    /// the image and its IPv4 or IPv6 source in six words, with golden
-    /// bytes; `ImageUnavailable` names the image in three words.
+    /// the image and its IPv4 or IPv6 source in six words, the source in
+    /// `NetworkSubscriptionReady`'s address encoding, with golden bytes;
+    /// `ImageUnavailable` names the image in three words.
     #[test]
     fn image_events_name_the_image_and_its_source() {
         let v4 = Event::ImageAvailable {
@@ -3102,9 +3083,9 @@ mod tests {
             &out[16..48],
             &[
                 12, 0, 0, 0, 0, 0, 0, 0, // image registration
-                0xA0, 0x0F, 4, 0, 0, 0, 0, 0, // port 4000, family 4
+                0xA0, 0x0F, 4, 0, 0, 0, 0, 0, // port 4000, family 4, no scope
+                0, 0, 0, 0, 0, 0, 0, 0, // high word zero
                 3, 2, 1, 10, 0, 0, 0, 0, // 10.1.2.3 in bits 31 to 0
-                0, 0, 0, 0, 0, 0, 0, 0, // nothing more
             ]
         );
         assert_eq!(Event::decode(IMAGE_AVAILABLE, &out[..length]), Ok(v4));
@@ -3135,9 +3116,10 @@ mod tests {
     }
 
     /// The image events are decoded strictly: the two-word layouts of a
-    /// build before D2 are `WrongLength`, and a family other than 4 or 6,
-    /// a reserved bit, a second word under IPv4 or an image of 0 are
-    /// `Reserved`.
+    /// build before D2 are `WrongLength`, and a family other than 4 or 6
+    /// (family 0 included: an image always has a source), a reserved bit,
+    /// a high word, high low-word bits or a scope id under IPv4, or an
+    /// image of 0 are `Reserved`.
     #[test]
     fn image_events_are_decoded_strictly() {
         let mut out = [0u8; MAX_EVENT_LENGTH];
@@ -3165,11 +3147,12 @@ mod tests {
         };
         assert!(refused(&|bytes| bytes[26] = 5), "family 5");
         assert!(refused(&|bytes| bytes[27] = 1), "a bit above the family");
+        assert!(refused(&|bytes| bytes[28] = 1), "a scope id under IPv4");
+        assert!(refused(&|bytes| bytes[32] = 1), "a high word under IPv4");
         assert!(
-            refused(&|bytes| bytes[36] = 1),
+            refused(&|bytes| bytes[44] = 1),
             "an IPv4 address above 32 bits"
         );
-        assert!(refused(&|bytes| bytes[40] = 1), "a second word under IPv4");
         assert!(refused(&|bytes| bytes[16] = 0), "image 0");
         let mut bytes = [0u8; 24];
         bytes[16] = 0;
@@ -3191,6 +3174,99 @@ mod tests {
             Event::decode(PUBLICATION_CLOSED, &out[..24]),
             Err(CncError::WrongLength { .. })
         ));
+    }
+
+    /// The documented `ImageAvailable` vector, an IPv6 link-local source
+    /// with its scope id, decodes to its source and re-encodes
+    /// identically: one address encoding with `NetworkSubscriptionReady`.
+    #[test]
+    fn image_available_vector() {
+        let hex = "0700000005000000 0200000000000000 0300000000000000 \
+                   BB9C060003000000 00000000000080FE 0100000000000000";
+        let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
+        let bytes: Vec<u8> = digits
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(bytes.len(), 48);
+        let source: SocketAddr = "[fe80::1%3]:40123".parse().unwrap();
+        let SocketAddr::V6(scoped) = source else {
+            panic!("an IPv6 address");
+        };
+        assert_eq!(scoped.scope_id(), 3);
+        let expected = Event::ImageAvailable {
+            stream: StreamKey {
+                stream_id: 7,
+                session_id: 5,
+            },
+            registration: 2,
+            image: 3,
+            source,
+        };
+        assert_eq!(Event::decode(IMAGE_AVAILABLE, &bytes), Ok(expected));
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let length = expected.encode(&mut out).unwrap();
+        assert_eq!(&out[..length], &bytes[..]);
+        // The same address words as `NetworkSubscriptionReady`'s.
+        let mut ready = [0u8; MAX_RESPONSE_LENGTH];
+        let length = Response::NetworkSubscriptionReady {
+            request: RequestId {
+                client: 1,
+                sequence: 2,
+            },
+            registration: 3,
+            bound: Some(source),
+        }
+        .encode(&mut ready)
+        .unwrap();
+        assert_eq!(&ready[24..length], &bytes[24..48]);
+    }
+
+    /// `ImageAvailable`'s source words are decoded as strictly as
+    /// `NetworkSubscriptionReady`'s, and family 0 is refused.
+    #[test]
+    fn image_available_source_is_decoded_strictly() {
+        let type_id = IMAGE_AVAILABLE;
+        let words = |family_port: u64, high: u64, low: u64| -> Vec<u8> {
+            [7u64 | 5 << 32, 2, 3, family_port, high, low]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect()
+        };
+        let decode = |bytes: &[u8]| Event::decode(type_id, bytes);
+        let reserved = Err(CncError::Reserved { type_id });
+        let v4 = 40123 | 4 << 16;
+        let v6 = 40123 | 6 << 16;
+        assert!(decode(&words(v4, 0, 0x7F00_0001)).is_ok());
+        assert!(matches!(
+            decode(&words(v6 | 3 << 32, 0xFE80 << 48, 1)),
+            Ok(Event::ImageAvailable { source: SocketAddr::V6(source), .. })
+                if source.scope_id() == 3 && source.flowinfo() == 0
+        ));
+        // Family 0: an image always has a source, so even all zero.
+        assert_eq!(decode(&words(0, 0, 0)), reserved);
+        assert_eq!(decode(&words(40123, 0, 1)), reserved);
+        // Reserved bits 24 to 31, for each family.
+        for family_port in [v4, v6] {
+            for bit in 24..32 {
+                assert_eq!(decode(&words(family_port | 1 << bit, 0, 1)), reserved);
+            }
+        }
+        // An unknown family.
+        for family in [1u64, 2, 3, 5, 7, 0x10, 0xFF] {
+            assert_eq!(decode(&words(40123 | family << 16, 0, 1)), reserved);
+        }
+        // IPv4: the high bits of the low word, the high word, a scope id.
+        assert_eq!(decode(&words(v4, 0, 1 << 32 | 1)), reserved);
+        assert_eq!(decode(&words(v4, 0, u64::MAX)), reserved);
+        assert_eq!(decode(&words(v4, 1, 1)), reserved);
+        assert_eq!(decode(&words(v4 | 1 << 32, 0, 1)), reserved);
+        assert_eq!(
+            decode(&words(v4 | u64::from(u32::MAX) << 32, 0, 1)),
+            reserved
+        );
+        // The layout before the alignment: IPv4 in the high word.
+        assert_eq!(decode(&words(v4, 0x7F00_0001, 0)), reserved);
     }
 
     /// `AddImageSubscription` names one lane of an image by its
@@ -4303,6 +4379,7 @@ mod journal_tests {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod properties {
     use core::fmt::Debug;
+    use std::net::IpAddr;
 
     use proptest::prelude::*;
 
@@ -4531,14 +4608,16 @@ mod properties {
         ]
     }
 
-    /// A source address as `ImageAvailable` carries it: no scope or flow
-    /// label.
+    /// A source address as `ImageAvailable` carries it: IPv4, or IPv6
+    /// with any scope id (flow information is not carried, so it stays
+    /// zero).
     fn source() -> impl Strategy<Value = SocketAddr> {
         prop_oneof![
             (any::<u32>(), any::<u16>())
                 .prop_map(|(ip, port)| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)),
-            (any::<u128>(), any::<u16>())
-                .prop_map(|(ip, port)| SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)),
+            (any::<u128>(), any::<u16>(), any::<u32>()).prop_map(|(ip, port, scope)| {
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, scope))
+            }),
         ]
     }
 
