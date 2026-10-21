@@ -336,9 +336,13 @@ on disk:
 - The admission protocol is version 2; alpha.1 used version 1.
 - The log buffer layout is version 5; regions of earlier versions are
   refused at attach.
-- Public enums and report structs of `karyos-client` and
-  `karyos-archive` are `#[non_exhaustive]`: a match outside the crate
-  needs a wildcard arm, and inputs are built through constructors.
+- Public enums decoded from evolving wire and record schemas, the
+  channel URI enums and the public error enums of the library crates are
+  `#[non_exhaustive]` (karyos#613, #616): a match outside the crate needs
+  a wildcard arm, and an unknown value is refused with a typed error,
+  never given another meaning. `GroupGateway` is sealed. Public report
+  structs of `karyos-client` and `karyos-archive` are built through
+  constructors.
 - The C ABI is new in this release, at version 0.1.1. A caller accepts
   exactly the `0.y` it targets with at least its minimum `0.y.z`.
 
