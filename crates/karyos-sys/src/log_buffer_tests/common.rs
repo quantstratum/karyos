@@ -2071,6 +2071,7 @@ fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
         let _ = append_retrying(&mut publication, &mut conductor, &message(1), || {});
     }
     let before = buffer.reserved_head().load(Ordering::Acquire);
+    let old_floor = buffer.floor().load(Ordering::Acquire);
     let mut context = SubscriptionContext {
         buffer: &buffer,
         cursor: &mut subscription.cursor,
@@ -2093,6 +2094,7 @@ fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
             resume,
         }) => {
             assert!(from < lost_to);
+            assert!(lost_to >= old_floor, "lost to below the old floor");
             assert!(lost_to <= resume, "resumed inside the lost range");
         }
         _ => panic!("unexpected step"),

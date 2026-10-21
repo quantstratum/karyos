@@ -3304,6 +3304,33 @@ impl<O: BufferOwner> Drop for Subscription<O> {
     }
 }
 
+/// A pause inside a subscriber's copy (tests; the contract traceability
+/// plan, item 9): set on the polling thread, it runs with the copy's loan
+/// held, after the floor check and before the read, so a test can make the
+/// duty cycle meet that loan.
+#[cfg(test)]
+pub(crate) mod copy_pause {
+    use core::cell::RefCell;
+
+    std::thread_local! {
+        static PAUSE: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Sets this thread's pause, or clears it with `None`.
+    pub(crate) fn set(pause: Option<Box<dyn FnMut()>>) {
+        PAUSE.with(|slot| *slot.borrow_mut() = pause);
+    }
+
+    /// Runs this thread's pause, if any.
+    pub(super) fn run() {
+        PAUSE.with(|slot| {
+            if let Some(pause) = slot.borrow_mut().as_mut() {
+                pause();
+            }
+        });
+    }
+}
+
 /// A subscriber's cursor borrowed together with its buffer.
 struct SubscriptionContext<'a, T: TermBytes> {
     buffer: &'a LogBuffer<T>,
@@ -3369,6 +3396,8 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             release_loan(&cell.loan);
             return self.overrun();
         }
+        #[cfg(test)]
+        copy_pause::run();
         let result = self.read_block(slot, offset, out);
         release_loan(&cell.loan);
         let result = result?;
