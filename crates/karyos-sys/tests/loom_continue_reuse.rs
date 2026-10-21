@@ -24,7 +24,7 @@
 #![cfg(loom)]
 
 use karyos_sys::loan::{
-    LoanOutcome, LoanTarget, begin_cleaning, begin_reclaim, loan_held, publish, release_loan,
+    Loan, LoanOutcome, LoanTarget, begin_cleaning, begin_reclaim, loan_held, publish, release_loan,
     take_loan,
 };
 use karyos_sys::participant::{
@@ -228,6 +228,11 @@ enum Clean {
     WithoutTheLoanScan,
 }
 
+/// Set, across Loom's executions, when one cleaned slot 1 while the loan
+/// word named slot 0: the interleaving the pinned model exists for.
+static CLEANED_WHILE_THE_OTHER_WAS_LOANED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The revoked holder reads slot 0, then slot 1, each under its one loan,
 /// concurrently with its revocation; then, once it has seen the revocation
 /// complete, it tries slot 0 again. The driver revokes under `continue` and
@@ -282,6 +287,14 @@ fn pinned_model(variant: Clean) {
                 }
             }
             let cleaning = begin_cleaning(&slot.descriptor, reclaiming).unwrap();
+            if core::ptr::eq(slot, &shared.slots[1])
+                && Loan::decode(shared.loan.load(Ordering::SeqCst))
+                    .unwrap()
+                    .is_some_and(|loan| loan.slot() == shared.slots[0].target.slot())
+            {
+                CLEANED_WHILE_THE_OTHER_WAS_LOANED
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             slot.write_bytes(CLEANED_BYTES);
             publish(&slot.descriptor, cleaning.with_state(SlotState::Free));
         }
@@ -294,6 +307,11 @@ fn pinned_model(variant: Clean) {
 #[test]
 fn a_continue_revoked_holder_pins_only_the_slot_its_loan_names() {
     pinned_model(Clean::Correct);
+    // Some execution cleaned slot 1 while the holder's loan pinned slot 0.
+    assert!(
+        CLEANED_WHILE_THE_OTHER_WAS_LOANED.load(std::sync::atomic::Ordering::Relaxed),
+        "no execution reclaimed one slot while the other was loaned"
+    );
 }
 
 /// Negative control: cleaning a slot without the loan scan lets the
