@@ -2058,7 +2058,8 @@ fn the_deadline_service_is_idle_for_concurrent_buffers() {
 }
 
 /// A rejoin never resumes inside the range it reports lost, even when the
-/// floor and the head advance between its two reads.
+/// floor and the head advance between its two reads: it is an overrun from
+/// the cursor to at least the old floor, resuming at or past it.
 #[test]
 fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
     let buffer = new_buffer(config(3, 3)).unwrap();
@@ -2094,8 +2095,69 @@ fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
             assert!(from < lost_to);
             assert!(lost_to <= resume, "resumed inside the lost range");
         }
-        Step::Done(PollOutcome::Pending) => {}
         _ => panic!("unexpected step"),
+    }
+}
+
+/// A rejoin whose head snapshot is inconsistent (an injected inconsistent
+/// snapshot: the active term's tail names another term, as a reader sees
+/// when the slot is reused under it) waits: `Pending`, the cursor unmoved
+/// and nothing published. Once the snapshot is consistent again, the next
+/// poll is an overrun that never resumes inside the lost range.
+#[test]
+fn a_rejoin_with_an_inconsistent_head_snapshot_waits_then_overruns() {
+    let buffer = new_buffer(concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    // Lap the subscriber: its position falls below the floor.
+    while buffer.floor().load(Ordering::Acquire) < TERM {
+        let _ = offer_concurrent(&mut handle, &mut conductor, &message(1), || {});
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    let cell = subscription.cell();
+    let from = subscription.cursor.position;
+    let published = buffer.cell(cell).unwrap().position.load(Ordering::Acquire);
+    let count = TermCount::try_new(
+        u32::try_from(buffer.active_count().load(Ordering::Acquire)).unwrap(),
+    )
+    .unwrap();
+    let Lookup::Slot(slot) = buffer.lookup(count).unwrap() else {
+        panic!("no active slot");
+    };
+    let tail = buffer.tail(slot).unwrap();
+    let consistent = tail.load(Ordering::Acquire);
+    let mut context = SubscriptionContext {
+        buffer: &buffer,
+        cursor: &mut subscription.cursor,
+    };
+    let step = context
+        .overrun_with(&mut || {
+            // Another term's id in the tail's high half.
+            let other = (consistent >> 32).wrapping_add(1);
+            tail.store((other << 32) | (consistent & 0xffff_ffff), Ordering::Release);
+        })
+        .unwrap();
+    assert!(matches!(step, Step::Done(PollOutcome::Pending)));
+    assert_eq!(subscription.cursor.position, from, "the cursor moved");
+    assert_eq!(
+        buffer.cell(cell).unwrap().position.load(Ordering::Acquire),
+        published,
+        "a position was published"
+    );
+    tail.store(consistent, Ordering::Release);
+    let mut out = vec![0u8; 4096];
+    match subscription.poll(&mut out).unwrap() {
+        PollOutcome::Overrun {
+            from: lost_from,
+            lost_to,
+            resume,
+        } => {
+            assert_eq!(lost_from, from);
+            assert!(from < lost_to);
+            assert!(lost_to <= resume, "resumed inside the lost range");
+        }
+        other => panic!("unexpected {other:?}"),
     }
 }
 
