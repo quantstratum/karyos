@@ -557,3 +557,207 @@ fn a_fenced_async_recording_rejoins_at_the_head_past_a_gap() {
         assert_eq!(recorded(dir.path(), position), payload(index));
     }
 }
+
+/// Plan item 4 (contract-traceability-phase-3.md): SPEC §13's "Cutover
+/// with backlog" at one seal, on a concurrent stream, with every
+/// participant at once:
+/// - a required reader that keeps up;
+/// - an optional reader and an `async` recording that lag;
+/// - a second recording that never reads, so it is paused;
+/// - one claim committing before the claim deadline and one after it;
+/// - a publisher that pauses.
+///
+/// The commit is delivered and the late claim aborted in everyone's
+/// backlog, the aborted block included in the lagging recording's. The
+/// paused publisher and the paused recording are fenced without delaying
+/// the cutover. The responsive participants drain to the seal and
+/// continue on the successor.
+#[test]
+fn every_participant_of_a_cutover_with_backlog_at_one_seal() {
+    use karyos_client::{
+        CommitOutcome, ConcurrentClaimOutcome, ConcurrentOfferOutcome, MessageLimit,
+    };
+
+    let lagging_dir = TempDir::new("combined-lagging");
+    let paused_dir = TempDir::new("combined-paused");
+    let (mut driver, clock) = driver();
+    let stream = driver
+        .add_stream(StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 10,
+                max_subscribers: 6,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 11,
+                claim_deadline: 50,
+                publication: PublicationMode::Concurrent {
+                    publishers: 3,
+                    allow_non_lse: true,
+                },
+                schedule_capacity: 0,
+            },
+            allow_unconnected: true,
+            on_required_loss: LossPolicy::Hold,
+            conflation: None,
+        })
+        .unwrap();
+    let mut required = driver.subscribe(stream, Role::Required).unwrap();
+    let mut lagging = driver.subscribe(stream, Role::Optional).unwrap();
+    let mut recorder = recording(&mut driver, stream, lagging_dir.path(), 1 << 20);
+    let mut paused_recorder = recording(&mut driver, stream, paused_dir.path(), 1 << 20);
+    let mut on_time = driver.concurrent_publication(stream).unwrap();
+    let mut late = driver.concurrent_publication(stream).unwrap();
+    let mut paused = driver.concurrent_publication(stream).unwrap();
+    let accepted = |outcome| match outcome {
+        ConcurrentOfferOutcome::Accepted { position, .. } => position,
+        other => panic!("{other:?}"),
+    };
+    // A backlog that the lagging participants have not read.
+    for _ in 0..3 {
+        let _ = accepted(paused.offer(b"backlog").unwrap());
+    }
+    let ConcurrentClaimOutcome::Claimed(mut committed) = on_time.try_claim(4).unwrap() else {
+        panic!("not claimed");
+    };
+    let ConcurrentClaimOutcome::Claimed(mut expired) = late.try_claim(4).unwrap() else {
+        panic!("not claimed");
+    };
+    let (kept_at, expired_at) = (committed.position(), expired.position());
+    let _ = driver.do_work().unwrap();
+    // The successor holds the same participants' spare-slot credits.
+    let reconfiguration = Reconfiguration {
+        spare_slots: 10,
+        ..larger()
+    };
+    let _ = driver.reconfigure_stream(stream, reconfiguration).unwrap();
+    let seal = driver.generations(stream).unwrap()[0].seal.unwrap();
+    // One claim commits before its deadline; the other after it, aborted.
+    committed.payload().copy_from_slice(b"kept");
+    assert!(matches!(committed.commit(), CommitOutcome::Accepted { .. }));
+    clock.set(50);
+    let _ = driver.do_work().unwrap();
+    expired.payload().copy_from_slice(b"lost");
+    assert!(matches!(
+        expired.commit(),
+        CommitOutcome::Aborted { position, .. } if position == expired_at
+    ));
+    // The responsive publishers try again before the deadline: told to
+    // wait for the successor, they are not paused.
+    for handle in [&mut on_time, &mut late] {
+        assert_eq!(
+            handle.offer(b"x").unwrap(),
+            ConcurrentOfferOutcome::AdminAction
+        );
+    }
+    // The required reader keeps up; the lagging reader and recording make
+    // some progress, which renews their leases.
+    let read = |subscription: &mut karyos_client::ClientSubscription, limit| {
+        let mut seen = Vec::new();
+        let mut aborted = Vec::new();
+        loop {
+            let summary = subscription
+                .poll(
+                    |bytes, info| seen.push((info.position, bytes.to_vec())),
+                    MessageLimit::new(limit),
+                )
+                .unwrap();
+            aborted.extend(summary.aborted.map(|abort| abort.position));
+            if summary.delivered == 0 && summary.aborted.is_none() || limit == 1 {
+                return (seen, aborted);
+            }
+        }
+    };
+    let (mut required_seen, mut required_aborted) = read(&mut required, 8);
+    let (mut lagging_seen, mut lagging_aborted) = read(&mut lagging, 1);
+    let _ = recorder.duty(0).unwrap();
+    let _ = driver.do_work().unwrap();
+    // Past the cutover deadline of the paused publisher and recording,
+    // which last moved at 0; not of the participants that moved at 50.
+    // The paused publisher is fenced, and the responsive one writes on the
+    // successor at the seal.
+    clock.set(50 + DEADLINE - 1);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(paused.offer(b"x").unwrap(), ConcurrentOfferOutcome::Closed);
+    assert_eq!(accepted(on_time.offer(b"new").unwrap()), seal);
+    let _ = driver.do_work().unwrap();
+    // Everyone responsive drains to the seal and continues.
+    let (seen, aborted) = read(&mut required, 8);
+    required_seen.extend(seen);
+    required_aborted.extend(aborted);
+    loop {
+        let (seen, aborted) = read(&mut lagging, 8);
+        if seen.is_empty() && aborted.is_empty() {
+            break;
+        }
+        lagging_seen.extend(seen);
+        lagging_aborted.extend(aborted);
+    }
+    for (who, seen, aborted) in [
+        ("required", &required_seen, &required_aborted),
+        ("lagging", &lagging_seen, &lagging_aborted),
+    ] {
+        assert_eq!(aborted, &[expired_at], "{who}");
+        let payloads: Vec<&[u8]> = seen.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        assert_eq!(
+            payloads,
+            [&b"backlog"[..], b"backlog", b"backlog", b"kept", b"new"],
+            "{who}"
+        );
+        assert!(seen.contains(&(kept_at, b"kept".to_vec())), "{who}");
+        assert_eq!(seen.last().unwrap(), &(seal, b"new".to_vec()), "{who}");
+    }
+    // The lagging recording drains to the seal, the aborted block in its
+    // backlog, and follows onto the successor; the paused one is fenced
+    // and ends at the seal.
+    let end = seal + 64;
+    for _ in 0..64 {
+        let duty = recorder.duty(0).unwrap();
+        assert_eq!(duty.ended, None);
+        assert!(!duty.fenced);
+        let _ = driver.do_work().unwrap();
+        if recorder.store().written() == end {
+            break;
+        }
+    }
+    assert_eq!(recorder.store().written(), end, "recorded past the seal");
+    assert!(recorder.store().gaps().is_empty());
+    let mut ended = None;
+    let mut fenced = false;
+    for _ in 0..16 {
+        let duty = paused_recorder.duty(0).unwrap();
+        fenced |= duty.fenced;
+        if duty.ended.is_some() {
+            ended = duty.ended;
+            break;
+        }
+    }
+    assert!(fenced, "the paused recording was fenced");
+    let ended = ended.unwrap();
+    assert_eq!(
+        (ended.position, ended.reason, ended.incomplete),
+        (seal, StopReason::Lapped, true)
+    );
+    drop((recorder, paused_recorder));
+    let mut store = SegmentStore::recover(
+        StdDisk,
+        lagging_dir.path(),
+        1,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap()
+    .store;
+    let mut bytes = [0u8; 4];
+    store.read(kept_at + 32, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"kept", "the commit recorded");
+    store.read(seal + 32, &mut bytes).unwrap();
+    assert_eq!(
+        &bytes[..3],
+        b"new",
+        "the successor's first message recorded"
+    );
+}
