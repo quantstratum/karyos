@@ -682,6 +682,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The conformance suite gains `op.replay.u64` (feature `archive-replay`):
+  a replay's `uint64_t` arguments past the signed range, as runners parse
+  and pass them. The length 2^64 - 1, the ABI's "to the end", delivers
+  the whole recording, and a position or a length of 2^63 is refused as
+  an invalid request (code 4). FORMAT.md's Values says why no ABI result
+  reaches 2^63, so each binding's own tests check that it reads such a
+  `uint64_t` result as unsigned.
 - The facade `karyos` crate re-exports `ImageChange`, `ImageEnd` and
   `SealReason`, and `karyos-client` re-exports `SealReason` at its root:
   a facade user drains a network subscription's image changes and reads
