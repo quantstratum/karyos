@@ -8,8 +8,8 @@ layouts and the C ABI will change.
 
 This alpha adds cross-process data streams on Linux, the UDP transport,
 the Archive with replay and recording groups, the management agent and
-its tools, and a C ABI with a conformance suite. It holds 2133 commits
-since 0.1.0-alpha.1 (TODO: recount at the release head). No phase of the
+its tools, and a C ABI with a conformance suite. It holds 1198
+commits since 0.1.0-alpha.1 (2173 with merges). No phase of the
 delivery plan is complete: each section below says what is covered and
 what is partial.
 
@@ -200,8 +200,7 @@ says so in its crate documentation.
   and 2, run by `tests/conformance.rs`): typed statuses, use after close,
   double close, struct sizes of other minors, the reentrant and bounded
   polls, claims, and the features `archive-replay`, `remote-driver` and
-  `incompatible-driver` (Linux). TODO: scenario count at the release
-  head.
+  `incompatible-driver` (Linux): 49 scenarios.
 - **Partial: C ABI boundary.** The protocol and panic rows are not yet
   scenarios, the kept fragment pointer row is covered by a Rust test
   only, and there is no older-minor manifest before a first released
@@ -277,9 +276,9 @@ says so in its crate documentation.
   regions of a stream stay writable by every client admitted to it, as
   the loan and position protocol requires, so the admission rules bound
   who can write them.
-- Hosted CI is configured, but its jobs do not start (no step runs), so
-  the gates are run locally; the Evidence table records them.
-  TODO(M8): re-check at the release head.
+- Hosted CI is configured, but its jobs do not start (no step runs, as
+  in its latest run on 2026-10-21), so the gates are run locally; the
+  Evidence table records them.
 - The netem tests are `#[ignore]` and run only through
   `scripts/netem-test.sh`; several multicast tests are Linux only and
   return early when the host's multicast probe fails.
