@@ -2140,10 +2140,16 @@ fn optional_receiver_closes(
         // The reset resends up to `retransmit_window` at once. Let it
         // drain before going on: a datagram B is later told to lose must
         // be new data, not one of these copies, which B drops as
-        // duplicates (karyos#603).
-        let sent_datagrams =
-            |a: &EmbeddedDriver| a.net.as_ref().unwrap().sender_counters().unwrap().sent;
-        let (mut last, mut quiet) = (sent_datagrams(&a), 0u32);
+        // duplicates (karyos#603). Drained once B's DATA frames, committed
+        // or dropped, stop arriving (heartbeats are counted apart).
+        let data_frames = |b: &EmbeddedDriver| {
+            let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+            receiver
+                .data_committed
+                .checked_add(receiver.data_dropped)
+                .unwrap()
+        };
+        let (mut last, mut quiet) = (data_frames(&b), 0u32);
         for _ in 0..40_000 {
             offer_and_read(
                 [&mut a, &mut b],
@@ -2153,7 +2159,7 @@ fn optional_receiver_closes(
                 total,
             );
             let _ = c.do_work().unwrap();
-            let now = sent_datagrams(&a);
+            let now = data_frames(&b);
             quiet = if now == last {
                 quiet.checked_add(1).unwrap()
             } else {
