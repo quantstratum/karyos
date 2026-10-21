@@ -11,6 +11,29 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A slow optional receiver no longer holds a reliable network
+  publisher (quantstratum-docs:
+  `karyos/design/retention-floor-optional-receivers.md`; REVIEWER-01's
+  phase 2 plan item 6). The sender's registered position, the
+  publication's limit, follows only what was submitted and what the
+  required receivers consumed (SPEC.md §4, "Sender position"). A
+  separate retention hold, a new log buffer cell state
+  (`CELL_SENDER_HOLD`, 11) that holds the floor and never bounds the
+  limit, keeps the floor at `sent - retransmit_window` lowered by the
+  required receivers (SPEC.md §4, "Retention floor"; §6). So a counted
+  receiver's hole stays repairable: a lone unicast receiver, or the
+  slowest under `min`. Under `max`, an optional receiver's hole below
+  the floor is answered `RANGE_UNAVAILABLE` and its image closes as
+  unrecoverable. `retransmit_window` is a driver setting
+  (`RepairConfig::retransmit_window`) of half a term by default and at
+  most; no URI key sets it yet. Each reliable lane takes one more
+  registry cell, and a full registry refuses the publication with
+  `DriverError::RetentionHoldUnavailable`. A reliable endpoint reset
+  still resends at once what the receivers had not consumed: the reader
+  rewinds to a restart position between the hold and the registered
+  position, from every receiver's consumption. The cell state is in
+  place under the unreleased layout.
+
 - A timed lane on a driver's IPC stream wedges, and the docs now say so:
   only a network sender releases schedule ring entries, so a
   `karyos_driver_add_stream` (or `EmbeddedDriver::add_stream`) stream

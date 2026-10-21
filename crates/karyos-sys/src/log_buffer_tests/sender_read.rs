@@ -2334,3 +2334,37 @@ fn a_thinned_ring_raises_the_restart_past_the_hold_and_counts_it() {
         "{result:?}"
     );
 }
+
+/// A silent sender (docs#336, condition 5): with no receiver's status
+/// messages live, the sender's reader is `CELL_SENDER_SILENT`, and its
+/// retention hold still holds the floor at `sent - retransmit_window`
+/// while the registered position bounds the limit.
+#[test]
+fn a_silent_senders_hold_keeps_the_floor() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    reader.with_hold(conductor.admit_hold(2).unwrap()).unwrap();
+    assert!(reader.set_receivers_live(false));
+    assert_eq!(
+        buffer
+            .cell(reader.subscription().cell())
+            .unwrap()
+            .state
+            .load(Ordering::Acquire),
+        participant::CELL_SENDER_SILENT
+    );
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = sized_message(1, 992);
+    for _ in 0..8 {
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    sr_sent(&mut reader);
+    let sent = reader.sent_position();
+    assert_eq!(reader.hold_at(sent - 4 * 1024), Some(sent - 4 * 1024));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.floor(), sent - 4 * 1024);
+    assert_eq!(conductor.limit(), sent + u64::from(MIN_TERM_LENGTH / 2));
+}

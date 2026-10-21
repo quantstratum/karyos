@@ -13,6 +13,11 @@
 //! not below the published floor: it is never lapped. The limit's bound
 //! must stay the required reader's, never the walker's.
 //!
+//! The same model holds a reliable network sender's retention hold
+//! (`CELL_SENDER_HOLD`; quantstratum-docs:
+//! karyos/design/retention-floor-optional-receivers.md): a cell whose
+//! position only grows, which holds the floor and never bounds the limit.
+//!
 //! Negative control, which must fail: the walker's cell counted as an
 //! observer (the floor ignores it), so the floor follows the required
 //! reader past the walker.
@@ -26,7 +31,9 @@
     reason = "a test model, as ADR-0007 allows in tests"
 )]
 
-use karyos_sys::participant::{CELL_OBSERVER, CELL_REQUIRED, CELL_WALKER, reader_minima};
+use karyos_sys::participant::{
+    CELL_OBSERVER, CELL_REQUIRED, CELL_SENDER_HOLD, CELL_WALKER, reader_minima,
+};
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::sync::Arc;
 use loom::thread;
@@ -95,6 +102,11 @@ fn model(walker_state: u64) {
 #[test]
 fn the_walker_holds_the_floor() {
     model(CELL_WALKER);
+}
+
+#[test]
+fn the_sender_hold_holds_the_floor() {
+    model(CELL_SENDER_HOLD);
 }
 
 #[test]
