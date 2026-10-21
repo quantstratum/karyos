@@ -23,6 +23,8 @@ count() {
     grep -rhE --include='*.rs' "$2" "$1" 2>/dev/null | grep -vcE '^[[:space:]]*//' || true
 }
 
+# The backquotes are Markdown code spans in the report, not commands.
+# shellcheck disable=SC2016
 {
     printf '# `unsafe` surface\n\n'
     printf 'Commit `%s`. Text counts over `crates/*/src`, approximate.\n\n' \

@@ -66,8 +66,9 @@ define() {
 major="$(define KARYOS_ABI_VERSION_MAJOR)"
 minor="$(define KARYOS_ABI_VERSION_MINOR)"
 patch="$(define KARYOS_ABI_VERSION_PATCH)"
-[ -n "$major" ] && [ -n "$minor" ] && [ -n "$patch" ] ||
+if [ -z "$major" ] || [ -z "$minor" ] || [ -z "$patch" ]; then
     fail "no KARYOS_ABI_VERSION_* in $header"
+fi
 abi="$major.$minor.$patch"
 if [ "$major" = 0 ]; then
     soversion="$major.$minor"
