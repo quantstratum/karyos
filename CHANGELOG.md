@@ -122,6 +122,19 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos_sys::log_buffer::ReadError` stays exhaustive for now: the
   Archive's source classifies each of its variants, and an unknown one
   needs a design choice.
+- `ImageAvailable` (CnC `0xC6`) encodes its source address exactly as
+  `NetworkSubscriptionReady` (`0x8A`) encodes its bound address, aligned
+  in place under admission `VERSION` 2 before its freeze, so the version
+  has one address encoding. Its six words stay `stream | registration |
+  image | family_port | address_hi | address_lo`; an IPv4 source moves
+  from word 4 to bits 31 to 0 of `address_lo`, with `address_hi` zero,
+  and strict decoding refuses the old layout. The IPv6 scope id is now
+  carried in bits 63 to 32 of `family_port` (it was dropped); the flow
+  information is still not carried. An image always has a source, so
+  family 0 is refused. The `cnc` module docs give a byte vector with an
+  IPv6 link-local source and its scope. For the item 41 API list: no
+  public signature changes; `Event::ImageAvailable`'s `source` now keeps
+  its IPv6 scope id through the CnC.
 
 - `karyos-ffi`: each copy of the library draws its own base generation
   for its handles, once, from the address of one of its statics (never
