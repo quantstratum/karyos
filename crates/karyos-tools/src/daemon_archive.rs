@@ -433,6 +433,7 @@ impl DaemonArchive {
         let control = |stream_id| StreamOption {
             stream_id,
             session_id: 0,
+            allow_unconnected: false,
         };
         let mut requests_config = control_config(terms, control(options.requests))?;
         requests_config.buffer.max_reserved = REQUEST_MAX_RESERVED;

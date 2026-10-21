@@ -691,6 +691,11 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyosd --stream <stream_id>:<session_id>:allow-unconnected` starts a
+  stream whose publications offer with no subscriber attached, a remote
+  client's included (its grant carries the stream's policy, #577).
+  Without the suffix a stream refuses offers until a subscriber attaches,
+  as before. The conformance test kit's karyosd takes the flag as built.
 - `make libkaryos-copies-check` (C-LINKAGE, not part of pre-push): two
   file copies of the package's shared library, loaded in one process with
   `RTLD_LOCAL`, each answer `KARYOS_E_CLOSED` to the other's driver and
