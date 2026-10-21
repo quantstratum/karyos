@@ -18,8 +18,14 @@ release may break APIs, wire formats and shared-memory layouts.
   client's request, which the client facade always sent without it, so
   a C caller's offer on such a stream answered `KARYOS_E_NOT_CONNECTED`
   until a subscriber attached (REVIEWER-01's finding from the .NET
-  binding, B1b). A remote (karyosd) client still decides by its own
-  request: the CnC response carries no such flag yet.
+  binding, B1b). A remote (karyosd) client gets it too, from its grant:
+  bit 16 of a manifest record's word 6 says the stream allows offers
+  with no subscriber, valid only with an exclusive or concurrent
+  publication's capability and reserved otherwise (quantstratum-docs:
+  `karyos/design/ipc-admission.md`, Unconnected offers). This is in
+  place under the unreleased admission version 2, so a version 2 client
+  built before it refuses such a grant rather than ignore the policy.
+  `karyos_protocol::admission::Record` gains `allow_unconnected`.
 
 ### Changed
 

@@ -1125,6 +1125,83 @@ fn a_remote_client_takes_handles_that_exchange_and_detach_on_drop() {
     assert_eq!(counter(&driver, "grants detached"), 2);
 }
 
+/// A stream's `allow_unconnected` reaches a remote client's publication
+/// through its grant's record (quantstratum-docs:
+/// karyos/design/ipc-admission.md, Unconnected offers): with no subscriber,
+/// an exclusive or a concurrent handle taken without it offers on a stream
+/// that allows it, and is not connected on one that does not.
+#[test]
+fn a_streams_allow_unconnected_reaches_a_remote_publication() {
+    for concurrent in [false, true] {
+        for allow in [false, true] {
+            let dir = dir(&format!("unconnected-{concurrent}-{allow}"));
+            let mut driver = system_driver(&dir);
+            let mut config = shared_stream_config();
+            config.allow_unconnected = allow;
+            if concurrent {
+                config.buffer.publication = PublicationMode::Concurrent {
+                    publishers: 1,
+                    allow_non_lse: true,
+                };
+            }
+            let _stream = driver.add_stream(config).unwrap();
+            let mut client = attach_serving(&mut driver, &dir).unwrap();
+            let key = StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            };
+            let accepted = serve_while(&mut driver, move || {
+                if concurrent {
+                    let _ = client.add_concurrent_publication(key, false).unwrap();
+                } else {
+                    let _ = client.add_publication(key, false).unwrap();
+                }
+                let mut fetchable = None;
+                let start = Instant::now();
+                while fetchable.is_none() {
+                    assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+                    let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                        Outcome::Fetchable(grant) => fetchable = Some(grant),
+                        other => panic!("expected a fetchable grant, got {other:?}"),
+                    });
+                }
+                let grant = fetchable.unwrap();
+                let accepted = if concurrent {
+                    let mut publication = client.take_concurrent_publication(&grant).unwrap();
+                    let outcome = publication.offer(b"alone").unwrap();
+                    assert!(
+                        matches!(
+                            outcome,
+                            karyos_client::ConcurrentOfferOutcome::Accepted { .. }
+                                | karyos_client::ConcurrentOfferOutcome::NotConnected
+                        ),
+                        "{outcome:?}"
+                    );
+                    matches!(
+                        outcome,
+                        karyos_client::ConcurrentOfferOutcome::Accepted { .. }
+                    )
+                } else {
+                    let mut publication = client.take_publication(&grant).unwrap();
+                    let outcome = publication.offer(b"alone").unwrap();
+                    assert!(
+                        matches!(
+                            outcome,
+                            OfferOutcome::Accepted { .. } | OfferOutcome::NotConnected
+                        ),
+                        "{outcome:?}"
+                    );
+                    matches!(outcome, OfferOutcome::Accepted { .. })
+                };
+                drop(client);
+                accepted
+            });
+            assert_eq!(accepted, allow, "concurrent {concurrent}, allow {allow}");
+            serve_until(&mut driver, |driver| driver.clients() == 0);
+        }
+    }
+}
+
 /// A manifest that does not answer the request (here, another
 /// registration than the `Ready` response's) aborts the fetch: its region
 /// is still received, closed and detached, so nothing stays charged and the

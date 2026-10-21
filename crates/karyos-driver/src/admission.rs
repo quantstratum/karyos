@@ -396,6 +396,7 @@ fn record(region: &Region, export: u64) -> Option<Record> {
         session_id: 0,
         lane: 0,
         capability: Capability::None,
+        allow_unconnected: false,
     })
 }
 
@@ -1004,6 +1005,7 @@ impl<T: StreamTerms> Admission<T> {
             stream.stream_id,
             stream.session_id,
             stream.config.lane.get(),
+            stream.allow_unconnected,
         ) else {
             return refuse(remote, refusal::RESOURCES);
         };
@@ -1289,13 +1291,16 @@ fn descriptor(region: &Region) -> Option<OwnedFd> {
         .and_then(|fd| fd.try_clone_to_owned().ok())
 }
 
-/// The manifest record of a grant's log buffer region.
+/// The manifest record of a grant's log buffer region; a publication's
+/// carries its stream's `allow_unconnected` (quantstratum-docs:
+/// karyos/design/ipc-admission.md, Unconnected offers).
 fn grant_record(
     region: &Region,
     grant: &Grant,
     stream_id: i32,
     session_id: i32,
     lane: u8,
+    allow_unconnected: bool,
 ) -> Option<Record> {
     let header = region.record();
     Some(Record {
@@ -1340,6 +1345,8 @@ fn grant_record(
                 return None;
             }
         },
+        // Encoded only with a publication's capability.
+        allow_unconnected,
     })
 }
 

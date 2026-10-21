@@ -563,6 +563,7 @@ fn wire(region: &Region, export: u64) -> Record {
         session_id: 0,
         lane: 0,
         capability: Capability::None,
+        allow_unconnected: false,
     }
 }
 
