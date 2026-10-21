@@ -47,7 +47,7 @@ use karyos_sys::term_bytes::SharedTerms;
 
 #[cfg(target_os = "linux")]
 use crate::args::AdmissionOptions;
-use crate::args::{Options, StreamOption, TermOptions};
+use crate::args::{ConflationOption, GuardOption, Options, StreamOption, TermOptions};
 #[cfg(target_os = "linux")]
 use crate::idle::BackoffIdle;
 
@@ -82,6 +82,21 @@ pub enum StartError {
         /// Why it was refused.
         error: DriverError,
     },
+    /// A `--conflation` table's capacity does not fit this platform's
+    /// sizes.
+    Conflation {
+        /// The table as given.
+        table: ConflationOption,
+    },
+    /// A `--guard` was refused: its guard could not be added, or the
+    /// stream could not be guarded (a concurrent stream, or messages that
+    /// do not fit half a term).
+    Guard {
+        /// The guard as given.
+        guard: GuardOption,
+        /// Why it was refused.
+        error: DriverError,
+    },
     /// The Archive did not start (`--archive`).
     #[cfg(target_os = "linux")]
     Archive(crate::daemon_archive::ArchiveStartError),
@@ -97,6 +112,16 @@ impl fmt::Display for StartError {
                 f,
                 "stream {}:{} refused: {error}",
                 stream.stream_id, stream.session_id
+            ),
+            Self::Conflation { table } => write!(
+                f,
+                "conflation table of stream {}:{} too large",
+                table.stream_id, table.session_id
+            ),
+            Self::Guard { guard, error } => write!(
+                f,
+                "guard {:?} of stream {}:{} refused: {error}",
+                guard.name, guard.stream_id, guard.session_id
             ),
             #[cfg(target_os = "linux")]
             Self::Archive(error) => write!(f, "{error}"),
@@ -174,6 +199,67 @@ pub fn stream_config(
     })
 }
 
+/// The conflation table `--conflation` gives `stream`, if any.
+///
+/// # Errors
+///
+/// [`StartError::Conflation`] for a capacity past this platform's `usize`.
+pub fn conflation_of(
+    options: &Options,
+    stream: StreamOption,
+) -> Result<Option<karyos_sys::conflation::ConflationConfig>, StartError> {
+    let Some(table) = options
+        .conflations
+        .iter()
+        .find(|table| (table.stream_id, table.session_id) == (stream.stream_id, stream.session_id))
+    else {
+        return Ok(None);
+    };
+    let too_large = |_| StartError::Conflation { table: *table };
+    Ok(Some(karyos_sys::conflation::ConflationConfig {
+        keys: table.keys,
+        value_capacity: usize::try_from(table.value_capacity).map_err(too_large)?,
+        journal_capacity: usize::try_from(table.journal_capacity).map_err(too_large)?,
+    }))
+}
+
+/// Guards `stream`, just added as `handle`, if a `--guard` names it: its
+/// guard is added and opened once, then the stream guarded with no rate
+/// limit, before any handle is issued.
+#[cfg(target_os = "linux")]
+fn guard(
+    driver: &mut EmbeddedDriver<SharedTerms>,
+    options: &Options,
+    stream: StreamOption,
+    handle: StreamHandle,
+) -> Result<(), StartError> {
+    let Some(option) = options
+        .guards
+        .iter()
+        .find(|guard| (guard.stream_id, guard.session_id) == (stream.stream_id, stream.session_id))
+    else {
+        return Ok(());
+    };
+    let refused = |error| StartError::Guard {
+        guard: option.clone(),
+        error,
+    };
+    // A new guard is closed at epoch 1: the daemon opens it once, so its
+    // streams' publications offer at once (the reopen is audited, with
+    // operation 0). Closing it again is an operator's action.
+    let guard = match driver.guard(&option.name) {
+        Some(guard) => guard,
+        None => {
+            let guard = driver.add_guard(&option.name).map_err(refused)?;
+            let _ = driver.reopen_guard(guard, 1, 0).map_err(refused)?;
+            guard
+        }
+    };
+    driver
+        .guard_stream(handle, guard, option.messages, None)
+        .map_err(refused)
+}
+
 /// The driver's admission settings from the command line.
 #[cfg(target_os = "linux")]
 #[must_use]
@@ -238,9 +324,11 @@ impl Daemon {
                 .streams
                 .iter()
                 .map(|stream| {
-                    stream_config(&options.terms, *stream).map(|config| (*stream, config))
+                    let mut config = stream_config(&options.terms, *stream)?;
+                    config.conflation = conflation_of(options, *stream)?;
+                    Ok((*stream, config))
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, StartError>>()?;
             let mut driver = EmbeddedDriver::with_ipc(
                 options.driver,
                 ipc_config(&options.admission),
@@ -252,6 +340,7 @@ impl Daemon {
                 let handle = driver
                     .add_stream(config)
                     .map_err(|error| StartError::Stream { stream, error })?;
+                guard(&mut driver, options, stream, handle)?;
                 streams.push(handle);
             }
             let serving = match &options.archive {
@@ -659,6 +748,48 @@ mod tests {
         options.streams.push(STREAM);
         let daemon = Daemon::start(&options).unwrap();
         assert_eq!(daemon.streams.len(), 1);
+        let stop = AtomicBool::new(true);
+        assert_eq!(daemon.run(&stop), Shutdown::Clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--guard` opens each named guard once at start, audited: two
+    /// streams under one guard give one guard and one `Reopened` record,
+    /// in process, operation 0, from the closed epoch 1 to the open 2.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_guard_is_opened_once_at_start_and_audited() {
+        use karyos_driver::{AuditOutcome, Requester};
+
+        let dir = std::env::temp_dir().join(format!("karyosd-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut options = Options::new(dir.clone());
+        options.terms.term_length = karyos_sys::sizing::MIN_TERM_LENGTH;
+        options.streams.push(STREAM);
+        options.streams.push(StreamOption {
+            stream_id: 11,
+            ..STREAM
+        });
+        for stream_id in [10, 11] {
+            options.guards.push(crate::args::GuardOption {
+                name: "orders".to_owned(),
+                stream_id,
+                session_id: 1,
+                messages: 4,
+            });
+        }
+        let daemon = Daemon::start(&options).unwrap();
+        let audit = daemon.driver().guard_audit();
+        assert_eq!(audit.records.len(), 1, "{audit:?}");
+        let record = audit.records[0];
+        assert_eq!(record.outcome, AuditOutcome::Reopened);
+        assert_eq!(record.requester, Requester::InProcess);
+        assert_eq!(record.operation, 0);
+        let state = |word| karyos_sys::guard::decode(word).map(|state| (state.epoch, state.open));
+        assert_eq!(
+            (state(record.before), state(record.after)),
+            (Ok((1, false)), Ok((2, true)))
+        );
         let stop = AtomicBool::new(true);
         assert_eq!(daemon.run(&stop), Shutdown::Clean);
         let _ = std::fs::remove_dir_all(&dir);

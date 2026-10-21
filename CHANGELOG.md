@@ -703,6 +703,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyosd --conflation <stream>:<session>:<keys>:<value>:<journal>`
+  (the value and journal capacities are sizes) gives a configured stream
+  a conflation table (an offer's reserved value
+  is its key), so a remote client's conflated view can read it.
+  `karyosd --guard <name>:<stream_id>:<session_id>:<messages>` guards a
+  configured stream with guard `<name>`, which the daemon adds and opens
+  once at start (the reopen is audited), so a remote guarded publication
+  reads its outcome records. Each must name a stream a `--stream`
+  configures, once. Closing or reopening a guard stays an operator action
+  (owner item 59), and rate limits are not offered.
 - `karyosd --stream <stream_id>:<session_id>:allow-unconnected` starts a
   stream whose publications offer with no subscriber attached, a remote
   client's included (its grant carries the stream's policy, #577).
