@@ -711,7 +711,11 @@ release may break APIs, wire formats and shared-memory layouts.
   records. `publication.offer` takes an optional `reserved_value` (a
   conflated stream's key), and `conflated.poll` and
   `publication.poll_outcomes` an optional `until`, a count to poll for
-  within 10 s, since a remote driver answers after the offer.
+  within 10 s, since a remote driver answers after the offer. A
+  runner retries a remote publication's offer that answers
+  `back_pressured` or `admin_action`, serving its client, for up to
+  10 s, and each exclusive remote stream is added at most once per
+  suite run (REVIEWER-02's review of karyos#590).
 - `karyosd --conflation <stream>:<session>:<keys>:<value>:<journal>`
   (the value and journal capacities are sizes) gives a configured stream
   a conflation table (an offer's reserved value

@@ -422,15 +422,23 @@ streams:
 - **24:** plain, neither conflated nor guarded; offers need no
   subscriber.
 
-A scenario uses each exclusive stream's publication at most once: a
-remote publication is released asynchronously after its close, so a
-second `publication.add` of the same stream may be refused.
+Each exclusive stream's publication is added at most once in the whole
+suite run, since karyosd serves every scenario: a remote publication is
+released asynchronously after its close, so a later `publication.add`
+of the same stream, in any scenario, may be refused.
 
 The driver works in another process, so a conflated view's values and a
 guarded publication's outcome records arrive after the offer.
 `conflated.poll` and `publication.poll_outcomes` take `until`: the
 runner polls, serving the object's client, until the `delivered` total
 reaches `until`, and answers that total, or fails at 10 s.
+
+For the same reason a remote publication's first offers may answer
+`back_pressured` or `admin_action` until its client has been served.
+The runner retries `publication.offer` on a publication of
+`$remote_client` while it answers either, serving the client, and
+answers the first other status, or the last one at 10 s. A scenario
+does not retry offers itself.
 
 ### Bounds
 

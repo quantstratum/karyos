@@ -242,6 +242,40 @@ impl Adapter {
         }
     }
 
+    /// Runs `offer` on `publication`. On a remote publication (its client is
+    /// the runner's, FORMAT.md, Remote driver) a `back_pressured` or
+    /// `admin_action` answer is retried, serving the client, until the
+    /// offer answers anything else or 10 s pass: the driver serves the
+    /// remote client in another process, so its first offers may wait.
+    fn offer_remote<T>(
+        &self,
+        publication: usize,
+        mut offer: impl FnMut() -> (i32, T),
+        at: &str,
+    ) -> (i32, T) {
+        let client = self.objects[publication]
+            .parent
+            .filter(|parent| self.objects[*parent].provided)
+            .map(|parent| self.objects[parent].handle);
+        let start = std::time::Instant::now();
+        loop {
+            let (status, value) = offer();
+            let Some(client) = client else {
+                return (status, value);
+            };
+            let waits = status != 0
+                && matches!(
+                    self.name(status, at).as_str(),
+                    "back_pressured" | "admin_action"
+                );
+            if !waits || start.elapsed() >= UNTIL_DEADLINE {
+                return (status, value);
+            }
+            let _ = abi::client_poll(client);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Runs `op` with `arguments` (variables already bound).
     pub fn op(&mut self, op: &str, arguments: &BTreeMap<String, Value>, at: &str) -> Answer {
         let args = Args { arguments, at };
@@ -396,22 +430,25 @@ impl Adapter {
                 let handle = self.objects[publication].handle;
                 let lane = args.narrow("lane", Some(0));
                 let accepted_size = u32::try_from(size_of::<abi::Accepted>()).unwrap();
-                // A reserved value goes through the offer options: a
-                // conflated stream's key (FORMAT.md, Ops).
-                let (status, accepted) = if args.arguments.contains_key("reserved_value") {
-                    let (_, mut options) = abi::offer_options();
-                    options.reserved_value = args.narrow("reserved_value", None);
-                    abi::publication_offer_with(
-                        handle,
-                        lane,
-                        &args.message(),
-                        &options,
-                        options.size,
-                        accepted_size,
-                    )
-                } else {
-                    abi::publication_offer_on(handle, lane, &args.message(), accepted_size)
+                let offer = || {
+                    // A reserved value goes through the offer options: a
+                    // conflated stream's key (FORMAT.md, Ops).
+                    if args.arguments.contains_key("reserved_value") {
+                        let (_, mut options) = abi::offer_options();
+                        options.reserved_value = args.narrow("reserved_value", None);
+                        abi::publication_offer_with(
+                            handle,
+                            lane,
+                            &args.message(),
+                            &options,
+                            options.size,
+                            accepted_size,
+                        )
+                    } else {
+                        abi::publication_offer_on(handle, lane, &args.message(), accepted_size)
+                    }
                 };
+                let (status, accepted) = self.offer_remote(publication, offer, at);
                 self.accepted(status, &accepted, at)
             }
             "publication.publish_claimed" => {
