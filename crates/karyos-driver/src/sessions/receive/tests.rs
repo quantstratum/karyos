@@ -189,21 +189,22 @@ fn a_replaced_challenges_late_answer_binds_nothing_after_its_successor() {
     // The current challenge's answer first.
     let pending =
         accepted(sessions.answer(key(1), &answer(2, current.challenge.nonce), 2 * MS, || true));
-    // The replaced one's, late, while the image awaits installation.
-    assert!(matches!(
+    // The replaced one's, late, while the image awaits installation: the
+    // key's challenge is answered already.
+    assert_eq!(
         sessions.answer(key(1), &answer(1, replaced.challenge.nonce), 3 * MS, || {
             true
         }),
-        AnswerOutcome::Dropped(_)
-    ));
+        AnswerOutcome::Dropped(Ignored::AlreadyAnswered)
+    );
     sessions.image_ready(pending, 4 * MS);
     // And again once it is installed.
-    assert!(matches!(
+    assert_eq!(
         sessions.answer(key(1), &answer(1, replaced.challenge.nonce), 5 * MS, || {
             true
         }),
-        AnswerOutcome::Dropped(_)
-    ));
+        AnswerOutcome::Dropped(Ignored::NoChallenge)
+    );
     // Bound to the later identity, installed once.
     assert_eq!(
         sessions.announce(key(1), &announce(2), 6 * MS, &mut nonces),
