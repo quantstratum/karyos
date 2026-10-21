@@ -8,8 +8,7 @@ layouts and the C ABI will change.
 
 This alpha adds cross-process data streams on Linux, the UDP transport,
 the Archive with replay and recording groups, the management agent and
-its tools, and a C ABI with a conformance suite. It holds 1198
-commits since 0.1.0-alpha.1 (2173 with merges). No phase of the
+its tools, and a C ABI with a conformance suite. No phase of the
 delivery plan is complete: each section below says what is covered and
 what is partial.
 
@@ -327,11 +326,12 @@ latency on physical hosts.
 
 The rows with a head other than the release head are historical evidence
 for that commit, recorded during development by the author and the
-reviewer of each change. The release-gate rows are run on the release
-tree: this branch merged over main `2ccefd0a` (tree `c0517039`); the
-tagged commit adds only these notes and the changelog date on top of it.
-A row marked "not run at the release head" names its own head and what
-changed since.
+reviewer of each change. The release-gate rows were run on tree
+`c0517039` (#611 `b6e7e527` over main `2ccefd0a`). The tagged head
+differs from that tree only in `RELEASE-NOTES-0.1.0-alpha.2.md` and in
+the `//!` documentation of `crates/karyos-ffi/src/lib.rs`, plus the
+changelog date. A row marked "not run at the release head" names its own
+head and what changed since.
 
 | Check | Platform | Head | Result |
 | --- | --- | --- | --- |
@@ -341,7 +341,7 @@ changed since.
 | `scripts/linux-test.sh`, clippy, `make pre-push` | Docker (Linux run), aarch64; kernel not recorded | `05b628e1` | 151 suites, 0 failed; clippy clean; pre-push green |
 | Release gate `make pre-push` | macOS arm64 | TODO | TODO |
 | Release gate `make miri`, `karyos-sys` (`--lib`), sharded one per core | macOS arm64 | TODO | TODO |
-| `karyos-ffi` Miri per `crates/karyos-ffi/MIRI.md` (10 lib shards and the integration tests), not run at the release head | macOS arm64 | `f365ac26` (base `37c9a6d2`) | Lib shards 00 to 06 and 08: 84 passed, 0 failed, 37 ignored; shards 07 and 09: TODO; integration: abi 4/0, conformance 3/0 (5 native only), driver 6/0 (3 ignored), all passed; 4843 s wall for the shards and integration tests, under heavy host load. Since that head, `karyos-ffi` changed only in #614's later commits (a test's port and the conformance runner; no `unsafe`) and in this release's crate documentation; its dependencies changed in #615 (the CnC 0xC6 address encoding), #616 (`#[non_exhaustive]` enums) and #617 (`fc` refusal) |
+| `karyos-ffi` Miri per `crates/karyos-ffi/MIRI.md` (10 lib shards and the integration tests), not run at the release head | macOS arm64 | `f365ac26` (merge base with main `5bf2423b`) | Lib shards 00 to 06 and 08: 84 passed, 0 failed, 37 ignored; shards 07 and 09: TODO; integration: abi 4/0, conformance 3/0 (5 native only), driver 6/0 (3 ignored), all passed; 4843 s wall for the shards and integration tests, under heavy host load. Since that run, `karyos-ffi` changed in #610 (the cross-copy handle documentation), #613 (`abi.rs`, `api/archive.rs`, `handles.rs` and `header.rs`: unknown archive values refused), #614's later commits (a test's port and the conformance runner) and this release's crate documentation; none adds or changes an `unsafe` line; its dependencies changed in #615 (the CnC 0xC6 address encoding), #616 (`#[non_exhaustive]` enums) and #617 (`fc` refusal) |
 | Release gate `make loom` | macOS arm64 | TODO | TODO |
 | Release gate `make sim` | macOS arm64 | TODO | TODO |
 | Release gate `scripts/linux-test.sh --workspace --all-features --locked` | Docker `rust:1.99`, kernel TODO aarch64 | TODO | TODO |
