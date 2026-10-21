@@ -36,7 +36,9 @@ fn idle() {
 fn defaults() -> ClientOptions {
     let mut options = core::mem::MaybeUninit::<ClientOptions>::zeroed();
     // SAFETY: a live, aligned, writable `ClientOptions`.
-    let status = unsafe { karyos_client_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_client_options_init_sized(options.as_mut_ptr(), size_of::<ClientOptions>())
+    };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_client_options_init` wrote every field.
     unsafe { options.assume_init() }
@@ -77,7 +79,9 @@ fn options_init_fills_the_defaults_and_the_size() {
     assert_eq!(options.max_pending, 64);
     assert_eq!(options.max_images, 8);
     // SAFETY: a null pointer is refused before any use.
-    let status = unsafe { karyos_client_options_init(core::ptr::null_mut()) };
+    let status = unsafe {
+        karyos_client_options_init_sized(core::ptr::null_mut(), size_of::<ClientOptions>())
+    };
     assert_eq!(status, Status::InvalidArgument.code());
 }
 
@@ -1034,6 +1038,10 @@ fn a_subscription_delivers_each_message_from_its_private_copy() {
         image_id: 7,
         lane: 7,
         available: 7,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
     };
     let (mut has, mut lost) = (u32::MAX, u64::MAX);
     // SAFETY: live, aligned out-parameters.
@@ -1217,6 +1225,10 @@ fn image_changes_and_bad_arguments() {
         image_id: 0,
         lane: 0,
         available: 0,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
     };
     let (mut has, mut lost) = (u32::MAX, u64::MAX);
     // SAFETY: live, aligned out-parameters.
@@ -1319,11 +1331,18 @@ fn a_copy_that_cannot_grow_delivers_nothing_and_loses_nothing() {
 
 /// A driven driver with a network (Shared threading) and `N` conductors.
 fn driven_network<const N: usize>() -> (Driven, [karyos_client::ClientConductor; N]) {
+    driven_network_with(karyos_driver::net::NetworkConfig::default())
+}
+
+/// [`driven_network`] over `network`, its threading Shared.
+fn driven_network_with<const N: usize>(
+    network: karyos_driver::net::NetworkConfig,
+) -> (Driven, [karyos_client::ClientConductor; N]) {
     let mut driver = EmbeddedDriver::with_config(karyos_driver::DriverConfig {
         client_liveness_timeout: 3_600_000_000_000,
         network: Some(karyos_driver::net::NetworkConfig {
             threading: karyos_driver::agents::ThreadingMode::Shared,
-            ..karyos_driver::net::NetworkConfig::default()
+            ..network
         }),
         ..karyos_driver::DriverConfig::default()
     })
@@ -1429,6 +1448,10 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
         image_id: 0,
         lane: u32::MAX,
         available: 0,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
     };
     // SAFETY: live, aligned out-parameters.
     let status =
@@ -1461,6 +1484,139 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
     }
     assert_eq!(api::subscription::copy_length(handle), Some(large_max));
     assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// A retired image's change carries its end: a removed publication's EOS
+/// ends the image cleanly at its seal (`KARYOS_END_END_OF_STREAM`), and a
+/// publisher whose driver stopped sends none, so its image retires at its
+/// liveness timeout (`KARYOS_END_IMAGE_RETIRED`). The linger and the
+/// timeout are short and real: each case takes a few seconds at most.
+#[test]
+#[cfg_attr(miri, ignore = "UDP sockets")]
+fn a_retired_images_change_carries_its_end() {
+    use karyos_sys::log_buffer::SealReason;
+    const MS: u64 = 1_000_000;
+    let network = || karyos_driver::net::NetworkConfig {
+        agents: karyos_driver::agents::AgentConfig {
+            image_liveness_timeout: 1_000 * MS,
+            ..karyos_driver::agents::AgentConfig::default()
+        },
+        stream_defaults: karyos_driver::net::NetworkStreamDefaults {
+            publication_linger: 50 * MS,
+            ..karyos_driver::net::NetworkStreamDefaults::default()
+        },
+        ..karyos_driver::net::NetworkConfig::default()
+    };
+    for removed in [true, false] {
+        let (_reading, [ours]) = driven_network_with::<1>(network());
+        let (writing, [theirs]) = driven_network_with::<1>(network());
+        let client = client::insert_embedded(Client::with_conductor(ours, test_context()))
+            .unwrap()
+            .raw();
+        let port = test_port();
+        let uri = std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{port}")).unwrap();
+        let mut subscription = 0;
+        // SAFETY: a live C string, a live `u64`, no detail.
+        let status = unsafe {
+            karyos_client_add_subscription(
+                client,
+                uri.as_ptr(),
+                8,
+                &mut subscription,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, Status::Ok.code());
+        let mut publisher = Client::with_conductor(theirs, test_context());
+        let mut publication = publisher
+            .add_exclusive_publication(
+                &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+                karyos_client::StreamId::new(8),
+            )
+            .unwrap();
+        let mut seen = Seen::default();
+        let start = std::time::Instant::now();
+        while seen.messages.is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(60),
+                "nothing"
+            );
+            let _ = (publisher.poll(), poll(client));
+            let _ = publication.offer(b"end");
+            assert_eq!(poll_into(subscription, &mut seen, 1).0, Status::Ok.code());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Takes the next change, polling both clients meanwhile.
+        let mut next = |publisher: Option<&mut Client<karyos_client::ClientConductor>>| {
+            let mut change = ImageChange {
+                size: size_of_u32::<ImageChange>(),
+                session_id: 0,
+                image_id: 0,
+                lane: 7,
+                available: 7,
+                end_reason: 7,
+                reserved: 7,
+                end_position: 7,
+                seal_code: 7,
+            };
+            let mut publisher = publisher;
+            let start = std::time::Instant::now();
+            loop {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(60),
+                    "no change"
+                );
+                if let Some(publisher) = publisher.as_deref_mut() {
+                    let _ = publisher.poll();
+                }
+                let _ = poll(client);
+                assert_eq!(poll_into(subscription, &mut seen, 8).0, Status::Ok.code());
+                let mut has = 0;
+                // SAFETY: live, aligned out-parameters.
+                let status = unsafe {
+                    karyos_subscription_next_image_change(subscription, &mut change, &mut has)
+                };
+                assert_eq!(status, Status::Ok.code());
+                if has == 1 {
+                    return change;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let attached = next(Some(&mut publisher));
+        assert_eq!(
+            (attached.available, attached.end_reason, attached.reserved),
+            (1, END_NONE, 0)
+        );
+        assert_eq!((attached.end_position, attached.seal_code), (0, 0));
+        let retired = if removed {
+            publisher.remove_publication(publication);
+            next(Some(&mut publisher))
+        } else {
+            drop(publication);
+            drop(writing);
+            next(None)
+        };
+        assert_eq!(
+            (retired.image_id, retired.available, retired.reserved),
+            (attached.image_id, 0, 0)
+        );
+        let (reason, code) = if removed {
+            (END_END_OF_STREAM, SealReason::EndOfStream.code())
+        } else {
+            (END_IMAGE_RETIRED, SealReason::ImageRetired.code())
+        };
+        assert_eq!(
+            (retired.end_reason, retired.seal_code),
+            (reason, code),
+            "{removed}"
+        );
+        if removed {
+            // The clean end is positioned after what was delivered.
+            assert!(retired.end_position > 0);
+        }
+        assert_eq!(karyos_client_close(client), Status::Ok.code());
+    }
 }
 
 /// A panic inside the poll, while it holds the subscription, returns
@@ -1521,6 +1677,10 @@ fn next_image_change_checks_its_struct_before_its_handle() {
         image_id: 7,
         lane: 7,
         available: 7,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
     };
     // SAFETY: live, aligned out-parameters.
     let status = unsafe { karyos_subscription_next_image_change(stale, &mut change, &mut has) };
@@ -1639,6 +1799,117 @@ fn a_timed_lane_takes_a_timed_offer() {
     assert_eq!(read(&mut subscriber, &mut reading, 1), [b"timed".to_vec()]);
 }
 
+/// `karyos_image_change`'s write is by the caller's size: a 24-byte struct
+/// of the first header takes no end fields and keeps what follows it; a
+/// 48-byte one takes a retired image's end, or `KARYOS_END_NONE` for an
+/// arrival; a newer, longer one keeps its tail. The caller's size stays.
+#[test]
+fn an_image_change_is_written_by_the_callers_size() {
+    use karyos_sys::log_buffer::SealReason;
+    let lane = karyos_sys::frame::Lane::try_new(3).unwrap();
+    let retired = karyos_client::ImageChange::new(9, 5, lane, false).with_end(Some(
+        karyos_client::ImageEnd::new(SealReason::ImageRetired, Some(4096)),
+    ));
+    let filled = |size| ImageChange {
+        size,
+        session_id: 7,
+        image_id: 7,
+        lane: 7,
+        available: 7,
+        end_reason: 7,
+        reserved: 7,
+        end_position: 7,
+        seal_code: 7,
+    };
+    // The first header's struct: the end fields are past its size.
+    let mut first = filled(IMAGE_CHANGE_SIZE_0_1);
+    // SAFETY: `first` is live, aligned and larger than its size.
+    unsafe { write_image_change(&raw mut first, &retired) };
+    assert_eq!(
+        (
+            first.size,
+            first.session_id,
+            first.image_id,
+            first.lane,
+            first.available
+        ),
+        (24, 5, 9, 3, 0)
+    );
+    assert_eq!(
+        (
+            first.end_reason,
+            first.reserved,
+            first.end_position,
+            first.seal_code
+        ),
+        (7, 7, 7, 7)
+    );
+    // This header's: the end.
+    let mut current = filled(IMAGE_CHANGE_SIZE_ENDS);
+    // SAFETY: `current` is live, aligned and of its size.
+    unsafe { write_image_change(&raw mut current, &retired) };
+    assert_eq!(
+        (
+            current.size,
+            current.end_reason,
+            current.reserved,
+            current.end_position,
+            current.seal_code
+        ),
+        (
+            48,
+            END_IMAGE_RETIRED,
+            0,
+            4096,
+            SealReason::ImageRetired.code()
+        )
+    );
+    assert_eq!(size_of_u32::<ImageChange>(), IMAGE_CHANGE_SIZE_ENDS);
+    // A clean end, an end whose seal is not positioned, and an arrival.
+    for (change, fields) in [
+        (
+            karyos_client::ImageChange::new(1, 1, lane, false).with_end(Some(
+                karyos_client::ImageEnd::new(SealReason::EndOfStream, Some(64)),
+            )),
+            (END_END_OF_STREAM, 64, SealReason::EndOfStream.code()),
+        ),
+        (
+            karyos_client::ImageChange::new(1, 1, lane, false).with_end(Some(
+                karyos_client::ImageEnd::new(SealReason::ImageRetired, None),
+            )),
+            (END_IMAGE_RETIRED, 0, SealReason::ImageRetired.code()),
+        ),
+        (
+            karyos_client::ImageChange::new(1, 1, lane, true),
+            (END_NONE, 0, 0),
+        ),
+    ] {
+        let mut written = filled(IMAGE_CHANGE_SIZE_ENDS);
+        // SAFETY: `written` is live, aligned and of its size.
+        unsafe { write_image_change(&raw mut written, &change) };
+        assert_eq!(
+            (written.end_reason, written.end_position, written.seal_code),
+            fields
+        );
+    }
+    // A struct of a newer header, 8 bytes longer: its tail stays.
+    #[repr(C)]
+    struct Newer {
+        change: ImageChange,
+        tail: u64,
+    }
+    let mut newer = Newer {
+        change: filled(56),
+        tail: 0xA5A5,
+    };
+    // SAFETY: `newer` is live, aligned and 56 bytes, its size.
+    unsafe { write_image_change(&raw mut newer.change, &retired) };
+    assert_eq!(
+        (newer.change.size, newer.change.end_position, newer.tail),
+        (56, 4096, 0xA5A5)
+    );
+}
+
 mod archive;
 mod concurrent;
 mod conflated;
@@ -1653,7 +1924,12 @@ mod threads;
 fn subscription_defaults() -> SubscriptionOptions {
     let mut options = core::mem::MaybeUninit::<SubscriptionOptions>::zeroed();
     // SAFETY: a live, aligned, writable `SubscriptionOptions`.
-    let status = unsafe { karyos_subscription_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_subscription_options_init_sized(
+            options.as_mut_ptr(),
+            size_of::<SubscriptionOptions>(),
+        )
+    };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_subscription_options_init` wrote every field.
     unsafe { options.assume_init() }
@@ -1705,8 +1981,163 @@ fn subscription_options_init_fills_the_defaults_and_the_size() {
         (0, 0, 0, 0)
     );
     // SAFETY: a null pointer is refused before any use.
-    let status = unsafe { karyos_subscription_options_init(core::ptr::null_mut()) };
+    let status = unsafe {
+        karyos_subscription_options_init_sized(
+            core::ptr::null_mut(),
+            size_of::<SubscriptionOptions>(),
+        )
+    };
     assert_eq!(status, Status::InvalidArgument.code());
+}
+
+/// Guard words after a caller's struct: an init that writes past the
+/// caller's size overwrites them.
+const CANARY: u64 = 0xa5a5_a5a5_a5a5_a5a5;
+
+/// The first (ABI 0.1.0) `karyos_subscription_options`, as an older header
+/// declared it: 16 bytes, then guard words.
+#[repr(C)]
+struct OlderSubscriptionOptions {
+    size: u32,
+    role: u32,
+    rejoin: u32,
+    reserved: u32,
+    canaries: [u64; 3],
+}
+
+/// An older header's 16-byte struct, filled through the exported
+/// `karyos_subscription_options_init` an older binary calls (owner item
+/// 48, F-48: it wrote the current 40 bytes) and through the sized init:
+/// 16 bytes at most, the size set to 16, the guard words intact.
+#[test]
+fn an_older_headers_subscription_options_are_filled_within_their_size() {
+    for sized in [false, true] {
+        let mut older = OlderSubscriptionOptions {
+            size: 0,
+            role: 9,
+            rejoin: 9,
+            reserved: 9,
+            canaries: [CANARY; 3],
+        };
+        let options = (&raw mut older).cast::<SubscriptionOptions>();
+        let status = if sized {
+            // SAFETY: `older` is 16 writable bytes and more.
+            unsafe { karyos_subscription_options_init_sized(options, 16) }
+        } else {
+            // SAFETY: `older` is the 0.1.0 size and more.
+            unsafe { karyos_subscription_options_init(options) }
+        };
+        assert_eq!(status, Status::Ok.code());
+        assert_eq!(older.size, SUBSCRIPTION_OPTIONS_SIZE_0_1);
+        assert_eq!(
+            (older.role, older.rejoin, older.reserved),
+            (ROLE_REQUIRED, REJOIN_AT_HEAD, 0)
+        );
+        assert_eq!(older.canaries, [CANARY; 3], "nothing written past 16 bytes");
+    }
+    // A size below the first version's writes nothing.
+    let mut older = OlderSubscriptionOptions {
+        size: 7,
+        role: 9,
+        rejoin: 9,
+        reserved: 9,
+        canaries: [CANARY; 3],
+    };
+    // SAFETY: a live local of more than the size given.
+    let status = unsafe {
+        karyos_subscription_options_init_sized(
+            (&raw mut older).cast(),
+            usize::try_from(SUBSCRIPTION_OPTIONS_SIZE_0_1 - 4).unwrap(),
+        )
+    };
+    assert_eq!(status, Status::InvalidArgument.code());
+    assert_eq!((older.size, older.role), (7, 9));
+}
+
+/// The sized init with this header's size fills every field, and the
+/// struct an older binary's init filled is read by its 16 bytes only, at
+/// an address that is 4 mod 8 as an older header's struct may be. The
+/// options are accepted (the client is looked up next: no client 0).
+#[test]
+fn a_16_byte_struct_is_read_by_its_size() {
+    let mut options = core::mem::MaybeUninit::<SubscriptionOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `SubscriptionOptions`.
+    let status = unsafe {
+        karyos_subscription_options_init_sized(
+            options.as_mut_ptr(),
+            size_of::<SubscriptionOptions>(),
+        )
+    };
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: the sized init wrote every field.
+    let full = unsafe { options.assume_init() };
+    assert_eq!(full.size, SUBSCRIPTION_OPTIONS_SIZE_ARCHIVE);
+    // An older header's struct is 4-aligned and may land at an address
+    // that is 4 mod 8, where this version's 8-aligned struct cannot: the
+    // 16 bytes start at whichever of the first two words sits there, so a
+    // check of this version's alignment would refuse them.
+    let mut words = [0_u32; 6];
+    let at = usize::from(words.as_ptr().addr() % 8 == 0);
+    // From the array's pointer, whose provenance covers the 16 bytes.
+    let small = words
+        .as_mut_ptr()
+        .wrapping_add(at)
+        .cast::<SubscriptionOptions>();
+    assert_eq!(small.addr() % 8, 4);
+    // SAFETY: `words` holds the 0.1.0 size from `at` on.
+    let status = unsafe { karyos_subscription_options_init(small) };
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(words[at], SUBSCRIPTION_OPTIONS_SIZE_0_1);
+    // SAFETY: the struct is 16 bytes at `small`, of its stated size.
+    let (status, subscription) = unsafe { add_subscription_with(0, STREAM, small) };
+    assert_eq!(
+        status,
+        Status::InvalidHandle.code(),
+        "the options were accepted"
+    );
+    assert_eq!(subscription, u64::MAX);
+}
+
+/// The grown `karyos_stream_options`: an older binary's 64- or 80-byte
+/// struct is filled within its size, the legacy symbol fills the 0.1.0
+/// 64 bytes, and this header's size fills them all.
+#[test]
+fn an_older_headers_stream_options_are_filled_within_their_size() {
+    #[repr(C, align(8))]
+    struct Room([u8; 120]);
+    let ours = size_of_u32::<StreamOptions>();
+    for (size, legacy) in [
+        (STREAM_OPTIONS_SIZE_0_1, false),
+        (STREAM_OPTIONS_SIZE_CONFLATION, false),
+        (STREAM_OPTIONS_SIZE_CONCURRENT, false),
+        (STREAM_OPTIONS_SIZE_CONFLATION, true),
+    ] {
+        let mut room = Room([0xa5; 120]);
+        let options = (&raw mut room).cast::<StreamOptions>();
+        let status = if legacy {
+            // SAFETY: `room` is more than the 0.1.0 size.
+            unsafe { karyos_stream_options_init(options) }
+        } else {
+            // SAFETY: `room` is more than `size` writable bytes.
+            unsafe { karyos_stream_options_init_sized(options, usize::try_from(size).unwrap()) }
+        };
+        assert_eq!(status, Status::Ok.code());
+        let written = if legacy {
+            STREAM_OPTIONS_SIZE_0_1
+        } else {
+            size.min(ours)
+        };
+        let bytes = &room.0;
+        assert_eq!(
+            u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            written
+        );
+        let past = usize::try_from(written).unwrap();
+        assert!(
+            bytes[past..].iter().all(|byte| *byte == 0xa5),
+            "nothing written past {written} bytes"
+        );
+    }
 }
 
 /// Bad options are refused before the client is looked up: nothing is
@@ -1854,7 +2285,9 @@ fn a_sealed_stream_closes_its_subscription() {
     const SEALED: i32 = 1010;
     let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
     // SAFETY: a live, aligned, writable `DriverOptions`.
-    let status = unsafe { karyos_driver_options_init(options.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_driver_options_init_sized(options.as_mut_ptr(), size_of::<DriverOptions>())
+    };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_driver_options_init` wrote every field.
     let options = unsafe { options.assume_init() };
@@ -1864,7 +2297,9 @@ fn a_sealed_stream_closes_its_subscription() {
     assert_eq!(status, Status::Ok.code());
     let mut stream = core::mem::MaybeUninit::<StreamOptions>::zeroed();
     // SAFETY: a live, aligned, writable `StreamOptions`.
-    let status = unsafe { karyos_stream_options_init(stream.as_mut_ptr()) };
+    let status = unsafe {
+        karyos_stream_options_init_sized(stream.as_mut_ptr(), size_of::<StreamOptions>())
+    };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_stream_options_init` wrote every field.
     let mut stream = unsafe { stream.assume_init() };
@@ -1928,7 +2363,8 @@ fn a_sealed_stream_closes_its_subscription() {
 fn offer_defaults() -> OfferOptions {
     let mut options = core::mem::MaybeUninit::<OfferOptions>::zeroed();
     // SAFETY: a live, aligned, writable `OfferOptions`.
-    let status = unsafe { karyos_offer_options_init(options.as_mut_ptr()) };
+    let status =
+        unsafe { karyos_offer_options_init_sized(options.as_mut_ptr(), size_of::<OfferOptions>()) };
     assert_eq!(status, Status::Ok.code());
     // SAFETY: `karyos_offer_options_init` wrote every field.
     unsafe { options.assume_init() }
@@ -1967,7 +2403,9 @@ fn offer_options_init_fills_the_defaults_and_the_size() {
     assert_eq!(options.size, OFFER_OPTIONS_SIZE_0_1);
     assert_eq!((options.reserved, options.reserved_value), (0, 0));
     // SAFETY: a null pointer is refused before any use.
-    let status = unsafe { karyos_offer_options_init(core::ptr::null_mut()) };
+    let status = unsafe {
+        karyos_offer_options_init_sized(core::ptr::null_mut(), size_of::<OfferOptions>())
+    };
     assert_eq!(status, Status::InvalidArgument.code());
 }
 

@@ -15,7 +15,7 @@ use support::abi;
 
 #[test]
 fn the_abi_version_is_0_1_0() {
-    assert_eq!(abi::abi_version(), (0, [0, 1, 0]));
+    assert_eq!(abi::abi_version(), (0, [0, 1, 1]));
 }
 
 #[test]

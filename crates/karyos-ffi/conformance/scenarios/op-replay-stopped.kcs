@@ -1,7 +1,8 @@
 # A replay at a millionth of the recorded pace holds the recording's
-# second half (published 5 ms after the first) for about 5000 s, so it can
-# only end by its stop: the target then seals as an image retired, not a
-# clean end, and a second stop finds no such replay (code 3).
+# second half (recorded at least 50 ms after the first, FORMAT.md's
+# seeding) for at least 50 000 s, so it can only end by its stop: the
+# target then seals as an image retired, not a clean end, and a second
+# stop finds no such replay (code 3).
 format 2
 id op.replay.stopped
 abi 0.1

@@ -43,8 +43,8 @@ pub mod trace;
 
 pub use client::{
     Accepted, Claim, Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES,
-    DEFAULT_MAX_PENDING, DEFAULT_TIMEOUT, IdleStrategy, ImageChange, ImageStop, MessageLength,
-    NotRejoinable, OfferError, OfferOptions, Publication, RejoiningSubscription,
+    DEFAULT_MAX_PENDING, DEFAULT_TIMEOUT, IdleStrategy, ImageChange, ImageEnd, ImageStop,
+    MessageLength, NotRejoinable, OfferError, OfferOptions, Publication, RejoiningSubscription,
     ReplayTargetSubscriber, Subscription, SubscriptionError, SubscriptionOptions, SubscriptionPoll,
 };
 pub use concurrent::{
@@ -70,6 +70,8 @@ pub use karyos_protocol::trace_hook::PublicationIdentity;
 pub use karyos_sys::conflation::Budget as ConflatedBudget;
 pub use karyos_sys::frame::Lane;
 pub use karyos_sys::freshness::Freshness;
+/// Why a stream sealed, as a retired image's end reports it ([`ImageEnd`]).
+pub use karyos_sys::log_buffer::SealReason;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
 pub use merge::{
     LiveMerge, MergeError, MergeFailed, MergePoll, Replay, ReplayProvider, ReplayRejoin,

@@ -277,6 +277,16 @@ fn header_functions() -> BTreeMap<String, Signature> {
     code.split(';')
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
+        .map(|statement| {
+            // A `static inline` init's definition, `static inline int32_t
+            // karyos_X_init(karyos_X *options) { return ...`: its prototype
+            // is the part before the body, which declares the exported
+            // symbol of that name an older header's binary calls.
+            match statement.strip_prefix("static inline ") {
+                Some(inline) => inline.split_once('{').expect("a body").0.trim(),
+                None => statement,
+            }
+        })
         .map(|prototype| {
             let open = prototype.find('(').expect("a prototype");
             let close = prototype.rfind(')').expect("a prototype");
@@ -346,6 +356,35 @@ fn the_header_declares_every_struct_with_its_fields() {
     let rust = rust_structs();
     assert!(rust.contains_key("karyos_detail"));
     assert_eq!(header_structs().1, rust);
+}
+
+/// Every `_init` is the header's `static inline` wrapper over an exported
+/// `_init_sized` with the caller's `sizeof` (owner item 48's option A,
+/// interim), so a struct that grows is never filled past a caller's.
+#[test]
+fn every_init_is_an_inline_over_a_sized_export() {
+    let functions = rust_functions();
+    let inits: Vec<String> = header_functions()
+        .into_keys()
+        .filter(|name| name.ends_with("_init"))
+        .collect();
+    assert_eq!(inits.len(), 7, "{inits:?}");
+    let flat = HEADER.split_whitespace().collect::<Vec<_>>().join(" ");
+    for name in inits {
+        assert!(
+            flat.contains(&format!("static inline int32_t {name}(")),
+            "{name} is not the header's inline wrapper"
+        );
+        assert!(
+            flat.contains(&format!("return {name}_sized( options, sizeof *options);"))
+                || flat.contains(&format!("return {name}_sized(options, sizeof *options);")),
+            "{name} does not pass its sizeof"
+        );
+        assert!(
+            functions.contains_key(&format!("{name}_sized")),
+            "{name}_sized is not exported"
+        );
+    }
 }
 
 #[test]
@@ -586,6 +625,10 @@ fn the_header_states_the_replay_rates_and_end_codes() {
         ("KARYOS_END_REVOKED", END_REVOKED),
         ("KARYOS_END_CLOSED_BY_OVERRUN", END_CLOSED_BY_OVERRUN),
         ("KARYOS_END_OTHER", END_OTHER),
+        (
+            "KARYOS_IMAGE_CHANGE_SIZE_ENDS",
+            crate::abi::IMAGE_CHANGE_SIZE_ENDS,
+        ),
     ] {
         assert_eq!(defines[name], i64::from(value), "{name}");
     }

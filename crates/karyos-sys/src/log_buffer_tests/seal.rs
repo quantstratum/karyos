@@ -197,6 +197,7 @@ fn a_cutover_seal_marks_its_successor_and_positioning_keeps_the_mark() {
         ));
         let end = buffer.reserved_head().load(Ordering::Acquire);
         assert!(!buffer.sealed_with_successor());
+        assert_eq!(buffer.terminal_seal(), None);
         if cutover {
             conductor.seal_for_cutover().unwrap();
         } else {
@@ -204,11 +205,15 @@ fn a_cutover_seal_marks_its_successor_and_positioning_keeps_the_mark() {
         }
         assert_eq!(conductor.seal_state(), SealState::Sealed);
         assert_eq!(buffer.sealed_with_successor(), cutover);
+        // Terminal only without a successor; no position yet.
+        let terminal = |position| (!cutover).then_some((SealReason::Unspecified, position));
+        assert_eq!(buffer.terminal_seal(), terminal(None));
         drop(publication);
         let _ = conductor.duty_cycle().unwrap();
         // The position is the same either way; the mark survives it.
         assert_eq!(conductor.seal_state(), SealState::Retired { position: end });
         assert_eq!(buffer.sealed_with_successor(), cutover);
+        assert_eq!(buffer.terminal_seal(), terminal(Some(end)));
         // A later seal of either kind changes nothing.
         conductor.seal().unwrap();
         conductor.seal_for_cutover().unwrap();
@@ -599,6 +604,8 @@ fn a_seal_reason_reaches_readers_publishers_and_the_conductor() {
         SealReason::ConflationVersionsExhausted,
         SealReason::StreamRemoved,
         SealReason::ConflationFeederLost,
+        SealReason::ImageRetired,
+        SealReason::EndOfStream,
     ] {
         let buffer = new_buffer(config(3, 2)).unwrap();
         let mut conductor = buffer.conductor().unwrap();
@@ -625,6 +632,7 @@ fn a_seal_reason_reaches_readers_publishers_and_the_conductor() {
             drain_to_end(&mut subscription),
             (1, PollOutcome::Closed { position: end, reason })
         );
+        assert_eq!(buffer.terminal_seal(), Some((reason, Some(end))));
         assert_eq!(SealReason::from_code(reason.code()), reason);
     }
     // A code this build does not know reads as unspecified.

@@ -461,6 +461,62 @@ fn a_subscription_follows_its_clients_driver() {
     client::close(client).unwrap();
 }
 
+/// A stop or a close of a started driver returns at once whatever its idle
+/// strategy, a sleep of `u64::MAX` nanoseconds included: the thread parks
+/// in its idle sleep and the stop unparks it (`karyos.h`, Threads). A
+/// driver call meanwhile takes the driver at once too: the thread parks
+/// with the driver's lock released.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn no_idle_strategy_holds_a_stop_or_a_close() {
+    let _serial = serial();
+    let bound = std::time::Duration::from_secs(1);
+    for strategy in [
+        IDLE_SLEEP,
+        IDLE_YIELD_THEN_SLEEP,
+        IDLE_YIELD,
+        IDLE_BUSY_SPIN,
+    ] {
+        let idle = Idle {
+            strategy,
+            sleep_ns: if strategy == IDLE_SLEEP { u64::MAX } else { 0 },
+        };
+        for closing in [false, true] {
+            let driver = created();
+            start(driver, idle).unwrap();
+            // The thread runs a cycle and goes idle: no stream, no work.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let (done, returned) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result =
+                    add_stream(driver, &stream(900)).and_then(|()| remove_stream(driver, 900));
+                let _ = done.send(result);
+            });
+            let result = returned.recv_timeout(bound).unwrap_or_else(|_| {
+                panic!("strategy {strategy}: a driver call waited past {bound:?}")
+            });
+            assert_eq!(result, Ok(()), "strategy {strategy}: a driver call");
+            // Off this thread, so a stop that never returns fails the
+            // test instead of hanging it.
+            let (done, returned) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = if closing { close(driver) } else { stop(driver) };
+                let _ = done.send(result);
+            });
+            let result = returned.recv_timeout(bound).unwrap_or_else(|_| {
+                panic!(
+                    "strategy {strategy}: the {} waited past {bound:?}",
+                    if closing { "close" } else { "stop" }
+                )
+            });
+            assert_eq!(result, Ok(()), "strategy {strategy}");
+            if !closing {
+                close(driver).unwrap();
+            }
+        }
+    }
+}
+
 /// A call on a started driver waits for about one duty cycle, not for as
 /// long as the thread keeps winning the driver's lock (`karyos.h`,
 /// "Threads"). Against a busy-spinning thread, which takes the lock back
