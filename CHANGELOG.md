@@ -161,7 +161,8 @@ release may break APIs, wire formats and shared-memory layouts.
   a timed offer is not delivered before its time, then is, with the
   typed refusals as before. The new `stream.schedule.refused` covers the
   refusal on a driver's stream. The semantic layer gains
-  `publication.offer_at` and `until` on `subscription.poll`, and the
+  `publication.offer_at` (answering its `tx_time`) and `until` and
+  `not_before` on `subscription.poll`, and the
   runner retries a remote offer's `not_connected` too. No `Tai` timed
   lane exists now: the network route refuses that domain. The frozen
   bindings keep their pinned suite; their first pin update after the
