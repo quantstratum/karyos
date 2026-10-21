@@ -121,6 +121,20 @@ fn larger() -> Reconfiguration {
     }
 }
 
+/// The first cutover's seal, the successor's base: read from the
+/// successor's entry, since once every participant has moved the
+/// predecessor may already be freed, and the table's first entry is then
+/// the successor, with no seal.
+fn first_seal(driver: &EmbeddedDriver, stream: StreamHandle) -> u64 {
+    driver
+        .generations(stream)
+        .unwrap()
+        .iter()
+        .find(|entry| entry.generation.get() == 1)
+        .unwrap()
+        .base
+}
+
 fn payload(index: u64) -> Vec<u8> {
     vec![u8::try_from(index % 251).unwrap(); PAYLOAD]
 }
@@ -211,7 +225,7 @@ fn a_lagging_async_recording_drains_to_the_seal_and_continues_on_the_successor()
     for index in before..before + after {
         positions.push(publish(&mut driver, &mut writer, index));
     }
-    let seal = driver.generations(stream).unwrap()[0].seal.unwrap();
+    let seal = first_seal(&driver, stream);
     assert_eq!(seal, window, "the recording lagged its whole window");
     assert_eq!(positions[0], seal, "the successor starts at the seal");
     // The recording drains the backlog to the seal and follows.
@@ -302,7 +316,7 @@ fn a_recording_draining_across_deadlines_keeps_its_lease() {
     }
     let _ = driver.reconfigure_stream(stream, larger()).unwrap();
     let first = publish(&mut driver, &mut writer, before);
-    let seal = driver.generations(stream).unwrap()[0].seal.unwrap();
+    let seal = first_seal(&driver, stream);
     // One frame per duty, a little less than a deadline apart.
     let mut now = 0;
     for _ in 0..before + 2 {
@@ -373,7 +387,7 @@ fn the_agent_records_across_a_cutover_through_its_documented_wiring() {
     for index in before..before + 6 {
         positions.push(publish(&mut driver, &mut writer, index));
     }
-    let seal = driver.generations(stream).unwrap()[0].seal.unwrap();
+    let seal = first_seal(&driver, stream);
     assert_eq!(positions[0], seal);
     let end = positions[positions.len() - 1] + FRAME;
     let deadline = Instant::now() + Duration::from_secs(30);
