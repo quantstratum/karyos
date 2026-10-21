@@ -174,6 +174,50 @@ fn a_challenge_is_resent_replaced_and_expires() {
     ));
 }
 
+/// Delayed answers to two challenges of one key arrive out of order
+/// (SPEC §13, "Challenge lifecycle"): the later challenge's answer comes
+/// first and binds; the replaced challenge's answer, arriving after it,
+/// binds nothing, while the image awaits installation and once it is
+/// installed, and the key stays bound to the later identity.
+#[test]
+fn a_replaced_challenges_late_answer_binds_nothing_after_its_successor() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let replaced = challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces));
+    let current = challenged(sessions.announce(key(1), &announce(2), MS, &mut nonces));
+    assert_ne!(replaced.challenge.nonce, current.challenge.nonce);
+    // The current challenge's answer first.
+    let pending =
+        accepted(sessions.answer(key(1), &answer(2, current.challenge.nonce), 2 * MS, || true));
+    // The replaced one's, late, while the image awaits installation: the
+    // key's challenge is answered already.
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, replaced.challenge.nonce), 3 * MS, || {
+            true
+        }),
+        AnswerOutcome::Dropped(Ignored::AlreadyAnswered)
+    );
+    sessions.image_ready(pending, 4 * MS);
+    // And again once it is installed.
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, replaced.challenge.nonce), 5 * MS, || {
+            true
+        }),
+        AnswerOutcome::Dropped(Ignored::NoChallenge)
+    );
+    // Bound to the later identity, installed once.
+    assert_eq!(
+        sessions.announce(key(1), &announce(2), 6 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::BoundSameIdentity)
+    );
+    assert_eq!(
+        sessions.announce(key(1), &announce(1), 6 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::BoundOtherIdentity)
+    );
+    assert_eq!(sessions.counters().installed, 1);
+    assert_eq!(sessions.counters().challenges_replaced, 1);
+}
+
 /// Every field of the answer must match: identity, term parameters, lane
 /// count, boot id, nonce and key.
 #[test]
