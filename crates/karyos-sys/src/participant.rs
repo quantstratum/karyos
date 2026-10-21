@@ -352,7 +352,10 @@ mod tests {
         assert_eq!(reader_minima(pairs), (None, Some(40)));
         // A sender's retention hold lowers the floor below its bound cell,
         // never the limit's bound.
-        let sender = [cell(CELL_REQUIRED_RESERVED, 900), cell(CELL_SENDER_HOLD, 500)];
+        let sender = [
+            cell(CELL_REQUIRED_RESERVED, 900),
+            cell(CELL_SENDER_HOLD, 500),
+        ];
         let pairs = sender.iter().map(|(state, position)| (state, position));
         assert_eq!(reader_minima(pairs), (Some(900), Some(500)));
         let silent = [cell(CELL_SENDER_SILENT, 900), cell(CELL_SENDER_HOLD, 500)];

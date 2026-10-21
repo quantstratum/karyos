@@ -140,8 +140,7 @@ pub const CLEANING_HEADROOM: u8 = 1;
 use crate::participant::{
     self, CELL_FREE, CELL_LOST, CELL_LOST_HOLDING, CELL_LOST_RESERVED, CELL_OBSERVER,
     CELL_OPTIONAL, CELL_PUBLICATION, CELL_REQUIRED, CELL_REQUIRED_RESERVED, CELL_SENDER_HOLD,
-    CELL_WALKER, bounds,
-    counts_for_connection, is_observer_like, is_reader, is_required_reserved,
+    CELL_WALKER, bounds, counts_for_connection, is_observer_like, is_reader, is_required_reserved,
     visible_as_subscriber,
 };
 
