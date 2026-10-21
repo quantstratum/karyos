@@ -1128,13 +1128,15 @@ fn a_remote_client_takes_handles_that_exchange_and_detach_on_drop() {
 /// A stream's `allow_unconnected` reaches a remote client's publication
 /// through its grant's record (quantstratum-docs:
 /// karyos/design/ipc-admission.md, Unconnected offers): with no subscriber,
-/// an exclusive or a concurrent handle taken without it offers on a stream
-/// that allows it, and is not connected on one that does not.
+/// an exclusive or a concurrent handle offers when its request or its
+/// stream allows it, and is not connected when neither does.
 #[test]
 fn a_streams_allow_unconnected_reaches_a_remote_publication() {
+    // (stream allows, request asks): the OR of the two, not either alone.
+    let cases = [(false, false), (true, false), (false, true)];
     for concurrent in [false, true] {
-        for allow in [false, true] {
-            let dir = dir(&format!("unconnected-{concurrent}-{allow}"));
+        for (allow, request) in cases {
+            let dir = dir(&format!("unconnected-{concurrent}-{allow}-{request}"));
             let mut driver = system_driver(&dir);
             let mut config = shared_stream_config();
             config.allow_unconnected = allow;
@@ -1152,9 +1154,9 @@ fn a_streams_allow_unconnected_reaches_a_remote_publication() {
             };
             let accepted = serve_while(&mut driver, move || {
                 if concurrent {
-                    let _ = client.add_concurrent_publication(key, false).unwrap();
+                    let _ = client.add_concurrent_publication(key, request).unwrap();
                 } else {
-                    let _ = client.add_publication(key, false).unwrap();
+                    let _ = client.add_publication(key, request).unwrap();
                 }
                 let mut fetchable = None;
                 let start = Instant::now();
@@ -1196,7 +1198,11 @@ fn a_streams_allow_unconnected_reaches_a_remote_publication() {
                 drop(client);
                 accepted
             });
-            assert_eq!(accepted, allow, "concurrent {concurrent}, allow {allow}");
+            assert_eq!(
+                accepted,
+                allow || request,
+                "concurrent {concurrent}, allow {allow}, request {request}"
+            );
             serve_until(&mut driver, |driver| driver.clients() == 0);
         }
     }
