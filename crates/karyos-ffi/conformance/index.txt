@@ -25,4 +25,4 @@ staged claims: claim.outstanding op.claim.published op.claim.retry op.claim.pare
 clocks: op.clock.monotonic op.clock.tai
 # Not a §13 row: the Archive replays of B6 (quantstratum-docs:
 # karyos/design/archive-replay-control.md), Linux only.
-archive replays: op.replay.complete op.replay.stopped op.replay.refused
+archive replays: op.replay.complete op.replay.stopped op.replay.refused op.replay.u64
