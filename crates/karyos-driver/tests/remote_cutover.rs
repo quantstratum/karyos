@@ -746,9 +746,21 @@ fn a_remote_backlog_drains_to_the_seal_and_a_stopped_subscriber_never_delays_the
         (moved.unwrap(), seen)
     });
     let (at, after) = moved;
-    // An exclusive stream is sealed at the writer's next call after the
-    // reconfiguration.
-    let end = driver.generations(stream).unwrap()[0].seal.unwrap();
+    // The writer moved while the stopped subscriber was not yet fenced.
+    assert_eq!(
+        counter(&driver, "grants fenced"),
+        0,
+        "the stopped subscriber was fenced before the writer moved"
+    );
+    // The seal, as the successor's base: the predecessor may be freed once
+    // the stopped subscriber is fenced.
+    let end = driver
+        .generations(stream)
+        .unwrap()
+        .iter()
+        .find(|entry| entry.generation.get() == 1)
+        .unwrap()
+        .base;
     assert_eq!(
         at, end,
         "the writer's first successor message is at the seal"
