@@ -277,6 +277,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.net.as_ref()?.subscription_address(stream_id)
     }
 
+    /// The bound address `subscription` on `channel` reports in
+    /// `NetworkSubscriptionReady` (decision row 26): its first path's
+    /// endpoint address as the socket reports it, or for a multicast
+    /// subscription the group address with the bound port, not the
+    /// interface. `None` without such an endpoint.
+    pub(crate) fn network_subscription_bound(
+        &self,
+        subscription: &NetworkSubscription,
+        channel: &UdpConfig,
+    ) -> Option<SocketAddr> {
+        let local = self
+            .net
+            .as_ref()?
+            .endpoint_address(subscription.endpoint())?;
+        Some(match &channel.destination {
+            Destination::Multicast { group, .. } => SocketAddr::new(group.ip(), local.port()),
+            Destination::Unicast(_) | Destination::MultiDestination { .. } => local,
+        })
+    }
+
     pub(crate) fn subscribe_network(
         &mut self,
         stream_id: i32,

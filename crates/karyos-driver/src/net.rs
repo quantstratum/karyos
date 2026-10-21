@@ -1270,6 +1270,11 @@ impl<T: StreamTerms> Network<T> {
         self.net_images.iter().filter_map(|image| image.exposed)
     }
 
+    /// The bound local address of `endpoint` in its current epoch.
+    pub(crate) fn endpoint_address(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        self.endpoints.local_address(endpoint)
+    }
+
     /// The bound local address of the endpoint `stream_id`'s first
     /// subscription path is on, in its current epoch (a port 0 bind
     /// resolved by the kernel); `None` without such a subscription.

@@ -191,6 +191,44 @@ fn a_udp_publication_reaches_a_udp_subscription() {
     });
 }
 
+/// Decision row 26: a network subscription's handle reports the address
+/// its endpoint bound, exactly the URI's address and port, over IPv4 and,
+/// where the host has it, IPv6 loopback.
+#[test]
+fn a_network_subscription_reports_its_bound_address() {
+    let (_b, mut b) = driven(1, None);
+    let mut subscriber = Client::with_conductor(b.remove(0), context());
+    let port = port();
+    let reading = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    assert_eq!(
+        reading.bound_address(),
+        Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    );
+    let v6 = std::net::Ipv6Addr::LOCALHOST;
+    if std::net::UdpSocket::bind((v6, 0)).is_err() {
+        // The IPv6 part is skipped: no IPv6 loopback on this host.
+        return;
+    }
+    let port = loop {
+        let candidate = test_port();
+        if std::net::UdpSocket::bind((v6, candidate)).is_ok() {
+            break candidate;
+        }
+    };
+    let reading = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=[::1]:{port}"),
+            StreamId::new(8),
+        )
+        .unwrap();
+    assert_eq!(reading.bound_address(), Some(SocketAddr::from((v6, port))));
+}
+
 /// Two images are polled in turn under one limit, starting after the
 /// image the last poll ended at, so neither starves.
 #[test]
@@ -766,6 +804,7 @@ mod remote {
             .add_subscription("karyos:ipc", StreamId::new(3))
             .unwrap();
         assert_eq!(reading.registration(), None);
+        assert_eq!(reading.bound_address(), None);
         let mut publication = client
             .add_exclusive_publication("karyos:ipc", StreamId::new(3))
             .unwrap();
@@ -920,6 +959,12 @@ mod remote {
             )
             .unwrap();
         assert!(reading.registration().is_some());
+        // Decision row 26: the grant carried the bound address over the
+        // broadcast buffer.
+        assert_eq!(
+            reading.bound_address(),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        );
         let mut publication = publisher
             .add_exclusive_publication(
                 &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),

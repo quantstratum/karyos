@@ -89,6 +89,26 @@ release may break APIs, wire formats and shared-memory layouts.
   `GroupGateway` is sealed; `ReplayProvider` gains methods only with
   default bodies or a breaking version. `OnLap`, `Mode` and both
   `CommitOutcome` stay closed by design.
+- `NetworkSubscriptionReady` (CnC `0x8A`) carries the network
+  subscription's bound local address (decision row 26, alpha.2 M5),
+  changed in place under admission `VERSION` 2, which no release has
+  used: it grows from 3 to exactly 6 words, `client | sequence |
+  registration | family_port | address_hi | address_lo`, and any other
+  length is refused. `family_port` packs the port (bits 15 to 0), the
+  family (bits 23 to 16: 0 none, 4 IPv4, 6 IPv6), reserved bits 31 to 24
+  (zero) and the IPv6 scope id (bits 63 to 32; zero for IPv4 and family
+  0). An IPv6 address fills both address words in network order; an IPv4
+  address sits in bits 31 to 0 of `address_lo`, with `address_hi` zero.
+  Family 0 has every other field zero. The IPv6 flow information is not
+  carried. The address is what the driver's socket reports after the
+  bind; a multicast subscription reports its group address and the bound
+  port, not the interface. The `cnc` module docs give two byte vectors.
+  For the item 41 API list: `Response::NetworkSubscriptionReady` and
+  `karyos_client::Outcome::NetworkSubscription` gain
+  `bound: Option<SocketAddr>`, and `karyos_client::Subscription` gains
+  `bound_address() -> Option<SocketAddr>` (`None` for a stream
+  subscription). Port 0 stays refused in every channel URI; the C ABI is
+  unchanged.
 
 - `karyos-ffi`: each copy of the library draws its own base generation
   for its handles, once, from the address of one of its statics (never

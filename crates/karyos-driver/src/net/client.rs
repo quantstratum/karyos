@@ -453,6 +453,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Ok(handle) => handle,
             Err(error) => return refuse(refusal(error), detail),
         };
+        let bound = self.network_subscription_bound(&handle, &udp);
         self.next_registration = next;
         self.net_owned.push(OwnedNetwork {
             registration,
@@ -465,6 +466,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(Response::NetworkSubscriptionReady {
             request,
             registration,
+            bound,
         })
     }
 
