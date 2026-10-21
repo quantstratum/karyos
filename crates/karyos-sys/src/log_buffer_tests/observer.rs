@@ -290,12 +290,13 @@ fn stall_isolation_with_a_sender_kept_up(hold: bool) {
         .map(|role| conductor.subscribe(role).unwrap())
         .collect();
     let mut sender = sr_reader(&mut conductor);
-    if hold {
+    let hold_cell = hold.then(|| {
         let at = sender.sent_position();
-        sender
-            .with_hold(conductor.admit_hold(2, at).unwrap())
-            .unwrap();
-    }
+        let admitted = conductor.admit_hold(2, at).unwrap();
+        let cell = admitted.cell;
+        sender.with_hold(admitted).unwrap();
+        cell
+    });
     let mut publication = buffer.publication().unwrap().unwrap();
     // Something committed in term 0, under every paused reader's loan.
     let first = message(1);
@@ -312,6 +313,7 @@ fn stall_isolation_with_a_sender_kept_up(hold: bool) {
     let data = vec![9u8; 6000];
     let mut out = sr_out();
     let mut appended = 0u64;
+    let mut held = 0u64;
     let mut cycles = 0u32;
     let mut most_pinned = 0usize;
     while appended < 10 * TERM {
@@ -323,11 +325,15 @@ fn stall_isolation_with_a_sender_kept_up(hold: bool) {
         }
         // The sender keeps up: it reads every committed frame and registers
         // what it read; the hold follows a window behind.
-        while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut sender, &mut out) {}
+        sr_drain(&mut sender, &mut out);
         sr_sent(&mut sender);
         if hold {
+            // The hold moves to `sent - window`, never down.
             let sent = sender.sent_position();
-            let _ = sender.hold_at(sent.max(window) - window);
+            let target = sent.max(window) - window;
+            assert_eq!(sender.hold_at(target), Some(target), "the hold did not move");
+            assert!(target >= held, "the hold moved down from {held} to {target}");
+            held = target;
         }
         let _ = conductor.duty_cycle().unwrap();
         cycles += 1;
@@ -364,17 +370,35 @@ fn stall_isolation_with_a_sender_kept_up(hold: bool) {
     }
     assert!(most_pinned >= 1, "no slot was ever pinned");
     // The sender read everything the publisher committed, up to the head.
-    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut sender, &mut out) {}
+    sr_drain(&mut sender, &mut out);
     assert_eq!(
         sender.position(),
         conductor.head().unwrap(),
         "the sender's cursor stopped short of the head"
     );
-    // The paused readers still hold their loans; dropping the sender frees
-    // its hold.
+    // The paused readers still hold their loans.
     for reader in &readers {
         let loan = &buffer.cells().get(reader.cell()).unwrap().loan;
         assert_ne!(loan.load(Ordering::Acquire), 0, "a paused reader's loan was lost");
+    }
+    // The hold followed the sender, and dropping the sender frees its cell.
+    if let Some(cell) = hold_cell {
+        assert!(held > 0, "the hold never moved");
+        drop(sender);
+        assert_eq!(cell_state(&buffer, cell), CELL_FREE, "the hold's cell was not freed");
+    }
+}
+
+/// Reads at the sender's cursor until nothing more is committed: a copied
+/// datagram or a canonical record goes on, `Pending` or a term not active
+/// yet (`Retry`) ends, and any other error fails, naming it.
+fn sr_drain(sender: &mut SenderRead<&LogBuffer<Terms>>, out: &mut [u8]) {
+    loop {
+        match sr_read(sender, out) {
+            Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. }) => {}
+            Ok(ReadOutcome::Pending) | Err(ReadError::Retry) => return,
+            Err(error) => panic!("the sender's read failed: {error:?}"),
+        }
     }
 }
 
