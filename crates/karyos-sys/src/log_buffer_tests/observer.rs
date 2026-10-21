@@ -498,3 +498,88 @@ fn test_observer_concurrent_publish_and_reclaim_no_data_race() {
         "no slot was reclaimed while the observer polled"
     );
 }
+
+/// Plan items 9 and 3 (contract traceability, "Observer race freedom"): a
+/// reclaim of the very slot an observer is copying. The observer's poll
+/// pauses inside its copy, its loan held after the floor check
+/// (`copy_pause`), while another thread publishes past the floor and runs
+/// the duty cycle until that cycle meets the loan and quarantines the slot.
+/// The copy then completes with the committed bytes, unchanged; once the
+/// loan is released the next cycle cleans the slot. Under Miri, the
+/// cleaner and the copy run on two threads around the held loan.
+#[test]
+fn test_observer_copy_paused_while_its_slot_is_reclaimed() {
+    use std::sync::Arc;
+
+    let len = 7000;
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut observer = conductor.subscribe(Role::Observer).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    assert!(matches!(
+        publication
+            .append(&sized_message(0, len), AppendOptions::default())
+            .unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+    let paused = Arc::new(AtomicBool::new(false));
+    let met = Arc::new(AtomicBool::new(false));
+    let (pausing, meeting) = (Arc::clone(&paused), Arc::clone(&met));
+    let mut first = true;
+    crate::log_buffer::copy_pause::set(Some(Box::new(move || {
+        if !core::mem::take(&mut first) {
+            return;
+        }
+        pausing.store(true, Ordering::Release);
+        while !meeting.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    })));
+    let mut out = vec![0u8; 8192];
+    std::thread::scope(|scope| {
+        let reclaimer = scope.spawn(|| {
+            while !paused.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // Past the floor: the duty cycle reclaims the term the observer
+            // is copying, and meets its loan.
+            // The observer goes on either way; `None` if no cycle met it.
+            let mut sequence = 1u32;
+            let mut quarantined = None;
+            for _ in 0..10_000 {
+                if matches!(
+                    publication
+                        .append(&sized_message(sequence, len), AppendOptions::default())
+                        .unwrap(),
+                    AppendOutcome::Appended { .. }
+                ) {
+                    sequence += 1;
+                }
+                if conductor.duty_cycle().unwrap().quarantined > 0 {
+                    quarantined = Some(sequence);
+                    break;
+                }
+            }
+            met.store(true, Ordering::Release);
+            quarantined
+        });
+        let outcome = observer.poll(&mut out).unwrap();
+        let quarantined = reclaimer.join().unwrap();
+        assert!(
+            quarantined.is_some_and(|sequence| sequence > 1),
+            "the duty cycle never met the observer's loan"
+        );
+        match outcome {
+            PollOutcome::Message { position, length, .. } => {
+                assert_eq!(position, 0);
+                assert_eq!(&out[..length as usize], &sized_message(0, len)[..]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    });
+    crate::log_buffer::copy_pause::set(None);
+    // The loan is released: the quarantined slot is cleaned.
+    let report = conductor.duty_cycle().unwrap();
+    assert_eq!(report.quarantined, 0, "{report:?}");
+    assert!(report.cleaned >= 1, "{report:?}");
+}
