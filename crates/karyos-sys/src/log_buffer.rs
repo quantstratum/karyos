@@ -3664,7 +3664,11 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             return Ok(Step::Done(PollOutcome::Pending));
         };
         if head < lost_to {
-            // Never resume inside the range just reported lost.
+            // Never resume inside the range just reported lost. Defensive:
+            // unreachable in a consistent state, since the conductor
+            // publishes a floor only from an earlier head snapshot and the
+            // head never decreases, so the head read after the floor is at
+            // or above it.
             return Ok(Step::Done(PollOutcome::Pending));
         }
         let resume = head.max(from);
