@@ -9,6 +9,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ## [Unreleased]
 
+### Added
+
+- SPEC.md §13 "Required set transitions" gains its fourth case, a
+  required Archive only: `test_recording_required_alone_connects_and_bounds_until_it_leaves`
+  (karyos-driver, with a shared-terms variant on Linux) runs a strict
+  stream whose only required participant is a `Role::Required`
+  recording. The stream is connected; the limit is the recording's
+  position plus the window and never decreases; once the recording
+  leaves, the limit is the head snapshot plus the window and offers are
+  `NotConnected`; an optional reader leaves the limit following the
+  head; a required recording joining later bounds the publisher again.
+  The alpha.2 release notes list this case as missing under "Partial:
+  required set transitions".
+
 ## [0.1.0-alpha.2]: 2026-10-21
 
 Second alpha: cross-process data streams on Linux, the UDP transport, the
