@@ -125,12 +125,22 @@ impl<T: TermBytes> BufferOwner for Arc<LogBuffer<T>> {
     type Terms = T;
 }
 
+/// A reliable network publication's retention hold, admitted by
+/// [`Conductor::admit_hold`] and owned by the lane's sender reader
+/// ([`SenderRead::with_hold`]), which frees its cell when dropped.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RetentionHold {
+    pub(crate) cell: usize,
+    pub(crate) occupant: u64,
+}
+
 /// Slots reserved as headroom for slots awaiting cleaning (`C`).
 pub const CLEANING_HEADROOM: u8 = 1;
 
 use crate::participant::{
     self, CELL_FREE, CELL_LOST, CELL_LOST_HOLDING, CELL_LOST_RESERVED, CELL_OBSERVER,
-    CELL_OPTIONAL, CELL_PUBLICATION, CELL_REQUIRED, CELL_REQUIRED_RESERVED, CELL_WALKER, bounds,
+    CELL_OPTIONAL, CELL_PUBLICATION, CELL_REQUIRED, CELL_REQUIRED_RESERVED, CELL_SENDER_HOLD,
+    CELL_WALKER, bounds,
     counts_for_connection, is_observer_like, is_reader, is_required_reserved,
     visible_as_subscriber,
 };
@@ -4016,6 +4026,55 @@ impl<O: BufferOwner> Conductor<O> {
         Ok(Subscription {
             buffer: self.buffer.clone(),
             cursor,
+        })
+    }
+
+    /// Admits a reliable network publication's retention hold
+    /// ([`participant::CELL_SENDER_HOLD`]; quantstratum-docs:
+    /// karyos/design/retention-floor-optional-receivers.md) as occupant
+    /// `occupant`: a free cell that holds the floor at the head, from which
+    /// its owner, the lane's sender reader, only raises it
+    /// ([`SenderRead::with_hold`]). It takes no spare-slot credit: it never
+    /// reads, and its owner keeps it at most `retransmit_window` (at most
+    /// half a term) below the sender's position.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::ResourcesUnavailable`] with no free cell;
+    /// [`SysError::InvalidPublicationMode`] for an image;
+    /// [`SysError::Protocol`] for an occupant that is not a valid export id.
+    pub fn admit_hold(&mut self, occupant: u64) -> Result<RetentionHold, SysError> {
+        if !valid_export(occupant) {
+            return Err(NOT_GRANTED);
+        }
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if buffer.image() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "a retention hold of an image",
+            });
+        }
+        let (index, cell) = buffer
+            .cells()
+            .iter()
+            .enumerate()
+            .skip(buffer.first_subscriber_cell())
+            .find(|(_, cell)| cell.state.load(Ordering::Acquire) == CELL_FREE)
+            .ok_or(SysError::ResourcesUnavailable)?;
+        // The Acquire load observed the previous holder's FREE; a hold takes
+        // no loan, and its loan word stays zero.
+        debug_assert_eq!(cell.loan.load(Ordering::Relaxed), 0);
+        cell.position
+            .store(buffer.conductor_head()?, Ordering::Relaxed);
+        participant::admit(
+            &cell.state,
+            &cell.revoked,
+            &cell.registration,
+            occupant,
+            CELL_SENDER_HOLD,
+        );
+        Ok(RetentionHold {
+            cell: index,
+            occupant,
         })
     }
 

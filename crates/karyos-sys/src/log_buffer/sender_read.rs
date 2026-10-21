@@ -97,8 +97,8 @@ use core::sync::atomic::{Ordering, fence};
 use std::collections::VecDeque;
 
 use super::{
-    BufferOwner, Cursor, LogBuffer, Lookup, Role, SealWord, Subscription, SubscriptionContext,
-    Validated, decode_seal,
+    BufferOwner, Cursor, LogBuffer, Lookup, RetentionHold, Role, SealWord, Subscription,
+    SubscriptionContext, Validated, decode_seal,
 };
 use crate::error::SysError;
 use crate::frame::{Flags, FrameType, HEADER_LENGTH, Word0};
@@ -422,6 +422,21 @@ pub struct SenderRead<O: BufferOwner> {
     /// The last cursor read found the position below the floor: an
     /// optional reader was lapped, and may rejoin at the head.
     lapped: bool,
+    /// A reliable lane's retention hold ([`SenderRead::with_hold`]), freed
+    /// on drop.
+    hold: Option<RetentionHold>,
+}
+
+impl<O: BufferOwner> Drop for SenderRead<O> {
+    fn drop(&mut self) {
+        if let Some(hold) = self.hold.take()
+            && let Ok(cell) = self.subscription.buffer.cell(hold.cell)
+        {
+            // As a subscriber's detach: the registration is cleared before
+            // the cell is freed, and FREE is this holder's last access.
+            participant::leave(&cell.state, &cell.registration);
+        }
+    }
 }
 
 /// Block-boundary read ends a reader remembers until they are registered.
@@ -560,7 +575,53 @@ impl<O: BufferOwner> SenderRead<O> {
             boundaries: VecDeque::with_capacity(BOUNDARIES),
             checkpoints,
             lapped: false,
+            hold: None,
         })
+    }
+
+    /// Takes `hold`, a retention hold the same buffer's conductor admitted
+    /// ([`super::Conductor::admit_hold`]), for a reliable lane: from then on
+    /// [`SenderRead::hold_at`] keeps the floor there, and dropping the
+    /// reader frees it.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::InvalidPublicationMode`] for a reader that holds one
+    /// already, or a cell that is not that hold (another state or
+    /// occupant); the hold is left in place.
+    pub fn with_hold(&mut self, hold: RetentionHold) -> Result<(), SysError> {
+        let held = self
+            .subscription
+            .buffer
+            .cell(hold.cell)
+            .is_ok_and(|cell| {
+                cell.state.load(Ordering::Acquire) == participant::CELL_SENDER_HOLD
+                    && cell.registration.load(Ordering::Acquire) == hold.occupant
+            });
+        if self.hold.is_some() || !held {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "a retention hold of this buffer's conductor, one per sender reader",
+            });
+        }
+        self.hold = Some(hold);
+        Ok(())
+    }
+
+    /// Raises the retention hold to `position`, the lane's `sent -
+    /// retransmit_window` lowered by its required receivers: never lowers
+    /// it, so the cell's position only grows, as `reader_minima` requires
+    /// (docs#336, condition 1). Returns the hold, or `None` with none.
+    pub fn hold_at(&mut self, position: u64) -> Option<u64> {
+        let hold = self.hold.as_ref()?;
+        let cell = self.subscription.buffer.cell(hold.cell).ok()?;
+        // The only writer: the load reads its own last store.
+        let held = cell.position.load(Ordering::Relaxed);
+        if position > held {
+            cell.position.store(position, Ordering::Release);
+            Some(position)
+        } else {
+            Some(held)
+        }
     }
 
     /// Rejoins an optional reader the publisher lapped at the reserved

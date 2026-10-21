@@ -49,10 +49,18 @@ pub const CELL_WALKER: u64 = 9;
 /// publication connected (SPEC.md §4). Its owner moves it between the two
 /// with [`set_sender_counts`].
 pub const CELL_SENDER_SILENT: u64 = 10;
+/// A reliable network publication's retention hold (quantstratum-docs:
+/// karyos/design/retention-floor-optional-receivers.md): a position that
+/// holds the floor at `sent - retransmit_window`, lowered by the required
+/// receivers, and only grows. It never bounds the limit, never reads (it
+/// takes no loan and no spare-slot credit), does not keep the
+/// publication connected, is not listed as a subscriber, and is never
+/// lapped or revoked. Its owner, the lane's sender reader, frees it.
+pub const CELL_SENDER_HOLD: u64 = 11;
 
 /// Every cell state, in value order: the one list the predicate tests
 /// enumerate, so a new state cannot be left out of them.
-pub const CELL_STATES: [u64; 11] = [
+pub const CELL_STATES: [u64; 12] = [
     CELL_FREE,
     CELL_REQUIRED,
     CELL_OPTIONAL,
@@ -64,6 +72,7 @@ pub const CELL_STATES: [u64; 11] = [
     CELL_OBSERVER,
     CELL_WALKER,
     CELL_SENDER_SILENT,
+    CELL_SENDER_HOLD,
 ];
 
 /// Whether a cell in `state` is a live reader of any role: it has a
@@ -101,11 +110,13 @@ pub const fn is_observer_like(state: u64) -> bool {
 }
 
 /// Whether a cell in `state` holds the retention floor: the cells that
-/// bound the limit, and the driver's walker, which must never be lapped
-/// (coordinator, ACS 15161) yet never bounds the limit.
+/// bound the limit, the driver's walker, which must never be lapped
+/// (coordinator, ACS 15161) yet never bounds the limit, and a reliable
+/// sender's retention hold ([`CELL_SENDER_HOLD`]), which never bounds it
+/// either.
 #[must_use]
 pub const fn holds_floor(state: u64) -> bool {
-    bounds(state) || state == CELL_WALKER
+    bounds(state) || matches!(state, CELL_WALKER | CELL_SENDER_HOLD)
 }
 
 /// The minimum position of the reader cells that bound the limit, and of
@@ -299,6 +310,9 @@ mod tests {
             (CELL_OBSERVER, true, true, true, true, false, false),
             (CELL_WALKER, true, false, false, true, false, true),
             (CELL_SENDER_SILENT, true, false, true, false, true, true),
+            // A sender's retention hold: it holds the floor and nothing
+            // else (docs#336, condition 2).
+            (CELL_SENDER_HOLD, false, false, false, false, false, true),
         ];
         for (state, reader, connects, listed, observer, bounding, floor) in table {
             assert_eq!(holds_floor(state), floor, "holds_floor({state})");
@@ -309,14 +323,14 @@ mod tests {
             assert_eq!(bounds(state), bounding, "bounds({state})");
         }
         // The table covers every state, in the order of CELL_STATES, and the
-        // states are the values 0 to 10 with no gap: a new constant must be
+        // states are the values 0 to 11 with no gap: a new constant must be
         // added to CELL_STATES and here.
         let states: Vec<u64> = table.iter().map(|row| row.0).collect();
         assert_eq!(states, CELL_STATES);
         let expected: Vec<u64> = (0..).take(CELL_STATES.len()).collect();
         assert_eq!(CELL_STATES.to_vec(), expected);
         // Any other value is no reader at all.
-        let next = CELL_SENDER_SILENT + 1;
+        let next = CELL_SENDER_HOLD + 1;
         assert!(!is_reader(next) && !bounds(next) && !is_observer_like(next));
         assert!(!holds_floor(next));
     }
@@ -336,6 +350,14 @@ mod tests {
         let alone = [cell(CELL_WALKER, 40), cell(CELL_OPTIONAL, 10)];
         let pairs = alone.iter().map(|(state, position)| (state, position));
         assert_eq!(reader_minima(pairs), (None, Some(40)));
+        // A sender's retention hold lowers the floor below its bound cell,
+        // never the limit's bound.
+        let sender = [cell(CELL_REQUIRED_RESERVED, 900), cell(CELL_SENDER_HOLD, 500)];
+        let pairs = sender.iter().map(|(state, position)| (state, position));
+        assert_eq!(reader_minima(pairs), (Some(900), Some(500)));
+        let silent = [cell(CELL_SENDER_SILENT, 900), cell(CELL_SENDER_HOLD, 500)];
+        let pairs = silent.iter().map(|(state, position)| (state, position));
+        assert_eq!(reader_minima(pairs), (Some(900), Some(500)));
     }
 
     /// The sender toggle changes only the connection count: the bound,
