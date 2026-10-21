@@ -209,7 +209,7 @@ offers. The features are:
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
-| `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded and plain streams (Remote driver, below; Linux only) |
+| `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
 | `tai-clock` | `clock.now` of the TAI domain, which some platforms lack |
 
 A new feature is added here; a feature name not in this table is a
@@ -294,6 +294,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `publication.add` | `client`, `stream_id`, [`uri`, default `"karyos:ipc"`] | `publication` | |
 | `publication.add_concurrent` | as `publication.add` | `publication` | `concurrent-publication` |
 | `publication.offer` | `publication`, [`lane`, `reserved_value`], `payload` or `length` | `lane`, `position` | |
+| `publication.offer_at` | `publication`, [`lane`], `payload` or `length`, `tx_time` or `delay_ns`: `karyos_publication_offer_at` at `tx_time`, or at `delay_ns` after the runner's `karyos_clock_now` of the monotonic domain, read at each attempt | `lane`, `position` | |
 | `publication.publish_claimed` | `publication`, [`lane`], `payload` or `length` | `lane`, `position` | |
 | `publication.claim` | `publication`, `length`, [`lane`] | `claim` | `claim-retry` |
 | `claim.commit` | `claim` | `lane`, `position` | `claim-retry` |
@@ -301,7 +302,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `publication.poll_outcomes` | `publication`, [`lane`, `limit` (default 1), `until`] | `delivered` | `guarded-publication` |
 | `publication.close` | `publication` | none | |
 | `subscription.add` | `client`, `stream_id`, [`uri`, `role`, `rejoin`: the values of the header's subscription options] | `subscription` | |
-| `subscription.poll` | `subscription`, [`limit` (default 1)] | `delivered`, `last` (the last message as UTF-8 text, when there is one) | |
+| `subscription.poll` | `subscription`, [`limit` (default 1), `until` (Remote driver)] | `delivered`, `last` (the last message as UTF-8 text, when there is one) | |
 | `subscription.close` | `subscription` | none | |
 | `conflated.add` | `client`, `stream_id`, [`uri`] | `conflated` | `conflation` |
 | `conflated.poll` | `conflated`, [`key_budget` (default 1), `until`] | `delivered` | `conflation` |
@@ -361,10 +362,11 @@ declares the feature absent.
           --stream 22:1 --conflation 22:1:4:64:4k
           --stream 23:1:allow-unconnected --guard orders:23:1:4
           --stream 24:1:allow-unconnected
+          --network on --timed-network 25:4 --stream 26:1:allow-unconnected
   ```
 
   Stream 20 is recorded from boot; 1030 and 1031 are the Archive's
-  request and response streams; 22, 23 and 24 are the remote driver's
+  request and response streams; 22 to 26 are the remote driver's
   (Remote driver, below). Stream 1041, the replay target's, is
   not configured: each replay opens its own target there. Its output
   goes to a file the runner prints when the provisioning or a scenario
@@ -422,6 +424,16 @@ streams:
   start; offers need no subscriber.
 - **24:** plain, neither conflated nor guarded; offers need no
   subscriber.
+- **25:** a timed network stream (`--network on --timed-network 25:4`,
+  owner item 65): a publication `$remote_client` adds with a `karyos:udp`
+  URI is timed, with a schedule ring of 4 entries on its lane and the
+  default schedule. A driver's own stream is never timed.
+- **26:** plain, offers need no subscriber: the timed scenario's lane
+  that is not timed.
+
+The runner binds `$loopback_uri` to `karyos:udp?endpoint=127.0.0.1:<p>`,
+a free loopback port `p`: a network subscription of `$remote_client`
+there receives what its network publication of the same stream sends.
 
 Each exclusive stream's publication is added at most once in the whole
 suite run, since karyosd serves every scenario: a remote publication is
@@ -430,17 +442,20 @@ of the same stream, in any scenario, may be refused.
 
 The driver works in another process, so a conflated view's values and a
 guarded publication's outcome records arrive after the offer.
-`conflated.poll` and `publication.poll_outcomes` take `until`: the
+`conflated.poll`, `publication.poll_outcomes` and `subscription.poll`
+take `until`: the
 runner polls, serving the object's client, until the `delivered` total
 reaches `until`, and answers that total, or fails at 10 s.
 
 For the same reason an offer on a remote publication may answer
-`back_pressured` or `admin_action` until its client has been served.
-The runner retries every `publication.offer` on a publication of a
-provided client (`$remote_client` or `$archive_client`, one karyosd
-client) while it answers either, serving the client, and answers the
-first other status, or the last one at 10 s. A scenario does not retry
-offers itself.
+`back_pressured` or `admin_action` until its client has been served,
+and a network publication's `not_connected` until its receiver's status
+messages arrive. The runner retries every `publication.offer` and
+`publication.offer_at` on a publication of a provided client
+(`$remote_client` or `$archive_client`, one karyosd client) while it
+answers any of the three, serving the client, and answers the first
+other status, or the last one at 10 s. A scenario does not retry offers
+itself.
 
 ### Incompatible driver
 

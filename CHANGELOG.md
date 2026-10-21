@@ -141,6 +141,31 @@ release may break APIs, wire formats and shared-memory layouts.
   IPv6 link-local source and its scope. For the item 41 API list: no
   public signature changes; `Event::ImageAvailable`'s `source` now keeps
   its IPv6 scope id through the CnC.
+- A schedule ring on a driver's local stream is refused (owner item 65).
+  `EmbeddedDriver::add_stream` and `add_aggregate`, the client facade's
+  local streams, `karyos_driver_add_stream` and karyosd's `--stream`
+  answer `schedule_capacity` above 0 with `DriverError::InvalidConfig` or
+  `KARYOS_E_INVALID_ARGUMENT`: nothing would release such a ring, which
+  took its capacity of timed offers and then back pressured for good. A
+  timed lane is a network publication's. A driver configures timed
+  network streams (`NetworkStreamDefaults::timed`, at most 8, with a
+  capacity of 0 or a stream given twice refused at start; karyosd
+  `--timed-network <stream>:<capacity>`, which needs `--network on` and
+  names no `--stream`). A client's network publication of such a stream,
+  added by URI, is timed with the default schedule; there is no URI key.
+  `EmbeddedDriver::add_timed_network_publication_with_clock` is the
+  network twin of `schedule_stream_with_clock`, its clock fixed for the
+  publication's life. No signature, struct or CnC change. The conformance
+  scenario `publication.timed.offer` now runs against karyosd's timed
+  network stream 25, with a loopback receiver (feature `remote-driver`):
+  a timed offer is not delivered before its time, then is, with the
+  typed refusals as before. The new `stream.schedule.refused` covers the
+  refusal on a driver's stream. The semantic layer gains
+  `publication.offer_at` and `until` on `subscription.poll`, and the
+  runner retries a remote offer's `not_connected` too. No `Tai` timed
+  lane exists now: the network route refuses that domain. The frozen
+  bindings keep their pinned suite; their first pin update after the
+  freeze adopts this behaviour and the scenario.
 
 - `karyos-ffi`: each copy of the library draws its own base generation
   for its handles, once, from the address of one of its statics (never
