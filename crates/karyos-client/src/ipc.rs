@@ -638,6 +638,8 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
             | WireKind::ConsumedCell => {
                 return Err(AttachError::Protocol);
             }
+            // A kind a later protocol version admits (owner item 41).
+            _ => return Err(AttachError::Protocol),
         };
         if duplicate {
             return Err(AttachError::Protocol);

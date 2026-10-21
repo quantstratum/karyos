@@ -220,7 +220,7 @@ fn a_listing_pages_through_the_catalog_after_an_id() {
             Seen {
                 id: 2,
                 state: RECORDING_STOPPED,
-                stop_reason: stop_reason(StopReason::Stopped),
+                stop_reason: stop_reason(StopReason::Stopped).unwrap(),
                 incomplete: 0,
                 position: 200,
                 start_time_ns: 20,

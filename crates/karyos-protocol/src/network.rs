@@ -188,6 +188,7 @@ pub enum ControlError {
 
 /// The kind of a version 1 control: its frame type and variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ControlKind {
     /// SETUP ANNOUNCE.
     SetupAnnounce,
@@ -541,6 +542,7 @@ pub struct Nak {
 
 /// The reason of an ERR NAK_REPLY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum NakReplyReason {
     /// [`reason::RANGE_UNAVAILABLE`].
     RangeUnavailable {
@@ -598,6 +600,7 @@ pub struct Unbound {
 
 /// Whether an RTTM is a request or a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum RttmKind {
     /// A request; `service_delay_ns` is 0 on the wire.
     Request,
@@ -635,6 +638,7 @@ pub struct PathHeartbeat {
 
 /// One decoded version 1 control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Control {
     /// SETUP ANNOUNCE.
     SetupAnnounce(SetupAnnounce),
@@ -689,6 +693,7 @@ impl<'a> DataDatagram<'a> {
 
 /// The group of a classified datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Datagram<'a> {
     /// DATA with payload, PAD and ABORTED records of one publication and
     /// one lane.

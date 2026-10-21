@@ -315,6 +315,7 @@ pub enum CncError {
 
 /// A subscriber's role (SPEC.md §4 reader roles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SubscriberRole {
     /// Bounds the publisher; never lapped.
     Required,
@@ -476,6 +477,7 @@ impl ChannelUri {
 /// it: a stable `u8` code, never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum RejoinPolicyCode {
     /// `rejoin at head`.
     RejoinAtHead = 1,
@@ -504,6 +506,7 @@ impl RejoinPolicyCode {
 /// it is the secondary policy's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum RejoinOutcomeCode {
     /// Delivery continued at the head.
     ResumedAtHead = 1,
@@ -550,6 +553,7 @@ impl RejoinOutcomeCode {
 /// carries it: a stable `u8` code, never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum FallbackReasonCode {
     /// No Archive exists (phase 1).
     NoArchive = 1,
@@ -667,6 +671,7 @@ impl ReportedLoss {
 
 /// A command from a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Command {
     /// Create the stream's exclusive publication.
     AddPublication {
@@ -907,6 +912,7 @@ pub fn guard_parameters(
 
 /// Why the driver refused a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// Every publication the stream can issue is out: its exclusive
     /// publication, or all publisher slots of a concurrent stream.
@@ -1001,6 +1007,7 @@ impl ErrorCode {
 
 /// A driver response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Response {
     /// The publication is ready for hand-over.
     PublicationReady {
@@ -1098,6 +1105,7 @@ pub enum Response {
 /// Where a remote registration stands in its stream's cutovers, as
 /// `CutoverState` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CutoverState {
     /// No cutover waits for it: its handle's current mapping is the
     /// stream's.
@@ -2019,6 +2027,7 @@ impl Response {
 /// What `on_required_loss` did with a lost required participant
 /// (quantstratum-docs: `karyos/design/required-participant-loss.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LossPolicyCode {
     /// `hold`: it keeps bounding the publisher until its loan ends.
     Hold,
@@ -2049,6 +2058,7 @@ impl LossPolicyCode {
 
 /// Why a publication was closed, reported with its `Closed` outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CloseReason {
     /// A required participant was lost under the `abort` policy.
     RequiredParticipantLost,
@@ -2115,6 +2125,7 @@ impl CloseReason {
 /// `karyos/design/required-participant-loss.md`, Reporting). A client that
 /// does not know an event type skips it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A participant of a lost client was handled by the stream's
     /// `on_required_loss` policy, at the time out, under every policy.
@@ -2424,6 +2435,79 @@ mod tests {
     /// a typed decode error (`CncError::Reserved`), never a panic: what a
     /// build from before `EndOfStream` (code 8) decodes for an image's
     /// clean end. The client skips such an event.
+    /// Owner item 41: these enums are `#[non_exhaustive]`, and a value
+    /// this build does not know is a typed decode error, never a guessed
+    /// variant. A `ParticipantLost` whose loss policy is no code of this
+    /// build is `Reserved`.
+    #[test]
+    fn an_unknown_loss_policy_is_a_typed_decode_error() {
+        let event = Event::ParticipantLost {
+            stream: stream(),
+            registration: 7,
+            client: 3,
+            policy: LossPolicyCode::Hold,
+            position: 4096,
+        };
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let length = event.encode(&mut out).unwrap();
+        for code in [0u64, 4, u64::MAX] {
+            let mut bytes = out;
+            bytes[24..32].copy_from_slice(&code.to_le_bytes());
+            assert_eq!(
+                Event::decode(PARTICIPANT_LOST, &bytes[..length]),
+                Err(CncError::Reserved {
+                    type_id: PARTICIPANT_LOST
+                }),
+                "{code}"
+            );
+        }
+    }
+
+    /// Owner item 41: a response or event type this build does not know is
+    /// `UnknownType`, whatever the bytes.
+    #[test]
+    fn an_unknown_response_or_event_type_is_a_typed_decode_error() {
+        let bytes = [0u8; 16];
+        for type_id in [NETWORK_SUBSCRIPTION_READY + 1, ADD_IMAGE_SUBSCRIPTION] {
+            assert_eq!(
+                Response::decode(type_id, &bytes),
+                Err(CncError::UnknownType { type_id })
+            );
+        }
+        for type_id in [IMAGE_UNAVAILABLE + 1, NETWORK_SUBSCRIPTION_READY] {
+            assert_eq!(
+                Event::decode(type_id, &bytes),
+                Err(CncError::UnknownType { type_id })
+            );
+        }
+    }
+
+    /// Owner item 41: an `AddImageSubscription` whose role is no code of
+    /// this build is `Reserved`, as for the other subscriptions.
+    #[test]
+    fn an_image_subscription_with_an_unknown_role_is_a_typed_decode_error() {
+        let command = Command::AddImageSubscription {
+            sequence: 5,
+            image: 12,
+            lane: Lane::ZERO,
+            role: SubscriberRole::Optional,
+        };
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = command.encode(&mut out).unwrap();
+        assert!(Command::decode(ADD_IMAGE_SUBSCRIPTION, &out[..length]).is_ok());
+        for code in [3u64, u64::MAX] {
+            let mut bytes = out;
+            bytes[16..24].copy_from_slice(&code.to_le_bytes());
+            assert_eq!(
+                Command::decode(ADD_IMAGE_SUBSCRIPTION, &bytes[..length]),
+                Err(CncError::Reserved {
+                    type_id: ADD_IMAGE_SUBSCRIPTION
+                }),
+                "{code}"
+            );
+        }
+    }
+
     #[test]
     fn a_close_reason_this_build_does_not_know_is_a_typed_decode_error() {
         let event = Event::PublicationClosed {

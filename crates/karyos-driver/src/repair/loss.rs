@@ -1210,6 +1210,12 @@ impl ImageLoss {
                     lowest_retained,
                 }
             }
+            // A reason a later protocol version decodes: counted as an
+            // anomaly, the hole left in its schedule.
+            _ => {
+                self.counters.bump(|c| &mut c.anomalies);
+                ReplyOutcome::Unmatched
+            }
         }
     }
 }

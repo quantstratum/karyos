@@ -598,8 +598,8 @@ fn the_header_states_the_archive_constants() {
         ),
     ] {
         assert_eq!(
-            defines[name],
-            i64::from(crate::abi::stop_reason(reason)),
+            Some(defines[name]),
+            crate::abi::stop_reason(reason).map(i64::from),
             "{name}"
         );
     }

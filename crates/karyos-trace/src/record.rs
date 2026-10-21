@@ -41,6 +41,7 @@ pub const MAX_LANE: u8 = 3;
 /// Where an observation was taken. Each point names what it measures: none
 /// stands for ring submission time on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Point {
     /// The publication committed the frame.
     Publish,

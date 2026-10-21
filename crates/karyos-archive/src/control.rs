@@ -257,6 +257,7 @@ impl ListRecordings {
 
 /// The pace of a replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReplayRate {
     /// As fast as the target stream takes it.
     Full,
@@ -379,6 +380,7 @@ impl StopReplay {
 
 /// The outcome of a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResponseCode {
     /// Done.
     Ok,
@@ -483,6 +485,7 @@ impl<'a> ControlResponse<'a> {
 
 /// Whether a listed recording still records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecordingState {
     /// It still records.
     Recording {
@@ -628,6 +631,7 @@ impl<'a> RecordingDescriptor<'a> {
 
 /// What happened to a recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Signal {
     /// It started.
     Started,
@@ -711,6 +715,7 @@ impl RecordingSignal {
 
 /// Any message of schema 1, version 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlMessage<'a> {
     /// Template 1.
     StartRecording(StartRecording<'a>),

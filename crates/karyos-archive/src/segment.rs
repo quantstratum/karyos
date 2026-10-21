@@ -205,6 +205,7 @@ pub enum SyncPolicy {
 
 /// What an index entry covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EntryKind {
     /// Frames, stored at their positions and checked by their CRC.
     Data,

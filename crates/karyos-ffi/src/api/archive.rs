@@ -296,8 +296,9 @@ pub(crate) fn connect(client: Handle, options: Options) -> Result<Handle, Failur
     })?
 }
 
-/// What a listing hands each recording to.
-pub(crate) type RecordingHandler<'a> = dyn FnMut(&ListedRecording) + 'a;
+/// What a listing hands each recording to: `false` when it cannot take
+/// the recording, which refuses the call.
+pub(crate) type RecordingHandler<'a> = dyn FnMut(&ListedRecording) -> bool + 'a;
 
 /// The recordings of `archive`'s catalog whose id is above `after_id`, in
 /// id order, at most `limit`, each handed to `handler`; returns how many.
@@ -369,9 +370,32 @@ fn list_entry(
             }
         }
     };
+    // A state or stop reason a later Archive version decodes has no C code:
+    // the page is refused as an unsupported schema, nothing delivered
+    // (owner item 41). The check is the handler's own conversion.
+    let unsupported = || {
+        Failure::with(
+            Status::Refused,
+            response_code(ResponseCode::UnsupportedSchema),
+            0,
+        )
+    };
+    if !listing
+        .recordings
+        .iter()
+        .take(count)
+        .all(crate::abi::expressible)
+    {
+        return Err(unsupported());
+    }
     let mut delivered = 0u32;
     for recording in listing.recordings.iter().take(count) {
-        handler(recording);
+        // Never after the check above, which converts the same way; were
+        // it to happen, the call is refused rather than a recording
+        // skipped.
+        if !handler(recording) {
+            return Err(unsupported());
+        }
         // At most `limit`: never past a u32.
         if let Some(next) = delivered.checked_add(1) {
             delivered = next;

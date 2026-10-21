@@ -485,6 +485,8 @@ fn by_reference<D: Disk + Clone>(
     read_message(archive.disk.clone(), &recording, frames, out)
 }
 
+impl<D: Disk + Clone> crate::group::gateway::sealed::Sealed for ReplayGateway<D> {}
+
 impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
     fn dispatch(&mut self, handler: &mut dyn Handler) -> Result<Dispatched, GatewayError> {
         if let Some(stopped) = self.stopped {

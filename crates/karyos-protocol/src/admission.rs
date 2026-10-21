@@ -242,6 +242,7 @@ pub enum AdmissionError {
 
 /// What a region holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegionKind {
     /// A client's command ring.
     CommandRing,
@@ -372,6 +373,7 @@ impl RegionKind {
 
 /// The capability a record grants in its region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Capability {
     /// None: a control region.
     None,
@@ -524,6 +526,7 @@ impl Record {
 
 /// An admission message.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Message {
     /// The client's first message, carrying its pidfd.
     Hello {

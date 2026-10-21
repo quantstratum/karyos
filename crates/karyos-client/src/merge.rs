@@ -156,6 +156,9 @@ pub enum ReplayStatus<T: TermBytes = HeapTerms> {
 
 /// Hands out replays of recordings: the Archive's client implements it,
 /// and the merge uses it without knowing the Archive (SPEC.md §14).
+///
+/// Implemented outside this crate, so a method added later has a default
+/// body, or comes with a breaking version (owner item 41).
 pub trait ReplayProvider<T: TermBytes = HeapTerms>: Send {
     /// Asks for `request`'s replay, or polls the request already asked for.
     /// Never blocks: it runs on the polling thread, which may be the only

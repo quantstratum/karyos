@@ -214,15 +214,25 @@ mod watch {
     }
 
     fn listed(shared: &Mutex<Catalog>, listing: Listing) {
+        // A state or stop reason a later Archive version decodes has no
+        // name in this API: the listing fails, the last catalog stays
+        // (owner item 41).
+        let Some(recordings) = listing.recordings.iter().map(recording).collect() else {
+            fail(
+                shared,
+                "a recording state or stop reason this agent does not know",
+            );
+            return;
+        };
         let mut catalog = lock(shared);
-        catalog.recordings = listing.recordings.iter().map(recording).collect();
+        catalog.recordings = recordings;
         catalog.left_out = listing.left_out;
         catalog.listed_at = Some(host_monotonic_ns());
         catalog.listings = catalog.listings.checked_add(1).unwrap_or(catalog.listings);
         catalog.last_error = None;
     }
 
-    fn recording(listed: &ListedRecording) -> CatalogRecording {
+    fn recording(listed: &ListedRecording) -> Option<CatalogRecording> {
         let (recording, position, stopped_ns, stop_reason, incomplete) = match listed.state {
             RecordingState::Recording {
                 written,
@@ -232,11 +242,12 @@ mod watch {
                 false,
                 stop.position,
                 Some(stop.time_ns),
-                Some(reason(stop.reason).to_owned()),
+                Some(reason(stop.reason)?.to_owned()),
                 stop.incomplete,
             ),
+            _ => return None,
         };
-        CatalogRecording {
+        Some(CatalogRecording {
             recording_id: listed.recording_id,
             stream_id: listed.stream_id,
             session_id: listed.session_id,
@@ -248,11 +259,11 @@ mod watch {
             stopped_ns,
             stop_reason,
             incomplete,
-        }
+        })
     }
 
-    fn reason(reason: StopReason) -> &'static str {
-        match reason {
+    fn reason(reason: StopReason) -> Option<&'static str> {
+        Some(match reason {
             StopReason::Normal => "normal",
             StopReason::Recovered => "recovered",
             StopReason::Empty => "empty",
@@ -262,7 +273,8 @@ mod watch {
             StopReason::Failed(FailKind::Source) => "failed_source",
             StopReason::Failed(FailKind::RequiredLapped) => "failed_required_lapped",
             StopReason::Failed(FailKind::Invalid) => "failed_invalid",
-        }
+            _ => return None,
+        })
     }
 
     /// What the signals ask now, if anything.

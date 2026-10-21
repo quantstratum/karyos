@@ -1837,6 +1837,9 @@ pub enum ClaimOutcome<'a, O: BufferOwner> {
 }
 
 /// Result of [`Claim::commit`].
+///
+/// Closed by design (owner item 41): a new variant comes only with a
+/// breaking version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a commit can lose to an abort"]
 pub enum CommitOutcome {

@@ -383,6 +383,31 @@ fn field_error(result: Result<ControlMessage<'_>, CodecError>) -> &'static str {
     }
 }
 
+/// Owner item 41: the control enums are `#[non_exhaustive]`, and a code
+/// this build does not know is exactly `InvalidEnum` with the field and
+/// the value, never another variant.
+#[test]
+fn an_unknown_control_code_is_an_invalid_enum() {
+    let samples = samples();
+    for (sample, at, byte, field) in [
+        (9, 16, 6u8, "code"),
+        (5, 40, 4, "rate"),
+        (13, 24, 4, "signal"),
+        (11, 108, 10, "stop_reason"),
+    ] {
+        let bytes = encoded(&samples[sample]);
+        assert!(ControlMessage::decode(&bytes).is_ok(), "{field}");
+        assert_eq!(
+            with_byte(&bytes, at, byte),
+            Err(CodecError::InvalidEnum {
+                field,
+                value: u64::from(byte)
+            }),
+            "{field}"
+        );
+    }
+}
+
 #[test]
 fn every_invalid_field_is_refused_by_name() {
     let samples = samples();

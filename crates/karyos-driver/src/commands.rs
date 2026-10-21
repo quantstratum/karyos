@@ -877,7 +877,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     request: RequestId { client, sequence },
                 })
             }
-            _ => Ok(self.execute(client, link, command)),
+            _ => self.execute(client, link, command),
         }
     }
 
@@ -995,17 +995,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !verified {
             self.counters.add(Event::LossReportsUnverified, 1);
         }
-        self.counters.add(
-            match loss.applied {
-                RejoinOutcomeCode::ResumedAtHead => Event::OverrunsRejoinAtHead,
-                RejoinOutcomeCode::SnapshotRebuilt | RejoinOutcomeCode::SnapshotFailed => {
-                    Event::OverrunsSnapshot
-                }
-                RejoinOutcomeCode::Closed => Event::OverrunsClose,
-                RejoinOutcomeCode::Replayed => Event::OverrunsReplayed,
-            },
-            1,
-        );
+        let applied = match loss.applied {
+            RejoinOutcomeCode::ResumedAtHead => Some(Event::OverrunsRejoinAtHead),
+            RejoinOutcomeCode::SnapshotRebuilt | RejoinOutcomeCode::SnapshotFailed => {
+                Some(Event::OverrunsSnapshot)
+            }
+            RejoinOutcomeCode::Closed => Some(Event::OverrunsClose),
+            RejoinOutcomeCode::Replayed => Some(Event::OverrunsReplayed),
+            // An outcome a later protocol version decodes: the loss is
+            // recorded above, under no outcome counter of this driver.
+            _ => None,
+        };
+        if let Some(applied) = applied {
+            self.counters.add(applied, 1);
+        }
         // Only a replay that fell back: one that recovered reports no
         // fallback reason, and is counted as replayed above.
         if loss.fallback.is_some() {
@@ -1015,12 +1018,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Preflight, then effect. Returns the single response.
+    ///
+    /// # Errors
+    ///
+    /// A command this driver does not serve: a variant a later protocol
+    /// version decodes (`Command` is `#[non_exhaustive]`, owner item 41),
+    /// unreachable while the driver and its protocol crate are one version.
+    /// The caller treats it as a protocol violation, as it does a command
+    /// that does not decode.
     pub(crate) fn execute(
         &mut self,
         client: u64,
         link: &Arc<ClientLink<T>>,
         command: Command,
-    ) -> Response {
+    ) -> Result<Response, &'static str> {
         let request = RequestId {
             client,
             sequence: command.sequence(),
@@ -1030,7 +1041,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             code,
             detail,
         };
-        match command {
+        Ok(match command {
             Command::AddPublication { .. }
             | Command::AddConcurrentPublication { .. }
             | Command::AddSubscription { .. }
@@ -1052,7 +1063,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     _ => (None, 0),
                 };
                 let Some(index) = found else {
-                    return refuse(ErrorCode::UnknownStream, detail);
+                    return Ok(refuse(ErrorCode::UnknownStream, detail));
                 };
                 // A guarded stream's publications are bound to the guard's
                 // open epoch with an outcome ring: a remote client is granted
@@ -1066,7 +1077,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         .get(index)
                         .is_some_and(|found| found.guarded.is_some() && !remote)
                 {
-                    return refuse(ErrorCode::InvalidPublicationMode, detail);
+                    return Ok(refuse(ErrorCode::InvalidPublicationMode, detail));
                 }
                 // A timed lane's handle reads its schedule from the ring's
                 // binding (timed-tx.md section 11), granted in process or
@@ -1076,13 +1087,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if matches!(command, Command::AddPublication { .. })
                     && let Err(namespace) = self.timed_grantable(client, index)
                 {
-                    return refuse(ErrorCode::InvalidPublicationMode, namespace);
+                    return Ok(refuse(ErrorCode::InvalidPublicationMode, namespace));
                 }
                 let remote = self.remote_full(client);
                 match remote {
                     // The export bound refuses before anything is reserved.
-                    Some(true) => return refuse(ErrorCode::ResourcesUnavailable, detail),
-                    Some(false) => return self.add_remote(client, index, command, request),
+                    Some(true) => return Ok(refuse(ErrorCode::ResourcesUnavailable, detail)),
+                    Some(false) => return Ok(self.add_remote(client, index, command, request)),
                     None => {}
                 }
                 if link.held() >= self.config.max_pending_per_client
@@ -1090,19 +1101,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         .held_total()
                         .is_none_or(|held| held >= self.config.max_hand_over)
                 {
-                    return refuse(ErrorCode::ResourcesUnavailable, detail);
+                    return Ok(refuse(ErrorCode::ResourcesUnavailable, detail));
                 }
                 let registration = self.next_registration;
                 let Some(next) = registration.checked_add(1) else {
-                    return refuse(ErrorCode::IdentitiesExhausted, 0);
+                    return Ok(refuse(ErrorCode::IdentitiesExhausted, 0));
                 };
                 let Some(target) = self.streams.get_mut(index) else {
-                    return refuse(ErrorCode::UnknownStream, detail);
+                    return Ok(refuse(ErrorCode::UnknownStream, detail));
                 };
                 // New handles wait for a pending cutover's successor
                 // (quantstratum-docs: karyos/design/mapping-generations.md).
                 if target.issuing().is_err() {
-                    return refuse(ErrorCode::ResourcesUnavailable, detail);
+                    return Ok(refuse(ErrorCode::ResourcesUnavailable, detail));
                 }
                 let occupant = self.next_export;
                 let mut subscriber = None;
@@ -1131,8 +1142,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                                 },
                                 Kind::Publication,
                             ),
-                            Ok(None) => return refuse(ErrorCode::PublicationTaken, detail),
-                            Err(error) => return refuse(issue_refusal(&error), detail),
+                            Ok(None) => return Ok(refuse(ErrorCode::PublicationTaken, detail)),
+                            Err(error) => return Ok(refuse(issue_refusal(&error), detail)),
                         },
                     },
                     Command::AddConcurrentPublication {
@@ -1145,8 +1156,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             },
                             Kind::Publication,
                         ),
-                        Ok(None) => return refuse(ErrorCode::PublicationTaken, detail),
-                        Err(error) => return refuse(issue_refusal(&error), detail),
+                        Ok(None) => return Ok(refuse(ErrorCode::PublicationTaken, detail)),
+                        Err(error) => return Ok(refuse(issue_refusal(&error), detail)),
                     },
                     _ => {
                         let role = subscription_role(command);
@@ -1155,7 +1166,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         let reserve =
                             role == Role::Required && target.policy == LossPolicy::Continue;
                         let Some(next_occupant) = occupant.checked_add(1) else {
-                            return refuse(ErrorCode::IdentitiesExhausted, 0);
+                            return Ok(refuse(ErrorCode::IdentitiesExhausted, 0));
                         };
                         match target.conductor.subscribe_as(role, reserve, occupant) {
                             Ok(inner) => {
@@ -1163,7 +1174,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                                 occupant_used = Some(next_occupant);
                                 (Capability::Subscription(inner), Kind::Subscription)
                             }
-                            Err(_) => return refuse(ErrorCode::ResourcesUnavailable, detail),
+                            Err(_) => return Ok(refuse(ErrorCode::ResourcesUnavailable, detail)),
                         }
                     }
                 };
@@ -1177,7 +1188,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 {
                     Some(position) => match target.base.checked_add(position) {
                         Some(join) => Some(join),
-                        None => return refuse(ErrorCode::ResourcesUnavailable, detail),
+                        None => return Ok(refuse(ErrorCode::ResourcesUnavailable, detail)),
                     },
                     None => None,
                 };
@@ -1190,7 +1201,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     if let Capability::Publication { inner, .. } = capability {
                         target.spare = Some(inner);
                     }
-                    return refuse(ErrorCode::InvalidPublicationMode, detail);
+                    return Ok(refuse(ErrorCode::InvalidPublicationMode, detail));
                 }
                 // Effect: everything below cannot fail.
                 let member = match &capability {
@@ -1253,7 +1264,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if matches!(command, Command::RemoveSubscription { .. })
                     && self.remove_owned_subscription(client, registration)
                 {
-                    return Response::OperationSucceeded { request };
+                    return Ok(Response::OperationSucceeded { request });
                 }
                 let kind = if matches!(command, Command::RemovePublication { .. }) {
                     Kind::Publication
@@ -1269,7 +1280,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     .iter()
                     .position(|r| r.id == registration && r.client == client && removes(r.kind))
                 else {
-                    return refuse(ErrorCode::UnknownRegistration, registration);
+                    return Ok(refuse(ErrorCode::UnknownRegistration, registration));
                 };
                 self.registrations.swap_remove(index);
                 // Drops a capability still held; a taken one was dropped by
@@ -1369,28 +1380,33 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 concurrent,
                 uri,
                 ..
-            } => self.serve_network_publication(
-                client,
-                link,
-                request,
-                stream_id,
-                (allow_unconnected, concurrent),
-                uri.as_str(),
-            ),
+            } => {
+                return self.serve_network_publication(
+                    client,
+                    link,
+                    request,
+                    stream_id,
+                    (allow_unconnected, concurrent),
+                    uri.as_str(),
+                );
+            }
             Command::AddNetworkSubscription {
                 stream_id,
                 role,
                 uri,
                 ..
-            } => self.serve_network_subscription(
-                client,
-                link,
-                request,
-                stream_id,
-                role,
-                uri.as_str(),
-            ),
-        }
+            } => {
+                return self.serve_network_subscription(
+                    client,
+                    link,
+                    request,
+                    stream_id,
+                    role,
+                    uri.as_str(),
+                );
+            }
+            _ => return Err("a command this driver does not serve"),
+        })
     }
 
     /// Serves `GuardClose` and `GuardReopen` (`quantstratum-docs:
