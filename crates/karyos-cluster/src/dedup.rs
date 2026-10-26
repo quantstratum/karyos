@@ -50,11 +50,14 @@
 //! - **Memory.** [`SessionTable::new`] allocates `sessions × window ×
 //!   response_bytes` reply bytes and the slot tables; nothing after. A
 //!   lookup scans the sessions, `O(sessions)`.
-//! - **Configuration.** The defaults are the design's proposal (owner item
-//!   37, not decided yet): 1024 sessions, 64 replies, 8 KiB, 60 s. They
-//!   are interim, and the owner's choice is a configuration change. The
-//!   table returns its configuration at registration, so a client learns
-//!   the bounds it is held to.
+//! - **Configuration.** The defaults are those item 37 of the decisions
+//!   of 2026-10-21 chose (`decisions.md` in quantstratum-docs): 1024
+//!   sessions, 64 replies, 8 KiB, 60 s. They are
+//!   initial evaluation values, to be measured in C5 W1 and W2 before the
+//!   phase 4 gate, and 1024 x 64 x 8 KiB is a named large profile, not a
+//!   universal default; a change is a configuration change. The table
+//!   returns its configuration at registration, so a client learns the
+//!   bounds it is held to.
 //!
 //! - **Snapshots** (C8). [`SessionTable::encode`] writes the table as a
 //!   snapshot's sessions section ([`SESSIONS_VERSION`]), and
@@ -107,14 +110,15 @@ pub enum DecodeError {
     },
 }
 
-/// The proposed sessions bound (design D3; interim, owner item 37).
+/// The sessions bound (design D3; item 37's initial value, to be measured).
 pub const DEFAULT_SESSIONS: u32 = 1024;
-/// The proposed replies per session (design D3; interim, owner item 37).
+/// The replies per session (design D3; item 37's initial value, to be
+/// measured).
 pub const DEFAULT_WINDOW: u32 = 64;
-/// The proposed bytes per reply (design D3; interim, owner item 37).
+/// The bytes per reply (design D3; item 37's initial value, to be measured).
 pub const DEFAULT_RESPONSE_BYTES: u32 = 8 * 1024;
-/// The proposed session expiry in log-time nanoseconds (design D3;
-/// interim, owner item 37).
+/// The session expiry in log-time nanoseconds (design D3; item 37's
+/// initial value, to be measured).
 pub const DEFAULT_TTL: u64 = 60_000_000_000;
 
 /// The table's bounds, advertised to a client at registration.
@@ -132,7 +136,7 @@ pub struct DedupConfig {
 }
 
 impl Default for DedupConfig {
-    /// The design's proposal, interim until the owner decides (item 37).
+    /// Item 37's initial values, to be measured before the phase 4 gate.
     fn default() -> Self {
         Self {
             sessions: DEFAULT_SESSIONS,

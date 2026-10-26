@@ -20,8 +20,8 @@
 //!   snapshot's bytes. Its replacement is the publish. The design appends
 //!   manifest records; a replaced file gives the same atomic publish and
 //!   holds no more than [`MAX_KEEP`] entries, so it needs no purge of its
-//!   own. The digest is CRC-32C until the owner decides on SHA-256 (item
-//!   15).
+//!   own. The digest is CRC-32C, which item 15 of the 2026-10-21 decisions
+//!   keeps; it detects corruption and claims no tamper evidence.
 //! - **Purge** (design S4(c)). After a publish the manifest keeps the
 //!   newest [`SnapshotConfig::keep`] snapshots (2 proposed), and the
 //!   others' files are removed. A crash while snapshot k + 1 is built
@@ -48,10 +48,10 @@
 //! - **Poison.** A failed write, sync, publish or purge poisons the store:
 //!   it refuses writes until it is reopened, which finds what was
 //!   published.
-//! - **Configuration.** The defaults are the design's proposal (owner item
-//!   37, not decided yet): keep 2, a 1 GiB allowance, a snapshot every
-//!   1 Mi entries or 256 MiB. They are interim, and the owner's choice is a
-//!   configuration change.
+//! - **Configuration.** The defaults are those item 37 of the 2026-10-21
+//!   decisions chose: keep 2, a 1 GiB allowance, a snapshot every 1 Mi
+//!   entries or 256 MiB. They are initial evaluation values, to be
+//!   measured before the phase 4 gate; a change is a configuration change.
 //!
 //! Crash points, run on C2's simulated disk by karyos-sim's
 //! `tests/snapshot_crash.rs`: every disk operation of a write (the
@@ -77,16 +77,16 @@ pub const MANIFEST_FILE: &str = "snapshot-manifest";
 pub const MAX_KEEP: u32 = 16;
 /// A section header's length.
 pub const SECTION_HEADER: usize = 24;
-/// The proposed snapshots kept (design S4; interim, owner item 37).
+/// The snapshots kept (design S4; item 37's initial value, to be measured).
 pub const DEFAULT_KEEP: u32 = 2;
-/// The proposed catch-up allowance in log bytes (design S4(c); interim,
-/// owner item 37).
+/// The catch-up allowance in log bytes (design S4(c); item 37's initial
+/// value, to be measured).
 pub const DEFAULT_ALLOWANCE: u64 = 1 << 30;
-/// The proposed entries between snapshots (design S2; interim, owner item
-/// 37).
+/// The entries between snapshots (design S2; item 37's initial value, to
+/// be measured).
 pub const DEFAULT_EVERY_ENTRIES: u64 = 1 << 20;
-/// The proposed log bytes between snapshots (design S2; interim, owner
-/// item 37).
+/// The log bytes between snapshots (design S2; item 37's initial value,
+/// to be measured).
 pub const DEFAULT_EVERY_BYTES: u64 = 256 << 20;
 
 const SECTION_MAGIC: [u8; 4] = *b"KRSN";
@@ -120,7 +120,7 @@ pub struct SnapshotConfig {
 }
 
 impl Default for SnapshotConfig {
-    /// The design's proposal, interim until the owner decides (item 37).
+    /// Item 37's initial values, to be measured before the phase 4 gate.
     fn default() -> Self {
         Self {
             keep: DEFAULT_KEEP,
