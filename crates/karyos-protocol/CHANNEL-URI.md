@@ -46,14 +46,15 @@ value        = 1*( %x21-7B / %x7D-7E )             ; any visible ASCII except "|
 ## 2. Key names
 
 ```abnf
-key-name     = lower *( lower / DIGIT ) *( "-" 1*( lower / DIGIT ) )
+key-name     = word *( "-" word )
+word         = lower *( lower / DIGIT )
 lower        = %x61-7A
 ```
 
-Every key is kebab-case: lower-case ASCII letters and digits in words
-joined by single hyphens, starting with a letter. The parser checks this
-at compile time for every entry of `KEYS`, so a key that breaks it does
-not build. Each setting has exactly one spelling: there are no aliases,
+Every key is kebab-case: words of lower-case ASCII letters and digits,
+each starting with a letter, joined by single hyphens (`a1-b2` is a key
+name, `a-1b` is not). The parser checks this at compile time for every
+entry of `KEYS`, so a key that breaks it does not build. Each setting has exactly one spelling: there are no aliases,
 no case folding and no `_` forms, so `term_length=` is an unknown key, not
 a second spelling of `term-length`.
 

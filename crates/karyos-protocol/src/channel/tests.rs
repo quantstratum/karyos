@@ -391,7 +391,10 @@ fn published_keys_keep_their_meaning() {
                     .map(TermLength::get),
                 Some(1 << 30)
             ),
-            Key::Reliable => assert!(udp("karyos:udp?endpoint=10.0.0.5:1|reliable=true").reliable),
+            // Not the default, so an ignored key would fail.
+            Key::Reliable => {
+                assert!(!udp("karyos:udp?endpoint=10.0.0.5:1|reliable=false").reliable)
+            }
             Key::Paths => assert_eq!(
                 udp("karyos:udp?group=239.1.1.1:1|paths=eth1;::1").paths,
                 vec![
@@ -483,6 +486,8 @@ fn the_grammar_file_lists_every_key() {
 #[test]
 fn keys_are_kebab_case_with_one_spelling() {
     assert!(keys_follow_the_naming_rule());
+    // Each word starts with a letter: `a1-b2` is a key name, `a-1b` is
+    // not (CHANNEL-URI.md section 2).
     for name in [
         "mtu",
         "term-length",

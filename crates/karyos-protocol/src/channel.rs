@@ -366,9 +366,9 @@ const KEYS: [(&str, Key); 16] = [
     ("ttl", Key::Ttl),
 ];
 
-/// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): lower-case
-/// letters and digits in words joined by single hyphens, starting with a
-/// letter.
+/// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
+/// lower-case letters and digits, each starting with a letter, joined by
+/// single hyphens.
 const fn kebab_case(name: &str) -> bool {
     let mut rest = name.as_bytes();
     let mut previous = b'-';
