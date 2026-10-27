@@ -24,6 +24,16 @@ release may break APIs, wire formats and shared-memory layouts.
   schema 1. An Archive that does not know schema 4 answers code 5, which
   `DurableQuery` reports as unsupported, never as a durable position.
   `Described` gains `durable`.
+- SPEC.md §13 "Stall isolation and capacity" with the real network
+  sender (karyos#627): `tests/stall_isolation_sender.rs` stalls two
+  optional readers and an observer in their copies, loans held, on a
+  reliable network publication's lane while its sender keeps up and an
+  in-process publisher runs ten terms. The publisher is never held,
+  quarantined slots stay within `S`, an extra admission is refused, and
+  the stalled readers read unchanged bytes, then are lapped. A paused
+  claim on that lane holds the in-order sender, and so the publisher at
+  its window, until the claim's deadline aborts it, which a second test
+  pins.
 - `RELEASING.md` lists the gates a release runs, as the 0.1.0-alpha.2
   Evidence table records them, and how each result is recorded.
   `make loom-full` is now required at every release head, not only on
