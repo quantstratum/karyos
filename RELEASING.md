@@ -36,7 +36,7 @@ both. The fold is deterministic: fragments in file name order, after the
 entries already in each section, and sections in Keep a Changelog order.
 That pull request is the only one that edits `CHANGELOG.md`, so its gate
 runs with `CHANGELOG_RELEASE=1 make pre-push`; for any other branch
-`make changelog-check` fails when it adds a line to `CHANGELOG.md`. Then
+`make changelog-check` fails when it adds more lines to `CHANGELOG.md` than it removes. Then
 rename `[Unreleased]` to the release's heading and open a new,
 empty `[Unreleased]` above it. Pull requests never edit `CHANGELOG.md`
 directly (`CONTRIBUTING.md`). Decided 2026-10-27 by QS-COORDINATOR under

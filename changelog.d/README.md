@@ -20,8 +20,10 @@ sections uses two files, both named after the issue
 (`634-refresh-cycles.md`, `634-refresh-cycles-fix.md`). A change with no
 issue does not get a fragment until it has one. `make changelog-check`,
 which `make pre-push` runs, rejects a fragment with another name or
-without exactly one header, and a branch that adds lines to
-`CHANGELOG.md` itself.
+without exactly one header, and a branch that adds more lines to
+`CHANGELOG.md` than it removes. A pull request may still correct an
+existing entry in `CHANGELOG.md` in place, as long as the entry does not
+grow; a correction that needs more lines goes in a fragment.
 
 At a release, `scripts/changelog-assemble.sh` folds the fragments into
 `[Unreleased]` in file name order, after the entries already there, and
