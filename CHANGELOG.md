@@ -22,6 +22,23 @@ release may break APIs, wire formats and shared-memory layouts.
   head; a required recording joining later bounds the publisher again.
   The alpha.2 release notes list this case as missing under "Partial:
   required set transitions".
+- The channel URI grammar is recorded in
+  `crates/karyos-protocol/CHANNEL-URI.md`, with the rules every new key follows
+  (owner decisions of 2026-10-21, "Common URI rule"; karyos#636): kebab-case
+  names with one spelling, checked when `karyos-protocol` builds; the duration
+  grammar, `channel::parse_duration`, which requires an `ns`, `us`, `ms` or `s`
+  unit and refuses a missing or unknown unit and overflow with a typed
+  `DurationError`; and `ChannelError::InvalidDuration` (code 11) for duration
+  keys. A test per published key asserts the sixteen existing keys parse as
+  before.
+
+### Changed
+
+- A channel URI list that names one address in two spellings is refused as a
+  repetition: `destinations=10.0.0.5:1;[::ffff:10.0.0.5]:1` and
+  `paths=10.0.0.7;::ffff:10.0.0.7` are now `InvalidValue`, as an exact repeat
+  already was. An IPv4-mapped IPv6 address compares equal to the IPv4 address it
+  maps; IPv6 zones still tell addresses apart.
 
 ## [0.1.0-alpha.2]: 2026-10-21
 

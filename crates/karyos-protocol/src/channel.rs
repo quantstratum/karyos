@@ -17,11 +17,17 @@
 //! [`MAX_URI_LENGTH`]. Nothing here opens a socket or resolves a name: an
 //! interface is kept as an address or a name for the driver to resolve.
 //!
+//! The grammar, and the rules every new key follows (owner decisions of
+//! 2026-10-21, "Common URI rule"), are recorded in `CHANNEL-URI.md` beside
+//! this crate's manifest. [`parse_duration`] is the duration grammar new
+//! keys use.
+//!
 //! Phase 2 implements the `trusted` protection class only: `authenticated`
 //! and `encrypted` are refused with [`ChannelError::SecurityUnsupported`]
 //! until the security profile is accepted.
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use crate::frame::{Flags, Lane};
 use crate::sizing::{FragmentPlan, TermLength};
@@ -105,6 +111,14 @@ pub enum ChannelError {
         /// The requested class.
         class: &'static str,
     },
+    /// A duration value outside the duration grammar (`CHANNEL-URI.md`).
+    #[error("invalid duration for `{key}`: {error}")]
+    InvalidDuration {
+        /// The key.
+        key: &'static str,
+        /// What is wrong.
+        error: DurationError,
+    },
 }
 
 impl ChannelError {
@@ -123,8 +137,59 @@ impl ChannelError {
             Self::Destination => 8,
             Self::Conflict { .. } => 9,
             Self::SecurityUnsupported { .. } => 10,
+            Self::InvalidDuration { .. } => 11,
         }
     }
+}
+
+/// Why a duration was refused (`CHANNEL-URI.md`, "Durations").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DurationError {
+    /// No unit follows the number.
+    #[error("no unit: use ns, us, ms or s")]
+    MissingUnit,
+    /// The text after the number is not `ns`, `us`, `ms` or `s`.
+    #[error("unknown unit: use ns, us, ms or s")]
+    UnknownUnit,
+    /// The number is missing, signed or has a leading zero.
+    #[error("not a decimal integer")]
+    NotDecimal,
+    /// The duration does not fit in a `u64` of nanoseconds.
+    #[error("overflows 2^64 - 1 nanoseconds")]
+    Overflow,
+}
+
+/// Parses a duration of the URI grammar: a decimal integer and a unit of
+/// `ns`, `us`, `ms` or `s`, converted to nanoseconds with checked
+/// arithmetic. A key checks its own range on the result.
+///
+/// # Errors
+///
+/// A [`DurationError`] when the unit is missing or unknown, the number is
+/// not a canonical decimal, or the value overflows a `u64` of nanoseconds.
+pub fn parse_duration(value: &str) -> Result<Duration, DurationError> {
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, unit) = value
+        .split_at_checked(digits)
+        .ok_or(DurationError::NotDecimal)?;
+    if number.is_empty() || (number.len() > 1 && number.starts_with('0')) {
+        return Err(DurationError::NotDecimal);
+    }
+    let nanos_per_unit: u64 = match unit {
+        "" => return Err(DurationError::MissingUnit),
+        "ns" => 1,
+        "us" => 1_000,
+        "ms" => 1_000_000,
+        "s" => 1_000_000_000,
+        _ => return Err(DurationError::UnknownUnit),
+    };
+    // `number` is all digits, so the only way it fails to parse is size.
+    let count: u64 = number.parse().map_err(|_| DurationError::Overflow)?;
+    count
+        .checked_mul(nanos_per_unit)
+        .map(Duration::from_nanos)
+        .ok_or(DurationError::Overflow)
 }
 
 /// A local interface: an address to bind, or a name the driver resolves.
@@ -300,6 +365,71 @@ const KEYS: [(&str, Key); 16] = [
     ("control-mode", Key::ControlMode),
     ("ttl", Key::Ttl),
 ];
+
+/// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
+/// lower-case letters and digits, each starting with a letter, joined by
+/// single hyphens.
+const fn kebab_case(name: &str) -> bool {
+    let mut rest = name.as_bytes();
+    let mut previous = b'-';
+    let mut first = true;
+    while let [byte, tail @ ..] = rest {
+        let valid = match *byte {
+            b'a'..=b'z' => true,
+            b'0'..=b'9' => !first && previous != b'-',
+            b'-' => previous != b'-',
+            _ => false,
+        };
+        if !valid {
+            return false;
+        }
+        previous = *byte;
+        first = false;
+        rest = tail;
+    }
+    !first && previous != b'-'
+}
+
+/// Whether two names are the same bytes.
+const fn same(left: &str, right: &str) -> bool {
+    let (mut left, mut right) = (left.as_bytes(), right.as_bytes());
+    loop {
+        match (left, right) {
+            ([], []) => return true,
+            ([one, left_tail @ ..], [other, right_tail @ ..]) if *one == *other => {
+                left = left_tail;
+                right = right_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Every key is kebab-case and has one spelling: no name and no [`Key`]
+/// appears twice in [`KEYS`].
+const fn keys_follow_the_naming_rule() -> bool {
+    let mut rest: &[(&str, Key)] = &KEYS;
+    while let [(name, key), tail @ ..] = rest {
+        if !kebab_case(name) {
+            return false;
+        }
+        let mut later = tail;
+        while let [(other_name, other_key), later_tail @ ..] = later {
+            if same(name, other_name) || *key as u8 == *other_key as u8 {
+                return false;
+            }
+            later = later_tail;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// The common URI rule's naming obligation, checked when the crate builds.
+const _: () = assert!(
+    keys_follow_the_naming_rule(),
+    "a channel URI key is not kebab-case or has two spellings"
+);
 
 impl Key {
     fn name(self) -> &'static str {
@@ -553,12 +683,49 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
     })
 }
 
-/// Whether an item of `items` appears twice.
-fn repeats<T: PartialEq>(items: &[T]) -> bool {
-    items
-        .iter()
-        .enumerate()
-        .any(|(index, one)| items.iter().take(index).any(|earlier| earlier == one))
+/// Whether an item of `items` appears twice, comparing in the canonical
+/// form of [`Canonical`].
+fn repeats<T: Canonical>(items: &[T]) -> bool {
+    items.iter().enumerate().any(|(index, one)| {
+        items
+            .iter()
+            .take(index)
+            .any(|earlier| earlier.canonical() == one.canonical())
+    })
+}
+
+/// A list element's identity for the repetition rule (`CHANNEL-URI.md`
+/// section 3): an IPv4-mapped IPv6 address is the IPv4 address it maps,
+/// so one receiver or interface written in two spellings is a repetition.
+/// The element itself is kept as written.
+trait Canonical {
+    /// The form two elements are compared in.
+    type Form: PartialEq;
+    /// This element in that form.
+    fn canonical(&self) -> Self::Form;
+}
+
+impl Canonical for SocketAddr {
+    type Form = (IpAddr, u16, u32);
+
+    fn canonical(&self) -> Self::Form {
+        let scope = match self {
+            SocketAddr::V4(_) => 0,
+            SocketAddr::V6(v6) => v6.scope_id(),
+        };
+        (self.ip().to_canonical(), self.port(), scope)
+    }
+}
+
+impl Canonical for Interface {
+    type Form = Interface;
+
+    fn canonical(&self) -> Self::Form {
+        match self {
+            Interface::Address(address) => Interface::Address(address.to_canonical()),
+            Interface::Name(name) => Interface::Name(name.clone()),
+        }
+    }
 }
 
 /// A decimal integer without sign, leading zeros or other characters.
