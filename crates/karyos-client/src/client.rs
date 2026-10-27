@@ -1217,6 +1217,10 @@ pub struct Client<C: Connection> {
     /// which its record takes when its grant arrives, before the events
     /// that announce its first images.
     adding: Option<(SubscriberRole, RejoinPolicy)>,
+    /// The application counters registered, by label and kind, each alive
+    /// while its handle is (R-CORE-3); at most `max_counters_per_client`
+    /// once the dead are pruned.
+    applications: Vec<(String, CounterKind, Weak<()>)>,
     /// The replay-target subscribers made by [`Client::replay_targets`].
     targets: Vec<Arc<Mutex<targets::Target<C::Terms>>>>,
     /// Their requests in flight.
@@ -1267,6 +1271,7 @@ impl<C: Connection> Client<C> {
             completions: Vec::new(),
             events: Vec::new(),
             adding: None,
+            applications: Vec::new(),
             targets: Vec::new(),
             target_asks: Vec::new(),
         }
@@ -1752,6 +1757,9 @@ impl<C: Connection> Client<C> {
     ///
     /// # Errors
     ///
+    /// [`ClientError::DuplicateCounter`] when this client holds a live
+    /// application counter of the same label and kind, whose export would
+    /// repeat its series, before anything is requested;
     /// [`ClientError::Conductor`] with `ConductorError::LabelTooLong` for a
     /// label of more than 64 bytes, before anything is requested: a label is
     /// never truncated; [`ClientError::Refused`] with
@@ -1763,12 +1771,26 @@ impl<C: Connection> Client<C> {
         label: &str,
         kind: CounterKind,
     ) -> Result<ClientCounterHandle, ClientError> {
+        self.applications
+            .retain(|(_, _, name)| name.strong_count() > 0);
+        if self
+            .applications
+            .iter()
+            .any(|(held, held_kind, _)| held == label && *held_kind == kind)
+        {
+            return Err(ClientError::DuplicateCounter);
+        }
         let sequence = self
             .connection
             .allocate_counter(kind.type_id(), label, 0, 0)?;
         match self.wait(sequence)? {
             Found::Outcome(outcome) => match *outcome {
-                Outcome::Counter(handle) => Ok(handle),
+                Outcome::Counter(handle) => {
+                    let name = Arc::new(());
+                    self.applications
+                        .push((label.to_owned(), kind, Arc::downgrade(&name)));
+                    Ok(handle.named(name))
+                }
                 other => Err(refusal(&other)),
             },
             Found::Network(..) => Err(ClientError::Unknown),

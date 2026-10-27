@@ -2462,3 +2462,24 @@ fn the_65th_counter_is_refused_and_a_client_that_goes_frees_its_cells() {
         let _ = driver.do_work().unwrap();
     }
 }
+
+/// R-CORE-3 review: a client holds at most one live application counter
+/// per label and kind, so its export never repeats a series (Prometheus
+/// refuses a scrape that does). Another kind of the same label is a
+/// different series; once the first is released, the label is free again.
+#[test]
+fn a_second_live_counter_of_the_same_label_and_kind_is_refused() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    serve(&mut driver, || {
+        let first = client.add_counter("orders", CounterKind::Event).unwrap();
+        assert_eq!(
+            client.add_counter("orders", CounterKind::Event).err(),
+            Some(ClientError::DuplicateCounter)
+        );
+        let gauge = client.add_counter("orders", CounterKind::Gauge).unwrap();
+        first.release();
+        let again = client.add_counter("orders", CounterKind::Event).unwrap();
+        drop((gauge, again));
+    });
+}

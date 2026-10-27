@@ -111,6 +111,9 @@ pub struct ClientCounterHandle {
     /// A client process's admission session, kept so that `Leave` is not
     /// sent while this handle lives; `None` in process.
     _session: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    /// An application counter's name, held while the handle lives so its
+    /// client refuses a second one of the same label and kind.
+    _name: Option<Arc<()>>,
 }
 
 impl ClientCounterHandle {
@@ -127,7 +130,14 @@ impl ClientCounterHandle {
             inner,
             releases,
             _session: session,
+            _name: None,
         }
+    }
+
+    /// This handle, holding `name` while it lives.
+    pub(crate) fn named(mut self, name: Arc<()>) -> Self {
+        self._name = Some(name);
+        self
     }
 
     /// The cell in the client counters region.

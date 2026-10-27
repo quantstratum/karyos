@@ -8,7 +8,8 @@
   `max_counters_per_client`, shared with the client's other counters, and
   past it registration is refused with `ClientError::Refused`
   (`ResourcesUnavailable`); a label of more than 64 bytes is refused, never
-  truncated. The cells are freed when the handle is released or the client
+  truncated, and a second live counter of the same label and kind with
+  `ClientError::DuplicateCounter`, so the export never repeats a series. The cells are freed when the handle is released or the client
   goes. The agent's exporter shows them as `karyos_application_events_total`
   and `karyos_application_gauge`, labelled with the name and the client, and
   `karyos-stat` lists them under "application counters:". Updating one

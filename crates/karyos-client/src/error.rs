@@ -88,6 +88,12 @@ pub enum ClientError {
         /// What is wrong.
         reason: &'static str,
     },
+    /// [`Client::add_counter`](crate::Client::add_counter): this client
+    /// already holds a live application counter of the same label and
+    /// kind. Its export would repeat one series, which Prometheus refuses
+    /// (R-CORE-3).
+    #[error("an application counter of this label and kind is already registered")]
+    DuplicateCounter,
     /// `Client::connect` needs the driver's directory.
     #[error("the context names no driver directory")]
     NoDirectory,
