@@ -42,7 +42,8 @@
 //!   in that request and applies to it only, so no client changes
 //!   another's. In v1 only `read.request_bytes` is negotiable, downwards:
 //!   a proposal at or below 256 is the effective value and applies to the
-//!   `limits` request itself, whose line must fit it. A proposal for a
+//!   `limits` request itself, whose line, its newline included, must fit
+//!   it. A proposal for a
 //!   dimension the agent does not know is refused by name
 //!   (`{"error":"unknown dimension","dimension":D}`), never as `bad
 //!   request`. A client reads "limits not supported" only from `bad
@@ -151,14 +152,15 @@ fn negotiate<'a, const N: usize>(
 }
 
 /// The negotiated `read.request_bytes` applied to the request `line` that
-/// negotiated it: `Some` with the negotiated bound when the line, without
-/// its newline, is longer.
+/// negotiated it: `Some` with the negotiated bound when the line, its
+/// newline included as [`parse`] counts it against [`MAX_REQUEST`], is
+/// longer.
 fn request_within<const N: usize>(
     line: &str,
     limits: &[Limit; N],
     effective: &[Option<u64>; N],
 ) -> Option<Limit> {
-    let length = u64::try_from(line.trim_end_matches(['\n', '\r']).len()).ok()?;
+    let length = u64::try_from(line.len()).ok()?;
     limits
         .iter()
         .zip(effective)
@@ -584,7 +586,7 @@ mod tests {
     }
 
     /// R-CORE-38's three answers, on a table with a negotiable dimension
-    /// (none is in v1): a proposal within its bound is applied, one above
+    /// (only `read.request_bytes` is in v1): a proposal within its bound is applied, one above
     /// it is refused with the bound, and the answer renders the negotiable,
     /// the fixed and the unbounded dimension.
     #[test]
@@ -631,14 +633,18 @@ mod tests {
     /// request that negotiated it.
     #[test]
     fn a_negotiated_request_size_applies_to_its_request() {
-        let line = "KARYOS-AGENT 1 limits read.request_bytes=60\n";
-        let effective = negotiate(&LIMITS, "read.request_bytes=60").unwrap();
+        // 44 bytes, its newline included, as `parse` counts against
+        // `MAX_REQUEST`: a bound of 44 takes it, 43 refuses it with 43.
+        let line = "KARYOS-AGENT 1 limits read.request_bytes=44\n";
+        assert_eq!(line.len(), 44);
+        let effective = negotiate(&LIMITS, "read.request_bytes=44").unwrap();
         assert_eq!(request_within(line, &LIMITS, &effective), None);
-        let effective = negotiate(&LIMITS, "read.request_bytes=40").unwrap();
+        let line = "KARYOS-AGENT 1 limits read.request_bytes=43\n";
+        let effective = negotiate(&LIMITS, "read.request_bytes=43").unwrap();
         let refused = request_within(line, &LIMITS, &effective).unwrap();
         assert_eq!(
             (refused.name, refused.bound),
-            ("read.request_bytes", Some(40))
+            ("read.request_bytes", Some(43))
         );
         let bounds = LIMITS.map(|limit| limit.bound);
         assert_eq!(request_within(line, &LIMITS, &bounds), None);
