@@ -400,6 +400,22 @@ impl<T: StreamTerms> ImageTable<T> {
             })
     }
 
+    /// Moves the view link of the installed image `slot` to `link`, a
+    /// recreated view's (karyos#658). `false` without an installed image
+    /// with a conflated view.
+    pub fn relink(&mut self, slot: SlotRef, link: karyos_sys::freshness::FreshnessLink) -> bool {
+        self.images
+            .iter_mut()
+            .find_map(|image| match (&image.state, &mut image.freshness) {
+                (State::Installed(installed), Some((_, held))) if *installed == slot => {
+                    *held = link.clone();
+                    Some(())
+                }
+                _ => None,
+            })
+            .is_some()
+    }
+
     /// Serves every session event the receiver posted, building lanes from
     /// `lanes`, then reclaims the retired images no loan holds any more,
     /// reporting image events to `on_event`; returns how many events it

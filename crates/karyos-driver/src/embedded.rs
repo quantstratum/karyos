@@ -560,6 +560,12 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// The required subscriber and keyed table writer, when conflation is
     /// configured. The table itself survives mapping generations.
     pub(crate) feeder: Option<ConflationFeeder<T>>,
+    /// A network image lane's view its terminal cell closed: the closed
+    /// table and the terminal, kept to seed the view's recreation
+    /// (karyos#658) and released when it is recreated, the image retires or
+    /// the driver closes. Its feeder's subscription is gone, so it holds no
+    /// position of the lane.
+    pub(crate) closed_view: Option<ClosedView>,
     /// Terminal table failure that sealed this stream. Kept for internal
     /// lifecycle state until the public seal reason is designed.
     pub(crate) conflation_terminal: Option<karyos_sys::conflation::ConflationError>,
@@ -763,6 +769,16 @@ pub(crate) struct ConflationFeeder<T: StreamTerms> {
     /// The freshness state of a network image's view; `None` for an IPC
     /// stream's (which has no loss).
     pub(crate) fresh: Option<FreshFeed>,
+}
+
+/// A network image lane's view closed by its terminal cell, kept until its
+/// recreation (karyos#658).
+#[derive(Debug)]
+pub(crate) struct ClosedView {
+    /// The closed table: its last values seed the recreated view.
+    pub(crate) writer: ConflationWriter,
+    /// The terminal that closed it.
+    pub(crate) terminal: karyos_sys::freshness::Terminal,
 }
 
 /// The feeder side of a network image lane's view
@@ -1130,6 +1146,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 retained: Vec::new(),
                 spare: None,
                 feeder: None,
+                closed_view: None,
                 conflation_terminal: None,
                 feeder_counters: None,
                 guarded: None,
@@ -2508,6 +2525,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             retained: Vec::new(),
             spare: None,
             feeder,
+            closed_view: None,
             conflation_terminal: None,
             feeder_counters,
             guarded: None,
@@ -3585,6 +3603,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if published {
                 if let Some(mut feeder) = stream.feeder.take() {
                     feeder.writer.close();
+                    // Kept to seed a recreation (karyos#658), unless the
+                    // image is going: a retired image's view is never
+                    // recreated.
+                    let terminal = feeder.fresh.as_ref().and_then(|fresh| {
+                        karyos_sys::freshness::TerminalCell::read(&fresh.link.terminal_words())
+                    });
+                    if let Some(terminal) = terminal
+                        && !stream.retiring
+                        && terminal.reason != karyos_sys::freshness::TERMINAL_IMAGE_RETIRED
+                    {
+                        stream.closed_view = Some(ClosedView {
+                            writer: feeder.writer,
+                            terminal,
+                        });
+                    }
                 }
                 stream
                     .members
@@ -4133,6 +4166,168 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// Recreates the conflated view of `handle`'s `lane`, a network
+    /// image's whose view its terminal cell closed (SPEC.md §7.1, "Lane
+    /// seal and terminal closure": "recovery recreates the view, and every
+    /// key of the new view starts `Stale` until its own update";
+    /// `quantstratum-docs: karyos/design/conflated-network-images.md`,
+    /// "Recovery"; karyos#658). Driver-internal until owner item 7 gives
+    /// conflated network views a way in (karyos#637).
+    ///
+    /// The new table, over a new link, is seeded with the closed view's
+    /// last value of every written key at the terminal's start, then the
+    /// loss from there to the new feeder's join position is recorded, so
+    /// every seeded key reads `Stale { since: terminal.start }` before any
+    /// reader can see the view; a key turns `Fresh` only with its own
+    /// update past the join. The receiver's seal gate moves to the new link,
+    /// and the closed table is released.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::UnknownStream`] for a lane `handle` does not have;
+    /// [`DriverError::StreamRetiring`] for a retiring or retired image;
+    /// [`DriverError::NotConflated`] without a network view;
+    /// [`DriverError::ViewNotClosed`] for a view that is open or was never
+    /// closed by its terminal cell; [`DriverError::NetworkBusy`] when the
+    /// receiver cannot take the relink now (retry); a table or subscription
+    /// failure as [`DriverError::Conflation`], [`DriverError::Client`] or
+    /// [`DriverError::Sys`].
+    /// Nothing changes on error: the closed view stays to retry.
+    #[allow(
+        dead_code,
+        reason = "driver-internal until owner item 7 gives conflated network views a way in"
+    )]
+    pub(crate) fn recreate_network_view(
+        &mut self,
+        handle: &AggregateHandle,
+        lane: karyos_sys::frame::Lane,
+    ) -> Result<(), DriverError> {
+        let id = handle
+            .lanes
+            .get(usize::from(lane.get()))
+            .copied()
+            .flatten()
+            .ok_or(DriverError::UnknownStream {
+                stream: handle.registration,
+            })?;
+        let index = self
+            .streams
+            .iter()
+            .position(|stream| stream.id == id)
+            .ok_or(DriverError::UnknownStream { stream: id })?;
+        // An image no longer installed is a retired one.
+        let slot = self.net.as_ref().and_then(|net| net.image_slot(handle));
+        let stream = self
+            .streams
+            .get_mut(index)
+            .ok_or(DriverError::UnknownStream { stream: id })?;
+        let slot = match slot {
+            Some(slot) if !stream.retiring => slot,
+            _ => return Err(DriverError::StreamRetiring { stream: id }),
+        };
+        let config = stream.conflation.ok_or(DriverError::NotConflated)?;
+        if stream.feeder.is_some() {
+            return Err(DriverError::ViewNotClosed);
+        }
+        let terminal = stream
+            .closed_view
+            .as_ref()
+            .map(|closed| closed.terminal)
+            .ok_or(DriverError::ViewNotClosed)?;
+        let link = karyos_sys::freshness::FreshnessLink::new();
+        let mut writer = karyos_sys::conflation::conflation_fresh(
+            config.keys,
+            config.value_capacity,
+            config.journal_capacity,
+            link.clone(),
+        )?;
+        let inner = stream
+            .conductor
+            .subscribe(Role::Required)
+            .map_err(DriverError::Sys)?;
+        let generation = GenerationLink::new();
+        let subscription =
+            ClientSubscription::new(inner).with_generation(Arc::clone(&generation), 0)?;
+        // Seeds at the terminal's start, the loss from there to the join:
+        // the join is the lane's reserved head, past every position the
+        // closed view held, so the interval is never empty unless nothing
+        // was ever published, and then nothing is seeded either.
+        let join = subscription.position();
+        if terminal.start < join {
+            let mut out = vec![0u8; config.value_capacity];
+            let mut seeded = Ok(());
+            if let Some(closed) = &stream.closed_view {
+                let _ = closed.writer.for_each_value(&mut out, |key, value| {
+                    if seeded.is_ok() {
+                        seeded = writer.write_at(key, value, terminal.start).map(|_| ());
+                    }
+                });
+            }
+            seeded?;
+            // A new table: its ring is empty and its frontier 0, and the
+            // interval is not empty, so no refusal is expected here.
+            writer
+                .record_loss(terminal.start, join)
+                .map_err(|_| DriverError::Conflation(ConflationError::InvalidConfig))?;
+            // One pass reconciles every slot; the bound only guards the
+            // loop.
+            for _ in 0..=config.keys {
+                if !writer.reconciling() {
+                    break;
+                }
+                writer.reconcile(u32::MAX)?;
+            }
+            writer.passed(join);
+        }
+        if let Some(net) = &mut self.net {
+            net.relink_view(slot, lane, &link)?;
+        }
+        let stream = self
+            .streams
+            .get_mut(index)
+            .ok_or(DriverError::UnknownStream { stream: id })?;
+        stream.members.push(Member {
+            link: Arc::downgrade(&generation),
+            kind: MemberKind::Feeder,
+        });
+        stream.feeder = Some(ConflationFeeder {
+            subscription,
+            writer,
+            fresh: Some(FreshFeed {
+                link: link.clone(),
+                gap: None,
+                #[cfg(test)]
+                fail_polls: false,
+            }),
+        });
+        stream.closed_view = None;
+        let deferred = self
+            .net
+            .as_ref()
+            .is_some_and(crate::net::Network::defers_view_attach);
+        if !deferred && let Ok(mailbox) = link.mailbox() {
+            mailbox.attach();
+        }
+        if let Some(net) = &mut self.net {
+            net.count_views(|views| views.add(|c| &mut c.recreated, 1));
+        }
+        Ok(())
+    }
+
+    /// Whether `handle`'s `lane` keeps a closed view's table for a
+    /// recreation (tests).
+    #[cfg(test)]
+    pub(crate) fn holds_closed_network_view(
+        &self,
+        handle: &AggregateHandle,
+        lane: karyos_sys::frame::Lane,
+    ) -> bool {
+        let id = handle.lanes.get(usize::from(lane.get())).copied().flatten();
+        self.streams
+            .iter()
+            .any(|stream| Some(stream.id) == id && stream.closed_view.is_some())
+    }
+
     /// Attaches every built conflated view of a network image that
     /// `Network::defer_view_attach` held back (tests).
     #[cfg(test)]
@@ -4329,6 +4524,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                                         }
                                     });
                                 }
+                            }
+                            // A closed view is never recreated on a
+                            // retired image: its table goes now.
+                            if let Ok(lane) = self.stream(stream) {
+                                lane.closed_view = None;
                             }
                             let _ = self.retire_lane_with(stream, seal, close);
                         }

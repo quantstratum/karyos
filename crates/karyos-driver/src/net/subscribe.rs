@@ -172,9 +172,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// # Errors
     ///
-    /// As [`EmbeddedDriver::add_network_subscription`], and
+    /// As [`EmbeddedDriver::add_network_subscription`],
     /// [`DriverError::ConflationMismatch`] for a stream already subscribed
-    /// on the endpoint with another conflated lane, or with none.
+    /// on the endpoint with another conflated lane, or with none, and
+    /// [`DriverError::BarrierAckTimeout`] for an unreliable channel whose
+    /// `barrier_ack_timeout` plus seal deadline reaches the far-window
+    /// timeout (karyos#658).
     #[allow(
         dead_code,
         reason = "driver-internal until owner item 7 gives conflated network views a way in"
@@ -322,6 +325,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !channel.paths.is_empty() && !net.paths_isolated() {
             net.count_paths_refused();
             return Err(DriverError::UnsupportedChannel);
+        }
+        // A conflated view of an unreliable channel needs its fail-safe to
+        // close the view before the far-window close ends the image
+        // (karyos#658).
+        if options.1.is_some() && !channel.reliable {
+            net.unreliable_view_bound()
+                .map_err(DriverError::BarrierAckTimeout)?;
         }
         let route = receive_route(channel)?;
         let later = later_routes(channel)?;

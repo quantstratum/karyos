@@ -31,6 +31,19 @@ release may break APIs, wire formats and shared-memory layouts.
   `DurationError`; and `ChannelError::InvalidDuration` (code 11) for duration
   keys. A test per published key asserts the sixteen existing keys parse as
   before.
+- `AgentConfig::conductor_duty_period` (default 1 ms): the longest time between
+  two conductor duty cycles. `barrier_ack_timeout` is validated against it
+  (karyos#658). karyosd bounds its idle sleep by it; a caller that drives an
+  embedded driver's `duty_cycle` itself must call it at least this often while
+  a conflated network view is open.
+- A conflated network view closed by its terminal cell can be recreated
+  (driver-internal, `EmbeddedDriver::recreate_network_view`, until karyos#637
+  gives it a public way in). The new view starts with every written key's last
+  value `Stale { since }` the terminal's start, and a key turns `Fresh` only
+  with its own update. The receiver's seal gate moves to the new view. The
+  closed table is kept until the recreation, the image's retirement or the
+  driver's close, never longer. Counted as `recreated` (view counters) and
+  `views_relinked` / `relinks_refused` (receiver).
 
 ### Changed
 
@@ -39,6 +52,27 @@ release may break APIs, wire formats and shared-memory layouts.
   `paths=10.0.0.7;::ffff:10.0.0.7` are now `InvalidValue`, as an exact repeat
   already was. An IPv4-mapped IPv6 address compares equal to the IPv4 address it
   maps; IPv6 zones still tell addresses apart.
+- `barrier_ack_timeout` is refused below 10 ms (`BarrierAckBound::Floor`) and
+  below ten `conductor_duty_period` (`BarrierAckBound::DutyPeriods`), each with
+  its own refusal: `AgentError::BarrierAckTimeout` from the agents,
+  `DriverError::BarrierAckTimeout` at driver start (previously an untyped
+  `InvalidConfig` for the floor only, and no duty period check).
+- A conflated network subscription of an unreliable channel is refused with
+  `DriverError::BarrierAckTimeout(BarrierAckBound::FarWindow)` unless
+  `max(gap_reorder_timeout, path_skew_window) + barrier_ack_timeout` is below
+  `far_window_timeout`. The far-window clock starts at the first `Ahead`
+  arrival, while the fail-safe counts from the hole's post, so a longer timeout
+  could let the far-window close end the image before its view closes. A
+  reliable channel never closes by that timer and is not checked. Decided
+  2026-10-27 by QS-COORDINATOR under owner delegation (karyos#658).
+
+### Fixed
+
+- The alpha.2 release notes stated that "A conflated view closed at
+  `barrier_ack_timeout` is recreated with every key stale"; it was not
+  implemented until this change. That limitation's two halves, the missing
+  recreation test and the missing duty period check, are both closed here
+  (karyos#658).
 
 ## [0.1.0-alpha.2]: 2026-10-21
 

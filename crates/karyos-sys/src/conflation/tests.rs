@@ -1038,6 +1038,32 @@ fn fresh_table(keys: u32) -> (ConflationWriter, FreshnessLink) {
     (conflation_fresh(keys, 8, 1024, link.clone()).unwrap(), link)
 }
 
+/// karyos#658: a closed table still yields the last value of every
+/// written key, in key order, for a recreated view to seed from; a buffer
+/// shorter than the value capacity, or a table without a barrier, yields
+/// nothing.
+#[test]
+#[allow(clippy::unwrap_used, reason = "test, as ADR-0007 allows in tests")]
+fn a_closed_table_yields_its_last_values() {
+    let (mut writer, _link) = fresh_table(4);
+    writer.write_at(2, &[2, 2], 0).unwrap();
+    writer.write_at(0, &[1], 32).unwrap();
+    writer.write_at(2, &[7], 64).unwrap();
+    writer.close();
+    let mut out = [0u8; 8];
+    let mut seen = Vec::new();
+    let unstable = writer.for_each_value(&mut out, |key, value| seen.push((key, value.to_vec())));
+    assert_eq!(unstable, 0);
+    assert_eq!(seen, vec![(0, vec![1]), (2, vec![7])]);
+    let mut short = [0u8; 7];
+    let mut none = 0;
+    let _ = writer.for_each_value(&mut short, |_, _| none += 1);
+    assert_eq!(none, 0);
+    let plain = conflation(4, 8, 1024).unwrap();
+    let _ = plain.for_each_value(&mut out, |_, _| none += 1);
+    assert_eq!(none, 0);
+}
+
 /// GU-8, GU-9: a recorded loss makes every written key Stale since the
 /// gap's start at once, before any slot is reconciled, and a reader that
 /// already delivered them gets them again, same versions, Stale. The

@@ -37,6 +37,7 @@
 
 pub mod chain;
 pub(crate) mod conflated_gate;
+pub use conflated_gate::BarrierAckBound;
 pub mod control;
 pub mod data;
 pub mod endpoints;
@@ -102,6 +103,9 @@ pub enum AgentError {
     /// A work count overflowed.
     #[error("the {0:?} agent's work count overflowed")]
     CountOverflow(AgentKind),
+    /// `barrier_ack_timeout` misses a bound (SPEC.md §7.1; karyos#658).
+    #[error("invalid agent configuration: {0}")]
+    BarrierAckTimeout(BarrierAckBound),
     /// The runner could not start a thread.
     #[error("cannot start an agent thread: {0}")]
     Spawn(String),
@@ -281,9 +285,21 @@ pub struct AgentConfig {
     pub stop_timeout: Duration,
     /// `barrier_ack_timeout` in ns: how long a conflated image lane's seal
     /// waits for its view's feeder before the fail-safe closes the view
-    /// (conflated-network-images.md (c); default 100 ms, an owner flag; at
-    /// least ten idle sleeps of a duty loop, 10 ms).
+    /// (conflated-network-images.md (c); default 100 ms, an owner flag).
+    /// At least 10 ms and at least ten `conductor_duty_period`
+    /// ([`BarrierAckBound`]); a conflated subscription of an unreliable
+    /// channel also needs it below the far-window timeout less the seal
+    /// deadline ([`BarrierAckBound::FarWindow`]).
     pub barrier_ack_timeout: u64,
+    /// `conductor_duty_period` in ns (default 1 ms, at least 1): the
+    /// longest time between two conductor duty cycles, idle sleep
+    /// included, that `barrier_ack_timeout` is validated against (SPEC.md
+    /// §7.1; decided 2026-10-27 by QS-COORDINATOR under owner delegation,
+    /// karyos#658). karyosd bounds its idle sleep by it. A caller that
+    /// drives an embedded driver's `duty_cycle` itself must call it at
+    /// least this often while a conflated network view is open, or its
+    /// views can close at `barrier_ack_timeout` without a loss.
+    pub conductor_duty_period: u64,
 }
 
 impl Default for AgentConfig {
@@ -321,6 +337,7 @@ impl Default for AgentConfig {
             group_nak_budget: 64,
             stop_timeout: Duration::from_secs(1),
             barrier_ack_timeout: conflated_gate::DEFAULT_BARRIER_ACK_TIMEOUT_NS,
+            conductor_duty_period: conflated_gate::DEFAULT_CONDUCTOR_DUTY_PERIOD_NS,
         }
     }
 }
@@ -432,11 +449,13 @@ impl AgentConfig {
                 "control_capacity below max_pending_challenges + max_images * max_paths + 32",
             ));
         }
-        if self.barrier_ack_timeout < conflated_gate::MIN_BARRIER_ACK_TIMEOUT_NS {
+        if self.conductor_duty_period == 0 {
             return Err(AgentError::InvalidConfig(
-                "barrier_ack_timeout must be at least 10 ms",
+                "conductor_duty_period must be at least 1",
             ));
         }
+        conflated_gate::check_duty(self.barrier_ack_timeout, self.conductor_duty_period)
+            .map_err(AgentError::BarrierAckTimeout)?;
         if self.idle_image_timeout < self.image_liveness_timeout {
             return Err(AgentError::InvalidConfig(
                 "idle_image_timeout below image_liveness_timeout",
@@ -624,6 +643,22 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         slot: crate::sessions::receive::SlotRef,
         /// Its cells, in `IMAGE_CELLS` order.
         cells: AgentCells,
+    },
+    /// Receiver only: the conflated view of `lane` of the installed image
+    /// at `slot` was recreated over `link` (karyos#658): the lane's seal
+    /// gate moves to it, if the closed view's terminal cell is published.
+    /// No reply: the unit is released. A command for an image retired
+    /// meanwhile, another lane, or a view still open changes nothing and is
+    /// counted (`relinks_refused`).
+    RelinkView {
+        /// The reply's slot, unused.
+        reply: Reservation,
+        /// The installed slot.
+        slot: crate::sessions::receive::SlotRef,
+        /// The conflated lane.
+        lane: karyos_sys::frame::Lane,
+        /// The recreated view's link.
+        link: karyos_sys::freshness::FreshnessLink,
     },
     /// Close journal `number`, of `lane` of `publication`. Answer
     /// [`AgentEvent::NetworkJournalClosed`]. The number, not the
@@ -1023,7 +1058,8 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                 | AgentCommand::SetNetworkTrace { .. }
                 | AgentCommand::OpenNetworkJournal { .. }
                 | AgentCommand::CloseNetworkJournal { .. }
-                | AgentCommand::AttachImageCells { .. }) => {
+                | AgentCommand::AttachImageCells { .. }
+                | AgentCommand::RelinkView { .. }) => {
                     if let Some((reply, event)) = role(command)
                         && self.reply(reply, event)?
                     {
