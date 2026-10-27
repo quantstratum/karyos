@@ -268,7 +268,6 @@ dependencies = [
  "karyos-cluster",
  "karyos-codec",
  "karyos-driver",
- "karyos-feed",
  "karyos-io",
  "karyos-protocol",
  "karyos-sim",
@@ -312,7 +311,7 @@ dependencies = [
 name = "karyos-feed"
 version = "0.1.0-alpha.2"
 dependencies = [
- "karyos-client",
+ "karyos-sys",
 ]
 
 [[package]]
@@ -381,7 +380,6 @@ dependencies = [
  "karyos-cluster",
  "karyos-codec",
  "karyos-driver",
- "karyos-feed",
  "karyos-io",
  "karyos-protocol",
  "karyos-sim",
