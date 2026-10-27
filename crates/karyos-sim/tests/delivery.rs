@@ -482,3 +482,177 @@ fn test_delivery_a_request_unresolved_at_its_deadline_is_unknown() {
     assert_eq!(applied_times(&sim, LEADER, 10), 0);
     restore();
 }
+
+// Timers and configuration changes through the log (karyos#686, part 4).
+
+use karyos_sim::harness::core::{Change, ConsensusCore};
+use karyos_sim::harness::delivery::schedule;
+use karyos_sim::harness::reference::decode_configuration;
+
+/// The index of every entry of `kind` `server` applied.
+fn indexes_of<C: ConsensusCore>(server: &DeliveryServer<C, AppendService>, kind: &str) -> Vec<u64> {
+    server
+        .kinds()
+        .iter()
+        .filter(|(_, applied)| *applied == kind)
+        .map(|(index, _)| *index)
+        .collect()
+}
+
+/// The index of every `event` the service of `server` recorded.
+fn events_of<C: ConsensusCore>(server: &DeliveryServer<C, AppendService>, event: &str) -> Vec<u64> {
+    server
+        .container()
+        .service()
+        .events
+        .iter()
+        .filter(|(_, recorded)| recorded == event)
+        .map(|(index, _)| *index)
+        .collect()
+}
+
+#[test]
+fn test_delivery_a_timer_fires_through_its_log_entry_on_every_replica() {
+    for servers in [3, 5] {
+        for seed in scenarios::seeds() {
+            let mut commands = vec![schedule(1, 200)];
+            commands.extend(values(&[3]));
+            let (mut sim, clients) = cluster(seed, servers, vec![commands], false);
+            sim.run_for(1200).unwrap();
+            assert!(client(&sim, clients[0]).done());
+            let leader = server(&sim, LEADER);
+            let timers = indexes_of(leader, "timer");
+            assert_eq!(
+                timers.len(),
+                1,
+                "{servers} servers, seed {seed}: {timers:?}"
+            );
+            // Delivered at its own entry, after the request that set it.
+            assert_eq!(events_of(leader, "timer 1"), timers);
+            assert!(indexes_of(leader, "request")[0] < timers[0]);
+            for id in 0..servers {
+                assert_eq!(
+                    events_of(server(&sim, id), "timer 1"),
+                    timers,
+                    "server {id}"
+                );
+            }
+            replicas_agree(&sim, servers);
+        }
+    }
+}
+
+#[test]
+fn test_delivery_a_configuration_change_is_delivered_at_its_entry_before_what_follows() {
+    for servers in [3, 5] {
+        let (mut sim, clients) = {
+            let mut sim = Sim::new("delivery", 11, LinkConfig::default()).unwrap();
+            for id in 0..servers {
+                let server = DeliveryServer::new(
+                    id,
+                    (0..servers).collect(),
+                    SimDisk::new(),
+                    Survives::Synced,
+                    Geometry::new(4096, 4096).unwrap(),
+                    AppendService::default(),
+                    config(),
+                )
+                .unwrap()
+                .with_configurations(|payload| decode_configuration(payload).is_some());
+                sim.add_node(Member::Server(Box::new(server)), 0, 0)
+                    .unwrap();
+            }
+            let client = DeliveryClient::new(servers, LEADER, values(&[1, 2]));
+            let id = sim.add_node(Member::Client(client), 0, 0).unwrap();
+            (sim, vec![id])
+        };
+        sim.run_for(200).unwrap();
+        // The operator adds a learner that is never started: the change is
+        // an entry, and the service sees it when it applies.
+        let _ = sim.send(
+            clients[0],
+            LEADER,
+            Delivery::Change(Change::AddLearner(servers + 1)),
+        );
+        sim.run_for(800).unwrap();
+        assert!(client(&sim, clients[0]).done());
+        for id in 0..servers {
+            let server = server(&sim, id);
+            assert_eq!(server.halted(), None, "server {id}");
+            let changes = indexes_of(server, "configuration");
+            assert_eq!(changes.len(), 1, "server {id}: {:?}", server.kinds());
+            assert_eq!(
+                events_of(
+                    server,
+                    &format!("configuration of {} bytes", configuration_bytes(servers))
+                ),
+                changes,
+                "server {id}"
+            );
+        }
+        replicas_agree(&sim, servers);
+    }
+}
+
+/// The reference core's configuration entry for `servers` voters and one
+/// learner.
+fn configuration_bytes(servers: u32) -> usize {
+    karyos_sim::harness::reference::encode_configuration(
+        &(0..servers).collect::<Vec<_>>(),
+        &[servers + 1],
+    )
+    .len()
+}
+
+/// karyos#686, condition 4: a leader that comes back after losing its
+/// leadership proposes the due timers again, those it proposed before
+/// included; the second firing of a timer is a no-op, so the timer runs
+/// once on every replica. A timer that fell due while no one led is
+/// proposed by the next leader.
+#[test]
+fn test_delivery_a_new_leader_proposes_due_timers_again_and_a_duplicate_firing_is_a_no_op() {
+    for servers in [3, 5] {
+        for seed in scenarios::seeds() {
+            let mut commands = vec![schedule(1, 300), schedule(2, 900)];
+            commands.extend(values(&[8]));
+            let (mut sim, client) = movable(seed, servers, LEADER, commands, DEADLINE_OFF);
+            // Timer 1's firing proposed, then the leader is deposed and
+            // restored: it proposes the firing again.
+            run_until(&mut sim, 4000, |sim| {
+                movable_server(sim, LEADER)
+                    .kinds()
+                    .iter()
+                    .any(|(_, kind)| *kind == "timer")
+                    || movable_server(sim, LEADER).proposed_firings() > 0
+            });
+            depose(LEADER);
+            sim.run_for(5).unwrap();
+            restore();
+            // Timer 2 falls due while no one leads.
+            run_until(&mut sim, 4000, |sim| movable_client(sim, client).done());
+            depose(LEADER);
+            sim.run_for(1200).unwrap();
+            assert!(events_of(movable_server(&sim, LEADER), "timer 2").is_empty());
+            restore();
+            sim.run_for(800).unwrap();
+            for id in 0..servers {
+                let server = movable_server(&sim, id);
+                assert_eq!(
+                    events_of(server, "timer 1").len(),
+                    1,
+                    "server {id}, seed {seed}"
+                );
+                assert_eq!(
+                    events_of(server, "timer 2").len(),
+                    1,
+                    "server {id}, seed {seed}"
+                );
+            }
+            let firings = indexes_of(movable_server(&sim, LEADER), "timer").len();
+            assert!(
+                firings >= 3,
+                "timer 1 proposed twice: {firings} firings logged"
+            );
+        }
+    }
+}

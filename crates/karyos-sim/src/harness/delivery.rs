@@ -29,11 +29,19 @@
 //!   same epoch and sequence again, which the session table answers if
 //!   the entry applied, and reports [`Answer::Unknown`] itself only at its
 //!   deadline, or for a session gone after an earlier attempt.
+//! - **Timers and configuration** (decision D6). A leader proposes a
+//!   [`Envelope::TimerFired`] for every scheduled timer due at its clock
+//!   that it has not proposed in its leadership; a new leadership proposes
+//!   them all again, and a firing that applies twice delivers once. A
+//!   core's own configuration entries, which
+//!   [`DeliveryServer::with_configurations`] recognises, reach the service
+//!   as configuration changes when they apply. An operator's
+//!   [`Delivery::Change`] goes to the core.
 //! - **Restart.** A restart reopens the log, recovers the core, and
 //!   rebuilds the container from the committed entries the core hands
 //!   out again, as `ServerNode` rebuilds its service.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use karyos_archive::segment::Geometry;
@@ -44,7 +52,7 @@ use karyos_cluster::service::{
 };
 use karyos_cluster::{Entry, LogError, RaftLog};
 
-use super::core::{ConsensusCore, LogView, drive};
+use super::core::{Change, ConsensusCore, LogView, drive};
 use super::node::LOG_DIR;
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
@@ -93,6 +101,9 @@ pub enum Delivery<M> {
         /// Its [`Delivery::Register`] or [`Delivery::Request`].
         message: Box<Self>,
     },
+    /// An operator's membership change, for the core; nothing answers
+    /// it. The service sees it when the core's entry for it applies.
+    Change(Change),
     /// The leader's answer to a forwarded message, for the follower to
     /// pass to the client.
     Relay {
@@ -241,6 +252,14 @@ pub struct DeliveryServer<C, S> {
     pending: BTreeMap<Pending, Taker>,
     /// Whether the core led, and its term, at the end of the last duty.
     led: Option<u64>,
+    /// The timer firings this server proposed while leading, by timer
+    /// and deadline; cleared when its leadership changes, so a new
+    /// leader proposes every due timer again (decision D6).
+    fired: BTreeSet<(u64, u64)>,
+    /// Which of the core's own entries are configuration changes.
+    configurations: fn(&[u8]) -> bool,
+    /// Every entry applied since the last start: its index and kind.
+    kinds: Vec<(u64, &'static str)>,
     /// Every entry applied since the last start: its index and outcome.
     outcomes: Vec<(u64, Option<Answer>)>,
     /// Why the container stopped, if it did.
@@ -283,10 +302,38 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
             config,
             pending: BTreeMap::new(),
             led: None,
+            fired: BTreeSet::new(),
+            configurations: |_| false,
+            kinds: Vec::new(),
             outcomes: Vec::new(),
             halted: None,
             lost: None,
         })
+    }
+
+    /// Delivers the core's own entries that `configurations` recognises
+    /// to the service as configuration changes (decision D6), so a core
+    /// that writes its membership in its own format does not stop the
+    /// container. Every replica recognises the same entries.
+    #[must_use]
+    pub fn with_configurations(mut self, configurations: fn(&[u8]) -> bool) -> Self {
+        self.configurations = configurations;
+        self
+    }
+
+    /// Every entry applied since the last start, with its index and its
+    /// kind: `register`, `close`, `request`, `timer`, `configuration` or
+    /// `core`.
+    #[must_use]
+    pub fn kinds(&self) -> &[(u64, &'static str)] {
+        &self.kinds
+    }
+
+    /// The timer firings it proposed in its leadership and has not seen
+    /// apply.
+    #[must_use]
+    pub fn proposed_firings(&self) -> usize {
+        self.fired.len()
     }
 
     /// Whether it is up.
@@ -415,7 +462,42 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
                 }
             }
         }
+        if self.led != now {
+            self.fired.clear();
+        }
         self.led = now;
+    }
+
+    /// A leader proposes a firing for every scheduled timer due at its
+    /// clock `now` that it has not proposed in its leadership. A firing
+    /// its predecessor proposed too applies once (decision D6).
+    fn propose_due(&mut self, now: u64) {
+        let Some((core, log)) = self.running.as_mut() else {
+            return;
+        };
+        if !core.leads() {
+            return;
+        }
+        let due: Vec<_> = self
+            .container
+            .due(now)
+            .filter(|envelope| match *envelope {
+                Envelope::TimerFired { timer, deadline } => {
+                    !self.fired.contains(&(timer, deadline))
+                }
+                _ => false,
+            })
+            .collect();
+        let mut view = LogView::new(log);
+        for envelope in due {
+            if let Envelope::TimerFired { timer, deadline } = envelope
+                && Proposer::new(core, &mut view)
+                    .propose(envelope.to_vec())
+                    .is_ok()
+            {
+                let _ = self.fired.insert((timer, deadline));
+            }
+        }
     }
 
     /// Drives the core, applies what it committed, and answers what this
@@ -448,6 +530,29 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         if self.halted.is_some() {
             return;
         }
+        // A core's own configuration entry, as the service's change.
+        let translated;
+        let entry = if (self.configurations)(&entry.payload) {
+            translated = Entry {
+                payload: Envelope::Configuration(&entry.payload).to_vec(),
+                ..entry.clone()
+            };
+            &translated
+        } else {
+            entry
+        };
+        let kind = match Envelope::decode(&entry.payload) {
+            _ if entry.payload.is_empty() => "core",
+            Ok(Envelope::Register { .. }) => "register",
+            Ok(Envelope::Close { .. }) => "close",
+            Ok(Envelope::Request { .. }) => "request",
+            Ok(Envelope::TimerFired { timer, deadline }) => {
+                let _ = self.fired.remove(&(timer, deadline));
+                "timer"
+            }
+            Ok(Envelope::Configuration(_)) => "configuration",
+            _ => "unknown",
+        };
         let key = Envelope::decode(&entry.payload)
             .ok()
             .and_then(|envelope| pending_of(&envelope));
@@ -473,6 +578,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
             _ => None,
         };
         self.outcomes.push((entry.index, outcome));
+        self.kinds.push((entry.index, kind));
         if let (Some(key), Some(answer)) = (key, answer)
             && let Some(taker) = self.pending.remove(&key)
         {
@@ -492,6 +598,8 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         let core = C::recover(self.id, &self.peers, &mut LogView::new(&mut log));
         self.container = container(self.fresh.clone(), self.config);
         self.outcomes.clear();
+        self.kinds.clear();
+        self.fired.clear();
         self.halted = None;
         self.running = Some((core, log));
     }
@@ -518,6 +626,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
         if let Some((core, log)) = self.running.as_mut() {
             core.tick(now, &mut LogView::new(log));
         }
+        self.propose_due(now);
         self.duty(out);
     }
 
@@ -536,6 +645,11 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
             }
             Delivery::Forward { client, message } => self.take(from, client, *message, out),
             Delivery::Relay { client, message } => out.push((client, *message)),
+            Delivery::Change(change) => {
+                if let Some((core, log)) = self.running.as_mut() {
+                    let _ = core.propose_change(change, &mut LogView::new(log));
+                }
+            }
             message @ (Delivery::Register | Delivery::Request { .. }) => {
                 self.take(from, from, message, out);
             }
@@ -829,9 +943,12 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
 }
 
 /// The delivery path's test service: an append-only register of `u64`s.
-/// A command is 8 bytes, the value; its reply is the count after it, 8
-/// bytes. Timers and configuration changes are recorded with the index
-/// they applied at.
+/// A command of 8 bytes is a value to append, and its reply is the count
+/// after it, 8 bytes. A command of 17 bytes, `T` then a timer and a delay,
+/// schedules that timer at the log time plus the delay, and replies
+/// nothing. Any other command does nothing and replies nothing. Timers
+/// fired and configuration changes are recorded with the index they
+/// applied at.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppendService {
     /// The values, in the order applied.
@@ -840,19 +957,38 @@ pub struct AppendService {
     pub events: Vec<(u64, String)>,
 }
 
+/// The [`AppendService`] command that schedules `timer` `after` log-time
+/// units from the log time it applies at.
+#[must_use]
+pub fn schedule(timer: u64, after: u64) -> Vec<u8> {
+    let mut command = vec![b'T'];
+    command.extend_from_slice(&timer.to_le_bytes());
+    command.extend_from_slice(&after.to_le_bytes());
+    command
+}
+
 impl ClusteredService for AppendService {
     fn on_command(
         &mut self,
-        _context: &mut Context<'_>,
+        context: &mut Context<'_>,
         _client: u64,
         command: &[u8],
         reply: &mut [u8],
     ) -> Option<usize> {
-        let value = u64::from_le_bytes(command.try_into().ok()?);
-        self.values.push(value);
-        let count = u64::try_from(self.values.len()).unwrap_or(u64::MAX);
-        reply.get_mut(..8)?.copy_from_slice(&count.to_le_bytes());
-        Some(8)
+        if let Ok(value) = <[u8; 8]>::try_from(command) {
+            self.values.push(u64::from_le_bytes(value));
+            let count = u64::try_from(self.values.len()).unwrap_or(u64::MAX);
+            reply.get_mut(..8)?.copy_from_slice(&count.to_le_bytes());
+            return Some(8);
+        }
+        if let [b'T', rest @ ..] = command
+            && let (Some(timer), Some(after)) = (rest.get(..8), rest.get(8..))
+            && let (Ok(timer), Ok(after)) = (<[u8; 8]>::try_from(timer), <[u8; 8]>::try_from(after))
+        {
+            let deadline = context.log_time().saturating_add(u64::from_le_bytes(after));
+            let _ = context.schedule(u64::from_le_bytes(timer), deadline);
+        }
+        Some(0)
     }
 
     fn on_timer(&mut self, context: &mut Context<'_>, timer: u64) {
@@ -863,7 +999,7 @@ impl ClusteredService for AppendService {
     fn on_configuration(&mut self, context: &mut Context<'_>, configuration: &[u8]) {
         self.events.push((
             context.index(),
-            format!("configuration {}", String::from_utf8_lossy(configuration)),
+            format!("configuration of {} bytes", configuration.len()),
         ));
     }
 }
