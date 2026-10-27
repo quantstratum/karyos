@@ -520,6 +520,32 @@ pub(crate) fn lane_max(publication: Handle, lane: Lane) -> Option<u32> {
         .flatten()
 }
 
+/// The admission state of `publication`, a network publication, as its
+/// client last heard it (karyos#637); `None` before the driver reports
+/// one, after a lap until it does again, and for a publication that is not
+/// a network one (a concurrent handle is a `karyos:ipc` stream's).
+///
+/// # Errors
+///
+/// The handles' statuses, of the publication or of its client.
+pub(crate) fn network_admission(
+    publication: Handle,
+) -> Result<Option<karyos_client::NetworkAdmission>, Status> {
+    let (client, registration) = table().with(publication, |entry| {
+        let registration = match &entry.lanes {
+            #[cfg(target_os = "linux")]
+            Lanes::Remote(lanes) => lanes.registration(),
+            Lanes::Embedded(lanes) => lanes.registration(),
+            _ => None,
+        };
+        (entry.client, registration)
+    })?;
+    let Some(registration) = registration else {
+        return Ok(None);
+    };
+    crate::api::client::with_client(client, |entry| entry.client.network_admission(registration))
+}
+
 /// Whether a commit that met `error` keeps its claim staged for a retry.
 fn retryable(error: &OfferError) -> bool {
     matches!(

@@ -81,6 +81,30 @@ release may break APIs, wire formats and shared-memory layouts.
     table is on its driver's heap, and remote clients are not in scope of the
     design (`conflated-network-images.md`, (c)).
 
+- A network publication's admission state is visible (owner item 7: "the
+  existing NotJoined/LostRequired outcome mapping"; karyos#637, part 4 of 5;
+  decided 2026-10-27 by QS-COORDINATOR under owner delegation).
+  - `NetworkAdmission { Open, NotJoined, LostRequired }`, `#[non_exhaustive]`.
+  - Each sender cycle stores it in a slot the conductor reads and in a new
+    `network admission` publication cell.
+  - The conductor sends a client's network publication a new CnC event,
+    `PublicationAdmission` (0xC8, admission `VERSION` 3). It is sent when the
+    sender first reports the state, when the state changes between two of the
+    conductor's duty cycles, and again before the answer to a `QueryCutover`.
+  - A client that laps the broadcast reads the state as unknown until the
+    state is sent again: an in-process conductor asks for it, and a remote
+    client's lap query already does.
+  - Getters: `Client::network_admission` and
+    `ClientConductor::network_admission`, `None` until reported;
+    `EmbeddedDriver::network_publication_admission`; and the C ABI's
+    `karyos_publication_network_admission` with `KARYOS_ADMISSION_*` (ABI
+    0.1.2).
+  - It is the last state observed, not each transition (the membership
+    counters count those). Offers keep the existing mapping: under
+    `NotJoined` and `LostRequired` they answer `BackPressured` once the window
+    is full, never a terminal outcome. Tested on Linux with one case per cause
+    and a change seen by event.
+
 ### Changed
 
 - A channel URI list that names one address in two spellings is refused as a

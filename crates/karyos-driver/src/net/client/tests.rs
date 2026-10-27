@@ -505,6 +505,89 @@ fn an_identity_travels_by_command() {
     ));
 }
 
+/// Owner item 7, karyos#637: a client's network publication reports its
+/// admission state as its sender observes it: with no required receiver it
+/// is `Open` from the sender's first cycle, `None` before. A lap of the
+/// client's broadcast receiver may lose the event, so the state is unknown
+/// again until the conductor's resync query has the driver send it again.
+#[test]
+fn a_network_publication_reports_its_admission_to_its_client() {
+    use karyos_protocol::cnc::NetworkAdmission;
+
+    let mut driver = driver();
+    let mut client = driver.connect().unwrap();
+    let mut outcomes = Vec::new();
+    let unread = silent();
+    let uri = format!(
+        "karyos:udp?endpoint={}|interface=127.0.0.1",
+        unread.local_addr().unwrap()
+    );
+    let sequence = client.add_network_publication(&uri, 70, true).unwrap();
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |outcomes, _| outcomes.iter().any(|(_, found, _)| *found == sequence),
+    );
+    let Outcome::Publication(publication) = take(&mut outcomes, sequence) else {
+        panic!("not granted");
+    };
+    let registration = publication.origin().unwrap().registration();
+    // The embedded driver's own reading, from the sender's slot.
+    let handle = driver
+        .net_owned
+        .iter()
+        .find(|owned| owned.registration == registration)
+        .map(|owned| owned.owned);
+    let Some(crate::net::client::Owned::Publication(handle)) = handle else {
+        panic!("not a network publication");
+    };
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |_, clients| clients[0].network_admission(registration) == Some(NetworkAdmission::Open),
+    );
+    // Another client's answers fill the broadcast many times over while
+    // this one does not poll: it is lapped.
+    let mut other = driver.connect().unwrap();
+    for _ in 0..200 {
+        for _ in 0..32 {
+            let _ = other.add_subscription(
+                StreamKey {
+                    stream_id: 99,
+                    session_id: 1,
+                },
+                SubscriberRole::Optional,
+            );
+        }
+        for _ in 0..40 {
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = other.poll(usize::MAX, |_| {});
+    }
+    let _ = client.poll(usize::MAX, |_| {});
+    assert_eq!(
+        client.network_admission(registration),
+        None,
+        "unknown after the lap"
+    );
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |_, clients| clients[0].network_admission(registration) == Some(NetworkAdmission::Open),
+    );
+    assert_eq!(
+        driver.network_publication_admission(&handle),
+        Some(NetworkAdmission::Open)
+    );
+    // A registration that is not a network publication of this client has
+    // no state.
+    assert_eq!(client.network_admission(registration + 1000), None);
+    drop(publication);
+}
+
 /// W5b B3: what a client created goes with it: its network publication
 /// and its network subscription are removed once its conductor is gone.
 #[test]

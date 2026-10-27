@@ -1988,6 +1988,236 @@ fn a_retired_image_closes_its_view_as_retired() {
     );
 }
 
+/// A multicast channel on its own group for the admission tests, `fc=min`
+/// from its URI (karyos#637).
+#[cfg(target_os = "linux")]
+fn admission_channel(last: u8) -> UdpConfig {
+    let uri = format!(
+        "karyos:udp?group=239.255.0.{last}:{}|reliable=false|fc=min",
+        free_port()
+    );
+    let karyos_protocol::channel::Media::Udp(channel) =
+        karyos_protocol::channel::ChannelConfig::parse(&uri)
+            .unwrap()
+            .media
+    else {
+        panic!("not udp");
+    };
+    channel
+}
+
+/// Offers 1000-byte messages on `lane` while serving `drivers`, until
+/// `limit` offers; returns the outcomes' kinds in order of first sight
+/// and whether any was terminal (`Closed`, `Gated`).
+#[cfg(target_os = "linux")]
+fn offer_outcomes(
+    drivers: &mut [&mut EmbeddedDriver],
+    lane: &mut karyos_client::ClientPublication<HeapTerms>,
+    limit: u32,
+) -> (u32, u32, bool) {
+    let (mut accepted, mut back_pressured, mut terminal) = (0, 0, false);
+    for _ in 0..limit {
+        match lane.offer(&[7u8; 1000]).unwrap() {
+            OfferOutcome::Accepted { .. } => accepted += 1,
+            OfferOutcome::BackPressured => back_pressured += 1,
+            OfferOutcome::Closed | OfferOutcome::Gated => terminal = true,
+            _ => {}
+        }
+        for driver in drivers.iter_mut() {
+            let _ = driver.do_work().unwrap();
+        }
+    }
+    (accepted, back_pressured, terminal)
+}
+
+/// Owner item 7, karyos#637: while a configured required receiver has not
+/// joined, the publication's admission state is `NotJoined` and offers
+/// keep the existing outcome mapping: the sender stages nothing, so the
+/// publication fills its window and offers answer `BackPressured`, never a
+/// terminal outcome. Linux, after the multicast probe.
+#[cfg(target_os = "linux")]
+#[test]
+fn not_joined_maps_to_back_pressured() {
+    use std::io::Write as _;
+
+    use crate::membership::{PublicationRoles, Strategy};
+    use karyos_protocol::cnc::NetworkAdmission;
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED not_joined_maps_to_back_pressured: {why}"
+        );
+        return;
+    }
+    let channel = admission_channel(31);
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    // B subscribes without the required identity: receiver 77 never joins.
+    let _ = b.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication_with_roles(
+            aggregate(10, 3, 1),
+            &channel,
+            PublicationRoles {
+                strategy: Strategy::Min,
+                required: vec![77],
+                tags: Vec::new(),
+            },
+        )
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].network_publication_admission(&publication) == Some(NetworkAdmission::NotJoined)
+    });
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (_, back_pressured, terminal) = offer_outcomes(&mut [&mut a, &mut b], &mut lane, 4000);
+    assert!(back_pressured > 0, "never back pressured");
+    assert!(!terminal, "a terminal outcome under NotJoined");
+    assert_eq!(
+        a.network_publication_admission(&publication),
+        Some(NetworkAdmission::NotJoined)
+    );
+}
+
+/// Owner item 7, karyos#637: once a joined required receiver is lost (its
+/// SMs stop past `receiver_timeout`), the admission state is
+/// `LostRequired` and offers answer `BackPressured` (stop admission, MC-7),
+/// never a terminal outcome. Linux, after the multicast probe.
+#[cfg(target_os = "linux")]
+#[test]
+fn lost_required_maps_to_back_pressured() {
+    use std::io::Write as _;
+
+    use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
+    use karyos_protocol::cnc::NetworkAdmission;
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED lost_required_maps_to_back_pressured: {why}"
+        );
+        return;
+    }
+    let channel = admission_channel(32);
+    let (mut a, mut b) = (
+        fast_driver(ThreadingMode::Shared),
+        fast_driver(ThreadingMode::Shared),
+    );
+    let subscription = b
+        .add_network_subscription_as(
+            10,
+            &channel,
+            ReceiverIdentity {
+                receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+                group_tag: 0,
+            },
+        )
+        .unwrap();
+    let publication = a
+        .add_network_publication_with_roles(
+            aggregate(10, 3, 1),
+            &channel,
+            PublicationRoles {
+                strategy: Strategy::Min,
+                required: vec![77],
+                tags: Vec::new(),
+            },
+        )
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].network_publication_admission(&publication) == Some(NetworkAdmission::Open)
+    });
+    // B goes: its SMs stop, and past the receiver timeout 77 is lost.
+    assert!(b.remove_network_subscription(subscription).unwrap());
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0].network_publication_admission(&publication)
+            == Some(NetworkAdmission::LostRequired)
+    });
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (_, back_pressured, terminal) = offer_outcomes(&mut [&mut a, &mut b], &mut lane, 4000);
+    assert!(back_pressured > 0, "never back pressured");
+    assert!(!terminal, "a terminal outcome under LostRequired");
+    assert_eq!(
+        a.network_publication_admission(&publication),
+        Some(NetworkAdmission::LostRequired)
+    );
+}
+
+/// Owner item 7, karyos#637: a client sees its network publication's
+/// admission state change by event: `NotJoined` while receiver 77 has not
+/// joined, then `Open` once it joins. Linux, after the multicast probe.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_sees_the_admission_change_by_event() {
+    use std::io::Write as _;
+
+    use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
+    use karyos_protocol::cnc::NetworkAdmission;
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED a_client_sees_the_admission_change_by_event: {why}"
+        );
+        return;
+    }
+    let port = free_port();
+    let uri = format!("karyos:udp?group=239.255.0.33:{port}|reliable=false|fc=min");
+    let karyos_protocol::channel::Media::Udp(channel) =
+        karyos_protocol::channel::ChannelConfig::parse(&uri)
+            .unwrap()
+            .media
+    else {
+        panic!("not udp");
+    };
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let mut client = a.connect().unwrap();
+    let roles = PublicationRoles {
+        strategy: Strategy::Min,
+        required: vec![77],
+        tags: Vec::new(),
+    };
+    let sequence = client
+        .add_network_publication_with_roles(&uri, 10, true, &roles)
+        .unwrap();
+    // The publication is held for the test: dropping it releases its
+    // registration, and the driver removes the network publication.
+    let mut held = None;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = client.poll(usize::MAX, |completion| {
+            if completion.sequence == sequence
+                && let karyos_client::Outcome::Publication(publication) = completion.outcome
+            {
+                held = Some(publication);
+            }
+        });
+        held.as_ref()
+            .and_then(|publication| publication.origin())
+            .is_some_and(|origin| {
+                client.network_admission(origin.registration()) == Some(NetworkAdmission::NotJoined)
+            })
+    });
+    let registration = held.as_ref().unwrap().origin().unwrap().registration();
+    let _ = b
+        .add_network_subscription_as(
+            10,
+            &channel,
+            ReceiverIdentity {
+                receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+                group_tag: 0,
+            },
+        )
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = client.poll(usize::MAX, |_| {});
+        client.network_admission(registration) == Some(NetworkAdmission::Open)
+    });
+    drop(held);
+}
+
 /// karyos#658 (SPEC.md §7.1 and the "Conflation freshness" row of §13):
 /// a view closed at `barrier_ack_timeout` is recreated with every key
 /// `Stale` since the terminal's start, its last value kept; a key turns

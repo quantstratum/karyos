@@ -1383,6 +1383,27 @@ fn call(step: &Step, at: &str) -> Returned {
             ))),
             results: BTreeMap::new(),
         },
+        "karyos_publication_network_admission" => {
+            let arguments = Arguments::new(step, &["publication", "admission"], at);
+            let null = match step.arguments.get("admission") {
+                None => false,
+                Some(Value::Null) => true,
+                Some(other) => panic!("{at}: `admission` takes only null, got {other:?}"),
+            };
+            let (status, admission) =
+                abi::publication_network_admission(arguments.handle("publication"), null);
+            let mut results = BTreeMap::new();
+            if admission != u32::MAX {
+                results.insert(
+                    "admission".to_owned(),
+                    Value::Integer(i128::from(admission)),
+                );
+            }
+            Returned {
+                status: Some(status),
+                results,
+            }
+        }
         "karyos_publication_close" => Returned {
             status: Some(abi::publication_close(handle_argument(
                 step,

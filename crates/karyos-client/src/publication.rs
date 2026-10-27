@@ -43,6 +43,14 @@ pub enum OfferOutcome {
         position: u64,
     },
     /// The flow-control limit does not admit the message; retry later.
+    ///
+    /// A network publication's admission (owner item 7, karyos#637) maps
+    /// here and to nothing else: while a configured required receiver has
+    /// not joined (`NetworkAdmission::NotJoined`), or once one is lost
+    /// (`NetworkAdmission::LostRequired`, stop admission), its sender stages
+    /// nothing, so the publication fills its window and its offers answer
+    /// `BackPressured`, never a terminal outcome. The cause is read with
+    /// `Client::network_admission`.
     BackPressured,
     /// The offer only padded or rotated, or waits for the driver; retry.
     AdminAction,

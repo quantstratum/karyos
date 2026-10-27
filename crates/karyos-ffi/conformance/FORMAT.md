@@ -123,6 +123,7 @@ The arguments and results of each function are those of the header:
 | `karyos_client_add_subscription_with` | `client` and `stream_id` (required), `uri` (default `"karyos:ipc"`), `size`, `role`, `rejoin`, `reserved`: the options of `karyos_subscription_options_init` with each given field set | status, `subscription` (on `KARYOS_OK`) |
 | `karyos_client_add_publication_with_roles` | `client` and `stream_id` (required), `uri` (default `"karyos:udp?group=239.255.0.21:40001\|fc=min"`), `strategy` and `tagged_group` (default 0), `required` (a string of comma-separated receiver ids, or `null`; default empty), `required_count` (default the list's count), `required_fill` (the ids 1 to n in place of `required`), `tags` (a string of comma-separated `id:tag` pairs, or `null`; default empty), `tag_count` (default the pairs' count), `detail_size` | status, `publication` (on `KARYOS_OK`), `code`, `value` |
 | `karyos_client_add_subscription_as` | `client` and `stream_id` (required), `uri` (default `"karyos:udp?group=239.255.0.21:40001"`), `receiver_id` (default 77), `group_tag` (default 0), `rejoin`, `archive`: the options of `karyos_subscription_options_init` with each given field set | status, `subscription` (on `KARYOS_OK`) |
+| `karyos_publication_network_admission` | `publication` (required), `admission` (`null` only) | status, `admission` (when written) |
 | `karyos_subscription_close` | `subscription` (required) | status |
 | `karyos_publication_offer_with` | `publication` (required), `lane` (default 0), `payload` or `length` (one of them), `size`, `reserved`, `reserved_value`: the options of `karyos_offer_options_init` with each given field set, `accepted_size` | status, `lane`, `position`, `tail` |
 | `karyos_subscription_poll` | `subscription` (required), `limit` (default 1), `handler`: `"keep"` (default) keeps each message's bytes; `"reenter"` also polls the same subscription from inside the handler, once, with a limit of 1 | status, `delivered` (the count written, checked against the handler's calls), `last` (the last message delivered, as UTF-8 text, when there is one), `reentered` (with `"reenter"`, the name of the status the inner poll returned, as text) |
@@ -551,7 +552,8 @@ The ABI version is independent of the workspace version. A runner calls
 `karyos_abi_version` first, before any other call. This suite needs ABI
 0.1.2 or a later 0.1.z (0.1.2 adds the roles calls,
 `karyos_client_add_publication_with_roles` and
-`karyos_client_add_subscription_as`, karyos#637): before 1.0 a runner
+`karyos_client_add_subscription_as`, and
+`karyos_publication_network_admission`, karyos#637): before 1.0 a runner
 accepts exactly the 0.y the suite targets, with at least its minimum
 0.y.z, and checks it once, before any scenario; a library outside it
 fails the run.

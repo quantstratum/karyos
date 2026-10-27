@@ -725,3 +725,30 @@ fn the_header_states_the_strategy_constants() {
     );
     assert_eq!([STRATEGY_MIN, STRATEGY_MAX, STRATEGY_TAGGED], [0, 1, 2]);
 }
+
+/// karyos#637: the admission codes of
+/// `karyos_publication_network_admission`, which keep the CnC's
+/// (`PublicationAdmission`, 1 to 3), with 0 for unknown.
+#[test]
+fn the_header_states_the_admission_constants() {
+    use crate::abi::{
+        ADMISSION_LOST_REQUIRED, ADMISSION_NOT_JOINED, ADMISSION_OPEN, ADMISSION_UNKNOWN,
+    };
+    use karyos_client::NetworkAdmission;
+    let defines = header_defines();
+    for (name, code) in [
+        ("KARYOS_ADMISSION_UNKNOWN", ADMISSION_UNKNOWN),
+        ("KARYOS_ADMISSION_OPEN", ADMISSION_OPEN),
+        ("KARYOS_ADMISSION_NOT_JOINED", ADMISSION_NOT_JOINED),
+        ("KARYOS_ADMISSION_LOST_REQUIRED", ADMISSION_LOST_REQUIRED),
+    ] {
+        assert_eq!(defines[name], i64::from(code), "{name}");
+    }
+    for (state, code) in [
+        (NetworkAdmission::Open, ADMISSION_OPEN),
+        (NetworkAdmission::NotJoined, ADMISSION_NOT_JOINED),
+        (NetworkAdmission::LostRequired, ADMISSION_LOST_REQUIRED),
+    ] {
+        assert_eq!(state.code(), u64::from(code));
+    }
+}

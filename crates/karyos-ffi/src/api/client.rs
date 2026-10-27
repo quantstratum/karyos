@@ -135,6 +135,19 @@ impl AnyClient {
         }
     }
 
+    /// The admission state of this client's network publication
+    /// `registration` (karyos#637).
+    pub(crate) fn network_admission(
+        &self,
+        registration: u64,
+    ) -> Option<karyos_client::NetworkAdmission> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(client) => client.network_admission_of(registration),
+            Self::Embedded(client) => client.network_admission_of(registration),
+        }
+    }
+
     /// The subscription of `stream_id` on `uri` with `options` (a control
     /// call: it waits for the driver up to the context's timeout).
     pub(crate) fn add_subscription_with(

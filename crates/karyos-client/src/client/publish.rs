@@ -207,6 +207,13 @@ fn committed(outcome: CommitOutcome) -> Result<Accepted, OfferError> {
 }
 
 impl<T: TermBytes> Publication<T> {
+    /// Its grant's registration, lane 0's: what the driver's
+    /// `PublicationAdmission` events name (karyos#637).
+    #[must_use]
+    pub fn registration(&self) -> Option<u64> {
+        Some(self.lanes.first()?.origin()?.registration)
+    }
+
     /// A publication over `lanes`, lane 0 first.
     pub(crate) fn new(lanes: Vec<ClientPublication<T>>) -> Self {
         Self { lanes }

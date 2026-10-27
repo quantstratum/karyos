@@ -3328,6 +3328,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.sweep_ended_registrations();
         // What ended registrations owned goes with them (W5b).
         self.reconcile_network_owned();
+        // Their publications' admission states, when they changed
+        // (karyos#637).
+        self.send_network_admissions();
         self.free_retired_streams();
         let mut work = self.serve_commands();
         let mut first_error = None;
@@ -5745,19 +5748,20 @@ mod stream_cells_tests {
             .count()
     }
 
-    /// With room for three cells, a publication's four are refused whole:
-    /// the three taken are freed, `counters unavailable` counts one, and
-    /// the region holds what it held. With room, all four are keyed by the
+    /// With room for four cells, a publication's five are refused whole:
+    /// the four taken are freed, `counters unavailable` counts one, and
+    /// the region holds what it held. With room, all five are keyed by the
     /// stream's registration.
     #[test]
     fn a_full_region_refuses_the_whole_group_once() {
         let labels = &crate::agents::PUBLICATION_CELLS;
-        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 3).unwrap();
+        assert_eq!(labels.len(), 5);
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 4).unwrap();
         let before = allocated(&counters);
         assert!(stream_network_cells(&mut counters, 7, labels).is_none());
         assert_eq!(allocated(&counters), before);
         assert_eq!(counters.value(Event::CountersUnavailable), 1);
-        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 4).unwrap();
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 5).unwrap();
         let mut cells = stream_network_cells(&mut counters, 7, labels).unwrap();
         assert_eq!(counters.value(Event::CountersUnavailable), 0);
         let reader = counters.reader();

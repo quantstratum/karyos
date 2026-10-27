@@ -474,6 +474,16 @@ pub struct ClientConductor<T: TermBytes = HeapTerms> {
     /// A remote client's cutover events (`SuccessorReady`, `Fenced`,
     /// `PublicationClosed`), kept for its control path whatever the
     /// application does with its own queue.
+    /// The admission state of each network publication granted by URI,
+    /// by registration, from the driver's `PublicationAdmission` events
+    /// (karyos#637): `None` until the first, and again after a lap until
+    /// the driver sends it again.
+    admissions: Vec<(u64, Option<karyos_protocol::cnc::NetworkAdmission>)>,
+    /// A lap made the admission states unknown: an in-process conductor
+    /// asks for them again (`QueryCutover`, which the driver answers after
+    /// sending the state); a remote client's control path asks about every
+    /// registration already.
+    admission_resync: bool,
     cutover_events: Vec<Event>,
     /// A remote client fell a lap behind the broadcast buffer since its
     /// control path last asked: cutover events may be lost.
@@ -529,6 +539,8 @@ impl<T: TermBytes> ClientConductor<T> {
             events_dropped: 0,
             events_undecoded: 0,
             remote: false,
+            admissions: Vec::new(),
+            admission_resync: false,
             cutover_events: Vec::new(),
             lapped: false,
             laps: 0,
@@ -616,6 +628,49 @@ impl<T: TermBytes> ClientConductor<T> {
             sequence,
             registration,
         })
+    }
+
+    /// The admission state of the network publication `registration`, as
+    /// the driver last reported it (owner item 7, karyos#637): the last
+    /// state its sender observed, not each transition. `None` until the
+    /// driver reports one, for a registration that is not one of this
+    /// client's network publications, and after this client lapped the
+    /// broadcast buffer until the driver reports it again. Offers keep the
+    /// existing outcome mapping: under `NotJoined` and `LostRequired` they
+    /// answer `BackPressured` once the publication's window is full.
+    #[must_use]
+    pub fn network_admission(
+        &self,
+        registration: u64,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission> {
+        self.admissions
+            .iter()
+            .find(|(held, _)| *held == registration)
+            .and_then(|(_, state)| *state)
+    }
+
+    /// After a lap, an in-process conductor asks for each tracked
+    /// admission state again; one that cannot be sent is asked at the next
+    /// poll.
+    fn resync_admissions(&mut self) {
+        if !self.admission_resync {
+            return;
+        }
+        self.admission_resync = false;
+        for index in 0..self.admissions.len() {
+            let Some(&(registration, None)) = self.admissions.get(index) else {
+                continue;
+            };
+            if self
+                .submit(Kind::QueryCutover, None, |sequence| Command::QueryCutover {
+                    sequence,
+                    registration,
+                })
+                .is_err()
+            {
+                self.admission_resync = true;
+            }
+        }
     }
 
     /// Sets the heartbeat interval and the driver timeout, both on this
@@ -1652,6 +1707,7 @@ impl<T: TermBytes> ClientConductor<T> {
     {
         let mut report = ConductorPoll::default();
         self.serve_liveness();
+        self.resync_admissions();
         // A closed client resolves its pending requests now, however small
         // the budget and however busy the broadcast buffer.
         if self.closed() {
@@ -1668,6 +1724,12 @@ impl<T: TermBytes> ClientConductor<T> {
                 Received::Pending => None,
                 Received::Lapped { .. } => {
                     self.lapped |= self.remote;
+                    // An admission event may be lost: unknown until sent
+                    // again (karyos#637).
+                    for (_, admission) in &mut self.admissions {
+                        *admission = None;
+                    }
+                    self.admission_resync |= !self.remote && !self.admissions.is_empty();
                     if let Some(laps) = self.laps.checked_add(1) {
                         self.laps = laps;
                     }
@@ -1679,6 +1741,18 @@ impl<T: TermBytes> ClientConductor<T> {
                     // Driver events answer no request: queue them for the
                     // application, dropping the oldest when full.
                     if let Ok(event) = Event::decode(type_id, payload) {
+                        if let Event::PublicationAdmission {
+                            registration,
+                            admission,
+                            ..
+                        } = event
+                            && let Some((_, state)) = self
+                                .admissions
+                                .iter_mut()
+                                .find(|(held, _)| *held == registration)
+                        {
+                            *state = Some(admission);
+                        }
                         if self.remote
                             && matches!(
                                 event,
@@ -1737,6 +1811,17 @@ impl<T: TermBytes> ClientConductor<T> {
                 continue;
             };
             let pending = self.pending.swap_remove(index);
+            // A publication granted by URI may be a network one: its
+            // admission state is tracked from here (karyos#637).
+            if let (true, Kind::AddPublication, Response::PublicationReady { registration, .. }) =
+                (pending.by_uri, pending.kind, response)
+                && !self
+                    .admissions
+                    .iter()
+                    .any(|(held, _)| *held == registration)
+            {
+                self.admissions.push((registration, None));
+            }
             // The conductor's own requests: nothing to report.
             if pending.kind == Kind::DroppedCounter {
                 self.dropped_counter_answered(Some(response));

@@ -1333,6 +1333,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
             Command::QueryCutover { registration, .. } => {
+                // A lapped client resynchronizes a network publication's
+                // admission state too, before the answer (karyos#637).
+                self.resend_network_admission(client, registration);
                 match self.query_cutover(client, registration) {
                     Some(state) => Response::CutoverState {
                         request,
