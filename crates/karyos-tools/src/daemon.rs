@@ -360,7 +360,7 @@ impl Daemon {
                 }
                 None => Serving::Plain(Box::new(driver)),
             };
-            Ok(Self {
+            let mut daemon = Self {
                 serving,
                 streams,
                 linger: options.shutdown_linger,
@@ -368,7 +368,11 @@ impl Daemon {
                 last_error: None,
                 logged: Vec::new(),
                 next_check: Instant::now(),
-            })
+            };
+            // R-CORE-35: the configured streams, their guards and the
+            // Archive exist, so a probe may now report ready.
+            let _ = daemon.driver_mut().startup_complete();
+            Ok(daemon)
         }
         #[cfg(not(target_os = "linux"))]
         {

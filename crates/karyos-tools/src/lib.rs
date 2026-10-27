@@ -34,6 +34,8 @@ pub mod daemon;
 pub mod daemon_archive;
 pub mod errors;
 pub mod idle;
+#[cfg(target_os = "linux")]
+pub mod probe;
 pub mod replay;
 pub mod replay_live;
 pub mod stat;

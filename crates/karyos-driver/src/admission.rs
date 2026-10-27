@@ -52,6 +52,14 @@
 //! reclaim (diagnostic regions are never reused while the driver lives), so
 //! closing its socket frees its connection; any message it sends after
 //! `ToolHello` closes the connection too.
+//!
+//! A readiness probe (R-CORE-35) sends `ProbeHello` instead, without a
+//! descriptor. The driver checks its uid as for a tool, answers one
+//! `ProbeState` with [`EmbeddedDriver::readiness`] and closes the
+//! connection: no slot, no region, no descriptor, and it counts neither
+//! against `max_clients` nor against `max_tools`. One step answers at most
+//! [`MAX_PROBES_PER_STEP`] probes; the next ones in that step are refused
+//! with `LIMIT`.
 
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, OwnedFd};
@@ -61,7 +69,7 @@ use std::sync::Arc;
 use karyos_client::link::ClientLink;
 use karyos_protocol::admission::{
     Capability, MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION,
-    hello_version, refusal, tool_hello_version,
+    hello_version, probe, probe_hello_version, refusal, tool_hello_version,
 };
 use karyos_sys::command_ring::RingConsumer;
 use karyos_sys::host_clock::age_ns;
@@ -72,6 +80,10 @@ use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::ledger::{BindingRegion, Grant, GrantState, Ledger, Participant};
 use karyos_sys::log_buffer::Role;
+
+/// Probes one admission step answers; past it a `ProbeHello` is refused
+/// with `LIMIT` (R-CORE-35).
+pub const MAX_PROBES_PER_STEP: usize = 4;
 
 /// Region id of the broadcast buffer.
 pub(crate) const BROADCAST_REGION: u64 = 1;
@@ -214,6 +226,8 @@ pub(crate) struct Admission<T: StreamTerms> {
     remotes: Vec<Remote<T>>,
     retiring: Vec<Retiring<T>>,
     tools: Vec<Tool>,
+    /// Probes answered in the current step (R-CORE-35).
+    probes: usize,
     next_region: u64,
 }
 
@@ -427,6 +441,7 @@ impl<T: StreamTerms> Admission<T> {
             remotes: Vec::new(),
             retiring: Vec::new(),
             tools: Vec::new(),
+            probes: 0,
             next_region: FIRST_RING_REGION,
         })
     }
@@ -485,6 +500,7 @@ impl<T: StreamTerms> Admission<T> {
     /// done.
     fn serve(&mut self, driver: &mut EmbeddedDriver<T>) -> (u32, Option<DriverError>) {
         let mut work = Work::default();
+        self.probes = 0;
         // Accept up to the pending bound.
         let mut now = None;
         while self.pending.len() < self.config.max_pending_hellos {
@@ -619,6 +635,9 @@ impl<T: StreamTerms> Admission<T> {
     ) {
         if let Some(version) = tool_hello_version(bytes) {
             return self.tool_hello(driver, socket, bytes, fd, version, now);
+        }
+        if let Some(version) = probe_hello_version(bytes) {
+            return self.probe(driver, &socket, bytes, fd, version);
         }
         let Some(version) = hello_version(bytes) else {
             return;
@@ -767,6 +786,63 @@ impl<T: StreamTerms> Admission<T> {
                 refusal::RESOURCES,
                 "tool bootstrap resources",
             ),
+        }
+    }
+
+    /// Answers a `ProbeHello` of `version` with the driver's readiness, or
+    /// refuses it; the connection closes either way (R-CORE-35).
+    fn probe(
+        &mut self,
+        driver: &mut EmbeddedDriver<T>,
+        socket: &OwnedFd,
+        bytes: &[u8],
+        fd: Option<OwnedFd>,
+        version: u64,
+    ) {
+        if version != VERSION {
+            return reject(
+                driver,
+                socket,
+                refusal::INCOMPATIBLE_VERSION,
+                "incompatible probe version",
+            );
+        }
+        if fd.is_some() || !matches!(Message::decode(bytes), Ok(Message::ProbeHello { .. })) {
+            return reject(driver, socket, refusal::PROFILE, "malformed probe hello");
+        }
+        let same_uid = ipc::peer_credentials(socket.as_fd())
+            .is_ok_and(|peer| peer.uid.as_raw() == ipc::own_uid());
+        if !same_uid {
+            return reject(driver, socket, refusal::PROFILE, "probe of another uid");
+        }
+        if self.probes >= MAX_PROBES_PER_STEP {
+            return reject(driver, socket, refusal::LIMIT, "probe limit");
+        }
+        self.probes += 1;
+        let (state, reason) = match driver.readiness() {
+            crate::embedded::Readiness::Starting => (probe::STARTING, probe::NONE),
+            crate::embedded::Readiness::Ready => (probe::READY, probe::NONE),
+            crate::embedded::Readiness::Recovering => (probe::RECOVERING, probe::NONE),
+            crate::embedded::Readiness::NotReady(why) => (
+                probe::NOT_READY,
+                match why {
+                    crate::embedded::NotReadyReason::NotAdmitting => probe::NOT_ADMITTING,
+                    crate::embedded::NotReadyReason::Full => probe::FULL,
+                    crate::embedded::NotReadyReason::Terminal => probe::TERMINAL,
+                },
+            ),
+            crate::embedded::Readiness::Failed(crate::embedded::FailedReason::StartupDeadline) => {
+                (probe::FAILED, probe::STARTUP_DEADLINE)
+            }
+        };
+        let answer = Message::ProbeState {
+            state,
+            reason,
+            uptime_ns: driver.uptime(),
+        };
+        // Best effort, as a refusal: a probe that went away learns nothing.
+        if let Some(bytes) = encode(&answer) {
+            let _ = ipc::send(socket.as_fd(), &bytes, None);
         }
     }
 

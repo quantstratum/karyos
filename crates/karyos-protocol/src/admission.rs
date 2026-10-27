@@ -21,11 +21,21 @@
 //! | `0x03` | `Detach` | export id (nonzero) |
 //! | `0x04` | `Leave` | none |
 //! | `0x05` | `ToolHello` | version |
+//! | `0x06` | `ProbeHello` | version |
 //! | `0x81` | `Admitted` | instance (low, high); protocol version; client id; record count; records |
 //! | `0x82` | `Manifest` | fetch id; hand-over key; registration; stream registration; incarnation; base; record count; records |
 //! | `0x83` | `Region` | fetch id; record index |
 //! | `0x84` | `Refused` | fetch id or 0; code (nonzero) |
 //! | `0x85` | `ToolAdmitted` | instance (low, high); protocol version; record count; records (capability none) |
+//! | `0x86` | `ProbeState` | state ([`probe`]); reason ([`probe`]); nanoseconds since the driver started |
+//!
+//! **Probes** (R-CORE-35). A readiness probe sends `ProbeHello`, without a
+//! descriptor; the driver answers one `ProbeState`, or `Refused`, and
+//! closes the connection. A probe gets no client id, slot, capability or
+//! region, so it maps no shared memory. Both are new types in version 3,
+//! added while that version is still open before its first release; a
+//! driver that does not know `ProbeHello` closes the connection without an
+//! answer, and one of another version answers `INCOMPATIBLE_VERSION`.
 //!
 //! **Tools** (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! Tool attach). A tool sends `ToolHello` instead of `Hello`, without a
@@ -189,6 +199,41 @@ pub fn hello_version(bytes: &[u8]) -> Option<u64> {
     version_of(HELLO, bytes)
 }
 
+/// The protocol version of a `ProbeHello` datagram of any version: its
+/// type and version words are fixed. `None` when the datagram is not a
+/// `ProbeHello`.
+#[must_use]
+pub fn probe_hello_version(bytes: &[u8]) -> Option<u64> {
+    version_of(PROBE_HELLO, bytes)
+}
+
+/// The states and reasons of `ProbeState` (R-CORE-35).
+pub mod probe {
+    /// The driver has not declared its startup complete, within its
+    /// startup deadline.
+    pub const STARTING: u64 = 1;
+    /// A client `Hello` now would be admitted, into no cutover.
+    pub const READY: u64 = 2;
+    /// Admitting, but a stream still retains predecessor mappings after a
+    /// cutover.
+    pub const RECOVERING: u64 = 3;
+    /// Not admitting a client now; the reason says why.
+    pub const NOT_READY: u64 = 4;
+    /// Startup failed; the reason says why. It does not end.
+    pub const FAILED: u64 = 5;
+
+    /// No reason: starting, ready or recovering.
+    pub const NONE: u64 = 0;
+    /// The driver stopped admitting for an orderly shutdown.
+    pub const NOT_ADMITTING: u64 = 1;
+    /// The driver holds `max_clients` clients.
+    pub const FULL: u64 = 2;
+    /// The driver is terminal.
+    pub const TERMINAL: u64 = 3;
+    /// Startup was not declared complete within the startup deadline.
+    pub const STARTUP_DEADLINE: u64 = 4;
+}
+
 /// The protocol version of a `ToolHello` datagram of any version: its type
 /// and version words are fixed. `None` when the datagram is not a
 /// `ToolHello`.
@@ -213,11 +258,13 @@ const FETCH: u64 = 0x02;
 const DETACH: u64 = 0x03;
 const LEAVE: u64 = 0x04;
 const TOOL_HELLO: u64 = 0x05;
+const PROBE_HELLO: u64 = 0x06;
 const ADMITTED: u64 = 0x81;
 const MANIFEST: u64 = 0x82;
 const REGION: u64 = 0x83;
 const REFUSED: u64 = 0x84;
 const TOOL_ADMITTED: u64 = 0x85;
+const PROBE_STATE: u64 = 0x86;
 
 /// `Hello` flags: the first profile accepted, and no fork while holding the
 /// socket, a descriptor or a mapping.
@@ -570,6 +617,12 @@ pub enum Message {
         /// The protocol version.
         version: u64,
     },
+    /// A readiness probe's only message (R-CORE-35); it carries no
+    /// descriptor.
+    ProbeHello {
+        /// The protocol version.
+        version: u64,
+    },
     /// The bootstrap answer: fetch 0, the client's CnC regions.
     Admitted {
         /// The driver instance id.
@@ -626,6 +679,16 @@ pub enum Message {
         version: u64,
         /// The diagnostic regions; each carries capability none.
         records: Vec<Record>,
+    },
+    /// The answer to `ProbeHello`; the connection closes after it.
+    ProbeState {
+        /// One of [`probe`]'s states.
+        state: u64,
+        /// One of [`probe`]'s reasons: [`probe::NONE`] unless the state is
+        /// not ready or failed.
+        reason: u64,
+        /// Nanoseconds since the driver started, on its clock.
+        uptime_ns: u64,
     },
 }
 
@@ -752,6 +815,12 @@ impl Message {
             Self::Detach { export } => words.extend([DETACH, *export]),
             Self::Leave => words.push(LEAVE),
             Self::ToolHello { version } => words.extend([TOOL_HELLO, *version]),
+            Self::ProbeHello { version } => words.extend([PROBE_HELLO, *version]),
+            Self::ProbeState {
+                state,
+                reason,
+                uptime_ns,
+            } => words.extend([PROBE_STATE, *state, *reason, *uptime_ns]),
             Self::Admitted {
                 instance,
                 version,
@@ -931,6 +1000,30 @@ impl Message {
             TOOL_HELLO => {
                 exact(2)?;
                 Ok(Self::ToolHello { version: word(1) })
+            }
+            PROBE_HELLO => {
+                exact(2)?;
+                Ok(Self::ProbeHello { version: word(1) })
+            }
+            PROBE_STATE => {
+                exact(4)?;
+                let (state, reason) = (word(1), word(2));
+                let consistent = match state {
+                    probe::STARTING | probe::READY | probe::RECOVERING => reason == probe::NONE,
+                    probe::NOT_READY => {
+                        matches!(reason, probe::NOT_ADMITTING | probe::FULL | probe::TERMINAL)
+                    }
+                    probe::FAILED => reason == probe::STARTUP_DEADLINE,
+                    _ => false,
+                };
+                if !consistent {
+                    return Err(AdmissionError::Reserved);
+                }
+                Ok(Self::ProbeState {
+                    state,
+                    reason,
+                    uptime_ns: word(3),
+                })
             }
             ADMITTED => Ok(Self::Admitted {
                 instance: u128::from(word(1)) | (u128::from(word(2)) << 64),
@@ -1625,6 +1718,57 @@ mod tests {
             version: VERSION,
             records: vec![tool_records()[0]; MAX_RECORDS],
         });
+    }
+
+    /// R-CORE-35: the probe messages, literally, and their strict decoding:
+    /// a state with an inconsistent reason, an unknown state or a wrong
+    /// length is refused; the version of any `ProbeHello` is readable.
+    #[test]
+    fn the_probe_messages_round_trip_and_decode_strictly() {
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let hello = Message::ProbeHello { version: VERSION };
+        let length = hello.encode(&mut out).unwrap();
+        assert_eq!(words_of(&out[..length]), [PROBE_HELLO, VERSION]);
+        round_trip(&hello);
+        assert_eq!(probe_hello_version(&out[..length]), Some(VERSION));
+        assert_eq!(
+            probe_hello_version(&bytes_of(&[PROBE_HELLO, 9, 0])),
+            Some(9)
+        );
+        assert_eq!(probe_hello_version(&bytes_of(&[TOOL_HELLO, 3])), None);
+        for (state, reason) in [
+            (probe::STARTING, probe::NONE),
+            (probe::READY, probe::NONE),
+            (probe::RECOVERING, probe::NONE),
+            (probe::NOT_READY, probe::NOT_ADMITTING),
+            (probe::NOT_READY, probe::FULL),
+            (probe::NOT_READY, probe::TERMINAL),
+            (probe::FAILED, probe::STARTUP_DEADLINE),
+        ] {
+            let message = Message::ProbeState {
+                state,
+                reason,
+                uptime_ns: 42,
+            };
+            let length = message.encode(&mut out).unwrap();
+            assert_eq!(words_of(&out[..length]), [PROBE_STATE, state, reason, 42]);
+            round_trip(&message);
+        }
+        for words in [
+            [PROBE_STATE, probe::READY, probe::FULL, 1],
+            [PROBE_STATE, probe::NOT_READY, probe::NONE, 1],
+            [PROBE_STATE, probe::FAILED, probe::TERMINAL, 1],
+            [PROBE_STATE, 6, probe::NONE, 1],
+            [PROBE_STATE, 0, probe::NONE, 1],
+        ] {
+            assert_eq!(
+                Message::decode(&bytes_of(&words)),
+                Err(AdmissionError::Reserved),
+                "{words:?}"
+            );
+        }
+        assert!(Message::decode(&bytes_of(&[PROBE_HELLO, VERSION, 0])).is_err());
+        assert!(Message::decode(&bytes_of(&[PROBE_STATE, probe::READY, 0])).is_err());
     }
 
     #[test]

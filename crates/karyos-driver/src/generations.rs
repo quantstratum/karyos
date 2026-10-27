@@ -707,6 +707,39 @@ mod tests {
         }
     }
 
+    /// R-CORE-35: while a stream retains its predecessor mapping after a
+    /// cutover, a reader still on it, the driver reports recovering; once
+    /// the reader moved on and the predecessor is freed, ready again.
+    #[test]
+    fn readiness_is_recovering_while_a_cutover_retains_its_predecessor() {
+        use crate::embedded::Readiness;
+        use karyos_client::MessageLimit;
+
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let handle = stream(&mut driver);
+        assert!(driver.startup_complete());
+        let mut reader = driver.subscribe(handle, Role::Optional).unwrap();
+        let mut writer = driver.concurrent_publication(handle).unwrap();
+        let _ = writer.offer(b"before").unwrap();
+        assert_eq!(driver.readiness(), Readiness::Ready);
+        let _ = driver
+            .reconfigure_stream(handle, reconfiguration())
+            .unwrap();
+        assert_eq!(driver.readiness(), Readiness::Recovering);
+        // The reader drains the predecessor and moves on; the writer
+        // reaches the successor.
+        let _ = writer.offer(b"after");
+        let _ = writer.offer(b"after");
+        for _ in 0..100 {
+            let _ = reader.poll(|_, _| {}, MessageLimit::new(8)).unwrap();
+            let _ = driver.do_work().unwrap();
+            if driver.readiness() == Readiness::Ready {
+                break;
+            }
+        }
+        assert_eq!(driver.readiness(), Readiness::Ready);
+    }
+
     #[test]
     fn the_last_generation_is_not_replaced_and_nothing_changes() {
         let mut driver = EmbeddedDriver::new().unwrap();

@@ -34,6 +34,8 @@ pub mod journal;
 pub mod link;
 pub mod loss;
 pub mod merge;
+#[cfg(target_os = "linux")]
+pub mod probe;
 pub mod publication;
 pub mod schedule;
 pub mod subscription;
