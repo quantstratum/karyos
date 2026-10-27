@@ -17,6 +17,10 @@
 //!   sender's idle DATA heartbeat (SPEC §6) lets the receiver repair.
 //! - N8 (network-shared-terms n4): N2 between two IPC drivers, whose
 //!   publication and image lanes are shared regions (Linux).
+//! - N10 and N11 (karyos#626): reorder alone, with no loss or duplicate in
+//!   the profile: a reliable channel still delivers exactly once and in
+//!   order, and an unreliable one at most once and in order, every
+//!   datagram that came too late for its place reported in a local gap.
 
 #![allow(
     clippy::print_stdout,
@@ -255,6 +259,30 @@ fn n3_a_reliable_channel_survives_five_percent_duplicates() {
     println!("N3: {naks} NAKs, {repairs} repairs, {dropped} DATA frames dropped");
     assert!(naks > 0 && repairs > 0, "no repair: netem idle?");
     assert!(dropped > 0, "no copy reached the receiver to be dropped");
+    drop(_profile);
+    // Duplicates alone (karyos#626): with no loss and no reorder in the
+    // profile, nothing is missing, so nothing is NAKed or repaired, and
+    // every DATA frame the receiver drops is a copy of one it committed.
+    let _duplicates = Profile::replace("limit 100000 duplicate 5%");
+    let shaping = super::super::netem::probe_loopback(2000);
+    println!("N3 duplicates-only probe: {shaping:?}");
+    assert!(shaping.duplicates > 0, "the profile duplicated nothing");
+    assert_eq!((shaping.lost, shaping.reordered), (0, 0), "{shaping:?}");
+    let (a, b) = reliable_delivery("N3 duplicates only", 2000);
+    let (naks, repairs) = repair_work(&a, &b);
+    let dropped = b
+        .net
+        .as_ref()
+        .unwrap()
+        .receiver_counters()
+        .unwrap()
+        .data_dropped;
+    println!("N3 duplicates only: {naks} NAKs, {repairs} repairs, {dropped} dropped");
+    assert_eq!((naks, repairs), (0, 0), "nothing was missing to repair");
+    assert!(
+        dropped > 0,
+        "no duplicate reached the receiver to be dropped"
+    );
 }
 
 /// The NAKs B's receiver sent and the repairs A's sender made, in Shared
@@ -266,14 +294,149 @@ fn repair_work(a: &EmbeddedDriver, b: &EmbeddedDriver) -> (u64, u64) {
 }
 
 /// N4 (T4): N2 with both drivers in Dedicated mode, each agent on its own
-/// thread: every message arrives exactly once and in order. It asserts the
-/// delivery only: Dedicated agents expose no counters here, so it cannot
-/// show that repairs happened.
+/// thread: every message arrives exactly once and in order, with no loss
+/// reported, and the repair happened. Dedicated agents keep no agent
+/// counters, so the repair is read from the per-stream cells N9 reads
+/// (karyos#626): B's image sent NAKs and A's publication retransmitted.
 #[test]
 #[ignore = "runs under scripts/netem-test.sh"]
 fn n4_a_reliable_channel_in_dedicated_mode_delivers_exactly_once_in_order() {
     super::super::netem::require_netem();
-    let _ = reliable_delivery_in("N4", ThreadingMode::Dedicated, 2000);
+    let (mut a, mut b) = (
+        driver(ThreadingMode::Dedicated),
+        driver(ThreadingMode::Dedicated),
+    );
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let (sent, seen) = (publication.registration(), image.registration());
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    exchange(&mut a, &mut b, &publication, &mut reader, 2000);
+    let poll = reader.poll(|_, _, _| {}, ONE);
+    assert_eq!(poll.lanes[0].first_loss, None, "a reliable lane lost data");
+    let value = |driver: &EmbeddedDriver, label: &str, stream: u64| {
+        super::cells(driver, label)
+            .into_iter()
+            .find(|(_, keys)| keys.stream == stream)
+            .map_or(0, |(value, _)| value)
+    };
+    // The agents store at the end of their cycles.
+    pump(&mut [&mut a, &mut b], |drivers| {
+        value(drivers[1], "network naks sent", seen) > 0
+            && value(drivers[0], "network retransmits", sent) > 0
+    });
+    println!(
+        "N4: 2000 delivered in order exactly once; naks sent {}, retransmits {}",
+        value(&b, "network naks sent", seen),
+        value(&a, "network retransmits", sent),
+    );
+}
+
+/// The reorder-only profile of N10 and N11: every fourth datagram, half
+/// the time with its successor, overtakes the others, which wait 2 ms.
+/// netem reorders only with a delay; there is no loss and no duplicate.
+const REORDER_ONLY: &str = "limit 100000 delay 2ms reorder 25% 50%";
+
+/// Puts the reorder-only profile in place and shows that it reorders and
+/// neither loses nor duplicates.
+fn reorder_only(label: &str) -> Profile {
+    let profile = Profile::replace(REORDER_ONLY);
+    let shaping = super::super::netem::probe_loopback(2000);
+    println!("{label} probe: {shaping:?}");
+    assert!(shaping.reordered > 0, "the profile reordered nothing");
+    assert_eq!((shaping.lost, shaping.duplicates), (0, 0), "{shaping:?}");
+    profile
+}
+
+/// N10 (karyos#626): reorder alone on a reliable channel: every message
+/// still reaches the subscriber exactly once and in order (`exchange`
+/// asserts it, and fails on an out-of-order or repeated message), with no
+/// loss reported. Holes that reordering opens may be NAKed and repaired,
+/// or filled by the late datagram; either way the order is the log's.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n10_a_reliable_channel_under_reorder_alone_delivers_exactly_once_in_order() {
+    super::super::netem::require_netem();
+    let _profile = reorder_only("N10");
+    let (a, b) = reliable_delivery("N10", 2000);
+    let (naks, repairs) = repair_work(&a, &b);
+    println!("N10: {naks} NAKs, {repairs} repairs under reorder alone");
+}
+
+/// N11 (karyos#626): reorder alone on an unreliable channel: each message
+/// is delivered at most once and in order, at its position. A datagram that
+/// arrives after the subscriber was given a local gap over its place is
+/// never delivered out of order: its message lies in that gap. Nothing is
+/// lost in the profile, so every message is either delivered or in a gap
+/// the subscriber was told of, and no gap covers a delivered message.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n11_an_unreliable_channel_under_reorder_alone_delivers_in_order() {
+    super::super::netem::require_netem();
+    let _profile = reorder_only("N11");
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, false, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let count = 2000u32;
+    let mut sent = 0u32;
+    let mut delivered: Vec<u32> = Vec::new();
+    let mut gaps: Vec<(u64, u64)> = Vec::new();
+    let mut accounted = 0u32;
+    pump(&mut [&mut a, &mut b], |_| {
+        while sent < count {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let poll = reader.poll(
+            |bytes, _, info| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert!(
+                    delivered.last().is_none_or(|last| index > *last),
+                    "{index} after {:?}: at most once, in order",
+                    delivered.last()
+                );
+                assert_eq!(info.position, position(index), "message {index}");
+                delivered.push(index);
+            },
+            ONE,
+        );
+        if let Some(skipped) = poll.lanes[0].skipped
+            && matches!(skipped.reason, SkipReason::LocalGap(_))
+        {
+            gaps.push((
+                skipped.position,
+                skipped.position + u64::from(skipped.extent),
+            ));
+        }
+        let in_gap = |n: u32| {
+            gaps.iter()
+                .any(|&(start, end)| start <= position(n) && position(n) < end)
+        };
+        while accounted < count
+            && (delivered.binary_search(&accounted).is_ok() || in_gap(accounted))
+        {
+            accounted += 1;
+        }
+        accounted == count
+    });
+    for &n in &delivered {
+        assert!(
+            !gaps
+                .iter()
+                .any(|&(start, end)| start <= position(n) && position(n) < end),
+            "message {n} delivered inside a gap"
+        );
+    }
+    println!(
+        "N11: sent {count}, delivered {}, {} local gaps over late datagrams",
+        delivered.len(),
+        gaps.len()
+    );
 }
 
 /// N5 (T4): a reliable publication of two lanes under the job's faults:
