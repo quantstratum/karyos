@@ -133,13 +133,14 @@ pub enum CapabilityState {
 
 /// The capability names of API v1, a closed list: a later agent may add
 /// names, and a client ignores the ones it does not know.
-pub const CAPABILITIES: [&str; 6] = [
+pub const CAPABILITIES: [&str; 7] = [
     "view",
     "guard-close",
     "guard-reopen",
     "gap-ack",
     "catalog",
     "trace-window",
+    "limits",
 ];
 
 /// The operations journal of the agent's guard operations (M10b; the

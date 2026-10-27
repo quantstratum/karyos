@@ -368,7 +368,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "guard-reopen",
             "gap-ack",
             "catalog",
-            "trace-window"
+            "trace-window",
+            "limits"
         ]
     );
     let known = Capability {

@@ -13,7 +13,8 @@
     `driver_gone` or `detached`).
   - New request `KARYOS-AGENT 1 capabilities`, answered for the caller's
     role. Each capability of a closed v1 list (`view`, `guard-close`,
-    `guard-reopen`, `gap-ack`, `catalog`, `trace-window`) is `served`,
+    `guard-reopen`, `gap-ack`, `catalog`, `trace-window`, `limits`) is
+    `served`,
     `unavailable` (off in this deployment: `not_configured` or
     `journal_unavailable`) or `forbidden` (`role`).
   - The request with arguments answers
