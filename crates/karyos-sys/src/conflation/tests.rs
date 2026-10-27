@@ -1348,6 +1348,56 @@ fn a_cut_cycle_restores_no_key() {
     );
 }
 
+/// ADR-0081 (a): a gap the receive owner recorded ahead of the feeder
+/// before it read the begin marker, inside the cycle's range, aborts the
+/// cycle. Key 0's refresh value lies below the gap and its newer live
+/// update was lost in it, so key 0 must not turn Fresh: without the rule,
+/// the end (past the gap, which is then behind) would restore it.
+#[test]
+fn a_gap_recorded_ahead_inside_the_cycle_aborts_it() {
+    let (mut writer, _link, at) = stale_cycle_table(1);
+    // The gap [at + 64, at + 96) is recorded while the feeder is at `at`.
+    assert_eq!(writer.record_loss(at + 64, at + 96), Ok(2));
+    writer.cycle_begin(id(1), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(1), 0, &[9], at + 32), Ok(4));
+    while writer.reconciling() {
+        let _ = writer.reconcile(64);
+    }
+    writer.passed(at + 128);
+    assert_eq!(writer.cycle_end(id(1), end(at, 1), at + 128), Ok(None));
+    assert!(matches!(
+        freshness_now(&writer)[..],
+        [(0, Freshness::Stale { .. })]
+    ));
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!((counters.cycles_completed, counters.cycles_aborted), (0, 1));
+}
+
+/// ADR-0081 (b): a gap recorded while the cycle is open that starts at or
+/// after the end marker's position does not cut it: the cycle completes,
+/// and the restored key reads Stale since that later gap (GU-9), not Fresh.
+#[test]
+fn a_gap_from_the_end_on_does_not_abort_the_cycle() {
+    let (mut writer, _link, at) = stale_cycle_table(1);
+    writer.cycle_begin(id(1), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(1), 0, &[9], at + 32), Ok(4));
+    // Recorded ahead, starting exactly at the end marker's position.
+    assert_eq!(writer.record_loss(at + 64, at + 96), Ok(2));
+    while writer.reconciling() {
+        let _ = writer.reconcile(64);
+    }
+    writer.passed(at + 64);
+    assert_eq!(writer.cycle_end(id(1), end(at, 1), at + 64), Ok(Some(1)));
+    assert_eq!(
+        freshness_now(&writer),
+        [(0, Freshness::Stale { since: at + 64 })]
+    );
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!((counters.cycles_completed, counters.cycles_aborted), (1, 0));
+}
+
 /// ADR-0080: a new begin aborts the open cycle; an end with no begin seen,
 /// or with another id, is ignored and leaves the open cycle open; an end
 /// whose begin position or count differs aborts it.

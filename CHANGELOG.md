@@ -25,13 +25,15 @@ release may break APIs, wire formats and shared-memory layouts.
   `DurableQuery` reports as unsupported, never as a durable position.
   `Described` gains `durable`.
 - Conflation refresh and snapshot cycles (SPEC §7.1, "Refresh and snapshot
-  reconciliation"; ADR-0080 in `quantstratum-docs`; karyos#634).
+  reconciliation"; ADR-0080 in `quantstratum-docs`, its loss rule amended
+  by ADR-0081; karyos#634).
   - A publisher runs a cycle on a conflated lane with
     `karyos_client::RefreshCycle`: a begin marker, refresh values of the
     keys it chooses, and an end marker, carried in ordinary messages
     through their reserved value. The frame format does not change.
   - A view whose table opts in (`ConflationConfig::refresh`) turns every
-    key a complete cycle carried `Fresh`. A cycle cut by a loss, replaced
+    key a complete cycle carried `Fresh`. A cycle whose range a recorded gap
+    cuts (ADR-0081, even one recorded before its begin was read), replaced
     by a new begin, or ended with another begin position, count or scope
     restores no key, not even keys whose refresh values arrived. Until the
     end marker a refresh value keeps its key's freshness. Live updates

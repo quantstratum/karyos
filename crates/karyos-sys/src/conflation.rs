@@ -1597,8 +1597,10 @@ mod owned {
 
         /// An end marker of `cycle` at `position` (ADR-0080). It completes
         /// the open cycle when its id, begin position, count and scope
-        /// match and no recorded gap starts below `position` over the
-        /// cycle: every key it carried is restored at `position`
+        /// match and no recorded gap cuts the cycle's range (ADR-0081: none
+        /// starts below `position` and ends above its begin, those recorded
+        /// ahead before the begin included): every key it carried is
+        /// restored at `position`
         /// ([`ConflationWriter::restore_at`]). With matching id otherwise,
         /// the cycle is aborted. With no open cycle or another id, it is
         /// ignored. Returns the keys restored, `None` when nothing
