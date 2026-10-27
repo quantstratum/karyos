@@ -83,6 +83,39 @@ fn heap_store(capacity: usize, record_words: usize) -> Result<(Store, usize), Sy
     Ok((Store::Heap(HeapWords::zeroed(words)?), capacity))
 }
 
+/// Bytes of a diagnostic ring region's structure: `capacity` records of
+/// `record_words` words and the ring's own words.
+#[cfg(target_os = "linux")]
+fn structure_length(capacity: usize, record_words: usize) -> Option<usize> {
+    ring_words(capacity, record_words)
+        .filter(|_| capacity > 0)
+        .and_then(|words| words.checked_mul(WORD_BYTES))
+}
+
+/// Bytes of an error log region's structure for `capacity` records
+/// (R-CORE-34): the size it is created with, after the region header.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn error_log_structure_length(capacity: usize) -> Option<usize> {
+    structure_length(capacity, ERROR_RECORD_WORDS)
+}
+
+/// Bytes of a loss report region's structure for `capacity` records
+/// (R-CORE-34).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn loss_report_structure_length(capacity: usize) -> Option<usize> {
+    structure_length(capacity, LOSS_RECORD_WORDS)
+}
+
+/// Bytes of a guard audit region's structure for `capacity` records
+/// (R-CORE-34).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn guard_audit_structure_length(capacity: usize) -> Option<usize> {
+    structure_length(capacity, GUARD_AUDIT_RECORD_WORDS)
+}
+
 /// Creates a ring store in a new driver-only shared region.
 #[cfg(target_os = "linux")]
 fn region_store(
@@ -92,9 +125,7 @@ fn region_store(
     capacity: usize,
     record_words: usize,
 ) -> Result<Store, SysError> {
-    let structure_length = ring_words(capacity, record_words)
-        .filter(|_| capacity > 0)
-        .and_then(|words| words.checked_mul(WORD_BYTES))
+    let structure_length = structure_length(capacity, record_words)
         .ok_or(SysError::InvalidRegion { address: 0, len: 0 })?;
     // Only the driver writes these regions: A2 seal order (owner decision
     // Q7), so tools can map them only read-only.

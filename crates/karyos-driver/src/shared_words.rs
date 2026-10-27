@@ -12,16 +12,25 @@ use karyos_client::{ConsumedCell, HeapWords};
 use karyos_sys::load_words::LoadWords;
 use karyos_sys::sync::AtomicU64;
 
+/// Bytes of the structure of a region of `length` words, at least one,
+/// rounded up to the header stride, as [`Words::region`] creates it
+/// (R-CORE-34); `None` on overflow.
+#[cfg(target_os = "linux")]
+pub(crate) fn structure_length(length: usize) -> Option<usize> {
+    length
+        .max(1)
+        .checked_mul(core::mem::size_of::<u64>())?
+        .checked_next_multiple_of(karyos_sys::ipc::HEADER_STRIDE)
+}
+
 /// The bytes of a region of `length` words, header included, as
 /// [`Words::region`] sizes it; `None` on overflow.
 #[cfg(target_os = "linux")]
 pub(crate) fn region_bytes(length: usize) -> Option<u64> {
-    let stride = karyos_sys::ipc::HEADER_STRIDE;
-    let structure = length
-        .max(1)
-        .checked_mul(core::mem::size_of::<u64>())?
-        .checked_next_multiple_of(stride)?;
-    u64::try_from(structure.checked_add(stride)?).ok()
+    u64::try_from(karyos_sys::sizing::region_length(structure_length(
+        length,
+    )?)?)
+    .ok()
 }
 
 /// Words the driver writes, or whose cell its client writes.
@@ -66,12 +75,9 @@ impl Words {
         length: usize,
         driver_only: bool,
     ) -> Result<Self, karyos_sys::error::SysError> {
-        use karyos_sys::ipc::{HEADER_STRIDE, Region, RegionRecord};
+        use karyos_sys::ipc::{Region, RegionRecord};
         // The structure is a nonzero multiple of the header stride.
-        let structure_length = length
-            .max(1)
-            .checked_mul(core::mem::size_of::<u64>())
-            .and_then(|bytes| bytes.checked_next_multiple_of(HEADER_STRIDE))
+        let structure_length = structure_length(length)
             .ok_or(karyos_sys::error::SysError::InvalidRegion { address: 0, len: 0 })?;
         let record = RegionRecord {
             instance,
@@ -166,6 +172,44 @@ impl LoadWords for WordAt {
             self.words.load_acquire(self.index)
         } else {
             None
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+
+    use super::*;
+    use karyos_sys::ipc::RegionKind;
+
+    /// R-CORE-34: the guard binding's three region kinds are created at
+    /// [`structure_length`] and [`region_bytes`], so the sizing report
+    /// states their mapped size.
+    #[test]
+    fn the_guard_binding_regions_are_created_at_their_extracted_size() {
+        for (kind, length, driver_only) in [
+            (RegionKind::GuardRegion, 64, true),
+            (RegionKind::GuardRegion, 1000, true),
+            (RegionKind::OutcomeRing, 520, true),
+            (RegionKind::ConsumedCell, 1, false),
+        ] {
+            let Words::Region(region) = Words::region(7, 3, kind, 1, length, driver_only).unwrap()
+            else {
+                unreachable!("a region was asked for");
+            };
+            assert_eq!(
+                Some(region.record().structure_length),
+                structure_length(length),
+                "{kind:?}"
+            );
+            let file =
+                std::fs::File::from(region.descriptor().unwrap().try_clone_to_owned().unwrap());
+            assert_eq!(
+                Some(file.metadata().unwrap().len()),
+                region_bytes(length),
+                "{kind:?}"
+            );
         }
     }
 }

@@ -417,9 +417,7 @@ impl LogBuffer<SharedTerms> {
         generation: Generation,
     ) -> Result<Self, SysError> {
         let (layout, slots, max_message_length) = Self::plan(&config)?;
-        let structure_length = layout
-            .total
-            .checked_mul(crate::atomic_view::WORD_BYTES)
+        let structure_length = Self::structure_length_of(&layout)
             .ok_or(SysError::InvalidRegion { address: 0, len: 0 })?;
         let mapped = crate::ipc::Region::create(crate::ipc::RegionRecord {
             instance,
@@ -562,6 +560,20 @@ impl<T: TermBytes> LogBuffer<T> {
 
     /// Validates `config` and computes its layout, slot count and largest
     /// message: the same checks for a new buffer and for an attachment.
+    /// Bytes of a log buffer region's structure for `config` (R-CORE-34):
+    /// the size one mapping generation is created with, after the region
+    /// header. `None` for a configuration a buffer refuses.
+    #[must_use]
+    pub fn structure_length(config: &LogBufferConfig) -> Option<usize> {
+        let (layout, _, _) = Self::plan(config).ok()?;
+        Self::structure_length_of(&layout)
+    }
+
+    /// Bytes of the structure of `layout`.
+    fn structure_length_of(layout: &Layout) -> Option<usize> {
+        layout.total.checked_mul(crate::atomic_view::WORD_BYTES)
+    }
+
     fn plan(config: &LogBufferConfig) -> Result<(Layout, u8, u32), SysError> {
         let slots = config
             .spare_slots

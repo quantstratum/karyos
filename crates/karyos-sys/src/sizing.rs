@@ -237,6 +237,28 @@ impl FragmentPlan {
     }
 }
 
+/// Bytes before a shared region's structure: the 64-byte header, padded
+/// to the 128-byte stride (`quantstratum-docs:
+/// karyos/design/cnc-primitives.md`).
+pub const REGION_HEADER_STRIDE: usize = 128;
+
+/// The total size of a shared region whose structure is
+/// `structure_length` bytes: the header stride plus the structure
+/// (R-CORE-34). `None` unless `structure_length` is a nonzero multiple of
+/// [`REGION_HEADER_STRIDE`] and the total fits an `isize`. Every region is
+/// created at this size, so a sizing report built from it is the size the
+/// region is mapped with.
+#[must_use]
+pub const fn region_length(structure_length: usize) -> Option<usize> {
+    if structure_length == 0 || !structure_length.is_multiple_of(REGION_HEADER_STRIDE) {
+        return None;
+    }
+    match REGION_HEADER_STRIDE.checked_add(structure_length) {
+        Some(total) if total <= isize::MAX as usize => Some(total),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

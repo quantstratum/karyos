@@ -515,7 +515,7 @@ pub use owned::{
     ClientCells, ClientCounter, Counter, CountersManager, CountersReader, client_counters, counters,
 };
 #[cfg(all(not(loom), target_os = "linux"))]
-pub use owned::{LAYOUT_VERSION, client_counters_in, counters_in};
+pub use owned::{LAYOUT_VERSION, client_counters_in, counters_in, structure_length};
 
 #[cfg(not(loom))]
 mod owned {
@@ -680,6 +680,17 @@ mod owned {
             .checked_add(STRIDE_WORDS)
     }
 
+    /// Bytes of a counters or client counters region's structure for
+    /// `capacity` counters (R-CORE-34): the size it is created with, after
+    /// the region header. `None` for a zero or oversized capacity.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn structure_length(capacity: usize) -> Option<usize> {
+        structure_words(capacity)
+            .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES))
+            .filter(|_| capacity > 0)
+    }
+
     /// Layout version of a counters region: 2 adds the key words
     /// (`quantstratum-docs: karyos/design/observability-and-tools.md`).
     /// Readers reject any other version.
@@ -744,10 +755,7 @@ mod owned {
         kind: crate::ipc::RegionKind,
     ) -> Result<Region, SysError> {
         let invalid = SysError::InvalidRegion { address: 0, len: 0 };
-        let structure_length = structure_words(capacity)
-            .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES))
-            .filter(|_| capacity > 0)
-            .ok_or(invalid)?;
+        let structure_length = structure_length(capacity).ok_or(invalid)?;
         let record = crate::ipc::RegionRecord {
             instance,
             region,

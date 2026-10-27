@@ -1029,6 +1029,17 @@ pub fn trace_mirror(entries: usize, log: usize, capacity: usize) -> Result<Trace
     )
 }
 
+/// Bytes of a trace mirror region's structure for `entries` table entries,
+/// a recycle log of `log` entries and `capacity` records (R-CORE-34): the
+/// size it is created with, after the region header.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn structure_length(entries: usize, log: usize, capacity: usize) -> Option<usize> {
+    geometry(entries, log, capacity)?
+        .total
+        .checked_mul(WORD_BYTES)
+}
+
 /// Creates a trace mirror in a new driver-only shared region of kind
 /// `TraceMirror` (A2 seals).
 ///
@@ -1045,14 +1056,13 @@ pub fn trace_mirror_in(
     capacity: usize,
 ) -> Result<TraceMirror, SysError> {
     let invalid = SysError::InvalidRegion { address: 0, len: 0 };
-    let total = geometry(entries, log, capacity).ok_or(invalid)?.total;
     let mapped = crate::ipc::Region::create_driver_only(crate::ipc::RegionRecord {
         instance,
         region,
         kind: crate::ipc::RegionKind::TraceMirror,
         generation: 0,
         layout: MIRROR_LAYOUT_VERSION,
-        structure_length: total.checked_mul(WORD_BYTES).ok_or(invalid)?,
+        structure_length: structure_length(entries, log, capacity).ok_or(invalid)?,
     })?;
     TraceMirror::new(Store::Mapped(mapped), entries, log, capacity)
 }
