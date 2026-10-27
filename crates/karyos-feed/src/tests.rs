@@ -579,13 +579,19 @@ fn the_configuration_is_checked() {
     );
     assert!(Arbiter::new(small, config(4)).is_ok());
     let tiny = TestFeed {
-        modulus: NonZeroU64::new(3),
+        modulus: NonZeroU64::new(4),
         start: None,
     };
     assert_eq!(
         Arbiter::new(tiny, config(1)).err(),
         Some(ConfigError::Modulus)
     );
+    // 5: window 2, a buffer of one.
+    let five = TestFeed {
+        modulus: NonZeroU64::new(5),
+        start: None,
+    };
+    assert!(Arbiter::new(five, config(1)).is_ok());
 }
 
 /// While an old epoch's hole is open, a new-epoch message beyond the
