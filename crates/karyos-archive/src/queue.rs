@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A frame source over records its owner queues (quantstratum-docs:
-//! karyos/design/management-agent-gap-analysis.md, M10 and owner item 7):
+//! karyos/design/management-agent-gap-analysis.md, M10 and its new owner
+//! item 7, decided as item 51(7) of the 2026-10-21 owner decisions):
 //! a process with no log of its own, such as the management agent writing
 //! its operations journal, records through the [`Recorder`] all the same.
 //!

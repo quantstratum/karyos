@@ -38,7 +38,7 @@
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
-//! | `0x84` | `Error` | client | sequence | code (1 to 17, see [`ErrorCode`]) | detail |
+//! | `0x84` | `Error` | client | sequence | code (1 to 18, see [`ErrorCode`]) | detail |
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
@@ -169,9 +169,14 @@
 //! | `AddNetworkSubscriptionAs` | `receiver_id`, nonzero | `group_tag` |
 //!
 //! `AddNetworkPublicationWithRoles` continues after its URI's padding with
-//! `R` words, the required `receiver_id`s (nonzero, distinct), then `T`
-//! pairs of words, a `receiver_id` (nonzero, distinct among the pairs) and
-//! its tag (nonzero): `6 + ceil(L / 8) + R + 2T` words in all, `L` the URI's length.
+//! `R` words, the required `receiver_id`s (nonzero), then `T` pairs of
+//! words, a `receiver_id` (nonzero) and its tag (nonzero):
+//! `6 + ceil(L / 8) + R + 2T` words in all, `L` the URI's length. A zero
+//! there is malformed. A `receiver_id` repeated among the required ids,
+//! or among the pairs, is `Error` with `InvalidRoles` (code 18), as is an
+//! `R` or a `T` above the membership's `max_receivers`: the driver checks
+//! the counts first, then the repeats, so decoding stays linear and a list
+//! longer than the membership costs the driver no traversal (karyos#637).
 //! `AddNetworkSubscriptionAs` is exactly `6 + ceil(L / 8)` words. Flags,
 //! role and URI follow their `AddNetworkPublication` and
 //! `AddNetworkSubscription` rules; a concurrent handle is refused with
@@ -181,7 +186,8 @@
 //! `R + 2T` is the command ring's largest record (`ring_capacity / 8`):
 //! a client refuses a command that does not fit before sending it
 //! (`CommandTooLarge`), and the driver checks the roles against its
-//! membership's `max_receivers`. No other numeric limit applies.
+//! membership's `max_receivers` (`InvalidRoles`). No other numeric limit
+//! applies.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -1134,6 +1140,11 @@ pub enum ErrorCode {
     /// A network publication's roles name another strategy than its URI's
     /// `fc`, the one source of the strategy (owner item 7, karyos#637).
     StrategyConflict,
+    /// A network publication's roles are invalid for the driver: more
+    /// required, or more tagged, receivers than its membership holds, or
+    /// a repeated `receiver_id` (karyos#637). Retrying the same roles
+    /// never succeeds.
+    InvalidRoles,
 }
 
 impl ErrorCode {
@@ -1158,6 +1169,7 @@ impl ErrorCode {
             Self::ReceiverIdentityMismatch => 15,
             Self::LaneMismatch => 16,
             Self::StrategyConflict => 17,
+            Self::InvalidRoles => 18,
         }
     }
 
@@ -1180,6 +1192,7 @@ impl ErrorCode {
             15 => Self::ReceiverIdentityMismatch,
             16 => Self::LaneMismatch,
             17 => Self::StrategyConflict,
+            18 => Self::InvalidRoles,
             _ => return None,
         })
     }
@@ -2216,9 +2229,9 @@ fn read_uri_block<const N: usize>(
 
 /// Reads the roles of `AddNetworkPublicationWithRoles` from its strategy and
 /// counts word, its tagged group word and the words after its URI, which
-/// must be exactly the counts' words: required `receiver_id`s, nonzero and
-/// distinct, then `(receiver_id, tag)` pairs, each `receiver_id` nonzero
-/// and distinct among the pairs, each tag nonzero.
+/// must be exactly the counts' words: required `receiver_id`s, nonzero,
+/// then `(receiver_id, tag)` pairs, each `receiver_id` and tag nonzero. A
+/// repeat is the driver's to refuse, after it bounds the counts.
 fn read_roles(
     type_id: u32,
     counts: u64,
@@ -2264,7 +2277,7 @@ fn read_roles(
         required,
         tags,
     };
-    if !roles.is_well_formed() {
+    if roles.required.contains(&0) || roles.tags.iter().any(|&(id, tag)| id == 0 || tag == 0) {
         return Err(reserved);
     }
     Ok(roles)
@@ -3429,8 +3442,9 @@ mod tests {
 
     /// karyos#637: the roles and identity commands are decoded strictly:
     /// reserved bits and strategy codes, a group that does not match the
-    /// strategy, a zero or repeated `receiver_id`, a zero tag, a receiver
-    /// id of 0 and any length but the counts' are refused.
+    /// strategy, a zero `receiver_id`, a zero tag, a receiver id of 0 and
+    /// any length but the counts' are refused. A repeated `receiver_id`
+    /// decodes: the driver refuses it after bounding the counts.
     #[test]
     fn roles_commands_are_decoded_strictly() {
         use crate::roles::Strategy;
@@ -3462,9 +3476,8 @@ mod tests {
             // A group without `tagged`, and `tagged` without one.
             (5, 9),
             (4, counts & !0xFF | 2),
-            // A zero or repeated required id.
+            // A zero required id.
             (tail, 0),
-            (tail + 1, 77),
             // A zero receiver id or a zero tag in a pair.
             (tail + 2, 0),
             (tail + 3, 0),
@@ -3489,6 +3502,12 @@ mod tests {
             Err(CncError::WrongLength { .. })
         ));
         assert_eq!(decode(&good), Ok(command));
+        let mut repeated = good.clone();
+        word(&mut repeated, tail + 1, 77);
+        assert!(matches!(
+            decode(&repeated),
+            Ok(Command::AddNetworkPublicationWithRoles { roles, .. }) if roles.required == [77, 77]
+        ));
         // An identity of receiver 0, a reserved role, a trailing word.
         let identity = Command::AddNetworkSubscriptionAs {
             sequence: 1,
@@ -3515,6 +3534,18 @@ mod tests {
             Err(CncError::WrongLength { .. })
         ));
         assert_eq!(Command::decode(0x13, &good), Ok(identity));
+    }
+
+    /// karyos#637: the roles' refusals keep their wire values.
+    #[test]
+    fn roles_error_codes_are_17_and_18() {
+        for (code, word) in [
+            (ErrorCode::StrategyConflict, 17),
+            (ErrorCode::InvalidRoles, 18),
+        ] {
+            assert_eq!(code.code(), word);
+            assert_eq!(ErrorCode::from_code(word), Some(code));
+        }
     }
 
     /// karyos#637: roles are bounded by the buffer they are encoded into
@@ -4857,7 +4888,7 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(18), None);
+        assert_eq!(ErrorCode::from_code(19), None);
     }
 
     /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
@@ -5045,9 +5076,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 18 is not defined.
+        // Error code 19 is not defined.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 18, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 19, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }
@@ -5572,6 +5603,8 @@ mod properties {
                 ErrorCode::ReliabilityMismatch,
                 ErrorCode::ReceiverIdentityMismatch,
                 ErrorCode::LaneMismatch,
+                ErrorCode::StrategyConflict,
+                ErrorCode::InvalidRoles,
             ][..],
         );
         prop_oneof![

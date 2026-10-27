@@ -864,7 +864,9 @@ int32_t karyos_client_add_subscription(uint64_t client, const char *uri,
  * with a count of 0). An unknown strategy, a group that does not match
  * it, a receiver id or tag of 0, a repeated receiver id, a null list with
  * a count, or roles the command ring's largest record cannot carry is
- * KARYOS_E_INVALID_ARGUMENT; a karyos:ipc URI is
+ * KARYOS_E_INVALID_ARGUMENT; more required, or more tagged, receivers
+ * than the driver's membership holds is KARYOS_E_REFUSED, detail code 18;
+ * a karyos:ipc URI is
  * KARYOS_E_UNSUPPORTED_CHANNEL. Nothing is opened on failure.
  */
 int32_t karyos_client_add_publication_with_roles(

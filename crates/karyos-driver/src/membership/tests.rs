@@ -231,6 +231,41 @@ fn the_configuration_is_validated() {
     }
 }
 
+/// karyos#637 review: the counts are checked before either list is read,
+/// and repeats by sorting a copy, so a long list costs no quadratic walk.
+/// One receiver more than the table is refused although every id is
+/// distinct and nonzero, which only the count refuses; a full table of
+/// each, one receiver both required and tagged, is accepted; a repeat at
+/// both ends of a full list is refused, also past the stack buffer.
+#[test]
+fn roles_are_bounded_before_they_are_read() {
+    let max = DEFAULT_MAX_RECEIVERS;
+    let full = usize::from(max);
+    let ids: Vec<u64> = (1..=u64::from(max) + 1).collect();
+    let pairs: Vec<(u64, u64)> = ids.iter().map(|&id| (id, 9)).collect();
+    let check = |required: &[u64], tags: &[(u64, u64)], max: u16| {
+        check_roles(&Roles { required, tags }, max)
+    };
+    let refused = Err(MembershipConfigError::Roles);
+    assert_eq!(check(&ids, &[], max), refused);
+    assert_eq!(check(&[], &pairs, max), refused);
+    let (ids_full, pairs_full) = (ids.get(..full).unwrap(), pairs.get(..full).unwrap());
+    assert_eq!(check(ids_full, pairs_full, max), Ok(()));
+    let mut repeated = ids_full.to_vec();
+    *repeated.last_mut().unwrap() = 1;
+    assert_eq!(check(&repeated, &[], max), refused);
+    let mut repeated = pairs_full.to_vec();
+    *repeated.last_mut().unwrap() = (1, 9);
+    assert_eq!(check(&[], &repeated, max), refused);
+    // A configured table past the stack buffer.
+    let wide = 4 * max;
+    let ids: Vec<u64> = (1..=u64::from(wide)).collect();
+    assert_eq!(check(&ids, &[], wide), Ok(()));
+    let mut repeated = ids;
+    *repeated.last_mut().unwrap() = 1;
+    assert_eq!(check(&repeated, &[], wide), refused);
+}
+
 /// The design's example: A at 100 with window 100 (edge 200), B at 150
 /// with window 10 (edge 160). The extrema are of the edges, and a required
 /// B bounds every strategy.

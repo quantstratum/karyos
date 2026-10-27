@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The operations journal of the agent's guard operations (quantstratum-docs:
-//! karyos/design/management-agent-gap-analysis.md, M10 and owner item 7,
-//! interim): an Archive recording in the agent's journal directory, written
+//! karyos/design/management-agent-gap-analysis.md, M10 and its new owner
+//! item 7, decided as item 51(7) of the 2026-10-21 owner decisions,
+//! interim; not item 7 of those decisions): an Archive recording in the agent's journal directory, written
 //! through the Archive's [`Recorder`] from a [`QueueSource`], and shown as
 //! unsealed until A10 seals it.
 //!

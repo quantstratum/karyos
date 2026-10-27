@@ -23,8 +23,10 @@ pub struct AgentView {
     pub journal: Option<JournalView>,
 }
 
-/// The operations journal of the agent's guard operations (M10b; owner
-/// item 7, interim).
+/// The operations journal of the agent's guard operations (M10b; the
+/// gap analysis's new owner item 7, decided as item 51(7) of the
+/// 2026-10-21 owner decisions, interim; not item 7 of those decisions,
+/// which is the public roles and tags surface).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct JournalView {

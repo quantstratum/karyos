@@ -3552,6 +3552,52 @@ mod tests {
         assert_eq!(driver.clients(), 0);
     }
 
+    /// karyos#637 review: a repeated `receiver_id` decodes, so the decoder
+    /// stays linear, and the driver refuses it with `InvalidRoles` once it
+    /// has bounded the counts; the client is served, not retired.
+    #[test]
+    fn a_repeated_receiver_is_refused_by_the_driver() {
+        use karyos_protocol::cnc::ErrorCode;
+        use karyos_protocol::roles::{PublicationRoles, Strategy};
+
+        let mut driver = EmbeddedDriver::with_config(crate::DriverConfig {
+            network: Some(crate::net::NetworkConfig {
+                threading: crate::agents::ThreadingMode::Shared,
+                ..crate::net::NetworkConfig::default()
+            }),
+            ..crate::DriverConfig::default()
+        })
+        .unwrap();
+        let (_, mut producer, _link) = raw_client(&mut driver);
+        let mut observer = driver.broadcast.receiver();
+        write(
+            &mut producer,
+            Command::AddNetworkPublicationWithRoles {
+                sequence: 1,
+                stream_id: 10,
+                allow_unconnected: true,
+                concurrent: false,
+                uri: karyos_protocol::cnc::ChannelUri::new("karyos:udp?group=239.255.0.10:40000")
+                    .unwrap(),
+                roles: PublicationRoles {
+                    strategy: Strategy::Min,
+                    required: vec![77, 77],
+                    tags: Vec::new(),
+                },
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert!(matches!(
+            responses(&mut observer)[..],
+            [Response::Error {
+                code: ErrorCode::InvalidRoles,
+                ..
+            }]
+        ));
+        assert!(driver.clients[0].consumer.is_some());
+        assert!(!producer.is_closed());
+    }
+
     /// #289 P1: a command ring whose largest record cannot carry a command
     /// with the longest URI is refused at start; 8192 bytes is the smallest
     /// power of two that can, and the default.
