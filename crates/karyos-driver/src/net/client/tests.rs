@@ -242,11 +242,12 @@ fn ipc_uris_and_refusals() {
     ));
 }
 
-/// Owner item 7: a client's network publication by URI with `fc=max` or
-/// `fc=tagged:<group>` is refused (`UnsupportedChannel`), not run as
-/// `min`; `fc=min` is granted.
+/// Owner item 7, karyos#637: a client's network publication by URI with
+/// `fc=max`, `fc=tagged:<group>` or `fc=min` is granted, its `fc` the
+/// strategy; `fc=tagged:0` names no group and is refused
+/// (`UnsupportedChannel`), never run as `min`.
 #[test]
-fn unsupported_flow_control_is_refused_by_uri() {
+fn flow_control_is_granted_by_uri() {
     let mut driver = driver();
     let mut client = driver.connect().unwrap();
     let mut outcomes = Vec::new();
@@ -265,7 +266,10 @@ fn unsupported_flow_control_is_refused_by_uri() {
     let min = client
         .add_network_publication(&group("min"), 32, true)
         .unwrap();
-    let sequences = [max, tagged, min];
+    let zero = client
+        .add_network_publication(&group("tagged:0"), 33, true)
+        .unwrap();
+    let sequences = [max, tagged, min, zero];
     run(
         &mut [&mut driver],
         &mut [&mut client],
@@ -276,16 +280,19 @@ fn unsupported_flow_control_is_refused_by_uri() {
                 .all(|sequence| outcomes.iter().any(|(_, found, _)| found == sequence))
         },
     );
-    for refused in [max, tagged] {
+    for granted in [max, tagged, min] {
         assert!(matches!(
-            take(&mut outcomes, refused),
-            Outcome::Refused {
-                code: ErrorCode::UnsupportedChannel,
-                ..
-            }
+            take(&mut outcomes, granted),
+            Outcome::Publication(_)
         ));
     }
-    assert!(matches!(take(&mut outcomes, min), Outcome::Publication(_)));
+    assert!(matches!(
+        take(&mut outcomes, zero),
+        Outcome::Refused {
+            code: ErrorCode::UnsupportedChannel,
+            ..
+        }
+    ));
 }
 
 /// W5b B3: what a client created goes with it: its network publication

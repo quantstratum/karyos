@@ -44,7 +44,7 @@ use crate::agents::data::{GuardSpec, Outbound};
 use crate::embedded::{AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION};
 use crate::error::DriverError;
 use crate::guards::{GuardHandle, GuardRate};
-use crate::membership::PublicationRoles;
+use crate::membership::{PublicationRoles, Strategy};
 use crate::sessions::send::Publication;
 
 /// Where a channel sends, and the local address its endpoint binds: one
@@ -111,7 +111,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// [`DriverError::NetworkUnavailable`] without a network,
-    /// [`DriverError::UnsupportedChannel`], [`DriverError::NetworkEndpoint`],
+    /// [`DriverError::UnsupportedChannel`] (`fc=tagged:0` included: a
+    /// tagged group is never 0), [`DriverError::NetworkEndpoint`],
     /// [`DriverError::NetworkBusy`], [`DriverError::ExportIdsExhausted`] and
     /// the errors of [`EmbeddedDriver::add_aggregate`]. Nothing is left
     /// configured on error. The key of a removed network publication stays
@@ -130,19 +131,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// [`EmbeddedDriver::add_network_publication`] whose receivers have the
-    /// configured `roles` and strategy (MC-1). Driver-internal: the public
-    /// way in is owner item 7.
+    /// configured `roles`: the required `receiver_id`s and the receivers'
+    /// tags (MC-1; owner decisions of 2026-10-21, item 7). The channel's
+    /// `fc` stays the one source of the strategy (`min` without one), so
+    /// `roles.strategy` must name the same strategy.
     ///
     /// # Errors
     ///
-    /// As [`EmbeddedDriver::add_network_publication`]; the sender refuses
-    /// roles its membership cannot hold, which leaves the publication
-    /// refused.
-    #[allow(
-        dead_code,
-        reason = "driver-internal until owner item 7 gives roles a public way in"
-    )]
-    pub(crate) fn add_network_publication_with_roles(
+    /// As [`EmbeddedDriver::add_network_publication`], and
+    /// [`DriverError::StrategyConflict`] for roles whose strategy is not
+    /// the channel's `fc`. The sender refuses roles its membership cannot
+    /// hold, which leaves the publication refused.
+    pub fn add_network_publication_with_roles(
         &mut self,
         config: AggregateConfig,
         channel: &UdpConfig,
@@ -280,15 +280,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
         };
-        // A channel's `fc=max` or `fc=tagged:<group>` is not wired to the
-        // sender's membership: refused rather than run as `min` (owner
-        // item 7). `fc=min` is what every publication runs.
-        if matches!(
-            channel.flow_control,
-            Some(FlowControl::Max | FlowControl::Tagged(_))
-        ) {
-            return Err(DriverError::UnsupportedChannel);
-        }
+        // The channel's `fc` is the strategy (owner item 7, karyos#637):
+        // typed roles name the same one, and `max` or `tagged:<group>`
+        // without roles runs on a membership with no required or tagged
+        // receiver. A tagged group of 0 is no group: refused, not run as
+        // `min`.
+        let strategy = match channel.flow_control {
+            None | Some(FlowControl::Min) => Strategy::Min,
+            Some(FlowControl::Max) => Strategy::Max,
+            Some(FlowControl::Tagged(0)) => return Err(DriverError::UnsupportedChannel),
+            Some(FlowControl::Tagged(group)) => Strategy::Tagged(group),
+            Some(_) => return Err(DriverError::UnsupportedChannel),
+        };
+        let roles = match roles {
+            Some(roles) if roles.strategy != strategy => {
+                return Err(DriverError::StrategyConflict);
+            }
+            None if strategy != Strategy::Min => Some(Box::new(PublicationRoles {
+                strategy,
+                required: Vec::new(),
+                tags: Vec::new(),
+            })),
+            roles => roles,
+        };
         // Timed lanes (a schedule ring on every lane): what the software
         // route does not support yet is refused before anything exists.
         let (options, clock) = schedule.unwrap_or_default();

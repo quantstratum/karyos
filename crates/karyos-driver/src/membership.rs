@@ -242,8 +242,9 @@ pub enum MembershipConfigError {
 
 /// A publication's configured receiver roles (MC-1): its strategy, the
 /// required `receiver_id`s and the `(receiver_id, tag)` pairs, owned and
-/// handed to the sender agent with the publication. Driver-internal: no
-/// public way in yet (owner item 7).
+/// handed to the sender agent with the publication
+/// ([`crate::EmbeddedDriver::add_network_publication_with_roles`]; owner
+/// item 7). Its strategy must be the channel's `fc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationRoles {
     /// The strategy.
@@ -268,8 +269,8 @@ impl PublicationRoles {
 /// A subscription's receiver identity (MC-1, MC-2): the configured
 /// `receiver_id` its images name in every RB block, stable across
 /// restarts, and the `group_tag` their SMs declare (0 for none). Without
-/// one an image names a `receiver_id` derived from its slot.
-/// Driver-internal: no public way in yet (owner item 7).
+/// one an image names a `receiver_id` derived from its slot
+/// ([`crate::EmbeddedDriver::add_network_subscription_as`]; owner item 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiverIdentity {
     /// The configured receiver id.
