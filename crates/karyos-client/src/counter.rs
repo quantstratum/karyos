@@ -77,6 +77,28 @@ impl CounterReleases {
     }
 }
 
+/// What an application counter counts (R-CORE-3), which sets its type id
+/// in the counters region and how the agent exports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CounterKind {
+    /// A lifetime total that only grows ([`ClientCounterHandle::increment`]).
+    Event,
+    /// A current value ([`ClientCounterHandle::set`]).
+    Gauge,
+}
+
+impl CounterKind {
+    /// The counters region's type id of this kind.
+    #[must_use]
+    pub const fn type_id(self) -> u64 {
+        match self {
+            Self::Event => karyos_sys::counters::TYPE_APPLICATION_EVENT,
+            Self::Gauge => karyos_sys::counters::TYPE_APPLICATION_GAUGE,
+        }
+    }
+}
+
 /// The application's capability to update one client counter (not
 /// `Clone`; share it by reference). Dropping it releases the cell, as
 /// [`ClientCounterHandle::release`] does.
@@ -154,5 +176,52 @@ impl Drop for ClientCounterHandle {
         // Every access of this handle happened before: an in-process driver
         // that reads 0 after the close flag may free the cell.
         self.releases.live.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+
+    use super::*;
+
+    /// R-CORE-3: updating an application counter writes its cell and
+    /// nothing else: no allocation and no free, counted as the data path's
+    /// tests count them.
+    #[test]
+    fn updating_an_application_counter_allocates_nothing() {
+        let (mut manager, reader, cells) = karyos_sys::counters::client_counters(4).unwrap();
+        // The allocator's capabilities stay alive, as the driver's do.
+        let mut allocated = Vec::new();
+        let mut handles = Vec::new();
+        for kind in [CounterKind::Event, CounterKind::Gauge] {
+            let counter = manager.allocate(kind.type_id(), "application").unwrap();
+            let inner = cells
+                .counter(counter.index(), counter.registration_id())
+                .unwrap();
+            allocated.push(counter);
+            handles.push(ClientCounterHandle::new(
+                inner,
+                Arc::new(CounterReleases::default()),
+                None,
+            ));
+        }
+        let (events, gauge) = (&handles[0], &handles[1]);
+        let (total, operations) = karyos_sys::alloc_count::count(|| {
+            let _ = events.increment(3);
+            events.increment(4)
+        });
+        assert_eq!(total, Ok(7));
+        assert_eq!(operations, 0, "an increment allocated or freed");
+        let ((), operations) = karyos_sys::alloc_count::count(|| gauge.set(9));
+        assert_eq!(operations, 0, "a set allocated or freed");
+        for (handle, value) in [(events, 7), (gauge, 9)] {
+            let karyos_sys::counters::CellRead::Allocated { value: read, .. } =
+                reader.read(handle.cell())
+            else {
+                panic!("not allocated");
+            };
+            assert_eq!(read, value);
+        }
     }
 }

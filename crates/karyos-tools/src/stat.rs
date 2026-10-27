@@ -22,7 +22,7 @@ use std::fmt::Write as _;
 
 use karyos_sys::counters::{
     CellRead, CounterMetadata, CountersReader, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER,
-    PassRead, TYPE_POSITION, read_pass,
+    PassRead, TYPE_APPLICATION_EVENT, TYPE_APPLICATION_GAUGE, TYPE_POSITION, read_pass,
 };
 use karyos_sys::host_clock::age_ns;
 
@@ -221,8 +221,19 @@ pub fn report(counters: &CountersReader, client_counters: &CountersReader, now: 
     // its client names it; one keyed to a participant names that
     // registration.
     let mut clients: BTreeMap<(u8, u64, u64), Group> = BTreeMap::new();
+    let mut applications: BTreeMap<u64, Group> = BTreeMap::new();
     for (metadata, value) in read_cells(client_counters) {
         let keys = metadata.keys;
+        if matches!(
+            metadata.type_id,
+            TYPE_APPLICATION_EVENT | TYPE_APPLICATION_GAUGE
+        ) {
+            applications
+                .entry(keys.participant)
+                .or_default()
+                .push((label(&metadata), value));
+            continue;
+        }
         clients
             .entry((keys.kind, keys.participant, keys.stream))
             .or_default()
@@ -239,6 +250,18 @@ pub fn report(counters: &CountersReader, client_counters: &CountersReader, now: 
             _ => "participant",
         };
         let _ = writeln!(out, "  {owner} {participant} stream {stream}:");
+        for (label, value) in counters {
+            let _ = writeln!(out, "    {label:<40} {value}");
+        }
+    }
+
+    // R-CORE-3: the counters applications registered, by client.
+    let _ = writeln!(out, "application counters:");
+    if applications.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    }
+    for (client, counters) in &applications {
+        let _ = writeln!(out, "  client {client}:");
         for (label, value) in counters {
             let _ = writeln!(out, "    {label:<40} {value}");
         }
@@ -322,7 +345,10 @@ mod tests {
             .find(|line| line.starts_with("    subscriber position generation 0 cell "))
             .unwrap_or_else(|| panic!("{text}"));
         assert!(subscriber.ends_with("position 0 lag 480"), "{subscriber}");
-        assert!(text.ends_with("client counters:\n  (none)\n"), "{text}");
+        assert!(
+            text.ends_with("client counters:\n  (none)\napplication counters:\n  (none)\n"),
+            "{text}"
+        );
     }
 
     /// The sample's age in nanoseconds, as a report prints it.

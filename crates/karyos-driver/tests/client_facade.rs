@@ -16,12 +16,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use karyos_client::{
-    Client, ClientConductor, ClientError, Context, IdleStrategy, MessageLimit, OfferError,
+    Client, ClientConductor, ClientError, ConductorError, Context, CounterKind, IdleStrategy,
+    MessageLimit, OfferError,
 };
 use karyos_driver::agents::ThreadingMode;
 use karyos_driver::net::NetworkConfig;
 use karyos_driver::{DriverConfig, EmbeddedDriver};
-use karyos_protocol::cnc::StreamId;
+use karyos_protocol::cnc::{ErrorCode, StreamId};
+use karyos_sys::counters::{TYPE_APPLICATION_EVENT, TYPE_APPLICATION_GAUGE};
 
 /// An in-process driver driven on its own thread until dropped.
 struct Driven {
@@ -2350,5 +2352,113 @@ fn a_network_image_is_closed_by_its_copied_policy() {
             break;
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The cells of the client counters region that hold an allocation.
+fn allocated(driver: &EmbeddedDriver) -> Vec<karyos_sys::counters::CounterMetadata> {
+    let reader = driver.client_counters();
+    (0..reader.capacity())
+        .filter_map(|cell| match reader.read(cell) {
+            karyos_sys::counters::CellRead::Allocated { metadata, .. } => Some(metadata),
+            _ => None,
+        })
+        .collect()
+}
+
+/// R-CORE-3: an application registers a named counter without a stream,
+/// keyed to its client, of its kind's type id; the label is written as
+/// given, and one too long is refused before anything is requested.
+#[test]
+fn an_application_registers_counters_without_a_stream() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    let longest = "l".repeat(64);
+    let (orders, depth, full, refused) = serve(&mut driver, || {
+        let orders = client.add_counter("orders processed", CounterKind::Event);
+        let depth = client.add_counter("queue depth", CounterKind::Gauge);
+        let full = client.add_counter(&longest, CounterKind::Event);
+        let refused = client.add_counter(&"l".repeat(65), CounterKind::Event);
+        (
+            orders.unwrap(),
+            depth.unwrap(),
+            full.unwrap(),
+            refused.err(),
+        )
+    });
+    assert_eq!(
+        refused,
+        Some(ClientError::Conductor(ConductorError::LabelTooLong))
+    );
+    assert_eq!(orders.increment(5), Ok(5));
+    assert_eq!(orders.increment(2), Ok(7));
+    depth.set(11);
+    let reader = driver.client_counters();
+    for (handle, type_id, label, value) in [
+        (&orders, TYPE_APPLICATION_EVENT, "orders processed", 7),
+        (&depth, TYPE_APPLICATION_GAUGE, "queue depth", 11),
+        (&full, TYPE_APPLICATION_EVENT, longest.as_str(), 0),
+    ] {
+        let karyos_sys::counters::CellRead::Allocated {
+            metadata,
+            value: read,
+            ..
+        } = reader.read(handle.cell())
+        else {
+            panic!("{label}: not allocated");
+        };
+        assert_eq!(metadata.type_id, type_id, "{label}");
+        assert_eq!(metadata.label(), label.as_bytes());
+        assert_eq!(metadata.keys.stream, 0, "{label}");
+        assert_eq!(
+            metadata.keys.kind,
+            karyos_sys::counters::KIND_CLIENT,
+            "{label}"
+        );
+        assert_eq!(read, value, "{label}");
+    }
+}
+
+/// R-CORE-3: the bound is the driver's `max_counters_per_client`, 64 by
+/// default and shared with the client's other counters; the 65th is
+/// refused with a typed error. A client that goes frees every cell it
+/// held, so the region does not leak across its lifetime.
+#[test]
+fn the_65th_counter_is_refused_and_a_client_that_goes_frees_its_cells() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    assert!(allocated(&driver).is_empty());
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    let (handles, refused) = serve(&mut driver, || {
+        let handles: Vec<_> = (0..64)
+            .map(|index| {
+                client
+                    .add_counter(&format!("application {index}"), CounterKind::Event)
+                    .unwrap()
+            })
+            .collect();
+        let refused = client.add_counter("one too many", CounterKind::Gauge);
+        (handles, refused.err())
+    });
+    assert!(
+        matches!(
+            refused,
+            Some(ClientError::Refused {
+                code: ErrorCode::ResourcesUnavailable,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(allocated(&driver).len(), 64);
+    drop(handles);
+    drop(client);
+    let start = Instant::now();
+    while !allocated(&driver).is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{} cells still held",
+            allocated(&driver).len()
+        );
+        let _ = driver.do_work().unwrap();
     }
 }

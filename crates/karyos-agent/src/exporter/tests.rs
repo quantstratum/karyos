@@ -58,7 +58,19 @@ fn view() -> AgentView {
                 }],
             }],
         }),
-        client_counters: vec![counter("messages", TYPE_EVENT, 3)],
+        client_counters: vec![
+            counter("messages", TYPE_EVENT, 3),
+            Counter {
+                kind: karyos_sys::counters::KIND_CLIENT,
+                participant: 11,
+                ..counter("orders \"filled\"\nby desk", TYPE_APPLICATION_EVENT, 42)
+            },
+            Counter {
+                kind: karyos_sys::counters::KIND_CLIENT,
+                participant: 11,
+                ..counter("queue\\depth", TYPE_APPLICATION_GAUGE, 7)
+            },
+        ],
         errors: Feed::default(),
         losses: Feed::default(),
         guards: Feed::default(),
@@ -290,6 +302,39 @@ fn the_exposition_parses_and_each_counter_keeps_its_type() {
         ),
         (0.0, 1.0)
     );
+}
+
+/// R-CORE-3: an application counter has its own family, labelled with its
+/// name as given, quotes, backslashes and newlines escaped, and its client;
+/// it is not repeated among the client's CnC counters.
+#[test]
+fn application_counters_have_their_own_families_and_escaped_names() {
+    let families = parse(&render(&view()));
+    let (kind, events) = &families["karyos_application_events_total"];
+    assert_eq!(kind, "counter");
+    assert_eq!(events.len(), 1);
+    let (labels, value) = &events[0];
+    assert_eq!(label(labels, "name"), Some("orders \"filled\"\nby desk"));
+    assert_eq!(label(labels, "client"), Some("11"));
+    assert_eq!(*value, 42.0);
+    let (kind, gauges) = &families["karyos_application_gauge"];
+    assert_eq!(kind, "gauge");
+    assert_eq!(label(&gauges[0].0, "name"), Some("queue\\depth"));
+    assert_eq!(gauges[0].1, 7.0);
+    let text = render(&view());
+    assert!(
+        text.contains(r#"name="orders \"filled\"\nby desk",client="11"} 42"#),
+        "{text}"
+    );
+    for family in ["karyos_events_total", "karyos_gauge", "karyos_value"] {
+        assert!(
+            families[family]
+                .1
+                .iter()
+                .all(|(labels, _)| label(labels, "participant") != Some("11")),
+            "{family}"
+        );
+    }
 }
 
 #[test]

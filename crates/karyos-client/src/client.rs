@@ -84,6 +84,7 @@ use crate::conductor::{
     ClientConductor, Completion, ConductorError, ConductorPoll, EVENT_QUEUE, Outcome,
 };
 use crate::conflated_subscription::{ConflatedOptions, ConflatedSubscription};
+use crate::counter::{ClientCounterHandle, CounterKind};
 use crate::error::ClientError;
 use crate::publication::ClientPublication;
 use crate::subscription::{
@@ -612,6 +613,17 @@ pub trait Connection: sealed::Sealed {
         options: ConflatedOptions,
     ) -> Result<ConflatedSubscription, ClientError>;
 
+    /// Requests a client counter cell of `type_id` with `label`, keyed to
+    /// `stream` and `participant` (0 for none).
+    #[doc(hidden)]
+    fn allocate_counter(
+        &mut self,
+        type_id: u64,
+        label: &str,
+        stream: u64,
+        participant: u64,
+    ) -> Result<u64, ConductorError>;
+
     /// Releases what a late answer granted; whether it granted anything.
     #[doc(hidden)]
     fn release(&mut self, outcome: Outcome) -> bool;
@@ -771,6 +783,16 @@ impl Connection for ClientConductor {
 
     fn add_conflated_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
         ClientConductor::add_conflated_subscription(self, stream)
+    }
+
+    fn allocate_counter(
+        &mut self,
+        type_id: u64,
+        label: &str,
+        stream: u64,
+        participant: u64,
+    ) -> Result<u64, ConductorError> {
+        ClientConductor::allocate_counter(self, type_id, label, stream, participant)
     }
 
     fn conflated_subscription(
@@ -953,6 +975,16 @@ impl Connection for crate::ipc::RemoteClient {
 
     fn add_conflated_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
         crate::ipc::RemoteClient::add_conflated_subscription(self, stream)
+    }
+
+    fn allocate_counter(
+        &mut self,
+        type_id: u64,
+        label: &str,
+        stream: u64,
+        participant: u64,
+    ) -> Result<u64, ConductorError> {
+        crate::ipc::RemoteClient::allocate_counter(self, type_id, label, stream, participant)
     }
 
     fn conflated_subscription(
@@ -1698,6 +1730,47 @@ impl<C: Connection> Client<C> {
         match self.wait(sequence)? {
             Found::Outcome(outcome) => self.connection.conflated_subscription(*outcome, options),
             // Only a network subscription's grant is one.
+            Found::Network(..) => Err(ClientError::Unknown),
+        }
+    }
+
+    /// Registers an application counter named `label` (R-CORE-3): a cell of
+    /// the driver's client counters region, keyed to this client and to no
+    /// stream, of `kind`'s type id. The management agent, its Prometheus
+    /// endpoint and `karyos-stat` show it with its label. It lives until the
+    /// handle is released or dropped, and at the latest until this client
+    /// goes, when the driver frees the cells it still holds.
+    ///
+    /// The bound is the driver's `max_counters_per_client` (64 by default),
+    /// shared with every other counter of this client, such as those of
+    /// its conflated views: an application counter takes one of those
+    /// cells, and past the bound registration is refused.
+    ///
+    /// Updating the counter ([`ClientCounterHandle::increment`],
+    /// [`ClientCounterHandle::set`]) writes the cell directly: it allocates
+    /// nothing and does not go through the driver's conductor.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Conductor`] with `ConductorError::LabelTooLong` for a
+    /// label of more than 64 bytes, before anything is requested: a label is
+    /// never truncated; [`ClientError::Refused`] with
+    /// `ErrorCode::ResourcesUnavailable` past the bound or when the region
+    /// has no free cell; [`ClientError::Timeout`], and the other
+    /// [`ClientError::Conductor`] errors.
+    pub fn add_counter(
+        &mut self,
+        label: &str,
+        kind: CounterKind,
+    ) -> Result<ClientCounterHandle, ClientError> {
+        let sequence = self
+            .connection
+            .allocate_counter(kind.type_id(), label, 0, 0)?;
+        match self.wait(sequence)? {
+            Found::Outcome(outcome) => match *outcome {
+                Outcome::Counter(handle) => Ok(handle),
+                other => Err(refusal(&other)),
+            },
             Found::Network(..) => Err(ClientError::Unknown),
         }
     }
