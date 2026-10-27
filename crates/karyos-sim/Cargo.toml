@@ -21,6 +21,9 @@ karyos-cluster.workspace = true
 [dev-dependencies]
 # The scripted sockets of the timed scenarios (tests/timed.rs).
 karyos-io = { workspace = true, features = ["test-hooks"] }
+# The read pause points of the stall test with an asynchronous Archive
+# (tests/stall_isolation_archive.rs).
+karyos-sys = { workspace = true, features = ["test-hooks"] }
 
 [lints]
 workspace = true
