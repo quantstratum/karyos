@@ -36,6 +36,7 @@ pub const TRAILER_WORDS: usize = 2 * STRIDE;
 /// Bytes of a command ring region's structure for `capacity` bytes of data
 /// (R-CORE-34): the size it is created with, after the region header.
 /// `None` for a capacity it refuses.
+#[cfg(not(loom))]
 #[must_use]
 pub fn structure_length(capacity: usize) -> Option<usize> {
     crate::cnc_store::ring_structure_length(capacity, MIN_CAPACITY, TRAILER_WORDS)
