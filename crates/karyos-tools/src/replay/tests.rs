@@ -1636,3 +1636,176 @@ fn both_names_run_the_same_diff() {
         "karyos-replay: unknown option --bogus (karyos-replay diff --help for the usage)\n"
     );
 }
+
+/// karyos#675: the comparison excludes nothing at compare time, so an
+/// exclusion cannot widen unnoticed. A change of any recorded field of the
+/// input event diverges as `input event`, the trace extension included (an
+/// input recorded with the message, and not excluded in version 1); a
+/// change of any recorded field of an observation diverges at it, as
+/// `output intent` when an offer's length and digest differ and as
+/// `observation` otherwise. The excluded metadata of recording-group-
+/// records.md (the `&'static str` reasons, error detail below one level)
+/// has no field in a version 1 record, so it cannot make two journals
+/// differ.
+#[test]
+fn test_replay_diff_every_recorded_field_diverges_and_nothing_is_excluded() {
+    static EXTENSION: [u8; 64] = [7; 64];
+    let input = |change: fn(&mut MessageEvent<'static>)| {
+        let mut records = recorded();
+        let GroupRecord::Message(event) = &mut records[0] else {
+            panic!("the first record is a message");
+        };
+        change(event);
+        records
+    };
+    let inputs: [(&str, Vec<GroupRecord<'static>>); 11] = [
+        ("logical_time", input(|e| e.logical_time += 1)),
+        ("incarnation", input(|e| e.incarnation += 1)),
+        ("position", input(|e| e.position += 32)),
+        ("extent", input(|e| e.extent += 32)),
+        ("stream_id", input(|e| e.stream_id += 1)),
+        ("session_id", input(|e| e.session_id += 1)),
+        ("lane", input(|e| e.lane = Lane::try_new(1).unwrap())),
+        ("reserved_value", input(|e| e.reserved_value += 1)),
+        ("end_of_stream", input(|e| e.end_of_stream = true)),
+        ("payload", input(|e| e.payload = Payload::Inline(b"z"))),
+        ("extension", input(|e| e.extension = Some(&EXTENSION))),
+    ];
+    for (field, right) in inputs {
+        let report = run(&recorded(), &right, |_| {});
+        assert!(
+            matches!(
+                report,
+                Report::Diverged {
+                    group_seq: 1,
+                    index: None,
+                    kind: Kind::InputEvent,
+                    ..
+                }
+            ),
+            "{field}: {report:?}"
+        );
+    }
+    let observation = |change: fn(&mut OutcomeObservation)| {
+        let mut records = recorded();
+        let GroupRecord::Outcome(outcome) = &mut records[1] else {
+            panic!("the second record is an offer");
+        };
+        change(outcome);
+        records
+    };
+    let observations: [(&str, Vec<GroupRecord<'static>>, Kind); 5] = [
+        (
+            "stream_id",
+            observation(|o| o.stream_id += 1),
+            Kind::Observation,
+        ),
+        (
+            "session_id",
+            observation(|o| o.session_id += 1),
+            Kind::Observation,
+        ),
+        (
+            "outcome",
+            observation(|o| {
+                o.outcome = Outcome::Accepted {
+                    lane: Lane::ZERO,
+                    position: 64,
+                };
+            }),
+            Kind::Observation,
+        ),
+        ("length", observation(|o| o.length += 1), Kind::OutputIntent),
+        ("crc32c", observation(|o| o.crc32c ^= 1), Kind::OutputIntent),
+    ];
+    for (field, right, kind) in observations {
+        let report = run(&recorded(), &right, |_| {});
+        let Report::Diverged {
+            group_seq,
+            index,
+            kind: found,
+            ..
+        } = &report
+        else {
+            panic!("{field}: {report:?}");
+        };
+        assert_eq!((*group_seq, *index, *found), (1, Some(0), kind), "{field}");
+    }
+}
+
+/// karyos#675: with several differences, the first is the one reported:
+/// the lowest `group_seq` across events, and within an event the lowest
+/// observation index.
+#[test]
+fn test_replay_diff_of_several_differences_reports_the_first() {
+    // Event 1's offer and event 2's schedule both differ: event 1's.
+    let mut right = recorded();
+    right[1] = offer(1, 0, b"out 2");
+    right[4] = schedule(2, 0, 101);
+    let report = run(&recorded(), &right, |_| {});
+    assert!(
+        matches!(
+            report,
+            Report::Diverged {
+                group_seq: 1,
+                index: Some(0),
+                kind: Kind::OutputIntent,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    // Event 2's schedule and event 3's input both differ: event 2's.
+    let mut right = recorded();
+    right[4] = schedule(2, 0, 101);
+    right[6] = message(3, Payload::Inline(b"d"));
+    let report = run(&recorded(), &right, |_| {});
+    assert!(
+        matches!(
+            report,
+            Report::Diverged {
+                group_seq: 2,
+                index: Some(0),
+                kind: Kind::Observation,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    // One event with two offers, both different: the first offer's.
+    let two = |first: &'static [u8], second: &'static [u8]| {
+        vec![
+            message(1, Payload::Inline(b"a")),
+            offer(1, 0, first),
+            offer(1, 1, second),
+            end(1, 2, EndOutcome::Complete),
+        ]
+    };
+    let report = run(&two(b"x", b"y"), &two(b"x2", b"y2"), |_| {});
+    assert!(
+        matches!(
+            report,
+            Report::Diverged {
+                group_seq: 1,
+                index: Some(0),
+                kind: Kind::OutputIntent,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    // Only the second differs: its index is reported.
+    let report = run(&two(b"x", b"y"), &two(b"x", b"y2"), |_| {});
+    assert!(
+        matches!(
+            report,
+            Report::Diverged {
+                group_seq: 1,
+                index: Some(1),
+                kind: Kind::OutputIntent,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+}
