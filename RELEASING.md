@@ -48,3 +48,12 @@ it, with the Miri version.
 
 A gate that fails gets an issue of its own, linked from its row; the
 fix is not folded into the pull request that records the evidence.
+
+## After the tag
+
+After a release is tagged, its release notes on `main` only gain dated
+Evidence rows and dated errata below the Evidence table; published rows
+and statements are never rewritten. Behaviour corrections go in
+`CHANGELOG.md`. Decided 2026-10-27 by QS-COORDINATOR under owner
+delegation (Joaquín, 2026-10-26),
+[karyos#758](https://github.com/quantstratum/karyos/pull/758).
