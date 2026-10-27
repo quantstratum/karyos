@@ -616,7 +616,11 @@ impl<S: FeedSequencer> Arbiter<S> {
     /// `position` (a snapshot's): deliveries resume after it. Held messages
     /// of another epoch, or at or before the position, are discarded and
     /// counted; held ones after it stay and are delivered in order once
-    /// contiguous. An open hole is not declared a gap by the resync.
+    /// contiguous. An open hole is not declared a gap by the resync. A
+    /// position below the buffer's anchor (an awaiting arbiter's first
+    /// message seen) leaves the sequences between them, whose copies
+    /// already counted as late, as a hole that both lines have passed: it
+    /// is reported as a gap at once.
     pub fn resync<F: FnMut(Event<'_>)>(&mut self, position: Identity, now: u64, mut emit: F) {
         let next = self.space.add(position.sequence, 1);
         if self.pending.take().is_some() {
