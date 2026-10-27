@@ -1524,6 +1524,9 @@ impl<O: BufferOwner> SenderRead<O> {
             release_loan(&cell.loan);
             return Err(ReadError::Unavailable { lowest: floor });
         }
+        // A test pause with the loan held (`test-hooks`).
+        #[cfg(feature = "test-hooks")]
+        crate::test_pause::reached(crate::test_pause::PausePoint::LaneReadLoanHeld);
         // Steps 4 and 5 under the loan; step 6 releases it, on every path,
         // through the cell it was taken in.
         let copied = Self::copy(

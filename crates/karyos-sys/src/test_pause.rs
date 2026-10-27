@@ -38,6 +38,12 @@ pub enum PausePoint {
     /// inside its copy, for the stall tests across processes (SPEC.md §13,
     /// Stall isolation and capacity).
     ReadLoanHeld = 5,
+    /// A lane reader's read (`SenderRead::read_committed`, the network
+    /// sender's and an Archive recording's) holds its loan, after the floor
+    /// check and before the copy: a recording paused inside its copy, for
+    /// the stall tests with an asynchronous Archive (SPEC.md §13, Stall
+    /// isolation and capacity; karyos#673).
+    LaneReadLoanHeld = 6,
 }
 
 #[cfg(not(loom))]

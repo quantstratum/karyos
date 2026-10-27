@@ -24,6 +24,16 @@ release may break APIs, wire formats and shared-memory layouts.
   schema 1. An Archive that does not know schema 4 answers code 5, which
   `DurableQuery` reports as unsupported, never as a durable position.
   `Described` gains `durable`.
+- SPEC.md §13 "Stall isolation and capacity" with the asynchronous
+  Archive among the stalled holders (karyos#673):
+  `karyos-sim/tests/stall_isolation_archive.rs` pauses two optional
+  readers, an observer and an `async` Archive recording inside their
+  copies, loans held, with a paused claim, while a publisher runs ten
+  terms: no back pressure, quarantined slots within `S`, an extra
+  admission refused, and every holder, the recording included, reads the
+  held bytes unchanged and is then lapped. `karyos-sys` gains the
+  `test-hooks` pause point `PausePoint::LaneReadLoanHeld`, inside a lane
+  reader's read with its loan held.
 - `RELEASING.md` lists the gates a release runs, as the 0.1.0-alpha.2
   Evidence table records them, and how each result is recorded.
   `make loom-full` is now required at every release head, not only on
