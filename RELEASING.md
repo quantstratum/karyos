@@ -28,7 +28,7 @@ release gate.
 
 ## Release gates
 
-The gates the 0.1.0-alpha.2 Evidence table records, in that order:
+The gates the 0.1.0-alpha.2 Evidence table records, and `make loom-full`:
 
 | Gate | Command | Platform |
 | --- | --- | --- |
