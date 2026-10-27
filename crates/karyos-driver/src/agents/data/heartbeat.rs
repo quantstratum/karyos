@@ -66,6 +66,9 @@ impl<T: StreamTerms> Outbound<T> {
         now: u64,
         interval: u64,
     ) -> Option<u32> {
+        if self.fanout.is_some() {
+            return self.serve_fanout_heartbeats(tx, now, interval);
+        }
         if self.removing() {
             return Some(0);
         }

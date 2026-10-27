@@ -356,6 +356,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     picked: Vec<(TraceExtension, u64)>,
     /// The redundant paths of a routed publication ([`Outbound::new_routed`]).
     routed: Option<Box<routed::Routed>>,
+    /// The destinations of a multi-destination publication
+    /// ([`Outbound::set_destinations`]).
+    fanout: Option<Box<fanout::Fanout>>,
     /// Per lane, since when it submitted no DATA nor heartbeat: its idle
     /// heartbeat is due `sender_heartbeat_interval` later (SPEC §6).
     idle_since: [Option<u64>; 4],
@@ -566,6 +569,7 @@ impl<T: StreamTerms> Outbound<T> {
                     .ok_or(OutboundError::Mtu)?,
             ),
             routed: None,
+            fanout: None,
             route: None,
             idle_since: [None; 4],
             removal: None,
@@ -1226,6 +1230,10 @@ impl<T: StreamTerms> Outbound<T> {
             routed.opened_resources(self.repair.as_deref(), &mut held);
             return;
         }
+        if let Some(fanout) = self.fanout.as_deref() {
+            fanout.opened_resources(self.endpoint, &mut held);
+            return;
+        }
         let (Some(epoch), Some(route)) = (self.opened, self.route) else {
             return;
         };
@@ -1362,6 +1370,9 @@ impl<T: StreamTerms> Outbound<T> {
         now: u64,
         mut hook: Option<&mut (dyn NetworkTraceHook + 'static)>,
     ) -> Result<u32, AgentError> {
+        if self.fanout.is_some() {
+            return self.serve_fanout(tx, budget, consumption, now);
+        }
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         if !self.open(tx) {
             // No queues this cycle, but a guard close still applies.
@@ -2349,9 +2360,12 @@ pub(crate) struct Opened {
     pub(crate) queues: [Option<TxQueueId>; OPENED_QUEUES],
 }
 
+mod fanout;
 mod heartbeat;
 mod removal;
 mod routed;
+
+pub use fanout::{MAX_DESTINATIONS, TargetCounters};
 
 pub use routed::{MAX_PATH_BACKOFF, MAX_PATH_COPY_ENTRIES, PathCounters, PathPolicy};
 

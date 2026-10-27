@@ -520,6 +520,14 @@ pub struct Membership {
     required_joined: Vec<bool>,
     /// Whether each required receiver was reported not joined.
     required_reported: Vec<bool>,
+    /// The required destinations of a multi-destination publication, by
+    /// endpoint (MD-11, MD-17; karyos#630): a member whose binding source
+    /// is one of them is required.
+    required_sources: Vec<SocketAddr>,
+    /// Whether each required destination has joined (parallel).
+    required_sources_joined: Vec<bool>,
+    /// Whether each one's missing join was counted (parallel).
+    required_sources_reported: Vec<bool>,
     tags: Vec<(u64, u64)>,
     sent_high: [u64; MAX_LANES],
     created: u64,
@@ -596,12 +604,55 @@ impl Membership {
             required: roles.required.to_vec(),
             required_joined: vec![false; roles.required.len()],
             required_reported: vec![false; roles.required.len()],
+            required_sources: Vec::new(),
+            required_sources_joined: Vec::new(),
+            required_sources_reported: Vec::new(),
             tags: roles.tags.to_vec(),
             sent_high: [0; MAX_LANES],
             created: now,
             cursor: 0,
             events,
             counters: MembershipCounters::default(),
+        })
+    }
+
+    /// Makes the receivers at `sources` required, as a multi-destination
+    /// publication names its required destinations by endpoint (control
+    /// path, before the first SM; karyos#630). Their joins gate admission
+    /// like configured required receiver ids.
+    pub fn set_required_sources(&mut self, sources: &[SocketAddr]) {
+        self.required_sources = sources.to_vec();
+        self.required_sources_joined = vec![false; sources.len()];
+        self.required_sources_reported = vec![false; sources.len()];
+    }
+
+    /// Whether an active member bound to `source` is live at `now`: a
+    /// multi-destination publication's destination at that address gets
+    /// copies (MD-16).
+    #[must_use]
+    pub fn live_at(&self, source: SocketAddr, now: u64) -> bool {
+        self.member_at(source, now).is_some()
+    }
+
+    /// The edge of `lane` of the live active member bound to `source` at
+    /// `now`: a destination's own edge (MD-1).
+    #[must_use]
+    pub fn edge_at(&self, source: SocketAddr, lane: Lane, now: u64) -> Option<u64> {
+        self.member_at(source, now)?
+            .edges
+            .get(usize::from(lane.get()))
+            .copied()
+    }
+
+    fn member_at(&self, source: SocketAddr, now: u64) -> Option<&Entry> {
+        self.entries.iter().find(|entry| {
+            entry.state == State::Active
+                && self.live(entry, now)
+                && entry
+                    .bindings
+                    .iter()
+                    .flatten()
+                    .any(|(_, bound)| *bound == source)
         })
     }
 
@@ -668,7 +719,8 @@ impl Membership {
             return Err(self.reject(StatusRejected::Identity));
         }
         let receiver = key.receiver;
-        let required = self.is_required(receiver.receiver_id);
+        let required =
+            self.is_required(receiver.receiver_id) || self.is_required_source(key.source);
         // A new establishment lifts the receiver's tombstone, once the
         // pending and table limits pass: the next SM joins.
         let mut lift = None;
@@ -718,7 +770,7 @@ impl Membership {
         if key.receiver != sm.receiver || key.identity != sm.identity || key.alias != sm.alias {
             return StatusOutcome::Rejected(self.reject(StatusRejected::Key));
         }
-        match self.try_status(sm, now) {
+        match self.try_status(sm, key.source, now) {
             Ok(outcome) => {
                 if let StatusOutcome::Accepted { member, .. } = outcome {
                     self.bind(usize::from(member.slot), key);
@@ -777,6 +829,7 @@ impl Membership {
     fn try_status(
         &mut self,
         sm: &StatusMessage,
+        source: SocketAddr,
         now: u64,
     ) -> Result<StatusOutcome, StatusRejected> {
         if sm.identity != self.identity || sm.alias != self.alias {
@@ -789,7 +842,7 @@ impl Membership {
         if sm.group_tag != self.tag_of(id) {
             return Err(StatusRejected::Tag);
         }
-        let required = self.is_required(id);
+        let required = self.is_required(id) || self.is_required_source(source);
         let mut found = self.find(sm.receiver);
         let mut tombstone = None;
         if let Some(slot) = found {
@@ -913,6 +966,11 @@ impl Membership {
             {
                 *joined = true;
             }
+            if let Some(at) = self.required_sources.iter().position(|r| *r == source)
+                && let Some(joined) = self.required_sources_joined.get_mut(at)
+            {
+                *joined = true;
+            }
             self.event(MemberEvent::Joined {
                 member,
                 receiver: sm.receiver,
@@ -1018,7 +1076,9 @@ impl Membership {
     pub fn admission(&self, now: u64) -> Admission {
         if self.lost(now) {
             Admission::LostRequired
-        } else if self.required_joined.iter().all(|joined| *joined) {
+        } else if self.required_joined.iter().all(|joined| *joined)
+            && self.required_sources_joined.iter().all(|joined| *joined)
+        {
             Admission::Open
         } else {
             Admission::NotJoined
@@ -1069,6 +1129,34 @@ impl Membership {
                 let receiver_id = self.required.get(at).copied().unwrap_or(0);
                 self.counters.bump(|c| &mut c.not_joined);
                 self.event(MemberEvent::NotJoined { receiver_id });
+                let Some(next) = actions.checked_add(1) else {
+                    return actions;
+                };
+                actions = next;
+            }
+        }
+        if age_ns(now, self.created) >= self.config.join_timeout {
+            for at in 0..self.required_sources.len() {
+                if actions >= limit {
+                    return actions;
+                }
+                let joined = self
+                    .required_sources_joined
+                    .get(at)
+                    .copied()
+                    .unwrap_or(true);
+                let reported = self
+                    .required_sources_reported
+                    .get(at)
+                    .copied()
+                    .unwrap_or(true);
+                if joined || reported {
+                    continue;
+                }
+                if let Some(flag) = self.required_sources_reported.get_mut(at) {
+                    *flag = true;
+                }
+                self.counters.bump(|c| &mut c.not_joined);
                 let Some(next) = actions.checked_add(1) else {
                     return actions;
                 };
@@ -1348,6 +1436,10 @@ impl Membership {
 
     fn is_required(&self, receiver_id: u64) -> bool {
         self.required.contains(&receiver_id)
+    }
+
+    fn is_required_source(&self, source: SocketAddr) -> bool {
+        self.required_sources.contains(&source)
     }
 
     fn tag_of(&self, receiver_id: u64) -> u64 {

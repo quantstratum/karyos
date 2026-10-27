@@ -66,6 +66,11 @@ pub enum DriverError {
     /// on a publication: a tagged group is never 0.
     #[error("unsupported network channel")]
     UnsupportedChannel,
+    /// A multi-destination channel in `control-mode=dynamic`: refused until
+    /// dynamic registration is implemented and tested (ADR-0082;
+    /// karyos#644).
+    #[error("dynamic multi-destination registration is not supported yet")]
+    DynamicRegistrationUnsupported,
     /// A network publication's typed roles name another strategy than its
     /// channel's `fc`, the one source of the strategy (`min` without one;
     /// owner item 7, karyos#637).

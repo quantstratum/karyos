@@ -338,6 +338,10 @@ struct NetPublication {
 pub(crate) struct SenderChannel {
     /// Where it sends.
     pub(crate) destination: SocketAddr,
+    /// A multi-destination channel's destinations (empty otherwise).
+    pub(crate) destinations: Vec<SocketAddr>,
+    /// The required ones among them, by endpoint (MD-11).
+    pub(crate) required_destinations: Vec<SocketAddr>,
     /// The local address of each path's endpoint, the founding path first.
     pub(crate) binds: Vec<SocketAddr>,
     /// Whether it is reliable.
