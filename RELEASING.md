@@ -28,10 +28,16 @@ release gate.
 
 ## Changelog
 
-Before the release section of `CHANGELOG.md` is cut, run
+The author of the release pull request assembles the changelog, in that
+pull request, before the release section of `CHANGELOG.md` is cut: run
 `scripts/changelog-assemble.sh` on the release branch. It folds every
 fragment of `changelog.d/` into `[Unreleased]` and deletes them; commit
-both. Then rename `[Unreleased]` to the release's heading and open a new,
+both. The fold is deterministic: fragments in file name order, after the
+entries already in each section, and sections in Keep a Changelog order.
+That pull request is the only one that edits `CHANGELOG.md`, so its gate
+runs with `CHANGELOG_RELEASE=1 make pre-push`; for any other branch
+`make changelog-check` fails when it adds a line to `CHANGELOG.md`. Then
+rename `[Unreleased]` to the release's heading and open a new,
 empty `[Unreleased]` above it. Pull requests never edit `CHANGELOG.md`
 directly (`CONTRIBUTING.md`). Decided 2026-10-27 by QS-COORDINATOR under
 owner delegation (Joaquín, 2026-10-26).

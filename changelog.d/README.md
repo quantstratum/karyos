@@ -16,10 +16,15 @@ is one file, `changelog.d/<issue>-<slug>.md`, for example
 The file holds exactly one section header (`Added`, `Changed`,
 `Deprecated`, `Removed`, `Fixed` or `Security`) and the entries under it,
 written as they will read in `CHANGELOG.md`. A change with entries in two
-sections uses two files. `make changelog-check` validates the fragments,
-and `make pre-push` runs it.
+sections uses two files, both named after the issue
+(`634-refresh-cycles.md`, `634-refresh-cycles-fix.md`). A change with no
+issue does not get a fragment until it has one. `make changelog-check`,
+which `make pre-push` runs, rejects a fragment with another name or
+without exactly one header, and a branch that adds lines to
+`CHANGELOG.md` itself.
 
 At a release, `scripts/changelog-assemble.sh` folds the fragments into
-`[Unreleased]`, after the entries already there, and deletes them
+`[Unreleased]` in file name order, after the entries already there, and
+deletes them
 (`RELEASING.md`). Decided 2026-10-27 by QS-COORDINATOR under owner
 delegation (Joaquín, 2026-10-26).

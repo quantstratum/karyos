@@ -6,7 +6,14 @@
 # "### Added", "### Changed", "### Deprecated", "### Removed", "### Fixed"
 # or "### Security" header, then its entries. Fragments are appended after
 # the section's existing entries, in file name order, and the sections come
-# out in Keep a Changelog order. --check only validates the fragments.
+# out in Keep a Changelog order. The fold is deterministic: fragments in
+# file name order (C collation), sections in a fixed order.
+#
+# --check only validates: each fragment is named <issue>-<slug>.md (issue
+# number, then lowercase words joined by hyphens) and holds one section
+# header; and the branch adds no line to CHANGELOG.md compared with its
+# merge base with origin/main, unless CHANGELOG_RELEASE=1 (the release
+# pull request, RELEASING.md).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -15,6 +22,7 @@ if [[ ${1:-} == --check ]]; then
 	check=1
 fi
 
+export LC_ALL=C
 shopt -s nullglob
 fragments=(changelog.d/*.md)
 fragments=("${fragments[@]/#changelog.d\/README.md/}")
@@ -22,13 +30,28 @@ list=()
 for f in "${fragments[@]}"; do
 	[[ -n $f ]] && list+=("$f")
 done
+status=0
+if ((check)) && [[ ${CHANGELOG_RELEASE:-0} != 1 ]]; then
+	if base=$(git merge-base HEAD origin/main 2>/dev/null); then
+		added=$(git diff "$base" -- CHANGELOG.md | grep -c '^+[^+]' || true)
+		if ((added != 0)); then
+			echo "changelog-assemble: this branch adds $added line(s) to CHANGELOG.md; add a fragment in changelog.d/ instead (changelog.d/README.md)" >&2
+			status=1
+		fi
+	else
+		echo "changelog-assemble: no origin/main, CHANGELOG.md not compared" >&2
+	fi
+fi
 if ((${#list[@]} == 0)); then
 	echo "changelog-assemble: no fragments"
-	exit 0
+	exit "$status"
 fi
 
-status=0
 for f in "${list[@]}"; do
+	if ! [[ ${f#changelog.d/} =~ ^[0-9]+-[a-z0-9]+(-[a-z0-9]+)*\.md$ ]]; then
+		echo "changelog-assemble: $f must be named <issue>-<slug>.md" >&2
+		status=1
+	fi
 	headers=$(grep -c '^### ' "$f" || true)
 	first=$(grep -m1 -v '^[[:space:]]*$' "$f" || true)
 	if [[ $headers != 1 ]] || ! [[ $first =~ ^\#\#\#\ (Added|Changed|Deprecated|Removed|Fixed|Security)$ ]]; then
