@@ -46,6 +46,7 @@ use super::journal::{GroupJournal, JournalError};
 use super::prefix::{self, Coverage, DurableFor, PrefixError, PrefixTracker, PrefixView};
 use super::record::{Capture, CheckpointRecord, GroupRecord, ReferenceUnavailable, Role};
 use crate::disk::Disk;
+use crate::durable::{Durability, GroupDurable};
 use crate::segment::SyncPolicy;
 
 #[cfg(test)]
@@ -541,6 +542,20 @@ impl CaptureSender {
     #[must_use]
     pub(crate) fn closing(&self) -> bool {
         self.shared.closing.load(Ordering::Acquire)
+    }
+
+    /// The group's durable prefix now (R-CORE-12), a wait-free load.
+    #[must_use]
+    pub fn group_durable(&self) -> GroupDurable {
+        GroupDurable {
+            durable_group_seq: self.shared.view.durable_group_seq(),
+        }
+    }
+
+    /// Whether event `seq` is durable now, across ranges (R-CORE-12).
+    #[must_use]
+    pub fn durability(&self, seq: u64) -> Durability {
+        self.shared.view.durable_for(seq).into()
     }
 
     /// A waiter for durability, for threads other than the event loop's.

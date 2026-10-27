@@ -11,6 +11,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- R-CORE-12, the Archive's public durable-prefix acknowledgement
+  (quantstratum-docs: karyos/design/archive-durable-acknowledgement.md).
+  `karyos_archive::durable` answers a recording's `DurablePosition` (the
+  stream position below which every recorded byte is on storage, never
+  ahead of the last successful sync) and a recording group's
+  `GroupDurable` (its durable `group_seq`), as two separate types. In
+  process through `ArchiveHandle::durable_position` and
+  `CaptureSender::group_durable` and `durability`; remotely through
+  `DurableQuery`, over the control streams with schema 4 version 1
+  (`QueryDurable`, `DurablePosition`), a new schema beside the frozen
+  schema 1. An Archive that does not know schema 4 answers code 5, which
+  `DurableQuery` reports as unsupported, never as a durable position.
+  `Described` gains `durable`.
 - `RELEASING.md` lists the gates a release runs, as the 0.1.0-alpha.2
   Evidence table records them, and how each result is recorded.
   `make loom-full` is now required at every release head, not only on

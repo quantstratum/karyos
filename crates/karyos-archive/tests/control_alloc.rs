@@ -98,3 +98,25 @@ fn errors_allocate_nothing() {
     assert!(result);
     assert_eq!(allocations, 0);
 }
+
+/// Schema 4, the durability query (R-CORE-12): the same, on success and
+/// on an error path.
+#[test]
+fn durability_messages_allocate_nothing() {
+    use karyos_archive::durable::{DurabilityMessage, QueryDurable};
+    let mut out = [0u8; 64];
+    let query = DurabilityMessage::QueryDurable(QueryDurable {
+        correlation_id: 1,
+        recording_id: 7,
+    });
+    let (length, allocations) = count(|| query.encode(&mut out).unwrap());
+    assert_eq!(allocations, 0, "encode");
+    let (decoded, allocations) = count(|| DurabilityMessage::decode(&out[..length]).unwrap());
+    assert_eq!(allocations, 0, "decode");
+    assert_eq!(decoded, query);
+    for cut in 0..length {
+        let (result, allocations) = count(|| DurabilityMessage::decode(&out[..cut]).is_err());
+        assert!(result);
+        assert_eq!(allocations, 0, "truncated at {cut}");
+    }
+}

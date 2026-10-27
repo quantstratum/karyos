@@ -43,6 +43,7 @@ use crate::control::{
     self, ControlMessage, ControlResponse, MAX_CHANNEL, MAX_RESPONSE_MESSAGE, RecordingDescriptor,
     RecordingSignal, RecordingState, ReplayRate, ResponseCode, Signal,
 };
+use crate::durable::{self, DurabilityMessage, DurableAnswer, DurablePosition};
 use crate::recorder::{Ended, FrameSource};
 use crate::replay::{Rate, ReplayError};
 use crate::segment::Geometry;
@@ -212,6 +213,11 @@ enum Waiting {
         correlation_id: u64,
         replay_id: u64,
         answer: Posted<u64>,
+    },
+    /// A durability query (schema 4, R-CORE-12).
+    Durable {
+        correlation_id: u64,
+        answer: Posted<Described>,
     },
 }
 
@@ -389,11 +395,19 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
 
     /// Queues `message`; `false` when it did not encode.
     fn queue(&mut self, message: &ControlMessage<'_>) -> bool {
+        self.queue_encoded(|out| message.encode(out))
+    }
+
+    /// Queues the message `encode` writes, of any schema.
+    fn queue_encoded(
+        &mut self,
+        encode: impl FnOnce(&mut [u8]) -> Result<usize, CodecError>,
+    ) -> bool {
         let mut out = vec![0u8; MAX_ANSWER];
         // Every message the server builds is valid and fits: a failure is
         // a bug, and the message is counted and dropped rather than sent
         // malformed.
-        let Ok(length) = message.encode(&mut out) else {
+        let Ok(length) = encode(&mut out) else {
             count(&mut self.unencoded);
             return false;
         };
@@ -453,19 +467,13 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
     }
 
     fn serve_bytes(&mut self, bytes: &[u8], length: usize) -> Option<Waiting> {
+        if bytes.get(..2) == Some(&durable::SCHEMA_ID.to_le_bytes()[..]) {
+            return self.serve_durable(bytes);
+        }
         let message = match ControlMessage::decode(bytes) {
             Ok(message) => message,
             Err(error) => {
-                let correlation_id = bytes
-                    .get(12..20)
-                    .and_then(|id| <[u8; 8]>::try_from(id).ok())
-                    .map_or(0, u64::from_le_bytes);
-                let code = if matches!(error, CodecError::UnsupportedSchema { .. }) {
-                    ResponseCode::UnsupportedSchema
-                } else {
-                    ResponseCode::InvalidRequest
-                };
-                self.respond(correlation_id, 0, code, &error.to_string());
+                self.undecodable(bytes, &error);
                 return None;
             }
         };
@@ -512,6 +520,50 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 None
             }
         }
+    }
+
+    /// Serves a schema 4 message: a durability query is posted to the
+    /// agent; anything else is refused.
+    fn serve_durable(&mut self, bytes: &[u8]) -> Option<Waiting> {
+        match DurabilityMessage::decode(bytes) {
+            Ok(DurabilityMessage::QueryDurable(query)) => {
+                let correlation_id = query.correlation_id;
+                let posted = self.agent.post_describe(query.recording_id);
+                self.posted(correlation_id, posted, |answer| Waiting::Durable {
+                    correlation_id,
+                    answer,
+                })
+            }
+            Ok(DurabilityMessage::DurablePosition(DurableAnswer { correlation_id, .. })) => {
+                self.respond(
+                    correlation_id,
+                    0,
+                    ResponseCode::InvalidRequest,
+                    "not a request",
+                );
+                None
+            }
+            Err(error) => {
+                self.undecodable(bytes, &error);
+                None
+            }
+        }
+    }
+
+    /// Answers a request that does not decode: unsupported for an unknown
+    /// tuple, invalid otherwise, under the correlation id at bytes 12 to 19
+    /// (every request's first field).
+    fn undecodable(&mut self, bytes: &[u8], error: &CodecError) {
+        let correlation_id = bytes
+            .get(12..20)
+            .and_then(|id| <[u8; 8]>::try_from(id).ok())
+            .map_or(0, u64::from_le_bytes);
+        let code = if matches!(error, CodecError::UnsupportedSchema { .. }) {
+            ResponseCode::UnsupportedSchema
+        } else {
+            ResponseCode::InvalidRequest
+        };
+        self.respond(correlation_id, 0, code, &error.to_string());
     }
 
     /// The request waiting for `posted`'s answer, or refused now when it
@@ -738,6 +790,36 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 }
                 Some(Err(error)) => {
                     self.respond(correlation_id, 0, ResponseCode::Error, &error.to_string());
+                    true
+                }
+            },
+            Waiting::Durable {
+                correlation_id,
+                answer,
+            } => match answer.try_answer() {
+                None => self.wait(Waiting::Durable {
+                    correlation_id,
+                    answer,
+                }),
+                Some(Ok(described)) => {
+                    let answer = DurableAnswer {
+                        correlation_id,
+                        position: DurablePosition::of(&described),
+                    };
+                    // A position the codec refuses is a bug: answered as
+                    // an error, so the querier is never left waiting.
+                    if !self.queue_encoded(|out| answer.encode(out)) {
+                        self.respond(
+                            correlation_id,
+                            0,
+                            ResponseCode::Error,
+                            "the durable position does not encode",
+                        );
+                    }
+                    true
+                }
+                Some(Err(error)) => {
+                    self.refuse(correlation_id, &error);
                     true
                 }
             },

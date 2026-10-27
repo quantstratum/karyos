@@ -343,6 +343,18 @@ fn a_stop_without_a_sync_policy_is_durable() {
     settles_at_every_crash_point(SyncPolicy::None);
 }
 
+/// R-CORE-12, the crash rule of the durable acknowledgement
+/// (quantstratum-docs: karyos/design/archive-durable-acknowledgement.md,
+/// section 2): the durable position the store reports after each duty is
+/// what the Archive acknowledges (`ArchiveHandle::durable_position`).
+/// Under a policy that syncs every 5 duties, it lags what is written; at
+/// every crash point, what recovery finds is never behind the last
+/// acknowledged position, so an acknowledgement never got ahead of a sync.
+#[test]
+fn an_acknowledged_durable_position_survives_every_crash_point() {
+    settles_at_every_crash_point(SyncPolicy::Every { interval_ns: 5 });
+}
+
 fn settles_at_every_crash_point(policy: SyncPolicy) {
     let script = || {
         vec![
