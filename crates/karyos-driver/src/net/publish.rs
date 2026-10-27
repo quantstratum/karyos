@@ -536,6 +536,67 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .publication_admission(aggregate.registration())
     }
 
+    /// Adds the optional destination `destination` to the multi-destination
+    /// publication `aggregate` at run time (MD-3; ADR-0082; karyos#630):
+    /// it is announced to and joins at the sender's position, and a
+    /// receiver there NAKs what it missed. An optional destination moves by
+    /// [`EmbeddedDriver::remove_network_destination`] and this. The
+    /// sender answers through
+    /// [`EmbeddedDriver::take_network_destination_changes`]: refused for a
+    /// required destination (fixed at creation), one already present, one
+    /// removed less than `image_liveness_timeout` ago (MD-14), or a full
+    /// set.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NetworkUnavailable`], [`DriverError::InvalidConfig`]
+    /// for no such active network publication, [`DriverError::NetworkBusy`]
+    /// when the sender's ring is full (nothing changes; retry).
+    pub fn add_network_destination(
+        &mut self,
+        aggregate: &AggregateHandle,
+        destination: SocketAddr,
+    ) -> Result<(), DriverError> {
+        self.net
+            .as_mut()
+            .ok_or(DriverError::NetworkUnavailable)?
+            .change_destination(aggregate.registration(), destination, true)
+    }
+
+    /// Removes the optional destination `destination` of the
+    /// multi-destination publication `aggregate` at run time (MD-3): it is
+    /// sent nothing more, reported as removed by command
+    /// ([`EmbeddedDriver::network_removed_destinations`]), and quarantined
+    /// before it can be added again (MD-14). A required destination is
+    /// never removed (ADR-0082). Answered as
+    /// [`EmbeddedDriver::add_network_destination`].
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_network_destination`].
+    pub fn remove_network_destination(
+        &mut self,
+        aggregate: &AggregateHandle,
+        destination: SocketAddr,
+    ) -> Result<(), DriverError> {
+        self.net
+            .as_mut()
+            .ok_or(DriverError::NetworkUnavailable)?
+            .change_destination(aggregate.registration(), destination, false)
+    }
+
+    /// The sender's answers to the destination changes of `aggregate`,
+    /// oldest first (the latest `MAX_DESTINATIONS`), taken.
+    pub fn take_network_destination_changes(
+        &mut self,
+        aggregate: &AggregateHandle,
+    ) -> Vec<(SocketAddr, crate::agents::data::DestinationChange)> {
+        self.net
+            .as_mut()
+            .map(|net| net.take_destination_changes(aggregate.registration()))
+            .unwrap_or_default()
+    }
+
     /// The destinations the multi-destination publication `aggregate` has
     /// removed, in order, each with its reason: an optional destination
     /// whose queue was full (MD-7) or whose sends kept faulting (MD-12)

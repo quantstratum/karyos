@@ -451,3 +451,160 @@ fn a_retransmission_reaches_only_the_requester() {
     assert!(repairs(addresses[0]) >= 1, "{counters:?}");
     assert_eq!(repairs(addresses[1]), 0, "{counters:?}");
 }
+
+/// Pumps `a` and `receivers` until the sender answered one destination
+/// change of `publication`, which it returns.
+fn answer(
+    a: &mut EmbeddedDriver,
+    receivers: &mut [EmbeddedDriver],
+    publication: &crate::embedded::AggregateHandle,
+) -> (SocketAddr, crate::agents::data::DestinationChange) {
+    let mut answers = Vec::new();
+    let mut all: Vec<&mut EmbeddedDriver> =
+        std::iter::once(a).chain(receivers.iter_mut()).collect();
+    pump(&mut all, |drivers| {
+        answers = drivers[0].take_network_destination_changes(publication);
+        !answers.is_empty()
+    });
+    answers[0]
+}
+
+/// MD-3, MD-14: an optional destination moves by a removal and an
+/// addition at run time. The new one gets its own image and the messages
+/// from its join; the removed one is reported as removed by command and
+/// cannot come back before its quarantine.
+#[test]
+fn an_optional_destination_moves_by_removal_and_addition() {
+    use crate::agents::data::{DestinationChange, RemovalReason};
+
+    let mut a = driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers(3);
+    let (publication, _) = {
+        let (listed, _) = receivers.split_at_mut(2);
+        connect(
+            &mut a,
+            listed,
+            &destinations(&addresses[..2], false),
+            &[],
+            None,
+        )
+    };
+    a.remove_network_destination(&publication, addresses[0])
+        .unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (addresses[0], DestinationChange::Removed)
+    );
+    a.add_network_destination(&publication, addresses[2])
+        .unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (addresses[2], DestinationChange::Added)
+    );
+    // Back at once: still quarantined.
+    a.add_network_destination(&publication, addresses[0])
+        .unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (addresses[0], DestinationChange::Quarantined)
+    );
+    // The new destination gets its own image, and messages.
+    let mut image = None;
+    {
+        let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+            .chain(receivers.iter_mut())
+            .collect();
+        pump(&mut all, |drivers| {
+            image = drivers[3].network_image(10, 3);
+            image.is_some()
+        });
+    }
+    let mut reader = receivers[2]
+        .subscribe_aggregate(image.as_ref().unwrap(), Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+        .chain(receivers.iter_mut())
+        .collect();
+    pump(&mut all, |_| {
+        while sent < 64 {
+            match lane.offer(&sent.to_le_bytes()).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        seen == 64
+    });
+    let removed = a.network_removed_destinations(&publication);
+    assert!(
+        removed
+            .iter()
+            .any(|removal| removal.destination == addresses[0]
+                && removal.reason == RemovalReason::Command),
+        "{removed:?}"
+    );
+}
+
+/// ADR-0082: a required destination is fixed at creation. It is never
+/// removed or added at run time, and a restart of its receiver (a new boot
+/// at the same endpoint) is rejected: the old member is lost and the
+/// publication's admission is `LostRequired`.
+#[test]
+fn a_required_destination_neither_moves_nor_restarts() {
+    use crate::agents::data::DestinationChange;
+    use karyos_protocol::cnc::NetworkAdmission;
+
+    let mut a = super::fast_driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers(2);
+    let (publication, _) = connect(
+        &mut a,
+        &mut receivers,
+        &destinations(&addresses, false),
+        &addresses[..1],
+        None,
+    );
+    a.remove_network_destination(&publication, addresses[0])
+        .unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (addresses[0], DestinationChange::Required)
+    );
+    a.add_network_destination(&publication, addresses[0])
+        .unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (addresses[0], DestinationChange::Required)
+    );
+    // The required receiver restarts at the same endpoint: a new driver,
+    // a new boot id.
+    let old = receivers.remove(0);
+    drop(old);
+    let mut restarted = super::fast_driver(ThreadingMode::Shared);
+    let _ = restarted
+        .add_network_subscription(10, &channel(addresses[0], false))
+        .unwrap();
+    assert_eq!(bound(&restarted, 10), addresses[0], "the same endpoint");
+    receivers.insert(0, restarted);
+    let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+        .chain(receivers.iter_mut())
+        .collect();
+    pump(&mut all, |drivers| {
+        drivers[0].network_publication_admission(&publication)
+            == Some(NetworkAdmission::LostRequired)
+    });
+    // The restarted receiver is never readmitted in its place.
+    for _ in 0..2_000 {
+        for driver in all.iter_mut() {
+            let _ = driver.do_work().unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+    assert_eq!(
+        all[0].network_publication_admission(&publication),
+        Some(NetworkAdmission::LostRequired)
+    );
+}

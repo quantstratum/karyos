@@ -69,6 +69,33 @@ pub enum RemovalReason {
     Slow,
     /// Its sends faulted [`DESTINATION_FAULT_LIMIT`] times in a row (MD-12).
     Fault,
+    /// Removed by `RemoveDestination` (MD-3).
+    Command,
+}
+
+/// The outcome of a run-time destination change (MD-3, MD-14; ADR-0082).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DestinationChange {
+    /// The destination was added: it is announced to and joins as an
+    /// optional destination.
+    Added,
+    /// The destination was removed.
+    Removed,
+    /// Refused: the required destinations are fixed at creation (ADR-0082,
+    /// M4); a required one is never removed or added.
+    Required,
+    /// Refused: it is already a destination.
+    Present,
+    /// Refused: it is not a destination.
+    Absent,
+    /// Refused: it was removed less than its quarantine ago (MD-14).
+    Quarantined,
+    /// Refused: the publication has [`MAX_DESTINATIONS`] destinations.
+    Full,
+    /// Refused: no multi-destination publication by that name, or an
+    /// address of another family.
+    Unknown,
 }
 
 /// The most destinations of one publication (MD-6: `max_destinations`
@@ -121,6 +148,8 @@ pub(super) struct Target {
     removed: Option<(RemovalReason, u64)>,
     /// Its removal was reported to the conductor.
     reported: bool,
+    /// What its queues held at its removal was dropped.
+    cancelled: bool,
     /// Consecutive send faults (MD-12).
     faults: u8,
     /// A reliable publication's repair path toward it (MD-8).
@@ -165,6 +194,17 @@ pub(super) struct Fanout {
     /// The last serve met backpressure on the shared socket, or an
     /// inactive endpoint: no target is slow then (design 6.5).
     backpressure: bool,
+    /// How each target's repair path is built, once the publication repairs
+    /// (MD-8): a destination added later gets its own.
+    repair: Option<(
+        crate::agents::repair::RepairConfig,
+        u32,
+        karyos_protocol::network::Alias,
+        karyos_protocol::network::Identity,
+    )>,
+    /// What a target's lane sender is built with.
+    drr: DrrConfig,
+    mtu: usize,
 }
 
 /// The gate of one target's first sends: every candidate is permitted,
@@ -265,6 +305,7 @@ impl Fanout {
                 counters: TargetCounters::default(),
                 removed: None,
                 reported: false,
+                cancelled: false,
                 faults: 0,
                 repair: None,
             });
@@ -276,6 +317,9 @@ impl Fanout {
             scratch: (0..lanes).map(|_| vec![0; mtu]).collect(),
             rotation: 0,
             backpressure: false,
+            repair: None,
+            drr,
+            mtu,
         })
     }
 
@@ -647,9 +691,32 @@ impl<T: StreamTerms> Outbound<T> {
             let Some(target) = fanout.targets.get_mut(at) else {
                 continue;
             };
-            // A removed target is never served again: its queues were
-            // emptied at the removal. One not open yet waits for its open.
-            if target.removed.is_some() || target.opened != Some(epoch) {
+            // A removed target is never served again: what its queues and
+            // its sender held is dropped once. One not open yet waits for
+            // its open.
+            if target.removed.is_some() {
+                if !target.cancelled {
+                    for lane in 0..target.queues.len() {
+                        let mut gate = TargetGate {
+                            lanes: &mut target.lanes,
+                            held: true,
+                            edges: target.edges,
+                        };
+                        let _ = target.sender.cancel(tx, lane, &mut gate);
+                        // What the backend no longer holds as pending
+                        // leaves the sender's records too.
+                        if let Some(queue) = target.queues.get(lane).copied() {
+                            target.sender.reopen(lane, queue);
+                        }
+                    }
+                    for track in &mut target.lanes {
+                        track.staged.clear();
+                    }
+                    target.cancelled = true;
+                }
+                continue;
+            }
+            if target.opened != Some(epoch) {
                 continue;
             }
             let mut gate = TargetGate {
@@ -704,7 +771,7 @@ impl<T: StreamTerms> Outbound<T> {
             if faulted {
                 target.faults = target.faults.saturating_add(1);
                 if target.faults >= DESTINATION_FAULT_LIMIT && !target.required {
-                    remove_target(target, RemovalReason::Fault, now, tx);
+                    remove_target(target, RemovalReason::Fault, now);
                     self.counters.bump(|c| &mut c.removed_fault, 1);
                 }
             } else if target.lanes.iter().any(|track| track.submitted) {
@@ -868,7 +935,7 @@ impl<T: StreamTerms> Outbound<T> {
                     if slow(target, held, backpressure, advancing) {
                         // MD-7: removed at once, so the others never wait
                         // for it.
-                        remove_target(target, RemovalReason::Slow, now, tx);
+                        remove_target(target, RemovalReason::Slow, now);
                         self.counters.bump(|c| &mut c.removed_slow, 1);
                     } else {
                         // A required or bounding destination holds the
@@ -1071,34 +1138,17 @@ fn slow(target: &Target, held: bool, backpressure: bool, advancing: bool) -> boo
     !target.required && !target.bounds && target.stalled && !held && !backpressure && advancing
 }
 
-/// Removes `target` for `reason` at `now`: it gets nothing more, and what
-/// its queues and its sender held is dropped (its receiver closes the gap
-/// by its gap policy, and its image expires), so it never keeps a lane
-/// from idling or draining.
-fn remove_target<O: SocketOps>(
-    target: &mut Target,
-    reason: RemovalReason,
-    now: u64,
-    tx: &mut SocketsTx<O>,
-) {
+/// Removes `target` for `reason` at `now`: it gets nothing more; what its
+/// queues held is dropped at its next serve (its receiver closes the gap
+/// by its gap policy, and its image expires).
+fn remove_target(target: &mut Target, reason: RemovalReason, now: u64) {
     if target.removed.is_some() {
         return;
     }
     target.removed = Some((reason, now));
     target.live = false;
-    for lane in 0..target.queues.len() {
-        let mut gate = TargetGate {
-            lanes: &mut target.lanes,
-            held: true,
-            edges: target.edges,
-        };
-        let _ = target.sender.cancel(tx, lane, &mut gate);
-        // What the backend no longer holds as pending (handed to the
-        // kernel, or a faulted queue) leaves the sender's records too.
-        if let Some(queue) = target.queues.get(lane).copied() {
-            target.sender.reopen(lane, queue);
-        }
-    }
+    target.cancelled = false;
+    target.reported = false;
     for track in &mut target.lanes {
         track.staged.clear();
     }
@@ -1173,6 +1223,7 @@ impl<T: StreamTerms> Outbound<T> {
             .max(1);
         let mut config = *config;
         config.jobs.repair_jobs = share;
+        fanout.repair = Some((config, term_length, alias, identity));
         for target in &mut fanout.targets {
             target.repair = Some(Box::new(crate::agents::repair::RepairPath::new(
                 &config,
@@ -1275,6 +1326,156 @@ impl<T: StreamTerms> Outbound<T> {
                 if let Some(repair) = target.repair.as_deref_mut() {
                     repair.drain_replies(|reply| send(reply));
                 }
+            }
+        }
+    }
+}
+
+impl Fanout {
+    /// A new optional target toward `address`, its lanes joining at
+    /// `joins` (allocates: a run-time addition, MD-3).
+    fn target(&self, address: SocketAddr, joins: &[u64]) -> Option<Target> {
+        let placeholder = TxQueueId::new(BackendEpoch::FIRST, u16::MAX, NonZeroU32::MAX);
+        let bound = usize::from(STAGED_PER_LANE);
+        let queues = vec![placeholder; joins.len()];
+        let sender = LaneSender::new(self.drr, &queues, bound).ok()?;
+        let repair = match self.repair {
+            Some((config, term_length, alias, identity)) => Some(Box::new(
+                crate::agents::repair::RepairPath::new(
+                    &config,
+                    self.drr,
+                    self.mtu,
+                    (term_length, alias, identity),
+                )
+                .ok()?,
+            )),
+            None => None,
+        };
+        Some(Target {
+            address,
+            required: false,
+            sender,
+            queues,
+            lanes: joins
+                .iter()
+                .map(|join| TargetLane {
+                    staged: VecDeque::with_capacity(bound),
+                    high: *join,
+                    unsent: false,
+                    mismatched: false,
+                    submitted: false,
+                })
+                .collect(),
+            route: None,
+            opened: None,
+            live: false,
+            edges: [0; 4],
+            bounds: false,
+            stalled: false,
+            idle_since: [None; 4],
+            counters: TargetCounters::default(),
+            removed: None,
+            reported: false,
+            cancelled: false,
+            faults: 0,
+            repair,
+        })
+    }
+}
+
+impl<T: StreamTerms> Outbound<T> {
+    /// Adds or removes the optional destination `destination` at `now`
+    /// (MD-3): a required destination is fixed at creation (ADR-0082), and
+    /// a destination removed less than `quarantine` ago cannot come back
+    /// yet (MD-14). An optional destination moves by a removal and an
+    /// addition. Allocates for an addition (a run-time command).
+    pub(crate) fn change_destination(
+        &mut self,
+        destination: SocketAddr,
+        add: bool,
+        now: u64,
+        quarantine: u64,
+    ) -> DestinationChange {
+        let joins: Vec<u64> = self
+            .readers
+            .iter()
+            .map(|reader| reader.position())
+            .collect();
+        let Some(fanout) = self.fanout.as_deref_mut() else {
+            return DestinationChange::Unknown;
+        };
+        let family = fanout
+            .targets
+            .first()
+            .map(|target| target.address.is_ipv4());
+        let found = fanout
+            .targets
+            .iter()
+            .position(|target| target.address == destination);
+        let Some(at) = found else {
+            if !add {
+                return DestinationChange::Absent;
+            }
+            if family != Some(destination.is_ipv4()) {
+                return DestinationChange::Unknown;
+            }
+            if fanout.targets.len() >= MAX_DESTINATIONS {
+                return DestinationChange::Full;
+            }
+            let Some(target) = fanout.target(destination, &joins) else {
+                return DestinationChange::Unknown;
+            };
+            fanout.targets.push(target);
+            for flags in &mut fanout.staged_for {
+                // The pending datagram, if any, is not the new target's.
+                flags.push(true);
+            }
+            return DestinationChange::Added;
+        };
+        let Some(target) = fanout.targets.get_mut(at) else {
+            return DestinationChange::Unknown;
+        };
+        if target.required {
+            return DestinationChange::Required;
+        }
+        match (add, target.removed) {
+            (false, Some(_)) => DestinationChange::Absent,
+            (false, None) => {
+                remove_target(target, RemovalReason::Command, now);
+                DestinationChange::Removed
+            }
+            (true, None) => DestinationChange::Present,
+            (true, Some((_, removed_at))) => {
+                if now
+                    .checked_sub(removed_at)
+                    .is_none_or(|age| age < quarantine)
+                {
+                    return DestinationChange::Quarantined;
+                }
+                // Back after its quarantine: a fresh optional destination,
+                // joining at the cursor, on queues emptied at its removal.
+                if !target.cancelled {
+                    return DestinationChange::Quarantined;
+                }
+                target.removed = None;
+                target.reported = false;
+                target.cancelled = false;
+                target.faults = 0;
+                target.live = false;
+                target.stalled = false;
+                for (track, join) in target.lanes.iter_mut().zip(&joins) {
+                    track.staged.clear();
+                    track.high = *join;
+                }
+                for (lane, queue) in target.queues.iter().enumerate() {
+                    target.sender.reopen(lane, *queue);
+                }
+                for flags in &mut fanout.staged_for {
+                    if let Some(flag) = flags.get_mut(at) {
+                        *flag = true;
+                    }
+                }
+                DestinationChange::Added
             }
         }
     }

@@ -1871,7 +1871,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 Some((reply, configured(found.is_some())))
             }
             AgentCommand::RemovePublication { reply, .. }
-            | AgentCommand::RemoveSenderSession { reply, .. } => Some((
+            | AgentCommand::RemoveSenderSession { reply, .. }
+            | AgentCommand::ChangeDestination { reply, .. } => Some((
                 reply,
                 AgentEvent::Unsupported {
                     agent: AgentKind::Receiver,
@@ -4544,55 +4545,85 @@ impl<T: StreamTerms> SenderRole<T> {
         &mut self,
         command: AgentCommand<O, T>,
     ) -> Option<(Reservation, AgentEvent<O, T>)> {
-        let (reply, publication, outbound, guard, roles) =
-            match command {
-                AgentCommand::AddPublication {
+        let (reply, publication, outbound, guard, roles) = match command {
+            AgentCommand::AddPublication {
+                reply,
+                publication,
+                outbound,
+                guard,
+                roles,
+            } => (reply, publication, outbound, guard, roles),
+            AgentCommand::ChangeDestination {
+                reply,
+                endpoint,
+                alias,
+                registration,
+                destination,
+                add,
+            } => {
+                let now = (self.clock)();
+                let quarantine = self.membership.receiver_timeout;
+                let outcome = self
+                    .publications
+                    .iter_mut()
+                    .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+                    .map_or(
+                        crate::agents::data::DestinationChange::Unknown,
+                        |outbound| outbound.change_destination(destination, add, now, quarantine),
+                    );
+                return Some((
                     reply,
-                    publication,
-                    outbound,
-                    guard,
-                    roles,
-                } => (reply, publication, outbound, guard, roles),
-                AgentCommand::RemovePublication {
+                    AgentEvent::DestinationChanged {
+                        endpoint,
+                        alias,
+                        registration,
+                        destination,
+                        outcome,
+                    },
+                ));
+            }
+            AgentCommand::RemovePublication {
+                reply,
+                endpoint,
+                alias,
+                registration,
+                linger,
+            } => {
+                return Some((
                     reply,
-                    endpoint,
-                    alias,
-                    registration,
-                    linger,
-                } => {
-                    return Some((
-                        reply,
-                        self.begin_remove(endpoint, alias, registration, linger),
-                    ));
+                    self.begin_remove(endpoint, alias, registration, linger),
+                ));
+            }
+            AgentCommand::RemoveSenderSession {
+                reply,
+                endpoint,
+                alias,
+                registration,
+            } => return Some((reply, self.remove(endpoint, alias, registration))),
+            #[cfg(test)]
+            AgentCommand::ForceReset { endpoint, alias } => {
+                if let Some(outbound) = self
+                    .publications
+                    .iter_mut()
+                    .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
+                {
+                    outbound.force_needs_reset();
                 }
-                AgentCommand::RemoveSenderSession {
+                return None;
+            }
+            AgentCommand::AddSubscription { reply, .. }
+            | AgentCommand::AddPublishedAlias { reply, .. }
+            | AgentCommand::RemovePublishedAlias { reply, .. }
+            | AgentCommand::RemoveSubscription { reply, .. } => {
+                return Some((
                     reply,
-                    endpoint,
-                    alias,
-                    registration,
-                } => return Some((reply, self.remove(endpoint, alias, registration))),
-                #[cfg(test)]
-                AgentCommand::ForceReset { endpoint, alias } => {
-                    if let Some(outbound) = self.publications.iter_mut().find(|outbound| {
-                        outbound.endpoint() == endpoint && outbound.alias() == alias
-                    }) {
-                        outbound.force_needs_reset();
-                    }
-                    return None;
-                }
-                AgentCommand::AddSubscription { reply, .. }
-                | AgentCommand::AddPublishedAlias { reply, .. }
-                | AgentCommand::RemovePublishedAlias { reply, .. }
-                | AgentCommand::RemoveSubscription { reply, .. } => {
-                    return Some((
-                        reply,
-                        AgentEvent::Unsupported {
-                            agent: AgentKind::Sender,
-                        },
-                    ));
-                }
-                command => return self.trace.command(&mut self.publications, command),
-            };
+                    AgentEvent::Unsupported {
+                        agent: AgentKind::Sender,
+                    },
+                ));
+            }
+            command => return self.trace.command(&mut self.publications, command),
+        };
         let mut outbound = outbound;
         let matches = outbound.endpoint() == publication.endpoint
             && outbound.alias() == publication.alias

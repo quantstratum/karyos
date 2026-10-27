@@ -2392,7 +2392,8 @@ mod removal;
 mod routed;
 
 pub use fanout::{
-    DESTINATION_FAULT_LIMIT, DestinationRemoval, MAX_DESTINATIONS, RemovalReason, TargetCounters,
+    DESTINATION_FAULT_LIMIT, DestinationChange, DestinationRemoval, MAX_DESTINATIONS,
+    RemovalReason, TargetCounters,
 };
 
 pub use routed::{MAX_PATH_BACKOFF, MAX_PATH_COPY_ENTRIES, PathCounters, PathPolicy};

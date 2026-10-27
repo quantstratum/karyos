@@ -329,6 +329,10 @@ struct NetPublication {
     reincarnating: bool,
     /// The destinations its sender removed, with why (karyos#630).
     removed_destinations: Vec<crate::agents::data::DestinationRemoval>,
+    /// The answers to its run-time destination changes, oldest first, at
+    /// most `MAX_DESTINATIONS` (karyos#630).
+    destination_changes:
+        std::collections::VecDeque<(std::net::SocketAddr, crate::agents::data::DestinationChange)>,
     /// The slot its sender stores its admission state's code in each cycle
     /// (karyos#637; 0 before the first).
     admission: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -1754,6 +1758,7 @@ impl<T: StreamTerms> Network<T> {
             channel: Some(channel),
             reincarnating: false,
             removed_destinations: Vec::new(),
+            destination_changes: std::collections::VecDeque::new(),
             admission,
         });
         Ok(())
@@ -2026,6 +2031,53 @@ impl<T: StreamTerms> Network<T> {
         karyos_protocol::cnc::NetworkAdmission::from_code(u64::from(
             entry.admission.load(std::sync::atomic::Ordering::Relaxed),
         ))
+    }
+
+    /// Posts the addition (`add`) or removal of `destination` to the sender
+    /// of the network publication `registration` (karyos#630).
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidConfig`] for no such active publication;
+    /// [`DriverError::NetworkBusy`] when the sender's ring is full.
+    pub(crate) fn change_destination(
+        &mut self,
+        registration: u64,
+        destination: std::net::SocketAddr,
+        add: bool,
+    ) -> Result<(), DriverError> {
+        let (endpoint, alias) = self
+            .publications
+            .iter()
+            .find(|entry| {
+                entry.registration == registration && entry.state == NetworkPublicationState::Active
+            })
+            .map(|entry| (entry.endpoint, entry.alias))
+            .ok_or(DriverError::InvalidConfig)?;
+        self.links
+            .sender
+            .post(|reply| AgentCommand::ChangeDestination {
+                reply,
+                endpoint,
+                alias,
+                registration,
+                destination,
+                add,
+            })
+            .map_err(|_| DriverError::NetworkBusy)
+    }
+
+    /// The answers to the run-time destination changes of the network
+    /// publication `registration`, oldest first, taken.
+    pub(crate) fn take_destination_changes(
+        &mut self,
+        registration: u64,
+    ) -> Vec<(std::net::SocketAddr, crate::agents::data::DestinationChange)> {
+        self.publications
+            .iter_mut()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| entry.destination_changes.drain(..).collect())
+            .unwrap_or_default()
     }
 
     /// The destinations the sender of the network publication
@@ -2829,6 +2881,24 @@ fn publication_answer<T: StreamTerms>(
                 });
             } else {
                 violations.drop_one();
+            }
+        }
+        // The answer to a run-time destination change: the latest ones are
+        // kept.
+        AgentEvent::DestinationChanged {
+            endpoint,
+            alias,
+            registration,
+            destination,
+            outcome,
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get_mut(index))
+            {
+                if entry.destination_changes.len() >= crate::agents::data::MAX_DESTINATIONS {
+                    let _ = entry.destination_changes.pop_front();
+                }
+                entry.destination_changes.push_back((destination, outcome));
             }
         }
         // A destination its sender removed: kept with the publication, at
