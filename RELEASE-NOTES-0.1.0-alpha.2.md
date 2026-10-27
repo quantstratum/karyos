@@ -353,6 +353,22 @@ head and what changed since.
 | Release gate conformance (`scripts/linux-test.sh -p karyos-ffi --all-features --locked --test conformance`; features `archive-replay`, `remote-driver`, `incompatible-driver`) | Docker `rust:1.99`, kernel 6.8.0-117-generic aarch64 | tree `c0517039` | Exit 0: 8 passed, including `every_scenario_passes_at_the_library_abi_version` |
 | Linux x86_64, kernels 6.9 and later | none | Not run for this alpha | Not claimed |
 
+**Erratum 2026-10-27: the `make loom` release-gate row.** Its result,
+"451 passed, 0 failed, 1 ignored over 115 binaries", does not match the
+target that row names. `make loom` runs
+`RUSTFLAGS="--cfg loom" cargo test -p karyos-sys --release --locked --test 'loom_*'`.
+The row's tree `c0517039` (the tree of `b6e7e527`) holds 38
+`crates/karyos-sys/tests/loom_*.rs` files with 208 `#[test]` models, and
+no other crate has `loom_*` tests, so the target selects 38 binaries and
+208 models, one of them ignored. Two runs agree with that count:
+`make loom` inside `make pre-push` at `7a8ae8b4` (38 binaries, 207
+passed, 1 ignored), and `make loom-full` at the tag, recorded in the row
+above (38 binaries, 208 passed). The run behind the published figures
+cannot be reproduced without its log, which is not available; the row
+entered in `0d64b84e`. The published row is left as it is (RELEASING.md,
+"After a tag"); read its counts as not reproduced. This erratum does not
+change the gate's outcome: no Loom model failed in any of these runs.
+
 ## Upgrading
 
 Nothing is compatible with 0.1.0-alpha.1 across a process boundary or
