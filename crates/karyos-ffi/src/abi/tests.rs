@@ -2129,6 +2129,86 @@ fn an_older_headers_subscription_options_are_filled_within_their_size() {
     assert_eq!((older.size, older.role), (7, 9));
 }
 
+/// A caller's struct and the guard words after it, all poison: a sized
+/// init writes the first `size` bytes at most and nothing past them.
+#[repr(C, align(8))]
+struct Poisoned([u8; 128]);
+
+/// Every sized init with its first version's size, written here as a
+/// literal (ABI 0.1, `karyos.h`), so a wrong minimum in one entry fails
+/// that entry: a size one byte short is refused with nothing written
+/// (owner item 48, "rejects capacity below its first-version minimum
+/// with INVALID_ARGUMENT before writing"), and the first version's size
+/// is filled up to it, with the guard bytes after it intact.
+#[test]
+fn every_sized_init_refuses_below_its_first_version_and_writes_within_it() {
+    /// Called with a pointer to at least `size` writable, 8-aligned bytes.
+    type SizedInit = unsafe fn(*mut u8, usize) -> i32;
+    let entries: [(&str, usize, SizedInit); 7] = [
+        ("client_options", 40, |p, size| {
+            // SAFETY: `SizedInit`'s contract: `size` writable, 8-aligned bytes.
+            unsafe { karyos_client_options_init_sized(p.cast(), size) }
+        }),
+        ("offer_options", 16, |p, size| {
+            // SAFETY: `SizedInit`'s contract: `size` writable, 8-aligned bytes.
+            unsafe { karyos_offer_options_init_sized(p.cast(), size) }
+        }),
+        ("subscription_options", 16, |p, size| {
+            // SAFETY: `SizedInit`'s contract: `size` writable, 8-aligned bytes.
+            unsafe { karyos_subscription_options_init_sized(p.cast(), size) }
+        }),
+        ("driver_options", 56, |p, size| {
+            // SAFETY: `SizedInit`'s contract: `size` writable, 8-aligned bytes.
+            unsafe { karyos_driver_options_init_sized(p.cast(), size) }
+        }),
+        ("stream_options", 64, |p, size| {
+            // SAFETY: `SizedInit`'s contract: `size` writable, 8-aligned bytes.
+            unsafe { karyos_stream_options_init_sized(p.cast(), size) }
+        }),
+        ("replay_options", 48, |p, size| {
+            // SAFETY: `SizedInit`'s contract: `size` writable, 8-aligned bytes.
+            unsafe { karyos_replay_options_init_sized(p.cast(), size) }
+        }),
+        ("replay_subscription_options", 8, |p, size| {
+            // SAFETY: `SizedInit`'s contract: `size` writable, 8-aligned bytes.
+            unsafe { karyos_replay_subscription_options_init_sized(p.cast(), size) }
+        }),
+    ];
+    for (name, first, init) in entries {
+        let mut caller = Poisoned([0xa5; 128]);
+        // SAFETY: `caller` is a live, 8-aligned local of 128 bytes, more
+        // than every size passed here.
+        let status = unsafe { init((&raw mut caller).cast(), first - 1) };
+        assert_eq!(
+            status,
+            Status::InvalidArgument.code(),
+            "{name}: one byte short"
+        );
+        assert!(
+            caller.0.iter().all(|&b| b == 0xa5),
+            "{name}: nothing written"
+        );
+
+        // SAFETY: as above.
+        let status = unsafe { init((&raw mut caller).cast(), first) };
+        assert_eq!(
+            status,
+            Status::Ok.code(),
+            "{name}: the first version's size"
+        );
+        let size = u32::from_ne_bytes(caller.0[..4].try_into().unwrap());
+        assert_eq!(
+            usize::try_from(size).unwrap(),
+            first,
+            "{name}: the size it records"
+        );
+        assert!(
+            caller.0[first..].iter().all(|&b| b == 0xa5),
+            "{name}: nothing written past {first} bytes"
+        );
+    }
+}
+
 /// The sized init with this header's size fills every field, and the
 /// struct an older binary's init filled is read by its 16 bytes only, at
 /// an address that is 4 mod 8 as an older header's struct may be. The

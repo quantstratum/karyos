@@ -44,6 +44,14 @@ release may break APIs, wire formats and shared-memory layouts.
   claim on that lane holds the in-order sender, and so the publisher at
   its window, until the claim's deadline aborts it, which a second test
   pins.
+- `karyos-ffi` tests owner item 48's refusal on every sized init:
+  `every_sized_init_refuses_below_its_first_version_and_writes_within_it`
+  calls each of the seven `karyos_*_init_sized` one byte short of its
+  first version's size, written as a literal, and at that size. The first
+  is refused with `KARYOS_E_INVALID_ARGUMENT` and nothing written, and the
+  second records that size and writes nothing past it, so a wrong minimum
+  in one entry fails that entry. Until now only
+  `karyos_subscription_options_init_sized` had the refusal tested.
 - `RELEASING.md` lists the gates a release runs, as the 0.1.0-alpha.2
   Evidence table records them, and how each result is recorded.
   `make loom-full` is now required at every release head, not only on
