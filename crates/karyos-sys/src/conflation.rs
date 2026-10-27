@@ -1816,7 +1816,12 @@ mod owned {
                 Ok(seq) => {
                     fresh.ahead.push((start, end));
                     fresh.unretired.push((seq, start));
-                    if let Some(open) = fresh.cycles.as_mut().and_then(|c| c.open.as_mut()) {
+                    // A gap that ends above the open cycle's begin counts
+                    // against it (ADR-0081); with the frontier rule every
+                    // gap recorded now does, but the code says the rule.
+                    if let Some(open) = fresh.cycles.as_mut().and_then(|c| c.open.as_mut())
+                        && end > open.begin
+                    {
                         open.cut_from = Some(open.cut_from.map_or(start, |cut| cut.min(start)));
                     }
                     bump(&mut fresh.counters.losses);
