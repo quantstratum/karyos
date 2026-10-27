@@ -8,8 +8,9 @@
 //! its term and vote store, core neutral, over the Archive's segment
 //! store ([`log`], [`hard_state`]); C7a's client deduplication, the
 //! replicated session table ([`dedup`]); and C8a's snapshot store, typed
-//! sections published by a manifest ([`snapshot`]). The consensus core,
-//! the service container and guards do not exist yet.
+//! sections published by a manifest ([`snapshot`]); and C10's service
+//! container, a [`service::ClusteredService`] fed committed entries
+//! ([`service`]). The consensus core and guards do not exist yet.
 //!
 //! Internal to the Karyos workspace and unstable in alpha, with no
 //! compatibility promise. The supported API is the `karyos` facade,
@@ -21,6 +22,7 @@ mod file;
 pub mod hard_state;
 pub mod log;
 pub mod mark;
+pub mod service;
 pub mod snapshot;
 
 pub use dedup::{DecodeError, DedupConfig, Outcome, Registered, Request, SessionTable};

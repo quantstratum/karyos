@@ -453,6 +453,13 @@ impl SessionTable {
         })
     }
 
+    /// Applies an entry of event time `event_time` that holds no session
+    /// operation, which still moves the log time on, so that every replica
+    /// expires sessions at the same entry.
+    pub fn observe(&mut self, event_time: u64) {
+        self.advance(event_time);
+    }
+
     /// Applies a close of `client`'s session `epoch`, freeing its slot;
     /// `false` if no live session holds them.
     pub fn close(&mut self, client: u64, epoch: u64, event_time: u64) -> bool {
