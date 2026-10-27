@@ -45,6 +45,8 @@ pub mod rtt;
 pub mod schedule;
 pub mod sessions;
 pub(crate) mod shared_words;
+#[cfg(target_os = "linux")]
+pub mod sizing;
 pub mod sm_schedule;
 pub mod spin;
 pub mod timed_gate;
