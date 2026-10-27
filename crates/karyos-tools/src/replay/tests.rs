@@ -1694,7 +1694,7 @@ fn test_replay_diff_every_recorded_field_diverges_and_nothing_is_excluded() {
         change(outcome);
         records
     };
-    let observations: [(&str, Vec<GroupRecord<'static>>, Kind); 5] = [
+    let observations: [(&str, Vec<GroupRecord<'static>>, Kind); 6] = [
         (
             "stream_id",
             observation(|o| o.stream_id += 1),
@@ -1703,6 +1703,11 @@ fn test_replay_diff_every_recorded_field_diverges_and_nothing_is_excluded() {
         (
             "session_id",
             observation(|o| o.session_id += 1),
+            Kind::Observation,
+        ),
+        (
+            "operation",
+            observation(|o| o.operation = Operation::Commit),
             Kind::Observation,
         ),
         (
