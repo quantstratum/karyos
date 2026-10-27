@@ -4100,7 +4100,7 @@ impl<T: StreamTerms> Intake<'_, T> {
         ];
         let fresh = outcomes.first().is_some_and(|committed| *committed > 0)
             || outcomes.get(3).is_some_and(|heartbeats| *heartbeats > 0);
-        // Image liveness, trusted profile (coordinator decision; an
+        // Image liveness, trusted profile (owner item 1; an
         // authenticated channel still needs its profile's freshness proof):
         // fresh evidence (a committed frame or a heartbeat above the lane's
         // highest seen position) keeps the image alive; an idle sender's

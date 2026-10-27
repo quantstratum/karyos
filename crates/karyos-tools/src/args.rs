@@ -794,10 +794,6 @@ fn timed_network(value: &str) -> Option<(i32, u32)> {
     (capacity > 0).then_some((stream_id.parse().ok()?, capacity))
 }
 
-/// Applies `--timed-network` to the network's stream defaults: it needs
-/// `--network on`, names no `--stream` (a configured stream is local, and
-/// refuses a schedule ring), names each stream once and at most
-/// `MAX_TIMED_NETWORK_STREAMS` streams.
 /// Sets `--idle-image-timeout` on the network configuration, whichever
 /// order the options came in. The driver checks it against the image
 /// liveness timeout when it starts.
@@ -819,6 +815,10 @@ fn idle_image_timeout(options: &mut Options) -> Result<(), ArgsError> {
     Ok(())
 }
 
+/// Applies `--timed-network` to the network's stream defaults: it needs
+/// `--network on`, names no `--stream` (a configured stream is local, and
+/// refuses a schedule ring), names each stream once and at most
+/// `MAX_TIMED_NETWORK_STREAMS` streams.
 fn timed_networks(options: &mut Options) -> Result<(), ArgsError> {
     use karyos_driver::net::{MAX_TIMED_NETWORK_STREAMS, TimedNetworkStream};
 
@@ -1125,8 +1125,6 @@ mod tests {
         assert_eq!(parsed.log_level, LogLevel::Debug);
     }
 
-    /// `--network on` runs the network agents with the driver's default
-    /// network configuration; `off`, the default, runs none.
     /// Owner item 1 (karyos#638): `idle_image_timeout` from the command
     /// line, in the channel URI's duration grammar, before or after
     /// `--network on`, and refused without the network.
@@ -1202,6 +1200,8 @@ mod tests {
         );
     }
 
+    /// `--network on` runs the network agents with the driver's default
+    /// network configuration; `off`, the default, runs none.
     #[test]
     fn the_network_is_off_unless_turned_on() {
         let base = ["--dir", "/d"];
