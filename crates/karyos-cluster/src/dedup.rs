@@ -50,14 +50,27 @@
 //! - **Memory.** [`SessionTable::new`] allocates `sessions × window ×
 //!   response_bytes` reply bytes and the slot tables; nothing after. A
 //!   lookup scans the sessions, `O(sessions)`.
-//! - **Configuration.** The defaults are those item 37 of the decisions
-//!   of 2026-10-21 chose (`decisions.md` in quantstratum-docs): 1024
-//!   sessions, 64 replies, 8 KiB, 60 s. They are
-//!   initial evaluation values, to be measured in C5 W1 and W2 before the
-//!   phase 4 gate, and 1024 x 64 x 8 KiB is a named large profile, not a
-//!   universal default; a change is a configuration change. The table
-//!   returns its configuration at registration, so a client learns the
-//!   bounds it is held to.
+//!   [`DedupConfig::reserved_bytes`] is that reservation, metadata
+//!   included, per replica.
+//! - **Configuration** (item 37 of the decisions of 2026-10-21,
+//!   `decisions.md` in quantstratum-docs). Two profiles; the large one is
+//!   had only by naming it:
+//!
+//! | Profile | Sessions | Replies | Bytes per reply | TTL | Reserved per replica |
+//! | --- | --- | --- | --- | --- | --- |
+//! | [`DedupConfig::default`] | 64 | 64 | 8 KiB | 60 s | 33,590,272 B (32 MiB and 35 KiB of metadata) |
+//! | [`DedupConfig::large`] | 1024 | 64 | 8 KiB | 60 s | 537,444,352 B (512 MiB and 560 KiB of metadata) |
+//!
+//!   A cluster reserves this on every replica: three replicas of the
+//!   large profile reserve over 1.5 GiB. Every number here is
+//!   provisional: they are initial evaluation values, to be measured in C5
+//!   W1 and W2 before the phase 4 gate ([plan issue 069], karyos#685); a
+//!   change is a configuration change. The table returns its
+//!   configuration at registration, so a client learns the bounds it is
+//!   held to.
+//!
+//!
+//! [plan issue 069]: https://github.com/quantstratum/quantstratum-docs/blob/main/karyos/issues/M04-replicated-cluster/069-measure-the-dedup-and-snapshot-defaults.md
 //!
 //! - **Snapshots** (C8). [`SessionTable::encode`] writes the table as a
 //!   snapshot's sessions section ([`SESSIONS_VERSION`]), and
@@ -110,8 +123,12 @@ pub enum DecodeError {
     },
 }
 
-/// The sessions bound (design D3; item 37's initial value, to be measured).
-pub const DEFAULT_SESSIONS: u32 = 1024;
+/// The sessions bound of the default profile: the large profile's
+/// replies, bytes and TTL for fewer clients (karyos#692).
+pub const DEFAULT_SESSIONS: u32 = 64;
+/// The sessions bound of [`DedupConfig::large`] (design D3; item 37's
+/// initial value, to be measured).
+pub const LARGE_SESSIONS: u32 = 1024;
 /// The replies per session (design D3; item 37's initial value, to be
 /// measured).
 pub const DEFAULT_WINDOW: u32 = 64;
@@ -136,7 +153,8 @@ pub struct DedupConfig {
 }
 
 impl Default for DedupConfig {
-    /// Item 37's initial values, to be measured before the phase 4 gate.
+    /// The default profile: [`DedupConfig::large`] with
+    /// [`DEFAULT_SESSIONS`] sessions, about 32 MiB per replica.
     fn default() -> Self {
         Self {
             sessions: DEFAULT_SESSIONS,
@@ -148,6 +166,29 @@ impl Default for DedupConfig {
 }
 
 impl DedupConfig {
+    /// The large profile, item 37's initial values: 1024 sessions, 64
+    /// replies of 8 KiB, 60 s, 512 MiB of replies per replica before
+    /// metadata ([`DedupConfig::reserved_bytes`]). Never the default.
+    #[must_use]
+    pub fn large() -> Self {
+        Self::default().with_sessions(LARGE_SESSIONS)
+    }
+
+    /// The bytes [`SessionTable::new`] reserves for this configuration,
+    /// per replica: the replies and the metadata, the session slots and
+    /// the reply lengths. `None` when the product overflows.
+    #[must_use]
+    pub fn reserved_bytes(&self) -> Option<u64> {
+        let sessions = u64::from(self.sessions);
+        let slots = sessions.checked_mul(u64::from(self.window))?;
+        let metadata = sessions
+            .checked_mul(size_of::<Session>() as u64)?
+            .checked_add(slots.checked_mul(size_of::<Stored>() as u64)?)?;
+        slots
+            .checked_mul(u64::from(self.response_bytes))?
+            .checked_add(metadata)
+    }
+
     /// With `sessions` live sessions at most.
     #[must_use]
     pub fn with_sessions(mut self, sessions: u32) -> Self {
