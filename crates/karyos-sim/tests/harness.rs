@@ -792,3 +792,52 @@ fn a_server_stopped_by_its_disk_is_verified_at_its_restart() {
         }
     }
 }
+
+/// karyos#686, decision E1: the reference core stamps its entries with
+/// its tick time, which the test service ignores. A healthy run's
+/// applied entries carry event times, and applying the same entries with
+/// event time 0 gives every answer unchanged.
+#[test]
+fn test_harness_the_test_service_ignores_the_event_time() {
+    use karyos_sim::harness::node::TestService;
+    let disks = vec![SimDisk::new(), SimDisk::new(), SimDisk::new()];
+    let mut script = appends(5);
+    script.push(Op::Read);
+    let (mut sim, recorder, client) = fresh(7, disks, script);
+    sim.run_for(400).unwrap();
+    assert!(sim.node(client).and_then(Member::client).unwrap().done());
+    let applied: Vec<(Entry, Option<Vec<u8>>)> = recorder
+        .borrow()
+        .observations
+        .iter()
+        .filter_map(|o| match o {
+            Observation::Applied {
+                node: LEADER,
+                entry,
+                response,
+                ..
+            } => Some((entry.clone(), response.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        applied.iter().any(|(entry, _)| entry.event_time > 0),
+        "the entries carry the tick time"
+    );
+    let (mut stamped, mut zeroed) = (TestService::default(), TestService::default());
+    for (entry, response) in &applied {
+        let at_zero = Entry {
+            event_time: 0,
+            ..entry.clone()
+        };
+        let answer = stamped.apply(entry).map(|(_, ret)| ret.canonical());
+        assert_eq!(&answer, response, "entry {}", entry.index);
+        assert_eq!(
+            zeroed.apply(&at_zero).map(|(_, ret)| ret.canonical()),
+            answer,
+            "entry {}",
+            entry.index
+        );
+    }
+    assert_eq!(stamped, zeroed);
+}

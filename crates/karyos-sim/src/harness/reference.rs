@@ -140,6 +140,9 @@ pub struct Reference {
     waiting: bool,
     /// The last index, written or not, after the last call.
     received: Option<u64>,
+    /// Its clock at its last tick: the event time of the entries it
+    /// proposes (karyos#686, decision E1).
+    now: u64,
 }
 
 impl Reference {
@@ -272,6 +275,9 @@ impl ConsensusCore for Reference {
             after_persist: Vec::new(),
             waiting: false,
             received: log.last_index(),
+            // Until its first tick; the log time never goes back, as it
+            // is the highest event time applied.
+            now: 0,
         }
     }
 
@@ -290,7 +296,7 @@ impl ConsensusCore for Reference {
         self.unpersisted.push(Entry {
             index,
             term: TERM,
-            event_time: 0,
+            event_time: self.now,
             payload: command,
         });
         self.settle(log);
@@ -346,6 +352,7 @@ impl ConsensusCore for Reference {
     }
 
     fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
+        self.now = now;
         if !self.leading() || !now.is_multiple_of(RESEND) {
             return;
         }
@@ -552,7 +559,7 @@ impl ConsensusCore for Reference {
         self.unpersisted.push(Entry {
             index,
             term: TERM,
-            event_time: 0,
+            event_time: self.now,
             payload: encode_configuration(&voters, &learners),
         });
         self.configs.push((index, voters, learners));
