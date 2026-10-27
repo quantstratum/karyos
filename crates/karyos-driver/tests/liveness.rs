@@ -462,19 +462,28 @@ fn test_abort_seal_closes_conflation_table_after_feeder_reaches_end() {
     time_out(&clock);
     let _ = observed_work(&mut driver, &mut observer);
     assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
+    // The publisher learns of the seal and releases; the seal is then
+    // positioned after the eight values.
+    assert_eq!(publication.offer(&[9]).unwrap(), OfferOutcome::Closed);
 
     let mut seen = [0u8; 4];
     let mut open_polls = 0;
+    let mut closed = false;
     for _ in 0..32 {
         let report = conflated
             .poll_changed(|key, value| seen[usize::try_from(key).unwrap()] = value.payload()[0])
             .unwrap();
         if report.closed {
+            closed = true;
             break;
         }
         open_polls += 1;
         let _ = observed_work(&mut driver, &mut observer);
     }
+    assert!(
+        closed,
+        "the abort seal must close the conflation writer: {open_polls} open polls, seen {seen:?}"
+    );
     // Closed only once the feeder reached the seal: every value appended
     // before it was written, the last one of each key included.
     assert_eq!(seen, last, "closed before the feeder reached the end");
