@@ -44,6 +44,21 @@ impl BackoffIdle {
         }
     }
 
+    /// With its sleep bounded by `max_sleep` instead (at least its
+    /// minimum sleep).
+    #[must_use]
+    pub fn with_max_sleep(mut self, max_sleep: Duration) -> Self {
+        self.max_sleep = max_sleep.max(self.min_sleep);
+        self.sleep = self.sleep.min(self.max_sleep);
+        self
+    }
+
+    /// The longest sleep of an idle cycle.
+    #[must_use]
+    pub fn max_sleep(&self) -> Duration {
+        self.max_sleep
+    }
+
     /// Reporting its spin time into `meter`, its loop's
     /// (`EmbeddedDriver::take_spin_meter` for the conductor's loop).
     #[must_use]
@@ -107,6 +122,22 @@ impl Default for BackoffIdle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// karyos#658: a shorter bound caps the sleep; it never drops below
+    /// the minimum sleep.
+    #[test]
+    fn the_sleep_bound_can_be_cut() {
+        let mut idle = BackoffIdle::new(0, 0, Duration::from_nanos(1), Duration::from_nanos(64))
+            .with_max_sleep(Duration::from_nanos(4));
+        assert_eq!(idle.max_sleep(), Duration::from_nanos(4));
+        for _ in 0..5 {
+            idle.idle(0);
+        }
+        assert_eq!(idle.next_sleep(), Duration::from_nanos(4));
+        let floor = BackoffIdle::new(0, 0, Duration::from_nanos(8), Duration::from_nanos(64))
+            .with_max_sleep(Duration::from_nanos(2));
+        assert_eq!(floor.max_sleep(), Duration::from_nanos(8));
+    }
 
     #[test]
     fn idle_cycles_back_off_to_the_bound_and_work_resets() {

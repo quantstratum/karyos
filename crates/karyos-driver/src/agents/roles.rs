@@ -344,6 +344,11 @@ pub struct ReceiverCounters {
     /// Installed images whose key's conflated lane is not one of their
     /// lanes: no gate, no view.
     pub conflated_lane_out_of_range: u64,
+    /// Seal gates moved to a recreated view's link (`RelinkView`).
+    pub views_relinked: u64,
+    /// `RelinkView` commands that moved no gate: the image retired, the
+    /// lane is not its conflated lane, or its view is still open.
+    pub relinks_refused: u64,
     /// Data and controls this phase does not handle yet.
     pub unhandled: u64,
     /// An increment did not apply.
@@ -1677,11 +1682,7 @@ pub(super) fn roles<T: StreamTerms>(
             sm_interval: config.sm_interval,
             liveness_timeout: config.image_liveness_timeout,
             idle_timeout: config.idle_image_timeout,
-            path_config: PathConfig {
-                max_paths: config.sessions.max_paths,
-                path_queue_datagrams: config.path_queue_datagrams,
-                ..PathConfig::default()
-            },
+            path_config: receiver_path_config(config),
             path_intake: None,
             rtt: config.rtt,
             multicast: config.multicast,
@@ -1979,6 +1980,23 @@ impl<T: StreamTerms> ReceiverRole<T> {
             AgentCommand::AttachImageCells { slot, cells, .. } => {
                 if let Some(image) = self.images.iter_mut().find(|image| image.slot == slot) {
                     image.cells = Some(cells);
+                }
+                None
+            }
+            AgentCommand::RelinkView {
+                slot, lane, link, ..
+            } => {
+                let relinked = self
+                    .images
+                    .iter_mut()
+                    .find(|image| image.slot == slot)
+                    .and_then(|image| image.gate.as_mut())
+                    .filter(|gate| gate.lane() == lane)
+                    .is_some_and(|gate| gate.relink(link));
+                if relinked {
+                    self.count(|c| &mut c.views_relinked);
+                } else {
+                    self.count(|c| &mut c.relinks_refused);
                 }
                 None
             }
@@ -2618,16 +2636,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
         let Ok(loss) = loss else {
             return Err(Some(chain.retire));
         };
-        // The skew window (RP-4): on an unreliable image the seal waits
-        // the larger of it and the reorder interval, never their sum.
-        let skip_config = SkipConfig {
-            skew_window_ns: self.path_config.path_skew_window,
-            ..if reliable {
-                SkipConfig::reliable()
-            } else {
-                SkipConfig::unreliable()
-            }
-        };
+        let skip_config = image_skip_config(&self.path_config, reliable);
         let Ok(skip) = SkipPolicy::new(skip_config, usize::from(chain.lane_count)) else {
             return Err(Some(chain.retire));
         };
@@ -5987,6 +5996,29 @@ fn established<T: StreamTerms>(sessions: &SendSessions, outbound: &Outbound<T>) 
 }
 
 mod path_intake;
+
+/// The receiver's redundant path settings under `config`.
+pub(crate) fn receiver_path_config(config: &AgentConfig) -> PathConfig {
+    PathConfig {
+        max_paths: config.sessions.max_paths,
+        path_queue_datagrams: config.path_queue_datagrams,
+        ..PathConfig::default()
+    }
+}
+
+/// The skip policy settings of an image under `paths`. The skew window
+/// (RP-4): on an unreliable image the seal waits the larger of it and the
+/// reorder interval, never their sum.
+pub(crate) fn image_skip_config(paths: &PathConfig, reliable: bool) -> SkipConfig {
+    SkipConfig {
+        skew_window_ns: paths.path_skew_window,
+        ..if reliable {
+            SkipConfig::reliable()
+        } else {
+            SkipConfig::unreliable()
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

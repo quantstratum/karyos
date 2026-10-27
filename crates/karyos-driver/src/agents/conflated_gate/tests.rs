@@ -241,3 +241,86 @@ fn a_published_terminal_cell_permits_without_a_post() {
 fn gate_pair() -> (ConflatedGate, FreshnessLink) {
     gate()
 }
+
+/// karyos#658: each bound of `barrier_ack_timeout` has its own refusal;
+/// the floor comes first, then ten duty periods, whose product is checked.
+#[test]
+fn the_timeout_bounds_are_told_apart() {
+    assert_eq!(check_duty(10 * MS - 1, MS), Err(BarrierAckBound::Floor));
+    assert_eq!(check_duty(10 * MS, MS), Ok(()));
+    assert_eq!(
+        check_duty(TIMEOUT, DEFAULT_CONDUCTOR_DUTY_PERIOD_NS),
+        Ok(())
+    );
+    // Above the floor, below ten periods of 2 ms; exactly ten is enough.
+    assert_eq!(
+        check_duty(15 * MS, 2 * MS),
+        Err(BarrierAckBound::DutyPeriods)
+    );
+    assert_eq!(check_duty(20 * MS, 2 * MS), Ok(()));
+    assert_eq!(
+        check_duty(u64::MAX, u64::MAX),
+        Err(BarrierAckBound::DutyPeriods)
+    );
+}
+
+/// karyos#658: on an unreliable image, the seal deadline plus the timeout
+/// must stay below the far-window timeout; equality is refused, and an
+/// overflowing sum too.
+#[test]
+fn the_far_window_bound_refuses_equality() {
+    let skip = karyos_sys::log_buffer::SkipConfig {
+        skew_window_ns: MS,
+        ..karyos_sys::log_buffer::SkipConfig::unreliable()
+    };
+    let far = skip.far_window_timeout_ns;
+    let deadline = skip.deadline_ns();
+    assert_eq!(
+        check_far_window(far - deadline, &skip),
+        Err(BarrierAckBound::FarWindow)
+    );
+    assert_eq!(check_far_window(far - deadline - 1, &skip), Ok(()));
+    assert_eq!(check_far_window(TIMEOUT, &skip), Ok(()));
+    assert_eq!(
+        check_far_window(u64::MAX, &skip),
+        Err(BarrierAckBound::FarWindow)
+    );
+    // The larger of the reorder interval and the skew window counts, never
+    // their sum.
+    let skewed = karyos_sys::log_buffer::SkipConfig {
+        skew_window_ns: 500 * MS,
+        ..skip
+    };
+    assert_eq!(check_far_window(499 * MS, &skewed), Ok(()));
+    assert_eq!(
+        check_far_window(500 * MS, &skewed),
+        Err(BarrierAckBound::FarWindow)
+    );
+}
+
+/// karyos#658: a gate moves to a recreated view's link only once the
+/// closed view's terminal cell is published, and then starts over
+/// unattached.
+#[test]
+fn a_gate_relinks_only_a_closed_view() {
+    let (mut gate, link) = gate();
+    let next = FreshnessLink::new();
+    assert!(!gate.relink(next.clone()));
+    assert!(link.terminal().unwrap().publish(Terminal {
+        start: 0,
+        end: 64,
+        reason: TERMINAL_BARRIER_TIMEOUT,
+    }));
+    assert!(gate.relink(next.clone()));
+    assert!(!gate.closed());
+    // Unattached: a seal is permitted at once, nothing posted.
+    assert_eq!(gate.before_seal(Lane::ZERO, 64, 64, 0), GateAnswer::Permit);
+    // Attached: the new view's mailbox takes the post.
+    next.mailbox().unwrap().attach();
+    assert_eq!(
+        gate.before_seal(Lane::ZERO, 128, 64, 0),
+        GateAnswer::Pending
+    );
+    assert!(next.mailbox().unwrap().pending().is_some());
+    assert_eq!(gate.lane(), Lane::ZERO);
+}

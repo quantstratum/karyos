@@ -28,6 +28,7 @@ use crate::agents::{AgentConfig, ThreadingMode};
 use crate::embedded::{
     AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, StreamConfig, StreamTerms,
 };
+use crate::error::DriverError;
 use crate::net::NetworkConfig;
 
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -1977,6 +1978,191 @@ fn a_retired_image_closes_its_view_as_retired() {
         (1, 0),
         "{views:?}"
     );
+}
+
+/// karyos#658 (SPEC.md §7.1 and the "Conflation freshness" row of §13):
+/// a view closed at `barrier_ack_timeout` is recreated with every key
+/// `Stale` since the terminal's start, its last value kept; a key turns
+/// `Fresh` only with its own update, and the receiver's gate moves to the
+/// new view.
+#[test]
+fn a_timed_out_view_is_recreated_with_every_key_stale() {
+    use karyos_sys::freshness::{Freshness, TERMINAL_BARRIER_TIMEOUT, Terminal};
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image, _subscription) = conflated_pair(&mut a, &mut b, VIEW);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 11);
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0].is_some() && latest[1].is_some()
+    });
+    // An open view is not recreated.
+    assert_eq!(
+        b.recreate_network_view(&image, Lane::ZERO),
+        Err(DriverError::ViewNotClosed)
+    );
+    // The cell the gate's fail-safe publishes at the timeout, on the link
+    // the gate holds.
+    let terminal = Terminal {
+        start: 32,
+        end: 64,
+        reason: TERMINAL_BARRIER_TIMEOUT,
+    };
+    let link = b.network_view_link(&image, Lane::ZERO).unwrap();
+    assert!(link.terminal().unwrap().publish(terminal));
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_view_counters().closed_terminal == 1
+    });
+    assert!(b.holds_closed_network_view(&image, Lane::ZERO));
+    b.recreate_network_view(&image, Lane::ZERO).unwrap();
+    assert!(!b.holds_closed_network_view(&image, Lane::ZERO));
+    assert_eq!(b.network_view_counters().recreated, 1);
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0].is_some() && latest[1].is_some()
+    });
+    let stale = Freshness::Stale { since: 32 };
+    assert_eq!(latest, [Some((10, stale)), Some((11, stale)), None, None]);
+    // Key 1's own update restores it, and only it.
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 21);
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[1] == Some((21, Freshness::Fresh))
+    });
+    assert_eq!(latest[0], Some((10, stale)));
+    // The receiver took the relink: its gate holds the new view's link.
+    let counters = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert_eq!((counters.views_relinked, counters.relinks_refused), (1, 0));
+    // The recreated view is open: a second recreation is refused.
+    assert_eq!(
+        b.recreate_network_view(&image, Lane::ZERO),
+        Err(DriverError::ViewNotClosed)
+    );
+}
+
+/// karyos#658: a closed view's table is released when its image retires,
+/// and a retired image's view is not recreated.
+#[test]
+fn a_retired_image_releases_its_closed_view() {
+    use karyos_sys::freshness::{TERMINAL_BARRIER_TIMEOUT, Terminal};
+
+    let (mut a, mut b) = (
+        fast_driver(ThreadingMode::Shared),
+        fast_driver(ThreadingMode::Shared),
+    );
+    let (publication, image, _subscription) = conflated_pair(&mut a, &mut b, VIEW);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
+    let link = b.network_view_link(&image, Lane::ZERO).unwrap();
+    assert!(link.terminal().unwrap().publish(Terminal {
+        start: 0,
+        end: 64,
+        reason: TERMINAL_BARRIER_TIMEOUT,
+    }));
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].holds_closed_network_view(&image, Lane::ZERO)
+    });
+    drop(lane);
+    a.remove_aggregate(&publication).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        !drivers[1].holds_closed_network_view(&image, Lane::ZERO)
+    });
+    assert!(matches!(
+        b.recreate_network_view(&image, Lane::ZERO),
+        Err(DriverError::StreamRetiring { .. } | DriverError::UnknownStream { .. })
+    ));
+}
+
+/// karyos#658: a conflated view of an unreliable channel needs the seal
+/// deadline plus `barrier_ack_timeout` below the far-window timeout, so
+/// its fail-safe closes the view before the far-window close ends the
+/// image. A reliable channel never closes by that timer and is not held
+/// to it.
+#[test]
+fn an_unreliable_view_needs_its_timeout_below_the_far_window() {
+    use crate::agents::BarrierAckBound;
+
+    let skip = crate::agents::roles::image_skip_config(
+        &crate::agents::roles::receiver_path_config(&AgentConfig::default()),
+        false,
+    );
+    let at_bound = skip.far_window_timeout_ns - skip.deadline_ns();
+    let mut b = driver_with(
+        ThreadingMode::Shared,
+        AgentConfig {
+            barrier_ack_timeout: at_bound,
+            ..AgentConfig::default()
+        },
+    );
+    assert_eq!(
+        b.add_network_subscription_conflated(10, &channel(ANY_PORT, false), Lane::ZERO, VIEW)
+            .err(),
+        Some(DriverError::BarrierAckTimeout(BarrierAckBound::FarWindow))
+    );
+    // The same timeout on a reliable channel, and an unconflated
+    // unreliable subscription, are accepted.
+    assert!(
+        b.add_network_subscription_conflated(11, &channel(ANY_PORT, true), Lane::ZERO, VIEW)
+            .is_ok()
+    );
+    assert!(
+        b.add_network_subscription(12, &channel(ANY_PORT, false))
+            .is_ok()
+    );
+    let mut c = driver_with(
+        ThreadingMode::Shared,
+        AgentConfig {
+            barrier_ack_timeout: at_bound - 1,
+            ..AgentConfig::default()
+        },
+    );
+    assert!(
+        c.add_network_subscription_conflated(10, &channel(ANY_PORT, false), Lane::ZERO, VIEW)
+            .is_ok()
+    );
+}
+
+/// karyos#658: a driver refuses a `barrier_ack_timeout` below its floor or
+/// below ten conductor duty periods, each with its own typed refusal; the
+/// default passes both.
+#[test]
+fn the_barrier_timeout_bounds_refuse_a_driver() {
+    use crate::agents::BarrierAckBound;
+
+    let start = |barrier_ack_timeout, conductor_duty_period| {
+        EmbeddedDriver::with_config(DriverConfig {
+            network: Some(NetworkConfig {
+                threading: ThreadingMode::Shared,
+                agents: AgentConfig {
+                    barrier_ack_timeout,
+                    conductor_duty_period,
+                    ..AgentConfig::default()
+                },
+                ..NetworkConfig::default()
+            }),
+            ..DriverConfig::default()
+        })
+        .err()
+    };
+    const MS: u64 = 1_000_000;
+    assert_eq!(
+        start(10 * MS - 1, MS),
+        Some(DriverError::BarrierAckTimeout(BarrierAckBound::Floor))
+    );
+    assert_eq!(
+        start(15 * MS, 2 * MS),
+        Some(DriverError::BarrierAckTimeout(BarrierAckBound::DutyPeriods))
+    );
+    assert_eq!(start(20 * MS, 2 * MS), None);
+    assert_eq!(start(100 * MS, MS), None);
+    assert_eq!(start(100 * MS, 0), Some(DriverError::InvalidConfig));
 }
 
 /// Offers numbered messages on `lane` up to `until`, runs A and B once and

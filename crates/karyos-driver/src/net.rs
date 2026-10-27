@@ -469,6 +469,8 @@ pub struct NetworkViewCounters {
     pub closed_retired: u64,
     /// Feeders that could not read on: their view closed, the image stayed.
     pub feeders_lost: u64,
+    /// Views recreated after their terminal cell closed them (karyos#658).
+    pub recreated: u64,
 }
 
 /// Why a conflated view of a network image could not be built.
@@ -695,6 +697,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// The agents' CnC cells, taken back at the close for the conductor to
     /// free (M2).
     cells: Vec<Counter>,
+    /// Whether `barrier_ack_timeout` fits an unreliable image's skip
+    /// deadlines ([`crate::agents::BarrierAckBound::FarWindow`]), checked
+    /// at start for the conflated subscriptions of unreliable channels.
+    unreliable_view_bound: Result<(), crate::agents::BarrierAckBound>,
     /// Conflated views built from now on are not attached (tests).
     #[cfg(test)]
     defer_view_attach: bool,
@@ -707,7 +713,8 @@ impl<T: StreamTerms> Network<T> {
     /// # Errors
     ///
     /// [`DriverError::InvalidConfig`] for an agent configuration the agents
-    /// refuse, a `publication_linger` above [`MAX_PUBLICATION_LINGER`] or
+    /// refuse ([`DriverError::BarrierAckTimeout`] for a `barrier_ack_timeout`
+    /// below a bound), a `publication_linger` above [`MAX_PUBLICATION_LINGER`] or
     /// invalid timed streams ([`NetworkStreamDefaults::timed`]);
     /// [`DriverError::NetworkStart`] when a thread cannot start.
     pub(crate) fn start(
@@ -723,8 +730,11 @@ impl<T: StreamTerms> Network<T> {
             return Err(DriverError::InvalidConfig);
         }
         control_group::validate(&config.nak_control_groups)?;
-        let (mut agents, links) = network_agents_over::<OsSocket, T>(config.agents)
-            .map_err(|_| DriverError::InvalidConfig)?;
+        let (mut agents, links) =
+            network_agents_over::<OsSocket, T>(config.agents).map_err(|error| match error {
+                AgentError::BarrierAckTimeout(bound) => DriverError::BarrierAckTimeout(bound),
+                _ => DriverError::InvalidConfig,
+            })?;
         // Each agent writes its own cells from its first cycle (M2).
         agents.attach_cells(cells.0, cells.1);
         let agents = match config.threading {
@@ -789,6 +799,13 @@ impl<T: StreamTerms> Network<T> {
             path_failures: 0,
             views: NetworkViewCounters::default(),
             cells: Vec::new(),
+            unreliable_view_bound: crate::agents::conflated_gate::check_far_window(
+                config.agents.barrier_ack_timeout,
+                &crate::agents::roles::image_skip_config(
+                    &crate::agents::roles::receiver_path_config(&config.agents),
+                    false,
+                ),
+            ),
             #[cfg(test)]
             defer_view_attach: false,
         })
@@ -1051,6 +1068,16 @@ impl<T: StreamTerms> Network<T> {
         self.paths_isolated
     }
 
+    /// Whether a conflated view of an unreliable channel may open: its
+    /// `barrier_ack_timeout` fits the skip deadlines.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::agents::BarrierAckBound::FarWindow`] when it does not.
+    pub(crate) fn unreliable_view_bound(&self) -> Result<(), crate::agents::BarrierAckBound> {
+        self.unreliable_view_bound
+    }
+
     /// One channel with `paths` refused: the sockets cannot be isolated.
     pub(crate) fn count_paths_refused(&mut self) {
         if let Some(count) = self.paths_refused.checked_add(1) {
@@ -1308,6 +1335,41 @@ impl<T: StreamTerms> Network<T> {
             .iter()
             .find(|image| image.slot == slot)
             .and_then(|image| image.exposed)
+    }
+
+    /// The installed image that `handle` exposes.
+    pub(crate) fn image_slot(&self, handle: &crate::embedded::AggregateHandle) -> Option<SlotRef> {
+        self.net_images
+            .iter()
+            .find(|image| image.exposed.as_ref() == Some(handle))
+            .map(|image| image.slot)
+    }
+
+    /// Moves the seal gate of `lane` of the installed image `slot`, and
+    /// the conductor's record of its view link, to `link`: a recreated
+    /// view's (karyos#658).
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NetworkBusy`] when the receiver's command ring is
+    /// full; nothing changes then.
+    pub(crate) fn relink_view(
+        &mut self,
+        slot: SlotRef,
+        lane: Lane,
+        link: &karyos_sys::freshness::FreshnessLink,
+    ) -> Result<(), DriverError> {
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::RelinkView {
+                reply,
+                slot,
+                lane,
+                link: link.clone(),
+            })
+            .map_err(|_| DriverError::NetworkBusy)?;
+        let _ = self.images.relink(slot, link.clone());
+        Ok(())
     }
 
     /// Forgets the reclaimed image `slot`.

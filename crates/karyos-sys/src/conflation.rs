@@ -1353,6 +1353,37 @@ mod owned {
             Ok(version)
         }
 
+        /// Calls `each(key, value)` with the last value of every written
+        /// key of a table with a barrier, in key order, copying through
+        /// `out` (at least the value capacity; a shorter buffer copies
+        /// nothing). For the conductor to seed a recreated view from a
+        /// closed one (`quantstratum-docs:
+        /// karyos/design/conflated-network-images.md`, "Recovery";
+        /// karyos#658). This writer is the only one, so every written slot
+        /// reads coherent; a slot that does not is skipped and counted in
+        /// the result, which is the number of such slots.
+        pub fn for_each_value(&self, out: &mut [u8], mut each: impl FnMut(u32, &[u8])) -> u32 {
+            let mut unstable = 0u32;
+            if out.len() < self.value_capacity || self.fresh.is_none() {
+                return unstable;
+            }
+            for key in 0..self.table.geometry.keys {
+                let Some(slot) = self.table.slot(key) else {
+                    continue;
+                };
+                match slot.read(out) {
+                    FreshRead::Value { length, .. } => {
+                        if let Some(value) = out.get(..length) {
+                            each(key, value);
+                        }
+                    }
+                    FreshRead::Unstable => unstable = unstable.saturating_add(1),
+                    FreshRead::Empty => {}
+                }
+            }
+            unstable
+        }
+
         /// Closes the table for good: later writes fail with
         /// [`ConflationError::Closed`]; readers keep reading the last
         /// values and see [`PollReport::closed`].

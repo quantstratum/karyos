@@ -48,7 +48,6 @@ use karyos_sys::term_bytes::SharedTerms;
 #[cfg(target_os = "linux")]
 use crate::args::AdmissionOptions;
 use crate::args::{ConflationOption, GuardOption, Options, StreamOption, TermOptions};
-#[cfg(target_os = "linux")]
 use crate::idle::BackoffIdle;
 
 /// How often, at most, the daemon looks for endpoints to log.
@@ -297,6 +296,11 @@ pub struct Daemon {
     streams: Vec<StreamHandle>,
     #[cfg(target_os = "linux")]
     linger: std::time::Duration,
+    /// The longest idle sleep between two duty cycles: the network's
+    /// `conductor_duty_period`, which its `barrier_ack_timeout` is
+    /// validated against (karyos#658), or the backoff's own 1 ms bound.
+    #[cfg(target_os = "linux")]
+    max_sleep: std::time::Duration,
     /// The last duty cycle error logged, so a repeated one is logged once.
     #[cfg(target_os = "linux")]
     last_error: Option<DriverError>,
@@ -360,6 +364,7 @@ impl Daemon {
                 serving,
                 streams,
                 linger: options.shutdown_linger,
+                max_sleep: max_sleep(options.driver.network.as_ref()),
                 last_error: None,
                 logged: Vec::new(),
                 next_check: Instant::now(),
@@ -446,6 +451,7 @@ impl Daemon {
             serving,
             streams,
             linger,
+            max_sleep,
             last_error,
             logged,
             next_check,
@@ -459,6 +465,7 @@ impl Daemon {
             serving: Serving::Plain(driver),
             streams,
             linger,
+            max_sleep,
             last_error,
             logged,
             next_check,
@@ -468,7 +475,9 @@ impl Daemon {
     fn serve(mut self, stop: &AtomicBool) -> Shutdown {
         // This loop drives the conductor: its spin time is the driver's
         // `conductor spin time` (M5).
-        let mut idle = BackoffIdle::default().with_spin_meter(self.driver_mut().take_spin_meter());
+        let mut idle = BackoffIdle::default()
+            .with_max_sleep(self.max_sleep)
+            .with_spin_meter(self.driver_mut().take_spin_meter());
         let mut clients = self.driver().clients();
         while !stop.load(Ordering::Acquire) {
             let work = self.cycle();
@@ -611,6 +620,22 @@ impl Daemon {
     }
 }
 
+/// The duty loop's longest idle sleep: the backoff's default bound, cut to
+/// the network's `conductor_duty_period` when that is shorter, so the
+/// conductor runs at least once per period (karyos#658).
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the daemon runs on Linux only")
+)]
+fn max_sleep(network: Option<&karyos_driver::net::NetworkConfig>) -> std::time::Duration {
+    let bound = BackoffIdle::default().max_sleep();
+    network.map_or(bound, |network| {
+        bound.min(std::time::Duration::from_nanos(
+            network.agents.conductor_duty_period,
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,6 +646,37 @@ mod tests {
         session_id: 1,
         allow_unconnected: false,
     };
+
+    /// karyos#658: the duty loop sleeps at most the network's
+    /// `conductor_duty_period`, and never longer than its own 1 ms bound.
+    #[test]
+    fn the_duty_loop_sleeps_within_the_conductor_duty_period() {
+        use std::time::Duration;
+
+        use karyos_driver::agents::AgentConfig;
+        use karyos_driver::net::NetworkConfig;
+
+        let network = |conductor_duty_period| NetworkConfig {
+            agents: AgentConfig {
+                conductor_duty_period,
+                ..AgentConfig::default()
+            },
+            ..NetworkConfig::default()
+        };
+        assert_eq!(max_sleep(None), Duration::from_millis(1));
+        assert_eq!(
+            max_sleep(Some(&network(250_000))),
+            Duration::from_micros(250)
+        );
+        assert_eq!(
+            max_sleep(Some(&network(5_000_000))),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            max_sleep(Some(&NetworkConfig::default())),
+            Duration::from_millis(1)
+        );
+    }
 
     #[test]
     fn stream_config_takes_the_term_settings() {

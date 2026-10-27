@@ -152,6 +152,12 @@ pub enum DriverError {
     /// A control-channel limit or size is invalid.
     #[error("invalid driver configuration")]
     InvalidConfig,
+    /// `barrier_ack_timeout` misses a bound: at driver start, the floor or
+    /// the conductor duty periods; at a conflated subscription of an
+    /// unreliable channel, the far-window timeout (SPEC.md §7.1;
+    /// karyos#658).
+    #[error("{0}")]
+    BarrierAckTimeout(crate::agents::BarrierAckBound),
     /// A replay's feed wrote past the end it was finished at; its target
     /// retired.
     #[error("a replay finished at {end} but written to {written}")]
@@ -368,6 +374,11 @@ pub enum DriverError {
     /// The stream has no keyed conflation table.
     #[error("the stream is not configured for conflation")]
     NotConflated,
+    /// A network image lane's conflated view cannot be recreated: it is
+    /// still open, or it was never closed by its terminal cell
+    /// (karyos#658).
+    #[error("the conflated view is not closed")]
+    ViewNotClosed,
     /// A keyed conflation operation failed.
     #[error(transparent)]
     Conflation(#[from] ConflationError),
