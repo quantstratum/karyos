@@ -35,6 +35,7 @@ pub mod link;
 pub mod loss;
 pub mod merge;
 pub mod publication;
+pub mod refresh;
 pub mod schedule;
 pub mod subscription;
 #[cfg(target_os = "linux")]
@@ -79,6 +80,7 @@ pub use merge::{
     ReplayRequest, ReplayStatus, ReplayStop, ReplayUnavailable,
 };
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
+pub use refresh::{CycleError, CycleId, RefreshCycle, Scope as CycleScope};
 pub use subscription::{
     Aborted, ClientSubscription, InvalidExtensions, MessageInfo, MessageLimit, Overrun, PollError,
     PollSummary, RejoinOutcome, RejoinPolicy, ReplayFallbackReason, Secondary, SecondaryOutcome,

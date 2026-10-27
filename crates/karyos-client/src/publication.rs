@@ -1206,6 +1206,7 @@ mod tests {
             keys: 2,
             value_capacity: past,
             journal_capacity: 1024,
+            refresh: false,
         });
         let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
         let refused =
@@ -1231,6 +1232,7 @@ mod tests {
             keys: 2,
             value_capacity: 4,
             journal_capacity: 1024,
+            refresh: false,
         });
         let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
 

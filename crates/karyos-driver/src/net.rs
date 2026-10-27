@@ -478,6 +478,20 @@ pub struct NetworkViewCounters {
     /// seeded, so came back absent instead of `Stale`; never expected,
     /// the closed table having one closed writer.
     pub recreate_unstable: u64,
+    /// Refresh and snapshot cycles completed by views that opt in
+    /// (ADR-0080, karyos#634).
+    pub cycles_completed: u64,
+    /// Snapshot cycles among the completed ones.
+    pub snapshots_completed: u64,
+    /// Cycles aborted: cut by a loss, replaced by a new begin, ended with
+    /// another begin position, count or scope, or meeting a refresh value
+    /// or marker the view could not take. They restore nothing.
+    pub cycles_aborted: u64,
+    /// Keys restored by completed cycles.
+    pub keys_restored: u64,
+    /// Cycle markers whose payload did not decode; each aborts the open
+    /// cycle.
+    pub markers_malformed: u64,
 }
 
 /// Why a conflated view of a network image could not be built.

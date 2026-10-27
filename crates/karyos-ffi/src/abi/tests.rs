@@ -350,6 +350,7 @@ fn driven() -> (
         keys: 4,
         value_capacity: 64,
         journal_capacity: 4096,
+        refresh: false,
     });
     let mut shared_conflated = stream_config(STREAM_CONFLATED_CONCURRENT);
     shared_conflated.buffer.publication = shared.buffer.publication;

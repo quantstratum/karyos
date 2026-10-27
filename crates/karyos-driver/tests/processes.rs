@@ -1282,6 +1282,7 @@ const TABLE: karyos_sys::conflation::ConflationConfig = karyos_sys::conflation::
     keys: 4,
     value_capacity: 8,
     journal_capacity: 1024,
+    refresh: false,
 };
 /// Rounds of updates to every key.
 const VIEW_ROUNDS: u8 = 50;

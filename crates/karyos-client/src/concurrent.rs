@@ -739,6 +739,7 @@ mod tests {
                 keys: 2,
                 value_capacity: 4,
                 journal_capacity: 1024,
+                refresh: false,
             });
         let subscription = conductor.subscribe(Role::Required).unwrap();
         let client_subscription = crate::ClientSubscription::new(subscription);

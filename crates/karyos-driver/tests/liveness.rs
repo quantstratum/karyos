@@ -438,6 +438,7 @@ fn test_abort_seal_closes_conflation_table_after_feeder_reaches_end() {
         keys: 4,
         value_capacity: 8,
         journal_capacity: 1024,
+        refresh: false,
     });
     let stream = driver.add_stream(config).unwrap();
     let mut conflated: ConflatedSubscription = driver.subscribe_conflated(stream).unwrap();
