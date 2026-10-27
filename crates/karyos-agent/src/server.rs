@@ -24,10 +24,33 @@
 //!   [REASON]` and `guard-reopen DIR GUARD EPOCH [REASON]`, made for the
 //!   peer's uid as the operator, the reason being the rest of the line
 //!   (M10b; a `DIR` holds no space); `gap-ack POSITION`, an
-//!   administrator's acknowledgement of the journal's unknown interval.
+//!   administrator's acknowledgement of the journal's unknown interval;
+//!   `limits [DIMENSION=VALUE ...]`, the negotiation of the bounds below
+//!   (R-CORE-38).
 //! - **Bounds.** Each connection is served on the calling thread with
 //!   [`IO_TIMEOUT`] on its reads and writes, so a slow client delays the
 //!   others by that much at most.
+//! - **Limits (R-CORE-38).** `limits` answers every dimension of [`LIMITS`]
+//!   with one of three answers, never "unknown": `{"value":N,
+//!   "negotiable":true}`, a bound a client may propose within;
+//!   `{"value":N,"negotiable":false}`, a fixed bound; `{"value":null}`, no
+//!   bound. A client may propose values: a proposal above a bound is
+//!   refused with the bound (`{"error":"above bound","dimension":D,
+//!   "bound":N}`); any other is answered with the effective value, which
+//!   for a fixed bound is the bound. The exchange is stateless, like every
+//!   v1 request: a negotiated value that a later request uses is repeated
+//!   in that request and applies to it only, so no client changes
+//!   another's. In v1 only `read.request_bytes` is negotiable, downwards:
+//!   a proposal at or below 256 is the effective value and applies to the
+//!   `limits` request itself, whose line, its newline included, must fit
+//!   it. A proposal for a
+//!   dimension the agent does not know is refused by name
+//!   (`{"error":"unknown dimension","dimension":D}`), never as `bad
+//!   request`. A client reads "limits not supported" only from `bad
+//!   request` to `limits` without proposals, never as "no limits". A
+//!   future dimension, such as the page
+//!   sizes of R-CORE-13 and R-CORE-14, enters [`LIMITS`] as a new entry,
+//!   negotiable or not, and a v1 client that does not name it is unaffected.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsFd;
@@ -35,7 +58,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::api::API_VERSION;
+use crate::api::{API_VERSION, Limit};
 use crate::{Agent, json};
 
 /// The API socket's name in its directory.
@@ -49,6 +72,106 @@ pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
 /// Connections one [`Server::poll`] serves at most; the rest wait for the
 /// next poll, so a burst of clients cannot hold the polling thread.
 pub const MAX_ACCEPTS: usize = 16;
+
+/// The dimensions `limits` answers, their bounds being the constants
+/// above. Only `read.request_bytes` is negotiable in v1, and only
+/// downwards: no bound is raised.
+pub const LIMITS: [Limit; 6] = [
+    Limit {
+        name: "read.request_bytes",
+        bound: Some(MAX_REQUEST as u64),
+        negotiable: true,
+    },
+    Limit {
+        name: "read.timeout_ms",
+        bound: Some(IO_TIMEOUT.as_millis() as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "write.timeout_ms",
+        bound: Some(IO_TIMEOUT.as_millis() as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "write.response_bytes",
+        bound: None,
+        negotiable: false,
+    },
+    Limit {
+        name: "connection.accepts_per_poll",
+        bound: Some(MAX_ACCEPTS as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "connection.requests",
+        bound: Some(1),
+        negotiable: false,
+    },
+];
+
+/// Why a `limits` proposal was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal<'a> {
+    /// Above this limit's bound.
+    Above(Limit),
+    /// A dimension this agent does not know.
+    Unknown(&'a str),
+    /// Malformed or repeated.
+    Bad,
+}
+
+/// The effective value of each of `limits` given `proposals`
+/// (`DIMENSION=VALUE` separated by single spaces), in `limits` order: a
+/// negotiable dimension takes its proposal, any other keeps its bound.
+fn negotiate<'a, const N: usize>(
+    limits: &[Limit; N],
+    proposals: &'a str,
+) -> Result<[Option<u64>; N], Refusal<'a>> {
+    let mut effective = limits.map(|limit| limit.bound);
+    let mut proposed = [false; N];
+    for proposal in proposals.split(' ').filter(|_| !proposals.is_empty()) {
+        let (name, value) = proposal.split_once('=').ok_or(Refusal::Bad)?;
+        let value = value.parse::<u64>().map_err(|_| Refusal::Bad)?;
+        let ((limit, slot), seen) = limits
+            .iter()
+            .zip(effective.iter_mut())
+            .zip(proposed.iter_mut())
+            .find(|((limit, _), _)| limit.name == name)
+            .ok_or(Refusal::Unknown(name))?;
+        if core::mem::replace(seen, true) {
+            return Err(Refusal::Bad);
+        }
+        if limit.bound.is_some_and(|bound| value > bound) {
+            return Err(Refusal::Above(*limit));
+        }
+        if limit.negotiable {
+            *slot = Some(value);
+        }
+    }
+    Ok(effective)
+}
+
+/// The negotiated `read.request_bytes` applied to the request `line` that
+/// negotiated it: `Some` with the negotiated bound when the line, its
+/// newline included as [`parse`] counts it against [`MAX_REQUEST`], is
+/// longer.
+fn request_within<const N: usize>(
+    line: &str,
+    limits: &[Limit; N],
+    effective: &[Option<u64>; N],
+) -> Option<Limit> {
+    let length = u64::try_from(line.len()).ok()?;
+    limits
+        .iter()
+        .zip(effective)
+        .find(|(limit, _)| limit.name == "read.request_bytes")
+        .and_then(|(limit, bound)| {
+            bound.filter(|bound| length > *bound).map(|bound| Limit {
+                bound: Some(bound),
+                ..*limit
+            })
+        })
+}
 
 /// What an operator may do (SPEC §11, access control). Every API v1
 /// request reads, which every role may.
@@ -144,6 +267,8 @@ pub enum Served {
     /// A guard operation or an acknowledgement, made (whatever came of
     /// it).
     Operated,
+    /// The limits, negotiated or reported.
+    Limits,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -300,6 +425,15 @@ impl Server {
                     forbidden()
                 }
             }
+            (Some(_), Request::Limits { proposals }) => match negotiate(&LIMITS, proposals) {
+                Ok(effective) => match request_within(&line, &LIMITS, &effective) {
+                    None => (json::limits(&LIMITS, &effective), Served::Limits),
+                    Some(limit) => (json::above_bound(&limit), Served::Refused),
+                },
+                Err(Refusal::Above(limit)) => (json::above_bound(&limit), Served::Refused),
+                Err(Refusal::Unknown(name)) => (json::unknown_dimension(name), Served::Refused),
+                Err(Refusal::Bad) => (json::error("bad request", None), Served::Refused),
+            },
             (Some(_), Request::Version) => (
                 json::error("unsupported version", Some(&[API_VERSION])),
                 Served::Refused,
@@ -342,6 +476,9 @@ enum Request<'a> {
     },
     GapAck {
         position: u64,
+    },
+    Limits {
+        proposals: &'a str,
     },
     /// A well-formed request of another version.
     Version,
@@ -406,6 +543,9 @@ fn request(rest: &str) -> Option<Request<'_>> {
                 reason,
             })
         }
+        "limits" => Some(Request::Limits {
+            proposals: arguments,
+        }),
         "gap-ack" => Some(Request::GapAck {
             position: number(arguments)?,
         }),
@@ -429,6 +569,149 @@ mod tests {
         assert_eq!(parse(""), Request::Bad);
         let long = format!("KARYOS-AGENT 1 {}", "v".repeat(MAX_REQUEST));
         assert_eq!(parse(&long), Request::Bad);
+    }
+
+    /// R-CORE-38: a dimension this agent does not know is refused by
+    /// name, so a client tells it from an agent without `limits`.
+    #[test]
+    fn an_unknown_dimension_is_refused_by_name() {
+        assert_eq!(
+            negotiate(&LIMITS, "read.timeout_ms=1 page.rows=10"),
+            Err(Refusal::Unknown("page.rows"))
+        );
+        assert_eq!(
+            json::unknown_dimension("page.rows"),
+            r#"{"error":"unknown dimension","dimension":"page.rows"}"#
+        );
+    }
+
+    /// R-CORE-38's three answers, on a table with a negotiable dimension
+    /// (only `read.request_bytes` is in v1): a proposal within its bound is applied, one above
+    /// it is refused with the bound, and the answer renders the negotiable,
+    /// the fixed and the unbounded dimension.
+    #[test]
+    fn a_negotiable_dimension_takes_a_proposal_within_its_bound() {
+        let table = [
+            Limit {
+                name: "page.rows",
+                bound: Some(1000),
+                negotiable: true,
+            },
+            Limit {
+                name: "read.timeout_ms",
+                bound: Some(100),
+                negotiable: false,
+            },
+            Limit {
+                name: "write.response_bytes",
+                bound: None,
+                negotiable: false,
+            },
+        ];
+        assert_eq!(negotiate(&table, ""), Ok([Some(1000), Some(100), None]));
+        let effective = negotiate(&table, "page.rows=50 read.timeout_ms=50").unwrap();
+        assert_eq!(effective, [Some(50), Some(100), None]);
+        assert_eq!(
+            negotiate(&table, "page.rows=1001"),
+            Err(Refusal::Above(table[0]))
+        );
+        assert_eq!(
+            json::above_bound(&table[0]),
+            r#"{"error":"above bound","dimension":"page.rows","bound":1000}"#
+        );
+        assert_eq!(
+            json::limits(&table, &effective),
+            concat!(
+                r#"{"limits":{"page.rows":{"value":50,"negotiable":true},"#,
+                r#""read.timeout_ms":{"value":100,"negotiable":false},"#,
+                r#""write.response_bytes":{"value":null}}}"#
+            )
+        );
+    }
+
+    /// R-CORE-38: the negotiated `read.request_bytes` applies to the
+    /// request that negotiated it.
+    #[test]
+    fn a_negotiated_request_size_applies_to_its_request() {
+        // 44 bytes, its newline included, as `parse` counts against
+        // `MAX_REQUEST`: a bound of 44 takes it, 43 refuses it with 43.
+        let line = "KARYOS-AGENT 1 limits read.request_bytes=44\n";
+        assert_eq!(line.len(), 44);
+        let effective = negotiate(&LIMITS, "read.request_bytes=44").unwrap();
+        assert_eq!(request_within(line, &LIMITS, &effective), None);
+        let line = "KARYOS-AGENT 1 limits read.request_bytes=43\n";
+        let effective = negotiate(&LIMITS, "read.request_bytes=43").unwrap();
+        let refused = request_within(line, &LIMITS, &effective).unwrap();
+        assert_eq!(
+            (refused.name, refused.bound),
+            ("read.request_bytes", Some(43))
+        );
+        let bounds = LIMITS.map(|limit| limit.bound);
+        assert_eq!(request_within(line, &LIMITS, &bounds), None);
+    }
+
+    /// R-CORE-38: `limits` parses with or without proposals.
+    #[test]
+    fn limits_requests_parse() {
+        assert_eq!(
+            parse("KARYOS-AGENT 1 limits\n"),
+            Request::Limits { proposals: "" }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 limits read.timeout_ms=50\n"),
+            Request::Limits {
+                proposals: "read.timeout_ms=50"
+            }
+        );
+    }
+
+    /// R-CORE-38: only `read.request_bytes` is negotiable in v1, so a
+    /// proposal within it is the effective value; a proposal within a fixed
+    /// bound is answered with the bound.
+    #[test]
+    fn a_fixed_bound_answers_its_value_whatever_is_proposed() {
+        let bounds = LIMITS.map(|limit| limit.bound);
+        let negotiable: Vec<_> = LIMITS
+            .iter()
+            .filter(|limit| limit.negotiable)
+            .map(|limit| limit.name)
+            .collect();
+        assert_eq!(negotiable, ["read.request_bytes"]);
+        assert_eq!(negotiate(&LIMITS, ""), Ok(bounds));
+        assert_eq!(negotiate(&LIMITS, "read.timeout_ms=50"), Ok(bounds));
+        assert_eq!(negotiate(&LIMITS, "write.response_bytes=4096"), Ok(bounds));
+        let mut lowered = bounds;
+        lowered[0] = Some(100);
+        assert_eq!(negotiate(&LIMITS, "read.request_bytes=100"), Ok(lowered));
+        assert_eq!(bounds[0], Some(256));
+        assert_eq!(bounds[1], Some(100));
+        assert_eq!(bounds[2], Some(100));
+        assert_eq!(bounds[3], None);
+        assert_eq!(bounds[4], Some(16));
+        assert_eq!(bounds[5], Some(1));
+    }
+
+    /// R-CORE-38: a proposal above a bound is refused with that limit;
+    /// a malformed or repeated one is a bad request.
+    #[test]
+    fn a_proposal_above_a_bound_is_refused_with_the_bound() {
+        assert_eq!(
+            negotiate(&LIMITS, "write.timeout_ms=101"),
+            Err(Refusal::Above(LIMITS[2]))
+        );
+        assert_eq!(
+            negotiate(&LIMITS, "read.request_bytes=256 connection.requests=2"),
+            Err(Refusal::Above(LIMITS[5]))
+        );
+        for bad in [
+            "read.timeout_ms",
+            "read.timeout_ms=x",
+            "read.timeout_ms=-1",
+            "read.timeout_ms=1 read.timeout_ms=2",
+            "read.timeout_ms=1  write.timeout_ms=1",
+        ] {
+            assert_eq!(negotiate(&LIMITS, bad), Err(Refusal::Bad), "{bad}");
+        }
     }
 
     /// M10b: the guard requests and their arguments, a reason being the

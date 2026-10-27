@@ -11,6 +11,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- R-CORE-38, the agent API's limits (quantstratum-docs:
+  karyos/design/agent-api-v1.md). A v1 request, `limits [DIMENSION=VALUE
+  ...]`, answers each connection, read and write dimension as a negotiable
+  bound, a fixed bound or no bound (`{"value":null}`), and refuses a
+  proposal above a bound with `{"error":"above bound","dimension":D,
+  "bound":N}` and one for a dimension it does not know with
+  `{"error":"unknown dimension","dimension":D}`. It is stateless, so a negotiated value applies to the
+  request that repeats it only. Only `read.request_bytes` is negotiable in v1,
+  downwards, and applies to the request that proposes it; no bound
+  changed, and a client that never sends `limits` is served as before.
+
 - R-CORE-12, the Archive's public durable-prefix acknowledgement
   (quantstratum-docs: karyos/design/archive-durable-acknowledgement.md).
   `karyos_archive::durable` answers a recording's `DurablePosition` (the
