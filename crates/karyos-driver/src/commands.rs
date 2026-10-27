@@ -75,8 +75,8 @@ use karyos_client::link::{
 };
 use karyos_protocol::cnc::{
     CloseReason, Command, CounterLabel, ErrorCode, Event as DriverEvent, LossPolicyCode,
-    MAX_COMMAND_LENGTH, MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RejoinOutcomeCode, ReportedLoss,
-    RequestId, Response, StreamKey,
+    MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RejoinOutcomeCode, ReportedLoss, RequestId, Response,
+    StreamKey,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::counters::{CounterKeys, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER};
@@ -273,7 +273,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Records the grant of `command` to `client` on the stream `stream`
     /// (an internal id) as `registration`, if that stream is audited.
-    fn audit_grant(&mut self, client: u64, stream: u64, command: Command, registration: u64) {
+    fn audit_grant(&mut self, client: u64, stream: u64, command: &Command, registration: u64) {
         if !self.grant_audits.watches(stream) {
             return;
         }
@@ -724,7 +724,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             };
             let client = slot.id;
             let link = Arc::clone(&slot.link);
-            let mut bytes = [0u8; MAX_COMMAND_LENGTH];
+            let bytes = &mut self.command_bytes;
             let copied = match consumer.read() {
                 Ok(None) => continue,
                 Ok(Some(message)) => {
@@ -752,6 +752,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 continue;
             };
             self.counters.add(Event::CommandsServed, 1);
+            let type_id = command.type_id();
             let response = match self.serve(client, &link, command) {
                 Ok(response) => response,
                 Err(violation) => {
@@ -760,7 +761,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     self.diagnostics.error(
                         &mut self.counters,
                         crate::diagnostics::ErrorCode::ClientProtocolViolation,
-                        [client, u64::from(command.type_id())],
+                        [client, u64::from(type_id)],
                         violation,
                     );
                     self.retire_faulty(index);
@@ -1160,7 +1161,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         Err(error) => return Ok(refuse(issue_refusal(&error), detail)),
                     },
                     _ => {
-                        let role = subscription_role(command);
+                        let role = subscription_role(&command);
                         // A required reader of a `continue` stream reserves
                         // its slots like an optional one.
                         let reserve =
@@ -1208,7 +1209,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     Capability::Publication { .. } => MemberKind::Exclusive,
                     Capability::ConcurrentPublication { .. } => MemberKind::Concurrent,
                     Capability::Subscription(inner) => MemberKind::Subscriber {
-                        role: subscription_role(command),
+                        role: subscription_role(&command),
                         cell: inner.cell(),
                     },
                 };
@@ -1243,7 +1244,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     join,
                     incarnation,
                 });
-                self.audit_grant(client, stream_id, command, registration);
+                self.audit_grant(client, stream_id, &command, registration);
                 match kind {
                     Kind::Publication => Response::PublicationReady {
                         request,
@@ -1387,7 +1388,41 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     request,
                     stream_id,
                     (allow_unconnected, concurrent),
-                    uri.as_str(),
+                    (uri.as_str(), None),
+                );
+            }
+            // Owner item 7, karyos#637: roles and identities by command.
+            Command::AddNetworkPublicationWithRoles {
+                stream_id,
+                allow_unconnected,
+                concurrent,
+                uri,
+                roles,
+                ..
+            } => {
+                return self.serve_network_publication(
+                    client,
+                    link,
+                    request,
+                    stream_id,
+                    (allow_unconnected, concurrent),
+                    (uri.as_str(), Some(roles)),
+                );
+            }
+            Command::AddNetworkSubscriptionAs {
+                stream_id,
+                role,
+                uri,
+                identity,
+                ..
+            } => {
+                return self.serve_network_subscription(
+                    client,
+                    link,
+                    request,
+                    stream_id,
+                    role,
+                    (uri.as_str(), Some(identity)),
                 );
             }
             Command::AddNetworkSubscription {
@@ -1402,7 +1437,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     request,
                     stream_id,
                     role,
-                    uri.as_str(),
+                    (uri.as_str(), None),
                 );
             }
             _ => return Err("a command this driver does not serve"),
@@ -2019,7 +2054,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
             _ => {
-                let role = subscription_role(command);
+                let role = subscription_role(&command);
                 let reserve = role == Role::Required && target.policy == LossPolicy::Continue;
                 match target
                     .conductor
@@ -2111,7 +2146,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             join,
             incarnation,
         });
-        self.audit_grant(client, stream, command, registration);
+        self.audit_grant(client, stream, &command, registration);
         self.counters.add(Event::GrantsReserved, 1);
         match kind {
             Kind::Publication => Response::PublicationReady {
@@ -2350,10 +2385,10 @@ fn conflation_bytes(writer: &karyos_sys::conflation::ConflationWriter) -> Option
 /// match the stream's mode, or a resource (staging, loan) not available.
 /// The reader role an `AddSubscription` asks for; `Required` for any
 /// other command (the callers only reach it for subscriptions).
-fn subscription_role(command: Command) -> Role {
+fn subscription_role(command: &Command) -> Role {
     match command {
         Command::AddSubscription { role, .. } | Command::AddImageSubscription { role, .. } => {
-            Role::from(role)
+            Role::from(*role)
         }
         _ => Role::Required,
     }
@@ -3476,7 +3511,7 @@ mod tests {
     }
 
     fn write(producer: &mut RingProducer, command: Command) {
-        let mut bytes = [0u8; MAX_COMMAND_LENGTH];
+        let mut bytes = [0u8; karyos_protocol::cnc::MAX_COMMAND_LENGTH];
         let length = command.encode(&mut bytes).unwrap();
         producer.write(command.type_id(), &bytes[..length]).unwrap();
     }
@@ -5996,7 +6031,7 @@ mod tests {
             allow_unconnected: true,
             lane: Lane::ZERO,
         };
-        write(&mut ring_producer, add);
+        write(&mut ring_producer, add.clone());
         write(&mut producer, add);
         let mut answers = Vec::new();
         for _ in 0..3 {

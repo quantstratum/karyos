@@ -903,6 +903,44 @@ impl RemoteClient {
             .add_network_subscription(uri, stream_id, role)
     }
 
+    /// Requests an exclusive network publication whose receivers have
+    /// `roles`, as [`ClientConductor::add_network_publication_with_roles`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_network_publication_with_roles`].
+    pub fn add_network_publication_with_roles(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        allow_unconnected: bool,
+        roles: &karyos_protocol::roles::PublicationRoles,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?.add_network_publication_with_roles(
+            uri,
+            stream_id,
+            allow_unconnected,
+            roles,
+        )
+    }
+
+    /// Subscribes `stream_id` on the channel `uri` as `identity`, as
+    /// [`ClientConductor::add_network_subscription_as`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_network_subscription_as`].
+    pub fn add_network_subscription_as(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        role: SubscriberRole,
+        identity: karyos_protocol::roles::ReceiverIdentity,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_network_subscription_as(uri, stream_id, role, identity)
+    }
+
     /// Removes the network subscription `registration`, as
     /// [`ClientConductor::remove_network_subscription`].
     ///

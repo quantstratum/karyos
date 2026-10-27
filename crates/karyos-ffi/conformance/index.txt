@@ -5,7 +5,7 @@
 # karyos/design/ffi-gap-analysis.md that brings them.
 
 abi version: abi.version op.library.version
-typed status codes: abi.version.null status.text handle.wrong.kind publication.typed.statuses publication.timed.offer stream.schedule.refused subscription.options.typed.statuses offer.options.typed.statuses conflated.typed.statuses archive.typed.statuses publication.concurrent outcomes.typed.statuses conflated.client.view op.publication.concurrent op.outcomes
+typed status codes: abi.version.null status.text handle.wrong.kind publication.typed.statuses publication.timed.offer stream.schedule.refused subscription.options.typed.statuses offer.options.typed.statuses conflated.typed.statuses archive.typed.statuses publication.concurrent outcomes.typed.statuses conflated.client.view op.publication.concurrent op.outcomes publication.roles.typed.statuses subscription.as.typed.statuses
 use after close: handle.use.after.close publication.use.after.close claim.use.after.close op.use.after.close op.parent.close
 double close: handle.double.close claim.double.commit op.double.close op.conflated
 older protocol version refused at admission: op.connect.refused op.connect.other.version

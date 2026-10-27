@@ -42,10 +42,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use karyos_protocol::cnc::{
-    ChannelUri, Command, CounterLabel, Event, MAX_COMMAND_LENGTH, Response, StreamKey,
+    ChannelUri, CncError, Command, CounterLabel, Event, MAX_COMMAND_LENGTH, Response, StreamKey,
     SubscriberRole,
 };
 use karyos_protocol::cnc::{CutoverState, ErrorCode};
+use karyos_protocol::roles::{PublicationRoles, ReceiverIdentity};
 use karyos_sys::broadcast::{BroadcastReceiver, Received};
 use karyos_sys::command_ring::{RingError, RingProducer};
 use karyos_sys::counters::ClientCells;
@@ -105,9 +106,18 @@ pub enum ConductorError {
         code: u64,
     },
     /// The command ring cannot carry the command: it is smaller than the
-    /// driver's minimum (`DriverConfig::ring_capacity`).
+    /// driver's minimum (`DriverConfig::ring_capacity`), or the command
+    /// names more receiver roles than its largest record holds
+    /// (`ring_capacity / 8`; karyos#637).
     #[error("command larger than the command ring carries")]
     CommandTooLarge,
+    /// A publication's roles are not well formed
+    /// ([`PublicationRoles::is_well_formed`]): a `receiver_id` 0 or
+    /// repeated, a tag 0, or a tagged group 0 (karyos#637). Nothing is
+    /// submitted, so the driver never sees a command it would refuse as
+    /// malformed.
+    #[error("roles with a zero or repeated receiver id, or a zero tag or group")]
+    InvalidRoles,
     /// A guard reopen names an epoch that cannot be closed: 0, an even
     /// (open) epoch, or one above `karyos_sys::guard::MAX_EPOCH`.
     #[error("not a closed guard epoch")]
@@ -763,6 +773,53 @@ impl<T: TermBytes> ClientConductor<T> {
         })
     }
 
+    /// [`add_network_publication`](Self::add_network_publication) of a
+    /// `karyos:udp` channel whose receivers have the configured `roles`
+    /// (owner decisions of 2026-10-21, item 7; karyos#637): the required
+    /// `receiver_id`s and the receivers' tags. The roles' strategy must be
+    /// the URI's `fc` (`min` without one), or the driver refuses with
+    /// `StrategyConflict`; a `karyos:ipc` URI is refused with
+    /// `UnsupportedChannel`. The roles travel in the command, so their
+    /// only bound is the command ring's largest record (`ring_capacity /
+    /// 8`) and the driver's membership.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_network_publication`](Self::add_network_publication),
+    /// [`ConductorError::InvalidRoles`] for roles that are not well formed,
+    /// and [`ConductorError::CommandTooLarge`] for roles the ring's records
+    /// cannot carry; nothing is submitted on error.
+    pub fn add_network_publication_with_roles(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        allow_unconnected: bool,
+        roles: &PublicationRoles,
+    ) -> Result<u64, ConductorError> {
+        let (uri, _) = channel_uri(uri)?;
+        if !roles.is_well_formed() {
+            return Err(ConductorError::InvalidRoles);
+        }
+        let request = Request::Publication {
+            stream: StreamKey {
+                stream_id,
+                session_id: 0,
+            },
+            lane: Lane::ZERO,
+            allow_unconnected,
+        };
+        self.submit_uri(Kind::AddPublication, request, |sequence| {
+            Command::AddNetworkPublicationWithRoles {
+                sequence,
+                stream_id,
+                allow_unconnected,
+                concurrent: false,
+                uri,
+                roles: roles.clone(),
+            }
+        })
+    }
+
     /// Requests a concurrent publication handle on lane 0 of the
     /// `karyos:ipc` stream of `stream_id` (M11), as
     /// [`add_network_publication`](Self::add_network_publication) resolves
@@ -839,6 +896,36 @@ impl<T: TermBytes> ClientConductor<T> {
         } else {
             self.submit(Kind::AddNetworkSubscription, None, command)
         }
+    }
+
+    /// [`add_network_subscription`](Self::add_network_subscription) of a
+    /// `karyos:udp` channel whose images name the configured receiver
+    /// `identity` (MC-1, MC-2; karyos#637): its `receiver_id` in every RB
+    /// block and its `group_tag` in their SMs. A `karyos:ipc` URI is
+    /// refused with `UnsupportedChannel`; a second subscription of the
+    /// stream on the endpoint with another identity with
+    /// `ReceiverIdentityMismatch`.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_network_publication`](Self::add_network_publication).
+    pub fn add_network_subscription_as(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        role: SubscriberRole,
+        identity: ReceiverIdentity,
+    ) -> Result<u64, ConductorError> {
+        let (uri, _) = channel_uri(uri)?;
+        self.submit(Kind::AddNetworkSubscription, None, |sequence| {
+            Command::AddNetworkSubscriptionAs {
+                sequence,
+                stream_id,
+                role,
+                uri,
+                identity,
+            }
+        })
     }
 
     /// Removes the network subscription `registration`; its images retire.
@@ -1517,13 +1604,24 @@ impl<T: TermBytes> ClientConductor<T> {
             .checked_add(1)
             .ok_or(ConductorError::SequencesExhausted)?;
         let command = command(sequence);
-        let mut bytes = [0u8; MAX_COMMAND_LENGTH];
-        // Every command fits MAX_COMMAND_LENGTH by construction.
-        let length = command
-            .encode(&mut bytes)
-            .map_err(|_| ConductorError::Closed)?;
         let producer = self.producer.as_mut().ok_or(ConductorError::Closed)?;
-        match producer.write(command.type_id(), bytes.get(..length).unwrap_or(&[])) {
+        let mut bytes = [0u8; MAX_COMMAND_LENGTH];
+        // Every command fits MAX_COMMAND_LENGTH but one with receiver roles
+        // (karyos#637), whose only bound is the ring's largest record: it
+        // is encoded there, or refused before anything is written.
+        let mut larger = Vec::new();
+        let encoded = match command.encode(&mut bytes) {
+            Ok(length) => bytes.get(..length),
+            Err(CncError::BufferTooShort { .. }) => {
+                larger.resize(producer.max_payload(), 0);
+                let length = command
+                    .encode(&mut larger)
+                    .map_err(|_| ConductorError::CommandTooLarge)?;
+                larger.get(..length)
+            }
+            Err(_) => return Err(ConductorError::Closed),
+        };
+        match producer.write(command.type_id(), encoded.unwrap_or(&[])) {
             Ok(_) => {
                 self.next_sequence = next;
                 self.pending.push(Pending {
@@ -1537,8 +1635,8 @@ impl<T: TermBytes> ClientConductor<T> {
                 Ok(sequence)
             }
             Err(RingError::Full) => Err(ConductorError::Full),
-            // Only a ring smaller than the driver's validated minimum
-            // refuses a command for its size.
+            // A ring smaller than the driver's validated minimum, or a
+            // command with more receiver roles than its records carry.
             Err(RingError::MessageTooLarge { .. }) => Err(ConductorError::CommandTooLarge),
             Err(_) => Err(ConductorError::Closed),
         }

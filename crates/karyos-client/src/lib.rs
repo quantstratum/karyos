@@ -65,6 +65,7 @@ pub use generation::{GenerationLink, LinkStatus, Next, Successor};
 pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
 pub use karyos_protocol::cnc::{StreamId, SubscriberRole};
+pub use karyos_protocol::roles::{PublicationRoles, ReceiverIdentity, Strategy};
 /// The publication identity a replay and a live merge name (merge module).
 pub use karyos_protocol::trace_hook::PublicationIdentity;
 pub use karyos_sys::conflation::Budget as ConflatedBudget;

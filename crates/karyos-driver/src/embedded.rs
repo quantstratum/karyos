@@ -974,6 +974,11 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) fail_at: Option<u64>,
     pub(crate) next_registration: u64,
     pub(crate) scan_cursor: usize,
+    /// The private copy of the command being decoded: the largest record
+    /// a command ring carries (`ring_capacity / 8`), allocated once, so a
+    /// command with receiver roles (karyos#637) is bounded by the ring and
+    /// a client never changes what is being decoded.
+    pub(crate) command_bytes: Vec<u8>,
     pub(crate) terminal: bool,
     /// Whether new clients are admitted; cleared once by
     /// [`EmbeddedDriver::stop_admitting`].
@@ -1443,6 +1448,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             fail_at: None,
             next_registration: 1,
             scan_cursor: 0,
+            command_bytes: vec![0; config.ring_capacity / 8],
             terminal: false,
             admitting: true,
             clock,

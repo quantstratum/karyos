@@ -104,6 +104,10 @@ fn refusal(error: DriverError) -> ErrorCode {
         }
         DriverError::ReliabilityMismatch => ErrorCode::ReliabilityMismatch,
         DriverError::ReceiverIdentityMismatch => ErrorCode::ReceiverIdentityMismatch,
+        DriverError::StrategyConflict => ErrorCode::StrategyConflict,
+        // Decoding refuses a zero, repeated or tag-0 entry, so what is
+        // left is a list longer than the membership holds: a limit.
+        DriverError::InvalidRoles => ErrorCode::ResourcesUnavailable,
         _ => ErrorCode::ResourcesUnavailable,
     }
 }
@@ -184,7 +188,10 @@ pub(crate) fn valid_network(network: &crate::net::NetworkConfig, max_clients: us
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Serves `AddNetworkPublication` (W5b): with `concurrent`, a
-    /// concurrent handle on lane 0 of a `karyos:ipc` stream (M11).
+    /// concurrent handle on lane 0 of a `karyos:ipc` stream (M11). With
+    /// `roles` (`AddNetworkPublicationWithRoles`, karyos#637), a network
+    /// publication whose receivers have them; a `karyos:ipc` URI has no
+    /// receivers and is refused with `UnsupportedChannel`.
     pub(crate) fn serve_network_publication(
         &mut self,
         client: u64,
@@ -192,7 +199,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         request: RequestId,
         stream_id: i32,
         (allow_unconnected, concurrent): (bool, bool),
-        uri: &str,
+        (uri, roles): (&str, Option<karyos_protocol::roles::PublicationRoles>),
     ) -> Result<Response, &'static str> {
         let refuse = |code: ErrorCode, detail: u64| {
             Ok(Response::Error {
@@ -219,6 +226,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             )
         };
         let udp = match channel.media {
+            Media::Ipc if roles.is_some() => {
+                return refuse(ErrorCode::UnsupportedChannel, detail);
+            }
             Media::Ipc => {
                 let Some(stream) = self.ipc_stream(stream_id) else {
                     return refuse(ErrorCode::UnknownStream, detail);
@@ -267,6 +277,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Media::Udp(_) if concurrent => {
                 return refuse(ErrorCode::UnsupportedChannel, detail);
             }
+            // Roles that contradict the URI's `fc` are refused before
+            // anything else of the request is looked at, so the conflict
+            // is the answer whatever the driver serves (karyos#637).
+            Media::Udp(udp)
+                if roles.as_ref().is_some_and(|roles| {
+                    crate::net::publish::strategy_of(&udp).is_ok_and(|fc| fc != roles.strategy)
+                }) =>
+            {
+                return refuse(ErrorCode::StrategyConflict, detail);
+            }
             Media::Udp(udp) => udp,
             // A medium a later protocol version parses: not served.
             _ => return refuse(ErrorCode::UnsupportedChannel, detail),
@@ -296,14 +316,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let added = match defaults.timed_capacity(stream_id) {
             Some(capacity) => {
                 config.stream.buffer.schedule_capacity = capacity;
-                self.add_timed_network_publication(
+                self.add_network(
                     config,
                     &udp,
                     None,
-                    karyos_client::schedule::ScheduleOptions::default(),
+                    roles.map(Box::new),
+                    Some((karyos_client::schedule::ScheduleOptions::default(), None)),
                 )
             }
-            None => self.add_network_publication(config, &udp),
+            None => self.add_network(config, &udp, None, roles.map(Box::new), None),
         };
         let handle = match added {
             Ok(handle) => handle,
@@ -413,7 +434,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Serves `AddNetworkSubscription` (W5b). A `karyos:ipc` URI subscribes
-    /// the only stream of `stream_id` as `AddSubscription` does (W7).
+    /// the only stream of `stream_id` as `AddSubscription` does (W7). With
+    /// `identity` (`AddNetworkSubscriptionAs`, karyos#637), its images name
+    /// that receiver identity; a `karyos:ipc` URI has no images and is
+    /// refused with `UnsupportedChannel`.
     pub(crate) fn serve_network_subscription(
         &mut self,
         client: u64,
@@ -421,7 +445,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         request: RequestId,
         stream_id: i32,
         role: SubscriberRole,
-        uri: &str,
+        (uri, identity): (&str, Option<karyos_protocol::roles::ReceiverIdentity>),
     ) -> Result<Response, &'static str> {
         let refuse = |code: ErrorCode, detail: u64| {
             Ok(Response::Error {
@@ -433,6 +457,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let detail = u64::from(stream_id.cast_unsigned());
         let udp = match ChannelConfig::parse(uri) {
             Err(error) => return refuse(ErrorCode::InvalidChannel, error.code()),
+            Ok(ChannelConfig {
+                media: Media::Ipc, ..
+            }) if identity.is_some() => {
+                return refuse(ErrorCode::UnsupportedChannel, detail);
+            }
             Ok(ChannelConfig {
                 media: Media::Ipc, ..
             }) => {
@@ -467,7 +496,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(next) = registration.checked_add(1) else {
             return refuse(ErrorCode::IdentitiesExhausted, 0);
         };
-        let handle = match self.add_network_subscription(stream_id, &udp) {
+        let added = match identity {
+            Some(identity) => self.add_network_subscription_as(stream_id, &udp, identity),
+            None => self.add_network_subscription(stream_id, &udp),
+        };
+        let handle = match added {
             Ok(handle) => handle,
             Err(error) => return refuse(refusal(error), detail),
         };

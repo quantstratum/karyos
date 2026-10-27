@@ -71,6 +71,12 @@ pub enum DriverError {
     /// owner item 7, karyos#637).
     #[error("the roles' strategy is not the channel's fc")]
     StrategyConflict,
+    /// A network publication's roles do not fit its membership: more
+    /// required or tagged receivers than
+    /// [`crate::membership::DEFAULT_MAX_RECEIVERS`], a `receiver_id` 0 or
+    /// repeated, or a tag 0 (karyos#637).
+    #[error("roles the membership cannot hold")]
+    InvalidRoles,
     /// A second subscription of one endpoint and stream asks for another
     /// reliability than the first: they would share one receiver entry,
     /// and a reliable subscriber must not get gap-tolerant delivery.

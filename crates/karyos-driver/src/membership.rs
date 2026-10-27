@@ -79,6 +79,7 @@ use std::net::SocketAddr;
 
 use karyos_protocol::frame::Lane;
 use karyos_protocol::network::{Alias, Identity, MAX_LANES, Receiver, StatusMessage};
+pub use karyos_protocol::roles::{PublicationRoles, ReceiverIdentity, Roles, Strategy};
 use karyos_sys::host_clock::age_ns;
 
 use crate::agents::EndpointId;
@@ -108,17 +109,6 @@ type Binding = (EndpointId, SocketAddr);
 const BINDINGS: usize = 16;
 
 const _: () = assert!(MAX_PATHS == 16, "BINDINGS is MAX_PATHS");
-
-/// How the optional contribution to a lane's edge is chosen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Strategy {
-    /// The slowest live member's edge (the default).
-    Min,
-    /// The fastest live member's edge: optional members may lose data.
-    Max,
-    /// The slowest live member configured with this tag (not 0).
-    Tagged(u64),
-}
 
 /// The membership settings (MC-1, MC-5, MC-6; provisional and
 /// configurable). Times are in nanoseconds.
@@ -160,7 +150,7 @@ impl MembershipConfig {
     #[must_use]
     pub const fn new(lane_count: u8, min_window: u32, max_window: u32) -> Self {
         Self {
-            max_receivers: 64,
+            max_receivers: DEFAULT_MAX_RECEIVERS,
             max_pending: 16,
             max_paths: 4,
             lane_count,
@@ -238,54 +228,6 @@ pub enum MembershipConfigError {
     /// names a receiver twice.
     #[error("a role list is longer than the table, names receiver or tag 0, or repeats a receiver")]
     Roles,
-}
-
-/// A publication's configured receiver roles (MC-1): its strategy, the
-/// required `receiver_id`s and the `(receiver_id, tag)` pairs, owned and
-/// handed to the sender agent with the publication
-/// ([`crate::EmbeddedDriver::add_network_publication_with_roles`]; owner
-/// item 7). Its strategy must be the channel's `fc`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicationRoles {
-    /// The strategy.
-    pub strategy: Strategy,
-    /// The required `receiver_id`s.
-    pub required: Vec<u64>,
-    /// `(receiver_id, tag)` pairs; a receiver absent here has tag 0.
-    pub tags: Vec<(u64, u64)>,
-}
-
-impl PublicationRoles {
-    /// The borrowed roles [`Membership::new`] takes.
-    #[must_use]
-    pub fn roles(&self) -> Roles<'_> {
-        Roles {
-            required: &self.required,
-            tags: &self.tags,
-        }
-    }
-}
-
-/// A subscription's receiver identity (MC-1, MC-2): the configured
-/// `receiver_id` its images name in every RB block, stable across
-/// restarts, and the `group_tag` their SMs declare (0 for none). Without
-/// one an image names a `receiver_id` derived from its slot
-/// ([`crate::EmbeddedDriver::add_network_subscription_as`]; owner item 7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceiverIdentity {
-    /// The configured receiver id.
-    pub receiver_id: core::num::NonZeroU64,
-    /// The declared group tag.
-    pub group_tag: u64,
-}
-
-/// The configured roles and tags of an incarnation.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Roles<'a> {
-    /// The required `receiver_id`s.
-    pub required: &'a [u64],
-    /// `(receiver_id, tag)` pairs; a receiver absent here has tag 0.
-    pub tags: &'a [(u64, u64)],
 }
 
 /// A membership: a slot and the generation it had then.
@@ -586,6 +528,32 @@ pub struct Membership {
     counters: MembershipCounters,
 }
 
+/// Table entries of a publication's membership, required members
+/// included (MC-1): the most required, and the most tagged, receivers
+/// its roles can name.
+pub const DEFAULT_MAX_RECEIVERS: u16 = 64;
+
+/// Whether `roles` fit a membership of `max_receivers` entries: at most
+/// that many required and that many tagged receivers, no `receiver_id` 0
+/// or repeated in either list, and no tag 0.
+///
+/// # Errors
+///
+/// [`MembershipConfigError::Roles`] when they do not.
+pub fn check_roles(roles: &Roles<'_>, max_receivers: u16) -> Result<(), MembershipConfigError> {
+    let table = usize::from(max_receivers);
+    let tagged: Vec<u64> = roles.tags.iter().map(|(id, _)| *id).collect();
+    if roles.required.len() > table
+        || roles.tags.len() > table
+        || zero_or_repeated(roles.required)
+        || zero_or_repeated(&tagged)
+        || roles.tags.iter().any(|(_, tag)| *tag == 0)
+    {
+        return Err(MembershipConfigError::Roles);
+    }
+    Ok(())
+}
+
 impl Membership {
     /// A table for the publication `identity` on `alias`, created at `now`.
     ///
@@ -601,15 +569,7 @@ impl Membership {
     ) -> Result<Self, MembershipConfigError> {
         config.validate()?;
         let table = usize::from(config.max_receivers);
-        let tagged: Vec<u64> = roles.tags.iter().map(|(id, _)| *id).collect();
-        if roles.required.len() > table
-            || roles.tags.len() > table
-            || zero_or_repeated(roles.required)
-            || zero_or_repeated(&tagged)
-            || roles.tags.iter().any(|(_, tag)| *tag == 0)
-        {
-            return Err(MembershipConfigError::Roles);
-        }
+        check_roles(roles, config.max_receivers)?;
         let mut events = Vec::new();
         events.reserve_exact(usize::from(config.max_events));
         Ok(Self {

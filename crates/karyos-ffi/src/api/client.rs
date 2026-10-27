@@ -87,6 +87,54 @@ impl AnyClient {
         }
     }
 
+    /// The exclusive publication of `stream_id` on the `karyos:udp` channel
+    /// `uri` whose receivers have `roles` (owner item 7, karyos#637). A
+    /// control call, as [`AnyClient::add_publication`].
+    pub(crate) fn add_publication_with_roles(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+        roles: &karyos_client::PublicationRoles,
+    ) -> Result<Lanes, Failure> {
+        let failure = |error: ClientError| Failure::from(&error);
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(client) => client
+                .add_exclusive_publication_with_roles(uri, stream_id, roles)
+                .map(Lanes::Remote)
+                .map_err(failure),
+            Self::Embedded(client) => client
+                .add_exclusive_publication_with_roles(uri, stream_id, roles)
+                .map(Lanes::Embedded)
+                .map_err(failure),
+        }
+    }
+
+    /// The subscription of `stream_id` on the `karyos:udp` channel `uri`
+    /// with `options`, whose images name the receiver `identity` (owner
+    /// item 7, karyos#637). A control call, as
+    /// [`AnyClient::add_subscription_with`].
+    pub(crate) fn add_subscription_as(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+        options: karyos_client::SubscriptionOptions,
+        identity: karyos_client::ReceiverIdentity,
+    ) -> Result<Reader, Failure> {
+        let failure = |error: ClientError| Failure::from(&error);
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Remote(client) => client
+                .add_subscription_as(uri, stream_id, options, identity)
+                .map(Reader::Remote)
+                .map_err(failure),
+            Self::Embedded(client) => client
+                .add_subscription_as(uri, stream_id, options, identity)
+                .map(Reader::Embedded)
+                .map_err(failure),
+        }
+    }
+
     /// The subscription of `stream_id` on `uri` with `options` (a control
     /// call: it waits for the driver up to the context's timeout).
     pub(crate) fn add_subscription_with(

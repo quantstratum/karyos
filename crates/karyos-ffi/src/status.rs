@@ -227,7 +227,8 @@ impl From<&ConductorError> for Failure {
             ConductorError::ForeignHandle => Status::InvalidHandle.into(),
             ConductorError::LabelTooLong
             | ConductorError::InvalidJournal
-            | ConductorError::CommandTooLarge => Status::InvalidArgument.into(),
+            | ConductorError::CommandTooLarge
+            | ConductorError::InvalidRoles => Status::InvalidArgument.into(),
             ConductorError::UriTooLong | ConductorError::EmptyUri => Status::InvalidChannel.into(),
             ConductorError::InvalidChannel { code } => Self::with(Status::InvalidChannel, *code, 0),
             _ => Status::Unknown.into(),

@@ -29,8 +29,9 @@ use support::{abi, semantic, sha256};
 /// The format versions this runner reads.
 const FORMATS: [&str; 2] = ["1", "2"];
 
-/// The lowest ABI version this suite needs (FORMAT.md, Versions).
-const MINIMUM_ABI: [u32; 3] = [0, 1, 0];
+/// The lowest ABI version this suite needs (FORMAT.md, Versions): 0.1.2,
+/// whose roles calls two scenarios make (karyos#637).
+const MINIMUM_ABI: [u32; 3] = [0, 1, 2];
 
 /// Whether a library of ABI `library` can run this suite (FORMAT.md,
 /// Versions): before 1.0 exactly the suite's 0.y, at least its 0.y.z;
@@ -865,6 +866,39 @@ impl<'a> Arguments<'a> {
     }
 }
 
+/// A roles list argument (karyos#637): a string of comma-separated
+/// entries, each `id` (`per` 1) or `id:tag` (`per` 2), or `null`; absent
+/// is empty. `count`, when given, is the count passed instead of the
+/// entries' (a null list with a count, or a count past the words).
+fn roles_list(
+    arguments: &Arguments<'_>,
+    name: &str,
+    count: &str,
+    at: &str,
+    per: usize,
+) -> abi::RolesList {
+    let words = match arguments.step.arguments.get(name) {
+        None => Some(Vec::new()),
+        Some(Value::Null) => None,
+        Some(Value::Text(text)) => Some(
+            text.split(',')
+                .filter(|entry| !entry.is_empty())
+                .flat_map(|entry| entry.split(':'))
+                .map(|word| {
+                    word.parse::<u64>()
+                        .unwrap_or_else(|_| panic!("{at}: `{name}` holds `{word}`"))
+                })
+                .collect(),
+        ),
+        Some(other) => panic!("{at}: `{name}` must be a string or null, got {other:?}"),
+    };
+    let entries = words.as_ref().map_or(0, |words| words.len() / per);
+    abi::RolesList {
+        count: arguments.narrow(count, entries),
+        words,
+    }
+}
+
 /// The size a sized struct argument names, or `T`'s.
 fn size_argument<T>(arguments: &Arguments<'_>, name: &str) -> u32 {
     let own = u32::try_from(size_of::<T>()).unwrap();
@@ -1165,6 +1199,125 @@ fn call(step: &Step, at: &str) -> Returned {
             status: Some(abi::claim_abort(handle_argument(step, "claim", at))),
             results: BTreeMap::new(),
         },
+        "karyos_client_add_publication_with_roles" => {
+            let arguments = Arguments::new(
+                step,
+                &[
+                    "client",
+                    "stream_id",
+                    "uri",
+                    "strategy",
+                    "tagged_group",
+                    "required",
+                    "required_count",
+                    "required_fill",
+                    "tags",
+                    "tag_count",
+                    "detail_size",
+                ],
+                at,
+            );
+            let uri = std::ffi::CString::new(
+                arguments
+                    .text("uri")
+                    .unwrap_or_else(|| "karyos:udp?group=239.255.0.21:40001|fc=min".to_owned()),
+            )
+            .unwrap_or_else(|_| panic!("{at}: `uri` holds a NUL"));
+            let stream_id = arguments
+                .integer("stream_id")
+                .map(|_| arguments.narrow("stream_id", 0))
+                .unwrap_or_else(|| panic!("{at}: `stream_id` is required"));
+            let required = roles_list(&arguments, "required", "required_count", at, 1);
+            let required = match arguments.integer("required_fill") {
+                Some(_) => {
+                    let fill: u64 = arguments.narrow("required_fill", 0);
+                    abi::RolesList {
+                        words: Some((1..=fill).collect()),
+                        count: usize::try_from(fill).unwrap(),
+                    }
+                }
+                None => required,
+            };
+            let tags = roles_list(&arguments, "tags", "tag_count", at, 2);
+            let (status, publication, detail) = abi::client_add_publication_with_roles(
+                arguments.handle("client"),
+                &uri,
+                stream_id,
+                arguments.narrow("strategy", 0),
+                arguments.narrow("tagged_group", 0),
+                &required,
+                &tags,
+                size_argument::<abi::Detail>(&arguments, "detail_size"),
+            );
+            let mut results = BTreeMap::new();
+            if status == 0 {
+                results.insert(
+                    "publication".to_owned(),
+                    Value::Integer(i128::from(publication)),
+                );
+            }
+            if let Some((code, value)) = abi::detail_fields(&detail) {
+                results.insert("code".to_owned(), Value::Integer(i128::from(code)));
+                results.insert("value".to_owned(), Value::Integer(i128::from(value)));
+            }
+            Returned {
+                status: Some(status),
+                results,
+            }
+        }
+        "karyos_client_add_subscription_as" => {
+            let arguments = Arguments::new(
+                step,
+                &[
+                    "client",
+                    "stream_id",
+                    "uri",
+                    "receiver_id",
+                    "group_tag",
+                    "rejoin",
+                    "archive",
+                ],
+                at,
+            );
+            let uri = std::ffi::CString::new(
+                arguments
+                    .text("uri")
+                    .unwrap_or_else(|| "karyos:udp?group=239.255.0.21:40001".to_owned()),
+            )
+            .unwrap_or_else(|_| panic!("{at}: `uri` holds a NUL"));
+            let stream_id = arguments
+                .integer("stream_id")
+                .map(|_| arguments.narrow("stream_id", 0))
+                .unwrap_or_else(|| panic!("{at}: `stream_id` is required"));
+            let (status, mut options) = abi::subscription_options();
+            assert_eq!(status, 0, "{at}: karyos_subscription_options_init");
+            options.rejoin = arguments.narrow("rejoin", options.rejoin);
+            options.archive = arguments
+                .integer("archive")
+                .map_or(options.archive, |_| arguments.handle("archive"));
+            let (status, subscription) = abi::client_add_subscription_as(
+                arguments.handle("client"),
+                &uri,
+                stream_id,
+                &options,
+                size_argument::<abi::SubscriptionOptions>(&arguments, "size"),
+                (
+                    arguments.narrow("receiver_id", 77),
+                    arguments.narrow("group_tag", 0),
+                ),
+            );
+            let mut results = BTreeMap::new();
+            if status == 0 {
+                results.insert(
+                    "subscription".to_owned(),
+                    Value::Integer(i128::from(subscription)),
+                );
+            }
+            Returned {
+                status: Some(status),
+                results,
+            }
+        }
         "karyos_client_add_subscription_with" => {
             let arguments = Arguments::new(
                 step,
@@ -2275,8 +2428,11 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert!(runs((1, 3), (1, 3)));
     assert!(!runs((1, 4), (1, 3)));
     assert!(!runs((2, 0), (1, 3)));
-    // The suite as a whole needs 0.1.0 or a later 0.1.z.
-    assert!(suite_runs_on([0, 1, 0]));
+    // The suite as a whole needs 0.1.2 or a later 0.1.z (the roles
+    // calls, karyos#637).
+    assert!(!suite_runs_on([0, 1, 0]));
+    assert!(!suite_runs_on([0, 1, 1]));
+    assert!(suite_runs_on([0, 1, 2]));
     assert!(suite_runs_on([0, 1, 7]));
     assert!(!suite_runs_on([0, 2, 0]));
     assert!(!suite_runs_on([0, 0, 9]));

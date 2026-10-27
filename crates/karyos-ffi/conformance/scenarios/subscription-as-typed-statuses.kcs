@@ -1,0 +1,29 @@
+# A subscription's receiver identity (owner item 7, karyos#637; ABI 0.1.2)
+# is checked before anything is opened: a receiver id of 0, or an Archive
+# rejoin in the options (a network subscription has none), answers
+# KARYOS_E_INVALID_ARGUMENT. A karyos:ipc URI has no images:
+# KARYOS_E_UNSUPPORTED_CHANNEL, as is a karyos:udp one on this driver,
+# which has no network (SPEC.md §10.2, §13).
+format 1
+id subscription.as.typed.statuses
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_subscription_as client=$client stream_id=5 receiver_id=0
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_subscription_as client=$client stream_id=5 rejoin=2 archive=$client
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_subscription_as client=$client stream_id=5 uri="karyos:ipc"
+expect KARYOS_E_UNSUPPORTED_CHANNEL
+call karyos_client_add_subscription_as client=$client stream_id=5 receiver_id=77 group_tag=9
+expect KARYOS_E_UNSUPPORTED_CHANNEL
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

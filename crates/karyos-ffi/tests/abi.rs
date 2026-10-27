@@ -13,9 +13,10 @@ mod support {
 
 use support::abi;
 
+/// 0.1.2: the roles calls (karyos#637) on 0.1.1.
 #[test]
-fn the_abi_version_is_0_1_0() {
-    assert_eq!(abi::abi_version(), (0, [0, 1, 1]));
+fn the_abi_version_is_0_1_2() {
+    assert_eq!(abi::abi_version(), (0, [0, 1, 2]));
 }
 
 #[test]
