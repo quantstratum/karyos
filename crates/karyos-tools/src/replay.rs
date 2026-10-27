@@ -1282,6 +1282,12 @@ fn decoded<'c>(event: &ReplayEvent<'c>, index: usize) -> Option<GroupRecord<'c>>
 }
 
 /// The first difference between two events, if any.
+///
+/// Every recorded field takes part: nothing is excluded at compare time,
+/// and the trace extension is an input like any other (karyos#675). An
+/// offer is compared by its length and CRC32C digest, the version 1
+/// record (recording-group-replay.md §5); a stronger digest would need a
+/// version 2 record (ADR-0077, ADR-0051).
 fn compare_events(left: &ReplayEvent<'_>, right: &ReplayEvent<'_>) -> Option<Report> {
     let diverged = |index: Option<usize>, kind: Kind, at: (Option<usize>, Option<usize>)| {
         Some(Report::Diverged {

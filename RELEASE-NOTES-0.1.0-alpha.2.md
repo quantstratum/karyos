@@ -370,6 +370,14 @@ entered in `0d64b84e`. The published row is left as it is (RELEASING.md,
 "After a tag"); read its counts as not reproduced. This erratum does not
 change the gate's outcome: no Loom model failed in any of these runs.
 
+**Clarification 2026-10-27: the output diff's test gap.** "What works"
+says one minor test gap of the output diff is "tracked as an issue"; the
+issue is karyos#675. On `main` after this release, tests show that the
+first of several differences is the one reported (the lowest
+`group_seq`, then the lowest observation index), and that a change of
+any recorded field diverges, the trace extension included. The release
+itself is unchanged.
+
 ## Upgrading
 
 Nothing is compatible with 0.1.0-alpha.1 across a process boundary or
