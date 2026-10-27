@@ -386,6 +386,17 @@ impl Server {
         let (answer, served) = match (peer, parse(&line)) {
             (None, _) => (json::error("not authorized", None), Served::Refused),
             (Some(_), Request::View) => (json::view(&agent.view()), Served::View),
+            (Some((_, role)), Request::Capabilities) => (
+                json::capabilities(&agent.capabilities(
+                    role.may_close(),
+                    role.may_reopen(),
+                    role.may_acknowledge(),
+                )),
+                Served::View,
+            ),
+            (Some(_), Request::BadArguments(request)) => {
+                (json::bad_arguments(request), Served::Refused)
+            }
             (Some((uid, role)), Request::GuardClose { dir, guard, reason }) => {
                 if role.may_close() {
                     let answer = agent.guard_close(Path::new(dir), guard, uid, reason.as_bytes());
@@ -463,6 +474,10 @@ impl Drop for Server {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Request<'a> {
     View,
+    /// The capability discovery of R-CORE-24.
+    Capabilities,
+    /// A known request with arguments it does not take.
+    BadArguments(&'static str),
     GuardClose {
         dir: &'a str,
         guard: u64,
@@ -523,6 +538,11 @@ fn request(rest: &str) -> Option<Request<'_>> {
     let number = |word: &str| word.parse::<u64>().ok();
     match name {
         "view" if arguments.is_empty() => Some(Request::View),
+        // A malformed request this agent knows gets its own typed error
+        // (the rule of karyos#733); an agent that does not know it answers
+        // `bad request`, which a client reads as "not supported".
+        "capabilities" if arguments.is_empty() => Some(Request::Capabilities),
+        "capabilities" => Some(Request::BadArguments("capabilities")),
         "guard-close" => {
             let mut fields = arguments.splitn(3, ' ');
             let dir = fields.next().filter(|dir| !dir.is_empty())?;

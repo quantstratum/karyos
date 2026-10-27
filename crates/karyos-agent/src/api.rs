@@ -21,7 +21,126 @@ pub struct AgentView {
     pub drivers: Vec<DriverView>,
     /// The operations journal, when one is configured (M10b).
     pub journal: Option<JournalView>,
+    /// The agent itself (R-CORE-24; karyos#728).
+    pub agent: AgentIdentity,
 }
+
+/// The agent's own identity, distinct from the drivers it watches
+/// (R-CORE-24; karyos#728).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AgentIdentity {
+    /// The name its deployment gave it (`--agent-id`), taken from
+    /// configuration only: the agent looks up no host or orchestrator
+    /// name. `None` when none was given.
+    pub id: Option<String>,
+    /// Its process id.
+    pub pid: u32,
+    /// Host `CLOCK_MONOTONIC` nanoseconds when it started. With `pid` it
+    /// identifies this incarnation of the agent: it is not a wall-clock
+    /// time, is not comparable between hosts and does not survive a
+    /// reboot.
+    pub started_ns: u64,
+}
+
+impl AgentIdentity {
+    /// The identity `id`, of process `pid`, started at `started_ns`.
+    #[must_use]
+    pub fn new(id: Option<String>, pid: u32, started_ns: u64) -> Self {
+        Self {
+            id,
+            pid,
+            started_ns,
+        }
+    }
+}
+
+/// A driver's attachment, as the agent states it (R-CORE-24).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Attachment {
+    /// Host `CLOCK_MONOTONIC` nanoseconds when the current attach began;
+    /// `None` while detached.
+    pub since_ns: Option<u64>,
+    /// Attaches so far.
+    pub attaches: u64,
+    /// How the previous attach ended; `None` before any ended.
+    pub previous: Option<AttachEnd>,
+}
+
+/// How an attach ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AttachEnd {
+    /// The driver instance it was attached to.
+    pub instance: u128,
+    /// Host `CLOCK_MONOTONIC` nanoseconds when it ended.
+    pub ended_ns: u64,
+    /// Why.
+    pub reason: AttachEndReason,
+}
+
+impl AttachEnd {
+    /// The end of the attach to `instance` at `ended_ns`, for `reason`.
+    #[must_use]
+    pub fn new(instance: u128, ended_ns: u64, reason: AttachEndReason) -> Self {
+        Self {
+            instance,
+            ended_ns,
+            reason,
+        }
+    }
+}
+
+/// Why an attach ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttachEndReason {
+    /// The driver closed (`"driver_gone"`).
+    DriverGone,
+    /// Reading the driver failed and the agent let it go (`"detached"`).
+    Detached,
+}
+
+/// One capability of the agent, for the caller that asked (R-CORE-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Capability {
+    /// Its name, one of [`CAPABILITIES`].
+    pub name: &'static str,
+    /// Whether the caller is served it.
+    pub state: CapabilityState,
+}
+
+/// Whether a capability is served to a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CapabilityState {
+    /// Served.
+    Served,
+    /// Not available in this deployment, whatever the caller's role, for
+    /// `reason`: `"not_configured"` or `"journal_unavailable"`.
+    Unavailable {
+        /// Why.
+        reason: &'static str,
+    },
+    /// Available, but not for the caller's role (`"role"`).
+    Forbidden {
+        /// Why.
+        reason: &'static str,
+    },
+}
+
+/// The capability names of API v1, a closed list: a later agent may add
+/// names, and a client ignores the ones it does not know.
+pub const CAPABILITIES: [&str; 6] = [
+    "view",
+    "guard-close",
+    "guard-reopen",
+    "gap-ack",
+    "catalog",
+    "trace-window",
+];
 
 /// The operations journal of the agent's guard operations (M10b; the
 /// gap analysis's new owner item 7, decided as item 51(7) of the
@@ -100,6 +219,9 @@ pub struct DriverView {
     /// The Archive catalog listed for this driver (M11); `None` unless the
     /// driver is configured with an Archive (`--archive`).
     pub catalog: Option<Catalog>,
+    /// Its attachment: since when, how many, and how the previous one
+    /// ended (R-CORE-24).
+    pub attachment: Attachment,
 }
 
 /// The Archive catalog of a driver, as the agent last listed it over the

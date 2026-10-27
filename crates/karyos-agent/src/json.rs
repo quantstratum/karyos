@@ -19,9 +19,9 @@
 use std::fmt::Write;
 
 use crate::api::{
-    AgentView, Alert, AlertKind, Catalog, CatalogRecording, Counter, DriverState, DriverView,
-    ErrorEntry, Feed, GuardEntry, JournalView, Lane, LaneLatency, LossEntry, Sample, Subscriber,
-    TraceCounts,
+    AgentIdentity, AgentView, Alert, AlertKind, AttachEndReason, Attachment, Capability,
+    CapabilityState, Catalog, CatalogRecording, Counter, DriverState, DriverView, ErrorEntry, Feed,
+    GuardEntry, JournalView, Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
 };
 
 /// A JSON value being written into a string.
@@ -128,6 +128,81 @@ pub fn view(view: &AgentView) -> String {
             .option(view.journal.as_ref(), |out, journal| {
                 journal_view(out, journal)
             });
+        agent_identity(fields.key("agent"), &view.agent);
+    });
+    text
+}
+
+/// The agent's identity (R-CORE-24).
+fn agent_identity(out: &mut Out<'_>, agent: &AgentIdentity) {
+    out.object(|fields| {
+        fields
+            .key("id")
+            .option(agent.id.as_deref(), |out, id| out.string(id));
+        fields.number("pid", agent.pid);
+        fields.number("started_ns", agent.started_ns);
+    });
+}
+
+/// A driver's attachment (R-CORE-24).
+fn attachment(out: &mut Out<'_>, attachment: &Attachment) {
+    out.object(|fields| {
+        fields
+            .key("since_ns")
+            .option(attachment.since_ns, |out, since| out.number(since));
+        fields.number("attaches", attachment.attaches);
+        fields
+            .key("previous")
+            .option(attachment.previous, |out, end| {
+                out.object(|fields| {
+                    fields.string("instance", &format!("{:032x}", end.instance));
+                    fields.number("ended_ns", end.ended_ns);
+                    fields.string(
+                        "reason",
+                        match end.reason {
+                            AttachEndReason::DriverGone => "driver_gone",
+                            AttachEndReason::Detached => "detached",
+                        },
+                    );
+                });
+            });
+    });
+}
+
+/// The answer to `capabilities` (R-CORE-24): each capability and whether
+/// the caller is served it.
+#[must_use]
+pub fn capabilities(capabilities: &[Capability]) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields
+            .key("capabilities")
+            .array(capabilities, |out, capability| {
+                out.object(|fields| {
+                    fields.string("name", capability.name);
+                    let (state, reason) = match capability.state {
+                        CapabilityState::Served => ("served", None),
+                        CapabilityState::Unavailable { reason } => ("unavailable", Some(reason)),
+                        CapabilityState::Forbidden { reason } => ("forbidden", Some(reason)),
+                    };
+                    fields.string("state", state);
+                    fields
+                        .key("reason")
+                        .option(reason, |out, reason| out.string(reason));
+                });
+            });
+    });
+    text
+}
+
+/// The typed error of a known request with arguments it does not take
+/// (`{"error":"bad arguments","request":NAME}`; the rule of karyos#733).
+#[must_use]
+pub fn bad_arguments(request: &str) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("error", "bad arguments");
+        fields.string("request", request);
     });
     text
 }
@@ -309,6 +384,7 @@ fn driver_view(out: &mut Out<'_>, driver: &DriverView) {
         fields
             .key("catalog")
             .option(driver.catalog.as_ref(), catalog_json);
+        attachment(fields.key("attachment"), &driver.attachment);
     });
 }
 

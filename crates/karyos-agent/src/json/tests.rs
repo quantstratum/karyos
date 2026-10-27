@@ -195,6 +195,15 @@ fn every_field() -> AgentView {
             failures: 1,
             last_error: Some("connect: timed out".to_owned()),
         }),
+        attachment: crate::api::Attachment {
+            since_ns: Some(50),
+            attaches: 2,
+            previous: Some(crate::api::AttachEnd::new(
+                0xabc,
+                40,
+                crate::api::AttachEndReason::Detached,
+            )),
+        },
     };
     let unavailable = DriverView {
         dir: PathBuf::from("/run/karyos/b"),
@@ -211,12 +220,22 @@ fn every_field() -> AgentView {
         trace: TraceCounts::default(),
         alerts: Vec::new(),
         catalog: None,
+        attachment: crate::api::Attachment::default(),
     };
     let closed = DriverView {
         dir: PathBuf::from("/run/karyos/c"),
         state: DriverState::Closed,
         // Configured, nothing listed yet.
         catalog: Some(Catalog::default()),
+        attachment: crate::api::Attachment {
+            since_ns: None,
+            attaches: 1,
+            previous: Some(crate::api::AttachEnd::new(
+                0xabc,
+                60,
+                crate::api::AttachEndReason::DriverGone,
+            )),
+        },
         ..unavailable.clone()
     };
     AgentView {
@@ -243,6 +262,7 @@ fn every_field() -> AgentView {
                 since: 70,
             }],
         }),
+        agent: crate::api::AgentIdentity::new(Some("ns/pod-0".to_owned()), 4242, 99),
     }
 }
 
@@ -261,13 +281,14 @@ fn a_journal_that_could_not_open_is_written_with_its_error() {
             gap: None,
             alerts: Vec::new(),
         }),
+        agent: crate::api::AgentIdentity::new(None, 7, 1),
     };
     assert_eq!(
         view(&agent),
         concat!(
             r#"{"version":1,"drivers":[],"journal":{"recording":null,"unsealed":true,"#,
             r#""unavailable":true,"error":"no such directory","failed_appends":0,"#,
-            r#""gap":null,"alerts":[]}}"#
+            r#""gap":null,"alerts":[]},"agent":{"id":null,"pid":7,"started_ns":1}}"#
         )
     );
 }
@@ -297,17 +318,21 @@ const V1: &str = concat!(
     r#""alerts":[{"kind":"lag","stream":3,"lane":1,"participant":5,"value":1024,"since":50},{"kind":"loss","stream":0,"lane":0,"participant":0,"value":15,"since":60},{"kind":"guard_ack","stream":0,"lane":0,"participant":2,"value":1,"since":70}],"#,
     r#""catalog":{"recordings":[{"recording_id":1,"stream_id":42,"session_id":-7,"channel":"karyos:ipc","start":0,"start_time_ns":5,"recording":true,"position":4096,"stopped_ns":null,"stop_reason":null,"incomplete":false},"#,
     r#"{"recording_id":2,"stream_id":42,"session_id":1,"channel":"karyos:udp?endpoint=\"x\"","start":64,"start_time_ns":6,"recording":false,"position":8192,"stopped_ns":9,"stop_reason":"failed_required_lapped","incomplete":true}],"#,
-    r#""left_out":3,"listed_at":80,"listings":4,"failures":1,"last_error":"connect: timed out"}},"#,
+    r#""left_out":3,"listed_at":80,"listings":4,"failures":1,"last_error":"connect: timed out"},"#,
+    r#""attachment":{"since_ns":50,"attaches":2,"previous":{"instance":"00000000000000000000000000000abc","ended_ns":40,"reason":"detached"}}},"#,
     r#"{"dir":"/run/karyos/b","state":{"state":"unavailable","reason":"no socket"},"instance":null,"sample":null,"client_counters":[],"#,
     r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0},"#,
-    r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0},"alerts":[],"catalog":null},"#,
+    r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0},"alerts":[],"catalog":null,"#,
+    r#""attachment":{"since_ns":null,"attaches":0,"previous":null}},"#,
     r#"{"dir":"/run/karyos/c","state":{"state":"closed"},"instance":null,"sample":null,"client_counters":[],"#,
     r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0},"#,
     r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0},"alerts":[],"#,
-    r#""catalog":{"recordings":[],"left_out":0,"listed_at":null,"listings":0,"failures":0,"last_error":null}}"#,
+    r#""catalog":{"recordings":[],"left_out":0,"listed_at":null,"listings":0,"failures":0,"last_error":null},"#,
+    r#""attachment":{"since_ns":null,"attaches":1,"previous":{"instance":"00000000000000000000000000000abc","ended_ns":60,"reason":"driver_gone"}}}"#,
     r#"],"journal":{"recording":4,"unsealed":true,"unavailable":false,"error":null,"failed_appends":2,"#,
     r#""gap":{"position":96,"from":10,"to":70,"reason":"unclean_stop"},"#,
-    r#""alerts":[{"kind":"journal_gap","stream":0,"lane":0,"participant":96,"value":60,"since":70}]}}"#,
+    r#""alerts":[{"kind":"journal_gap","stream":0,"lane":0,"participant":96,"value":60,"since":70}]},"#,
+    r#""agent":{"id":"ns/pod-0","pid":4242,"started_ns":99}}"#,
 );
 
 #[test]
@@ -324,5 +349,48 @@ fn an_error_lists_the_supported_versions() {
     assert_eq!(
         error("not authorized", None),
         r#"{"error":"not authorized"}"#
+    );
+}
+
+/// R-CORE-24: v1's capability names are a closed, documented list, and
+/// each answer entry is a self-describing object, so a later agent may
+/// add a name and a v1 client that keeps only the names it knows reads the
+/// rest unchanged.
+#[test]
+fn capability_names_are_closed_in_v1_and_extensible() {
+    use crate::api::{CAPABILITIES, Capability, CapabilityState};
+
+    assert_eq!(
+        CAPABILITIES,
+        [
+            "view",
+            "guard-close",
+            "guard-reopen",
+            "gap-ack",
+            "catalog",
+            "trace-window"
+        ]
+    );
+    let known = Capability {
+        name: "view",
+        state: CapabilityState::Served,
+    };
+    let future = Capability {
+        name: "a-later-capability",
+        state: CapabilityState::Unavailable {
+            reason: "not_configured",
+        },
+    };
+    let alone = capabilities(&[known]);
+    let with_future = capabilities(&[known, future]);
+    // The known entry is written the same, whatever follows it.
+    let entry = r#"{"name":"view","state":"served","reason":null}"#;
+    assert!(alone.contains(entry) && with_future.contains(entry));
+    assert_eq!(
+        with_future,
+        concat!(
+            r#"{"capabilities":[{"name":"view","state":"served","reason":null},"#,
+            r#"{"name":"a-later-capability","state":"unavailable","reason":"not_configured"}]}"#
+        )
     );
 }
