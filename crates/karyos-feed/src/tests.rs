@@ -288,21 +288,23 @@ fn a_jump_at_the_window_is_not_an_advance() {
 }
 
 /// An asymmetric epoch change: A reports epoch 2 while B still carries
-/// epoch 1. The first epoch 2 message ends epoch 1; B's later epoch 1
-/// messages are dropped and counted, never delivered after it.
+/// epoch 1. Epoch 1 stays open until B reports epoch 2 too, so B's end of
+/// epoch 1 is delivered; after the close, B's epoch 1 messages are stale,
+/// and none is delivered after the first message of epoch 2.
 #[test]
-fn an_asymmetric_epoch_change_drops_the_lagging_lines_old_messages() {
+fn an_asymmetric_epoch_change_keeps_the_old_epoch_open_for_the_lagging_line() {
     let mut arbiter = plain();
     let mut out = Vec::new();
     for sequence in 1..=3 {
         push(&mut arbiter, &mut out, Line::A, 1, sequence, 0);
     }
     push(&mut arbiter, &mut out, Line::A, 2, 1, 0);
-    // B lags: its epoch 1 messages arrive after the change.
+    // B lags: it brings 4 and 5, which A never carried.
     for sequence in 1..=5 {
         push(&mut arbiter, &mut out, Line::B, 1, sequence, 0);
     }
     push(&mut arbiter, &mut out, Line::B, 2, 1, 0);
+    push(&mut arbiter, &mut out, Line::B, 1, 6, 0);
     push(&mut arbiter, &mut out, Line::B, 2, 2, 0);
     let epoch_at = out.iter().position(|out| *out == Out::Epoch(1, 2)).unwrap();
     assert!(
@@ -310,8 +312,65 @@ fn an_asymmetric_epoch_change_drops_the_lagging_lines_old_messages() {
             .skip(epoch_at)
             .all(|out| !matches!(out, Out::Message(_, 1, ..)))
     );
-    assert_eq!(sequences(&out), vec![1, 2, 3, 1, 2]);
-    assert_eq!(arbiter.counters().stale_epoch, 5);
+    assert_eq!(sequences(&out), vec![1, 2, 3, 4, 5, 1, 2]);
+    assert_eq!(arbiter.counters().stale_epoch, 1);
+}
+
+/// The coordinator's case (ACS 31805): the end of an epoch lost on the
+/// leading line is repaired from the lagging one, never lost silently.
+/// A: 1/1, 1/2, 2/1; B: 1/1, 1/2, 1/3. Nothing is held when 2/1 arrives,
+/// and epoch 1 still stays open: 1/3 is delivered from B, then epoch 2
+/// starts when B reports it or the skew window expires.
+#[test]
+fn the_end_of_an_epoch_lost_on_the_leading_line_is_repaired() {
+    for close_by_line in [true, false] {
+        let mut arbiter = plain();
+        let mut out = Vec::new();
+        push(&mut arbiter, &mut out, Line::A, 1, 1, 0);
+        push(&mut arbiter, &mut out, Line::A, 1, 2, 0);
+        push(&mut arbiter, &mut out, Line::A, 2, 1, 0);
+        push(&mut arbiter, &mut out, Line::B, 1, 1, 0);
+        push(&mut arbiter, &mut out, Line::B, 1, 2, 0);
+        push(&mut arbiter, &mut out, Line::B, 1, 3, 0);
+        assert_eq!(
+            out.last(),
+            Some(&Out::Message(Line::B, 1, 3, message(1, 3, b"p")))
+        );
+        if close_by_line {
+            push(&mut arbiter, &mut out, Line::B, 2, 1, 0);
+        } else {
+            arbiter.poll(SKEW - 1, record(&mut out));
+            assert_eq!(sequences(&out), vec![1, 2, 3]);
+            arbiter.poll(SKEW, record(&mut out));
+        }
+        assert_eq!(sequences(&out), vec![1, 2, 3, 1]);
+        assert!(!out.iter().any(|out| matches!(out, Out::Gap(..))));
+        assert_eq!(out.get(3), Some(&Out::Epoch(1, 2)));
+    }
+}
+
+/// QS-REVIEWER's repro on #787: with epoch 1 current and epoch 3 waiting,
+/// an epoch 2 message from the lagging line is stale. It never enters the
+/// waiting buffer, so it is never delivered as epoch 3.
+#[test]
+fn an_epoch_between_the_current_and_the_waiting_one_is_stale() {
+    let mut arbiter = plain();
+    let mut out = Vec::new();
+    push(&mut arbiter, &mut out, Line::A, 1, 1, 0);
+    push(&mut arbiter, &mut out, Line::A, 3, 1, 0);
+    arbiter.push(Line::B, &message(2, 2, b"epoch two"), 0, record(&mut out));
+    arbiter.push(Line::A, &message(3, 2, b"p"), 0, record(&mut out));
+    push(&mut arbiter, &mut out, Line::B, 3, 1, 0);
+    assert_eq!(arbiter.counters().stale_epoch, 1);
+    assert_eq!(arbiter.counters().length_conflicts, 0);
+    assert_eq!(
+        out.iter().skip(1).cloned().collect::<Vec<_>>(),
+        vec![
+            Out::Epoch(1, 3),
+            Out::Message(Line::A, 3, 1, message(3, 1, b"p")),
+            Out::Message(Line::A, 3, 2, message(3, 2, b"p")),
+        ]
+    );
 }
 
 /// The lines are out of step at a reset: A moves to epoch 2 while it
@@ -338,10 +397,10 @@ fn an_old_epoch_hole_is_repaired_from_the_lagging_line_after_a_reset() {
     let epoch_at = out.iter().position(|out| *out == Out::Epoch(1, 2)).unwrap();
     assert_eq!(epoch_at, 5);
     let counters = arbiter.counters();
-    // B's 4 and 5 came after the close: stale. Its 1 and 2 were
-    // duplicates while epoch 1 was open.
-    assert_eq!(counters.stale_epoch, 2);
-    assert_eq!(counters.duplicates_b, 3);
+    // Epoch 1 stayed open until B reported epoch 2: B's 1, 2, 4 and 5
+    // were duplicates, none stale.
+    assert_eq!(counters.stale_epoch, 0);
+    assert_eq!(counters.duplicates_b, 5);
 
     // The same hole with B silent closes at the skew window: a gap.
     let mut arbiter = plain();
@@ -626,6 +685,8 @@ fn an_open_old_epoch_closes_on_overflow_or_a_third_epoch() {
     }
     push(&mut arbiter, &mut out, Line::A, 2, 1, 0);
     push(&mut arbiter, &mut out, Line::A, 3, 1, 0);
+    // Epoch 2 is current now and stays open for B until the skew window.
+    arbiter.poll(SKEW, record(&mut out));
     assert_eq!(
         out.iter().skip(1).cloned().collect::<Vec<_>>(),
         vec![

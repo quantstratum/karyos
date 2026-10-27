@@ -308,6 +308,9 @@ pub struct Arbiter<S> {
     /// had holes: its messages wait in the spare buffer, under their own
     /// base, until the current epoch closes (design section 6).
     pending: Option<Running>,
+    /// When the waiting epoch's first message arrived, in the caller's
+    /// time: the current epoch closes `skew_window` later at the latest.
+    pending_since: u64,
     spare_slots: Vec<Slot>,
     spare_arena: Vec<u8>,
     spare_history: Vec<Delivered>,
@@ -321,7 +324,7 @@ impl<S: FeedSequencer> Arbiter<S> {
     /// # Errors
     ///
     /// A [`ConfigError`] for a capacity that is not a power of two or not
-    /// below the window, a modulus below 4, or an arena that overflows.
+    /// below the window, a modulus below 5, or an arena that overflows.
     pub fn new(sequencer: S, config: ArbiterConfig) -> Result<Self, ConfigError> {
         let max = match sequencer.sequence_modulus() {
             Some(modulus) if modulus.get() < 5 => return Err(ConfigError::Modulus),
@@ -362,6 +365,7 @@ impl<S: FeedSequencer> Arbiter<S> {
             held: 0,
             state: None,
             pending: None,
+            pending_since: 0,
             spare_slots: vec![empty; config.capacity],
             spare_arena: vec![0; bytes],
             spare_history: vec![none; config.capacity],
@@ -482,8 +486,16 @@ impl<S: FeedSequencer> Arbiter<S> {
                 self.newer(line, identity, message, now, emit);
                 return;
             }
+            Some(pending) if identity.epoch < pending.epoch => {
+                // An epoch between the current one and the waiting one: it
+                // has no buffer of its own, and the waiting epoch already
+                // started after it, so it is stale.
+                self.counters.stale_epoch += 1;
+                return;
+            }
             Some(_) => {}
             None => {
+                self.pending_since = now;
                 let next = self
                     .sequencer
                     .epoch_start(identity.epoch)
@@ -999,13 +1011,20 @@ impl<S: FeedSequencer> Arbiter<S> {
             if state.awaiting {
                 return;
             }
-            if self.held == 0 {
-                if self.pending.is_none() {
-                    return;
+            if let Some(pending) = self.pending {
+                // The current epoch stays open, whether or not it holds
+                // anything, until both lines report the new one or the
+                // skew window expires: the lagging line may still bring
+                // its end (design section 6).
+                let both = pending.highest.iter().all(Option::is_some);
+                let expired = now.saturating_sub(self.pending_since) >= self.config.skew_window;
+                if both || expired {
+                    self.close(emit);
+                    continue;
                 }
-                // No hole is known in the current epoch: it closes.
-                self.promote(emit);
-                continue;
+            }
+            if self.held == 0 {
+                return;
             }
             let at = self.slot_of(state.index);
             let slot = self.slot(at);
