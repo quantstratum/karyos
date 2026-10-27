@@ -17,6 +17,18 @@
 //!   told its index: the node that took a request answers it when an
 //!   entry with the request's client, epoch and sequence applies
 //!   (decision E2).
+//! - **Leader following** (decision D4). A follower that a client sends
+//!   to forwards the message to the leader its core names, once, with
+//!   the client's identity, epoch and sequence unchanged; the leader's
+//!   answer comes back through it ([`Delivery::Forward`],
+//!   [`Delivery::Relay`]). With no leader known, the client gets
+//!   [`Delivery::NotLeader`] and tries again later.
+//! - **Unknown outcomes** (decision D5). A server whose core stops
+//!   leading, or moves to another term, answers every request it took
+//!   [`Answer::Unknown`]: the entry may still commit. The client sends the
+//!   same epoch and sequence again, which the session table answers if
+//!   the entry applied, and reports [`Answer::Unknown`] itself only at its
+//!   deadline, or for a session gone after an earlier attempt.
 //! - **Restart.** A restart reopens the log, recovers the core, and
 //!   rebuilds the container from the committed entries the core hands
 //!   out again, as `ServerNode` rebuilds its service.
@@ -72,6 +84,23 @@ pub enum Delivery<M> {
         /// The leader it knows of.
         leader: Option<NodeId>,
     },
+    /// A follower passes a client's registration or request to the
+    /// leader it knows of, one hop (decision D4): the leader proposes it
+    /// and sends the answer back through the follower.
+    Forward {
+        /// The client.
+        client: NodeId,
+        /// Its [`Delivery::Register`] or [`Delivery::Request`].
+        message: Box<Self>,
+    },
+    /// The leader's answer to a forwarded message, for the follower to
+    /// pass to the client.
+    Relay {
+        /// The client.
+        client: NodeId,
+        /// The answer.
+        message: Box<Self>,
+    },
 }
 
 /// A request's outcome, owned, as the session table gave it.
@@ -94,11 +123,25 @@ pub enum Answer {
         /// The one it expects.
         expected: u64,
     },
+    /// The request's fate cannot be determined: it may or may not have
+    /// been applied (decision D5). A server gives it for the requests it
+    /// took when it stops leading; a client gives it when it cannot
+    /// resolve a request before its deadline. Never a guess.
+    Unknown,
     /// An outcome this harness does not know.
     Other(String),
 }
 
 impl Answer {
+    /// The reply bytes of an applied or retained request; empty otherwise.
+    #[must_use]
+    pub fn reply(&self) -> &[u8] {
+        match self {
+            Self::Applied(reply) | Self::Retained(reply) => reply,
+            _ => &[],
+        }
+    }
+
     fn of(outcome: Outcome<'_>) -> Self {
         match outcome {
             Outcome::Applied(reply) => Self::Applied(reply.to_vec()),
@@ -156,6 +199,31 @@ fn pending_of(envelope: &Envelope<'_>) -> Option<Pending> {
     }
 }
 
+/// Who a server answers for a pending request: the node it sends the
+/// answer to, and the client, who differ for a forwarded request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Taker {
+    reply_to: NodeId,
+    client: NodeId,
+}
+
+impl Taker {
+    /// `message` for the client, wrapped for its follower if forwarded.
+    fn wrap<M>(self, message: Delivery<M>) -> (NodeId, Delivery<M>) {
+        if self.reply_to == self.client {
+            (self.client, message)
+        } else {
+            (
+                self.reply_to,
+                Delivery::Relay {
+                    client: self.client,
+                    message: Box::new(message),
+                },
+            )
+        }
+    }
+}
+
 /// A server of the delivery path: a core over C4's log on its own disk,
 /// and a service container.
 pub struct DeliveryServer<C, S> {
@@ -169,8 +237,10 @@ pub struct DeliveryServer<C, S> {
     fresh: S,
     config: ContainerConfig,
     container: ServiceContainer<S>,
-    /// Requests and registrations this server took, and their clients.
-    pending: BTreeMap<Pending, NodeId>,
+    /// Requests and registrations this server took, and who it answers.
+    pending: BTreeMap<Pending, Taker>,
+    /// Whether the core led, and its term, at the end of the last duty.
+    led: Option<u64>,
     /// Every entry applied since the last start: its index and outcome.
     outcomes: Vec<(u64, Option<Answer>)>,
     /// Why the container stopped, if it did.
@@ -212,6 +282,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
             fresh: service,
             config,
             pending: BTreeMap::new(),
+            led: None,
             outcomes: Vec::new(),
             halted: None,
             lost: None,
@@ -237,6 +308,15 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         &self.outcomes
     }
 
+    /// The requests this server took and has not answered.
+    #[must_use]
+    pub fn pending_requests(&self) -> usize {
+        self.pending
+            .keys()
+            .filter(|key| matches!(key, Pending::Request(..)))
+            .count()
+    }
+
     /// Why the container stopped, if it did.
     #[must_use]
     pub fn halted(&self) -> Option<ApplyError> {
@@ -249,30 +329,93 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         self.running.as_ref().map(|(core, _)| core)
     }
 
-    /// Proposes `envelope` for `client`; answers a refusal at once.
+    /// Proposes `envelope` for `taker`. A refusal is answered at once:
+    /// a follower forwards a client's own message to the leader it knows
+    /// of, one hop; otherwise the taker gets [`Delivery::NotLeader`].
     fn propose(
         &mut self,
-        client: NodeId,
+        taker: Taker,
         envelope: Envelope<'_>,
+        message: Delivery<C::Message>,
         out: &mut Outbox<Delivery<C::Message>>,
     ) {
         let Some((core, log)) = self.running.as_mut() else {
             return;
         };
         let mut view = LogView::new(log);
-        match Proposer::new(core, &mut view).propose(envelope.to_vec()) {
+        let refused = match Proposer::new(core, &mut view).propose(envelope.to_vec()) {
             Ok(()) => {
                 if let Some(key) = pending_of(&envelope) {
-                    let _ = self.pending.insert(key, client);
+                    let _ = self.pending.insert(key, taker);
                 }
+                return;
             }
-            Err(refused) => out.push((
-                client,
-                Delivery::NotLeader {
-                    leader: refused.leader.and_then(|leader| u32::try_from(leader).ok()),
+            Err(refused) => refused.leader.and_then(|leader| u32::try_from(leader).ok()),
+        };
+        match refused {
+            // Forwarded once: a message that came forwarded is answered.
+            Some(leader) if leader != self.id && taker.reply_to == taker.client => out.push((
+                leader,
+                Delivery::Forward {
+                    client: taker.client,
+                    message: Box::new(message),
                 },
             )),
+            leader => out.push(taker.wrap(Delivery::NotLeader { leader })),
         }
+    }
+
+    /// Takes `message` from client `client`, answering `reply_to`.
+    fn take(
+        &mut self,
+        reply_to: NodeId,
+        client: NodeId,
+        message: Delivery<C::Message>,
+        out: &mut Outbox<Delivery<C::Message>>,
+    ) {
+        let taker = Taker { reply_to, client };
+        match &message {
+            Delivery::Register => {
+                let envelope = Envelope::Register {
+                    client: u64::from(client),
+                };
+                self.propose(taker, envelope, message.clone(), out);
+            }
+            // A client speaks for itself only.
+            Delivery::Request { request, command } if request.client == u64::from(client) => {
+                let command = command.clone();
+                let envelope = Envelope::Request {
+                    request: *request,
+                    command: &command,
+                };
+                self.propose(taker, envelope, message.clone(), out);
+            }
+            _ => {}
+        }
+    }
+
+    /// A core that stopped leading, or moved to another term, cannot know
+    /// what becomes of the requests it took: each is answered
+    /// [`Answer::Unknown`] (decision D5). A registration is dropped; the
+    /// client registers again, and a session opened meanwhile expires
+    /// unused.
+    fn unknown_on_leadership_loss(&mut self, out: &mut Outbox<Delivery<C::Message>>) {
+        let now = self
+            .running
+            .as_ref()
+            .and_then(|(core, _)| core.leads().then(|| core.term()));
+        if self.led.is_some() && self.led != now {
+            for (key, taker) in std::mem::take(&mut self.pending) {
+                if let Pending::Request(client, epoch, sequence) = key {
+                    let request = Request::new(client, epoch, sequence, sequence);
+                    out.push(taker.wrap(Delivery::Answer {
+                        request,
+                        answer: Answer::Unknown,
+                    }));
+                }
+            }
+        }
+        self.led = now;
     }
 
     /// Drives the core, applies what it committed, and answers what this
@@ -298,6 +441,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         if !failed {
             self.running = Some((core, log));
         }
+        self.unknown_on_leadership_loss(out);
     }
 
     fn apply(&mut self, entry: &Entry, out: &mut Outbox<Delivery<C::Message>>) {
@@ -330,9 +474,9 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         };
         self.outcomes.push((entry.index, outcome));
         if let (Some(key), Some(answer)) = (key, answer)
-            && let Some(client) = self.pending.remove(&key)
+            && let Some(taker) = self.pending.remove(&key)
         {
-            out.push((client, answer));
+            out.push(taker.wrap(answer));
         }
     }
 
@@ -390,23 +534,10 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
                     core.step(from, message, &mut LogView::new(log));
                 }
             }
-            Delivery::Register => self.propose(
-                from,
-                Envelope::Register {
-                    client: u64::from(from),
-                },
-                out,
-            ),
-            // A client speaks for itself only.
-            Delivery::Request { request, command } if request.client == u64::from(from) => {
-                self.propose(
-                    from,
-                    Envelope::Request {
-                        request,
-                        command: &command,
-                    },
-                    out,
-                );
+            Delivery::Forward { client, message } => self.take(from, client, *message, out),
+            Delivery::Relay { client, message } => out.push((client, *message)),
+            message @ (Delivery::Register | Delivery::Request { .. }) => {
+                self.take(from, from, message, out);
             }
             _ => {}
         }
@@ -416,6 +547,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
     fn crash(&mut self) {
         self.running = None;
         self.pending.clear();
+        self.led = None;
         match self.disk.after_crash(self.survives) {
             Ok(disk) => self.disk = disk,
             Err(error) => self.lost = Some(error.to_string()),
@@ -431,6 +563,10 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
 /// again.
 pub const RETRY_AFTER: u64 = 400;
 
+/// Ticks a client tries one command, from its first send, before it
+/// reports [`Answer::Unknown`].
+pub const DEADLINE: u64 = 4000;
+
 /// A client of the delivery path: it registers with `server`, then sends
 /// its commands in order, one at a time, each until it is answered.
 #[derive(Debug, Clone)]
@@ -443,6 +579,15 @@ pub struct DeliveryClient {
     next: usize,
     /// When the current registration or command was last sent.
     sent_at: Option<u64>,
+    /// When the current command was first sent, and how often.
+    first_sent: Option<u64>,
+    attempts: u32,
+    deadline: u64,
+    /// [`Answer::Unknown`]s and [`Delivery::NotLeader`]s received, each
+    /// followed by a retry.
+    retries: u32,
+    /// [`Answer::Unknown`]s a server gave.
+    unknowns: u32,
     /// Each command is sent twice at once, as a client retry that races
     /// its first attempt.
     twice: bool,
@@ -460,6 +605,11 @@ impl DeliveryClient {
             epoch: None,
             next: 0,
             sent_at: None,
+            first_sent: None,
+            attempts: 0,
+            deadline: DEADLINE,
+            retries: 0,
+            unknowns: 0,
             twice: false,
             answers: Vec::new(),
         }
@@ -470,6 +620,42 @@ impl DeliveryClient {
     pub fn twice(mut self) -> Self {
         self.twice = true;
         self
+    }
+
+    /// Reports [`Answer::Unknown`] for a command not resolved `deadline`
+    /// ticks after its first send.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: u64) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// The server it sends to: the first one, or the leader a
+    /// [`Delivery::NotLeader`] named.
+    #[must_use]
+    pub fn server(&self) -> NodeId {
+        self.server
+    }
+
+    /// The retries an unknown outcome or a refusal caused.
+    #[must_use]
+    pub fn retries(&self) -> u32 {
+        self.retries
+    }
+
+    /// The [`Answer::Unknown`]s servers gave it, each retried.
+    #[must_use]
+    pub fn unknowns(&self) -> u32 {
+        self.unknowns
+    }
+
+    /// Records `answer` for the current command and moves to the next.
+    fn resolve(&mut self, answer: Answer) {
+        self.answers.push((self.sequence(), answer));
+        self.next += 1;
+        self.sent_at = None;
+        self.first_sent = None;
+        self.attempts = 0;
     }
 
     /// Its session's epoch, once registered.
@@ -508,9 +694,17 @@ impl<M> Node<Delivery<M>> for DeliveryClient {
             self.sent_at = Some(now);
             return;
         };
-        let Some(command) = self.commands.get(self.next) else {
+        let Some(command) = self.commands.get(self.next).cloned() else {
             return;
         };
+        // The client cannot resolve it: it says so, and moves on.
+        if self
+            .first_sent
+            .is_some_and(|first| now.saturating_sub(first) >= self.deadline)
+        {
+            self.resolve(Answer::Unknown);
+            return;
+        }
         let sequence = self.sequence();
         let request = Request::new(u64::from(self.id), epoch, sequence, sequence);
         let sends = if self.twice { 2 } else { 1 };
@@ -524,6 +718,8 @@ impl<M> Node<Delivery<M>> for DeliveryClient {
             ));
         }
         self.sent_at = Some(now);
+        self.first_sent.get_or_insert(now);
+        self.attempts = self.attempts.saturating_add(1);
     }
 
     fn deliver(
@@ -541,9 +737,27 @@ impl<M> Node<Delivery<M>> for DeliveryClient {
             Delivery::Answer { request, answer }
                 if Some(request.epoch) == self.epoch && request.sequence == self.sequence() =>
             {
-                self.answers.push((request.sequence, answer));
-                self.next += 1;
-                self.sent_at = None;
+                match answer {
+                    // Its fate unknown at the server: the same epoch and
+                    // sequence again, which the session table answers if
+                    // it was applied.
+                    Answer::Unknown => {
+                        self.retries = self.retries.saturating_add(1);
+                        self.unknowns = self.unknowns.saturating_add(1);
+                        self.sent_at = None;
+                    }
+                    // A session gone after an earlier attempt: that attempt
+                    // may have applied, so it is not known.
+                    Answer::SessionExpired if self.attempts > 1 => self.resolve(Answer::Unknown),
+                    answer => self.resolve(answer),
+                }
+            }
+            Delivery::NotLeader { leader } => {
+                self.retries = self.retries.saturating_add(1);
+                if let Some(leader) = leader {
+                    self.server = leader;
+                    self.sent_at = None;
+                }
             }
             _ => {}
         }
