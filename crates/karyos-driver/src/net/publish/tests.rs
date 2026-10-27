@@ -175,14 +175,16 @@ fn publications_share_and_release_a_send_endpoint() {
 #[test]
 fn unsupported_channels_are_refused_before_any_stream() {
     let mut driver = driver();
+    // Dynamic registration stays refused, with its own error (ADR-0082;
+    // karyos#644); manual mode is served (net/e2e/destinations.rs).
     let multi = Destination::MultiDestination {
-        destinations: vec![SocketAddr::new(LOOPBACK, 40_000)],
-        control: None,
-        mode: karyos_protocol::channel::ControlMode::Manual,
+        destinations: Vec::new(),
+        control: Some(SocketAddr::new(LOOPBACK, 40_000)),
+        mode: karyos_protocol::channel::ControlMode::Dynamic,
     };
     assert_eq!(
         driver.add_network_publication(aggregate(10, 1), &channel(multi)),
-        Err(DriverError::UnsupportedChannel)
+        Err(DriverError::DynamicRegistrationUnsupported)
     );
     let mut named = channel(Destination::Unicast(SocketAddr::new(LOOPBACK, 40_000)));
     named.interface = Some(Interface::Name("lo".into()));

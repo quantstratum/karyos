@@ -443,10 +443,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         let (destination, binds) = route(channel)?;
         let destinations = destinations_of(channel, required_destinations)?;
-        // This step of multi-destination unicast sends first sends only:
-        // repair to the requester (MD-8), and with it reliable channels,
-        // and guards and timed lanes come later (karyos#630).
-        if !destinations.0.is_empty() && (channel.reliable || guard.is_some() || timed.is_some()) {
+        // Guards and timed lanes are not combined with destinations yet
+        // (karyos#630).
+        if !destinations.0.is_empty() && (guard.is_some() || timed.is_some()) {
             return Err(DriverError::UnsupportedChannel);
         }
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
@@ -535,6 +534,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.net
             .as_ref()?
             .publication_admission(aggregate.registration())
+    }
+
+    /// The destinations the multi-destination publication `aggregate` has
+    /// removed, in order, each with its reason: an optional destination
+    /// whose queue was full (MD-7) or whose sends kept faulting (MD-12)
+    /// (karyos#630). Empty for another publication.
+    #[must_use]
+    pub fn network_removed_destinations(
+        &self,
+        aggregate: &AggregateHandle,
+    ) -> Vec<crate::agents::data::DestinationRemoval> {
+        self.net
+            .as_ref()
+            .map(|net| net.removed_destinations(aggregate.registration()))
+            .unwrap_or_default()
     }
 
     /// Guards every lane stream of `handle` with `guard`, unless a

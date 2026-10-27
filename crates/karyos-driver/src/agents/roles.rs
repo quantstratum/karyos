@@ -4730,6 +4730,39 @@ impl<T: StreamTerms> SenderRole<T> {
         }
     }
 
+    /// Posts, through `post`, a `DestinationRemoved` for each destination a
+    /// multi-destination publication removed and did not report yet, after
+    /// expiring its member, so it stops counting for the strategy edge
+    /// (design 4.5; MD-7, MD-12). One the ring refused is posted again next
+    /// cycle.
+    pub(super) fn report_removals<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O, T>) -> bool,
+    ) {
+        let now = (self.clock)();
+        for outbound in &mut self.publications {
+            while let Some(removal) = outbound.removal_unreported() {
+                if let Some(membership) = outbound.membership_mut() {
+                    let _ = membership.release_source(removal.destination, now);
+                }
+                let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+                let Some(identity) = self.sessions.identity(endpoint, alias) else {
+                    break;
+                };
+                let event = AgentEvent::DestinationRemoved {
+                    endpoint,
+                    alias,
+                    registration: identity.registration_id,
+                    removal,
+                };
+                if !post(event) {
+                    return;
+                }
+                outbound.removal_reported(removal.destination);
+            }
+        }
+    }
+
     /// Posts, through `post` (which says whether it was posted), the
     /// `ScheduleViolated` of each timed lane whose publisher breached its
     /// ring's protocol, once per lane; one the ring refused is posted again
@@ -5459,6 +5492,11 @@ impl<T: StreamTerms> SenderRole<T> {
             if !outbound.serves(binding.endpoint) || binding.alias != outbound.alias() {
                 continue;
             }
+            // A destination a multi-destination publication removed bounds
+            // nothing more (karyos#630).
+            if !outbound.sends_to(binding.source) {
+                continue;
+            }
             let positions = least.get_or_insert([u64::MAX; 4]);
             match binding.lanes {
                 Some(lanes) => {
@@ -5681,9 +5719,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     .is_none_or(|id| id == nak.receiver.receiver_id)
         });
         let index = self.publications.iter().position(|outbound| {
-            outbound.serves(endpoint)
-                && outbound.alias() == nak.alias
-                && outbound.repair().is_some()
+            outbound.serves(endpoint) && outbound.alias() == nak.alias && outbound.repairs()
         });
         let (true, Some(index)) = (bound, index) else {
             self.count(|c| &mut c.nak_unbound);
@@ -5727,7 +5763,14 @@ impl<T: StreamTerms> SenderRole<T> {
             .map_or(Requester::Unknown, |membership| {
                 membership.requester(nak.receiver, nak.range.lane, now)
             });
-        if let NakIntake::Reply(reply) = outbound.nak_on(nak, requester, (route, validated), now)
+        // A multi-destination publication repairs toward the requester's
+        // destination only (MD-8).
+        let intake = if outbound.destinations().is_some() {
+            outbound.nak_from(normal, nak, requester, now)
+        } else {
+            outbound.nak_on(nak, requester, (route, validated), now)
+        };
+        if let NakIntake::Reply(reply) = intake
             && self
                 .send(halves, endpoint, source, &Control::NakReply(reply))
                 .submitted()
@@ -5767,7 +5810,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 break;
             };
             let endpoint = outbound.endpoint();
-            if outbound.repair().is_none() || !established(&self.sessions, outbound) {
+            if !outbound.repairs() || !established(&self.sessions, outbound) {
                 continue;
             }
             let routed = outbound.is_routed();
@@ -5895,6 +5938,12 @@ impl<T: StreamTerms> SenderRole<T> {
             });
         if !tag_ok {
             self.count(|c| &mut c.sm_tag_mismatch);
+            return;
+        }
+        // A removed destination's SMs are ignored: it rejoins nothing
+        // (karyos#630).
+        if publication.is_some_and(|outbound| !outbound.sends_to(source)) {
+            self.count(|c| &mut c.sm_unbound);
             return;
         }
         // The incarnation is part of the binding: an earlier incarnation's

@@ -650,6 +650,7 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::PublicationDraining { .. }
             | AgentEvent::SenderSessionDrained { .. }
             | AgentEvent::ScheduleViolated { .. }
+            | AgentEvent::DestinationRemoved { .. }
             | AgentEvent::Configured { .. }
             | AgentEvent::NetworkTraceSet { .. }
             | AgentEvent::NetworkJournalOpened { .. }

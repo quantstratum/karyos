@@ -820,6 +820,18 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// Its registration.
         registration: u64,
     },
+    /// A multi-destination publication removed a destination (design 4.5;
+    /// MD-7, MD-12; karyos#630).
+    DestinationRemoved {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// The destination and why.
+        removal: data::DestinationRemoval,
+    },
     /// Posted unsolicited, once per lane, into a free slot and again each
     /// cycle until posted: the publisher of a timed lane breached its
     /// schedule ring's protocol (`quantstratum-docs:
@@ -1338,6 +1350,18 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index).map(data::Outbound::counters)
     }
 
+    /// The per-destination counters of its `index`-th publication (tests).
+    #[cfg(test)]
+    pub(crate) fn destination_counters(
+        &self,
+        index: usize,
+    ) -> Vec<(std::net::SocketAddr, data::TargetCounters)> {
+        self.role
+            .outbound(index)
+            .map(data::Outbound::destination_counters)
+            .unwrap_or_default()
+    }
+
     /// What the timed gate of its `index`-th publication counted (tests).
     #[cfg(test)]
     pub(crate) fn outbound_timed_counts(
@@ -1403,6 +1427,7 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         role.report_drained(|event| events.try_post(event).is_ok());
         // A schedule violation's report, likewise.
         role.report_violations(|event| events.try_post(event).is_ok());
+        role.report_removals(|event| events.try_post(event).is_ok());
         served
             .checked_add(work)
             .ok_or(AgentError::CountOverflow(AgentKind::Sender))

@@ -14,10 +14,17 @@
 //! edge, besides the strategy edge every target shares). The cursor moves
 //! past a datagram only once every live target has it staged, so a target
 //! whose queue is full holds the next datagram of every target until it
-//! takes it. That is this step's limit: the removal of a slow optional
-//! destination (MD-7) comes with the per-destination queues of the next
-//! step, as does repair to the requester only (MD-8); a reliable channel
-//! with destinations is refused until then.
+//! takes it, unless it is optional: an optional target that cannot take a
+//! datagram is removed at once (MD-7, decided: the alternative, so a slow
+//! destination never stalls the others), counted in `removed_slow` and
+//! reported with its reason. A required one bounds the publisher, as it
+//! must. A send fault stays with its target (MD-12): its queue is retried,
+//! and after [`DESTINATION_FAULT_LIMIT`] consecutive faults an optional
+//! target is removed and a required one held, never an endpoint reset.
+//!
+//! A reliable publication repairs per target (MD-8): each target has its
+//! own repair path and repair queue on its route, with a share of the job
+//! table, so a retransmission goes only to the destination that asked.
 //!
 //! A target is live while its receiver is an active member of the
 //! publication's membership, bound to the target's address: its SMs must
@@ -45,6 +52,20 @@ use super::{Limit, OPENED_QUEUES, Opened, Outbound, STAGED_PER_LANE, align_frame
 use crate::agents::{AgentError, AgentKind};
 use crate::embedded::StreamTerms;
 
+/// Consecutive send faults after which an optional destination is removed
+/// and a required one held (MD-12).
+pub const DESTINATION_FAULT_LIMIT: u8 = 3;
+
+/// Why a destination was removed (design 4.5, 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RemovalReason {
+    /// Its queue was full when a datagram had to be staged (MD-7).
+    Slow,
+    /// Its sends faulted [`DESTINATION_FAULT_LIMIT`] times in a row (MD-12).
+    Fault,
+}
+
 /// The most destinations of one publication (MD-6: `max_destinations`
 /// defaults to 16, configurable up to 64; this step fixes it at 16).
 pub const MAX_DESTINATIONS: usize = 16;
@@ -60,6 +81,8 @@ struct TargetLane {
     unsent: bool,
     /// A head left out of staging order.
     mismatched: bool,
+    /// A head was submitted this cycle.
+    submitted: bool,
 }
 
 /// One destination (design section 2.1).
@@ -75,10 +98,25 @@ pub(super) struct Target {
     opened: Option<BackendEpoch>,
     /// Its member is active and live: it gets copies.
     live: bool,
+    /// Per lane, its member's edge this cycle (MD-1): a staged head is
+    /// submitted only once it ends at or below it.
+    edges: [u64; 4],
+    /// Per lane, whether its queue was still full when the cycle began: it
+    /// sent nothing of a full queue in a whole cycle, so it is slow (MD-7).
+    full: [bool; 4],
     /// Per lane, since when it submitted nothing: its idle heartbeat is
     /// due `sender_heartbeat_interval` later.
     idle_since: [Option<u64>; 4],
     counters: TargetCounters,
+    /// Removed, why and when: it gets nothing more, and its SMs and NAKs
+    /// are ignored.
+    removed: Option<(RemovalReason, u64)>,
+    /// Its removal was reported to the conductor.
+    reported: bool,
+    /// Consecutive send faults (MD-12).
+    faults: u8,
+    /// A reliable publication's repair path toward it (MD-8).
+    repair: Option<Box<crate::agents::repair::RepairPath>>,
 }
 
 /// What one destination sent.
@@ -90,8 +128,10 @@ pub struct TargetCounters {
     pub submitted: u64,
     /// Times its copy waited at its own edge.
     pub window_waits: u64,
-    /// Times its full queue held the shared cursor.
+    /// Times its full queue held the shared cursor (a required one).
     pub fanout_waits: u64,
+    /// Repair datagrams submitted to it.
+    pub repairs: u64,
 }
 
 /// A datagram read once and not yet staged for every live target.
@@ -121,6 +161,8 @@ pub(super) struct Fanout {
 struct TargetGate<'a> {
     lanes: &'a mut [TargetLane],
     held: bool,
+    /// Per lane, the target's own edge (MD-1).
+    edges: [u64; 4],
 }
 
 impl SenderGate for TargetGate<'_> {
@@ -136,8 +178,15 @@ impl SenderGate for TargetGate<'_> {
 }
 
 impl LaneGate for TargetGate<'_> {
-    fn admits(&mut self, _lane: usize) -> bool {
-        !self.held
+    fn admits(&mut self, lane: usize) -> bool {
+        // The lane's next head waits until it fits the target's window:
+        // past its edge it stays queued (design 4.2).
+        let fits = self
+            .lanes
+            .get(lane)
+            .and_then(|track| track.staged.front())
+            .is_none_or(|(_, next)| self.edges.get(lane).is_some_and(|edge| next <= edge));
+        !self.held && fits
     }
 
     fn aborting(&self, _lane: usize) -> bool {
@@ -152,7 +201,10 @@ impl LaneGate for TargetGate<'_> {
         };
         match track.staged.pop_front() {
             Some((ticket, next)) if ticket == staged.ticket => match how {
-                Left::Submitted => track.high = track.high.max(next),
+                Left::Submitted => {
+                    track.high = track.high.max(next);
+                    track.submitted = true;
+                }
                 Left::Returned | Left::Unknown => track.unsent = true,
             },
             _ => track.mismatched = true,
@@ -189,13 +241,20 @@ impl Fanout {
                         high: joins.get(lane).copied().unwrap_or(0),
                         unsent: false,
                         mismatched: false,
+                        submitted: false,
                     })
                     .collect(),
                 route: None,
                 opened: None,
                 live: false,
+                edges: [0; 4],
+                full: [false; 4],
                 idle_since: [None; 4],
                 counters: TargetCounters::default(),
+                removed: None,
+                reported: false,
+                faults: 0,
+                repair: None,
             });
         }
         Some(Self {
@@ -212,9 +271,31 @@ impl Fanout {
         self.targets.iter().map(|target| target.address)
     }
 
-    /// Whether `address` is one of its destinations.
+    /// The retransmission window its destinations' repair paths keep (all
+    /// alike), if they repair.
+    fn retransmit_window(&self) -> Option<u32> {
+        self.targets
+            .iter()
+            .find_map(|target| target.repair.as_deref())
+            .map(crate::agents::repair::RepairPath::retransmit_window)
+    }
+
+    /// Whether a destination has a repair path.
+    fn repairs(&self) -> bool {
+        self.targets.iter().any(|target| target.repair.is_some())
+    }
+
+    /// Whether `address` is one of its destinations, not removed.
     pub(super) fn has(&self, address: SocketAddr) -> bool {
-        self.targets.iter().any(|target| target.address == address)
+        self.targets
+            .iter()
+            .any(|target| target.address == address && target.removed.is_none())
+    }
+
+    fn target_at(&mut self, address: SocketAddr) -> Option<&mut Target> {
+        self.targets
+            .iter_mut()
+            .find(|target| target.address == address && target.removed.is_none())
     }
 
     /// The required destinations.
@@ -225,16 +306,18 @@ impl Fanout {
             .map(|target| target.address)
     }
 
-    /// Whether every destination is live.
+    /// Whether every destination not removed is live.
     pub(super) fn all_live(&self) -> bool {
-        self.targets.iter().all(|target| target.live)
+        self.targets
+            .iter()
+            .all(|target| target.live || target.removed.is_some())
     }
 
-    /// The destinations not live, which announce again.
+    /// The destinations not live and not removed, which announce again.
     pub(super) fn not_live(&self) -> impl Iterator<Item = SocketAddr> + '_ {
         self.targets
             .iter()
-            .filter(|target| !target.live)
+            .filter(|target| !target.live && target.removed.is_none())
             .map(|target| target.address)
     }
 
@@ -251,6 +334,12 @@ impl Fanout {
             let mut queues = [None; OPENED_QUEUES];
             for (slot, queue) in queues.iter_mut().zip(&target.queues) {
                 *slot = Some(*queue);
+            }
+            if let Some(slot) = queues.last_mut() {
+                *slot = target
+                    .repair
+                    .as_deref()
+                    .and_then(|repair| repair.queue_on(0));
             }
             held(Opened {
                 endpoint,
@@ -281,7 +370,7 @@ impl Fanout {
         let high = |target: &Target| target.lanes.get(lane).map(|track| track.high);
         self.targets
             .iter()
-            .filter(|target| target.live)
+            .filter(|target| target.live && target.removed.is_none())
             .filter_map(high)
             .min()
             .or_else(|| self.targets.iter().filter_map(high).max())
@@ -333,6 +422,18 @@ impl<T: StreamTerms> Outbound<T> {
         .ok_or(super::OutboundError::Lanes)?;
         self.fanout = Some(Box::new(fanout));
         Ok(())
+    }
+
+    /// The retransmission window of a reliable multi-destination
+    /// publication's repair paths.
+    pub(super) fn fanout_retransmit_window(&self) -> Option<u32> {
+        self.fanout.as_deref().and_then(Fanout::retransmit_window)
+    }
+
+    /// Whether its destinations repair (a reliable multi-destination
+    /// publication).
+    pub(super) fn fanout_repairs(&self) -> bool {
+        self.fanout.as_deref().is_some_and(Fanout::repairs)
     }
 
     /// Its destinations, for a multi-destination publication.
@@ -409,6 +510,20 @@ impl<T: StreamTerms> Outbound<T> {
             for (lane, queue) in target.queues.iter().enumerate() {
                 target.sender.reopen(lane, *queue);
             }
+            // Its repair queue, on its own route (MD-8).
+            if let Some(repair) = target.repair.as_deref_mut() {
+                let queue = tx
+                    .open_queue(TxQueueConfig {
+                        authority: Authority::FIRST,
+                        route,
+                        max_pending: NonZeroU16::MIN,
+                    })
+                    .ok();
+                if queue.is_none() {
+                    self.counters.bump(|c| &mut c.queue_failures, 1);
+                }
+                repair.reopened(queue);
+            }
             for track in &mut target.lanes {
                 track.staged.clear();
             }
@@ -418,8 +533,15 @@ impl<T: StreamTerms> Outbound<T> {
         }
         if reopened {
             // What the old epoch read but had not staged everywhere is
-            // dropped: the receivers close the gap by their gap policy.
+            // dropped. A reliable lane reads again from its restart position,
+            // so the targets get it again (receivers drop copies); an
+            // unreliable one leaves the gap to the receivers' gap policy.
             fanout.pending.fill(None);
+            if self.reliable {
+                for reader in &mut self.readers {
+                    let _ = reader.rewind();
+                }
+            }
         }
         self.opened = Some(epoch);
         self.needs_reset = false;
@@ -435,8 +557,24 @@ impl<T: StreamTerms> Outbound<T> {
             return;
         };
         for target in &mut fanout.targets {
-            target.live =
-                membership.is_some_and(|membership| membership.live_at(target.address, now));
+            target.live = target.removed.is_none()
+                && membership.is_some_and(|membership| membership.live_at(target.address, now));
+            for (lane, full) in target.full.iter_mut().enumerate() {
+                *full = target
+                    .sender
+                    .pending(lane)
+                    .is_some_and(|count| count >= usize::from(STAGED_PER_LANE));
+            }
+            for (lane, edge) in target.edges.iter_mut().enumerate() {
+                *edge = u8::try_from(lane)
+                    .ok()
+                    .and_then(|lane| Lane::try_new(lane).ok())
+                    .and_then(|lane| {
+                        membership
+                            .and_then(|membership| membership.edge_at(target.address, lane, now))
+                    })
+                    .unwrap_or(0);
+            }
         }
     }
 
@@ -483,9 +621,15 @@ impl<T: StreamTerms> Outbound<T> {
             let Some(target) = fanout.targets.get_mut(at) else {
                 continue;
             };
+            // A removed target is never served again: its queues were
+            // emptied at the removal.
+            if target.removed.is_some() {
+                continue;
+            }
             let mut gate = TargetGate {
                 lanes: &mut target.lanes,
                 held,
+                edges: target.edges,
             };
             let report = target.sender.serve(tx, &mut gate, budget);
             if report.failure.is_some() {
@@ -499,13 +643,16 @@ impl<T: StreamTerms> Outbound<T> {
                     self.counters.bump(|c| &mut c.mismatched, 1);
                 }
             }
-            // A faulted queue is retried; anything else needs a reset of
-            // the shared endpoint (the next step keeps faults per
-            // destination, MD-12).
+            // A faulted queue is retried and the fault stays with the
+            // target (MD-12): after the limit an optional target is
+            // removed and a required one held. Only an item of unknown
+            // exposure needs a reset of the shared endpoint.
+            let mut faulted = false;
             for lane in 0..target.queues.len() {
                 if target.sender.suspended(lane) == Some(true) {
                     self.needs_reset = true;
                 } else if target.sender.needs_control(lane) == Some(true) {
+                    faulted = true;
                     self.counters.bump(|c| &mut c.send_faults, 1);
                     let retried = target
                         .queues
@@ -513,10 +660,19 @@ impl<T: StreamTerms> Outbound<T> {
                         .is_some_and(|queue| tx.retry_queue(*queue).is_ok());
                     if retried {
                         target.sender.retry(lane);
-                    } else {
-                        self.needs_reset = true;
                     }
                 }
+            }
+            if faulted {
+                target.faults = target.faults.saturating_add(1);
+                if target.faults >= DESTINATION_FAULT_LIMIT && !target.required {
+                    remove_target(target, RemovalReason::Fault, now, tx, &mut self.report);
+                }
+            } else if target.lanes.iter().any(|track| track.submitted) {
+                target.faults = 0;
+            }
+            for track in &mut target.lanes {
+                track.submitted = false;
             }
         }
         if let Some(
@@ -626,7 +782,6 @@ impl<T: StreamTerms> Outbound<T> {
             };
             // Copy into each live target that does not have it and whose
             // own edge and queue admit it (MD-1).
-            let lane_id = u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok());
             let mut waiting = false;
             for (at, target) in fanout.targets.iter_mut().enumerate() {
                 let done = fanout
@@ -638,29 +793,33 @@ impl<T: StreamTerms> Outbound<T> {
                 if done || !target.live {
                     continue;
                 }
-                let own = lane_id.and_then(|lane| {
-                    self.membership
-                        .as_deref()
-                        .and_then(|membership| membership.edge_at(target.address, lane, now))
-                });
-                let fits = own.is_some_and(|edge| {
-                    pending
-                        .from
-                        .checked_add(self.max_frame)
-                        .is_some_and(|end| end <= edge)
-                });
-                if !fits {
+                // Past its own edge it is staged anyway and waits in its
+                // queue (design 4.2, the gate); a full queue decides below.
+                if pending
+                    .from
+                    .checked_add(self.max_frame)
+                    .is_some_and(|end| end > target.edges.get(lane).copied().unwrap_or(0))
+                {
                     target.counters.window_waits = target.counters.window_waits.saturating_add(1);
-                    waiting = true;
-                    continue;
                 }
                 let room = target
                     .sender
                     .pending(lane)
                     .is_some_and(|count| count < usize::from(STAGED_PER_LANE));
                 let Some(queue) = target.queues.get(lane).copied().filter(|_| room) else {
-                    target.counters.fanout_waits = target.counters.fanout_waits.saturating_add(1);
-                    waiting = true;
+                    let slow = target.full.get(lane).copied().unwrap_or(false);
+                    if target.required || !slow {
+                        // A required destination bounds the publisher; a
+                        // queue filled this cycle drains when it is served.
+                        target.counters.fanout_waits =
+                            target.counters.fanout_waits.saturating_add(1);
+                        waiting = true;
+                    } else {
+                        // An optional one whose queue stayed full for a
+                        // whole cycle is removed at once (MD-7): the others
+                        // never wait for it longer.
+                        remove_target(target, RemovalReason::Slow, now, tx, &mut self.report);
+                    }
                     continue;
                 };
                 let Ok(mut frame) = tx.claim_tx(queue, self.mtu) else {
@@ -765,7 +924,7 @@ impl<T: StreamTerms> Outbound<T> {
                 let Some(since) = target.idle_since.get_mut(lane) else {
                     continue;
                 };
-                if !idle_lane || !target.live {
+                if !idle_lane || !target.live || target.removed.is_some() {
                     *since = Some(now);
                     continue;
                 }
@@ -839,5 +998,205 @@ impl<T: StreamTerms> Outbound<T> {
                 }
             },
         )
+    }
+}
+
+/// Removes `target` for `reason` at `now`: it gets nothing more, and what
+/// its queues held is dropped (its receiver closes the gap by its gap
+/// policy, and its image expires).
+fn remove_target<O: SocketOps>(
+    target: &mut Target,
+    reason: RemovalReason,
+    now: u64,
+    tx: &mut SocketsTx<O>,
+    report: &mut karyos_io::backend::TxReport,
+) {
+    if target.removed.is_some() {
+        return;
+    }
+    target.removed = Some((reason, now));
+    target.live = false;
+    for queue in &target.queues {
+        let _ = tx.cancel_pending(*queue, report);
+        while report.pop_front().is_some() {}
+    }
+    for track in &mut target.lanes {
+        track.staged.clear();
+    }
+}
+
+/// A destination's removal, for the conductor (design 4.5; MD-7, MD-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DestinationRemoval {
+    /// The destination.
+    pub destination: SocketAddr,
+    /// Why.
+    pub reason: RemovalReason,
+}
+
+impl<T: StreamTerms> Outbound<T> {
+    /// The first removed destination not reported yet.
+    pub(crate) fn removal_unreported(&self) -> Option<DestinationRemoval> {
+        self.fanout.as_deref().and_then(|fanout| {
+            fanout.targets.iter().find_map(|target| {
+                let (reason, _) = target.removed.filter(|_| !target.reported)?;
+                Some(DestinationRemoval {
+                    destination: target.address,
+                    reason,
+                })
+            })
+        })
+    }
+
+    /// Records `destination`'s removal as reported.
+    pub(crate) fn removal_reported(&mut self, destination: SocketAddr) {
+        if let Some(target) = self
+            .fanout
+            .as_deref_mut()
+            .and_then(|fanout| fanout.targets.iter_mut().find(|t| t.address == destination))
+        {
+            target.reported = true;
+        }
+    }
+
+    /// Each destination's counters (tests).
+    #[cfg(test)]
+    pub(crate) fn destination_counters(&self) -> Vec<(SocketAddr, TargetCounters)> {
+        self.fanout
+            .as_deref()
+            .map(|fanout| {
+                fanout
+                    .targets
+                    .iter()
+                    .map(|target| (target.address, target.counters))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Enables a repair path per destination, each with a fair share of
+    /// the job table (MD-8; control path, allocates).
+    pub(super) fn enable_fanout_repair(
+        &mut self,
+        config: &crate::agents::repair::RepairConfig,
+        term_length: u32,
+        identity: karyos_protocol::network::Identity,
+    ) -> Result<(), crate::agents::repair::RepairConfigError> {
+        let (drr, mtu, alias) = (self.drr, self.mtu, self.alias);
+        let Some(fanout) = self.fanout.as_deref_mut() else {
+            return Ok(());
+        };
+        let share = config
+            .jobs
+            .repair_jobs
+            .checked_div(fanout.targets.len())
+            .unwrap_or(1)
+            .max(1);
+        let mut config = *config;
+        config.jobs.repair_jobs = share;
+        for target in &mut fanout.targets {
+            target.repair = Some(Box::new(crate::agents::repair::RepairPath::new(
+                &config,
+                drr,
+                mtu,
+                (term_length, alias, identity),
+            )?));
+        }
+        Ok(())
+    }
+
+    /// Admits `nak` from the receiver at `source` into its destination's
+    /// repair path (MD-8); dropped for a source that is no destination.
+    pub(crate) fn nak_from(
+        &mut self,
+        source: SocketAddr,
+        nak: &karyos_protocol::network::Nak,
+        requester: crate::repair::admission::Requester,
+        now: u64,
+    ) -> crate::agents::repair::NakOutcome {
+        use crate::agents::repair::NakOutcome;
+
+        let lane = usize::from(nak.range.lane.get());
+        let lanes = u8::try_from(self.readers.len()).unwrap_or(u8::MAX);
+        let reader = self.readers.get(lane);
+        let Some(target) = self
+            .fanout
+            .as_deref_mut()
+            .and_then(|fanout| fanout.target_at(source))
+        else {
+            return NakOutcome::Dropped;
+        };
+        let sent_high = target.lanes.get(lane).map_or(0, |track| track.high);
+        match target.repair.as_deref_mut() {
+            Some(repair) => repair.nak_on(nak, (requester, 0, true), reader, sent_high, lanes, now),
+            None => NakOutcome::Dropped,
+        }
+    }
+
+    /// Serves each destination's repairs on `tx` within `budget`, from a
+    /// rotating start; returns the heads submitted.
+    pub(super) fn serve_fanout_repair<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        budget: &mut crate::repair::scheduler::RepairBudget,
+        now: u64,
+    ) -> u32 {
+        if !self.open_targets(tx) {
+            return 0;
+        }
+        let Some(fanout) = self.fanout.as_deref_mut() else {
+            return 0;
+        };
+        let count = fanout.targets.len();
+        let mut frames = 0u64;
+        for visit in 0..count {
+            let at = (fanout.rotation + visit) % count;
+            let Some(target) = fanout.targets.get_mut(at) else {
+                continue;
+            };
+            if target.removed.is_some() {
+                continue;
+            }
+            let mut sent_high = [0u64; karyos_protocol::network::MAX_LANES];
+            for (high, track) in sent_high.iter_mut().zip(&target.lanes) {
+                *high = track.high;
+            }
+            let closed = [false; karyos_protocol::network::MAX_LANES];
+            let Some(repair) = target.repair.as_deref_mut() else {
+                continue;
+            };
+            let before = repair.counts().submitted;
+            let report = repair.serve_routes(
+                &mut [Some(&mut *tx)],
+                &mut self.readers,
+                (&sent_high, &closed),
+                budget,
+                now,
+            );
+            let after = repair.counts().submitted;
+            target.counters.repairs = target
+                .counters
+                .repairs
+                .saturating_add(after.saturating_sub(before));
+            frames = report
+                .lanes
+                .iter()
+                .fold(frames, |sum, lane| sum.saturating_add(lane.served_frames));
+        }
+        u32::try_from(frames).unwrap_or(u32::MAX)
+    }
+
+    /// Hands each destination's step 8 ERRs to `send`.
+    pub(super) fn drain_fanout_replies(
+        &mut self,
+        send: &mut impl FnMut(&karyos_protocol::network::NakReply),
+    ) {
+        if let Some(fanout) = self.fanout.as_deref_mut() {
+            for target in &mut fanout.targets {
+                if let Some(repair) = target.repair.as_deref_mut() {
+                    repair.drain_replies(|reply| send(reply));
+                }
+            }
+        }
     }
 }

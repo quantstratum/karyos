@@ -644,6 +644,25 @@ impl Membership {
             .copied()
     }
 
+    /// Expires the active member bound to `source` at `now`, a removed
+    /// destination's (karyos#630): an optional one leaves a tombstone and
+    /// stops counting for the strategy edge; a required one is lost.
+    /// Returns whether there was one.
+    pub fn release_source(&mut self, source: SocketAddr, now: u64) -> bool {
+        let slot = self.entries.iter().position(|entry| {
+            entry.state == State::Active
+                && entry
+                    .bindings
+                    .iter()
+                    .flatten()
+                    .any(|(_, bound)| *bound == source)
+        });
+        if let Some(slot) = slot {
+            self.expire(slot, now);
+        }
+        slot.is_some()
+    }
+
     fn member_at(&self, source: SocketAddr, now: u64) -> Option<&Entry> {
         self.entries.iter().find(|entry| {
             entry.state == State::Active

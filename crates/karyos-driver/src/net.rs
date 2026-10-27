@@ -327,6 +327,8 @@ struct NetPublication {
     /// Removed for its next incarnation: no linger, and its removal ends
     /// in a [`Reincarnation`].
     reincarnating: bool,
+    /// The destinations its sender removed, with why (karyos#630).
+    removed_destinations: Vec<crate::agents::data::DestinationRemoval>,
     /// The slot its sender stores its admission state's code in each cycle
     /// (karyos#637; 0 before the first).
     admission: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -1751,6 +1753,7 @@ impl<T: StreamTerms> Network<T> {
             trace_closes: Vec::new(),
             channel: Some(channel),
             reincarnating: false,
+            removed_destinations: Vec::new(),
             admission,
         });
         Ok(())
@@ -2023,6 +2026,19 @@ impl<T: StreamTerms> Network<T> {
         karyos_protocol::cnc::NetworkAdmission::from_code(u64::from(
             entry.admission.load(std::sync::atomic::Ordering::Relaxed),
         ))
+    }
+
+    /// The destinations the sender of the network publication
+    /// `registration` removed, in order, with why (karyos#630).
+    pub(crate) fn removed_destinations(
+        &self,
+        registration: u64,
+    ) -> Vec<crate::agents::data::DestinationRemoval> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| entry.removed_destinations.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn publication_state(&self, registration: u64) -> Option<NetworkPublicationState> {
@@ -2813,6 +2829,21 @@ fn publication_answer<T: StreamTerms>(
                 });
             } else {
                 violations.drop_one();
+            }
+        }
+        // A destination its sender removed: kept with the publication, at
+        // most one entry per destination.
+        AgentEvent::DestinationRemoved {
+            endpoint,
+            alias,
+            registration,
+            removal,
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get_mut(index))
+                && entry.removed_destinations.len() < crate::agents::data::MAX_DESTINATIONS
+            {
+                entry.removed_destinations.push(removal);
             }
         }
         AgentEvent::PublicationRemoved {
