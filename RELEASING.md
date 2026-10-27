@@ -26,6 +26,16 @@ row run at any other head is marked "not run at the release head" and
 names its head and what changed since; it is historical evidence, not a
 release gate.
 
+## Changelog
+
+Before the release section of `CHANGELOG.md` is cut, run
+`scripts/changelog-assemble.sh` on the release branch. It folds every
+fragment of `changelog.d/` into `[Unreleased]` and deletes them; commit
+both. Then rename `[Unreleased]` to the release's heading and open a new,
+empty `[Unreleased]` above it. Pull requests never edit `CHANGELOG.md`
+directly (`CONTRIBUTING.md`). Decided 2026-10-27 by QS-COORDINATOR under
+owner delegation (Joaquín, 2026-10-26).
+
 ## Release gates
 
 The gates the 0.1.0-alpha.2 Evidence table records, and `make loom-full`:

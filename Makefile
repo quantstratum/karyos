@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit deny deps-inventory deps-check lint-sync changelog-check pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -108,10 +108,14 @@ deps-check:
 lint-sync:
 	scripts/check-lint-sync.sh
 
+# Each fragment of changelog.d/ starts with exactly one section header.
+changelog-check:
+	scripts/changelog-assemble.sh --check
+
 # The network fault tests under tc netem in Linux Docker (W6). Needs
 # Docker with NET_ADMIN; not part of pre-push. KARYOS_NETEM sets the
 # profile.
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check lint-sync deps-check lint doc test loom build-release timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check lint doc test loom build-release timing-build-check
