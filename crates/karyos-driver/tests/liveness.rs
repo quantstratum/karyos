@@ -19,11 +19,13 @@ use karyos_client::{
     OfferOutcome, Outcome, PollSummary,
 };
 use karyos_driver::{
-    DriverConfig, EmbeddedDriver, LossPolicy, MonotonicClock, SealReason, SealState, StreamConfig,
+    DriverConfig, DriverError, EmbeddedDriver, LossPolicy, MonotonicClock, SealReason, SealState,
+    StreamConfig,
 };
 use karyos_protocol::cnc::{CloseReason, Event, LossPolicyCode, StreamKey, SubscriberRole};
 use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::counters::CellRead;
+use karyos_sys::error::SysError;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
@@ -343,13 +345,22 @@ fn test_driver_loss_hold_revokes_a_lost_clients_required_subscriber() {
     }
 }
 
+const CREDITS: &str = "spare reservations in use";
+
+/// required-participant-loss.md, `continue`: the required subscriber is
+/// admitted `REQUIRED_RESERVED`, holding a spare-slot credit. Revoked, it
+/// keeps that credit while its cell may still be read, so the stream's
+/// last credit stays charged and an optional reader is refused; the
+/// credit returns when the cell is freed. The control, under `hold`,
+/// admits without a reservation: the same loss leaves no credit charged.
 #[test]
 fn test_driver_loss_continue_admits_with_a_reservation_and_revokes() {
     let (mut driver, clock) = driver();
     let stream = driver
         .add_stream(stream_config(LossPolicy::Continue))
         .unwrap();
-    let (_client, mut subscription) = lost_required_subscriber(&mut driver, &clock);
+    let credits = counter(&driver, CREDITS);
+    let (client, mut subscription) = lost_required_subscriber(&mut driver, &clock);
     assert_eq!(counter(&driver, "required participants lost"), 1);
     assert!(poll_once(&mut subscription).revoked.is_some());
     assert_eq!(driver.seal_state(stream).unwrap(), SealState::Active);
@@ -357,6 +368,26 @@ fn test_driver_loss_continue_admits_with_a_reservation_and_revokes() {
     let records = losses(&driver);
     assert_eq!(records.len(), 1);
     assert_eq!((records[0].kind, records[0].applied_policy), (2, 2));
+    // The reservation outlives the revocation: S - C = 2 credits, one the
+    // exclusive publication's, the other still the revoked subscriber's.
+    assert_eq!(counter(&driver, CREDITS), credits + 1);
+    assert!(matches!(
+        driver.subscribe(stream, Role::Optional),
+        Err(DriverError::Sys(SysError::ResourcesUnavailable))
+    ));
+    // The holder detaches: the cell is freed and its credit returned.
+    drop((client, subscription));
+    let _ = driver.do_work().unwrap();
+    assert_eq!(counter(&driver, CREDITS), credits);
+    assert!(driver.subscribe(stream, Role::Optional).is_ok());
+
+    // Control: `hold` charges no credit for the required subscriber.
+    let (mut hold, clock) = self::driver();
+    let stream = hold.add_stream(stream_config(LossPolicy::Hold)).unwrap();
+    let credits = counter(&hold, CREDITS);
+    let (_client, _subscription) = lost_required_subscriber(&mut hold, &clock);
+    assert_eq!(counter(&hold, CREDITS), credits);
+    assert!(hold.subscribe(stream, Role::Optional).is_ok());
 }
 
 #[test]
