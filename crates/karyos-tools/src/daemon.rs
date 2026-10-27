@@ -99,6 +99,9 @@ pub enum StartError {
     /// The Archive did not start (`--archive`).
     #[cfg(target_os = "linux")]
     Archive(crate::daemon_archive::ArchiveStartError),
+    /// No sizing report could be made (`--sizing-report`).
+    #[cfg(target_os = "linux")]
+    Sizing(karyos_driver::sizing::SizingError),
 }
 
 impl fmt::Display for StartError {
@@ -124,6 +127,8 @@ impl fmt::Display for StartError {
             ),
             #[cfg(target_os = "linux")]
             Self::Archive(error) => write!(f, "{error}"),
+            #[cfg(target_os = "linux")]
+            Self::Sizing(error) => write!(f, "sizing report: {error}"),
         }
     }
 }
@@ -156,6 +161,38 @@ impl Shutdown {
             Self::Lingering { .. } => EXIT_LINGERED,
             Self::Terminal => EXIT_TERMINAL,
         }
+    }
+}
+
+/// The sizing report of `options` (R-CORE-34, `karyosd --sizing-report`):
+/// the driver configuration and the configured streams, built as
+/// [`Daemon::start`] builds them, with nothing created.
+///
+/// # Errors
+///
+/// [`StartError::Unsupported`] off Linux; the stream errors of
+/// [`Daemon::start`]; `StartError::Sizing` (Linux) for a configuration the report
+/// refuses.
+pub fn sizing_report(options: &Options) -> Result<String, StartError> {
+    #[cfg(target_os = "linux")]
+    {
+        let streams = options
+            .streams
+            .iter()
+            .map(|stream| {
+                let mut config = stream_config(&options.terms, *stream)?;
+                config.conflation = conflation_of(options, *stream)?;
+                Ok(config)
+            })
+            .collect::<Result<Vec<_>, StartError>>()?;
+        karyos_driver::sizing::report(&options.driver, &streams)
+            .map(|report| report.to_string())
+            .map_err(StartError::Sizing)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = options;
+        Err(StartError::Unsupported)
     }
 }
 

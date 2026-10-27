@@ -4,7 +4,8 @@
 //! (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! Binaries).
 //!
-//! Every option takes one value, as `--name value` or `--name=value`.
+//! Every option takes one value, as `--name value` or `--name=value`,
+//! except `--help` and `--sizing-report`.
 //! Counts and sizes are decimal integers; a size may end in `k`, `m` or `g`
 //! (powers of 1024). Durations are an integer followed by `ns`, `us`, `ms`
 //! or `s`. Values are checked here only for their syntax and range; the
@@ -33,6 +34,7 @@ pub const HELP: &str = "\
 karyosd: runs one dedicated Karyos driver (IPC mode, Linux).
 
 Usage: karyosd --dir <path> [options]
+       karyosd --sizing-report [options]
 
 Admission:
   --dir <path>                      private directory of the admission socket (required)
@@ -129,6 +131,9 @@ Archive:
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
 
+  --sizing-report                   print the bytes of every shared region these options
+                                    map (configured, bounded and restart peak) and exit
+                                    without starting; --dir is not needed
   -h, --help                        print this text
 
 Exit status: 0 after an orderly shutdown with every client gone and every
@@ -149,6 +154,8 @@ pub enum Command {
     Help,
     /// Run the daemon.
     Run(Box<Options>),
+    /// Print the sizing report of these options (R-CORE-34) and exit.
+    SizingReport(Box<Options>),
 }
 
 /// The admission socket settings, mirroring the driver's `IpcConfig`
@@ -427,6 +434,7 @@ where
     let mut options = Options::new(PathBuf::new());
     let mut dir = None;
     let mut archive = Archive::default();
+    let mut sizing = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let text = arg
@@ -434,6 +442,10 @@ where
             .ok_or_else(|| ArgsError::UnknownOption(arg.to_string_lossy().into_owned()))?;
         if text == "-h" || text == "--help" {
             return Ok(Command::Help);
+        }
+        if text == "--sizing-report" {
+            sizing = true;
+            continue;
         }
         let (name, inline) = match text.split_once('=') {
             Some((name, value)) if name.starts_with("--") => (name, Some(OsString::from(value))),
@@ -479,11 +491,18 @@ where
             value: value.clone(),
         })?;
     }
-    options.admission.dir = dir.ok_or(ArgsError::Missing("--dir"))?;
+    options.admission.dir = match dir {
+        Some(dir) => dir,
+        None if sizing => PathBuf::new(),
+        None => return Err(ArgsError::Missing("--dir")),
+    };
     configured(&options)?;
     timed_networks(&mut options)?;
     idle_image_timeout(&mut options)?;
     options.archive = archive.finish()?;
+    if sizing {
+        return Ok(Command::SizingReport(Box::new(options)));
+    }
     Ok(Command::Run(Box::new(options)))
 }
 
@@ -1017,8 +1036,27 @@ mod tests {
     fn options(args: &[&str]) -> Options {
         match run(args).unwrap() {
             Command::Run(options) => *options,
-            Command::Help => panic!("expected options"),
+            Command::Help | Command::SizingReport(_) => panic!("expected options"),
         }
+    }
+
+    #[test]
+    fn the_sizing_report_needs_no_directory_and_keeps_the_options() {
+        match run(&["--sizing-report", "--max-clients", "3"]).unwrap() {
+            Command::SizingReport(options) => {
+                assert_eq!(options.driver.max_clients, 3);
+                assert_eq!(options.admission.dir, PathBuf::new());
+            }
+            other => panic!("expected a sizing report, got {other:?}"),
+        }
+        assert!(matches!(
+            run(&["--dir", "/run/karyos", "--sizing-report"]).unwrap(),
+            Command::SizingReport(_)
+        ));
+        assert_eq!(
+            run(&["--max-clients", "3"]),
+            Err(ArgsError::Missing("--dir"))
+        );
     }
 
     #[test]
