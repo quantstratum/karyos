@@ -20,7 +20,6 @@ karyos-driver.workspace = true
 karyos-trace.workspace = true
 karyos-archive.workspace = true
 karyos-cluster.workspace = true
-karyos-feed.workspace = true
 karyos-sim.workspace = true
 karyos.workspace = true
 signal-hook.workspace = true

@@ -10,8 +10,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[dependencies]
-karyos-client.workspace = true
+[dev-dependencies]
+# The counting allocator of the steady-cycle test (`alloc_count`).
+karyos-sys = { workspace = true, features = ["test-hooks"] }
 
 [lints]
 workspace = true

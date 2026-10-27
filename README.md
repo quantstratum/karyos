@@ -114,7 +114,8 @@ serves it from `do_work`; a client process attaches with
 | `karyos-sim` | Deterministic simulator | Implemented for phase 1 scenarios |
 | `karyos-bench` | Benchmark harness | Implemented |
 | `karyos` | Public facade | Re-exports the client API only |
-| `karyos-io`, `karyos-codec`, `karyos-archive`, `karyos-cluster`, `karyos-feed`, `karyos-tools` | Network I/O backends (the other crate allowed `unsafe`), codec, Archive, Cluster, feed arbitration, `karyosd` and tools | Scaffolds for later phases |
+| `karyos-feed` | A/B arbitration of external exchange feeds, pure and with no dependency | The arbiter; no feed adapter yet |
+| `karyos-io`, `karyos-codec`, `karyos-archive`, `karyos-cluster`, `karyos-tools` | Network I/O backends (the other crate allowed `unsafe`), codec, Archive, Cluster, `karyosd` and tools | Scaffolds for later phases |
 
 ## Documentation
 
