@@ -4256,14 +4256,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if terminal.start < join {
             let mut out = vec![0u8; config.value_capacity];
             let mut seeded = Ok(());
+            let mut unstable = 0;
             if let Some(closed) = &stream.closed_view {
-                let _ = closed.writer.for_each_value(&mut out, |key, value| {
+                unstable = closed.writer.for_each_value(&mut out, |key, value| {
                     if seeded.is_ok() {
                         seeded = writer.write_at(key, value, terminal.start).map(|_| ());
                     }
                 });
             }
             seeded?;
+            // The closed table has one writer, closed: every written slot
+            // reads coherent. A slot that did not would come back absent
+            // instead of Stale, so it is counted (#757 review).
+            debug_assert_eq!(unstable, 0, "a closed table's slot read unstable");
+            if unstable > 0
+                && let Some(net) = &mut self.net
+            {
+                net.count_views(|views| {
+                    views.add(|c| &mut c.recreate_unstable, u64::from(unstable))
+                });
+            }
             // A new table: its ring is empty and its frontier 0, and the
             // interval is not empty, so no refusal is expected here.
             writer

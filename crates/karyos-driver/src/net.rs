@@ -471,6 +471,10 @@ pub struct NetworkViewCounters {
     pub feeders_lost: u64,
     /// Views recreated after their terminal cell closed them (karyos#658).
     pub recreated: u64,
+    /// Slots of a closed view that read unstable when its recreation was
+    /// seeded, so came back absent instead of `Stale`; never expected,
+    /// the closed table having one closed writer.
+    pub recreate_unstable: u64,
 }
 
 /// Why a conflated view of a network image could not be built.

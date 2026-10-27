@@ -1066,7 +1066,9 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
 /// a term past it. B's window is also half a term, so this test cannot
 /// tell them apart; `membership/tests.rs`
 /// (`edges_are_checked_sums_and_required_members_bound_every_strategy`)
-/// checks the limit alone. Linux, after the multicast probe.
+/// checks the limit alone. Every call is public since karyos#637, and the
+/// strategy comes from the channel's URI (`fc=`). Linux, after the
+/// multicast probe.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_required_receiver_bounds_every_strategy() {
@@ -1106,14 +1108,20 @@ fn a_required_receiver_bounds_every_strategy() {
     ];
     for (name, strategy, required, tags, c_identity, held) in cases {
         let port = free_port();
-        let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), port);
-        let channel = UdpConfig {
-            destination: Destination::Multicast { group, ttl: None },
-            interface: None,
-            paths: Vec::new(),
-            reliable: false,
-            flow_control: None,
-            security: Security::Trusted,
+        // The strategy comes from the channel's URI, its one source
+        // (karyos#637): the public path, not a driver-internal one.
+        let fc = match strategy {
+            Strategy::Max => "max".to_owned(),
+            Strategy::Tagged(group) => format!("tagged:{group}"),
+            Strategy::Min => "min".to_owned(),
+        };
+        let uri = format!("karyos:udp?group=239.255.0.3:{port}|reliable=false|fc={fc}");
+        let karyos_protocol::channel::Media::Udp(channel) =
+            karyos_protocol::channel::ChannelConfig::parse(&uri)
+                .unwrap()
+                .media
+        else {
+            panic!("{name}: not udp");
         };
         let (mut a, mut b, mut c) = (
             driver(ThreadingMode::Shared),
@@ -2234,7 +2242,8 @@ fn optional_receiver_closes(
         interface: None,
         paths: Vec::new(),
         reliable: true,
-        flow_control: None,
+        // `max`, as the roles below: the channel's `fc` is the strategy.
+        flow_control: Some(karyos_protocol::channel::FlowControl::Max),
         security: Security::Trusted,
     };
     let (mut a, mut b, mut c) = (

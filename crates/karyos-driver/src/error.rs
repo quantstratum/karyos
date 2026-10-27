@@ -62,11 +62,15 @@ pub enum DriverError {
     #[error("no network is configured")]
     NetworkUnavailable,
     /// The channel uses a feature this driver does not wire yet (multi
-    /// destination, redundant paths, an interface name, or flow control
-    /// other than `min` on a publication: `fc=max` and `fc=tagged:<group>`,
-    /// owner item 7).
+    /// destination, redundant paths, an interface name), or `fc=tagged:0`
+    /// on a publication: a tagged group is never 0.
     #[error("unsupported network channel")]
     UnsupportedChannel,
+    /// A network publication's typed roles name another strategy than its
+    /// channel's `fc`, the one source of the strategy (`min` without one;
+    /// owner item 7, karyos#637).
+    #[error("the roles' strategy is not the channel's fc")]
+    StrategyConflict,
     /// A second subscription of one endpoint and stream asks for another
     /// reliability than the first: they would share one receiver entry,
     /// and a reliable subscriber must not get gap-tolerant delivery.

@@ -37,11 +37,6 @@ release may break APIs, wire formats and shared-memory layouts.
   `DurationError`; and `ChannelError::InvalidDuration` (code 11) for duration
   keys. A test per published key asserts the sixteen existing keys parse as
   before.
-- `AgentConfig::conductor_duty_period` (default 1 ms): the longest time between
-  two conductor duty cycles. `barrier_ack_timeout` is validated against it
-  (karyos#658). karyosd bounds its idle sleep by it; a caller that drives an
-  embedded driver's `duty_cycle` itself must call it at least this often while
-  a conflated network view is open.
 - A conflated network view closed by its terminal cell can be recreated
   (driver-internal, `EmbeddedDriver::recreate_network_view`, until karyos#637
   gives it a public way in). The new view starts with every written key's last
@@ -51,6 +46,12 @@ release may break APIs, wire formats and shared-memory layouts.
   driver's close, never longer. Counted as `recreated` (view counters) and
   `views_relinked` / `relinks_refused` (receiver).
 
+- `EmbeddedDriver::add_network_publication_with_roles` and
+  `EmbeddedDriver::add_network_subscription_as` are public: a network
+  publication's required `receiver_id`s and receiver tags (`PublicationRoles`),
+  and a subscription's receiver identity (`ReceiverIdentity`), owner item 7
+  (karyos#637, part 1 of 5).
+
 ### Changed
 
 - A channel URI list that names one address in two spellings is refused as a
@@ -58,6 +59,19 @@ release may break APIs, wire formats and shared-memory layouts.
   `paths=10.0.0.7;::ffff:10.0.0.7` are now `InvalidValue`, as an exact repeat
   already was. An IPv4-mapped IPv6 address compares equal to the IPv4 address it
   maps; IPv6 zones still tell addresses apart.
+- `AgentConfig::conductor_duty_period` (default 1 ms) is a new public field: the
+  longest time between two conductor duty cycles, which `barrier_ack_timeout`
+  is validated against (karyos#658). `AgentConfig` is not `#[non_exhaustive]`,
+  so a caller that builds it with an exhaustive struct literal must add the
+  field; `..AgentConfig::default()` keeps working. karyosd bounds its idle
+  sleep by it; a caller that drives an embedded driver's `duty_cycle` itself
+  must call it at least this often while a conflated network view is open.
+- A network publication runs the strategy its channel's `fc` names: `fc=max`
+  and `fc=tagged:<group>` are granted instead of refused with
+  `UnsupportedChannel`. The `fc` is the one source of the strategy: typed roles
+  that name another one are refused with `DriverError::StrategyConflict`.
+  `fc=tagged:0` names no group and stays refused (`UnsupportedChannel`).
+  Decided 2026-10-27 by QS-COORDINATOR under owner delegation (karyos#637).
 - `barrier_ack_timeout` is refused below 10 ms (`BarrierAckBound::Floor`) and
   below ten `conductor_duty_period` (`BarrierAckBound::DutyPeriods`), each with
   its own refusal: `AgentError::BarrierAckTimeout` from the agents,

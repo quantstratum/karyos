@@ -143,19 +143,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// [`EmbeddedDriver::add_network_subscription`] whose images name the
     /// configured receiver `identity` (MC-1, MC-2): its `receiver_id` in
-    /// every RB block and its `group_tag` in their SMs. Driver-internal:
-    /// the public way in is owner item 7.
+    /// every RB block and its `group_tag` in their SMs (owner decisions of
+    /// 2026-10-21, item 7): what a publication's required `receiver_id`s
+    /// and `tagged` group name.
     ///
     /// # Errors
     ///
     /// As [`EmbeddedDriver::add_network_subscription`], and
     /// [`DriverError::ReceiverIdentityMismatch`] for a stream already
     /// subscribed on the endpoint with another identity, or with none.
-    #[allow(
-        dead_code,
-        reason = "driver-internal until owner item 7 gives identities a public way in"
-    )]
-    pub(crate) fn add_network_subscription_as(
+    pub fn add_network_subscription_as(
         &mut self,
         stream_id: i32,
         channel: &UdpConfig,
