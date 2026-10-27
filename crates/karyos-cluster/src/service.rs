@@ -284,21 +284,28 @@ pub trait ClusteredService {
     fn on_configuration(&mut self, context: &mut Context<'_>, configuration: &[u8]);
 }
 
-/// The scheduled timers: ids and deadlines, sorted by id, never past
-/// their capacity.
+/// The scheduled timers: ids and deadlines, sorted by id, never more
+/// than the configured bound. The bound is kept, not read from the
+/// vector's capacity, which may exceed what was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Timers(Vec<(u64, u64)>);
+struct Timers {
+    scheduled: Vec<(u64, u64)>,
+    bound: usize,
+}
 
 impl Timers {
     fn deadline(&self, timer: u64) -> Option<u64> {
-        let slot = self.0.binary_search_by_key(&timer, |&(id, _)| id).ok()?;
-        self.0.get(slot).map(|&(_, deadline)| deadline)
+        let slot = self
+            .scheduled
+            .binary_search_by_key(&timer, |&(id, _)| id)
+            .ok()?;
+        self.scheduled.get(slot).map(|&(_, deadline)| deadline)
     }
 
     fn remove(&mut self, timer: u64) -> bool {
-        match self.0.binary_search_by_key(&timer, |&(id, _)| id) {
+        match self.scheduled.binary_search_by_key(&timer, |&(id, _)| id) {
             Ok(slot) => {
-                let _ = self.0.remove(slot);
+                let _ = self.scheduled.remove(slot);
                 true
             }
             Err(_) => false,
@@ -358,7 +365,8 @@ impl<'a> Context<'a> {
     ///
     /// [`TimersFull`] for a new timer when every slot is in use.
     pub fn schedule(&mut self, timer: u64, deadline: u64) -> Result<(), TimersFull> {
-        let timers = &mut self.timers.0;
+        let bound = self.timers.bound;
+        let timers = &mut self.timers.scheduled;
         match timers.binary_search_by_key(&timer, |&(id, _)| id) {
             Ok(slot) => {
                 if let Some(entry) = timers.get_mut(slot) {
@@ -366,7 +374,7 @@ impl<'a> Context<'a> {
                 }
             }
             Err(slot) => {
-                if timers.len() == timers.capacity() {
+                if timers.len() >= bound {
                     return Err(TimersFull);
                 }
                 timers.insert(slot, (timer, deadline));
@@ -452,7 +460,8 @@ pub enum Applied<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ApplyError {
-    /// The entry is not the one after the last applied.
+    /// The entry is not the one after the last applied, or not index 1
+    /// for the first.
     #[error("entry {index} after {last:?}: not in log order")]
     OutOfOrder {
         /// The entry's index.
@@ -487,7 +496,10 @@ impl<S: ClusteredService> ServiceContainer<S> {
         Ok(Self {
             service,
             sessions: SessionTable::new(config.dedup)?,
-            timers: Timers(Vec::with_capacity(timers)),
+            timers: Timers {
+                scheduled: Vec::with_capacity(timers),
+                bound: timers,
+            },
             applied: None,
         })
     }
@@ -520,7 +532,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
     /// envelopes a leader proposes for them, in timer order.
     pub fn due(&self, now: u64) -> impl Iterator<Item = Envelope<'static>> + '_ {
         self.timers
-            .0
+            .scheduled
             .iter()
             .filter(move |&&(_, deadline)| deadline <= now)
             .map(|&(timer, deadline)| Envelope::TimerFired { timer, deadline })
@@ -533,7 +545,10 @@ impl<S: ClusteredService> ServiceContainer<S> {
     /// [`ApplyError`] for an entry out of order or a payload that is not
     /// an envelope; the container applies nothing more.
     pub fn apply(&mut self, entry: &Entry) -> Result<Applied<'_>, ApplyError> {
-        if self.applied.is_some_and(|last| entry.index != last + 1) {
+        // The log starts at index 1 until snapshot install (#065) gives
+        // the container another start.
+        let expected = self.applied.map_or(1, |last| last.saturating_add(1));
+        if entry.index != expected {
             return Err(ApplyError::OutOfOrder {
                 index: entry.index,
                 last: self.applied,

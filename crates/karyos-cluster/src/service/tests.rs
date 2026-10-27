@@ -233,6 +233,38 @@ fn test_container_refuses_an_entry_out_of_order_or_not_an_envelope() {
 }
 
 #[test]
+fn test_container_the_first_entry_must_be_index_1() {
+    let mut container = container();
+    assert_eq!(
+        container.apply(&entry(2, 0, Envelope::Register { client: 7 })),
+        Err(ApplyError::OutOfOrder {
+            index: 2,
+            last: None
+        })
+    );
+    // An entry 1 that is not an envelope stops the container: entry 2 is
+    // not applied past it.
+    let bad = Entry {
+        index: 1,
+        term: 1,
+        event_time: 0,
+        payload: vec![1, 9],
+    };
+    assert_eq!(
+        container.apply(&bad),
+        Err(ApplyError::Envelope(EnvelopeError::Kind(9)))
+    );
+    assert_eq!(
+        container.apply(&entry(2, 0, Envelope::Register { client: 7 })),
+        Err(ApplyError::OutOfOrder {
+            index: 2,
+            last: None
+        })
+    );
+    assert_eq!(container.applied(), None);
+}
+
+#[test]
 fn test_container_a_core_entry_delivers_nothing_but_moves_the_log_time() {
     let mut container = registered();
     let empty = Entry {
@@ -326,6 +358,29 @@ fn test_container_timers_are_bounded() {
     }
     assert_eq!(container.timer(2), Some(10));
     assert_eq!(container.timer(3), None, "the third did not fit two slots");
+}
+
+/// The bound is the configured one, whatever capacity the allocator
+/// gave the vector, so every replica refuses the same timer.
+#[test]
+fn test_container_the_timer_bound_is_the_configured_one() {
+    for bound in [1u32, 3, 5, 7] {
+        let mut container =
+            ServiceContainer::new(Register::default(), config().with_timers(bound)).unwrap();
+        let _ = container
+            .apply(&entry(1, 0, Envelope::Register { client: 7 }))
+            .unwrap();
+        for timer in 1..=u64::from(bound) + 1 {
+            let command = schedule(timer, 10);
+            let _ = container
+                .apply(&entry(timer + 1, 0, request(timer, &command)))
+                .unwrap();
+        }
+        let scheduled = (1..=u64::from(bound) + 1)
+            .filter(|&timer| container.timer(timer).is_some())
+            .count();
+        assert_eq!(scheduled, bound as usize, "bound {bound}");
+    }
 }
 
 #[test]
