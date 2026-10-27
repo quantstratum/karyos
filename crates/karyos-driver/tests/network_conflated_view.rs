@@ -33,6 +33,7 @@ const VIEW: ConflationConfig = ConflationConfig {
     keys: 4,
     value_capacity: 16,
     journal_capacity: 1024,
+    refresh: false,
 };
 
 fn driver() -> EmbeddedDriver {
