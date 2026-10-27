@@ -170,7 +170,9 @@ pub enum Marker {
         scope: Scope,
         /// The begin marker's position in the lane.
         begin: u64,
-        /// The number of refresh values the publisher offered in the cycle.
+        /// The number of the cycle's refresh values the publisher's lane
+        /// accepted (appended); an offer that appended nothing does not
+        /// count.
         values: u64,
     },
 }

@@ -1404,6 +1404,27 @@ fn cycles_are_matched_by_id_begin_and_count() {
     );
 }
 
+/// ADR-0080: a refresh value of another id is written, keeping its key's
+/// freshness, but the open cycle does not count it, so an end with a count
+/// of 0 completes and restores nothing; and a loss entirely below the begin
+/// position (here the table's own gap, passed before the begin) does not
+/// abort a cycle.
+#[test]
+fn a_value_of_another_cycle_is_not_counted() {
+    let (mut writer, _link, at) = stale_cycle_table(1);
+    writer.cycle_begin(id(1), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(2), 0, &[9], at + 32), Ok(4));
+    writer.passed(at + 64);
+    assert_eq!(writer.cycle_end(id(1), end(at, 0), at + 64), Ok(Some(0)));
+    assert!(matches!(
+        freshness_now(&writer)[..],
+        [(0, Freshness::Stale { .. })]
+    ));
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!((counters.cycles_completed, counters.cycles_aborted), (1, 0));
+}
+
 /// ADR-0080: a live update during a cycle restores its key at once, as
 /// today, even when the cycle is later cut; and without a barrier, a
 /// refresh value is a value and markers do nothing.
