@@ -1600,6 +1600,13 @@ impl<C: Connection> Client<C> {
     /// client of a driver in this process is refused by its driver, which
     /// gives in-process views itself (`EmbeddedDriver::subscribe_conflated`).
     ///
+    /// A `karyos:udp` channel's conflated view, a network image's, is not
+    /// served to a client: its table is on its driver's heap, and remote
+    /// clients are not in scope of the design
+    /// (`quantstratum-docs: karyos/design/conflated-network-images.md`,
+    /// (c); owner item 7, karyos#637). The driver in the process gives it
+    /// (`EmbeddedDriver::add_network_subscription_conflated`).
+    ///
     /// # Errors
     ///
     /// As [`Client::add_conflated_subscription_with`].
@@ -1617,7 +1624,8 @@ impl<C: Connection> Client<C> {
     /// # Errors
     ///
     /// [`ClientError::UnsupportedChannel`] for a URI other than
-    /// `karyos:ipc`, before anything is requested;
+    /// `karyos:ipc` (a network view is the embedded driver's, above),
+    /// before anything is requested;
     /// [`ClientError::Conductor`] for a request that cannot be submitted,
     /// [`ClientError::Timeout`], [`ClientError::Refused`] (a stream without
     /// a table, or an in-process client), and on Linux

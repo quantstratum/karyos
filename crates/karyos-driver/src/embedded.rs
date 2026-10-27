@@ -4177,8 +4177,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// seal and terminal closure": "recovery recreates the view, and every
     /// key of the new view starts `Stale` until its own update";
     /// `quantstratum-docs: karyos/design/conflated-network-images.md`,
-    /// "Recovery"; karyos#658). Driver-internal until owner item 7 gives
-    /// conflated network views a way in (karyos#637).
+    /// "Recovery"; karyos#658), the view of
+    /// [`EmbeddedDriver::add_network_subscription_conflated`] (karyos#637).
     ///
     /// The new table, over a new link, is seeded with the closed view's
     /// last value of every written key at the terminal's start, then the
@@ -4199,11 +4199,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// failure as [`DriverError::Conflation`], [`DriverError::Client`] or
     /// [`DriverError::Sys`].
     /// Nothing changes on error: the closed view stays to retry.
-    #[allow(
-        dead_code,
-        reason = "driver-internal until owner item 7 gives conflated network views a way in"
-    )]
-    pub(crate) fn recreate_network_view(
+    pub fn recreate_network_view(
         &mut self,
         handle: &AggregateHandle,
         lane: karyos_sys::frame::Lane,

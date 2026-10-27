@@ -164,8 +164,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`EmbeddedDriver::add_network_subscription`] with a conflated view
     /// of `lane` of its images, a table of `config` (conflated-network-images.md
     /// (a)): the receiver gates that lane's seals through the view's barrier
-    /// mailbox, and the conductor feeds the view of each exposed image.
-    /// Driver-internal: a URI or public form is the owner's (item 7).
+    /// mailbox, and the conductor feeds the view of each exposed image
+    /// (owner decisions of 2026-10-21, item 7: "receiver-side conflated
+    /// subscriptions"; karyos#637). Read a view with
+    /// [`EmbeddedDriver::subscribe_conflated`] on the image's lane stream
+    /// (`AggregateHandle::lane` of [`EmbeddedDriver::network_image`]): each
+    /// value comes with its freshness. A view its terminal cell closed is
+    /// recreated with [`EmbeddedDriver::recreate_network_view`]. This is the
+    /// in-process way in, as for IPC views; a client of a driver in another
+    /// process is refused a network view (`Client::add_conflated_subscription`,
+    /// `UnsupportedChannel`): its table is on the driver's heap
+    /// (`quantstratum-docs: karyos/design/conflated-network-images.md`, (c)).
     ///
     /// # Errors
     ///
@@ -175,11 +184,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::BarrierAckTimeout`] for an unreliable channel whose
     /// `barrier_ack_timeout` plus seal deadline reaches the far-window
     /// timeout (karyos#658).
-    #[allow(
-        dead_code,
-        reason = "driver-internal until owner item 7 gives conflated network views a way in"
-    )]
-    pub(crate) fn add_network_subscription_conflated(
+    pub fn add_network_subscription_conflated(
         &mut self,
         stream_id: i32,
         channel: &UdpConfig,
