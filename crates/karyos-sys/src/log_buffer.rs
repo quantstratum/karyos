@@ -5378,6 +5378,10 @@ fn config_words(
         u64::from(config.schedule_capacity),
         conflation.map_or(0, |shape| u64::from(shape.keys)),
         conflation.map_or(0, |shape| u64::from(shape.value_capacity)),
+        // Bit 0: the table interprets refresh cycles (ADR-0080). Zero
+        // without them, so a block without refresh reads as before, and a
+        // reader that does not know the word refuses a block with it.
+        conflation.map_or(0, |shape| u64::from(shape.refresh)),
     ];
     for (word, field) in words.iter_mut().zip(fields) {
         *word = field;
@@ -5413,6 +5417,7 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<Parsed> {
         schedule_capacity,
         conflation_keys,
         conflation_value_capacity,
+        conflation_flags,
         rest @ ..,
     ] = words;
     if *version != LAYOUT_VERSION || rest.iter().any(|word| *word != 0) {
@@ -5454,15 +5459,27 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<Parsed> {
     let max_message_length = small(max_message_length)?;
     // Both words 0: no table; otherwise a table this buffer's messages can
     // carry, or the block is not valid.
-    let conflation = match (*conflation_keys, *conflation_value_capacity) {
-        (0, 0) => None,
-        (keys, value_capacity) => Some(ConflationShape {
+    let conflation = match (
+        *conflation_keys,
+        *conflation_value_capacity,
+        *conflation_flags,
+    ) {
+        (0, 0, 0) => None,
+        (keys, value_capacity, flags @ (0 | 1)) => Some(ConflationShape {
             keys: small(&keys)?,
             value_capacity: small(&value_capacity)?,
+            refresh: flags == 1,
         })
         .filter(|shape| shape.fits(max_message_length)),
+        _ => None,
     };
-    if conflation.is_none() && (*conflation_keys, *conflation_value_capacity) != (0, 0) {
+    if conflation.is_none()
+        && (
+            *conflation_keys,
+            *conflation_value_capacity,
+            *conflation_flags,
+        ) != (0, 0, 0)
+    {
         return None;
     }
     Some(Parsed {
@@ -5493,16 +5510,29 @@ pub struct ConflationShape {
     pub keys: u32,
     /// The largest value, in bytes.
     pub value_capacity: u32,
+    /// Whether publications may carry refresh and snapshot cycles
+    /// ([`crate::conflation::cycle`]; ADR-0080).
+    pub refresh: bool,
 }
 
 impl ConflationShape {
-    /// A table of `keys` keys and values of at most `value_capacity` bytes.
+    /// A table of `keys` keys and values of at most `value_capacity` bytes,
+    /// without refresh cycles.
     #[must_use]
     pub const fn new(keys: u32, value_capacity: u32) -> Self {
         Self {
             keys,
             value_capacity,
+            refresh: false,
         }
+    }
+
+    /// This shape, whose publications may carry refresh and snapshot
+    /// cycles.
+    #[must_use]
+    pub const fn with_refresh(mut self) -> Self {
+        self.refresh = true;
+        self
     }
 
     /// Whether a buffer whose largest message is `max_message_length` can
@@ -5514,14 +5544,19 @@ impl ConflationShape {
     }
 
     /// Checks a publication's reserved value (its key) and its value's
-    /// length against this table before it attempts a reservation.
+    /// length against this table before it attempts a reservation. A shape
+    /// with `refresh` also takes a refresh value of a key in `0..keys` and
+    /// a marker of exactly [`MARKER_LENGTH`] bytes, which no value capacity
+    /// bounds (ADR-0080).
     ///
     /// # Errors
     ///
     /// [`InvalidConfig`] for a table with no keys or an empty value (or a
     /// capacity this target's `usize` cannot hold), [`KeyOutOfRange`] for a
-    /// key outside `0..keys`, and [`ValueTooLarge`] for a value past the
-    /// capacity.
+    /// key outside `0..keys` (or, with `refresh`, a malformed marker), and
+    /// [`ValueTooLarge`] for a value past the capacity.
+    ///
+    /// [`MARKER_LENGTH`]: crate::conflation::cycle::MARKER_LENGTH
     ///
     /// [`InvalidConfig`]: crate::conflation::ConflationError::InvalidConfig
     /// [`KeyOutOfRange`]: crate::conflation::ConflationError::KeyOutOfRange
@@ -5532,17 +5567,29 @@ impl ConflationShape {
         value_length: usize,
     ) -> Result<(), crate::conflation::ConflationError> {
         use crate::conflation::ConflationError;
+        use crate::conflation::cycle::{MARKER_LENGTH, Reserved};
         if self.keys == 0 || self.value_capacity == 0 {
             return Err(ConflationError::InvalidConfig);
         }
-        if u32::try_from(reserved_value)
-            .ok()
-            .filter(|key| *key < self.keys)
-            .is_none()
-        {
-            return Err(ConflationError::KeyOutOfRange {
-                key: reserved_value,
-            });
+        let out_of_range = ConflationError::KeyOutOfRange {
+            key: reserved_value,
+        };
+        let key = match Reserved::read(reserved_value) {
+            Reserved::Live { key } => key,
+            Reserved::Value { key, .. } if self.refresh => key,
+            // Its payload is the receiver's to decode; a malformed one
+            // aborts the cycle there and restores nothing.
+            Reserved::Marker { .. } if self.refresh => {
+                return if value_length == MARKER_LENGTH {
+                    Ok(())
+                } else {
+                    Err(out_of_range)
+                };
+            }
+            _ => return Err(out_of_range),
+        };
+        if key >= self.keys {
+            return Err(out_of_range);
         }
         // A u32 capacity a target's usize cannot hold is no table it serves.
         let max =
@@ -6108,6 +6155,8 @@ mod region_tests {
     /// words 19 and 20 of the configuration block, written before the
     /// buffer is shared: an attached participant reads the creator's. A
     /// shape the buffer cannot carry, or half of one, is refused at attach.
+    /// Word 21 carries `refresh` (ADR-0080): bit 0 only, and only with a
+    /// shape.
     #[test]
     fn attach_reads_the_conflation_shape_and_refuses_a_bad_one() {
         let shape = ConflationShape::new(4, 64);
@@ -6127,8 +6176,9 @@ mod region_tests {
             result
         };
         // No keys with a value, a value with no keys (half a shape), a
-        // value past the largest message, a key count past `u32`.
-        for (index, value) in [(19, 0), (20, 0), (20, max + 1), (19, 1 << 32)] {
+        // value past the largest message, a key count past `u32`, an
+        // unknown flag.
+        for (index, value) in [(19, 0), (20, 0), (20, max + 1), (19, 1 << 32), (21, 2)] {
             assert!(
                 corrupt(index, value).is_err(),
                 "word {index} = {value} accepted"
@@ -6139,10 +6189,26 @@ mod region_tests {
             corrupt(20, max).unwrap().conflation(),
             Some(ConflationShape::new(4, creator.max_message_length()))
         );
+        // The refresh flag travels, and a flag without a shape is refused.
+        assert_eq!(
+            corrupt(21, 1).unwrap().conflation(),
+            Some(shape.with_refresh())
+        );
+        let refresh = LogBuffer::create_in(1, 9, config(PublicationMode::Exclusive), generation())
+            .unwrap()
+            .with_conflation(shape.with_refresh())
+            .unwrap();
+        assert_eq!(
+            attach(&refresh).unwrap().conflation(),
+            Some(shape.with_refresh())
+        );
         // A buffer created without a table has none, attached too.
         let plain =
             LogBuffer::create_in(1, 8, config(PublicationMode::Exclusive), generation()).unwrap();
         assert_eq!(attach(&plain).unwrap().conflation(), None);
+        let structure = plain.region().unwrap().structure();
+        structure.get(21).unwrap().store(1, Ordering::Release);
+        assert!(attach(&plain).is_err());
     }
 
     /// A self-consistent region of another kind whose structure holds a

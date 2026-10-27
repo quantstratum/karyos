@@ -218,6 +218,7 @@ impl ConflatedLimits {
             keys: fetchable.keys,
             value_capacity: usize::try_from(fetchable.value_capacity).ok()?,
             journal_capacity: usize::try_from(fetchable.journal_capacity).ok()?,
+            refresh: false,
         };
         (config.keys <= self.max_keys
             && config.value_capacity <= self.max_value_capacity

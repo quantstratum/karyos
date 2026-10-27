@@ -41,6 +41,7 @@ const TABLE: ConflationConfig = ConflationConfig {
     keys: 4,
     value_capacity: 8,
     journal_capacity: 1024,
+    refresh: false,
 };
 
 fn dir(name: &str) -> PathBuf {

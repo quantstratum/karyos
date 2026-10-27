@@ -51,6 +51,8 @@
 //! over heap memory.
 
 use crate::freshness::SlotFreshness;
+
+pub mod cycle;
 use crate::load_words::LoadWords;
 use crate::sync::{AtomicU64, Ordering, fence};
 
@@ -119,9 +121,32 @@ pub struct ConflationConfig {
     pub value_capacity: usize,
     /// Capacity of the update journal in bytes.
     pub journal_capacity: usize,
+    /// Whether the table's views interpret refresh and snapshot cycles
+    /// ([`cycle`]; ADR-0080, karyos#634). False: a reserved value outside
+    /// `0..keys`, cycle traffic included, is a rejected key, as before.
+    pub refresh: bool,
 }
 
 impl ConflationConfig {
+    /// A table of `keys` keys, values of at most `value_capacity` bytes and
+    /// a journal of `journal_capacity` bytes, without refresh cycles.
+    #[must_use]
+    pub const fn new(keys: u32, value_capacity: usize, journal_capacity: usize) -> Self {
+        Self {
+            keys,
+            value_capacity,
+            journal_capacity,
+            refresh: false,
+        }
+    }
+
+    /// This table, whose views interpret refresh and snapshot cycles.
+    #[must_use]
+    pub const fn with_refresh(mut self) -> Self {
+        self.refresh = true;
+        self
+    }
+
     /// The shape of this table that its publications check: its keys and
     /// its largest value.
     ///
@@ -141,10 +166,12 @@ impl ConflationConfig {
                 }
             })
         })?;
-        Ok(crate::log_buffer::ConflationShape::new(
-            self.keys,
-            value_capacity,
-        ))
+        let shape = crate::log_buffer::ConflationShape::new(self.keys, value_capacity);
+        Ok(if self.refresh {
+            shape.with_refresh()
+        } else {
+            shape
+        })
     }
 
     /// Checks a publication's reserved value and payload length before it
@@ -630,6 +657,7 @@ pub use owned::{LAYOUT_VERSION, conflation_in};
 mod owned {
     use std::sync::Arc;
 
+    use super::cycle::{CycleId, Marker, Scope};
     use super::{
         ConflationConfig, ConflationError, FRESH_SEQ, FRESH_VALUE, FRESH_VERSION, FreshRead,
         FreshSlotWords, STRIDE_WORDS, WORD_BYTES, read_fresh_slot,
@@ -648,6 +676,11 @@ mod owned {
 
     /// Message type of a journal record.
     const JOURNAL_TYPE: u32 = 1;
+    /// The journal record type of a freshness-only change of a key (a
+    /// refresh cycle's restore, ADR-0080): same payload, and a reader
+    /// serves the key again even at a version it delivered, as after a
+    /// loss, so the new freshness reaches it.
+    const JOURNAL_FRESHNESS_TYPE: u32 = 2;
     /// Bytes of a journal record payload: key, padding, version.
     const JOURNAL_PAYLOAD: usize = 16;
 
@@ -699,13 +732,10 @@ mod owned {
             })
         }
 
-        /// The configuration a publication checks against.
+        /// The configuration a publication checks against. The layout does
+        /// not hold `refresh`, which is its views' concern.
         fn config(&self) -> ConflationConfig {
-            ConflationConfig {
-                keys: self.keys,
-                value_capacity: self.value_capacity,
-                journal_capacity: self.journal_capacity,
-            }
+            ConflationConfig::new(self.keys, self.value_capacity, self.journal_capacity)
         }
 
         /// Word index of the journal trailer in a region's structure, after
@@ -997,6 +1027,7 @@ mod owned {
                 ahead: Vec::with_capacity(DEFAULT_RING),
                 unretired: Vec::with_capacity(DEFAULT_RING),
                 pass: None,
+                cycles: None,
                 counters: FreshCounters::default(),
             })
         });
@@ -1063,6 +1094,38 @@ mod owned {
         /// was exhausted, and slot sequences exhausted by a reconciliation,
         /// each closing the view terminally.
         pub exhausted: u64,
+        /// Refresh and snapshot cycles completed (ADR-0080).
+        pub cycles_completed: u64,
+        /// Snapshot cycles among the completed ones.
+        pub snapshots_completed: u64,
+        /// Cycles aborted: cut by a loss, replaced by a new begin, ended
+        /// with another begin position, count or scope, or with a
+        /// refresh value or marker the view could not take.
+        pub cycles_aborted: u64,
+        /// Keys restored by completed cycles.
+        pub keys_restored: u64,
+    }
+
+    /// The one open refresh cycle of a view (ADR-0080).
+    #[derive(Debug, Clone, Copy)]
+    struct OpenCycle {
+        id: CycleId,
+        scope: Scope,
+        /// The begin marker's position.
+        begin: u64,
+        /// Refresh values of this cycle written.
+        values: u64,
+        /// The lowest start of a recorded gap over the cycle: its gaps
+        /// ahead at the begin, and its losses recorded since.
+        cut_from: Option<u64>,
+    }
+
+    /// A view's refresh cycles (ADR-0080): the open cycle and the keys it
+    /// carried, one bit per key, allocated when cycles are enabled.
+    #[derive(Debug)]
+    struct Cycles {
+        open: Option<OpenCycle>,
+        carried: Box<[u64]>,
     }
 
     fn bump(counter: &mut u64) {
@@ -1076,6 +1139,8 @@ mod owned {
     /// ring.
     #[derive(Debug)]
     struct FreshState {
+        /// The refresh cycles, when enabled (ADR-0080).
+        cycles: Option<Cycles>,
         /// The stream position below which the feeder consumed the log.
         frontier: u64,
         /// Recorded gaps `[start, end)` whose end is above the frontier.
@@ -1301,6 +1366,321 @@ mod owned {
             self.write_slot(key, value, freshness)
         }
 
+        /// Writes a refresh value of `key` that starts at stream `position`
+        /// (ADR-0080): stored like [`ConflationWriter::write_at`], but the
+        /// slot keeps its freshness words, so a `Fresh` key stays `Fresh`
+        /// and a `Stale` one stays `Stale` with its `since` until its cycle
+        /// completes ([`ConflationWriter::restore_at`]) or a live update
+        /// replaces it. Without a barrier, as [`ConflationWriter::write`].
+        ///
+        /// Keeping the words is sound: a reader classifies a slot against
+        /// the records it has not applied as covering every value, and a
+        /// `Fresh` slot through a record was not covered by it at an older
+        /// position, so neither is it at this newer one.
+        ///
+        /// # Errors
+        ///
+        /// As [`ConflationWriter::write_at`].
+        pub fn write_refresh_at(
+            &mut self,
+            key: u32,
+            value: &[u8],
+            position: u64,
+        ) -> Result<u64, ConflationError> {
+            let Some(fresh) = &self.fresh else {
+                return self.write_slot(key, value, None);
+            };
+            if position < fresh.frontier {
+                return Err(ConflationError::BehindFrontier {
+                    position,
+                    frontier: fresh.frontier,
+                });
+            }
+            let slot = self.table.slot(key).ok_or(ConflationError::KeyOutOfRange {
+                key: i64::from(key),
+            })?;
+            let kept = slot.freshness();
+            self.write_slot(key, value, Some(kept))
+        }
+
+        /// Restores `key` as of stream `position` (ADR-0080), the end of a
+        /// complete refresh cycle that carried it: its freshness words are
+        /// rewritten as [`ConflationWriter::write_at`] computes them for a
+        /// value at `position`, through the newest loss, without changing
+        /// its value. `Fresh` unless a recorded gap still ahead covers it.
+        /// A key never written stays empty.
+        ///
+        /// The caller restores only keys whose value lies at or above the
+        /// cycle's begin, with no recorded loss over the cycle: every gap
+        /// still ahead then starts at or above `position`, so it covers the
+        /// value exactly as it covers `position`.
+        ///
+        /// # Errors
+        ///
+        /// [`ConflationError::KeyOutOfRange`], [`ConflationError::Closed`],
+        /// [`ConflationError::BehindFrontier`] for a `position` below the
+        /// frontier, [`ConflationError::PositionRequired`] without a barrier,
+        /// and [`ConflationError::VersionsExhausted`] for an exhausted slot
+        /// sequence: the table closes and the terminal cell is published.
+        pub fn restore_at(&mut self, key: u32, position: u64) -> Result<(), ConflationError> {
+            if self.closed {
+                return Err(ConflationError::Closed);
+            }
+            let (Some(fresh), Some(words)) = (&self.fresh, self.table.barrier_words()) else {
+                return Err(ConflationError::PositionRequired);
+            };
+            if position < fresh.frontier {
+                return Err(ConflationError::BehindFrontier {
+                    position,
+                    frontier: fresh.frontier,
+                });
+            }
+            let slot = self.table.slot(key).ok_or(ConflationError::KeyOutOfRange {
+                key: i64::from(key),
+            })?;
+            let version = slot.version();
+            if version == 0 {
+                return Ok(());
+            }
+            let journal = self
+                .table
+                .journal()
+                .map_err(|_| ConflationError::InvalidConfig)?;
+            // Admitted before the slot changes, as for a value.
+            if !journal.has_room(JOURNAL_PAYLOAD) {
+                self.close();
+                return Err(ConflationError::VersionsExhausted);
+            }
+            let barrier = BarrierWords::new(words, DEFAULT_RING)
+                .map_err(|_| ConflationError::InvalidConfig)?;
+            let since = fresh
+                .ahead
+                .iter()
+                .filter(|&&(_, end)| end > position)
+                .map(|&(start, _)| start)
+                .min();
+            let restored = SlotFreshness {
+                loss_applied: since.map_or(barrier.loss_seq(), |_| barrier.loss_seq() | STALE),
+                stale_since: since.unwrap_or(0),
+            };
+            if let Err(error) = slot.set_freshness(restored) {
+                if let Some(fresh) = self.fresh.as_mut() {
+                    bump(&mut fresh.counters.exhausted);
+                }
+                let through = barrier.loss_seq();
+                self.close_terminally(0, through, TERMINAL_FRESHNESS_EXHAUSTED);
+                return Err(error);
+            }
+            let mut record = [0u8; JOURNAL_PAYLOAD];
+            record[..4].copy_from_slice(&key.to_le_bytes());
+            record[8..].copy_from_slice(&version.to_le_bytes());
+            if journal.transmit(JOURNAL_FRESHNESS_TYPE, &record).is_err() {
+                // Unreachable after `has_room`, as for a value.
+                self.close();
+            }
+            Ok(())
+        }
+
+        /// Readies refresh and snapshot cycles (ADR-0080; control path):
+        /// allocates one bit per key for the keys a cycle carries. Returns
+        /// whether cycles apply: only a table with a loss barrier has
+        /// freshness to restore, so without one markers are ignored and
+        /// refresh values are written as values.
+        pub fn enable_cycles(&mut self) -> bool {
+            let words = (self.table.geometry.keys as usize).div_ceil(64);
+            match self.fresh.as_mut() {
+                Some(fresh) => {
+                    if fresh.cycles.is_none() {
+                        fresh.cycles = Some(Cycles {
+                            open: None,
+                            carried: vec![0; words].into_boxed_slice(),
+                        });
+                    }
+                    true
+                }
+                None => false,
+            }
+        }
+
+        /// A begin marker of `cycle` at `position` (ADR-0080): an open
+        /// cycle is aborted, and this one opens. Gaps already recorded
+        /// ahead of `position` count against it. Nothing without cycles.
+        pub fn cycle_begin(&mut self, cycle: CycleId, scope: Scope, position: u64) {
+            let Some(fresh) = self.fresh.as_mut() else {
+                return;
+            };
+            let cut_from = fresh
+                .ahead
+                .iter()
+                .filter(|&&(_, end)| end > position)
+                .map(|&(start, _)| start)
+                .min();
+            let Some(cycles) = fresh.cycles.as_mut() else {
+                return;
+            };
+            if cycles.open.is_some() {
+                cycles.carried.fill(0);
+                bump(&mut fresh.counters.cycles_aborted);
+            }
+            cycles.open = Some(OpenCycle {
+                id: cycle,
+                scope,
+                begin: position,
+                values: 0,
+                cut_from,
+            });
+        }
+
+        /// Aborts the open cycle, if any: it restores nothing (ADR-0080; a
+        /// malformed marker, or a refresh value the view cannot take).
+        pub fn cycle_abort(&mut self) {
+            if let Some(fresh) = self.fresh.as_mut()
+                && let Some(cycles) = fresh.cycles.as_mut()
+                && cycles.open.take().is_some()
+            {
+                cycles.carried.fill(0);
+                bump(&mut fresh.counters.cycles_aborted);
+            }
+        }
+
+        /// A refresh value of `key` in `cycle` at `position` (ADR-0080):
+        /// written with [`ConflationWriter::write_refresh_at`], and counted
+        /// with its key when `cycle` is the open one. Without cycles, a
+        /// value like any other. A value that cannot be written aborts the
+        /// open cycle of its id.
+        ///
+        /// # Errors
+        ///
+        /// As [`ConflationWriter::write_refresh_at`].
+        pub fn cycle_value(
+            &mut self,
+            cycle: CycleId,
+            key: u32,
+            value: &[u8],
+            position: u64,
+        ) -> Result<u64, ConflationError> {
+            let enabled = self
+                .fresh
+                .as_ref()
+                .is_some_and(|fresh| fresh.cycles.is_some());
+            if !enabled {
+                return if self.fresh.is_some() {
+                    self.write_at(key, value, position)
+                } else {
+                    self.write_slot(key, value, None)
+                };
+            }
+            let written = self.write_refresh_at(key, value, position);
+            let ours = self
+                .fresh
+                .as_ref()
+                .and_then(|fresh| fresh.cycles.as_ref())
+                .and_then(|cycles| cycles.open)
+                .is_some_and(|open| open.id == cycle);
+            if !ours {
+                return written;
+            }
+            if written.is_err() {
+                self.cycle_abort();
+                return written;
+            }
+            if let Some(cycles) = self.fresh.as_mut().and_then(|fresh| fresh.cycles.as_mut()) {
+                if let Some(open) = cycles.open.as_mut() {
+                    open.values = open.values.saturating_add(1);
+                }
+                if let Some(word) = cycles.carried.get_mut(key as usize / 64) {
+                    *word |= 1 << (key % 64);
+                }
+            }
+            written
+        }
+
+        /// An end marker of `cycle` at `position` (ADR-0080). It completes
+        /// the open cycle when its id, begin position, count and scope
+        /// match and no recorded gap cuts the cycle's range (ADR-0081: none
+        /// starts below `position` and ends above its begin, those recorded
+        /// ahead before the begin included): every key it carried is
+        /// restored at `position`
+        /// ([`ConflationWriter::restore_at`]). With matching id otherwise,
+        /// the cycle is aborted. With no open cycle or another id, it is
+        /// ignored. Returns the keys restored, `None` when nothing
+        /// completed.
+        ///
+        /// The restore runs once per completed cycle, over the keys its
+        /// values carried, so its cost is that of the values already fed.
+        ///
+        /// # Errors
+        ///
+        /// As [`ConflationWriter::restore_at`]: a slot sequence exhausted
+        /// closes the table.
+        pub fn cycle_end(
+            &mut self,
+            cycle: CycleId,
+            end: Marker,
+            position: u64,
+        ) -> Result<Option<u64>, ConflationError> {
+            let Marker::End {
+                scope,
+                begin,
+                values,
+            } = end
+            else {
+                self.cycle_abort();
+                return Ok(None);
+            };
+            let Some(cycles) = self.fresh.as_mut().and_then(|fresh| fresh.cycles.as_mut()) else {
+                return Ok(None);
+            };
+            let Some(open) = cycles.open.filter(|open| open.id == cycle) else {
+                return Ok(None);
+            };
+            let complete = open.begin == begin
+                && open.values == values
+                && open.scope == scope
+                && open.cut_from.is_none_or(|start| start >= position);
+            cycles.open = None;
+            if !complete {
+                cycles.carried.fill(0);
+                if let Some(fresh) = self.fresh.as_mut() {
+                    bump(&mut fresh.counters.cycles_aborted);
+                }
+                return Ok(None);
+            }
+            let carried = std::mem::take(&mut cycles.carried);
+            let mut restored = 0u64;
+            let mut outcome = Ok(());
+            for (at, &word) in carried.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 && outcome.is_ok() {
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    let key = u32::try_from(at * 64)
+                        .ok()
+                        .and_then(|base| base.checked_add(bit));
+                    if let Some(key) = key {
+                        outcome = self.restore_at(key, position);
+                        restored += u64::from(outcome.is_ok());
+                    }
+                }
+            }
+            let mut carried = carried;
+            carried.fill(0);
+            if let Some(fresh) = self.fresh.as_mut() {
+                if let Some(cycles) = fresh.cycles.as_mut() {
+                    cycles.carried = carried;
+                }
+                if outcome.is_ok() {
+                    bump(&mut fresh.counters.cycles_completed);
+                    if scope == Scope::Snapshot {
+                        bump(&mut fresh.counters.snapshots_completed);
+                    }
+                }
+                fresh.counters.keys_restored =
+                    fresh.counters.keys_restored.saturating_add(restored);
+            }
+            outcome.map(|()| Some(restored))
+        }
+
         fn write_slot(
             &mut self,
             key: u32,
@@ -1436,6 +1816,14 @@ mod owned {
                 Ok(seq) => {
                     fresh.ahead.push((start, end));
                     fresh.unretired.push((seq, start));
+                    // A gap that ends above the open cycle's begin counts
+                    // against it (ADR-0081); with the frontier rule every
+                    // gap recorded now does, but the code says the rule.
+                    if let Some(open) = fresh.cycles.as_mut().and_then(|c| c.open.as_mut())
+                        && end > open.begin
+                    {
+                        open.cut_from = Some(open.cut_from.map_or(start, |cut| cut.min(start)));
+                    }
                     bump(&mut fresh.counters.losses);
                     Ok(seq)
                 }
@@ -1813,7 +2201,12 @@ mod owned {
                     Geometry::new(keys, value_capacity, journal_capacity)
                 })
                 .ok_or(invalid)?;
-            if geometry.config() != expected
+            // The layout does not hold `refresh`, its views' concern.
+            let layout = ConflationConfig {
+                refresh: false,
+                ..expected
+            };
+            if geometry.config() != layout
                 || geometry.config_line()
                     != Some([keys, value_capacity, slot_words, journal_capacity])
                 || rest.iter().any(|word| *word != 0)
@@ -1969,7 +2362,7 @@ mod owned {
                     Ok(Receive::Pending),
                     |view| view.journal.receive(&mut self.cursor, &mut self.scratch),
                 ));
-                let (key, version) = match received {
+                let (key, version, restored) = match received {
                     // The scratch is sized for the largest payload at
                     // creation, so an error is not expected; it reads as
                     // nothing new, as for a broadcast receiver.
@@ -1982,7 +2375,9 @@ mod owned {
                         self.scan_remaining = self.keys;
                         continue;
                     }
-                    Ok(Receive::Message { length, .. }) => {
+                    Ok(Receive::Message {
+                        length, type_id, ..
+                    }) => {
                         let payload = self.scratch.get(..length).unwrap_or(&[]);
                         let key = payload
                             .get(..4)
@@ -1993,12 +2388,16 @@ mod owned {
                             .and_then(|bytes| bytes.try_into().ok())
                             .map(u64::from_le_bytes);
                         match (key, version) {
-                            (Some(key), Some(version)) => (key, version),
+                            (Some(key), Some(version)) => {
+                                (key, version, type_id == JOURNAL_FRESHNESS_TYPE)
+                            }
                             _ => continue,
                         }
                     }
                 };
-                if self.changed(key, version) {
+                // A restore changes freshness at a delivered version: serve
+                // the key again, which skips it if nothing changed.
+                if (restored && version != 0) || self.changed(key, version) {
                     self.push(key);
                 }
             }

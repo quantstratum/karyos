@@ -805,6 +805,8 @@ struct FreshFed {
     withheld: u64,
     /// Gaps met in the log and recorded (not through the mailbox).
     caught_up: u64,
+    /// Refresh cycle markers whose payload did not decode (ADR-0080).
+    markers_malformed: u64,
 }
 
 impl<T: StreamTerms> Stream<T> {
@@ -3656,38 +3658,91 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let fail_poll = fresh.as_ref().is_some_and(|fresh| fresh.fail_polls);
             let mut terminal = None;
             let mut fed = Fed::default();
+            let cycles_before = writer.fresh_counters().unwrap_or_default();
+            let mut fed_markers_malformed = 0u64;
             let polled = if blocked {
                 Ok(karyos_client::subscription::PollSummary::default())
             } else {
                 subscription.poll(
-                    |value, info| match config
-                        .validate_publication(info.reserved_value, value.len())
-                    {
-                        Err(ConflationError::KeyOutOfRange { .. }) => fed.keys_rejected += 1,
-                        Err(ConflationError::ValueTooLarge { .. }) => fed.values_too_large += 1,
-                        Err(_) => {}
-                        Ok(()) => {
-                            if let Ok(key) = u32::try_from(info.reserved_value) {
-                                let written = if with_positions {
-                                    // Everything below the message is consumed.
+                    |value, info| {
+                        use karyos_sys::conflation::cycle::{Marker, Reserved};
+                        // Cycle traffic only when the view opts in
+                        // (ADR-0080); otherwise every reserved value
+                        // outside the keys is a rejected key, as before.
+                        let reserved = if config.refresh {
+                            Reserved::read(info.reserved_value)
+                        } else {
+                            Reserved::Invalid
+                        };
+                        let written = match reserved {
+                            // A refresh value: its errors may abort its
+                            // cycle, so it goes to the writer even when the
+                            // shape refuses it.
+                            Reserved::Value { cycle, key } => Some(if with_positions {
+                                writer.passed(info.position);
+                                writer.cycle_value(cycle, key, value, info.position)
+                            } else {
+                                writer.cycle_value(cycle, key, value, 0)
+                            }),
+                            Reserved::Marker { cycle } => {
+                                // A table without a barrier has nothing to
+                                // restore: its markers are ignored.
+                                if with_positions {
                                     writer.passed(info.position);
-                                    writer.write_at(key, value, info.position)
-                                } else {
-                                    writer.write(key, value)
-                                };
-                                match written {
-                                    Ok(_) => fed.written += 1,
-                                    Err(error @ ConflationError::VersionsExhausted) => {
-                                        terminal = Some(error);
+                                    match Marker::decode(value) {
+                                        Some(Marker::Begin { scope }) => {
+                                            writer.cycle_begin(cycle, scope, info.position);
+                                            None
+                                        }
+                                        Some(end) => writer
+                                            .cycle_end(cycle, end, info.position)
+                                            .err()
+                                            .map(Err),
+                                        None => {
+                                            fed_markers_malformed += 1;
+                                            writer.cycle_abort();
+                                            None
+                                        }
                                     }
-                                    Err(_) => {}
+                                } else {
+                                    None
                                 }
                             }
+                            Reserved::Live { .. } | Reserved::Invalid => {
+                                match config.validate_publication(info.reserved_value, value.len())
+                                {
+                                    Err(error) => Some(Err(error)),
+                                    Ok(()) => u32::try_from(info.reserved_value).ok().map(|key| {
+                                        if with_positions {
+                                            // Everything below the message is
+                                            // consumed.
+                                            writer.passed(info.position);
+                                            writer.write_at(key, value, info.position)
+                                        } else {
+                                            writer.write(key, value)
+                                        }
+                                    }),
+                                }
+                            }
+                        };
+                        match written {
+                            Some(Ok(_)) => fed.written += 1,
+                            Some(Err(ConflationError::KeyOutOfRange { .. })) => {
+                                fed.keys_rejected += 1;
+                            }
+                            Some(Err(ConflationError::ValueTooLarge { .. })) => {
+                                fed.values_too_large += 1;
+                            }
+                            Some(Err(error @ ConflationError::VersionsExhausted)) => {
+                                terminal = Some(error);
+                            }
+                            Some(Err(_)) | None => {}
                         }
                     },
                     MessageLimit::new(budget),
                 )
             };
+            fresh_fed.markers_malformed = fed_markers_malformed;
             // A poll failure injected by a test (a feeder that cannot read
             // on).
             #[cfg(test)]
@@ -3722,6 +3777,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             views.add(|c| &mut c.acked, fresh_fed.acked);
                             views.add(|c| &mut c.withheld, fresh_fed.withheld);
                             views.add(|c| &mut c.caught_up, fresh_fed.caught_up);
+                            count_cycles(views, &cycles_before, writer, &fresh_fed);
                             if reason == karyos_sys::freshness::TERMINAL_FEEDER_LOST {
                                 views.add(|c| &mut c.feeders_lost, 1);
                             }
@@ -3747,6 +3803,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     views.add(|c| &mut c.acked, fresh_fed.acked);
                     views.add(|c| &mut c.withheld, fresh_fed.withheld);
                     views.add(|c| &mut c.caught_up, fresh_fed.caught_up);
+                    count_cycles(views, &cycles_before, writer, &fresh_fed);
                 });
             }
             let summary = match polled {
@@ -4110,13 +4167,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .as_ref()
                 .and_then(|net| net.conflation_of(endpoint, stream_id))
                 .ok_or(Some(ViewBuildFailure::NoConfiguration))?;
-            let writer = karyos_sys::conflation::conflation_fresh(
+            let mut writer = karyos_sys::conflation::conflation_fresh(
                 config.keys,
                 config.value_capacity,
                 config.journal_capacity,
                 link.clone(),
             )
             .map_err(|error| Some(ViewBuildFailure::Table(error)))?;
+            // The cycles' bitset, allocated with the view (ADR-0080).
+            if config.refresh {
+                let _ = writer.enable_cycles();
+            }
             let stream = self
                 .streams
                 .get_mut(index)
@@ -4246,6 +4307,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             config.journal_capacity,
             link.clone(),
         )?;
+        // A recreated view starts with no open cycle (ADR-0080).
+        if config.refresh {
+            let _ = writer.enable_cycles();
+        }
         let inner = stream
             .conductor
             .subscribe(Role::Required)
@@ -4770,6 +4835,38 @@ mod fresh_feed_tests;
 /// (conflated-network-images.md (b)): first a held gap from the log, then
 /// the seal mailbox, whose request is acknowledged only once the barrier
 /// recorded the loss. Returns whether the poll may run (no gap is held).
+/// Adds a view's refresh cycle work of one duty (ADR-0080): the change of
+/// its writer's counters since `before`, and the malformed markers met.
+fn count_cycles(
+    views: &mut crate::net::NetworkViewCounters,
+    before: &karyos_sys::conflation::FreshCounters,
+    writer: &ConflationWriter,
+    fed: &FreshFed,
+) {
+    let after = writer.fresh_counters().unwrap_or_default();
+    views.add(
+        |c| &mut c.cycles_completed,
+        after
+            .cycles_completed
+            .saturating_sub(before.cycles_completed),
+    );
+    views.add(
+        |c| &mut c.snapshots_completed,
+        after
+            .snapshots_completed
+            .saturating_sub(before.snapshots_completed),
+    );
+    views.add(
+        |c| &mut c.cycles_aborted,
+        after.cycles_aborted.saturating_sub(before.cycles_aborted),
+    );
+    views.add(
+        |c| &mut c.keys_restored,
+        after.keys_restored.saturating_sub(before.keys_restored),
+    );
+    views.add(|c| &mut c.markers_malformed, fed.markers_malformed);
+}
+
 fn serve_fresh(writer: &mut ConflationWriter, fresh: &mut FreshFeed, fed: &mut FreshFed) -> bool {
     if !serve_gap(writer, fresh, fed) {
         return false;
@@ -5079,7 +5176,8 @@ mod tests {
     /// refuses bad keys and oversized values before reserving, from the
     /// table its buffer carries (F7b-2c-2), so the rejected ones are
     /// appended through the buffer's raw publication, as a misbehaving
-    /// process could write them.
+    /// process could write them. A table without `refresh` treats refresh
+    /// cycle traffic as rejected keys, exactly as before ADR-0080.
     #[test]
     fn the_feeder_counts_writes_and_rejections_by_cause() {
         use karyos_sys::counters::CellRead;
@@ -5091,6 +5189,7 @@ mod tests {
             keys: 4,
             value_capacity: 8,
             journal_capacity: 1024,
+            refresh: false,
         });
         let handle = driver.add_stream(stream_config).unwrap();
         let inner = driver
@@ -5101,12 +5200,25 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut publication = inner;
+        let cycle = karyos_sys::conflation::cycle::CycleId::default();
+        let begin = karyos_sys::conflation::cycle::Marker::Begin {
+            scope: karyos_sys::conflation::cycle::Scope::Refresh,
+        }
+        .encode();
         for (key, value) in [
             (1, b"ok".as_slice()),
             (99, b"bad-key"),
             (-1, b"negative"),
             (2, b"too-long-value"),
             (3, b"fine"),
+            (
+                karyos_sys::conflation::cycle::marker(cycle),
+                begin.as_slice(),
+            ),
+            (
+                karyos_sys::conflation::cycle::value(cycle, 1).unwrap(),
+                b"refresh",
+            ),
         ] {
             let options = AppendOptions {
                 reserved_value: key,
@@ -5126,8 +5238,64 @@ mod tests {
         };
         let counters = driver.streams[0].feeder_counters.as_ref().unwrap();
         assert_eq!(value(&counters.written), 2);
-        assert_eq!(value(&counters.keys_rejected), 2);
+        assert_eq!(value(&counters.keys_rejected), 4);
         assert_eq!(value(&counters.values_too_large), 1);
+    }
+
+    /// ADR-0080: an IPC table with `refresh` has no loss, so nothing to
+    /// restore: a refresh value is written as a value, and a marker is
+    /// ignored, neither written nor rejected.
+    #[test]
+    fn an_ipc_table_with_refresh_writes_refresh_values_as_values() {
+        use karyos_sys::counters::CellRead;
+        use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
+
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let mut stream_config = config(42);
+        stream_config.conflation = Some(ConflationConfig::new(4, 8, 1024).with_refresh());
+        let handle = driver.add_stream(stream_config).unwrap();
+        let mut publication = driver
+            .stream(handle)
+            .unwrap()
+            .buffer
+            .publication_owned()
+            .unwrap()
+            .unwrap();
+        let cycle = karyos_sys::conflation::cycle::CycleId::default();
+        let begin = karyos_sys::conflation::cycle::Marker::Begin {
+            scope: karyos_sys::conflation::cycle::Scope::Refresh,
+        }
+        .encode();
+        for (key, value) in [
+            (
+                karyos_sys::conflation::cycle::marker(cycle),
+                begin.as_slice(),
+            ),
+            (
+                karyos_sys::conflation::cycle::value(cycle, 1).unwrap(),
+                b"refresh",
+            ),
+            (-1, b"negative"),
+        ] {
+            let options = AppendOptions {
+                reserved_value: key,
+                ..AppendOptions::default()
+            };
+            assert!(matches!(
+                publication.append(value, options).unwrap(),
+                AppendOutcome::Appended { .. }
+            ));
+        }
+        let _ = driver.do_work().unwrap();
+        let reader = driver.counters();
+        let value = |counter: &Option<Counter>| match reader.read(counter.as_ref().unwrap().index())
+        {
+            CellRead::Allocated { value, .. } => value,
+            other => panic!("unexpected {other:?}"),
+        };
+        let counters = driver.streams[0].feeder_counters.as_ref().unwrap();
+        assert_eq!(value(&counters.written), 1);
+        assert_eq!(value(&counters.keys_rejected), 0);
     }
 
     /// A conflation table that exhausted its versions seals the stream
@@ -5141,6 +5309,7 @@ mod tests {
             keys: 4,
             value_capacity: 8,
             journal_capacity: 1024,
+            refresh: false,
         });
         let handle = driver.add_stream(stream_config).unwrap();
         let mut observer = driver.connect().unwrap();
@@ -5182,6 +5351,7 @@ mod tests {
             keys: 4,
             value_capacity: 8,
             journal_capacity: 1024,
+            refresh: false,
         });
         let handle = driver.add_stream(stream_config).unwrap();
         let mut observer = driver.connect().unwrap();

@@ -362,6 +362,7 @@ impl<'s> Sim<'s> {
                         // Above the largest payload a publisher sends.
                         value_capacity: 512,
                         journal_capacity: 1024,
+                        refresh: false,
                     }),
                 })
                 .map_err(|error| fail(format!("stream: {error}")))?;

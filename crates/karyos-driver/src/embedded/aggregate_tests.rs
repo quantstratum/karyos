@@ -169,6 +169,7 @@ fn a_failure_at_any_lane_leaves_nothing() {
             keys: 4,
             value_capacity: 8,
             journal_capacity: 1024,
+            refresh: false,
         });
         let next = driver.next_stream;
         let free = allocated(&driver);

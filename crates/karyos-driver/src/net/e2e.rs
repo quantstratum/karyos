@@ -1475,6 +1475,7 @@ const VIEW: karyos_sys::conflation::ConflationConfig = karyos_sys::conflation::C
     keys: 4,
     value_capacity: 16,
     journal_capacity: 1024,
+    refresh: false,
 };
 
 /// Offers `value` under `key` on `lane`, pumping both drivers until it is
@@ -1692,6 +1693,134 @@ fn a_lost_update_stales_the_view_until_replaced() {
         "{counters:?}"
     );
     assert_eq!(counters.barrier_timeouts, 0);
+}
+
+/// Runs one step of a refresh cycle on `lane`, pumping both drivers until
+/// it is accepted (ADR-0080).
+fn cycle_step(
+    a: &mut EmbeddedDriver,
+    b: &mut EmbeddedDriver,
+    lane: &mut karyos_client::ClientPublication<HeapTerms>,
+    mut step: impl FnMut(
+        &mut karyos_client::ClientPublication<HeapTerms>,
+    ) -> Result<OfferOutcome, karyos_client::CycleError>,
+) {
+    pump(&mut [a, b], |_| {
+        matches!(step(lane).unwrap(), OfferOutcome::Accepted { .. })
+    });
+}
+
+/// SPEC §13 "Conflation refresh" (ADR-0080, karyos#634), end to end over
+/// an unreliable channel. A lost update leaves every key Stale. Then a
+/// complete refresh cycle that carries key 0 turns it Fresh, while key 3,
+/// which it does not carry, stays Stale. Separately, a cycle cut by a lost
+/// datagram before its end marker restores no key, not even key 3, whose
+/// refresh value arrived.
+#[test]
+fn a_refresh_cycle_restores_what_it_carried_and_a_cut_one_nothing() {
+    use karyos_client::refresh::{CycleId, RefreshCycle, Scope};
+    use karyos_sys::freshness::Freshness;
+
+    let view = karyos_sys::conflation::ConflationConfig {
+        refresh: true,
+        ..VIEW
+    };
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let _subscription = b
+        .add_network_subscription_conflated(10, &channel(ANY_PORT, false), Lane::ZERO, view)
+        .unwrap();
+    let address = bound(&b, 10);
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    for key in 0..4 {
+        offer_keyed(&mut a, &mut b, &mut lane, key, 10 + key as u8);
+    }
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest.iter().all(Option::is_some)
+    });
+    // Key 1's update is lost: every key turns Stale.
+    b.net.as_mut().unwrap().drop_receiver_data(&[0]);
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 21);
+    offer_keyed(&mut a, &mut b, &mut lane, 2, 22);
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0].is_some_and(|(_, freshness)| freshness != Freshness::Fresh)
+    });
+    let Some((10, Freshness::Stale { since })) = latest[0] else {
+        panic!("{latest:?}");
+    };
+    // A complete cycle carrying key 0: key 0 turns Fresh, key 3 does not.
+    let first = CycleId::default();
+    let mut cycle = RefreshCycle::new(first, Scope::Refresh);
+    cycle_step(&mut a, &mut b, &mut lane, |lane| cycle.begin(lane));
+    cycle_step(&mut a, &mut b, &mut lane, |lane| {
+        cycle.offer(lane, 0, &[40; 16])
+    });
+    // Before the end marker, the refresh value reads Stale.
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0].is_some_and(|(value, _)| value == 40)
+    });
+    assert_eq!(latest[0], Some((40, Freshness::Stale { since })));
+    cycle_step(&mut a, &mut b, &mut lane, |lane| cycle.end(lane));
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0] == Some((40, Freshness::Fresh))
+    });
+    assert_eq!(latest[3], Some((13, Freshness::Stale { since })));
+    let views = b.network_view_counters();
+    assert_eq!(
+        (
+            views.cycles_completed,
+            views.keys_restored,
+            views.cycles_aborted
+        ),
+        (1, 1, 0),
+        "{views:?}"
+    );
+    // A cycle cut by a lost datagram: key 3's refresh value arrives, key
+    // 2's is lost, and the end marker restores nothing.
+    let mut cut = RefreshCycle::new(first.next(), Scope::Refresh);
+    cycle_step(&mut a, &mut b, &mut lane, |lane| cut.begin(lane));
+    cycle_step(&mut a, &mut b, &mut lane, |lane| {
+        cut.offer(lane, 3, &[50; 16])
+    });
+    // Key 3's refresh value reaches the view, Stale, before the loss.
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[3].is_some_and(|(value, _)| value == 50)
+    });
+    b.net.as_mut().unwrap().drop_receiver_data(&[0]);
+    cycle_step(&mut a, &mut b, &mut lane, |lane| {
+        cut.offer(lane, 2, &[60; 16])
+    });
+    cycle_step(&mut a, &mut b, &mut lane, |lane| cut.end(lane));
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_view_counters().cycles_aborted == 1
+    });
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |_| true);
+    assert!(
+        matches!(latest[3], Some((50, Freshness::Stale { .. }))),
+        "{latest:?}"
+    );
+    assert!(
+        matches!(latest[2], Some((22, Freshness::Stale { .. }))),
+        "{latest:?}"
+    );
+    let views = b.network_view_counters();
+    assert_eq!(
+        (views.cycles_completed, views.keys_restored),
+        (1, 1),
+        "{views:?}"
+    );
 }
 
 /// C4, design (c): once the view's terminal cell is published (here by the
@@ -2280,6 +2409,115 @@ fn a_timed_out_view_is_recreated_with_every_key_stale() {
     assert_eq!(
         b.recreate_network_view(&image, Lane::ZERO),
         Err(DriverError::ViewNotClosed)
+    );
+}
+
+/// ADR-0080 with karyos#658: a recreated view starts with no open cycle.
+/// A cycle open when the view closed is gone, so its end marker read by
+/// the recreated view restores nothing, and key 0, whose refresh value the
+/// closed view took, stays `Stale` since the terminal's start.
+#[test]
+fn a_recreated_view_starts_with_no_open_cycle() {
+    use karyos_client::refresh::{CycleId, RefreshCycle, Scope};
+    use karyos_sys::freshness::{Freshness, TERMINAL_BARRIER_TIMEOUT, Terminal};
+
+    let view = karyos_sys::conflation::ConflationConfig {
+        refresh: true,
+        ..VIEW
+    };
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image, _subscription) = conflated_pair(&mut a, &mut b, view);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 11);
+    let mut cycle = RefreshCycle::new(CycleId::default(), Scope::Refresh);
+    cycle_step(&mut a, &mut b, &mut lane, |lane| cycle.begin(lane));
+    cycle_step(&mut a, &mut b, &mut lane, |lane| {
+        cycle.offer(lane, 0, &[40; 16])
+    });
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0].is_some_and(|(value, _)| value == 40) && latest[1].is_some()
+    });
+    let terminal = Terminal {
+        start: 32,
+        end: 64,
+        reason: TERMINAL_BARRIER_TIMEOUT,
+    };
+    let link = b.network_view_link(&image, Lane::ZERO).unwrap();
+    assert!(link.terminal().unwrap().publish(terminal));
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_view_counters().closed_terminal == 1
+    });
+    b.recreate_network_view(&image, Lane::ZERO).unwrap();
+    // The cycle's end, then a live update of key 1 past it: once key 1 is
+    // Fresh, the end marker was read, and it restored nothing.
+    cycle_step(&mut a, &mut b, &mut lane, |lane| cycle.end(lane));
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 21);
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[1] == Some((21, Freshness::Fresh)) && latest[0].is_some()
+    });
+    assert_eq!(latest[0], Some((40, Freshness::Stale { since: 32 })));
+    let views = b.network_view_counters();
+    assert_eq!(
+        (views.recreated, views.cycles_completed),
+        (1, 0),
+        "{views:?}"
+    );
+}
+
+/// ADR-0080: a marker whose payload does not decode aborts the open cycle
+/// and is counted; the cycle's own end marker then finds no open cycle and
+/// restores nothing.
+#[test]
+fn a_malformed_marker_aborts_the_open_cycle() {
+    use karyos_client::refresh::{CycleId, RefreshCycle, Scope};
+
+    let view = karyos_sys::conflation::ConflationConfig {
+        refresh: true,
+        ..VIEW
+    };
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, _image, _subscription) = conflated_pair(&mut a, &mut b, view);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let id = CycleId::default();
+    let mut cycle = RefreshCycle::new(id, Scope::Refresh);
+    cycle_step(&mut a, &mut b, &mut lane, |lane| cycle.begin(lane));
+    cycle_step(&mut a, &mut b, &mut lane, |lane| {
+        cycle.offer(lane, 0, &[40; 16])
+    });
+    let junk = karyos_sys::log_buffer::AppendOptions {
+        reserved_value: karyos_sys::conflation::cycle::marker(id),
+        ..karyos_sys::log_buffer::AppendOptions::default()
+    };
+    pump(&mut [&mut a, &mut b], |_| {
+        matches!(
+            lane.offer_with(&[0xFF; 24], junk).unwrap(),
+            OfferOutcome::Accepted { .. }
+        )
+    });
+    cycle_step(&mut a, &mut b, &mut lane, |lane| cycle.end(lane));
+    // A live value after the end, so the feeder has read past it.
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 11);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_view_counters().markers_malformed == 1
+    });
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let views = drivers[1].network_view_counters();
+        views.cycles_aborted == 1
+    });
+    let views = b.network_view_counters();
+    assert_eq!(
+        (views.cycles_completed, views.keys_restored),
+        (0, 0),
+        "{views:?}"
     );
 }
 

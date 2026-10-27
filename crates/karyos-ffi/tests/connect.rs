@@ -259,6 +259,7 @@ fn a_remote_client_reads_a_conflated_view_until_its_close() {
             keys: 4,
             value_capacity: 8,
             journal_capacity: 1024,
+            refresh: false,
         }),
     };
     let handle = driver.add_stream(stream).unwrap();

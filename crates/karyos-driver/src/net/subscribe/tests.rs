@@ -652,6 +652,7 @@ fn a_subscription_with_another_conflated_lane_is_refused() {
             keys: 4,
             value_capacity: 8,
             journal_capacity: 1024,
+            refresh: false,
         };
     let lane1 = Lane::try_new(1).unwrap();
     let mut b = driver(ThreadingMode::Shared);
@@ -1054,6 +1055,7 @@ fn every_path_of_a_conflated_subscription_finds_its_view() {
             keys: 4,
             value_capacity: 8,
             journal_capacity: 1024,
+            refresh: false,
         };
     let mut driver = driver(ThreadingMode::Shared);
     driver.net.as_mut().unwrap().assume_isolated_paths();

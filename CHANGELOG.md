@@ -52,6 +52,32 @@ release may break APIs, wire formats and shared-memory layouts.
   second records that size and writes nothing past it, so a wrong minimum
   in one entry fails that entry. Until now only
   `karyos_subscription_options_init_sized` had the refusal tested.
+- Conflation refresh and snapshot cycles (SPEC §7.1, "Refresh and snapshot
+  reconciliation"; ADR-0080 in `quantstratum-docs`, its loss rule amended
+  by ADR-0081; karyos#634).
+  - A publisher runs a cycle on a conflated lane with
+    `karyos_client::RefreshCycle`: a begin marker, refresh values of the
+    keys it chooses, and an end marker, carried in ordinary messages
+    through their reserved value. The frame format does not change.
+  - A view whose table opts in (`ConflationConfig::refresh`) turns every
+    key a complete cycle carried `Fresh`. A cycle whose range a recorded gap
+    cuts (ADR-0081, even one recorded before its begin was read), replaced
+    by a new begin, or ended with another begin position, count or scope
+    restores no key, not even keys whose refresh values arrived. Until the
+    end marker a refresh value keeps its key's freshness. Live updates
+    restore their key as before.
+  - Encoding and marker payload: `karyos_sys::conflation::cycle`. Writer:
+    `ConflationWriter::enable_cycles`, `cycle_begin`, `cycle_value`,
+    `cycle_end`, `cycle_abort`, `write_refresh_at` and `restore_at`.
+  - Counters: `NetworkViewCounters::{cycles_completed,
+    snapshots_completed, cycles_aborted, keys_restored, markers_malformed}`
+    and the same in `FreshCounters`.
+  - Tests: `a_refresh_cycle_restores_what_it_carried_and_a_cut_one_nothing`
+    (SPEC §13 "Conflation refresh", end to end), and the writer's
+    `a_complete_cycle_restores_only_the_keys_it_carried`,
+    `a_cut_cycle_restores_no_key`, `cycles_are_matched_by_id_begin_and_count`
+    and `live_updates_inside_a_cycle_are_unchanged`.
+
 - `RELEASING.md` lists the gates a release runs, as the 0.1.0-alpha.2
   Evidence table records them, and how each result is recorded.
   `make loom-full` is now required at every release head, not only on
@@ -161,6 +187,15 @@ release may break APIs, wire formats and shared-memory layouts.
     and a change seen by event.
 
 ### Changed
+
+- `ConflationConfig` gains `refresh: bool` (ADR-0080, karyos#634), with
+  `ConflationConfig::new` and `with_refresh`. A struct literal outside the
+  crate must name it (`refresh: false`). With `refresh` false a view
+  behaves as before: a reserved value outside `0..keys`, refresh cycle
+  traffic included, is a rejected key. `ConflationShape` gains the same
+  flag, and a log buffer's configuration block carries it in word 21; a
+  reader that does not know the word refuses a block with the flag set
+  and reads one without it as before.
 
 - A channel URI list that names one address in two spellings is refused as a
   repetition: `destinations=10.0.0.5:1;[::ffff:10.0.0.5]:1` and

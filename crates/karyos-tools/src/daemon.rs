@@ -219,6 +219,7 @@ pub fn conflation_of(
         keys: table.keys,
         value_capacity: usize::try_from(table.value_capacity).map_err(too_large)?,
         journal_capacity: usize::try_from(table.journal_capacity).map_err(too_large)?,
+        refresh: false,
     }))
 }
 

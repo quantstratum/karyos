@@ -60,6 +60,7 @@ fn publication_config_rejects_invalid_keys_and_oversized_values() {
         keys: 3,
         value_capacity: 8,
         journal_capacity: 1024,
+        refresh: false,
     };
     assert_eq!(config.validate_publication(0, 8), Ok(()));
     assert_eq!(
@@ -82,6 +83,52 @@ fn publication_config_rejects_invalid_keys_and_oversized_values() {
     );
 }
 
+/// ADR-0080: with `refresh`, a publication may carry a refresh value of a
+/// key in range and a marker of exactly 24 bytes, whatever the value
+/// capacity; a refresh value out of range, a marker of another length and
+/// a negative value that is neither stay refused. Without it, both are
+/// rejected keys, as before.
+#[test]
+fn a_refresh_table_admits_cycle_traffic() {
+    use super::cycle::{CycleId, MARKER_LENGTH, marker, value};
+    let plain = ConflationConfig::new(3, 8, 1024);
+    let config = plain.with_refresh();
+    let cycle = CycleId::MAX;
+    let refresh = value(cycle, 2).unwrap();
+    assert_eq!(config.validate_publication(refresh, 8), Ok(()));
+    assert_eq!(
+        config.validate_publication(refresh, 9),
+        Err(ConflationError::ValueTooLarge { length: 9, max: 8 })
+    );
+    let outside = value(cycle, 3).unwrap();
+    assert_eq!(
+        config.validate_publication(outside, 1),
+        Err(ConflationError::KeyOutOfRange { key: outside })
+    );
+    assert_eq!(
+        config.validate_publication(marker(cycle), MARKER_LENGTH),
+        Ok(())
+    );
+    assert_eq!(
+        config.validate_publication(marker(cycle), MARKER_LENGTH - 1),
+        Err(ConflationError::KeyOutOfRange { key: marker(cycle) })
+    );
+    assert_eq!(
+        config.validate_publication(i64::from(u32::MAX) + 1, 1),
+        Err(ConflationError::KeyOutOfRange {
+            key: i64::from(u32::MAX) + 1
+        })
+    );
+    for traffic in [refresh, marker(cycle)] {
+        assert_eq!(
+            plain.validate_publication(traffic, MARKER_LENGTH.min(8)),
+            Err(ConflationError::KeyOutOfRange { key: traffic })
+        );
+    }
+    assert!(!plain.refresh && config.refresh);
+    assert_eq!(config.shape().map(|shape| shape.refresh), Ok(true));
+}
+
 /// SPEC §14: a value capacity past `u32`, which no message carries, has no
 /// shape: it is refused, never saturated to `u32::MAX`, and a publication
 /// check of such a table fails with that refusal. The capacity `u32::MAX`
@@ -95,6 +142,7 @@ fn a_capacity_past_u32_has_no_shape() {
         keys: 3,
         value_capacity: past,
         journal_capacity: 1024,
+        refresh: false,
     };
     let refused = ConflationError::ValueTooLarge {
         length: past,
@@ -557,6 +605,7 @@ mod region {
         keys: 2,
         value_capacity: 8,
         journal_capacity: 1024,
+        refresh: false,
     };
 
     fn table() -> ConflationWriter {
@@ -1117,6 +1166,339 @@ fn a_loss_stales_every_key_until_its_replacement() {
         (counters.losses, counters.reconciled, counters.retirements),
         (1, 3, 1)
     );
+}
+
+/// ADR-0080: a refresh value keeps its slot's freshness, Stale with its
+/// `since` or Fresh, and a restore at the cycle's end turns the key Fresh
+/// without changing its value; a key never written stays empty.
+#[test]
+fn a_refresh_value_waits_for_its_restore() {
+    let (mut writer, _link) = fresh_table(3);
+    let mut reader = writer.reader();
+    assert_eq!(writer.write_at(0, &[1], 0), Ok(2));
+    assert_eq!(writer.write_at(1, &[1], 32), Ok(2));
+    writer.passed(64);
+    assert_eq!(writer.record_loss(64, 128), Ok(1));
+    while writer.reconciling() {
+        let _ = writer.reconcile(64);
+    }
+    writer.passed(128);
+    let stale = Freshness::Stale { since: 64 };
+    let _ = drain_fresh(&mut reader);
+    // A refresh value of key 0 past the gap: newer, still Stale since 64.
+    assert_eq!(writer.write_refresh_at(0, &[5], 160), Ok(4));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(0, 4, stale)]);
+    // A live value of key 1 past the gap is Fresh at once, as before, and a
+    // refresh value after it keeps it Fresh.
+    assert_eq!(writer.write_at(1, &[6], 192), Ok(4));
+    assert_eq!(writer.write_refresh_at(1, &[7], 224), Ok(6));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(1, 6, Freshness::Fresh)]);
+    // The cycle's end restores key 0 only; key 2 was never written.
+    writer.passed(256);
+    assert_eq!(writer.restore_at(0, 256), Ok(()));
+    assert_eq!(writer.restore_at(2, 256), Ok(()));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(0, 4, Freshness::Fresh)]);
+    let mut out = [0u8; 8];
+    assert!(matches!(
+        writer.table_slot(2).unwrap().read(&mut out),
+        FreshRead::Empty
+    ));
+}
+
+/// ADR-0080: a restore below the frontier is refused, and a gap already
+/// recorded ahead of the cycle's end still covers the restored key: it is
+/// Stale since that gap, not Fresh.
+#[test]
+fn a_restore_respects_a_gap_ahead() {
+    let (mut writer, _link) = fresh_table(1);
+    let mut reader = writer.reader();
+    assert_eq!(writer.write_at(0, &[1], 0), Ok(2));
+    writer.passed(32);
+    assert_eq!(writer.record_loss(32, 64), Ok(1));
+    while writer.reconciling() {
+        let _ = writer.reconcile(64);
+    }
+    writer.passed(64);
+    assert_eq!(writer.write_refresh_at(0, &[2], 64), Ok(4));
+    // The receive owner posts [160, 192) before the feeder reaches it.
+    assert_eq!(writer.record_loss(160, 192), Ok(2));
+    while writer.reconciling() {
+        let _ = writer.reconcile(64);
+    }
+    writer.passed(128);
+    assert!(matches!(
+        writer.restore_at(0, 96),
+        Err(ConflationError::BehindFrontier { .. })
+    ));
+    assert_eq!(writer.restore_at(0, 128), Ok(()));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen.last(), Some(&(0, 4, Freshness::Stale { since: 160 })));
+    // Without a barrier there is nothing to restore.
+    let mut plain = conflation(1, 8, 1024).unwrap();
+    assert_eq!(plain.write_refresh_at(0, &[1], 0), Ok(2));
+    assert_eq!(
+        plain.restore_at(0, 0),
+        Err(ConflationError::PositionRequired)
+    );
+}
+
+/// A table of `keys` keys with a barrier and refresh cycles, keys
+/// `0..keys` written at positions `0, 32, ..`, then a loss over
+/// `[64 * keys, 64 * keys + 32)` reconciled and passed: every key `Stale`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper, as ADR-0007 allows in tests"
+)]
+fn stale_cycle_table(keys: u32) -> (ConflationWriter, FreshnessLink, u64) {
+    let (mut writer, link) = fresh_table(keys);
+    assert!(writer.enable_cycles());
+    for key in 0..keys {
+        writer.write_at(key, &[1], u64::from(key) * 32).unwrap();
+    }
+    let gap = u64::from(keys) * 64;
+    writer.passed(gap);
+    writer.record_loss(gap, gap + 32).unwrap();
+    while writer.reconciling() {
+        let _ = writer.reconcile(64);
+    }
+    writer.passed(gap + 32);
+    (writer, link, gap + 32)
+}
+
+fn id(value: u32) -> cycle::CycleId {
+    cycle::CycleId::new(value).unwrap_or_default()
+}
+
+fn end(begin: u64, values: u64) -> cycle::Marker {
+    cycle::Marker::End {
+        scope: cycle::Scope::Refresh,
+        begin,
+        values,
+    }
+}
+
+/// The freshness each written key reads now, from a new reader.
+fn freshness_now(writer: &ConflationWriter) -> Vec<(u32, Freshness)> {
+    let (seen, _) = drain_fresh(&mut writer.reader());
+    seen.into_iter().map(|(key, _, f)| (key, f)).collect()
+}
+
+/// SPEC §13 "Conflation refresh", ADR-0080: a complete cycle that carries
+/// key 0 turns it Fresh; key 1, which it does not carry, stays Stale.
+/// Values inside the cycle stay Stale until its end marker.
+#[test]
+fn a_complete_cycle_restores_only_the_keys_it_carried() {
+    let (mut writer, _link, at) = stale_cycle_table(2);
+    let stale = Freshness::Stale { since: 128 };
+    writer.cycle_begin(id(5), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(5), 0, &[9], at + 32), Ok(4));
+    assert_eq!(freshness_now(&writer), [(0, stale), (1, stale)]);
+    writer.passed(at + 64);
+    assert_eq!(writer.cycle_end(id(5), end(at, 1), at + 64), Ok(Some(1)));
+    assert_eq!(freshness_now(&writer), [(0, Freshness::Fresh), (1, stale)]);
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!(
+        (
+            counters.cycles_completed,
+            counters.keys_restored,
+            counters.cycles_aborted
+        ),
+        (1, 1, 0)
+    );
+}
+
+/// SPEC §13 "Conflation refresh", ADR-0080: a cycle cut by a gap before its
+/// end marker restores no key, not even the ones whose values arrived;
+/// so does a gap already recorded ahead of its begin.
+#[test]
+fn a_cut_cycle_restores_no_key() {
+    let (mut writer, _link, at) = stale_cycle_table(2);
+    writer.cycle_begin(id(1), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(1), 0, &[9], at + 32), Ok(4));
+    assert_eq!(writer.record_loss(at + 64, at + 96), Ok(2));
+    writer.passed(at + 96);
+    assert_eq!(writer.cycle_value(id(1), 1, &[9], at + 96), Ok(4));
+    writer.passed(at + 128);
+    assert_eq!(writer.cycle_end(id(1), end(at, 2), at + 128), Ok(None));
+    assert!(
+        freshness_now(&writer)
+            .iter()
+            .all(|&(_, f)| matches!(f, Freshness::Stale { .. }))
+    );
+    // A gap recorded ahead before the begin cuts the cycle too.
+    let (mut writer, _link, at) = stale_cycle_table(1);
+    assert_eq!(writer.record_loss(at + 64, at + 96), Ok(2));
+    writer.cycle_begin(id(2), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(2), 0, &[9], at + 32), Ok(4));
+    writer.passed(at + 128);
+    assert_eq!(writer.cycle_end(id(2), end(at, 1), at + 128), Ok(None));
+    assert!(matches!(
+        freshness_now(&writer)[..],
+        [(0, Freshness::Stale { .. })]
+    ));
+    assert_eq!(
+        writer.fresh_counters().unwrap_or_default().cycles_aborted,
+        1
+    );
+}
+
+/// ADR-0081 (a): a gap the receive owner recorded ahead of the feeder
+/// before it read the begin marker, inside the cycle's range, aborts the
+/// cycle. Key 0's refresh value lies below the gap and its newer live
+/// update was lost in it, so key 0 must not turn Fresh: without the rule,
+/// the end (past the gap, which is then behind) would restore it.
+#[test]
+fn a_gap_recorded_ahead_inside_the_cycle_aborts_it() {
+    let (mut writer, _link, at) = stale_cycle_table(1);
+    // The gap [at + 64, at + 96) is recorded while the feeder is at `at`.
+    assert_eq!(writer.record_loss(at + 64, at + 96), Ok(2));
+    writer.cycle_begin(id(1), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(1), 0, &[9], at + 32), Ok(4));
+    while writer.reconciling() {
+        let _ = writer.reconcile(64);
+    }
+    writer.passed(at + 128);
+    assert_eq!(writer.cycle_end(id(1), end(at, 1), at + 128), Ok(None));
+    assert!(matches!(
+        freshness_now(&writer)[..],
+        [(0, Freshness::Stale { .. })]
+    ));
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!((counters.cycles_completed, counters.cycles_aborted), (0, 1));
+}
+
+/// ADR-0081 (b): a gap recorded while the cycle is open that starts at or
+/// after the end marker's position does not cut it: the cycle completes,
+/// and the restored key reads Stale since that later gap (GU-9), not Fresh.
+#[test]
+fn a_gap_from_the_end_on_does_not_abort_the_cycle() {
+    let (mut writer, _link, at) = stale_cycle_table(1);
+    writer.cycle_begin(id(1), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(1), 0, &[9], at + 32), Ok(4));
+    // Recorded ahead, starting exactly at the end marker's position.
+    assert_eq!(writer.record_loss(at + 64, at + 96), Ok(2));
+    while writer.reconciling() {
+        let _ = writer.reconcile(64);
+    }
+    writer.passed(at + 64);
+    assert_eq!(writer.cycle_end(id(1), end(at, 1), at + 64), Ok(Some(1)));
+    assert_eq!(
+        freshness_now(&writer),
+        [(0, Freshness::Stale { since: at + 64 })]
+    );
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!((counters.cycles_completed, counters.cycles_aborted), (1, 0));
+}
+
+/// ADR-0080: a new begin aborts the open cycle; an end with no begin seen,
+/// or with another id, is ignored and leaves the open cycle open; an end
+/// whose begin position or count differs aborts it.
+#[test]
+fn cycles_are_matched_by_id_begin_and_count() {
+    let (mut writer, _link, at) = stale_cycle_table(1);
+    // No cycle open: ignored.
+    assert_eq!(writer.cycle_end(id(3), end(at, 0), at), Ok(None));
+    writer.cycle_begin(id(3), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(3), 0, &[9], at + 32), Ok(4));
+    // A new begin aborts cycle 3: its value restores nothing.
+    writer.passed(at + 64);
+    writer.cycle_begin(id(4), cycle::Scope::Refresh, at + 64);
+    writer.passed(at + 96);
+    assert_eq!(writer.cycle_end(id(3), end(at, 1), at + 96), Ok(None));
+    assert!(matches!(
+        freshness_now(&writer)[..],
+        [(0, Freshness::Stale { .. })]
+    ));
+    // Cycle 4 is still open after that foreign end; a wrong count aborts it.
+    writer.passed(at + 128);
+    assert_eq!(writer.cycle_value(id(4), 0, &[9], at + 128), Ok(6));
+    writer.passed(at + 160);
+    assert_eq!(writer.cycle_end(id(4), end(at + 64, 2), at + 160), Ok(None));
+    // A wrong begin position aborts too.
+    writer.cycle_begin(id(5), cycle::Scope::Refresh, at + 160);
+    writer.passed(at + 192);
+    assert_eq!(writer.cycle_value(id(5), 0, &[9], at + 192), Ok(8));
+    writer.passed(at + 224);
+    assert_eq!(writer.cycle_end(id(5), end(at, 1), at + 224), Ok(None));
+    assert!(matches!(
+        freshness_now(&writer)[..],
+        [(0, Freshness::Stale { .. })]
+    ));
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!((counters.cycles_completed, counters.cycles_aborted), (0, 3));
+    // The same id after all that completes when everything matches.
+    writer.cycle_begin(id(5), cycle::Scope::Snapshot, at + 224);
+    writer.passed(at + 256);
+    assert_eq!(writer.cycle_value(id(5), 0, &[9], at + 256), Ok(10));
+    writer.passed(at + 288);
+    let snapshot = cycle::Marker::End {
+        scope: cycle::Scope::Snapshot,
+        begin: at + 224,
+        values: 1,
+    };
+    assert_eq!(writer.cycle_end(id(5), snapshot, at + 288), Ok(Some(1)));
+    assert_eq!(freshness_now(&writer), [(0, Freshness::Fresh)]);
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!(
+        (counters.cycles_completed, counters.snapshots_completed),
+        (1, 1)
+    );
+}
+
+/// ADR-0080: a refresh value of another id is written, keeping its key's
+/// freshness, but the open cycle does not count it, so an end with a count
+/// of 0 completes and restores nothing; and a loss entirely below the begin
+/// position (here the table's own gap, passed before the begin) does not
+/// abort a cycle.
+#[test]
+fn a_value_of_another_cycle_is_not_counted() {
+    let (mut writer, _link, at) = stale_cycle_table(1);
+    writer.cycle_begin(id(1), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.cycle_value(id(2), 0, &[9], at + 32), Ok(4));
+    writer.passed(at + 64);
+    assert_eq!(writer.cycle_end(id(1), end(at, 0), at + 64), Ok(Some(0)));
+    assert!(matches!(
+        freshness_now(&writer)[..],
+        [(0, Freshness::Stale { .. })]
+    ));
+    let counters = writer.fresh_counters().unwrap_or_default();
+    assert_eq!((counters.cycles_completed, counters.cycles_aborted), (1, 0));
+}
+
+/// ADR-0080: a live update during a cycle restores its key at once, as
+/// today, even when the cycle is later cut; and without a barrier, a
+/// refresh value is a value and markers do nothing.
+#[test]
+fn live_updates_inside_a_cycle_are_unchanged() {
+    let (mut writer, _link, at) = stale_cycle_table(2);
+    writer.cycle_begin(id(1), cycle::Scope::Refresh, at);
+    writer.passed(at + 32);
+    assert_eq!(writer.write_at(1, &[7], at + 32), Ok(4));
+    assert_eq!(writer.cycle_value(id(1), 0, &[9], at + 32), Ok(4));
+    assert_eq!(
+        freshness_now(&writer),
+        [(0, Freshness::Stale { since: 128 }), (1, Freshness::Fresh)]
+    );
+    writer.cycle_abort();
+    assert_eq!(
+        freshness_now(&writer),
+        [(0, Freshness::Stale { since: 128 }), (1, Freshness::Fresh)]
+    );
+    let mut plain = conflation(1, 8, 1024).unwrap();
+    assert!(!plain.enable_cycles());
+    plain.cycle_begin(id(1), cycle::Scope::Refresh, 0);
+    assert_eq!(plain.cycle_value(id(1), 0, &[1], 0), Ok(2));
+    assert_eq!(plain.cycle_end(id(1), end(0, 1), 32), Ok(None));
 }
 
 /// A value written between the frontier and a recorded gap ahead lies

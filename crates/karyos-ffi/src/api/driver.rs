@@ -212,6 +212,7 @@ impl StreamOptions {
                 keys,
                 value_capacity: usize::try_from(value).map_err(|_| invalid(u64::from(value)))?,
                 journal_capacity: usize::try_from(journal).map_err(|_| invalid(journal))?,
+                refresh: false,
             })),
         }
     }
