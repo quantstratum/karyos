@@ -295,6 +295,216 @@ fn flow_control_is_granted_by_uri() {
     ));
 }
 
+/// Owner item 7, karyos#637: a client's network publication with roles
+/// is granted when the roles' strategy is the URI's `fc` (`min` without
+/// one), and refused with `StrategyConflict` otherwise, whichever way
+/// round; a `karyos:ipc` URI has no receivers and is refused with
+/// `UnsupportedChannel`. Roles a membership cannot hold (more required ids
+/// than `DEFAULT_MAX_RECEIVERS`) are refused as a limit.
+#[test]
+fn roles_travel_by_command_and_must_name_the_fc() {
+    use karyos_protocol::roles::{PublicationRoles, Strategy};
+
+    let mut driver = driver();
+    let mut client = driver.connect().unwrap();
+    let mut outcomes = Vec::new();
+    let group = |fc: &str| {
+        let fc = if fc.is_empty() {
+            String::new()
+        } else {
+            format!("|fc={fc}")
+        };
+        format!(
+            "karyos:udp?group=239.255.0.10:{}|interface=127.0.0.1{fc}",
+            port()
+        )
+    };
+    let roles = |strategy, required: Vec<u64>| PublicationRoles {
+        strategy,
+        required,
+        tags: vec![(88, 9)],
+    };
+    let mut submit = |uri: &str, stream_id: i32, roles: PublicationRoles| {
+        client
+            .add_network_publication_with_roles(uri, stream_id, true, &roles)
+            .unwrap()
+    };
+    let granted = [
+        submit(&group("max"), 40, roles(Strategy::Max, vec![77])),
+        submit(&group("tagged:9"), 41, roles(Strategy::Tagged(9), vec![77])),
+        submit(&group(""), 42, roles(Strategy::Min, vec![77, 78])),
+    ];
+    let conflicts = [
+        submit(&group("max"), 43, roles(Strategy::Min, vec![77])),
+        submit(&group(""), 44, roles(Strategy::Max, vec![77])),
+        submit(&group("tagged:9"), 45, roles(Strategy::Tagged(8), vec![77])),
+    ];
+    let ipc = submit("karyos:ipc", 46, roles(Strategy::Min, vec![77]));
+    let many = submit(
+        &group("max"),
+        47,
+        roles(
+            Strategy::Max,
+            (1..=u64::from(crate::membership::DEFAULT_MAX_RECEIVERS) + 1).collect(),
+        ),
+    );
+    let mut all = granted.to_vec();
+    all.extend(conflicts);
+    all.extend([ipc, many]);
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |outcomes, _| {
+            all.iter()
+                .all(|sequence| outcomes.iter().any(|(_, found, _)| found == sequence))
+        },
+    );
+    for sequence in granted {
+        assert!(matches!(
+            take(&mut outcomes, sequence),
+            Outcome::Publication(_)
+        ));
+    }
+    for sequence in conflicts {
+        assert!(matches!(
+            take(&mut outcomes, sequence),
+            Outcome::Refused {
+                code: ErrorCode::StrategyConflict,
+                ..
+            }
+        ));
+    }
+    assert!(matches!(
+        take(&mut outcomes, ipc),
+        Outcome::Refused {
+            code: ErrorCode::UnsupportedChannel,
+            ..
+        }
+    ));
+    assert!(matches!(
+        take(&mut outcomes, many),
+        Outcome::Refused {
+            code: ErrorCode::ResourcesUnavailable,
+            ..
+        }
+    ));
+}
+
+/// karyos#637: a client's roles that are not well formed are refused before
+/// anything is submitted, so the driver never retires the client for a
+/// malformed command; roles too many for the ring's largest record are
+/// refused as too large, and a large enough ring carries them.
+#[test]
+fn malformed_or_oversized_roles_are_refused_by_the_client() {
+    use karyos_client::ConductorError;
+    use karyos_protocol::roles::{PublicationRoles, Strategy};
+
+    let mut driver = driver();
+    let mut client = driver.connect().unwrap();
+    let uri = format!(
+        "karyos:udp?group=239.255.0.10:{}|interface=127.0.0.1|fc=max",
+        port()
+    );
+    for roles in [
+        PublicationRoles {
+            strategy: Strategy::Max,
+            required: vec![0],
+            tags: Vec::new(),
+        },
+        PublicationRoles {
+            strategy: Strategy::Max,
+            required: vec![77, 77],
+            tags: Vec::new(),
+        },
+        PublicationRoles {
+            strategy: Strategy::Max,
+            required: Vec::new(),
+            tags: vec![(88, 0)],
+        },
+        PublicationRoles {
+            strategy: Strategy::Tagged(0),
+            required: Vec::new(),
+            tags: Vec::new(),
+        },
+    ] {
+        assert_eq!(
+            client.add_network_publication_with_roles(&uri, 50, true, &roles),
+            Err(ConductorError::InvalidRoles),
+            "{roles:?}"
+        );
+    }
+    let oversized = PublicationRoles {
+        strategy: Strategy::Max,
+        required: (1..=200).collect(),
+        tags: Vec::new(),
+    };
+    assert_eq!(
+        client.add_network_publication_with_roles(&uri, 50, true, &oversized),
+        Err(ConductorError::CommandTooLarge)
+    );
+    // The client is still served.
+    assert!(client.add_network_publication(&uri, 51, true).is_ok());
+}
+
+/// karyos#637: a subscription's receiver identity travels by command; a
+/// second subscription of the stream on the same endpoint with another
+/// identity is refused with `ReceiverIdentityMismatch`, and a `karyos:ipc`
+/// URI with `UnsupportedChannel`.
+#[test]
+fn an_identity_travels_by_command() {
+    use karyos_protocol::roles::ReceiverIdentity;
+
+    let mut driver = driver();
+    let mut client = driver.connect().unwrap();
+    let mut outcomes = Vec::new();
+    let identity = |id: u64| ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(id).unwrap(),
+        group_tag: 9,
+    };
+    let uri = format!(
+        "karyos:udp?group=239.255.0.11:{}|interface=127.0.0.1",
+        port()
+    );
+    let first = client
+        .add_network_subscription_as(&uri, 60, SubscriberRole::Required, identity(77))
+        .unwrap();
+    let other = client
+        .add_network_subscription_as(&uri, 60, SubscriberRole::Required, identity(78))
+        .unwrap();
+    let ipc = client
+        .add_network_subscription_as("karyos:ipc", 61, SubscriberRole::Required, identity(77))
+        .unwrap();
+    let all = [first, other, ipc];
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |outcomes, _| {
+            all.iter()
+                .all(|sequence| outcomes.iter().any(|(_, found, _)| found == sequence))
+        },
+    );
+    assert!(matches!(
+        take(&mut outcomes, first),
+        Outcome::NetworkSubscription { .. }
+    ));
+    assert!(matches!(
+        take(&mut outcomes, other),
+        Outcome::Refused {
+            code: ErrorCode::ReceiverIdentityMismatch,
+            ..
+        }
+    ));
+    assert!(matches!(
+        take(&mut outcomes, ipc),
+        Outcome::Refused {
+            code: ErrorCode::UnsupportedChannel,
+            ..
+        }
+    ));
+}
+
 /// W5b B3: what a client created goes with it: its network publication
 /// and its network subscription are removed once its conductor is gone.
 #[test]

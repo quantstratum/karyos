@@ -33,10 +33,12 @@
 //! | `0x0F` | `AddNetworkPublication` | sequence | stream id (low 32; high 32 zero) | flags: as `AddPublication`, and bit 1 concurrent | channel URI length |
 //! | `0x10` | `AddNetworkSubscription` | sequence | stream id (low 32; high 32 zero) | role as `AddSubscription` | channel URI length |
 //! | `0x11` | `AddImageSubscription` | sequence | image registration (nonzero) | role as `AddSubscription` | lane as `AddPublication` |
+//! | `0x12` | `AddNetworkPublicationWithRoles` | sequence | stream id as `AddNetworkPublication` | flags as `AddNetworkPublication` | channel URI length |
+//! | `0x13` | `AddNetworkSubscriptionAs` | sequence | stream id as `AddNetworkSubscription` | role as `AddSubscription` | channel URI length |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
-//! | `0x84` | `Error` | client | sequence | code (1 to 11, see [`ErrorCode`]) | detail |
+//! | `0x84` | `Error` | client | sequence | code (1 to 17, see [`ErrorCode`]) | detail |
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
@@ -47,7 +49,7 @@
 //! `NetworkSubscriptionReady` is exactly six words: client, sequence,
 //! registration, then the subscription's bound local address in words 3
 //! to 5 (decision row 26; added in place under admission `VERSION` 2,
-//! which no release has used, so the three word layout before it has
+//! before alpha.2 published it, so the three word layout before it has
 //! another length and strict decoding refuses it):
 //!
 //! | Word | Bits | Meaning |
@@ -146,12 +148,40 @@
 //! names `lanes` other than the stream configures, granting nothing.
 //! Bit 1 of `AddNetworkPublication`'s flags asks for a concurrent handle
 //! on lane 0 instead of the exclusive publication (M11; added in place
-//! under admission `VERSION` 2, which no release has used): a
+//! under admission `VERSION` 2, before alpha.2 published it): a
 //! `karyos:ipc` URI only, so the stream is shared with its other
 //! publishers. A `karyos:udp` one is refused with `UnsupportedChannel`,
 //! an exclusive stream with `InvalidPublicationMode`. A driver that does
 //! not know the bit fails to decode the command and retires the client as
 //! faulty (`ClientProtocolViolation`), with no response.
+//!
+//! `AddNetworkPublicationWithRoles` and `AddNetworkSubscriptionAs` (owner
+//! decisions of 2026-10-21, item 7; karyos#637; layout decided 2026-10-27
+//! by QS-COORDINATOR under owner delegation) are new types of admission
+//! [`VERSION`](crate::admission::VERSION) 3, carrying a publication's
+//! receiver roles and a subscription's receiver identity
+//! ([`crate::roles`]). Both continue after their four words with words 4
+//! and 5, then the channel URI as above:
+//!
+//! | Message | Word 4 | Word 5 |
+//! | --- | --- | --- |
+//! | `AddNetworkPublicationWithRoles` | bits 7 to 0 the strategy (0 `min`, 1 `max`, 2 `tagged`); bits 31 to 16 `R`, the required count; bits 47 to 32 `T`, the tag count; other bits zero | the tagged group: nonzero for `tagged`, zero otherwise |
+//! | `AddNetworkSubscriptionAs` | `receiver_id`, nonzero | `group_tag` |
+//!
+//! `AddNetworkPublicationWithRoles` continues after its URI's padding with
+//! `R` words, the required `receiver_id`s (nonzero, distinct), then `T`
+//! pairs of words, a `receiver_id` (nonzero, distinct among the pairs) and
+//! its tag (nonzero): `6 + ceil(L / 8) + R + 2T` words in all, `L` the URI's length.
+//! `AddNetworkSubscriptionAs` is exactly `6 + ceil(L / 8)` words. Flags,
+//! role and URI follow their `AddNetworkPublication` and
+//! `AddNetworkSubscription` rules; a concurrent handle is refused with
+//! `UnsupportedChannel`, since roles are a network publication's. The
+//! roles' strategy must be the URI's `fc` (`min` without one): otherwise
+//! `Error` with `StrategyConflict`, granting nothing. The only bound on
+//! `R + 2T` is the command ring's largest record (`ring_capacity / 8`):
+//! a client refuses a command that does not fit before sending it
+//! (`CommandTooLarge`), and the driver checks the roles against its
+//! membership's `max_receivers`. No other numeric limit applies.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -171,13 +201,13 @@
 //! `replay` and the outcome is not `Replayed`); the other bits are zero.
 //! The outcome must be one the configured policy can produce. `Replayed`
 //! and the reasons from 4 on were added in place under admission
-//! `VERSION` 2, which no release has used. The driver answers `OperationSucceeded`
+//! `VERSION` 2, before alpha.2 published it. The driver answers `OperationSucceeded`
 //! when it recorded the report, and nothing for a protocol violation.
 //!
 //! `TraceJournal` continues after its four words with word 4, the
 //! observed registration (nonzero), and word 5, the clock provenance
 //! word. The two words were added in place under admission `VERSION` 2,
-//! which no release has used (`quantstratum-docs:
+//! before alpha.2 published it (`quantstratum-docs:
 //! karyos/design/trace-tool.md`, T2 and T4): the five word layout before
 //! them has another length, so strict decoding refuses it.
 //!
@@ -250,6 +280,8 @@ use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::SealReason;
 use thiserror::Error;
 
+use crate::roles::{PublicationRoles, ReceiverIdentity};
+
 /// Longest counter label, in bytes: the label of a counter cell.
 pub const MAX_LABEL_LENGTH: usize = karyos_sys::counters::MAX_LABEL_LENGTH;
 /// Words of an encoded counter label.
@@ -264,6 +296,14 @@ const REPORT_LOSS_WORDS: usize = 9;
 pub const MAX_COMMAND_URI: usize = 512;
 /// Words of the fixed part of a command carrying a channel URI.
 const URI_COMMAND_WORDS: usize = 4;
+/// Words of the fixed part of a command carrying a channel URI with
+/// receiver roles or a receiver identity (karyos#637).
+const ROLES_COMMAND_WORDS: usize = 6;
+/// The strategy codes of `AddNetworkPublicationWithRoles` (word 4, bits 7
+/// to 0).
+const STRATEGY_MIN: u64 = 0;
+const STRATEGY_MAX: u64 = 1;
+const STRATEGY_TAGGED: u64 = 2;
 /// Largest encoded command, in bytes: a command with the longest channel
 /// URI.
 pub const MAX_COMMAND_LENGTH: usize =
@@ -300,6 +340,8 @@ const GUARD_REOPEN: u32 = 0x0E;
 const ADD_NETWORK_PUBLICATION: u32 = 0x0F;
 const ADD_NETWORK_SUBSCRIPTION: u32 = 0x10;
 const ADD_IMAGE_SUBSCRIPTION: u32 = 0x11;
+const ADD_NETWORK_PUBLICATION_WITH_ROLES: u32 = 0x12;
+const ADD_NETWORK_SUBSCRIPTION_AS: u32 = 0x13;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -722,8 +764,9 @@ impl ReportedLoss {
     }
 }
 
-/// A command from a client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A command from a client. Not `Copy`: a command with receiver roles
+/// owns their lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
     /// Create the stream's exclusive publication.
@@ -788,6 +831,39 @@ pub enum Command {
         role: SubscriberRole,
         /// The channel.
         uri: ChannelUri,
+    },
+    /// [`Command::AddNetworkPublication`] of an exclusive publication
+    /// whose receivers have the configured `roles` (owner decisions of
+    /// 2026-10-21, item 7; karyos#637). The roles' strategy must be the
+    /// URI's `fc`. `concurrent` is never granted: a concurrent handle is a
+    /// `karyos:ipc` stream's, which has no receivers.
+    AddNetworkPublicationWithRoles {
+        /// Request sequence.
+        sequence: u64,
+        /// The stream.
+        stream_id: i32,
+        /// Accept offers with no subscriber attached.
+        allow_unconnected: bool,
+        /// A concurrent handle was asked for; refused by the driver.
+        concurrent: bool,
+        /// The channel.
+        uri: ChannelUri,
+        /// The receivers' roles.
+        roles: PublicationRoles,
+    },
+    /// [`Command::AddNetworkSubscription`] whose images name the
+    /// configured receiver `identity` (MC-1, MC-2; karyos#637).
+    AddNetworkSubscriptionAs {
+        /// Request sequence.
+        sequence: u64,
+        /// The stream.
+        stream_id: i32,
+        /// The role of the subscribers that attach to its images.
+        role: SubscriberRole,
+        /// The channel.
+        uri: ChannelUri,
+        /// The receiver identity.
+        identity: ReceiverIdentity,
     },
     /// Issue a concurrent publication handle on one of the stream's
     /// publisher slots.
@@ -1009,6 +1085,9 @@ pub enum ErrorCode {
     /// configures; nothing is granted (W8). The detail is the stream's lane
     /// count.
     LaneMismatch,
+    /// A network publication's roles name another strategy than its URI's
+    /// `fc`, the one source of the strategy (owner item 7, karyos#637).
+    StrategyConflict,
 }
 
 impl ErrorCode {
@@ -1032,6 +1111,7 @@ impl ErrorCode {
             Self::ReliabilityMismatch => 14,
             Self::ReceiverIdentityMismatch => 15,
             Self::LaneMismatch => 16,
+            Self::StrategyConflict => 17,
         }
     }
 
@@ -1053,6 +1133,7 @@ impl ErrorCode {
             14 => Self::ReliabilityMismatch,
             15 => Self::ReceiverIdentityMismatch,
             16 => Self::LaneMismatch,
+            17 => Self::StrategyConflict,
             _ => return None,
         })
     }
@@ -1270,6 +1351,8 @@ impl Command {
             Self::AddNetworkPublication { .. } => ADD_NETWORK_PUBLICATION,
             Self::AddNetworkSubscription { .. } => ADD_NETWORK_SUBSCRIPTION,
             Self::AddImageSubscription { .. } => ADD_IMAGE_SUBSCRIPTION,
+            Self::AddNetworkPublicationWithRoles { .. } => ADD_NETWORK_PUBLICATION_WITH_ROLES,
+            Self::AddNetworkSubscriptionAs { .. } => ADD_NETWORK_SUBSCRIPTION_AS,
         }
     }
 
@@ -1293,7 +1376,9 @@ impl Command {
             | Self::GuardReopen { sequence, .. }
             | Self::AddNetworkPublication { sequence, .. }
             | Self::AddNetworkSubscription { sequence, .. }
-            | Self::AddImageSubscription { sequence, .. } => sequence,
+            | Self::AddImageSubscription { sequence, .. }
+            | Self::AddNetworkPublicationWithRoles { sequence, .. }
+            | Self::AddNetworkSubscriptionAs { sequence, .. } => sequence,
         }
     }
 
@@ -1488,6 +1573,42 @@ impl Command {
                 role,
             } => write_words(
                 &[sequence, image, role_code(role), u64::from(lane.get())],
+                out,
+            ),
+            Self::AddNetworkPublicationWithRoles {
+                sequence,
+                stream_id,
+                allow_unconnected,
+                concurrent,
+                uri,
+                ref roles,
+            } => write_roles_command(
+                [
+                    sequence,
+                    u64::from(stream_id.cast_unsigned()),
+                    u64::from(allow_unconnected) | if concurrent { CONCURRENT } else { 0 },
+                    u64::from(uri.length),
+                ],
+                &uri,
+                roles,
+                out,
+            ),
+            Self::AddNetworkSubscriptionAs {
+                sequence,
+                stream_id,
+                role,
+                uri,
+                identity,
+            } => write_identity_command(
+                [
+                    sequence,
+                    u64::from(stream_id.cast_unsigned()),
+                    role_code(role),
+                    u64::from(uri.length),
+                    identity.receiver_id.get(),
+                    identity.group_tag,
+                ],
+                &uri,
                 out,
             ),
         }
@@ -1727,6 +1848,50 @@ impl Command {
                     })
                 }
             }
+            ADD_NETWORK_PUBLICATION_WITH_ROLES => {
+                let ([sequence, stream, flags, _, counts, group], uri, rest) =
+                    read_uri_block::<ROLES_COMMAND_WORDS>(type_id, bytes)?;
+                let stream_id = u32::try_from(stream)
+                    .map_err(|_| CncError::Reserved { type_id })?
+                    .cast_signed();
+                if flags & !(ALLOW_UNCONNECTED | CONCURRENT) != 0 {
+                    return Err(CncError::Reserved { type_id });
+                }
+                let roles = read_roles(type_id, counts, group, rest)?;
+                Ok(Self::AddNetworkPublicationWithRoles {
+                    sequence,
+                    stream_id,
+                    allow_unconnected: flags & ALLOW_UNCONNECTED != 0,
+                    concurrent: flags & CONCURRENT != 0,
+                    uri,
+                    roles,
+                })
+            }
+            ADD_NETWORK_SUBSCRIPTION_AS => {
+                let ([sequence, stream, role, _, receiver_id, group_tag], uri, rest) =
+                    read_uri_block::<ROLES_COMMAND_WORDS>(type_id, bytes)?;
+                if !rest.is_empty() {
+                    return Err(CncError::WrongLength {
+                        type_id,
+                        length: bytes.len(),
+                        expected: bytes.len().saturating_sub(rest.len()),
+                    });
+                }
+                let stream_id = u32::try_from(stream)
+                    .map_err(|_| CncError::Reserved { type_id })?
+                    .cast_signed();
+                Ok(Self::AddNetworkSubscriptionAs {
+                    sequence,
+                    stream_id,
+                    role: role_from(role).ok_or(CncError::Reserved { type_id })?,
+                    uri,
+                    identity: ReceiverIdentity {
+                        receiver_id: core::num::NonZeroU64::new(receiver_id)
+                            .ok_or(CncError::Reserved { type_id })?,
+                        group_tag,
+                    },
+                })
+            }
             _ => Err(CncError::UnknownType { type_id }),
         }
     }
@@ -1871,6 +2036,192 @@ fn read_uri_command(
     }
     let uri = ChannelUri::from_bytes(uri).ok_or(CncError::Reserved { type_id })?;
     Ok((words, uri))
+}
+
+/// Writes a roles command: its four words, the strategy and counts word,
+/// the tagged group word, the channel URI padded to a word, then each
+/// required `receiver_id` and each `(receiver_id, tag)` pair. A count that
+/// does not fit its 16 bits cannot be carried: reported as a buffer too
+/// short for the command.
+fn write_roles_command(
+    words: [u64; URI_COMMAND_WORDS],
+    uri: &ChannelUri,
+    roles: &PublicationRoles,
+    out: &mut [u8],
+) -> Result<usize, CncError> {
+    let (strategy, group) = match roles.strategy {
+        crate::roles::Strategy::Min => (STRATEGY_MIN, 0),
+        crate::roles::Strategy::Max => (STRATEGY_MAX, 0),
+        crate::roles::Strategy::Tagged(group) => (STRATEGY_TAGGED, group),
+    };
+    let tail_words = roles
+        .tags
+        .len()
+        .checked_mul(2)
+        .and_then(|tags| tags.checked_add(roles.required.len()));
+    let available = out.len();
+    let too_large = || CncError::BufferTooShort {
+        required: usize::MAX,
+        available,
+    };
+    let (Ok(required), Ok(tags), Some(tail_words)) = (
+        u16::try_from(roles.required.len()),
+        u16::try_from(roles.tags.len()),
+        tail_words,
+    ) else {
+        return Err(too_large());
+    };
+    let counts = strategy | u64::from(required) << 16 | u64::from(tags) << 32;
+    let [sequence, stream, flags, length] = words;
+    let head = write_words(&[sequence, stream, flags, length, counts, group], out)?;
+    let padded = uri.padded();
+    let roles_at = head.checked_add(padded.len()).ok_or_else(too_large)?;
+    let end = tail_words
+        .checked_mul(8)
+        .and_then(|bytes| roles_at.checked_add(bytes))
+        .ok_or_else(too_large)?;
+    let short = CncError::BufferTooShort {
+        required: end,
+        available,
+    };
+    out.get_mut(head..roles_at)
+        .ok_or(short)?
+        .copy_from_slice(padded);
+    let tail = out.get_mut(roles_at..end).ok_or(short)?;
+    let values = roles
+        .required
+        .iter()
+        .copied()
+        .chain(roles.tags.iter().flat_map(|&(id, tag)| [id, tag]));
+    for (chunk, word) in tail.as_chunks_mut::<8>().0.iter_mut().zip(values) {
+        *chunk = word.to_le_bytes();
+    }
+    Ok(end)
+}
+
+/// Writes an identity command: its six words and the channel URI padded
+/// to a word.
+fn write_identity_command(
+    words: [u64; ROLES_COMMAND_WORDS],
+    uri: &ChannelUri,
+    out: &mut [u8],
+) -> Result<usize, CncError> {
+    let head = write_words(&words, out)?;
+    let padded = uri.padded();
+    let end = head
+        .checked_add(padded.len())
+        .ok_or(CncError::BufferTooShort {
+            required: usize::MAX,
+            available: out.len(),
+        })?;
+    let available = out.len();
+    out.get_mut(head..end)
+        .ok_or(CncError::BufferTooShort {
+            required: end,
+            available,
+        })?
+        .copy_from_slice(padded);
+    Ok(end)
+}
+
+/// Reads a command's `N` words and the channel URI after them, strictly as
+/// [`read_uri_command`] does for its URI, and returns the bytes after the
+/// URI's padding for the caller to read exactly.
+fn read_uri_block<const N: usize>(
+    type_id: u32,
+    bytes: &[u8],
+) -> Result<([u64; N], ChannelUri, &[u8]), CncError> {
+    let head = N * 8;
+    let Some(head_bytes) = bytes.get(..head) else {
+        return Err(CncError::WrongLength {
+            type_id,
+            length: bytes.len(),
+            expected: head,
+        });
+    };
+    let words = read_words::<N>(type_id, head_bytes)?;
+    let length = words
+        .get(URI_COMMAND_WORDS - 1)
+        .and_then(|&length| usize::try_from(length).ok())
+        .filter(|length| (1..=MAX_COMMAND_URI).contains(length))
+        .ok_or(CncError::Reserved { type_id })?;
+    let padded = length
+        .checked_next_multiple_of(8)
+        .ok_or(CncError::Reserved { type_id })?;
+    let after = head
+        .checked_add(padded)
+        .ok_or(CncError::Reserved { type_id })?;
+    let Some(block) = bytes.get(head..after) else {
+        return Err(CncError::WrongLength {
+            type_id,
+            length: bytes.len(),
+            expected: after,
+        });
+    };
+    let (uri, padding) = block
+        .split_at_checked(length)
+        .ok_or(CncError::Reserved { type_id })?;
+    if padding.iter().any(|&byte| byte != 0) {
+        return Err(CncError::Reserved { type_id });
+    }
+    let uri = ChannelUri::from_bytes(uri).ok_or(CncError::Reserved { type_id })?;
+    Ok((words, uri, bytes.get(after..).unwrap_or_default()))
+}
+
+/// Reads the roles of `AddNetworkPublicationWithRoles` from its strategy and
+/// counts word, its tagged group word and the words after its URI, which
+/// must be exactly the counts' words: required `receiver_id`s, nonzero and
+/// distinct, then `(receiver_id, tag)` pairs, each `receiver_id` nonzero
+/// and distinct among the pairs, each tag nonzero.
+fn read_roles(
+    type_id: u32,
+    counts: u64,
+    group: u64,
+    rest: &[u8],
+) -> Result<PublicationRoles, CncError> {
+    let reserved = CncError::Reserved { type_id };
+    // Bits 15 to 8 and 63 to 48 are reserved.
+    if counts & 0xFFFF_0000_0000_FF00 != 0 {
+        return Err(reserved);
+    }
+    let strategy = match (counts & 0xFF, group) {
+        (STRATEGY_MIN, 0) => crate::roles::Strategy::Min,
+        (STRATEGY_MAX, 0) => crate::roles::Strategy::Max,
+        (STRATEGY_TAGGED, group) if group != 0 => crate::roles::Strategy::Tagged(group),
+        _ => return Err(reserved),
+    };
+    let required = usize::from((counts >> 16) as u16);
+    let tags = usize::from((counts >> 32) as u16);
+    let expected = tags
+        .checked_mul(2)
+        .and_then(|words| words.checked_add(required))
+        .and_then(|words| words.checked_mul(8))
+        .ok_or(reserved)?;
+    if rest.len() != expected {
+        return Err(CncError::WrongLength {
+            type_id,
+            length: rest.len(),
+            expected,
+        });
+    }
+    let mut words = rest
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk));
+    let required: Vec<u64> = words.by_ref().take(required).collect();
+    let tags: Vec<(u64, u64)> = (0..tags)
+        .map(|_| (words.next().unwrap_or(0), words.next().unwrap_or(0)))
+        .collect();
+    let roles = PublicationRoles {
+        strategy,
+        required,
+        tags,
+    };
+    if !roles.is_well_formed() {
+        return Err(reserved);
+    }
+    Ok(roles)
 }
 
 impl Response {
@@ -2878,6 +3229,216 @@ mod tests {
         assert_eq!(decode(&good), Ok(command));
     }
 
+    fn command_words(bytes: &[u8]) -> Vec<u64> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
+            .collect()
+    }
+
+    fn roles(strategy: crate::roles::Strategy) -> PublicationRoles {
+        PublicationRoles {
+            strategy,
+            required: vec![77, 78],
+            tags: vec![(88, 9)],
+        }
+    }
+
+    /// karyos#637: the roles and identity commands round-trip, and their
+    /// words are the layout the module docs give: six words, the padded
+    /// URI, then the required ids and the tag pairs.
+    #[test]
+    fn roles_commands_round_trip() {
+        use crate::roles::Strategy;
+
+        let uri = ChannelUri::new("karyos:udp?group=239.1.1.1:1|fc=tagged:9").unwrap();
+        let command = Command::AddNetworkPublicationWithRoles {
+            sequence: 3,
+            stream_id: 10,
+            allow_unconnected: true,
+            concurrent: false,
+            uri,
+            roles: roles(Strategy::Tagged(9)),
+        };
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = command.encode(&mut out).unwrap();
+        let words = command_words(&out[..length]);
+        let padded = uri.padded().len() / 8;
+        assert_eq!(words.len(), 6 + padded + 2 + 2);
+        assert_eq!(
+            words[..6],
+            [3, 10, 1, 40, 2 | 2 << 16 | 1 << 32, 9],
+            "sequence, stream, flags, URI length, strategy and counts, group"
+        );
+        assert_eq!(words[6 + padded..], [77, 78, 88, 9]);
+        assert_eq!(command.type_id(), 0x12);
+        assert_eq!(Command::decode(0x12, &out[..length]), Ok(command.clone()));
+        for strategy in [Strategy::Min, Strategy::Max] {
+            let empty = Command::AddNetworkPublicationWithRoles {
+                sequence: 4,
+                stream_id: -1,
+                allow_unconnected: false,
+                concurrent: true,
+                uri,
+                roles: PublicationRoles {
+                    strategy,
+                    required: Vec::new(),
+                    tags: Vec::new(),
+                },
+            };
+            let length = empty.encode(&mut out).unwrap();
+            assert_eq!(length, 48 + uri.padded().len());
+            assert_eq!(Command::decode(0x12, &out[..length]), Ok(empty));
+        }
+        let identity = Command::AddNetworkSubscriptionAs {
+            sequence: 5,
+            stream_id: 10,
+            role: SubscriberRole::Optional,
+            uri,
+            identity: ReceiverIdentity {
+                receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+                group_tag: 9,
+            },
+        };
+        let length = identity.encode(&mut out).unwrap();
+        assert_eq!(command_words(&out[..6 * 8]), [5, 10, 1, 40, 77, 9]);
+        assert_eq!(length, 48 + uri.padded().len());
+        assert_eq!(identity.type_id(), 0x13);
+        assert_eq!(Command::decode(0x13, &out[..length]), Ok(identity));
+    }
+
+    /// karyos#637: the roles and identity commands are decoded strictly:
+    /// reserved bits and strategy codes, a group that does not match the
+    /// strategy, a zero or repeated `receiver_id`, a zero tag, a receiver
+    /// id of 0 and any length but the counts' are refused.
+    #[test]
+    fn roles_commands_are_decoded_strictly() {
+        use crate::roles::Strategy;
+
+        let uri = ChannelUri::new("karyos:udp?group=239.1.1.1:1").unwrap();
+        let command = Command::AddNetworkPublicationWithRoles {
+            sequence: 1,
+            stream_id: 10,
+            allow_unconnected: false,
+            concurrent: false,
+            uri,
+            roles: roles(Strategy::Max),
+        };
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = command.encode(&mut out).unwrap();
+        let good = out[..length].to_vec();
+        let decode = |bytes: &[u8]| Command::decode(0x12, bytes);
+        let reserved = Err(CncError::Reserved { type_id: 0x12 });
+        let word = |bytes: &mut Vec<u8>, at: usize, value: u64| {
+            bytes[at * 8..at * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        let tail = 6 + uri.padded().len() / 8;
+        let counts = 1 | 2 << 16 | 1 << 32;
+        for (at, value) in [
+            // Strategy 3, reserved bits 15 to 8 and 63 to 48.
+            (4, counts & !0xFF | 3),
+            (4, counts | 1 << 8),
+            (4, counts | 1 << 48),
+            // A group without `tagged`, and `tagged` without one.
+            (5, 9),
+            (4, counts & !0xFF | 2),
+            // A zero or repeated required id.
+            (tail, 0),
+            (tail + 1, 77),
+            // A zero receiver id or a zero tag in a pair.
+            (tail + 2, 0),
+            (tail + 3, 0),
+            // A flag above bit 1.
+            (2, 4),
+        ] {
+            let mut bad = good.clone();
+            word(&mut bad, at, value);
+            assert_eq!(decode(&bad), reserved, "word {at} = {value:#x}");
+        }
+        // Counts that do not match the record, both ways.
+        for value in [counts + (1 << 16), counts - (1 << 16)] {
+            let mut bad = good.clone();
+            word(&mut bad, 4, value);
+            assert!(
+                matches!(decode(&bad), Err(CncError::WrongLength { .. })),
+                "counts {value:#x}"
+            );
+        }
+        assert!(matches!(
+            decode(&good[..good.len() - 8]),
+            Err(CncError::WrongLength { .. })
+        ));
+        assert_eq!(decode(&good), Ok(command));
+        // An identity of receiver 0, a reserved role, a trailing word.
+        let identity = Command::AddNetworkSubscriptionAs {
+            sequence: 1,
+            stream_id: 10,
+            role: SubscriberRole::Required,
+            uri,
+            identity: ReceiverIdentity {
+                receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+                group_tag: 0,
+            },
+        };
+        let length = identity.encode(&mut out).unwrap();
+        let good = out[..length].to_vec();
+        let reserved = Err(CncError::Reserved { type_id: 0x13 });
+        for (at, value) in [(4, 0), (2, 3)] {
+            let mut bad = good.clone();
+            word(&mut bad, at, value);
+            assert_eq!(Command::decode(0x13, &bad), reserved);
+        }
+        let mut longer = good.clone();
+        longer.extend_from_slice(&[0; 8]);
+        assert!(matches!(
+            Command::decode(0x13, &longer),
+            Err(CncError::WrongLength { .. })
+        ));
+        assert_eq!(Command::decode(0x13, &good), Ok(identity));
+    }
+
+    /// karyos#637: roles are bounded by the buffer they are encoded into
+    /// (the command ring's largest record), and by nothing else: a list too
+    /// long for the buffer, or for its 16-bit count, is refused as a buffer
+    /// too short, never truncated.
+    #[test]
+    fn roles_are_bounded_by_the_record_only() {
+        use crate::roles::Strategy;
+
+        let uri = ChannelUri::new("karyos:udp?group=239.1.1.1:1").unwrap();
+        let many = |required: usize| Command::AddNetworkPublicationWithRoles {
+            sequence: 1,
+            stream_id: 10,
+            allow_unconnected: false,
+            concurrent: false,
+            uri,
+            roles: PublicationRoles {
+                strategy: Strategy::Min,
+                required: (1..=required as u64).collect(),
+                tags: Vec::new(),
+            },
+        };
+        // A large record carries a list the default buffer cannot.
+        let mut large = vec![0u8; 64 * 1024];
+        let command = many(1000);
+        let length = command.encode(&mut large).unwrap();
+        assert_eq!(length, 48 + uri.padded().len() + 8000);
+        assert_eq!(Command::decode(0x12, &large[..length]), Ok(command));
+        let mut small = [0u8; MAX_COMMAND_LENGTH];
+        assert!(matches!(
+            many(1000).encode(&mut small),
+            Err(CncError::BufferTooShort { .. })
+        ));
+        // A count past 16 bits cannot be carried, whatever the buffer.
+        let mut huge = vec![0u8; 1024 * 1024];
+        assert!(matches!(
+            many(usize::from(u16::MAX) + 1).encode(&mut huge),
+            Err(CncError::BufferTooShort { .. })
+        ));
+    }
+
     /// Decision row 26: the documented `NetworkSubscriptionReady` vectors
     /// decode to their addresses and re-encode identically.
     #[test]
@@ -3597,7 +4158,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x12, &out[..length]),
+            Command::decode(0x14, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         // A lane word of 4 or more, or with any bit above the lane, is
@@ -4063,7 +4624,7 @@ mod journal_tests {
         let length = open.encode(&mut out).unwrap();
         assert_eq!(open.type_id(), 0x09);
         assert_eq!(words_of(&out[..length]), [3, 64, 25, 8, 11, 2]);
-        assert_eq!(Command::decode(0x09, &out[..length]), Ok(open));
+        assert_eq!(Command::decode(0x09, &out[..length]), Ok(open.clone()));
         // The provenance is a raw word: any value round trips.
         let raw = Command::TraceJournal {
             sequence: 3,
@@ -4178,7 +4739,7 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(17), None);
+        assert_eq!(ErrorCode::from_code(18), None);
     }
 
     /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
@@ -4366,9 +4927,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 17 is not defined.
+        // Error code 18 is not defined.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 17, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 18, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }

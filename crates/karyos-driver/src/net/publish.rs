@@ -101,6 +101,22 @@ pub struct NetworkGuard {
     pub rate: Option<GuardRate>,
 }
 
+/// The strategy a network publication of `channel` runs: its `fc`, `min`
+/// without one (owner item 7, karyos#637).
+///
+/// # Errors
+///
+/// [`DriverError::UnsupportedChannel`] for `fc=tagged:0`, which names no
+/// group, or a flow control a later protocol version parses.
+pub(crate) fn strategy_of(channel: &UdpConfig) -> Result<Strategy, DriverError> {
+    match channel.flow_control {
+        None | Some(FlowControl::Min) => Ok(Strategy::Min),
+        Some(FlowControl::Max) => Ok(Strategy::Max),
+        Some(FlowControl::Tagged(group)) if group != 0 => Ok(Strategy::Tagged(group)),
+        Some(_) => Err(DriverError::UnsupportedChannel),
+    }
+}
+
 impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Creates an aggregate publication, as [`EmbeddedDriver::add_aggregate`]
     /// does, whose lanes the sender agent sends over `channel` (control
@@ -138,10 +154,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// # Errors
     ///
-    /// As [`EmbeddedDriver::add_network_publication`], and
+    /// As [`EmbeddedDriver::add_network_publication`],
+    /// [`DriverError::InvalidRoles`] for roles a membership cannot hold
+    /// ([`crate::membership::check_roles`]), and
     /// [`DriverError::StrategyConflict`] for roles whose strategy is not
-    /// the channel's `fc`. The sender refuses roles its membership cannot
-    /// hold, which leaves the publication refused.
+    /// the channel's `fc`.
     pub fn add_network_publication_with_roles(
         &mut self,
         config: AggregateConfig,
@@ -266,7 +283,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.add_network(config, channel, guard, None, Some((schedule, Some(clock))))
     }
 
-    fn add_network(
+    pub(crate) fn add_network(
         &mut self,
         config: AggregateConfig,
         channel: &UdpConfig,
@@ -285,13 +302,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // without roles runs on a membership with no required or tagged
         // receiver. A tagged group of 0 is no group: refused, not run as
         // `min`.
-        let strategy = match channel.flow_control {
-            None | Some(FlowControl::Min) => Strategy::Min,
-            Some(FlowControl::Max) => Strategy::Max,
-            Some(FlowControl::Tagged(0)) => return Err(DriverError::UnsupportedChannel),
-            Some(FlowControl::Tagged(group)) => Strategy::Tagged(group),
-            Some(_) => return Err(DriverError::UnsupportedChannel),
-        };
+        let strategy = strategy_of(channel)?;
+        if let Some(roles) = &roles {
+            crate::membership::check_roles(
+                &roles.roles(),
+                crate::membership::DEFAULT_MAX_RECEIVERS,
+            )
+            .map_err(|_| DriverError::InvalidRoles)?;
+        }
         let roles = match roles {
             Some(roles) if roles.strategy != strategy => {
                 return Err(DriverError::StrategyConflict);

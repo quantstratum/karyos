@@ -126,6 +126,28 @@ fn a_driver_that_admits_at_another_version_is_incompatible() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// SPEC.md §13, C ABI boundary row (karyos#637): an alpha.2 driver speaks
+/// admission version 2 and this client version 3, so the pair is
+/// incompatible whichever way the driver answers: `Admitted` at version 2
+/// here, and a `Refused` with `INCOMPATIBLE_VERSION` above.
+#[test]
+fn an_alpha2_driver_is_incompatible() {
+    let _serial = serial();
+    assert_eq!(VERSION, 3);
+    let dir = dir("alpha2");
+    let admitted = Message::Admitted {
+        instance: 1,
+        version: 2,
+        client: 1,
+        records: Vec::new(),
+    };
+    let (status, client, detail) = fake_driver(&dir, &admitted);
+    assert_eq!(status, INCOMPATIBLE_DRIVER);
+    assert_eq!(client, 0);
+    assert_eq!(detail.value, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_driver_admits_the_client_until_it_is_closed() {
     let _serial = serial();

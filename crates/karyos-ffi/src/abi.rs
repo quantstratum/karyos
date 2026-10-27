@@ -22,7 +22,7 @@ pub(crate) const ABI_VERSION_MAJOR: u32 = 0;
 /// The ABI version's minor number (`KARYOS_ABI_VERSION_MINOR`).
 pub(crate) const ABI_VERSION_MINOR: u32 = 1;
 /// The ABI version's patch number (`KARYOS_ABI_VERSION_PATCH`).
-pub(crate) const ABI_VERSION_PATCH: u32 = 1;
+pub(crate) const ABI_VERSION_PATCH: u32 = 2;
 
 /// Whether `out` can take a `T`: not null and aligned. It cannot tell a
 /// dangling pointer; the caller's contract excludes one.
@@ -1456,6 +1456,202 @@ pub unsafe extern "C" fn karyos_client_add_subscription_with(
             options,
             archive,
         ) {
+            Ok(handle) => {
+                // SAFETY: `subscription` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { subscription.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// `KARYOS_STRATEGY_MIN`: the slowest live receiver bounds the sender
+/// (owner item 7, karyos#637); a channel's `fc=min`, or no `fc`.
+pub(crate) const STRATEGY_MIN: u32 = 0;
+/// `KARYOS_STRATEGY_MAX`: the fastest live receiver bounds it (`fc=max`).
+pub(crate) const STRATEGY_MAX: u32 = 1;
+/// `KARYOS_STRATEGY_TAGGED`: the receivers of a tagged group bound it
+/// (`fc=tagged:<group>`).
+pub(crate) const STRATEGY_TAGGED: u32 = 2;
+
+/// The `count` words at `words`: empty for a count of 0, whatever the
+/// pointer; [`Status::InvalidArgument`] for a null or misaligned pointer
+/// with a count, or a byte length past `isize::MAX`.
+///
+/// # Safety
+///
+/// With a nonzero `count`, `words` points to `count` readable `uint64_t`,
+/// unchanged during the call.
+unsafe fn read_words<'a>(words: *const u64, count: usize) -> Result<&'a [u64], Status> {
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if !readable(words)
+        || count
+            .checked_mul(8)
+            .is_none_or(|bytes| isize::try_from(bytes).is_err())
+    {
+        return Err(Status::InvalidArgument);
+    }
+    // SAFETY: non-null and aligned, `count` readable words below
+    // `isize::MAX` bytes (the caller's contract and the checks above), used
+    // only during the call.
+    Ok(unsafe { std::slice::from_raw_parts(words, count) })
+}
+
+/// Adds the exclusive publication of `stream_id` on the `karyos:udp`
+/// channel `uri` whose receivers have configured roles (owner decisions of
+/// 2026-10-21, item 7; karyos#637), and writes its handle through
+/// `publication`. `strategy` is a `KARYOS_STRATEGY_*` and must be the
+/// channel's `fc` (`KARYOS_STRATEGY_MIN` without one), or the driver
+/// refuses with `KARYOS_E_REFUSED`, detail code 17 (`StrategyConflict`);
+/// `tagged_group` is the group of `KARYOS_STRATEGY_TAGGED` and 0 for the
+/// others. `required` holds `required_count` required `receiver_id`s, and
+/// `tags` `tag_count` pairs of words, a `receiver_id` and its tag. An
+/// unknown strategy, a group that does not match it, a `receiver_id` or tag
+/// of 0, a repeated `receiver_id`, or a null list with a count, is
+/// `KARYOS_E_INVALID_ARGUMENT`, as are roles the command ring's largest
+/// record cannot carry. A `karyos:ipc` URI is
+/// `KARYOS_E_UNSUPPORTED_CHANNEL`. A control call, as
+/// `karyos_client_add_publication`; on failure nothing is opened and
+/// `detail` (may be null) receives the failure's detail.
+///
+/// # Safety
+///
+/// As `karyos_client_add_publication`; with a nonzero count, `required`
+/// points to `required_count` readable `uint64_t` and `tags` to `2 *
+/// tag_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_publication_with_roles(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    strategy: u32,
+    tagged_group: u64,
+    required: *const u64,
+    required_count: usize,
+    tags: *const u64,
+    tag_count: usize,
+    publication: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(publication) {
+            return Status::InvalidArgument;
+        }
+        let strategy = match (strategy, tagged_group) {
+            (STRATEGY_MIN, 0) => karyos_client::Strategy::Min,
+            (STRATEGY_MAX, 0) => karyos_client::Strategy::Max,
+            (STRATEGY_TAGGED, group) if group != 0 => karyos_client::Strategy::Tagged(group),
+            _ => return Status::InvalidArgument,
+        };
+        let Some(tag_words) = tag_count.checked_mul(2) else {
+            return Status::InvalidArgument;
+        };
+        // SAFETY: the caller's contract on `required` and `tags`.
+        let lists = unsafe { read_words(required, required_count) }
+            .and_then(|required| Ok((required, unsafe { read_words(tags, tag_words) }?)));
+        let (required, tags) = match lists {
+            Ok(lists) => lists,
+            Err(status) => return status,
+        };
+        let roles = karyos_client::PublicationRoles {
+            strategy,
+            required: required.to_vec(),
+            tags: tags
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[id, tag]| (id, tag))
+                .collect(),
+        };
+        if !roles.is_well_formed() {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: the caller's contract on `uri`.
+        let uri = match unsafe { read_str(uri) } {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match api::publication::add_with_roles(Handle::from_raw(client), uri, stream_id, &roles) {
+            Ok(handle) => {
+                // SAFETY: `publication` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint64_t`.
+                unsafe { publication.write(handle.raw()) };
+                Status::Ok
+            }
+            Err(failure) => {
+                // SAFETY: the caller's contract on `detail`.
+                unsafe { write_detail(detail, failure) };
+                failure.status
+            }
+        }
+    })
+}
+
+/// As `karyos_client_add_subscription_with` on a `karyos:udp` channel,
+/// whose images name the configured receiver identity (MC-1, MC-2; owner
+/// item 7, karyos#637): `receiver_id` (nonzero) in every RB block and
+/// `group_tag` in their SMs, what a publication's required `receiver_id`s
+/// and tagged group name. A `receiver_id` of 0, or an Archive rejoin in
+/// `options` (a network subscription has none), is
+/// `KARYOS_E_INVALID_ARGUMENT`; a `karyos:ipc` URI is
+/// `KARYOS_E_UNSUPPORTED_CHANNEL`; another identity on the same endpoint and
+/// stream is `KARYOS_E_REFUSED`, detail code 15
+/// (`ReceiverIdentityMismatch`). Nothing stays open on failure.
+///
+/// # Safety
+///
+/// As `karyos_client_add_subscription_with`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_client_add_subscription_as(
+    client: u64,
+    uri: *const c_char,
+    stream_id: i32,
+    options: *const SubscriptionOptions,
+    receiver_id: u64,
+    group_tag: u64,
+    subscription: *mut u64,
+    detail: *mut Detail,
+) -> i32 {
+    guard(|| {
+        if !writable(subscription) {
+            return Status::InvalidArgument;
+        }
+        let Some(receiver_id) = core::num::NonZeroU64::new(receiver_id) else {
+            return Status::InvalidArgument;
+        };
+        // SAFETY: the caller's contract on `options`; `SubscriptionOptions`
+        // holds integers only, valid for every bit pattern.
+        let read = unsafe {
+            read_sized(
+                options,
+                SUBSCRIPTION_OPTIONS_SIZE_0_1,
+                default_subscription_options(),
+            )
+        };
+        let options = match read.and_then(subscription_options) {
+            Ok((options, None)) => options,
+            Ok((_, Some(_))) => return Status::InvalidArgument,
+            Err(status) => return status,
+        };
+        // SAFETY: the caller's contract on `uri`.
+        let uri = match unsafe { read_str(uri) } {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        let identity = karyos_client::ReceiverIdentity {
+            receiver_id,
+            group_tag,
+        };
+        match api::subscription::add_as(Handle::from_raw(client), uri, stream_id, options, identity)
+        {
             Ok(handle) => {
                 // SAFETY: `subscription` is non-null and aligned, and the
                 // caller's contract makes it a writable `uint64_t`.

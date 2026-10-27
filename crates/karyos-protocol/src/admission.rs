@@ -76,6 +76,20 @@
 //! (G-d2c, ACS 15268): one word more makes every manifest length `8 + 8n`
 //! words against `7 + 8n` before, never equal.
 //!
+//! **The in-place window closes at a version's first publication**
+//! (`quantstratum-docs: owner-decisions/2026-10-21/decisions.md:64` to
+//! `:69`, item 4: "Later incompatible format changes require a new
+//! version"). Alpha.1 published version 1 and alpha.2 version 2, so both
+//! are closed: their released contracts are kept, and an incompatible
+//! change needs a new version. Version 3 (karyos#637: new CnC command
+//! types for a publication's receiver roles and a subscription's receiver
+//! identity) stays open in place until its first publication; the later
+//! parts of karyos#637 (the conflated network subscription and the network
+//! admission state) enter it too. A client and a driver of different
+//! versions, 2 and 3 in either direction, are refused at admission with
+//! [`refusal::INCOMPATIBLE_VERSION`] (decided 2026-10-27 by QS-COORDINATOR
+//! under owner delegation).
+//!
 //! **Base.** A manifest's base is the stream position at which the grant's
 //! log buffer starts: zero for a stream's first incarnation, the seal
 //! position of its predecessor for a later one (`quantstratum-docs:
@@ -135,8 +149,10 @@
 
 use thiserror::Error;
 
-/// The protocol version a client announces in `Hello`.
-pub const VERSION: u64 = 2;
+/// The protocol version a client announces in `Hello`: 3 since
+/// karyos#637 added `AddNetworkPublicationWithRoles` and
+/// `AddNetworkSubscriptionAs` (`cnc`), after alpha.2 published version 2.
+pub const VERSION: u64 = 3;
 /// Most records in one manifest.
 pub const MAX_RECORDS: usize = 16;
 /// The bit of a record's word 6 that says its stream allows offers with
@@ -1286,14 +1302,16 @@ mod tests {
         assert_eq!(RegionKind::from_code(15), None);
     }
 
-    /// The protocol version is 2 (ACS 13677): the trace journal kinds.
+    /// The protocol version is 3 (karyos#637: the roles and identity
+    /// commands); 2 was the trace journal kinds' (ACS 13677), published by
+    /// alpha.2.
     #[test]
-    fn the_version_is_two() {
+    fn the_version_is_three() {
         let mut out = [0u8; MAX_MESSAGE_LENGTH];
         let length = Message::Hello { version: VERSION }
             .encode(&mut out)
             .unwrap();
-        assert_eq!(words_of(&out[..length]), [HELLO, 2, PROFILE_FLAGS]);
+        assert_eq!(words_of(&out[..length]), [HELLO, 3, PROFILE_FLAGS]);
     }
 
     /// The manifest's words, literally: the stream registration, the

@@ -68,6 +68,7 @@
 //! granted, which stays held until the client leaves.
 //! `ClientError::Attach` exists on Linux only, where remote clients do.
 
+use karyos_protocol::roles::{PublicationRoles, ReceiverIdentity};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -494,6 +495,23 @@ pub trait Connection: sealed::Sealed {
     ) -> Result<u64, ConductorError>;
 
     #[doc(hidden)]
+    fn add_network_publication_with_roles(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        roles: &PublicationRoles,
+    ) -> Result<u64, ConductorError>;
+
+    #[doc(hidden)]
+    fn add_network_subscription_as(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        role: SubscriberRole,
+        identity: ReceiverIdentity,
+    ) -> Result<u64, ConductorError>;
+
+    #[doc(hidden)]
     fn add_subscription(
         &mut self,
         stream: StreamKey,
@@ -621,6 +639,25 @@ impl Connection for ClientConductor {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         ClientConductor::add_network_subscription(self, uri, stream_id, role)
+    }
+
+    fn add_network_publication_with_roles(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        roles: &PublicationRoles,
+    ) -> Result<u64, ConductorError> {
+        ClientConductor::add_network_publication_with_roles(self, uri, stream_id, false, roles)
+    }
+
+    fn add_network_subscription_as(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        role: SubscriberRole,
+        identity: ReceiverIdentity,
+    ) -> Result<u64, ConductorError> {
+        ClientConductor::add_network_subscription_as(self, uri, stream_id, role, identity)
     }
 
     fn add_subscription(
@@ -778,6 +815,27 @@ impl Connection for crate::ipc::RemoteClient {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         crate::ipc::RemoteClient::add_network_subscription(self, uri, stream_id, role)
+    }
+
+    fn add_network_publication_with_roles(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        roles: &PublicationRoles,
+    ) -> Result<u64, ConductorError> {
+        crate::ipc::RemoteClient::add_network_publication_with_roles(
+            self, uri, stream_id, false, roles,
+        )
+    }
+
+    fn add_network_subscription_as(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        role: SubscriberRole,
+        identity: ReceiverIdentity,
+    ) -> Result<u64, ConductorError> {
+        crate::ipc::RemoteClient::add_network_subscription_as(self, uri, stream_id, role, identity)
     }
 
     fn add_subscription(
@@ -1217,9 +1275,46 @@ impl<C: Connection> Client<C> {
         uri: &str,
         stream_id: StreamId,
     ) -> Result<Publication<C::Terms>, ClientError> {
-        let sequence = self
-            .connection
-            .add_network_publication(uri, stream_id.get())?;
+        self.exclusive_publication(uri, stream_id, None)
+    }
+
+    /// [`Client::add_exclusive_publication`] of a `karyos:udp` channel
+    /// whose receivers have the configured `roles` (owner decisions of
+    /// 2026-10-21, item 7; karyos#637): the required `receiver_id`s and
+    /// the receivers' tags. The channel's `fc` is the one source of the
+    /// strategy, and `roles.strategy` must name it (`min` without one):
+    /// otherwise the driver refuses with `StrategyConflict`. A `karyos:ipc`
+    /// URI is refused with `UnsupportedChannel`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::add_exclusive_publication`]; roles the command ring's
+    /// largest record cannot carry are refused before anything is
+    /// requested (`ConductorError::CommandTooLarge`).
+    pub fn add_exclusive_publication_with_roles(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+        roles: &PublicationRoles,
+    ) -> Result<Publication<C::Terms>, ClientError> {
+        self.exclusive_publication(uri, stream_id, Some(roles))
+    }
+
+    fn exclusive_publication(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+        roles: Option<&PublicationRoles>,
+    ) -> Result<Publication<C::Terms>, ClientError> {
+        let sequence = match roles {
+            Some(roles) => {
+                self.connection
+                    .add_network_publication_with_roles(uri, stream_id.get(), roles)?
+            }
+            None => self
+                .connection
+                .add_network_publication(uri, stream_id.get())?,
+        };
         let first = match self.wait(sequence)? {
             Found::Outcome(outcome) => self.connection.publication(*outcome)?,
             Found::Network(..) => return Err(ClientError::Unknown),
@@ -1406,6 +1501,37 @@ impl<C: Connection> Client<C> {
         stream_id: StreamId,
         options: SubscriptionOptions,
     ) -> Result<Subscription<C::Terms>, ClientError> {
+        self.subscription(uri, stream_id, options, None)
+    }
+
+    /// [`Client::add_subscription_with`] of a `karyos:udp` channel whose
+    /// images name the configured receiver `identity` (MC-1, MC-2; owner
+    /// item 7, karyos#637): its `receiver_id` in every RB block and its
+    /// `group_tag` in their SMs, what a publication's required
+    /// `receiver_id`s and `tagged` group name. A `karyos:ipc` URI is
+    /// refused with `UnsupportedChannel`; another identity on the same
+    /// endpoint and stream with `ReceiverIdentityMismatch`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::add_subscription_with`].
+    pub fn add_subscription_as(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+        options: SubscriptionOptions,
+        identity: ReceiverIdentity,
+    ) -> Result<Subscription<C::Terms>, ClientError> {
+        self.subscription(uri, stream_id, options, Some(identity))
+    }
+
+    fn subscription(
+        &mut self,
+        uri: &str,
+        stream_id: StreamId,
+        options: SubscriptionOptions,
+        identity: Option<ReceiverIdentity>,
+    ) -> Result<Subscription<C::Terms>, ClientError> {
         let SubscriptionOptions { role, rejoin } = options;
         let network = uri.starts_with("karyos:udp");
         if network && rejoin.duplicate().is_none() {
@@ -1421,9 +1547,15 @@ impl<C: Connection> Client<C> {
                 .ok_or(ClientError::InvalidContext {
                     reason: "too many images to queue their changes",
                 })?;
-        let sequence = self
-            .connection
-            .add_network_subscription(uri, stream_id.get(), role)?;
+        let sequence = match identity {
+            Some(identity) => {
+                self.connection
+                    .add_network_subscription_as(uri, stream_id.get(), role, identity)?
+            }
+            None => self
+                .connection
+                .add_network_subscription(uri, stream_id.get(), role)?,
+        };
         // A network grant's record takes the role and policy when the grant
         // arrives (`found`), before the events announcing its images; a
         // stream subscription takes the policy back here.

@@ -34,6 +34,7 @@ pub mod journal;
 pub mod lanes;
 pub mod network;
 pub mod protection;
+pub mod roles;
 pub mod sizing;
 pub mod term;
 pub mod trace_hook;

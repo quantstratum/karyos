@@ -335,6 +335,29 @@ unsafe extern "C" {
         subscription: *mut u64,
         detail: *mut Detail,
     ) -> i32;
+    fn karyos_client_add_publication_with_roles(
+        client: u64,
+        uri: *const c_char,
+        stream_id: i32,
+        strategy: u32,
+        tagged_group: u64,
+        required: *const u64,
+        required_count: usize,
+        tags: *const u64,
+        tag_count: usize,
+        publication: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
+    fn karyos_client_add_subscription_as(
+        client: u64,
+        uri: *const c_char,
+        stream_id: i32,
+        options: *const SubscriptionOptions,
+        receiver_id: u64,
+        group_tag: u64,
+        subscription: *mut u64,
+        detail: *mut Detail,
+    ) -> i32;
     safe fn karyos_subscription_close(subscription: u64) -> i32;
     fn karyos_offer_options_init_sized(options: *mut OfferOptions, size: usize) -> i32;
     fn karyos_publication_offer_with(
@@ -576,6 +599,86 @@ pub fn client_add_subscription_with(
             uri.as_ptr(),
             stream_id,
             options.as_ptr(),
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, subscription)
+}
+
+/// A list a roles call passes: its words, or null, and the count it
+/// names (karyos#637).
+pub struct RolesList {
+    /// The words; `None` passes null.
+    pub words: Option<Vec<u64>>,
+    /// The count passed with them.
+    pub count: usize,
+}
+
+/// `karyos_client_add_publication_with_roles` of `stream_id` on `uri`:
+/// the status, the handle and the detail (karyos#637). `tags` holds the
+/// pairs' words, two per counted pair.
+#[allow(clippy::too_many_arguments, reason = "the C function's own parameters")]
+pub fn client_add_publication_with_roles(
+    client: u64,
+    uri: &CStr,
+    stream_id: i32,
+    strategy: u32,
+    tagged_group: u64,
+    required: &RolesList,
+    tags: &RolesList,
+    detail_size: u32,
+) -> (i32, u64, SizedStruct<Detail>) {
+    let pointer = |list: &RolesList| {
+        list.words
+            .as_ref()
+            .map_or(core::ptr::null(), |words| words.as_ptr())
+    };
+    let mut publication = 0;
+    let mut detail = SizedStruct::<Detail>::new(None, detail_size);
+    // SAFETY: a live C string; each list null or live with at least the
+    // words its count names (the runner builds them so); a live, aligned
+    // `u64`; a detail of at least `detail_size` writable bytes.
+    let status = unsafe {
+        karyos_client_add_publication_with_roles(
+            client,
+            uri.as_ptr(),
+            stream_id,
+            strategy,
+            tagged_group,
+            pointer(required),
+            required.count,
+            pointer(tags),
+            tags.count,
+            &mut publication,
+            detail.as_mut_ptr(),
+        )
+    };
+    (status, publication, detail)
+}
+
+/// `karyos_client_add_subscription_as` of `stream_id` on `uri` with
+/// `options` sized as `size`: the status and the handle (karyos#637).
+pub fn client_add_subscription_as(
+    client: u64,
+    uri: &CStr,
+    stream_id: i32,
+    options: &SubscriptionOptions,
+    size: u32,
+    (receiver_id, group_tag): (u64, u64),
+) -> (i32, u64) {
+    let options = SizedStruct::new(Some(options), size);
+    let mut subscription = 0;
+    // SAFETY: a live C string, options of at least `size` readable bytes,
+    // a live, aligned `u64`; a null detail is allowed.
+    let status = unsafe {
+        karyos_client_add_subscription_as(
+            client,
+            uri.as_ptr(),
+            stream_id,
+            options.as_ptr(),
+            receiver_id,
+            group_tag,
             &mut subscription,
             core::ptr::null_mut(),
         )

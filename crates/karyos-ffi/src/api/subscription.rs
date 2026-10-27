@@ -371,6 +371,29 @@ pub(crate) fn add_rejoining(
     })?
 }
 
+/// As [`add_with`], a network subscription whose images name the receiver
+/// `identity` (owner item 7, karyos#637).
+///
+/// # Errors
+///
+/// As [`add_with`].
+pub(crate) fn add_as(
+    client: Handle,
+    uri: &str,
+    stream_id: i32,
+    options: karyos_client::SubscriptionOptions,
+    identity: karyos_client::ReceiverIdentity,
+) -> Result<Handle, Failure> {
+    with_client(client, |entry| {
+        entry.usable()?;
+        let reader =
+            entry
+                .client
+                .add_subscription_as(uri, StreamId::new(stream_id), options, identity)?;
+        insert(entry, client, reader)
+    })?
+}
+
 /// Inserts `reader` of `client` (its `entry`) as a subscription handle, with
 /// its copy buffer; on failure the reader is released.
 fn insert(

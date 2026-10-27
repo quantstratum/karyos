@@ -46,6 +46,28 @@ release may break APIs, wire formats and shared-memory layouts.
   and a subscription's receiver identity (`ReceiverIdentity`), owner item 7
   (karyos#637, part 1 of 5).
 
+- Typed roles and receiver identities over the client command path (owner
+  item 7; karyos#637, part 2 of 5; layout decided 2026-10-27 by
+  QS-COORDINATOR under owner delegation).
+  - Two new CnC commands: `AddNetworkPublicationWithRoles` (0x12) and
+    `AddNetworkSubscriptionAs` (0x13). The layout is in `karyos_protocol::cnc`.
+  - The new error code is `StrategyConflict` (17).
+  - Rust client: `ClientConductor::add_network_publication_with_roles`,
+    `ClientConductor::add_network_subscription_as`,
+    `Client::add_exclusive_publication_with_roles` and
+    `Client::add_subscription_as`.
+  - C ABI 0.1.2: `karyos_client_add_publication_with_roles`,
+    `karyos_client_add_subscription_as` and `KARYOS_STRATEGY_*`, with two
+    conformance scenarios. The conformance suite now needs ABI 0.1.2.
+  - `PublicationRoles`, `ReceiverIdentity` and `Strategy` move to
+    `karyos_protocol::roles`. `karyos_driver::membership`, `karyos_client`
+    and the `karyos` facade re-export them.
+  - The roles' only size bound is the command ring's largest record
+    (`ring_capacity / 8`), which the driver now decodes into a buffer of that
+    size, allocated once. A client refuses roles that do not fit
+    (`ConductorError::CommandTooLarge`) or are not well formed
+    (`ConductorError::InvalidRoles`) before sending.
+
 ### Changed
 
 - A channel URI list that names one address in two spellings is refused as a
@@ -60,6 +82,16 @@ release may break APIs, wire formats and shared-memory layouts.
   field; `..AgentConfig::default()` keeps working. karyosd bounds its idle
   sleep by it; a caller that drives an embedded driver's `duty_cycle` itself
   must call it at least this often while a conflated network view is open.
+- **Admission `VERSION` 3.** Alpha.2 published version 2, and its in-place
+  window closed with that publication
+  (`owner-decisions/2026-10-21/decisions.md:64` to `:69`). The new commands
+  therefore need a new version. A client and a driver of different versions
+  are refused at admission with `INCOMPATIBLE_VERSION`: an alpha.3 client with
+  an alpha.2 driver, or the reverse, in either combination. The C ABI's
+  `KARYOS_PROTOCOL_VERSION` is 3.
+- **`karyos_protocol::cnc::Command` is no longer `Copy`**, since a command with
+  roles owns their lists. This is a public API change: code that copied a
+  command clones it.
 - A network publication runs the strategy its channel's `fc` names: `fc=max`
   and `fc=tagged:<group>` are granted instead of refused with
   `UnsupportedChannel`. The `fc` is the one source of the strategy: typed roles

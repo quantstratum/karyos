@@ -61,6 +61,7 @@ fn c_type(rust: &str) -> String {
         "*mut u32" => "uint32_t *",
         "*mut u64" => "uint64_t *",
         "*const u8" => "const uint8_t *",
+        "*const u64" => "const uint64_t *",
         "*const c_char" => "const char *",
         "*const ClientOptions" => "const karyos_client_options *",
         "*mut ClientOptions" => "karyos_client_options *",
@@ -707,4 +708,20 @@ fn the_header_states_the_subscription_option_constants() {
     // The wire codes of the roles (karyos_protocol::cnc), which the C codes
     // keep.
     assert_eq!([ROLE_REQUIRED, ROLE_OPTIONAL, ROLE_OBSERVER], [0, 1, 2]);
+}
+
+/// karyos#637: the strategy codes of
+/// `karyos_client_add_publication_with_roles`, which keep the CnC's
+/// (`AddNetworkPublicationWithRoles`, word 4).
+#[test]
+fn the_header_states_the_strategy_constants() {
+    use crate::abi::{STRATEGY_MAX, STRATEGY_MIN, STRATEGY_TAGGED};
+    let defines = header_defines();
+    assert_eq!(defines["KARYOS_STRATEGY_MIN"], i64::from(STRATEGY_MIN));
+    assert_eq!(defines["KARYOS_STRATEGY_MAX"], i64::from(STRATEGY_MAX));
+    assert_eq!(
+        defines["KARYOS_STRATEGY_TAGGED"],
+        i64::from(STRATEGY_TAGGED)
+    );
+    assert_eq!([STRATEGY_MIN, STRATEGY_MAX, STRATEGY_TAGGED], [0, 1, 2]);
 }

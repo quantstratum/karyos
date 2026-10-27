@@ -1,0 +1,52 @@
+# A network publication's roles (owner item 7, karyos#637; ABI 0.1.2) are
+# checked before anything is opened: an unknown strategy
+# (KARYOS_STRATEGY_*), a tagged group that does not match the strategy, a
+# receiver id or tag of 0, a repeated receiver id and a null list with a
+# count answer KARYOS_E_INVALID_ARGUMENT, and so do roles the command
+# ring's largest record cannot carry (200 required ids). Roles whose
+# strategy is not the URI's fc are refused by the driver with
+# KARYOS_E_REFUSED, detail code 17 (StrategyConflict), before it looks
+# for a network. A karyos:ipc URI has no receivers:
+# KARYOS_E_UNSUPPORTED_CHANNEL, as is a consistent karyos:udp request to
+# this driver, which has no network (SPEC.md §10.2, §13).
+format 1
+id publication.roles.typed.statuses
+abi 0.1
+covers "typed status codes"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_connect driver=$driver
+expect KARYOS_OK client=$client
+call karyos_client_add_publication_with_roles client=$client stream_id=5 strategy=3
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 strategy=1 tagged_group=9
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 strategy=2 tagged_group=0
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 required="0"
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 required="77,77"
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 tags="88:0"
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 tags="88:9,88:8"
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 required=null required_count=1
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 required_fill=200
+expect KARYOS_E_INVALID_ARGUMENT
+call karyos_client_add_publication_with_roles client=$client stream_id=5 uri="karyos:udp?group=239.255.0.21:40001|fc=max" strategy=0 required="77"
+expect KARYOS_E_REFUSED code=17
+call karyos_client_add_publication_with_roles client=$client stream_id=5 uri="karyos:udp?group=239.255.0.21:40001" strategy=2 tagged_group=9
+expect KARYOS_E_REFUSED code=17
+call karyos_client_add_publication_with_roles client=$client stream_id=5 uri="karyos:ipc" required="77"
+expect KARYOS_E_UNSUPPORTED_CHANNEL
+call karyos_client_add_publication_with_roles client=$client stream_id=5 uri="karyos:udp?group=239.255.0.21:40001|fc=tagged:9" strategy=2 tagged_group=9 required="77" tags="88:9"
+expect KARYOS_E_UNSUPPORTED_CHANNEL
+call karyos_client_close client=$client
+expect KARYOS_OK
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

@@ -44,7 +44,7 @@ use crate::status::{Failure, Status};
 
 /// The protocol version of the embedded client and driver
 /// (`KARYOS_PROTOCOL_VERSION`).
-pub(crate) const PROTOCOL_VERSION: u64 = 2;
+pub(crate) const PROTOCOL_VERSION: u64 = 3;
 
 // The client and the driver of one build share karyos-protocol's version,
 // and the header documents it: a change of it is a change of this library.

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 /*
- * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.1.
+ * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.2.
  *
  * Written by hand until cbindgen is admitted; a test in karyos-ffi checks
  * it against the Rust source (quantstratum-docs:
@@ -101,7 +101,7 @@ extern "C" {
 
 #define KARYOS_ABI_VERSION_MAJOR 0
 #define KARYOS_ABI_VERSION_MINOR 1
-#define KARYOS_ABI_VERSION_PATCH 1
+#define KARYOS_ABI_VERSION_PATCH 2
 
 /** No handle names an object with this value. */
 #define KARYOS_NULL_HANDLE 0
@@ -176,6 +176,16 @@ extern "C" {
 #define KARYOS_ROLE_OBSERVER 2
 
 /**
+ * The strategy of a network publication's receivers
+ * (karyos_client_add_publication_with_roles; ABI 0.1.2): the slowest live
+ * receiver bounds the sender, the fastest, or the receivers of a tagged
+ * group. It must be the channel's fc (KARYOS_STRATEGY_MIN without one).
+ */
+#define KARYOS_STRATEGY_MIN 0
+#define KARYOS_STRATEGY_MAX 1
+#define KARYOS_STRATEGY_TAGGED 2
+
+/**
  * What follows an overrun of an optional or observer reader: delivery
  * goes on at the head; the subscription closes and its polls return
  * KARYOS_E_CLOSED_BY_OVERRUN; or the gap is recovered from an Archive and
@@ -214,7 +224,7 @@ extern "C" {
  * The protocol version an embedded client and its driver speak: both come
  * from this library's build.
  */
-#define KARYOS_PROTOCOL_VERSION 2
+#define KARYOS_PROTOCOL_VERSION 3
 
 /**
  * Publication modes of a stream (karyos_stream_options): one exclusive
@@ -832,6 +842,26 @@ int32_t karyos_client_add_subscription(uint64_t client, const char *uri,
                                        karyos_detail *detail);
 
 /**
+ * As karyos_client_add_publication on a karyos:udp channel, whose
+ * receivers have configured roles (ABI 0.1.2): strategy is a
+ * KARYOS_STRATEGY_* and must be the channel's fc (KARYOS_STRATEGY_MIN
+ * without one), or the driver refuses with KARYOS_E_REFUSED, detail code
+ * 17; tagged_group is the group of KARYOS_STRATEGY_TAGGED and 0 for the
+ * others. required holds required_count required receiver ids, and tags
+ * tag_count pairs of words, a receiver id and its tag (either may be null
+ * with a count of 0). An unknown strategy, a group that does not match
+ * it, a receiver id or tag of 0, a repeated receiver id, a null list with
+ * a count, or roles the command ring's largest record cannot carry is
+ * KARYOS_E_INVALID_ARGUMENT; a karyos:ipc URI is
+ * KARYOS_E_UNSUPPORTED_CHANNEL. Nothing is opened on failure.
+ */
+int32_t karyos_client_add_publication_with_roles(
+    uint64_t client, const char *uri, int32_t stream_id, uint32_t strategy,
+    uint64_t tagged_group, const uint64_t *required, size_t required_count,
+    const uint64_t *tags, size_t tag_count, uint64_t *publication,
+    karyos_detail *detail);
+
+/**
  * A subscription's role and rejoin policy, read by
  * karyos_client_add_subscription_with. Fill it with
  * karyos_subscription_options_init (KARYOS_ROLE_REQUIRED,
@@ -902,6 +932,25 @@ int32_t karyos_client_add_subscription_with(uint64_t client, const char *uri,
                                             const karyos_subscription_options *options,
                                             uint64_t *subscription,
                                             karyos_detail *detail);
+
+/**
+ * As karyos_client_add_subscription_with on a karyos:udp channel, whose
+ * images name a configured receiver identity (ABI 0.1.2): receiver_id
+ * (nonzero) in every RB block and group_tag in their status messages,
+ * what a publication's required receiver ids and tagged group name. A
+ * receiver_id of 0, or an Archive rejoin in options, is
+ * KARYOS_E_INVALID_ARGUMENT; a karyos:ipc URI is
+ * KARYOS_E_UNSUPPORTED_CHANNEL; another identity on the same endpoint and
+ * stream is KARYOS_E_REFUSED, detail code 15. Nothing stays open on
+ * failure.
+ */
+int32_t karyos_client_add_subscription_as(uint64_t client, const char *uri,
+                                          int32_t stream_id,
+                                          const karyos_subscription_options *options,
+                                          uint64_t receiver_id,
+                                          uint64_t group_tag,
+                                          uint64_t *subscription,
+                                          karyos_detail *detail);
 
 /**
  * Where a subscription's Archive rejoin stands. size is the caller's

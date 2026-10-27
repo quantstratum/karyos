@@ -333,6 +333,29 @@ pub(crate) fn add(
     })?
 }
 
+/// As [`add`], an exclusive network publication whose receivers have
+/// `roles` (owner item 7, karyos#637).
+///
+/// # Errors
+///
+/// As [`add`].
+pub(crate) fn add_with_roles(
+    client: Handle,
+    uri: &str,
+    stream_id: i32,
+    roles: &karyos_client::PublicationRoles,
+) -> Result<Handle, Failure> {
+    with_client(client, |entry| {
+        entry.usable()?;
+        let lanes = entry.client.add_publication_with_roles(
+            uri,
+            karyos_client::StreamId::new(stream_id),
+            roles,
+        )?;
+        insert(client, entry, lanes)
+    })?
+}
+
 /// Opens a handle over `lanes` of `client`, whose `entry` lists it.
 ///
 /// # Errors
