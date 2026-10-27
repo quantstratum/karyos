@@ -211,3 +211,274 @@ fn test_delivery_a_restarted_server_rebuilds_its_container_from_the_log() {
     assert_eq!(server(&sim, 2).container().service(), &before);
     replicas_agree(&sim, 3);
 }
+
+// Forwarding and unknown outcomes (karyos#686, part 3). The reference core
+// never changes leader, so a loss of leadership is played by `Deposable`:
+// the reference core, whose node can be told it no longer leads, in a
+// later term, while the core underneath goes on replicating. A request it
+// took may then still commit, which is the case an unknown outcome is for.
+
+mod deposable {
+    use std::cell::Cell;
+
+    use karyos_sim::harness::core::{ConsensusCore, LogView, NotLeader, Persisted, Ready};
+    use karyos_sim::harness::reference::{Message, Reference};
+    use karyos_sim::net::NodeId;
+
+    thread_local! {
+        static DEPOSED: Cell<Option<NodeId>> = const { Cell::new(None) };
+        static TERMS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// `node` stops leading, until [`restore`].
+    pub fn depose(node: NodeId) {
+        DEPOSED.with(|deposed| deposed.set(Some(node)));
+        TERMS.with(|terms| terms.set(terms.get() + 1));
+    }
+
+    /// The deposed node leads again, in a later term.
+    pub fn restore() {
+        DEPOSED.with(|deposed| deposed.set(None));
+        TERMS.with(|terms| terms.set(terms.get() + 1));
+    }
+
+    fn deposed(node: NodeId) -> bool {
+        DEPOSED.with(Cell::get) == Some(node)
+    }
+
+    /// The reference core, deposable.
+    pub struct Deposable {
+        id: NodeId,
+        inner: Reference,
+    }
+
+    impl ConsensusCore for Deposable {
+        type Message = Message;
+
+        fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+            Self {
+                id,
+                inner: Reference::recover(id, peers, log),
+            }
+        }
+
+        fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
+            if deposed(self.id) {
+                // A deposed leader knows of no leader.
+                return Err(NotLeader { leader: None });
+            }
+            self.inner.propose(command, log)
+        }
+
+        fn step(&mut self, from: NodeId, message: Message, log: &mut LogView<'_>) {
+            self.inner.step(from, message, log);
+        }
+
+        fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
+            self.inner.tick(now, log);
+        }
+
+        fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+            self.inner.ready(log)
+        }
+
+        fn advance(&mut self, persisted: Persisted, log: &mut LogView<'_>) {
+            self.inner.advance(persisted, log);
+        }
+
+        fn term(&self) -> u64 {
+            self.inner.term() + TERMS.with(Cell::get)
+        }
+
+        fn leads(&self) -> bool {
+            self.inner.leads() && !deposed(self.id)
+        }
+
+        fn received(&self) -> Option<u64> {
+            self.inner.received()
+        }
+
+        fn committed(&self) -> Option<u64> {
+            self.inner.committed()
+        }
+    }
+}
+
+use deposable::{Deposable, depose, restore};
+
+type Movable = DeliveryMember<Deposable, AppendService>;
+type MovableSim = ClusterSim<Movable, Delivery<Message>>;
+
+/// `servers` deposable servers and one client sending `commands` to
+/// `to`.
+fn movable(
+    seed: u64,
+    servers: u32,
+    to: NodeId,
+    commands: Vec<Vec<u8>>,
+    deadline: u64,
+) -> (MovableSim, NodeId) {
+    let mut sim = MovableSim::new("delivery", seed, LinkConfig::default()).unwrap();
+    for id in 0..servers {
+        let server = DeliveryServer::new(
+            id,
+            (0..servers).collect(),
+            SimDisk::new(),
+            Survives::Synced,
+            Geometry::new(4096, 4096).unwrap(),
+            AppendService::default(),
+            config(),
+        )
+        .unwrap();
+        assert_eq!(
+            sim.add_node(Movable::Server(Box::new(server)), 0, 0)
+                .unwrap(),
+            id
+        );
+    }
+    let client = DeliveryClient::new(servers, to, commands).with_deadline(deadline);
+    assert_eq!(
+        sim.add_node(Movable::Client(client), 0, 0).unwrap(),
+        servers
+    );
+    (sim, servers)
+}
+
+fn movable_server(sim: &MovableSim, id: NodeId) -> &DeliveryServer<Deposable, AppendService> {
+    sim.node(id).and_then(Movable::server).unwrap()
+}
+
+fn movable_client(sim: &MovableSim, id: NodeId) -> &DeliveryClient {
+    sim.node(id).and_then(Movable::client).unwrap()
+}
+
+/// Steps until `until` holds, at most `steps` times.
+fn run_until(sim: &mut MovableSim, steps: u64, until: impl Fn(&MovableSim) -> bool) {
+    for _ in 0..steps {
+        if until(sim) {
+            return;
+        }
+        sim.step().unwrap();
+    }
+    panic!("not reached in {steps} steps");
+}
+
+#[test]
+fn test_delivery_a_request_to_a_follower_is_forwarded_and_answered() {
+    for servers in [3, 5] {
+        for seed in scenarios::seeds() {
+            let follower = servers - 1;
+            let (mut sim, client) = movable(seed, servers, follower, values(&[4, 5]), DEADLINE_OFF);
+            sim.run_for(800).unwrap();
+            let client = movable_client(&sim, client);
+            assert!(client.done(), "{servers} servers, seed {seed}");
+            assert_eq!(client.answers(), [(0, count(1)), (1, count(2))]);
+            // Forwarded, not redirected: the client never left the follower.
+            assert_eq!(client.server(), follower);
+            assert_eq!(client.retries(), 0);
+            assert_eq!(
+                movable_server(&sim, LEADER).container().service().values,
+                [4, 5]
+            );
+        }
+    }
+}
+
+/// A deadline no test reaches.
+const DEADLINE_OFF: u64 = u64::MAX;
+
+/// The number of times `value` was applied on `server`.
+fn applied_times(sim: &MovableSim, server: NodeId, value: u64) -> usize {
+    movable_server(sim, server)
+        .container()
+        .service()
+        .values
+        .iter()
+        .filter(|applied| **applied == value)
+        .count()
+}
+
+/// A leader that stops leading with a request pending answers it
+/// `Unknown`, not a failure; the client retries the same epoch and
+/// sequence, and once a leader takes it again the session table answers
+/// it. The command runs once.
+fn deposed_with_a_request_pending(servers: u32, to: NodeId) {
+    for seed in scenarios::seeds() {
+        let (mut sim, client) = movable(seed, servers, to, values(&[42]), DEADLINE_OFF);
+        // Until the leader holds the request, uncommitted.
+        run_until(&mut sim, 2000, |sim| {
+            movable_server(sim, LEADER).pending_requests() > 0
+        });
+        depose(LEADER);
+        run_until(&mut sim, 2000, |sim| {
+            movable_client(sim, client).unknowns() > 0
+        });
+        assert!(
+            movable_client(&sim, client).answers().is_empty(),
+            "no guess"
+        );
+        sim.run_for(200).unwrap();
+        restore();
+        sim.run_for(1500).unwrap();
+        let answered = movable_client(&sim, client);
+        assert!(answered.done(), "{servers} servers, seed {seed}");
+        let [(0, answer)] = answered.answers() else {
+            panic!("{:?}", answered.answers());
+        };
+        assert!(
+            matches!(answer, Answer::Applied(_) | Answer::Retained(_)),
+            "{answer:?}"
+        );
+        assert_eq!(
+            *answer.reply(),
+            1u64.to_le_bytes(),
+            "{servers} servers, seed {seed}"
+        );
+        for server in 0..servers {
+            assert_eq!(
+                applied_times(&sim, server, 42),
+                1,
+                "server {server}, seed {seed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_delivery_a_deposed_leader_answers_unknown_and_the_retry_is_deduplicated() {
+    for servers in [3, 5] {
+        deposed_with_a_request_pending(servers, LEADER);
+    }
+}
+
+/// karyos#686, condition 3: the leader changes while a forward is in
+/// flight; the follower relays `Unknown`, the client retries through it,
+/// and the command never runs twice.
+#[test]
+fn test_delivery_a_leader_change_with_a_forward_in_flight_never_applies_twice() {
+    for servers in [3, 5] {
+        deposed_with_a_request_pending(servers, servers - 1);
+    }
+}
+
+#[test]
+fn test_delivery_a_request_unresolved_at_its_deadline_is_unknown() {
+    let (mut sim, client) = movable(1, 3, LEADER, values(&[9, 10]), 1000);
+    run_until(&mut sim, 2000, |sim| {
+        movable_server(sim, LEADER).pending_requests() > 0
+    });
+    // Deposed for good: nothing resolves the request.
+    depose(LEADER);
+    sim.run_for(3000).unwrap();
+    let client = movable_client(&sim, client);
+    assert!(client.done());
+    assert_eq!(
+        client.answers(),
+        [(0, Answer::Unknown), (1, Answer::Unknown)]
+    );
+    // The first may have applied, never twice; the second never reached a
+    // leader.
+    assert!(applied_times(&sim, LEADER, 9) <= 1);
+    assert_eq!(applied_times(&sim, LEADER, 10), 0);
+    restore();
+}
