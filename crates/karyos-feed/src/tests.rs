@@ -587,3 +587,48 @@ fn the_configuration_is_checked() {
         Some(ConfigError::Modulus)
     );
 }
+
+/// While an old epoch's hole is open, a new-epoch message beyond the
+/// second buffer, or a message of a third epoch, closes it at once: the
+/// hole is a gap.
+#[test]
+fn an_open_old_epoch_closes_on_overflow_or_a_third_epoch() {
+    // Overflow of the waiting buffer (capacity 8).
+    let mut arbiter = plain();
+    let mut out = Vec::new();
+    for sequence in [1, 3] {
+        push(&mut arbiter, &mut out, Line::A, 1, sequence, 0);
+    }
+    push(&mut arbiter, &mut out, Line::A, 2, 1, 0);
+    push(&mut arbiter, &mut out, Line::A, 2, 9, 0);
+    assert!(out.contains(&Out::Gap(1, 2, 1)));
+    assert!(out.contains(&Out::Epoch(1, 2)));
+    assert_eq!(sequences(&out), vec![1, 3, 1]);
+    assert_eq!(
+        arbiter.position(),
+        Some(Identity {
+            epoch: 2,
+            sequence: 2
+        })
+    );
+
+    // A third epoch.
+    let mut arbiter = plain();
+    let mut out = Vec::new();
+    for sequence in [1, 3] {
+        push(&mut arbiter, &mut out, Line::A, 1, sequence, 0);
+    }
+    push(&mut arbiter, &mut out, Line::A, 2, 1, 0);
+    push(&mut arbiter, &mut out, Line::A, 3, 1, 0);
+    assert_eq!(
+        out.iter().skip(1).cloned().collect::<Vec<_>>(),
+        vec![
+            Out::Gap(1, 2, 1),
+            Out::Message(Line::A, 1, 3, message(1, 3, b"p")),
+            Out::Epoch(1, 2),
+            Out::Message(Line::A, 2, 1, message(2, 1, b"p")),
+            Out::Epoch(2, 3),
+            Out::Message(Line::A, 3, 1, message(3, 1, b"p")),
+        ]
+    );
+}
