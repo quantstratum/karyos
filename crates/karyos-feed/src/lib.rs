@@ -59,7 +59,7 @@ pub trait FeedSequencer {
     /// as `unsequenced` and not delivered.
     fn identity(&self, message: &[u8]) -> Option<Identity>;
 
-    /// The sequence space when the sequence wraps, at least 4; `None` when
+    /// The sequence space when the sequence wraps, at least 5; `None` when
     /// it never does (a `u64` that only grows). A sequence at or above the
     /// modulus is a [`Event::Jump`].
     fn sequence_modulus(&self) -> Option<NonZeroU64>;
@@ -119,7 +119,10 @@ pub enum Start {
     #[default]
     AtFirst,
     /// Holds messages and delivers nothing until [`Arbiter::resync`], for
-    /// a consumer that recovers through a snapshot.
+    /// a consumer that recovers through a snapshot. The buffer is anchored
+    /// at the first sequenced message seen: later ones are held, the oldest
+    /// discarded when it is full, and earlier ones arriving afterwards are
+    /// late.
     AwaitingResync,
 }
 
@@ -147,7 +150,7 @@ pub enum ConfigError {
     Capacity,
     /// The capacity is not below the sequence window.
     CapacityAboveWindow,
-    /// The modulus is below 4, which leaves no window.
+    /// The modulus is below 5, whose window cannot hold a buffer of one.
     Modulus,
     /// The arena does not fit in memory.
     Arena,
@@ -158,7 +161,7 @@ impl std::fmt::Display for ConfigError {
         f.write_str(match self {
             Self::Capacity => "the capacity must be a power of two",
             Self::CapacityAboveWindow => "the capacity must be below the sequence window",
-            Self::Modulus => "the sequence modulus must be at least 4",
+            Self::Modulus => "the sequence modulus must be at least 5",
             Self::Arena => "capacity times max_message_length overflows",
         })
     }
@@ -321,7 +324,7 @@ impl<S: FeedSequencer> Arbiter<S> {
     /// below the window, a modulus below 4, or an arena that overflows.
     pub fn new(sequencer: S, config: ArbiterConfig) -> Result<Self, ConfigError> {
         let max = match sequencer.sequence_modulus() {
-            Some(modulus) if modulus.get() < 4 => return Err(ConfigError::Modulus),
+            Some(modulus) if modulus.get() < 5 => return Err(ConfigError::Modulus),
             Some(modulus) => modulus.get() - 1,
             None => u64::MAX,
         };
