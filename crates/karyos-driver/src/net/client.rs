@@ -108,9 +108,9 @@ fn refusal(error: DriverError) -> ErrorCode {
         DriverError::ReliabilityMismatch => ErrorCode::ReliabilityMismatch,
         DriverError::ReceiverIdentityMismatch => ErrorCode::ReceiverIdentityMismatch,
         DriverError::StrategyConflict => ErrorCode::StrategyConflict,
-        // Decoding refuses a zero, repeated or tag-0 entry, so what is
-        // left is a list longer than the membership holds: a limit.
-        DriverError::InvalidRoles => ErrorCode::ResourcesUnavailable,
+        // A list longer than the membership holds, or a repeated
+        // `receiver_id`: invalid roles, which no retry grants.
+        DriverError::InvalidRoles => ErrorCode::InvalidRoles,
         _ => ErrorCode::ResourcesUnavailable,
     }
 }

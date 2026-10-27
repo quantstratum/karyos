@@ -173,10 +173,10 @@
 //! words, a `receiver_id` (nonzero) and its tag (nonzero):
 //! `6 + ceil(L / 8) + R + 2T` words in all, `L` the URI's length. A zero
 //! there is malformed. A `receiver_id` repeated among the required ids,
-//! or among the pairs, is `Error` with `ResourcesUnavailable`: the driver
-//! checks `R` and `T` against its membership's `max_receivers` first, then
-//! the repeats, so decoding stays linear and a list longer than the
-//! membership costs the driver no traversal (karyos#637).
+//! or among the pairs, is `Error` with `InvalidRoles` (code 18), as is an
+//! `R` or a `T` above the membership's `max_receivers`: the driver checks
+//! the counts first, then the repeats, so decoding stays linear and a list
+//! longer than the membership costs the driver no traversal (karyos#637).
 //! `AddNetworkSubscriptionAs` is exactly `6 + ceil(L / 8)` words. Flags,
 //! role and URI follow their `AddNetworkPublication` and
 //! `AddNetworkSubscription` rules; a concurrent handle is refused with
@@ -186,7 +186,8 @@
 //! `R + 2T` is the command ring's largest record (`ring_capacity / 8`):
 //! a client refuses a command that does not fit before sending it
 //! (`CommandTooLarge`), and the driver checks the roles against its
-//! membership's `max_receivers`. No other numeric limit applies.
+//! membership's `max_receivers` (`InvalidRoles`). No other numeric limit
+//! applies.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -1139,6 +1140,11 @@ pub enum ErrorCode {
     /// A network publication's roles name another strategy than its URI's
     /// `fc`, the one source of the strategy (owner item 7, karyos#637).
     StrategyConflict,
+    /// A network publication's roles are invalid for the driver: more
+    /// required, or more tagged, receivers than its membership holds, or
+    /// a repeated `receiver_id` (karyos#637). Retrying the same roles
+    /// never succeeds.
+    InvalidRoles,
 }
 
 impl ErrorCode {
@@ -1163,6 +1169,7 @@ impl ErrorCode {
             Self::ReceiverIdentityMismatch => 15,
             Self::LaneMismatch => 16,
             Self::StrategyConflict => 17,
+            Self::InvalidRoles => 18,
         }
     }
 
@@ -1185,6 +1192,7 @@ impl ErrorCode {
             15 => Self::ReceiverIdentityMismatch,
             16 => Self::LaneMismatch,
             17 => Self::StrategyConflict,
+            18 => Self::InvalidRoles,
             _ => return None,
         })
     }
@@ -3528,6 +3536,18 @@ mod tests {
         assert_eq!(Command::decode(0x13, &good), Ok(identity));
     }
 
+    /// karyos#637: the roles' refusals keep their wire values.
+    #[test]
+    fn roles_error_codes_are_17_and_18() {
+        for (code, word) in [
+            (ErrorCode::StrategyConflict, 17),
+            (ErrorCode::InvalidRoles, 18),
+        ] {
+            assert_eq!(code.code(), word);
+            assert_eq!(ErrorCode::from_code(word), Some(code));
+        }
+    }
+
     /// karyos#637: roles are bounded by the buffer they are encoded into
     /// (the command ring's largest record), and by nothing else: a list too
     /// long for the buffer, or for its 16-bit count, is refused as a buffer
@@ -4868,7 +4888,7 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(18), None);
+        assert_eq!(ErrorCode::from_code(19), None);
     }
 
     /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
@@ -5056,9 +5076,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 18 is not defined.
+        // Error code 19 is not defined.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 18, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 19, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }
@@ -5583,6 +5603,8 @@ mod properties {
                 ErrorCode::ReliabilityMismatch,
                 ErrorCode::ReceiverIdentityMismatch,
                 ErrorCode::LaneMismatch,
+                ErrorCode::StrategyConflict,
+                ErrorCode::InvalidRoles,
             ][..],
         );
         prop_oneof![

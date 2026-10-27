@@ -51,7 +51,9 @@ release may break APIs, wire formats and shared-memory layouts.
   QS-COORDINATOR under owner delegation).
   - Two new CnC commands: `AddNetworkPublicationWithRoles` (0x12) and
     `AddNetworkSubscriptionAs` (0x13). The layout is in `karyos_protocol::cnc`.
-  - The new error code is `StrategyConflict` (17).
+  - The new error codes are `StrategyConflict` (17) and `InvalidRoles` (18):
+    roles longer than the driver's membership holds, or a repeated
+    `receiver_id`.
   - Rust client: `ClientConductor::add_network_publication_with_roles`,
     `ClientConductor::add_network_subscription_as`,
     `Client::add_exclusive_publication_with_roles` and
@@ -71,7 +73,8 @@ release may break APIs, wire formats and shared-memory layouts.
     membership's `max_receivers` before it reads either list, then finds
     repeats by sorting a copy in a stack buffer of that size: O(n log n),
     allocating nothing. The decoder refuses a zero `receiver_id` or tag; a
-    repeated `receiver_id` is `Error` with `ResourcesUnavailable`.
+    repeated `receiver_id`, like a list too long, is `Error` with
+    `InvalidRoles`.
 
 - A conflated view of a network image has a public way in, the embedded
   driver's, as IPC views in a process have (owner item 7: "receiver-side

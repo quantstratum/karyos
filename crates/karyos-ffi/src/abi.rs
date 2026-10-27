@@ -1517,7 +1517,9 @@ unsafe fn read_words<'a>(words: *const u64, count: usize) -> Result<&'a [u64], S
 /// unknown strategy, a group that does not match it, a `receiver_id` or tag
 /// of 0, a repeated `receiver_id`, or a null list with a count, is
 /// `KARYOS_E_INVALID_ARGUMENT`, as are roles the command ring's largest
-/// record cannot carry. A `karyos:ipc` URI is
+/// record cannot carry. More required, or more tagged, receivers than the
+/// driver's membership holds is `KARYOS_E_REFUSED`, detail code 18
+/// (`InvalidRoles`). A `karyos:ipc` URI is
 /// `KARYOS_E_UNSUPPORTED_CHANNEL`. A control call, as
 /// `karyos_client_add_publication`; on failure nothing is opened and
 /// `detail` (may be null) receives the failure's detail.

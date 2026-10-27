@@ -300,7 +300,7 @@ fn flow_control_is_granted_by_uri() {
 /// one), and refused with `StrategyConflict` otherwise, whichever way
 /// round; a `karyos:ipc` URI has no receivers and is refused with
 /// `UnsupportedChannel`. Roles a membership cannot hold (more required ids
-/// than `DEFAULT_MAX_RECEIVERS`) are refused as a limit.
+/// than `DEFAULT_MAX_RECEIVERS`) are refused with `InvalidRoles`.
 #[test]
 fn roles_travel_by_command_and_must_name_the_fc() {
     use karyos_protocol::roles::{PublicationRoles, Strategy};
@@ -385,7 +385,7 @@ fn roles_travel_by_command_and_must_name_the_fc() {
     assert!(matches!(
         take(&mut outcomes, many),
         Outcome::Refused {
-            code: ErrorCode::ResourcesUnavailable,
+            code: ErrorCode::InvalidRoles,
             ..
         }
     ));

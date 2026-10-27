@@ -3553,8 +3553,8 @@ mod tests {
     }
 
     /// karyos#637 review: a repeated `receiver_id` decodes, so the decoder
-    /// stays linear, and the driver refuses it with `ResourcesUnavailable`
-    /// once it has bounded the counts; the client is served, not retired.
+    /// stays linear, and the driver refuses it with `InvalidRoles` once it
+    /// has bounded the counts; the client is served, not retired.
     #[test]
     fn a_repeated_receiver_is_refused_by_the_driver() {
         use karyos_protocol::cnc::ErrorCode;
@@ -3590,7 +3590,7 @@ mod tests {
         assert!(matches!(
             responses(&mut observer)[..],
             [Response::Error {
-                code: ErrorCode::ResourcesUnavailable,
+                code: ErrorCode::InvalidRoles,
                 ..
             }]
         ));
