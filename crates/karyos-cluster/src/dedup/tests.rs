@@ -60,18 +60,54 @@ fn owned(outcome: Outcome<'_>) -> Outcome<'static> {
     }
 }
 
+fn bounds(config: DedupConfig) -> (u32, u32, u32, u64) {
+    (
+        config.sessions,
+        config.window,
+        config.response_bytes,
+        config.ttl,
+    )
+}
+
 #[test]
 fn the_defaults_are_the_proposal() {
-    let config = DedupConfig::default();
     assert_eq!(
-        (
-            config.sessions,
-            config.window,
-            config.response_bytes,
-            config.ttl
-        ),
+        bounds(DedupConfig::default()),
+        (64, 64, 8192, 60_000_000_000)
+    );
+    assert_ne!(DedupConfig::default(), DedupConfig::large());
+    assert!(
+        DedupConfig::default().reserved_bytes().unwrap() < 64 << 20,
+        "the default reserves less than 64 MiB"
+    );
+}
+
+#[test]
+fn the_large_profile_is_the_proposal() {
+    assert_eq!(
+        bounds(DedupConfig::large()),
         (1024, 64, 8192, 60_000_000_000)
     );
+}
+
+/// What a table allocates, from its vectors.
+fn allocated(table: &SessionTable) -> u64 {
+    (table.sessions.capacity() * size_of::<Session>()
+        + table.stored.capacity() * size_of::<Stored>()
+        + table.replies.capacity()) as u64
+}
+
+#[test]
+fn each_profile_reserves_its_published_budget() {
+    for (config, published) in [
+        (DedupConfig::default(), 33_590_272),
+        (DedupConfig::large(), 537_444_352),
+        (small(), 4 * 48 + 12 * 8 + 12 * 8),
+    ] {
+        assert_eq!(config.reserved_bytes(), Some(published), "{config:?}");
+        let table = SessionTable::new(config).unwrap();
+        assert_eq!(allocated(&table), published, "{config:?}");
+    }
 }
 
 #[test]

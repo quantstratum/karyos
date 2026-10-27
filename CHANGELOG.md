@@ -144,6 +144,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos_cluster::dedup::DedupConfig::default()` is no longer the
+  512 MiB configuration (karyos#692; item 37 of the decisions of
+  2026-10-21, a named large profile rather than a hidden default). The
+  default profile keeps 64 replies of 8 KiB and the 60 s TTL for 64
+  sessions, 33,590,272 bytes per replica; `DedupConfig::large()` is the
+  1024 × 64 × 8 KiB profile, 537,444,352 bytes per replica.
+  `DedupConfig::reserved_bytes()` publishes what `SessionTable::new`
+  reserves, metadata included, and a test checks it against the
+  allocation. `DEFAULT_SESSIONS` is 64; `LARGE_SESSIONS` is 1024.
+  A deployment that needs more than 64 sessions names
+  `DedupConfig::large()`; with `default()`, the 65th live session is
+  `RegisterError::SessionsExhausted`. The numbers stay provisional until
+  plan issue 069 (karyos#685) measures them.
+
 - A channel URI list that names one address in two spellings is refused as a
   repetition: `destinations=10.0.0.5:1;[::ffff:10.0.0.5]:1` and
   `paths=10.0.0.7;::ffff:10.0.0.7` are now `InvalidValue`, as an exact repeat
