@@ -495,6 +495,12 @@ pub trait Connection: sealed::Sealed {
     ) -> Result<u64, ConductorError>;
 
     #[doc(hidden)]
+    fn network_admission(
+        &self,
+        registration: u64,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission>;
+
+    #[doc(hidden)]
     fn add_network_publication_with_roles(
         &mut self,
         uri: &str,
@@ -639,6 +645,13 @@ impl Connection for ClientConductor {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         ClientConductor::add_network_subscription(self, uri, stream_id, role)
+    }
+
+    fn network_admission(
+        &self,
+        registration: u64,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission> {
+        ClientConductor::network_admission(self, registration)
     }
 
     fn add_network_publication_with_roles(
@@ -815,6 +828,13 @@ impl Connection for crate::ipc::RemoteClient {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         crate::ipc::RemoteClient::add_network_subscription(self, uri, stream_id, role)
+    }
+
+    fn network_admission(
+        &self,
+        registration: u64,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission> {
+        crate::ipc::RemoteClient::network_admission(self, registration)
     }
 
     fn add_network_publication_with_roles(
@@ -1357,6 +1377,35 @@ impl<C: Connection> Client<C> {
             return Err(refused);
         }
         Ok(Publication::new(lanes))
+    }
+
+    /// The admission state of `publication`, a network publication of
+    /// this client, as its sender last observed it (owner item 7,
+    /// karyos#637): `Open`; `NotJoined` while a configured required
+    /// receiver has not joined; `LostRequired` once one is lost. `None`
+    /// until the driver reports it, for a publication that is not a
+    /// network one, and after this client lapped the driver's broadcast
+    /// until the state is sent again. It is the last state observed, not a
+    /// list of transitions. Offers keep the existing outcome mapping:
+    /// under `NotJoined` and `LostRequired` the sender stages nothing, so
+    /// the publication fills its window and offers answer
+    /// `OfferError::BackPressured`, never a terminal outcome.
+    #[must_use]
+    pub fn network_admission(
+        &self,
+        publication: &Publication<C::Terms>,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission> {
+        self.network_admission_of(publication.registration()?)
+    }
+
+    /// As [`Client::network_admission`], of the publication whose grant is
+    /// `registration` ([`Publication::registration`]).
+    #[must_use]
+    pub fn network_admission_of(
+        &self,
+        registration: u64,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission> {
+        self.connection.network_admission(registration)
     }
 
     /// A concurrent publication of `stream_id` on the `karyos:ipc` channel

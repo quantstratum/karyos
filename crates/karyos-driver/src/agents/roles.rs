@@ -4500,7 +4500,11 @@ impl<T: StreamTerms> SenderRole<T> {
     /// Stores each publication's changed counts into its CnC cells, at
     /// the end of a duty cycle (M2b).
     pub(crate) fn publish_stream_cells(&mut self) {
+        // Each publication's admission state too (karyos#637), observed
+        // at one reading of the clock.
+        let now = karyos_sys::host_clock::host_monotonic_ns();
         for outbound in &mut self.publications {
+            outbound.observe_admission(now);
             outbound.publish_cells();
         }
     }

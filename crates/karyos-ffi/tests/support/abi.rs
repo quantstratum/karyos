@@ -348,6 +348,7 @@ unsafe extern "C" {
         publication: *mut u64,
         detail: *mut Detail,
     ) -> i32;
+    fn karyos_publication_network_admission(publication: u64, admission: *mut u32) -> i32;
     fn karyos_client_add_subscription_as(
         client: u64,
         uri: *const c_char,
@@ -840,6 +841,21 @@ pub fn claim_abort(claim: u64) -> i32 {
 /// `karyos_publication_close`.
 pub fn publication_close(publication: u64) -> i32 {
     karyos_publication_close(publication)
+}
+
+/// `karyos_publication_network_admission`: the status and the code
+/// written, or `u32::MAX` where nothing was; with `null`, a null pointer
+/// (karyos#637).
+pub fn publication_network_admission(publication: u64, null: bool) -> (i32, u32) {
+    let mut admission = u32::MAX;
+    let out = if null {
+        core::ptr::null_mut()
+    } else {
+        &raw mut admission
+    };
+    // SAFETY: null or a live, aligned, writable `u32`.
+    let status = unsafe { karyos_publication_network_admission(publication, out) };
+    (status, admission)
 }
 
 /// `karyos_stream_options_init` with `stream_id` set: the status and the

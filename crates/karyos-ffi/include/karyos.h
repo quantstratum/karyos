@@ -186,6 +186,18 @@ extern "C" {
 #define KARYOS_STRATEGY_TAGGED 2
 
 /**
+ * A network publication's admission state
+ * (karyos_publication_network_admission; ABI 0.1.2): unknown (before the
+ * driver reports one, after a lap until it does again, or not a network
+ * publication), open, a configured required receiver not joined, or one
+ * lost.
+ */
+#define KARYOS_ADMISSION_UNKNOWN 0
+#define KARYOS_ADMISSION_OPEN 1
+#define KARYOS_ADMISSION_NOT_JOINED 2
+#define KARYOS_ADMISSION_LOST_REQUIRED 3
+
+/**
  * What follows an overrun of an optional or observer reader: delivery
  * goes on at the head; the subscription closes and its polls return
  * KARYOS_E_CLOSED_BY_OVERRUN; or the gap is recovered from an Archive and
@@ -860,6 +872,17 @@ int32_t karyos_client_add_publication_with_roles(
     uint64_t tagged_group, const uint64_t *required, size_t required_count,
     const uint64_t *tags, size_t tag_count, uint64_t *publication,
     karyos_detail *detail);
+
+/**
+ * Writes the admission state of a network publication through admission,
+ * a KARYOS_ADMISSION_* (ABI 0.1.2): the last state its sender observed, as
+ * its client last heard it, not a list of transitions. Offers keep their
+ * outcomes: under not joined and lost required they answer
+ * KARYOS_E_BACK_PRESSURED once the window is full. A null admission is
+ * KARYOS_E_INVALID_ARGUMENT.
+ */
+int32_t karyos_publication_network_admission(uint64_t publication,
+                                             uint32_t *admission);
 
 /**
  * A subscription's role and rejoin policy, read by

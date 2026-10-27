@@ -408,6 +408,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .publication_state(aggregate.registration())
     }
 
+    /// The admission state of the network publication `aggregate`, as its
+    /// sender last observed it (owner item 7, karyos#637): `Open`,
+    /// `NotJoined` while a configured required receiver has not joined, or
+    /// `LostRequired` once one is lost. `None` before the sender's first
+    /// cycle, and for an aggregate that is not a network publication. It is
+    /// the last state observed, not a list of transitions: the membership
+    /// counters count those. Offers keep the existing outcome mapping:
+    /// under `NotJoined` and `LostRequired` the sender stages nothing, so
+    /// the publication fills its window and offers answer `BackPressured`.
+    #[must_use]
+    pub fn network_publication_admission(
+        &self,
+        aggregate: &AggregateHandle,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission> {
+        self.net
+            .as_ref()?
+            .publication_admission(aggregate.registration())
+    }
+
     /// Guards every lane stream of `handle` with `guard`, unless a
     /// reincarnation already did (`guarded`), and registers the
     /// publication's sender gate with the guard's owner: the spec the

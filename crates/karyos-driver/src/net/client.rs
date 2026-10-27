@@ -79,6 +79,9 @@ pub(crate) struct OwnedNetwork {
     pub(crate) registration: u64,
     pub(crate) client: u64,
     pub(crate) owned: Owned,
+    /// The admission state's code last sent for a publication
+    /// (`PublicationAdmission`, karyos#637); 0 before the first.
+    pub(crate) admission_sent: u64,
 }
 
 /// One word of the system's random source; `None` when it fails.
@@ -343,6 +346,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     registration,
                     client,
                     owned: Owned::Publication(handle),
+                    admission_sent: 0,
                 });
             }
             // Nothing was granted: nothing may stay.
@@ -513,12 +517,91 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 handle,
                 announced: false,
             },
+            admission_sent: 0,
         });
         Ok(Response::NetworkSubscriptionReady {
             request,
             registration,
             bound,
         })
+    }
+
+    /// Sends the admission state of each network publication a client
+    /// owns when it differs from the one last sent (`PublicationAdmission`,
+    /// owner item 7, karyos#637): the last state observed, not each
+    /// transition. Run every cycle; a load and a compare per publication,
+    /// no allocation. An event the broadcast buffer cannot take is sent on
+    /// a later cycle.
+    pub(crate) fn send_network_admissions(&mut self) {
+        for index in 0..self.net_owned.len() {
+            let Some(owned) = self.net_owned.get(index).copied() else {
+                continue;
+            };
+            if let Owned::Publication(handle) = owned.owned {
+                self.send_admission(index, handle, owned.registration, false);
+            }
+        }
+    }
+
+    /// Sends again the admission state of `client`'s network publication
+    /// `registration`, if it is one with a state: before the answer to a
+    /// `QueryCutover`, so a client that lapped the broadcast buffer
+    /// resynchronizes (karyos#637).
+    pub(crate) fn resend_network_admission(&mut self, client: u64, registration: u64) {
+        let found = self.net_owned.iter().position(|owned| {
+            owned.client == client
+                && owned.registration == registration
+                && matches!(owned.owned, Owned::Publication(_))
+        });
+        if let Some(index) = found
+            && let Some(Owned::Publication(handle)) =
+                self.net_owned.get(index).map(|owned| owned.owned)
+        {
+            self.send_admission(index, handle, registration, true);
+        }
+    }
+
+    /// Sends `net_owned[index]`'s publication state, when it changed or
+    /// with `again`.
+    fn send_admission(
+        &mut self,
+        index: usize,
+        handle: AggregateHandle,
+        registration: u64,
+        again: bool,
+    ) {
+        let Some(state) = self
+            .net
+            .as_ref()
+            .and_then(|net| net.publication_admission(handle.registration()))
+        else {
+            return;
+        };
+        let sent = self.net_owned.get(index).map(|owned| owned.admission_sent);
+        if !again && sent == Some(state.code()) {
+            return;
+        }
+        let Some(stream) = self
+            .streams
+            .iter()
+            .find(|stream| stream.id == handle.registration())
+            .map(|stream| StreamKey {
+                stream_id: stream.stream_id,
+                session_id: stream.session_id,
+            })
+        else {
+            return;
+        };
+        let event = karyos_protocol::cnc::Event::PublicationAdmission {
+            stream,
+            registration,
+            admission: state,
+        };
+        if self.try_emit(&event)
+            && let Some(owned) = self.net_owned.get_mut(index)
+        {
+            owned.admission_sent = state.code();
+        }
     }
 
     /// Removes the network subscription `registration` of `client`;

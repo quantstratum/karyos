@@ -1140,11 +1140,15 @@ pub(crate) const SENDER_CELLS: [&str; 5] = [
 /// M2b), keyed by its stream's registration: datagrams and their bytes
 /// staged for sending (PAD and ABORTED records included), repair
 /// datagrams submitted, and NAKs received.
-pub(crate) const PUBLICATION_CELLS: [&str; 4] = [
+pub(crate) const PUBLICATION_CELLS: [&str; 5] = [
     "network frames sent",
     "network bytes sent",
     "network retransmits",
     "network naks received",
+    // A gauge, not a count: the admission state's code, 0 before the
+    // sender's first cycle, then 1 open, 2 not joined, 3 lost required
+    // (karyos#637).
+    "network admission",
 ];
 
 /// A network image's counters in the CnC (M2b), keyed by its stream's

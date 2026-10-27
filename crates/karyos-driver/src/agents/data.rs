@@ -60,6 +60,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use karyos_io::backend::{
     Authority, BackendEpoch, Commit, Exposure, GateDecision, RouteId, SenderGate, SenderToken,
@@ -365,6 +366,14 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     /// Its counters' CnC cells (M2b), when the region had room for them:
     /// the sender agent is their only writer.
     cells: Option<crate::agents::AgentCells>,
+    /// Its admission state's code as the last cycle observed it
+    /// ([`karyos_protocol::cnc::NetworkAdmission::code`]; 0 before the
+    /// first), stored for the conductor in the slot it shares, and in the
+    /// `network admission` cell (owner item 7, karyos#637).
+    admission: u8,
+    /// The slot the conductor reads the admission state from, when it gave
+    /// one ([`Outbound::set_admission_slot`]).
+    admission_slot: Option<Arc<AtomicU8>>,
 }
 
 /// The guard of a guarded publication, as the conductor hands it to the
@@ -562,12 +571,40 @@ impl<T: StreamTerms> Outbound<T> {
             removal: None,
             timed: None,
             cells: None,
+            admission: 0,
+            admission_slot: None,
         })
     }
 
     /// With its counters' CnC cells, in `PUBLICATION_CELLS` order (M2b).
     pub(crate) fn set_cells(&mut self, cells: crate::agents::AgentCells) {
         self.cells = Some(cells);
+    }
+
+    /// Shares `slot` with the conductor: each cycle stores the admission
+    /// state's code there (karyos#637).
+    pub(crate) fn set_admission_slot(&mut self, slot: Arc<AtomicU8>) {
+        self.admission_slot = Some(slot);
+    }
+
+    /// Observes its admission state at `now`, at the end of the sender's
+    /// duty cycle, whether or not it staged anything: `Open` without a
+    /// membership, else the membership's gate. Stores its code in the slot
+    /// the conductor reads and for the `network admission` cell
+    /// (karyos#637). A load, a compare and a store: no allocation.
+    pub(crate) fn observe_admission(&mut self, now: u64) {
+        use karyos_protocol::cnc::NetworkAdmission;
+
+        let state = match self.membership.as_deref().map(|m| m.admission(now)) {
+            None | Some(Admission::Open) => NetworkAdmission::Open,
+            Some(Admission::NotJoined) => NetworkAdmission::NotJoined,
+            Some(Admission::LostRequired) => NetworkAdmission::LostRequired,
+        };
+        // The codes are 1 to 3: no truncation.
+        self.admission = u8::try_from(state.code()).unwrap_or(0);
+        if let Some(slot) = &self.admission_slot {
+            slot.store(self.admission, Ordering::Relaxed);
+        }
     }
 
     /// Hands its cells back, for the conductor to free (M2b).
@@ -594,7 +631,13 @@ impl<T: StreamTerms> Outbound<T> {
         let frames = counters.staged.checked_add(counters.records);
         // A sum past `u64::MAX` keeps the last value stored; no allocation
         // on the duty cycle.
-        let counts = [frames, Some(counters.bytes), Some(repair.submitted), naks];
+        let counts = [
+            frames,
+            Some(counters.bytes),
+            Some(repair.submitted),
+            naks,
+            Some(u64::from(self.admission)),
+        ];
         let mut values = [0; crate::agents::PUBLICATION_CELLS.len()];
         for ((value, count), stored) in values.iter_mut().zip(counts).zip(cells.stored()) {
             *value = count.unwrap_or(*stored);

@@ -327,6 +327,9 @@ struct NetPublication {
     /// Removed for its next incarnation: no linger, and its removal ends
     /// in a [`Reincarnation`].
     reincarnating: bool,
+    /// The slot its sender stores its admission state's code in each cycle
+    /// (karyos#637; 0 before the first).
+    admission: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// What a network publication's sender is added with, kept for the next
@@ -1573,7 +1576,7 @@ impl<T: StreamTerms> Network<T> {
         &mut self,
         registration: u64,
         publication: Publication,
-        outbound: Box<Outbound<T>>,
+        mut outbound: Box<Outbound<T>>,
         guard: Option<(
             crate::agents::data::GuardSpec,
             crate::guard_ack::GuardSenderId,
@@ -1690,6 +1693,8 @@ impl<T: StreamTerms> Network<T> {
         // posted later would drop the new publication's alias. One posted
         // earlier precedes the add in the ring.
         self.stale_aliases.retain(|key| !mine(key));
+        let admission = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        outbound.set_admission_slot(std::sync::Arc::clone(&admission));
         let posted = self
             .links
             .sender
@@ -1728,6 +1733,7 @@ impl<T: StreamTerms> Network<T> {
             trace_closes: Vec::new(),
             channel: Some(channel),
             reincarnating: false,
+            admission,
         });
         Ok(())
     }
@@ -1985,6 +1991,22 @@ impl<T: StreamTerms> Network<T> {
     }
 
     /// The state of the network publication `registration`.
+    /// The admission state the sender of the network publication
+    /// `registration` last observed (karyos#637); `None` before its first
+    /// cycle, and for no such publication.
+    pub(crate) fn publication_admission(
+        &self,
+        registration: u64,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission> {
+        let entry = self
+            .publications
+            .iter()
+            .find(|entry| entry.registration == registration)?;
+        karyos_protocol::cnc::NetworkAdmission::from_code(u64::from(
+            entry.admission.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+
     pub(crate) fn publication_state(&self, registration: u64) -> Option<NetworkPublicationState> {
         if self
             .reincarnations

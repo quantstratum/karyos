@@ -1560,6 +1560,16 @@ impl RemoteClient {
         }
     }
 
+    /// The admission state of the network publication `registration`, as
+    /// [`ClientConductor::network_admission`].
+    #[must_use]
+    pub fn network_admission(
+        &self,
+        registration: u64,
+    ) -> Option<karyos_protocol::cnc::NetworkAdmission> {
+        self.conductor.as_ref()?.network_admission(registration)
+    }
+
     fn conductor_mut(&mut self) -> Result<&mut ClientConductor, ConductorError> {
         self.conductor.as_mut().ok_or(ConductorError::Closed)
     }

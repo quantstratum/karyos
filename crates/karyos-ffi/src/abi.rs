@@ -1667,6 +1667,60 @@ pub unsafe extern "C" fn karyos_client_add_subscription_as(
     })
 }
 
+/// `KARYOS_ADMISSION_UNKNOWN`: no admission state reported yet, or a
+/// publication that is not a network one (karyos#637).
+pub(crate) const ADMISSION_UNKNOWN: u32 = 0;
+/// `KARYOS_ADMISSION_OPEN`.
+pub(crate) const ADMISSION_OPEN: u32 = 1;
+/// `KARYOS_ADMISSION_NOT_JOINED`.
+pub(crate) const ADMISSION_NOT_JOINED: u32 = 2;
+/// `KARYOS_ADMISSION_LOST_REQUIRED`.
+pub(crate) const ADMISSION_LOST_REQUIRED: u32 = 3;
+
+/// Writes the admission state of `publication`, a network publication,
+/// through `admission` (owner item 7, karyos#637): `KARYOS_ADMISSION_OPEN`,
+/// `KARYOS_ADMISSION_NOT_JOINED` while a configured required receiver has
+/// not joined, `KARYOS_ADMISSION_LOST_REQUIRED` once one is lost, or
+/// `KARYOS_ADMISSION_UNKNOWN` before the driver reports one, after the
+/// client lapped the driver's broadcast until it does again, and for a
+/// publication that is not a network one. It is the last state the sender
+/// observed, not a list of transitions. Offers keep the existing outcome
+/// mapping: under not joined and lost required they answer
+/// `KARYOS_E_BACK_PRESSURED` once the window is full. A control call on
+/// the publication's client, which it holds for the read.
+///
+/// # Safety
+///
+/// `admission` points to a writable `uint32_t`; a null one returns
+/// `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_publication_network_admission(
+    publication: u64,
+    admission: *mut u32,
+) -> i32 {
+    guard(|| {
+        if !writable(admission) {
+            return Status::InvalidArgument;
+        }
+        match api::publication::network_admission(Handle::from_raw(publication)) {
+            Ok(state) => {
+                let code = match state {
+                    None => ADMISSION_UNKNOWN,
+                    Some(karyos_client::NetworkAdmission::Open) => ADMISSION_OPEN,
+                    Some(karyos_client::NetworkAdmission::NotJoined) => ADMISSION_NOT_JOINED,
+                    Some(karyos_client::NetworkAdmission::LostRequired) => ADMISSION_LOST_REQUIRED,
+                    Some(_) => ADMISSION_UNKNOWN,
+                };
+                // SAFETY: `admission` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint32_t`.
+                unsafe { admission.write(code) };
+                Status::Ok
+            }
+            Err(status) => status,
+        }
+    })
+}
+
 /// `KARYOS_MERGE_NONE`: no merge failed.
 pub(crate) const MERGE_NONE: u32 = 0;
 /// `KARYOS_MERGE_OTHER`: a failure a newer library knows and this ABI

@@ -242,6 +242,7 @@
 //! | `0xC5` | `Fenced` | stream and session | registration | | | |
 //! | `0xC6` | `ImageAvailable` | stream and session | network subscription registration | image registration (nonzero) | source family, port and scope (see below) | source address, high word |
 //! | `0xC7` | `ImageUnavailable` | stream and session | network subscription registration | image registration (nonzero) | | |
+//! | `0xC8` | `PublicationAdmission` | stream and session | network publication registration | admission: 1 open, 2 not joined, 3 lost required | | |
 //!
 //! `ImageAvailable` continues after its five words with word 5, the
 //! source address's low word. Its source in words 3 to 5 has exactly
@@ -364,6 +365,7 @@ const SUCCESSOR_READY: u32 = 0xC4;
 const FENCED: u32 = 0xC5;
 const IMAGE_AVAILABLE: u32 = 0xC6;
 const IMAGE_UNAVAILABLE: u32 = 0xC7;
+const PUBLICATION_ADMISSION: u32 = 0xC8;
 
 const ALLOW_UNCONNECTED: u64 = 1;
 /// `AddNetworkPublication`'s flag for a concurrent handle (M11).
@@ -1037,6 +1039,50 @@ pub fn guard_parameters(
             // overflow is an error; a hash has no overflow to report.
             (hash ^ u64::from(byte)).wrapping_mul(PRIME)
         })
+}
+
+/// The admission state of a network publication, as its sender last
+/// observed it (owner decisions of 2026-10-21, item 7; karyos#637;
+/// `quantstratum-docs: karyos/design/multicast-flow-control.md`). Offers
+/// keep the existing outcome mapping: under `NotJoined` and `LostRequired`
+/// the sender stages nothing, so the publication fills its window and its
+/// offers answer `BackPressured`, never a terminal outcome while the
+/// policy is stop admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NetworkAdmission {
+    /// Every configured required receiver has joined and none is lost (and
+    /// a publication with none is open).
+    Open,
+    /// A configured required receiver has not joined yet.
+    NotJoined,
+    /// A required receiver is lost: admission stops for the incarnation
+    /// (owner decision M5).
+    LostRequired,
+}
+
+impl NetworkAdmission {
+    /// The wire code: 1, 2, 3; 0 is no state reported yet.
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Open => 1,
+            Self::NotJoined => 2,
+            Self::LostRequired => 3,
+        }
+    }
+
+    /// The state of a wire code; `None` for 0 (none reported yet) and any
+    /// code not defined.
+    #[must_use]
+    pub const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::Open),
+            2 => Some(Self::NotJoined),
+            3 => Some(Self::LostRequired),
+            _ => None,
+        }
+    }
 }
 
 /// Why the driver refused a command.
@@ -2639,6 +2685,22 @@ pub enum Event {
         /// The registration fenced.
         registration: u64,
     },
+    /// The admission state of a client's network publication
+    /// `registration` changed, as its sender last observed it (owner item
+    /// 7, karyos#637; admission `VERSION` 3): sent once the sender first
+    /// reports it, on each change the conductor sees between two of its
+    /// duty cycles, and again before the answer to a `QueryCutover` of the
+    /// registration, so a client that lapped resynchronizes. A state that
+    /// changes and comes back between two duty cycles sends nothing; the
+    /// membership counters count every transition.
+    PublicationAdmission {
+        /// The publication's stream and session.
+        stream: StreamKey,
+        /// The network publication's registration.
+        registration: u64,
+        /// The state.
+        admission: NetworkAdmission,
+    },
     /// A remote publication's image is a stream of the driver under its
     /// alias `stream`, for the network subscription `registration` (W5),
     /// named by its aggregate registration `image` and its `source`
@@ -2674,6 +2736,7 @@ impl Event {
             Self::PublicationClosed { .. } => PUBLICATION_CLOSED,
             Self::SuccessorReady { .. } => SUCCESSOR_READY,
             Self::Fenced { .. } => FENCED,
+            Self::PublicationAdmission { .. } => PUBLICATION_ADMISSION,
             Self::ImageAvailable { .. } => IMAGE_AVAILABLE,
             Self::ImageUnavailable { .. } => IMAGE_UNAVAILABLE,
         }
@@ -2742,6 +2805,11 @@ impl Event {
                 stream,
                 registration,
             } => write_words(&[stream_word(stream), registration], out),
+            Self::PublicationAdmission {
+                stream,
+                registration,
+                admission,
+            } => write_words(&[stream_word(stream), registration, admission.code()], out),
             Self::ImageAvailable {
                 stream,
                 registration,
@@ -2822,6 +2890,15 @@ impl Event {
                 Ok(Self::Fenced {
                     stream: stream_from(stream),
                     registration,
+                })
+            }
+            PUBLICATION_ADMISSION => {
+                let [stream, registration, admission] = read_words::<3>(type_id, bytes)?;
+                Ok(Self::PublicationAdmission {
+                    stream: stream_from(stream),
+                    registration,
+                    admission: NetworkAdmission::from_code(admission)
+                        .ok_or(CncError::Reserved { type_id })?,
                 })
             }
             IMAGE_AVAILABLE => {
@@ -2922,7 +2999,7 @@ mod tests {
                 Err(CncError::UnknownType { type_id })
             );
         }
-        for type_id in [IMAGE_UNAVAILABLE + 1, NETWORK_SUBSCRIPTION_READY] {
+        for type_id in [PUBLICATION_ADMISSION + 1, NETWORK_SUBSCRIPTION_READY] {
             assert_eq!(
                 Event::decode(type_id, &bytes),
                 Err(CncError::UnknownType { type_id })
@@ -3244,6 +3321,47 @@ mod tests {
             required: vec![77, 78],
             tags: vec![(88, 9)],
         }
+    }
+
+    /// karyos#637: `PublicationAdmission` is three words, its state code
+    /// 1 to 3; 0 (no state reported) and any other code are refused.
+    #[test]
+    fn publication_admission_round_trips_strictly() {
+        let stream = StreamKey {
+            stream_id: 10,
+            session_id: 3,
+        };
+        for (admission, code) in [
+            (NetworkAdmission::Open, 1),
+            (NetworkAdmission::NotJoined, 2),
+            (NetworkAdmission::LostRequired, 3),
+        ] {
+            let event = Event::PublicationAdmission {
+                stream,
+                registration: 7,
+                admission,
+            };
+            let mut out = [0u8; MAX_EVENT_LENGTH];
+            let length = event.encode(&mut out).unwrap();
+            assert_eq!(command_words(&out[..length]), [10 | 3 << 32, 7, code]);
+            assert_eq!(event.type_id(), 0xC8);
+            assert_eq!(Event::decode(0xC8, &out[..length]), Ok(event));
+            assert_eq!(NetworkAdmission::from_code(code), Some(admission));
+        }
+        for code in [0u64, 4, u64::MAX] {
+            let mut bytes = Vec::new();
+            for word in [10 | 3 << 32, 7, code] {
+                bytes.extend_from_slice(&u64::to_le_bytes(word));
+            }
+            assert_eq!(
+                Event::decode(0xC8, &bytes),
+                Err(CncError::Reserved { type_id: 0xC8 })
+            );
+        }
+        assert!(matches!(
+            Event::decode(0xC8, &[0; 16]),
+            Err(CncError::WrongLength { .. })
+        ));
     }
 
     /// karyos#637: the roles and identity commands round-trip, and their
