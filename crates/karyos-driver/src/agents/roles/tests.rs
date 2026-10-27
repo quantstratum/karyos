@@ -1146,7 +1146,7 @@ fn unconfirmed_bindings_never_hold_the_table() {
     assert!(sender.bindings.is_empty());
 }
 
-/// The heartbeat rule of the trusted profile (coordinator decision): above
+/// The heartbeat rule of the trusted profile (owner item 1): above
 /// the lane's highest seen position is fresh, at it stationary, below it
 /// stale, outside the image's window rejected.
 /// An installed one-lane image (session 5, stream 6, initial term 9,

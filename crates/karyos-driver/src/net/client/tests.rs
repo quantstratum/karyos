@@ -1610,6 +1610,110 @@ fn a_local_reader_keeps_a_network_publication_connected() {
     ));
 }
 
+/// Owner item 13 (karyos#638), the mixed case: a network publication with
+/// a local reader and a live receiver is connected; when the receiver goes
+/// and its SMs lapse it stays connected through the local reader alone,
+/// which says nothing about the network; once the local reader goes too it
+/// is `NotConnected`. With the three tests above (no reader, remote only,
+/// local only) this is the matrix: connected means an eligible reader
+/// exists, not that a remote one is reachable.
+#[test]
+fn a_network_publication_with_local_and_remote_readers_is_connected_by_either() {
+    let mut a = driver_with(|config| {
+        if let Some(network) = &mut config.network {
+            network.agents.image_liveness_timeout = 1_000_000_000;
+        }
+    });
+    let mut b = driver();
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(mut receive),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse("karyos:udp?endpoint=127.0.0.1:9")
+    else {
+        panic!("not a udp channel");
+    };
+    receive.destination = karyos_protocol::channel::Destination::Unicast(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        0,
+    ));
+    let _subscription = b.add_network_subscription(10, &receive).unwrap();
+    let address = b.network_subscription_address(10).unwrap();
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(udp),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse(&format!(
+        "karyos:udp?endpoint={address}|interface=127.0.0.1"
+    ))
+    else {
+        panic!("not a udp channel");
+    };
+    let defaults = crate::net::NetworkStreamDefaults {
+        term_length: 64 * 1024,
+        ..crate::net::NetworkStreamDefaults::default()
+    };
+    let config = super::aggregate(
+        &defaults,
+        &karyos_protocol::channel::CommonConfig::default(),
+        10,
+        5,
+        false,
+    )
+    .unwrap();
+    let handle = a.add_network_publication(config, &udp).unwrap();
+    let lane = handle.lane(karyos_sys::frame::Lane::ZERO).unwrap();
+    let mut publication = a.publication(lane).unwrap();
+    let mut reader = a
+        .subscribe(lane, karyos_sys::log_buffer::Role::Required)
+        .unwrap();
+    // The readers that count for the connection: the local one, and the
+    // sender's cell while a receiver's SMs are live.
+    let attached = |driver: &EmbeddedDriver| {
+        driver
+            .streams
+            .iter()
+            .map(|stream| stream.buffer.attached_subscribers())
+            .max()
+            .unwrap_or(0)
+    };
+    // Both readers: the receiver's SMs connect the sender's cell too.
+    let start = std::time::Instant::now();
+    let mut both = false;
+    while !both {
+        assert!(start.elapsed() < Duration::from_secs(30), "no receiver");
+        assert!(matches!(
+            publication.offer(b"m").unwrap(),
+            OfferOutcome::Accepted { .. } | OfferOutcome::BackPressured
+        ));
+        let _ = reader.poll(|_, _| {}, karyos_client::MessageLimit::new(64));
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+        both = attached(&a) == 2;
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    // The receiver goes: its SMs lapse, and the local reader alone keeps
+    // the publication connected.
+    drop(b);
+    let start = std::time::Instant::now();
+    while attached(&a) > 1 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the receiver never lapsed"
+        );
+        let _ = reader.poll(|_, _| {}, karyos_client::MessageLimit::new(64));
+        let _ = a.do_work().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let _ = reader.poll(|_, _| {}, karyos_client::MessageLimit::new(64));
+    assert!(matches!(
+        publication.offer(b"m").unwrap(),
+        OfferOutcome::Accepted { .. } | OfferOutcome::BackPressured
+    ));
+    // The local reader goes too: no eligible reader is left.
+    drop(reader);
+    let _ = a.do_work().unwrap();
+    assert_eq!(publication.offer(b"m").unwrap(), OfferOutcome::NotConnected);
+}
+
 /// #313 review: a silent sender cell still bounds the publisher. With no
 /// receiver the sender sends nothing, so its reader never advances; an
 /// unconnected-allowed publication fills up to that bound and is then

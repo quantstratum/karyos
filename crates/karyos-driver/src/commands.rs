@@ -1791,10 +1791,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         {
             return Ok(());
         }
-        match self.time_namespace(client) {
-            TimeNamespace::Same => Ok(()),
-            namespace => Err(namespace.code()),
-        }
+        monotonic_grantable(self.time_namespace(client))
     }
 
     /// The time namespace of `client` against the driver's (T2): the same
@@ -2427,6 +2424,17 @@ impl<T: StreamTerms> Drop for EmbeddedDriver<T> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod guarded_grant_tests;
+
+/// Whether a client in `namespace` may hold a `Monotonic` lane: only in
+/// the driver's own time namespace; otherwise the namespace's code, for a
+/// namespace proven different and for one that could not be compared alike
+/// (owner item 58).
+fn monotonic_grantable(namespace: TimeNamespace) -> Result<(), u64> {
+    match namespace {
+        TimeNamespace::Same => Ok(()),
+        namespace => Err(namespace.code()),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -5978,6 +5986,42 @@ mod tests {
         );
         // Nothing was written: the ring's binding is as before.
         assert_eq!(ring(&driver), before);
+    }
+
+    /// Owner item 58: a client in a time namespace proven *different*, two
+    /// distinct namespace files (device and inode), is refused a
+    /// `Monotonic` lane with its own code, apart from the unknown case
+    /// above; the same file is granted. The process harness cannot create
+    /// a time namespace unprivileged (tests/network_processes.rs), so the
+    /// pair is compared here.
+    #[test]
+    fn a_monotonic_timed_stream_refuses_a_client_in_another_time_namespace() {
+        use crate::trace_journals::compare_time_namespaces;
+
+        let driver = (0x2a, 4_026_531_834);
+        let other = (0x2a, 4_026_532_517);
+        let different = compare_time_namespaces(Some(driver), Some(other));
+        assert_eq!(different, TimeNamespace::Different);
+        assert_eq!(
+            super::monotonic_grantable(different),
+            Err(TimeNamespace::Different.code())
+        );
+        assert_ne!(
+            TimeNamespace::Different.code(),
+            TimeNamespace::Unknown.code()
+        );
+        // The same inode on another device is another namespace too.
+        assert_eq!(
+            compare_time_namespaces(Some((0x2b, driver.1)), Some(driver)),
+            TimeNamespace::Different
+        );
+        let same = compare_time_namespaces(Some(driver), Some(driver));
+        assert_eq!(same, TimeNamespace::Same);
+        assert_eq!(super::monotonic_grantable(same), Ok(()));
+        assert_eq!(
+            compare_time_namespaces(Some(driver), None),
+            TimeNamespace::Unknown
+        );
     }
 
     // T-x2 (TT-6a) granted a `Tai` lane to a remote client whatever its

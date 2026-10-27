@@ -56,6 +56,13 @@ pub enum OfferOutcome {
     AdminAction,
     /// No subscriber is attached and the publication does not allow
     /// unconnected offers (SPEC.md §4 connection rule).
+    ///
+    /// Connected means an eligible reader exists, not that a remote one is
+    /// reachable (owner item 13, karyos#638): on a network publication a
+    /// local IPC reader of its stream connects it as well as a receiver
+    /// whose status messages are live, so an accepted offer says nothing
+    /// about the network. The network side is read with
+    /// [`crate::Client::network_admission`].
     NotConnected,
     /// The stream is sealed: the publication accepts nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
@@ -91,6 +98,8 @@ pub enum ClaimOutcome<'a, T: TermBytes = HeapTerms> {
     AdminAction,
     /// No subscriber is attached and the publication does not allow
     /// unconnected claims (SPEC.md §4 connection rule); nothing reserved.
+    /// As for offers, a local reader connects a network publication too
+    /// ([`OfferOutcome::NotConnected`]).
     NotConnected,
     /// The reservation was consumed but aborted before it could be
     /// marked (the commit deadline passed); nothing was written.
@@ -935,7 +944,9 @@ impl<T: TermBytes> ClientPublication<T> {
 
     /// The connection rule (SPEC.md §4): one advisory load of the attached
     /// subscriber count, any role counting, unless unconnected use is
-    /// allowed.
+    /// allowed. A network sender's cell counts only while a receiver's
+    /// status messages are live; a local reader counts alike, so this is
+    /// never proof of remote reachability (owner item 13).
     fn connected(&self) -> bool {
         self.allow_unconnected || self.inner.buffer().attached_subscribers() > 0
     }
