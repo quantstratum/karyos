@@ -237,7 +237,8 @@ pub struct Counter {
     /// Its label.
     pub label: String,
     /// Its type (`TYPE_EVENT` 1, `TYPE_GAUGE` 2, `TYPE_POSITION` 4,
-    /// `TYPE_TIMESTAMP` 5).
+    /// `TYPE_TIMESTAMP` 5, and an application's `TYPE_APPLICATION_EVENT` 6
+    /// and `TYPE_APPLICATION_GAUGE` 7, R-CORE-3).
     pub type_id: u64,
     /// The stream registration, 0 for driver-wide counters.
     pub stream: u64,

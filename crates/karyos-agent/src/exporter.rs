@@ -54,6 +54,8 @@ const TYPE_GAUGE: u64 = 2;
 const TYPE_SPIN_TIME: u64 = 3;
 const TYPE_POSITION: u64 = 4;
 const TYPE_TIMESTAMP: u64 = 5;
+const TYPE_APPLICATION_EVENT: u64 = karyos_sys::counters::TYPE_APPLICATION_EVENT;
+const TYPE_APPLICATION_GAUGE: u64 = karyos_sys::counters::TYPE_APPLICATION_GAUGE;
 
 /// One metric family: its type, help and sample lines.
 struct Family {
@@ -233,7 +235,9 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
         }
     }
     for counter in &driver.client_counters {
-        render_counter(families, &dir, "client", counter);
+        if !render_application(families, &dir, counter) {
+            render_counter(families, &dir, "client", counter);
+        }
     }
     for (ring, delivered, overwritten) in [
         ("errors", driver.errors.delivered, driver.errors.overwritten),
@@ -468,6 +472,32 @@ fn render_counter(families: &mut Families, dir: &str, source: &str, counter: &Co
         ),
     };
     families.sample(name, kind, help, &labels, counter.value);
+}
+
+/// An application counter (R-CORE-3) in its own family, labelled with its
+/// name, escaped as the text format requires, and its client; whether
+/// `counter` is one.
+fn render_application(families: &mut Families, dir: &str, counter: &Counter) -> bool {
+    let (name, kind, help) = match counter.type_id {
+        TYPE_APPLICATION_EVENT => (
+            "karyos_application_events_total",
+            "counter",
+            "An application's event counter, registered by its client.",
+        ),
+        TYPE_APPLICATION_GAUGE => (
+            "karyos_application_gauge",
+            "gauge",
+            "An application's gauge, registered by its client.",
+        ),
+        _ => return false,
+    };
+    let labels = [
+        ("driver", dir.to_owned()),
+        ("name", counter.label.clone()),
+        ("client", counter.participant.to_string()),
+    ];
+    families.sample(name, kind, help, &labels, counter.value);
+    true
 }
 
 /// Why the exporter could not start.

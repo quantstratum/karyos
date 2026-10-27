@@ -62,6 +62,12 @@ pub const TYPE_GAUGE: u64 = 2;
 pub const TYPE_POSITION: u64 = 4;
 /// Counter type: a host `CLOCK_MONOTONIC` time in nanoseconds.
 pub const TYPE_TIMESTAMP: u64 = 5;
+/// Counter type: an application's event count, registered with
+/// `Client::add_counter` (R-CORE-3); only grows.
+pub const TYPE_APPLICATION_EVENT: u64 = 6;
+/// Counter type: an application's gauge, registered with
+/// `Client::add_counter` (R-CORE-3).
+pub const TYPE_APPLICATION_GAUGE: u64 = 7;
 
 /// Participant kind in `key1` bits 15 to 8: none.
 pub const KIND_NONE: u8 = 0;

@@ -60,7 +60,7 @@ pub use conflated_subscription::{
     CONFLATION_BUDGETS_EXHAUSTED, CONFLATION_SKIPS, ConflatedLimits, ConflatedOptions,
     ConflatedSubscription, ConflatedValue, ReaderCounts, ViewClosed,
 };
-pub use counter::{ClientCounterHandle, CounterReleases};
+pub use counter::{ClientCounterHandle, CounterKind, CounterReleases};
 pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Next, Successor};
 pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
