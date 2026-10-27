@@ -217,24 +217,6 @@ impl Fields<'_> {
     }
 }
 
-/// An entry proposed: where the core put it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Proposed {
-    /// Its log index.
-    pub index: u64,
-    /// Its term.
-    pub term: u64,
-}
-
-impl Proposed {
-    /// At `index` in `term`.
-    #[must_use]
-    pub fn new(index: u64, term: u64) -> Self {
-        Self { index, term }
-    }
-}
-
 /// A proposal refused: this node does not lead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("not the leader")]
@@ -253,14 +235,17 @@ impl NotLeader {
 }
 
 /// The consensus core as the container sees it: a core's adapter
-/// implements it (design decision D1 of karyos#686).
+/// implements it (design decisions D1 and E2 of karyos#686). A proposal
+/// is not told its index: its answer is found when the entry applies, by
+/// the request's client, epoch and sequence, which a forward and a retry
+/// share.
 pub trait Propose {
     /// Appends `payload` as a new entry, if this node leads.
     ///
     /// # Errors
     ///
     /// [`NotLeader`] when it does not, with the leader it knows of.
-    fn propose(&mut self, payload: Vec<u8>) -> Result<Proposed, NotLeader>;
+    fn propose(&mut self, payload: Vec<u8>) -> Result<(), NotLeader>;
 }
 
 /// The user's state machine (SPEC.md §9). Every method sees only its
