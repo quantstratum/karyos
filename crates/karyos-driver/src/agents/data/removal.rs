@@ -143,6 +143,9 @@ impl<T: StreamTerms> Outbound<T> {
         mut tx: Option<&mut SocketsTx<O>>,
         now: u64,
     ) -> RemovalStep {
+        if self.fanout.is_some() {
+            return self.serve_fanout_removal(tx, now);
+        }
         self.serve_removal_with(
             now,
             |outbound, lane| outbound.drained_seal(lane),

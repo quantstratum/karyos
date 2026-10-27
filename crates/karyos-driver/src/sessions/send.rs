@@ -133,6 +133,9 @@ struct Session {
     publication: Publication,
     last_announce: Option<u64>,
     established: bool,
+    /// Announces even once established: a multi-destination publication
+    /// with a destination that has no live member (karyos#630).
+    announcing: bool,
 }
 
 /// The sender's SETUP state of every publication incarnation it sends,
@@ -217,6 +220,7 @@ impl SendSessions {
             publication,
             last_announce: None,
             established: false,
+            announcing: false,
         });
         Ok(())
     }
@@ -281,12 +285,22 @@ impl SendSessions {
         true
     }
 
+    /// Makes the publication on `endpoint` and `alias` announce every
+    /// `setup_interval` whether or not it is established, while
+    /// `announcing`: a multi-destination publication does so until each of
+    /// its destinations has a live member (karyos#630).
+    pub fn set_announcing(&mut self, endpoint: EndpointId, alias: Alias, announcing: bool) {
+        if let Some(session) = self.find_mut(endpoint, alias) {
+            session.announcing = announcing;
+        }
+    }
+
     /// The announcements due at `now`, each to send on its endpoint;
     /// `emit` is called once per due SETUP.
     pub fn announce_due(&mut self, now: u64, mut emit: impl FnMut(EndpointId, SetupAnnounce)) {
         let interval = self.setup_interval;
         for session in &mut self.sessions {
-            let due = !session.established
+            let due = (!session.established || session.announcing)
                 && session
                     .last_announce
                     .is_none_or(|last| age_ns(now, last) >= interval);

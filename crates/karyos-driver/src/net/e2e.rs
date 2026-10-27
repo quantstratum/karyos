@@ -3928,3 +3928,5 @@ fn a_publication_crosses_the_term_id_wrap() {
     // About four 64 KiB terms: term ids MAX - 1, MAX, 0 and 1.
     exchange(&mut a, &mut b, &publication, &mut reader, 256);
 }
+
+mod destinations;

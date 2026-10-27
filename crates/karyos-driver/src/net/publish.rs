@@ -30,7 +30,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::embedded::StreamTerms;
-use karyos_protocol::channel::{Destination, FlowControl, Interface, UdpConfig};
+use karyos_protocol::channel::{ControlMode, Destination, FlowControl, Interface, UdpConfig};
 use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
@@ -40,7 +40,7 @@ use super::{NetworkPublicationState, SenderChannel};
 use karyos_io::lanes::routes::MAX_ROUTES;
 
 use crate::agents::EndpointId;
-use crate::agents::data::{GuardSpec, Outbound};
+use crate::agents::data::{GuardSpec, MAX_DESTINATIONS, Outbound};
 use crate::embedded::{AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION};
 use crate::error::DriverError;
 use crate::guards::{GuardHandle, GuardRate};
@@ -54,6 +54,24 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverErr
     let destination = match &channel.destination {
         Destination::Unicast(address) => *address,
         Destination::Multicast { group, .. } => *group,
+        // A manual destination set sends from one endpoint (design 2.1),
+        // bound as for unicast; its first destination stands for the
+        // address family. `control` has no meaning in manual mode (design
+        // 11.1) and redundant paths are not combined with destinations
+        // (ADR-0056).
+        Destination::MultiDestination {
+            destinations,
+            control: None,
+            mode: ControlMode::Manual,
+        } if channel.paths.is_empty() => *destinations
+            .first()
+            .ok_or(DriverError::UnsupportedChannel)?,
+        // Dynamic registration stays refused until it is implemented and
+        // tested (ADR-0082; karyos#644).
+        Destination::MultiDestination {
+            mode: ControlMode::Dynamic,
+            ..
+        } => return Err(DriverError::DynamicRegistrationUnsupported),
         Destination::MultiDestination { .. } => return Err(DriverError::UnsupportedChannel),
         // A destination a later protocol version parses: not served.
         _ => return Err(DriverError::UnsupportedChannel),
@@ -83,6 +101,58 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverErr
         None => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
     Ok((destination, vec![SocketAddr::new(ip, 0)]))
+}
+
+/// The destinations of a multi-destination channel and its required ones
+/// (design 2.1, 3.5; MD-6, MD-11, MD-17): none for another channel, which
+/// names no required destination. At most `MAX_DESTINATIONS`, the
+/// destinations distinct, of one address family, and the required ones
+/// among them.
+///
+/// # Errors
+///
+/// [`DriverError::InvalidConfig`] for required destinations on another
+/// channel or that are not destinations; [`DriverError::UnsupportedChannel`]
+/// for too many destinations, one named twice or mixed families.
+fn destinations_of(
+    channel: &UdpConfig,
+    required: &[SocketAddr],
+) -> Result<(Vec<SocketAddr>, Vec<SocketAddr>), DriverError> {
+    let Destination::MultiDestination { destinations, .. } = &channel.destination else {
+        return if required.is_empty() {
+            Ok((Vec::new(), Vec::new()))
+        } else {
+            Err(DriverError::InvalidConfig)
+        };
+    };
+    let family = destinations.first().map(SocketAddr::is_ipv4);
+    let distinct = destinations.iter().enumerate().all(|(at, address)| {
+        !destinations
+            .iter()
+            .skip(at + 1)
+            .any(|other| other == address)
+    });
+    if destinations.is_empty()
+        || destinations.len() > MAX_DESTINATIONS
+        || !distinct
+        || destinations
+            .iter()
+            .any(|address| Some(address.is_ipv4()) != family)
+    {
+        return Err(DriverError::UnsupportedChannel);
+    }
+    let required_distinct = required
+        .iter()
+        .enumerate()
+        .all(|(at, address)| !required.iter().skip(at + 1).any(|other| other == address));
+    if !required_distinct
+        || required
+            .iter()
+            .any(|address| !destinations.contains(address))
+    {
+        return Err(DriverError::InvalidConfig);
+    }
+    Ok((destinations.clone(), required.to_vec()))
 }
 
 /// The guard of a guarded network publication: every lane stream is
@@ -143,7 +213,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         config: AggregateConfig,
         channel: &UdpConfig,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, None, None)
+        self.add_network(config, channel, None, None, None, &[])
     }
 
     /// [`EmbeddedDriver::add_network_publication`] whose receivers have the
@@ -165,7 +235,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         roles: PublicationRoles,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, Some(Box::new(roles)), None)
+        self.add_network(config, channel, None, Some(Box::new(roles)), None, &[])
+    }
+
+    /// [`EmbeddedDriver::add_network_publication_with_roles`] on a
+    /// multi-destination channel (`control-mode=manual`) whose
+    /// `required` destinations, named by endpoint, are required: they
+    /// bound the sender and are never removed, and the others are optional
+    /// (ADR-0056, ADR-0082; design MD-11, MD-17; karyos#630). `roles`
+    /// gives the strategy and any required or tagged receiver ids.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_network_publication`]; also
+    /// [`DriverError::InvalidConfig`] for a required destination that is
+    /// not one of the channel's.
+    pub fn add_network_publication_with_destinations(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        roles: Option<PublicationRoles>,
+        required: &[SocketAddr],
+    ) -> Result<AggregateHandle, DriverError> {
+        self.add_network(config, channel, None, roles.map(Box::new), None, required)
     }
 
     /// [`EmbeddedDriver::add_timed_network_publication`] with `roles`
@@ -184,6 +276,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             None,
             Some(Box::new(roles)),
             Some((schedule, None)),
+            &[],
         )
     }
 
@@ -211,7 +304,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         guard: NetworkGuard,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, Some(guard), None, None)
+        self.add_network(config, channel, Some(guard), None, None, &[])
     }
 
     /// [`EmbeddedDriver::add_network_publication`] whose lanes are timed
@@ -256,7 +349,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if config.stream.buffer.schedule_capacity == 0 {
             return Err(DriverError::InvalidConfig);
         }
-        self.add_network(config, channel, guard, None, Some((schedule, None)))
+        self.add_network(config, channel, guard, None, Some((schedule, None)), &[])
     }
 
     /// [`EmbeddedDriver::add_timed_network_publication`] whose lanes check
@@ -280,7 +373,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if config.stream.buffer.schedule_capacity == 0 {
             return Err(DriverError::InvalidConfig);
         }
-        self.add_network(config, channel, guard, None, Some((schedule, Some(clock))))
+        self.add_network(
+            config,
+            channel,
+            guard,
+            None,
+            Some((schedule, Some(clock))),
+            &[],
+        )
     }
 
     pub(crate) fn add_network(
@@ -293,6 +393,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             karyos_client::schedule::ScheduleOptions,
             Option<karyos_client::schedule::ScheduleClock>,
         )>,
+        required_destinations: &[SocketAddr],
     ) -> Result<AggregateHandle, DriverError> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
@@ -341,6 +442,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::UnsupportedChannel);
         }
         let (destination, binds) = route(channel)?;
+        let destinations = destinations_of(channel, required_destinations)?;
+        // This step of multi-destination unicast sends first sends only:
+        // repair to the requester (MD-8), and with it reliable channels,
+        // and guards and timed lanes come later (karyos#630).
+        if !destinations.0.is_empty() && (channel.reliable || guard.is_some() || timed.is_some()) {
+            return Err(DriverError::UnsupportedChannel);
+        }
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
         // The incarnation's first term id, drawn on the control path before
         // the publication and its SETUP exist (SPEC §4, initial state; §5),
@@ -360,6 +468,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         let channel = SenderChannel {
             destination,
+            destinations: destinations.0,
+            required_destinations: destinations.1,
             binds,
             reliable: channel.reliable,
             quanta,
@@ -517,6 +627,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let kept = channel.clone();
         let SenderChannel {
             destination,
+            destinations,
+            required_destinations,
             binds,
             reliable,
             quanta,
@@ -651,6 +763,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 config.mtu,
                 reliable,
             )
+            .and_then(|mut outbound| {
+                if !destinations.is_empty() {
+                    outbound.set_destinations(&destinations, &required_destinations)?;
+                }
+                Ok(outbound)
+            })
         };
         let posted = outbound
             .and_then(|mut outbound| {

@@ -4626,7 +4626,11 @@ impl<T: StreamTerms> SenderRole<T> {
                 .ok()
             });
         let added = match membership {
-            Some(membership) if matches => {
+            Some(mut membership) if matches => {
+                // A multi-destination publication's required destinations,
+                // by endpoint (MD-11, MD-17; karyos#630).
+                let required: Vec<SocketAddr> = outbound.required_destinations().collect();
+                membership.set_required_sources(&required);
                 outbound.attach_membership(Box::new(membership));
                 // A reliable publication repairs (R4, R5, R7).
                 let repairs = !outbound.reliable()
@@ -4984,6 +4988,23 @@ impl<T: StreamTerms> SenderRole<T> {
         }
     }
 
+    /// Whether the publication `alias` on `endpoint` is a multi-destination
+    /// one; `None` when there is no such publication.
+    fn destinations_of(&self, endpoint: EndpointId, alias: Alias) -> Option<bool> {
+        self.publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            .map(|outbound| outbound.destinations().is_some())
+    }
+
+    /// Whether the publication `alias` on `endpoint` sends to `address`.
+    fn sends_to(&self, endpoint: EndpointId, alias: Alias, address: SocketAddr) -> bool {
+        self.publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            .is_some_and(|outbound| outbound.sends_to(address))
+    }
+
     /// The publication's channel destination and join points.
     fn route_of(&self, endpoint: EndpointId, alias: Alias) -> Option<(SocketAddr, Lanes<u64>)> {
         // A removing publication announces nothing and admits no new
@@ -5121,6 +5142,12 @@ impl<T: StreamTerms> SenderRole<T> {
                     let _ = self.sessions.disconnected(path, alias);
                 }
             }
+            // A multi-destination publication keeps announcing while one of
+            // its destinations has no live member.
+            for path in outbound.route_endpoints() {
+                self.sessions
+                    .set_announcing(path, alias, !outbound.every_destination_live());
+            }
         }
         for _ in 0..changes {
             self.count(|c| &mut c.connection_changes);
@@ -5132,13 +5159,46 @@ impl<T: StreamTerms> SenderRole<T> {
             // An ANNOUNCE goes to the channel's configured destination
             // (§6.2).
             if let Some((destination, _)) = self.route_of(endpoint, announce.alias) {
-                work = work.checked_add(1).ok_or(overflow.clone())?;
-                let _ = self.send(
-                    halves,
-                    endpoint,
-                    destination,
-                    &Control::SetupAnnounce(announce),
-                );
+                // A multi-destination publication announces to each of its
+                // destinations that has no live member yet (design 3.6).
+                let targets = self
+                    .publications
+                    .iter()
+                    .find(|outbound| {
+                        outbound.serves(endpoint) && outbound.alias() == announce.alias
+                    })
+                    .filter(|outbound| outbound.destinations().is_some())
+                    .map(|outbound| {
+                        let mut targets = [None; super::data::MAX_DESTINATIONS];
+                        for (slot, address) in
+                            targets.iter_mut().zip(outbound.destinations_not_live())
+                        {
+                            *slot = Some(address);
+                        }
+                        targets
+                    });
+                match targets {
+                    Some(targets) => {
+                        for address in targets.into_iter().flatten() {
+                            work = work.checked_add(1).ok_or(overflow.clone())?;
+                            let _ = self.send(
+                                halves,
+                                endpoint,
+                                address,
+                                &Control::SetupAnnounce(announce),
+                            );
+                        }
+                    }
+                    None => {
+                        work = work.checked_add(1).ok_or(overflow.clone())?;
+                        let _ = self.send(
+                            halves,
+                            endpoint,
+                            destination,
+                            &Control::SetupAnnounce(announce),
+                        );
+                    }
+                }
             }
         }
         // Its capacity stays for the next cycle.
@@ -5938,6 +5998,21 @@ impl<T: StreamTerms> SenderRole<T> {
         let Some((destination, joins)) = self.route_of(endpoint, alias) else {
             self.count(|c| &mut c.refused);
             return None;
+        };
+        // A multi-destination publication answers only a configured
+        // destination, at that destination (design 9.2; MD-16): a source
+        // outside its set is refused, so it reflects nothing.
+        let destination = match self.destinations_of(endpoint, alias) {
+            None => destination,
+            Some(fanout) if fanout => {
+                let source = normalized(source);
+                if !self.sends_to(endpoint, alias, source) {
+                    self.count(|c| &mut c.refused);
+                    return None;
+                }
+                source
+            }
+            Some(_) => destination,
         };
         let answer = match control {
             Control::Challenge(challenge) => {
