@@ -1832,10 +1832,25 @@ fn a_timed_lane_takes_a_timed_offer() {
         let _ = reading.poll(|_, _| {}, karyos_client::MessageLimit::new(0));
         idle();
     }
-    let (status, now) = clock_now(CLOCK_MONOTONIC);
-    assert_eq!(status, Status::Ok.code());
-    let (status, done) = offer_at(publication, b"timed", now);
-    assert_eq!(status, Status::Ok.code());
+    // The image exists before the publication has the receiver's status
+    // message, so the first offers may find no subscriber connected yet:
+    // retried, each at a fresh `now`, as `offer_with`'s test does.
+    let (now, done) = loop {
+        let (status, now) = clock_now(CLOCK_MONOTONIC);
+        assert_eq!(status, Status::Ok.code());
+        let (status, done) = offer_at(publication, b"timed", now);
+        if status != Status::NotConnected.code() {
+            assert_eq!(status, Status::Ok.code());
+            break (now, done);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "never connected"
+        );
+        let _ = subscriber.poll();
+        let _ = reading.poll(|_, _| {}, karyos_client::MessageLimit::new(0));
+        idle();
+    };
     assert_eq!(done.lane, 0);
     let schedule = Status::InvalidSchedule.code();
     assert_eq!(offer(publication, b"plain").0, schedule);
