@@ -74,6 +74,19 @@ release may break APIs, wire formats and shared-memory layouts.
     (`ConductorError::CommandTooLarge`) or are not well formed
     (`ConductorError::InvalidRoles`) before sending.
 
+- A conflated view of a network image has a public way in, the embedded
+  driver's, as IPC views in a process have (owner item 7: "receiver-side
+  conflated subscriptions"; karyos#637, part 3 of 5; decided 2026-10-27 by
+  QS-COORDINATOR under owner delegation).
+  - `EmbeddedDriver::add_network_subscription_conflated` and
+    `EmbeddedDriver::recreate_network_view` are public.
+  - A view is read with `EmbeddedDriver::subscribe_conflated` on the image's
+    lane stream, each value with its freshness.
+  - A client of a driver in another process is still refused a `karyos:udp`
+    conflated subscription (`ClientError::UnsupportedChannel`): the view's
+    table is on its driver's heap, and remote clients are not in scope of the
+    design (`conflated-network-images.md`, (c)).
+
 ### Changed
 
 - A channel URI list that names one address in two spellings is refused as a
