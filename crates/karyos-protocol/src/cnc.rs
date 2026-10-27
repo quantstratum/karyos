@@ -169,9 +169,14 @@
 //! | `AddNetworkSubscriptionAs` | `receiver_id`, nonzero | `group_tag` |
 //!
 //! `AddNetworkPublicationWithRoles` continues after its URI's padding with
-//! `R` words, the required `receiver_id`s (nonzero, distinct), then `T`
-//! pairs of words, a `receiver_id` (nonzero, distinct among the pairs) and
-//! its tag (nonzero): `6 + ceil(L / 8) + R + 2T` words in all, `L` the URI's length.
+//! `R` words, the required `receiver_id`s (nonzero), then `T` pairs of
+//! words, a `receiver_id` (nonzero) and its tag (nonzero):
+//! `6 + ceil(L / 8) + R + 2T` words in all, `L` the URI's length. A zero
+//! there is malformed. A `receiver_id` repeated among the required ids,
+//! or among the pairs, is `Error` with `ResourcesUnavailable`: the driver
+//! checks `R` and `T` against its membership's `max_receivers` first, then
+//! the repeats, so decoding stays linear and a list longer than the
+//! membership costs the driver no traversal (karyos#637).
 //! `AddNetworkSubscriptionAs` is exactly `6 + ceil(L / 8)` words. Flags,
 //! role and URI follow their `AddNetworkPublication` and
 //! `AddNetworkSubscription` rules; a concurrent handle is refused with
@@ -2216,9 +2221,9 @@ fn read_uri_block<const N: usize>(
 
 /// Reads the roles of `AddNetworkPublicationWithRoles` from its strategy and
 /// counts word, its tagged group word and the words after its URI, which
-/// must be exactly the counts' words: required `receiver_id`s, nonzero and
-/// distinct, then `(receiver_id, tag)` pairs, each `receiver_id` nonzero
-/// and distinct among the pairs, each tag nonzero.
+/// must be exactly the counts' words: required `receiver_id`s, nonzero,
+/// then `(receiver_id, tag)` pairs, each `receiver_id` and tag nonzero. A
+/// repeat is the driver's to refuse, after it bounds the counts.
 fn read_roles(
     type_id: u32,
     counts: u64,
@@ -2264,7 +2269,7 @@ fn read_roles(
         required,
         tags,
     };
-    if !roles.is_well_formed() {
+    if roles.required.contains(&0) || roles.tags.iter().any(|&(id, tag)| id == 0 || tag == 0) {
         return Err(reserved);
     }
     Ok(roles)
@@ -3429,8 +3434,9 @@ mod tests {
 
     /// karyos#637: the roles and identity commands are decoded strictly:
     /// reserved bits and strategy codes, a group that does not match the
-    /// strategy, a zero or repeated `receiver_id`, a zero tag, a receiver
-    /// id of 0 and any length but the counts' are refused.
+    /// strategy, a zero `receiver_id`, a zero tag, a receiver id of 0 and
+    /// any length but the counts' are refused. A repeated `receiver_id`
+    /// decodes: the driver refuses it after bounding the counts.
     #[test]
     fn roles_commands_are_decoded_strictly() {
         use crate::roles::Strategy;
@@ -3462,9 +3468,8 @@ mod tests {
             // A group without `tagged`, and `tagged` without one.
             (5, 9),
             (4, counts & !0xFF | 2),
-            // A zero or repeated required id.
+            // A zero required id.
             (tail, 0),
-            (tail + 1, 77),
             // A zero receiver id or a zero tag in a pair.
             (tail + 2, 0),
             (tail + 3, 0),
@@ -3489,6 +3494,12 @@ mod tests {
             Err(CncError::WrongLength { .. })
         ));
         assert_eq!(decode(&good), Ok(command));
+        let mut repeated = good.clone();
+        word(&mut repeated, tail + 1, 77);
+        assert!(matches!(
+            decode(&repeated),
+            Ok(Command::AddNetworkPublicationWithRoles { roles, .. }) if roles.required == [77, 77]
+        ));
         // An identity of receiver 0, a reserved role, a trailing word.
         let identity = Command::AddNetworkSubscriptionAs {
             sequence: 1,

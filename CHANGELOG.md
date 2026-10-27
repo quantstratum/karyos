@@ -67,6 +67,11 @@ release may break APIs, wire formats and shared-memory layouts.
     size, allocated once. A client refuses roles that do not fit
     (`ConductorError::CommandTooLarge`) or are not well formed
     (`ConductorError::InvalidRoles`) before sending.
+  - The driver checks a command's required and tagged counts against its
+    membership's `max_receivers` before it reads either list, then finds
+    repeats by sorting a copy in a stack buffer of that size: O(n log n),
+    allocating nothing. The decoder refuses a zero `receiver_id` or tag; a
+    repeated `receiver_id` is `Error` with `ResourcesUnavailable`.
 
 - A conflated view of a network image has a public way in, the embedded
   driver's, as IPC views in a process have (owner item 7: "receiver-side

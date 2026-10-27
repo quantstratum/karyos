@@ -37,22 +37,21 @@ impl PublicationRoles {
     /// Whether the roles are well formed: every required `receiver_id`
     /// nonzero and distinct, every tagged `receiver_id` nonzero and
     /// distinct among the pairs, every tag nonzero, and a tagged strategy's
-    /// group nonzero. What the CnC decoder refuses (`cnc`,
-    /// `AddNetworkPublicationWithRoles`), so a client checks it before
-    /// sending; how many receivers a membership holds is the driver's
-    /// check.
+    /// group nonzero. A client checks it before sending
+    /// (`cnc`, `AddNetworkPublicationWithRoles`): the CnC decoder refuses a
+    /// zero, and the driver a repeat once it has bounded the counts; how
+    /// many receivers a membership holds is the driver's check. Each list
+    /// is sorted in a copy, so the check is O(n log n).
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        let repeats = |ids: &[u64]| {
-            ids.iter()
-                .enumerate()
-                .any(|(at, id)| *id == 0 || ids.iter().take(at).any(|earlier| earlier == id))
+        let distinct_nonzero = |mut ids: Vec<u64>| {
+            ids.sort_unstable();
+            ids.first() != Some(&0) && !ids.windows(2).any(|pair| matches!(pair, [a, b] if a == b))
         };
-        let tagged: Vec<u64> = self.tags.iter().map(|&(id, _)| id).collect();
-        !repeats(&self.required)
-            && !repeats(&tagged)
+        self.strategy != Strategy::Tagged(0)
             && self.tags.iter().all(|&(_, tag)| tag != 0)
-            && self.strategy != Strategy::Tagged(0)
+            && distinct_nonzero(self.required.clone())
+            && distinct_nonzero(self.tags.iter().map(|&(id, _)| id).collect())
     }
 
     /// The borrowed roles `Membership::new` takes.

@@ -537,17 +537,33 @@ pub const DEFAULT_MAX_RECEIVERS: u16 = 64;
 /// that many required and that many tagged receivers, no `receiver_id` 0
 /// or repeated in either list, and no tag 0.
 ///
+/// The counts are checked first, before either list is read, so a list
+/// longer than the table costs nothing (karyos#637). Each list is then
+/// copied into a buffer of `max_receivers` entries and sorted: O(n log n),
+/// and the buffer is on the stack up to [`DEFAULT_MAX_RECEIVERS`], the
+/// bound of every command, so a command allocates nothing here.
+///
 /// # Errors
 ///
 /// [`MembershipConfigError::Roles`] when they do not.
 pub fn check_roles(roles: &Roles<'_>, max_receivers: u16) -> Result<(), MembershipConfigError> {
     let table = usize::from(max_receivers);
-    let tagged: Vec<u64> = roles.tags.iter().map(|(id, _)| *id).collect();
-    if roles.required.len() > table
-        || roles.tags.len() > table
-        || zero_or_repeated(roles.required)
-        || zero_or_repeated(&tagged)
-        || roles.tags.iter().any(|(_, tag)| *tag == 0)
+    if roles.required.len() > table || roles.tags.len() > table {
+        return Err(MembershipConfigError::Roles);
+    }
+    let mut stack = [0u64; DEFAULT_MAX_RECEIVERS as usize];
+    let mut heap = Vec::new();
+    let scratch: &mut [u64] = if table <= stack.len() {
+        &mut stack
+    } else {
+        // A configured table larger than any command's: once per
+        // publication, on the control path.
+        heap.resize(table, 0);
+        &mut heap
+    };
+    if zero_or_repeated(roles.required.iter().copied(), scratch)
+        || zero_or_repeated(roles.tags.iter().map(|&(id, _)| id), scratch)
+        || roles.tags.iter().any(|&(_, tag)| tag == 0)
     {
         return Err(MembershipConfigError::Roles);
     }
@@ -1372,10 +1388,19 @@ impl Membership {
 }
 
 /// Whether `ids` has a 0 or names an id twice.
-fn zero_or_repeated(ids: &[u64]) -> bool {
-    ids.iter()
-        .enumerate()
-        .any(|(at, id)| *id == 0 || ids.iter().take(at).any(|other| other == id))
+/// Whether `ids` hold a 0 or a repeat, sorted in `scratch`, which holds
+/// them all (the caller bounds their count first).
+fn zero_or_repeated(ids: impl Iterator<Item = u64>, scratch: &mut [u64]) -> bool {
+    let mut count = 0;
+    for (slot, id) in scratch.iter_mut().zip(ids) {
+        *slot = id;
+        count += 1;
+    }
+    let Some(ids) = scratch.get_mut(..count) else {
+        return true;
+    };
+    ids.sort_unstable();
+    ids.first() == Some(&0) || ids.windows(2).any(|pair| matches!(pair, [a, b] if a == b))
 }
 
 #[cfg(test)]
