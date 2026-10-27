@@ -28,7 +28,8 @@ loom:
 # CI is off, so this is a merge gate: a PR that touches the counters seqlock
 # or its layout (crates/*/src/counters*, crates/karyos-sys/tests/loom_counters.rs)
 # cites a green `make loom-full` run on its exact head as review evidence
-# (coordinator decision, ACS 12607).
+# (coordinator decision, ACS 12607). It is also a release gate, run at every
+# release head (RELEASING.md).
 loom-full:
 	RUSTFLAGS="--cfg loom" $(CARGO) test -p karyos-sys --release --locked --test 'loom_*' -- --include-ignored
 

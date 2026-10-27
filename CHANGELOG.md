@@ -11,6 +11,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `RELEASING.md` lists the gates a release runs, as the 0.1.0-alpha.2
+  Evidence table records them, and how each result is recorded.
+  `make loom-full` is now required at every release head, not only on
+  pull requests that touch the counters seqlock. After a tag, its
+  release notes only gain dated Evidence rows and dated errata. Publishing
+  to crates.io is not decided there.
 - SPEC.md §13 "Required set transitions" gains its fourth case, a
   required Archive only: `test_recording_required_alone_connects_and_bounds_until_it_leaves`
   (karyos-driver, with a shared-terms variant on Linux) runs a strict

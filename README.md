@@ -85,6 +85,8 @@ scripts/linux-test.sh -p karyos-sys --locked  # any cargo test arguments
 ```
 
 Hosted CI is not running; the gates above are run locally before a merge.
+The gates a release runs, and how their results are recorded, are in
+[RELEASING.md](RELEASING.md).
 
 The cross-process control path is exercised by the Linux tests of
 `karyos-driver`: `tests/admission.rs` (admission in one process),
