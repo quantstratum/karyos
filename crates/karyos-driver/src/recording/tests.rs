@@ -140,6 +140,161 @@ fn required_bounds_the_publisher<T: StreamTerms>(driver: &mut EmbeddedDriver<T>)
     assert_eq!(offer_until_refused(driver, &mut publication, most), most);
 }
 
+/// The stream's publication limit and head, as its conductor published
+/// and observed them.
+fn limit_and_head<T: StreamTerms>(
+    driver: &mut EmbeddedDriver<T>,
+    handle: StreamHandle,
+) -> (u64, u64) {
+    let stream = driver.stream(handle).unwrap();
+    (stream.conductor.limit(), stream.conductor.head().unwrap())
+}
+
+/// Runs a duty cycle and returns the limit it published, asserting that
+/// it is not below `last` (SPEC §4: limits never decrease).
+fn cycle<T: StreamTerms>(
+    driver: &mut EmbeddedDriver<T>,
+    handle: StreamHandle,
+    last: &mut u64,
+) -> u64 {
+    driver.do_work().unwrap();
+    let (limit, _) = limit_and_head(driver, handle);
+    assert!(limit >= *last, "the limit decreased: {limit} below {last}");
+    *last = limit;
+    limit
+}
+
+/// Reads and acknowledges one chunk of at most `bytes`; returns the
+/// reader's position.
+fn read_some<T: StreamTerms>(reader: &mut LaneReader<T>, bytes: usize) -> u64 {
+    let mut out = vec![0u8; bytes];
+    let from = reader.position();
+    match reader.read_committed(from, ReadOrigin::Cursor, &mut out) {
+        Ok(ReadOutcome::Copied { next, .. } | ReadOutcome::Canonical { next, .. }) => {
+            reader.sent(next).unwrap();
+        }
+        other => panic!("{other:?}"),
+    }
+    reader.position()
+}
+
+/// Required set transitions with a required Archive only (SPEC §4 and
+/// §13, contract-traceability plan item 6): a stream without
+/// `allow_unconnected` whose only participant is a required recording is
+/// connected and bounded by the recording's position plus the window;
+/// once the recording leaves, the limit follows the head plus the window
+/// and stays finite, and a required recording joining later bounds the
+/// publisher again. The limit never decreases across any transition.
+#[test]
+fn test_recording_required_alone_connects_and_bounds_until_it_leaves() {
+    required_recording_alone(&mut EmbeddedDriver::new().unwrap());
+}
+
+fn required_recording_alone<T: StreamTerms>(driver: &mut EmbeddedDriver<T>) {
+    let window = u64::from(MIN_TERM_LENGTH / 2);
+    let most = 4 * usize::try_from(MIN_TERM_LENGTH).unwrap() / MESSAGE;
+    let handle = driver
+        .add_stream(StreamConfig {
+            allow_unconnected: false,
+            ..stream()
+        })
+        .unwrap();
+    let mut publication = driver.publication(handle).unwrap();
+    // Control: without any participant the strict stream is not connected.
+    assert_eq!(
+        publication.offer(&[7; MESSAGE]).unwrap(),
+        OfferOutcome::NotConnected
+    );
+    let (mut reader, lease) = driver
+        .recording_reader(handle, Role::Required)
+        .unwrap()
+        .into_parts();
+    let mut last = cycle(driver, handle, &mut 0);
+
+    // 1. The recording alone connects the stream.
+    assert_eq!(
+        publication.offer(&[7; MESSAGE]).unwrap(),
+        OfferOutcome::Accepted {
+            lane: Lane::ZERO,
+            position: 0
+        }
+    );
+
+    // 2. While it lags, the publisher is bounded by its position plus the
+    // window; reading moves the limit up with it, never down.
+    let accepted = offer_until_refused(driver, &mut publication, most);
+    assert!(
+        accepted > 0 && accepted + 1 < most,
+        "bounded: {accepted} of {most}"
+    );
+    let limit = cycle(driver, handle, &mut last);
+    let (_, head) = limit_and_head(driver, handle);
+    assert_eq!(limit, reader.position() + window);
+    let framed = 2 * u64::try_from(MESSAGE).unwrap();
+    assert!(
+        head <= limit && limit - head < framed,
+        "refused at the limit"
+    );
+    for _ in 0..3 {
+        let position = read_some(&mut reader, 4 * MESSAGE);
+        let limit = cycle(driver, handle, &mut last);
+        assert_eq!(limit, position + window, "follows the recording");
+        let _ = offer_until_refused(driver, &mut publication, most);
+        let (limit, head) = limit_and_head(driver, handle);
+        assert!(head <= limit, "head {head} above limit {limit}");
+        assert_eq!(cycle(driver, handle, &mut last), position + window);
+    }
+
+    // 3. The recording leaves: no required participant remains. The limit
+    // moves to the head snapshot plus the window, and with no participant
+    // at all the strict stream is not connected and appends nothing.
+    let lagged = reader.position();
+    let (_, head) = limit_and_head(driver, handle);
+    assert!(head > lagged, "the recording lagged the head");
+    drop((reader, lease));
+    let limit = cycle(driver, handle, &mut last);
+    assert_eq!(limit, head + window, "head snapshot plus the window");
+    assert_eq!(
+        publication.offer(&[7; MESSAGE]).unwrap(),
+        OfferOutcome::NotConnected
+    );
+    assert_eq!(limit_and_head(driver, handle).1, head, "appended nothing");
+    // An optional reader connects it again without bounding it: the
+    // limit follows the head across terms and stays finite.
+    let optional = driver.subscribe(handle, Role::Optional).unwrap();
+    for _ in 0..8 {
+        let accepted = offer_until_refused(driver, &mut publication, most / 8);
+        assert_eq!(accepted, most / 8, "unbounded by the optional reader");
+        let (_, head) = limit_and_head(driver, handle);
+        let limit = cycle(driver, handle, &mut last);
+        assert_eq!(limit, head + window, "follows the head");
+    }
+    drop(optional);
+    let _ = cycle(driver, handle, &mut last);
+
+    // 4. A required recording joining later bounds the publisher again, at
+    // its join position (the head) plus the window: not below the limit
+    // already published.
+    let (_, join) = limit_and_head(driver, handle);
+    let (reader, lease) = driver
+        .recording_reader(handle, Role::Required)
+        .unwrap()
+        .into_parts();
+    assert_eq!(reader.position(), join, "joins at the head");
+    let accepted = offer_until_refused(driver, &mut publication, most);
+    assert!(
+        accepted > 0 && accepted + 1 < most,
+        "bounded again: {accepted} of {most}"
+    );
+    let limit = cycle(driver, handle, &mut last);
+    assert_eq!(limit, join + window);
+    let (_, head) = limit_and_head(driver, handle);
+    assert!(head <= limit);
+    let _ = offer_until_refused(driver, &mut publication, most);
+    assert_eq!(limit_and_head(driver, handle).1, head, "still bounded");
+    drop((reader, lease));
+}
+
 /// An optional recording never bounds the publisher: lapped, its read is
 /// `Unavailable`, and it rejoins at the head and reads what follows.
 #[test]
@@ -404,6 +559,11 @@ mod shared {
     #[test]
     fn a_required_recording_bounds_a_shared_publisher() {
         required_bounds_the_publisher(&mut ipc("required").driver);
+    }
+
+    #[test]
+    fn test_recording_required_alone_connects_and_bounds_a_shared_stream_until_it_leaves() {
+        required_recording_alone(&mut ipc("alone").driver);
     }
 
     #[test]
