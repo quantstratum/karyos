@@ -199,7 +199,10 @@ fn a_client_negotiates_the_limits() {
         &mut agent,
         "KARYOS-AGENT 1 limits page.rows=10\n",
     );
-    assert_eq!(answer, "{\"error\":\"bad request\"}\n");
+    assert_eq!(
+        answer,
+        "{\"error\":\"unknown dimension\",\"dimension\":\"page.rows\"}\n"
+    );
     // A client that never negotiates is served as before.
     let (_, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 view\n");
     assert_eq!(served, [Served::View]);

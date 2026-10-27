@@ -243,6 +243,17 @@ pub fn above_bound(limit: &crate::api::Limit) -> String {
     text
 }
 
+/// The refusal of a proposal for a dimension this agent does not know.
+#[must_use]
+pub fn unknown_dimension(name: &str) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("error", "unknown dimension");
+        fields.string("dimension", name);
+    });
+    text
+}
+
 /// An error answer: `{"error": message}` with `detail`'s fields.
 #[must_use]
 pub fn error(message: &str, supported: Option<&[u32]>) -> String {

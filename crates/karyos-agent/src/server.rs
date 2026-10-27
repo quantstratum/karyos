@@ -40,9 +40,12 @@
 //!   for a fixed bound is the bound. The exchange is stateless, like every
 //!   v1 request: a negotiated value that a later request uses is repeated
 //!   in that request and applies to it only, so no client changes
-//!   another's. In v1 no dimension is negotiable. An agent older than
-//!   `limits` answers it `bad request`, which a client reads as "limits not
-//!   supported", never as "no limits". A future dimension, such as the page
+//!   another's. In v1 no dimension is negotiable. A proposal for a
+//!   dimension the agent does not know is refused by name
+//!   (`{"error":"unknown dimension","dimension":D}`), never as `bad
+//!   request`. So `bad request` to `limits` means the agent predates it: a
+//!   client reads that as "limits not supported", never as "no limits". A
+//!   future dimension, such as the page
 //!   sizes of R-CORE-13 and R-CORE-14, enters [`LIMITS`] as a new entry,
 //!   negotiable or not, and a v1 client that does not name it is unaffected.
 
@@ -102,27 +105,40 @@ pub const LIMITS: [Limit; 6] = [
     },
 ];
 
-/// The effective value of each of [`LIMITS`] given `proposals`
-/// (`DIMENSION=VALUE` separated by single spaces), in [`LIMITS`] order;
-/// `Err(Some(limit))` for a proposal above `limit`'s bound, `Err(None)` for
-/// a malformed, unknown or repeated one.
-fn negotiate(proposals: &str) -> Result<[Option<u64>; LIMITS.len()], Option<Limit>> {
-    let mut effective = LIMITS.map(|limit| limit.bound);
-    let mut proposed = [false; LIMITS.len()];
+/// Why a `limits` proposal was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal<'a> {
+    /// Above this limit's bound.
+    Above(Limit),
+    /// A dimension this agent does not know.
+    Unknown(&'a str),
+    /// Malformed or repeated.
+    Bad,
+}
+
+/// The effective value of each of `limits` given `proposals`
+/// (`DIMENSION=VALUE` separated by single spaces), in `limits` order: a
+/// negotiable dimension takes its proposal, any other keeps its bound.
+fn negotiate<'a, const N: usize>(
+    limits: &[Limit; N],
+    proposals: &'a str,
+) -> Result<[Option<u64>; N], Refusal<'a>> {
+    let mut effective = limits.map(|limit| limit.bound);
+    let mut proposed = [false; N];
     for proposal in proposals.split(' ').filter(|_| !proposals.is_empty()) {
-        let (name, value) = proposal.split_once('=').ok_or(None)?;
-        let value = value.parse::<u64>().map_err(|_| None)?;
-        let ((limit, slot), seen) = LIMITS
+        let (name, value) = proposal.split_once('=').ok_or(Refusal::Bad)?;
+        let value = value.parse::<u64>().map_err(|_| Refusal::Bad)?;
+        let ((limit, slot), seen) = limits
             .iter()
             .zip(effective.iter_mut())
             .zip(proposed.iter_mut())
             .find(|((limit, _), _)| limit.name == name)
-            .ok_or(None)?;
+            .ok_or(Refusal::Unknown(name))?;
         if core::mem::replace(seen, true) {
-            return Err(None);
+            return Err(Refusal::Bad);
         }
         if limit.bound.is_some_and(|bound| value > bound) {
-            return Err(Some(*limit));
+            return Err(Refusal::Above(*limit));
         }
         if limit.negotiable {
             *slot = Some(value);
@@ -383,10 +399,11 @@ impl Server {
                     forbidden()
                 }
             }
-            (Some(_), Request::Limits { proposals }) => match negotiate(proposals) {
+            (Some(_), Request::Limits { proposals }) => match negotiate(&LIMITS, proposals) {
                 Ok(effective) => (json::limits(&LIMITS, &effective), Served::Limits),
-                Err(Some(limit)) => (json::above_bound(&limit), Served::Refused),
-                Err(None) => (json::error("bad request", None), Served::Refused),
+                Err(Refusal::Above(limit)) => (json::above_bound(&limit), Served::Refused),
+                Err(Refusal::Unknown(name)) => (json::unknown_dimension(name), Served::Refused),
+                Err(Refusal::Bad) => (json::error("bad request", None), Served::Refused),
             },
             (Some(_), Request::Version) => (
                 json::error("unsupported version", Some(&[API_VERSION])),
@@ -525,6 +542,64 @@ mod tests {
         assert_eq!(parse(&long), Request::Bad);
     }
 
+    /// R-CORE-38: a dimension this agent does not know is refused by
+    /// name, so a client tells it from an agent without `limits`.
+    #[test]
+    fn an_unknown_dimension_is_refused_by_name() {
+        assert_eq!(
+            negotiate(&LIMITS, "read.timeout_ms=1 page.rows=10"),
+            Err(Refusal::Unknown("page.rows"))
+        );
+        assert_eq!(
+            json::unknown_dimension("page.rows"),
+            r#"{"error":"unknown dimension","dimension":"page.rows"}"#
+        );
+    }
+
+    /// R-CORE-38's three answers, on a table with a negotiable dimension
+    /// (none is in v1): a proposal within its bound is applied, one above
+    /// it is refused with the bound, and the answer renders the negotiable,
+    /// the fixed and the unbounded dimension.
+    #[test]
+    fn a_negotiable_dimension_takes_a_proposal_within_its_bound() {
+        let table = [
+            Limit {
+                name: "page.rows",
+                bound: Some(1000),
+                negotiable: true,
+            },
+            Limit {
+                name: "read.timeout_ms",
+                bound: Some(100),
+                negotiable: false,
+            },
+            Limit {
+                name: "write.response_bytes",
+                bound: None,
+                negotiable: false,
+            },
+        ];
+        assert_eq!(negotiate(&table, ""), Ok([Some(1000), Some(100), None]));
+        let effective = negotiate(&table, "page.rows=50 read.timeout_ms=50").unwrap();
+        assert_eq!(effective, [Some(50), Some(100), None]);
+        assert_eq!(
+            negotiate(&table, "page.rows=1001"),
+            Err(Refusal::Above(table[0]))
+        );
+        assert_eq!(
+            json::above_bound(&table[0]),
+            r#"{"error":"above bound","dimension":"page.rows","bound":1000}"#
+        );
+        assert_eq!(
+            json::limits(&table, &effective),
+            concat!(
+                r#"{"limits":{"page.rows":{"value":50,"negotiable":true},"#,
+                r#""read.timeout_ms":{"value":100,"negotiable":false},"#,
+                r#""write.response_bytes":{"value":null}}}"#
+            )
+        );
+    }
+
     /// R-CORE-38: `limits` parses with or without proposals.
     #[test]
     fn limits_requests_parse() {
@@ -547,9 +622,9 @@ mod tests {
     fn a_fixed_bound_answers_its_value_whatever_is_proposed() {
         let bounds = LIMITS.map(|limit| limit.bound);
         assert!(LIMITS.iter().all(|limit| !limit.negotiable));
-        assert_eq!(negotiate(""), Ok(bounds));
-        assert_eq!(negotiate("read.timeout_ms=50"), Ok(bounds));
-        assert_eq!(negotiate("write.response_bytes=4096"), Ok(bounds));
+        assert_eq!(negotiate(&LIMITS, ""), Ok(bounds));
+        assert_eq!(negotiate(&LIMITS, "read.timeout_ms=50"), Ok(bounds));
+        assert_eq!(negotiate(&LIMITS, "write.response_bytes=4096"), Ok(bounds));
         assert_eq!(bounds[0], Some(256));
         assert_eq!(bounds[1], Some(100));
         assert_eq!(bounds[2], Some(100));
@@ -559,23 +634,25 @@ mod tests {
     }
 
     /// R-CORE-38: a proposal above a bound is refused with that limit;
-    /// a malformed, unknown or repeated one is a bad request.
+    /// a malformed or repeated one is a bad request.
     #[test]
     fn a_proposal_above_a_bound_is_refused_with_the_bound() {
-        assert_eq!(negotiate("write.timeout_ms=101"), Err(Some(LIMITS[2])));
         assert_eq!(
-            negotiate("read.request_bytes=256 connection.requests=2"),
-            Err(Some(LIMITS[5]))
+            negotiate(&LIMITS, "write.timeout_ms=101"),
+            Err(Refusal::Above(LIMITS[2]))
+        );
+        assert_eq!(
+            negotiate(&LIMITS, "read.request_bytes=256 connection.requests=2"),
+            Err(Refusal::Above(LIMITS[5]))
         );
         for bad in [
             "read.timeout_ms",
             "read.timeout_ms=x",
             "read.timeout_ms=-1",
-            "page.rows=10",
             "read.timeout_ms=1 read.timeout_ms=2",
             "read.timeout_ms=1  write.timeout_ms=1",
         ] {
-            assert_eq!(negotiate(bad), Err(None), "{bad}");
+            assert_eq!(negotiate(&LIMITS, bad), Err(Refusal::Bad), "{bad}");
         }
     }
 

@@ -16,7 +16,8 @@ release may break APIs, wire formats and shared-memory layouts.
   ...]`, answers each connection, read and write dimension as a negotiable
   bound, a fixed bound or no bound (`{"value":null}`), and refuses a
   proposal above a bound with `{"error":"above bound","dimension":D,
-  "bound":N}`. It is stateless, so a negotiated value applies to the
+  "bound":N}` and one for a dimension it does not know with
+  `{"error":"unknown dimension","dimension":D}`. It is stateless, so a negotiated value applies to the
   request that repeats it only. No dimension is negotiable in v1, no bound
   changed, and a client that never sends `limits` is served as before.
 
