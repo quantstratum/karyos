@@ -36,7 +36,8 @@
 //! - **Not yet.** An endpoint's capability gauges read as one group in
 //!   the view (M6b's `karyos_client::capabilities` reads them).
 //! - **Operations journal** (M10b): [`journal`] keeps the agent's guard
-//!   operations as an Archive recording (owner item 7, interim).
+//!   operations as an Archive recording (owner item 51(7) of the
+//!   2026-10-21 decisions, interim; the gap analysis's new owner item 7).
 //! - **Crate graph** (owner item 52): it depends on `karyos-archive`,
 //!   `karyos-client`, `karyos-sys` and `karyos-trace`, never on the driver
 //!   or the tools; neither the driver, the client nor the Archive depends
