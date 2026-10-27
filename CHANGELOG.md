@@ -18,7 +18,8 @@ release may break APIs, wire formats and shared-memory layouts.
   proposal above a bound with `{"error":"above bound","dimension":D,
   "bound":N}` and one for a dimension it does not know with
   `{"error":"unknown dimension","dimension":D}`. It is stateless, so a negotiated value applies to the
-  request that repeats it only. No dimension is negotiable in v1, no bound
+  request that repeats it only. Only `read.request_bytes` is negotiable in v1,
+  downwards, and applies to the request that proposes it; no bound
   changed, and a client that never sends `limits` is served as before.
 
 - R-CORE-12, the Archive's public durable-prefix acknowledgement

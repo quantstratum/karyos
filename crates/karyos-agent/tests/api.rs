@@ -166,7 +166,7 @@ fn a_client_negotiates_the_limits() {
     let mut server =
         Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
     let all = concat!(
-        r#"{"limits":{"read.request_bytes":{"value":256,"negotiable":false},"#,
+        r#"{"limits":{"read.request_bytes":{"value":256,"negotiable":true},"#,
         r#""read.timeout_ms":{"value":100,"negotiable":false},"#,
         r#""write.timeout_ms":{"value":100,"negotiable":false},"#,
         r#""write.response_bytes":{"value":null},"#,
@@ -203,6 +203,42 @@ fn a_client_negotiates_the_limits() {
         answer,
         "{\"error\":\"unknown dimension\",\"dimension\":\"page.rows\"}\n"
     );
+    // The one negotiable dimension, downwards only, applied to the request.
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        "KARYOS-AGENT 1 limits read.request_bytes=200\n",
+    );
+    assert_eq!(served, [Served::Limits]);
+    assert_eq!(
+        answer,
+        all.replace(
+            r#""read.request_bytes":{"value":256,"#,
+            r#""read.request_bytes":{"value":200,"#
+        )
+    );
+    let (answer, _) = ask(
+        &mut server,
+        &mut agent,
+        "KARYOS-AGENT 1 limits read.request_bytes=257\n",
+    );
+    assert_eq!(
+        answer,
+        "{\"error\":\"above bound\",\"dimension\":\"read.request_bytes\",\"bound\":256}\n"
+    );
+    let (answer, _) = ask(
+        &mut server,
+        &mut agent,
+        "KARYOS-AGENT 1 limits read.request_bytes=20\n",
+    );
+    assert_eq!(
+        answer,
+        "{\"error\":\"above bound\",\"dimension\":\"read.request_bytes\",\"bound\":20}\n"
+    );
+    // `limits` without proposals is never `bad request` from an agent that
+    // serves it, so that answer alone means "limits not supported".
+    let (answer, _) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 limits\n");
+    assert!(answer.starts_with("{\"limits\":"), "{answer}");
     // A client that never negotiates is served as before.
     let (_, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 view\n");
     assert_eq!(served, [Served::View]);
