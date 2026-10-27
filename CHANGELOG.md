@@ -31,11 +31,6 @@ release may break APIs, wire formats and shared-memory layouts.
   `DurationError`; and `ChannelError::InvalidDuration` (code 11) for duration
   keys. A test per published key asserts the sixteen existing keys parse as
   before.
-- `AgentConfig::conductor_duty_period` (default 1 ms): the longest time between
-  two conductor duty cycles. `barrier_ack_timeout` is validated against it
-  (karyos#658). karyosd bounds its idle sleep by it; a caller that drives an
-  embedded driver's `duty_cycle` itself must call it at least this often while
-  a conflated network view is open.
 - A conflated network view closed by its terminal cell can be recreated
   (driver-internal, `EmbeddedDriver::recreate_network_view`, until karyos#637
   gives it a public way in). The new view starts with every written key's last
