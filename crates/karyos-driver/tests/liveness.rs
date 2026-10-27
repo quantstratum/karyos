@@ -10,6 +10,7 @@
 // test exemptions (ADR-0007 exempts tests from these lints).
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -27,7 +28,7 @@ use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::counters::CellRead;
 use karyos_sys::error::SysError;
 use karyos_sys::frame::Lane;
-use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+use karyos_sys::log_buffer::{AppendOptions, LogBufferConfig, PublicationMode, Role};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
@@ -417,9 +418,21 @@ fn test_driver_loss_abort_seals_the_stream() {
     }
 }
 
+/// An `abort` seal closes the conflation table only once its feeder has
+/// read the log to the seal. With a feeder budget of one message per
+/// duty cycle, the seal comes while eight keyed values are still unread:
+/// the view stays open as they arrive, and when it reports `closed` it
+/// already holds the last value of every key.
 #[test]
 fn test_abort_seal_closes_conflation_table_after_feeder_reaches_end() {
-    let (mut driver, clock) = driver();
+    let clock = ManualClock::default();
+    let config = DriverConfig {
+        heartbeat_interval: INTERVAL,
+        client_liveness_timeout: TIMEOUT,
+        conflation_feeder_budget: NonZeroU32::MIN,
+        ..DriverConfig::default()
+    };
+    let mut driver = EmbeddedDriver::with_clock(config, Box::new(clock.clone())).unwrap();
     let mut config = stream_config(LossPolicy::Abort);
     config.conflation = Some(ConflationConfig {
         keys: 4,
@@ -428,18 +441,55 @@ fn test_abort_seal_closes_conflation_table_after_feeder_reaches_end() {
     });
     let stream = driver.add_stream(config).unwrap();
     let mut conflated: ConflatedSubscription = driver.subscribe_conflated(stream).unwrap();
-    let (_client, _subscription) = lost_required_subscriber(&mut driver, &clock);
+    let mut observer = beating(&mut driver);
+    let (_client, _subscription) = required_subscriber(&mut driver, &mut observer);
+    // Eight values, two per key, appended before the seal; the feeder
+    // has read none of them yet.
+    let mut publication = driver.publication(stream).unwrap();
+    let mut last = [0u8; 4];
+    for value in 1..=8u8 {
+        let key = value % 4;
+        let options = AppendOptions {
+            reserved_value: i64::from(key),
+            ..AppendOptions::default()
+        };
+        assert!(matches!(
+            publication.offer_with(&[value], options).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+        last[usize::from(key)] = value;
+    }
+    time_out(&clock);
+    let _ = observed_work(&mut driver, &mut observer);
     assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
+    // The publisher learns of the seal and releases; the seal is then
+    // positioned after the eight values.
+    assert_eq!(publication.offer(&[9]).unwrap(), OfferOutcome::Closed);
 
-    let mut report = conflated.poll_changed(|_, _| {}).unwrap();
-    for _ in 0..8 {
-        let _ = driver.do_work().unwrap();
-        report = conflated.poll_changed(|_, _| {}).unwrap();
+    let mut seen = [0u8; 4];
+    let mut open_polls = 0;
+    let mut closed = false;
+    for _ in 0..32 {
+        let report = conflated
+            .poll_changed(|key, value| seen[usize::try_from(key).unwrap()] = value.payload()[0])
+            .unwrap();
         if report.closed {
+            closed = true;
             break;
         }
+        open_polls += 1;
+        let _ = observed_work(&mut driver, &mut observer);
     }
-    assert!(report.closed, "Abort seal must close the conflation writer");
+    assert!(
+        closed,
+        "the abort seal must close the conflation writer: {open_polls} open polls, seen {seen:?}"
+    );
+    // Closed only once the feeder reached the seal: every value appended
+    // before it was written, the last one of each key included.
+    assert_eq!(seen, last, "closed before the feeder reached the end");
+    // The seal came first: the view stayed open while the feeder read on
+    // after it.
+    assert!(open_polls > 1, "closed after {open_polls} open polls");
 }
 
 // ---- p4b-2b: the driver reports losses as events ----
