@@ -61,11 +61,11 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
     karyos_sys::alloc_count::CountingAllocator;
 
 #[cfg(target_os = "linux")]
-pub use admission::{DEFAULT_MAX_TOOLS, IpcConfig};
+pub use admission::{DEFAULT_MAX_TOOLS, IpcConfig, MAX_PROBES_PER_STEP};
 pub use clock::{MonotonicClock, SystemClock};
 pub use embedded::{
     AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, FIRST_INCARNATION,
-    StreamConfig, StreamHandle, StreamState,
+    FailedReason, NotReadyReason, Readiness, StreamConfig, StreamHandle, StreamState,
 };
 pub use error::{DriverError, TimedNetworkUnsupported, WalkerUnavailable};
 pub use generations::{GenerationInfo, Reconfiguration};

@@ -80,18 +80,21 @@ fn claimed(outcome: ClaimOutcome<'_>) -> ClientClaim<'_> {
 #[test]
 fn a_held_claim_is_aborted_at_exactly_its_deadline() {
     let (mut driver, clock) = driver();
+    // Creating the driver reads the clock once, for its startup deadline
+    // (R-CORE-35); the duty cycle's reads are counted from there.
+    let created = clock.reads();
     let stream = driver.add_stream(config(2, 100)).unwrap();
     let mut subscription = driver.subscribe(stream, Role::Required).unwrap();
     let mut publication = driver.publication(stream).unwrap();
     // No claim: the clock is never read.
     clock.set(10);
     let _ = driver.do_work().unwrap();
-    assert_eq!(clock.reads(), 0);
+    assert_eq!(clock.reads(), created);
     let mut claim = claimed(publication.try_claim(8).unwrap());
     let position = claim.position();
     // First observation at 10: the deadline counts from there.
     let _ = driver.do_work().unwrap();
-    assert_eq!(clock.reads(), 1);
+    assert_eq!(clock.reads(), created + 1);
     clock.set(109);
     let work = driver.do_work().unwrap();
     assert_eq!(work, 0, "waiting adds no work");

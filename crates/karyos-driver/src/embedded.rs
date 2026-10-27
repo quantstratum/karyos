@@ -303,6 +303,12 @@ pub struct DriverConfig {
     /// close before the effective-close acknowledgement reports it overdue;
     /// it is still pending, never closed (guards-and-abort.md). Nonzero.
     pub guard_ack_timeout: u64,
+    /// How long, in the driver clock's unit, the host has to declare its
+    /// startup complete ([`EmbeddedDriver::startup_complete`]) before the
+    /// driver's readiness is failed with
+    /// [`FailedReason::StartupDeadline`] (R-CORE-35). Nonzero; 30 s by
+    /// default.
+    pub startup_timeout: u64,
     /// The network agents (`quantstratum-docs:
     /// karyos/design/driver-network-agents.md`); `None`, the default, for
     /// a driver without network channels. In
@@ -371,6 +377,7 @@ impl Default for DriverConfig {
             guard_audit_records: 1024,
             max_guard_senders: 64,
             guard_ack_timeout: 1_000_000_000,
+            startup_timeout: 30_000_000_000,
             network: None,
             initial_term_id: None,
         }
@@ -379,6 +386,56 @@ impl Default for DriverConfig {
 
 /// Bytes of the largest response record: header plus payload.
 const RESPONSE_EXTENT: usize = HEADER_LENGTH as usize + MAX_RESPONSE_LENGTH;
+
+/// Where the host's startup stands (R-CORE-35).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Startup {
+    /// Not yet declared complete, within the deadline.
+    Pending,
+    /// Declared complete in time.
+    Complete,
+    /// Not declared complete in time; it does not end.
+    Failed,
+}
+
+/// A driver's readiness for a probe (R-CORE-35;
+/// [`EmbeddedDriver::readiness`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Readiness {
+    /// The host has not declared its startup complete, within the deadline.
+    Starting,
+    /// A client would be admitted now, into no cutover.
+    Ready,
+    /// Admitting, but a stream still retains a predecessor mapping after a
+    /// cutover: traffic routed now would meet the cutover.
+    Recovering,
+    /// Not admitting a client now.
+    NotReady(NotReadyReason),
+    /// Startup failed; it does not end.
+    Failed(FailedReason),
+}
+
+/// Why a driver is not ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NotReadyReason {
+    /// [`EmbeddedDriver::stop_admitting`]: an orderly shutdown.
+    NotAdmitting,
+    /// The driver holds `max_clients` clients.
+    Full,
+    /// The driver is terminal.
+    Terminal,
+}
+
+/// Why a driver's startup failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FailedReason {
+    /// [`EmbeddedDriver::startup_complete`] was not called within
+    /// [`DriverConfig::startup_timeout`].
+    StartupDeadline,
+}
 
 /// Configuration of one stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -985,6 +1042,10 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// Whether new clients are admitted; cleared once by
     /// [`EmbeddedDriver::stop_admitting`].
     pub(crate) admitting: bool,
+    /// When the driver was created, on its clock (R-CORE-35).
+    pub(crate) started_at: u64,
+    /// Where the host's startup stands (R-CORE-35).
+    pub(crate) startup: Startup,
     pub(crate) counters: DriverCounters,
     /// The client counters region and the owner of each allocated cell.
     pub(crate) client_counters: ClientCounters,
@@ -1267,6 +1328,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             && config.trace_drain_budget > 0
             && config.trace_mirror_records > 0
             && config.cutover_deadline > 0
+            && config.startup_timeout > 0
             && config.heartbeat_interval > 0
             && config
                 .heartbeat_interval
@@ -1428,6 +1490,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Event::DriverStartedAt,
             karyos_sys::host_clock::host_monotonic_ns(),
         );
+        // R-CORE-35: the startup deadline counts from here.
+        let mut clock = clock;
+        let started_at = clock.now();
         let id = NEXT_DRIVER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| DriverError::DriverIdsExhausted)?;
@@ -1453,6 +1518,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             command_bytes: vec![0; config.ring_capacity / 8],
             terminal: false,
             admitting: true,
+            started_at,
+            startup: Startup::Pending,
             clock,
             next_export: 1,
             holding: Vec::new(),
@@ -1888,6 +1955,81 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     #[must_use]
     pub fn is_admitting(&self) -> bool {
         self.admitting
+    }
+
+    /// Declares the host's startup complete (R-CORE-35): the streams,
+    /// guards and services it configures before taking traffic exist, so
+    /// [`EmbeddedDriver::readiness`] may report ready. Before it, readiness
+    /// is starting, and past [`DriverConfig::startup_timeout`] it is
+    /// failed: **a host that never calls this reports failed once the
+    /// deadline passes**, and a probe then stops the pod. Returns whether
+    /// startup is complete: false when the deadline had already passed,
+    /// which this call does not undo. Calling it again has no effect.
+    pub fn startup_complete(&mut self) -> bool {
+        let now = self.clock.now();
+        self.startup_at(now);
+        if self.startup == Startup::Pending {
+            self.startup = Startup::Complete;
+        }
+        self.startup == Startup::Complete
+    }
+
+    /// Fails a pending startup whose deadline passed at `now`.
+    fn startup_at(&mut self, now: u64) {
+        if self.startup == Startup::Pending
+            && karyos_sys::host_clock::age_ns(now, self.started_at) > self.config.startup_timeout
+        {
+            self.startup = Startup::Failed;
+        }
+    }
+
+    /// The driver's readiness (R-CORE-35), from the conditions a client
+    /// `Hello` is admitted under, never from a counter. In order:
+    ///
+    /// - terminal, or not admitting: [`Readiness::NotReady`];
+    /// - startup not declared complete: [`Readiness::Starting`] until
+    ///   [`DriverConfig::startup_timeout`], then [`Readiness::Failed`] for
+    ///   good;
+    /// - `max_clients` clients: [`Readiness::NotReady`] (full);
+    /// - a stream still retaining a predecessor mapping after a cutover:
+    ///   [`Readiness::Recovering`];
+    /// - otherwise [`Readiness::Ready`]: a client would be admitted now,
+    ///   into no cutover.
+    ///
+    /// It reads plain fields of the driver and its clock: no region, no
+    /// counter, nothing a publisher or subscriber touches.
+    pub fn readiness(&mut self) -> Readiness {
+        let now = self.clock.now();
+        self.startup_at(now);
+        if self.terminal {
+            return Readiness::NotReady(NotReadyReason::Terminal);
+        }
+        if !self.admitting {
+            return Readiness::NotReady(NotReadyReason::NotAdmitting);
+        }
+        match self.startup {
+            Startup::Pending => return Readiness::Starting,
+            Startup::Failed => return Readiness::Failed(FailedReason::StartupDeadline),
+            Startup::Complete => {}
+        }
+        if self.clients.len() >= self.config.max_clients {
+            return Readiness::NotReady(NotReadyReason::Full);
+        }
+        if self
+            .streams
+            .iter()
+            .any(|stream| !stream.retained.is_empty())
+        {
+            return Readiness::Recovering;
+        }
+        Readiness::Ready
+    }
+
+    /// Nanoseconds since the driver was created, on its clock.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn uptime(&mut self) -> u64 {
+        let now = self.clock.now();
+        karyos_sys::host_clock::age_ns(now, self.started_at)
     }
 
     /// Adds a guard named `name`, created closed at epoch 1, on the control
@@ -5118,6 +5260,76 @@ mod tests {
         fn now(&mut self) -> u64 {
             self.0.load(Ordering::Relaxed)
         }
+    }
+
+    /// R-CORE-35: starting until the host declares its startup complete,
+    /// then ready; a full driver is not ready, and an orderly shutdown
+    /// is not ready for good.
+    #[test]
+    fn readiness_goes_from_starting_to_ready_and_to_not_ready() {
+        let clock = ManualClock::default();
+        let mut driver = EmbeddedDriver::with_clock(
+            DriverConfig {
+                max_clients: 1,
+                ..DriverConfig::default()
+            },
+            Box::new(clock.clone()),
+        )
+        .unwrap();
+        assert_eq!(driver.readiness(), Readiness::Starting);
+        clock.0.store(29_000_000_000, Ordering::Relaxed);
+        assert_eq!(driver.readiness(), Readiness::Starting);
+        assert!(driver.startup_complete());
+        assert_eq!(driver.readiness(), Readiness::Ready);
+        // Past the deadline once complete: still ready.
+        clock.0.store(60_000_000_000, Ordering::Relaxed);
+        assert_eq!(driver.readiness(), Readiness::Ready);
+        let conductor = driver.connect().unwrap();
+        assert_eq!(
+            driver.readiness(),
+            Readiness::NotReady(NotReadyReason::Full)
+        );
+        drop(conductor);
+        driver.stop_admitting();
+        assert_eq!(
+            driver.readiness(),
+            Readiness::NotReady(NotReadyReason::NotAdmitting)
+        );
+    }
+
+    /// R-CORE-35: a host that does not declare its startup complete within
+    /// `startup_timeout` reports failed, for good: a late declaration does
+    /// not undo it.
+    #[test]
+    fn a_startup_past_its_deadline_fails_for_good() {
+        let clock = ManualClock::default();
+        let mut driver = EmbeddedDriver::with_clock(
+            DriverConfig {
+                startup_timeout: 1_000,
+                ..DriverConfig::default()
+            },
+            Box::new(clock.clone()),
+        )
+        .unwrap();
+        clock.0.store(1_000, Ordering::Relaxed);
+        assert_eq!(driver.readiness(), Readiness::Starting);
+        clock.0.store(1_001, Ordering::Relaxed);
+        assert_eq!(
+            driver.readiness(),
+            Readiness::Failed(FailedReason::StartupDeadline)
+        );
+        assert!(!driver.startup_complete());
+        assert_eq!(
+            driver.readiness(),
+            Readiness::Failed(FailedReason::StartupDeadline)
+        );
+        assert!(matches!(
+            EmbeddedDriver::with_config(DriverConfig {
+                startup_timeout: 0,
+                ..DriverConfig::default()
+            }),
+            Err(DriverError::InvalidConfig)
+        ));
     }
 
     fn config(stream_id: i32) -> StreamConfig {

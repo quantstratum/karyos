@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `karyos-tools`: subcommands that read Karyos's files offline. The one
-//! so far is `replay diff` (`quantstratum-docs:
+//! `karyos-tools`: subcommands that read Karyos's files offline, and
+//! `probe` (Linux; R-CORE-35), a driver's readiness for an orchestrator's
+//! probe, whose logic is in `karyos_tools::probe`. The offline one is
+//! `replay diff` (`quantstratum-docs:
 //! karyos/design/recording-group-replay.md` section 10), the alias of
 //! `karyos-replay diff` (`karyos/design/archive-host.md`, H5), whose logic
 //! is in [`karyos_tools::replay`]. See `karyos-tools replay diff --help`.
@@ -16,6 +18,7 @@ const HELP: &str = "\
 karyos-tools: subcommands that read Karyos's files offline.
 
 Usage: karyos-tools replay diff ...   (see karyos-tools replay diff --help)
+       karyos-tools probe --dir <dir>  (Linux; see karyos-tools probe --help)
 
 `karyos-tools replay diff` is `karyos-replay diff` by another name.
 ";
@@ -32,6 +35,12 @@ fn main() -> ExitCode {
         (Some(Some("replay")), Some(Some("diff"))) => ExitCode::from(replay::run_diff(
             DIFF,
             args,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )),
+        #[cfg(target_os = "linux")]
+        (Some(Some("probe")), _) => ExitCode::from(karyos_tools::probe::run(
+            sub.into_iter().chain(args),
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         )),

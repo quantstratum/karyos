@@ -167,11 +167,14 @@ fn test_driver_liveness_a_paused_driver_does_not_time_out_a_client_that_kept_bea
 #[test]
 fn test_driver_liveness_the_clock_is_read_only_while_a_client_is_admitted() {
     let (mut driver, clock) = driver();
+    // Creating the driver reads the clock once, for its startup deadline
+    // (R-CORE-35); the duty cycle's reads are counted from there.
+    let created = clock.reads();
     let _ = driver.do_work().unwrap();
-    assert_eq!(clock.reads(), 0);
+    assert_eq!(clock.reads(), created);
     let client = driver.connect().unwrap();
     let _ = driver.do_work().unwrap();
-    assert_eq!(clock.reads(), 1);
+    assert_eq!(clock.reads(), created + 1);
     drop(client);
     let _ = driver.do_work().unwrap();
     let reads = clock.reads();
