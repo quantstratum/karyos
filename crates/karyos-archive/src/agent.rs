@@ -56,6 +56,7 @@ use karyos_sys::frame::Lane;
 
 use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason, StreamFormat};
 use crate::disk::Disk;
+use crate::durable::DurablePosition;
 use crate::group::capture::{
     self, CaptureConfig, CaptureError, CaptureJob, CaptureSender, CaptureSetup, CheckpointStep,
     GroupState,
@@ -580,6 +581,9 @@ pub struct Described {
     pub recording: Recording,
     /// Its end now.
     pub end: u64,
+    /// Its durable position now: every byte below it, with its index, is
+    /// on storage. Its stop once stopped, since the close syncs first.
+    pub durable: u64,
     /// It lost ranges: its stop's, or so far for one that records.
     pub incomplete: bool,
 }
@@ -1019,6 +1023,27 @@ impl ArchiveHandle {
     /// [`AgentError::Unknown`] and [`AgentError::Gone`].
     pub fn describe(&self, id: u64) -> Result<Described, AgentError> {
         self.call(|reply| Command::Describe(id, reply))
+    }
+
+    /// As [`ArchiveHandle::describe`], without waiting for room or for the
+    /// answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_describe(&self, id: u64) -> Result<Posted<Described>, AgentError> {
+        self.post(|reply| Command::Describe(id, reply))
+    }
+
+    /// Recording `id`'s durable position now (R-CORE-12): never ahead of
+    /// the last successful sync of its store.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Unknown`] and [`AgentError::Gone`].
+    pub fn durable_position(&self, id: u64) -> Result<DurablePosition, AgentError> {
+        self.describe(id)
+            .map(|described| DurablePosition::of(&described))
     }
 
     /// Starts a replay of a recording's range onto `start.sink`; returns
@@ -2530,14 +2555,17 @@ fn stop<D: Disk>(
 
 /// `recording` and where it ends now.
 fn described<D: Disk>(recording: &Recording, active: &[Active<D>]) -> Described {
-    let (end, incomplete) = match recording.stop {
-        Some(stop) => (stop.position, stop.incomplete),
+    let (end, durable, incomplete) = match recording.stop {
+        // The close synced: the stop is durable.
+        Some(stop) => (stop.position, stop.position, stop.incomplete),
         None => active
             .iter()
             .find(|active| active.id == recording.id)
-            .map_or((recording.start, false), |active| {
+            .map_or((recording.start, recording.start, false), |active| {
+                let store = active.recorder.store();
                 (
-                    active.recorder.store().written(),
+                    store.written(),
+                    store.durable(),
                     active.recorder.incomplete(),
                 )
             }),
@@ -2545,6 +2573,7 @@ fn described<D: Disk>(recording: &Recording, active: &[Active<D>]) -> Described 
     Described {
         recording: recording.clone(),
         end,
+        durable,
         incomplete,
     }
 }

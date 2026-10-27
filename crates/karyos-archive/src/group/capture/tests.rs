@@ -274,6 +274,27 @@ fn events_in_flight_are_bounded_until_durable() {
     sender.admit().unwrap();
 }
 
+/// R-CORE-12 in process: the sender's crate-root answers follow the
+/// prefixes, written but not durable until a sync.
+#[test]
+fn test_capture_group_durable_follows_the_durable_prefix() {
+    use crate::durable::Durability;
+    let none = Recordings::default();
+    let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(4096, 400, 2));
+    sender.admit().unwrap();
+    sender.send(&event(1, 10, None), 1).unwrap();
+    job.duty(0, 16, &none).unwrap();
+    assert_eq!(sender.group_durable().durable_group_seq, 0, "written only");
+    assert_eq!(sender.durability(1), Durability::Pending(0));
+    job.sync(&none).unwrap();
+    assert_eq!(sender.group_durable().durable_group_seq, 1);
+    assert_eq!(sender.durability(1), Durability::Reached(1));
+    assert_eq!(
+        sender.group_durable().durable_group_seq,
+        sender.view().durable_group_seq()
+    );
+}
+
 /// A best-effort group marks an event it could not take with a gap,
 /// which needs only ring room; the gap stops the prefixes, so no event is
 /// in flight any more and the bound is lifted.

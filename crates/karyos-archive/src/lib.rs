@@ -16,6 +16,7 @@ pub mod client;
 pub mod control;
 pub mod crc32c;
 pub mod disk;
+pub mod durable;
 #[cfg(test)]
 mod fault;
 pub mod group;

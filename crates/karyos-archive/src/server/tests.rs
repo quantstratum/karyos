@@ -22,6 +22,7 @@ use super::*;
 use crate::agent::{AgentConfig, SinkClosed};
 use crate::catalog::StopReason;
 use crate::disk::StdDisk;
+use crate::durable::{DurableState, DurableSync};
 use crate::recorder::{Frames, Mode, SourceError};
 use crate::segment::SyncPolicy;
 
@@ -847,4 +848,96 @@ fn a_replay_session_is_the_ids_low_half() {
     assert_eq!(replay_session_id(0x1_0000_0002), 2);
     assert_eq!(replay_session_id(0xFFFF_FFFF), -1);
     assert_eq!(replay_session_id(0x8000_0000), i32::MIN);
+}
+
+fn durable_query(correlation_id: u64, recording_id: u64) -> Vec<u8> {
+    let mut out = vec![0u8; MAX_REQUEST];
+    let length = durable::QueryDurable {
+        correlation_id,
+        recording_id,
+    }
+    .encode(&mut out)
+    .unwrap();
+    out.truncate(length);
+    out
+}
+
+fn durable_answer(bytes: &[u8]) -> DurableAnswer {
+    match DurabilityMessage::decode(bytes).unwrap() {
+        DurabilityMessage::DurablePosition(answer) => answer,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// R-CORE-12 over the control streams: a schema 4 query is answered with
+/// the recording's durable position, never ahead of what it wrote, and,
+/// once stopped, equal to its stop; an unknown recording and an unknown
+/// schema 4 version are refused, typed and correlated; an answer sent as
+/// a request is refused.
+#[test]
+fn test_server_durable_query_answers_the_durable_position() {
+    let mut rig = Rig::new("durable", Host::of(frames(2, 2), false));
+    rig.request(&start(1));
+    rig.sent(2);
+    for _ in 0..5000 {
+        if rig.server.agent().describe(1).unwrap().end == 192 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rig.raw(durable_query(2, 1));
+    let sent = rig.sent(3);
+    let answer = durable_answer(&sent[2]);
+    assert_eq!(answer.correlation_id, 2);
+    let position = answer.position;
+    assert_eq!(
+        (
+            position.recording_id,
+            position.written,
+            position.state,
+            position.sync
+        ),
+        (1, 192, DurableState::Recording, DurableSync::PerSegment)
+    );
+    assert!(position.start <= position.durable && position.durable <= position.written);
+    rig.request(&ControlMessage::StopRecording(control::StopRecording {
+        correlation_id: 3,
+        recording_id: 1,
+    }));
+    rig.sent(5);
+    rig.raw(durable_query(4, 1));
+    let sent = rig.sent(6);
+    let stopped = durable_answer(&sent[5]).position;
+    assert_eq!(
+        (stopped.state, stopped.written, stopped.durable),
+        (DurableState::Stopped, 192, 192)
+    );
+    assert!(
+        stopped.durable >= position.durable,
+        "never behind an answer"
+    );
+    rig.raw(durable_query(5, 99));
+    let sent = rig.sent(7);
+    let unknown = response(&sent[6]);
+    assert_eq!(
+        (unknown.correlation_id, unknown.code),
+        (5, ResponseCode::UnknownRecording)
+    );
+    let mut later = durable_query(6, 1);
+    later[4] = 2;
+    rig.raw(later);
+    let sent = rig.sent(8);
+    let unsupported = response(&sent[7]);
+    assert_eq!(
+        (unsupported.correlation_id, unsupported.code),
+        (6, ResponseCode::UnsupportedSchema)
+    );
+    rig.raw(sent[5].clone());
+    let sent = rig.sent(9);
+    let not_a_request = response(&sent[8]);
+    assert_eq!(
+        (not_a_request.correlation_id, not_a_request.code),
+        (4, ResponseCode::InvalidRequest)
+    );
+    rig.finish();
 }
