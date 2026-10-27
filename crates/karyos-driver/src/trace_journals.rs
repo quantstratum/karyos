@@ -928,17 +928,37 @@ impl TraceJournals {
 #[cfg(target_os = "linux")]
 pub(crate) fn time_namespace_of(pidfd: &karyos_sys::ipc::PidFd) -> TimeNamespace {
     use std::os::unix::fs::MetadataExt;
-    let own = std::fs::metadata("/proc/self/ns/time");
-    let theirs = std::fs::metadata(format!("/proc/{}/ns/time", pidfd.pid()));
+    let file = |path: &str| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    };
+    let own = file("/proc/self/ns/time");
+    let theirs = file(&format!("/proc/{}/ns/time", pidfd.pid()));
     // Alive after the read: the pid named the proven process throughout.
     if pidfd.exited().unwrap_or(true) {
         return TimeNamespace::Unknown;
     }
+    compare_time_namespaces(own, theirs)
+}
+
+/// Two time namespace files, each as its device and inode, compared: the
+/// same file is the same namespace, two distinct files are two namespaces,
+/// and a file that could not be read leaves it unknown.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "time namespaces exist only on Linux; tested everywhere"
+    )
+)]
+pub(crate) fn compare_time_namespaces(
+    own: Option<(u64, u64)>,
+    theirs: Option<(u64, u64)>,
+) -> TimeNamespace {
     match (own, theirs) {
-        (Ok(own), Ok(theirs)) if (own.dev(), own.ino()) == (theirs.dev(), theirs.ino()) => {
-            TimeNamespace::Same
-        }
-        (Ok(_), Ok(_)) => TimeNamespace::Different,
+        (Some(own), Some(theirs)) if own == theirs => TimeNamespace::Same,
+        (Some(_), Some(_)) => TimeNamespace::Different,
         _ => TimeNamespace::Unknown,
     }
 }

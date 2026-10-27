@@ -16,7 +16,8 @@
 //! `lanes` keys override the stream defaults. The rest of the network
 //! configuration is not on the command line yet: the agents' rings and
 //! session limits, the threading mode, the image template, the stream
-//! defaults, the NAK control groups and the per-client limit.
+//! defaults, the NAK control groups and the per-client limit. The one
+//! exception is `--idle-image-timeout` (owner item 1, karyos#638).
 
 use std::ffi::OsString;
 use std::fmt;
@@ -83,6 +84,10 @@ Network:
                                     entries (a power of two) on each lane; needs
                                     --network on; not a --stream; at most 8 streams,
                                     each once; repeatable
+  --idle-image-timeout <duration>   how long stationary heartbeats keep an image alive
+                                    after its last fresh evidence, in ns, us, ms or s;
+                                    at least the image liveness timeout (10s); needs
+                                    --network on [60s]
 
 Streams:
   --stream <stream_id>:<session_id>[:allow-unconnected]
@@ -302,6 +307,9 @@ pub struct Options {
     /// The timed network streams (`--timed-network`): stream id and
     /// schedule capacity, in command-line order.
     pub timed_networks: Vec<(i32, u32)>,
+    /// The network agents' `idle_image_timeout` (`--idle-image-timeout`),
+    /// set on the network configuration once the arguments are parsed.
+    pub idle_image_timeout: Option<Duration>,
     /// How long the shutdown waits for clients to leave.
     pub shutdown_linger: Duration,
     /// The control-path log verbosity.
@@ -340,6 +348,7 @@ impl Options {
             conflations: Vec::new(),
             guards: Vec::new(),
             timed_networks: Vec::new(),
+            idle_image_timeout: None,
             shutdown_linger: DEFAULT_SHUTDOWN_LINGER,
             log_level: LogLevel::Info,
             archive: None,
@@ -371,6 +380,16 @@ pub enum ArgsError {
         /// The option it needs.
         needs: &'static str,
     },
+    /// A duration that does not parse in the channel URI grammar
+    /// ([`karyos_protocol::channel::parse_duration`]).
+    InvalidDuration {
+        /// The option.
+        option: &'static str,
+        /// The value as given.
+        value: String,
+        /// Why it does not parse.
+        error: karyos_protocol::channel::DurationError,
+    },
 }
 
 impl fmt::Display for ArgsError {
@@ -383,6 +402,11 @@ impl fmt::Display for ArgsError {
             }
             Self::Missing(option) => write!(f, "option {option} is required"),
             Self::Needs { option, needs } => write!(f, "option {option} needs {needs}"),
+            Self::InvalidDuration {
+                option,
+                value,
+                error,
+            } => write!(f, "invalid duration {value:?} for {option}: {error}"),
         }
     }
 }
@@ -433,6 +457,17 @@ where
                 option,
                 value: value.to_string_lossy().into_owned(),
             })?;
+        if option == "--idle-image-timeout" {
+            let parsed = karyos_protocol::channel::parse_duration(&value).map_err(|error| {
+                ArgsError::InvalidDuration {
+                    option,
+                    value: value.clone(),
+                    error,
+                }
+            })?;
+            options.idle_image_timeout = Some(parsed);
+            continue;
+        }
         let applied = match option {
             "--archive-control" => control(&value).map(|control| archive.control = Some(control)),
             "--record" => record(&value).map(|record| archive.records.push(record)),
@@ -447,6 +482,7 @@ where
     options.admission.dir = dir.ok_or(ArgsError::Missing("--dir"))?;
     configured(&options)?;
     timed_networks(&mut options)?;
+    idle_image_timeout(&mut options)?;
     options.archive = archive.finish()?;
     Ok(Command::Run(Box::new(options)))
 }
@@ -492,6 +528,7 @@ const OPTIONS: &[&str] = &[
     "--conflation",
     "--guard",
     "--timed-network",
+    "--idle-image-timeout",
     "--term-length",
     "--mtu",
     "--max-reserved",
@@ -761,6 +798,27 @@ fn timed_network(value: &str) -> Option<(i32, u32)> {
 /// `--network on`, names no `--stream` (a configured stream is local, and
 /// refuses a schedule ring), names each stream once and at most
 /// `MAX_TIMED_NETWORK_STREAMS` streams.
+/// Sets `--idle-image-timeout` on the network configuration, whichever
+/// order the options came in. The driver checks it against the image
+/// liveness timeout when it starts.
+fn idle_image_timeout(options: &mut Options) -> Result<(), ArgsError> {
+    let Some(timeout) = options.idle_image_timeout else {
+        return Ok(());
+    };
+    let Some(network) = options.driver.network.as_mut() else {
+        return Err(ArgsError::Needs {
+            option: "--idle-image-timeout",
+            needs: "--network on",
+        });
+    };
+    network.agents.idle_image_timeout =
+        u64::try_from(timeout.as_nanos()).map_err(|_| ArgsError::InvalidValue {
+            option: "--idle-image-timeout",
+            value: format!("{timeout:?}"),
+        })?;
+    Ok(())
+}
+
 fn timed_networks(options: &mut Options) -> Result<(), ArgsError> {
     use karyos_driver::net::{MAX_TIMED_NETWORK_STREAMS, TimedNetworkStream};
 
@@ -1069,6 +1127,81 @@ mod tests {
 
     /// `--network on` runs the network agents with the driver's default
     /// network configuration; `off`, the default, runs none.
+    /// Owner item 1 (karyos#638): `idle_image_timeout` from the command
+    /// line, in the channel URI's duration grammar, before or after
+    /// `--network on`, and refused without the network.
+    #[test]
+    fn the_idle_image_timeout_is_set_from_the_command_line() {
+        use karyos_protocol::channel::DurationError;
+
+        let timeout = |args: &[&str]| {
+            options(args)
+                .driver
+                .network
+                .map(|network| network.agents.idle_image_timeout)
+        };
+        assert_eq!(
+            timeout(&["--dir", "/d", "--network", "on"]),
+            Some(60_000_000_000)
+        );
+        assert_eq!(
+            timeout(&[
+                "--dir",
+                "/d",
+                "--idle-image-timeout",
+                "90s",
+                "--network",
+                "on"
+            ]),
+            Some(90_000_000_000)
+        );
+        assert_eq!(
+            timeout(&[
+                "--dir",
+                "/d",
+                "--network=on",
+                "--idle-image-timeout=15000ms"
+            ]),
+            Some(15_000_000_000)
+        );
+        assert_eq!(
+            run(&[
+                "--dir",
+                "d",
+                "--network",
+                "on",
+                "--idle-image-timeout",
+                "90"
+            ]),
+            Err(ArgsError::InvalidDuration {
+                option: "--idle-image-timeout",
+                value: "90".to_owned(),
+                error: DurationError::MissingUnit,
+            })
+        );
+        assert_eq!(
+            run(&["--dir", "d", "--idle-image-timeout", "90s"]),
+            Err(ArgsError::Needs {
+                option: "--idle-image-timeout",
+                needs: "--network on"
+            })
+        );
+        assert_eq!(
+            run(&[
+                "--dir",
+                "d",
+                "--idle-image-timeout",
+                "90s",
+                "--network",
+                "off"
+            ]),
+            Err(ArgsError::Needs {
+                option: "--idle-image-timeout",
+                needs: "--network on"
+            })
+        );
+    }
+
     #[test]
     fn the_network_is_off_unless_turned_on() {
         let base = ["--dir", "/d"];

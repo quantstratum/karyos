@@ -264,7 +264,8 @@ pub struct AgentConfig {
     /// `idle_image_timeout` in ns: how long stationary heartbeats (an idle
     /// sender repeating its position) keep an image alive after its last
     /// fresh evidence (default 60 s, at least `image_liveness_timeout`;
-    /// coordinator decision, trusted profile).
+    /// the trusted profile's interim, confirmed by owner item 1 on
+    /// 2026-10-21; `karyosd --idle-image-timeout`, karyos#638).
     pub idle_image_timeout: u64,
     /// The RTT settings: the receiver's probes and the sender's replies
     /// (reliable-transport.md, "RTT observations"; RC-1).
