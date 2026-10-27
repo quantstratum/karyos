@@ -26,6 +26,13 @@ row run at any other head is marked "not run at the release head" and
 names its head and what changed since; it is historical evidence, not a
 release gate.
 
+A release is not tagged until every gate below has an Evidence row for
+its release head or its documented release tree; a missing row blocks
+the tag. A historical row, or an argument that nothing changed since the
+last run, does not stand in for one. Decided 2026-10-27 by
+QS-COORDINATOR under owner delegation (Joaquín, 2026-10-26),
+[karyos#767](https://github.com/quantstratum/karyos/pull/767).
+
 ## Changelog
 
 The author of the release pull request assembles the changelog, in that
