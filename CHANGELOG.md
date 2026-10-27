@@ -58,6 +58,13 @@ release may break APIs, wire formats and shared-memory layouts.
   `paths=10.0.0.7;::ffff:10.0.0.7` are now `InvalidValue`, as an exact repeat
   already was. An IPv4-mapped IPv6 address compares equal to the IPv4 address it
   maps; IPv6 zones still tell addresses apart.
+- `AgentConfig::conductor_duty_period` (default 1 ms) is a new public field: the
+  longest time between two conductor duty cycles, which `barrier_ack_timeout`
+  is validated against (karyos#658). `AgentConfig` is not `#[non_exhaustive]`,
+  so a caller that builds it with an exhaustive struct literal must add the
+  field; `..AgentConfig::default()` keeps working. karyosd bounds its idle
+  sleep by it; a caller that drives an embedded driver's `duty_cycle` itself
+  must call it at least this often while a conflated network view is open.
 - A network publication runs the strategy its channel's `fc` names: `fc=max`
   and `fc=tagged:<group>` are granted instead of refused with
   `UnsupportedChannel`. The `fc` is the one source of the strategy: typed roles
