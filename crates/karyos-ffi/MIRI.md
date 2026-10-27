@@ -126,3 +126,28 @@ cargo +nightly-2026-10-11 miri test -p karyos-ffi --locked
 
 A PR's record states the toolchain, the exact head, the command, the
 test counts with the ignored ones, and the wall time.
+
+### Sharded runs
+
+Under Miri the tests run one at a time, so on a loaded host the single
+run above can take hours. A run may be split into shards instead, by a
+rule a third party can repeat without asking which tests went where:
+
+1. List the library's tests, sorted bytewise:
+   `cargo +nightly-2026-10-11 miri test -p karyos-ffi --lib --locked -- --list`,
+   keeping the names of the lines that end in `: test`, under
+   `LC_ALL=C sort`.
+2. Give the `i`-th name, counting from 0, to library shard `i mod N + 1`.
+   Each library shard runs
+   `cargo +nightly-2026-10-11 miri test -p karyos-ffi --lib --locked -- --exact <its names>`.
+3. One more shard runs the integration tests:
+   `cargo +nightly-2026-10-11 miri test -p karyos-ffi --locked --test abi --test conformance --test connect --test driver --test outcomes`.
+   `connect` and `outcomes` are Linux only and run nothing on macOS, as
+   the cross-process client is outside Miri (above).
+4. Each shard may use a target directory of its own, so the shards do
+   not wait for one another's build lock.
+
+The evidence is the union of the shards. Its record states `N`, each
+shard's counts, wall time and exit code, and that the names the library
+shards ran are exactly the sorted list of step 1, none missing and none
+twice.
