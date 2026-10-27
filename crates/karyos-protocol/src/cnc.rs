@@ -2999,7 +2999,7 @@ mod tests {
                 Err(CncError::UnknownType { type_id })
             );
         }
-        for type_id in [IMAGE_UNAVAILABLE + 1, NETWORK_SUBSCRIPTION_READY] {
+        for type_id in [PUBLICATION_ADMISSION + 1, NETWORK_SUBSCRIPTION_READY] {
             assert_eq!(
                 Event::decode(type_id, &bytes),
                 Err(CncError::UnknownType { type_id })
