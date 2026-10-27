@@ -806,7 +806,16 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                         correlation_id,
                         position: DurablePosition::of(&described),
                     };
-                    self.queue_encoded(|out| answer.encode(out));
+                    // A position the codec refuses is a bug: answered as
+                    // an error, so the querier is never left waiting.
+                    if !self.queue_encoded(|out| answer.encode(out)) {
+                        self.respond(
+                            correlation_id,
+                            0,
+                            ResponseCode::Error,
+                            "the durable position does not encode",
+                        );
+                    }
                     true
                 }
                 Some(Err(error)) => {
