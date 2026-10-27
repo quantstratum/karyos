@@ -466,3 +466,15 @@ pub struct TraceCounts {
     /// Messages pending now.
     pub pending: u64,
 }
+
+/// One dimension `limits` answers (R-CORE-38).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limit {
+    /// Its name in a request and in the answer.
+    pub name: &'static str,
+    /// The bound; `None` when the dimension has none.
+    pub bound: Option<u64>,
+    /// Whether a client may propose a value within the bound and have it
+    /// applied to its request.
+    pub negotiable: bool,
+}

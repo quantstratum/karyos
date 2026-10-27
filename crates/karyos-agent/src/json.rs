@@ -208,6 +208,41 @@ pub fn acknowledged(position: u64) -> String {
     text
 }
 
+/// `limits`' answer: each dimension's effective value and whether it is
+/// negotiable, or `{"value":null}` for one with no bound (R-CORE-38).
+#[must_use]
+pub fn limits(limits: &[crate::api::Limit], effective: &[Option<u64>]) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.key("limits").object(|dimensions| {
+            for (limit, value) in limits.iter().zip(effective) {
+                dimensions.key(limit.name).object(|answer| match value {
+                    Some(value) => {
+                        answer.number("value", value);
+                        answer.key("negotiable").bool(limit.negotiable);
+                    }
+                    None => answer.key("value").raw("null"),
+                });
+            }
+        });
+    });
+    text
+}
+
+/// The refusal of a proposal above `limit`'s bound, carrying the bound.
+#[must_use]
+pub fn above_bound(limit: &crate::api::Limit) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("error", "above bound");
+        fields.string("dimension", limit.name);
+        fields
+            .key("bound")
+            .option(limit.bound, |out, bound| out.number(bound));
+    });
+    text
+}
+
 /// An error answer: `{"error": message}` with `detail`'s fields.
 #[must_use]
 pub fn error(message: &str, supported: Option<&[u32]>) -> String {

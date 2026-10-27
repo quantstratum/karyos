@@ -156,6 +156,55 @@ fn other_versions_uids_without_a_role_and_bad_requests_are_refused() {
     assert_eq!(answer, "{\"error\":\"not authorized\"}\n");
 }
 
+/// R-CORE-38 over the socket: `limits` answers every dimension with one of
+/// the three answers, a proposal within a fixed bound gets the bound, and
+/// one above it is refused with the bound. No bound changed.
+#[test]
+fn a_client_negotiates_the_limits() {
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("limits");
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let all = concat!(
+        r#"{"limits":{"read.request_bytes":{"value":256,"negotiable":false},"#,
+        r#""read.timeout_ms":{"value":100,"negotiable":false},"#,
+        r#""write.timeout_ms":{"value":100,"negotiable":false},"#,
+        r#""write.response_bytes":{"value":null},"#,
+        r#""connection.accepts_per_poll":{"value":16,"negotiable":false},"#,
+        r#""connection.requests":{"value":1,"negotiable":false}}}"#,
+        "\n"
+    );
+    let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 limits\n");
+    assert_eq!(served, [Served::Limits]);
+    assert_eq!(answer, all);
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        "KARYOS-AGENT 1 limits read.timeout_ms=50 write.response_bytes=4096\n",
+    );
+    assert_eq!(served, [Served::Limits]);
+    assert_eq!(answer, all);
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        "KARYOS-AGENT 1 limits write.timeout_ms=1000\n",
+    );
+    assert_eq!(served, [Served::Refused]);
+    assert_eq!(
+        answer,
+        "{\"error\":\"above bound\",\"dimension\":\"write.timeout_ms\",\"bound\":100}\n"
+    );
+    let (answer, _) = ask(
+        &mut server,
+        &mut agent,
+        "KARYOS-AGENT 1 limits page.rows=10\n",
+    );
+    assert_eq!(answer, "{\"error\":\"bad request\"}\n");
+    // A client that never negotiates is served as before.
+    let (_, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 view\n");
+    assert_eq!(served, [Served::View]);
+}
+
 #[test]
 fn the_socket_is_private_never_taken_over_and_cleaned_up() {
     use std::os::unix::fs::PermissionsExt;

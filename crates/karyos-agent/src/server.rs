@@ -24,10 +24,27 @@
 //!   [REASON]` and `guard-reopen DIR GUARD EPOCH [REASON]`, made for the
 //!   peer's uid as the operator, the reason being the rest of the line
 //!   (M10b; a `DIR` holds no space); `gap-ack POSITION`, an
-//!   administrator's acknowledgement of the journal's unknown interval.
+//!   administrator's acknowledgement of the journal's unknown interval;
+//!   `limits [DIMENSION=VALUE ...]`, the negotiation of the bounds below
+//!   (R-CORE-38).
 //! - **Bounds.** Each connection is served on the calling thread with
 //!   [`IO_TIMEOUT`] on its reads and writes, so a slow client delays the
 //!   others by that much at most.
+//! - **Limits (R-CORE-38).** `limits` answers every dimension of [`LIMITS`]
+//!   with one of three answers, never "unknown": `{"value":N,
+//!   "negotiable":true}`, a bound a client may propose within;
+//!   `{"value":N,"negotiable":false}`, a fixed bound; `{"value":null}`, no
+//!   bound. A client may propose values: a proposal above a bound is
+//!   refused with the bound (`{"error":"above bound","dimension":D,
+//!   "bound":N}`); any other is answered with the effective value, which
+//!   for a fixed bound is the bound. The exchange is stateless, like every
+//!   v1 request: a negotiated value that a later request uses is repeated
+//!   in that request and applies to it only, so no client changes
+//!   another's. In v1 no dimension is negotiable. An agent older than
+//!   `limits` answers it `bad request`, which a client reads as "limits not
+//!   supported", never as "no limits". A future dimension, such as the page
+//!   sizes of R-CORE-13 and R-CORE-14, enters [`LIMITS`] as a new entry,
+//!   negotiable or not, and a v1 client that does not name it is unaffected.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsFd;
@@ -35,7 +52,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::api::API_VERSION;
+use crate::api::{API_VERSION, Limit};
 use crate::{Agent, json};
 
 /// The API socket's name in its directory.
@@ -49,6 +66,70 @@ pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
 /// Connections one [`Server::poll`] serves at most; the rest wait for the
 /// next poll, so a burst of clients cannot hold the polling thread.
 pub const MAX_ACCEPTS: usize = 16;
+
+/// The dimensions `limits` answers, their bounds being the constants
+/// above. None is negotiable in v1.
+pub const LIMITS: [Limit; 6] = [
+    Limit {
+        name: "read.request_bytes",
+        bound: Some(MAX_REQUEST as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "read.timeout_ms",
+        bound: Some(IO_TIMEOUT.as_millis() as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "write.timeout_ms",
+        bound: Some(IO_TIMEOUT.as_millis() as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "write.response_bytes",
+        bound: None,
+        negotiable: false,
+    },
+    Limit {
+        name: "connection.accepts_per_poll",
+        bound: Some(MAX_ACCEPTS as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "connection.requests",
+        bound: Some(1),
+        negotiable: false,
+    },
+];
+
+/// The effective value of each of [`LIMITS`] given `proposals`
+/// (`DIMENSION=VALUE` separated by single spaces), in [`LIMITS`] order;
+/// `Err(Some(limit))` for a proposal above `limit`'s bound, `Err(None)` for
+/// a malformed, unknown or repeated one.
+fn negotiate(proposals: &str) -> Result<[Option<u64>; LIMITS.len()], Option<Limit>> {
+    let mut effective = LIMITS.map(|limit| limit.bound);
+    let mut proposed = [false; LIMITS.len()];
+    for proposal in proposals.split(' ').filter(|_| !proposals.is_empty()) {
+        let (name, value) = proposal.split_once('=').ok_or(None)?;
+        let value = value.parse::<u64>().map_err(|_| None)?;
+        let ((limit, slot), seen) = LIMITS
+            .iter()
+            .zip(effective.iter_mut())
+            .zip(proposed.iter_mut())
+            .find(|((limit, _), _)| limit.name == name)
+            .ok_or(None)?;
+        if core::mem::replace(seen, true) {
+            return Err(None);
+        }
+        if limit.bound.is_some_and(|bound| value > bound) {
+            return Err(Some(*limit));
+        }
+        if limit.negotiable {
+            *slot = Some(value);
+        }
+    }
+    Ok(effective)
+}
 
 /// What an operator may do (SPEC §11, access control). Every API v1
 /// request reads, which every role may.
@@ -144,6 +225,8 @@ pub enum Served {
     /// A guard operation or an acknowledgement, made (whatever came of
     /// it).
     Operated,
+    /// The limits, negotiated or reported.
+    Limits,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -300,6 +383,11 @@ impl Server {
                     forbidden()
                 }
             }
+            (Some(_), Request::Limits { proposals }) => match negotiate(proposals) {
+                Ok(effective) => (json::limits(&LIMITS, &effective), Served::Limits),
+                Err(Some(limit)) => (json::above_bound(&limit), Served::Refused),
+                Err(None) => (json::error("bad request", None), Served::Refused),
+            },
             (Some(_), Request::Version) => (
                 json::error("unsupported version", Some(&[API_VERSION])),
                 Served::Refused,
@@ -342,6 +430,9 @@ enum Request<'a> {
     },
     GapAck {
         position: u64,
+    },
+    Limits {
+        proposals: &'a str,
     },
     /// A well-formed request of another version.
     Version,
@@ -406,6 +497,9 @@ fn request(rest: &str) -> Option<Request<'_>> {
                 reason,
             })
         }
+        "limits" => Some(Request::Limits {
+            proposals: arguments,
+        }),
         "gap-ack" => Some(Request::GapAck {
             position: number(arguments)?,
         }),
@@ -429,6 +523,60 @@ mod tests {
         assert_eq!(parse(""), Request::Bad);
         let long = format!("KARYOS-AGENT 1 {}", "v".repeat(MAX_REQUEST));
         assert_eq!(parse(&long), Request::Bad);
+    }
+
+    /// R-CORE-38: `limits` parses with or without proposals.
+    #[test]
+    fn limits_requests_parse() {
+        assert_eq!(
+            parse("KARYOS-AGENT 1 limits\n"),
+            Request::Limits { proposals: "" }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 limits read.timeout_ms=50\n"),
+            Request::Limits {
+                proposals: "read.timeout_ms=50"
+            }
+        );
+    }
+
+    /// R-CORE-38: none of the v1 dimensions is negotiable, so every
+    /// effective value is the bound, and a proposal within a fixed bound is
+    /// answered with the bound.
+    #[test]
+    fn a_fixed_bound_answers_its_value_whatever_is_proposed() {
+        let bounds = LIMITS.map(|limit| limit.bound);
+        assert!(LIMITS.iter().all(|limit| !limit.negotiable));
+        assert_eq!(negotiate(""), Ok(bounds));
+        assert_eq!(negotiate("read.timeout_ms=50"), Ok(bounds));
+        assert_eq!(negotiate("write.response_bytes=4096"), Ok(bounds));
+        assert_eq!(bounds[0], Some(256));
+        assert_eq!(bounds[1], Some(100));
+        assert_eq!(bounds[2], Some(100));
+        assert_eq!(bounds[3], None);
+        assert_eq!(bounds[4], Some(16));
+        assert_eq!(bounds[5], Some(1));
+    }
+
+    /// R-CORE-38: a proposal above a bound is refused with that limit;
+    /// a malformed, unknown or repeated one is a bad request.
+    #[test]
+    fn a_proposal_above_a_bound_is_refused_with_the_bound() {
+        assert_eq!(negotiate("write.timeout_ms=101"), Err(Some(LIMITS[2])));
+        assert_eq!(
+            negotiate("read.request_bytes=256 connection.requests=2"),
+            Err(Some(LIMITS[5]))
+        );
+        for bad in [
+            "read.timeout_ms",
+            "read.timeout_ms=x",
+            "read.timeout_ms=-1",
+            "page.rows=10",
+            "read.timeout_ms=1 read.timeout_ms=2",
+            "read.timeout_ms=1  write.timeout_ms=1",
+        ] {
+            assert_eq!(negotiate(bad), Err(None), "{bad}");
+        }
     }
 
     /// M10b: the guard requests and their arguments, a reason being the
