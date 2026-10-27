@@ -9,6 +9,9 @@
 //!   adapter implements, its neutral [`core::Ready`], and
 //!   [`core::drive`], the only place that orders persistence before the
 //!   messages that depend on it.
+//! - [`delivery`]: the `ClusteredService` delivery path (C10): a server
+//!   node over a service container and a client with a session, apart
+//!   from the C5 nodes.
 //! - [`node`]: a server node (a core, C4's log over a simulated disk, the
 //!   deterministic test service) and a scripted client node, over one wire
 //!   type, with the [`node::Recorder`] they report to.
@@ -25,6 +28,7 @@
 
 pub mod check;
 pub mod core;
+pub mod delivery;
 pub mod membership;
 pub mod node;
 pub mod reference;
