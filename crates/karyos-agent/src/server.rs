@@ -461,11 +461,8 @@ impl Server {
                     epoch,
                 },
             ) => match agent.trace_buckets(Path::new(dir), from, count, epoch) {
-                Ok(Ok(read)) => (
-                    json::trace_buckets(&read, crate::api::MAX_BUCKET_REPLY),
-                    Served::TraceBuckets,
-                ),
-                Ok(Err(refusal)) => (json::bucket_refusal(&refusal), Served::TraceBuckets),
+                Ok(Ok(read)) => (json::trace_buckets(&read), Served::TraceBuckets),
+                Ok(Err(refusal)) => (json::bucket_refusal(&refusal), Served::Refused),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
             (Some(_), Request::Version) => (
@@ -520,7 +517,7 @@ enum Request<'a> {
     },
     TraceBuckets {
         dir: &'a str,
-        from: u64,
+        from: crate::api::BucketCursor,
         count: usize,
         epoch: Option<u64>,
     },
@@ -598,8 +595,10 @@ fn request(rest: &str) -> Option<Request<'_>> {
         "gap-ack" => Some(Request::GapAck {
             position: number(arguments)?,
         }),
-        // `trace-buckets DIR FROM [COUNT [EPOCH]]` (R-CORE-23); a count
-        // of 0 or above BUCKETS_MAX is a bad argument.
+        // `trace-buckets DIR FROM [COUNT [EPOCH [LANE]]]` (R-CORE-23): a
+        // continuation names the lane its bucket's next page starts at,
+        // with the epoch; a count of 0 or above BUCKETS_MAX is a bad
+        // argument.
         "trace-buckets" => {
             let mut fields = arguments.split(' ');
             let parsed = (|| {
@@ -615,9 +614,13 @@ fn request(rest: &str) -> Option<Request<'_>> {
                     None => None,
                     Some(word) => Some(number(word)?),
                 };
+                let lane = match fields.next() {
+                    None => 0,
+                    Some(word) => usize::try_from(number(word)?).ok()?,
+                };
                 fields.next().is_none().then_some(Request::TraceBuckets {
                     dir,
-                    from,
+                    from: crate::api::BucketCursor::new(from, lane),
                     count,
                     epoch,
                 })
@@ -653,7 +656,7 @@ mod tests {
     fn trace_buckets_parse_with_their_bounds() {
         let buckets = |dir, from, count, epoch| Request::TraceBuckets {
             dir,
-            from,
+            from: crate::api::BucketCursor::new(from, 0),
             count,
             epoch,
         };
@@ -665,6 +668,16 @@ mod tests {
             parse("KARYOS-AGENT 1 trace-buckets /run/k 4 60 77\n"),
             buckets("/run/k", 4, 60, Some(77))
         );
+        // A continuation: bucket 4 from its lane 3.
+        assert_eq!(
+            parse("KARYOS-AGENT 1 trace-buckets /run/k 4 60 77 3\n"),
+            Request::TraceBuckets {
+                dir: "/run/k",
+                from: crate::api::BucketCursor::new(4, 3),
+                count: 60,
+                epoch: Some(77),
+            }
+        );
         for bad in [
             "trace-buckets",
             "trace-buckets /run/k",
@@ -672,7 +685,8 @@ mod tests {
             "trace-buckets /run/k 4 0",
             "trace-buckets /run/k 4 61",
             "trace-buckets /run/k 4 6 e",
-            "trace-buckets /run/k 4 6 7 8",
+            "trace-buckets /run/k 4 6 7 x",
+            "trace-buckets /run/k 4 6 7 8 9",
         ] {
             assert_eq!(
                 parse(&format!("KARYOS-AGENT 1 {bad}\n")),

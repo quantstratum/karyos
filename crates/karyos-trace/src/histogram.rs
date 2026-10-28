@@ -217,12 +217,14 @@ impl SideCounts {
                 .filter_map(|(index, count)| Some((u32::try_from(index).ok()?, *count)))
                 .collect()
         };
-        Self {
+        let mut counts = Self {
             non_negative: nonzero(&side.non_negative),
             negative: nonzero(&side.negative),
             above: side.above,
             below: side.below,
-        }
+        };
+        counts.shrink();
+        counts
     }
 
     /// The side these counts describe in a layout of `len` buckets, and
@@ -250,11 +252,22 @@ impl SideCounts {
         Some((side, total))
     }
 
-    /// The bytes these counts hold: 12 per nonzero bucket and 16 for the
-    /// tails (R-CORE-23's retained-bucket budget).
+    /// The heap bytes these counts hold: each list's allocated capacity,
+    /// at the size of its entries (R-CORE-23's retained-bucket budget).
     #[must_use]
     pub fn bytes(&self) -> usize {
-        (self.non_negative.len() + self.negative.len()) * 12 + 16
+        let entry = core::mem::size_of::<(u32, u64)>();
+        self.non_negative
+            .capacity()
+            .saturating_add(self.negative.capacity())
+            .saturating_mul(entry)
+    }
+
+    /// Gives back each list's spare capacity, so [`Self::bytes`] is what it
+    /// needs.
+    fn shrink(&mut self) {
+        self.non_negative.shrink_to_fit();
+        self.negative.shrink_to_fit();
     }
 }
 
@@ -282,10 +295,13 @@ pub struct HistogramCounts {
 }
 
 impl HistogramCounts {
-    /// The bytes these counts hold, for a retention budget.
+    /// The bytes these counts hold, for a retention budget: the struct
+    /// itself and both sides' heap bytes.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.min.bytes() + self.max.bytes() + 64
+        core::mem::size_of::<Self>()
+            .saturating_add(self.min.bytes())
+            .saturating_add(self.max.bytes())
     }
 }
 

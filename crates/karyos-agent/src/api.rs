@@ -155,14 +155,25 @@ pub const CAPABILITIES: [&str; 8] = [
 ];
 
 /// The byte bound of a `trace-buckets` reply (R-CORE-23). A reply holds
-/// whole buckets only, and always at least the first one asked for, so a
-/// reader always progresses: its size is at most
-/// `max(MAX_BUCKET_REPLY, the first bucket's encoding)`, and a bucket's
-/// encoding is bounded by the window's `max_bucket_bytes` budget (a larger
-/// bucket is never kept). A client sizes its buffer for that maximum. The
-/// next bucket that would pass the bound is left for the next read, named
-/// by `next`.
+/// whole lanes only, and always at least one, so a reader always
+/// progresses: it is at most `MAX_BUCKET_REPLY` plus one lane's encoding,
+/// [`MAX_LANE_REPLY`] at most. A bucket larger than the bound is paged by
+/// lane; the first lane left out is named by `next`, a bucket number and a
+/// lane index. A client sizes its buffer for
+/// `MAX_BUCKET_REPLY + MAX_LANE_REPLY`.
 pub const MAX_BUCKET_REPLY: usize = 1 << 20;
+/// The largest encoding of one lane of a bucket: its header, at most
+/// [`LANE_HEADER_REPLY`] bytes, and its histogram's four count arrays of
+/// [`LANE_BUCKETS`] entries each (two sides, two signs), each entry
+/// `[index,count],` at most 29 bytes (an index of 5 digits, a count of
+/// 20): `LANE_HEADER_REPLY + 4 x LANE_BUCKETS x 29`, 2 870 932 bytes at
+/// the trace window's 3 significant digits and 10 s highest magnitude.
+pub const MAX_LANE_REPLY: usize = LANE_HEADER_REPLY + 4 * LANE_BUCKETS * 29;
+/// The entries of one count array of a lane's histogram, at the trace
+/// window's 3 significant digits and 10 s highest magnitude.
+pub const LANE_BUCKETS: usize = 24_745;
+/// The most bytes of a lane's encoding besides its count arrays.
+pub const LANE_HEADER_REPLY: usize = 512;
 /// Buckets one `trace-buckets` request asks for by default, and at most.
 pub const BUCKETS_DEFAULT: usize = 6;
 /// The most buckets one request may ask for.
@@ -672,6 +683,11 @@ pub struct TraceCounts {
 pub struct TraceBucket {
     /// Its slice number.
     pub number: u64,
+    /// Its lanes in all; `lanes` is the part from `first_lane` on that
+    /// this reply holds (R-CORE-23's paging by lane).
+    pub lanes_total: usize,
+    /// The index of the first lane of `lanes` among the bucket's.
+    pub first_lane: usize,
     /// Its span of the agent's time, `[start_ns, end_ns)`.
     pub start_ns: u64,
     /// The end of its span.
@@ -726,6 +742,10 @@ pub struct Loss {
     pub mirror_overwritten: u64,
     /// Records of journals past the bound.
     pub journals_dropped: u64,
+    /// Records whose payload did not decode.
+    pub malformed: u64,
+    /// Records of a journal not (yet) in the table.
+    pub unknown_journal: u64,
 }
 
 impl Loss {
@@ -737,6 +757,8 @@ impl Loss {
             aged_out: counts.aged_out,
             mirror_overwritten: counts.mirror_overwritten,
             journals_dropped: counts.journals_dropped,
+            malformed: counts.malformed,
+            unknown_journal: counts.unknown_journal,
         }
     }
 
@@ -749,6 +771,8 @@ impl Loss {
             aged_out: less(self.aged_out, start.aged_out),
             mirror_overwritten: less(self.mirror_overwritten, start.mirror_overwritten),
             journals_dropped: less(self.journals_dropped, start.journals_dropped),
+            malformed: less(self.malformed, start.malformed),
+            unknown_journal: less(self.unknown_journal, start.unknown_journal),
         }
     }
 
@@ -795,6 +819,31 @@ pub struct BucketRead {
     pub current: u64,
     /// The oldest bucket number kept.
     pub oldest: u64,
-    /// The buckets, oldest first.
+    /// The buckets, oldest first; the last may hold only part of its
+    /// lanes, and the first starts at the lane asked for.
     pub buckets: Vec<TraceBucket>,
+    /// Where the next read starts, when the reply stopped before every
+    /// bucket asked for (the byte bound, or a bucket refused as over
+    /// budget); `None` when every bucket asked for is here, whole.
+    pub next: Option<BucketCursor>,
+}
+
+/// A position in the buckets: a bucket number and a lane index in it
+/// (R-CORE-23). A bucket's first page starts at lane 0. Ordered by number,
+/// then lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct BucketCursor {
+    /// The bucket number.
+    pub number: u64,
+    /// The index of its first lane to read.
+    pub lane: usize,
+}
+
+impl BucketCursor {
+    /// Bucket `number` from its lane `lane`.
+    #[must_use]
+    pub const fn new(number: u64, lane: usize) -> Self {
+        Self { number, lane }
+    }
 }

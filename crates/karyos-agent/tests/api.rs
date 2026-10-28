@@ -454,3 +454,72 @@ fn a_poll_serves_at_most_max_accepts() {
         assert!(answer.starts_with(r#"{"version":1,"#), "{answer}");
     }
 }
+
+/// R-CORE-23: `trace-buckets` over the socket: the window's run as the
+/// epoch and the buckets read; a cursor of another run gets the typed
+/// refusal, served as a refusal; bad arguments their own error.
+#[test]
+fn trace_buckets_are_served_over_the_socket() {
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("buckets");
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let driver_dir = dir.join("driver");
+    // Number 0 is before this run's first slice: expired, with the oldest.
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!("KARYOS-AGENT 1 trace-buckets {} 0\n", driver_dir.display()),
+    );
+    assert_eq!(served, [Served::Refused]);
+    let prefix = r#"{"error":"buckets expired","oldest":"#;
+    assert!(answer.starts_with(prefix), "{answer}");
+    let oldest: u64 = answer[prefix.len()..]
+        .trim_end_matches("}\n")
+        .parse()
+        .unwrap();
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 trace-buckets {} {oldest}\n",
+            driver_dir.display()
+        ),
+    );
+    assert_eq!(served, [Served::TraceBuckets]);
+    assert!(answer.starts_with(r#"{"epoch":"#), "{answer}");
+    assert!(answer.contains(r#","buckets":["#), "{answer}");
+    let epoch: u64 = answer[r#"{"epoch":"#.len()..]
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 trace-buckets {} {oldest} 6 {}\n",
+            driver_dir.display(),
+            epoch ^ 1
+        ),
+    );
+    assert_eq!(served, [Served::Refused]);
+    assert!(
+        answer.starts_with(&format!(r#"{{"error":"epoch changed","epoch":{epoch},"#)),
+        "{answer}"
+    );
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 trace-buckets {} 0 0\n",
+            driver_dir.display()
+        ),
+    );
+    assert_eq!(served, [Served::Refused]);
+    assert_eq!(
+        answer,
+        "{\"error\":\"bad arguments\",\"request\":\"trace-buckets\"}\n"
+    );
+}

@@ -426,6 +426,8 @@ fn spread_bucket(number: u64, lanes: u8, spread: i64) -> crate::api::TraceBucket
     }
     crate::api::TraceBucket {
         number,
+        lanes_total: usize::from(lanes),
+        first_lane: 0,
         start_ns: number * 10,
         end_ns: number * 10 + 10,
         lanes: (0..lanes)
@@ -441,47 +443,90 @@ fn spread_bucket(number: u64, lanes: u8, spread: i64) -> crate::api::TraceBucket
     }
 }
 
-/// R-CORE-23 (E2): a `trace-buckets` reply stays within its byte bound,
-/// with full lanes and spread histograms. It stops before the first
-/// bucket that would pass it, never cutting one, and names it in `next`;
-/// the first bucket is always whole, so a reader always progresses.
+/// R-CORE-23: a reply names where the next read starts, a bucket and a
+/// lane, or `null`; each bucket states its lanes in all and the first one
+/// it holds, and the lengths a read bounds it by are its encoding's.
 #[test]
-fn a_bucket_reply_stops_at_a_whole_bucket_within_its_bound() {
-    let read = crate::api::BucketRead {
+fn a_bucket_reply_names_its_next_bucket_and_lane() {
+    let mut bucket = spread_bucket(4, 3, 50);
+    bucket.first_lane = 1;
+    bucket.lanes.remove(0);
+    let header = bucket_header_len(&bucket);
+    let lanes: usize = bucket.lanes.iter().map(bucket_lane_len).sum();
+    let mut read = crate::api::BucketRead {
         epoch: 7,
         slice_ns: 10,
-        current: 3,
+        current: 9,
         oldest: 0,
-        buckets: (0..3)
-            .map(|number| spread_bucket(number, 4, 2_000))
-            .collect(),
+        buckets: vec![bucket],
+        next: Some(crate::api::BucketCursor::new(4, 3)),
     };
-    let whole = trace_buckets(&read, usize::MAX);
+    let text = trace_buckets(&read);
     assert!(
-        whole.ends_with(r#""next":null}"#),
-        "{}",
-        &whole[whole.len() - 40..]
+        text.starts_with(
+            r#"{"epoch":7,"slice_ns":10,"current":9,"oldest":0,"buckets":[{"number":4,"#
+        ),
+        "{text}"
     );
-    let one = whole.len() / 3;
-    for bound in [one + one / 2, 2 * one + one / 2] {
-        let cut = trace_buckets(&read, bound);
-        assert!(cut.len() <= bound + 300, "{} over {bound}", cut.len());
-        let kept = cut.matches(r#""number":"#).count();
-        let next = if kept == 1 {
-            r#""next":1}"#
-        } else {
-            r#""next":2}"#
-        };
-        assert!(cut.ends_with(next), "{}", &cut[cut.len() - 40..]);
-    }
-    // Even a bound below one bucket returns that bucket, whole.
-    let tiny = trace_buckets(&read, 10);
-    assert_eq!(tiny.matches(r#""number":"#).count(), 1);
-    assert!(tiny.ends_with(r#""next":1}"#));
-    assert!(
-        tiny.starts_with(
-            r#"{"epoch":7,"slice_ns":10,"current":3,"oldest":0,"buckets":[{"number":0,"#
-        )
+    assert!(text.contains(r#""lanes_total":3,"first_lane":1,"lanes":[{"#));
+    assert!(text.ends_with(r#""next":{"number":4,"lane":3}}"#), "{text}");
+    // The bucket's encoding is its header and its lanes, as counted.
+    assert!(text.len() <= BUCKET_REPLY_OVERHEAD + header + lanes);
+    assert!(text.len() + 2 >= header + lanes);
+    read.next = None;
+    assert!(trace_buckets(&read).ends_with(r#""next":null}"#));
+}
+
+/// R-CORE-23: the largest lane, every count array full of the largest
+/// indices and counts, encodes within `MAX_LANE_REPLY`, and the arrays'
+/// length is the layout's.
+#[test]
+fn the_largest_lane_encodes_within_its_bound() {
+    use crate::api::{LANE_BUCKETS, MAX_LANE_REPLY};
+    use karyos_trace::{Histogram, HistogramCounts, HistogramError, SideCounts};
+
+    let full = |count: u64| SideCounts {
+        non_negative: (0..u32::try_from(LANE_BUCKETS).unwrap())
+            .map(|index| (index, count))
+            .collect(),
+        negative: (0..u32::try_from(LANE_BUCKETS).unwrap())
+            .map(|index| (index, count))
+            .collect(),
+        above: count,
+        below: count,
+    };
+    let counts = |count: u64, available: u64| HistogramCounts {
+        digits: 3,
+        highest: 10_000_000_000,
+        unit: 1,
+        min: full(count),
+        max: full(count),
+        available,
+        unavailable: [u64::MAX; 4],
+        incomplete: true,
+    };
+    let lane = crate::api::BucketLane {
+        stream: u64::MAX,
+        incarnation: u64::MAX,
+        lane: u8::MAX,
+        counts: counts(u64::MAX, u64::MAX),
+    };
+    let size = bucket_lane_len(&lane);
+    assert!(size <= MAX_LANE_REPLY, "{size} > {MAX_LANE_REPLY}");
+    // LANE_BUCKETS is the layout's: one more index is out of it.
+    let like = Histogram::new(3, 10_000_000_000, 1).unwrap();
+    let total = 2 * u64::try_from(LANE_BUCKETS).unwrap() + 2;
+    assert!(Histogram::from_counts(&counts(1, total), &like).is_ok());
+    let mut over = counts(1, total + 1);
+    over.min
+        .non_negative
+        .push((u32::try_from(LANE_BUCKETS).unwrap(), 1));
+    over.max
+        .non_negative
+        .push((u32::try_from(LANE_BUCKETS).unwrap(), 1));
+    assert_eq!(
+        Histogram::from_counts(&over, &like).err(),
+        Some(HistogramError::InvalidCounts)
     );
 }
 
@@ -505,35 +550,4 @@ fn bucket_refusals_are_typed() {
         bucket_refusal(&BucketRefusal::OverBudget { number: 3 }),
         r#"{"error":"bucket over budget","number":3}"#
     );
-}
-
-/// R-CORE-23: a bucket larger than the reply bound on its own comes back
-/// whole and alone, with `next` naming the one after it: the reply is at
-/// most `max(MAX_BUCKET_REPLY, one bucket)`.
-#[test]
-fn a_bucket_over_the_reply_bound_comes_back_whole_and_alone() {
-    let read = crate::api::BucketRead {
-        epoch: 7,
-        slice_ns: 10,
-        current: 2,
-        oldest: 0,
-        buckets: (0..2)
-            .map(|number| spread_bucket(number, 16, 20_000))
-            .collect(),
-    };
-    let alone = {
-        let mut text = String::new();
-        trace_bucket(&mut Out(&mut text), &read.buckets[0]);
-        text
-    };
-    assert!(
-        alone.len() > crate::api::MAX_BUCKET_REPLY,
-        "{}",
-        alone.len()
-    );
-    let reply = trace_buckets(&read, crate::api::MAX_BUCKET_REPLY);
-    assert_eq!(reply.matches(r#""number":"#).count(), 1);
-    assert!(reply.contains(&alone), "the bucket is whole");
-    assert!(reply.ends_with(r#""next":1}"#));
-    assert!(reply.len() <= alone.len() + 256);
 }

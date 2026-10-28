@@ -233,14 +233,16 @@ impl Agent {
     }
 
     /// Up to `count` closed trace buckets of the driver in `dir`, from
-    /// number `from` on, of the window run `epoch` when given (R-CORE-23).
+    /// `from` on (a bucket number and a lane), of the window run `epoch`
+    /// when given, in a reply within [`crate::api::MAX_BUCKET_REPLY`] plus
+    /// one lane (R-CORE-23).
     /// `Ok(Err(_))` is the window's own refusal; `Err(answer)` a driver
     /// unknown or with no trace window yet, answered as a guard
     /// operation's.
     pub fn trace_buckets(
         &self,
         dir: &Path,
-        from: u64,
+        from: crate::api::BucketCursor,
         count: usize,
         epoch: Option<u64>,
     ) -> Result<Result<crate::api::BucketRead, crate::api::BucketRefusal>, GuardAnswer> {
@@ -250,7 +252,7 @@ impl Agent {
             .find(|driver| driver.dir == dir)
             .ok_or(GuardAnswer::UnknownDriver)?;
         let window = driver.trace.as_ref().ok_or(GuardAnswer::Unattached)?;
-        Ok(window.buckets(from, count, epoch))
+        Ok(window.buckets(from, count, epoch, crate::api::MAX_BUCKET_REPLY))
     }
 
     /// Closes guard `guard` of the driver in `dir` for operator `uid`
