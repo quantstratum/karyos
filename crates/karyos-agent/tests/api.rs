@@ -122,9 +122,114 @@ fn a_v1_client_reads_the_view() {
         dir.join("driver").display()
     );
     assert!(answer.starts_with(&expected), "{answer}");
-    // No journal configured: `journal` is null (M10b).
-    assert!(answer.ends_with("}],\"journal\":null}\n"), "{answer}");
+    // No journal configured: `journal` is null (M10b). Then the agent's
+    // identity, added after it (R-CORE-24): no id configured here.
+    let agent_field = format!(
+        r#"}}],"journal":null,"agent":{{"id":null,"pid":{},"started_ns":"#,
+        std::process::id()
+    );
+    assert!(answer.contains(&agent_field), "{answer}");
+    assert!(
+        answer.contains(r#""catalog":null,"attachment":{"since_ns":"#),
+        "{answer}"
+    );
     assert!(answer.contains(r#""label":"driver pid""#));
+}
+
+/// R-CORE-24: capability discovery, answered per role. What the deployment
+/// does not offer is `unavailable`, whatever the role; what it offers but
+/// the role lacks is `forbidden`. A known request with stray arguments gets
+/// its own typed error; a request this agent does not know is `bad
+/// request`, which is what an agent without discovery answers.
+#[test]
+fn capabilities_tell_unavailable_from_forbidden() {
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("capabilities");
+    let answer = |role: Role, agent: &mut Agent| {
+        let mut server =
+            Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), role)])).unwrap();
+        let (answer, served) = ask(&mut server, agent, "KARYOS-AGENT 1 capabilities\n");
+        assert_eq!(served, [Served::Capabilities]);
+        answer
+    };
+    // No journal and no Archive configured.
+    let viewer = answer(Role::Viewer, &mut agent);
+    assert_eq!(
+        viewer,
+        concat!(
+            r#"{"capabilities":[{"name":"view","state":"served","reason":null},"#,
+            r#"{"name":"guard-close","state":"forbidden","reason":"role"},"#,
+            r#"{"name":"guard-reopen","state":"unavailable","reason":"not_configured"},"#,
+            r#"{"name":"gap-ack","state":"unavailable","reason":"not_configured"},"#,
+            r#"{"name":"catalog","state":"unavailable","reason":"not_configured"},"#,
+            r#"{"name":"trace-window","state":"served","reason":null},"#,
+            r#"{"name":"limits","state":"served","reason":null}]}"#,
+            "\n"
+        )
+    );
+    // An operator may close: served. Reopening needs a journal this
+    // deployment does not have: unavailable, not forbidden.
+    let operator = answer(Role::Operator, &mut agent);
+    assert!(operator.contains(r#"{"name":"guard-close","state":"served","reason":null}"#));
+    assert!(
+        operator
+            .contains(r#"{"name":"guard-reopen","state":"unavailable","reason":"not_configured"}"#)
+    );
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 capabilities all\n");
+    assert_eq!(served, [Served::Refused]);
+    assert_eq!(
+        answer,
+        "{\"error\":\"bad arguments\",\"request\":\"capabilities\"}\n"
+    );
+    let (answer, _) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 capabilities-v2\n");
+    assert_eq!(answer, "{\"error\":\"bad request\"}\n");
+}
+
+/// R-CORE-24: a configured journal turns reopen and acknowledgement into
+/// role questions, and a catalog configured for a driver is served.
+#[test]
+fn a_configured_journal_and_catalog_are_served_by_role() {
+    let _serial = serial();
+    let dir = dir("capabilities-configured");
+    std::fs::create_dir_all(&dir).unwrap();
+    // A regular file where the journal's directory should be: it cannot
+    // open.
+    std::fs::write(dir.join("not-a-journal"), b"x").unwrap();
+    let _driver = driver(&dir.join("driver"));
+    let agent = Agent::new(
+        AgentConfig::new(vec![dir.join("driver")])
+            .with_attach_timeout(Duration::from_secs(5))
+            .with_journal(dir.join("not-a-journal"))
+            .with_archive(
+                dir.join("driver"),
+                karyos_agent::catalog::CatalogConfig::new(
+                    karyos_agent::catalog::ArchiveStreams::new(1, 2),
+                ),
+            ),
+    );
+    let caps = agent.capabilities(false, false, false);
+    let state = |name: &str| {
+        caps.iter()
+            .find(|capability| capability.name == name)
+            .map(|capability| capability.state)
+            .unwrap()
+    };
+    use karyos_agent::api::CapabilityState;
+    // A journal configured but not opened: reopens need it; the
+    // acknowledgement of its unknown interval does not.
+    assert_eq!(
+        state("guard-reopen"),
+        CapabilityState::Unavailable {
+            reason: "journal_unavailable"
+        }
+    );
+    assert_eq!(
+        state("gap-ack"),
+        CapabilityState::Forbidden { reason: "role" }
+    );
+    assert_eq!(state("catalog"), CapabilityState::Served);
 }
 
 #[test]

@@ -156,6 +156,55 @@ fn a_driver_that_exits_is_reported_closed_and_frees_its_slot() {
     assert_ne!(view.drivers[0].instance, instance);
 }
 
+/// R-CORE-24: the view states each driver's attachment (since when, how
+/// many, how the previous one ended) and the agent's own identity, apart
+/// from the driver instance it watches.
+#[test]
+fn the_view_states_the_attachment_and_the_agent_identity() {
+    use karyos_agent::api::AttachEndReason;
+
+    let _serial = serial();
+    let dir = dir("attachment");
+    let mut driver = driver(&dir, DriverConfig::default(), 1);
+    let mut agent = Agent::new(
+        AgentConfig::new(vec![dir.clone()])
+            .with_attach_timeout(Duration::from_secs(5))
+            .with_agent_id("ns/pod-0".to_owned()),
+    );
+    let identity = agent.view().agent;
+    assert_eq!(identity.id.as_deref(), Some("ns/pod-0"));
+    assert_eq!(identity.pid, std::process::id());
+    assert!(identity.started_ns > 0);
+    let before = agent.view().drivers[0].attachment;
+    assert_eq!(
+        (before.since_ns, before.attaches, before.previous),
+        (None, 0, None)
+    );
+    refresh_serving(&mut driver, &mut agent);
+    let first = agent.view().drivers[0].clone();
+    assert!(first.attachment.since_ns.is_some());
+    assert_eq!(first.attachment.attaches, 1);
+    assert_eq!(first.attachment.previous, None);
+    // The driver goes: the attach ends, with the instance it named.
+    drop(driver);
+    agent.refresh();
+    let ended = agent.view().drivers[0].attachment;
+    assert_eq!(ended.since_ns, None);
+    let previous = ended.previous.unwrap();
+    assert_eq!(Some(previous.instance), first.instance);
+    assert_eq!(previous.reason, AttachEndReason::DriverGone);
+    assert!(previous.ended_ns >= first.attachment.since_ns.unwrap());
+    // A new driver: a second attach, the previous end kept.
+    let mut driver = self::driver(&dir, DriverConfig::default(), 1);
+    refresh_serving(&mut driver, &mut agent);
+    let second = agent.view().drivers[0].attachment;
+    assert_eq!(second.attaches, 2);
+    assert!(second.since_ns.unwrap() >= previous.ended_ns);
+    assert_eq!(second.previous, Some(previous));
+    // The agent's identity is its own: the same across the driver change.
+    assert_eq!(agent.view().agent, identity);
+}
+
 #[test]
 fn a_lapped_cursor_reports_what_it_lost() {
     let _serial = serial();

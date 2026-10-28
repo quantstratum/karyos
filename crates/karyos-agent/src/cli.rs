@@ -10,7 +10,7 @@ pub const USAGE: &str = "\
 usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
 --role UID=ROLE [--role UID=ROLE]... [--refresh-ms MS] [--lag-bytes N] \
 [--lag-refreshes N] [--loss-quiet N] [--archive DIR=REQ,RESP]... \
-[--journal DIR]
+[--journal DIR] [--agent-id NAME]
 
 Serves API v1 (JSON) on DIR/agent.sock to the uids given a role (viewer,
 operator, risk-officer, administrator), reading each driver's CnC as a
@@ -24,12 +24,16 @@ the driver in DIR (one of the --driver directories) over the control
 streams REQ, which the host configures concurrent, and RESP; off by
 default, it costs one client slot of that driver. Guard operations are
 journalled in the --journal directory, an Archive directory; without
-one, reopens are refused. Linux only.
+one, reopens are refused. --agent-id names this agent in its view (1 to
+64 bytes of A-Z a-z 0-9 . _ : / -), as its deployment calls it, for
+example namespace/pod; the agent looks no name up. Linux only.
 
 A request is one line: KARYOS-AGENT 1 view, or
 KARYOS-AGENT 1 guard-close DIR GUARD [REASON] (operator, risk-officer),
 KARYOS-AGENT 1 guard-reopen DIR GUARD EPOCH [REASON] (risk-officer,
-administrator), KARYOS-AGENT 1 gap-ack POSITION (administrator).
+administrator), KARYOS-AGENT 1 gap-ack POSITION (administrator),
+KARYOS-AGENT 1 limits [DIMENSION=VALUE ...], or KARYOS-AGENT 1 capabilities
+(each capability served, unavailable here or forbidden for the role).
 ";
 
 /// The default refresh period.
@@ -53,6 +57,8 @@ pub struct Args {
     pub journal: Option<PathBuf>,
     /// The drivers whose Archive catalog is listed, and its streams.
     pub archives: Vec<(PathBuf, crate::catalog::ArchiveStreams)>,
+    /// The agent's own name (R-CORE-24).
+    pub agent_id: Option<String>,
 }
 
 /// Parses `args` (without the program name); `None` for anything this
@@ -66,12 +72,19 @@ pub fn parse(args: &[String]) -> Option<Args> {
     let mut alerts = crate::alerts::AlertRules::default();
     let mut journal = None;
     let mut archives: Vec<(PathBuf, crate::catalog::ArchiveStreams)> = Vec::new();
+    let mut agent_id = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
         match flag.as_str() {
             "--api-dir" if api_dir.is_none() => api_dir = Some(PathBuf::from(value)),
             "--journal" if journal.is_none() => journal = Some(PathBuf::from(value)),
+            "--agent-id" if agent_id.is_none() => {
+                if !crate::api::valid_agent_id(value) {
+                    return None;
+                }
+                agent_id = Some(value.clone());
+            }
             "--driver" => drivers.push(PathBuf::from(value)),
             "--role" => {
                 let (uid, role) = value.split_once('=')?;
@@ -134,6 +147,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
         alerts,
         journal,
         archives,
+        agent_id,
     })
 }
 
@@ -153,9 +167,11 @@ mod tests {
             "--api-dir /run/agent --driver /run/a --driver /run/b \
              --role 1000=viewer --role 0=administrator --refresh-ms 250 \
              --lag-bytes 4096 --lag-refreshes 5 --loss-quiet 7 \
-             --archive /run/b=100,101 --journal /var/lib/karyos/journal",
+             --archive /run/b=100,101 --journal /var/lib/karyos/journal \
+             --agent-id prod/agent-0",
         ))
         .unwrap();
+        assert_eq!(parsed.agent_id.as_deref(), Some("prod/agent-0"));
         assert_eq!(
             parsed.archives,
             [(
@@ -209,6 +225,10 @@ mod tests {
             "--api-dir /a --driver /d --role 1=viewer --archive /d=1",
             "--api-dir /a --driver /d --role 1=viewer --archive /d=x,2",
             "--api-dir /a --driver /d --role 1=viewer --archive /d",
+            "--api-dir /a --driver /d --role 1=viewer --agent-id",
+            "--api-dir /a --driver /d --role 1=viewer --agent-id ns/pod --agent-id x",
+            "--api-dir /a --driver /d --role 1=viewer --agent-id a+b",
+            "--api-dir /a --driver /d --role 1=viewer --agent-id é",
         ] {
             assert_eq!(parse(&args(line)), None, "{line}");
         }

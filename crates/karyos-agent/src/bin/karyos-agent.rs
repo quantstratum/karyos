@@ -56,6 +56,9 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
     if let Some(journal) = args.journal {
         config = config.with_journal(journal);
     }
+    if let Some(id) = args.agent_id {
+        config = config.with_agent_id(id);
+    }
     let mut agent = Agent::new(config);
     // Between refreshes the socket is polled every 10 ms.
     let tick = Duration::from_millis(10).min(args.refresh);

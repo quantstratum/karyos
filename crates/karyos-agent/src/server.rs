@@ -26,7 +26,10 @@
 //!   (M10b; a `DIR` holds no space); `gap-ack POSITION`, an
 //!   administrator's acknowledgement of the journal's unknown interval;
 //!   `limits [DIMENSION=VALUE ...]`, the negotiation of the bounds below
-//!   (R-CORE-38).
+//!   (R-CORE-38); `capabilities`, each capability of the closed v1 list
+//!   served, unavailable in this deployment or forbidden for the peer's
+//!   role (R-CORE-24). A request this agent knows with arguments it does
+//!   not take is `{"error":"bad arguments","request":NAME}`.
 //! - **Bounds.** Each connection is served on the calling thread with
 //!   [`IO_TIMEOUT`] on its reads and writes, so a slow client delays the
 //!   others by that much at most.
@@ -269,6 +272,8 @@ pub enum Served {
     Operated,
     /// The limits, negotiated or reported.
     Limits,
+    /// The capabilities, for the caller's role (R-CORE-24).
+    Capabilities,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -386,6 +391,17 @@ impl Server {
         let (answer, served) = match (peer, parse(&line)) {
             (None, _) => (json::error("not authorized", None), Served::Refused),
             (Some(_), Request::View) => (json::view(&agent.view()), Served::View),
+            (Some((_, role)), Request::Capabilities) => (
+                json::capabilities(&agent.capabilities(
+                    role.may_close(),
+                    role.may_reopen(),
+                    role.may_acknowledge(),
+                )),
+                Served::Capabilities,
+            ),
+            (Some(_), Request::BadArguments(request)) => {
+                (json::bad_arguments(request), Served::Refused)
+            }
             (Some((uid, role)), Request::GuardClose { dir, guard, reason }) => {
                 if role.may_close() {
                     let answer = agent.guard_close(Path::new(dir), guard, uid, reason.as_bytes());
@@ -463,6 +479,10 @@ impl Drop for Server {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Request<'a> {
     View,
+    /// The capability discovery of R-CORE-24.
+    Capabilities,
+    /// A known request with arguments it does not take.
+    BadArguments(&'static str),
     GuardClose {
         dir: &'a str,
         guard: u64,
@@ -523,6 +543,11 @@ fn request(rest: &str) -> Option<Request<'_>> {
     let number = |word: &str| word.parse::<u64>().ok();
     match name {
         "view" if arguments.is_empty() => Some(Request::View),
+        // A malformed request this agent knows gets its own typed error
+        // (the rule of karyos#733); an agent that does not know it answers
+        // `bad request`, which a client reads as "not supported".
+        "capabilities" if arguments.is_empty() => Some(Request::Capabilities),
+        "capabilities" => Some(Request::BadArguments("capabilities")),
         "guard-close" => {
             let mut fields = arguments.splitn(3, ' ');
             let dir = fields.next().filter(|dir| !dir.is_empty())?;

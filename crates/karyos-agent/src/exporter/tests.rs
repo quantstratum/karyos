@@ -110,6 +110,7 @@ fn view() -> AgentView {
             failures: 1,
             last_error: None,
         }),
+        attachment: crate::api::Attachment::default(),
     };
     let closed = DriverView {
         dir: PathBuf::from("/run/karyos/c"),
@@ -124,11 +125,13 @@ fn view() -> AgentView {
         trace: TraceCounts::default(),
         alerts: Vec::new(),
         catalog: None,
+        attachment: crate::api::Attachment::default(),
     };
     AgentView {
         version: API_VERSION,
         drivers: vec![attached, closed],
         journal: None,
+        agent: crate::api::AgentIdentity::new(None, 1, 1),
     }
 }
 

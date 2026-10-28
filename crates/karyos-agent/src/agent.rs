@@ -54,6 +54,9 @@ pub struct AgentConfig {
     /// The drivers whose Archive catalog the agent lists (M11), each a
     /// directory of `drivers`; none by default.
     pub archives: Vec<(PathBuf, CatalogConfig)>,
+    /// The agent's own name (R-CORE-24), from its deployment's
+    /// configuration; `None` by default.
+    pub agent_id: Option<String>,
 }
 
 impl AgentConfig {
@@ -69,7 +72,18 @@ impl AgentConfig {
             journal: None,
             guard_timeout: DEFAULT_ATTACH_TIMEOUT,
             archives: Vec::new(),
+            agent_id: None,
         }
+    }
+
+    /// With `id` as the agent's own name (R-CORE-24): what its deployment
+    /// calls it, for example `namespace/pod`. The agent reports it and
+    /// looks nothing up.
+    #[must_use]
+    pub fn with_agent_id(mut self, id: String) -> Self {
+        // The same rule as `--agent-id`; an id outside it is not taken.
+        self.agent_id = crate::api::valid_agent_id(&id).then_some(id);
+        self
     }
 
     /// With the operations journal in `dir` (M10b).
@@ -132,6 +146,7 @@ struct Driver {
     trace: Option<TraceWindow>,
     alerts: Alerts,
     catalog: Option<CatalogWatch>,
+    attachment: crate::api::Attachment,
 }
 
 /// The agent. Each driver it is attached to counts one tool against the
@@ -150,6 +165,8 @@ pub struct Agent {
     unopened_gap: Option<Gap>,
     /// The next guard operation's id.
     next_operation: u64,
+    /// When it started (R-CORE-24).
+    started_ns: u64,
 }
 
 impl Agent {
@@ -180,6 +197,7 @@ impl Agent {
                     .iter()
                     .find(|(archive, _)| archive == dir)
                     .map(|(_, catalog)| CatalogWatch::start(dir.clone(), *catalog)),
+                attachment: crate::api::Attachment::default(),
             })
             .collect();
         let start = host_monotonic_ns();
@@ -204,6 +222,7 @@ impl Agent {
             unopened_gap,
             // Ids from the agent's start time: unique across restarts.
             next_operation: host_monotonic_ns().max(1),
+            started_ns: start,
         }
     }
 
@@ -370,7 +389,63 @@ impl Agent {
             version: API_VERSION,
             drivers: self.drivers.iter().map(Driver::view).collect(),
             journal: self.journal_view(),
+            agent: crate::api::AgentIdentity::new(
+                self.config.agent_id.clone(),
+                std::process::id(),
+                self.started_ns,
+            ),
         }
+    }
+
+    /// Its capabilities for a caller who may close guards (`close`),
+    /// reopen them (`reopen`) and acknowledge the journal's unknown
+    /// interval (`acknowledge`), in [`crate::api::CAPABILITIES`] order
+    /// (R-CORE-24). What this deployment does not offer is `Unavailable`,
+    /// whatever the role; what it offers but the role does not allow is
+    /// `Forbidden`.
+    #[must_use]
+    pub fn capabilities(
+        &self,
+        close: bool,
+        reopen: bool,
+        acknowledge: bool,
+    ) -> Vec<crate::api::Capability> {
+        use crate::api::{CAPABILITIES, Capability, CapabilityState};
+
+        // Reopens need a journal that records; an acknowledgement also
+        // serves the unknown interval of a journal that could not open.
+        let (reopen_off, acknowledge_off) = match (&self.config.journal, &self.journal) {
+            (None, _) => (Some("not_configured"), Some("not_configured")),
+            // Could not open: only its unknown interval can be acknowledged.
+            (Some(_), None) => (Some("journal_unavailable"), None),
+            // Opened, then an append failed: it refuses every append.
+            (Some(_), Some(journal)) if journal.unavailable() => {
+                (Some("journal_unavailable"), Some("journal_unavailable"))
+            }
+            (Some(_), Some(_)) => (None, None),
+        };
+        let catalog = self.drivers.iter().any(|driver| driver.catalog.is_some());
+        CAPABILITIES
+            .iter()
+            .map(|&name| {
+                let (unavailable, permitted) = match name {
+                    "guard-close" => (None, close),
+                    "guard-reopen" => (reopen_off, reopen),
+                    "gap-ack" => (acknowledge_off, acknowledge),
+                    "catalog" => ((!catalog).then_some("not_configured"), true),
+                    // Served to every role, always.
+                    "view" | "trace-window" | "limits" => (None, true),
+                    // A name added to CAPABILITIES must be classified here.
+                    _ => (Some("not_configured"), true),
+                };
+                let state = match (unavailable, permitted) {
+                    (Some(reason), _) => CapabilityState::Unavailable { reason },
+                    (None, false) => CapabilityState::Forbidden { reason: "role" },
+                    (None, true) => CapabilityState::Served,
+                };
+                Capability { name, state }
+            })
+            .collect()
     }
 }
 
@@ -390,6 +465,8 @@ impl Driver {
                     self.instance = Some(tool.instance());
                     self.state = DriverState::Attached;
                     self.tool = Some(tool);
+                    self.attachment.since_ns = Some(host_monotonic_ns());
+                    self.attachment.attaches = self.attachment.attaches.saturating_add(1);
                 }
                 Err(error) => {
                     // A closed driver stays reported closed until it is
@@ -438,19 +515,31 @@ impl Driver {
             })
             .collect();
         self.alerts.update_guard_acks(&acks, host_monotonic_ns());
-        match tool.driver_closed() {
+        let ended = match tool.driver_closed() {
             Ok(false) => return,
             Ok(true) => {
                 self.tool = None;
                 self.state = DriverState::Closed;
+                crate::api::AttachEndReason::DriverGone
             }
             Err(error) => {
                 self.tool = None;
                 self.state = DriverState::Unavailable {
                     reason: error.to_string(),
                 };
+                crate::api::AttachEndReason::Detached
             }
+        };
+        // The attach ended: stated, with the instance it was attached to
+        // (R-CORE-24).
+        if let Some(instance) = self.instance {
+            self.attachment.previous = Some(crate::api::AttachEnd::new(
+                instance,
+                host_monotonic_ns(),
+                ended,
+            ));
         }
+        self.attachment.since_ns = None;
         // The driver it was attached to went away: its catalog's session
         // ends now, not at its deadline (M11). An attach that fails later
         // does not signal, as the driver may be alive with its tool slots
@@ -479,6 +568,7 @@ impl Driver {
             trace,
             alerts: self.alerts.firing(),
             catalog: self.catalog.as_ref().map(CatalogWatch::view),
+            attachment: self.attachment,
         }
     }
 }
