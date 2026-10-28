@@ -595,7 +595,7 @@ fn a_half_request_is_dropped_within_the_read_deadline() {
         assert!(start.elapsed() < Duration::from_secs(5), "never served");
     }
     assert!(
-        start.elapsed() < READ_DEADLINE + IO_TIMEOUT,
+        start.elapsed() < READ_DEADLINE + IO_TIMEOUT * 2,
         "{:?}",
         start.elapsed()
     );

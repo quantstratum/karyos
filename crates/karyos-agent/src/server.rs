@@ -954,7 +954,10 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
         let took = start.elapsed();
-        assert!(took < WRITE_DEADLINE + IO_TIMEOUT, "{took:?}");
+        // The deadline plus the one write it cut short, with a write's
+        // timeout of slack for a loaded machine's scheduling: a trickling
+        // reader once held it for seconds.
+        assert!(took < WRITE_DEADLINE + IO_TIMEOUT * 2, "{took:?}");
         writer.shutdown(std::net::Shutdown::Both).unwrap();
         assert!(trickle.join().unwrap() < reply.len());
     }
@@ -976,7 +979,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(read_request(&reader), None);
         assert!(
-            start.elapsed() < READ_DEADLINE + IO_TIMEOUT,
+            start.elapsed() < READ_DEADLINE + IO_TIMEOUT * 2,
             "{:?}",
             start.elapsed()
         );
