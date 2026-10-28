@@ -23,6 +23,7 @@ use crate::api::{
     CapabilityState, Catalog, CatalogRecording, Counter, DriverState, DriverView, ErrorEntry, Feed,
     GuardEntry, JournalView, Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
 };
+use crate::api::{BucketRead, BucketRefusal, TraceBucket};
 
 /// A JSON value being written into a string.
 struct Out<'a>(&'a mut String);
@@ -638,3 +639,117 @@ fn guard_entry(out: &mut Out<'_>, entry: &GuardEntry) {
 
 #[cfg(test)]
 mod tests;
+
+/// A `trace-buckets` reply (R-CORE-23): the run's `epoch`, the slice
+/// length, the current and oldest numbers, and the buckets read, whole
+/// and in order. Past `max_bytes` (the first bucket aside, which is always
+/// whole) the rest is left out and `next` names the first bucket left
+/// out; `next` is `null` when every bucket read is here.
+#[must_use]
+pub fn trace_buckets(read: &BucketRead, max_bytes: usize) -> String {
+    let mut encoded = Vec::with_capacity(read.buckets.len());
+    let mut used = 256usize;
+    let mut next = None;
+    for bucket in &read.buckets {
+        let mut text = String::new();
+        trace_bucket(&mut Out(&mut text), bucket);
+        let after = used.saturating_add(text.len()).saturating_add(1);
+        if !encoded.is_empty() && after > max_bytes {
+            next = Some(bucket.number);
+            break;
+        }
+        used = after;
+        encoded.push(text);
+    }
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.number("epoch", read.epoch);
+        fields.number("slice_ns", read.slice_ns);
+        fields.number("current", read.current);
+        fields.number("oldest", read.oldest);
+        fields
+            .key("buckets")
+            .array(&encoded, |out, bucket| out.raw(bucket));
+        fields
+            .key("next")
+            .option(next, |out, next| out.number(next));
+    });
+    text
+}
+
+/// A refused `trace-buckets` read, typed (R-CORE-23).
+#[must_use]
+pub fn bucket_refusal(refusal: &BucketRefusal) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match *refusal {
+        BucketRefusal::EpochChanged { epoch, oldest } => {
+            fields.string("error", "epoch changed");
+            fields.number("epoch", epoch);
+            fields.number("oldest", oldest);
+        }
+        BucketRefusal::Expired { oldest } => {
+            fields.string("error", "buckets expired");
+            fields.number("oldest", oldest);
+        }
+        BucketRefusal::OverBudget { number } => {
+            fields.string("error", "bucket over budget");
+            fields.number("number", number);
+        }
+    });
+    text
+}
+
+fn trace_bucket(out: &mut Out<'_>, bucket: &TraceBucket) {
+    out.object(|fields| {
+        fields.number("number", bucket.number);
+        fields.number("start_ns", bucket.start_ns);
+        fields.number("end_ns", bucket.end_ns);
+        fields.key("incomplete").bool(bucket.incomplete);
+        fields.key("loss").object(|loss| {
+            for (key, value) in [
+                ("pending_dropped", bucket.loss.pending_dropped),
+                ("polls_dropped", bucket.loss.polls_dropped),
+                ("lanes_dropped", bucket.loss.lanes_dropped),
+                ("aged_out", bucket.loss.aged_out),
+                ("mirror_overwritten", bucket.loss.mirror_overwritten),
+                ("journals_dropped", bucket.loss.journals_dropped),
+            ] {
+                loss.number(key, value);
+            }
+        });
+        fields.key("lanes").array(&bucket.lanes, |out, lane| {
+            out.object(|fields| {
+                fields.number("stream", lane.stream);
+                fields.number("incarnation", lane.incarnation);
+                fields.number("lane", lane.lane);
+                let counts = &lane.counts;
+                fields.number("digits", counts.digits);
+                fields.number("highest", counts.highest);
+                fields.number("unit", counts.unit);
+                fields.number("available", counts.available);
+                fields
+                    .key("unavailable")
+                    .array(&counts.unavailable, |out, count| out.number(count));
+                fields.key("incomplete").bool(counts.incomplete);
+                for (key, side) in [("min", &counts.min), ("max", &counts.max)] {
+                    fields.key(key).object(|fields| {
+                        for (key, buckets) in [
+                            ("non_negative", &side.non_negative),
+                            ("negative", &side.negative),
+                        ] {
+                            fields.key(key).array(buckets, |out, (index, count)| {
+                                out.raw("[");
+                                out.number(index);
+                                out.raw(",");
+                                out.number(count);
+                                out.raw("]");
+                            });
+                        }
+                        fields.number("above", side.above);
+                        fields.number("below", side.below);
+                    });
+                }
+            });
+        });
+    });
+}

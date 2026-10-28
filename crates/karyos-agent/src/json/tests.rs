@@ -383,7 +383,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "gap-ack",
             "catalog",
             "trace-window",
-            "limits"
+            "limits",
+            "trace-buckets"
         ]
     );
     let known = Capability {
@@ -407,5 +408,101 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             r#"{"capabilities":[{"name":"view","state":"served","reason":null},"#,
             r#"{"name":"a-later-capability","state":"unavailable","reason":"not_configured"}]}"#
         )
+    );
+}
+
+/// A bucket of `lanes` lanes, each with a histogram spread over `spread`
+/// values.
+fn spread_bucket(number: u64, lanes: u8, spread: i64) -> crate::api::TraceBucket {
+    let mut histogram = karyos_trace::Histogram::new(3, 10_000_000_000, 1).unwrap();
+    for value in 0..spread {
+        let value = value * 9_973;
+        histogram
+            .record(karyos_trace::Latency::Available {
+                min: value,
+                max: value + 5,
+            })
+            .unwrap();
+    }
+    crate::api::TraceBucket {
+        number,
+        start_ns: number * 10,
+        end_ns: number * 10 + 10,
+        lanes: (0..lanes)
+            .map(|lane| crate::api::BucketLane {
+                stream: 5,
+                incarnation: 1,
+                lane,
+                counts: histogram.counts(),
+            })
+            .collect(),
+        loss: crate::api::Loss::default(),
+        incomplete: false,
+    }
+}
+
+/// R-CORE-23 (E2): a `trace-buckets` reply stays within its byte bound,
+/// with full lanes and spread histograms. It stops before the first
+/// bucket that would pass it, never cutting one, and names it in `next`;
+/// the first bucket is always whole, so a reader always progresses.
+#[test]
+fn a_bucket_reply_stops_at_a_whole_bucket_within_its_bound() {
+    let read = crate::api::BucketRead {
+        epoch: 7,
+        slice_ns: 10,
+        current: 3,
+        oldest: 0,
+        buckets: (0..3)
+            .map(|number| spread_bucket(number, 4, 2_000))
+            .collect(),
+    };
+    let whole = trace_buckets(&read, usize::MAX);
+    assert!(
+        whole.ends_with(r#""next":null}"#),
+        "{}",
+        &whole[whole.len() - 40..]
+    );
+    let one = whole.len() / 3;
+    for bound in [one + one / 2, 2 * one + one / 2] {
+        let cut = trace_buckets(&read, bound);
+        assert!(cut.len() <= bound + 300, "{} over {bound}", cut.len());
+        let kept = cut.matches(r#""number":"#).count();
+        let next = if kept == 1 {
+            r#""next":1}"#
+        } else {
+            r#""next":2}"#
+        };
+        assert!(cut.ends_with(next), "{}", &cut[cut.len() - 40..]);
+    }
+    // Even a bound below one bucket returns that bucket, whole.
+    let tiny = trace_buckets(&read, 10);
+    assert_eq!(tiny.matches(r#""number":"#).count(), 1);
+    assert!(tiny.ends_with(r#""next":1}"#));
+    assert!(
+        tiny.starts_with(
+            r#"{"epoch":7,"slice_ns":10,"current":3,"oldest":0,"buckets":[{"number":0,"#
+        )
+    );
+}
+
+/// R-CORE-23: each refusal is typed, with what the reader needs to resume.
+#[test]
+fn bucket_refusals_are_typed() {
+    use crate::api::BucketRefusal;
+
+    assert_eq!(
+        bucket_refusal(&BucketRefusal::EpochChanged {
+            epoch: 9,
+            oldest: 4
+        }),
+        r#"{"error":"epoch changed","epoch":9,"oldest":4}"#
+    );
+    assert_eq!(
+        bucket_refusal(&BucketRefusal::Expired { oldest: 4 }),
+        r#"{"error":"buckets expired","oldest":4}"#
+    );
+    assert_eq!(
+        bucket_refusal(&BucketRefusal::OverBudget { number: 3 }),
+        r#"{"error":"bucket over budget","number":3}"#
     );
 }

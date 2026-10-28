@@ -232,6 +232,27 @@ impl Agent {
         }
     }
 
+    /// Up to `count` closed trace buckets of the driver in `dir`, from
+    /// number `from` on, of the window run `epoch` when given (R-CORE-23).
+    /// `Ok(Err(_))` is the window's own refusal; `Err(answer)` a driver
+    /// unknown or with no trace window yet, answered as a guard
+    /// operation's.
+    pub fn trace_buckets(
+        &self,
+        dir: &Path,
+        from: u64,
+        count: usize,
+        epoch: Option<u64>,
+    ) -> Result<Result<crate::api::BucketRead, crate::api::BucketRefusal>, GuardAnswer> {
+        let driver = self
+            .drivers
+            .iter()
+            .find(|driver| driver.dir == dir)
+            .ok_or(GuardAnswer::UnknownDriver)?;
+        let window = driver.trace.as_ref().ok_or(GuardAnswer::Unattached)?;
+        Ok(window.buckets(from, count, epoch))
+    }
+
     /// Closes guard `guard` of the driver in `dir` for operator `uid`
     /// with `reason`, journalled (M10b; see `operations`).
     pub fn guard_close(&mut self, dir: &Path, guard: u64, uid: u32, reason: &[u8]) -> GuardAnswer {
@@ -440,7 +461,7 @@ impl Agent {
                     "gap-ack" => (acknowledge_off, acknowledge),
                     "catalog" => ((!catalog).then_some("not_configured"), true),
                     // Served to every role, always.
-                    "view" | "trace-window" | "limits" => (None, true),
+                    "view" | "trace-window" | "limits" | "trace-buckets" => (None, true),
                     // A name added to CAPABILITIES must be classified here.
                     _ => (Some("not_configured"), true),
                 };

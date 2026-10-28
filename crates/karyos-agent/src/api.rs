@@ -143,7 +143,7 @@ pub enum CapabilityState {
 
 /// The capability names of API v1, a closed list: a later agent may add
 /// names, and a client ignores the ones it does not know.
-pub const CAPABILITIES: [&str; 7] = [
+pub const CAPABILITIES: [&str; 8] = [
     "view",
     "guard-close",
     "guard-reopen",
@@ -151,7 +151,17 @@ pub const CAPABILITIES: [&str; 7] = [
     "catalog",
     "trace-window",
     "limits",
+    "trace-buckets",
 ];
+
+/// A `trace-buckets` reply's bytes at most, besides the first bucket,
+/// which is always whole (R-CORE-23): the next bucket that would pass it
+/// is left for the next read, named by `next`.
+pub const MAX_BUCKET_REPLY: usize = 1 << 20;
+/// Buckets one `trace-buckets` request asks for by default, and at most.
+pub const BUCKETS_DEFAULT: usize = 6;
+/// The most buckets one request may ask for.
+pub const BUCKETS_MAX: usize = 60;
 
 /// The operations journal of the agent's guard operations (M10b; the
 /// gap analysis's new owner item 7, decided as item 51(7) of the
@@ -653,6 +663,7 @@ pub struct TraceCounts {
 /// One closed slice of the trace window, a disjoint bucket (R-CORE-23):
 /// no pair in it is in any other bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TraceBucket {
     /// Its slice number.
     pub number: u64,
@@ -663,13 +674,14 @@ pub struct TraceBucket {
     /// Each lane with pairs in it.
     pub lanes: Vec<BucketLane>,
     /// What was lost while it was current.
-    pub loss: crate::trace_window::Loss,
+    pub loss: Loss,
     /// It lost something, or a lane's count overflowed: no clean quantile.
     pub incomplete: bool,
 }
 
 /// One lane's histogram in a bucket, as mergeable counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BucketLane {
     /// The publication's stream registration.
     pub stream: u64,
@@ -691,4 +703,93 @@ pub struct Limit {
     /// Whether a client may propose a value within the bound and have it
     /// applied to its request.
     pub negotiable: bool,
+}
+
+/// The loss counted while a slice was current: what its histograms miss.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Loss {
+    /// Messages refused at the pending bound.
+    pub pending_dropped: u64,
+    /// Polls past the bound of one message.
+    pub polls_dropped: u64,
+    /// Pairs of lanes past the bound.
+    pub lanes_dropped: u64,
+    /// Messages aged out unmatched.
+    pub aged_out: u64,
+    /// Mirror records overwritten unread.
+    pub mirror_overwritten: u64,
+    /// Records of journals past the bound.
+    pub journals_dropped: u64,
+}
+
+impl Loss {
+    pub(crate) fn of(counts: &TraceCounts) -> Self {
+        Self {
+            pending_dropped: counts.pending_dropped,
+            polls_dropped: counts.polls_dropped,
+            lanes_dropped: counts.lanes_dropped,
+            aged_out: counts.aged_out,
+            mirror_overwritten: counts.mirror_overwritten,
+            journals_dropped: counts.journals_dropped,
+        }
+    }
+
+    pub(crate) fn since(self, start: Self) -> Self {
+        let less = |now: u64, then: u64| now.saturating_sub(then);
+        Self {
+            pending_dropped: less(self.pending_dropped, start.pending_dropped),
+            polls_dropped: less(self.polls_dropped, start.polls_dropped),
+            lanes_dropped: less(self.lanes_dropped, start.lanes_dropped),
+            aged_out: less(self.aged_out, start.aged_out),
+            mirror_overwritten: less(self.mirror_overwritten, start.mirror_overwritten),
+            journals_dropped: less(self.journals_dropped, start.journals_dropped),
+        }
+    }
+
+    /// Whether anything was lost.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+/// Why a bucket read is refused (R-CORE-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BucketRefusal {
+    /// The reader's cursor belongs to another run of the window.
+    EpochChanged {
+        /// This run's epoch.
+        epoch: u64,
+        /// The oldest bucket number kept.
+        oldest: u64,
+    },
+    /// The bucket is no longer kept.
+    Expired {
+        /// The oldest bucket number kept.
+        oldest: u64,
+    },
+    /// The bucket was larger than the whole budget and never kept.
+    OverBudget {
+        /// Its number.
+        number: u64,
+    },
+}
+
+/// What a bucket read returns: the buckets from the asked number on, in
+/// order, with no gap.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct BucketRead {
+    /// This run's epoch.
+    pub epoch: u64,
+    /// One slice's length, in ns.
+    pub slice_ns: u64,
+    /// The slice now current: buckets are the numbers below it.
+    pub current: u64,
+    /// The oldest bucket number kept.
+    pub oldest: u64,
+    /// The buckets, oldest first.
+    pub buckets: Vec<TraceBucket>,
 }

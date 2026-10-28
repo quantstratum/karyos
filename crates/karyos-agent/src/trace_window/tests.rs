@@ -553,10 +553,8 @@ fn the_bucket_budget_holds_and_refuses_with_its_reason() {
     );
     window.journal(PUBLISHER, Some(HOST), 0);
     window.journal(SUBSCRIBER, Some(HOST), 0);
-    let mut position = 0;
     for slice in 0..40u64 {
-        pair(&mut window, position, slice * 10 + 1);
-        position += 1;
+        pair(&mut window, slice, slice * 10 + 1);
         assert!(window.bucket_bytes() <= budget, "{}", window.bucket_bytes());
     }
     window.close_slices(401);

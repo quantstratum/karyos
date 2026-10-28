@@ -32,8 +32,9 @@
 //!   window. Pending keys older than the window age out, counted.
 //! - **Bounds.** Journals, pending keys, polls per key and lanes are each
 //!   bounded; what a bound refuses is counted, never kept. The rolling
-//!   view's histograms are dense: at most `max_lanes x slices` of them, each
-//!   [`HISTOGRAM_BYTES`].
+//!   view's histograms are dense: at most `max_lanes x slices` of them,
+//!   each 24 745 buckets in four `u64` arrays (two sides, two signs) at
+//!   [`DIGITS`] and [`HIGHEST`], 791 840 bytes.
 //! - **Buckets (R-CORE-23).** A slice the scan has moved past is closed:
 //!   no pair is recorded in it again, so it shares no record with any other
 //!   and is a disjoint bucket. It is kept, sparse (each lane's
@@ -55,15 +56,15 @@ use karyos_trace::{
     Quantile, RECORD_WORDS, TraceRecord, Unavailable, decode_record,
 };
 
-use crate::api::{BucketLane, LaneLatency, QuantileBounds, TraceBucket, TraceCounts};
+use crate::api::{
+    BucketLane, BucketRead, BucketRefusal, LaneLatency, Loss, QuantileBounds, TraceBucket,
+    TraceCounts,
+};
 
 /// Histogram significant digits, as the trace tool's.
 const DIGITS: u8 = 3;
 /// Histogram highest magnitude: 10 s in nanoseconds.
 const HIGHEST: u64 = 10_000_000_000;
-/// One dense window histogram's memory at [`DIGITS`] and [`HIGHEST`]: its
-/// 24 745 buckets in four `u64` arrays (two sides, two signs).
-pub const HISTOGRAM_BYTES: usize = 24_745 * 4 * 8;
 /// A retained bucket's bytes besides its lanes' counts, and each lane's
 /// key: what [`Bucket::bytes`] adds to the counts' own.
 const BUCKET_OVERHEAD: usize = 128;
@@ -205,92 +206,6 @@ struct Bucket {
     bytes: usize,
 }
 
-/// The loss counted while a slice was current: what its histograms miss.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Loss {
-    /// Messages refused at the pending bound.
-    pub pending_dropped: u64,
-    /// Polls past the bound of one message.
-    pub polls_dropped: u64,
-    /// Pairs of lanes past the bound.
-    pub lanes_dropped: u64,
-    /// Messages aged out unmatched.
-    pub aged_out: u64,
-    /// Mirror records overwritten unread.
-    pub mirror_overwritten: u64,
-    /// Records of journals past the bound.
-    pub journals_dropped: u64,
-}
-
-impl Loss {
-    fn of(counts: &TraceCounts) -> Self {
-        Self {
-            pending_dropped: counts.pending_dropped,
-            polls_dropped: counts.polls_dropped,
-            lanes_dropped: counts.lanes_dropped,
-            aged_out: counts.aged_out,
-            mirror_overwritten: counts.mirror_overwritten,
-            journals_dropped: counts.journals_dropped,
-        }
-    }
-
-    fn since(self, start: Self) -> Self {
-        let less = |now: u64, then: u64| now.saturating_sub(then);
-        Self {
-            pending_dropped: less(self.pending_dropped, start.pending_dropped),
-            polls_dropped: less(self.polls_dropped, start.polls_dropped),
-            lanes_dropped: less(self.lanes_dropped, start.lanes_dropped),
-            aged_out: less(self.aged_out, start.aged_out),
-            mirror_overwritten: less(self.mirror_overwritten, start.mirror_overwritten),
-            journals_dropped: less(self.journals_dropped, start.journals_dropped),
-        }
-    }
-
-    /// Whether anything was lost.
-    #[must_use]
-    pub fn any(&self) -> bool {
-        *self != Self::default()
-    }
-}
-
-/// Why a bucket read is refused (R-CORE-23).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BucketRefusal {
-    /// The reader's cursor belongs to another run of the window.
-    EpochChanged {
-        /// This run's epoch.
-        epoch: u64,
-        /// The oldest bucket number kept.
-        oldest: u64,
-    },
-    /// The bucket is no longer kept.
-    Expired {
-        /// The oldest bucket number kept.
-        oldest: u64,
-    },
-    /// The bucket was larger than the whole budget and never kept.
-    OverBudget {
-        /// Its number.
-        number: u64,
-    },
-}
-
-/// What a bucket read returns: the buckets from the asked number on, in
-/// order, with no gap.
-#[derive(Debug)]
-pub struct BucketRead {
-    /// This run's epoch.
-    pub epoch: u64,
-    /// One slice's length, in ns.
-    pub slice_ns: u64,
-    /// The slice now current: buckets are the numbers below it.
-    pub current: u64,
-    /// The oldest bucket number kept.
-    pub oldest: u64,
-    /// The buckets, oldest first.
-    pub buckets: Vec<TraceBucket>,
-}
-
 /// The follower of one driver's trace mirror.
 #[derive(Debug)]
 pub(crate) struct TraceWindow {
@@ -334,7 +249,8 @@ impl TraceWindow {
         }
     }
 
-    /// This run's epoch.
+    /// This run's epoch (tests).
+    #[cfg(test)]
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
