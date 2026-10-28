@@ -830,16 +830,28 @@ pub(crate) const EXPORT_REPLY_OVERHEAD: usize =
 /// The bytes `record`'s encoding takes in a page, with its separator,
 /// computed without encoding it:
 /// `{"seq":S,"journal":J,"sequence":Q,"payload":[W,...]},`.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn export_record_len(record: &crate::api::ExportRecord) -> usize {
+    export_record_len_of(record.seq, record.journal, record.sequence, &record.payload)
+}
+
+/// [`export_record_len`] of a record's parts, before it is built.
+#[must_use]
+pub(crate) fn export_record_len_of(
+    seq: u64,
+    journal: u64,
+    sequence: u64,
+    payload: &[u64],
+) -> usize {
     let digits = |value: u64| value.checked_ilog10().map_or(1, |log| log as usize + 1);
-    let payload: usize = record.payload.iter().map(|word| digits(*word) + 1).sum();
+    let words: usize = payload.iter().map(|word| digits(*word) + 1).sum();
     // The keys and punctuation, the payload's last word having no comma.
     r#"{"seq":,"journal":,"sequence":,"payload":[]},"#.len()
-        + digits(record.seq)
-        + digits(record.journal)
-        + digits(record.sequence)
-        + payload.saturating_sub(usize::from(!record.payload.is_empty()))
+        + digits(seq)
+        + digits(journal)
+        + digits(sequence)
+        + words.saturating_sub(usize::from(!payload.is_empty()))
 }
 
 fn export_record(out: &mut Out<'_>, record: &crate::api::ExportRecord) {

@@ -24,10 +24,11 @@
   `unknown`, its records counted in `unknown_records`. A malformed record
   (a length past the payload bound, `MirrorRecord::truncated`) is never
   delivered: it is lost with its sequence and reason `malformed`, and the
-  page goes on. An entry busy on every attempt while a page's first record
-  is its journal's never stalls the cursor and loses nothing: those
-  records go out without calibration, their journal `unreadable`, counted
-  in `unreadable_records`. Each lost range carries its `reason`
+  page goes on. A table or log entry being written is retried, yielding,
+  for 1 ms; one still busy then, while a page's first record is its
+  journal's, never stalls the cursor and loses nothing: those records go
+  out without calibration, their journal `unreadable`, counted in
+  `unreadable_records`. Each lost range carries its `reason`
   (`overwritten` or `malformed`), is stated once, and is below the page's
   `next`. The read alone bounds the page, in
   batches of 64 records; `json::trace_export` encodes it whole.
@@ -46,6 +47,6 @@
   ended at the deadline. `limits` answers it as `write.deadline_ms`. A
   request is read within `READ_DEADLINE` (250 ms) in all, each read under
   the time left (`read.deadline_ms`). One poll
-  starts connections for `POLL_BUDGET` (500 ms) at most, so it lasts 1 s at
-  most. Refusals of
+  starts connections for `POLL_BUDGET` (500 ms) at most, so its waiting on
+  clients is 1 s at most, besides the work of building the answers. Refusals of
   `trace-export` are served as refusals.

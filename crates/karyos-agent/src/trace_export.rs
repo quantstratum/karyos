@@ -17,20 +17,27 @@
 //!   records live in the driver's mirror.
 //! - **Loss, explicit.** A cursor behind the ring's retention is not
 //!   refused: the page starts at the oldest record and states the lost
-//!   sequences first, typed, before any record. A record overwritten while
-//!   the page is read is never delivered torn (the ring's seqlock): it is
-//!   lost too, stated the same way, and the page ends before it, so a
-//!   page's loss always precedes its records.
+//!   sequences, typed `overwritten`. A record overwritten while the page is
+//!   read is never delivered torn (the ring's seqlock): it is lost too, and
+//!   the page ends before it. A malformed record (its length past the
+//!   payload bound) is never delivered: it is lost, typed `malformed`, and
+//!   the page goes on. Every loss is below `next` and stated once across
+//!   pages.
 //! - **Whole records.** A page holds whole records, at most `count` of
-//!   them; the reply's byte bound ([`crate::api::MAX_EXPORT_REPLY`]) leaves
-//!   whole records out, named by `next`.
+//!   them, within the reply's byte bound ([`crate::api::MAX_EXPORT_REPLY`]
+//!   plus one record and one journal); the read alone decides where it
+//!   ends, `next` naming the first record left out.
 //! - **The table.** Each page names the journals its records come from, as
-//!   the table showed them when the page was read: the entry (with the clock
-//!   provenance, the time namespace and the drop ranges a record needs to be
-//!   decoded and calibrated), the recycle log's entry for a journal recycled
-//!   since, or unknown.
+//!   the table showed them when the page was read: the entry (with the
+//!   clock provenance, the time namespace and the drop ranges a record
+//!   needs to be decoded and calibrated), the recycle log's entry for a
+//!   journal recycled since, unknown (gone from both), or unreadable (an
+//!   entry still being written after `BUSY_BUDGET` (1 ms), while the page's
+//!   first record was its journal's; otherwise the page ends before such a
+//!   record).
 //! - **Bounds.** At most [`crate::api::EXPORT_MAX`] records per page, read
-//!   in one bounded scan, and one pass over the table and the log.
+//!   in batches that stop where the page ends, and a pass over the table
+//!   and the log, its busy entries retried for `BUSY_BUDGET` (1 ms) at most.
 
 use std::collections::BTreeSet;
 
@@ -49,8 +56,10 @@ pub(crate) const LOSS_BYTES: usize = 96;
 /// Records one scan of a page reads at most, so a page that ends early
 /// copies no more than this past its end.
 const SCAN_BATCH: usize = 64;
-/// Reads of the ring's bounds, or of a table or log entry, retried while
-/// a publication is in progress.
+/// The time a read of the table and the log waits, in all, for entries
+/// being written, yielding between attempts.
+const BUSY_BUDGET: std::time::Duration = std::time::Duration::from_millis(1);
+/// Reads of the ring's bounds retried while a publication is in progress.
 const BUSY_RETRIES: usize = 16;
 
 /// Up to `count` records (at most [`crate::api::EXPORT_MAX`]) of
@@ -111,6 +120,7 @@ pub fn export(
     // copying the rest of the count.
     let mut scanned = 0usize;
     let mut retries = 0;
+    let mut overwritten_ranges = 0usize;
     loop {
         let batch = count.saturating_sub(scanned).min(SCAN_BATCH);
         if batch == 0 {
@@ -137,25 +147,32 @@ pub fn export(
                     }
                     return;
                 }
-                let exported = ExportRecord {
-                    seq: record.seq,
-                    journal: record.journal,
-                    sequence: record.sequence,
-                    payload: record.payload.to_vec(),
-                };
+                // Measured before it is copied: a record past the bound
+                // costs no allocation.
                 let journal = if named.contains(&record.journal) {
                     0
                 } else {
                     crate::api::MAX_JOURNAL_REPLY
                 };
-                let size = crate::json::export_record_len(&exported).saturating_add(journal);
+                let size = crate::json::export_record_len_of(
+                    record.seq,
+                    record.journal,
+                    record.sequence,
+                    record.payload,
+                )
+                .saturating_add(journal);
                 if !records.is_empty() && used.saturating_add(size) > max_bytes {
                     stop = Some(record.seq);
                     return;
                 }
                 used = used.saturating_add(size);
                 let _ = named.insert(record.journal);
-                records.push(exported);
+                records.push(ExportRecord {
+                    seq: record.seq,
+                    journal: record.journal,
+                    sequence: record.sequence,
+                    payload: record.payload.to_vec(),
+                });
             },
         );
         if scan.overwritten > 0 {
@@ -174,6 +191,12 @@ pub fn export(
                 before + scan.overwritten - 1,
                 LossReason::Overwritten,
             );
+            overwritten_ranges += 1;
+            // The reply's overhead holds MAX_LOST_RANGES of them: the
+            // page ends at the last one it can state.
+            if overwritten_ranges >= MAX_LOST_RANGES {
+                break;
+            }
         }
         if stop.is_some() {
             break;
@@ -220,39 +243,34 @@ pub fn export(
         next = records.get(at).map_or(next, |record| record.seq);
         records.truncate(at);
     }
-    // Nothing is stated past where the page ends.
+    // Nothing is stated past where the page ends: a page cut before a
+    // record drops what lies after it, and no range crosses the cut, as an
+    // overwritten range precedes every record and a malformed one is one
+    // sequence.
     lost.retain(|loss| loss.first < next);
-    for loss in &mut lost {
-        loss.last = loss.last.min(next.saturating_sub(1));
-    }
+    debug_assert!(
+        lost.iter().all(|loss| loss.last < next),
+        "{lost:?} past {next}"
+    );
     lost.sort_by_key(|loss| loss.first);
     let kept: BTreeSet<u64> = records.iter().map(|record| record.journal).collect();
     let journals: Vec<ExportJournal> = journals
         .into_iter()
         .filter(|journal| kept.contains(&journal_number(journal)))
         .collect();
-    let unknown: BTreeSet<u64> = journals
-        .iter()
-        .filter_map(|journal| match journal {
-            ExportJournal::Unknown { journal } => Some(*journal),
-            _ => None,
-        })
-        .collect();
-    let unknown_records = records
-        .iter()
-        .filter(|record| unknown.contains(&record.journal))
-        .count();
-    let unreadable: BTreeSet<u64> = journals
-        .iter()
-        .filter_map(|journal| match journal {
-            ExportJournal::Unreadable { journal } => Some(*journal),
-            _ => None,
-        })
-        .collect();
-    let unreadable_records = records
-        .iter()
-        .filter(|record| unreadable.contains(&record.journal))
-        .count();
+    // Records without calibration, by why: one pass.
+    let (mut unknown_records, mut unreadable_records) = (0usize, 0usize);
+    for record in &records {
+        match journals
+            .binary_search_by_key(&record.journal, journal_number)
+            .ok()
+            .and_then(|at| journals.get(at))
+        {
+            Some(ExportJournal::Unknown { .. }) => unknown_records += 1,
+            Some(ExportJournal::Unreadable { .. }) => unreadable_records += 1,
+            _ => {}
+        }
+    }
     // The head is the ring's, read again after the page, never the cursor.
     let head = (0..BUSY_RETRIES)
         .find_map(|_| mirror.bounds())
@@ -280,59 +298,73 @@ fn journal_number(journal: &ExportJournal) -> u64 {
 }
 
 /// The journals `records` name, from the table, then the recycle log, and
-/// those that could not be read: a table or log entry busy on every
-/// attempt may have been any of them, so a journal found in neither is
-/// unknown only when every entry was read.
+/// those that could not be read. An entry being written is retried, the
+/// others read once: each busy entry again and again, yielding, for
+/// `BUSY_BUDGET` (1 ms) in all, so a writer preempted for a moment mid-write is
+/// waited for. One still busy then may hold any journal, so a journal
+/// found in neither part is unknown only when every entry was read, and
+/// unread otherwise.
 fn journals(
     mirror: &TraceMirrorReader,
     records: &[ExportRecord],
 ) -> (Vec<ExportJournal>, BTreeSet<u64>) {
+    #[derive(Clone, Copy)]
+    enum Slot {
+        Table(usize),
+        Log(usize),
+    }
     let mut wanted: BTreeSet<u64> = records.iter().map(|record| record.journal).collect();
     let mut found = Vec::with_capacity(wanted.len());
-    let mut busy = false;
-    for index in 0..mirror.entries() {
+    let take = |slot: Slot, found: &mut Vec<ExportJournal>, wanted: &mut BTreeSet<u64>| match slot {
+        Slot::Table(index) => match mirror.entry(index) {
+            EntryRead::Busy => false,
+            EntryRead::Entry(entry) => {
+                if wanted.remove(&entry.journal) {
+                    found.push(ExportJournal::Live(Box::new(entry)));
+                }
+                true
+            }
+            EntryRead::Free => true,
+        },
+        Slot::Log(index) => match mirror.log_entry(index) {
+            LogRead::Busy => false,
+            LogRead::Entry(entry) => {
+                if wanted.remove(&entry.journal) {
+                    found.push(ExportJournal::Recycled(Box::new(entry)));
+                }
+                true
+            }
+            LogRead::Free => true,
+        },
+    };
+    let mut busy: Vec<Slot> = Vec::new();
+    let slots = (0..mirror.entries())
+        .map(Slot::Table)
+        .chain((0..mirror.log_entries()).map(Slot::Log));
+    for slot in slots {
         if wanted.is_empty() {
             break;
         }
-        let read = (0..BUSY_RETRIES)
-            .map(|_| mirror.entry(index))
-            .find(|read| !matches!(read, EntryRead::Busy))
-            .unwrap_or(EntryRead::Busy);
-        match read {
-            EntryRead::Entry(entry) if wanted.remove(&entry.journal) => {
-                found.push(ExportJournal::Live(Box::new(entry)));
-            }
-            EntryRead::Busy => busy = true,
-            _ => {}
+        if !take(slot, &mut found, &mut wanted) {
+            busy.push(slot);
         }
     }
-    for index in 0..mirror.log_entries() {
-        if wanted.is_empty() {
-            break;
-        }
-        let read = (0..BUSY_RETRIES)
-            .map(|_| mirror.log_entry(index))
-            .find(|read| !matches!(read, LogRead::Busy))
-            .unwrap_or(LogRead::Busy);
-        match read {
-            LogRead::Entry(entry) if wanted.remove(&entry.journal) => {
-                found.push(ExportJournal::Recycled(Box::new(entry)));
-            }
-            LogRead::Busy => busy = true,
-            _ => {}
-        }
+    let start = std::time::Instant::now();
+    while !busy.is_empty() && !wanted.is_empty() && start.elapsed() < BUSY_BUDGET {
+        std::thread::yield_now();
+        busy.retain(|slot| !take(*slot, &mut found, &mut wanted));
     }
-    if busy {
-        found.sort_by_key(journal_number);
-        return (found, wanted);
-    }
-    found.extend(
-        wanted
-            .into_iter()
-            .map(|journal| ExportJournal::Unknown { journal }),
-    );
     found.sort_by_key(journal_number);
-    (found, BTreeSet::new())
+    if busy.is_empty() || wanted.is_empty() {
+        found.extend(
+            wanted
+                .into_iter()
+                .map(|journal| ExportJournal::Unknown { journal }),
+        );
+        found.sort_by_key(journal_number);
+        return (found, BTreeSet::new());
+    }
+    (found, wanted)
 }
 
 #[cfg(test)]

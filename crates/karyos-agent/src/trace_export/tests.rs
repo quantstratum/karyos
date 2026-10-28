@@ -458,3 +458,77 @@ fn every_sequence_is_delivered_or_lost_exactly_once() {
 fn mirror_hold(mirror: &mut TraceMirror, held: bool) -> bool {
     mirror.hold_entry(1, held)
 }
+
+/// Re-review U2 of #826: against a writer that keeps appending to a small
+/// ring, pages of the most records a request may ask for (several batches
+/// each, lapped mid-page by the writer) deliver or lose every sequence
+/// exactly once, every loss below its page's `next`, and every record
+/// whole.
+#[test]
+fn full_count_pages_against_a_writer_cover_every_sequence_once() {
+    const WRITTEN: u64 = 300_000;
+    let mut mirror = mirror(64);
+    let reader = mirror.reader();
+    let writer = std::thread::spawn(move || append(&mut mirror, 0..WRITTEN));
+    let mut seen = vec![0u8; usize::try_from(WRITTEN).unwrap()];
+    let mut cursor = 0;
+    while cursor < WRITTEN {
+        let page = export(
+            &reader,
+            EPOCH,
+            cursor,
+            crate::api::EXPORT_MAX,
+            Some(EPOCH),
+            usize::MAX,
+        )
+        .unwrap();
+        for loss in &page.lost {
+            assert!(loss.last < page.next, "{loss:?} past {}", page.next);
+            for seq in loss.first..=loss.last {
+                seen[usize::try_from(seq).unwrap()] += 1;
+            }
+        }
+        for record in &page.records {
+            assert!(record.seq < page.next);
+            assert_eq!(record.payload, [record.sequence, !record.sequence]);
+            seen[usize::try_from(record.seq).unwrap()] += 1;
+        }
+        cursor = page.next;
+    }
+    writer.join().unwrap();
+    assert!(seen.iter().all(|count| *count == 1));
+}
+
+/// Re-review U2 of #826: a full page, the most records of the largest
+/// payload, encodes within `MAX_EXPORT_REPLY` plus one record and one
+/// journal, and leaves the rest for the next page.
+#[test]
+fn a_full_page_stays_within_the_reply_bound() {
+    use crate::api::{EXPORT_MAX, MAX_EXPORT_REPLY, MAX_JOURNAL_REPLY, MAX_RECORD_REPLY};
+    use karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD;
+
+    let mut mirror = mirror(EXPORT_MAX);
+    for seq in 0..u64::try_from(EXPORT_MAX).unwrap() {
+        let _ = mirror
+            .append(10, u64::MAX - seq, &[u64::MAX; MAX_MIRROR_PAYLOAD])
+            .unwrap();
+    }
+    let page = export(
+        &mirror.reader(),
+        EPOCH,
+        0,
+        EXPORT_MAX,
+        None,
+        MAX_EXPORT_REPLY,
+    )
+    .unwrap();
+    let reply = crate::json::trace_export(&page);
+    assert!(
+        reply.len() <= MAX_EXPORT_REPLY + MAX_RECORD_REPLY + MAX_JOURNAL_REPLY,
+        "{}",
+        reply.len()
+    );
+    assert!(page.records.len() > 1);
+    assert_eq!(page.next, u64::try_from(page.records.len()).unwrap());
+    assert!(page.next < u64::try_from(EXPORT_MAX).unwrap());
+}

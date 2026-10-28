@@ -85,10 +85,12 @@ pub const WRITE_DEADLINE: Duration = Duration::from_millis(250);
 pub const READ_DEADLINE: Duration = Duration::from_millis(250);
 /// The bytes of one write of a reply at most.
 const WRITE_CHUNK: usize = 64 << 10;
-/// The time one [`Server::poll`] starts connections in: one started
-/// before it may still take [`READ_DEADLINE`] to read and
-/// [`WRITE_DEADLINE`] to answer, so a poll lasts at most `POLL_BUDGET +
-/// READ_DEADLINE + WRITE_DEADLINE`, 1 s, however many clients wait.
+/// The time one [`Server::poll`] starts connections in. One started before
+/// it may still take [`READ_DEADLINE`] to read and [`WRITE_DEADLINE`] to
+/// answer, besides the work of building its answer (an export page is
+/// bounded by its count and bytes), so a poll's waiting on clients is at
+/// most `POLL_BUDGET + READ_DEADLINE + WRITE_DEADLINE`, 1 s, however many
+/// clients wait.
 pub const POLL_BUDGET: Duration = Duration::from_millis(500);
 /// Connections one [`Server::poll`] serves at most; the rest wait for the
 /// next poll, so a burst of clients cannot hold the polling thread.
@@ -549,8 +551,9 @@ fn write_within(stream: &mut UnixStream, reply: &[u8], deadline: Duration) -> bo
         }
         let chunk = rest.get(..WRITE_CHUNK.min(rest.len())).unwrap_or(rest);
         match stream.write(chunk) {
-            Ok(0) | Err(_) => return false,
-            Ok(written) => rest = rest.get(written..).unwrap_or(&[]),
+            Ok(written) if written > 0 => rest = rest.get(written..).unwrap_or(&[]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(_) | Err(_) => return false,
         }
     }
     // Written whole: served, even if the last write ended past the
@@ -626,6 +629,9 @@ fn read_request(stream: &UnixStream) -> Option<String> {
         match stream.read(buffer.get_mut(..want)?) {
             Ok(0) => break,
             Ok(read) => line.extend_from_slice(buffer.get(..read)?),
+            // A signal is not the client's doing: read again, within the
+            // same deadline.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return None,
         }
     }
