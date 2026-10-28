@@ -81,7 +81,16 @@ pub(crate) struct Options {
     /// How long the host has to declare its startup complete, in
     /// nanoseconds (R-CORE-35).
     pub(crate) startup_timeout_ns: u64,
+    /// Whether the driver runs its network agents, with
+    /// `NetworkConfig::default()`.
+    pub(crate) network: bool,
 }
+
+/// `KARYOS_NETWORK_OFF`: no network agents; `karyos:ipc` only.
+pub(crate) const NETWORK_OFF: u32 = 0;
+/// `KARYOS_NETWORK_ON`: the network agents with their default
+/// configuration, on their own threads.
+pub(crate) const NETWORK_ON: u32 = 1;
 
 impl Options {
     /// The driver's defaults.
@@ -99,6 +108,7 @@ impl Options {
             client_liveness_timeout_ns: config.client_liveness_timeout,
             cutover_deadline_ns: config.cutover_deadline,
             startup_timeout_ns: config.startup_timeout,
+            network: config.network.is_some(),
         }
     }
 
@@ -116,6 +126,9 @@ impl Options {
             client_liveness_timeout: self.client_liveness_timeout_ns,
             cutover_deadline: self.cutover_deadline_ns,
             startup_timeout: self.startup_timeout_ns,
+            network: self
+                .network
+                .then(karyos_driver::net::NetworkConfig::default),
             ..DriverConfig::default()
         })
     }

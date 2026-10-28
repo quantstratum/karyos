@@ -212,6 +212,7 @@ offers. The features are:
 | `concurrent-publication` | `publication.add_concurrent` |
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
+| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner binds for the scenario. As for a remote publication, the runner retries an offer of such a driver's client that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
@@ -288,6 +289,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `library.version` | none | `major`, `minor`, `patch` | |
 | `clock.now` | `domain`: `"monotonic"` or `"tai"` | `now` | `tai-clock` for `"tai"` |
 | `driver.create` | none | `driver` | `embedded-driver` |
+| `driver.create_networked` | none: the options of `karyos_driver_options_init` with `network` set to `KARYOS_NETWORK_ON` | `driver` | `embedded-driver`, `embedded-network` |
 | `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none | `embedded-driver` |
 | `driver.start` | `driver`, [`idle_strategy`: `"busy_spin"`, `"yield"`, `"sleep"` or `"yield_then_sleep"`, default `"yield_then_sleep"`, the ABI's declared default; `idle_sleep_ns`] | none | `embedded-driver` |
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
@@ -552,12 +554,13 @@ A scenario fails, and is reported as failed, on any of these:
 
 The ABI version is independent of the workspace version. A runner calls
 `karyos_abi_version` first, before any other call. This suite needs ABI
-0.1.3 or a later 0.1.z (0.1.2 adds the roles calls,
+0.1.4 or a later 0.1.z (0.1.2 adds the roles calls,
 `karyos_client_add_publication_with_roles` and
 `karyos_client_add_subscription_as`, and
 `karyos_publication_network_admission`, karyos#637; 0.1.3 adds
 `karyos_driver_startup_complete` and `karyos_driver_readiness`,
-karyos#794): before 1.0 a runner
+karyos#794; 0.1.4 adds `karyos_driver_options.network`, karyos#735):
+before 1.0 a runner
 accepts exactly the 0.y the suite targets, with at least its minimum
 0.y.z, and checks it once, before any scenario; a library outside it
 fails the run.

@@ -2908,3 +2908,164 @@ fn a_readiness_struct_below_its_first_size_is_refused_and_a_larger_one_gets_the_
     assert_eq!(large[3], u64::MAX, "nothing past the known fields");
     assert_eq!(karyos_driver_close(driver), Status::Ok.code());
 }
+
+// An embedded driver's network over the C ABI (karyos#735).
+
+/// Counts the messages a poll delivers into the `u32` behind `context`.
+///
+/// # Safety
+///
+/// `context` points to a live `u32`.
+unsafe extern "C" fn count_message(
+    context: *mut c_void,
+    _data: *const u8,
+    _length: usize,
+    _info: *const MessageInfo,
+) {
+    // SAFETY: the caller's contract.
+    unsafe { *context.cast::<u32>() += 1 };
+}
+
+/// A driver of `network` on its own thread, and a client of it.
+fn network_driver(network: u32) -> (i32, u64, u64) {
+    let mut options = default_driver_options();
+    options.network = network;
+    let mut driver = 0;
+    // SAFETY: live, aligned pointers; no detail.
+    let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
+    if status != Status::Ok.code() {
+        return (status, 0, 0);
+    }
+    assert_eq!(
+        karyos_driver_start(driver, crate::api::client::IDLE_YIELD, 0),
+        Status::Ok.code()
+    );
+    let mut client = 0;
+    // SAFETY: a live, aligned `u64`; no detail.
+    let status = unsafe { karyos_driver_connect(driver, &mut client, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    (Status::Ok.code(), driver, client)
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "UDP sockets")]
+fn an_embedded_driver_with_its_network_carries_a_udp_channel() {
+    const STREAM: i32 = 735;
+    let (status, driver, client) = network_driver(api::driver::NETWORK_ON);
+    assert_eq!(status, Status::Ok.code());
+    let port = test_port();
+    let receive = std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{port}")).unwrap();
+    let send = std::ffi::CString::new(format!(
+        "karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"
+    ))
+    .unwrap();
+    let mut subscription = 0;
+    // SAFETY: a live C string, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_subscription(
+            client,
+            receive.as_ptr(),
+            STREAM,
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::Ok.code());
+    let mut publication = 0;
+    // SAFETY: a live C string, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_publication(
+            client,
+            send.as_ptr(),
+            STREAM,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::Ok.code());
+    let mut seen = 0u32;
+    let start = std::time::Instant::now();
+    let payload = b"over udp";
+    while seen == 0 {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "nothing delivered"
+        );
+        // Offered until one arrives: an offer before the receiver's image
+        // exists is not delivered to it.
+        let mut done = accepted();
+        // SAFETY: a live payload and a live `karyos_accepted`.
+        let _ = unsafe {
+            karyos_publication_offer(publication, 0, payload.as_ptr(), payload.len(), &mut done)
+        };
+        // The client attaches the subscription's images as it is served.
+        let _ = poll(client);
+        let mut delivered = 0;
+        // SAFETY: a handler that writes the live `u32` behind its context.
+        let status = unsafe {
+            karyos_subscription_poll(
+                subscription,
+                Some(count_message),
+                (&raw mut seen).cast(),
+                16,
+                &mut delivered,
+            )
+        };
+        assert_eq!(status, Status::Ok.code());
+        idle();
+    }
+    assert!(seen >= 1);
+    assert_eq!(karyos_publication_close(publication), Status::Ok.code());
+    assert_eq!(karyos_subscription_close(subscription), Status::Ok.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
+    // The default, as an older caller's struct reads it.
+    let (status, driver, client) = network_driver(api::driver::NETWORK_OFF);
+    assert_eq!(status, Status::Ok.code());
+    let uri =
+        std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{}", test_port())).unwrap();
+    let mut subscription = 0;
+    // SAFETY: a live C string, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_subscription(
+            client,
+            uri.as_ptr(),
+            9,
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_ne!(status, Status::Ok.code());
+    assert_eq!(karyos_client_close(client), Status::Ok.code());
+    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+}
+
+#[test]
+fn an_older_driver_options_struct_has_no_network_and_a_bad_value_is_refused() {
+    let mut given = default_driver_options();
+    given.network = api::driver::NETWORK_ON;
+    // ABI 0.1.3's struct ends before the field: off.
+    given.size = 64;
+    // SAFETY: a live, aligned `DriverOptions` whose size is set.
+    let read = unsafe { read_sized(&given, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) };
+    assert_eq!(read.unwrap().network, api::driver::NETWORK_OFF);
+    for (network, reserved0) in [(2, 0), (u32::MAX, 0), (api::driver::NETWORK_ON, 1)] {
+        let mut options = default_driver_options();
+        options.network = network;
+        options.reserved0 = reserved0;
+        let mut driver = 0;
+        // SAFETY: live, aligned pointers; no detail.
+        let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
+        assert_eq!(
+            status,
+            Status::InvalidArgument.code(),
+            "{network} {reserved0}"
+        );
+        assert_eq!(driver, 0, "nothing created");
+    }
+}

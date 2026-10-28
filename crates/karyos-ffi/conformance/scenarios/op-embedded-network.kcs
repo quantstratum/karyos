@@ -1,0 +1,48 @@
+# An embedded driver created with its network on (karyos#735; ABI 0.1.4):
+# its client opens a karyos:udp subscription and publication on a loopback
+# endpoint the runner provides, $network_uri, and the subscription
+# receives what the publication offers. A runner without
+# embedded-network skips it, and a driver created without its network
+# refuses the channel.
+format 2
+id op.embedded.network
+abi 0.1
+covers "embedded network"
+since B3
+feature embedded-driver
+feature embedded-network
+
+op driver.create_networked
+expect ok driver=$driver
+op driver.start driver=$driver
+expect ok
+op client.connect driver=$driver
+expect ok client=$client
+op subscription.add client=$client stream_id=735 uri=$network_uri
+expect ok subscription=$reading
+op publication.add client=$client stream_id=735 uri=$network_uri
+expect ok publication=$publication
+op publication.offer publication=$publication payload="over udp"
+expect ok
+op subscription.poll subscription=$reading limit=8 until=1
+expect ok delivered=1 last="over udp"
+op publication.close publication=$publication
+expect ok
+op subscription.close subscription=$reading
+expect ok
+op client.close client=$client
+expect ok
+op driver.close driver=$driver
+expect ok
+op driver.create
+expect ok driver=$plain
+op driver.start driver=$plain
+expect ok
+op client.connect driver=$plain
+expect ok client=$ipc_only
+op subscription.add client=$ipc_only stream_id=736 uri=$network_uri
+expect status=unsupported_channel
+op client.close client=$ipc_only
+expect ok
+op driver.close driver=$plain
+expect ok

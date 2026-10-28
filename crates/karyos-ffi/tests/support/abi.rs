@@ -41,6 +41,8 @@ pub struct DriverOptions {
     pub client_liveness_timeout_ns: u64,
     pub cutover_deadline_ns: u64,
     pub startup_timeout_ns: u64,
+    pub network: u32,
+    pub reserved0: u32,
 }
 
 /// `karyos_readiness` (ABI 0.1.3).
@@ -1183,6 +1185,16 @@ pub fn driver_create_with(options: &DriverOptions) -> (i32, u64, Detail) {
 pub fn driver_create() -> (i32, u64) {
     let (status, options) = driver_options();
     assert_eq!(status, 0);
+    let (status, driver, _) = driver_create_with(&options);
+    (status, driver)
+}
+
+/// `karyos_driver_create` with the defaults and `KARYOS_NETWORK_ON`: the
+/// status and the handle.
+pub fn driver_create_networked() -> (i32, u64) {
+    let (status, mut options) = driver_options();
+    assert_eq!(status, 0);
+    options.network = 1;
     let (status, driver, _) = driver_create_with(&options);
     (status, driver)
 }
