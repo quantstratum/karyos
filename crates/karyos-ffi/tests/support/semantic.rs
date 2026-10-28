@@ -290,10 +290,10 @@ impl Adapter {
         })
     }
 
-    /// Takes the queued image changes of `subscription` into its count;
-    /// a failing status fails the step.
-    /// Takes the queued image changes of `subscription` into its count: the
-    /// failing status of `karyos_subscription_next_image_change`, if any.
+    /// Takes the queued image changes of `subscription` into its count,
+    /// returning the failing status of
+    /// `karyos_subscription_next_image_change`, if any, for the op to
+    /// answer.
     fn take_image_changes(&mut self, subscription: usize) -> Result<(), i32> {
         loop {
             match abi::subscription_next_image_change(self.objects[subscription].handle) {
