@@ -978,13 +978,13 @@ fn an_aggregate_change_is_weighed_on_every_lane() {
             Some(per_second(100, 10, None)),
         )
         .unwrap();
-    // Lane 1 takes the aggregate's policy, with its own reserve.
+    // Lane 1 has the aggregate's policy, with its own reserve.
     driver
         .guard_stream(
             lane_of(&aggregate, 1),
             b,
             4,
-            Some(per_second(20, 10, None).with_reserve(reserve)),
+            Some(per_second(100, 10, None).with_reserve(reserve)),
         )
         .unwrap();
     let admin = |operation| (RateAuthority::Administrator, operation);
@@ -1078,7 +1078,7 @@ fn lane_of(aggregate: &karyos_driver::AggregateHandle, lane: u8) -> StreamHandle
 /// aggregate that has a policy, takes the aggregate's policy and version:
 /// it never blocks a change with `NoRate`, and changes with the others.
 #[test]
-fn a_lane_guarded_without_a_rate_is_left_out() {
+fn a_lane_guarded_without_a_rate_takes_the_aggregates_policy() {
     use karyos_driver::RateAuthority;
 
     let mut driver = EmbeddedDriver::new().unwrap();
@@ -1231,4 +1231,101 @@ fn a_lane_refusal_and_a_retiring_lane_are_named_and_audited() {
         .collect();
     let gone = AuditOutcome::Refused(ErrorCode::UnknownStream);
     assert_eq!(audit, [(a.id(), gone), (b.id(), gone)]);
+}
+
+/// Re-review P1 of #814: guarding a lane with a policy other than its
+/// aggregate's is refused, never a silent change of either; the same
+/// policy, or none, is taken.
+#[test]
+fn a_lane_guarded_with_another_policy_is_refused() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = two_lanes(&mut driver, 2);
+    let guard = driver.add_guard("orders").unwrap();
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 0),
+            guard,
+            4,
+            Some(per_second(100, 10, None)),
+        )
+        .unwrap();
+    assert_eq!(
+        driver.guard_stream(
+            lane_of(&aggregate, 1),
+            guard,
+            4,
+            Some(per_second(20, 10, None))
+        ),
+        Err(DriverError::InvalidConfig)
+    );
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 1),
+            guard,
+            4,
+            Some(per_second(100, 10, None)),
+        )
+        .unwrap();
+}
+
+/// Re-review P2 of #814: a lane guarded without a rate before its
+/// aggregate had a policy takes the policy another lane brings, at its
+/// version, and changes with it; its guard audits each change from it.
+#[test]
+fn a_lane_guarded_first_without_a_rate_follows_the_policy() {
+    use karyos_driver::{AuditOutcome, RateAuthority};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = two_lanes(&mut driver, 2);
+    let (a, b) = (
+        driver.add_guard("a").unwrap(),
+        driver.add_guard("b").unwrap(),
+    );
+    driver
+        .guard_stream(lane_of(&aggregate, 0), a, 4, None)
+        .unwrap();
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 1),
+            b,
+            4,
+            Some(per_second(100, 10, None)),
+        )
+        .unwrap();
+    let safety = (RateAuthority::Safety, 7);
+    assert_eq!(
+        driver.change_aggregate_rate_policy(&aggregate, 1, per_second(50, 10, None).policy, safety),
+        Ok(2)
+    );
+    let audit: Vec<_> = driver
+        .guard_audit()
+        .records
+        .iter()
+        .filter(|record| record.operation == 7)
+        .map(|record| (record.guard, record.before, record.after, record.outcome))
+        .collect();
+    let changed = AuditOutcome::RateChanged {
+        authority: RateAuthority::Safety,
+    };
+    assert_eq!(audit, [(a.id(), 1, 2, changed), (b.id(), 1, 2, changed)]);
+}
+
+/// Re-review of #814: a retiring lane, guarded or not, refuses the change
+/// as retiring, never as `NoRate`: here no lane is guarded.
+#[test]
+fn a_retiring_unguarded_lane_is_retiring() {
+    use karyos_driver::RateAuthority;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = two_lanes(&mut driver, 2);
+    driver.remove_aggregate(&aggregate).unwrap();
+    assert!(matches!(
+        driver.change_rate_policy(
+            lane_of(&aggregate, 1),
+            1,
+            per_second(50, 10, None).policy,
+            (RateAuthority::Safety, 1)
+        ),
+        Err(DriverError::StreamRetiring { .. })
+    ));
 }
