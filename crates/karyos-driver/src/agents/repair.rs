@@ -118,6 +118,16 @@ pub enum RepairConfigError {
     /// No room for a step 8 ERR, or no NAK admitted per cycle.
     #[error("repair replies and naks_per_cycle must be at least 1")]
     Zero,
+    /// A multi-destination publication's job table holds less than one job
+    /// per destination: MD-8 gives each its share, `repair_jobs /
+    /// max_destinations`, of at least 1.
+    #[error("repair_jobs {repair_jobs} is below one job for each of {destinations} destinations")]
+    DestinationShare {
+        /// The configured `repair_jobs`.
+        repair_jobs: usize,
+        /// The most destinations of the publication.
+        destinations: usize,
+    },
     /// A `retransmit_window` of zero, above half the term, or not
     /// frame-aligned.
     #[error("retransmit_window must be frame-aligned, nonzero and at most half a term")]

@@ -881,3 +881,43 @@ fn a_late_destination_does_not_hold_the_eos() {
         );
     }
 }
+
+/// Review N1: the address family is the publication's, kept when every
+/// destination has been removed, so an addition still answers `Added`, and
+/// one of another family `Unknown`.
+#[test]
+fn an_addition_after_every_destination_removed_is_still_taken() {
+    use crate::agents::data::DestinationChange;
+
+    let mut a = driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers(1);
+    let lone = SocketAddr::from((LOOPBACK, 43_000));
+    let (publication, _) = connect(
+        &mut a,
+        &mut receivers,
+        &destinations(&[addresses[0], lone], false),
+        &[],
+        None,
+    );
+    for gone in [addresses[0], lone] {
+        a.remove_network_destination(&publication, gone).unwrap();
+        assert_eq!(
+            answer(&mut a, &mut receivers, &publication),
+            (gone, DestinationChange::Removed)
+        );
+    }
+    // No destination is left: the publication is not served, so its
+    // removed targets retire only once one is added and served again.
+    let next = SocketAddr::from((LOOPBACK, 43_001));
+    a.add_network_destination(&publication, next).unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (next, DestinationChange::Added)
+    );
+    let v6: SocketAddr = "[::1]:43002".parse().unwrap();
+    a.add_network_destination(&publication, v6).unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (v6, DestinationChange::Unknown)
+    );
+}

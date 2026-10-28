@@ -1468,6 +1468,9 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     path_heartbeat_interval: u64,
     /// `sender_heartbeat_interval` in ns (SPEC §6).
     sender_heartbeat_interval: u64,
+    /// `setup_interval`: the spacing of a destination's counted open
+    /// failures (karyos#630).
+    setup_interval: u64,
     /// Removed publications' routes and queues, closed at the next duty
     /// with the TX halves (allocated at creation: `publications` routes'
     /// worth, the most removals can leave).
@@ -1615,10 +1618,14 @@ pub(super) fn roles<T: StreamTerms>(
             due: Vec::with_capacity(config.publications),
             path_heartbeat_interval: config.path_heartbeat_interval,
             sender_heartbeat_interval: config.sender_heartbeat_interval,
+            setup_interval: config.setup_interval,
             closing: Vec::with_capacity(
                 config
                     .publications
-                    .checked_mul(karyos_io::lanes::routes::MAX_ROUTES)
+                    .checked_mul(
+                        karyos_io::lanes::routes::MAX_ROUTES
+                            .saturating_add(super::data::MAX_DESTINATIONS),
+                    )
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
             ),
             close_report: karyos_io::backend::TxReport::new(),
@@ -4688,6 +4695,9 @@ impl<T: StreamTerms> SenderRole<T> {
             Ok(()) => {
                 // `add` refuses past `publications` entries, the capacity.
                 // Kept boxed: removal hands the box back without allocating.
+                let mut outbound = outbound;
+                outbound
+                    .set_destination_timing(self.membership.receiver_timeout, self.setup_interval);
                 self.publications.push(outbound);
                 AgentEvent::PublicationAdded {
                     endpoint: publication.endpoint,
@@ -5093,6 +5103,9 @@ impl<T: StreamTerms> SenderRole<T> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);
+        for outbound in &mut self.publications {
+            outbound.drain_retired(&mut self.closing);
+        }
         self.close_removed(halves);
         self.naks_this_cycle = 0;
         // Bindings past their lifetime go even when nothing arrives.
