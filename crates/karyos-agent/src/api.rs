@@ -143,7 +143,7 @@ pub enum CapabilityState {
 
 /// The capability names of API v1, a closed list: a later agent may add
 /// names, and a client ignores the ones it does not know.
-pub const CAPABILITIES: [&str; 7] = [
+pub const CAPABILITIES: [&str; 8] = [
     "view",
     "guard-close",
     "guard-reopen",
@@ -151,7 +151,33 @@ pub const CAPABILITIES: [&str; 7] = [
     "catalog",
     "trace-window",
     "limits",
+    "trace-buckets",
 ];
+
+/// The byte bound of a `trace-buckets` reply (R-CORE-23). A reply holds
+/// whole lanes only, and always at least one, so a reader always
+/// progresses: it is at most `MAX_BUCKET_REPLY` plus one lane's encoding,
+/// [`MAX_LANE_REPLY`] at most. A bucket larger than the bound is paged by
+/// lane; the first lane left out is named by `next`, a bucket number and a
+/// lane index. A client sizes its buffer for
+/// `MAX_BUCKET_REPLY + MAX_LANE_REPLY`.
+pub const MAX_BUCKET_REPLY: usize = 1 << 20;
+/// The largest encoding of one lane of a bucket: its header, at most
+/// [`LANE_HEADER_REPLY`] bytes, and its histogram's four count arrays of
+/// [`LANE_BUCKETS`] entries each (two sides, two signs), each entry
+/// `[index,count],` at most 29 bytes (an index of 5 digits, a count of
+/// 20): `LANE_HEADER_REPLY + 4 x LANE_BUCKETS x 29`, 2 870 932 bytes at
+/// the trace window's 3 significant digits and 10 s highest magnitude.
+pub const MAX_LANE_REPLY: usize = LANE_HEADER_REPLY + 4 * LANE_BUCKETS * 29;
+/// The entries of one count array of a lane's histogram, at the trace
+/// window's 3 significant digits and 10 s highest magnitude.
+pub const LANE_BUCKETS: usize = 24_745;
+/// The most bytes of a lane's encoding besides its count arrays.
+pub const LANE_HEADER_REPLY: usize = 512;
+/// Buckets one `trace-buckets` request asks for by default, and at most.
+pub const BUCKETS_DEFAULT: usize = 6;
+/// The most buckets one request may ask for.
+pub const BUCKETS_MAX: usize = 60;
 
 /// The operations journal of the agent's guard operations (M10b; the
 /// gap analysis's new owner item 7, decided as item 51(7) of the
@@ -643,6 +669,49 @@ pub struct TraceCounts {
     pub mirror_overwritten: u64,
     /// Messages pending now.
     pub pending: u64,
+    /// Closed buckets evicted, oldest first, to keep within the budget
+    /// (R-CORE-23).
+    pub buckets_evicted: u64,
+    /// Closed buckets larger than the whole budget, never kept.
+    pub buckets_over_budget: u64,
+}
+
+/// One closed slice of the trace window, a disjoint bucket (R-CORE-23):
+/// no pair in it is in any other bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TraceBucket {
+    /// Its slice number.
+    pub number: u64,
+    /// Its lanes in all; `lanes` is the part from `first_lane` on that
+    /// this reply holds (R-CORE-23's paging by lane).
+    pub lanes_total: usize,
+    /// The index of the first lane of `lanes` among the bucket's.
+    pub first_lane: usize,
+    /// Its span of the agent's time, `[start_ns, end_ns)`.
+    pub start_ns: u64,
+    /// The end of its span.
+    pub end_ns: u64,
+    /// Each lane with pairs in it.
+    pub lanes: Vec<BucketLane>,
+    /// What was lost while it was current.
+    pub loss: Loss,
+    /// It lost something, or a lane's count overflowed: no clean quantile.
+    pub incomplete: bool,
+}
+
+/// One lane's histogram in a bucket, as mergeable counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BucketLane {
+    /// The publication's stream registration.
+    pub stream: u64,
+    /// Its incarnation.
+    pub incarnation: u64,
+    /// The lane.
+    pub lane: u8,
+    /// The histogram's counts (`karyos_trace::Histogram::from_counts`).
+    pub counts: karyos_trace::HistogramCounts,
 }
 
 /// One dimension `limits` answers (R-CORE-38).
@@ -655,4 +724,126 @@ pub struct Limit {
     /// Whether a client may propose a value within the bound and have it
     /// applied to its request.
     pub negotiable: bool,
+}
+
+/// The loss counted while a slice was current: what its histograms miss.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Loss {
+    /// Messages refused at the pending bound.
+    pub pending_dropped: u64,
+    /// Polls past the bound of one message.
+    pub polls_dropped: u64,
+    /// Pairs of lanes past the bound.
+    pub lanes_dropped: u64,
+    /// Messages aged out unmatched.
+    pub aged_out: u64,
+    /// Mirror records overwritten unread.
+    pub mirror_overwritten: u64,
+    /// Records of journals past the bound.
+    pub journals_dropped: u64,
+    /// Records whose payload did not decode.
+    pub malformed: u64,
+    /// Records of a journal not (yet) in the table.
+    pub unknown_journal: u64,
+}
+
+impl Loss {
+    pub(crate) fn of(counts: &TraceCounts) -> Self {
+        Self {
+            pending_dropped: counts.pending_dropped,
+            polls_dropped: counts.polls_dropped,
+            lanes_dropped: counts.lanes_dropped,
+            aged_out: counts.aged_out,
+            mirror_overwritten: counts.mirror_overwritten,
+            journals_dropped: counts.journals_dropped,
+            malformed: counts.malformed,
+            unknown_journal: counts.unknown_journal,
+        }
+    }
+
+    pub(crate) fn since(self, start: Self) -> Self {
+        let less = |now: u64, then: u64| now.saturating_sub(then);
+        Self {
+            pending_dropped: less(self.pending_dropped, start.pending_dropped),
+            polls_dropped: less(self.polls_dropped, start.polls_dropped),
+            lanes_dropped: less(self.lanes_dropped, start.lanes_dropped),
+            aged_out: less(self.aged_out, start.aged_out),
+            mirror_overwritten: less(self.mirror_overwritten, start.mirror_overwritten),
+            journals_dropped: less(self.journals_dropped, start.journals_dropped),
+            malformed: less(self.malformed, start.malformed),
+            unknown_journal: less(self.unknown_journal, start.unknown_journal),
+        }
+    }
+
+    /// Whether anything was lost.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+/// Why a bucket read is refused (R-CORE-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BucketRefusal {
+    /// The reader's cursor belongs to another run of the window.
+    EpochChanged {
+        /// This run's epoch.
+        epoch: u64,
+        /// The oldest bucket number kept.
+        oldest: u64,
+    },
+    /// The bucket is no longer kept.
+    Expired {
+        /// The oldest bucket number kept.
+        oldest: u64,
+    },
+    /// The bucket was larger than the whole budget and never kept.
+    OverBudget {
+        /// Its number.
+        number: u64,
+    },
+}
+
+/// What a bucket read returns: the buckets from the asked number on, in
+/// order, with no gap.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct BucketRead {
+    /// This run's epoch.
+    pub epoch: u64,
+    /// One slice's length, in ns.
+    pub slice_ns: u64,
+    /// The slice now current: buckets are the numbers below it.
+    pub current: u64,
+    /// The oldest bucket number kept.
+    pub oldest: u64,
+    /// The buckets, oldest first; the last may hold only part of its
+    /// lanes, and the first starts at the lane asked for.
+    pub buckets: Vec<TraceBucket>,
+    /// Where the next read starts, when the reply stopped before every
+    /// bucket asked for (the byte bound, or a bucket refused as over
+    /// budget); `None` when every bucket asked for is here, whole.
+    pub next: Option<BucketCursor>,
+}
+
+/// A position in the buckets: a bucket number and a lane index in it
+/// (R-CORE-23). A bucket's first page starts at lane 0. Ordered by number,
+/// then lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct BucketCursor {
+    /// The bucket number.
+    pub number: u64,
+    /// The index of its first lane to read.
+    pub lane: usize,
+}
+
+impl BucketCursor {
+    /// Bucket `number` from its lane `lane`.
+    #[must_use]
+    pub const fn new(number: u64, lane: usize) -> Self {
+        Self { number, lane }
+    }
 }

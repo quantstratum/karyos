@@ -39,7 +39,7 @@ pub use clocks::{
     Calibration, CalibrationError, ClockKey, Latency, Observation, Unavailable, latency,
 };
 pub use error::TraceError;
-pub use histogram::{Histogram, HistogramError, Quantile};
+pub use histogram::{Histogram, HistogramCounts, HistogramError, Quantile, SideCounts};
 pub use ids::{BufferedIds, OsRandom, RandomSource};
 pub use journal::{
     Collected, ObserverId, TraceCollector, TraceWriter, trace_journal, trace_writer,

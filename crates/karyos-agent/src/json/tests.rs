@@ -145,6 +145,8 @@ fn every_field() -> AgentView {
             aged_out: 11,
             mirror_overwritten: 12,
             pending: 13,
+            buckets_evicted: 14,
+            buckets_over_budget: 15,
         },
         alerts: vec![
             Alert {
@@ -326,7 +328,7 @@ const V1: &str = concat!(
     r#""losses":{"records":[{"seq":7,"time":30,"kind":1,"reason":2,"lane":0,"stream_id":9,"stream_registration":3,"from":100,"to":200,"participant":5,"client":6}],"delivered":8,"overwritten":7},"#,
     r#""guards":{"records":[{"seq":1,"time":40,"guard":1,"before":2,"after":3,"operation":42,"requester_kind":2,"requester":6,"outcome":4,"refusal":9,"operator":1000,"parameters":77}],"delivered":2,"overwritten":0}"#,
     r#","latencies":[{"stream":3,"incarnation":1,"lane":1,"available":10,"unavailable":2,"incomplete":false,"p50":{"low":480,"high":520},"p90":{"low":900,"high":null},"p99":null,"p999":null,"max":{"low":-5,"high":1000}}],"#,
-    r#""trace":{"records":1,"malformed":2,"unknown_journal":3,"network_ignored":4,"points_ignored":5,"duplicates":6,"journals_dropped":7,"pending_dropped":8,"polls_dropped":9,"lanes_dropped":10,"aged_out":11,"mirror_overwritten":12,"pending":13},"#,
+    r#""trace":{"records":1,"malformed":2,"unknown_journal":3,"network_ignored":4,"points_ignored":5,"duplicates":6,"journals_dropped":7,"pending_dropped":8,"polls_dropped":9,"lanes_dropped":10,"aged_out":11,"mirror_overwritten":12,"pending":13,"buckets_evicted":14,"buckets_over_budget":15},"#,
     r#""alerts":[{"kind":"lag","stream":3,"lane":1,"participant":5,"value":1024,"since":50},{"kind":"loss","stream":0,"lane":0,"participant":0,"value":15,"since":60},{"kind":"guard_ack","stream":0,"lane":0,"participant":2,"value":1,"since":70}],"#,
     r#""catalog":{"recordings":[{"recording_id":1,"stream_id":42,"session_id":-7,"channel":"karyos:ipc","start":0,"start_time_ns":5,"recording":true,"position":4096,"stopped_ns":null,"stop_reason":null,"incomplete":false},"#,
     r#"{"recording_id":2,"stream_id":42,"session_id":1,"channel":"karyos:udp?endpoint=\"x\"","start":64,"start_time_ns":6,"recording":false,"position":8192,"stopped_ns":9,"stop_reason":"failed_required_lapped","incomplete":true}],"#,
@@ -334,11 +336,11 @@ const V1: &str = concat!(
     r#""attachment":{"since_ns":50,"attaches":2,"previous":{"instance":"00000000000000000000000000000abc","ended_ns":40,"reason":"detached"}}},"#,
     r#"{"dir":"/run/karyos/b","state":{"state":"unavailable","reason":"no socket"},"instance":null,"sample":null,"client_counters":[],"#,
     r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0},"#,
-    r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0},"alerts":[],"catalog":null,"#,
+    r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0,"buckets_evicted":0,"buckets_over_budget":0},"alerts":[],"catalog":null,"#,
     r#""attachment":{"since_ns":null,"attaches":0,"previous":null}},"#,
     r#"{"dir":"/run/karyos/c","state":{"state":"closed"},"instance":null,"sample":null,"client_counters":[],"#,
     r#""errors":{"records":[],"delivered":0,"overwritten":0},"losses":{"records":[],"delivered":0,"overwritten":0},"guards":{"records":[],"delivered":0,"overwritten":0},"#,
-    r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0},"alerts":[],"#,
+    r#""latencies":[],"trace":{"records":0,"malformed":0,"unknown_journal":0,"network_ignored":0,"points_ignored":0,"duplicates":0,"journals_dropped":0,"pending_dropped":0,"polls_dropped":0,"lanes_dropped":0,"aged_out":0,"mirror_overwritten":0,"pending":0,"buckets_evicted":0,"buckets_over_budget":0},"alerts":[],"#,
     r#""catalog":{"recordings":[],"left_out":0,"listed_at":null,"listings":0,"failures":0,"last_error":null},"#,
     r#""attachment":{"since_ns":null,"attaches":1,"previous":{"instance":"00000000000000000000000000000abc","ended_ns":60,"reason":"driver_gone"}}}"#,
     r#"],"journal":{"recording":4,"unsealed":true,"unavailable":false,"error":null,"failed_appends":2,"#,
@@ -381,7 +383,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "gap-ack",
             "catalog",
             "trace-window",
-            "limits"
+            "limits",
+            "trace-buckets"
         ]
     );
     let known = Capability {
@@ -405,5 +408,146 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             r#"{"capabilities":[{"name":"view","state":"served","reason":null},"#,
             r#"{"name":"a-later-capability","state":"unavailable","reason":"not_configured"}]}"#
         )
+    );
+}
+
+/// A bucket of `lanes` lanes, each with a histogram spread over `spread`
+/// values.
+fn spread_bucket(number: u64, lanes: u8, spread: i64) -> crate::api::TraceBucket {
+    let mut histogram = karyos_trace::Histogram::new(3, 10_000_000_000, 1).unwrap();
+    for value in 0..spread {
+        let value = value * 9_973;
+        histogram
+            .record(karyos_trace::Latency::Available {
+                min: value,
+                max: value + 5,
+            })
+            .unwrap();
+    }
+    crate::api::TraceBucket {
+        number,
+        lanes_total: usize::from(lanes),
+        first_lane: 0,
+        start_ns: number * 10,
+        end_ns: number * 10 + 10,
+        lanes: (0..lanes)
+            .map(|lane| crate::api::BucketLane {
+                stream: 5,
+                incarnation: 1,
+                lane,
+                counts: histogram.counts(),
+            })
+            .collect(),
+        loss: crate::api::Loss::default(),
+        incomplete: false,
+    }
+}
+
+/// R-CORE-23: a reply names where the next read starts, a bucket and a
+/// lane, or `null`; each bucket states its lanes in all and the first one
+/// it holds, and the lengths a read bounds it by are its encoding's.
+#[test]
+fn a_bucket_reply_names_its_next_bucket_and_lane() {
+    let mut bucket = spread_bucket(4, 3, 50);
+    bucket.first_lane = 1;
+    bucket.lanes.remove(0);
+    let header = bucket_header_len(&bucket);
+    let lanes: usize = bucket.lanes.iter().map(bucket_lane_len).sum();
+    let mut read = crate::api::BucketRead {
+        epoch: 7,
+        slice_ns: 10,
+        current: 9,
+        oldest: 0,
+        buckets: vec![bucket],
+        next: Some(crate::api::BucketCursor::new(4, 3)),
+    };
+    let text = trace_buckets(&read);
+    assert!(
+        text.starts_with(
+            r#"{"epoch":7,"slice_ns":10,"current":9,"oldest":0,"buckets":[{"number":4,"#
+        ),
+        "{text}"
+    );
+    assert!(text.contains(r#""lanes_total":3,"first_lane":1,"lanes":[{"#));
+    assert!(text.ends_with(r#""next":{"number":4,"lane":3}}"#), "{text}");
+    // The bucket's encoding is its header and its lanes, as counted.
+    assert!(text.len() <= BUCKET_REPLY_OVERHEAD + header + lanes);
+    assert!(text.len() + 2 >= header + lanes);
+    read.next = None;
+    assert!(trace_buckets(&read).ends_with(r#""next":null}"#));
+}
+
+/// R-CORE-23: the largest lane, every count array full of the largest
+/// indices and counts, encodes within `MAX_LANE_REPLY`, and the arrays'
+/// length is the layout's.
+#[test]
+fn the_largest_lane_encodes_within_its_bound() {
+    use crate::api::{LANE_BUCKETS, MAX_LANE_REPLY};
+    use karyos_trace::{Histogram, HistogramCounts, HistogramError, SideCounts};
+
+    let full = |count: u64| SideCounts {
+        non_negative: (0..u32::try_from(LANE_BUCKETS).unwrap())
+            .map(|index| (index, count))
+            .collect(),
+        negative: (0..u32::try_from(LANE_BUCKETS).unwrap())
+            .map(|index| (index, count))
+            .collect(),
+        above: count,
+        below: count,
+    };
+    let counts = |count: u64, available: u64| HistogramCounts {
+        digits: 3,
+        highest: 10_000_000_000,
+        unit: 1,
+        min: full(count),
+        max: full(count),
+        available,
+        unavailable: [u64::MAX; 4],
+        incomplete: true,
+    };
+    let lane = crate::api::BucketLane {
+        stream: u64::MAX,
+        incarnation: u64::MAX,
+        lane: u8::MAX,
+        counts: counts(u64::MAX, u64::MAX),
+    };
+    let size = bucket_lane_len(&lane);
+    assert!(size <= MAX_LANE_REPLY, "{size} > {MAX_LANE_REPLY}");
+    // LANE_BUCKETS is the layout's: one more index is out of it.
+    let like = Histogram::new(3, 10_000_000_000, 1).unwrap();
+    let total = 2 * u64::try_from(LANE_BUCKETS).unwrap() + 2;
+    assert!(Histogram::from_counts(&counts(1, total), &like).is_ok());
+    let mut over = counts(1, total + 1);
+    over.min
+        .non_negative
+        .push((u32::try_from(LANE_BUCKETS).unwrap(), 1));
+    over.max
+        .non_negative
+        .push((u32::try_from(LANE_BUCKETS).unwrap(), 1));
+    assert_eq!(
+        Histogram::from_counts(&over, &like).err(),
+        Some(HistogramError::InvalidCounts)
+    );
+}
+
+/// R-CORE-23: each refusal is typed, with what the reader needs to resume.
+#[test]
+fn bucket_refusals_are_typed() {
+    use crate::api::BucketRefusal;
+
+    assert_eq!(
+        bucket_refusal(&BucketRefusal::EpochChanged {
+            epoch: 9,
+            oldest: 4
+        }),
+        r#"{"error":"epoch changed","epoch":9,"oldest":4}"#
+    );
+    assert_eq!(
+        bucket_refusal(&BucketRefusal::Expired { oldest: 4 }),
+        r#"{"error":"buckets expired","oldest":4}"#
+    );
+    assert_eq!(
+        bucket_refusal(&BucketRefusal::OverBudget { number: 3 }),
+        r#"{"error":"bucket over budget","number":3}"#
     );
 }

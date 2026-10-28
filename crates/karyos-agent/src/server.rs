@@ -274,6 +274,8 @@ pub enum Served {
     Limits,
     /// The capabilities, for the caller's role (R-CORE-24).
     Capabilities,
+    /// Closed trace buckets, or the window's refusal (R-CORE-23).
+    TraceBuckets,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -450,6 +452,19 @@ impl Server {
                 Err(Refusal::Unknown(name)) => (json::unknown_dimension(name), Served::Refused),
                 Err(Refusal::Bad) => (json::error("bad request", None), Served::Refused),
             },
+            (
+                Some(_),
+                Request::TraceBuckets {
+                    dir,
+                    from,
+                    count,
+                    epoch,
+                },
+            ) => match agent.trace_buckets(Path::new(dir), from, count, epoch) {
+                Ok(Ok(read)) => (json::trace_buckets(&read), Served::TraceBuckets),
+                Ok(Err(refusal)) => (json::bucket_refusal(&refusal), Served::Refused),
+                Err(answer) => (json::guard_answer(&answer), Served::Refused),
+            },
             (Some(_), Request::Version) => (
                 json::error("unsupported version", Some(&[API_VERSION])),
                 Served::Refused,
@@ -499,6 +514,12 @@ enum Request<'a> {
     },
     Limits {
         proposals: &'a str,
+    },
+    TraceBuckets {
+        dir: &'a str,
+        from: crate::api::BucketCursor,
+        count: usize,
+        epoch: Option<u64>,
     },
     /// A well-formed request of another version.
     Version,
@@ -574,6 +595,38 @@ fn request(rest: &str) -> Option<Request<'_>> {
         "gap-ack" => Some(Request::GapAck {
             position: number(arguments)?,
         }),
+        // `trace-buckets DIR FROM [COUNT [EPOCH [LANE]]]` (R-CORE-23): a
+        // continuation names the lane its bucket's next page starts at,
+        // with the epoch; a count of 0 or above BUCKETS_MAX is a bad
+        // argument.
+        "trace-buckets" => {
+            let mut fields = arguments.split(' ');
+            let parsed = (|| {
+                let dir = fields.next().filter(|dir| !dir.is_empty())?;
+                let from = number(fields.next()?)?;
+                let count = match fields.next() {
+                    None => crate::api::BUCKETS_DEFAULT,
+                    Some(word) => usize::try_from(number(word)?)
+                        .ok()
+                        .filter(|count| (1..=crate::api::BUCKETS_MAX).contains(count))?,
+                };
+                let epoch = match fields.next() {
+                    None => None,
+                    Some(word) => Some(number(word)?),
+                };
+                let lane = match fields.next() {
+                    None => 0,
+                    Some(word) => usize::try_from(number(word)?).ok()?,
+                };
+                fields.next().is_none().then_some(Request::TraceBuckets {
+                    dir,
+                    from: crate::api::BucketCursor::new(from, lane),
+                    count,
+                    epoch,
+                })
+            })();
+            Some(parsed.unwrap_or(Request::BadArguments("trace-buckets")))
+        }
         _ => None,
     }
 }
@@ -594,6 +647,53 @@ mod tests {
         assert_eq!(parse(""), Request::Bad);
         let long = format!("KARYOS-AGENT 1 {}", "v".repeat(MAX_REQUEST));
         assert_eq!(parse(&long), Request::Bad);
+    }
+
+    /// R-CORE-23: `trace-buckets DIR FROM [COUNT [EPOCH]]`; a count of 0
+    /// or above the maximum, a word that is not a number, or one more
+    /// argument is its own bad-arguments error.
+    #[test]
+    fn trace_buckets_parse_with_their_bounds() {
+        let buckets = |dir, from, count, epoch| Request::TraceBuckets {
+            dir,
+            from: crate::api::BucketCursor::new(from, 0),
+            count,
+            epoch,
+        };
+        assert_eq!(
+            parse("KARYOS-AGENT 1 trace-buckets /run/k 4\n"),
+            buckets("/run/k", 4, crate::api::BUCKETS_DEFAULT, None)
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 trace-buckets /run/k 4 60 77\n"),
+            buckets("/run/k", 4, 60, Some(77))
+        );
+        // A continuation: bucket 4 from its lane 3.
+        assert_eq!(
+            parse("KARYOS-AGENT 1 trace-buckets /run/k 4 60 77 3\n"),
+            Request::TraceBuckets {
+                dir: "/run/k",
+                from: crate::api::BucketCursor::new(4, 3),
+                count: 60,
+                epoch: Some(77),
+            }
+        );
+        for bad in [
+            "trace-buckets",
+            "trace-buckets /run/k",
+            "trace-buckets /run/k x",
+            "trace-buckets /run/k 4 0",
+            "trace-buckets /run/k 4 61",
+            "trace-buckets /run/k 4 6 e",
+            "trace-buckets /run/k 4 6 7 x",
+            "trace-buckets /run/k 4 6 7 8 9",
+        ] {
+            assert_eq!(
+                parse(&format!("KARYOS-AGENT 1 {bad}\n")),
+                Request::BadArguments("trace-buckets"),
+                "{bad}"
+            );
+        }
     }
 
     /// R-CORE-38: a dimension this agent does not know is refused by

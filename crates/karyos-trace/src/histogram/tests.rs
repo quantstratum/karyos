@@ -265,3 +265,85 @@ fn quantile_intervals_contain_the_true_quantile() {
         }
     }
 }
+
+/// R-CORE-23: a histogram's counts rebuild it exactly, so two disjoint
+/// histograms exported and rebuilt merge to what one histogram of both
+/// sets records.
+#[test]
+fn counts_rebuild_a_histogram_that_merges_exactly() {
+    let mut first = Histogram::new(3, 10_000_000_000, 1).unwrap();
+    let mut second = Histogram::new(3, 10_000_000_000, 1).unwrap();
+    let mut both = Histogram::new(3, 10_000_000_000, 1).unwrap();
+    for (at, value) in [5i64, 900, 1_234_567, -40, 20_000_000_000]
+        .iter()
+        .enumerate()
+    {
+        let target = if at % 2 == 0 { &mut first } else { &mut second };
+        target
+            .record(interval(*value, value.saturating_add(10)))
+            .unwrap();
+        both.record(interval(*value, value.saturating_add(10)))
+            .unwrap();
+    }
+    first
+        .record(Latency::Unavailable(Unavailable::NoCalibration))
+        .unwrap();
+    both.record(Latency::Unavailable(Unavailable::NoCalibration))
+        .unwrap();
+    let rebuilt =
+        |histogram: &Histogram| Histogram::from_counts(&histogram.counts(), histogram).unwrap();
+    assert_eq!(rebuilt(&first), first);
+    let mut merged = rebuilt(&first);
+    merged.merge(&rebuilt(&second)).unwrap();
+    assert_eq!(merged, both);
+    assert!(
+        first.counts().bytes() < 1024,
+        "sparse: {}",
+        first.counts().bytes()
+    );
+}
+
+/// R-CORE-23 (E4): counts of another layout or unit are refused, never
+/// converted; an index outside the layout, one named twice, a side whose
+/// total is not the population, or a total that overflows is refused with
+/// its typed error.
+#[test]
+fn counts_of_another_layout_or_inconsistent_counts_are_refused() {
+    let mut histogram = Histogram::new(3, 10_000_000_000, 1).unwrap();
+    histogram.record(interval(10, 20)).unwrap();
+    let counts = histogram.counts();
+    for other in [
+        Histogram::new(2, 10_000_000_000, 1).unwrap(),
+        Histogram::new(3, 1_000_000, 1).unwrap(),
+        Histogram::new(3, 10_000_000_000, 1000).unwrap(),
+    ] {
+        assert_eq!(
+            Histogram::from_counts(&counts, &other),
+            Err(HistogramError::Mismatch)
+        );
+    }
+    let refused = |edit: &dyn Fn(&mut HistogramCounts)| {
+        let mut bad = counts.clone();
+        edit(&mut bad);
+        Histogram::from_counts(&bad, &histogram)
+    };
+    assert_eq!(
+        refused(&|c| c.min.non_negative = vec![(u32::MAX, 1)]),
+        Err(HistogramError::InvalidCounts)
+    );
+    assert_eq!(
+        refused(&|c| c.max.non_negative = vec![(3, 1), (3, 0)]),
+        Err(HistogramError::InvalidCounts)
+    );
+    assert_eq!(
+        refused(&|c| c.available = 2),
+        Err(HistogramError::InvalidCounts)
+    );
+    assert_eq!(
+        refused(&|c| {
+            c.min.above = u64::MAX;
+            c.min.below = 1;
+        }),
+        Err(HistogramError::Overflow)
+    );
+}

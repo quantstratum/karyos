@@ -31,22 +31,52 @@
 //!   made it, and the reported histogram merges the slices of the last
 //!   window. Pending keys older than the window age out, counted.
 //! - **Bounds.** Journals, pending keys, polls per key and lanes are each
-//!   bounded; what a bound refuses is counted, never kept.
+//!   bounded; what a bound refuses is counted, never kept. The rolling
+//!   view's histograms are dense: at most `max_lanes x slices` of them,
+//!   each 24 745 buckets in four `u64` arrays (two sides, two signs) at
+//!   [`DIGITS`] and [`HIGHEST`], 791 840 bytes.
+//! - **Buckets (R-CORE-23).** A slice the scan has moved past is closed:
+//!   no pair is recorded in it again, so it shares no record with any other
+//!   and is a disjoint bucket. It is kept, sparse (each lane's
+//!   [`HistogramCounts`]), with the loss counted while it was current
+//!   (the loss of the scan that closes it is the next bucket's, where the
+//!   pairs are missing), under `max_bucket_bytes`: the retained buckets'
+//!   structs and allocations, counted at their capacity, never pass that
+//!   budget (the allocator's own overhead aside), the oldest evicted
+//!   first. A bucket larger than the budget on its own is not kept and
+//!   evicts nothing; its number is remembered for its own refusal, at most
+//!   `OVER_BUDGET_KEPT` of them. A number below the oldest answered (past
+//!   an eviction, or a forgotten over-budget number) is refused as
+//!   expired, never served as empty. Reading is not consuming: there is no
+//!   reset, any number of readers read the same buckets, each with its own
+//!   cursor, and a reader that crashes reads the same bucket again. A read
+//!   is paged by lane within its byte bound. `epoch` identifies this
+//!   window's run: slice numbers of another run are not a continuation.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use karyos_sys::trace_mirror::{EntryRead, TimeNamespace, TraceMirrorReader};
 use karyos_trace::{
-    Calibration, ClockKey, ClockProvenance, Histogram, Latency, ObserverId, Point, Quantile,
-    RECORD_WORDS, TraceRecord, Unavailable, decode_record,
+    Calibration, ClockKey, ClockProvenance, Histogram, HistogramCounts, Latency, ObserverId, Point,
+    Quantile, RECORD_WORDS, TraceRecord, Unavailable, decode_record,
 };
 
-use crate::api::{LaneLatency, QuantileBounds, TraceCounts};
+use crate::api::{
+    BucketCursor, BucketLane, BucketRead, BucketRefusal, LaneLatency, Loss, QuantileBounds,
+    TraceBucket, TraceCounts,
+};
 
 /// Histogram significant digits, as the trace tool's.
 const DIGITS: u8 = 3;
 /// Histogram highest magnitude: 10 s in nanoseconds.
 const HIGHEST: u64 = 10_000_000_000;
+/// A retained bucket's bytes besides its lanes' counts: the bucket and
+/// its place in the deque. Each lane adds its entry in the lanes' list
+/// (key and counts) and its counts' heap bytes.
+const BUCKET_OVERHEAD: usize = core::mem::size_of::<Bucket>();
+const LANE_ENTRY: usize = core::mem::size_of::<((u64, u64, u8), HistogramCounts)>();
+/// Bucket numbers refused as over budget remembered at most.
+const OVER_BUDGET_KEPT: usize = 64;
 
 /// The window's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,11 +94,13 @@ pub struct WindowConfig {
     pub max_polls: usize,
     /// Publication lanes with histograms at most.
     pub max_lanes: usize,
+    /// Bytes the retained closed buckets hold at most (R-CORE-23).
+    pub max_bucket_bytes: usize,
 }
 
 impl Default for WindowConfig {
     /// A minute in six slices; 1024 journals, 65 536 pending keys of up to
-    /// 16 polls, and 256 lanes.
+    /// 16 polls, 256 lanes, and 64 MiB of retained buckets.
     fn default() -> Self {
         Self {
             window: 60_000_000_000,
@@ -77,6 +109,7 @@ impl Default for WindowConfig {
             max_pending: 65_536,
             max_polls: 16,
             max_lanes: 256,
+            max_bucket_bytes: 64 << 20,
         }
     }
 }
@@ -103,6 +136,13 @@ impl WindowConfig {
         self.max_pending = max_pending;
         self.max_polls = max_polls;
         self.max_lanes = max_lanes;
+        self
+    }
+
+    /// With `bytes` of retained buckets at most (R-CORE-23).
+    #[must_use]
+    pub fn with_bucket_budget(mut self, bytes: usize) -> Self {
+        self.max_bucket_bytes = bytes;
         self
     }
 
@@ -163,6 +203,15 @@ struct Slices {
     slices: VecDeque<(u64, Histogram)>,
 }
 
+/// One closed slice, kept (R-CORE-23).
+#[derive(Debug)]
+struct Bucket {
+    number: u64,
+    lanes: Vec<((u64, u64, u8), HistogramCounts)>,
+    loss: Loss,
+    bytes: usize,
+}
+
 /// The follower of one driver's trace mirror.
 #[derive(Debug)]
 pub(crate) struct TraceWindow {
@@ -175,6 +224,19 @@ pub(crate) struct TraceWindow {
     pending: BTreeMap<Key, Pending>,
     lanes: BTreeMap<(u64, u64, u8), Slices>,
     counts: TraceCounts,
+    /// This run's identity (R-CORE-23): a nonce drawn at creation.
+    epoch: u64,
+    /// The slice current at the last scan, and the loss counts at its start.
+    current: Option<(u64, Loss)>,
+    /// Closed slices kept, oldest first, and their bytes.
+    closed: VecDeque<Bucket>,
+    closed_bytes: usize,
+    /// Numbers of buckets refused as over budget, at or above `floor`.
+    over_budget: BTreeSet<u64>,
+    /// The oldest number a read is answered for: every number below it was
+    /// evicted, or is an over-budget number the window no longer
+    /// remembers, so it is refused as expired, never served as empty.
+    floor: u64,
 }
 
 impl TraceWindow {
@@ -189,11 +251,215 @@ impl TraceWindow {
             pending: BTreeMap::new(),
             lanes: BTreeMap::new(),
             counts: TraceCounts::default(),
+            epoch: draw_epoch(),
+            current: None,
+            closed: VecDeque::new(),
+            closed_bytes: 0,
+            over_budget: BTreeSet::new(),
+            floor: 0,
         }
+    }
+
+    /// This run's epoch (tests).
+    #[cfg(test)]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Closes the slices the agent's time `now` has moved past
+    /// (R-CORE-23): the slice current at the last scan becomes a bucket,
+    /// with the loss counted while it was current.
+    fn close_slices(&mut self, now: u64) {
+        let slice = now.checked_div(self.config.slice()).unwrap_or(0);
+        let loss = Loss::of(&self.counts);
+        let Some((current, start)) = self.current else {
+            // The run's first slice: nothing before it is answered.
+            self.current = Some((slice, loss));
+            self.floor = slice;
+            return;
+        };
+        if slice <= current {
+            return;
+        }
+        let mut lanes = Vec::new();
+        for (&key, held) in &self.lanes {
+            if let Some((_, histogram)) = held.slices.iter().find(|(number, _)| *number == current)
+            {
+                lanes.push((key, histogram.counts()));
+            }
+        }
+        lanes.shrink_to_fit();
+        // The lanes' list at its capacity, and each lane's heap bytes
+        // (`HistogramCounts::bytes` less the struct, counted in the entry).
+        let bytes = lanes.iter().fold(
+            BUCKET_OVERHEAD.saturating_add(lanes.capacity().saturating_mul(LANE_ENTRY)),
+            |sum, (_, counts)| {
+                sum.saturating_add(
+                    counts
+                        .bytes()
+                        .saturating_sub(core::mem::size_of::<HistogramCounts>()),
+                )
+            },
+        );
+        self.current = Some((slice, loss));
+        let bucket = Bucket {
+            number: current,
+            lanes,
+            loss: loss.since(start),
+            bytes,
+        };
+        if bucket.bytes > self.config.max_bucket_bytes {
+            // Larger than the whole budget: not kept, and nothing evicted
+            // for it. Past the numbers remembered, the oldest is forgotten
+            // and the floor moves past it.
+            let _ = self.over_budget.insert(current);
+            if self.over_budget.len() > OVER_BUDGET_KEPT
+                && let Some(forgotten) = self.over_budget.pop_first()
+            {
+                self.raise_floor(forgotten.saturating_add(1));
+            }
+            count(&mut self.counts.buckets_over_budget, 1);
+            return;
+        }
+        while self.closed_bytes.saturating_add(bucket.bytes) > self.config.max_bucket_bytes {
+            let Some(old) = self.closed.pop_front() else {
+                break;
+            };
+            self.closed_bytes = self.closed_bytes.saturating_sub(old.bytes);
+            count(&mut self.counts.buckets_evicted, 1);
+            self.raise_floor(old.number.saturating_add(1));
+        }
+        self.closed_bytes = self.closed_bytes.saturating_add(bucket.bytes);
+        self.closed.push_back(bucket);
+    }
+
+    /// Moves the floor up to `number`: the over-budget numbers below it are
+    /// forgotten with it.
+    fn raise_floor(&mut self, number: u64) {
+        if number > self.floor {
+            self.floor = number;
+            self.over_budget = self.over_budget.split_off(&number);
+        }
+    }
+
+    /// The bytes the retained buckets hold (tests).
+    #[cfg(test)]
+    pub(crate) fn bucket_bytes(&self) -> usize {
+        self.closed_bytes
+    }
+
+    /// Up to `count` buckets from `from` on (a bucket number and the lane
+    /// to start it at), of the run `epoch` when given, in a reply of at
+    /// most `max_bytes` plus one lane (R-CORE-23). A number below the
+    /// current slice that holds no kept bucket and was never refused had no
+    /// pairs: it is an empty bucket, not a gap. The read stops before a
+    /// bucket refused as over budget, which a read from its own number
+    /// reports, and at the first lane past `max_bytes`; `next` names where
+    /// it stopped. Nothing is cloned past the bound.
+    ///
+    /// # Errors
+    ///
+    /// [`BucketRefusal`]: another run's epoch, a number no longer kept (a
+    /// bucket evicted between two pages of it included), or a bucket over
+    /// budget.
+    pub(crate) fn buckets(
+        &self,
+        from: BucketCursor,
+        count: usize,
+        epoch: Option<u64>,
+        max_bytes: usize,
+    ) -> Result<BucketRead, BucketRefusal> {
+        let current = self.current.map_or(0, |(number, _)| number);
+        let oldest = self.floor.min(current);
+        if epoch.is_some_and(|asked| asked != self.epoch) {
+            return Err(BucketRefusal::EpochChanged {
+                epoch: self.epoch,
+                oldest,
+            });
+        }
+        // Below the floor: evicted or forgotten, never served as empty.
+        if from.number < oldest {
+            return Err(BucketRefusal::Expired { oldest });
+        }
+        if self.over_budget.contains(&from.number) {
+            return Err(BucketRefusal::OverBudget {
+                number: from.number,
+            });
+        }
+        let slice_ns = self.config.slice();
+        let kept = |number: u64| {
+            // `closed` is in number order.
+            let at = self.closed.partition_point(|bucket| bucket.number < number);
+            self.closed.get(at).filter(|bucket| bucket.number == number)
+        };
+        // A continuation names a lane of a bucket that had it; one that no
+        // longer has it was evicted between the pages.
+        if from.lane > 0 && kept(from.number).is_none_or(|bucket| from.lane >= bucket.lanes.len()) {
+            return Err(BucketRefusal::Expired { oldest });
+        }
+        let mut buckets = Vec::new();
+        let mut used = crate::json::BUCKET_REPLY_OVERHEAD;
+        let mut next = None;
+        let mut number = from.number;
+        'read: while number < current && buckets.len() < count {
+            if self.over_budget.contains(&number) {
+                next = Some(BucketCursor { number, lane: 0 });
+                break;
+            }
+            let first_lane = if number == from.number { from.lane } else { 0 };
+            let mut bucket = bucket_of(number, slice_ns, kept(number), first_lane);
+            let header = crate::json::bucket_header_len(&bucket);
+            if !buckets.is_empty() && used.saturating_add(header) > max_bytes {
+                next = Some(BucketCursor { number, lane: 0 });
+                break;
+            }
+            used = used.saturating_add(header);
+            if let Some(held) = kept(number) {
+                for (index, ((stream, incarnation, lane), counts)) in
+                    held.lanes.iter().enumerate().skip(first_lane)
+                {
+                    let lane = BucketLane {
+                        stream: *stream,
+                        incarnation: *incarnation,
+                        lane: *lane,
+                        counts: counts.clone(),
+                    };
+                    let size = crate::json::bucket_lane_len(&lane);
+                    // Always one lane, so a reader progresses.
+                    let any = !buckets.is_empty() || !bucket.lanes.is_empty();
+                    if any && used.saturating_add(size) > max_bytes {
+                        next = Some(BucketCursor {
+                            number,
+                            lane: index,
+                        });
+                        buckets.push(bucket);
+                        break 'read;
+                    }
+                    used = used.saturating_add(size);
+                    bucket.lanes.push(lane);
+                }
+            }
+            buckets.push(bucket);
+            number = number.saturating_add(1);
+        }
+        Ok(BucketRead {
+            epoch: self.epoch,
+            slice_ns,
+            current,
+            oldest,
+            buckets,
+            next,
+        })
     }
 
     /// Reads the table and the ring at the agent's time `now`.
     pub(crate) fn scan(&mut self, mirror: &TraceMirrorReader, now: u64) {
+        // A pair is filed in the slice of the scan that makes it, so a
+        // slice is closed first: whatever this scan loses (a journal past
+        // the bound, an overwritten or malformed record, an unknown
+        // journal) is charged to the slice its surviving records land in,
+        // the one missing the pairs.
+        self.close_slices(now);
         for index in 0..mirror.entries() {
             if let EntryRead::Entry(entry) = mirror.entry(index) {
                 let clock = (!entry.kind.is_network()).then_some(JournalClock {
@@ -408,6 +674,36 @@ impl TraceWindow {
         let mut counts = self.counts;
         counts.pending = u64::try_from(self.pending.len()).unwrap_or(u64::MAX);
         (out, counts)
+    }
+}
+
+/// The bucket `number` of `slice_ns`, from `kept` or empty, with no lane
+/// yet: the read adds them from `first_lane` on, within its bound.
+fn bucket_of(number: u64, slice_ns: u64, kept: Option<&Bucket>, first_lane: usize) -> TraceBucket {
+    let start_ns = number.saturating_mul(slice_ns);
+    let (lanes_total, loss, incomplete) = kept.map_or((0, Loss::default(), false), |kept| {
+        let incomplete = kept.loss.any() || kept.lanes.iter().any(|(_, counts)| counts.incomplete);
+        (kept.lanes.len(), kept.loss, incomplete)
+    });
+    TraceBucket {
+        number,
+        lanes_total,
+        first_lane,
+        start_ns,
+        end_ns: start_ns.saturating_add(slice_ns),
+        lanes: Vec::new(),
+        loss,
+        incomplete,
+    }
+}
+
+/// A nonce for a window's run: the random source, or the host clock when
+/// it fails (distinct per run in practice either way).
+fn draw_epoch() -> u64 {
+    let mut word = [0u64; 1];
+    match karyos_sys::random::fill_u64s(&mut word) {
+        Ok(()) if word[0] != 0 => word[0],
+        _ => karyos_sys::host_clock::host_monotonic_ns().max(1),
     }
 }
 

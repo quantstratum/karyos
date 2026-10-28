@@ -41,6 +41,10 @@ pub enum HistogramError {
     /// Merging histograms of different layouts or units.
     #[error("histograms differ in layout or unit")]
     Mismatch,
+    /// Exported counts name a bucket outside the layout, name one twice,
+    /// or do not add up to their population (R-CORE-23).
+    #[error("histogram counts out of range or inconsistent")]
+    InvalidCounts,
 }
 
 /// The bucket layout: `d` significant digits up to a highest magnitude.
@@ -187,6 +191,118 @@ fn zeroed(len: usize) -> Option<Box<[u64]>> {
     counts.try_reserve_exact(len).ok()?;
     counts.resize(len, 0);
     Some(counts.into_boxed_slice())
+}
+
+/// The counts of one side, sparse: the nonzero buckets as `(index, count)`
+/// in ascending index, and the out-of-range tails.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SideCounts {
+    /// Nonzero buckets of the non-negative values.
+    pub non_negative: Vec<(u32, u64)>,
+    /// Nonzero buckets of the negative values (by magnitude).
+    pub negative: Vec<(u32, u64)>,
+    /// Values above `highest`.
+    pub above: u64,
+    /// Values below `-highest`.
+    pub below: u64,
+}
+
+impl SideCounts {
+    fn of(side: &Side) -> Self {
+        let nonzero = |counts: &[u64]| {
+            counts
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .filter_map(|(index, count)| Some((u32::try_from(index).ok()?, *count)))
+                .collect()
+        };
+        let mut counts = Self {
+            non_negative: nonzero(&side.non_negative),
+            negative: nonzero(&side.negative),
+            above: side.above,
+            below: side.below,
+        };
+        counts.shrink();
+        counts
+    }
+
+    /// The side these counts describe in a layout of `len` buckets, and
+    /// their total; `None` for an index out of range or out of order (so
+    /// named twice), or a total that overflows.
+    fn side(&self, len: usize) -> Option<(Side, u64)> {
+        let mut side = Side::new(len)?;
+        let mut total = self.above.checked_add(self.below)?;
+        let mut fill = |into: &mut [u64], counts: &[(u32, u64)]| -> Option<()> {
+            let mut last = None;
+            for &(index, count) in counts {
+                if last.is_some_and(|previous| previous >= index) {
+                    return None;
+                }
+                last = Some(index);
+                *into.get_mut(usize::try_from(index).ok()?)? = count;
+                total = total.checked_add(count)?;
+            }
+            Some(())
+        };
+        fill(&mut side.non_negative, &self.non_negative)?;
+        fill(&mut side.negative, &self.negative)?;
+        side.above = self.above;
+        side.below = self.below;
+        Some((side, total))
+    }
+
+    /// The heap bytes these counts hold: each list's allocated capacity,
+    /// at the size of its entries (R-CORE-23's retained-bucket budget).
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let entry = core::mem::size_of::<(u32, u64)>();
+        self.non_negative
+            .capacity()
+            .saturating_add(self.negative.capacity())
+            .saturating_mul(entry)
+    }
+
+    /// Gives back each list's spare capacity, so [`Self::bytes`] is what it
+    /// needs.
+    fn shrink(&mut self) {
+        self.non_negative.shrink_to_fit();
+        self.negative.shrink_to_fit();
+    }
+}
+
+/// A histogram's counts in a form another process can rebuild and merge
+/// (R-CORE-23): its layout, both sides sparse, and its accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistogramCounts {
+    /// Significant digits.
+    pub digits: u8,
+    /// Highest magnitude.
+    pub highest: u64,
+    /// The caller-declared unit.
+    pub unit: u64,
+    /// The `min` bounds.
+    pub min: SideCounts,
+    /// The `max` bounds.
+    pub max: SideCounts,
+    /// Available latencies (`N`).
+    pub available: u64,
+    /// Unavailable latencies, by reason: no calibration, not valid,
+    /// ambiguous, overflow.
+    pub unavailable: [u64; 4],
+    /// A count overflowed.
+    pub incomplete: bool,
+}
+
+impl HistogramCounts {
+    /// The bytes these counts hold, for a retention budget: the struct
+    /// itself and both sides' heap bytes.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        core::mem::size_of::<Self>()
+            .saturating_add(self.min.bytes())
+            .saturating_add(self.max.bytes())
+    }
 }
 
 /// A quantile of recorded latencies.
@@ -387,6 +503,70 @@ impl Histogram {
             // Values below `-highest` are still at most `-(highest + 1)`.
             Slot::Below => self.layout.highest.checked_add(1).and_then(negate),
         }
+    }
+
+    /// The histogram's counts, sparse (R-CORE-23; allocates).
+    #[must_use]
+    pub fn counts(&self) -> HistogramCounts {
+        HistogramCounts {
+            digits: self.layout.digits,
+            highest: self.layout.highest,
+            unit: self.unit,
+            min: SideCounts::of(&self.min),
+            max: SideCounts::of(&self.max),
+            available: self.available,
+            unavailable: self.unavailable,
+            incomplete: self.incomplete,
+        }
+    }
+
+    /// Rebuilds a histogram from `counts`, which must have the layout and
+    /// unit of `like` (the histogram it will merge with): a different
+    /// layout is never converted (R-CORE-23; allocates).
+    ///
+    /// # Errors
+    ///
+    /// [`HistogramError::Mismatch`] for other digits, highest magnitude or
+    /// unit; [`HistogramError::InvalidCounts`] for a bucket index outside
+    /// the layout, an index named twice, or sides whose totals differ from
+    /// the available count; [`HistogramError::Overflow`] for a total that
+    /// overflows.
+    pub fn from_counts(counts: &HistogramCounts, like: &Self) -> Result<Self, HistogramError> {
+        if counts.digits != like.layout.digits
+            || counts.highest != like.layout.highest
+            || counts.unit != like.unit
+        {
+            return Err(HistogramError::Mismatch);
+        }
+        let len = like.layout.len;
+        let total_fits = |side: &SideCounts| {
+            side.above
+                .checked_add(side.below)
+                .and_then(|tails| {
+                    side.non_negative
+                        .iter()
+                        .chain(&side.negative)
+                        .try_fold(tails, |sum, (_, count)| sum.checked_add(*count))
+                })
+                .is_some()
+        };
+        if !total_fits(&counts.min) || !total_fits(&counts.max) {
+            return Err(HistogramError::Overflow);
+        }
+        let (min, min_total) = counts.min.side(len).ok_or(HistogramError::InvalidCounts)?;
+        let (max, max_total) = counts.max.side(len).ok_or(HistogramError::InvalidCounts)?;
+        if min_total != counts.available || max_total != counts.available {
+            return Err(HistogramError::InvalidCounts);
+        }
+        Ok(Self {
+            layout: like.layout,
+            unit: like.unit,
+            min,
+            max,
+            available: counts.available,
+            unavailable: counts.unavailable,
+            incomplete: counts.incomplete,
+        })
     }
 
     /// Adds `other` into `self`. All or nothing: every sum is checked before
