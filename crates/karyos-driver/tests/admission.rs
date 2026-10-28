@@ -2198,8 +2198,22 @@ fn a_client_whose_socket_closes_before_its_exit_is_drained_then() {
         .unwrap();
     let closed = dir.join("child-closed");
     let faulty = counter(&driver, "clients faulty");
+    // Served until the child holds its export; then the driver waits, so
+    // the child's `Fetch` and `Detach` are both queued before it reads
+    // either.
     serve_until(&mut driver, |driver| {
-        closed.exists() && counter(driver, "clients closed before their exit") == 1
+        counter(driver, "grants exported") == 1
+    });
+    let start = Instant::now();
+    while !closed.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the child never closed"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    serve_until(&mut driver, |driver| {
+        counter(driver, "clients closed before their exit") == 1
     });
     // Drained before its exit proof: the `Detach` counts and the reply does
     // not go.
@@ -2299,6 +2313,143 @@ fn child_closes_its_socket_then_waits_to_exit() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+    std::mem::forget(client);
+    std::process::exit(0);
+}
+
+const UNREAD_CHILD: &str = "KARYOS_ADMISSION_UNREAD_CHILD";
+
+/// karyos#827: a client that dies with a reply unread leaves the driver's
+/// socket in error (`ECONNRESET`, reported once, before any datagram), and
+/// the drain must still read what the client queued behind it. The child
+/// holds one exported grant and one held grant, queues a `Fetch` of the
+/// held one and a `Detach` of the exported one, and exits once the driver
+/// has sent the reply to the `Fetch`, without reading it. The `Detach`
+/// counts as a detach.
+#[test]
+fn a_client_that_exits_with_a_reply_unread_is_drained() {
+    let dir = dir("unread-reply");
+    let mut driver = system_driver(&dir);
+    let mut second = shared_stream_config();
+    second.buffer.stream_id = 3;
+    let _streams = (
+        driver.add_stream(shared_stream_config()).unwrap(),
+        driver.add_stream(second).unwrap(),
+    );
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "child_exits_with_a_reply_unread", "--nocapture"])
+        .env(UNREAD_CHILD, &dir)
+        .spawn()
+        .unwrap();
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants exported") == 1
+    });
+    // The driver waits until both messages are queued, then serves the
+    // `Fetch` alone: one datagram a step, and the step that sends its
+    // reply ends the wait.
+    let queued = dir.join("child-queued");
+    let start = Instant::now();
+    while !queued.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the child never queued"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants exported") == 2
+    });
+    assert_eq!(
+        counter(&driver, "grants detached"),
+        0,
+        "the Detach was served live"
+    );
+    std::fs::write(dir.join("child-exit"), b"").unwrap();
+    assert!(child.wait().unwrap().success());
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants detached"), 1);
+    assert_eq!(
+        counter(&driver, "grants released at exit"),
+        1,
+        "the unread grant"
+    );
+}
+
+/// Runs only as the child of
+/// `a_client_that_exits_with_a_reply_unread_is_drained`.
+#[test]
+fn child_exits_with_a_reply_unread() {
+    let Some(dir) = std::env::var_os(UNREAD_CHILD) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let mut client = attach(&dir, Duration::from_secs(5), 16).unwrap();
+    for stream_id in [2, 3] {
+        let _ = client
+            .add_subscription(
+                StreamKey {
+                    stream_id,
+                    session_id: 1,
+                },
+                SubscriberRole::Required,
+            )
+            .unwrap();
+    }
+    let mut keys = Vec::new();
+    let start = Instant::now();
+    while keys.len() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(10), "no grants");
+        let _ = client.poll(usize::MAX, |completion| {
+            if let Outcome::Fetchable(fetchable) = completion.outcome {
+                keys.push(fetchable.key);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let socket = client.admission_socket().unwrap();
+    let message = encode(&Message::Fetch {
+        fetch: 1,
+        key: keys[0],
+    });
+    assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
+    let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
+    let start = Instant::now();
+    let export = loop {
+        assert!(start.elapsed() < Duration::from_secs(10), "no manifest");
+        if let Ok(Recv::Message(received)) = ipc::recv(socket, &mut buffer)
+            && let Ok(Message::Manifest { records, .. }) = Message::decode(&buffer[..received.len])
+        {
+            break records[0].export;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let start = Instant::now();
+    while !matches!(ipc::recv(socket, &mut buffer), Ok(Recv::Message(_))) {
+        assert!(start.elapsed() < Duration::from_secs(10), "no region");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for message in [
+        Message::Fetch {
+            fetch: 2,
+            key: keys[1],
+        },
+        Message::Detach { export },
+    ] {
+        assert_eq!(
+            ipc::send(socket, &encode(&message), None).unwrap(),
+            Sent::Sent
+        );
+    }
+    std::fs::write(dir.join("child-queued"), b"").unwrap();
+    let start = Instant::now();
+    while !dir.join("child-exit").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "never told to exit"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The reply to the second `Fetch` stays unread.
     std::mem::forget(client);
     std::process::exit(0);
 }

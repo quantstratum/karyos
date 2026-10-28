@@ -592,7 +592,7 @@ impl<T: StreamTerms> Admission<T> {
             if exited {
                 if drains < EXIT_DRAINS_PER_STEP {
                     drains += 1;
-                    let proven = !remote.gone;
+                    let proven = remote.pidfd.exited().unwrap_or(false);
                     self.release_at(index, proven, driver, &mut work);
                 } else {
                     index += 1;
@@ -1046,6 +1046,9 @@ impl<T: StreamTerms> Admission<T> {
         work: &mut Work,
     ) {
         let mut remote = self.remotes.swap_remove(index);
+        // Its partly sent fetches fail first, so a queued `Detach` of one
+        // of their grants is served.
+        Self::fail_open(driver, &remote);
         if let Ok(unsent) = u64::try_from(remote.outbound.len())
             && unsent > 0
         {
@@ -1053,7 +1056,6 @@ impl<T: StreamTerms> Admission<T> {
         }
         remote.outbound.clear();
         let served = Self::drain_exited(&mut remote, driver);
-        Self::fail_open(driver, &remote);
         if proven {
             remote.link.mark_closed();
         } else {
@@ -1090,6 +1092,10 @@ impl<T: StreamTerms> Admission<T> {
             let received = match ipc::recv(remote.socket.as_fd(), &mut buffer) {
                 Ok(Recv::Message(received)) => received,
                 Ok(Recv::WouldBlock | Recv::PeerClosed) => return served,
+                // A dying client that left a reply unread sets the socket's
+                // error (`ECONNRESET`), reported once and before any
+                // datagram: nothing was taken, and the drain goes on.
+                Err(error) if ipc::peer_gone(&error) => continue,
                 // A protocol error took exactly one datagram: counted, and
                 // the drain goes on. A failed call ends it.
                 Err(error) => {
@@ -1455,6 +1461,12 @@ impl<T: StreamTerms> Admission<T> {
     fn drain(remote: &mut Remote<T>) -> (Step, Vec<Mark>) {
         let mut sent = Vec::new();
         while let Some(next) = remote.outbound.front() {
+            // No descriptor goes to a client whose exit is proven
+            // (karyos#827). The window from its descriptors' close to its
+            // pidfd's readiness remains; a send in it fails with `EPIPE`.
+            if next.fd.is_some() && remote.pidfd.exited().unwrap_or(false) {
+                return (Step::Gone, sent);
+            }
             match ipc::send(
                 remote.socket.as_fd(),
                 &next.bytes,
