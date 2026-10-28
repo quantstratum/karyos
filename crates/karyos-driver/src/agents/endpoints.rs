@@ -208,6 +208,9 @@ struct Entry<O: SocketOps> {
     /// A request was deferred since the last requested reset: the fault
     /// came back within the interval.
     deferred: bool,
+    /// A deferred request waits for the interval's end, when the table
+    /// serves it itself: the sender asks once (#838).
+    waiting: bool,
 }
 
 /// The first interval between two requested resets of an endpoint (ns).
@@ -429,6 +432,7 @@ impl<O: SocketOps> Endpoints<O> {
                     backoff: RESET_BACKOFF_MIN,
                     last_reset: None,
                     deferred: false,
+                    waiting: false,
                     state: State::Failing {
                         error: EndpointError::Agent(error.clone()),
                         sender: Fate::Posted,
@@ -447,6 +451,7 @@ impl<O: SocketOps> Endpoints<O> {
             backoff: RESET_BACKOFF_MIN,
             last_reset: None,
             deferred: false,
+            waiting: false,
         });
         Ok(id)
     }
@@ -471,7 +476,13 @@ impl<O: SocketOps> Endpoints<O> {
         links: &AgentLinks<O, T>,
         endpoint: EndpointId,
     ) -> Result<(), EndpointError> {
-        self.detach(links, endpoint, Purpose::Reset)
+        self.detach(links, endpoint, Purpose::Reset)?;
+        // Any reset serves a deferred request: its new epoch is what the
+        // request asked for.
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) {
+            entry.waiting = false;
+        }
+        Ok(())
     }
 
     /// Retires an active endpoint: its halves come back and its socket
@@ -550,6 +561,21 @@ impl<O: SocketOps> Endpoints<O> {
                 }
             }
         }
+        // A deferred request whose interval ended is served now.
+        for index in 0..self.entries.len() {
+            let Some(entry) = self.entries.get(index) else {
+                break;
+            };
+            let due = entry.waiting
+                && matches!(entry.state, State::Active)
+                && entry
+                    .last_reset
+                    .is_none_or(|at| now < at || age_ns(now, at) >= entry.backoff);
+            if due {
+                let endpoint = entry.id;
+                self.serve_request(links, endpoint, now);
+            }
+        }
         // Backwards, so a removed entry never makes the loop skip another.
         // Each entry fails at most once, so at most `max` failures.
         let (mut failed, mut overflowed) = (0usize, false);
@@ -581,8 +607,10 @@ impl<O: SocketOps> Endpoints<O> {
     /// at least its interval old. A request within the interval is
     /// deferred, and the next reset doubles the interval (up to
     /// [`RESET_BACKOFF_MAX`]); a reset after a clean interval starts over
-    /// at [`RESET_BACKOFF_MIN`]. The sender asks again while the need
-    /// holds, so a deferred or refused request is not lost.
+    /// at [`RESET_BACKOFF_MIN`]. A deferred request is kept and served by
+    /// [`Endpoints::poll`] when the interval ends, so the sender need not
+    /// ask again (#838); a refused one the sender asks again while the
+    /// need holds.
     fn requested<T: StreamTerms>(
         &mut self,
         links: &AgentLinks<O, T>,
@@ -590,6 +618,16 @@ impl<O: SocketOps> Endpoints<O> {
         now: u64,
     ) {
         self.counters.bump(|c| &mut c.reset_requests);
+        self.serve_request(links, endpoint, now);
+    }
+
+    /// Serves a reset request for `endpoint` at `now`, or defers it.
+    fn serve_request<T: StreamTerms>(
+        &mut self,
+        links: &AgentLinks<O, T>,
+        endpoint: EndpointId,
+        now: u64,
+    ) {
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -607,7 +645,10 @@ impl<O: SocketOps> Endpoints<O> {
             && age_ns(now, at) < entry.backoff
         {
             entry.deferred = true;
-            self.counters.bump(|c| &mut c.resets_deferred);
+            if !entry.waiting {
+                entry.waiting = true;
+                self.counters.bump(|c| &mut c.resets_deferred);
+            }
             return;
         }
         let backoff = if entry.deferred {
@@ -624,6 +665,7 @@ impl<O: SocketOps> Endpoints<O> {
                     entry.backoff = backoff;
                     entry.last_reset = Some(now);
                     entry.deferred = false;
+                    entry.waiting = false;
                 }
                 self.counters.bump(|c| &mut c.resets);
             }

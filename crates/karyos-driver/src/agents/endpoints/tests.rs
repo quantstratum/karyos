@@ -655,3 +655,53 @@ fn a_reopen_refused_for_a_required_capability_counts_as_missing() {
     assert_eq!(endpoints.missing(), 1);
     assert_eq!(endpoints.capabilities().count(), 0);
 }
+
+/// #838: a request deferred within the endpoint's interval is kept and
+/// served by the table itself when the interval ends, with no new request
+/// from the sender.
+#[test]
+fn a_deferred_request_is_served_when_its_interval_ends() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    let poll_at = |endpoints: &mut Endpoints<S>, agents: &mut NetworkAgents<S>, now| {
+        let mut events = Vec::new();
+        for _ in 0..1000 {
+            agents.do_work(now).unwrap();
+            endpoints.poll(&links, now, |event| events.push(event), |_| {});
+        }
+        events
+    };
+    endpoints.requested(&links, id, 10 * SEC);
+    assert_eq!(endpoints.counters().resets, 1);
+    let events = poll_at(&mut endpoints, &mut agents, 10 * SEC);
+    assert!(
+        matches!(events.as_slice(), [EndpointEvent::Reopened { .. }]),
+        "{events:?}"
+    );
+    // The fault recurs half an interval later: deferred, asked once.
+    endpoints.requested(&links, id, 10 * SEC + SEC / 2);
+    let counters = endpoints.counters();
+    assert_eq!((counters.resets, counters.resets_deferred), (1, 1));
+    // Still within the interval: nothing.
+    assert!(poll_at(&mut endpoints, &mut agents, 10 * SEC + SEC - 1).is_empty());
+    assert_eq!(endpoints.counters().resets, 1);
+    // The interval ends: the table serves it, no new request.
+    let requests = endpoints.counters().reset_requests;
+    let events = poll_at(&mut endpoints, &mut agents, 11 * SEC);
+    assert!(
+        matches!(events.as_slice(), [EndpointEvent::Reopened { endpoint, .. }] if *endpoint == id),
+        "{events:?}"
+    );
+    let counters = endpoints.counters();
+    assert_eq!(counters.resets, 2);
+    assert_eq!(counters.reset_requests, requests, "no new request");
+    // Served once: no further reset.
+    assert!(poll_at(&mut endpoints, &mut agents, 20 * SEC).is_empty());
+    assert_eq!(endpoints.counters().resets, 2);
+}

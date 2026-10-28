@@ -387,9 +387,9 @@ pub struct SenderCounters {
     /// sender's control routes, each counted once; a handle already gone
     /// counts as closed, and one with frames in flight gets one more duty
     /// first. When the endpoint then refuses a route or a queue for its
-    /// limit in the same epoch, its reset is asked for, and asked again
-    /// every `RESET_REQUEST_CYCLES` while the limit holds, until one is
-    /// served: the new epoch drops them.
+    /// limit in the same epoch, its reset is asked for, once per epoch
+    /// (the endpoint table serves a deferred request when its interval
+    /// ends): the new epoch drops them.
     pub removed_close_failed: u64,
     /// Endpoints with a failed close not recorded, with no room for them
     /// (never, by its capacity): their limit then resets nothing.
@@ -529,9 +529,9 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
 
 /// An endpoint that failed to close something in its current epoch: when
 /// one of its routes or queues is then refused for its limit, what did not
-/// close may be what holds it there, so its reset is asked for. At most one
-/// reset is served per epoch: it starts a new epoch, which starts afresh
-/// (QS-COORDINATOR on #838).
+/// close may be what holds it there, so its reset is asked for, once per
+/// epoch: the endpoint table keeps a deferred request and serves it when
+/// its interval ends (QS-COORDINATOR on #838). A new epoch starts afresh.
 #[derive(Debug, Clone, Copy)]
 struct EndpointCloses {
     endpoint: EndpointId,
@@ -557,10 +557,9 @@ enum CloseReset {
     Idle,
     /// A limit was refused: the reset is to be asked for.
     Due,
-    /// Asked for in this sender cycle. The endpoint table may defer it
-    /// (its backoff), so a limit refused `RESET_REQUEST_CYCLES` later asks
-    /// again, until the reset is served and the epoch changes.
-    Asked(u64),
+    /// Asked for in this epoch; the endpoint table serves it, at once or
+    /// when its interval ends.
+    Asked,
 }
 
 /// The receiver agent's network state.
@@ -5037,6 +5036,21 @@ impl<T: StreamTerms> SenderRole<T> {
                 _ => false,
             })
         });
+        // The control routes evicted with frames in flight, once per duty.
+        for index in 0..self.routes.len() {
+            let Some(slot) = self.routes.get_mut(index) else {
+                break;
+            };
+            let Some(endpoint) = slot.endpoint else {
+                continue;
+            };
+            if let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
+                Half::Tx(tx) if *held == endpoint => Some(tx),
+                _ => None,
+            }) {
+                slot.routes.close_lingering(tx);
+            }
+        }
         // Last cycle's entries with frames in flight get their one more
         // try: what still does not close has failed.
         while let Some(mut opened) = self.closing_again.pop() {
@@ -5097,9 +5111,9 @@ impl<T: StreamTerms> SenderRole<T> {
 
     /// The endpoints that refused a route or a queue for their limit this
     /// cycle, on any open path or control route: one that failed a close in
-    /// the epoch it refused in has its reset asked for, and asked again
-    /// while the need lasts, so a deferral cannot swallow it. Without a
-    /// failed close the refusal is an ordinary limit and resets nothing.
+    /// the epoch it refused in has its reset asked for, once per epoch.
+    /// Without a failed close the refusal is an ordinary limit and resets
+    /// nothing.
     fn reset_limited(&mut self) {
         // The control routes' failed closes count as the publications' do.
         for index in 0..self.routes.len() {
@@ -5130,24 +5144,14 @@ impl<T: StreamTerms> SenderRole<T> {
 
     /// `endpoint` refused a route or a queue for its limit in `epoch`.
     fn limit_refused(&mut self, endpoint: EndpointId, epoch: karyos_io::backend::BackendEpoch) {
-        let cycle = self.cycle;
-        let Some(record) = self
+        if let Some(record) = self
             .close_failures
             .iter_mut()
             .find(|record| record.endpoint == endpoint && record.epoch == epoch)
-        else {
-            return;
-        };
-        record.reset = match record.reset {
-            CloseReset::Asked(at)
-                if cycle
-                    .checked_sub(at)
-                    .is_some_and(|age| age < super::data::RESET_REQUEST_CYCLES) =>
-            {
-                CloseReset::Asked(at)
-            }
-            _ => CloseReset::Due,
-        };
+            && record.reset == CloseReset::Idle
+        {
+            record.reset = CloseReset::Due;
+        }
     }
 
     /// Closes `opened` whole, clearing each queue that closed from it.
@@ -5733,16 +5737,15 @@ impl<T: StreamTerms> SenderRole<T> {
     /// others while the reset is in flight. Nothing allocates.
     pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
         let cycle = self.cycle;
-        // An endpoint a failed close may hold at its limit: its reset, asked
-        // again next cycle when the ring was full, and again while the limit
-        // holds once `RESET_REQUEST_CYCLES` passed (a deferral).
+        // An endpoint a failed close may hold at its limit: its one reset of
+        // the epoch, asked again next cycle only when the ring was full.
         let (mut posted, mut refused) = (0u64, 0u64);
         for record in &mut self.close_failures {
             if record.reset != CloseReset::Due {
                 continue;
             }
             if post(record.endpoint) {
-                record.reset = CloseReset::Asked(cycle);
+                record.reset = CloseReset::Asked;
                 posted = posted.saturating_add(1);
             } else {
                 refused = refused.saturating_add(1);

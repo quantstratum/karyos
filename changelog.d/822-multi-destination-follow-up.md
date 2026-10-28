@@ -35,9 +35,12 @@
     will not close. When that endpoint then refuses a route or a queue
     for its limit (`RouteLimit`, `QueueLimit`, `OverCommitted`), on any
     open path or control route, in the same epoch, its reset is asked
-    for, and asked again every `RESET_REQUEST_CYCLES` while the limit
-    holds, so the endpoint table's backoff cannot swallow it; the served
-    reset starts a new epoch, which drops what did not close. Without a
+    for, once per epoch; the served reset starts a new epoch, which drops
+    what did not close. The endpoint table now keeps a reset request it
+    defers within the endpoint's interval and serves it itself when the
+    interval ends, so no request is lost to the backoff. A control route
+    evicted with frames in flight is closed again at the sender's next
+    duty, however many controls it sends meanwhile. Without a
     failed close in the epoch the limit is an ordinary refusal and
     resets nothing. With the
     quarantine full, the record removed earliest makes room, the

@@ -5005,18 +5005,18 @@ fn a_route_limit_without_a_failed_close_resets_nothing() {
     assert_eq!(route_limit_after(false, true).0, 0);
 }
 
-/// Y1 (#838): the endpoint table defers the reset (its backoff), so it is
-/// not served: a limit refused `RESET_REQUEST_CYCLES` later asks again,
-/// and once served the route opens. No more than one ask per period.
+/// #838: however long the limit holds, the sender asks for the epoch's
+/// reset once; a deferral is the endpoint table's to serve
+/// (`a_deferred_request_is_served_when_its_interval_ends`).
 #[test]
-fn a_deferred_reset_is_asked_again_while_the_limit_holds() {
+fn the_sender_asks_one_reset_per_epoch() {
     let cycles = 2 * super::super::data::RESET_REQUEST_CYCLES + 4;
     let (asked, opened) = limit_after(LimitCase {
         failed_close: true,
         cycles,
         ..LimitCase::default()
     });
-    assert_eq!(asked, 3, "asked again each period while not served");
+    assert_eq!(asked, 1, "once per epoch");
     assert!(opened, "the route opens after the reset");
 }
 
@@ -5146,7 +5146,9 @@ fn control_routes_report_limits_and_failed_closes() {
         );
         assert_eq!(routes.take_refusal(), None, "taken");
     }
-    // An eviction in flight: closed at the next use, or failed.
+    // An eviction in flight, then a burst of sends: none of them marks it
+    // failed. The duty closes it again, with no further send: closed, or
+    // failed when still in flight; either way nothing is left lingering.
     for (in_flight, close_failed) in [(1u32, false), (2, true)] {
         let mut tx = open(4, 4);
         let mut routes = ControlRoutes::new(1);
@@ -5157,9 +5159,14 @@ fn control_routes_report_limits_and_failed_closes() {
         routes
             .send(&mut tx, at(41_002), &challenge_control())
             .unwrap();
-        routes
-            .send(&mut tx, at(41_002), &challenge_control())
-            .unwrap();
+        for _ in 0..3 {
+            routes
+                .send(&mut tx, at(41_002), &challenge_control())
+                .unwrap();
+        }
+        assert_eq!(routes.take_refusal(), None, "not failed before the duty");
+        routes.close_lingering(&mut tx);
+        assert_eq!(routes.lingering(), 0, "nothing leaks");
         let refusal = routes.take_refusal().map(|(_, refusal)| refusal);
         assert_eq!(
             refusal.unwrap_or_default().close_failed,
@@ -5226,6 +5233,49 @@ fn a_control_close_failure_counts_for_the_limit() {
         assert_eq!(
             sender.counters().removed_close_failed,
             u64::from(close_failed)
+        );
+    }
+}
+
+/// V1 (#838) on the sender: a control route evicted with frames in flight
+/// is closed again by the duty, with no further control sent: closed, or
+/// counted as a failed close once still in flight; nothing lingers.
+#[test]
+fn the_duty_closes_an_evicted_control_route_in_flight() {
+    for (in_flight, failed) in [(1u32, 0u64), (2, 1)] {
+        let config = AgentConfig {
+            control_routes: 1,
+            ..AgentConfig::default()
+        };
+        let (mut sender, _receiver) =
+            super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+        let (half, _frames, _data, _rx) = header_only_endpoint();
+        let mut halves: Halves = vec![(EndpointId(1), half)];
+        let control = challenge_control();
+        let first: SocketAddr = "10.0.0.8:5000".parse().unwrap();
+        let second: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+        let _ = sender.send(&mut halves, EndpointId(1), first, &control);
+        let slot = sender
+            .routes
+            .iter_mut()
+            .find(|slot| slot.endpoint == Some(EndpointId(1)))
+            .unwrap();
+        slot.routes.close_in_flight = in_flight;
+        // Evicts the first destination's route, in flight.
+        let _ = sender.send(&mut halves, EndpointId(1), second, &control);
+        for now in 0..3 {
+            let _ = sender.duty(&mut halves, now).unwrap();
+        }
+        let slot = sender
+            .routes
+            .iter()
+            .find(|slot| slot.endpoint == Some(EndpointId(1)))
+            .unwrap();
+        assert_eq!(slot.routes.lingering(), 0, "nothing lingers");
+        assert_eq!(
+            sender.counters().removed_close_failed,
+            failed,
+            "in flight {in_flight}"
         );
     }
 }

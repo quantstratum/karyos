@@ -289,7 +289,7 @@ pub struct ControlRoutes {
     tick: u64,
     report: TxReport,
     /// Evicted entries whose queue still had frames in flight: closed again
-    /// at the next use, once, before they count as failed (#838).
+    /// at the sender's next duty, once, before they count as failed (#838).
     lingering: Vec<Destination>,
     /// What this epoch refused or failed to close, until the sender takes
     /// it ([`ControlRoutes::take_refusal`]).
@@ -349,6 +349,12 @@ impl ControlRoutes {
         self.refusal = ControlRefusal::default();
     }
 
+    /// Test only: the entries evicted in flight, not closed yet.
+    #[cfg(test)]
+    pub(crate) fn lingering(&self) -> usize {
+        self.lingering.len()
+    }
+
     /// Test only: records `refusal` as this cache's, in `epoch`.
     #[cfg(test)]
     pub(crate) fn refuse(&mut self, epoch: BackendEpoch, refusal: ControlRefusal) {
@@ -390,9 +396,15 @@ impl ControlRoutes {
         }
     }
 
-    /// Closes the entries evicted with frames in flight, once more: what
-    /// still does not close has failed.
-    fn close_lingering<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+    /// Closes the entries evicted with frames in flight once more, at the
+    /// sender's duty (each cycle, however many controls it sends): what
+    /// still does not close has failed. A half of another epoch dropped
+    /// them in its reset.
+    pub fn close_lingering<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        if self.epoch != Some(tx.capabilities().epoch) {
+            self.lingering.clear();
+            return;
+        }
         while let Some(old) = self.lingering.pop() {
             if self.close(tx, old) != Closed::Done {
                 self.refusal.close_failed = true;
@@ -448,7 +460,6 @@ impl ControlRoutes {
             self.epoch = Some(epoch);
             self.refusal = ControlRefusal::default();
         }
-        self.close_lingering(tx);
         // A u64 use clock does not wrap in practice; if it ever would, the
         // ages start over.
         self.tick = match self.tick.checked_add(1) {
