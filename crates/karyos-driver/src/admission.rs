@@ -189,6 +189,9 @@ struct Remote<T: StreamTerms> {
     last_fetch: u64,
     /// Its fetches whose messages are still queued.
     open: Vec<u64>,
+    /// Its socket closed before its exit proof, and its drain waits for a
+    /// later step's bound (karyos#827).
+    gone: bool,
 }
 
 /// An admitted tool: its socket and what is still queued of its bootstrap.
@@ -214,6 +217,9 @@ enum Step {
     Keep,
     Leave,
     Retire,
+    /// Its socket closed (end of file, `EPIPE` or `ECONNRESET`), or a
+    /// `Fetch` came after its exit: it is drained as exited (karyos#827).
+    Gone,
 }
 
 /// The admission socket and its connections.
@@ -232,20 +238,20 @@ pub(crate) struct Admission<T: StreamTerms> {
 }
 
 /// The most datagrams the driver reads from an exited client's socket
-/// before it releases the client (karyos#827). A client's `SOCK_SEQPACKET`
-/// socket queues at most `net.unix.max_dgram_qlen` datagrams before its
-/// sends block (Linux's default is 512; `unix_recvq_full`), so twice that
-/// covers the whole queue of a default host. A host that raises the
-/// sysctl past 1023 can leave `Detach` messages unread, counted in
+/// before it releases the client (karyos#827). The driver's own bound: a
+/// connected `SOCK_SEQPACKET` pair is limited by the sender's send buffer
+/// in bytes, not by `net.unix.max_dgram_qlen`, so with a raised
+/// `wmem_default` a client can queue more. A client that follows the
+/// protocol has at most one `Detach` per export
+/// (`max_exports_per_client`), one `Fetch` per fetch it may open and its
+/// `Leave` queued, far below it; what is left past it is counted in
 /// "admission messages dropped at exit".
 const EXIT_DRAIN_DATAGRAMS: usize = 1024;
 
-/// Whether admitted client `index` has exited, as its pidfd proves.
-fn remote_exited<T: StreamTerms>(remotes: &[Remote<T>], index: usize) -> bool {
-    remotes
-        .get(index)
-        .is_some_and(|remote| remote.pidfd.exited().unwrap_or(false))
-}
+/// The most exited clients drained in one admission step (karyos#827), so
+/// that many exits at once do not stall the duty cycle; the rest wait for
+/// the next step.
+const EXIT_DRAINS_PER_STEP: usize = 8;
 
 /// The descriptors an IPC driver with `network` can hold at the bounds of
 /// `config` (network-shared-terms, resolution 4): one per image lane
@@ -561,28 +567,42 @@ impl<T: StreamTerms> Admission<T> {
                 }
             }
         }
-        // One datagram per client, then its outbound queue. A client whose
-        // exit proof is readable is not served: what it queued before it
-        // exited is drained, and it is released (karyos#827).
+        // One datagram per client, then its outbound queue (karyos#827):
+        // - a client the conductor found faulty is retired first, exited or
+        //   not;
+        // - a client whose exit is proven is not served: what it queued
+        //   before it exited is drained and it is released, at most
+        //   `EXIT_DRAINS_PER_STEP` of them a step;
+        // - a client whose socket closed (end of file, `EPIPE` or
+        //   `ECONNRESET`) counts as exited for the drain, since Linux
+        //   closes a dying process's descriptors before its pidfd reads
+        //   exited: drained the same way, then retired, not as faulty, its
+        //   slot charged until the exit proof. Only a protocol error
+        //   retires a client as faulty.
         let mut index = 0;
+        let mut drains = 0usize;
         while let Some(remote) = self.remotes.get_mut(index) {
-            if remote.pidfd.exited().unwrap_or(false) {
-                let served = Self::release_exited(remote, driver);
-                let remote = self.remotes.swap_remove(index);
-                remote.link.mark_closed();
-                work.add_items(served.saturating_add(1));
-                continue;
-            }
-            // A client the conductor found faulty (a timed lane's schedule
-            // violation) is retired as one admission found faulty.
             let faulty = driver
                 .faulty_pending
                 .iter()
                 .position(|client| *client == remote.client)
                 .map(|found| driver.faulty_pending.swap_remove(found));
-            let step = match faulty {
-                Some(_) => Step::Retire,
-                None => Self::receive(remote, driver, &self.config),
+            let exited =
+                faulty.is_none() && (remote.gone || remote.pidfd.exited().unwrap_or(false));
+            if exited {
+                if drains < EXIT_DRAINS_PER_STEP {
+                    drains += 1;
+                    let proven = !remote.gone;
+                    self.release_at(index, proven, driver, &mut work);
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            let step = if faulty.is_some() {
+                Step::Retire
+            } else {
+                Self::receive(remote, driver, &self.config)
             };
             let step = match step {
                 Step::Keep => {
@@ -614,23 +634,21 @@ impl<T: StreamTerms> Admission<T> {
             };
             match step {
                 Step::Keep => index += 1,
+                // Drained at once; past this step's bound, at the next.
+                Step::Gone if drains < EXIT_DRAINS_PER_STEP => {
+                    drains += 1;
+                    let proven = remote.pidfd.exited().unwrap_or(false);
+                    self.release_at(index, proven, driver, &mut work);
+                }
+                Step::Gone => {
+                    remote.gone = true;
+                    index += 1;
+                }
                 Step::Leave => {
                     let remote = self.remotes.swap_remove(index);
                     Self::fail_open(driver, &remote);
                     remote.link.mark_closed();
                     work.add(1);
-                }
-                // A failure of a client that has exited, such as a send
-                // to its closed socket, is its exit: drained first, then
-                // released, never retired with its queue unread.
-                Step::Retire if remote_exited(&self.remotes, index) => {
-                    let served = self
-                        .remotes
-                        .get_mut(index)
-                        .map_or(0, |remote| Self::release_exited(remote, driver));
-                    let remote = self.remotes.swap_remove(index);
-                    remote.link.mark_closed();
-                    work.add_items(served.saturating_add(1));
                 }
                 Step::Retire => {
                     let remote = self.remotes.swap_remove(index);
@@ -718,6 +736,7 @@ impl<T: StreamTerms> Admission<T> {
                 draining_since: Some(now),
                 last_fetch: 0,
                 open: Vec::new(),
+                gone: false,
             }),
             None => reject(driver, &socket, refusal::RESOURCES, "bootstrap resources"),
         }
@@ -983,6 +1002,12 @@ impl<T: StreamTerms> Admission<T> {
                     {
                         Step::Leave
                     }
+                    // Never served once the client's exit is proven: it
+                    // would send a region to a dead client (karyos#827).
+                    Some(Message::Fetch { .. }) if remote.pidfd.exited().unwrap_or(false) => {
+                        driver.counters.add(Event::FetchesDroppedAtExit, 1);
+                        Step::Gone
+                    }
                     Some(Message::Fetch { fetch, key }) => {
                         Self::fetch(remote, driver, config, fetch, key)
                     }
@@ -992,7 +1017,9 @@ impl<T: StreamTerms> Admission<T> {
             }
             // A descriptor on a message that takes none, a closed socket or
             // a receive error.
-            Ok(Recv::Message(_) | Recv::PeerClosed) | Err(_) => Step::Retire,
+            Ok(Recv::PeerClosed) => Step::Gone,
+            Err(error) if ipc::peer_gone(&error) => Step::Gone,
+            Ok(Recv::Message(_)) | Err(_) => Step::Retire,
         }
     }
 
@@ -1005,18 +1032,38 @@ impl<T: StreamTerms> Admission<T> {
         Message::decode(buffer.get(..received.len).unwrap_or(&[])).ok()
     }
 
-    /// Releases an exited client's admission state (karyos#827): its queued
+    /// Releases admitted client `index` (karyos#827), whose exit is proven,
+    /// or whose socket closed before it (`proven` false): its queued
     /// outbound messages are dropped and counted, since nothing is sent to
-    /// a dead client, and what it queued before it exited is drained.
-    /// Returns how many messages the drain served.
-    fn release_exited(remote: &mut Remote<T>, driver: &mut EmbeddedDriver<T>) -> usize {
+    /// a dead client; what it queued is drained. A proven exit releases it
+    /// like a `Leave`; a closed socket retires it, not as faulty, its slot
+    /// charged until the exit proof.
+    fn release_at(
+        &mut self,
+        index: usize,
+        proven: bool,
+        driver: &mut EmbeddedDriver<T>,
+        work: &mut Work,
+    ) {
+        let mut remote = self.remotes.swap_remove(index);
         if let Ok(unsent) = u64::try_from(remote.outbound.len())
             && unsent > 0
         {
             driver.counters.add(Event::OutboundDroppedAtExit, unsent);
         }
         remote.outbound.clear();
-        Self::drain_exited(remote, driver)
+        let served = Self::drain_exited(&mut remote, driver);
+        Self::fail_open(driver, &remote);
+        if proven {
+            remote.link.mark_closed();
+        } else {
+            driver.retire_closed_client(remote.client);
+            self.retiring.push(Retiring {
+                pidfd: remote.pidfd,
+                link: remote.link,
+            });
+        }
+        work.add_items(served.saturating_add(1));
     }
 
     /// Reads what an exited client queued on its socket before it exited
@@ -1043,11 +1090,16 @@ impl<T: StreamTerms> Admission<T> {
             let received = match ipc::recv(remote.socket.as_fd(), &mut buffer) {
                 Ok(Recv::Message(received)) => received,
                 Ok(Recv::WouldBlock | Recv::PeerClosed) => return served,
-                Err(_) => {
+                // A protocol error took exactly one datagram: counted, and
+                // the drain goes on. A failed call ends it.
+                Err(error) => {
                     driver
                         .counters
                         .add(Event::AdmissionMessagesDroppedAtExit, 1);
-                    return served;
+                    if matches!(error, karyos_sys::error::SysError::Os { .. }) {
+                        return served;
+                    }
+                    continue;
                 }
             };
             match Self::decoded(&buffer, &received) {
@@ -1417,6 +1469,7 @@ impl<T: StreamTerms> Admission<T> {
                     }
                 }
                 Ok(Sent::WouldBlock) => break,
+                Err(error) if ipc::peer_gone(&error) => return (Step::Gone, sent),
                 Err(_) => return (Step::Retire, sent),
             }
         }

@@ -149,7 +149,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 72] = [
+const LABELS: [(u64, &str); 73] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -222,6 +222,7 @@ const LABELS: [(u64, &str); 72] = [
     (TYPE_EVENTS, "fetches dropped at exit"),
     (TYPE_EVENTS, "admission messages dropped at exit"),
     (TYPE_EVENTS, "admission messages not sent at exit"),
+    (TYPE_EVENTS, "clients closed before their exit"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -406,9 +407,10 @@ pub(crate) enum Event {
     /// Schedule violation reports dropped: past their bound, or naming a
     /// publication, lane or incarnation no longer live.
     ScheduleViolationsDropped,
-    /// Grants a remote client still held when its exit proof (or its
-    /// `Leave`) released it, after its queued messages were drained: ended
-    /// by the exit, not by a `Detach`, which `GrantsDetached` counts
+    /// Grants whose descriptor left and that a remote client did not
+    /// detach: its exit proof (or its `Leave`) ended them, after its queued
+    /// messages were drained. A faulty client is retired without a drain,
+    /// so its grants count here too. `GrantsDetached` counts a `Detach`
     /// (karyos#827).
     GrantsReleasedAtExit,
     /// `Fetch` messages found queued after a client's exit proof: not
@@ -428,12 +430,21 @@ pub(crate) enum Event {
     )]
     AdmissionMessagesDroppedAtExit,
     /// Admission messages queued for a client when its exit was proven,
-    /// dropped unsent. Last, so no other counter's id moves.
+    /// dropped unsent.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "admission is served only on Linux")
     )]
     OutboundDroppedAtExit,
+    /// Remote clients whose socket closed (end of file, `EPIPE` or
+    /// `ECONNRESET`) before their exit proof: drained, then retired like a
+    /// faulty client but not counted as one, since a dying process closes
+    /// its socket first (karyos#827). Last, so no other counter's id moves.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    ClientsClosedBeforeExit,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -733,6 +744,10 @@ mod tests {
             (
                 Event::OutboundDroppedAtExit,
                 "admission messages not sent at exit",
+            ),
+            (
+                Event::ClientsClosedBeforeExit,
+                "clients closed before their exit",
             ),
         ];
         assert_eq!(events.len(), LABELS.len());

@@ -1135,11 +1135,6 @@ fn a_remote_client_takes_handles_that_exchange_and_detach_on_drop() {
     serve_until(&mut driver, |driver| driver.clients() == 0);
     assert_eq!(counter(&driver, "grants exported"), 2);
     assert_eq!(counter(&driver, "grants detached"), 2);
-    assert_eq!(
-        counter(&driver, "grants exported"),
-        2,
-        "a fetch served after the exit"
-    );
 }
 
 /// A stream's `allow_unconnected` reaches a remote client's publication
@@ -2087,6 +2082,11 @@ fn an_exited_clients_queued_detaches_are_served_before_its_release() {
     assert!(child.wait().unwrap().success());
     serve_until(&mut driver, |driver| driver.clients() == 0);
     assert_eq!(counter(&driver, "grants detached"), 2);
+    assert_eq!(
+        counter(&driver, "grants exported"),
+        2,
+        "a fetch served after the exit"
+    );
     assert_eq!(counter(&driver, "fetches dropped at exit"), DRAIN_FETCHES);
     assert_eq!(counter(&driver, "grants released at exit"), 0);
     assert_eq!(counter(&driver, "admission messages dropped at exit"), 0);
@@ -2161,6 +2161,144 @@ fn child_detaches_twice_fetches_and_exits() {
     }
     // Exit without dropping the client: no Leave, and the driver has not
     // run since the last region.
+    std::mem::forget(client);
+    std::process::exit(0);
+}
+
+const GONE_CHILD: &str = "KARYOS_ADMISSION_GONE_CHILD";
+
+/// karyos#827: Linux closes a dying process's descriptors before its pidfd
+/// reads exited, so the driver can find a client's socket gone first. The
+/// child stands for that window: it holds one exported grant and one held
+/// grant, queues a `Fetch` of the held one and a `Detach` of the exported
+/// one after shutting its socket's receiving side, and stays alive until
+/// the parent tells it to exit. Serving the `Fetch` queues a reply whose
+/// send fails with `EPIPE`, which counts as an exit for the drain
+/// (QS-COORDINATOR, 2026-10-28): the reply is dropped and counted, the
+/// `Detach` behind it is drained and counted as a detach, and the client
+/// is retired, not as faulty, its slot kept until its exit proof.
+#[test]
+fn a_client_whose_socket_closes_before_its_exit_is_drained_then() {
+    let dir = dir("gone-before-exit");
+    let mut driver = system_driver(&dir);
+    let mut second = shared_stream_config();
+    second.buffer.stream_id = 3;
+    let _streams = (
+        driver.add_stream(shared_stream_config()).unwrap(),
+        driver.add_stream(second).unwrap(),
+    );
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_closes_its_socket_then_waits_to_exit",
+            "--nocapture",
+        ])
+        .env(GONE_CHILD, &dir)
+        .spawn()
+        .unwrap();
+    let closed = dir.join("child-closed");
+    let faulty = counter(&driver, "clients faulty");
+    serve_until(&mut driver, |driver| {
+        closed.exists() && counter(driver, "clients closed before their exit") == 1
+    });
+    // Drained before its exit proof: the `Detach` counts and the reply does
+    // not go.
+    assert_eq!(counter(&driver, "grants detached"), 1);
+    assert!(counter(&driver, "admission messages not sent at exit") >= 1);
+    assert_eq!(driver.clients(), 1, "released before its exit proof");
+    assert_eq!(
+        counter(&driver, "clients faulty"),
+        faulty,
+        "retired as faulty"
+    );
+    std::fs::write(dir.join("child-exit"), b"").unwrap();
+    assert!(child.wait().unwrap().success());
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants detached"), 1);
+    assert_eq!(counter(&driver, "grants exported"), 1);
+    assert!(counter(&driver, "admission messages not sent at exit") >= 1);
+    assert_eq!(counter(&driver, "grants released at exit"), 0);
+    assert_eq!(counter(&driver, "clients faulty"), faulty);
+}
+
+/// Runs only as the child of
+/// `a_client_whose_socket_closes_before_its_exit_is_drained_then`.
+#[test]
+fn child_closes_its_socket_then_waits_to_exit() {
+    let Some(dir) = std::env::var_os(GONE_CHILD) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let mut client = attach(&dir, Duration::from_secs(5), 16).unwrap();
+    for stream_id in [2, 3] {
+        let _ = client
+            .add_subscription(
+                StreamKey {
+                    stream_id,
+                    session_id: 1,
+                },
+                SubscriberRole::Required,
+            )
+            .unwrap();
+    }
+    let mut keys = Vec::new();
+    let start = Instant::now();
+    while keys.len() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(10), "no grants");
+        let _ = client.poll(usize::MAX, |completion| {
+            if let Outcome::Fetchable(fetchable) = completion.outcome {
+                keys.push(fetchable.key);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let socket = client.admission_socket().unwrap();
+    let message = encode(&Message::Fetch {
+        fetch: 1,
+        key: keys[0],
+    });
+    assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
+    let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
+    let start = Instant::now();
+    let export = loop {
+        assert!(start.elapsed() < Duration::from_secs(10), "no manifest");
+        if let Ok(Recv::Message(received)) = ipc::recv(socket, &mut buffer)
+            && let Ok(Message::Manifest { records, .. }) = Message::decode(&buffer[..received.len])
+        {
+            break records[0].export;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    // The region's descriptor, closed at once: nothing stays mapped.
+    let start = Instant::now();
+    while !matches!(ipc::recv(socket, &mut buffer), Ok(Recv::Message(_))) {
+        assert!(start.elapsed() < Duration::from_secs(10), "no region");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Its receiving side closes first, so the reply to the next `Fetch`
+    // cannot be delivered, whenever the driver serves it.
+    ipc::shutdown_read(socket).unwrap();
+    for message in [
+        Message::Fetch {
+            fetch: 2,
+            key: keys[1],
+        },
+        Message::Detach { export },
+    ] {
+        assert_eq!(
+            ipc::send(socket, &encode(&message), None).unwrap(),
+            Sent::Sent
+        );
+    }
+    std::fs::write(dir.join("child-closed"), b"").unwrap();
+    let start = Instant::now();
+    while !dir.join("child-exit").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "never told to exit"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     std::mem::forget(client);
     std::process::exit(0);
 }

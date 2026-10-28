@@ -1081,6 +1081,28 @@ pub fn accept(listener: BorrowedFd<'_>) -> Result<Option<OwnedFd>, SysError> {
     }
 }
 
+/// Whether `error`, from [`send`] or [`recv`] on a connected socket, says
+/// its peer is gone (`EPIPE` or `ECONNRESET`): the peer closed it, or the
+/// peer process is exiting (karyos#827).
+#[must_use]
+pub fn peer_gone(error: &SysError) -> bool {
+    matches!(error, SysError::Os { errno, .. }
+        if *errno == rustix::io::Errno::PIPE.raw_os_error()
+            || *errno == rustix::io::Errno::CONNRESET.raw_os_error())
+}
+
+/// Shuts the receiving side of `socket` down while the descriptor stays
+/// open, so its peer's sends fail with `EPIPE` and its own sends still go:
+/// how a test stands for a process whose descriptors are closing before
+/// its exit is visible (karyos#827).
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when the call fails.
+pub fn shutdown_read(socket: BorrowedFd<'_>) -> Result<(), SysError> {
+    rustix::net::shutdown(socket, rustix::net::Shutdown::Read).map_err(os("shutdown"))
+}
+
 /// Connects to the driver's admission socket in `dir` (client side,
 /// `quantstratum-docs: karyos/design/ipc-admission.md`): the directory must be a private
 /// directory of this uid, the socket a socket of this uid with mode

@@ -8,8 +8,14 @@
     dropped.
   - An exited client is drained instead of served, never after its
     turn, so nothing is fetched or sent for it.
-  - The drain reads at most 1024 datagrams, twice Linux's default
-    `net.unix.max_dgram_qlen`, so a default socket's whole queue fits.
+  - A client whose socket closes (end of file, `EPIPE` or `ECONNRESET`)
+    before its exit is visible (Linux closes a dying process's
+    descriptors first) is drained the same way, then retired, not as
+    faulty, its slot charged until its exit proof: the new counter
+    "clients closed before their exit". Only a protocol error retires a
+    client as faulty.
+  - The drain reads at most 1024 datagrams, the driver's own bound, and
+    at most 8 exited clients are drained in one admission step.
   - Messages queued for the exited client are dropped unsent.
   - New driver counters: "grants released at exit" (grants whose
     descriptor left and that the exit ended), "fetches dropped at exit",
