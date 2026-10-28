@@ -440,6 +440,14 @@ The runner binds `$loopback_uri` to `karyos:udp?endpoint=127.0.0.1:<p>`,
 a free loopback port `p`: a network subscription of `$remote_client`
 there receives what its network publication of the same stream sends.
 
+A client's heartbeat advances only when it is polled, and karyosd
+releases a client that stays silent for its client liveness timeout; a
+call of the released client answers `closed`. The runner therefore
+serves `$remote_client` before every scenario and provisions it after
+anything slow (the incompatible driver's stubs), so the client is silent
+for one scenario at most (karyos#820). A scenario that does not use the
+client must take less than karyosd's client liveness timeout (10 s).
+
 Each exclusive stream's publication is added at most once in the whole
 suite run, since karyosd serves every scenario: a remote publication is
 released asynchronously after its close, so a later `publication.add`

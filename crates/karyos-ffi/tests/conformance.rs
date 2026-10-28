@@ -1683,6 +1683,13 @@ impl Runner {
     /// [`Runner::reference`] elsewhere.
     fn reference_with_archive() -> Self {
         let mut runner = Self::reference();
+        // The stubs first: building one may take long, and the karyosd
+        // client must not wait unserved meanwhile (karyos#820).
+        if let Some(provided) = incompatible_host::provide() {
+            runner.absent.remove("incompatible-driver");
+            runner.offered.insert("incompatible-driver");
+            runner.incompatible = Some(provided);
+        }
         if let Some(provided) = archive_host::provide() {
             // The same karyosd serves both (FORMAT.md, Remote driver).
             for feature in ["archive-replay", "remote-driver"] {
@@ -1691,12 +1698,18 @@ impl Runner {
             }
             runner.archive = Some(provided);
         }
-        if let Some(provided) = incompatible_host::provide() {
-            runner.absent.remove("incompatible-driver");
-            runner.offered.insert("incompatible-driver");
-            runner.incompatible = Some(provided);
-        }
         runner
+    }
+
+    /// Serves the karyosd client it provides, so that its heartbeat
+    /// advances between the scenarios that use it (FORMAT.md, Remote
+    /// driver; karyos#820): a client's heartbeat advances only when it is
+    /// polled, and karyosd releases a client silent for its liveness
+    /// timeout.
+    fn serve_provided(&self) {
+        if let Some(provided) = &self.archive {
+            let _ = abi::client_poll(provided.client);
+        }
     }
 
     /// The line a run prints after its pinning line (FORMAT.md,
@@ -2083,6 +2096,7 @@ fn every_scenario_passes_at_the_library_abi_version() {
     let scenarios = scenarios();
     assert!(!scenarios.is_empty());
     for scenario in &scenarios {
+        runner.serve_provided();
         let outcome = run(scenario, &statuses, (major, minor), &runner);
         println!("{} {outcome}", scenario.id);
         // Every scenario targets this library's ABI and a step the
@@ -2746,7 +2760,14 @@ mod archive_host {
     /// fails the run, with karyosd's output.
     #[cfg(target_os = "linux")]
     pub(crate) fn provide() -> Option<Provided> {
-        let karyosd = linux::Karyosd::start();
+        provide_with("archive", None)
+    }
+
+    /// As [`provide`], under `name`, with karyosd's client liveness
+    /// timeout set to `liveness` when given.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn provide_with(name: &str, liveness: Option<&str>) -> Option<Provided> {
+        let karyosd = linux::Karyosd::start_with(name, liveness);
         let (client, recording, end) = karyosd.seed();
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .unwrap()
@@ -2763,7 +2784,7 @@ mod archive_host {
     }
 
     #[cfg(target_os = "linux")]
-    mod linux {
+    pub(crate) mod linux {
         use std::ffi::CString;
         use std::path::PathBuf;
         use std::process::{Child, Command, Stdio};
@@ -2780,11 +2801,11 @@ mod archive_host {
         /// The remote driver's guarded stream.
         const GUARDED: i32 = 23;
         /// The remote driver's plain stream, neither conflated nor guarded.
-        const PLAIN: i32 = 24;
+        pub(crate) const PLAIN: i32 = 24;
         /// The remote driver's timed network stream (`--timed-network`).
         const TIMED: i32 = 25;
         /// The remote driver's plain stream of the timed scenario.
-        const UNTIMED: i32 = 26;
+        pub(crate) const UNTIMED: i32 = 26;
         const REQUESTS: i32 = 1030;
         const RESPONSES: i32 = 1031;
 
@@ -2834,9 +2855,12 @@ mod archive_host {
         }
 
         impl Karyosd {
-            pub(crate) fn start() -> Self {
+            /// A karyosd under `name` in the temporary directory, whose
+            /// clients time out after `liveness` of silence when given,
+            /// else after karyosd's default.
+            pub(crate) fn start_with(name: &str, liveness: Option<&str>) -> Self {
                 let root = std::env::temp_dir()
-                    .join(format!("karyos-conformance-archive-{}", std::process::id()));
+                    .join(format!("karyos-conformance-{name}-{}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&root);
                 let (dir, archive) = (root.join("driver"), root.join("archive"));
                 std::fs::create_dir_all(&archive).unwrap();
@@ -2851,6 +2875,11 @@ mod archive_host {
                 let child = Command::new(binary())
                     .arg("--dir")
                     .arg(&dir)
+                    .args(
+                        liveness
+                            .map(|timeout| vec!["--client-liveness-timeout", timeout])
+                            .unwrap_or_default(),
+                    )
                     .args(["--stream", &format!("{RECORDED}:1")])
                     // The remote driver's streams (FORMAT.md, Remote driver):
                     // a conflated one and a guarded one.
@@ -2987,4 +3016,40 @@ mod archive_host {
             }
         }
     }
+}
+
+/// karyos#820: a karyosd client's heartbeat advances only when it is
+/// polled, and karyosd releases a client silent for its liveness timeout.
+/// The runner serves its client before every scenario
+/// (`Runner::serve_provided`), so scenarios that do not use it, as long as
+/// twice the timeout in all, leave it usable; left unserved as long, it is
+/// released and its next call answers `closed`, as `op.remote.conflated`
+/// did after a slow provisioning. Without `serve_provided` the first half
+/// fails. A 2 s timeout keeps the test short.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_runner_keeps_its_karyosd_client_served_between_scenarios() {
+    use std::time::{Duration, Instant};
+    let closed = statuses()["KARYOS_E_CLOSED"];
+    let mut runner = Runner::reference();
+    runner.archive = archive_host::provide_with("liveness", Some("2s"));
+    let client = runner.archive.as_ref().unwrap().client;
+    let gap = Duration::from_secs(4);
+    let start = Instant::now();
+    while start.elapsed() < gap {
+        runner.serve_provided();
+        // A scenario that does not use the client.
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (status, publication, _) =
+        abi::client_add_publication(client, c"karyos:ipc", archive_host::linux::PLAIN, 24);
+    assert_eq!(
+        status, 0,
+        "served between scenarios for {gap:?}, yet released"
+    );
+    let _ = abi::publication_close(publication);
+    std::thread::sleep(gap);
+    let (status, _, _) =
+        abi::client_add_publication(client, c"karyos:ipc", archive_host::linux::UNTIMED, 24);
+    assert_eq!(status, closed, "unserved for {gap:?}, yet kept");
 }
