@@ -2676,8 +2676,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ));
         }
         let key = (config.buffer.stream_id, config.buffer.session_id);
-        self.check_stream_bytes(&buffer_config, config.conflation.as_ref())?;
+        // The table's own refusal first, so the cap never hides it.
         let shape = config.conflation.map(conflation_shape).transpose()?;
+        self.check_stream_bytes(&buffer_config, config.conflation.as_ref())?;
         let buffer = Arc::new(<T as sealed::Create>::create(
             self,
             buffer_config,
@@ -3120,7 +3121,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // A conflated stream has no fresh incarnation
         // (`reincarnation_plan` refuses it), so its buffer has no table.
         // Its configuration is the stream's current one, already within
-        // `max_stream_bytes`, so it needs no cap check.
+        // `max_stream_bytes`, so it needs no cap check; kept checked in
+        // debug builds.
+        debug_assert!(
+            check_lane_bytes(self.config.max_stream_bytes, &plan.config, None).is_ok(),
+            "a reincarnation above max_stream_bytes"
+        );
         let buffer = Arc::new(<T as sealed::Create>::create(
             self,
             plan.config,
@@ -6243,7 +6249,7 @@ pub(crate) fn table_region_bytes(table: &ConflationConfig) -> Option<u64> {
     region_bytes(table.structure_length())
 }
 
-fn region_bytes(structure: Option<usize>) -> Option<u64> {
+pub(crate) fn region_bytes(structure: Option<usize>) -> Option<u64> {
     structure
         .and_then(karyos_sys::sizing::region_length)
         .and_then(|bytes| u64::try_from(bytes).ok())

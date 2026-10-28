@@ -97,7 +97,7 @@ fn random_word() -> Option<u64> {
 /// the removal ended succeeds, at worst `max(publication_linger,
 /// path_heartbeat_interval) + publication_linger` after it started (about
 /// 10 s at the defaults).
-fn refusal(error: DriverError) -> ErrorCode {
+fn refusal(error: &DriverError) -> ErrorCode {
     match error {
         DriverError::NetworkUnavailable | DriverError::UnsupportedChannel => {
             ErrorCode::UnsupportedChannel
@@ -115,6 +115,16 @@ fn refusal(error: DriverError) -> ErrorCode {
         // no retry changes (karyos#809).
         DriverError::StreamTooLarge { .. } => ErrorCode::StreamTooLarge,
         _ => ErrorCode::ResourcesUnavailable,
+    }
+}
+
+/// The detail word of a network operation's refusal: the request's own
+/// (its stream id), except for `StreamTooLarge`, whose detail is the
+/// lane's bytes, as the C driver path carries them (karyos#824).
+fn refusal_detail(error: &DriverError, detail: u64) -> u64 {
+    match error {
+        DriverError::StreamTooLarge { bytes, .. } => *bytes,
+        _ => detail,
     }
 }
 
@@ -315,7 +325,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             allow_unconnected,
         ) {
             Ok(config) => config,
-            Err(error) => return refuse(refusal(error), detail),
+            Err(error) => return refuse(refusal(&error), refusal_detail(&error, detail)),
         };
         // A timed stream's publication: a schedule ring on each lane,
         // released by the sender (`NetworkStreamDefaults::timed`).
@@ -335,7 +345,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let handle = match added {
             Ok(handle) => handle,
-            Err(error) => return refuse(refusal(error), detail),
+            Err(error) => return refuse(refusal(&error), refusal_detail(&error, detail)),
         };
         let response = grant(
             self,
@@ -510,7 +520,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let handle = match added {
             Ok(handle) => handle,
-            Err(error) => return refuse(refusal(error), detail),
+            Err(error) => return refuse(refusal(&error), refusal_detail(&error, detail)),
         };
         let bound = self.network_subscription_bound(&handle, &udp);
         self.next_registration = next;

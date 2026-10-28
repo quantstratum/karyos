@@ -505,7 +505,10 @@ pub extern "C" fn karyos_client_close(client: u64) -> i32 {
 /// through `publication`. A control call: it waits for the driver up to
 /// the client's timeout, and holds the client handle meanwhile
 /// (`KARYOS_E_BUSY` to another thread). On failure nothing is opened and
-/// `detail` (may be null) receives the failure's detail.
+/// `detail` (may be null) receives the failure's detail: a driver's
+/// refusal is `KARYOS_E_REFUSED` with its CnC code in `code`, such as 24
+/// for a `karyos:udp` publication above the driver's `max_stream_bytes`,
+/// with the lane's bytes in `value`.
 ///
 /// # Safety
 ///
@@ -2480,7 +2483,11 @@ pub unsafe extern "C" fn karyos_stream_options_init_sized(
 /// `karyos_driver_remove_stream` or the driver's close. The options are
 /// copied. On failure nothing is added, and `detail` receives the
 /// failure's detail (a duplicate stream id: `KARYOS_E_INVALID_ARGUMENT`
-/// with the stream id in `code` and the session id in `value`).
+/// with the stream id in `code` and the session id in `value`). A stream
+/// above the driver's `max_stream_bytes` would be
+/// `KARYOS_E_INVALID_ARGUMENT` with its bytes in `code` and the cap in
+/// `value`, but `karyos_driver_options` cannot set the cap yet
+/// (karyos#818).
 ///
 /// # Safety
 ///

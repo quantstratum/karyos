@@ -11,6 +11,7 @@
     reason = "test helpers, as ADR-0007 allows in tests"
 )]
 
+use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
@@ -133,6 +134,35 @@ fn the_cap_does_not_hide_a_buffers_own_refusal() {
     );
     let (mut driver, _) = capped();
     assert_eq!(driver.add_stream(invalid).map(|_| ()), uncapped);
+}
+
+/// A table that `conflation_shape` refuses (a value capacity past `u32`)
+/// keeps its own error with the cap set, on `add_stream` and
+/// `add_aggregate` (karyos#824): the cap must not turn it into
+/// `StreamTooLarge`. A reconfiguration keeps its stream's table, which its
+/// creation already checked.
+#[test]
+fn the_cap_does_not_hide_a_tables_own_refusal() {
+    let mut table = stream(2, MIN_TERM_LENGTH);
+    table.conflation = Some(ConflationConfig::new(1, 1 << 32, 4096));
+    let uncapped = EmbeddedDriver::new().unwrap().add_stream(table).map(|_| ());
+    assert_eq!(uncapped, Err(DriverError::InvalidConfig));
+    let (mut driver, _) = capped();
+    assert_eq!(driver.add_stream(table).map(|_| ()), uncapped, "add_stream");
+    let frame = u64::from(karyos_sys::sizing::align_frame(DEFAULT_MTU).unwrap()) * 4;
+    let mut aggregate = stream(4, MIN_TERM_LENGTH);
+    aggregate.conflation = table.conflation;
+    assert_eq!(
+        driver
+            .add_aggregate(AggregateConfig {
+                stream: aggregate,
+                quanta: vec![frame; 2],
+            })
+            .map(|_| ()),
+        uncapped,
+        "add_aggregate"
+    );
+    assert!(driver.streams.is_empty(), "nothing created");
 }
 
 #[test]

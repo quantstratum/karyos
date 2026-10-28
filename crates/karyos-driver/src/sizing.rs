@@ -56,8 +56,6 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
-use karyos_sys::sizing::region_length;
-
 use crate::embedded::{DriverConfig, StreamConfig};
 
 /// What the report does not cover without `max_stream_bytes`.
@@ -159,10 +157,7 @@ impl Pages {
     /// The mapped bytes of a region of `structure` bytes: header included,
     /// rounded up to the page.
     fn region(&self, structure: Option<usize>, what: &'static str) -> Result<u64, SizingError> {
-        let bytes = structure
-            .and_then(region_length)
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(SizingError::Invalid(what))?;
+        let bytes = crate::embedded::region_bytes(structure).ok_or(SizingError::Invalid(what))?;
         self.round(bytes)
     }
 
@@ -196,20 +191,20 @@ fn sum(lines: &[SizingLine]) -> Result<u64, SizingError> {
 }
 
 /// The mapped bytes of one generation of `stream`'s log buffer, and of its
-/// conflation table when it has one.
-fn stream_bytes(pages: &Pages, stream: &StreamConfig) -> Result<(u64, u64), SizingError> {
-    let buffer = pages.round(
-        crate::embedded::log_region_bytes(&stream.buffer)
-            .ok_or(SizingError::Invalid("a stream's log buffer configuration"))?,
-    )?;
+/// conflation table when it has one; and the lane's bytes before rounding,
+/// which `max_stream_bytes` bounds (`stream_lane_bytes`): each region
+/// sized once.
+fn stream_bytes(pages: &Pages, stream: &StreamConfig) -> Result<(u64, u64, u64), SizingError> {
+    let log = crate::embedded::log_region_bytes(&stream.buffer)
+        .ok_or(SizingError::Invalid("a stream's log buffer configuration"))?;
     let table = match &stream.conflation {
-        Some(conflation) => pages.round(
-            crate::embedded::table_region_bytes(conflation)
-                .ok_or(SizingError::Invalid("a stream's conflation configuration"))?,
-        )?,
+        Some(conflation) => crate::embedded::table_region_bytes(conflation)
+            .ok_or(SizingError::Invalid("a stream's conflation configuration"))?,
         None => 0,
     };
-    Ok((buffer, table))
+    let lane = log.checked_add(table).ok_or(SizingError::Overflow)?;
+    let table = if table == 0 { 0 } else { pages.round(table)? };
+    Ok((pages.round(log)?, table, lane))
 }
 
 /// The sizing report of a driver of `config` in IPC mode serving `streams`
@@ -360,14 +355,11 @@ pub fn report(
     let mut retained = Vec::new();
     let generations = count(config.max_retained_generations)?;
     for (index, stream) in streams.iter().enumerate() {
-        let (buffer, table) = stream_bytes(&pages, stream)?;
+        let (buffer, table, lane) = stream_bytes(&pages, stream)?;
         // A declared stream above the cap is one `add_stream` refuses.
-        crate::embedded::check_lane_bytes(
-            config.max_stream_bytes,
-            &stream.buffer,
-            stream.conflation.as_ref(),
-        )
-        .map_err(|_| SizingError::Invalid("a stream above max_stream_bytes"))?;
+        if config.max_stream_bytes.is_some_and(|max| lane > max) {
+            return Err(SizingError::Invalid("a stream above max_stream_bytes"));
+        }
         let name = format!(
             "stream {}:{} (declared {index})",
             stream.buffer.stream_id, stream.buffer.session_id
@@ -480,16 +472,16 @@ impl fmt::Display for SizingReport {
     /// figures, the peak's assumption, what the cgroup counts and what is
     /// excluded.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (title, lines) in [
+        let mut groups = vec![
             ("configured shared regions", &self.configured),
             ("configured heap budgets", &self.heap),
             ("retained across a cutover or restart", &self.retained),
-            ("bounded by max_stream_bytes", &self.bounded),
-        ] {
-            // Without the cap the report is the one it was before it.
-            if title.starts_with("bounded") && lines.is_empty() {
-                continue;
-            }
+        ];
+        // Without the cap the report is the one it was before it.
+        if self.bounded_bytes.is_some() {
+            groups.push(("bounded by max_stream_bytes", &self.bounded));
+        }
+        for (title, lines) in groups {
             writeln!(f, "{title}:")?;
             if lines.is_empty() {
                 writeln!(f, "  (none)")?;
