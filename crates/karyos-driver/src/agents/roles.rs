@@ -379,8 +379,12 @@ pub struct SenderCounters {
     /// carried over instead (`OutboundCounters::close_deferred`).
     pub removed_unrecorded: u64,
     /// Entries of the close list whose endpoint's TX half was not held at
-    /// a duty, kept for the next one (each counted per duty it waits).
-    pub removed_waiting: u64,
+    /// their duty: it comes back only in a new epoch, whose reset drops
+    /// them, or never. Dropped, each counted once.
+    pub removed_dropped: u64,
+    /// Queues or routes of the close list the endpoint refused to close,
+    /// or that returned nothing while not done: left to its next reset.
+    pub removed_close_failed: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -4937,55 +4941,54 @@ impl<T: StreamTerms> SenderRole<T> {
     /// the same epoch. An endpoint whose half it does not hold, or now in
     /// another epoch, dropped them already (a reset or a retirement).
     fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
-        // What waits for its endpoint's TX half (handed back this cycle)
-        // stays, counted once per cycle, for the next duty: its route and
-        // queues are never lost. Taking the list keeps its capacity.
-        let mut closing = std::mem::take(&mut self.closing);
-        let mut kept = 0usize;
-        let mut at = 0usize;
-        while at < closing.len() {
-            let Some(opened) = closing.get(at).copied() else {
-                break;
-            };
+        while let Some(opened) = self.closing.pop() {
+            // A half not held now comes back only in a new epoch, whose
+            // reset drops these handles, or never (retired): dropped and
+            // counted, so the list never fills with what cannot close.
             let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
                 Half::Tx(tx) if *held == opened.endpoint => Some(tx),
                 _ => None,
             }) else {
-                closing.swap(kept, at);
-                kept += 1;
-                at += 1;
+                self.count(|c| &mut c.removed_dropped);
                 continue;
             };
-            at += 1;
             if tx.capabilities().epoch != opened.epoch {
                 continue;
             }
             for queue in opened.queues.into_iter().flatten() {
                 // A full report leaves items pending: emptied and called
                 // again until none remains, each call returning at least
-                // one, so the queue's depth bounds the loop.
-                while let Ok(outcome) = tx.close_queue(queue, &mut self.close_report) {
-                    while self.close_report.pop_front().is_some() {
-                        self.count(|c| &mut c.removed_returned);
-                    }
-                    if !outcome.more {
-                        self.count(|c| &mut c.removed_closed);
-                        break;
-                    }
-                    if outcome.returned == 0 {
-                        break;
+                // one, so the queue's depth bounds the loop. A refusal or a
+                // call that returns nothing is counted: the endpoint's next
+                // reset drops the queue.
+                loop {
+                    match tx.close_queue(queue, &mut self.close_report) {
+                        Ok(outcome) => {
+                            while self.close_report.pop_front().is_some() {
+                                self.count(|c| &mut c.removed_returned);
+                            }
+                            if !outcome.more {
+                                self.count(|c| &mut c.removed_closed);
+                                break;
+                            }
+                            if outcome.returned == 0 {
+                                self.count(|c| &mut c.removed_close_failed);
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            self.count(|c| &mut c.removed_close_failed);
+                            break;
+                        }
                     }
                 }
             }
             if tx.remove_route(opened.route).is_ok() {
                 self.count(|c| &mut c.removed_closed);
+            } else {
+                self.count(|c| &mut c.removed_close_failed);
             }
         }
-        closing.truncate(kept);
-        for _ in 0..kept {
-            self.count(|c| &mut c.removed_waiting);
-        }
-        self.closing = closing;
     }
 
     /// Frees the route slots of endpoints the agent no longer holds: their

@@ -28,9 +28,13 @@
     the next duty, counted once each (`close_deferred`), and keep their
     slots: nothing is dropped. The report hands them to the close list
     itself, so the next cycle's commands, served before its duty, find
-    the slot free. A close whose endpoint's TX half is not held at a duty
-    waits for a later one (`removed_waiting`) instead of being lost. With
-    the quarantine full, the record removed earliest makes room.
+    the slot free. A close whose endpoint's TX half is not held at its
+    duty is dropped and counted once (`removed_dropped`): that half comes
+    back only in a new epoch, whose reset drops the handles, or never. A
+    queue or route the endpoint refuses to close is counted
+    (`removed_close_failed`) and left to its next reset. With the
+    quarantine full, the record removed earliest makes room, the incoming
+    one included.
   - A route table, queue entries or TX slots that other publications
     filled (`RouteLimit`, `QueueLimit`, `OverCommitted`) no longer count
     as the destination's own fault, so an optional destination is not

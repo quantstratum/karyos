@@ -93,9 +93,9 @@ pub enum DestinationChange {
     Quarantined,
     /// Refused: the publication has [`MAX_DESTINATIONS`] destinations,
     /// counting those removed whose route and queues have not left for the
-    /// sender's close list yet: a removal is reported at once and retired
-    /// at its report, and its route and queues leave at the next duty (or
-    /// later, `close_deferred`, when the close list is full).
+    /// sender's close list yet: a removal is reported at once, retired at
+    /// its report, and its route and queues go to the close list then (or
+    /// at a later duty, `close_deferred`, when that list is full).
     Full,
     /// Refused: the publication is being removed.
     Removing,
@@ -516,22 +516,28 @@ impl Fanout {
                 now.checked_sub(*removed_at)
                     .is_none_or(|age| age < quarantine)
             });
-            // The record removed earliest goes first: retirement order may
-            // differ from removal order.
+            // The record removed earliest goes first, the incoming one
+            // included: retirement order may differ from removal order.
+            let removed_at = target.removed.map_or(now, |(_, time)| time);
+            let mut keep = true;
             if fanout.quarantined.len() >= MAX_DESTINATIONS {
                 let earliest = fanout
                     .quarantined
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, (_, removed_at))| *removed_at)
-                    .map(|(at, _)| at);
-                if let Some(at) = earliest {
-                    let _ = fanout.quarantined.remove(at);
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(at, (_, removed))| (at, *removed));
+                match earliest {
+                    Some((at, earliest)) if earliest <= removed_at => {
+                        let _ = fanout.quarantined.remove(at);
+                    }
+                    _ => keep = false,
                 }
                 forgotten = forgotten.saturating_add(1);
             }
-            let removed_at = target.removed.map_or(now, |(_, time)| time);
-            fanout.quarantined.push_back((target.address, removed_at));
+            if keep {
+                fanout.quarantined.push_back((target.address, removed_at));
+            }
             retired = retired.saturating_add(1);
         }
         (retired, forgotten)
@@ -1443,8 +1449,8 @@ const fn queue_limit(error: karyos_io::backend::QueueError) -> bool {
 /// Removes `target` for `reason` at `now`: it gets nothing more, its
 /// removal is reported in that cycle, and it is retired at the report as a
 /// removed publication is (design 3.7): its queues and route go to the
-/// sender's close list, which returns what they hold as `QueueClosed` and
-/// closes them at the next duty, and its slot is freed then. Its receiver closes the gap by its gap
+/// sender's close list then, which frees its slot, and the next duty
+/// returns what they hold as `QueueClosed` and closes them. Its receiver closes the gap by its gap
 /// policy, and its image expires.
 fn remove_target(target: &mut Target, reason: RemovalReason, now: u64) {
     if target.removed.is_some() {
@@ -1787,14 +1793,11 @@ impl<T: StreamTerms> Outbound<T> {
                 // A removed target holds its slot until its route and queues
                 // pass to the close list, at its report: a move retried
                 // after the removal shows in `network_removed_destinations`
-                // finds the slot free. While
-                // the conductor's ring is full nothing is reported and
-                // nothing retires, so churn never grows the targets, their
-                // flags or the retired list past their capacity.
-                // A slot is held until the old route and queues leave for
-                // the close list, which the next duty closes before it
-                // serves commands: the new destination's route never
-                // competes with the old one's for the endpoint's limits.
+                // finds the slot free, and the next duty closes the old
+                // route before it opens the new one. While the conductor's
+                // ring is full nothing is reported and nothing retires, so
+                // churn never grows the targets, their flags or the retired
+                // list past their capacity.
                 if fanout.targets.len().saturating_add(fanout.retired.len()) >= MAX_DESTINATIONS {
                     return DestinationChange::Full;
                 }
@@ -2154,11 +2157,6 @@ mod tests {
         assert_eq!(outbound.counters().destinations_retired, 1, "at its report");
         outbound.drain_retired(&mut Vec::with_capacity(MAX_DESTINATIONS));
         assert_eq!(
-            outbound.counters().destinations_retired,
-            1,
-            "the drain retires nothing"
-        );
-        assert_eq!(
             outbound.change_destination(address(4001), true, 5_999, quarantine),
             DestinationChange::Quarantined
         );
@@ -2254,6 +2252,33 @@ mod tests {
                 .iter()
                 .any(|(at, _)| *at == address(5000))
         );
+        assert_eq!(outbound.counters().quarantine_forgotten, 1);
+    }
+
+    /// Should-fix of #829: the incoming record counts too: when it was
+    /// removed before every record held, it is the one forgotten.
+    #[test]
+    fn a_full_quarantine_forgets_an_earlier_incoming_removal() {
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut outbound = fanned(address(4000));
+        let _ = outbound.change_destination(address(4001), true, 0, 0);
+        let fanout = outbound.fanout.as_deref_mut().unwrap();
+        fanout.quarantine = 1_000_000;
+        for index in 0..16u16 {
+            fanout
+                .quarantined
+                .push_back((address(5000 + index), 1_000 + u64::from(index)));
+        }
+        let _ = outbound.change_destination(address(4001), false, 500, 1_000_000);
+        outbound.removal_reported(address(4001), 2_000);
+        let fanout = outbound.fanout.as_deref().unwrap();
+        assert!(
+            !fanout
+                .quarantined
+                .iter()
+                .any(|(at, _)| *at == address(4001))
+        );
+        assert_eq!(fanout.quarantined.len(), 16, "every held record kept");
         assert_eq!(outbound.counters().quarantine_forgotten, 1);
     }
 
