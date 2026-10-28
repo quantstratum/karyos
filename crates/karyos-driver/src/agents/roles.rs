@@ -677,6 +677,11 @@ fn classify_heartbeat<T: StreamTerms>(
         Some(seen) if position == seen => HeartbeatClass::Stationary,
         _ => {
             *mark = Some(position);
+            // An unreliable tail no frame revealed is sealed after its
+            // deadline (SPEC §6, G1); a reliable image NAKs it instead.
+            if !image.reliable {
+                image.skip.revealed(lane, position);
+            }
             HeartbeatClass::Fresh
         }
     }

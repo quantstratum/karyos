@@ -12,7 +12,9 @@
 //!   `duty` after its arrivals. A duplicate never restarts the deadline. At
 //!   expiry the extent maps are read again and only what is still uncovered
 //!   is sealed, up to the start of the next committed extent. No NAK is
-//!   sent.
+//!   sent. A tail above the covered end that only a sender's heartbeat
+//!   reveals ([`SkipPolicy::revealed`]) is a hole too, from the resolved
+//!   prefix (never below the join point) to the heartbeat's position.
 //! - **Reliable.** A timer never seals. Under `on_unrecoverable = close`
 //!   (the default) a correlated `RANGE_UNAVAILABLE` closes the image with
 //!   the interval; under `skip` it seals the whole hole with reason
@@ -240,6 +242,9 @@ struct LaneState {
     unrecoverable_to: u64,
     /// Since when every arrival was `Ahead`, and the earliest such position.
     ahead: Option<(u64, u64)>,
+    /// The highest position a sender's heartbeat named (unreliable): a
+    /// tail above the covered end that no frame revealed.
+    mark: u64,
     /// The lane was reported closed.
     closed: bool,
     /// The closes reported on the lane.
@@ -304,6 +309,17 @@ impl SkipPolicy {
             // Duplicates, late copies and refusals neither fill nor reveal
             // a hole, and never restart a deadline.
             _ => {}
+        }
+    }
+
+    /// Records that a sender's heartbeat on `lane` named `mark`, its next
+    /// position (SPEC §6, G1): on an unreliable channel, a tail from the
+    /// covered end to `mark` that no frame revealed is a hole like any
+    /// other, sealed once its deadline passes. A lower or equal mark
+    /// changes nothing; a higher one extends the open hole.
+    pub fn revealed(&mut self, lane: Lane, mark: u64) {
+        if let Some(state) = self.lanes.get_mut(usize::from(lane.get())) {
+            state.mark = state.mark.max(mark);
         }
     }
 
@@ -483,11 +499,17 @@ impl SkipPolicy {
         for _ in 0..SEALS_PER_DUTY {
             // The extent maps are read again before each seal: only what is
             // still uncovered is sealed, up to the next committed extent.
-            let Some((position, extent)) = owner.first_hole(lane)? else {
+            // A tail hole is seen up to the heartbeat's mark.
+            let (hole, seen) = match owner.first_hole(lane)? {
+                Some(hole) => (Some(hole), owner.high_water(lane)),
+                None if !config.reliable => (owner.tail_hole(lane, state.mark)?, Some(state.mark)),
+                None => (None, None),
+            };
+            let Some((position, extent)) = hole else {
                 state.episode = None;
                 return Ok(());
             };
-            let high = owner.high_water(lane).unwrap_or(position);
+            let high = seen.unwrap_or(position);
             let (detected, seen_to) = match state.episode {
                 Some((at, seen_to)) if position < seen_to => (at, seen_to),
                 // A hole above what the episode saw: a new detection.

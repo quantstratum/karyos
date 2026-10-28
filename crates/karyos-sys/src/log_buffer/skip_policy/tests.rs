@@ -39,6 +39,11 @@ fn params() -> ImageParams {
 }
 
 fn image() -> (Arc<LogBuffer>, ReceiveOwner) {
+    image_from(0)
+}
+
+/// An image joined at `join`.
+fn image_from(join: u64) -> (Arc<LogBuffer>, ReceiveOwner) {
     let buffer = Arc::new(
         LogBuffer::new(LogBufferConfig {
             term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
@@ -52,7 +57,7 @@ fn image() -> (Arc<LogBuffer>, ReceiveOwner) {
             stream_id: STREAM,
             claim_deadline: DEFAULT_CLAIM_DEADLINE,
             publication: PublicationMode::Image {
-                join: 0,
+                join,
                 local_gaps: true,
             },
             schedule_capacity: 0,
@@ -652,4 +657,99 @@ fn an_unrecoverable_seal_is_told() {
         .unwrap();
     assert_eq!(report.sealed, 1);
     assert_eq!(sealed, [(Lane::ZERO, 64, 64)]);
+}
+
+/// A heartbeat's tail (SPEC §6, G1): frame `[0, 64)` received, the sender's
+/// next position 192, so `[64, 192)` was lost with nothing after it.
+fn with_tail() -> (Arc<LogBuffer>, ReceiveOwner, SkipPolicy) {
+    let (buffer, mut owner) = image();
+    receive(&mut owner, &data(0, 0, 1)).unwrap();
+    let mut skip = policy_of(SkipConfig::unreliable());
+    skip.revealed(Lane::ZERO, 192);
+    (buffer, owner, skip)
+}
+
+/// What one duty sealed, each `(position, extent)`.
+fn sealed_by(skip: &mut SkipPolicy, owner: &mut ReceiveOwner, now: u64) -> Vec<(u64, u32)> {
+    let mut seals = Vec::new();
+    let _ = skip
+        .duty_observed(owner, now, &mut Ungated, |_, position, extent| {
+            seals.push((position, extent));
+        })
+        .unwrap();
+    seals
+}
+
+/// karyos#806: an unreliable tail no frame revealed is sealed from the
+/// covered end to the heartbeat's mark, at the reorder deadline, with its
+/// exact range.
+#[test]
+fn an_unreliable_tail_a_heartbeat_reveals_is_sealed_at_the_deadline() {
+    let (_buffer, mut owner, mut skip) = with_tail();
+    assert_eq!(
+        owner.first_hole(Lane::ZERO).unwrap(),
+        None,
+        "no frame shows it"
+    );
+    assert!(
+        sealed_by(&mut skip, &mut owner, 0).is_empty(),
+        "detected at 0"
+    );
+    assert!(sealed_by(&mut skip, &mut owner, MS - 1).is_empty());
+    assert_eq!(sealed_by(&mut skip, &mut owner, MS), [(64, 128)]);
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(192));
+    assert!(sealed_by(&mut skip, &mut owner, 2 * MS).is_empty(), "once");
+}
+
+/// The tail's data arriving before the deadline leaves nothing to seal.
+#[test]
+fn a_tail_that_arrives_before_the_deadline_is_not_sealed() {
+    let (_buffer, mut owner, mut skip) = with_tail();
+    assert!(sealed_by(&mut skip, &mut owner, 0).is_empty());
+    receive(&mut owner, &data(0, 64, 2)).unwrap();
+    receive(&mut owner, &data(0, 128, 3)).unwrap();
+    assert!(sealed_by(&mut skip, &mut owner, MS).is_empty());
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(192));
+}
+
+/// The same mark again neither restarts the deadline nor seals twice; a
+/// higher one extends the open hole, detected when it opened.
+#[test]
+fn a_repeated_mark_is_idempotent_and_a_higher_one_extends_the_hole() {
+    let (_buffer, mut owner, mut skip) = with_tail();
+    assert!(sealed_by(&mut skip, &mut owner, 0).is_empty());
+    skip.revealed(Lane::ZERO, 192);
+    skip.revealed(Lane::ZERO, 128);
+    skip.revealed(Lane::ZERO, 256);
+    assert!(sealed_by(&mut skip, &mut owner, MS / 2).is_empty());
+    assert_eq!(sealed_by(&mut skip, &mut owner, MS), [(64, 192)]);
+    skip.revealed(Lane::ZERO, 256);
+    assert!(sealed_by(&mut skip, &mut owner, 3 * MS).is_empty());
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(256));
+}
+
+/// An image that joined at 256 seals nothing before its join: a mark at
+/// or below it is no tail, one above it a tail from the join.
+#[test]
+fn a_tail_never_reaches_below_the_join() {
+    let (_buffer, mut owner) = image_from(256);
+    let mut skip = policy_of(SkipConfig::unreliable());
+    skip.revealed(Lane::ZERO, 256);
+    assert!(sealed_by(&mut skip, &mut owner, 0).is_empty());
+    assert!(sealed_by(&mut skip, &mut owner, 10 * MS).is_empty());
+    skip.revealed(Lane::ZERO, 320);
+    assert!(sealed_by(&mut skip, &mut owner, 11 * MS).is_empty());
+    assert_eq!(sealed_by(&mut skip, &mut owner, 12 * MS), [(256, 64)]);
+}
+
+/// A reliable image NAKs its tail (the driver's business): the policy
+/// never seals it.
+#[test]
+fn a_reliable_tail_is_never_sealed() {
+    let (_buffer, mut owner) = image();
+    receive(&mut owner, &data(0, 0, 1)).unwrap();
+    let mut skip = policy_of(SkipConfig::reliable());
+    skip.revealed(Lane::ZERO, 192);
+    assert!(sealed_by(&mut skip, &mut owner, 0).is_empty());
+    assert!(sealed_by(&mut skip, &mut owner, 10 * MS).is_empty());
 }

@@ -517,6 +517,25 @@ impl<T: TermBytes> ReceiveOwner<T> {
         Ok(owner.first_hole()?)
     }
 
+    /// The tail hole of `lane` a sender's heartbeat at `mark` reveals, as
+    /// `(position, extent)`: from the resolved prefix to `mark`, within one
+    /// term, when nothing above the prefix is covered (`quantstratum-docs:
+    /// karyos/SPEC.md` §6, G1). `None` when the prefix reaches `mark` or a
+    /// covered extent lies above it ([`ReceiveOwner::first_hole`] names
+    /// that hole). Nothing below the image's join point is a hole.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::Foreign`] for a lane the image does not have,
+    /// [`ReceiveError::Sys`] for a position outside the incarnation.
+    pub fn tail_hole(&self, lane: Lane, mark: u64) -> Result<Option<(u64, u32)>, ReceiveError> {
+        let owner = self
+            .lanes
+            .get(usize::from(lane.get()))
+            .ok_or(ReceiveError::Foreign)?;
+        Ok(owner.tail_hole(mark)?)
+    }
+
     /// Whether `position` of `lane` lies in the window `{r, r + 1}` of
     /// terms, `r` the term of the resolved prefix (GU-6: a position beyond
     /// it cannot be resumed). A position outside the incarnation, which a
@@ -925,6 +944,21 @@ impl<T: TermBytes> LaneOwner<T> {
                 reason: "hole extent",
             })?;
         Ok(Some((self.rebuild, end_offset - offset)))
+    }
+
+    /// The tail hole a heartbeat at `mark` reveals: from the resolved
+    /// prefix (never below the join point) to `mark`, within its term,
+    /// while nothing above the prefix is covered.
+    fn tail_hole(&self, mark: u64) -> Result<Option<(u64, u32)>, SysError> {
+        let start = self.rebuild.max(self.join);
+        if self.high > self.rebuild || mark <= start {
+            return Ok(None);
+        }
+        let (_, offset) = self.buffer.split(start)?;
+        let room = u64::from(self.buffer.term_length - offset);
+        let extent = (mark - start).min(room);
+        let extent = u32::try_from(extent).unwrap_or(u32::MAX) / FRAME_ALIGNMENT * FRAME_ALIGNMENT;
+        Ok((extent > 0).then_some((start, extent)))
     }
 
     /// [`LogBuffer::split`], except that the end of the incarnation's last
