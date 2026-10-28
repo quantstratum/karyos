@@ -649,6 +649,8 @@ fn a_journal_recycled_during_the_wait_is_found_in_the_log() {
         let other = JournalEntry::open(11, 1, JournalKind::Subscriber, 2, 16);
         assert!(mirror.write_entry(1, Some(&other)));
         let _ = mirror.append(11, 0, &[0, !0]).unwrap();
+        // A record of the journal that takes the entry over.
+        let _ = mirror.append(12, 1, &[1, !1]).unwrap();
         assert!(mirror.hold_entry(1, true));
     }
     let reader = mirror.borrow().reader();
@@ -690,9 +692,15 @@ fn a_journal_recycled_during_the_wait_is_found_in_the_log() {
     );
     DURING_TABLE_WAIT.with(|hook| *hook.borrow_mut() = None);
     let page = page.unwrap();
-    assert_eq!(seqs(&page), [0]);
+    assert_eq!(seqs(&page), [0, 1]);
+    // The recycled journal from the log, the new one calibrated against
+    // its table entry.
     assert!(
-        matches!(&page.journals[..], [ExportJournal::Recycled(entry)] if entry.journal == 11),
+        matches!(
+            &page.journals[..],
+            [ExportJournal::Recycled(old), ExportJournal::Live(new)]
+                if old.journal == 11 && new.journal == 12
+        ),
         "{:?}",
         page.journals
     );
@@ -725,4 +733,28 @@ fn a_page_ends_at_the_overwritten_ranges_it_can_state() {
     )
     .unwrap();
     assert_eq!(page.next, 300);
+}
+
+/// QS-COORDINATOR, ACS 33989 (W2): with journal A busy past the wait and
+/// first in the page, and journal B readable, only A's leading run goes
+/// out unreadable; B's records are calibrated, and the page ends at A's
+/// next record.
+#[test]
+fn only_the_busy_first_journals_run_is_unreadable() {
+    let mut mirror = mirror(16);
+    let a = JournalEntry::open(11, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.write_entry(1, Some(&a)));
+    // Journal 10 (B) is entry 0, readable.
+    for (seq, journal) in [(0, 11), (1, 11), (2, 10), (3, 10), (4, 11), (5, 10)] {
+        let _ = mirror.append(journal, seq, &[seq, !seq]).unwrap();
+    }
+    assert!(mirror.hold_entry(1, true));
+    let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
+    assert_eq!(seqs(&page), [0, 1, 2, 3]);
+    assert_eq!(page.next, 4);
+    assert_eq!(page.unreadable_records, 2);
+    assert!(matches!(
+        &page.journals[..],
+        [ExportJournal::Live(b), ExportJournal::Unreadable { journal: 11 }] if b.journal == 10
+    ));
 }
