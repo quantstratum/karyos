@@ -378,12 +378,13 @@ pub struct SenderCounters {
     /// endpoint's next reset drops them). A retired destination's are
     /// carried over instead (`OutboundCounters::close_deferred`).
     pub removed_unrecorded: u64,
-    /// Entries of the close list whose endpoint's TX half was not held at
-    /// their duty: it comes back only in a new epoch, whose reset drops
-    /// them, or never. Dropped, each counted once.
+    /// Entries of the close list dropped at their duty, each counted once:
+    /// their endpoint's TX half was not held (in a reset, which drops them,
+    /// or retired) or was in another epoch (whose reset dropped them).
     pub removed_dropped: u64,
-    /// Queues or routes of the close list the endpoint refused to close,
-    /// or that returned nothing while not done: left to its next reset.
+    /// Entries of the close list (a route and its queues) the endpoint
+    /// would not close whole, each counted once: the sender asks for the
+    /// endpoint's reset, which drops them.
     pub removed_close_failed: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
@@ -1482,6 +1483,9 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     /// with the TX halves (allocated at creation: `publications` routes'
     /// worth, the most removals can leave).
     closing: Vec<super::data::Opened>,
+    /// Endpoints a close failed on, whose reset the sender asks for: the
+    /// reset drops what would not close, which nothing else frees.
+    close_resets: Vec<EndpointId>,
     /// Report storage for those closes (allocated at creation).
     close_report: karyos_io::backend::TxReport,
     /// When a routed publication's path leaves the live set (RP-8).
@@ -1638,6 +1642,11 @@ pub(super) fn roles<T: StreamTerms>(
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
             ),
             close_report: karyos_io::backend::TxReport::new(),
+            close_resets: Vec::with_capacity(
+                config
+                    .publications
+                    .saturating_mul(karyos_io::lanes::routes::MAX_ROUTES),
+            ),
             path_policy: config.path_policy,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
@@ -4950,9 +4959,10 @@ impl<T: StreamTerms> SenderRole<T> {
     /// another epoch, dropped them already (a reset or a retirement).
     fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
         while let Some(opened) = self.closing.pop() {
-            // A half not held now comes back only in a new epoch, whose
-            // reset drops these handles, or never (retired): dropped and
-            // counted, so the list never fills with what cannot close.
+            // A half not held now is in a reset or retired: the reset, done
+            // or to come, drops these handles, and a retired half never
+            // comes back. Dropped and counted, so the list never fills
+            // with what cannot close.
             let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
                 Half::Tx(tx) if *held == opened.endpoint => Some(tx),
                 _ => None,
@@ -4960,15 +4970,16 @@ impl<T: StreamTerms> SenderRole<T> {
                 self.count(|c| &mut c.removed_dropped);
                 continue;
             };
+            // Another epoch's handles died with it.
             if tx.capabilities().epoch != opened.epoch {
+                self.count(|c| &mut c.removed_dropped);
                 continue;
             }
+            let mut failed = false;
             for queue in opened.queues.into_iter().flatten() {
                 // A full report leaves items pending: emptied and called
                 // again until none remains, each call returning at least
-                // one, so the queue's depth bounds the loop. A refusal or a
-                // call that returns nothing is counted: the endpoint's next
-                // reset drops the queue.
+                // one, so the queue's depth bounds the loop.
                 loop {
                     match tx.close_queue(queue, &mut self.close_report) {
                         Ok(outcome) => {
@@ -4980,12 +4991,12 @@ impl<T: StreamTerms> SenderRole<T> {
                                 break;
                             }
                             if outcome.returned == 0 {
-                                self.count(|c| &mut c.removed_close_failed);
+                                failed = true;
                                 break;
                             }
                         }
                         Err(_) => {
-                            self.count(|c| &mut c.removed_close_failed);
+                            failed = true;
                             break;
                         }
                     }
@@ -4994,7 +5005,18 @@ impl<T: StreamTerms> SenderRole<T> {
             if tx.remove_route(opened.route).is_ok() {
                 self.count(|c| &mut c.removed_closed);
             } else {
+                failed = true;
+            }
+            // Once per entry. What would not close holds the endpoint's
+            // queue entries or route table until a reset, so one is asked
+            // for (at most one pending per endpoint).
+            if failed {
                 self.count(|c| &mut c.removed_close_failed);
+                if !self.close_resets.contains(&opened.endpoint)
+                    && self.close_resets.len() < self.close_resets.capacity()
+                {
+                    self.close_resets.push(opened.endpoint);
+                }
             }
         }
     }
@@ -5490,6 +5512,18 @@ impl<T: StreamTerms> SenderRole<T> {
     /// others while the reset is in flight. Nothing allocates.
     pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
         let cycle = self.cycle;
+        // The endpoints a close failed on; one the ring refused is asked
+        // again next cycle.
+        let mut at = 0;
+        while let Some(&endpoint) = self.close_resets.get(at) {
+            if post(endpoint) {
+                let _ = self.close_resets.swap_remove(at);
+                self.count(|c| &mut c.reset_requests);
+            } else {
+                self.count(|c| &mut c.reset_requests_full);
+                at += 1;
+            }
+        }
         for index in 0..self.publications.len() {
             let Some(outbound) = self.publications.get_mut(index) else {
                 break;

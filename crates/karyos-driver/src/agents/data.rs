@@ -276,9 +276,6 @@ pub struct OutboundCounters {
     /// the destination (they are in `route_failures` or `queue_failures`
     /// too).
     pub endpoint_limits: u64,
-    /// Retired destinations' routes and queues the sender's close list had
-    /// no room for in a duty, carried over to the next, each counted once.
-    pub close_deferred: u64,
     /// Send faults reported for a lane's head.
     pub send_faults: u64,
     /// Invariant, sender or DRR failures.
@@ -313,9 +310,11 @@ pub struct OutboundCounters {
     /// Removed destinations retired: their queues and route closed and
     /// their slot freed (karyos#630, design 3.7).
     pub destinations_retired: u64,
-    /// Retired destinations whose quarantine record was overwritten by a
-    /// newer one before it expired (more than `MAX_DESTINATIONS` within one
-    /// quarantine).
+    /// Retired destinations' quarantine records forgotten while still in
+    /// their quarantine, to make room (more than `MAX_DESTINATIONS` within
+    /// one quarantine): the record removed earliest, which may be the
+    /// incoming one. An incoming record already past its quarantine is not
+    /// kept, and not counted.
     pub quarantine_forgotten: u64,
     /// An increment did not apply.
     pub overflowed: bool,

@@ -4471,8 +4471,8 @@ fn a_move_right_after_the_report_is_added_in_the_cycle_order() {
 }
 
 /// Review J1 of #829: an entry of the close list whose endpoint's TX half
-/// is not held at its duty is dropped and counted once: that half comes
-/// back only in a new epoch, whose reset drops the handles, or never.
+/// is not held at its duty is dropped and counted once: that half is in a
+/// reset, which drops the handles, or retired.
 #[test]
 fn a_close_without_its_tx_half_is_dropped_once() {
     use karyos_io::backend::{Authority, TxQueueConfig};
@@ -4505,9 +4505,96 @@ fn a_close_without_its_tx_half_is_dropped_once() {
     sender.close_removed(&mut none);
     assert!(sender.closing.is_empty(), "dropped");
     assert_eq!(sender.counters().removed_dropped, 1);
-    sender.close_removed(&mut halves);
-    assert_eq!(sender.counters().removed_dropped, 1, "once");
     assert_eq!(sender.counters().removed_closed, 0);
+    let _ = halves;
+}
+
+/// The follow-up of #829's review, points 1 and 2: an entry the endpoint
+/// will not close whole (its queue already gone, so the route stays in
+/// use) is counted once, and the sender asks for the endpoint's reset,
+/// which drops what would not close; one request per endpoint.
+#[test]
+fn a_failed_close_asks_for_one_reset_and_counts_once() {
+    use karyos_io::backend::{Authority, TxQueueConfig};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let open = |tx: &mut Box<karyos_io::sockets::endpoint::SocketsTx<_>>| {
+        tx.open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap()
+    };
+    // A queue that stays open on the route, and a stale one in the entry.
+    let _held = open(tx);
+    let stale = open(tx);
+    let mut report = karyos_io::backend::TxReport::new();
+    let _ = tx.close_queue(stale, &mut report);
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(stale);
+    let entry = super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    };
+    sender.closing.push(entry);
+    sender.closing.push(entry);
+    sender.close_removed(&mut halves);
+    let counters = sender.counters();
+    assert_eq!(
+        counters.removed_close_failed, 2,
+        "once per entry: {counters:?}"
+    );
+    let mut asked = Vec::new();
+    sender.request_resets(|endpoint| {
+        asked.push(endpoint);
+        true
+    });
+    assert_eq!(asked, [EndpointId(1)], "one request for the endpoint");
+    assert_eq!(sender.counters().reset_requests, 1);
+    let mut again = 0;
+    sender.request_resets(|_| {
+        again += 1;
+        true
+    });
+    assert_eq!(again, 0, "asked once");
+}
+
+/// The follow-up of #829's review, point 3: an entry of another epoch
+/// than its endpoint's half is dropped and counted.
+#[test]
+fn an_entry_of_another_epoch_is_dropped_and_counted() {
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let older = tx.capabilities().epoch.next().unwrap();
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: older,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    });
+    sender.close_removed(&mut halves);
+    let counters = sender.counters();
+    assert_eq!(counters.removed_dropped, 1, "{counters:?}");
+    assert_eq!(
+        (counters.removed_closed, counters.removed_close_failed),
+        (0, 0)
+    );
 }
 
 /// Review H2 of #829 (karyos#630): with the conductor's event ring full,
