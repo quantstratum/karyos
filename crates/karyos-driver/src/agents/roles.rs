@@ -1619,12 +1619,14 @@ pub(super) fn roles<T: StreamTerms>(
             path_heartbeat_interval: config.path_heartbeat_interval,
             sender_heartbeat_interval: config.sender_heartbeat_interval,
             setup_interval: config.setup_interval,
+            // Per publication: its routes, or its destinations and those
+            // retired since the last drain, which a removal closes too.
             closing: Vec::with_capacity(
                 config
                     .publications
                     .checked_mul(
                         karyos_io::lanes::routes::MAX_ROUTES
-                            .saturating_add(super::data::MAX_DESTINATIONS),
+                            .saturating_add(super::data::MAX_DESTINATIONS.saturating_mul(2)),
                     )
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
             ),

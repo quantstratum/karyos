@@ -837,10 +837,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
         }
         let &(endpoint, _) = held.first().ok_or(DriverError::InvalidConfig)?;
-        // The family of every destination: the shared endpoint's own.
+        // The family of every destination: the shared endpoint's own. An
+        // endpoint of unknown address is not taken for IPv4: its
+        // destinations are refused (plan 157, point 6).
         let ipv4 = net
             .endpoint_address(endpoint)
-            .is_none_or(|address| address.is_ipv4());
+            .map(|address| address.is_ipv4());
         let outbound = if held.len() > 1 {
             Outbound::new_routed(&held, alias, readers, &quanta, config.mtu, reliable)
         } else {
