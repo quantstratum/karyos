@@ -288,7 +288,7 @@ fn trace_export_page(c: &mut Criterion) {
                 Some(1),
                 MAX_EXPORT_REPLY,
             ) {
-                black_box(karyos_agent::json::trace_export(&page, MAX_EXPORT_REPLY));
+                black_box(karyos_agent::json::trace_export(&page));
             }
         });
     });

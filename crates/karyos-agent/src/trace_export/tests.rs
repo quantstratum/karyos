@@ -350,3 +350,59 @@ fn the_read_is_bounded_by_bytes_and_count() {
     let page = export(&reader, EPOCH, 0, usize::MAX, None, usize::MAX).unwrap();
     assert_eq!(page.records.len(), 40);
 }
+
+/// Re-review F1 of #826: a page that ends before a busy journal's record
+/// states nothing past its end: a malformed record after the cut is lost
+/// on the next page, not on this one.
+#[test]
+fn nothing_is_lost_past_where_the_page_ends() {
+    use karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD;
+
+    let mut mirror = mirror(16);
+    let other = JournalEntry::open(11, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.write_entry(1, Some(&other)));
+    let long = u64::try_from(MAX_MIRROR_PAYLOAD).unwrap() + 1;
+    let _ = mirror.append(10, 0, &[0, !0]).unwrap();
+    let _ = mirror.append(11, 1, &[1, !1]).unwrap();
+    let _ = mirror.append_with_length(10, 2, &[2, 2], long).unwrap();
+    let _ = mirror.append(10, 3, &[3, !3]).unwrap();
+    assert!(mirror.hold_entry(1, true));
+    let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
+    assert_eq!((seqs(&page), page.next), (vec![0], 1));
+    assert!(page.lost.is_empty(), "{:?}", page.lost);
+    assert!(mirror.hold_entry(1, false));
+    let page = read_page(&mirror.reader(), EPOCH, 1, 16, None).unwrap();
+    assert_eq!(seqs(&page), [1, 3]);
+    assert_eq!(
+        page.lost,
+        vec![ExportLoss {
+            first: 2,
+            last: 2,
+            reason: LossReason::Malformed
+        }]
+    );
+}
+
+/// Re-review of #826: an entry busy on every attempt (a writer stopped
+/// mid-write) never stalls the cursor: when the page's first record is
+/// its journal's, its records are lost as `journal_unreadable`, and the
+/// page goes on.
+#[test]
+fn a_stuck_entry_is_a_loss_not_a_stall() {
+    let mut mirror = mirror(16);
+    let other = JournalEntry::open(11, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.write_entry(1, Some(&other)));
+    let _ = mirror.append(11, 0, &[0, !0]).unwrap();
+    let _ = mirror.append(10, 1, &[1, !1]).unwrap();
+    let _ = mirror.append(11, 2, &[2, !2]).unwrap();
+    assert!(mirror.hold_entry(1, true));
+    let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
+    assert_eq!(seqs(&page), [1]);
+    assert_eq!(page.next, 3);
+    let unreadable = |seq| ExportLoss {
+        first: seq,
+        last: seq,
+        reason: LossReason::UnreadableJournal,
+    };
+    assert_eq!(page.lost, vec![unreadable(0), unreadable(2)]);
+}

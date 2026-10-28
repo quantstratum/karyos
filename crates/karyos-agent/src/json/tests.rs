@@ -580,12 +580,13 @@ fn export_page(records: u64) -> crate::api::ExportPage {
 }
 
 /// R-CORE-13: a page states its loss first, then whole records, `next`,
-/// the head and the journals; past the bound it stops at a whole record,
-/// and `next` names the first one left out.
+/// the head, the journals and the unknown count, encoded whole: the read
+/// bounded it, the encoder cuts nothing. A record's length is computed
+/// without encoding it, exactly.
 #[test]
-fn an_export_page_stops_at_a_whole_record_within_its_bound() {
+fn an_export_page_is_encoded_whole() {
     let page = export_page(3);
-    let whole = trace_export(&page, usize::MAX);
+    let whole = trace_export(&page);
     assert!(
         whole.starts_with(
             r#"{"epoch":"000000000000000000000000000000ab","from":2,"lost":[{"first":2,"last":4,"reason":"overwritten"}],"records":[{"seq":5,"journal":10,"sequence":5,"payload":[5,"#
@@ -596,32 +597,25 @@ fn an_export_page_stops_at_a_whole_record_within_its_bound() {
         whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"unknown_records":3}"#),
         "{whole}"
     );
-    let one = whole.matches(r#"{"seq":"#).count();
-    assert_eq!(one, 3);
-    // A bound below one record still returns that record, whole.
-    let tiny = trace_export(&page, 10);
-    assert_eq!(tiny.matches(r#"{"seq":"#).count(), 1);
-    assert!(tiny.contains(r#""next":6,"#), "{tiny}");
-    // A bound of two records and their journal leaves the third.
-    let record = (whole.len() - tiny.len()) / 2;
-    let journal = r#"{"journal":10,"table":"unknown"}"#.len();
-    let two = trace_export(&page, EXPORT_REPLY_OVERHEAD + 2 * record + journal + 4);
-    assert_eq!(two.matches(r#"{"seq":"#).count(), 2, "{two}");
-    assert!(two.contains(r#""next":7,"#), "{two}");
-}
-
-/// R-CORE-13: a page of the most records one request may ask for stays
-/// within the reply bound.
-#[test]
-fn a_full_export_page_stays_within_the_bound() {
-    let records = u64::try_from(crate::api::EXPORT_MAX).unwrap();
-    let reply = trace_export(&export_page(records), crate::api::MAX_EXPORT_REPLY);
-    assert!(
-        reply.len() <= crate::api::MAX_EXPORT_REPLY + 300,
-        "{}",
-        reply.len()
-    );
-    assert!(reply.matches(r#"{"seq":"#).count() < crate::api::EXPORT_MAX);
+    assert_eq!(whole.matches(r#"{"seq":"#).count(), 3);
+    for record in [
+        crate::api::ExportRecord {
+            seq: 0,
+            journal: 9,
+            sequence: 10,
+            payload: Vec::new(),
+        },
+        crate::api::ExportRecord {
+            seq: u64::MAX,
+            journal: 1,
+            sequence: 999,
+            payload: vec![0, 9, 10, 99, 100, u64::MAX],
+        },
+    ] {
+        let mut text = String::new();
+        export_record(&mut Out(&mut text), &record);
+        assert_eq!(export_record_len(&record), text.len() + 1, "{text}");
+    }
 }
 
 /// R-CORE-13: a cursor of another driver instance is refused, typed, with
@@ -639,9 +633,7 @@ fn export_refusals_are_typed() {
 /// `MAX_EXPORT_REPLY` plus one of each.
 #[test]
 fn the_largest_record_and_journal_encode_within_their_bounds() {
-    use crate::api::{
-        ExportJournal, ExportRecord, MAX_EXPORT_REPLY, MAX_JOURNAL_REPLY, MAX_RECORD_REPLY,
-    };
+    use crate::api::{ExportJournal, ExportRecord, MAX_JOURNAL_REPLY, MAX_RECORD_REPLY};
     use karyos_sys::record_journal::DropRange;
     use karyos_sys::trace_mirror::{
         JournalEntry, JournalKind, JournalState, MAX_MIRROR_PAYLOAD, MIRROR_RANGES, TimeNamespace,
@@ -706,42 +698,13 @@ fn the_largest_record_and_journal_encode_within_their_bounds() {
         journals: vec![ExportJournal::Live(Box::new(entry))],
         unknown_records: 0,
     };
-    let reply = trace_export(&page, MAX_EXPORT_REPLY);
-    assert!(reply.len() <= MAX_EXPORT_REPLY + MAX_RECORD_REPLY + MAX_JOURNAL_REPLY);
-    assert_eq!(reply.matches(r#""table":"live""#).count(), 1);
-}
-
-/// R-CORE-13: a page's journals are those its records here name, so a
-/// journal of a record left out by the bound is left out with it.
-#[test]
-fn an_export_page_names_only_the_journals_of_its_records() {
-    use crate::api::{ExportJournal, ExportPage, ExportRecord};
-
-    let record = |seq, journal| ExportRecord {
-        seq,
-        journal,
-        sequence: seq,
-        payload: vec![seq; 26],
+    // One record and one journal, the most a reply holds past the bound.
+    let one = crate::api::ExportPage {
+        records: page.records[..1].to_vec(),
+        ..page
     };
-    let page = ExportPage {
-        epoch: 1,
-        from: 0,
-        lost: Vec::new(),
-        records: vec![record(0, 10), record(1, 11)],
-        next: 2,
-        head: 2,
-        journals: vec![
-            ExportJournal::Unknown { journal: 10 },
-            ExportJournal::Unknown { journal: 11 },
-        ],
-        unknown_records: 2,
-    };
-    let one = trace_export(&page, 10);
-    assert!(one.contains(r#""next":1,"#), "{one}");
+    let reply = trace_export(&one);
     assert!(
-        one.ends_with(r#""journals":[{"journal":10,"table":"unknown"}],"unknown_records":2}"#),
-        "{one}"
+        reply.len() <= crate::json::EXPORT_REPLY_OVERHEAD + MAX_RECORD_REPLY + MAX_JOURNAL_REPLY
     );
-    let both = trace_export(&page, usize::MAX);
-    assert_eq!(both.matches(r#""table":"unknown""#).count(), 2);
 }

@@ -60,7 +60,7 @@
 //!   sizes of R-CORE-13 and R-CORE-14, enters [`LIMITS`] as a new entry,
 //!   negotiable or not, and a v1 client that does not name it is unaffected.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -80,12 +80,15 @@ pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
 /// The time a whole reply may take to write: past it, the reply is cut
 /// short and the connection closed (`Served::Dropped`).
 pub const WRITE_DEADLINE: Duration = Duration::from_millis(250);
+/// The time a whole request may take to read: past it, the connection is
+/// dropped unanswered.
+pub const READ_DEADLINE: Duration = Duration::from_millis(250);
 /// The bytes of one write of a reply at most.
 const WRITE_CHUNK: usize = 64 << 10;
 /// The time one [`Server::poll`] starts connections in: one started
-/// before it may still take [`IO_TIMEOUT`] to read and [`WRITE_DEADLINE`]
-/// to answer, so a poll lasts at most `POLL_BUDGET + IO_TIMEOUT +
-/// WRITE_DEADLINE`, 850 ms, however many clients wait.
+/// before it may still take [`READ_DEADLINE`] to read and
+/// [`WRITE_DEADLINE`] to answer, so a poll lasts at most `POLL_BUDGET +
+/// READ_DEADLINE + WRITE_DEADLINE`, 1 s, however many clients wait.
 pub const POLL_BUDGET: Duration = Duration::from_millis(500);
 /// Connections one [`Server::poll`] serves at most; the rest wait for the
 /// next poll, so a burst of clients cannot hold the polling thread.
@@ -94,7 +97,7 @@ pub const MAX_ACCEPTS: usize = 16;
 /// The dimensions `limits` answers, their bounds being the constants
 /// above. Only `read.request_bytes` is negotiable in v1, and only
 /// downwards: no bound is raised.
-pub const LIMITS: [Limit; 7] = [
+pub const LIMITS: [Limit; 8] = [
     Limit {
         name: "read.request_bytes",
         bound: Some(MAX_REQUEST as u64),
@@ -103,6 +106,11 @@ pub const LIMITS: [Limit; 7] = [
     Limit {
         name: "read.timeout_ms",
         bound: Some(IO_TIMEOUT.as_millis() as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "read.deadline_ms",
+        bound: Some(READ_DEADLINE.as_millis() as u64),
         negotiable: false,
     },
     Limit {
@@ -499,10 +507,7 @@ impl Server {
                     epoch,
                 },
             ) => match agent.trace_export(Path::new(dir), from, count, epoch) {
-                Ok(Ok(page)) => (
-                    json::trace_export(&page, crate::api::MAX_EXPORT_REPLY),
-                    Served::TraceExport,
-                ),
+                Ok(Ok(page)) => (json::trace_export(&page), Served::TraceExport),
                 Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::Refused),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
@@ -548,7 +553,9 @@ fn write_within(stream: &mut UnixStream, reply: &[u8], deadline: Duration) -> bo
             Ok(written) => rest = rest.get(written..).unwrap_or(&[]),
         }
     }
-    start.elapsed() <= deadline && stream.flush().is_ok()
+    // Written whole: served, even if the last write ended past the
+    // deadline.
+    stream.flush().is_ok()
 }
 
 impl Drop for Server {
@@ -603,13 +610,32 @@ enum Request<'a> {
 /// Reads one request line, up to [`MAX_REQUEST`] bytes; `None` when the
 /// client sent none in time or closed first.
 fn read_request(stream: &UnixStream) -> Option<String> {
-    let limit = u64::try_from(MAX_REQUEST).ok()?.checked_add(1)?;
-    let mut reader = BufReader::new(stream.take(limit));
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line),
+    let start = std::time::Instant::now();
+    let limit = MAX_REQUEST.checked_add(1)?;
+    let mut stream = stream;
+    let mut line = Vec::with_capacity(limit);
+    let mut buffer = [0u8; MAX_REQUEST + 1];
+    // Within READ_DEADLINE in all: each read gets the time left, so a
+    // client sending a byte at a time cannot hold the polling thread.
+    while !line.contains(&b'\n') && line.len() < limit {
+        let left = READ_DEADLINE.saturating_sub(start.elapsed());
+        if left.is_zero() || stream.set_read_timeout(Some(left.min(IO_TIMEOUT))).is_err() {
+            return None;
+        }
+        let want = limit.saturating_sub(line.len());
+        match stream.read(buffer.get_mut(..want)?) {
+            Ok(0) => break,
+            Ok(read) => line.extend_from_slice(buffer.get(..read)?),
+            Err(_) => return None,
+        }
     }
+    if let Some(end) = line.iter().position(|byte| *byte == b'\n') {
+        line.truncate(end + 1);
+    }
+    if line.is_empty() {
+        return None;
+    }
+    String::from_utf8(line).ok()
 }
 
 /// `KARYOS-AGENT <version> <request> [arguments]`, with or without its
@@ -927,6 +953,37 @@ mod tests {
         assert!(trickle.join().unwrap() < reply.len());
     }
 
+    /// Re-review F2 of #826: a client sending a request a byte at a time,
+    /// just under each read's timeout, cannot hold the polling thread past
+    /// the read deadline; a whole request is read.
+    #[test]
+    fn a_request_is_read_within_its_deadline() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let trickle = std::thread::spawn(move || {
+            for byte in b"KARYOS-AGENT 1 view\n" {
+                if writer.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(read_request(&reader), None);
+        assert!(
+            start.elapsed() < READ_DEADLINE + IO_TIMEOUT,
+            "{:?}",
+            start.elapsed()
+        );
+        drop(reader);
+        trickle.join().unwrap();
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"KARYOS-AGENT 1 view\nextra").unwrap();
+        assert_eq!(
+            read_request(&reader).as_deref(),
+            Some("KARYOS-AGENT 1 view\n")
+        );
+    }
+
     /// R-CORE-38: a dimension this agent does not know is refused by
     /// name, so a client tells it from an agent without `limits`.
     #[test]
@@ -1041,11 +1098,12 @@ mod tests {
         assert_eq!(negotiate(&LIMITS, "read.request_bytes=100"), Ok(lowered));
         assert_eq!(bounds[0], Some(256));
         assert_eq!(bounds[1], Some(100));
-        assert_eq!(bounds[2], Some(100));
-        assert_eq!(bounds[3], Some(250));
-        assert_eq!(bounds[4], None);
-        assert_eq!(bounds[5], Some(16));
-        assert_eq!(bounds[6], Some(1));
+        assert_eq!(bounds[2], Some(250));
+        assert_eq!(bounds[3], Some(100));
+        assert_eq!(bounds[4], Some(250));
+        assert_eq!(bounds[5], None);
+        assert_eq!(bounds[6], Some(16));
+        assert_eq!(bounds[7], Some(1));
     }
 
     /// R-CORE-38: a proposal above a bound is refused with that limit;
@@ -1054,11 +1112,11 @@ mod tests {
     fn a_proposal_above_a_bound_is_refused_with_the_bound() {
         assert_eq!(
             negotiate(&LIMITS, "write.timeout_ms=101"),
-            Err(Refusal::Above(LIMITS[2]))
+            Err(Refusal::Above(LIMITS[3]))
         );
         assert_eq!(
             negotiate(&LIMITS, "read.request_bytes=256 connection.requests=2"),
-            Err(Refusal::Above(LIMITS[6]))
+            Err(Refusal::Above(LIMITS[7]))
         );
         for bad in [
             "read.timeout_ms",

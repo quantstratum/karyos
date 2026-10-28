@@ -913,6 +913,10 @@ pub enum LossReason {
     /// A record whose length passed the payload bound: never delivered
     /// cut.
     Malformed,
+    /// Records whose journal's table or log entry stayed busy on every
+    /// attempt from a page's first record on: never delivered without
+    /// their journal, and never stalling the cursor.
+    UnreadableJournal,
 }
 
 /// A journal a page's records name, as the table showed it when the page

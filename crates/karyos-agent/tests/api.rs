@@ -274,6 +274,7 @@ fn a_client_negotiates_the_limits() {
     let all = concat!(
         r#"{"limits":{"read.request_bytes":{"value":256,"negotiable":true},"#,
         r#""read.timeout_ms":{"value":100,"negotiable":false},"#,
+        r#""read.deadline_ms":{"value":250,"negotiable":false},"#,
         r#""write.timeout_ms":{"value":100,"negotiable":false},"#,
         r#""write.deadline_ms":{"value":250,"negotiable":false},"#,
         r#""write.response_bytes":{"value":null},"#,

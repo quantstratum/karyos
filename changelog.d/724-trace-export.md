@@ -24,8 +24,12 @@
   `unknown`, its records counted in `unknown_records`. A malformed record
   (a length past the payload bound, `MirrorRecord::truncated`) is never
   delivered: it is lost with its sequence and reason `malformed`, and the
-  page goes on. Each lost range carries its `reason` (`overwritten` or
-  `malformed`).
+  page goes on. An entry busy on every attempt from a page's first record
+  on (a writer stopped mid-write) never stalls the cursor: its records are
+  lost with reason `journal_unreadable`. Each lost range carries its
+  `reason` (`overwritten`, `malformed` or `journal_unreadable`), and none
+  is stated past the page's `next`. The read alone bounds the page, in
+  batches of 64 records; `json::trace_export` encodes it whole.
   `capabilities` lists `trace-export`.
 - `karyos_sys::diag_ring::scan_at_most` and
   `TraceMirrorReader::scan_at_most`: a ring scan that delivers at most a
@@ -37,6 +41,10 @@
 - The API socket writes each reply within `WRITE_DEADLINE` (250 ms) in
   all, checked after every write: a reply a client reads too slowly is
   cut short, and the connection closed, so it ends at EOF without its
-  final newline. `limits` answers it as `write.deadline_ms`. One poll
-  starts connections for `POLL_BUDGET` (500 ms) at most. Refusals of
+  final newline; a reply written whole is served even if its last write
+  ended at the deadline. `limits` answers it as `write.deadline_ms`. A
+  request is read within `READ_DEADLINE` (250 ms) in all, each read under
+  the time left (`read.deadline_ms`). One poll
+  starts connections for `POLL_BUDGET` (500 ms) at most, so it lasts 1 s at
+  most. Refusals of
   `trace-export` are served as refusals.

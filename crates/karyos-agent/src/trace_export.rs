@@ -45,7 +45,10 @@ pub(crate) const OVERWRITE_RETRIES: usize = 4;
 /// one range each.
 pub(crate) const MAX_LOST_RANGES: usize = OVERWRITE_RETRIES + 1;
 /// The bytes one lost range takes in a reply at most.
-const LOSS_BYTES: usize = 96;
+pub(crate) const LOSS_BYTES: usize = 96;
+/// Records one scan of a page reads at most, so a page that ends early
+/// copies no more than this past its end.
+const SCAN_BATCH: usize = 64;
 /// Reads of the ring's bounds, or of a table or log entry, retried while
 /// a publication is in progress.
 const BUSY_RETRIES: usize = 16;
@@ -104,45 +107,67 @@ pub fn export(
             reason,
         }),
     };
-    for _ in 0..=OVERWRITE_RETRIES {
+    // In batches, so the read stops where the page ends instead of
+    // copying the rest of the count.
+    let mut scanned = 0usize;
+    let mut retries = 0;
+    loop {
+        let batch = count.saturating_sub(scanned).min(SCAN_BATCH);
+        if batch == 0 {
+            break;
+        }
         let before = cursor;
-        let left = u64::try_from(count.saturating_sub(records.len())).unwrap_or(u64::MAX);
-        let scan = mirror.scan_at_most(&mut cursor, left, |record| {
-            if stop.is_some() {
-                return;
-            }
-            // A malformed record is never delivered: it is lost, with its
-            // sequence, counted in the bound, and the page goes on.
-            if record.truncated {
-                if used.saturating_add(LOSS_BYTES) > max_bytes && !records.is_empty() {
-                    stop = Some(record.seq);
-                } else {
-                    used = used.saturating_add(LOSS_BYTES);
-                    note(&mut lost, record.seq, record.seq, LossReason::Malformed);
+        let (kept, lost_kept) = (records.len(), lost.len());
+        let scan = mirror.scan_at_most(
+            &mut cursor,
+            u64::try_from(batch).unwrap_or(u64::MAX),
+            |record| {
+                if stop.is_some() {
+                    return;
                 }
-                return;
-            }
-            let exported = ExportRecord {
-                seq: record.seq,
-                journal: record.journal,
-                sequence: record.sequence,
-                payload: record.payload.to_vec(),
-            };
-            let journal = if named.contains(&record.journal) {
-                0
-            } else {
-                crate::api::MAX_JOURNAL_REPLY
-            };
-            let size = crate::json::export_record_len(&exported).saturating_add(journal);
-            if !records.is_empty() && used.saturating_add(size) > max_bytes {
-                stop = Some(record.seq);
-                return;
-            }
-            used = used.saturating_add(size);
-            let _ = named.insert(record.journal);
-            records.push(exported);
-        });
+                scanned += 1;
+                // A malformed record is never delivered: it is lost, with
+                // its sequence, counted in the bound, and the page goes on.
+                if record.truncated {
+                    if used.saturating_add(LOSS_BYTES) > max_bytes && !records.is_empty() {
+                        stop = Some(record.seq);
+                    } else {
+                        used = used.saturating_add(LOSS_BYTES);
+                        note(&mut lost, record.seq, record.seq, LossReason::Malformed);
+                    }
+                    return;
+                }
+                let exported = ExportRecord {
+                    seq: record.seq,
+                    journal: record.journal,
+                    sequence: record.sequence,
+                    payload: record.payload.to_vec(),
+                };
+                let journal = if named.contains(&record.journal) {
+                    0
+                } else {
+                    crate::api::MAX_JOURNAL_REPLY
+                };
+                let size = crate::json::export_record_len(&exported).saturating_add(journal);
+                if !records.is_empty() && used.saturating_add(size) > max_bytes {
+                    stop = Some(record.seq);
+                    return;
+                }
+                used = used.saturating_add(size);
+                let _ = named.insert(record.journal);
+                records.push(exported);
+            },
+        );
         if scan.overwritten > 0 {
+            if kept > 0 {
+                // Lapped after this page's first records: the page ends
+                // where it was, so its loss is never stated after them; the
+                // next read states it first.
+                records.truncate(kept);
+                lost.truncate(lost_kept);
+                stop = Some(before);
+                break;
+            }
             note(
                 &mut lost,
                 before,
@@ -150,27 +175,61 @@ pub fn export(
                 LossReason::Overwritten,
             );
         }
-        // Overwritten under the reader: the next scan's boundary proves
-        // it and states it as lost, in this page while it has no record
-        // yet (the loss comes first), else in the next one.
-        if stop.is_some()
-            || scan.stopped != Some(karyos_sys::diag_ring::ScanStop::Overwritten)
-            || !records.is_empty()
-        {
+        if stop.is_some() {
             break;
+        }
+        match scan.stopped {
+            // Overwritten under the reader: the next scan's boundary proves
+            // it and states it as lost, in this page while it has no record
+            // yet (the loss comes first), else in the next one.
+            Some(karyos_sys::diag_ring::ScanStop::Overwritten) => {
+                if !records.is_empty() || retries == OVERWRITE_RETRIES {
+                    break;
+                }
+                retries += 1;
+            }
+            Some(karyos_sys::diag_ring::ScanStop::Busy) => break,
+            // The end of what the ring holds.
+            None if usize::try_from(scan.delivered).unwrap_or(usize::MAX) < batch => break,
+            None => {}
         }
     }
     let mut next = stop.unwrap_or(cursor);
     let (journals, unread) = journals(mirror, &records);
-    // A record whose journal could not be read would not be decodable:
-    // the page ends before the first one.
-    if let Some(at) = records
+    if records
+        .first()
+        .is_some_and(|record| unread.contains(&record.journal))
+    {
+        // An entry busy on every attempt from the page's first record on
+        // (a writer stopped mid-write leaves it so): its records are lost,
+        // stated as such, rather than stalling the cursor for good.
+        for record in records
+            .iter()
+            .filter(|record| unread.contains(&record.journal))
+        {
+            note(
+                &mut lost,
+                record.seq,
+                record.seq,
+                LossReason::UnreadableJournal,
+            );
+        }
+        records.retain(|record| !unread.contains(&record.journal));
+    } else if let Some(at) = records
         .iter()
         .position(|record| unread.contains(&record.journal))
     {
+        // A record whose journal could not be read would not be
+        // decodable: the page ends before it, and the reader retries.
         next = records.get(at).map_or(next, |record| record.seq);
         records.truncate(at);
     }
+    // Nothing is stated past where the page ends.
+    lost.retain(|loss| loss.first < next);
+    for loss in &mut lost {
+        loss.last = loss.last.min(next.saturating_sub(1));
+    }
+    lost.sort_by_key(|loss| loss.first);
     let kept: BTreeSet<u64> = records.iter().map(|record| record.journal).collect();
     let journals: Vec<ExportJournal> = journals
         .into_iter()

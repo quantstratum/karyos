@@ -783,52 +783,12 @@ fn bucket_lane(out: &mut Out<'_>, lane: &BucketLane) {
 /// A `trace-export` page (R-CORE-13): the driver instance as `epoch` (32
 /// lowercase hex digits, as `instance`), the sequence asked for, the lost
 /// ranges first, then whole records in order, the next sequence to ask
-/// for, the ring's head, and the journals the records here name. Each
-/// record counts in `max_bytes` with its journal the first time one names
-/// it; past the bound (the first record aside, which is always here, with
-/// its journal) the rest is left out and `next` is the first record left
-/// out. So a reply is at most `max_bytes` plus one record and one journal
-/// ([`crate::api::MAX_RECORD_REPLY`], [`crate::api::MAX_JOURNAL_REPLY`]).
+/// for, the ring's head, the journals the records name, and how many
+/// records name an unknown one. The read
+/// ([`crate::trace_export::export`]) bounded the page; this encodes it
+/// whole, cutting nothing.
 #[must_use]
-pub fn trace_export(page: &ExportPage, max_bytes: usize) -> String {
-    let journal_of = |number: u64| {
-        page.journals.iter().find(|journal| match journal {
-            ExportJournal::Live(entry) => entry.journal == number,
-            ExportJournal::Recycled(entry) => entry.journal == number,
-            ExportJournal::Unknown { journal } => *journal == number,
-        })
-    };
-    let mut records = Vec::with_capacity(page.records.len());
-    let mut journals: Vec<String> = Vec::new();
-    let mut named = std::collections::BTreeSet::new();
-    let mut used = EXPORT_REPLY_OVERHEAD;
-    let mut next = page.next;
-    for record in &page.records {
-        let mut text = String::new();
-        export_record(&mut Out(&mut text), record);
-        let mut journal = None;
-        if !named.contains(&record.journal)
-            && let Some(found) = journal_of(record.journal)
-        {
-            let mut text = String::new();
-            export_journal(&mut Out(&mut text), found);
-            journal = Some(text);
-        }
-        let size = text
-            .len()
-            .saturating_add(journal.as_ref().map_or(0, String::len))
-            .saturating_add(2);
-        if !records.is_empty() && used.saturating_add(size) > max_bytes {
-            next = record.seq;
-            break;
-        }
-        used = used.saturating_add(size);
-        records.push(text);
-        if let Some(journal) = journal {
-            let _ = named.insert(record.journal);
-            journals.push(journal);
-        }
-    }
+pub fn trace_export(page: &ExportPage) -> String {
     let mut text = String::new();
     Out(&mut text).object(|fields| {
         fields.string("epoch", &format!("{:032x}", page.epoch));
@@ -842,34 +802,44 @@ pub fn trace_export(page: &ExportPage, max_bytes: usize) -> String {
                     match loss.reason {
                         crate::api::LossReason::Overwritten => "overwritten",
                         crate::api::LossReason::Malformed => "malformed",
+                        crate::api::LossReason::UnreadableJournal => "journal_unreadable",
                     },
                 );
             });
         });
         fields
             .key("records")
-            .array(&records, |out, record| out.raw(record));
-        fields.number("next", next);
+            .array(&page.records, |out, record| export_record(out, record));
+        fields.number("next", page.next);
         fields.number("head", page.head);
         fields
             .key("journals")
-            .array(&journals, |out, journal| out.raw(journal));
+            .array(&page.journals, |out, journal| export_journal(out, journal));
         fields.number("unknown_records", page.unknown_records);
     });
     text
 }
 
 /// The bytes of a `trace-export` reply besides its records and journals:
-/// its fields, 256 bytes at most, and its lost ranges, at most
-/// `MAX_LOST_RANGES` of at most 48 bytes each.
-pub(crate) const EXPORT_REPLY_OVERHEAD: usize = 256 + crate::trace_export::MAX_LOST_RANGES * 48;
+/// its fields, 256 bytes at most, and its overwritten ranges, at most
+/// `MAX_LOST_RANGES` of at most `LOSS_BYTES` each (malformed records are
+/// counted as the read meets them).
+pub(crate) const EXPORT_REPLY_OVERHEAD: usize =
+    256 + crate::trace_export::MAX_LOST_RANGES * crate::trace_export::LOSS_BYTES;
 
-/// The bytes `record`'s encoding takes in a page, with its separator.
+/// The bytes `record`'s encoding takes in a page, with its separator,
+/// computed without encoding it:
+/// `{"seq":S,"journal":J,"sequence":Q,"payload":[W,...]},`.
 #[must_use]
 pub(crate) fn export_record_len(record: &crate::api::ExportRecord) -> usize {
-    let mut text = String::new();
-    export_record(&mut Out(&mut text), record);
-    text.len().saturating_add(1)
+    let digits = |value: u64| value.checked_ilog10().map_or(1, |log| log as usize + 1);
+    let payload: usize = record.payload.iter().map(|word| digits(*word) + 1).sum();
+    // The keys and punctuation, the payload's last word having no comma.
+    r#"{"seq":,"journal":,"sequence":,"payload":[]},"#.len()
+        + digits(record.seq)
+        + digits(record.journal)
+        + digits(record.sequence)
+        + payload.saturating_sub(usize::from(!record.payload.is_empty()))
 }
 
 fn export_record(out: &mut Out<'_>, record: &crate::api::ExportRecord) {
