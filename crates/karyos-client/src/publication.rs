@@ -1605,6 +1605,30 @@ mod tests {
             assert_eq!(publication.offer(b"w").unwrap(), OfferOutcome::RateLimited);
         }
 
+        /// R-CORE-21: a spent copy reads the policy the driver published in
+        /// the outcome ring and applies a newer version, clamped and never
+        /// granting tokens: the looser rate earns sooner.
+        #[test]
+        fn a_spent_rate_copy_applies_a_newer_published_policy() {
+            use karyos_sys::rate_policy_slot::{OUTCOME_SLOT, publish};
+
+            let (driver, mut publication) = guarded_with(Some(messages_per_second(1, 1)));
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert_eq!(publication.offer(b"b").unwrap(), OfferOutcome::RateLimited);
+            publish(
+                driver.ring.words(),
+                OUTCOME_SLOT,
+                1,
+                &messages_per_second(100, 4),
+            );
+            // Applied, but no token granted at the change.
+            assert_eq!(publication.offer(b"b").unwrap(), OfferOutcome::RateLimited);
+            assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
+            // 10 ms at the new 100/s earns one: at the old 1/s it would not.
+            advance(10_000_000);
+            assert!(accepted(publication.offer(b"b").unwrap()));
+        }
+
         /// G-e3 (ACS 15347): a claim that will never be sent gives its
         /// token back: dropped, aborted, or aborted by its deadline before
         /// the commit; an accepted commit keeps it.

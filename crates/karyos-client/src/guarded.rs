@@ -29,6 +29,7 @@ use karyos_sys::guard;
 use karyos_sys::load_words::LoadWords;
 use karyos_sys::outcome_ring::{Kind, OutcomeError, OutcomeReader, Record};
 use karyos_sys::rate_limit::{RateLimiter, RatePolicy};
+use karyos_sys::rate_policy_slot::{OUTCOME_SLOT, SlotRead, try_read};
 use karyos_sys::sync::AtomicU64;
 
 use crate::error::ClientError;
@@ -118,6 +119,9 @@ pub struct GuardBinding {
 struct RateCopy {
     limiter: RateLimiter,
     clock: fn() -> u64,
+    /// The version of the published policy the copy applies; 0 for the
+    /// policy it was created with.
+    version: u64,
 }
 
 impl GuardBinding {
@@ -186,6 +190,7 @@ impl GuardBinding {
         self.rate = Some(RateCopy {
             limiter: RateLimiter::new(messages, clock()),
             clock,
+            version: 0,
         });
         self
     }
@@ -198,12 +203,31 @@ impl GuardBinding {
     }
 
     /// Whether the rate copy admits one more message now (refilled from the
-    /// clock, charging nothing); always without a rate limit.
+    /// clock, charging nothing); always without a rate limit. On the slow
+    /// path, a copy that does not admit reads the policy the driver
+    /// published in the outcome ring and applies a newer version (R-CORE-21,
+    /// clamped, never granting tokens) before it answers; a read that finds
+    /// a publication in progress keeps the copy as it is.
     pub(crate) fn rate_admits(&mut self) -> bool {
-        self.rate.as_mut().is_none_or(|copy| {
-            copy.limiter.refill_at((copy.clock)());
-            copy.limiter.admits(0, true)
-        })
+        let Some(copy) = self.rate.as_mut() else {
+            return true;
+        };
+        let now = (copy.clock)();
+        copy.limiter.refill_at(now);
+        if copy.limiter.admits(0, true) {
+            return true;
+        }
+        if let SlotRead::Policy { version, policy } = try_read(&*self.ring, OUTCOME_SLOT)
+            && version > copy.version
+        {
+            let messages = RatePolicy {
+                messages: policy.messages,
+                bytes: None,
+            };
+            copy.limiter.set_policy(messages, now);
+            copy.version = version;
+        }
+        copy.limiter.admits(0, true)
     }
 
     /// Whether the handle keeps a rate copy.
