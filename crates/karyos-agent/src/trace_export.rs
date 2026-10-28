@@ -32,16 +32,17 @@
 //!   clock provenance, the time namespace and the drop ranges a record
 //!   needs to be decoded and calibrated), the recycle log's entry for a
 //!   journal recycled since, unknown (gone from both, every entry read),
-//!   or unreadable: an entry still being written after `BUSY_BUDGET`
-//!   (1 ms) while the page's first record was its journal's, whose leading
-//!   run of records then goes out without calibration. Otherwise, and past
-//!   that run, the page ends before a record whose journal was not read.
-//!   The table is read, its busy entries waited for, before the log, as
-//!   the driver writes a log entry before it reuses a table entry.
-
+//!   or unreadable: an entry still being written after its wait while the
+//!   page's first record was its journal's, whose records in the page then
+//!   all go out without calibration. Otherwise the page ends before a
+//!   record whose journal was not read. The table is read, its busy
+//!   entries waited for, before the log, as the driver writes a log entry
+//!   before it reuses a table entry.
 //! - **Bounds.** At most [`crate::api::EXPORT_MAX`] records per page, read
 //!   in batches that stop where the page ends, and a pass over the table
-//!   and the log, its busy entries retried for `BUSY_BUDGET` (1 ms) at most.
+//!   and one over the log, the busy entries of each retried for
+//!   `BUSY_BUDGET` (1 ms): 2 ms in all, past which one yield and one more
+//!   read of the busy entries may run.
 
 use std::collections::BTreeSet;
 
@@ -70,8 +71,8 @@ thread_local! {
     pub(crate) static BETWEEN_BATCHES: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         std::cell::RefCell::new(None);
 }
-/// The time a read of the table and the log waits, in all, for entries
-/// being written, yielding between attempts: a driver writes an entry in
+/// The time a read of the table, and then one of the log, waits for
+/// entries being written, yielding between attempts: a driver writes an entry in
 /// a few stores, so a busy entry is a writer mid-write, which this waits
 /// out unless it was preempted or stopped there; 1 ms is past any write
 /// but a preempted one, and short enough not to hold the agent.
@@ -85,10 +86,11 @@ const BUSY_RETRIES: usize = 16;
 /// the epoch of the reader's cursor, if it has one.
 ///
 /// The read stops where the page must end: at the byte bound, before a
-/// record overwritten under it, and before the first record whose
-/// journal's table entry could not be read (busy: the reader retries);
-/// `next` names where. A malformed record is lost, with its sequence and
-/// reason, and the page goes on.
+/// record overwritten under it, and before the first record whose journal
+/// could not be read (busy: the reader retries), unless that journal is
+/// the first record's, whose records all go out `unreadable`; `next` names
+/// where. A malformed record is lost, with its sequence and reason, and
+/// the page goes on.
 ///
 /// # Errors
 ///
@@ -116,16 +118,18 @@ pub fn export(
     )
 }
 
-/// What one export waits for and states at most: the time busy table and
-/// log entries are waited for, and the overwritten ranges a page states.
+/// What one export waits for and states at most: the time busy entries are
+/// waited for, in the table and then in the log, and the overwritten
+/// ranges a page states.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Waits {
     pub(crate) busy_budget: std::time::Duration,
     pub(crate) max_lost_ranges: usize,
 }
 
-/// [`export`] with its [`Waits`]: `busy_budget` at most for table and log
-/// entries being written, and `max_lost_ranges` overwritten ranges.
+/// [`export`] with its [`Waits`]: `busy_budget` for table entries being
+/// written, then as much for log entries, and `max_lost_ranges`
+/// overwritten ranges.
 pub(crate) fn export_within(
     mirror: &TraceMirrorReader,
     (epoch, asked): (u128, Option<u128>),
@@ -281,27 +285,23 @@ pub(crate) fn export_within(
     // the page's first record, an entry stayed busy past the budget: the
     // agent keeps no state to tell a writer stopped mid-write from an
     // unlucky moment, so nothing is lost and the cursor never stalls: that
-    // journal's leading run of records goes out without calibration, its
-    // journal `unreadable`, and the page ends at the next record whose
-    // journal is unread.
-    let mut skip = 0;
+    // journal's records in the page all go out without calibration, its
+    // journal `unreadable`, so a stuck entry costs one wait per page, not
+    // one per run of its records. The page ends at the first record of
+    // another journal left unread.
+    let mut unreadable = None;
     if let Some(first) = records
         .first()
         .filter(|record| unread.contains(&record.journal))
         .map(|record| record.journal)
     {
-        skip = records
-            .iter()
-            .position(|record| record.journal != first)
-            .unwrap_or(records.len());
+        unreadable = Some(first);
         journals.push(ExportJournal::Unreadable { journal: first });
         journals.sort_by_key(journal_number);
     }
     if let Some(at) = records
         .iter()
-        .skip(skip)
-        .position(|record| unread.contains(&record.journal))
-        .map(|at| at + skip)
+        .position(|record| Some(record.journal) != unreadable && unread.contains(&record.journal))
     {
         next = records.get(at).map_or(next, |record| record.seq);
         records.truncate(at);
@@ -366,11 +366,11 @@ fn journal_number(journal: &ExportJournal) -> u64 {
 
 /// The journals `records` name, from the table, then the recycle log, and
 /// those that could not be read. An entry being written is retried, the
-/// others read once: each busy entry again and again, yielding, for
-/// `BUSY_BUDGET` (1 ms) in all, so a writer preempted for a moment mid-write is
-/// waited for. One still busy then may hold any journal, so a journal
-/// found in neither part is unknown only when every entry was read, and
-/// unread otherwise.
+/// others read once: each part's busy entries again and again, yielding,
+/// for `busy_budget` (1 ms) per part, so a writer preempted for a moment
+/// mid-write is waited for. One still busy then may hold any journal, so a
+/// journal found in neither part is unknown only when every entry was
+/// read, and unread otherwise.
 fn journals(
     mirror: &TraceMirrorReader,
     records: &[ExportRecord],
@@ -405,55 +405,61 @@ fn journals(
             LogRead::Free => true,
         },
     };
+    // One part: every slot read once, then its busy ones retried for the
+    // budget, which each part has whole. Whether a busy entry was left.
+    let part = |slots: &mut dyn Iterator<Item = Slot>,
+                found: &mut Vec<ExportJournal>,
+                wanted: &mut BTreeSet<u64>| {
+        let mut busy = Vec::new();
+        for slot in slots {
+            if wanted.is_empty() {
+                break;
+            }
+            if !take(slot, found, wanted) {
+                busy.push(slot);
+            }
+        }
+        let start = std::time::Instant::now();
+        while !busy.is_empty() && !wanted.is_empty() && start.elapsed() < busy_budget {
+            std::thread::yield_now();
+            #[cfg(test)]
+            if matches!(busy.first(), Some(Slot::Table(_))) {
+                DURING_TABLE_WAIT.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
+            }
+            busy.retain(|slot| !take(*slot, found, wanted));
+        }
+        !busy.is_empty()
+    };
     // The table first, its busy entries waited for, and only then the log:
     // the driver writes a log entry before it reuses a table entry, so a
     // journal recycled while the table is waited for is in the log read
     // after (trace-journal-region.md, "Recycling").
-    let start = std::time::Instant::now();
-    let mut busy = Vec::new();
-    for slot in (0..mirror.entries()).map(Slot::Table) {
-        if wanted.is_empty() {
-            break;
-        }
-        if !take(slot, &mut found, &mut wanted) {
-            busy.push(slot);
-        }
-    }
-    while !busy.is_empty() && !wanted.is_empty() && start.elapsed() < busy_budget {
-        std::thread::yield_now();
-        #[cfg(test)]
-        DURING_TABLE_WAIT.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-        busy.retain(|slot| !take(*slot, &mut found, &mut wanted));
-    }
-    let mut log_busy = Vec::new();
-    for slot in (0..mirror.log_entries()).map(Slot::Log) {
-        if wanted.is_empty() {
-            break;
-        }
-        if !take(slot, &mut found, &mut wanted) {
-            log_busy.push(slot);
-        }
-    }
-    while !log_busy.is_empty() && !wanted.is_empty() && start.elapsed() < busy_budget {
-        std::thread::yield_now();
-        log_busy.retain(|slot| !take(*slot, &mut found, &mut wanted));
-    }
-    busy.extend(log_busy);
-    if busy.is_empty() || wanted.is_empty() {
-        found.extend(
-            wanted
-                .into_iter()
-                .map(|journal| ExportJournal::Unknown { journal }),
-        );
-        found.sort_by_key(journal_number);
-        return (found, BTreeSet::new());
-    }
+    let table_busy = part(
+        &mut (0..mirror.entries()).map(Slot::Table),
+        &mut found,
+        &mut wanted,
+    );
+    let log_busy = part(
+        &mut (0..mirror.log_entries()).map(Slot::Log),
+        &mut found,
+        &mut wanted,
+    );
+    let unread = if table_busy || log_busy {
+        core::mem::take(&mut wanted)
+    } else {
+        BTreeSet::new()
+    };
+    found.extend(
+        wanted
+            .into_iter()
+            .map(|journal| ExportJournal::Unknown { journal }),
+    );
     found.sort_by_key(journal_number);
-    (found, wanted)
+    (found, unread)
 }
 
 #[cfg(test)]

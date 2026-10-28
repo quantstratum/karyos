@@ -990,6 +990,23 @@ impl TraceMirror {
         true
     }
 
+    /// Test hook: holds recycle log entry `index` mid-write (its seqlock
+    /// odd) when `held`, as [`Self::hold_entry`] does a table entry.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_log(&mut self, index: usize, held: bool) -> bool {
+        let Some(version) = slot_start(STRIDE_WORDS, index, self.log, LOG_ENTRY_WORDS)
+            .and_then(|start| self.store.words().get(start))
+        else {
+            return false;
+        };
+        let now = version.load(Ordering::Relaxed);
+        let odd = now % 2 == 1;
+        if odd != held {
+            version.store(now.wrapping_add(1), Ordering::Release);
+        }
+        true
+    }
+
     /// Test hook: appends a record whose length word is `length` whatever
     /// `payload` holds, as a broken writer would; a dependent crate's test
     /// of a malformed record.
