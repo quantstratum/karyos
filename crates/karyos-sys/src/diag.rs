@@ -671,7 +671,9 @@ pub struct GuardAuditRecord {
     pub requester: u64,
     /// What happened: 1 closed, 2 already closed, 3 reopened, 4 refused,
     /// 5 a guarded stream's rate policy changed (R-CORE-21, `before` and
-    /// `after` its versions, `parameters` 1 safety or 2 administrator).
+    /// `after` its versions, `parameters` 1 safety or 2 administrator),
+    /// 6 a rate policy change that named the policy in force (unchanged,
+    /// `before` equal to `after`).
     /// A reader passes any other value through as it is: an outcome a
     /// later driver adds reads as unknown, never as a corrupt record.
     pub outcome: u8,

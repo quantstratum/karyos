@@ -288,7 +288,9 @@ fn only_a_change_tighter_in_every_dimension_is_a_tightening() {
     assert_eq!(policy(99, 10, None).transition(&base), Transition::Other);
 }
 
-/// R-CORE-21: the control reserve is a floor on the message rate and burst.
+/// R-CORE-21: the control reserve is a floor on the message rate and
+/// burst, and on a byte limit's, at `frame` bytes a reserved message
+/// (review B4 of #814: a byte bucket of 1 B/s held back every datagram).
 #[test]
 fn a_policy_keeps_its_reserve_only_at_or_above_it() {
     use crate::rate_limit::Rate;
@@ -297,10 +299,14 @@ fn a_policy_keeps_its_reserve_only_at_or_above_it() {
         per_second: 10,
         burst: 2,
     };
-    assert!(policy(10, 2, None).keeps(&reserve));
-    assert!(policy(50, 5, Some((1, 1))).keeps(&reserve));
-    assert!(!policy(9, 5, None).keeps(&reserve));
-    assert!(!policy(50, 1, None).keeps(&reserve));
+    assert!(policy(10, 2, None).keeps(&reserve, 1500));
+    assert!(!policy(9, 5, None).keeps(&reserve, 1500));
+    assert!(!policy(50, 1, None).keeps(&reserve, 1500));
+    // Bytes: 10 and 2 messages of 1500 bytes.
+    assert!(policy(50, 5, Some((15_000, 3000))).keeps(&reserve, 1500));
+    assert!(!policy(50, 5, Some((1, 1500))).keeps(&reserve, 1500));
+    assert!(!policy(50, 5, Some((15_000, 2999))).keeps(&reserve, 1500));
+    assert!(!policy(50, 5, Some((14_999, 3000))).keeps(&reserve, 1500));
 }
 
 /// R-CORE-21: a new policy earns the old rates up to the change, then

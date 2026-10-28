@@ -149,10 +149,21 @@ impl RatePolicy {
 
     /// Whether `self` keeps at least `reserve`, the least message rate and
     /// burst a member needs for its cancellations and resolutions
-    /// (R-CORE-21's control reserve).
+    /// (R-CORE-21's control reserve), in both buckets: a byte limit keeps
+    /// `reserve` messages of `frame` bytes each, its rate and its burst, so
+    /// a tight byte bucket never holds back the reserved messages.
     #[must_use]
-    pub const fn keeps(&self, reserve: &Rate) -> bool {
-        self.messages.per_second >= reserve.per_second && self.messages.burst >= reserve.burst
+    pub const fn keeps(&self, reserve: &Rate, frame: u64) -> bool {
+        let messages =
+            self.messages.per_second >= reserve.per_second && self.messages.burst >= reserve.burst;
+        match self.bytes {
+            None => messages,
+            Some(bytes) => {
+                messages
+                    && bytes.per_second >= reserve.per_second.saturating_mul(frame)
+                    && bytes.burst >= reserve.burst.saturating_mul(frame)
+            }
+        }
     }
 }
 

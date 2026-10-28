@@ -1510,6 +1510,17 @@ mod tests {
         fn guarded_with(
             rate: Option<karyos_sys::rate_limit::RatePolicy>,
         ) -> (Driver, ClientPublication) {
+            guarded_by(|binding, _| match rate {
+                Some(policy) => binding.with_rate(policy, now),
+                None => binding,
+            })
+        }
+
+        /// A guarded publication whose binding `bind` finishes, given its
+        /// outcome ring's words.
+        fn guarded_by(
+            bind: impl FnOnce(GuardBinding, &HeapWords) -> GuardBinding,
+        ) -> (Driver, ClientPublication) {
             let slots = capacity(MESSAGES, 1).unwrap();
             let guard = Arc::new(HeapWords::zeroed(2));
             guard.words()[1].store(guard::created(), Ordering::Relaxed);
@@ -1535,10 +1546,7 @@ mod tests {
                 MESSAGES,
             )
             .unwrap();
-            let binding = match rate {
-                Some(policy) => binding.with_rate(policy, now),
-                None => binding,
-            };
+            let binding = bind(binding, &ring);
             let (_buffer, conductor, publication) = setup(true);
             let driver = Driver {
                 conductor,
@@ -1627,6 +1635,47 @@ mod tests {
             // 10 ms at the new 100/s earns one: at the old 1/s it would not.
             advance(10_000_000);
             assert!(accepted(publication.offer(b"b").unwrap()));
+        }
+
+        /// R-CORE-21, review B1 of #814: a copy that still admits reads a
+        /// newer published policy on its next call, so a tightening holds
+        /// a handle that never ran out under the old one.
+        #[test]
+        fn a_tightening_holds_a_copy_that_still_admits() {
+            use karyos_sys::rate_policy_slot::{OUTCOME_SLOT, publish};
+
+            let (driver, mut publication) = guarded_with(Some(messages_per_second(100, 4)));
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert_eq!(publication.guard().unwrap().rate_tokens(), Some(3));
+            publish(
+                driver.ring.words(),
+                OUTCOME_SLOT,
+                1,
+                &messages_per_second(1, 1),
+            );
+            // Clamped to the new burst at once: one more spends the last
+            // token, where the old policy would have kept two.
+            assert!(accepted(publication.offer(b"b").unwrap()));
+            assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
+        }
+
+        /// Review of #814: a remote handle whose published policy was being
+        /// written on every attempt at bind takes its copy at its first
+        /// call that reads it whole, never staying unlimited.
+        #[test]
+        fn a_busy_policy_at_bind_is_adopted_later() {
+            use karyos_sys::rate_policy_slot::{OUTCOME_SLOT, SEQUENCE, publish};
+
+            let (driver, mut publication) = guarded_by(|binding, ring| {
+                publish(ring.words(), OUTCOME_SLOT, 1, &messages_per_second(1, 1));
+                // A publication in progress: an odd sequence.
+                ring.words()[OUTCOME_SLOT + SEQUENCE].fetch_add(1, Ordering::Relaxed);
+                binding.with_published_rate(now)
+            });
+            assert_eq!(publication.guard().unwrap().rate_tokens(), None);
+            driver.ring.words()[OUTCOME_SLOT + SEQUENCE].fetch_add(1, Ordering::Relaxed);
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
         }
 
         /// G-e3 (ACS 15347): a claim that will never be sent gives its

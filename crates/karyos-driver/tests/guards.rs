@@ -754,6 +754,11 @@ fn a_rate_policy_changes_by_version_under_its_authority() {
         change(&mut driver, 3, per_second(200, 20, None), safety(8)),
         Ok(3)
     );
+    // A policy the stream refuses is refused, audited with its own code.
+    assert!(matches!(
+        change(&mut driver, 3, per_second(0, 0, None), admin(9)),
+        Err(DriverError::InvalidRatePolicy(_))
+    ));
     let audit: Vec<_> = driver
         .guard_audit()
         .records
@@ -769,6 +774,7 @@ fn a_rate_policy_changes_by_version_under_its_authority() {
         .collect();
     let refused = |code| AuditOutcome::Refused(code);
     let changed = |authority| AuditOutcome::RateChanged { authority };
+    let unchanged = |authority| AuditOutcome::RateUnchanged { authority };
     assert_eq!(
         audit,
         [
@@ -779,14 +785,15 @@ fn a_rate_policy_changes_by_version_under_its_authority() {
             (5, 2, 2, refused(ErrorCode::RateReserveCrossed)),
             (6, 2, 2, refused(ErrorCode::RateReserveCrossed)),
             (7, 2, 3, changed(RateAuthority::Administrator)),
-            (8, 3, 3, changed(RateAuthority::Safety)),
+            (8, 3, 3, unchanged(RateAuthority::Safety)),
+            (9, 3, 3, refused(ErrorCode::RateInvalidPolicy)),
         ]
     );
     // A stream guarded without a rate has none to change.
     let other = stream(&mut driver, 3, PublicationMode::Exclusive, true);
     driver.guard_stream(other, guard, 4, None).unwrap();
     assert_eq!(
-        driver.change_rate_policy(other, 0, per_second(1, 1, None).policy, admin(9)),
+        driver.change_rate_policy(other, 0, per_second(1, 1, None).policy, admin(10)),
         Err(DriverError::RateChange(RateChangeError::NoRate))
     );
 }
@@ -830,4 +837,87 @@ fn a_rate_policy_change_reaches_an_issued_handle() {
         }
     };
     assert!(accepted, "the handle applied the new policy");
+}
+
+/// R-CORE-21, review B3 of #814: a per-stream change on a lane of an
+/// aggregate of several lanes changes every lane, so the lanes' versions
+/// never part and the aggregate's next change is served. A call refused
+/// before its policy is weighed, an aggregate with an unguarded lane, is
+/// audited too.
+#[test]
+fn a_change_on_one_lane_changes_its_aggregate() {
+    use karyos_driver::{AggregateConfig, AuditOutcome, RateAuthority, RateChangeError};
+    use karyos_protocol::cnc::ErrorCode;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let config = |stream_id| AggregateConfig {
+        stream: StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 6,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            },
+            allow_unconnected: true,
+            on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+            conflation: None,
+        },
+        quanta: vec![u64::from(DEFAULT_MTU) * 4; 2],
+    };
+    let lane = |aggregate: &karyos_driver::AggregateHandle, lane| {
+        aggregate.lane(Lane::try_new(lane).unwrap()).unwrap()
+    };
+    let aggregate = driver.add_aggregate(config(2)).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    for number in 0..2 {
+        driver
+            .guard_stream(
+                lane(&aggregate, number),
+                guard,
+                4,
+                Some(per_second(100, 10, None)),
+            )
+            .unwrap();
+    }
+    let admin = |operation| (RateAuthority::Administrator, operation);
+    assert_eq!(
+        driver.change_rate_policy(
+            lane(&aggregate, 1),
+            1,
+            per_second(50, 10, None).policy,
+            admin(1)
+        ),
+        Ok(2)
+    );
+    assert_eq!(
+        driver.change_aggregate_rate_policy(
+            &aggregate,
+            2,
+            per_second(40, 10, None).policy,
+            admin(2)
+        ),
+        Ok(3)
+    );
+    // Lane 1 of another aggregate is not guarded: refused, and audited.
+    let partial = driver.add_aggregate(config(3)).unwrap();
+    driver
+        .guard_stream(lane(&partial, 0), guard, 4, Some(per_second(100, 10, None)))
+        .unwrap();
+    assert_eq!(
+        driver.change_aggregate_rate_policy(&partial, 1, per_second(40, 10, None).policy, admin(3)),
+        Err(DriverError::RateChange(RateChangeError::NoRate))
+    );
+    let last = *driver.guard_audit().records.last().unwrap();
+    assert_eq!(
+        (last.operation, last.before, last.after, last.outcome),
+        (3, 1, 1, AuditOutcome::Refused(ErrorCode::RateNotSet))
+    );
 }

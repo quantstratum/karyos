@@ -33,7 +33,9 @@ pub const SLOT_WORDS: usize = 7;
 /// The first header word of an outcome ring that holds the slot.
 pub const OUTCOME_SLOT: usize = 6;
 
-const SEQUENCE: usize = 0;
+/// The slot's sequence word, from its start: a reader that skips an
+/// unchanged slot compares it alone, with one Acquire load.
+pub const SEQUENCE: usize = 0;
 const VERSION: usize = 1;
 const MESSAGES_RATE: usize = 2;
 const MESSAGES_BURST: usize = 3;
@@ -95,15 +97,28 @@ pub fn publish(words: &[AtomicU64], start: usize, version: u64, policy: &RatePol
 /// A slot past the end reads as [`SlotRead::Unpublished`].
 #[must_use]
 pub fn try_read(words: &(impl LoadWords + ?Sized), start: usize) -> SlotRead {
+    try_read_sequenced(words, start).0
+}
+
+/// [`try_read`], with the sequence word the read validated: `Some` for a
+/// read whole (a policy, or a slot with none published yet), `None` for a
+/// busy read or a slot past the end. A reader that skips unchanged slots
+/// keeps this sequence, never one loaded after the read, which a
+/// publication completed in between would make newer than what it read.
+#[must_use]
+pub fn try_read_sequenced(
+    words: &(impl LoadWords + ?Sized),
+    start: usize,
+) -> (SlotRead, Option<u64>) {
     let at = |offset: usize| start.checked_add(offset);
     let (Some(first), Some(_)) = (
         at(SEQUENCE).and_then(|index| words.load_acquire(index)),
         at(BYTES_LIMITED).and_then(|index| words.load(index)),
     ) else {
-        return SlotRead::Unpublished;
+        return (SlotRead::Unpublished, None);
     };
     if first % 2 == 1 {
-        return SlotRead::Busy;
+        return (SlotRead::Busy, None);
     }
     let field = |offset: usize| at(offset).and_then(|index| words.load(index)).unwrap_or(0);
     let version = field(VERSION);
@@ -121,18 +136,21 @@ pub fn try_read(words: &(impl LoadWords + ?Sized), start: usize) -> SlotRead {
         .and_then(|index| words.load(index))
         .unwrap_or(first.wrapping_add(1));
     if first != second {
-        return SlotRead::Busy;
+        return (SlotRead::Busy, None);
     }
     if version == 0 {
-        return SlotRead::Unpublished;
+        return (SlotRead::Unpublished, Some(first));
     }
-    SlotRead::Policy {
-        version,
-        policy: RatePolicy {
-            messages,
-            bytes: (limited != 0).then_some(bytes),
+    (
+        SlotRead::Policy {
+            version,
+            policy: RatePolicy {
+                messages,
+                bytes: (limited != 0).then_some(bytes),
+            },
         },
-    }
+        Some(first),
+    )
 }
 
 #[cfg(all(test, not(loom)))]

@@ -274,8 +274,14 @@ impl<T: TermBytes> GuardedStream<T> {
     /// the current policy (R-CORE-21).
     pub(crate) fn set_gate_slot(&mut self, slot: Arc<Words>) {
         if let Some(policy) = &self.rate {
-            karyos_sys::rate_policy_slot::publish(slot.words(), 0, self.rate_version, policy);
+            publish_gate(&slot, self.rate_version, policy);
         }
+        self.gate_slot = Some(slot);
+    }
+
+    /// Keeps the slot of the incarnation it replaces, which already holds
+    /// this stream's policy at its version: nothing is published again.
+    pub(crate) fn keep_gate_slot(&mut self, slot: Arc<Words>) {
         self.gate_slot = Some(slot);
     }
 
@@ -302,7 +308,7 @@ impl<T: TermBytes> GuardedStream<T> {
         self.rate = Some(policy);
         self.rate_version = version;
         if let Some(slot) = &self.gate_slot {
-            karyos_sys::rate_policy_slot::publish(slot.words(), 0, version, &policy);
+            publish_gate(slot, version, &policy);
         }
         for bound in &self.bounds {
             karyos_sys::rate_policy_slot::publish(
@@ -527,6 +533,19 @@ pub(crate) fn new_ring(
     karyos_sys::outcome_ring::init(ring.words(), &binding).map_err(DriverError::Outcomes)?;
     let writer = OutcomeWriter::new(capacity).map_err(DriverError::Outcomes)?;
     Ok((Arc::new(ring), Arc::new(consumed), writer))
+}
+
+/// Publishes `policy` as `version` into a sender gate's slot, which an
+/// aggregate's lanes share: once, by the first lane, so the gate never
+/// sees one version published over and over, nor an older one after it.
+fn publish_gate(slot: &Words, version: u64, policy: &karyos_sys::rate_limit::RatePolicy) {
+    use karyos_sys::rate_policy_slot::{SlotRead, publish, try_read};
+
+    let words = slot.words();
+    match try_read(&words, 0) {
+        SlotRead::Policy { version: held, .. } if held >= version => {}
+        _ => publish(words, 0, version, policy),
+    }
 }
 
 #[cfg(test)]

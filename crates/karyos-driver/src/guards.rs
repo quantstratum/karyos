@@ -97,6 +97,12 @@ pub enum AuditOutcome {
         /// Who changed it.
         authority: RateAuthority,
     },
+    /// A rate policy change named the policy in force: nothing changed,
+    /// and `before` equals `after` (R-CORE-21).
+    RateUnchanged {
+        /// Who asked.
+        authority: RateAuthority,
+    },
 }
 
 /// One record of the audit ring.
@@ -420,6 +426,7 @@ impl Guards {
             RateAuthority::Administrator => 2,
         };
         let outcome = match result {
+            Ok(()) if before == after => AuditOutcome::RateUnchanged { authority },
             Ok(()) => AuditOutcome::RateChanged { authority },
             Err(error) => refused(error),
         };
@@ -582,6 +589,7 @@ impl Guards {
             AuditOutcome::Reopened => (3, 0),
             AuditOutcome::Refused(code) => (4, u16::try_from(code.code()).unwrap_or(u16::MAX)),
             AuditOutcome::RateChanged { .. } => (5, 0),
+            AuditOutcome::RateUnchanged { .. } => (6, 0),
         };
         // A ring whose sequences are exhausted keeps what it has and counts
         // the record dropped; the driver's own audit below still records.
@@ -761,6 +769,7 @@ pub(crate) fn error_code(error: &DriverError) -> ErrorCode {
         DriverError::RateChange(RateChangeError::NotATightening) => ErrorCode::RateNotATightening,
         DriverError::RateChange(RateChangeError::ReserveCrossed) => ErrorCode::RateReserveCrossed,
         DriverError::RateChange(RateChangeError::NoRate) => ErrorCode::RateNotSet,
+        DriverError::InvalidRatePolicy(_) => ErrorCode::RateInvalidPolicy,
         // A corrupt word is a broken invariant, reported as unknown to
         // the requester; the guard stays closed.
         _ => ErrorCode::UnknownGuard,

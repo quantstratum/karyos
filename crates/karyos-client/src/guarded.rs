@@ -29,7 +29,7 @@ use karyos_sys::guard;
 use karyos_sys::load_words::LoadWords;
 use karyos_sys::outcome_ring::{Kind, OutcomeError, OutcomeReader, Record};
 use karyos_sys::rate_limit::{RateLimiter, RatePolicy};
-use karyos_sys::rate_policy_slot::{OUTCOME_SLOT, SlotRead, try_read};
+use karyos_sys::rate_policy_slot::{OUTCOME_SLOT, SEQUENCE, SlotRead, try_read_sequenced};
 use karyos_sys::sync::AtomicU64;
 
 use crate::error::ClientError;
@@ -110,6 +110,10 @@ pub struct GuardBinding {
     reserved: u64,
     released: u64,
     rate: Option<RateCopy>,
+    /// A remote handle whose published policy was being written at bind:
+    /// the clock to create its copy with on the first call that reads the
+    /// slot whole.
+    pending_rate: Option<fn() -> u64>,
 }
 
 /// The handle's copy of its publication's message bucket: an early
@@ -122,6 +126,9 @@ struct RateCopy {
     /// The version of the published policy the copy applies; 0 for the
     /// policy it was created with.
     version: u64,
+    /// The slot's sequence word when the copy last read it whole; `None`
+    /// before the first read.
+    sequence: Option<u64>,
 }
 
 impl GuardBinding {
@@ -159,6 +166,7 @@ impl GuardBinding {
             reserved: 0,
             released: 0,
             rate: None,
+            pending_rate: None,
         })
     }
 
@@ -183,6 +191,19 @@ impl GuardBinding {
     /// seal before the copy is asked.
     #[must_use]
     pub fn with_rate(mut self, policy: RatePolicy, clock: fn() -> u64) -> Self {
+        self.set_rate(policy, clock, 0, None);
+        self
+    }
+
+    /// Gives the handle a copy of `policy`'s message bucket at `version`,
+    /// read at slot `sequence`.
+    fn set_rate(
+        &mut self,
+        policy: RatePolicy,
+        clock: fn() -> u64,
+        version: u64,
+        sequence: Option<u64>,
+    ) {
         let messages = RatePolicy {
             messages: policy.messages,
             bytes: None,
@@ -190,33 +211,50 @@ impl GuardBinding {
         self.rate = Some(RateCopy {
             limiter: RateLimiter::new(messages, clock()),
             clock,
-            version: 0,
+            version,
+            sequence,
         });
-        self
+        self.pending_rate = None;
     }
 
     /// [`Self::with_rate`] from the policy the driver published in the
     /// outcome ring, if any (R-CORE-21): how a handle of another process
     /// gets its copy, the grant carrying no policy. A ring with none
-    /// published, or one being published, leaves the handle without a copy,
-    /// as before; the sender gate stays authoritative.
+    /// published leaves the handle without a copy, as before; the sender
+    /// gate stays authoritative. One being published on every attempt
+    /// leaves the copy to the handle's first call that reads it whole, so
+    /// a busy slot never leaves a policy's handle unlimited for good.
     #[must_use]
-    pub fn with_published_rate(self, clock: fn() -> u64) -> Self {
+    pub fn with_published_rate(mut self, clock: fn() -> u64) -> Self {
         // A publication in progress is short: a few reads see it whole.
         for _ in 0..8 {
-            match try_read(&*self.ring, OUTCOME_SLOT) {
-                SlotRead::Policy { version, policy } => {
-                    let mut bound = self.with_rate(policy, clock);
-                    if let Some(copy) = &mut bound.rate {
-                        copy.version = version;
-                    }
-                    return bound;
-                }
-                SlotRead::Unpublished => return self,
-                SlotRead::Busy => core::hint::spin_loop(),
+            if self.adopt_published(clock) || self.pending_rate.is_none() {
+                return self;
             }
+            core::hint::spin_loop();
         }
         self
+    }
+
+    /// One read of the published policy for a handle without a copy:
+    /// `true` with the copy made from it; `false` with `pending_rate`
+    /// cleared when none is published, or set to `clock` when the read was
+    /// busy.
+    fn adopt_published(&mut self, clock: fn() -> u64) -> bool {
+        match try_read_sequenced(&*self.ring, OUTCOME_SLOT) {
+            (SlotRead::Policy { version, policy }, sequence) => {
+                self.set_rate(policy, clock, version, sequence);
+                true
+            }
+            (SlotRead::Unpublished, _) => {
+                self.pending_rate = None;
+                false
+            }
+            (SlotRead::Busy, _) => {
+                self.pending_rate = Some(clock);
+                false
+            }
+        }
     }
 
     /// Whole message tokens the handle's copy holds at its last refill;
@@ -227,29 +265,36 @@ impl GuardBinding {
     }
 
     /// Whether the rate copy admits one more message now (refilled from the
-    /// clock, charging nothing); always without a rate limit. On the slow
-    /// path, a copy that does not admit reads the policy the driver
-    /// published in the outcome ring and applies a newer version (R-CORE-21,
-    /// clamped, never granting tokens) before it answers; a read that finds
-    /// a publication in progress keeps the copy as it is.
+    /// clock, charging nothing); always without a rate limit. Every call
+    /// first compares the published policy's sequence word (one Acquire
+    /// load) and, when it moved, applies a newer version (R-CORE-21,
+    /// clamped, never granting tokens), so a tightening binds the handle's
+    /// next call whether or not its bucket ran out; a read that finds a
+    /// publication in progress keeps the copy as it is until the next call.
     pub(crate) fn rate_admits(&mut self) -> bool {
+        if let Some(clock) = self.pending_rate {
+            let _ = self.adopt_published(clock);
+        }
         let Some(copy) = self.rate.as_mut() else {
             return true;
         };
         let now = (copy.clock)();
         copy.limiter.refill_at(now);
-        if copy.limiter.admits(0, true) {
-            return true;
-        }
-        if let SlotRead::Policy { version, policy } = try_read(&*self.ring, OUTCOME_SLOT)
-            && version > copy.version
-        {
-            let messages = RatePolicy {
-                messages: policy.messages,
-                bytes: None,
-            };
-            copy.limiter.set_policy(messages, now);
-            copy.version = version;
+        if self.ring.load_acquire(OUTCOME_SLOT + SEQUENCE) != copy.sequence {
+            let (read, sequence) = try_read_sequenced(&*self.ring, OUTCOME_SLOT);
+            if let SlotRead::Policy { version, policy } = read
+                && version > copy.version
+            {
+                let messages = RatePolicy {
+                    messages: policy.messages,
+                    bytes: None,
+                };
+                copy.limiter.set_policy(messages, now);
+                copy.version = version;
+            }
+            if sequence.is_some() {
+                copy.sequence = sequence;
+            }
         }
         copy.limiter.admits(0, true)
     }

@@ -420,23 +420,22 @@ impl PolicySlot {
     /// sequence word is one Acquire load; a torn read waits for the next
     /// call.
     fn refresh(&mut self, limiter: &mut RateLimiter, now: u64) {
-        use karyos_sys::rate_policy_slot::{SlotRead, try_read};
+        use karyos_sys::rate_policy_slot::{SEQUENCE, SlotRead, try_read_sequenced};
 
-        if self.words.load_acquire(0) == Some(self.sequence) {
+        if self.words.load_acquire(SEQUENCE) == Some(self.sequence) {
             return;
         }
-        match try_read(&*self.words, 0) {
-            SlotRead::Policy { version, policy } => {
-                if version > self.version {
-                    limiter.set_policy(policy, now);
-                    self.version = version;
-                }
-                self.sequence = self.words.load(0).unwrap_or(self.sequence);
-            }
-            SlotRead::Unpublished => {
-                self.sequence = self.words.load(0).unwrap_or(self.sequence);
-            }
-            SlotRead::Busy => {}
+        // The sequence the read validated, never one loaded after it: a
+        // publication completed in between must still look new.
+        let (read, sequence) = try_read_sequenced(&*self.words, 0);
+        if let SlotRead::Policy { version, policy } = read
+            && version > self.version
+        {
+            limiter.set_policy(policy, now);
+            self.version = version;
+        }
+        if let Some(sequence) = sequence {
+            self.sequence = sequence;
         }
     }
 }

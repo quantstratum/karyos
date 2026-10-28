@@ -5,10 +5,14 @@
     `change_aggregate_rate_policy` change a guarded stream's rate policy
     by version (compare and set). `RateAuthority::Safety` takes only a
     provable tightening (`RatePolicy::transition`); `Administrator` takes
-    any valid policy. No policy goes below the stream's control reserve.
-    Refusals are `DriverError::RateChange` (`VersionMismatch`,
-    `NotATightening`, `ReserveCrossed`, `NoRate`), with CnC error codes
-    19 to 22.
+    any valid policy. No policy goes below the stream's control reserve,
+    in messages and, for a byte limit, in reserve messages of the largest
+    frame. A change on one lane of an aggregate of several lanes changes
+    every lane. Refusals are `DriverError::RateChange` (`VersionMismatch`,
+    `NotATightening`, `ReserveCrossed`, `NoRate`) and
+    `DriverError::InvalidRatePolicy`, with CnC error codes 19 to 23 (23
+    `RateInvalidPolicy`). A byte burst is validated against the largest
+    lane MTU.
   - A change binds at once and never grants tokens: each bucket earns the
     old rates up to the change, then its level is clamped to the new
     burst (`RateLimiter::set_policy`). A byte limit added starts empty.
@@ -16,9 +20,14 @@
     (header words 6 to 12, reserved and zero in layout version 2, so no
     version change) and in the sender gate's slot
     (`karyos_sys::rate_policy_slot`, a sequence lock with a Loom model).
-    A handle's copy reads it on its slow path; a network sender gate at
-    each serve. A handle in another process now takes its rate copy from
-    its ring when it binds (before, only an in-process handle had one).
-  - Every change, accepted or refused, is in the guard audit: outcome
-    `RateChanged` (ring code 5), `before` and `after` the policy
-    versions, `parameters` the authority.
+    A handle's copy compares the slot's sequence word on every call (one
+    Acquire load) and applies a newer version before it answers; a network
+    sender gate at each serve. A handle in another process now takes its
+    rate copy from its ring when it binds (before, only an in-process
+    handle had one), or at its first call that reads the slot whole when a
+    publication was in progress at bind. A reincarnation publishes nothing
+    to the gate's slot, and an aggregate's change publishes it once.
+  - Every call that names a guarded stream, accepted or refused, is in
+    the guard audit: outcome `RateChanged` (ring code 5), or
+    `RateUnchanged` (ring code 6) for the policy in force, `before` and
+    `after` the policy versions, `parameters` the authority.
