@@ -644,6 +644,39 @@ impl Membership {
             .copied()
     }
 
+    /// Whether the live active member bound to `source` at `now` bounds
+    /// the strategy edge: every member under `min`, none under `max`, and
+    /// the group's under `tagged` (design 4.5: such a destination bounds
+    /// the others and is never removed as slow).
+    #[must_use]
+    pub fn bounds_at(&self, source: SocketAddr, now: u64) -> bool {
+        self.member_at(source, now)
+            .is_some_and(|entry| match self.config.strategy {
+                Strategy::Min => true,
+                Strategy::Max => false,
+                Strategy::Tagged(tag) => entry.tag == tag,
+            })
+    }
+
+    /// Expires the active member bound to `source` at `now`, a removed
+    /// destination's (karyos#630): an optional one leaves a tombstone and
+    /// stops counting for the strategy edge; a required one is lost.
+    /// Returns whether there was one.
+    pub fn release_source(&mut self, source: SocketAddr, now: u64) -> bool {
+        let slot = self.entries.iter().position(|entry| {
+            entry.state == State::Active
+                && entry
+                    .bindings
+                    .iter()
+                    .flatten()
+                    .any(|(_, bound)| *bound == source)
+        });
+        if let Some(slot) = slot {
+            self.expire(slot, now);
+        }
+        slot.is_some()
+    }
+
     fn member_at(&self, source: SocketAddr, now: u64) -> Option<&Entry> {
         self.entries.iter().find(|entry| {
             entry.state == State::Active

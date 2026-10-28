@@ -295,6 +295,13 @@ pub struct OutboundCounters {
     /// ring refused a release: a broken invariant, counted; the lane
     /// stages nothing more.
     pub schedule_faults: u64,
+    /// Optional destinations removed as slow (MD-7).
+    pub removed_slow: u64,
+    /// Optional destinations removed after repeated send faults (MD-12).
+    pub removed_fault: u64,
+    /// Faulted destination queues that refused their retry: the control
+    /// path resets the endpoint for a required one (MD-12).
+    pub retries_refused: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -718,6 +725,9 @@ impl<T: StreamTerms> Outbound<T> {
         term_length: u32,
         identity: Identity,
     ) -> Result<(), RepairConfigError> {
+        if self.fanout.is_some() {
+            return self.enable_fanout_repair(config, term_length, identity);
+        }
         self.repair = Some(Box::new(RepairPath::new(
             config,
             self.drr,
@@ -907,6 +917,9 @@ impl<T: StreamTerms> Outbound<T> {
         budget: &mut RepairBudget,
         now: u64,
     ) -> u32 {
+        if self.fanout.is_some() {
+            return self.serve_fanout_repair(tx, budget, now);
+        }
         // Over redundant paths `tx` is the founding route's half, as one
         // route of [`Outbound::serve_repair_routes`], which serves every
         // live route (RP-11).
@@ -977,6 +990,10 @@ impl<T: StreamTerms> Outbound<T> {
     /// endpoint on one path.
     pub fn drain_repair_replies_on(&mut self, mut send: impl FnMut(&NakReply, EndpointId)) {
         let founding = self.endpoint;
+        if self.fanout.is_some() {
+            self.drain_fanout_replies(&mut |reply| send(reply, founding));
+            return;
+        }
         let mut endpoints = [founding; MAX_ROUTES];
         if let Some(routed) = self.routed.as_deref() {
             for (slot, endpoint) in endpoints.iter_mut().zip(routed.endpoints()) {
@@ -988,6 +1005,13 @@ impl<T: StreamTerms> Outbound<T> {
                 send(reply, endpoints.get(route).copied().unwrap_or(founding));
             });
         }
+    }
+
+    /// Whether it repairs: a reliable publication, on its one path or per
+    /// destination (MD-8).
+    #[must_use]
+    pub fn repairs(&self) -> bool {
+        self.repair.is_some() || self.fanout_repairs()
     }
 
     /// Its receivers' membership, if attached.
@@ -1580,8 +1604,10 @@ impl<T: StreamTerms> Outbound<T> {
         let retransmit_window = self
             .repair
             .as_deref()
+            .map(RepairPath::retransmit_window)
+            .or_else(|| self.fanout_retransmit_window())
             .filter(|_| self.reliable)
-            .map(|repair| u64::from(repair.retransmit_window()));
+            .map(u64::from);
         for (lane, (track, reader)) in self.tracks.iter_mut().zip(&mut self.readers).enumerate() {
             let submitted = track.high;
             // The membership's sent frontier (one path: `sent_high`), and
@@ -2365,7 +2391,9 @@ mod heartbeat;
 mod removal;
 mod routed;
 
-pub use fanout::{MAX_DESTINATIONS, TargetCounters};
+pub use fanout::{
+    DESTINATION_FAULT_LIMIT, DestinationRemoval, MAX_DESTINATIONS, RemovalReason, TargetCounters,
+};
 
 pub use routed::{MAX_PATH_BACKOFF, MAX_PATH_COPY_ENTRIES, PathCounters, PathPolicy};
 

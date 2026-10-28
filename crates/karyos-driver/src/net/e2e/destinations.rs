@@ -5,21 +5,19 @@
 //! ADR-0056, ADR-0082; karyos#630): one publication sends every datagram
 //! over unicast to each configured destination, each with its own
 //! establishment, SMs and image, on loopback with no multicast at all. A
-//! required destination bounds the sender. Dynamic registration and, in
-//! this step, reliable channels are refused.
-//!
-//! No test here claims isolation between destinations: until the next step
-//! removes a slow optional destination (MD-7), one that stops consuming
-//! holds the others.
+//! required destination bounds the sender, a slow optional one is removed
+//! without stalling the others (MD-7), and a retransmission goes only to
+//! the destination that asked (MD-8). Dynamic registration is refused.
 
 use std::net::SocketAddr;
 
 use karyos_client::OfferOutcome;
+use karyos_client::aggregate::LaneEnd;
 use karyos_protocol::channel::{
     ControlMode, Destination, FlowControl, Interface, Security, UdpConfig,
 };
 use karyos_sys::frame::Lane;
-use karyos_sys::log_buffer::Role;
+use karyos_sys::log_buffer::{Role, SealReason};
 
 use super::{ANY_PORT, BUDGET, LOOPBACK, aggregate, bound, channel, driver, pump};
 use crate::agents::ThreadingMode;
@@ -46,12 +44,17 @@ fn destinations(destinations: &[SocketAddr], reliable: bool) -> UdpConfig {
 /// Receivers on their own drivers, each subscribed to stream 10 on any
 /// port, with the addresses they bound.
 fn receivers(count: usize) -> (Vec<EmbeddedDriver>, Vec<SocketAddr>) {
+    receivers_on(count, false)
+}
+
+/// [`receivers`] on reliable or unreliable subscriptions.
+fn receivers_on(count: usize, reliable: bool) -> (Vec<EmbeddedDriver>, Vec<SocketAddr>) {
     let mut drivers = Vec::with_capacity(count);
     let mut addresses = Vec::with_capacity(count);
     for _ in 0..count {
         let mut receiver = driver(ThreadingMode::Shared);
         let _ = receiver
-            .add_network_subscription(10, &channel(ANY_PORT, false))
+            .add_network_subscription(10, &channel(ANY_PORT, reliable))
             .unwrap();
         addresses.push(bound(&receiver, 10));
         drivers.push(receiver);
@@ -182,9 +185,9 @@ fn a_required_destination_bounds_the_sender() {
     assert!(accepted < 1024, "accepted {accepted}");
 }
 
-/// What this step refuses: dynamic registration (a typed error), a
-/// reliable channel with destinations, `control` with a manual set, a
-/// destination named twice, and a required destination that is not one.
+/// What manual mode refuses: dynamic registration (a typed error),
+/// `control` with a manual set, a destination named twice, and a required
+/// destination that is not one.
 #[test]
 fn what_manual_mode_does_not_take_yet_is_refused() {
     let mut a = driver(ThreadingMode::Shared);
@@ -199,10 +202,6 @@ fn what_manual_mode_does_not_take_yet_is_refused() {
     assert!(matches!(
         a.add_network_publication(aggregate(10, 3, 1), &dynamic),
         Err(DriverError::DynamicRegistrationUnsupported)
-    ));
-    assert!(matches!(
-        a.add_network_publication(aggregate(10, 3, 1), &destinations(&[one, two], true)),
-        Err(DriverError::UnsupportedChannel)
     ));
     let mut controlled = destinations(&[one], false);
     controlled.destination = Destination::MultiDestination {
@@ -237,4 +236,218 @@ fn what_manual_mode_does_not_take_yet_is_refused() {
         ),
         Err(DriverError::InvalidConfig)
     ));
+}
+
+/// Connects `receivers` to a publication on `a` with `channel`, returning
+/// the publication and each receiver's image.
+fn connect(
+    a: &mut EmbeddedDriver,
+    receivers: &mut [EmbeddedDriver],
+    channel: &UdpConfig,
+    required: &[SocketAddr],
+    roles: Option<PublicationRoles>,
+) -> (
+    crate::embedded::AggregateHandle,
+    Vec<crate::embedded::AggregateHandle>,
+) {
+    let publication = a
+        .add_network_publication_with_destinations(aggregate(10, 3, 1), channel, roles, required)
+        .unwrap();
+    let mut images = vec![None; receivers.len()];
+    let mut all: Vec<&mut EmbeddedDriver> =
+        std::iter::once(a).chain(receivers.iter_mut()).collect();
+    pump(&mut all, |drivers| {
+        for (image, receiver) in images.iter_mut().zip(drivers.iter().skip(1)) {
+            *image = receiver.network_image(10, 3);
+        }
+        images.iter().all(Option::is_some)
+    });
+    (
+        publication,
+        images.into_iter().map(Option::unwrap).collect(),
+    )
+}
+
+/// MD-7: under `fc=max`, an optional destination whose receiver stops
+/// (its driver no longer runs: no SM, no read) fills its queue and is
+/// removed, reported as slow, while the other destination receives every
+/// message without a stall.
+#[test]
+fn a_slow_optional_destination_is_removed_without_stalling_the_others() {
+    use crate::agents::data::RemovalReason;
+
+    let mut a = driver(ThreadingMode::Shared);
+    // Reliable, so a datagram the live receiver's socket drops is
+    // repaired: the test is about the removal, not about loopback loss.
+    let (mut receivers, addresses) = receivers_on(2, true);
+    let mut channel = destinations(&addresses, true);
+    channel.flow_control = Some(FlowControl::Max);
+    let roles = PublicationRoles {
+        strategy: Strategy::Max,
+        required: Vec::new(),
+        tags: Vec::new(),
+    };
+    let (publication, images) = connect(&mut a, &mut receivers, &channel, &[], Some(roles));
+    let mut live = receivers.pop().unwrap();
+    let _frozen = receivers.pop().unwrap();
+    let mut reader = live
+        .subscribe_aggregate(&images[1], Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    pump(&mut [&mut a, &mut live], |_| {
+        while sent < 512 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 512
+    });
+    let mut removed = Vec::new();
+    pump(&mut [&mut a, &mut live], |drivers| {
+        removed = drivers[0].network_removed_destinations(&publication);
+        !removed.is_empty()
+    });
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert_eq!(removed[0].destination, addresses[0]);
+    assert_eq!(removed[0].reason, RemovalReason::Slow);
+    // The removed destination no longer keeps the lane from draining: the
+    // publication's EOS reaches the remaining one, whose image ends there.
+    // The handle is released first, so the seal is positioned.
+    drop(lane);
+    a.remove_aggregate(&publication).unwrap();
+    let mut end = None;
+    pump(&mut [&mut a, &mut live], |_| {
+        let poll = reader.poll(|_, _, _| seen += 1, BUDGET);
+        if poll.terminal.is_some() {
+            end = Some(poll.lanes[0].end);
+        }
+        end.is_some()
+    });
+    assert!(
+        matches!(
+            end,
+            Some(Some(LaneEnd::Closed {
+                reason: SealReason::EndOfStream,
+                ..
+            }))
+        ),
+        "{end:?}"
+    );
+}
+
+/// MD-7 under `min` (no `fc`): a destination whose receiver stops bounds
+/// the others until its liveness expiry and is never removed as slow
+/// (design 4.5).
+#[test]
+fn under_min_a_stopped_destination_bounds_and_is_not_removed() {
+    let mut a = driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers_on(2, true);
+    let channel = destinations(&addresses, true);
+    let (publication, images) = connect(&mut a, &mut receivers, &channel, &[], None);
+    let mut live = receivers.pop().unwrap();
+    let _frozen = receivers.pop().unwrap();
+    let mut reader = live
+        .subscribe_aggregate(&images[1], Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let mut sent = 0u32;
+    for _ in 0..3_000 {
+        while sent < 512 {
+            let payload = [0u8; 1000];
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = a.do_work().unwrap();
+        let _ = live.do_work().unwrap();
+        let _ = reader.poll(|_, _, _| {}, BUDGET);
+    }
+    let removed = a.network_removed_destinations(&publication);
+    assert!(removed.is_empty(), "{removed:?}");
+}
+
+/// MD-8: on a reliable channel, a datagram one destination lost is
+/// repaired to that destination only.
+#[test]
+fn a_retransmission_reaches_only_the_requester() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut receivers = Vec::new();
+    let mut addresses = Vec::new();
+    for _ in 0..2 {
+        let mut receiver = driver(ThreadingMode::Shared);
+        let _ = receiver
+            .add_network_subscription(10, &channel(ANY_PORT, true))
+            .unwrap();
+        addresses.push(bound(&receiver, 10));
+        receivers.push(receiver);
+    }
+    let (publication, images) = connect(
+        &mut a,
+        &mut receivers,
+        &destinations(&addresses, true),
+        &[],
+        None,
+    );
+    // The first receiver loses its second DATA datagram.
+    super::shared(&mut receivers[0]).receiver.drop_data(&[1]);
+    let mut readers: Vec<_> = receivers
+        .iter_mut()
+        .zip(&images)
+        .map(|(receiver, image)| receiver.subscribe_aggregate(image, Role::Required).unwrap())
+        .collect();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, [0u32; 2]);
+    let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+        .chain(receivers.iter_mut())
+        .collect();
+    pump(&mut all, |_| {
+        while sent < 16 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        for (reader, seen) in readers.iter_mut().zip(seen.iter_mut()) {
+            let _ = reader.poll(
+                |bytes, _, _| {
+                    let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                    assert_eq!(index, *seen, "in order, exactly once");
+                    *seen += 1;
+                },
+                BUDGET,
+            );
+        }
+        seen == [16, 16]
+    });
+    let counters = super::shared(&mut a).sender.destination_counters(0);
+    let repairs = |address: SocketAddr| {
+        counters
+            .iter()
+            .find(|(held, _)| *held == address)
+            .map(|(_, counters)| counters.repairs)
+            .unwrap()
+    };
+    assert!(repairs(addresses[0]) >= 1, "{counters:?}");
+    assert_eq!(repairs(addresses[1]), 0, "{counters:?}");
 }
