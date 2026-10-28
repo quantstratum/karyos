@@ -954,11 +954,14 @@ fn a_change_on_one_lane_changes_its_aggregate() {
 
 /// Review N1 of #814: an aggregate change is weighed on each guarded lane
 /// with its own policy and reserve, and taken by all of them or none. A
-/// safety change that tightens lane 0 but loosens lane 1 is refused for
-/// both, and audited for each guard.
+/// safety change that lane 0 accepts (a tightening) and lane 1 refuses (a
+/// loosening) is refused naming lane 1, changes neither, and is audited
+/// for each guard.
 #[test]
 fn an_aggregate_change_is_weighed_on_every_lane() {
-    use karyos_driver::{AggregateConfig, AuditOutcome, RateAuthority, RateChangeError};
+    use karyos_driver::{
+        AggregateConfig, AuditOutcome, LaneRefusal, RateAuthority, RateChangeError,
+    };
     use karyos_protocol::cnc::ErrorCode;
 
     let mut driver = EmbeddedDriver::new().unwrap();
@@ -1017,7 +1020,10 @@ fn an_aggregate_change_is_weighed_on_every_lane() {
             per_second(50, 10, None).policy,
             safety(1)
         ),
-        Err(DriverError::RateChange(RateChangeError::NotATightening))
+        Err(DriverError::RateChangeOnLane {
+            lane: 1,
+            refusal: LaneRefusal::Change(RateChangeError::NotATightening)
+        })
     );
     // Lane 1's reserve is weighed too, under any authority.
     assert_eq!(
@@ -1027,7 +1033,10 @@ fn an_aggregate_change_is_weighed_on_every_lane() {
             per_second(5, 10, None).policy,
             admin(2)
         ),
-        Err(DriverError::RateChange(RateChangeError::ReserveCrossed))
+        Err(DriverError::RateChangeOnLane {
+            lane: 1,
+            refusal: LaneRefusal::Change(RateChangeError::ReserveCrossed)
+        })
     );
     // Nothing changed: both lanes are still at version 1.
     assert_eq!(

@@ -277,6 +277,15 @@ pub enum DriverError {
     /// A rate policy change was refused (R-CORE-21).
     #[error(transparent)]
     RateChange(crate::guards::RateChangeError),
+    /// A rate policy change of an aggregate was refused by one of its
+    /// guarded lanes, named, so nothing changed on any lane (R-CORE-21).
+    #[error("lane {lane} refused the rate policy change: {refusal}")]
+    RateChangeOnLane {
+        /// The lane that refused.
+        lane: u8,
+        /// Its refusal.
+        refusal: crate::guards::LaneRefusal,
+    },
     /// Every sender slot of the guards' owner is taken
     /// (`DriverConfig::max_guard_senders`).
     #[error("too many guard senders")]

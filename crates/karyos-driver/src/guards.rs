@@ -230,6 +230,37 @@ pub enum RateAuthority {
     Administrator,
 }
 
+/// Why one lane of an aggregate refused a rate policy change (R-CORE-21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum LaneRefusal {
+    /// The change's own refusal on that lane.
+    #[error(transparent)]
+    Change(RateChangeError),
+    /// The policy that lane refuses.
+    #[error(transparent)]
+    Invalid(karyos_sys::rate_limit::RatePolicyError),
+}
+
+impl LaneRefusal {
+    /// The refusal of `error`, a rate change's, if it is one.
+    pub(crate) fn of(error: &DriverError) -> Option<Self> {
+        match error {
+            DriverError::RateChange(change) => Some(Self::Change(*change)),
+            DriverError::InvalidRatePolicy(invalid) => Some(Self::Invalid(*invalid)),
+            _ => None,
+        }
+    }
+
+    /// The error it stands for, without its lane.
+    pub(crate) const fn error(self) -> DriverError {
+        match self {
+            Self::Change(change) => DriverError::RateChange(change),
+            Self::Invalid(invalid) => DriverError::InvalidRatePolicy(invalid),
+        }
+    }
+}
+
 /// Why a rate policy change was refused (R-CORE-21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -770,6 +801,8 @@ pub(crate) fn error_code(error: &DriverError) -> ErrorCode {
         DriverError::RateChange(RateChangeError::ReserveCrossed) => ErrorCode::RateReserveCrossed,
         DriverError::RateChange(RateChangeError::NoRate) => ErrorCode::RateNotSet,
         DriverError::InvalidRatePolicy(_) => ErrorCode::RateInvalidPolicy,
+        // A lane's refusal has its own code.
+        DriverError::RateChangeOnLane { refusal, .. } => error_code(&refusal.error()),
         // A lane of the call that is gone or retiring names no guard.
         DriverError::UnknownStream { .. } | DriverError::StreamRetiring { .. } => {
             ErrorCode::UnknownStream

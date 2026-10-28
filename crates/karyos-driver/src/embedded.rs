@@ -2370,9 +2370,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// # Errors
     ///
-    /// As [`Self::change_rate_policy`]: a refusal of any guarded lane
-    /// refuses the change on every lane; `VersionMismatch` when a lane is
-    /// at another version than `expected`.
+    /// As [`Self::change_rate_policy`]; a guarded lane's refusal, a lane at
+    /// another version than `expected` included, is
+    /// [`DriverError::RateChangeOnLane`], naming the lane, and refuses the
+    /// change on every lane.
     pub fn change_aggregate_rate_policy(
         &mut self,
         aggregate: &AggregateHandle,
@@ -2418,6 +2419,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             guarded.rate,
                             guarded.rate_version,
                             guarded.reserve,
+                            found.config.lane.get(),
                         ));
                     }
                 }
@@ -2425,7 +2427,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         // Each guard once, with the version of its first lane.
         let mut guards: Vec<(GuardHandle, u64)> = Vec::new();
-        for &(_, guard, _, version, _) in &lanes {
+        for &(_, guard, _, version, _, _) in &lanes {
             if !guards.iter().any(|(seen, _)| *seen == guard) {
                 guards.push((guard, version));
             }
@@ -2437,17 +2439,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if lanes.is_empty() {
                 return Err(DriverError::RateChange(RateChangeError::NoRate));
             }
+            // An aggregate's refusal names the lane that refused it.
+            let named = streams.len() > 1;
             let mut next = expected;
-            for &(_, _, rate, version, reserve) in &lanes {
-                let lane = decide_rate_change(
+            for &(_, _, rate, version, reserve, lane) in &lanes {
+                let decided = decide_rate_change(
                     rate,
                     &policy,
                     (expected, version),
                     reserve,
                     frame,
                     authority,
-                )?;
-                next = next.max(lane);
+                )
+                .map_err(|error| match crate::guards::LaneRefusal::of(&error) {
+                    Some(refusal) if named => DriverError::RateChangeOnLane { lane, refusal },
+                    _ => error,
+                })?;
+                next = next.max(decided);
             }
             Ok(next)
         })();

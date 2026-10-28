@@ -11,7 +11,9 @@
     lane of an aggregate of several lanes is a change of the aggregate:
     its guarded lanes, each weighed with its own policy, version and
     reserve, take it together or not at all, and each guard audits it;
-    unguarded lanes are left as they are. Refusals are `DriverError::RateChange` (`VersionMismatch`,
+    a lane's refusal is `DriverError::RateChangeOnLane`, naming the lane
+    (`LaneRefusal`), with the refusal's own CnC code. Unguarded lanes are
+    left as they are. Refusals are `DriverError::RateChange` (`VersionMismatch`,
     `NotATightening`, `ReserveCrossed`, `NoRate`) and
     `DriverError::InvalidRatePolicy`, with CnC error codes 19 to 23 (23
     `RateInvalidPolicy`). A byte burst is validated against the largest
