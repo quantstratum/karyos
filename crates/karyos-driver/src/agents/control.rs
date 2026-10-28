@@ -291,10 +291,10 @@ struct Destination {
     closing_since: Option<u64>,
 }
 
-/// How long an evicted control route may stay in flight, from the first
-/// duty that found it so, before it counts as a failed close (#849): the
-/// endpoint's reset then frees it.
-pub const CONTROL_CLOSE_TIMEOUT: u64 = 1_000_000_000;
+/// How long an evicted control route may stay in flight before it counts
+/// as a failed close: the driver's one bound for closes in flight, with its
+/// reason at [`super::CLOSE_IN_FLIGHT_TIMEOUT`].
+pub use super::CLOSE_IN_FLIGHT_TIMEOUT as CONTROL_CLOSE_TIMEOUT;
 
 /// The control routes of one endpoint's TX half, for one backend epoch.
 #[derive(Debug)]
