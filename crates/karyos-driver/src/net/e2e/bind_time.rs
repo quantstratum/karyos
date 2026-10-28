@@ -352,7 +352,7 @@ fn report(label: &str, joins: &[Join], sent: u32) {
         if sorted.is_empty() {
             "none".to_owned()
         } else if rank > sorted.len().saturating_sub(censored) {
-            format!(">= {:.1}", ms(JOIN_LIMIT))
+            format!(">= {:.1} (censored)", ms(JOIN_LIMIT))
         } else {
             format!("{:.1}", ms(at_rank(sorted, rank)))
         }
