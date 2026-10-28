@@ -4505,8 +4505,10 @@ fn a_close_without_its_tx_half_is_dropped_once() {
     sender.close_removed(&mut none);
     assert!(sender.closing.is_empty(), "dropped");
     assert_eq!(sender.counters().removed_dropped, 1);
+    // The next duty, holding the half, has nothing of it left.
+    sender.close_removed(&mut halves);
+    assert_eq!(sender.counters().removed_dropped, 1, "once");
     assert_eq!(sender.counters().removed_closed, 0);
-    let _ = halves;
 }
 
 /// The follow-up of #829's review, points 1 and 2: an entry the endpoint
@@ -4566,13 +4568,96 @@ fn a_failed_close_asks_for_one_reset_and_counts_once() {
         again += 1;
         true
     });
-    assert_eq!(again, 0, "asked once");
+    assert_eq!(again, 0, "not again within RESET_REQUEST_CYCLES");
 }
 
-/// The follow-up of #829's review, point 3: an entry of another epoch
-/// than its endpoint's half is dropped and counted.
+/// Review T2 of #838: a close reset request is kept while what it is for
+/// stands in its epoch: a ring full asks again next cycle, a request the
+/// endpoint table deferred is asked again after `RESET_REQUEST_CYCLES`,
+/// and it is cleared once the half is in another epoch or gone.
 #[test]
-fn an_entry_of_another_epoch_is_dropped_and_counted() {
+fn a_close_reset_request_stands_until_its_epoch_ends() {
+    use karyos_io::backend::{Authority, InstanceId, TxQueueConfig, TxReport};
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    let endpoint =
+        SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new()).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let open = |tx: &mut karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>| {
+        tx.open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap()
+    };
+    let _held = open(&mut tx);
+    let stale = open(&mut tx);
+    let _ = tx.close_queue(stale, &mut TxReport::new());
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(stale);
+    let epoch = tx.capabilities().epoch;
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch,
+        route,
+        queues,
+    });
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    sender.close_removed(&mut halves);
+    // The ring is full: asked again the next cycle.
+    sender.request_resets(|_| false);
+    assert_eq!(sender.counters().reset_requests_full, 1);
+    sender.cycle += 1;
+    let mut asked = 0;
+    sender.request_resets(|_| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 1);
+    // Deferred by the endpoint table (its backoff): asked again once
+    // `RESET_REQUEST_CYCLES` have passed, the entry's epoch still standing.
+    sender.cycle += super::super::data::RESET_REQUEST_CYCLES;
+    sender.close_removed(&mut halves);
+    sender.request_resets(|_| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 2, "asked again");
+    // The reset: the half comes back in a new epoch, and the request ends.
+    let super::super::Half::Tx(tx) = halves.pop().unwrap().1 else {
+        panic!("a TX half");
+    };
+    let mut endpoint = SocketsEndpoint::join(*tx, rx).unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    let _ = endpoint.reopen(&config).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    assert_ne!(tx.capabilities().epoch, epoch);
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    sender.close_removed(&mut halves);
+    sender.cycle += super::super::data::RESET_REQUEST_CYCLES;
+    sender.request_resets(|_| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 2, "cleared by the new epoch");
+}
+
+/// Review T1 of #838: an entry whose handles are already gone (its queue
+/// and route unknown to the endpoint) holds nothing: it is counted as
+/// failed, and no reset of the shared endpoint is asked for.
+#[test]
+fn a_close_of_handles_already_gone_asks_no_reset() {
+    use karyos_io::backend::{Authority, TxQueueConfig, TxReport};
+
     let (mut sender, _receiver) =
         super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
     let (half, _frames, _data, _rx) = header_only_endpoint();
@@ -4581,7 +4666,59 @@ fn an_entry_of_another_epoch_is_dropped_and_counted() {
         panic!("a TX half");
     };
     let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
-    let older = tx.capabilities().epoch.next().unwrap();
+    let queue = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let _ = tx.close_queue(queue, &mut TxReport::new());
+    let _ = tx.remove_route(route);
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(queue);
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    });
+    sender.close_removed(&mut halves);
+    assert_eq!(sender.counters().removed_close_failed, 1);
+    let mut asked = 0;
+    sender.request_resets(|_| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 0, "nothing held, nothing to reset");
+}
+
+/// The follow-up of #829's review, point 3: an entry of an older epoch
+/// than its endpoint's half (the endpoint was reset since) is dropped and
+/// counted.
+#[test]
+fn an_entry_of_another_epoch_is_dropped_and_counted() {
+    use karyos_io::backend::{InstanceId, TxReport};
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    let endpoint =
+        SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new()).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let older = tx.capabilities().epoch;
+    let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    let _ = endpoint.reopen(&config).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    assert!(tx.capabilities().epoch > older);
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
     sender.closing.push(super::super::data::Opened {
         endpoint: EndpointId(1),
         epoch: older,

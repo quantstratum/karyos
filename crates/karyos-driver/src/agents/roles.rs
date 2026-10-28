@@ -373,19 +373,23 @@ pub struct SenderCounters {
     /// Items still pending in those queues when they closed, returned
     /// with `QueueClosed`.
     pub removed_returned: u64,
-    /// Removed publications' routes or queues not recorded for closing:
-    /// the preallocated close list was full (never, by construction; their
-    /// endpoint's next reset drops them). A retired destination's are
-    /// carried over instead (`OutboundCounters::close_deferred`).
+    /// Removed publications' routes or queues, or retired destinations',
+    /// not recorded for closing: the preallocated close list was full
+    /// (never, by construction; their endpoint's next reset drops them, and
+    /// a retired destination's wait in the publication for a later duty).
     pub removed_unrecorded: u64,
     /// Entries of the close list dropped at their duty, each counted once:
     /// their endpoint's TX half was not held (in a reset, which drops them,
     /// or retired) or was in another epoch (whose reset dropped them).
     pub removed_dropped: u64,
     /// Entries of the close list (a route and its queues) the endpoint
-    /// would not close whole, each counted once: the sender asks for the
-    /// endpoint's reset, which drops them.
+    /// would not close whole, each counted once. When what did not close
+    /// still holds the endpoint's resources, the sender asks for its
+    /// reset, which drops them; a handle already gone holds nothing.
     pub removed_close_failed: u64,
+    /// Endpoints whose reset a close would have asked for, with no room to
+    /// record the request (never, by its capacity).
+    pub close_resets_full: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -429,7 +433,9 @@ pub struct SenderCounters {
     /// SMs whose consumption is below one already reported (replayed or
     /// reordered): the higher value is kept.
     pub sm_stale: u64,
-    /// Reset requests posted to the endpoint table.
+    /// Reset requests posted to the endpoint table: a publication's route
+    /// fault, and an endpoint whose close list held what it would not
+    /// close (asked again every `RESET_REQUEST_CYCLES` until resolved).
     pub reset_requests: u64,
     /// Reset requests not posted: the event ring was full.
     pub reset_requests_full: u64,
@@ -512,6 +518,17 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
         Some(next) => *value = next,
         None => *overflowed = true,
     }
+}
+
+/// An endpoint whose close list held something it would not close, in that
+/// epoch, and when its reset was last asked for: asked again every
+/// `RESET_REQUEST_CYCLES` (the endpoint table may defer a request inside
+/// its backoff) until the half is gone or back in another epoch.
+#[derive(Debug, Clone, Copy)]
+struct CloseReset {
+    endpoint: EndpointId,
+    epoch: karyos_io::backend::BackendEpoch,
+    requested: Option<u64>,
 }
 
 /// The receiver agent's network state.
@@ -1485,7 +1502,7 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     closing: Vec<super::data::Opened>,
     /// Endpoints a close failed on, whose reset the sender asks for: the
     /// reset drops what would not close, which nothing else frees.
-    close_resets: Vec<EndpointId>,
+    close_resets: Vec<CloseReset>,
     /// Report storage for those closes (allocated at creation).
     close_report: karyos_io::backend::TxReport,
     /// When a routed publication's path leaves the live set (RP-8).
@@ -4811,7 +4828,8 @@ impl<T: StreamTerms> SenderRole<T> {
         mut post: impl FnMut(AgentEvent<O, T>) -> bool,
     ) {
         let now = (self.clock)();
-        for outbound in &mut self.publications {
+        let mut unrecorded = 0u64;
+        'publications: for outbound in &mut self.publications {
             while let Some(removal) = outbound.removal_unreported() {
                 // Its member stops counting for the strategy edge before
                 // the report is posted: with the conductor's ring full, a
@@ -4832,14 +4850,18 @@ impl<T: StreamTerms> SenderRole<T> {
                     removal,
                 };
                 if !post(event) {
-                    return;
+                    break 'publications;
                 }
                 outbound.removal_reported(removal.destination, now);
                 // Its route and queues go to the close list now, so the
                 // next cycle's commands, served before its duty, find the
                 // slot free; that duty closes them before it opens anything.
-                outbound.drain_retired(&mut self.closing);
+                let left = outbound.drain_retired(&mut self.closing);
+                unrecorded = unrecorded.saturating_add(left);
             }
+        }
+        for _ in 0..unrecorded {
+            self.count(|c| &mut c.removed_unrecorded);
         }
     }
 
@@ -4958,6 +4980,18 @@ impl<T: StreamTerms> SenderRole<T> {
     /// the same epoch. An endpoint whose half it does not hold, or now in
     /// another epoch, dropped them already (a reset or a retirement).
     fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
+        use karyos_io::backend::{QueueError, RouteError};
+
+        // A request whose half is gone (in a reset, or retired) or back in
+        // another epoch is resolved.
+        self.close_resets.retain(|request| {
+            halves.iter().any(|(held, half)| match half {
+                Half::Tx(tx) => {
+                    *held == request.endpoint && tx.capabilities().epoch == request.epoch
+                }
+                _ => false,
+            })
+        });
         while let Some(opened) = self.closing.pop() {
             // A half not held now is in a reset or retired: the reset, done
             // or to come, drops these handles, and a retired half never
@@ -4970,12 +5004,19 @@ impl<T: StreamTerms> SenderRole<T> {
                 self.count(|c| &mut c.removed_dropped);
                 continue;
             };
-            // Another epoch's handles died with it.
-            if tx.capabilities().epoch != opened.epoch {
+            // An older epoch's handles died with its reset (an entry is
+            // never of a later epoch than its half).
+            let epoch = tx.capabilities().epoch;
+            if epoch != opened.epoch {
+                debug_assert!(opened.epoch < epoch, "an entry of a later epoch");
                 self.count(|c| &mut c.removed_dropped);
                 continue;
             }
-            let mut failed = false;
+            // Failed: something did not close. Held: what did not close
+            // still holds the endpoint's queue entries or route table,
+            // which only a reset frees; a handle already gone holds
+            // nothing.
+            let (mut failed, mut held) = (false, false);
             for queue in opened.queues.into_iter().flatten() {
                 // A full report leaves items pending: emptied and called
                 // again until none remains, each call returning at least
@@ -4991,31 +5032,47 @@ impl<T: StreamTerms> SenderRole<T> {
                                 break;
                             }
                             if outcome.returned == 0 {
-                                failed = true;
+                                (failed, held) = (true, true);
                                 break;
                             }
                         }
-                        Err(_) => {
+                        Err(QueueError::UnknownQueue) => {
                             failed = true;
+                            break;
+                        }
+                        Err(error) => {
+                            failed = true;
+                            held |= matches!(error, QueueError::NeedsReset);
                             break;
                         }
                     }
                 }
             }
-            if tx.remove_route(opened.route).is_ok() {
-                self.count(|c| &mut c.removed_closed);
-            } else {
-                failed = true;
+            match tx.remove_route(opened.route) {
+                Ok(()) => self.count(|c| &mut c.removed_closed),
+                Err(error) => {
+                    failed = true;
+                    held |= matches!(error, RouteError::InUse);
+                }
             }
-            // Once per entry. What would not close holds the endpoint's
-            // queue entries or route table until a reset, so one is asked
-            // for (at most one pending per endpoint).
+            // Once per entry; a reset asked for only for what is held.
             if failed {
                 self.count(|c| &mut c.removed_close_failed);
-                if !self.close_resets.contains(&opened.endpoint)
-                    && self.close_resets.len() < self.close_resets.capacity()
-                {
-                    self.close_resets.push(opened.endpoint);
+            }
+            if held
+                && !self
+                    .close_resets
+                    .iter()
+                    .any(|request| request.endpoint == opened.endpoint)
+            {
+                if self.close_resets.len() < self.close_resets.capacity() {
+                    self.close_resets.push(CloseReset {
+                        endpoint: opened.endpoint,
+                        epoch,
+                        requested: None,
+                    });
+                } else {
+                    self.count(|c| &mut c.close_resets_full);
                 }
             }
         }
@@ -5172,8 +5229,12 @@ impl<T: StreamTerms> SenderRole<T> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);
+        let mut unrecorded = 0u64;
         for outbound in &mut self.publications {
-            outbound.drain_retired(&mut self.closing);
+            unrecorded = unrecorded.saturating_add(outbound.drain_retired(&mut self.closing));
+        }
+        for _ in 0..unrecorded {
+            self.count(|c| &mut c.removed_unrecorded);
         }
         self.close_removed(halves);
         self.naks_this_cycle = 0;
@@ -5512,17 +5573,32 @@ impl<T: StreamTerms> SenderRole<T> {
     /// others while the reset is in flight. Nothing allocates.
     pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
         let cycle = self.cycle;
-        // The endpoints a close failed on; one the ring refused is asked
-        // again next cycle.
-        let mut at = 0;
-        while let Some(&endpoint) = self.close_resets.get(at) {
-            if post(endpoint) {
-                let _ = self.close_resets.swap_remove(at);
-                self.count(|c| &mut c.reset_requests);
-            } else {
-                self.count(|c| &mut c.reset_requests_full);
-                at += 1;
+        // The endpoints a close held resources on, asked again every
+        // `RESET_REQUEST_CYCLES` until the reset is seen (the endpoint
+        // table may defer a request), and next cycle when the ring was
+        // full.
+        let (mut posted, mut refused) = (0u64, 0u64);
+        for request in &mut self.close_resets {
+            let due = request.requested.is_none_or(|at| {
+                cycle
+                    .checked_sub(at)
+                    .is_none_or(|age| age >= super::data::RESET_REQUEST_CYCLES)
+            });
+            if !due {
+                continue;
             }
+            if post(request.endpoint) {
+                request.requested = Some(cycle);
+                posted = posted.saturating_add(1);
+            } else {
+                refused = refused.saturating_add(1);
+            }
+        }
+        for _ in 0..posted {
+            self.count(|c| &mut c.reset_requests);
+        }
+        for _ in 0..refused {
+            self.count(|c| &mut c.reset_requests_full);
         }
         for index in 0..self.publications.len() {
             let Some(outbound) = self.publications.get_mut(index) else {

@@ -442,9 +442,10 @@ impl Fanout {
     /// dropped), go to `retired`, for the sender's close list, which
     /// returns their pending items as `QueueClosed` (counted in
     /// `removed_returned`) and closes the queues and the route. They leave
-    /// `targets`, and their address is kept for its quarantine (MD-14,
-    /// from `now`). Returns the targets retired and the quarantine records
-    /// forgotten to make room.
+    /// `targets`, and their address is kept for its quarantine (MD-14),
+    /// counted from its removal; `now` expires the records past theirs.
+    /// Returns the targets retired and the quarantine records forgotten to
+    /// make room.
     fn retire(
         &mut self,
         endpoint: crate::agents::EndpointId,
@@ -1522,10 +1523,11 @@ impl<T: StreamTerms> Outbound<T> {
     /// the sender's list of what removed publications left, which closes
     /// each whole (design 3.7). The list empties at every duty and has room
     /// for every publication's routes and destinations twice over, so
-    /// everything fits.
-    pub(crate) fn drain_retired(&mut self, closing: &mut Vec<Opened>) {
+    /// everything fits. Returns what did not (never): it waits in the
+    /// publication for a later duty, and the caller counts it.
+    pub(crate) fn drain_retired(&mut self, closing: &mut Vec<Opened>) -> u64 {
         let Some(fanout) = self.fanout.as_deref_mut() else {
-            return;
+            return 0;
         };
         debug_assert!(
             closing.capacity().saturating_sub(closing.len()) >= fanout.retired.len(),
@@ -1534,6 +1536,7 @@ impl<T: StreamTerms> Outbound<T> {
         let room = closing.capacity().saturating_sub(closing.len());
         let taken = room.min(fanout.retired.len());
         closing.extend(fanout.retired.drain(..taken));
+        u64::try_from(fanout.retired.len()).unwrap_or(u64::MAX)
     }
 
     /// The repair jobs every destination's table holds, summed (tests).
