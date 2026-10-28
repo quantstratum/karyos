@@ -38,7 +38,7 @@
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
-//! | `0x84` | `Error` | client | sequence | code (1 to 18, see [`ErrorCode`]) | detail |
+//! | `0x84` | `Error` | client | sequence | code (1 to 18 and 24, see [`ErrorCode`]) | detail |
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
@@ -1147,7 +1147,8 @@ pub enum ErrorCode {
     InvalidRoles,
     /// A stream lane the driver would create for the command is larger
     /// than its `max_stream_bytes` (R-CORE-34, karyos#809); nothing was
-    /// created. Retrying the same channel never succeeds.
+    /// created. The detail is the lane's bytes (karyos#824), not the stream
+    /// id. Retrying the same channel never succeeds.
     StreamTooLarge,
 }
 
