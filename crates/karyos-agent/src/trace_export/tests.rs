@@ -818,9 +818,8 @@ fn a_page_stops_at_its_cap_across_several_laps() {
 /// log's own wait is still waited out, and the journal it holds is found
 /// there, calibrated. The log entry is released from inside the log's wait
 /// (a hook), so the test needs no sleep: under one budget shared with the
-/// table, that wait would never run. The budget is 200 ms, so a thread
-/// preempted between the log's first read and its first check still
-/// enters the wait.
+/// table, that wait would never run. Each part retries its busy entries
+/// at least once, so the hook runs whatever the clock says.
 #[test]
 fn the_log_waits_with_its_own_budget_after_a_stuck_table() {
     let mirror = std::rc::Rc::new(std::cell::RefCell::new(mirror(16)));
@@ -858,7 +857,7 @@ fn the_log_waits_with_its_own_budget_after_a_stuck_table() {
         16,
         usize::MAX,
         Waits {
-            busy_budget: std::time::Duration::from_millis(200),
+            busy_budget: std::time::Duration::ZERO,
             max_lost_ranges: MAX_LOST_RANGES,
         },
     );

@@ -431,8 +431,14 @@ fn journals(
                 busy.push(slot);
             }
         }
+        // Each part retries its busy entries at least once, whatever the
+        // clock says, so a thread preempted past the budget before its
+        // first check still waits once.
         let start = std::time::Instant::now();
-        while !busy.is_empty() && !wanted.is_empty() && start.elapsed() < busy_budget {
+        let mut retried = false;
+        while !busy.is_empty() && !wanted.is_empty() && (!retried || start.elapsed() < busy_budget)
+        {
+            retried = true;
             std::thread::yield_now();
             #[cfg(test)]
             {
