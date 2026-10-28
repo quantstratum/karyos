@@ -2075,8 +2075,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
 
     /// The reasons the receive sessions ignored controls, in order (tests).
     #[cfg(test)]
-    pub(crate) fn ignored_controls(&self) -> Vec<crate::sessions::receive::Ignored> {
-        self.sessions.ignored.clone()
+    pub(crate) fn ignored_controls(&self) -> crate::sessions::receive::IgnoredCounts {
+        self.sessions.ignored_counts()
     }
 
     /// The session table's counters.

@@ -504,21 +504,39 @@ fn n5_two_reliable_lanes_each_deliver_exactly_once_in_order() {
 /// Multicast groups in 239.255.0.0/16 carried by the loopback, which the
 /// job shapes: `lo` takes multicast and a route of the range. Without it a
 /// group's datagrams leave by the default route, unshaped. Undone on drop.
-pub(super) struct MulticastOnLoopback;
+/// The route is the host's, so one test holds it at a time, whatever the
+/// test threads.
+pub(super) struct MulticastOnLoopback(
+    #[allow(dead_code, reason = "held for its lock")] std::sync::MutexGuard<'static, ()>,
+);
+
+/// The one holder of the loopback's multicast route.
+static ROUTE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl MulticastOnLoopback {
     pub(super) fn route() -> Self {
+        // A test that panicked while holding it poisoned the lock, and its
+        // drop still undid the route.
+        let guard = ROUTE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ip(&["link", "set", "lo", "multicast", "on"]);
         ip(&["route", "add", "239.255.0.0/16", "dev", "lo"]);
-        Self
+        Self(guard)
     }
 }
 
 impl Drop for MulticastOnLoopback {
     fn drop(&mut self) {
-        ip(&["route", "del", "239.255.0.0/16", "dev", "lo"]);
-        ip(&["link", "set", "lo", "multicast", "off"]);
+        // Never panics: a drop during a test's panic must not abort it.
+        let _ = ip_status(&["route", "del", "239.255.0.0/16", "dev", "lo"]);
+        let _ = ip_status(&["link", "set", "lo", "multicast", "off"]);
     }
+}
+
+/// `ip <args>`'s status, `None` when it could not run.
+fn ip_status(args: &[&str]) -> Option<std::process::ExitStatus> {
+    std::process::Command::new("ip").args(args).status().ok()
 }
 
 /// `ip <args>`.

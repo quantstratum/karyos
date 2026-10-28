@@ -1333,7 +1333,7 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
 
     /// The reasons the receive sessions ignored controls, in order (tests).
     #[cfg(test)]
-    pub(crate) fn ignored_controls(&self) -> Vec<crate::sessions::receive::Ignored> {
+    pub(crate) fn ignored_controls(&self) -> crate::sessions::receive::IgnoredCounts {
         self.role.ignored_controls()
     }
 

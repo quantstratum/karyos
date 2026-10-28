@@ -19,7 +19,9 @@
 //!
 //! Its module path does not name `netem`, so the default netem run (the N
 //! suite, a release gate) never includes it. Without `KARYOS_NETEM_MEASURE`
-//! it prints that it was skipped and measures nothing.
+//! it fails, measuring nothing, so a missing variable never reads as a
+//! measurement. It runs in the test profile (a debug build), so its times
+//! carry that build's overhead: the 2 s steps of a lost exchange do not.
 
 #![allow(
     clippy::unwrap_used,
@@ -40,8 +42,9 @@ use super::netem::MulticastOnLoopback;
 use super::{BUDGET, aggregate, driver, free_port, shared};
 use crate::agents::ThreadingMode;
 
-/// The longest one join may take before the run gives up on it: well past
-/// three lost exchanges of about 2 s each.
+/// The longest one join is waited for: well past three lost exchanges of
+/// about 2 s each. A join still unbound then is censored: counted, and
+/// ranked at this value.
 const JOIN_LIMIT: Duration = Duration::from_secs(30);
 /// The publisher's pace: one 1000-byte message per millisecond.
 const PACE: Duration = Duration::from_millis(1);
@@ -52,28 +55,37 @@ const PACE: Duration = Duration::from_millis(1);
 /// only loss makes a join solicit again.
 const JOIN_GAP: Duration = Duration::from_millis(60);
 
-/// One join: from the first unbound DATA to the install, from the
-/// subscription to the install, and the SOLICITs it sent and saw expire.
+/// One join: from its first unbound DATA to the install (`None` when no
+/// unbound DATA came before it), from the subscription to the install, the
+/// SOLICITs it sent and saw expire, and whether it was censored.
 #[derive(Debug, Clone, Copy)]
 struct Join {
-    bind: Duration,
+    bind: Option<Duration>,
     subscribe: Duration,
     solicits: u64,
     expired: u64,
+    censored: bool,
 }
 
-/// The joins to measure, from `KARYOS_NETEM_MEASURE`; `None` prints the
-/// skip.
-fn joins() -> Option<usize> {
-    super::super::netem::require_netem();
+/// The joins to measure, from `KARYOS_NETEM_MEASURE`; it fails without
+/// one, then without the netem job.
+fn joins() -> usize {
     let joins = std::env::var("KARYOS_NETEM_MEASURE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|joins| *joins > 0);
-    if joins.is_none() {
-        println!("SKIPPED: KARYOS_NETEM_MEASURE is unset, nothing measured");
-    }
+    let Some(joins) = joins else {
+        panic!("KARYOS_NETEM_MEASURE is unset: nothing measured");
+    };
+    super::super::netem::require_netem();
     joins
+}
+
+/// DATA while a solicit entry or its holdoff stands: the expected noise of
+/// a join, apart from the reasons that explain one.
+const fn expected(reason: crate::sessions::receive::Ignored) -> bool {
+    use crate::sessions::receive::Ignored;
+    matches!(reason, Ignored::EntryPending | Ignored::SolicitHoldoff)
 }
 
 /// The value at rank `rank` (1-based) of `sorted`, clamped to its ends.
@@ -93,25 +105,49 @@ fn quantile(sorted: &[Duration], q: f64) -> Duration {
     at_rank(sorted, rank)
 }
 
-/// A distribution-free 95% interval of the `q` quantile of `sorted`: the
-/// order statistics at `n q ± 1.96 sqrt(n q (1 - q))`, the normal
-/// approximation of the binomial ranks.
-fn interval(sorted: &[Duration], q: f64) -> (Duration, Duration) {
+/// `P(X <= k)` for `X` binomial of `n` trials and success `q`, summed in
+/// logs.
+fn binomial_cdf(n: usize, q: f64, k: usize) -> f64 {
     #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
         clippy::cast_precision_loss,
-        reason = "ranks of at most a few thousand"
+        reason = "counts of at most a few thousand"
     )]
-    let (low, high) = {
-        let n = sorted.len() as f64;
-        let spread = 1.96 * (n * q * (1.0 - q)).sqrt();
-        (
-            (n * q - spread).floor().max(1.0) as usize,
-            (n * q + spread).ceil() as usize,
-        )
+    let (n, mut log_choose) = (n as f64, 0.0f64);
+    let mut total = 0.0f64;
+    let mut i = 0usize;
+    while i <= k && i as f64 <= n {
+        #[allow(clippy::cast_precision_loss, reason = "as above")]
+        let at = i as f64;
+        if i > 0 {
+            log_choose += (n - at + 1.0).ln() - at.ln();
+        }
+        total += (log_choose + at * q.ln() + (n - at) * (1.0 - q).ln()).exp();
+        i += 1;
+    }
+    total.min(1.0)
+}
+
+/// A distribution-free interval of at least `level` for the `q` quantile
+/// of `n` samples, as 1-based ranks `(low, high)` of its order statistics,
+/// from the exact binomial: `low` the largest rank with
+/// `P(B < low) <= (1 - level) / 2`, `high` the smallest with
+/// `P(B >= high) <= (1 - level) / 2`, `B` the samples below the quantile.
+/// `high` is `None` when no rank reaches it (the upper bound is open), and
+/// the coverage `P(low <= B < high)` is returned.
+fn interval_ranks(n: usize, q: f64, level: f64) -> (usize, Option<usize>, f64) {
+    let tail = (1.0 - level) / 2.0;
+    let mut low = 1;
+    while low < n && binomial_cdf(n, q, low) <= tail {
+        low += 1;
+    }
+    let high = (1..=n).find(|rank| binomial_cdf(n, q, rank - 1) >= 1.0 - tail);
+    let below = if low > 1 {
+        binomial_cdf(n, q, low - 2)
+    } else {
+        0.0
     };
-    (at_rank(sorted, low), at_rank(sorted, high))
+    let upto = high.map_or(1.0, |rank| binomial_cdf(n, q, rank - 1));
+    (low, high, upto - below)
 }
 
 /// Joins `count` fresh subscribers, one after another, to a live
@@ -203,33 +239,21 @@ fn measure(label: &str, reliable: bool, count: usize) {
                     // ignored (DATA while an entry or holdoff stands is
                     // the expected noise, summed apart).
                     let ignored = shared(&mut joiner).receiver.ignored_controls();
-                    let noise = ignored
-                        .iter()
-                        .filter(|reason| {
-                            matches!(
-                                reason,
-                                crate::sessions::receive::Ignored::EntryPending
-                                    | crate::sessions::receive::Ignored::SolicitHoldoff
-                            )
-                        })
-                        .count();
+                    let noise: u64 = ignored
+                        .seen()
+                        .filter(|(reason, _)| expected(*reason))
+                        .map(|(_, count)| count)
+                        .sum();
                     let other: Vec<_> = ignored
-                        .iter()
-                        .filter(|reason| {
-                            !matches!(
-                                reason,
-                                crate::sessions::receive::Ignored::EntryPending
-                                    | crate::sessions::receive::Ignored::SolicitHoldoff
-                            )
-                        })
+                        .seen()
+                        .filter(|(reason, _)| !expected(*reason))
                         .collect();
                     let publisher = a.net.as_ref().unwrap().receiver_counters().unwrap();
                     println!(
                         "bind_time slow join {}: {:.1} ms, solicits {} expired {} withdrawn {} | ignored {other:?} (+{noise} pending or held off) | publisher ring_full_solicit {} rsp_setup_rate_limited {} rsp_setup_total_limited {} unanswerable {}",
                         joins.len(),
-                        now.duration_since(unbound_at.unwrap_or(subscribed))
-                            .as_secs_f64()
-                            * 1000.0,
+                        unbound_at
+                            .map_or(f64::NAN, |at| now.duration_since(at).as_secs_f64() * 1000.0),
                         sessions.solicits,
                         sessions.solicits_expired,
                         sessions.solicits_withdrawn,
@@ -240,18 +264,29 @@ fn measure(label: &str, reliable: bool, count: usize) {
                     );
                 }
                 joins.push(Join {
-                    bind: now.duration_since(unbound_at.unwrap_or(subscribed)),
+                    bind: unbound_at.map(|at| now.duration_since(at)),
                     subscribe: now.duration_since(subscribed),
                     solicits: sessions.solicits,
                     expired: sessions.solicits_expired,
+                    censored: false,
                 });
                 break;
             }
-            assert!(
-                subscribed.elapsed() < JOIN_LIMIT,
-                "join {} never bound",
-                joins.len()
-            );
+            if subscribed.elapsed() >= JOIN_LIMIT {
+                let sessions = shared(&mut joiner).receiver.session_counters();
+                println!(
+                    "bind_time censored join {}: unbound after {JOIN_LIMIT:?}",
+                    joins.len()
+                );
+                joins.push(Join {
+                    bind: Some(JOIN_LIMIT),
+                    subscribe: JOIN_LIMIT,
+                    solicits: sessions.solicits,
+                    expired: sessions.solicits_expired,
+                    censored: true,
+                });
+                break;
+            }
             std::thread::sleep(Duration::from_micros(100));
         }
     }
@@ -265,7 +300,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
 
 /// Prints `joins`' distribution: one line for the log and one record.
 fn report(label: &str, joins: &[Join], sent: u32) {
-    let mut bind: Vec<Duration> = joins.iter().map(|join| join.bind).collect();
+    let mut bind: Vec<Duration> = joins.iter().filter_map(|join| join.bind).collect();
     bind.sort_unstable();
     let mut subscribe: Vec<Duration> = joins.iter().map(|join| join.subscribe).collect();
     subscribe.sort_unstable();
@@ -277,17 +312,24 @@ fn report(label: &str, joins: &[Join], sent: u32) {
     };
     let more = joins.iter().filter(|join| join.solicits >= 3).count();
     let expired: u64 = joins.iter().map(|join| join.expired).sum();
-    let (p99_low, p99_high) = interval(&bind, 0.99);
+    let censored = joins.iter().filter(|join| join.censored).count();
+    let no_unbound = joins.iter().filter(|join| join.bind.is_none()).count();
+    let (low, high, coverage) = interval_ranks(bind.len(), 0.99, 0.95);
     let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+    let upper = high.map_or_else(
+        || "open".to_owned(),
+        |rank| format!("{:.1}", ms(at_rank(&bind, rank))),
+    );
     println!(
-        "bind_time {label}: n {} | t_bind ms median {:.1} p90 {:.1} p99 {:.1} (95% {:.1} to {:.1}) max {:.1} \
-         | t_subscribe ms median {:.1} max {:.1} | solicits 1: {} 2: {} 3+: {} (0: {}) expired {} | {} sent",
-        joins.len(),
+        "bind_time {label}: n {} | t_bind ms median {:.1} p90 {:.1} p99 {:.1} ({:.1}% {:.1} to {upper}) max {:.1} \
+         | t_subscribe ms median {:.1} max {:.1} | solicits 1: {} 2: {} 3+: {} (0: {}) expired {} \
+         | censored {censored}, no unbound DATA {no_unbound} | {} sent",
+        bind.len(),
         ms(quantile(&bind, 0.5)),
         ms(quantile(&bind, 0.9)),
         ms(quantile(&bind, 0.99)),
-        ms(p99_low),
-        ms(p99_high),
+        coverage * 100.0,
+        ms(at_rank(&bind, low)),
         ms(at_rank(&bind, bind.len())),
         ms(quantile(&subscribe, 0.5)),
         ms(at_rank(&subscribe, subscribe.len())),
@@ -313,9 +355,7 @@ fn report(label: &str, joins: &[Join], sent: u32) {
 #[test]
 #[ignore = "a measurement: scripts/netem-test.sh with KARYOS_NETEM_MEASURE"]
 fn m150_a_late_reliable_multicast_subscriber_binds() {
-    if let Some(count) = joins() {
-        measure("reliable", true, count);
-    }
+    measure("reliable", true, joins());
 }
 
 /// The control: the same join on an unreliable group, whose bind path is
@@ -323,9 +363,7 @@ fn m150_a_late_reliable_multicast_subscriber_binds() {
 #[test]
 #[ignore = "a measurement: scripts/netem-test.sh with KARYOS_NETEM_MEASURE"]
 fn m150_a_late_unreliable_multicast_subscriber_binds() {
-    if let Some(count) = joins() {
-        measure("unreliable", false, count);
-    }
+    measure("unreliable", false, joins());
 }
 
 /// The quantile helpers on a known sample.
@@ -334,9 +372,20 @@ fn the_quantiles_are_nearest_rank() {
     let sorted: Vec<Duration> = (1..=200).map(Duration::from_millis).collect();
     assert_eq!(quantile(&sorted, 0.5), Duration::from_millis(100));
     assert_eq!(quantile(&sorted, 0.99), Duration::from_millis(198));
-    let (low, high) = interval(&sorted, 0.99);
-    assert_eq!(
-        (low, high),
-        (Duration::from_millis(195), Duration::from_millis(200))
-    );
+}
+
+/// The exact interval of the p99: at n = 200 no rank reaches the upper
+/// bound, which is open; at n = 1000 both are found, covering at least
+/// 95%.
+#[test]
+fn the_p99_interval_is_exact() {
+    let (low, high, coverage) = interval_ranks(200, 0.99, 0.95);
+    assert!(high.is_none(), "{low} {high:?} {coverage}");
+    assert!(coverage >= 0.95, "{coverage}");
+    let (low, high, coverage) = interval_ranks(1000, 0.99, 0.95);
+    let high = high.unwrap();
+    assert!(low < 990 && high > 990, "{low} {high}");
+    assert!(coverage >= 0.95, "{coverage}");
+    assert!((binomial_cdf(10, 0.5, 10) - 1.0).abs() < 1e-9);
+    assert!((binomial_cdf(10, 0.5, 4) - 0.376_953_125).abs() < 1e-9);
 }

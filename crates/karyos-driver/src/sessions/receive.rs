@@ -215,6 +215,39 @@ pub enum ReadyOutcome {
     Release(SlotRef),
 }
 
+/// How often each reason ignored a control, in a fixed array of
+/// `(reason, count)` entries, the first free one taken by a new reason
+/// (tests; no allocation).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IgnoredCounts {
+    entries: [Option<(Ignored, u64)>; 32],
+}
+
+#[cfg(test)]
+impl IgnoredCounts {
+    fn bump(&mut self, reason: Ignored) {
+        for entry in &mut self.entries {
+            match entry {
+                Some((seen, count)) if *seen == reason => {
+                    *count = count.saturating_add(1);
+                    return;
+                }
+                None => {
+                    *entry = Some((reason, 1));
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// The reasons seen, with their counts.
+    pub(crate) fn seen(&self) -> impl Iterator<Item = (Ignored, u64)> + '_ {
+        self.entries.iter().flatten().copied()
+    }
+}
+
 /// Why a control was ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ignored {
@@ -386,10 +419,11 @@ pub struct ReceiveSessions {
     boot_id: [u64; 2],
     slots: Vec<Slot>,
     counters: SessionCounters,
-    /// Every reason a control was ignored, in order (tests: the bind-time
-    /// measurement, karyos#805).
+    /// How often each reason ignored a control (tests: the bind-time
+    /// measurement, karyos#805), in a fixed array, so the cycle never
+    /// allocates for it.
     #[cfg(test)]
-    pub(crate) ignored: Vec<Ignored>,
+    ignored: IgnoredCounts,
     /// The images' path bindings (redundant-paths.md sections 2 and 3).
     paths: PathBindings,
     /// Keys whose solicit entry ended without a binding, and until when no
@@ -448,7 +482,7 @@ impl ReceiveSessions {
             ],
             counters: SessionCounters::default(),
             #[cfg(test)]
-            ignored: Vec::new(),
+            ignored: IgnoredCounts::default(),
             paths,
             holdoffs: Vec::with_capacity(config.max_pending_challenges),
         })
@@ -473,10 +507,16 @@ impl ReceiveSessions {
         self.counters
     }
 
+    /// How often each reason ignored a control (tests).
+    #[cfg(test)]
+    pub(crate) fn ignored_counts(&self) -> IgnoredCounts {
+        self.ignored
+    }
+
     fn ignore(&mut self, reason: Ignored) -> Ignored {
         self.counters.bump(|c| &mut c.dropped);
         #[cfg(test)]
-        self.ignored.push(reason);
+        self.ignored.bump(reason);
         reason
     }
 
