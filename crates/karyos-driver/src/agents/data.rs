@@ -295,6 +295,13 @@ pub struct OutboundCounters {
     /// ring refused a release: a broken invariant, counted; the lane
     /// stages nothing more.
     pub schedule_faults: u64,
+    /// Optional destinations removed as slow (MD-7).
+    pub removed_slow: u64,
+    /// Optional destinations removed after repeated send faults (MD-12).
+    pub removed_fault: u64,
+    /// Faulted destination queues that refused their retry: the control
+    /// path resets the endpoint for a required one (MD-12).
+    pub retries_refused: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }

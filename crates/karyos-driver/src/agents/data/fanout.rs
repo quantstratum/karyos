@@ -14,13 +14,17 @@
 //! edge, besides the strategy edge every target shares). The cursor moves
 //! past a datagram only once every live target has it staged, so a target
 //! whose queue is full holds the next datagram of every target until it
-//! takes it, unless it is optional: an optional target that cannot take a
-//! datagram is removed at once (MD-7, decided: the alternative, so a slow
-//! destination never stalls the others), counted in `removed_slow` and
-//! reported with its reason. A required one bounds the publisher, as it
-//! must. A send fault stays with its target (MD-12): its queue is retried,
-//! and after [`DESTINATION_FAULT_LIMIT`] consecutive faults an optional
-//! target is removed and a required one held, never an endpoint reset.
+//! takes it. An optional target is removed at the first datagram its full
+//! queue cannot take while the others take it (MD-7, decided: the
+//! alternative, with no grace), counted in `removed_slow` and reported with
+//! its reason; never while the publisher is held by a required loss, while
+//! the shared socket pushes back (design 6.5), or while it bounds the
+//! others under `min` or inside a `tagged` group (design 4.5). A required
+//! one bounds the publisher, as it must. A send fault stays with its
+//! target (MD-12): its queue is retried, and after
+//! [`DESTINATION_FAULT_LIMIT`] consecutive faults an optional target is
+//! removed and a required one held; a queue that refuses its retry goes to
+//! the control path, which for a required target resets the endpoint.
 //!
 //! A reliable publication repairs per target (MD-8): each target has its
 //! own repair path and repair queue on its route, with a share of the job
@@ -44,7 +48,7 @@ use karyos_io::lanes::{LaneGate, LaneSender, Left, SenderFailure, Staged};
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::frame::Lane;
-use karyos_protocol::lanes::drr::{Budget, DrrConfig};
+use karyos_protocol::lanes::drr::{Budget, DrrConfig, Stop};
 use karyos_sys::log_buffer::{ReadError, ReadOrigin, ReadOutcome};
 
 use super::removal::{EosSent, RemovalStep};
@@ -60,7 +64,8 @@ pub const DESTINATION_FAULT_LIMIT: u8 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RemovalReason {
-    /// Its queue was full when a datagram had to be staged (MD-7).
+    /// Its queue was full when a datagram had to be staged while the others
+    /// took it (MD-7).
     Slow,
     /// Its sends faulted [`DESTINATION_FAULT_LIMIT`] times in a row (MD-12).
     Fault,
@@ -101,9 +106,12 @@ pub(super) struct Target {
     /// Per lane, its member's edge this cycle (MD-1): a staged head is
     /// submitted only once it ends at or below it.
     edges: [u64; 4],
-    /// Per lane, whether its queue was still full when the cycle began: it
-    /// sent nothing of a full queue in a whole cycle, so it is slow (MD-7).
-    full: [bool; 4],
+    /// Its member bounds the strategy edge (`min`, or inside the `tagged`
+    /// group): it is never removed as slow (design 4.5).
+    bounds: bool,
+    /// Its last serve found nothing it could send while it had staged
+    /// heads: it waits at its own edge, not on the socket or the budget.
+    stalled: bool,
     /// Per lane, since when it submitted nothing: its idle heartbeat is
     /// due `sender_heartbeat_interval` later.
     idle_since: [Option<u64>; 4],
@@ -154,6 +162,9 @@ pub(super) struct Fanout {
     scratch: Vec<Vec<u8>>,
     /// The rotating start of each cycle's target visits (MD-9).
     rotation: usize,
+    /// The last serve met backpressure on the shared socket, or an
+    /// inactive endpoint: no target is slow then (design 6.5).
+    backpressure: bool,
 }
 
 /// The gate of one target's first sends: every candidate is permitted,
@@ -248,7 +259,8 @@ impl Fanout {
                 opened: None,
                 live: false,
                 edges: [0; 4],
-                full: [false; 4],
+                bounds: false,
+                stalled: false,
                 idle_since: [None; 4],
                 counters: TargetCounters::default(),
                 removed: None,
@@ -263,6 +275,7 @@ impl Fanout {
             pending: vec![None; lanes],
             scratch: (0..lanes).map(|_| vec![0; mtu]).collect(),
             rotation: 0,
+            backpressure: false,
         })
     }
 
@@ -351,21 +364,22 @@ impl Fanout {
     }
 
     /// Whether `lane` has nothing read and nothing staged or pending on any
-    /// target.
+    /// target not removed.
     fn idle(&self, lane: usize) -> bool {
         self.pending.get(lane).is_none_or(Option::is_none)
             && self.targets.iter().all(|target| {
-                target
-                    .lanes
-                    .get(lane)
-                    .is_none_or(|track| track.staged.is_empty())
-                    && target.sender.pending(lane).unwrap_or(0) == 0
+                target.removed.is_some()
+                    || target
+                        .lanes
+                        .get(lane)
+                        .is_none_or(|track| track.staged.is_empty())
+                        && target.sender.pending(lane).unwrap_or(0) == 0
             })
     }
 
     /// `lane`'s sent frontier: the least position its live targets
-    /// submitted (`sent_low`, design 4.3), or the most any target did when
-    /// none is live.
+    /// submitted (`sent_low`, design 4.3), or the most any target not
+    /// removed did when none is live.
     fn sent(&self, lane: usize) -> Option<u64> {
         let high = |target: &Target| target.lanes.get(lane).map(|track| track.high);
         self.targets
@@ -373,7 +387,13 @@ impl Fanout {
             .filter(|target| target.live && target.removed.is_none())
             .filter_map(high)
             .min()
-            .or_else(|| self.targets.iter().filter_map(high).max())
+            .or_else(|| {
+                self.targets
+                    .iter()
+                    .filter(|target| target.removed.is_none())
+                    .filter_map(high)
+                    .max()
+            })
     }
 }
 
@@ -473,21 +493,26 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Opens each target's route and lane queues for the current epoch,
-    /// once per epoch; a new epoch drops what the old one staged.
+    /// once per epoch; a new epoch drops what the old one staged. A removed
+    /// target is never opened again, and one that fails to open is retried
+    /// at the next call without holding the others (it gets nothing until
+    /// it opens; a required one bounds the publisher meanwhile).
     fn open_targets<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) -> bool {
         let epoch = tx.capabilities().epoch;
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return false;
         };
-        let mut reopened = false;
+        // Once per epoch change, even when a target opens only later.
+        let reopened = self.opened.is_some_and(|opened| opened != epoch);
         for target in &mut fanout.targets {
-            if target.opened == Some(epoch) {
+            if target.opened == Some(epoch) || target.removed.is_some() {
                 continue;
             }
             let Ok(route) = tx.add_route(target.address) else {
                 self.counters.bump(|c| &mut c.route_failures, 1);
-                return false;
+                continue;
             };
+            let mut failed = false;
             for lane in 0..target.queues.len() {
                 let opened = tx.open_queue(TxQueueConfig {
                     authority: Authority::FIRST,
@@ -501,11 +526,15 @@ impl<T: StreamTerms> Outbound<T> {
                         while self.report.pop_front().is_some() {}
                     }
                     let _ = tx.remove_route(route);
-                    return false;
+                    failed = true;
+                    break;
                 };
                 if let Some(queue) = target.queues.get_mut(lane) {
                     *queue = opened;
                 }
+            }
+            if std::mem::take(&mut failed) {
+                continue;
             }
             for (lane, queue) in target.queues.iter().enumerate() {
                 target.sender.reopen(lane, *queue);
@@ -527,7 +556,6 @@ impl<T: StreamTerms> Outbound<T> {
             for track in &mut target.lanes {
                 track.staged.clear();
             }
-            reopened |= target.opened.is_some();
             target.opened = Some(epoch);
             target.route = Some(route);
         }
@@ -559,12 +587,8 @@ impl<T: StreamTerms> Outbound<T> {
         for target in &mut fanout.targets {
             target.live = target.removed.is_none()
                 && membership.is_some_and(|membership| membership.live_at(target.address, now));
-            for (lane, full) in target.full.iter_mut().enumerate() {
-                *full = target
-                    .sender
-                    .pending(lane)
-                    .is_some_and(|count| count >= usize::from(STAGED_PER_LANE));
-            }
+            target.bounds =
+                membership.is_some_and(|membership| membership.bounds_at(target.address, now));
             for (lane, edge) in target.edges.iter_mut().enumerate() {
                 *edge = u8::try_from(lane)
                     .ok()
@@ -602,7 +626,7 @@ impl<T: StreamTerms> Outbound<T> {
         for lane in 0..self.readers.len() {
             let limit = limits.get(lane).copied().unwrap_or(Limit::Held);
             work = work
-                .checked_add(self.stage_fanout(tx, lane, limit, now)?)
+                .checked_add(self.stage_fanout(tx, lane, (limit, held), now)?)
                 .ok_or(overflow.clone())?;
         }
         let Some(fanout) = self.fanout.as_deref_mut() else {
@@ -615,15 +639,17 @@ impl<T: StreamTerms> Outbound<T> {
         } else {
             fanout.rotation.wrapping_add(1) % count
         };
+        let epoch = tx.capabilities().epoch;
         let mut failure = None;
+        let mut backpressure = false;
         for visit in 0..count {
             let at = (fanout.rotation + visit) % count;
             let Some(target) = fanout.targets.get_mut(at) else {
                 continue;
             };
             // A removed target is never served again: its queues were
-            // emptied at the removal.
-            if target.removed.is_some() {
+            // emptied at the removal. One not open yet waits for its open.
+            if target.removed.is_some() || target.opened != Some(epoch) {
                 continue;
             }
             let mut gate = TargetGate {
@@ -635,6 +661,10 @@ impl<T: StreamTerms> Outbound<T> {
             if report.failure.is_some() {
                 failure = report.failure;
             }
+            backpressure |= report.inactive || matches!(report.drr.stop, Stop::Backpressure { .. });
+            target.stalled = report.drr.stop == Stop::Idle
+                && (0..target.queues.len())
+                    .any(|lane| target.sender.pending(lane).unwrap_or(0) > 0);
             for track in &mut target.lanes {
                 if std::mem::take(&mut track.unsent) {
                     self.counters.bump(|c| &mut c.unsent, 1);
@@ -660,13 +690,22 @@ impl<T: StreamTerms> Outbound<T> {
                         .is_some_and(|queue| tx.retry_queue(*queue).is_ok());
                     if retried {
                         target.sender.retry(lane);
+                    } else {
+                        // A queue that refuses its retry (closed, unrouted)
+                        // needs the control path: a required target would
+                        // otherwise hold the publisher for good.
+                        self.counters.bump(|c| &mut c.retries_refused, 1);
+                        if target.required {
+                            self.needs_reset = true;
+                        }
                     }
                 }
             }
             if faulted {
                 target.faults = target.faults.saturating_add(1);
                 if target.faults >= DESTINATION_FAULT_LIMIT && !target.required {
-                    remove_target(target, RemovalReason::Fault, now, tx, &mut self.report);
+                    remove_target(target, RemovalReason::Fault, now, tx);
+                    self.counters.bump(|c| &mut c.removed_fault, 1);
                 }
             } else if target.lanes.iter().any(|track| track.submitted) {
                 target.faults = 0;
@@ -675,6 +714,7 @@ impl<T: StreamTerms> Outbound<T> {
                 track.submitted = false;
             }
         }
+        fanout.backpressure = backpressure;
         if let Some(
             SenderFailure::Backend { .. }
             | SenderFailure::Invariant { .. }
@@ -711,10 +751,11 @@ impl<T: StreamTerms> Outbound<T> {
         &mut self,
         tx: &mut SocketsTx<O>,
         lane: usize,
-        limit: Limit,
+        (limit, held): (Limit, bool),
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
+        let epoch = tx.capabilities().epoch;
         let mut staged = 0u32;
         loop {
             let Some(fanout) = self.fanout.as_deref_mut() else {
@@ -782,6 +823,20 @@ impl<T: StreamTerms> Outbound<T> {
             };
             // Copy into each live target that does not have it and whose
             // own edge and queue admit it (MD-1).
+            let room = |target: &Target| {
+                target
+                    .sender
+                    .pending(lane)
+                    .is_some_and(|count| count < usize::from(STAGED_PER_LANE))
+            };
+            // Whether some live target takes datagrams: MD-7's "while the
+            // others take it".
+            let advancing = fanout
+                .targets
+                .iter()
+                .filter(|target| target.live && target.opened == Some(epoch))
+                .any(room);
+            let backpressure = fanout.backpressure;
             let mut waiting = false;
             for (at, target) in fanout.targets.iter_mut().enumerate() {
                 let done = fanout
@@ -793,6 +848,12 @@ impl<T: StreamTerms> Outbound<T> {
                 if done || !target.live {
                     continue;
                 }
+                if target.opened != Some(epoch) {
+                    // Not open in this epoch yet: a required one bounds the
+                    // publisher; an optional one misses it.
+                    waiting |= target.required;
+                    continue;
+                }
                 // Past its own edge it is staged anyway and waits in its
                 // queue (design 4.2, the gate); a full queue decides below.
                 if pending
@@ -802,23 +863,20 @@ impl<T: StreamTerms> Outbound<T> {
                 {
                     target.counters.window_waits = target.counters.window_waits.saturating_add(1);
                 }
-                let room = target
-                    .sender
-                    .pending(lane)
-                    .is_some_and(|count| count < usize::from(STAGED_PER_LANE));
-                let Some(queue) = target.queues.get(lane).copied().filter(|_| room) else {
-                    let slow = target.full.get(lane).copied().unwrap_or(false);
-                    if target.required || !slow {
-                        // A required destination bounds the publisher; a
-                        // queue filled this cycle drains when it is served.
+                let has_room = room(target);
+                let Some(queue) = target.queues.get(lane).copied().filter(|_| has_room) else {
+                    if slow(target, held, backpressure, advancing) {
+                        // MD-7: removed at once, so the others never wait
+                        // for it.
+                        remove_target(target, RemovalReason::Slow, now, tx);
+                        self.counters.bump(|c| &mut c.removed_slow, 1);
+                    } else {
+                        // A required or bounding destination holds the
+                        // publisher, as does a held publisher or a socket
+                        // that pushes back.
                         target.counters.fanout_waits =
                             target.counters.fanout_waits.saturating_add(1);
                         waiting = true;
-                    } else {
-                        // An optional one whose queue stayed full for a
-                        // whole cycle is removed at once (MD-7): the others
-                        // never wait for it longer.
-                        remove_target(target, RemovalReason::Slow, now, tx, &mut self.report);
                     }
                     continue;
                 };
@@ -982,10 +1040,13 @@ impl<T: StreamTerms> Outbound<T> {
                     .map_or(0, |fanout| fanout.targets.len());
                 let mut any = false;
                 for at in 0..count {
+                    // A removed destination gets nothing more, its EOS
+                    // included.
                     let queue = outbound
                         .fanout
                         .as_deref()
                         .and_then(|fanout| fanout.targets.get(at))
+                        .filter(|target| target.removed.is_none())
                         .and_then(|target| target.queues.get(lane).copied());
                     if let Some(queue) = queue {
                         any |= outbound.write_heartbeat_on(tx, queue, lane, seal, true);
@@ -1001,24 +1062,42 @@ impl<T: StreamTerms> Outbound<T> {
     }
 }
 
+/// Whether an optional `target` whose queue cannot take a datagram is slow
+/// (MD-7): it waits at its own edge while some live target takes
+/// datagrams, the publisher is not held by a required loss, the shared
+/// socket did not push back, and it does not bound the strategy edge
+/// (design 4.5, 6.5).
+fn slow(target: &Target, held: bool, backpressure: bool, advancing: bool) -> bool {
+    !target.required && !target.bounds && target.stalled && !held && !backpressure && advancing
+}
+
 /// Removes `target` for `reason` at `now`: it gets nothing more, and what
-/// its queues held is dropped (its receiver closes the gap by its gap
-/// policy, and its image expires).
+/// its queues and its sender held is dropped (its receiver closes the gap
+/// by its gap policy, and its image expires), so it never keeps a lane
+/// from idling or draining.
 fn remove_target<O: SocketOps>(
     target: &mut Target,
     reason: RemovalReason,
     now: u64,
     tx: &mut SocketsTx<O>,
-    report: &mut karyos_io::backend::TxReport,
 ) {
     if target.removed.is_some() {
         return;
     }
     target.removed = Some((reason, now));
     target.live = false;
-    for queue in &target.queues {
-        let _ = tx.cancel_pending(*queue, report);
-        while report.pop_front().is_some() {}
+    for lane in 0..target.queues.len() {
+        let mut gate = TargetGate {
+            lanes: &mut target.lanes,
+            held: true,
+            edges: target.edges,
+        };
+        let _ = target.sender.cancel(tx, lane, &mut gate);
+        // What the backend no longer holds as pending (handed to the
+        // kernel, or a faulted queue) leaves the sender's records too.
+        if let Some(queue) = target.queues.get(lane).copied() {
+            target.sender.reopen(lane, queue);
+        }
     }
     for track in &mut target.lanes {
         track.staged.clear();
@@ -1198,5 +1277,44 @@ impl<T: StreamTerms> Outbound<T> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+
+    use super::*;
+
+    fn target(required: bool) -> Target {
+        let address: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let drr = DrrConfig::new(&[1536], 1536).unwrap();
+        let required = if required { vec![address] } else { Vec::new() };
+        let mut fanout = Fanout::new(&[address], &required, drr, 1, 1500, &[0]).unwrap();
+        let mut target = fanout.targets.pop().unwrap();
+        target.stalled = true;
+        target
+    }
+
+    /// MD-7: an optional destination stalled at its own edge while the
+    /// others take datagrams is slow; it is not when it is required, when
+    /// it bounds the strategy edge (`min`, or inside the `tagged` group),
+    /// when the publisher is held by a required loss, when the shared
+    /// socket pushed back, when nothing advances, or when its last serve
+    /// was cut short rather than stalled (design 4.5, 6.5).
+    #[test]
+    fn only_an_optional_destination_stalled_at_its_own_edge_is_slow() {
+        let optional = target(false);
+        assert!(slow(&optional, false, false, true));
+        assert!(!slow(&target(true), false, false, true), "required");
+        let mut bounding = target(false);
+        bounding.bounds = true;
+        assert!(!slow(&bounding, false, false, true), "min or tagged");
+        assert!(!slow(&optional, true, false, true), "held");
+        assert!(!slow(&optional, false, true, true), "backpressure");
+        assert!(!slow(&optional, false, false, false), "nothing advances");
+        let mut busy = target(false);
+        busy.stalled = false;
+        assert!(!slow(&busy, false, false, true), "cut short, not stalled");
     }
 }

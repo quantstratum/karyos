@@ -12,11 +12,12 @@
 use std::net::SocketAddr;
 
 use karyos_client::OfferOutcome;
+use karyos_client::aggregate::LaneEnd;
 use karyos_protocol::channel::{
     ControlMode, Destination, FlowControl, Interface, Security, UdpConfig,
 };
 use karyos_sys::frame::Lane;
-use karyos_sys::log_buffer::Role;
+use karyos_sys::log_buffer::{Role, SealReason};
 
 use super::{ANY_PORT, BUDGET, LOOPBACK, aggregate, bound, channel, driver, pump};
 use crate::agents::ThreadingMode;
@@ -323,6 +324,63 @@ fn a_slow_optional_destination_is_removed_without_stalling_the_others() {
     assert_eq!(removed.len(), 1, "{removed:?}");
     assert_eq!(removed[0].destination, addresses[0]);
     assert_eq!(removed[0].reason, RemovalReason::Slow);
+    // The removed destination no longer keeps the lane from draining: the
+    // publication's EOS reaches the remaining one, whose image ends there.
+    // The handle is released first, so the seal is positioned.
+    drop(lane);
+    a.remove_aggregate(&publication).unwrap();
+    let mut end = None;
+    pump(&mut [&mut a, &mut live], |_| {
+        let poll = reader.poll(|_, _, _| seen += 1, BUDGET);
+        if poll.terminal.is_some() {
+            end = Some(poll.lanes[0].end);
+        }
+        end.is_some()
+    });
+    assert!(
+        matches!(
+            end,
+            Some(Some(LaneEnd::Closed {
+                reason: SealReason::EndOfStream,
+                ..
+            }))
+        ),
+        "{end:?}"
+    );
+}
+
+/// MD-7 under `min` (no `fc`): a destination whose receiver stops bounds
+/// the others until its liveness expiry and is never removed as slow
+/// (design 4.5).
+#[test]
+fn under_min_a_stopped_destination_bounds_and_is_not_removed() {
+    let mut a = driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers_on(2, true);
+    let channel = destinations(&addresses, true);
+    let (publication, images) = connect(&mut a, &mut receivers, &channel, &[], None);
+    let mut live = receivers.pop().unwrap();
+    let _frozen = receivers.pop().unwrap();
+    let mut reader = live
+        .subscribe_aggregate(&images[1], Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let mut sent = 0u32;
+    for _ in 0..3_000 {
+        while sent < 512 {
+            let payload = [0u8; 1000];
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = a.do_work().unwrap();
+        let _ = live.do_work().unwrap();
+        let _ = reader.poll(|_, _, _| {}, BUDGET);
+    }
+    let removed = a.network_removed_destinations(&publication);
+    assert!(removed.is_empty(), "{removed:?}");
 }
 
 /// MD-8: on a reliable channel, a datagram one destination lost is

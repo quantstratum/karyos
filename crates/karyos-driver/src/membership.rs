@@ -644,6 +644,20 @@ impl Membership {
             .copied()
     }
 
+    /// Whether the live active member bound to `source` at `now` bounds
+    /// the strategy edge: every member under `min`, none under `max`, and
+    /// the group's under `tagged` (design 4.5: such a destination bounds
+    /// the others and is never removed as slow).
+    #[must_use]
+    pub fn bounds_at(&self, source: SocketAddr, now: u64) -> bool {
+        self.member_at(source, now)
+            .is_some_and(|entry| match self.config.strategy {
+                Strategy::Min => true,
+                Strategy::Max => false,
+                Strategy::Tagged(tag) => entry.tag == tag,
+            })
+    }
+
     /// Expires the active member bound to `source` at `now`, a removed
     /// destination's (karyos#630): an optional one leaves a tombstone and
     /// stops counting for the strategy edge; a required one is lost.
