@@ -576,6 +576,7 @@ fn export_page(records: u64) -> crate::api::ExportPage {
         head: 5 + records,
         journals: vec![ExportJournal::Unknown { journal: 10 }],
         unknown_records: 3,
+        unreadable_records: 0,
     }
 }
 
@@ -594,7 +595,7 @@ fn an_export_page_is_encoded_whole() {
         "{whole}"
     );
     assert!(
-        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"unknown_records":3}"#),
+        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"unknown_records":3,"unreadable_records":0}"#),
         "{whole}"
     );
     assert_eq!(whole.matches(r#"{"seq":"#).count(), 3);
@@ -697,6 +698,7 @@ fn the_largest_record_and_journal_encode_within_their_bounds() {
         head: 4000,
         journals: vec![ExportJournal::Live(Box::new(entry))],
         unknown_records: 0,
+        unreadable_records: 0,
     };
     // One record and one journal, the most a reply holds past the bound.
     let one = crate::api::ExportPage {

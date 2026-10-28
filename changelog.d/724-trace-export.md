@@ -24,11 +24,12 @@
   `unknown`, its records counted in `unknown_records`. A malformed record
   (a length past the payload bound, `MirrorRecord::truncated`) is never
   delivered: it is lost with its sequence and reason `malformed`, and the
-  page goes on. An entry busy on every attempt from a page's first record
-  on (a writer stopped mid-write) never stalls the cursor: its records are
-  lost with reason `journal_unreadable`. Each lost range carries its
-  `reason` (`overwritten`, `malformed` or `journal_unreadable`), and none
-  is stated past the page's `next`. The read alone bounds the page, in
+  page goes on. An entry busy on every attempt while a page's first record
+  is its journal's never stalls the cursor and loses nothing: those
+  records go out without calibration, their journal `unreadable`, counted
+  in `unreadable_records`. Each lost range carries its `reason`
+  (`overwritten` or `malformed`), is stated once, and is below the page's
+  `next`. The read alone bounds the page, in
   batches of 64 records; `json::trace_export` encodes it whole.
   `capabilities` lists `trace-export`.
 - `karyos_sys::diag_ring::scan_at_most` and

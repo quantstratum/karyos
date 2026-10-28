@@ -574,3 +574,33 @@ fn trace_export_is_served_over_the_socket() {
     );
     assert_eq!(served, [Served::Refused]);
 }
+
+/// QS-COORDINATOR, ACS 33663 (F2): a client that sends half a request
+/// and stops is dropped, unanswered and counted, and the poll comes back
+/// within the read deadline.
+#[test]
+fn a_half_request_is_dropped_within_the_read_deadline() {
+    use karyos_agent::server::{IO_TIMEOUT, READ_DEADLINE};
+
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("half");
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let mut client = UnixStream::connect(server.path()).unwrap();
+    client.write_all(b"KARYOS-AGENT 1 vi").unwrap();
+    let start = Instant::now();
+    let mut served = Vec::new();
+    while served.is_empty() {
+        served = server.poll(&mut agent).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5), "never served");
+    }
+    assert!(
+        start.elapsed() < READ_DEADLINE + IO_TIMEOUT,
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(served, [Served::Dropped]);
+    let mut answer = Vec::new();
+    client.read_to_end(&mut answer).unwrap();
+    assert!(answer.is_empty());
+}

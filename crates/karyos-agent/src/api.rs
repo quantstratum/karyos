@@ -913,10 +913,6 @@ pub enum LossReason {
     /// A record whose length passed the payload bound: never delivered
     /// cut.
     Malformed,
-    /// Records whose journal's table or log entry stayed busy on every
-    /// attempt from a page's first record on: never delivered without
-    /// their journal, and never stalling the cursor.
-    UnreadableJournal,
 }
 
 /// A journal a page's records name, as the table showed it when the page
@@ -929,9 +925,16 @@ pub enum ExportJournal {
     Live(Box<karyos_sys::trace_mirror::JournalEntry>),
     /// Recycled from the table, still in the recycle log.
     Recycled(Box<karyos_sys::trace_mirror::RecycledJournal>),
-    /// In neither: recycled and gone from the log too, or busy on every
-    /// attempt.
+    /// In neither: recycled and gone from the log too, every entry having
+    /// been read.
     Unknown {
+        /// Its number.
+        journal: u64,
+    },
+    /// Not read: a table or log entry stayed busy on every attempt while
+    /// this page's first record was its journal's. Its records are
+    /// delivered without calibration, counted in `unreadable_records`.
+    Unreadable {
         /// Its number.
         journal: u64,
     },
@@ -960,6 +963,9 @@ pub struct ExportPage {
     /// The records whose journal is `unknown` (recycled and gone from the
     /// log too): they are delivered, without their calibration.
     pub unknown_records: u64,
+    /// The records whose journal is `unreadable`: delivered, without their
+    /// calibration; a later read of the same records may name it.
+    pub unreadable_records: u64,
 }
 
 /// Why an export read is refused (R-CORE-13).

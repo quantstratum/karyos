@@ -195,26 +195,22 @@ pub fn export(
         }
     }
     let mut next = stop.unwrap_or(cursor);
-    let (journals, unread) = journals(mirror, &records);
+    let (mut journals, unread) = journals(mirror, &records);
     if records
         .first()
         .is_some_and(|record| unread.contains(&record.journal))
     {
-        // An entry busy on every attempt from the page's first record on
-        // (a writer stopped mid-write leaves it so): its records are lost,
-        // stated as such, rather than stalling the cursor for good.
-        for record in records
-            .iter()
-            .filter(|record| unread.contains(&record.journal))
-        {
-            note(
-                &mut lost,
-                record.seq,
-                record.seq,
-                LossReason::UnreadableJournal,
-            );
-        }
-        records.retain(|record| !unread.contains(&record.journal));
+        // An entry busy on every attempt while the page's first record is
+        // its journal's: the agent keeps no state to tell a writer stopped
+        // mid-write from an unlucky moment, so nothing is lost and the
+        // cursor never stalls. The records go out without calibration,
+        // their journal `unreadable`.
+        journals.extend(
+            unread
+                .iter()
+                .map(|journal| ExportJournal::Unreadable { journal: *journal }),
+        );
+        journals.sort_by_key(journal_number);
     } else if let Some(at) = records
         .iter()
         .position(|record| unread.contains(&record.journal))
@@ -246,6 +242,17 @@ pub fn export(
         .iter()
         .filter(|record| unknown.contains(&record.journal))
         .count();
+    let unreadable: BTreeSet<u64> = journals
+        .iter()
+        .filter_map(|journal| match journal {
+            ExportJournal::Unreadable { journal } => Some(*journal),
+            _ => None,
+        })
+        .collect();
+    let unreadable_records = records
+        .iter()
+        .filter(|record| unreadable.contains(&record.journal))
+        .count();
     // The head is the ring's, read again after the page, never the cursor.
     let head = (0..BUSY_RETRIES)
         .find_map(|_| mirror.bounds())
@@ -259,6 +266,7 @@ pub fn export(
         head,
         journals,
         unknown_records: u64::try_from(unknown_records).unwrap_or(u64::MAX),
+        unreadable_records: u64::try_from(unreadable_records).unwrap_or(u64::MAX),
     })
 }
 
@@ -267,7 +275,7 @@ fn journal_number(journal: &ExportJournal) -> u64 {
     match journal {
         ExportJournal::Live(entry) => entry.journal,
         ExportJournal::Recycled(entry) => entry.journal,
-        ExportJournal::Unknown { journal } => *journal,
+        ExportJournal::Unknown { journal } | ExportJournal::Unreadable { journal } => *journal,
     }
 }
 

@@ -802,7 +802,6 @@ pub fn trace_export(page: &ExportPage) -> String {
                     match loss.reason {
                         crate::api::LossReason::Overwritten => "overwritten",
                         crate::api::LossReason::Malformed => "malformed",
-                        crate::api::LossReason::UnreadableJournal => "journal_unreadable",
                     },
                 );
             });
@@ -816,6 +815,7 @@ pub fn trace_export(page: &ExportPage) -> String {
             .key("journals")
             .array(&page.journals, |out, journal| export_journal(out, journal));
         fields.number("unknown_records", page.unknown_records);
+        fields.number("unreadable_records", page.unreadable_records);
     });
     text
 }
@@ -942,6 +942,10 @@ fn export_journal(out: &mut Out<'_>, journal: &ExportJournal) {
         ExportJournal::Unknown { journal } => {
             fields.number("journal", *journal);
             fields.string("table", "unknown");
+        }
+        ExportJournal::Unreadable { journal } => {
+            fields.number("journal", *journal);
+            fields.string("table", "unreadable");
         }
     });
 }

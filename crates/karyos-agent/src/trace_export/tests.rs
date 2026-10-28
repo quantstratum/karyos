@@ -383,12 +383,12 @@ fn nothing_is_lost_past_where_the_page_ends() {
     );
 }
 
-/// Re-review of #826: an entry busy on every attempt (a writer stopped
-/// mid-write) never stalls the cursor: when the page's first record is
-/// its journal's, its records are lost as `journal_unreadable`, and the
-/// page goes on.
+/// Re-review of #826 (QS-REVIEWER's design point, ACS 33673): an entry
+/// busy on every attempt while the page's first record is its journal's
+/// never stalls the cursor and loses nothing: its records go out without
+/// calibration, the journal `unreadable`, counted in `unreadable_records`.
 #[test]
-fn a_stuck_entry_is_a_loss_not_a_stall() {
+fn a_stuck_entry_is_delivered_uncalibrated_not_lost() {
     let mut mirror = mirror(16);
     let other = JournalEntry::open(11, 1, JournalKind::Publisher, 2, 16);
     assert!(mirror.write_entry(1, Some(&other)));
@@ -397,12 +397,64 @@ fn a_stuck_entry_is_a_loss_not_a_stall() {
     let _ = mirror.append(11, 2, &[2, !2]).unwrap();
     assert!(mirror.hold_entry(1, true));
     let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
-    assert_eq!(seqs(&page), [1]);
+    assert_eq!(seqs(&page), [0, 1, 2]);
     assert_eq!(page.next, 3);
-    let unreadable = |seq| ExportLoss {
-        first: seq,
-        last: seq,
-        reason: LossReason::UnreadableJournal,
-    };
-    assert_eq!(page.lost, vec![unreadable(0), unreadable(2)]);
+    assert!(page.lost.is_empty());
+    assert!(
+        page.journals
+            .contains(&ExportJournal::Unreadable { journal: 11 })
+    );
+    assert_eq!(page.unreadable_records, 2);
+}
+
+/// QS-COORDINATOR, ACS 33663 (F1): across pages cut by bytes and by a busy
+/// journal, every sequence the ring held is delivered or lost exactly
+/// once, and every lost range of a page is below its `next`.
+#[test]
+fn every_sequence_is_delivered_or_lost_exactly_once() {
+    use karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD;
+
+    let mut mirror = mirror(64);
+    let other = JournalEntry::open(11, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.write_entry(1, Some(&other)));
+    let long = u64::try_from(MAX_MIRROR_PAYLOAD).unwrap() + 1;
+    for seq in 0..40u64 {
+        let journal = if seq % 7 == 3 { 11 } else { 10 };
+        let _ = if seq % 5 == 2 {
+            mirror.append_with_length(journal, seq, &[seq, seq], long)
+        } else {
+            mirror.append(journal, seq, &[seq, !seq])
+        }
+        .unwrap();
+    }
+    let reader = mirror.reader();
+    let bound = crate::json::EXPORT_REPLY_OVERHEAD + crate::api::MAX_JOURNAL_REPLY + 300;
+    let mut seen = vec![0u32; 40];
+    let mut cursor = 0;
+    let mut pages = 0;
+    while cursor < 40 {
+        // The busy entry holds for the first pages only.
+        assert!(mirror_hold(&mut mirror, pages < 3));
+        let page = export(&reader, EPOCH, cursor, usize::MAX, None, bound).unwrap();
+        for loss in &page.lost {
+            assert!(loss.last < page.next, "{loss:?} past {}", page.next);
+            for seq in loss.first..=loss.last {
+                seen[usize::try_from(seq).unwrap()] += 1;
+            }
+        }
+        for record in &page.records {
+            assert!(record.seq < page.next);
+            seen[usize::try_from(record.seq).unwrap()] += 1;
+        }
+        assert!(page.next > cursor || page.records.is_empty() && page.lost.is_empty());
+        cursor = page.next;
+        pages += 1;
+        assert!(pages < 200, "no progress at {cursor}");
+    }
+    assert!(seen.iter().all(|count| *count == 1), "{seen:?}");
+}
+
+/// Holds or releases table entry 1 of `mirror`.
+fn mirror_hold(mirror: &mut TraceMirror, held: bool) -> bool {
+    mirror.hold_entry(1, held)
 }
