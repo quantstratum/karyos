@@ -111,6 +111,9 @@ archive() {
     find "$dir" -type d -exec chmod 755 {} +
     find "$dir" -type f -perm -u+x -exec chmod 755 {} +
     find "$dir" -type f ! -perm -u+x -exec chmod 644 {} +
+    # A symbolic link's own mode follows the umask on BSD and is archived;
+    # Linux has none to set (its links are 777), and GNU chmod no -h.
+    find "$dir" -type l -exec chmod -h 755 {} + 2>/dev/null || true
     # The commit's time, in UTC whichever TZ the builder has: BSD
     # `touch -t` reads its argument as local time.
     find "$dir" -exec touch -h -d "@$epoch" {} + 2>/dev/null ||
