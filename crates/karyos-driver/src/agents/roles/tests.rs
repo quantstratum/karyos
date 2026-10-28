@@ -5307,3 +5307,50 @@ fn a_refused_standing_request_is_asked_again_until_accepted() {
         assert!(opened, "the route opens after the reset");
     }
 }
+
+/// #838 review: a burst to more distinct destinations than the cache and
+/// its in-flight list hold marks no close failed: with the list full of
+/// entries still in flight, a further destination's send is refused until
+/// the duty closes them, and then goes out.
+#[test]
+fn a_burst_to_many_destinations_fails_no_close_in_flight() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::control::ControlRoutes;
+
+    let socket = ScriptedSocket::new();
+    for _ in 0..8 {
+        socket.push_send(karyos_io::sockets::ops::SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (mut tx, _rx) = endpoint.split().unwrap();
+    let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
+    let mut routes = ControlRoutes::new(1);
+    routes
+        .send(&mut tx, at(41_001), &challenge_control())
+        .unwrap();
+    // A's eviction, then its reclose at C: both in flight.
+    routes.close_in_flight = 2;
+    routes
+        .send(&mut tx, at(41_002), &challenge_control())
+        .unwrap();
+    assert!(
+        routes
+            .send(&mut tx, at(41_003), &challenge_control())
+            .is_err(),
+        "C waits"
+    );
+    assert_eq!(routes.take_refusal(), None, "nothing failed, no limit");
+    // The duty closes A; C goes out.
+    routes.close_lingering(&mut tx);
+    assert_eq!(routes.take_refusal(), None);
+    routes
+        .send(&mut tx, at(41_003), &challenge_control())
+        .unwrap();
+    assert_eq!(routes.cached(), [at(41_003)]);
+}

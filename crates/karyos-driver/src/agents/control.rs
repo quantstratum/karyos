@@ -386,12 +386,10 @@ impl ControlRoutes {
             let old = self.entries.swap_remove(index);
             match self.close(tx, old) {
                 Closed::Done => {}
-                // One more use before it counts as failed; a full list
-                // counts it now.
-                Closed::InFlight if self.lingering.len() < self.lingering.capacity() => {
-                    self.lingering.push(old);
-                }
-                Closed::InFlight | Closed::Failed => self.refusal.close_failed = true,
+                // Closed again at the next duty before it counts as
+                // failed; the caller made room ([`ControlRoutes::queue`]).
+                Closed::InFlight => self.lingering.push(old),
+                Closed::Failed => self.refusal.close_failed = true,
             }
         }
     }
@@ -408,6 +406,20 @@ impl ControlRoutes {
         while let Some(old) = self.lingering.pop() {
             if self.close(tx, old) != Closed::Done {
                 self.refusal.close_failed = true;
+            }
+        }
+    }
+
+    /// Closes again the entries evicted in flight that have closed since,
+    /// keeping the others for the duty: none counts as failed here, so a
+    /// burst of sends cannot use up their grace.
+    fn reclose_closed<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        let mut index = 0;
+        while let Some(old) = self.lingering.get(index).copied() {
+            if self.close(tx, old) == Closed::Done {
+                self.lingering.swap_remove(index);
+            } else {
+                index += 1;
             }
         }
     }
@@ -479,6 +491,15 @@ impl ControlRoutes {
         {
             entry.used = tick;
             return Ok(entry.queue);
+        }
+        if self.entries.len() >= self.max && self.lingering.len() >= self.lingering.capacity() {
+            // Every evicted entry is still in flight: those that closed
+            // since make room; with none, this send waits (refused, not a
+            // failed close nor a limit).
+            self.reclose_closed(tx);
+            if self.lingering.len() >= self.lingering.capacity() {
+                return Err(ControlSendError::Route);
+            }
         }
         if self.entries.len() >= self.max
             && let Some(oldest) = self
