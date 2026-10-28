@@ -303,3 +303,213 @@ fn counters_and_positions_name_the_aggregate_and_the_lane() {
     lanes.sort_unstable();
     assert_eq!(lanes, vec![0, 1]);
 }
+
+/// Re-review of #814: an aggregate's change publishes its lanes' shared
+/// gate slot exactly once, at the new version.
+#[test]
+fn an_aggregate_change_publishes_its_gate_slot_once() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+    use karyos_sys::rate_policy_slot::{SEQUENCE, SLOT_WORDS, SlotRead, try_read};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = driver
+        .add_aggregate(AggregateConfig {
+            stream: stream(2),
+            quanta: vec![u64::from(DEFAULT_MTU) * 4; 2],
+        })
+        .unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = |per_second| RatePolicy {
+        messages: Rate {
+            per_second,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    for lane in aggregate.streams() {
+        driver
+            .guard_stream(
+                lane,
+                guard,
+                4,
+                Some(crate::guards::GuardRate::publication(policy(100))),
+            )
+            .unwrap();
+    }
+    // The lanes share one slot, as a guarded network publication's do.
+    let slot = Arc::new(crate::shared_words::Words::heap(SLOT_WORDS));
+    let mut lanes = aggregate.streams();
+    let first = lanes.next().unwrap();
+    driver
+        .stream(first)
+        .unwrap()
+        .guarded
+        .as_mut()
+        .unwrap()
+        .set_gate_slot(Arc::clone(&slot));
+    for lane in lanes {
+        driver
+            .stream(lane)
+            .unwrap()
+            .guarded
+            .as_mut()
+            .unwrap()
+            .keep_gate_slot(Arc::clone(&slot));
+    }
+    let sequence = |slot: &crate::shared_words::Words| {
+        slot.words()[SEQUENCE].load(std::sync::atomic::Ordering::Acquire)
+    };
+    let before = sequence(&slot);
+    assert_eq!(
+        driver.change_aggregate_rate_policy(
+            &aggregate,
+            1,
+            policy(50),
+            (crate::guards::RateAuthority::Safety, 1)
+        ),
+        Ok(2)
+    );
+    // One publication: the sequence word moves by 2 (odd, then even).
+    assert_eq!(sequence(&slot), before + 2);
+    let words = slot.words();
+    assert!(matches!(
+        try_read(&words, 0),
+        SlotRead::Policy { version: 2, policy: published } if published == policy(50)
+    ));
+}
+
+/// Re-review of #814: a change named on a lane whose aggregate cannot be
+/// assembled (a lane missing from the table, which the API never leaves)
+/// is refused with the lookup's error and audited for every guard of the
+/// lanes still there.
+#[test]
+fn a_change_on_an_aggregate_with_a_lane_gone_is_audited_for_every_guard() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = driver
+        .add_aggregate(AggregateConfig {
+            stream: stream(2),
+            quanta: vec![u64::from(DEFAULT_MTU) * 4; 3],
+        })
+        .unwrap();
+    let policy = |per_second| RatePolicy {
+        messages: Rate {
+            per_second,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    let lanes: Vec<StreamHandle> = aggregate.streams().collect();
+    let (a, b) = (
+        driver.add_guard("a").unwrap(),
+        driver.add_guard("b").unwrap(),
+    );
+    for (lane, guard) in [(lanes[0], a), (lanes[1], b)] {
+        driver
+            .guard_stream(
+                lane,
+                guard,
+                4,
+                Some(crate::guards::GuardRate::publication(policy(100))),
+            )
+            .unwrap();
+    }
+    // Lane 2 leaves the table under the aggregate.
+    driver.streams.retain(|lane| lane.id != lanes[2].stream);
+    let refused = driver.change_rate_policy(
+        lanes[0],
+        1,
+        policy(50),
+        (crate::guards::RateAuthority::Safety, 9),
+    );
+    assert!(
+        matches!(refused, Err(DriverError::UnknownStream { .. })),
+        "{refused:?}"
+    );
+    let audit: Vec<_> = driver
+        .guard_audit()
+        .records
+        .iter()
+        .filter(|record| record.operation == 9)
+        .map(|record| (record.guard, record.before, record.after))
+        .collect();
+    assert_eq!(audit, [(a.id(), 1, 1), (b.id(), 1, 1)]);
+}
+
+/// Re-review V2 of #814: a publication's stored rate policy goes with its
+/// last lane, so creating and removing publications never grows it.
+#[test]
+fn a_publications_rate_policy_goes_with_its_last_lane() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    for round in 0..3 {
+        let aggregate = driver
+            .add_aggregate(AggregateConfig {
+                stream: stream(2 + round),
+                quanta: vec![u64::from(DEFAULT_MTU) * 4; 2],
+            })
+            .unwrap();
+        for lane in aggregate.streams() {
+            driver
+                .guard_stream(
+                    lane,
+                    guard,
+                    4,
+                    Some(crate::guards::GuardRate::publication(policy)),
+                )
+                .unwrap();
+        }
+        assert_eq!(driver.rate_policies.len(), 1);
+        driver.remove_aggregate(&aggregate).unwrap();
+        driver.free_retired_streams();
+        assert!(driver.rate_policies.is_empty(), "round {round}");
+    }
+}
+
+/// QS-COORDINATOR, ACS 33899: with every lane the driver can hold guarded
+/// with a rate, the stored policies never pass `max_streams`, and the next
+/// stream is refused before any policy could be stored for it.
+#[test]
+fn the_stored_policies_never_pass_max_streams() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let max_streams = 4;
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        max_streams,
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    for stream_id in 0..i32::try_from(max_streams).unwrap() {
+        let handle = driver.add_stream(stream(10 + stream_id)).unwrap();
+        driver
+            .guard_stream(
+                handle,
+                guard,
+                4,
+                Some(crate::guards::GuardRate::publication(policy)),
+            )
+            .unwrap();
+        assert!(driver.rate_policies.len() <= max_streams);
+    }
+    assert_eq!(driver.rate_policies.len(), max_streams);
+    assert!(driver.add_stream(stream(99)).is_err());
+    assert_eq!(driver.rate_policies.len(), max_streams);
+}

@@ -416,6 +416,10 @@ pub struct GuardSpec {
     pub epoch: u64,
     /// The publication's rate policy.
     pub rate: Option<karyos_sys::rate_limit::RatePolicy>,
+    /// Where the driver publishes a changed rate policy
+    /// (`karyos_sys::rate_policy_slot`, at word 0), which the gate reads at
+    /// each serve (R-CORE-21); `None`: the policy never changes.
+    pub policy: Option<Arc<dyn karyos_client::SharedWords>>,
     /// The submission frontier its gate publishes for the walker, which
     /// records each lane's outcomes by it.
     pub frontier: Arc<karyos_sys::submission_frontier::SubmissionFrontier>,
@@ -793,6 +797,9 @@ impl<T: StreamTerms> Outbound<T> {
         };
         let mut gate = gate;
         gate.set_frontier(frontier);
+        if let Some(slot) = spec.policy {
+            gate.set_policy_slot(slot);
+        }
         self.guard = Some(Box::new(gate));
         Ok(())
     }

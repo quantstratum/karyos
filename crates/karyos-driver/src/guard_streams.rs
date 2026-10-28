@@ -90,6 +90,14 @@ pub(crate) struct GuardedStream<T: TermBytes> {
     /// karyos/design/driver-network-agents.md`), the handles' copies are
     /// the only limiter in practice.
     pub(crate) rate: Option<karyos_sys::rate_limit::RatePolicy>,
+    /// The version of `rate` (R-CORE-21): 1 when the stream was guarded
+    /// with a rate, one more for each accepted change; 0 without a rate.
+    pub(crate) rate_version: u64,
+    /// The control reserve no policy goes below (R-CORE-21).
+    pub(crate) reserve: Option<karyos_sys::rate_limit::Rate>,
+    /// A guarded network publication's policy slot, which its sender gate
+    /// reads at each serve (driver heap words, shared by its lanes).
+    gate_slot: Option<Arc<Words>>,
     walker: Subscription<Arc<LogBuffer<T>>>,
     scratch: Vec<u8>,
     /// Rings of issued handles, oldest first.
@@ -138,7 +146,10 @@ impl<T: TermBytes> GuardedStream<T> {
     pub(crate) fn new(
         guard: GuardHandle,
         messages: u64,
-        rate: Option<karyos_sys::rate_limit::RatePolicy>,
+        (rate, reserve): (
+            Option<karyos_sys::rate_limit::RatePolicy>,
+            Option<karyos_sys::rate_limit::Rate>,
+        ),
         walker: Subscription<Arc<LogBuffer<T>>>,
         max_message: usize,
     ) -> Self {
@@ -146,6 +157,9 @@ impl<T: TermBytes> GuardedStream<T> {
             guard,
             messages,
             rate,
+            rate_version: u64::from(rate.is_some()),
+            reserve,
+            gate_slot: None,
             walker,
             scratch: vec![0; max_message],
             bounds: VecDeque::new(),
@@ -251,9 +265,64 @@ impl<T: TermBytes> GuardedStream<T> {
         Ok(())
     }
 
-    /// Binds a newly issued handle's ring, for blocks from `from` on.
+    /// Its sender gate's policy slot, if it has one.
+    pub(crate) fn gate_slot(&self) -> Option<&Arc<Words>> {
+        self.gate_slot.as_ref()
+    }
+
+    /// Gives the stream its sender gate's policy slot, which starts with
+    /// the current policy (R-CORE-21).
+    pub(crate) fn set_gate_slot(&mut self, slot: Arc<Words>) {
+        self.gate_slot = Some(slot);
+        self.publish_gate();
+    }
+
+    /// Keeps the slot of the incarnation it replaces, which already holds
+    /// this stream's policy at its version: nothing is published again.
+    pub(crate) fn keep_gate_slot(&mut self, slot: Arc<Words>) {
+        self.gate_slot = Some(slot);
+    }
+
+    /// Binds a newly issued handle's ring, for blocks from `from` on. The
+    /// ring starts with the stream's current rate policy published in its
+    /// header (R-CORE-21).
     pub(crate) fn bind(&mut self, bound: Bound) {
+        if let Some(policy) = &self.rate {
+            karyos_sys::rate_policy_slot::publish(
+                bound.ring.words(),
+                karyos_sys::rate_policy_slot::OUTCOME_SLOT,
+                self.rate_version,
+                policy,
+            );
+        }
         self.bounds.push_back(bound);
+    }
+
+    /// Publishes the stream's policy at its version into its sender gate's
+    /// slot, if it has one (R-CORE-21). An aggregate's lanes share the slot,
+    /// so the caller publishes it once per change, from one lane.
+    pub(crate) fn publish_gate(&self) {
+        if let (Some(slot), Some(policy)) = (&self.gate_slot, &self.rate) {
+            karyos_sys::rate_policy_slot::publish(slot.words(), 0, self.rate_version, policy);
+        }
+    }
+
+    /// Makes `policy` the stream's rate policy as version `version`, and
+    /// publishes it into every bound handle's ring, which each handle reads
+    /// on its next call (R-CORE-21); the gate's slot is the caller's
+    /// ([`Self::publish_gate`]). The caller validated the policy and its
+    /// transition.
+    pub(crate) fn set_rate(&mut self, policy: karyos_sys::rate_limit::RatePolicy, version: u64) {
+        self.rate = Some(policy);
+        self.rate_version = version;
+        for bound in &self.bounds {
+            karyos_sys::rate_policy_slot::publish(
+                bound.ring.words(),
+                karyos_sys::rate_policy_slot::OUTCOME_SLOT,
+                version,
+                &policy,
+            );
+        }
     }
 
     /// The ring for a block at `position`: the newest bound issued at or
@@ -504,7 +573,7 @@ mod tests {
             driver: 1,
             guard: 1,
         };
-        let mut guarded = GuardedStream::new(guard, 2, None, walker, 64);
+        let mut guarded = GuardedStream::new(guard, 2, (None, None), walker, 64);
         let (ring, consumed, writer) = new_ring(2, 2, 0, Place::Heap).unwrap();
         guarded.bind(Bound {
             from: 0,
@@ -570,7 +639,7 @@ mod tests {
             driver: 1,
             guard: 1,
         };
-        GuardedStream::new(guard, 2, None, walker, 64)
+        GuardedStream::new(guard, 2, (None, None), walker, 64)
     }
 
     fn message(position: u64, end: u64) -> Block {
