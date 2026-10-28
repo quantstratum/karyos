@@ -397,6 +397,49 @@ fn resolve(state: &mut State) -> u64 {
     frontier.resolved
 }
 
+/// A gate's view of its publication's policy slot.
+struct PolicySlot {
+    words: Arc<dyn SharedWords>,
+    /// The slot's sequence word when it was last read whole.
+    sequence: u64,
+    /// The policy version applied.
+    version: u64,
+}
+
+impl core::fmt::Debug for PolicySlot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PolicySlot")
+            .field("sequence", &self.sequence)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PolicySlot {
+    /// Applies a newer published policy to `limiter` at `now`. An unchanged
+    /// sequence word is one Acquire load; a torn read waits for the next
+    /// call.
+    fn refresh(&mut self, limiter: &mut RateLimiter, now: u64) {
+        use karyos_sys::rate_policy_slot::{SEQUENCE, SlotRead, try_read_sequenced};
+
+        if self.words.load_acquire(SEQUENCE) == Some(self.sequence) {
+            return;
+        }
+        // The sequence the read validated, never one loaded after it: a
+        // publication completed in between must still look new.
+        let (read, sequence) = try_read_sequenced(&*self.words, 0);
+        if let SlotRead::Policy { version, policy } = read
+            && version > self.version
+        {
+            limiter.set_policy(policy, now);
+            self.version = version;
+        }
+        if let Some(sequence) = sequence {
+            self.sequence = sequence;
+        }
+    }
+}
+
 /// The gate of one guard over one lane sender's lanes.
 #[derive(Debug)]
 pub struct GuardGate {
@@ -405,6 +448,9 @@ pub struct GuardGate {
     lanes: Vec<State>,
     /// The publication's bucket, shared by its lanes.
     limiter: Option<RateLimiter>,
+    /// Where the driver publishes a changed policy (R-CORE-21), the
+    /// sequence word last read whole there, and the version applied.
+    policy: Option<PolicySlot>,
     /// The lane the sender is flushing, from [`LaneGate::flushing`].
     flushing: Option<usize>,
     /// The epoch last published to the cell.
@@ -523,6 +569,7 @@ impl GuardGate {
             cell,
             lanes,
             limiter: rate.map(|policy| RateLimiter::new(policy, now)),
+            policy: None,
             flushing: None,
             applied: 0,
             published_in_flight: 0,
@@ -650,11 +697,35 @@ impl GuardGate {
     }
 
     /// Refills the bucket from the clock time `now`, before a serve call.
-    /// A backward step earns nothing.
+    /// A backward step earns nothing. A newer policy the driver published
+    /// is applied first (R-CORE-21): the bucket earns the old rates up to
+    /// `now`, then takes the new ones, its level clamped and never raised.
+    /// One load decides that nothing changed; a publication in progress is
+    /// read at the next call.
     pub fn set_now(&mut self, now: u64) {
+        if let (Some(slot), Some(limiter)) = (&mut self.policy, &mut self.limiter) {
+            slot.refresh(limiter, now);
+        }
         if let Some(limiter) = &mut self.limiter {
             limiter.refill_at(now);
         }
+    }
+
+    /// Reads the publication's rate policy changes from `slot`, at word 0
+    /// (`karyos_sys::rate_policy_slot`), from the next [`Self::set_now`].
+    pub fn set_policy_slot(&mut self, slot: Arc<dyn SharedWords>) {
+        self.policy = Some(PolicySlot {
+            words: slot,
+            sequence: 0,
+            version: 0,
+        });
+    }
+
+    /// The version of the published rate policy the gate applies; 0 for
+    /// the policy it was built with.
+    #[must_use]
+    pub fn policy_version(&self) -> u64 {
+        self.policy.as_ref().map_or(0, |slot| slot.version)
     }
 
     /// Records a datagram committed to `lane`'s queue, at its tail, in both

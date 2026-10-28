@@ -217,6 +217,9 @@ pub struct ImageChange {
     pub seal_code: u64,
 }
 
+// From a released package's libkaryos under `--cfg karyos_package`
+// (scripts/conformance-package.sh); from the crate's rlib otherwise.
+#[cfg_attr(karyos_package, link(name = "karyos"))]
 unsafe extern "C" {
     fn karyos_subscription_next_image_change(
         subscription: u64,

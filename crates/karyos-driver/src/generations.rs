@@ -573,11 +573,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if maximum >= 1 << 63 {
             return Err(DriverError::PositionsExhausted);
         }
-        crate::embedded::check_lane_bytes(max_bytes, &config, target.conflation.as_ref())?;
+        // The table's shape, then the cap, as in `stage_lane`; the table is
+        // the live stream's, already checked at its creation.
         let shape = target
             .conflation
             .map(crate::embedded::conflation_shape)
             .transpose()?;
+        crate::embedded::check_lane_bytes(max_bytes, &config, target.conflation.as_ref())?;
         let successor = Arc::new(<T as crate::embedded::sealed::Create>::create(
             self, config, generation, shape,
         )?);

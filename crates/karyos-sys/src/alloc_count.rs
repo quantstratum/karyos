@@ -18,12 +18,22 @@ thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     /// Allocations, reallocations and frees seen while armed.
     static SEEN: Cell<u64> = const { Cell::new(0) };
+    /// Allocations and reallocations alone seen while armed.
+    static ALLOCATED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The system allocator, counting the calling thread's operations while
 /// [`count`] runs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CountingAllocator;
+
+/// Counts an allocation or a reallocation, which also counts in [`note`].
+fn note_allocation() {
+    let armed = ARMED.try_with(Cell::get).unwrap_or(false);
+    if armed {
+        let _ = ALLOCATED.try_with(|seen| seen.set(seen.get().saturating_add(1)));
+    }
+}
 
 fn note() {
     // `try_with`: a thread-local being destroyed is simply not counted.
@@ -43,12 +53,14 @@ fn note() {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         note();
+        note_allocation();
         // SAFETY: forwarded with the caller's guarantees.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         note();
+        note_allocation();
         // SAFETY: forwarded with the caller's guarantees.
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -61,6 +73,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         note();
+        note_allocation();
         // SAFETY: forwarded with the caller's guarantees.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -85,4 +98,12 @@ pub fn count<R>(call: impl FnOnce() -> R) -> (R, u64) {
     let result = call();
     drop(disarm);
     (result, SEEN.with(Cell::get))
+}
+
+/// [`count`], counting allocations and reallocations only: for a call
+/// that may free (dropping what it retires) but must not allocate.
+pub fn count_allocations<R>(call: impl FnOnce() -> R) -> (R, u64) {
+    ALLOCATED.with(|seen| seen.set(0));
+    let (result, _) = count(call);
+    (result, ALLOCATED.with(Cell::get))
 }

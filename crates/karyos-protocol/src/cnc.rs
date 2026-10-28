@@ -38,7 +38,7 @@
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
-//! | `0x84` | `Error` | client | sequence | code (1 to 18, see [`ErrorCode`]) | detail |
+//! | `0x84` | `Error` | client | sequence | code (1 to 18 and 24, see [`ErrorCode`]) | detail |
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
@@ -1147,8 +1147,26 @@ pub enum ErrorCode {
     InvalidRoles,
     /// A stream lane the driver would create for the command is larger
     /// than its `max_stream_bytes` (R-CORE-34, karyos#809); nothing was
-    /// created. Retrying the same channel never succeeds.
+    /// created. The detail is the lane's bytes (karyos#824), not the stream
+    /// id. Retrying the same channel never succeeds.
     StreamTooLarge,
+    /// A rate policy change named another version than the stream's
+    /// (R-CORE-21, karyos#740).
+    RateVersionMismatch,
+    /// A rate policy change on the safety path is not a provable
+    /// tightening (R-CORE-21).
+    RateNotATightening,
+    /// A rate policy change goes below the stream's control reserve
+    /// (R-CORE-21).
+    RateReserveCrossed,
+    /// A rate policy change on a stream with no rate policy (R-CORE-21).
+    RateNotSet,
+    /// A rate policy change names a policy its stream refuses: a zero
+    /// rate, or a byte burst below the largest frame (R-CORE-21).
+    RateInvalidPolicy,
+    /// A lane guarded with a rate other than its publication's policy
+    /// (R-CORE-21): only a policy change changes it.
+    RatePolicyConflict,
 }
 
 impl ErrorCode {
@@ -1175,6 +1193,12 @@ impl ErrorCode {
             Self::StrategyConflict => 17,
             Self::InvalidRoles => 18,
             Self::StreamTooLarge => 24,
+            Self::RateVersionMismatch => 19,
+            Self::RateNotATightening => 20,
+            Self::RateReserveCrossed => 21,
+            Self::RateNotSet => 22,
+            Self::RateInvalidPolicy => 23,
+            Self::RatePolicyConflict => 25,
         }
     }
 
@@ -1199,6 +1223,12 @@ impl ErrorCode {
             17 => Self::StrategyConflict,
             18 => Self::InvalidRoles,
             24 => Self::StreamTooLarge,
+            19 => Self::RateVersionMismatch,
+            20 => Self::RateNotATightening,
+            21 => Self::RateReserveCrossed,
+            22 => Self::RateNotSet,
+            23 => Self::RateInvalidPolicy,
+            25 => Self::RatePolicyConflict,
             _ => return None,
         })
     }
@@ -3551,6 +3581,24 @@ mod tests {
         assert_eq!(ErrorCode::from_code(24), Some(ErrorCode::StreamTooLarge));
     }
 
+    /// karyos#740: the rate policy change's refusals keep their wire
+    /// values, added in place under admission `VERSION` 3 before a release
+    /// published it, as `InvalidRoles` was.
+    #[test]
+    fn rate_change_error_codes_are_19_to_23_and_25() {
+        for (code, word) in [
+            (ErrorCode::RateVersionMismatch, 19),
+            (ErrorCode::RateNotATightening, 20),
+            (ErrorCode::RateReserveCrossed, 21),
+            (ErrorCode::RateNotSet, 22),
+            (ErrorCode::RateInvalidPolicy, 23),
+            (ErrorCode::RatePolicyConflict, 25),
+        ] {
+            assert_eq!(code.code(), word);
+            assert_eq!(ErrorCode::from_code(word), Some(code));
+        }
+    }
+
     /// karyos#637: the roles' refusals keep their wire values.
     #[test]
     fn roles_error_codes_are_17_and_18() {
@@ -5620,7 +5668,13 @@ mod properties {
                 ErrorCode::LaneMismatch,
                 ErrorCode::StrategyConflict,
                 ErrorCode::InvalidRoles,
+                ErrorCode::RateVersionMismatch,
+                ErrorCode::RateNotATightening,
+                ErrorCode::RateReserveCrossed,
+                ErrorCode::RateNotSet,
+                ErrorCode::RateInvalidPolicy,
                 ErrorCode::StreamTooLarge,
+                ErrorCode::RatePolicyConflict,
             ][..],
         );
         prop_oneof![

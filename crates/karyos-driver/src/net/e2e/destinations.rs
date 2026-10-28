@@ -609,8 +609,9 @@ fn a_required_destination_neither_moves_nor_restarts() {
     );
 }
 
-/// Design 3.7: a removed destination retires once drained and reported:
-/// its queues and route close and its slot is freed. Twenty moves of an
+/// Design 3.7: a removed destination is reported and retired, as a
+/// removed publication is: its queues and route close at the next duty
+/// and its slot is freed then. Twenty moves of an
 /// optional destination never answer `Full`, never fail to open, and leave
 /// the publication with its two destinations; the removal history keeps
 /// the newest sixteen and counts the rest.
@@ -671,6 +672,98 @@ fn twenty_moves_neither_fill_the_table_nor_leak() {
     );
     assert_eq!(a.network_removed_destinations(&publication).len(), 16);
     assert_eq!(a.network_removals_overwritten(&publication), 4);
+}
+
+/// Plan 157, point 2: a move at `MAX_DESTINATIONS` answers `Full` while
+/// the removed destination holds its slot, and once its removal shows in
+/// `network_removed_destinations` (it is reported in the cycle of the
+/// removal, which hands its route and queues to the close list), the move
+/// retried is added. It checks the public contract end to end in both
+/// threading modes; the cycle order it relies on is guarded by the sender
+/// test `a_move_right_after_the_report_is_added_in_the_cycle_order`, and
+/// the bound by the unit churn test.
+#[test]
+fn a_move_at_capacity_waits_for_the_removal_to_retire() {
+    move_at_capacity(ThreadingMode::Shared);
+    move_at_capacity(ThreadingMode::Dedicated);
+}
+
+/// [`a_move_at_capacity_waits_for_the_removal_to_retire`] in `threading`.
+fn move_at_capacity(threading: ThreadingMode) {
+    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+
+    let mut a = driver(threading);
+    let (mut receivers, addresses) = receivers(1);
+    let at = |index: u16| SocketAddr::from((LOOPBACK, 43_000 + index));
+    let (publication, _) = connect(
+        &mut a,
+        &mut receivers,
+        &destinations(&addresses, false),
+        &[],
+        None,
+    );
+    for index in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        a.add_network_destination(&publication, at(index)).unwrap();
+        assert_eq!(
+            answer(&mut a, &mut receivers, &publication),
+            (at(index), DestinationChange::Added)
+        );
+    }
+    a.remove_network_destination(&publication, at(1)).unwrap();
+    a.add_network_destination(&publication, at(100)).unwrap();
+    let mut answers = Vec::new();
+    {
+        let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+            .chain(receivers.iter_mut())
+            .collect();
+        pump(&mut all, |drivers| {
+            answers.extend(drivers[0].take_network_destination_changes(&publication));
+            answers.len() == 2
+        });
+    }
+    let changes: Vec<DestinationChange> = answers.iter().map(|(_, change)| *change).collect();
+    match threading {
+        // One thread serves the two commands back to back, before the
+        // removal is reported.
+        ThreadingMode::Shared => assert_eq!(
+            changes,
+            [DestinationChange::Removed, DestinationChange::Full],
+            "the slot is held until the removal retires"
+        ),
+        // The sender's thread may report, retire and close the removal
+        // between the two posts: either answer, then the end state below.
+        _ => assert!(
+            matches!(
+                changes.as_slice(),
+                [
+                    DestinationChange::Removed,
+                    DestinationChange::Full | DestinationChange::Added
+                ]
+            ),
+            "{changes:?}"
+        ),
+    }
+    let added_early = changes.last() == Some(&DestinationChange::Added);
+    // The public signal: once the removal shows, a retried move is added.
+    let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+        .chain(receivers.iter_mut())
+        .collect();
+    pump(&mut all, |drivers| {
+        drivers[0]
+            .network_removed_destinations(&publication)
+            .iter()
+            .any(|removal| removal.destination == at(1))
+    });
+    let expected = if added_early {
+        DestinationChange::Present
+    } else {
+        DestinationChange::Added
+    };
+    a.add_network_destination(&publication, at(100)).unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (at(100), expected)
+    );
 }
 
 /// Design 3.7, MD-8: a destination removed and added back after its
@@ -982,4 +1075,7 @@ fn endpoint_resets_remove_no_optional_destination() {
         .map(|(address, _)| address)
         .collect();
     assert_eq!(destinations, [addresses[0], idle]);
+    // Review B3 of #829: the resets' refused opens are not limits.
+    let counters = super::shared(&mut a).sender.outbound_counters(0).unwrap();
+    assert_eq!(counters.endpoint_limits, 0, "{counters:?}");
 }

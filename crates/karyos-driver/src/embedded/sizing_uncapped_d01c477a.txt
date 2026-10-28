@@ -1,0 +1,31 @@
+configured shared regions:
+  broadcast buffer                                                1 x          36864 =            36864  [broadcast_capacity]
+  driver counters                                                 1 x         266240 =           266240  [counters_capacity]
+  client counters                                                 1 x         266240 =           266240  [client_counters_capacity]
+  error log                                                       1 x         266240 =           266240  [error_log_records]
+  loss report                                                     1 x          36864 =            36864  [loss_report_records]
+  trace mirror                                                    1 x        1110016 =          1110016  [max_trace_journals, trace_recycle_log_entries, trace_mirror_records]
+  guard audit                                                     1 x         135168 =           135168  [guard_audit_records]
+  guard region                                                    1 x           4096 =             4096  [max_guards]
+  command rings                                                  16 x          12288 =           196608  [max_clients, ring_capacity]
+  client trace journals (budget, plus a page per journal)         1 x       67371008 =         67371008  [max_trace_journal_bytes, max_trace_journals]
+  stream 2:1 (declared 0): log buffer                             1 x         401408 =           401408  [stream term_length, spare_slots, max_subscribers, mtu]
+  stream 3:1 (declared 1): log buffer                             1 x         401408 =           401408  [stream term_length, spare_slots, max_subscribers, mtu]
+  stream 3:1 (declared 1): conflation table                       1 x           8192 =             8192  [stream conflation keys, value_capacity, journal_capacity]
+configured heap budgets:
+  (none)
+retained across a cutover or restart:
+  stream 2:1 (declared 0): retained generations                   2 x         401408 =           802816  [max_retained_generations, stream term_length]
+  stream 3:1 (declared 1): retained generations                   2 x         401408 =           802816  [max_retained_generations, stream term_length]
+configured steady state: 70500352 bytes
+restart peak:            72105984 bytes
+the restart peak assumes no reconfigure_stream or reconfigure_aggregate since start: a retained predecessor has its stream's current geometry; after a reconfiguration, size with the largest geometry the stream has had.
+cgroup: every region is a shared memfd, mapped in whole pages and charged once to the cgroup of the process that first touches each page; the figures are mapped pages, a ceiling.
+excluded:
+  - streams added after start and Archive replay targets: no configuration sets their maximum geometry, so nothing bounds them
+  - the application's and karyosd's own heap, code and thread stacks, except the network trace journal budget
+  - kernel socket buffers and network receive buffers
+  - the Archive's page cache and recording files
+  - page tables and other kernel memory
+  - the network image lanes and network publications, sized by remote senders and URIs, not by this configuration
+  - the outcome rings and consumed cells of guarded handles, one pair per handle a client takes

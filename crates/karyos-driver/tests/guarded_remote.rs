@@ -292,3 +292,82 @@ fn the_facade_reads_a_remote_guarded_publications_outcomes() {
     thread.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R-CORE-21 (karyos#740) across processes: a remote handle takes its rate
+/// copy from the policy published in its outcome ring, and a change the
+/// driver makes later reaches it on its slow path.
+#[test]
+fn a_remote_handle_follows_a_rate_policy_change() {
+    use karyos_driver::{GuardRate, RateAuthority};
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let per_second = |per_second, burst| RatePolicy {
+        messages: Rate { per_second, burst },
+        bytes: None,
+    };
+    let dir = dir("rate");
+    let mut driver = driver(&dir);
+    let stream = driver.add_stream(stream_config()).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    // One message a second, a burst of one: no refill between the offers.
+    driver
+        .guard_stream(
+            stream,
+            guard,
+            4,
+            Some(GuardRate::publication(per_second(1, 1))),
+        )
+        .unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let (client, mut publication) = serve_while(&mut driver, move || {
+        let _ = client.add_publication(KEY, true).unwrap();
+        let mut fetchable = None;
+        let start = Instant::now();
+        while fetchable.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+            let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                Outcome::Fetchable(grant) => fetchable = Some(grant),
+                other => panic!("expected a fetchable grant, got {other:?}"),
+            });
+        }
+        let mut publication = client.take_publication(&fetchable.unwrap()).unwrap();
+        assert_eq!(publication.guard().unwrap().rate_tokens(), Some(1));
+        assert!(matches!(
+            publication.offer(b"a").unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+        assert_eq!(publication.offer(b"b").unwrap(), OfferOutcome::RateLimited);
+        (client, publication)
+    });
+    // A million a second: the handle earns a token within microseconds.
+    assert_eq!(
+        driver.change_rate_policy(
+            stream,
+            1,
+            per_second(1_000_000, 1),
+            (RateAuthority::Administrator, 1)
+        ),
+        Ok(2)
+    );
+    let (client, publication) = serve_while(&mut driver, move || {
+        let start = Instant::now();
+        loop {
+            match publication.offer(b"b").unwrap() {
+                OfferOutcome::Accepted { .. } => break,
+                OfferOutcome::RateLimited => {
+                    assert!(
+                        start.elapsed() < Duration::from_millis(500),
+                        "never applied"
+                    );
+                }
+                other => panic!("not accepted: {other:?}"),
+            }
+        }
+        (client, publication)
+    });
+    drop(publication);
+    drop(client);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

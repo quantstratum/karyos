@@ -1466,6 +1466,8 @@ mod linger;
 
 mod netem;
 
+mod bind_time;
+
 mod trace;
 
 mod timed;
@@ -3902,6 +3904,59 @@ fn an_idle_heartbeat_reveals_a_lost_tail() {
     let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
     assert!(sender.heartbeats_sent >= 1, "{sender:?}");
     assert!(receiver.naks >= 1, "{receiver:?}");
+    assert!(b.network_image(10, 3).is_some(), "the image is still live");
+}
+
+/// SPEC §6 (G1) on an unreliable lane (karyos#806): the last two DATA
+/// datagrams are dropped at B's intake and the publisher goes idle.
+/// Nothing but the heartbeat at the lane's next position shows the tail,
+/// so at the reorder deadline B seals it as one local gap of its exact
+/// range, after the one message delivered, and the image stays live.
+#[test]
+fn an_idle_heartbeat_reveals_a_lost_unreliable_tail_as_a_gap() {
+    use karyos_sys::log_buffer::SkipReason;
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, false, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    b.net.as_mut().unwrap().drop_receiver_data(&[1, 2]);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    for index in 0..3u32 {
+        let mut payload = [0u8; 1000];
+        payload[..4].copy_from_slice(&index.to_le_bytes());
+        assert!(matches!(
+            lane.offer(&payload).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    // A 1000-byte message takes 1056 bytes of the log.
+    let frame = 1056u64;
+    let mut delivered = Vec::new();
+    let mut gaps = Vec::new();
+    pump(&mut [&mut a, &mut b], |_| {
+        let poll = reader.poll(
+            |bytes, _, _| delivered.push(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+            BUDGET,
+        );
+        if let Some(skipped) = poll.lanes[0].skipped
+            && matches!(skipped.reason, SkipReason::LocalGap(_))
+        {
+            gaps.push((
+                skipped.position,
+                skipped.position + u64::from(skipped.extent),
+            ));
+        }
+        !gaps.is_empty()
+    });
+    assert_eq!(delivered, [0]);
+    assert_eq!(gaps, [(frame, 3 * frame)], "the exact tail");
+    let sender = a.net.as_ref().unwrap().sender_counters().unwrap();
+    let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert!(sender.heartbeats_sent >= 1, "{sender:?}");
+    assert_eq!(receiver.gaps_sealed, 1, "{receiver:?}");
+    assert_eq!(receiver.naks, 0, "no NAK on an unreliable lane");
     assert!(b.network_image(10, 3).is_some(), "the image is still live");
 }
 

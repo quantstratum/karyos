@@ -657,7 +657,8 @@ int32_t karyos_client_close(uint64_t client);
  * with KARYOS_E_REFUSED, detail code 6 (invalid publication mode). A
  * karyos:udp publication whose lanes are above the driver's
  * max_stream_bytes (karyosd --max-stream-bytes) is KARYOS_E_REFUSED,
- * detail code 24; no retry of the same uri succeeds.
+ * detail code 24 with the lane's bytes in value; no retry of the same
+ * uri succeeds.
  */
 int32_t karyos_client_add_publication(uint64_t client, const char *uri,
                                       int32_t stream_id, uint64_t *publication,
@@ -1201,9 +1202,10 @@ static inline int32_t karyos_stream_options_init(
  * Adds a stream to the driver, until karyos_driver_remove_stream or the
  * driver's close. A failure adds nothing and fills detail (may be null): a
  * duplicate stream id is KARYOS_E_INVALID_ARGUMENT with the stream id in
- * code and the session id in value, and a stream above the driver's
- * max_stream_bytes is KARYOS_E_INVALID_ARGUMENT with the stream's bytes
- * in code and the cap in value.
+ * code and the session id in value. A stream above the driver's
+ * max_stream_bytes would be KARYOS_E_INVALID_ARGUMENT with the stream's
+ * bytes in code and the cap in value; karyos_driver_options cannot set
+ * the cap yet (karyos#818), so no embedded driver refuses one today.
  */
 int32_t karyos_driver_add_stream(uint64_t driver, const karyos_stream_options *options,
                                  karyos_detail *detail);

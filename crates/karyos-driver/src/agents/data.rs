@@ -271,6 +271,14 @@ pub struct OutboundCounters {
     pub queue_failures: u64,
     /// Route setup failures.
     pub route_failures: u64,
+    /// Failed opens of a destination for an endpoint-wide limit (its route
+    /// table, queue entries or TX slots full), which never count against
+    /// the destination (they are in `route_failures` or `queue_failures`
+    /// too).
+    pub endpoint_limits: u64,
+    /// Retired destinations' routes and queues the sender's close list had
+    /// no room for in a duty, carried over to the next, each counted once.
+    pub close_deferred: u64,
     /// Send faults reported for a lane's head.
     pub send_faults: u64,
     /// Invariant, sender or DRR failures.
@@ -408,6 +416,10 @@ pub struct GuardSpec {
     pub epoch: u64,
     /// The publication's rate policy.
     pub rate: Option<karyos_sys::rate_limit::RatePolicy>,
+    /// Where the driver publishes a changed rate policy
+    /// (`karyos_sys::rate_policy_slot`, at word 0), which the gate reads at
+    /// each serve (R-CORE-21); `None`: the policy never changes.
+    pub policy: Option<Arc<dyn karyos_client::SharedWords>>,
     /// The submission frontier its gate publishes for the walker, which
     /// records each lane's outcomes by it.
     pub frontier: Arc<karyos_sys::submission_frontier::SubmissionFrontier>,
@@ -785,6 +797,9 @@ impl<T: StreamTerms> Outbound<T> {
         };
         let mut gate = gate;
         gate.set_frontier(frontier);
+        if let Some(slot) = spec.policy {
+            gate.set_policy_slot(slot);
+        }
         self.guard = Some(Box::new(gate));
         Ok(())
     }

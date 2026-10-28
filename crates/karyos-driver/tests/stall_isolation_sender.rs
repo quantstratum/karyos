@@ -344,25 +344,59 @@ fn test_stall_isolation_a_paused_claim_holds_the_in_order_sender_until_its_deadl
     let window = TERM / 2 - u64::from(MIN_TERM_LENGTH / 8);
     let messages = 200u32;
     let (mut sent, mut received) = (0u32, 0u32);
-    let mut held: Option<(u32, Instant)> = None;
+    let payload_of = |index: u32| {
+        let mut payload = [0u8; PAYLOAD];
+        payload[..4].copy_from_slice(&index.to_le_bytes());
+        payload
+    };
+    // The window is filled before any duty cycle runs (karyos#832; SPEC
+    // §13, "Stall isolation and capacity"). The claim's deadline counts
+    // from the conductor's first sight of the claim, in `a.do_work()`, so
+    // it cannot pass while the window fills, however loaded the host. No
+    // duty cycle may run inside this burst.
+    let mut held = None;
+    while sent < messages {
+        match running.offer(&payload_of(sent)).unwrap() {
+            ConcurrentOfferOutcome::Accepted { .. } => sent += 1,
+            ConcurrentOfferOutcome::BackPressured => {
+                held = Some((sent, Instant::now()));
+                break;
+            }
+            ConcurrentOfferOutcome::AdminAction => {
+                panic!("AdminAction before the window filled, after {sent} offers")
+            }
+            other => panic!("message {sent}: {other:?}"),
+        }
+    }
+    let Some((at, since)) = held else {
+        panic!("the window was not filled before the claim's deadline: {sent} offers accepted");
+    };
+    // Until the first duty cycle the limit is the stored `join + window`,
+    // so that refusal holds with or without a claim. After it, the
+    // conductor has seen the claim, and the publisher must still be held:
+    // the sender cannot pass the claim's block. The claim's deadline counts
+    // from this cycle, so the publisher must stay held until it passes.
+    let seen = Instant::now();
+    let _ = a.do_work().unwrap();
+    let _ = b.do_work().unwrap();
+    assert!(
+        matches!(
+            running.offer(&payload_of(sent)).unwrap(),
+            ConcurrentOfferOutcome::BackPressured
+        ),
+        "the claim did not hold the publisher after the first duty cycle"
+    );
     let mut freed = None;
     for _ in 0..400_000 {
         if sent < messages {
-            let mut payload = [0u8; PAYLOAD];
-            payload[..4].copy_from_slice(&sent.to_le_bytes());
-            match running.offer(&payload).unwrap() {
+            match running.offer(&payload_of(sent)).unwrap() {
                 ConcurrentOfferOutcome::Accepted { .. } => {
-                    if held.is_some() && freed.is_none() {
+                    if freed.is_none() {
                         freed = Some(Instant::now());
                     }
                     sent += 1;
                 }
-                ConcurrentOfferOutcome::BackPressured => {
-                    if held.is_none() {
-                        held = Some((sent, Instant::now()));
-                    }
-                }
-                ConcurrentOfferOutcome::AdminAction => {}
+                ConcurrentOfferOutcome::BackPressured | ConcurrentOfferOutcome::AdminAction => {}
                 other => panic!("message {sent}: {other:?}"),
             }
         }
@@ -384,7 +418,6 @@ fn test_stall_isolation_a_paused_claim_holds_the_in_order_sender_until_its_deadl
         }
         std::thread::sleep(Duration::from_micros(50));
     }
-    let (at, since) = held.expect("the paused claim never held the publisher");
     let freed = freed.expect("the publisher was never freed");
     // Held at its window: the claim's block (64 bytes and a 32-byte
     // header), then the messages behind it, 1056 bytes each.
@@ -393,7 +426,13 @@ fn test_stall_isolation_a_paused_claim_holds_the_in_order_sender_until_its_deadl
         filled <= window && window < filled + 1056,
         "held after {at} messages, {filled} bytes, for a window of {window}"
     );
-    assert!(freed >= claimed + DEADLINE, "freed before the deadline");
+    // Held until the deadline, which counts from the conductor's first
+    // sight of the claim (`seen`), and freed within the margin after it.
+    assert!(
+        freed >= seen + DEADLINE,
+        "freed {:?} after the claim was seen, before its {DEADLINE:?} deadline",
+        freed - seen
+    );
     assert!(
         freed <= claimed + DEADLINE + ABORT_MARGIN,
         "freed {:?} after the deadline",

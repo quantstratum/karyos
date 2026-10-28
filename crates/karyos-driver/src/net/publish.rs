@@ -545,7 +545,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`EmbeddedDriver::take_network_destination_changes`]: refused for a
     /// required destination (fixed at creation), one already present, one
     /// removed less than `image_liveness_timeout` ago (MD-14), or a full
-    /// set.
+    /// set. A removed destination holds its slot until its removal is
+    /// reported, in the sender cycle of the removal: a move at
+    /// [`MAX_DESTINATIONS`] answers `Full` until then, and a move retried
+    /// after the removal shows in
+    /// [`EmbeddedDriver::network_removed_destinations`] finds the slot
+    /// free.
     ///
     /// # Errors
     ///
@@ -649,6 +654,38 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let _ = lane;
             self.guard_stream(stream, guard.guard, guard.messages, guard.rate)?;
         }
+        // The gate reads the policy its lanes publish (R-CORE-21): one slot
+        // for the publication, kept across its incarnations.
+        let slot = handle.streams().next().and_then(|stream| {
+            self.stream(stream)
+                .ok()?
+                .guarded
+                .as_ref()?
+                .gate_slot()
+                .cloned()
+        });
+        let slot = match slot {
+            Some(slot) => slot,
+            None => {
+                let slot = Arc::new(crate::shared_words::Words::heap(
+                    karyos_sys::rate_policy_slot::SLOT_WORDS,
+                ));
+                // Published once, by the first guarded lane; the others
+                // keep the same slot.
+                let mut published = false;
+                for stream in handle.streams() {
+                    if let Some(guarded) = self.stream(stream)?.guarded.as_mut() {
+                        if published {
+                            guarded.keep_gate_slot(Arc::clone(&slot));
+                        } else {
+                            guarded.set_gate_slot(Arc::clone(&slot));
+                            published = true;
+                        }
+                    }
+                }
+                slot
+            }
+        };
         // The gate reads word 0: the guard's word in the guard words.
         let (words, index) = self.guards.view(guard.guard)?;
         let word = Arc::new(crate::shared_words::WordAt::new(words, index))
@@ -673,6 +710,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 cell,
                 epoch,
                 rate: guard.rate.map(|rate| rate.policy),
+                policy: Some(slot as Arc<dyn karyos_client::SharedWords>),
                 frontier,
             },
             id,
@@ -837,10 +875,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
         }
         let &(endpoint, _) = held.first().ok_or(DriverError::InvalidConfig)?;
-        // The family of every destination: the shared endpoint's own.
+        // The family of every destination: the shared endpoint's own. An
+        // endpoint of unknown address is not taken for IPv4: its
+        // destinations are refused (plan 157, point 6).
         let ipv4 = net
             .endpoint_address(endpoint)
-            .is_none_or(|address| address.is_ipv4());
+            .map(|address| address.is_ipv4());
         let outbound = if held.len() > 1 {
             Outbound::new_routed(&held, alias, readers, &quanta, config.mtu, reliable)
         } else {
