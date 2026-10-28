@@ -1661,7 +1661,8 @@ mod tests {
 
         /// Review of #814: a remote handle whose published policy was being
         /// written on every attempt at bind takes its copy at its first
-        /// call that reads it whole, never staying unlimited.
+        /// call that reads it whole, never staying unlimited; empty (#841
+        /// review), as it cannot tell that policy from one coming then.
         #[test]
         fn a_busy_policy_at_bind_is_adopted_later() {
             use karyos_sys::rate_policy_slot::{OUTCOME_SLOT, SEQUENCE, publish};
@@ -1674,7 +1675,7 @@ mod tests {
             });
             assert_eq!(publication.guard().unwrap().rate_tokens(), None);
             driver.ring.words()[OUTCOME_SLOT + SEQUENCE].fetch_add(1, Ordering::Relaxed);
-            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert_eq!(publication.offer(b"a").unwrap(), OfferOutcome::RateLimited);
             assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
         }
 

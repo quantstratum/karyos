@@ -2322,10 +2322,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     );
                     return Err(error);
                 }
-                // Every datagram fits the MTU (aggregate-lanes.md), so a byte
-                // burst that holds the MTU holds whatever a route's sender
-                // gate is validated against.
-                let frame = u64::from(found.config.mtu);
+                // The largest charge a route's sender gate validates against:
+                // the MTU aligned as a frame, so a policy accepted here is
+                // never one the gate refuses (#841 review, A1).
+                let frame = gate_charge(found.config.mtu);
                 policy
                     .validate(frame)
                     .map_err(DriverError::InvalidRatePolicy)?;
@@ -2578,7 +2578,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     lookup.get_or_insert(error);
                 }
                 Ok(found) => {
-                    frame = frame.max(u64::from(found.config.mtu));
+                    frame = frame.max(gate_charge(found.config.mtu));
                     registration.get_or_insert(found.aggregate.registration);
                     if found.retiring {
                         lookup.get_or_insert(DriverError::StreamRetiring { stream: found.id });
@@ -6576,20 +6576,20 @@ mod stream_cells_tests {
             .count()
     }
 
-    /// With room for four cells, a publication's five are refused whole:
-    /// the four taken are freed, `counters unavailable` counts one, and
-    /// the region holds what it held. With room, all five are keyed by the
+    /// With room for five cells, a publication's six are refused whole:
+    /// the five taken are freed, `counters unavailable` counts one, and
+    /// the region holds what it held. With room, all six are keyed by the
     /// stream's registration.
     #[test]
     fn a_full_region_refuses_the_whole_group_once() {
         let labels = &crate::agents::PUBLICATION_CELLS;
-        assert_eq!(labels.len(), 5);
-        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 4).unwrap();
+        assert_eq!(labels.len(), 6);
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 5).unwrap();
         let before = allocated(&counters);
         assert!(stream_network_cells(&mut counters, 7, labels).is_none());
         assert_eq!(allocated(&counters), before);
         assert_eq!(counters.value(Event::CountersUnavailable), 1);
-        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 5).unwrap();
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 6).unwrap();
         let mut cells = stream_network_cells(&mut counters, 7, labels).unwrap();
         assert_eq!(counters.value(Event::CountersUnavailable), 0);
         let reader = counters.reader();
@@ -6696,6 +6696,14 @@ pub(crate) fn conflation_shape(
         config.keys,
         value_capacity,
     ))
+}
+
+/// The largest charge a sender gate validates a rate policy against for a
+/// stream of `mtu`: the MTU aligned as a frame, as the gate's outbound
+/// computes it and as [`largest_charge`] does (R-CORE-21). An MTU no frame aligns is refused when the
+/// outbound is made; the MTU itself stands for it here.
+fn gate_charge(mtu: u32) -> u64 {
+    karyos_sys::sizing::align_frame(mtu).map_or(u64::from(mtu), u64::from)
 }
 
 /// Whether `policy` replaces `rate` at version `current`, as the caller

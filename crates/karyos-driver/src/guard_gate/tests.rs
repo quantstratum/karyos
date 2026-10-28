@@ -1081,10 +1081,10 @@ fn a_rateless_gate_adopts_a_published_policy() {
 }
 
 /// Z1 of the #841 review: positions a gate with no rate let through took
-/// no tokens, so they are not taken as paid once it adopts a policy: with
-/// a burst of 2, at most 2 positions go until the bucket refills.
+/// no tokens: once it adopts a policy they are exempt, exposed again on
+/// any route without a charge, and returning them gives nothing back.
 #[test]
-fn a_rateless_gates_positions_are_not_taken_as_paid_after_adoption() {
+fn a_rateless_gates_positions_are_never_refunded_after_adoption() {
     use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
 
     let mut f = Fixture::new(1, None);
@@ -1092,7 +1092,8 @@ fn a_rateless_gates_positions_are_not_taken_as_paid_after_adoption() {
     f.gate
         .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
     f.gate.set_now(0);
-    let mut tokens: Vec<_> = (0..2).map(|_| f.stage(0).0).collect();
+    let early: Vec<_> = (0..2).map(|_| f.stage(0)).collect();
+    let mut tokens: Vec<_> = early.iter().map(|(token, _, _)| *token).collect();
     assert_eq!(check(&mut f.gate, 0, &tokens), permit(2));
     publish(slot.words(), 0, 1, &rate(1, 2));
     f.gate.set_now(0);
@@ -1100,34 +1101,38 @@ fn a_rateless_gates_positions_are_not_taken_as_paid_after_adoption() {
     // Two seconds fill the burst of 2.
     f.gate.set_now(2_000_000_000);
     assert_eq!(f.gate.message_tokens(), Some(2));
-    // The backend kept the two pending; two more are staged. Exposed
-    // together, a gate that took the first two as paid would let all
-    // four go on a burst of 2.
+    // Exposed again with two new ones: the early two are exempt, the new
+    // two take the burst.
     tokens.extend((0..2).map(|_| f.stage(0).0));
-    let GateDecision::Permit { count } = check(&mut f.gate, 0, &tokens) else {
-        panic!("permitted");
-    };
-    assert!(count.get() <= 2, "{count} positions on a burst of 2");
+    assert_eq!(check(&mut f.gate, 0, &tokens), permit(4));
     assert_eq!(f.gate.message_tokens(), Some(0));
+    // The early two come back unsent: nothing is refunded, as nothing was
+    // taken for them.
+    for (_, _, staged) in early {
+        f.gate.left(0, staged, Left::Returned);
+    }
+    assert_eq!(f.gate.message_tokens(), Some(0), "nothing refunded");
     assert_eq!(f.gate.counts().faults, 0);
 }
 
-/// Z2 of the #841 review: a published policy whose byte burst is below the
-/// gate's largest datagram is not adopted (it would hold the lane for
-/// good), and is counted.
+/// Z2 and A1 of the #841 review: a published policy the gate refuses (a
+/// byte burst below its largest datagram, which the driver never
+/// publishes) is counted, and the gate fails closed: it limits with the
+/// stricter of it and the policy in force, here a byte bucket no frame
+/// fits, so the lane is held until a valid version.
 #[test]
-fn a_policy_the_largest_datagram_refuses_is_not_adopted() {
+fn a_policy_the_gate_refuses_is_applied_as_the_stricter() {
     use karyos_sys::rate_limit::Rate;
     use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
 
-    let mut f = Fixture::new(1, None);
+    let mut f = Fixture::new(1, Some(rate(10, 8)));
     let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
     f.gate
         .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
     let small = RatePolicy {
         messages: Rate {
-            per_second: 10,
-            burst: 10,
+            per_second: 20,
+            burst: 20,
         },
         bytes: Some(Rate {
             per_second: 1000,
@@ -1136,14 +1141,35 @@ fn a_policy_the_largest_datagram_refuses_is_not_adopted() {
     };
     publish(slot.words(), 0, 1, &small);
     f.gate.set_now(1);
-    assert_eq!(
-        (f.gate.policy_version(), f.gate.message_tokens()),
-        (0, None)
-    );
+    assert_eq!(f.gate.policy_version(), 1);
     assert_eq!(f.gate.counts().policies_refused, 1);
+    // The stricter of each: 10 messages a second, a burst of 8 (the level
+    // kept), and the refused byte bucket, which no frame fits.
+    assert_eq!(f.gate.message_tokens(), Some(8));
+    // The largest datagram: more bytes than the refused burst holds.
+    let (token, _, _) = f.stage_with(0, MAX_FRAME, 1, None);
+    f.gate.set_now(10_000_000_000);
+    assert!(!f.gate.admits(0), "held");
+    assert_eq!(check(&mut f.gate, 0, &[token]), GateDecision::Deny);
     // Read once: the next serve does not count it again.
-    f.gate.set_now(2);
     assert_eq!(f.gate.counts().policies_refused, 1);
+    // A valid version releases it.
+    publish(slot.words(), 0, 2, &rate(1, 1));
+    f.gate.set_now(10_000_000_001);
+    assert_eq!(f.gate.policy_version(), 2);
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
+}
+
+/// The coordinator's decision on the #841 review: a reincarnation's gate
+/// starts its bucket empty, so reincarnating never buys a new burst.
+#[test]
+fn a_reincarnations_gate_starts_empty() {
+    let mut f = Fixture::new(1, Some(rate(1, 4)));
+    assert_eq!(f.gate.message_tokens(), Some(4));
+    f.gate.empty_bucket(0);
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    f.gate.set_now(2_000_000_000);
+    assert_eq!(f.gate.message_tokens(), Some(2), "it earns from then on");
 }
 
 /// Words that complete a publication of version 3 right after the first

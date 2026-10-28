@@ -716,6 +716,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 cell,
                 epoch,
                 rate,
+                full: !guarded,
                 policy: Some(slot as Arc<dyn karyos_client::SharedWords>),
                 frontier,
             },

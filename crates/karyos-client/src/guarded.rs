@@ -119,8 +119,8 @@ pub struct GuardBinding {
 }
 
 /// How a handle's rate copy starts: full when the handle binds to a policy
-/// in force, as a lane guarded with it; empty when it takes one at run
-/// time, which never grants tokens (R-CORE-21).
+/// in force, read whole at bind, as a lane guarded with it; empty when it
+/// takes one later, which never grants tokens (R-CORE-21).
 #[derive(Debug, Clone, Copy)]
 enum Bucket {
     Full,
@@ -133,9 +133,6 @@ enum Bucket {
 struct RateWatch {
     clock: fn() -> u64,
     seen: Option<u64>,
-    /// How the copy starts: full while no read has found the slot
-    /// unpublished (a policy in force at bind, read late), empty after.
-    bucket: Bucket,
 }
 
 /// The handle's copy of its publication's message bucket: an early
@@ -247,9 +244,11 @@ impl GuardBinding {
     /// [`Self::with_rate`] from the policy the driver published in the
     /// outcome ring, if any (R-CORE-21): how a handle gets its copy when
     /// the grant carries no policy, a remote one's or a rateless lane's.
-    /// With none published yet, the handle watches the ring: its sequence
-    /// word, one Acquire load a call, and takes a policy published later at
-    /// its next call; the sender gate stays authoritative.
+    /// A policy read whole here starts the copy full, as a lane guarded
+    /// with it. With none published yet, or one being written, the handle
+    /// watches the ring: its sequence word, one Acquire load a call, and
+    /// takes the policy at its next call that reads it whole, its copy
+    /// starting empty; the sender gate stays authoritative.
     #[must_use]
     pub fn with_published_rate(mut self, clock: fn() -> u64) -> Self {
         // A publication in progress is short: a few reads see it whole.
@@ -275,20 +274,11 @@ impl GuardBinding {
                 true
             }
             (SlotRead::Unpublished, seen) => {
-                // A policy published from now on is taken at run time.
-                self.pending_rate = Some(RateWatch {
-                    clock,
-                    seen,
-                    bucket: Bucket::Empty,
-                });
+                self.pending_rate = Some(RateWatch { clock, seen });
                 false
             }
             (SlotRead::Busy, _) => {
-                self.pending_rate = Some(RateWatch {
-                    clock,
-                    seen: None,
-                    bucket,
-                });
+                self.pending_rate = Some(RateWatch { clock, seen: None });
                 false
             }
         }
@@ -316,7 +306,9 @@ impl GuardBinding {
         {
             // A policy taken at run time never grants tokens: the copy
             // starts empty, as the sender gate's bucket does (R-CORE-21).
-            let _ = self.adopt_published(watch.clock, watch.bucket);
+            // So does one a read at bind found mid-write: the handle cannot
+            // tell a policy in force from one coming then.
+            let _ = self.adopt_published(watch.clock, Bucket::Empty);
         }
         let Some(copy) = self.rate.as_mut() else {
             return true;

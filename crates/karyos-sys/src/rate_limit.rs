@@ -18,7 +18,9 @@
 //!   never lost, and every product and sum is checked; a refill that would
 //!   overflow caps the bucket at its burst, a stated limit of the
 //!   algorithm.
-//! - Buckets start full.
+//! - A limiter made with a policy ([`RateLimiter::new`]) starts full; one
+//!   that takes a policy at run time ([`RateLimiter::empty`]) starts empty,
+//!   as a change never grants tokens.
 //!
 //! The authoritative buckets live in the driver, at the sender gate; a
 //! client keeps its own copy only to reject earlier.
@@ -267,6 +269,18 @@ impl RateLimiter {
             messages: Bucket::full(policy.messages),
             bytes: policy.bytes.map(Bucket::full),
             last: now,
+        }
+    }
+
+    /// The policy its buckets follow.
+    #[must_use]
+    pub const fn policy(&self) -> RatePolicy {
+        RatePolicy {
+            messages: self.messages.rate,
+            bytes: match &self.bytes {
+                Some(bytes) => Some(bytes.rate),
+                None => None,
+            },
         }
     }
 

@@ -640,6 +640,62 @@ fn freeing_several_publications_drops_only_the_policies_with_no_lane_left() {
     assert!(driver.rate_policies.is_empty());
 }
 
+/// A1 of the #841 review: the driver validates a byte burst against the
+/// largest charge its sender gate does, the MTU aligned as a frame, so a
+/// burst between the MTU and that charge is refused at the change and
+/// never reaches a gate that would refuse it.
+#[test]
+fn a_byte_burst_below_the_aligned_mtu_is_refused_at_the_change() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mtu = 1400;
+    let aligned = u64::from(karyos_sys::sizing::align_frame(mtu).unwrap());
+    assert!(aligned > u64::from(mtu));
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut config = stream(2);
+    config.buffer.mtu = mtu;
+    let handle = driver.add_stream(config).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = |burst| RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 10,
+        },
+        bytes: Some(Rate {
+            per_second: 1_000_000,
+            burst,
+        }),
+    };
+    driver
+        .guard_stream(
+            handle,
+            guard,
+            4,
+            Some(crate::guards::GuardRate::publication(policy(aligned * 4))),
+        )
+        .unwrap();
+    let admin = (crate::guards::RateAuthority::Administrator, 1);
+    assert!(matches!(
+        driver.change_rate_policy(handle, 1, policy(u64::from(mtu)), admin),
+        Err(DriverError::InvalidRatePolicy(_))
+    ));
+    // Refused and audited so; nothing published, the policy in force kept.
+    let refused = *driver.guard_audit().records.last().unwrap();
+    assert!(matches!(
+        refused.outcome,
+        crate::guards::AuditOutcome::Refused(_)
+    ));
+    assert_eq!((refused.before, refused.after), (1, 1));
+    assert_eq!(
+        driver.rate_policies.values().copied().collect::<Vec<_>>(),
+        vec![(policy(aligned * 4), 1)]
+    );
+    assert_eq!(
+        driver.change_rate_policy(handle, 1, policy(aligned), admin),
+        Ok(2)
+    );
+}
+
 /// QS-COORDINATOR, ACS 33899: with every lane the driver can hold guarded
 /// with a rate, the stored policies never pass `max_streams`, and the next
 /// stream is refused before any policy could be stored for it.
