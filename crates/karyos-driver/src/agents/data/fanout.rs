@@ -247,6 +247,9 @@ pub(super) struct Fanout {
     targets: Vec<Target>,
     /// Per lane, the datagram read and the targets that still need it.
     pending: Vec<Option<Pending>>,
+    /// The lanes' cursors for an addition, one per lane, reused by every
+    /// command so none allocates for them.
+    joins: Vec<u64>,
     /// Per lane and target, whether the pending datagram is staged there.
     staged_for: Vec<Vec<bool>>,
     /// Per lane, one datagram of scratch (MD-2).
@@ -378,6 +381,7 @@ impl Fanout {
             retired: Vec::with_capacity(MAX_DESTINATIONS),
             targets,
             pending: vec![None; lanes],
+            joins: vec![0; lanes],
             scratch: (0..lanes).map(|_| vec![0; mtu]).collect(),
             rotation: 0,
             backpressure: false,
@@ -1479,15 +1483,23 @@ impl<T: StreamTerms> Outbound<T> {
         })
     }
 
-    /// Records `destination`'s removal as reported.
-    pub(crate) fn removal_reported(&mut self, destination: SocketAddr) {
-        if let Some(target) = self
-            .fanout
-            .as_deref_mut()
-            .and_then(|fanout| fanout.targets.iter_mut().find(|t| t.address == destination))
-        {
+    /// Records `destination`'s removal as reported at `now`, and retires
+    /// it in the same cycle: its removal is reported only once drained, so
+    /// a move retried after the report finds its slot free.
+    pub(crate) fn removal_reported(&mut self, destination: SocketAddr, now: u64) {
+        let (endpoint, epoch) = (self.endpoint, self.opened);
+        let Some(fanout) = self.fanout.as_deref_mut() else {
+            return;
+        };
+        if let Some(target) = fanout.targets.iter_mut().find(|t| t.address == destination) {
             target.reported = true;
         }
+        let (retired, forgotten, unrecorded) = fanout.retire(endpoint, epoch, now);
+        self.counters.bump(|c| &mut c.destinations_retired, retired);
+        self.counters
+            .bump(|c| &mut c.quarantine_forgotten, forgotten);
+        self.counters
+            .bump(|c| &mut c.retired_unrecorded, unrecorded);
     }
 
     /// Its destinations' quarantine (MD-14) and the spacing of counted
@@ -1501,22 +1513,20 @@ impl<T: StreamTerms> Outbound<T> {
 
     /// Hands the routes and queues of retired destinations to `closing`,
     /// the sender's list of what removed publications left, which closes
-    /// each whole (design 3.7).
+    /// each whole (design 3.7). The list has a fixed capacity: what does
+    /// not fit waits for the next duty (`close_deferred`).
     pub(crate) fn drain_retired(&mut self, closing: &mut Vec<Opened>) {
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return;
         };
-        let mut unrecorded = 0u64;
-        for opened in fanout.retired.drain(..) {
-            if closing.len() < closing.capacity() {
-                closing.push(opened);
-            } else {
-                unrecorded = unrecorded.saturating_add(1);
-            }
-        }
-        debug_assert_eq!(unrecorded, 0, "the close list holds every route");
-        self.counters
-            .bump(|c| &mut c.retired_unrecorded, unrecorded);
+        // Within the close list's fixed capacity: what finds no room stays
+        // for the next duty, counted, never dropped.
+        let room = closing.capacity().saturating_sub(closing.len());
+        let taken = room.min(fanout.retired.len());
+        closing.extend(fanout.retired.drain(..taken));
+        let deferred = u64::try_from(fanout.retired.len()).unwrap_or(u64::MAX);
+        debug_assert_eq!(deferred, 0, "the close list holds every route");
+        self.counters.bump(|c| &mut c.close_deferred, deferred);
     }
 
     /// The repair jobs every destination's table holds, summed (tests).
@@ -1785,14 +1795,13 @@ impl<T: StreamTerms> Outbound<T> {
                         .bump(|c| &mut c.retired_unrecorded, unrecorded);
                     return DestinationChange::Full;
                 }
-                // A fresh optional destination, joining at the cursor (an
-                // addition allocates: a run-time command).
-                let joins: Vec<u64> = self
-                    .readers
-                    .iter()
-                    .map(|reader| reader.position())
-                    .collect();
-                let target = fanout.target(destination, &joins);
+                // A fresh optional destination, joining at the cursor; its
+                // target is built here (an addition allocates its queues
+                // and repair path), nothing else does.
+                for (join, reader) in fanout.joins.iter_mut().zip(&self.readers) {
+                    *join = reader.position();
+                }
+                let target = fanout.target(destination, &fanout.joins);
                 self.counters.bump(|c| &mut c.destinations_retired, retired);
                 self.counters
                     .bump(|c| &mut c.quarantine_forgotten, forgotten);
@@ -1955,12 +1964,21 @@ mod tests {
         let mut full = 0;
         // Every removal emptied and never reported (the ring full).
         for port in 1..=40u16 {
-            match outbound.change_destination(address(4000 + port), true, 0, 0) {
+            let (change, allocations) = karyos_sys::alloc_count::count(|| {
+                outbound.change_destination(address(4000 + port), true, 0, 0)
+            });
+            match change {
                 DestinationChange::Added => {}
-                DestinationChange::Full => full += 1,
+                DestinationChange::Full => {
+                    full += 1;
+                    assert_eq!(allocations, 0, "a refused addition allocates nothing");
+                }
                 other => panic!("{other:?}"),
             }
-            let _ = outbound.change_destination(address(4000 + port), false, 0, 0);
+            let (_, allocations) = karyos_sys::alloc_count::count(|| {
+                outbound.change_destination(address(4000 + port), false, 0, 0)
+            });
+            assert_eq!(allocations, 0, "a removal allocates nothing");
             // Emptied, and its removal never reported.
             if let Some(target) = outbound
                 .fanout
@@ -1981,10 +1999,14 @@ mod tests {
             assert!(fanout.staged_for[0].len() <= MAX_DESTINATIONS);
         }
         assert!(full > 0, "the table filled");
+        let mut closing = Vec::with_capacity(MAX_DESTINATIONS);
+        let (_, allocations) =
+            karyos_sys::alloc_count::count(|| outbound.drain_retired(&mut closing));
+        assert_eq!(allocations, 0, "the drain allocates nothing");
         // The ring drains: each removal is reported, and the next addition
         // retires the reported ones, within the retired list's capacity.
         while let Some(removal) = outbound.removal_unreported() {
-            outbound.removal_reported(removal.destination);
+            outbound.removal_reported(removal.destination, 0);
         }
         for port in 41..=80u16 {
             let change = outbound.change_destination(address(4000 + port), true, 0, 0);
@@ -2035,12 +2057,16 @@ mod tests {
             .cancelled = true;
         let removal = outbound.removal_unreported().unwrap();
         assert_eq!(removal.destination, address(4001));
-        outbound.removal_reported(removal.destination);
+        outbound.removal_reported(removal.destination, 0);
+        assert_eq!(
+            outbound.counters().destinations_retired,
+            1,
+            "retired in the cycle of its report"
+        );
         assert_eq!(
             outbound.change_destination(address(4100), true, 0, 0),
             DestinationChange::Added
         );
-        assert_eq!(outbound.counters().destinations_retired, 1);
     }
 
     /// MD-15, review N2: a destination moves to the cursor when it first

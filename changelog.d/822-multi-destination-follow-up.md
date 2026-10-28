@@ -12,7 +12,11 @@
     duty path. An addition now answers `Full` instead. A move at capacity
     retried after the removal shows in `network_removed_destinations`
     finds the slot free: the addition retires the reported destination
-    first. Only an addition allocates.
+    first. A removal is retired in the cycle it is reported. A removal, a
+    refused addition and the drain of retired destinations allocate
+    nothing; only an accepted addition does. The sender's close list has
+    a fixed capacity, and what does not fit waits for the next duty
+    (`close_deferred`).
   - A route table, queue entries or TX slots that other publications
     filled (`RouteLimit`, `QueueLimit`, `OverCommitted`) no longer count
     as the destination's own fault, so an optional destination is not

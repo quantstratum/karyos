@@ -1054,4 +1054,7 @@ fn endpoint_resets_remove_no_optional_destination() {
         .map(|(address, _)| address)
         .collect();
     assert_eq!(destinations, [addresses[0], idle]);
+    // Review B3 of #829: the resets' refused opens are not limits.
+    let counters = super::shared(&mut a).sender.outbound_counters(0).unwrap();
+    assert_eq!(counters.endpoint_limits, 0, "{counters:?}");
 }

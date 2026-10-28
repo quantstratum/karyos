@@ -280,6 +280,10 @@ pub struct OutboundCounters {
     /// found no room in the list closing them (never, by its capacity):
     /// left to the endpoint's next epoch.
     pub retired_unrecorded: u64,
+    /// Retired destinations' routes and queues that the sender's close
+    /// list had no room for in a duty, left for the next (never, by its
+    /// capacity).
+    pub close_deferred: u64,
     /// Send faults reported for a lane's head.
     pub send_faults: u64,
     /// Invariant, sender or DRR failures.

@@ -4801,7 +4801,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 if !post(event) {
                     return;
                 }
-                outbound.removal_reported(removal.destination);
+                outbound.removal_reported(removal.destination, now);
             }
         }
     }
