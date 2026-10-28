@@ -1167,6 +1167,12 @@ pub enum ErrorCode {
     /// A lane guarded with a rate other than its publication's policy
     /// (R-CORE-21): only a policy change changes it.
     RatePolicyConflict,
+    /// A refusal code this peer does not define, read from a newer driver
+    /// (karyos#819): a refusal all the same, with its wire value and its
+    /// detail kept. It encodes to its own wire value, so a decoded
+    /// response re-encodes to its bytes; a driver never sends it. Code 0
+    /// stays reserved.
+    Unknown(u64),
 }
 
 impl ErrorCode {
@@ -1199,9 +1205,20 @@ impl ErrorCode {
             Self::RateNotSet => 22,
             Self::RateInvalidPolicy => 23,
             Self::RatePolicyConflict => 25,
+            Self::Unknown(code) => code,
         }
     }
 
+    /// Whether this peer defines the code: every variant but
+    /// [`ErrorCode::Unknown`].
+    #[must_use]
+    pub const fn is_defined(self) -> bool {
+        !matches!(self, Self::Unknown(_))
+    }
+
+    /// The code of wire value `code`: a defined one, [`ErrorCode::Unknown`]
+    /// for any other nonzero value (karyos#819), and `None` for 0, which
+    /// is reserved.
     const fn from_code(code: u64) -> Option<Self> {
         Some(match code {
             1 => Self::PublicationTaken,
@@ -1229,7 +1246,8 @@ impl ErrorCode {
             22 => Self::RateNotSet,
             23 => Self::RateInvalidPolicy,
             25 => Self::RatePolicyConflict,
-            _ => return None,
+            0 => return None,
+            other => Self::Unknown(other),
         })
     }
 }
@@ -4387,8 +4405,8 @@ mod tests {
             }
             out[24..32].fill(0);
         }
-        let mut response = [0u8; 4 * 8];
-        response[16] = 99;
+        // Error code 0 is reserved; any other code decodes (karyos#819).
+        let response = [0u8; 4 * 8];
         assert!(matches!(
             Response::decode(0x84, &response),
             Err(CncError::Reserved { .. })
@@ -4951,7 +4969,8 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(1000), None);
+        assert_eq!(ErrorCode::from_code(1000), Some(ErrorCode::Unknown(1000)));
+        assert_eq!(ErrorCode::from_code(0), None);
     }
 
     /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
@@ -5139,11 +5158,28 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 1000 is not defined: an unknown code fails the decode.
+        // Error code 1000 is not defined: a refusal all the same, its code
+        // and detail kept (karyos#819); code 0 stays reserved.
+        let unknown = Response::Error {
+            request: RequestId {
+                client: 1,
+                sequence: 2,
+            },
+            code: ErrorCode::Unknown(1000),
+            detail: 7,
+        };
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 1000, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 1000, 7])),
+            Ok(unknown)
+        );
+        assert_eq!(
+            Response::decode(ERROR, &bytes_of(&[1, 2, 0, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
+        // It re-encodes to its own bytes.
+        let mut out = [0u8; MAX_RESPONSE_LENGTH];
+        let length = unknown.encode(&mut out).unwrap();
+        assert_eq!(words_of(&out[..length]), [1, 2, 1000, 7]);
     }
 }
 

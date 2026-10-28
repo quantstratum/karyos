@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 96ba68eccf6aaa43fc901313cf715034f2c72471088582520738bda8222aa2e7 # shrinks to response = PublicationReady { request: RequestId { client: 0, sequence: 0 }, registration: 26, key: 0 }, flip = Index(0), mask = 1, cut = Index(0), other = Index(5534023222112865485)
+cc a95691e4371bf3ad00111ae6409ced594e9283faac1551eec3102ee90267cad5 # shrinks to (type_id, bytes) = (132, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])

@@ -69,6 +69,14 @@ The gates the 0.1.0-alpha.2 Evidence table records, and `make loom-full`:
 `MIRI_TOOLCHAIN` is the nightly pinned in the `Makefile`; the row names
 it, with the Miri version.
 
+Before the release is cut, also check:
+
+- **Forward-compatible error codes present; see karyos#819.** The release
+  contains `ErrorCode::Unknown`, so a client of this release reads a CnC
+  refusal code it does not define as a refusal. The admission `VERSION`
+  stays 3 only because no VERSION 3 peer is released without it
+  (QS-COORDINATOR, 2026-10-28).
+
 A gate that fails gets an issue of its own, linked from its row; the
 fix is not folded into the pull request that records the evidence.
 

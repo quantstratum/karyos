@@ -790,6 +790,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if matches!(response, Response::Error { .. }) {
                 self.counters.add(Event::CommandsRefused, 1);
             }
+            // A driver sends only the refusal codes it defines; a peer reads
+            // any other as `ErrorCode::Unknown` (karyos#819).
+            debug_assert!(
+                !matches!(response, Response::Error { code, .. } if !code.is_defined()),
+                "an undefined refusal code"
+            );
             let mut out = [0u8; MAX_RESPONSE_LENGTH];
             let sent = response
                 .encode(&mut out)
