@@ -17,7 +17,8 @@
     version change) and in the sender gate's slot
     (`karyos_sys::rate_policy_slot`, a sequence lock with a Loom model).
     A handle's copy reads it on its slow path; a network sender gate at
-    each serve.
+    each serve. A handle in another process now takes its rate copy from
+    its ring when it binds (before, only an in-process handle had one).
   - Every change, accepted or refused, is in the guard audit: outcome
     `RateChanged` (ring code 5), `before` and `after` the policy
     versions, `parameters` the authority.

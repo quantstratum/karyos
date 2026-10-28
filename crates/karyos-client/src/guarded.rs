@@ -195,6 +195,30 @@ impl GuardBinding {
         self
     }
 
+    /// [`Self::with_rate`] from the policy the driver published in the
+    /// outcome ring, if any (R-CORE-21): how a handle of another process
+    /// gets its copy, the grant carrying no policy. A ring with none
+    /// published, or one being published, leaves the handle without a copy,
+    /// as before; the sender gate stays authoritative.
+    #[must_use]
+    pub fn with_published_rate(self, clock: fn() -> u64) -> Self {
+        // A publication in progress is short: a few reads see it whole.
+        for _ in 0..8 {
+            match try_read(&*self.ring, OUTCOME_SLOT) {
+                SlotRead::Policy { version, policy } => {
+                    let mut bound = self.with_rate(policy, clock);
+                    if let Some(copy) = &mut bound.rate {
+                        copy.version = version;
+                    }
+                    return bound;
+                }
+                SlotRead::Unpublished => return self,
+                SlotRead::Busy => core::hint::spin_loop(),
+            }
+        }
+        self
+    }
+
     /// Whole message tokens the handle's copy holds at its last refill;
     /// `None` without a rate limit.
     #[must_use]
