@@ -513,6 +513,12 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
     }
 }
 
+/// Test only: a tail's first transmission lost (`ReceiverRole::drop_tail`):
+/// the term offset, whether on one source only, the source chosen, and the
+/// sources whose idle heartbeat ended it.
+#[cfg(test)]
+type DropTail = (u32, bool, Option<SocketAddr>, [Option<SocketAddr>; 4]);
+
 /// The receiver agent's network state.
 #[derive(Debug)]
 pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
@@ -527,6 +533,14 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// that duplicates).
     #[cfg(test)]
     repeat_data_from: Option<u64>,
+    /// Test only: a tail's first transmission lost: DATA datagrams with a
+    /// payload at or past this term offset of the first term are lost
+    /// from a source until that source's idle heartbeat at or past it
+    /// arrives (so repairs after it pass), on every source or on the first
+    /// such datagram's source only (a tail lost on one path). Heartbeats
+    /// always arrive. The sources: the chosen one, and those done.
+    #[cfg(test)]
+    drop_tail: Option<DropTail>,
     /// Test only: every NAK handed to the sender.
     #[cfg(test)]
     posted_naks: Vec<Nak>,
@@ -1664,6 +1678,8 @@ pub(super) fn roles<T: StreamTerms>(
             #[cfg(test)]
             repeat_data_from: None,
             #[cfg(test)]
+            drop_tail: None,
+            #[cfg(test)]
             posted_naks: Vec::new(),
             #[cfg(test)]
             posted_challenges: Vec::new(),
@@ -2247,6 +2263,18 @@ impl<T: StreamTerms> ReceiverRole<T> {
     pub(super) fn drop_data(&mut self, nth: &[u64]) {
         self.drop_data = nth.to_vec();
         self.data_seen = 0;
+    }
+
+    /// Loses every DATA datagram with a payload at or past `term_offset`
+    /// of the first term: from every source, or from the first such
+    /// datagram's source only when `one_source` (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(super) fn drop_tail(&mut self, term_offset: u32, one_source: bool) {
+        self.drop_tail = Some((term_offset, one_source, None, [None; 4]));
     }
 
     /// Whether the path queues are allocated (tests).
@@ -3863,6 +3891,33 @@ impl<T: StreamTerms> Intake<'_, T> {
             if self.role.drop_data.contains(&seen) {
                 return;
             }
+            // A frame with a payload at or past the offset: its header's
+            // length is above 32, its term offset at bytes 4 to 8.
+            if let Some((offset, one_source, chosen, mut done)) = self.role.drop_tail
+                && let (Some(length), Some(at)) = (
+                    bytes
+                        .get(..4)
+                        .and_then(|word| word.try_into().ok())
+                        .map(i32::from_le_bytes),
+                    bytes
+                        .get(4..8)
+                        .and_then(|word| word.try_into().ok())
+                        .map(u32::from_le_bytes),
+                )
+                && at >= offset
+                && !done.contains(&Some(source))
+            {
+                if length <= 32 {
+                    // The source's idle heartbeat: its tail was sent.
+                    if let Some(slot) = done.iter_mut().find(|slot| slot.is_none()) {
+                        *slot = Some(source);
+                    }
+                    self.role.drop_tail = Some((offset, one_source, chosen, done));
+                } else if !one_source || chosen.is_none_or(|chosen| chosen == source) {
+                    self.role.drop_tail = Some((offset, one_source, Some(source), done));
+                    return;
+                }
+            }
             if self.role.repeat_data_from.is_some_and(|from| seen >= from) {
                 self.data_once(source, alias, bytes);
             }
@@ -5370,7 +5425,17 @@ impl<T: StreamTerms> SenderRole<T> {
                     now,
                 )?;
                 work = work.checked_add(served).ok_or(overflow.clone())?;
-                if outbound.needs_reset() {
+                // An idle lane's heartbeat on every live path (SPEC §6,
+                // karyos#834).
+                let beats = outbound
+                    .serve_routed_heartbeats(halves, now, self.sender_heartbeat_interval)
+                    .ok_or(overflow.clone())?;
+                work = work.checked_add(beats).ok_or(overflow.clone())?;
+                let needs_reset = outbound.needs_reset();
+                for _ in 0..beats {
+                    self.count(|c| &mut c.heartbeats_sent);
+                }
+                if needs_reset {
                     needing_reset = needing_reset.checked_add(1).ok_or(overflow.clone())?;
                 }
                 continue;

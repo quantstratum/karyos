@@ -12,8 +12,9 @@
 //! instead of waiting for liveness to retire the image. A removal's EOS
 //! (`removal`) is the same frame with the EOS flag, and replaces the idle
 //! heartbeat while the publication is removed. A lane whose guard does not
-//! admit it sends neither (GC-6). Routed publications send PATH_HB instead
-//! (redundant-paths.md RP-3).
+//! admit it sends neither (GC-6). A routed publication's lane sends the
+//! same frame on every path that can send (karyos#834), and PATH_HB keeps
+//! each path's binding live (redundant-paths.md RP-3).
 
 use std::num::NonZeroU16;
 

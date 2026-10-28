@@ -3308,6 +3308,215 @@ fn a_fragmented_message_straddling_a_reset_is_read_once_and_whole() {
     exchange_from(&mut a, &mut b, &mut lane, &mut reader, 9, 9..64);
 }
 
+/// Two drivers on a two-path multicast channel of `reliable` delivery, the
+/// isolated-paths switch assumed (as in
+/// `a_two_path_publication_reaches_a_two_path_subscription`), connected:
+/// the publication and B's image. `None` when the host cannot carry
+/// multicast, said on stderr.
+#[cfg(target_os = "linux")]
+fn two_paths(
+    label: &str,
+    reliable: bool,
+) -> Option<(
+    EmbeddedDriver,
+    EmbeddedDriver,
+    crate::embedded::AggregateHandle,
+    crate::embedded::AggregateHandle,
+)> {
+    use std::io::Write as _;
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(std::io::stderr(), "SKIPPED {label}: {why}");
+        return None;
+    }
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), free_port());
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ],
+        reliable,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    for side in [&mut a, &mut b] {
+        side.net.as_mut().unwrap().assume_isolated_paths();
+    }
+    let _ = b.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 4, 1), &channel)
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 4);
+        image.is_some()
+    });
+    let image = image?;
+    Some((a, b, publication, image))
+}
+
+/// Offers messages `0..3` on `a`'s lane 0, the tail from message 1 lost at
+/// B by `one_source`, and pumps until `done` holds of what B delivered and
+/// the local gaps it reported.
+#[cfg(target_os = "linux")]
+fn lose_the_tail(
+    a: &mut EmbeddedDriver,
+    b: &mut EmbeddedDriver,
+    publication: &crate::embedded::AggregateHandle,
+    image: &crate::embedded::AggregateHandle,
+    one_source: bool,
+    mut done: impl FnMut(&[u32], &[(u64, u64)]) -> bool,
+) -> (Vec<u32>, Vec<(u64, u64)>) {
+    use karyos_sys::log_buffer::SkipReason;
+
+    let mut reader = b.subscribe_aggregate(image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let offer = |lane: &mut karyos_client::ClientPublication<_>, index: u32| {
+        let mut payload = [0u8; 1000];
+        payload[..4].copy_from_slice(&index.to_le_bytes());
+        assert!(matches!(
+            lane.offer(&payload).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    };
+    let (mut delivered, mut gaps) = (Vec::new(), Vec::new());
+    // Message 0 arrives first, on its own.
+    offer(&mut lane, 0);
+    pump(&mut [&mut *a, &mut *b], |_| {
+        let _ = reader.poll(
+            |bytes, _, _| delivered.push(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+            BUDGET,
+        );
+        !delivered.is_empty()
+    });
+    // A 1000-byte message takes 1056 bytes of the log: the tail starts at
+    // 1056.
+    b.net.as_mut().unwrap().drop_receiver_tail(1056, one_source);
+    offer(&mut lane, 1);
+    offer(&mut lane, 2);
+    pump(&mut [a, b], |_| {
+        let poll = reader.poll(
+            |bytes, _, _| delivered.push(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+            BUDGET,
+        );
+        if let Some(skipped) = poll.lanes[0].skipped
+            && matches!(skipped.reason, SkipReason::LocalGap(_))
+        {
+            gaps.push((
+                skipped.position,
+                skipped.position + u64::from(skipped.extent),
+            ));
+        }
+        done(&delivered, &gaps)
+    });
+    (delivered, gaps)
+}
+
+/// karyos#834 (SPEC §6, G1, over redundant paths): an unreliable two-path
+/// lane whose tail is lost on every path goes idle; its idle DATA
+/// heartbeat on each path shows the tail, which B seals as one local gap
+/// of its exact range at the reorder deadline. The heartbeats keep coming
+/// on both paths, and the gap is neither sealed again nor moved.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tail_lost_on_every_path_is_one_local_gap() {
+    let label = "a_tail_lost_on_every_path_is_one_local_gap";
+    let Some((mut a, mut b, publication, image)) = two_paths(label, false) else {
+        return;
+    };
+    let (delivered, gaps) =
+        lose_the_tail(&mut a, &mut b, &publication, &image, false, |_, gaps| {
+            !gaps.is_empty()
+        });
+    assert_eq!(delivered, [0]);
+    assert_eq!(gaps, [(1056, 3 * 1056)], "the exact tail");
+    // More heartbeats on both paths: still one seal.
+    for _ in 0..2_000 {
+        for driver in [&mut a, &mut b] {
+            let _ = driver.do_work().unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+    let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert_eq!(receiver.gaps_sealed, 1, "{receiver:?}");
+    assert!(
+        a.net
+            .as_ref()
+            .unwrap()
+            .sender_counters()
+            .unwrap()
+            .heartbeats_sent
+            >= 2,
+        "heartbeats on both paths"
+    );
+}
+
+/// karyos#834: the same tail on a reliable two-path lane is NAKed and
+/// repaired: every message arrives once and in order.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tail_lost_on_every_reliable_path_is_repaired() {
+    let label = "a_tail_lost_on_every_reliable_path_is_repaired";
+    let Some((mut a, mut b, publication, image)) = two_paths(label, true) else {
+        return;
+    };
+    let (delivered, gaps) = lose_the_tail(
+        &mut a,
+        &mut b,
+        &publication,
+        &image,
+        false,
+        |delivered, _| delivered.len() == 3,
+    );
+    assert_eq!(delivered, [0, 1, 2], "in order, exactly once");
+    assert!(gaps.is_empty());
+    assert!(b.net.as_ref().unwrap().receiver_counters().unwrap().naks >= 1);
+}
+
+/// karyos#834: a tail lost on one path only arrives by the other, and
+/// nothing is sealed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tail_lost_on_one_path_arrives_by_the_other() {
+    use std::io::Write as _;
+
+    let label = "a_tail_lost_on_one_path_arrives_by_the_other";
+    let Some((mut a, mut b, publication, image)) = two_paths(label, false) else {
+        return;
+    };
+    if b.network_path_counters().1 > 0 {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED {label}: path 2's join failed on this host"
+        );
+        return;
+    }
+    let (delivered, gaps) = lose_the_tail(
+        &mut a,
+        &mut b,
+        &publication,
+        &image,
+        true,
+        |delivered, _| delivered.len() == 3,
+    );
+    assert_eq!(delivered, [0, 1, 2]);
+    assert!(gaps.is_empty());
+    assert_eq!(
+        b.net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap()
+            .gaps_sealed,
+        0
+    );
+}
+
 /// rp-w4b2c: a publication over two paths reaches a subscription over the
 /// same two paths, with the isolated-paths switch assumed on both drivers
 /// (owner item 12 keeps it off on real sockets): every message once, in

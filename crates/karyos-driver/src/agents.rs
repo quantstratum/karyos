@@ -1516,6 +1516,17 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
         self.role.drop_data(nth);
     }
 
+    /// Loses the receiver's DATA with a payload at or past `term_offset`
+    /// of the first term, from every source or from one (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn drop_tail(&mut self, term_offset: u32, one_source: bool) {
+        self.role.drop_tail(term_offset, one_source);
+    }
+
     /// After a stop: the halves of `Attach` commands the agent never read
     /// (DN-8). The conductor reclaims them with the held ones.
     pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {

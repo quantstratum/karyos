@@ -834,25 +834,10 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         halves: &mut [(EndpointId, Half<O>)],
         now: u64,
     ) -> RemovalStep {
-        let Some(routed) = self.routed.as_deref() else {
+        if self.routed.is_none() {
             return RemovalStep::default();
-        };
-        // The routes that can send now, by route.
-        let mut sending = [false; MAX_ROUTES];
-        for (held, half) in halves.iter() {
-            let Half::Tx(tx) = half else {
-                continue;
-            };
-            if let Some(index) = routed
-                .routes
-                .iter()
-                .position(|route| route.endpoint == *held)
-                && routed.repair_live(index, tx.capabilities().epoch)
-                && let Some(slot) = sending.get_mut(index)
-            {
-                *slot = true;
-            }
         }
+        let sending = self.sending_routes(halves);
         self.serve_removal_with(
             now,
             |outbound, lane| outbound.routed_drained_seal(lane, &sending),
@@ -878,6 +863,110 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     && track.staged.get(route).is_none_or(VecDeque::is_empty)
             });
         (idle && high >= seal && reader.position() >= seal).then_some(seal)
+    }
+
+    /// The routes that can send now, by route: those whose endpoint's TX
+    /// half is held, live in its epoch.
+    fn sending_routes<O: SocketOps>(&self, halves: &[(EndpointId, Half<O>)]) -> [bool; MAX_ROUTES] {
+        let mut sending = [false; MAX_ROUTES];
+        let Some(routed) = self.routed.as_deref() else {
+            return sending;
+        };
+        for (held, half) in halves {
+            let Half::Tx(tx) = half else {
+                continue;
+            };
+            if let Some(index) = routed
+                .routes
+                .iter()
+                .position(|route| route.endpoint == *held)
+                && routed.repair_live(index, tx.capabilities().epoch)
+                && let Some(slot) = sending.get_mut(index)
+            {
+                *slot = true;
+            }
+        }
+        sending
+    }
+
+    /// The idle heartbeats of a routed publication due at `now` (SPEC §6,
+    /// karyos#834): each lane idle for `interval`, with nothing staged or
+    /// pending on any route that can send, sends a header-only DATA frame
+    /// at its next position on every such route, as a single-path lane
+    /// does on its one. PATH_HB still keeps each path's binding live
+    /// (RP-3); this frame is what tells an image where the lane stands, so
+    /// a tail lost on every path shows. None while the publication is
+    /// removed (its EOS replaces them). Returns the frames submitted.
+    pub(crate) fn serve_routed_heartbeats<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+        interval: u64,
+    ) -> Option<u32> {
+        if self.removing() || self.routed.is_none() {
+            return Some(0);
+        }
+        let sending = self.sending_routes(halves);
+        let mut sent = 0u32;
+        for lane in 0..self.readers.len() {
+            let routed = self.routed.as_deref()?;
+            let busy = routed.tracks.get(lane).is_none_or(|track| {
+                (0..MAX_ROUTES)
+                    .filter(|route| sending.get(*route) == Some(&true))
+                    .any(|route| {
+                        routed.sender.pending(lane, route).unwrap_or(0) > 0
+                            || track
+                                .staged
+                                .get(route)
+                                .is_some_and(|staged| !staged.is_empty())
+                    })
+            });
+            let Some(since) = self.idle_since.get_mut(lane) else {
+                continue;
+            };
+            if busy {
+                *since = Some(now);
+                continue;
+            }
+            let since = *since.get_or_insert(now);
+            if now.checked_sub(since).is_none_or(|idle| idle < interval) {
+                continue;
+            }
+            if self
+                .guard
+                .as_deref_mut()
+                .is_some_and(|guard| !LaneGate::admits(guard, lane))
+            {
+                continue;
+            }
+            let Some(position) = self.readers.get(lane).map(|reader| reader.position()) else {
+                continue;
+            };
+            let routed = self.routed.as_deref()?;
+            let mut queues: [Option<(EndpointId, TxQueueId)>; MAX_ROUTES] = [None; MAX_ROUTES];
+            for ((slot, route), sending) in queues.iter_mut().zip(&routed.routes).zip(&sending) {
+                if *sending {
+                    *slot = route.queues.get(lane).map(|queue| (route.endpoint, *queue));
+                }
+            }
+            let mut submitted = false;
+            for (endpoint, queue) in queues.into_iter().flatten() {
+                let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                    Half::Tx(tx) if *held == endpoint => Some(&mut **tx),
+                    _ => None,
+                });
+                if let Some(tx) = tx
+                    && self.write_heartbeat_on(tx, queue, lane, position, false)
+                {
+                    submitted = true;
+                    sent = sent.checked_add(1)?;
+                }
+            }
+            if submitted && let Some(slot) = self.idle_since.get_mut(lane) {
+                *slot = Some(now);
+            }
+        }
+        Some(sent)
     }
 
     /// Sends `lane`'s EOS at `seal` on every `sending` route's lane queue.

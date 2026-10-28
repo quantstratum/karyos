@@ -3516,7 +3516,13 @@ fn a_refused_path_heartbeat_is_tried_next_cycle() {
     use super::super::Half;
 
     let interval = AgentConfig::default().path_heartbeat_interval;
-    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    // The lane's idle DATA heartbeat (karyos#834) is kept out of the way:
+    // the refusal is meant for the PATH_HB.
+    let config = AgentConfig {
+        sender_heartbeat_interval: interval.saturating_mul(1000),
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
     let routes = [
         (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
         (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),

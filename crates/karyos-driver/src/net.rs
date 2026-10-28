@@ -1462,6 +1462,19 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// Loses the receiver's DATA with a payload at or past `term_offset`
+    /// of the first term, from every path or from one (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn drop_receiver_tail(&mut self, term_offset: u32, one_source: bool) {
+        if let Agents::Shared(agents) = &mut self.agents {
+            agents.receiver.drop_tail(term_offset, one_source);
+        }
+    }
+
     /// Holds back the attach of the conflated views built from now on, as
     /// if their feeders attached late (tests).
     #[cfg(test)]
