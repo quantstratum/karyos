@@ -472,7 +472,13 @@ than it waited for (a reattach, another session). It answers
 `status=timeout` when `count` is not reached within 10 s, and
 `status=events_lost` when the subscription's image change queue dropped
 changes (`karyos_subscription_image_changes_lost`), since a dropped change
-may have been an image. A failing image change call answers its status.
+may have been an image. Each round reads the pending image changes,
+then checks in this order: a failing image change call answers its
+status; `count` reached answers `ok`, even when changes were also
+dropped, since the images it counted were reported; a dropped change
+answers `events_lost`; the deadline passed answers `timeout`. A runner
+answers the first that holds, so `ok` wins over `events_lost` and
+`events_lost` over `timeout`.
 The runner waits nowhere else: it matches no URI and keys no session.
 
 Each exclusive stream's publication is added at most once in the whole
