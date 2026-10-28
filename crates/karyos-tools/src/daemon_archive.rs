@@ -430,27 +430,7 @@ impl DaemonArchive {
         terms: &TermOptions,
         options: &ArchiveOptions,
     ) -> Result<(Self, [StreamHandle; 2]), ArchiveStartError> {
-        let control = |stream_id| StreamOption {
-            stream_id,
-            session_id: 0,
-            allow_unconnected: false,
-        };
-        let mut requests_config = control_config(terms, control(options.requests))?;
-        requests_config.buffer.max_reserved = REQUEST_MAX_RESERVED;
-        // A concurrent stream holds a spare slot per publisher beyond the
-        // cleaning headroom.
-        requests_config.buffer.spare_slots = REQUEST_SPARE_SLOTS;
-        requests_config.buffer.publication = PublicationMode::Concurrent {
-            publishers: REQUEST_PUBLISHERS,
-            // A control stream's few small requests: the lock-free
-            // fallback's cost does not matter (ADR-0012).
-            allow_non_lse: true,
-        };
-        let mut responses_config = control_config(terms, control(options.responses))?;
-        // An answer nobody reads is not held.
-        responses_config.allow_unconnected = true;
-        responses_config.buffer.max_subscribers = RESPONSE_READERS;
-        responses_config.buffer.spare_slots = RESPONSE_SPARE_SLOTS;
+        let [requests_config, responses_config] = control_configs(terms, options)?;
         let requests = driver
             .add_stream(requests_config)
             .map_err(ArchiveStartError::Stream)?;
@@ -578,6 +558,41 @@ impl DaemonArchive {
 }
 
 /// A control stream's configuration from the daemon's term settings.
+/// The configurations of the Archive's requests and responses control
+/// streams, as [`DaemonArchive::start`] adds them; the sizing report counts
+/// the same two.
+///
+/// # Errors
+///
+/// [`ArchiveStartError::Stream`] for term settings a stream refuses.
+pub(crate) fn control_configs(
+    terms: &TermOptions,
+    options: &ArchiveOptions,
+) -> Result<[StreamConfig; 2], ArchiveStartError> {
+    let control = |stream_id| StreamOption {
+        stream_id,
+        session_id: 0,
+        allow_unconnected: false,
+    };
+    let mut requests = control_config(terms, control(options.requests))?;
+    requests.buffer.max_reserved = REQUEST_MAX_RESERVED;
+    // A concurrent stream holds a spare slot per publisher beyond the
+    // cleaning headroom.
+    requests.buffer.spare_slots = REQUEST_SPARE_SLOTS;
+    requests.buffer.publication = PublicationMode::Concurrent {
+        publishers: REQUEST_PUBLISHERS,
+        // A control stream's few small requests: the lock-free
+        // fallback's cost does not matter (ADR-0012).
+        allow_non_lse: true,
+    };
+    let mut responses = control_config(terms, control(options.responses))?;
+    // An answer nobody reads is not held.
+    responses.allow_unconnected = true;
+    responses.buffer.max_subscribers = RESPONSE_READERS;
+    responses.buffer.spare_slots = RESPONSE_SPARE_SLOTS;
+    Ok([requests, responses])
+}
+
 fn control_config(
     terms: &TermOptions,
     stream: StreamOption,

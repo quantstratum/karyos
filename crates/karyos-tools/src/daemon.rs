@@ -99,6 +99,9 @@ pub enum StartError {
     /// The Archive did not start (`--archive`).
     #[cfg(target_os = "linux")]
     Archive(crate::daemon_archive::ArchiveStartError),
+    /// No sizing report could be made (`--sizing-report`).
+    #[cfg(target_os = "linux")]
+    Sizing(karyos_driver::sizing::SizingError),
 }
 
 impl fmt::Display for StartError {
@@ -124,6 +127,8 @@ impl fmt::Display for StartError {
             ),
             #[cfg(target_os = "linux")]
             Self::Archive(error) => write!(f, "{error}"),
+            #[cfg(target_os = "linux")]
+            Self::Sizing(error) => write!(f, "sizing report: {error}"),
         }
     }
 }
@@ -157,6 +162,59 @@ impl Shutdown {
             Self::Terminal => EXIT_TERMINAL,
         }
     }
+}
+
+/// The sizing report of `options` (R-CORE-34, `karyosd --sizing-report`):
+/// the driver configuration, the declared streams and, with `--archive`,
+/// its two control streams, built as [`Daemon::start`] builds them, with
+/// nothing created. Replay targets are excluded, as the report says.
+///
+/// # Errors
+///
+/// [`StartError::Unsupported`] off Linux; the stream errors of
+/// [`Daemon::start`]; `StartError::Sizing` (Linux) for a configuration the report
+/// refuses.
+pub fn sizing_report(options: &Options) -> Result<String, StartError> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut streams: Vec<StreamConfig> = declared_streams(options)?
+            .into_iter()
+            .map(|(_, config)| config)
+            .collect();
+        if let Some(archive) = &options.archive {
+            streams.extend(
+                crate::daemon_archive::control_configs(&options.terms, archive)
+                    .map_err(StartError::Archive)?,
+            );
+        }
+        karyos_driver::sizing::report(&options.driver, &streams, karyos_sys::ipc::page_size())
+            .map(|report| report.to_string())
+            .map_err(StartError::Sizing)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = options;
+        Err(StartError::Unsupported)
+    }
+}
+
+/// The streams `--stream` declares, with their conflation tables, as
+/// [`Daemon::start`] adds them and the sizing report counts them.
+///
+/// # Errors
+///
+/// As [`stream_config`] and [`conflation_of`].
+#[cfg(target_os = "linux")]
+fn declared_streams(options: &Options) -> Result<Vec<(StreamOption, StreamConfig)>, StartError> {
+    options
+        .streams
+        .iter()
+        .map(|stream| {
+            let mut config = stream_config(&options.terms, *stream)?;
+            config.conflation = conflation_of(options, *stream)?;
+            Ok((*stream, config))
+        })
+        .collect()
 }
 
 /// The configuration of a stream started from `terms`: exclusive
@@ -325,15 +383,7 @@ impl Daemon {
     pub fn start(options: &Options) -> Result<Self, StartError> {
         #[cfg(target_os = "linux")]
         {
-            let configs = options
-                .streams
-                .iter()
-                .map(|stream| {
-                    let mut config = stream_config(&options.terms, *stream)?;
-                    config.conflation = conflation_of(options, *stream)?;
-                    Ok((*stream, config))
-                })
-                .collect::<Result<Vec<_>, StartError>>()?;
+            let configs = declared_streams(options)?;
             let mut driver = EmbeddedDriver::with_ipc(
                 options.driver,
                 ipc_config(&options.admission),

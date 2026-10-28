@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use karyos_tools::args::{self, Command, LogLevel};
-use karyos_tools::daemon::{Daemon, EXIT_STARTUP};
+use karyos_tools::daemon::{self, Daemon, EXIT_STARTUP};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
 fn main() -> ExitCode {
@@ -23,6 +23,15 @@ fn main() -> ExitCode {
         Ok(Command::Help) => {
             let _ = std::io::stdout().write_all(args::HELP.as_bytes());
             return ExitCode::SUCCESS;
+        }
+        Ok(Command::SizingReport(options)) => {
+            return match daemon::sizing_report(&options) {
+                Ok(report) => {
+                    let _ = std::io::stdout().write_all(report.as_bytes());
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(&error),
+            };
         }
         Err(error) => return fail(&error),
     };
