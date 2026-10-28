@@ -11,6 +11,7 @@ covers "embedded network"
 since B3
 feature embedded-driver
 feature embedded-network
+feature image-wait
 
 op driver.create_networked
 expect ok driver=$driver
@@ -22,6 +23,8 @@ op subscription.add client=$client stream_id=735 uri=$network_uri
 expect ok subscription=$reading
 op publication.add client=$client stream_id=735 uri=$network_uri
 expect ok publication=$publication
+op subscription.await_image subscription=$reading
+expect ok images=1
 op publication.offer publication=$publication payload="over udp"
 expect ok
 op subscription.poll subscription=$reading limit=8 until=1

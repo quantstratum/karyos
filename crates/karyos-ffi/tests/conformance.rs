@@ -88,7 +88,7 @@ fn test_port() -> u16 {
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
 
 /// The features a format 2 scenario may need (FORMAT.md, Features).
-const FEATURES: [&str; 10] = [
+const FEATURES: [&str; 11] = [
     "archive-replay",
     "claim-retry",
     "concurrent-publication",
@@ -96,6 +96,7 @@ const FEATURES: [&str; 10] = [
     "embedded-driver",
     "embedded-network",
     "guarded-publication",
+    "image-wait",
     "incompatible-driver",
     "remote-driver",
     "tai-clock",
@@ -276,6 +277,14 @@ const OPS: &[Op] = &[
         &[],
     ),
     op("subscription.close", &["subscription"], &[], &[], &[]),
+    // A network subscription's wait for its images (karyos#830).
+    op(
+        "subscription.await_image",
+        &["subscription"],
+        &["count"],
+        &["images"],
+        &["image-wait"],
+    ),
     op(
         "conflated.add",
         &["client", "stream_id"],
@@ -2568,6 +2577,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
             "conflation",
             "embedded-network",
             "guarded-publication",
+            "image-wait",
             "incompatible-driver",
             "remote-driver",
             "tai-clock",
@@ -2576,7 +2586,8 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert_eq!(
         b1.declaration(),
         "step B1 offers embedded-driver absent archive-replay claim-retry concurrent-publication \
-         conflation embedded-network guarded-publication incompatible-driver remote-driver tai-clock"
+         conflation embedded-network guarded-publication image-wait incompatible-driver \
+         remote-driver tai-clock"
     );
     assert_eq!(
         run(&scenario((0, 1), Some(3), None), (0, 1), &b1),

@@ -212,8 +212,9 @@ offers. The features are:
 | `concurrent-publication` | `publication.add_concurrent` |
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
-| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously. The runner waits for an image before an offer or a claim on such a publication (Remote driver). |
+| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously. |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
+| `image-wait` | `subscription.await_image`, a network subscription's wait for its images (Remote driver) |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
 | `tai-clock` | `clock.now` of the TAI domain, which some platforms lack |
@@ -316,6 +317,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `conflated.close` | `conflated` | none | `conflation` |
 | `subscription.poll_to_end` | `subscription`, [`limit` (default 16)] | `delivered` (the count of every poll), `last` | |
 | `subscription.end` | `subscription` | `reason`: `"none"`, `"end_of_stream"`, `"image_retired"`, `"stream_removed"`, `"revoked"`, `"closed_by_overrun"` or `"other"`; `position`; `seal_code` | |
+| `subscription.await_image` | `subscription`, [`count` (default 1)] | `images`: the images the subscription has reported since it was added | `image-wait` |
 | `archive.connect` | `client` | `archive` | `archive-replay` |
 | `archive.replay` | `archive`, `recording`, `target_stream_id`, [`position` (default 0), `length` (default to the recording's end), `rate`: `"full"` (default), `"as_recorded"` or `"scaled"`, `scale_ppm`] | `replay`, `session` | `archive-replay` |
 | `archive.stop_replay` | `archive`, `replay` | none | `archive-replay` |
@@ -453,16 +455,20 @@ client must take less than karyosd's client liveness timeout (10 s).
 A reader joins an image at its head (SPEC §4, "Monotonic limits and
 joining"), and a network publication is connected once its receiver's
 status messages are live (SPEC §4, "Connection"), before the client that
-subscribed has attached the image. So before the first offer or claim on
-a `karyos:udp` publication of a provided client, or of a client of an
-embedded driver with its network on (`embedded-network`), the runner
-waits until each open `karyos:udp` subscription on the same stream and
-endpoint (or group), of any client, has reported one more image than it
-had when the publication was added (`karyos_subscription_next_image_change`).
-It serves every client involved, and runs an embedded driver the scenario
-did not start. At 10 s it goes on to the offer, whose answer the scenario
-checks. A message offered before that image exists may never reach the
-subscription (karyos#830).
+subscribed has attached the image. A message offered before that image is
+attached may never reach the subscription (karyos#830). A scenario that
+needs it to declares the wait itself: `subscription.await_image`
+(feature `image-wait`), after the publication is added and before its
+first offer or claim.
+
+`subscription.await_image subscription=$s` waits until `$s` has reported
+`count` images (default 1) since it was added, counting the image changes
+that report an image available (`karyos_subscription_next_image_change`).
+While it waits, the runner serves `$s`'s client, and runs its embedded
+driver when the scenario did not start it. It answers `ok` with `images`,
+the images reported so far, or `status=timeout` when `count` is not
+reached within 10 s. A failing image change status answers that status.
+The runner waits nowhere else: it matches no URI and keys no session.
 
 Each exclusive stream's publication is added at most once in the whole
 suite run, since karyosd serves every scenario: a remote publication is
