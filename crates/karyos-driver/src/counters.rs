@@ -94,14 +94,15 @@
 //! keyed by its stream's registration (key0; lane, kind and participant
 //! 0) and written the same way by its agent. Publication: `network frames
 //! sent`, `network bytes sent`, `network retransmits`, `network naks
-//! received`. Image: `network naks sent`, `network losses`, `network
+//! received`, `network admission` (a gauge) and `network rate policies
+//! refused`. Image: `network naks sent`, `network losses`, `network
 //! repaired`. They are allocated all or none with the publication, or
 //! once the image is installed and exposed; when the region has no room
 //! for the whole group, `counters unavailable` counts one and the stream
 //! runs without cells, never retried. They are freed when the publication
 //! is removed, the image retires or the network closes; cells still in
 //! flight to the receiver at the close are left pending release, which
-//! the allocator reuses. Size the region for 4 cells per network
+//! the allocator reuses. Size the region for 6 cells per network
 //! publication and 3 per image on top of the rest.
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,

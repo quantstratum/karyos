@@ -631,6 +631,8 @@ fn guard_stream_validates_its_rate_limit() {
 
 /// Every handle bound to a rate-limited guard carries the copy, a fresh
 /// incarnation's too: past the burst it refuses early and appends nothing.
+/// A fresh incarnation's copy starts empty, so reincarnating buys no new
+/// burst (#841 review, decided 2026-10-28 by QS-COORDINATOR).
 #[test]
 fn a_rate_limited_handle_refuses_past_its_burst() {
     let mut driver = EmbeddedDriver::new().unwrap();
@@ -664,14 +666,8 @@ fn a_rate_limited_handle_refuses_past_its_burst() {
     let _ = driver.do_work().unwrap();
     assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
     let mut fresh = driver.publication(handle).unwrap();
-    assert_eq!(fresh.guard().unwrap().rate_tokens(), Some(2));
-    for value in [b"d", b"e"] {
-        assert!(matches!(
-            fresh.offer(value).unwrap(),
-            OfferOutcome::Accepted { .. }
-        ));
-    }
-    assert_eq!(fresh.offer(b"f").unwrap(), OfferOutcome::RateLimited);
+    assert_eq!(fresh.guard().unwrap().rate_tokens(), Some(0));
+    assert_eq!(fresh.offer(b"d").unwrap(), OfferOutcome::RateLimited);
 }
 
 /// R-CORE-21: a guarded stream's rate policy changes by version (compare

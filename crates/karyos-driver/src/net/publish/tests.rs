@@ -1298,6 +1298,20 @@ fn waiting_reincarnation(
     crate::embedded::StreamHandle,
     UdpSocket,
 ) {
+    waiting_reincarnation_with(driver, None)
+}
+
+/// [`waiting_reincarnation`] of a publication guarded with `rate`.
+fn waiting_reincarnation_with(
+    driver: &mut EmbeddedDriver,
+    rate: Option<crate::guards::GuardRate>,
+) -> (
+    AggregateHandle,
+    crate::guards::GuardHandle,
+    u64,
+    crate::embedded::StreamHandle,
+    UdpSocket,
+) {
     use karyos_sys::guard::Closed;
     use karyos_sys::log_buffer::SealReason;
 
@@ -1315,7 +1329,7 @@ fn waiting_reincarnation(
             NetworkGuard {
                 guard,
                 messages: 2,
-                rate: None,
+                rate,
             },
         )
         .unwrap();
@@ -1995,6 +2009,56 @@ fn a_reincarnation_draws_its_own_initial_term_id() {
             Some(pin) => assert_eq!((first.get(), second.get()), (pin, pin)),
         }
     }
+}
+
+/// #841 review, points 1 and 3: a reincarnation of a publication guarded
+/// with a rate starts its sender gate's bucket empty and its new handle's
+/// copy empty too, where the first incarnation's started full, so
+/// reincarnating buys no new burst and the two agree.
+#[test]
+fn a_reincarnation_starts_its_gate_and_handle_empty() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let rate = crate::guards::GuardRate::publication(RatePolicy {
+        messages: Rate {
+            per_second: 1,
+            burst: 4,
+        },
+        bytes: None,
+    });
+    let mut driver = reincarnating_driver(20_000_000, 64);
+    let (_handle, _guard, _epoch, lane, _socket) =
+        waiting_reincarnation_with(&mut driver, Some(rate));
+    let mut taken = None;
+    until(&mut driver, |driver| match driver.publication(lane) {
+        Err(DriverError::QuarantinedAlias { .. }) => false,
+        other => {
+            taken = Some(other);
+            true
+        }
+    });
+    let publication = taken.unwrap().unwrap();
+    assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
+    // The reincarnation's gate, once its sender serves it: empty. A full
+    // one would hold the burst of 4.
+    until(&mut driver, |driver| {
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .gate_message_tokens()
+            .contains(&Some(0))
+    });
+    assert!(
+        !driver
+            .net
+            .as_ref()
+            .unwrap()
+            .gate_message_tokens()
+            .contains(&Some(4)),
+        "{:?}",
+        driver.net.as_ref().unwrap().gate_message_tokens()
+    );
 }
 
 /// P2.11 PR1: what a timed network publication's software route does

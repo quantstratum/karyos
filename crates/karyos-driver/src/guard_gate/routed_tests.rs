@@ -313,6 +313,36 @@ fn a_position_is_charged_once_for_every_route() {
     assert_eq!(f.gate.last_submitted(Lane::ZERO), end);
 }
 
+/// #841 review, point 9: a position a gate with no rate let through is
+/// exempt on every route: while its copy on route 1 is still held, the
+/// gate, having adopted a policy with an empty bucket, admits the lane
+/// for it, charges nothing, and holds nothing.
+#[test]
+fn another_routes_copy_of_an_exempt_position_is_not_charged() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(None);
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    let _ = f.stage(&[0, 1]);
+    f.routes[0].accept(1);
+    // Route 1 would block: its copy stays, exposed, uncharged.
+    let _ = f.serve();
+    assert_eq!(f.routes[0].socket.send_calls(), 1);
+    publish(slot.words(), 0, 1, &rate(1));
+    f.gate.set_now(0);
+    assert_eq!(f.gate.message_tokens(), Some(0), "adopted empty");
+    assert_eq!(f.sender.pending(0, 1), Some(1), "route 1 holds its copy");
+    assert!(f.gate.admits(0), "exempt, not held for the empty bucket");
+    assert_eq!(f.gate.counts().rate_held, 0);
+    f.routes[1].accept(1);
+    assert_eq!(f.catch_up(), 1, "route 1's copy went out");
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    assert_eq!(f.gate.counts().rate_held, 0);
+}
+
 /// A copy returned on one route refunds nothing while the position was
 /// submitted on another; a position whose every copy returns unsent is
 /// refunded.

@@ -444,11 +444,15 @@ impl core::fmt::Debug for PolicySlot {
 impl PolicySlot {
     /// Applies a newer published policy to `limiter` at `now`, creating it
     /// empty for a gate built with no rate (a rateless lane's publication
-    /// getting one): a policy taken at run time never grants tokens. An unchanged sequence word is one Acquire load; a torn read
-    /// waits for the next call.
-    /// A policy the gate's largest datagram refuses (a byte burst below
-    /// it) is not applied, as a gate is never built with one, and counted
-    /// in `counts.policies_refused`.
+    /// getting one): a policy taken at run time never grants tokens. An
+    /// unchanged sequence word is one Acquire load; a torn read waits for
+    /// the next call.
+    ///
+    /// A policy the gate refuses (a zero rate, or a byte burst below its
+    /// largest datagram) is counted in `counts.policies_refused`, and its
+    /// version is applied as the stricter of it and the policy in force.
+    /// That merge is not validated, on purpose: it fails closed, so a byte
+    /// bucket no datagram fits holds the lanes until a valid version.
     fn refresh(
         &mut self,
         limiter: &mut Option<RateLimiter>,
@@ -467,30 +471,23 @@ impl PolicySlot {
         if let SlotRead::Policy { version, policy } = read
             && version > self.version
         {
-            if policy.validate(max_datagram).is_err() {
-                // Fail closed: the driver validates against the same bound,
-                // so this is never reached from it; were it, the gate limits
-                // with the stricter of the policy in force and the one
-                // refused, never the looser, counted for the agent
-                // (`network rate policies refused`). A refused policy with
-                // no policy in force holds the lanes as it would.
+            // Fail closed: the driver validates against the same bound, so
+            // a refusal is never reached from it; were it, the gate limits
+            // with the stricter of the policy in force and the one refused,
+            // never the looser, counted for the agent (`network rate
+            // policies refused`). A refused policy with no policy in force
+            // holds the lanes as it would.
+            let applied = if policy.validate(max_datagram).is_err() {
                 bump(&mut counts.policies_refused, &mut counts.overflows);
-                let stricter = limiter
+                limiter
                     .as_ref()
-                    .map_or(policy, |held| stricter(&held.policy(), &policy));
-                match limiter {
-                    Some(limiter) => limiter.set_policy(stricter, now),
-                    None => *limiter = Some(RateLimiter::empty(stricter, now)),
-                }
-                self.version = version;
-                if let Some(sequence) = sequence {
-                    self.sequence = sequence;
-                }
-                return;
-            }
+                    .map_or(policy, |held| stricter(&held.policy(), &policy))
+            } else {
+                policy
+            };
             match limiter {
-                Some(limiter) => limiter.set_policy(policy, now),
-                None => *limiter = Some(RateLimiter::empty(policy, now)),
+                Some(limiter) => limiter.set_policy(applied, now),
+                None => *limiter = Some(RateLimiter::empty(applied, now)),
             }
             self.version = version;
         }
@@ -799,8 +796,9 @@ impl GuardGate {
     }
 
     /// The version of the published rate policy the gate applies: 0 for
-    /// the policy it was built with, or for none; a version it refused is
-    /// never this.
+    /// the policy it was built with, or for none. A version it refused is
+    /// applied as the stricter of it and the policy in force, so it is
+    /// this version too.
     #[must_use]
     pub fn policy_version(&self) -> u64 {
         self.policy.as_ref().map_or(0, |slot| slot.version)

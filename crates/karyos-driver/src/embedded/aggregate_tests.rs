@@ -666,6 +666,19 @@ fn a_byte_burst_below_the_aligned_mtu_is_refused_at_the_change() {
             burst,
         }),
     };
+    // At guarding too (#841 review, point 5): a byte burst of the MTU,
+    // below the aligned charge, is refused.
+    assert!(matches!(
+        driver.guard_stream(
+            handle,
+            guard,
+            4,
+            Some(crate::guards::GuardRate::publication(policy(u64::from(
+                mtu
+            )))),
+        ),
+        Err(DriverError::InvalidRatePolicy(_))
+    ));
     driver
         .guard_stream(
             handle,

@@ -1394,6 +1394,18 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index)?.sent_high(lane)
     }
 
+    /// The message tokens of its `index`-th publication's sender gate:
+    /// `None` past its publications, `Some(None)` with no rated gate
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn gate_message_tokens(&self, index: usize) -> Option<Option<u64>> {
+        self.role.outbound(index).map(|outbound| {
+            outbound
+                .guard_gate()
+                .and_then(crate::guard_gate::GuardGate::message_tokens)
+        })
+    }
+
     /// The counters of its `index`-th publication's data path (tests).
     #[cfg(test)]
     pub(crate) fn outbound_counters(&self, index: usize) -> Option<data::OutboundCounters> {

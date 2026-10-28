@@ -116,11 +116,15 @@ pub struct GuardBinding {
     /// policy published later, a rateless lane's publication getting one,
     /// gives the handle its copy at its next call.
     pending_rate: Option<RateWatch>,
+    /// How a copy made at bind starts: full, or empty for a reincarnation
+    /// ([`Self::reincarnated`]).
+    bind_bucket: Bucket,
 }
 
 /// How a handle's rate copy starts: full when the handle binds to a policy
 /// in force, read whole at bind, as a lane guarded with it; empty when it
-/// takes one later, which never grants tokens (R-CORE-21).
+/// takes one later, which never grants tokens, or binds to a reincarnation,
+/// whose gate starts empty (R-CORE-21).
 #[derive(Debug, Clone, Copy)]
 enum Bucket {
     Full,
@@ -186,6 +190,7 @@ impl GuardBinding {
             released: 0,
             rate: None,
             pending_rate: None,
+            bind_bucket: Bucket::Full,
         })
     }
 
@@ -210,7 +215,17 @@ impl GuardBinding {
     /// seal before the copy is asked.
     #[must_use]
     pub fn with_rate(mut self, policy: RatePolicy, clock: fn() -> u64) -> Self {
-        self.set_rate(policy, clock, 0, None, Bucket::Full);
+        self.set_rate(policy, clock, 0, None, self.bind_bucket);
+        self
+    }
+
+    /// Binds to a reincarnation of its publication (an incarnation past the
+    /// first): a rate copy made at bind starts empty, as the reincarnation's
+    /// sender gate does, so reincarnating buys no new burst (R-CORE-21).
+    /// Call it before [`Self::with_rate`] or [`Self::with_published_rate`].
+    #[must_use]
+    pub fn reincarnated(mut self) -> Self {
+        self.bind_bucket = Bucket::Empty;
         self
     }
 
@@ -253,7 +268,7 @@ impl GuardBinding {
     pub fn with_published_rate(mut self, clock: fn() -> u64) -> Self {
         // A publication in progress is short: a few reads see it whole.
         for _ in 0..8 {
-            if self.adopt_published(clock, Bucket::Full)
+            if self.adopt_published(clock, self.bind_bucket)
                 || self.pending_rate.is_some_and(|watch| watch.seen.is_some())
             {
                 return self;

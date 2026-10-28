@@ -463,7 +463,12 @@ impl BindingFds {
     /// them: the ring and the guard words read-only, the cell writable. The
     /// ring's header names the guard's index and the admission epoch, which
     /// must be open and fall within the guard words.
-    fn bind(self, instance: u128, lanes: u8) -> Result<GuardBinding, AttachError> {
+    fn bind(
+        self,
+        instance: u128,
+        lanes: u8,
+        incarnation: u64,
+    ) -> Result<GuardBinding, AttachError> {
         let read_only = |part: BindingFd| -> Result<MappedWords, AttachError> {
             let expected = fetched_region(instance, &part.record)?;
             let region = ReadOnlyRegion::attach(part.fd, expected, SealProfile::DriverOnly)?;
@@ -494,7 +499,16 @@ impl BindingFds {
             lanes,
             binding.messages,
         )
-        .map(|bound| bound.with_published_rate(karyos_sys::host_clock::host_monotonic_ns))
+        .map(|bound| {
+            // Past the first incarnation, a reincarnation: its copy starts
+            // empty, as its gate does (R-CORE-21).
+            let bound = if incarnation > 1 {
+                bound.reincarnated()
+            } else {
+                bound
+            };
+            bound.with_published_rate(karyos_sys::host_clock::host_monotonic_ns)
+        })
         .map_err(|_| AttachError::Protocol)
     }
 }
@@ -1414,7 +1428,7 @@ impl RemoteClient {
                 .checked_add(1)
                 .ok_or(AttachError::Protocol)?;
             let guard = match fetched.binding.take() {
-                Some(binding) => Some(binding.bind(instance, lanes)?),
+                Some(binding) => Some(binding.bind(instance, lanes, fetched.incarnation)?),
                 None => None,
             };
             let inner = prepare_publication(fetched, export)?

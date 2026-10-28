@@ -659,9 +659,14 @@ fn local_schedule(config: &StreamConfig) -> Result<(), DriverError> {
 /// The largest charged frame of a lane of `config` (aggregate-lanes.md,
 /// charged bytes): a frame never exceeds the MTU, aligned to 32 bytes.
 fn largest_charge(config: &StreamConfig) -> Result<u64, DriverError> {
-    karyos_sys::sizing::align_frame(config.buffer.mtu)
-        .map(u64::from)
-        .map_err(|_| DriverError::InvalidConfig)
+    charge_of(config.buffer.mtu).ok_or(DriverError::InvalidConfig)
+}
+
+/// The largest charge of a frame on a stream of `mtu`, the MTU aligned to
+/// 32 bytes: [`largest_charge`]'s, and the bound a sender gate validates a
+/// rate policy against (R-CORE-21); `None` for an MTU no frame aligns.
+fn charge_of(mtu: u32) -> Option<u64> {
+    karyos_sys::sizing::align_frame(mtu).ok().map(u64::from)
 }
 
 /// Source of driver identities within the process.
@@ -2325,7 +2330,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // The largest charge a route's sender gate validates against:
                 // the MTU aligned as a frame, so a policy accepted here is
                 // never one the gate refuses (#841 review, A1).
-                let frame = gate_charge(found.config.mtu);
+                let frame = charge_of(found.config.mtu).unwrap_or(u64::from(found.config.mtu));
                 policy
                     .validate(frame)
                     .map_err(DriverError::InvalidRatePolicy)?;
@@ -2578,7 +2583,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     lookup.get_or_insert(error);
                 }
                 Ok(found) => {
-                    frame = frame.max(gate_charge(found.config.mtu));
+                    frame = frame
+                        .max(charge_of(found.config.mtu).unwrap_or(u64::from(found.config.mtu)));
                     registration.get_or_insert(found.aggregate.registration);
                     if found.retiring {
                         lookup.get_or_insert(DriverError::StreamRetiring { stream: found.id });
@@ -3790,7 +3796,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guarded.messages,
         )?;
         // The handle's early copy of the rate limit, read against the host
-        // clock; the sender gate's bucket is authoritative.
+        // clock; the sender gate's bucket is authoritative. A reincarnation's
+        // copy starts empty, as its gate does (R-CORE-21).
+        let client = if found.incarnation > FIRST_INCARNATION {
+            client.reincarnated()
+        } else {
+            client
+        };
         let client = match guarded.rate {
             Some(policy) => client.with_rate(policy, karyos_sys::host_clock::host_monotonic_ns),
             // No policy yet: the handle watches its ring for one.
@@ -6705,14 +6717,6 @@ pub(crate) fn conflation_shape(
         config.keys,
         value_capacity,
     ))
-}
-
-/// The largest charge a sender gate validates a rate policy against for a
-/// stream of `mtu`: the MTU aligned as a frame, as the gate's outbound
-/// computes it and as [`largest_charge`] does (R-CORE-21). An MTU no frame aligns is refused when the
-/// outbound is made; the MTU itself stands for it here.
-fn gate_charge(mtu: u32) -> u64 {
-    karyos_sys::sizing::align_frame(mtu).map_or(u64::from(mtu), u64::from)
 }
 
 /// Whether `policy` replaces `rate` at version `current`, as the caller
