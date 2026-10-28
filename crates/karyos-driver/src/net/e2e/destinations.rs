@@ -673,6 +673,68 @@ fn twenty_moves_neither_fill_the_table_nor_leak() {
     assert_eq!(a.network_removals_overwritten(&publication), 4);
 }
 
+/// Plan 157, point 2: a move at `MAX_DESTINATIONS` answers `Full` while
+/// the removed destination holds its slot, and the cycle that reports and
+/// retires it frees the slot for the addition.
+#[test]
+fn a_move_at_capacity_waits_for_the_removal_to_retire() {
+    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+
+    let mut a = driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers(1);
+    let at = |index: u16| SocketAddr::from((LOOPBACK, 43_000 + index));
+    let (publication, _) = connect(
+        &mut a,
+        &mut receivers,
+        &destinations(&addresses, false),
+        &[],
+        None,
+    );
+    for index in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        a.add_network_destination(&publication, at(index)).unwrap();
+        assert_eq!(
+            answer(&mut a, &mut receivers, &publication),
+            (at(index), DestinationChange::Added)
+        );
+    }
+    a.remove_network_destination(&publication, at(1)).unwrap();
+    a.add_network_destination(&publication, at(100)).unwrap();
+    let mut answers = Vec::new();
+    {
+        let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+            .chain(receivers.iter_mut())
+            .collect();
+        pump(&mut all, |drivers| {
+            answers.extend(drivers[0].take_network_destination_changes(&publication));
+            answers.len() == 2
+        });
+    }
+    assert_eq!(
+        answers
+            .iter()
+            .map(|(_, change)| *change)
+            .collect::<Vec<_>>(),
+        [DestinationChange::Removed, DestinationChange::Full],
+        "the slot is held until the removal retires"
+    );
+    let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+        .chain(receivers.iter_mut())
+        .collect();
+    pump(&mut all, |drivers| {
+        super::shared(drivers[0])
+            .sender
+            .outbound_counters(0)
+            .unwrap()
+            .destinations_retired
+            == 1
+    });
+    a.add_network_destination(&publication, at(100)).unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (at(100), DestinationChange::Added)
+    );
+}
+
 /// Design 3.7, MD-8: a destination removed and added back after its
 /// quarantine is a fresh one: nothing of its old repair path, jobs or
 /// counts, reaches the receiver's new incarnation.
