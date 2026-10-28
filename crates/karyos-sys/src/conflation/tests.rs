@@ -663,7 +663,8 @@ mod region {
             ConflationConfig {
                 keys: 5,
                 value_capacity: 20,
-                journal_capacity: 1024
+                journal_capacity: 1024,
+                refresh: false,
             }
         );
         // The first scan delivers what was written before the attach.
