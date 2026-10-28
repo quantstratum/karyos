@@ -15,6 +15,8 @@ use crate::api::{API_VERSION, GapView, JournalView, LaneLatency, QuantileBounds,
 /// `Some` alike.
 fn every_field() -> AgentView {
     let counter = Counter {
+        read_ns: 0,
+        changed_ns: None,
         label: "streams active".to_owned(),
         type_id: 2,
         stream: 0,
@@ -33,6 +35,7 @@ fn every_field() -> AgentView {
             age_ns: Some(1500),
             counters: vec![counter.clone()],
             lanes: vec![Lane {
+                sampled_ns: None,
                 stream: 3,
                 lane: 1,
                 limit: Some(4096),
@@ -40,6 +43,7 @@ fn every_field() -> AgentView {
                 floor: None,
                 headroom: Some(3072),
                 subscribers: vec![Subscriber {
+                    changed_ns: None,
                     registration: 5,
                     label: "subscriber position generation 0 cell 1".to_owned(),
                     position: 2048,
@@ -306,10 +310,10 @@ const V1: &str = concat!(
     r#"{"dir":"/run/karyos/a","state":{"state":"attached"},"#,
     r#""instance":"0123456789abcdef0011223344556677","#,
     r#""sample":{"consistent":true,"sampled":true,"age_ns":1500,"#,
-    r#""counters":[{"label":"streams active","type_id":2,"stream":0,"lane":0,"kind":0,"participant":0,"value":18446744073709551615}],"#,
+    r#""counters":[{"label":"streams active","type_id":2,"stream":0,"lane":0,"kind":0,"participant":0,"value":18446744073709551615,"read_ns":0,"changed_ns":null}],"#,
     r#""lanes":[{"stream":3,"lane":1,"limit":4096,"head":1024,"floor":null,"headroom":3072,"#,
-    r#""subscribers":[{"registration":5,"label":"subscriber position generation 0 cell 1","position":2048,"lag":-1024}]}]},"#,
-    r#""client_counters":[{"label":"streams active","type_id":2,"stream":0,"lane":0,"kind":0,"participant":0,"value":18446744073709551615}],"#,
+    r#""subscribers":[{"registration":5,"label":"subscriber position generation 0 cell 1","position":2048,"lag":-1024,"changed_ns":null}],"sampled_ns":null}]},"#,
+    r#""client_counters":[{"label":"streams active","type_id":2,"stream":0,"lane":0,"kind":0,"participant":0,"value":18446744073709551615,"read_ns":0,"changed_ns":null}],"#,
     r#""errors":{"records":[{"seq":0,"first":10,"last":20,"occurrences":3,"code":4,"source":1,"key":[2,1],"message":"stream \"2\" rejected\n\ttwice\u0001"}],"delivered":1,"overwritten":0},"#,
     r#""losses":{"records":[{"seq":7,"time":30,"kind":1,"reason":2,"lane":0,"stream_id":9,"stream_registration":3,"from":100,"to":200,"participant":5,"client":6}],"delivered":8,"overwritten":7},"#,
     r#""guards":{"records":[{"seq":1,"time":40,"guard":1,"before":2,"after":3,"operation":42,"requester_kind":2,"requester":6,"outcome":4,"refusal":9,"operator":1000,"parameters":77}],"delivered":2,"overwritten":0}"#,

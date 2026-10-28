@@ -347,6 +347,21 @@ pub enum DriverState {
 }
 
 /// One sampling pass of the driver counters.
+///
+/// **Identity** (R-CORE-17). A counter's identity is its driver's
+/// `instance` with its `label`, `type_id`, `stream`, `lane`, `kind` and
+/// `participant`; a lane's is the instance with its `stream` and `lane`,
+/// and a subscriber's adds its `registration`. Within one pass each
+/// identity appears once, and two passes of one instance join on it. A
+/// new instance is a new series: nothing joins across it, and every
+/// `changed_ns` starts again at `None`.
+///
+/// **Times.** Each counter carries `read_ns`, when the agent read it, and
+/// `changed_ns`, the first pass in which the agent saw its value change.
+/// Each lane carries `sampled_ns`, the driver's own sampling time of its
+/// positions. A datum untouched for several passes reports this pass's
+/// `read_ns` and the older `changed_ns`, never the pass time as its change.
+/// The pass-level `consistent`, `sampled` and `age_ns` keep their meaning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Sample {
@@ -383,6 +398,16 @@ pub struct Counter {
     pub participant: u64,
     /// Its value.
     pub value: u64,
+    /// Host `CLOCK_MONOTONIC` nanoseconds at which the agent read this
+    /// cell: the end of the read of its pass (R-CORE-17).
+    pub read_ns: u64,
+    /// The `read_ns` of the first pass in which the agent saw this
+    /// datum's value differ from its previous pass: a lower bound the
+    /// agent observed, not the instant of the change, which happened
+    /// after the previous pass's `read_ns` and by this one. `None` until
+    /// the agent has seen the datum change since it appeared, or since
+    /// the driver instance changed.
+    pub changed_ns: Option<u64>,
 }
 
 /// One stream lane's positions.
@@ -404,6 +429,10 @@ pub struct Lane {
     pub headroom: Option<i64>,
     /// Each subscriber's position and lag.
     pub subscribers: Vec<Subscriber>,
+    /// Host `CLOCK_MONOTONIC` nanoseconds at which the driver sampled the
+    /// positions (its `positions sampled at` cell), if known: the time of
+    /// every position of this lane (R-CORE-17).
+    pub sampled_ns: Option<u64>,
 }
 
 /// One subscriber of a stream lane.
@@ -419,6 +448,9 @@ pub struct Subscriber {
     /// `head - position`, signed; `None` when the head is missing or the
     /// difference does not fit.
     pub lag: Option<i64>,
+    /// As [`Counter::changed_ns`], for the position, at the lane's
+    /// `sampled_ns` passes.
+    pub changed_ns: Option<u64>,
 }
 
 /// The records of a diagnostic ring the agent followed: the newest at most
