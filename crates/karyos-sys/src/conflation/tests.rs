@@ -601,12 +601,9 @@ mod region {
     use crate::ipc::{ReadOnlyRegion, Region, RegionKind, RegionRecord, SealProfile};
 
     /// The configuration of the tables these tests create.
-    const CONFIG: ConflationConfig = ConflationConfig {
-        keys: 2,
-        value_capacity: 8,
-        journal_capacity: 1024,
-        refresh: false,
-    };
+    // `new`, not a literal: a field added later keeps this Linux-only
+    // module compiling.
+    const CONFIG: ConflationConfig = ConflationConfig::new(2, 8, 1024);
 
     fn table() -> ConflationWriter {
         conflation_in(
@@ -658,15 +655,7 @@ mod region {
         writer.write(1, b"before the view").unwrap();
         let mut reader = view(&writer).unwrap();
         assert_eq!(reader.config(), writer.config());
-        assert_eq!(
-            reader.config(),
-            ConflationConfig {
-                keys: 5,
-                value_capacity: 20,
-                journal_capacity: 1024,
-                refresh: false,
-            }
-        );
+        assert_eq!(reader.config(), ConflationConfig::new(5, 20, 1024));
         // The first scan delivers what was written before the attach.
         let seen = drain(&mut reader, BUDGET);
         assert_eq!(seen, vec![(1, 2, b"before the view".to_vec())]);

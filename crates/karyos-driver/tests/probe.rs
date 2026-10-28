@@ -207,6 +207,10 @@ fn a_probe_of_no_driver_is_unreachable() {
 /// probe -- --ignored --nocapture`.
 #[test]
 #[ignore = "a measurement for the pull request, not a gate test"]
+#[expect(
+    clippy::print_stdout,
+    reason = "the ignored measurement prints its quantiles"
+)]
 fn probes_do_not_move_the_offer_latency() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

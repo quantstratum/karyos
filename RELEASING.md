@@ -55,7 +55,7 @@ The gates the 0.1.0-alpha.2 Evidence table records, and `make loom-full`:
 
 | Gate | Command | Platform |
 | --- | --- | --- |
-| The local gate | `make pre-push` (fmt-check, lint-sync, deps-check, lint, doc, test, loom, build-release, timing-build-check) | macOS arm64 |
+| The local gate | `make pre-push` (fmt-check, changelog-check, lint-sync, deps-check, lint, lint-linux, doc, test, loom, build-release, timing-build-check); `lint-linux` is clippy with every feature for `aarch64-unknown-linux-gnu`, which needs that rustup target | macOS arm64 |
 | The Loom models marked `#[ignore]` | `make loom-full`. Required at every release head, because `make loom` leaves out the ignored models (`a_transferred_gauge_is_never_mixed`) and the per pull request rule of the `Makefile` covers only changes to the counters seqlock. Decided 2026-10-27 by QS-COORDINATOR under owner delegation (Joaquín, 2026-10-26), [karyos#758](https://github.com/quantstratum/karyos/pull/758) | macOS arm64 |
 | Miri, `karyos-sys` | `cargo +<MIRI_TOOLCHAIN> miri test -p karyos-sys --lib --locked`, the first half of `make miri`; it may run in parallel shards of `--exact` test names, which the row then lists | macOS arm64 |
 | Miri, `karyos-ffi` | `cargo +<MIRI_TOOLCHAIN> miri test -p karyos-ffi --locked`, the second half of `make miri`, per `crates/karyos-ffi/MIRI.md` | macOS arm64 |
