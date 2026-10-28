@@ -1171,8 +1171,22 @@ pub enum ErrorCode {
     /// (karyos#819): a refusal all the same, with its wire value and its
     /// detail kept. It encodes to its own wire value, so a decoded
     /// response re-encodes to its bytes; a driver never sends it. Code 0
-    /// stays reserved.
-    Unknown(u64),
+    /// stays reserved. Only the decoder builds it, for a value no variant
+    /// defines, so no caller can spell a defined code as `Unknown`.
+    Unknown(UnknownCode),
+}
+
+/// The wire value of an [`ErrorCode::Unknown`]: nonzero and defined by no
+/// variant. Only [`ErrorCode::from_wire`] builds one (karyos#819).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnknownCode(u64);
+
+impl UnknownCode {
+    /// The wire value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl ErrorCode {
@@ -1205,7 +1219,7 @@ impl ErrorCode {
             Self::RateNotSet => 22,
             Self::RateInvalidPolicy => 23,
             Self::RatePolicyConflict => 25,
-            Self::Unknown(code) => code,
+            Self::Unknown(code) => code.0,
         }
     }
 
@@ -1247,8 +1261,16 @@ impl ErrorCode {
             23 => Self::RateInvalidPolicy,
             25 => Self::RatePolicyConflict,
             0 => return None,
-            other => Self::Unknown(other),
+            other => Self::Unknown(UnknownCode(other)),
         })
+    }
+
+    /// The code a peer reads for wire value `code`: a defined one,
+    /// [`ErrorCode::Unknown`] for any other nonzero value, and `None` for
+    /// the reserved 0.
+    #[must_use]
+    pub const fn from_wire(code: u64) -> Option<Self> {
+        Self::from_code(code)
     }
 }
 
@@ -4969,8 +4991,52 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(1000), Some(ErrorCode::Unknown(1000)));
+        assert_eq!(ErrorCode::from_wire(1000).map(ErrorCode::code), Some(1000));
         assert_eq!(ErrorCode::from_code(0), None);
+    }
+
+    /// karyos#819: every wire value up to the highest defined code decodes
+    /// to a defined variant that encodes back to it, so a missing
+    /// `from_code` arm fails here instead of turning a defined code into
+    /// `Unknown`. The match has no wildcard: a new variant does not compile
+    /// until it is placed in this table's range.
+    #[test]
+    fn every_defined_code_round_trips_to_its_variant() {
+        const HIGHEST: u64 = 25;
+        for word in 1..=HIGHEST {
+            let code = ErrorCode::from_code(word).unwrap();
+            assert!(code.is_defined(), "code {word} decodes as Unknown");
+            assert_eq!(code.code(), word);
+            match code {
+                ErrorCode::Unknown(_) => unreachable!(),
+                ErrorCode::PublicationTaken
+                | ErrorCode::UnknownStream
+                | ErrorCode::UnknownRegistration
+                | ErrorCode::ResourcesUnavailable
+                | ErrorCode::IdentitiesExhausted
+                | ErrorCode::InvalidPublicationMode
+                | ErrorCode::TraceJournalsExhausted
+                | ErrorCode::UnknownGuard
+                | ErrorCode::GuardNotClosedAt
+                | ErrorCode::GuardExhausted
+                | ErrorCode::NotAuthorized
+                | ErrorCode::InvalidChannel
+                | ErrorCode::UnsupportedChannel
+                | ErrorCode::ReliabilityMismatch
+                | ErrorCode::ReceiverIdentityMismatch
+                | ErrorCode::LaneMismatch
+                | ErrorCode::StrategyConflict
+                | ErrorCode::InvalidRoles
+                | ErrorCode::RateVersionMismatch
+                | ErrorCode::RateNotATightening
+                | ErrorCode::RateReserveCrossed
+                | ErrorCode::RateNotSet
+                | ErrorCode::RateInvalidPolicy
+                | ErrorCode::StreamTooLarge
+                | ErrorCode::RatePolicyConflict => {}
+            }
+        }
+        assert!(!ErrorCode::from_code(HIGHEST + 1).unwrap().is_defined());
     }
 
     /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
@@ -5165,7 +5231,7 @@ mod journal_tests {
                 client: 1,
                 sequence: 2,
             },
-            code: ErrorCode::Unknown(1000),
+            code: ErrorCode::from_wire(1000).unwrap(),
             detail: 7,
         };
         assert_eq!(
@@ -5684,7 +5750,7 @@ mod properties {
     }
 
     fn response() -> impl Strategy<Value = Response> {
-        let code = prop::sample::select(
+        let defined = prop::sample::select(
             &[
                 ErrorCode::PublicationTaken,
                 ErrorCode::UnknownStream,
@@ -5713,6 +5779,10 @@ mod properties {
                 ErrorCode::RatePolicyConflict,
             ][..],
         );
+        let code = prop_oneof![
+            defined,
+            (26..u64::MAX).prop_map(|word| ErrorCode::from_wire(word).unwrap()),
+        ];
         prop_oneof![
             (request(), any::<(u64, u64)>()).prop_map(|(request, (registration, key))| {
                 Response::PublicationReady {

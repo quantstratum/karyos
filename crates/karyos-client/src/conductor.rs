@@ -2288,9 +2288,9 @@ mod tests {
             matches!(
                 outcomes.as_slice(),
                 [(found, Outcome::Refused {
-                    code: ErrorCode::Unknown(1000),
+                    code,
                     detail: 7,
-                })] if *found == sequence
+                })] if *found == sequence && code.code() == 1000 && !code.is_defined()
             ),
             "{outcomes:?}"
         );

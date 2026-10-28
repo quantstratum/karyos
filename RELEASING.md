@@ -75,7 +75,8 @@ Before the release is cut, also check:
   contains `ErrorCode::Unknown`, so a client of this release reads a CnC
   refusal code it does not define as a refusal. The admission `VERSION`
   stays 3 only because no VERSION 3 peer is released without it
-  (QS-COORDINATOR, 2026-10-28).
+  (QS-COORDINATOR, 2026-10-28). Check it on the release commit:
+  `grep -q 'Unknown(UnknownCode)' crates/karyos-protocol/src/cnc.rs`.
 
 A gate that fails gets an issue of its own, linked from its row; the
 fix is not folded into the pull request that records the evidence.

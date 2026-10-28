@@ -791,7 +791,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 self.counters.add(Event::CommandsRefused, 1);
             }
             // A driver sends only the refusal codes it defines; a peer reads
-            // any other as `ErrorCode::Unknown` (karyos#819).
+            // any other as `ErrorCode::Unknown` (karyos#819). Only the
+            // decoder builds `Unknown`, so this check, run in debug builds
+            // only, catches a response relayed from a decoded one.
             debug_assert!(
                 !matches!(response, Response::Error { code, .. } if !code.is_defined()),
                 "an undefined refusal code"

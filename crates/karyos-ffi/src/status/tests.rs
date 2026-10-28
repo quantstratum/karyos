@@ -167,7 +167,7 @@ fn failures_carry_their_detail() {
     // A code this peer does not define (karyos#819): KARYOS_E_REFUSED with
     // the raw wire code, as for any refusal.
     let unknown = Failure::from(&ClientError::Refused {
-        code: ErrorCode::Unknown(1000),
+        code: ErrorCode::from_wire(1000).unwrap(),
         detail: 7,
     });
     assert_eq!(
