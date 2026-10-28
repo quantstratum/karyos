@@ -201,7 +201,7 @@ pub struct Context {
     dir: Option<PathBuf>,
     idle: IdleStrategy,
     timeout: Duration,
-    socket_timeout: Duration,
+    attach_timeout: Duration,
     max_pending: usize,
     max_images: usize,
 }
@@ -215,11 +215,11 @@ impl Context {
                 dir: None,
                 idle: IdleStrategy::YieldThenSleep,
                 timeout: DEFAULT_TIMEOUT,
-                socket_timeout: DEFAULT_TIMEOUT,
+                attach_timeout: DEFAULT_TIMEOUT,
                 max_pending: DEFAULT_MAX_PENDING,
                 max_images: DEFAULT_MAX_IMAGES,
             },
-            socket_timeout: None,
+            attach_timeout: None,
         }
     }
 
@@ -241,13 +241,12 @@ impl Context {
         self.timeout
     }
 
-    /// The longest wait per message on a remote client's driver socket:
-    /// `Client::connect`'s attach and every later fetch of a grant's
-    /// regions, a late grant's included. The control call timeout unless
-    /// set apart.
+    /// The longest wait per message of `Client::connect`'s attach; the
+    /// session's fetches then wait [`Self::timeout`]. The control call
+    /// timeout unless set apart.
     #[must_use]
-    pub fn socket_timeout(&self) -> Duration {
-        self.socket_timeout
+    pub fn attach_timeout(&self) -> Duration {
+        self.attach_timeout
     }
 
     /// The most images a network subscription attaches at once.
@@ -267,8 +266,8 @@ impl Context {
 #[derive(Debug, Clone)]
 pub struct ContextBuilder {
     context: Context,
-    /// The socket timeout set apart from the control call timeout.
-    socket_timeout: Option<Duration>,
+    /// The attach timeout set apart from the control call timeout.
+    attach_timeout: Option<Duration>,
 }
 
 impl ContextBuilder {
@@ -294,14 +293,13 @@ impl ContextBuilder {
         self
     }
 
-    /// The longest wait per message on a remote client's driver socket,
-    /// apart from a control call's ([`Self::timeout`] by default): the
-    /// attach and every fetch of a grant's regions, for the client's whole
-    /// life. A client whose calls time out fast need not attach or fetch
-    /// as fast: a fetch that times out leaves its session out of step.
+    /// The longest wait per message of `Client::connect`'s attach, apart
+    /// from a control call's ([`Self::timeout`] by default): a client whose
+    /// calls time out fast need not attach as fast. Once attached, the
+    /// session's fetches of a grant's regions wait the call timeout.
     #[must_use]
-    pub fn socket_timeout(mut self, timeout: Duration) -> Self {
-        self.socket_timeout = Some(timeout);
+    pub fn attach_timeout(mut self, timeout: Duration) -> Self {
+        self.attach_timeout = Some(timeout);
         self
     }
 
@@ -328,15 +326,15 @@ impl ContextBuilder {
     /// image bound.
     pub fn build(self) -> Result<Context, ClientError> {
         let mut context = self.context;
-        context.socket_timeout = self.socket_timeout.unwrap_or(context.timeout);
+        context.attach_timeout = self.attach_timeout.unwrap_or(context.timeout);
         if context.timeout.is_zero() {
             return Err(ClientError::InvalidContext {
                 reason: "the timeout is zero",
             });
         }
-        if context.socket_timeout.is_zero() {
+        if context.attach_timeout.is_zero() {
             return Err(ClientError::InvalidContext {
-                reason: "the socket timeout is zero",
+                reason: "the attach timeout is zero",
             });
         }
         if context.max_pending == 0 {
@@ -1261,14 +1259,20 @@ pub struct Client<C: Connection> {
 #[cfg(target_os = "linux")]
 impl Client<crate::ipc::RemoteClient> {
     /// Attaches to the driver whose admission socket is in the context's
-    /// directory, waiting at most the context's attach timeout per message.
+    /// directory, waiting at most the context's attach timeout per message
+    /// of the attach, then its timeout per message of every later fetch.
     ///
     /// # Errors
     ///
     /// [`ClientError::NoDirectory`], `ClientError::Attach`.
     pub fn connect(context: Context) -> Result<Self, ClientError> {
         let dir = context.dir.as_deref().ok_or(ClientError::NoDirectory)?;
-        let remote = crate::ipc::attach(dir, context.socket_timeout, context.max_pending)?;
+        let remote = crate::ipc::attach_with(
+            dir,
+            context.attach_timeout,
+            context.timeout,
+            context.max_pending,
+        )?;
         Ok(Self::new(remote, context))
     }
 }
@@ -2692,25 +2696,25 @@ mod tests {
     use super::*;
     use karyos_sys::frame::Lane;
 
-    /// Plan 166: the socket timeout is the control call timeout unless set
+    /// Plan 166: the attach timeout is the control call timeout unless set
     /// apart, set before or after it, and a zero one is refused as a zero
     /// timeout is.
     #[test]
-    fn the_socket_timeout_defaults_to_the_timeout() {
+    fn the_attach_timeout_defaults_to_the_timeout() {
         let fast = Duration::from_millis(50);
         let context = Context::builder().timeout(fast).build().unwrap();
-        assert_eq!(context.socket_timeout(), fast);
+        assert_eq!(context.attach_timeout(), fast);
         for context in [
             Context::builder()
                 .timeout(fast)
-                .socket_timeout(DEFAULT_TIMEOUT),
+                .attach_timeout(DEFAULT_TIMEOUT),
             Context::builder()
-                .socket_timeout(DEFAULT_TIMEOUT)
+                .attach_timeout(DEFAULT_TIMEOUT)
                 .timeout(fast),
         ] {
             let context = context.build().unwrap();
             assert_eq!(
-                (context.timeout(), context.socket_timeout()),
+                (context.timeout(), context.attach_timeout()),
                 (fast, DEFAULT_TIMEOUT)
             );
         }
@@ -2719,12 +2723,12 @@ mod tests {
             Context::builder().timeout(fast).build().unwrap(),
             Context::builder()
                 .timeout(fast)
-                .socket_timeout(fast)
+                .attach_timeout(fast)
                 .build()
                 .unwrap()
         );
         assert!(matches!(
-            Context::builder().socket_timeout(Duration::ZERO).build(),
+            Context::builder().attach_timeout(Duration::ZERO).build(),
             Err(ClientError::InvalidContext { .. })
         ));
     }

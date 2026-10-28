@@ -1122,6 +1122,18 @@ pub fn connect(dir: &std::path::Path, timeout: core::time::Duration) -> Result<O
             reason: "the driver runs as another uid",
         });
     }
+    set_timeouts(socket.as_fd(), timeout)?;
+    Ok(socket)
+}
+
+/// Sets `timeout` on every receive and send of `socket` (`SO_RCVTIMEO`,
+/// `SO_SNDTIMEO`): a client's attach waits its own timeout, then its
+/// session the call timeout (karyos#851).
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when a call fails.
+pub fn set_timeouts(socket: BorrowedFd<'_>, timeout: core::time::Duration) -> Result<(), SysError> {
     for (kind, operation) in [
         (
             rustix::net::sockopt::Timeout::Recv,
@@ -1132,10 +1144,20 @@ pub fn connect(dir: &std::path::Path, timeout: core::time::Duration) -> Result<O
             "setsockopt(SO_SNDTIMEO)",
         ),
     ] {
-        rustix::net::sockopt::set_socket_timeout(&socket, kind, Some(timeout))
+        rustix::net::sockopt::set_socket_timeout(socket, kind, Some(timeout))
             .map_err(os(operation))?;
     }
-    Ok(socket)
+    Ok(())
+}
+
+/// The receive timeout of `socket` (`SO_RCVTIMEO`), `None` for none.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when the call fails.
+pub fn receive_timeout(socket: BorrowedFd<'_>) -> Result<Option<core::time::Duration>, SysError> {
+    rustix::net::sockopt::socket_timeout(socket, rustix::net::sockopt::Timeout::Recv)
+        .map_err(os("getsockopt(SO_RCVTIMEO)"))
 }
 
 /// A descriptor known to be a pidfd: the client's exit proof

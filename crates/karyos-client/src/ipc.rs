@@ -663,7 +663,23 @@ pub fn attach(
     timeout: Duration,
     max_pending: usize,
 ) -> Result<RemoteClient, AttachError> {
-    let socket = ipc::connect(dir, timeout)?;
+    attach_with(dir, timeout, timeout, max_pending)
+}
+
+/// [`attach`] waiting at most `attach_timeout` for each message of the
+/// attach, then `timeout` for each message of the session: every later
+/// fetch of a grant's regions (karyos#851).
+///
+/// # Errors
+///
+/// As [`attach`].
+pub fn attach_with(
+    dir: &Path,
+    attach_timeout: Duration,
+    timeout: Duration,
+    max_pending: usize,
+) -> Result<RemoteClient, AttachError> {
+    let socket = ipc::connect(dir, attach_timeout)?;
     let pidfd = PidFd::of_self()?;
     // `PidFd` keeps its descriptor private; pass a duplicate.
     let pidfd_fd = pidfd.as_fd().try_clone_to_owned().map_err(|error| {
@@ -704,6 +720,12 @@ pub fn attach(
         )
         .with_counters(cells);
         Ok((instance, client, conductor, counters))
+    });
+    // Attached: the session's fetches wait the call timeout, not the
+    // attach's.
+    let built = built.and_then(|built| {
+        ipc::set_timeouts(socket.as_fd(), timeout)?;
+        Ok(built)
     });
     match built {
         Ok((instance, client, mut conductor, counters)) => {
