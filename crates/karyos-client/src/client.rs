@@ -201,6 +201,7 @@ pub struct Context {
     dir: Option<PathBuf>,
     idle: IdleStrategy,
     timeout: Duration,
+    attach_timeout: Option<Duration>,
     max_pending: usize,
     max_images: usize,
 }
@@ -214,6 +215,7 @@ impl Context {
                 dir: None,
                 idle: IdleStrategy::YieldThenSleep,
                 timeout: DEFAULT_TIMEOUT,
+                attach_timeout: None,
                 max_pending: DEFAULT_MAX_PENDING,
                 max_images: DEFAULT_MAX_IMAGES,
             },
@@ -236,6 +238,13 @@ impl Context {
     #[must_use]
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// The longest wait per message of `Client::connect`'s attach: the
+    /// control call timeout unless set apart.
+    #[must_use]
+    pub fn attach_timeout(&self) -> Duration {
+        self.attach_timeout.unwrap_or(self.timeout)
     }
 
     /// The most images a network subscription attaches at once.
@@ -280,6 +289,15 @@ impl ContextBuilder {
         self
     }
 
+    /// The longest wait per message of `Client::connect`'s attach, apart
+    /// from a control call's ([`Self::timeout`] by default): a client whose
+    /// calls time out fast need not attach as fast.
+    #[must_use]
+    pub fn attach_timeout(mut self, timeout: Duration) -> Self {
+        self.context.attach_timeout = Some(timeout);
+        self
+    }
+
     /// The most requests in flight ([`DEFAULT_MAX_PENDING`] by default).
     #[must_use]
     pub fn max_pending(mut self, max_pending: usize) -> Self {
@@ -306,6 +324,14 @@ impl ContextBuilder {
         if context.timeout.is_zero() {
             return Err(ClientError::InvalidContext {
                 reason: "the timeout is zero",
+            });
+        }
+        if context
+            .attach_timeout
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            return Err(ClientError::InvalidContext {
+                reason: "the attach timeout is zero",
             });
         }
         if context.max_pending == 0 {
@@ -1230,14 +1256,14 @@ pub struct Client<C: Connection> {
 #[cfg(target_os = "linux")]
 impl Client<crate::ipc::RemoteClient> {
     /// Attaches to the driver whose admission socket is in the context's
-    /// directory, waiting at most the context's timeout per message.
+    /// directory, waiting at most the context's attach timeout per message.
     ///
     /// # Errors
     ///
     /// [`ClientError::NoDirectory`], `ClientError::Attach`.
     pub fn connect(context: Context) -> Result<Self, ClientError> {
         let dir = context.dir.as_deref().ok_or(ClientError::NoDirectory)?;
-        let remote = crate::ipc::attach(dir, context.timeout, context.max_pending)?;
+        let remote = crate::ipc::attach(dir, context.attach_timeout(), context.max_pending)?;
         Ok(Self::new(remote, context))
     }
 }
@@ -2660,6 +2686,28 @@ impl<T: TermBytes> Images<T> {
 mod tests {
     use super::*;
     use karyos_sys::frame::Lane;
+
+    /// Plan 166: the attach timeout is the control call timeout unless set
+    /// apart, and a zero one is refused as a zero timeout is.
+    #[test]
+    fn the_attach_timeout_defaults_to_the_timeout() {
+        let fast = Duration::from_millis(50);
+        let context = Context::builder().timeout(fast).build().unwrap();
+        assert_eq!(context.attach_timeout(), fast);
+        let context = Context::builder()
+            .timeout(fast)
+            .attach_timeout(DEFAULT_TIMEOUT)
+            .build()
+            .unwrap();
+        assert_eq!(
+            (context.timeout(), context.attach_timeout()),
+            (fast, DEFAULT_TIMEOUT)
+        );
+        assert!(matches!(
+            Context::builder().attach_timeout(Duration::ZERO).build(),
+            Err(ClientError::InvalidContext { .. })
+        ));
+    }
 
     /// `YieldThenSleep` yields for 64 consecutive idle waits and sleeps
     /// 1 ms from the 65th, as the driver's agents do (ADR-0066); the other

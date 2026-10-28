@@ -1102,6 +1102,9 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
+                // 50 ms is for the paused request to time out; the attach
+                // is the setup and waits as a client's would (plan 166).
+                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )
@@ -1151,6 +1154,9 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
+                // 50 ms is for the paused request to time out; the attach
+                // is the setup and waits as a client's would (plan 166).
+                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )
@@ -1296,6 +1302,9 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
+                // 50 ms is for the paused request to time out; the attach
+                // is the setup and waits as a client's would (plan 166).
+                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )
