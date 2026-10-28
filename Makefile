@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit deny deps-inventory deps-check lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check deny deps-inventory deps-check lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -96,6 +96,12 @@ libkaryos-static-check: libkaryos
 libkaryos-copies-check: libkaryos
 	scripts/check-libkaryos-copies.sh $(LIBKARYOS_DIR)
 
+# The C header's ABI manifest (sizes, offsets, constants) matches the
+# committed one, crates/karyos-ffi/abi/manifest.txt: a layout change
+# without a new ABI version fails (owner item 48; karyos#700).
+abi-manifest-check:
+	scripts/check-abi-manifest.sh
+
 # The conformance test kit beside the package: karyosd from the same
 # commit, for the suite's archive-replay scenarios (Linux only). Not part
 # of the release package (owner item 44), and not part of pre-push.
@@ -124,4 +130,4 @@ changelog-check:
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check changelog-check lint-sync deps-check lint lint-linux doc test loom build-release timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check abi-manifest-check lint lint-linux doc test loom build-release timing-build-check

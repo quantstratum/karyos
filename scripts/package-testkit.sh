@@ -79,6 +79,7 @@ sha="$(sha256sum "$stage/bin/karyosd" | cut -d ' ' -f 1)"
 stub_sha="$(sha256sum "$stage/bin/karyos-admission-stub" | cut -d ' ' -f 1)"
 cat >"$stage/share/karyos-testkit/MANIFEST" <<EOF
 role=conformance test kit, not for release
+release_package=no
 core_commit=$commit
 core_dirty=$dirty
 karyosd_sha256=$sha
@@ -88,6 +89,13 @@ rustc=$(rustc -V)
 profile=release
 EOF
 
+cat >"$stage/README" <<EOF
+The Karyos conformance test kit: karyosd and the admission stub of core
+$commit, for a binding's conformance runner. It is not a release package
+(owner item 44): never ship or install it; the released karyosd is its
+own signed artifact, and libkaryos is released without it.
+EOF
+
 rm -rf "$dest"
 mv "$stage" "$dest"
-echo "test kit for core $commit in $dest: bin/karyosd (sha256 $sha), bin/karyos-admission-stub (sha256 $stub_sha)"
+echo "test kit (not a release package) for core $commit in $dest: bin/karyosd (sha256 $sha), bin/karyos-admission-stub (sha256 $stub_sha)"

@@ -12,6 +12,7 @@
 #   lib/pkgconfig/karyos-static.pc                 (links lib/libkaryos.a)
 #   share/karyos/conformance/                      (the suite of this commit)
 #   share/karyos/MANIFEST                          (versions and build)
+#   share/karyos/abi-manifest.txt                  (scripts/abi-manifest.sh)
 #   LICENSE.md
 #
 # The crate's library is `karyos_ffi` (`karyos` would collide with the
@@ -23,8 +24,16 @@
 # Soname policy (`soname_policy` in MANIFEST): the shared library's soname
 # (Linux) or install name and compatibility version (macOS) carry
 # MAJOR.MINOR of the ABI before 1.0, where a minor may break, and MAJOR
-# from 1.0 on. That is owner item 48's proposal (exact `0.y` targeting),
-# not a ruling yet: a ruling changes `soversion` and `soname_policy` here.
+# from 1.0 on. This is the ruling of owner item 48
+# (quantstratum-docs: owner-decisions/2026-10-21/decisions.md:208):
+# additive compatible growth increments `0.y.z`, a binding requires the
+# exact `0.y` line and a library patch at least its header's, and a
+# breaking change increments `y` (karyos#700).
+#
+# The package is the library alone (owner item 44): no karyosd and no
+# other binary, which MANIFEST states (`contents`, `excludes`) and a check
+# below enforces. The conformance test kit is built beside it by
+# scripts/package-testkit.sh and is not a release package.
 #
 # It builds for the host only (`--release --locked`; the release profile
 # unwinds, as lint-sync checks); a CARGO_BUILD_TARGET other than the host
@@ -154,6 +163,10 @@ cp "$root/crates/karyos-ffi/conformance/FORMAT.md" \
     "$root/crates/karyos-ffi/conformance/index.txt" "$stage/share/karyos/conformance/"
 cp -R "$root/crates/karyos-ffi/conformance/scenarios" "$stage/share/karyos/conformance/scenarios"
 cp "$root/LICENSE.md" "$stage/LICENSE.md"
+# The released header's ABI manifest, measured on this host
+# (karyos#700): what a binding asserts its declarations against.
+"$root/scripts/abi-manifest.sh" "$stage/include/karyos.h" >"$stage/share/karyos/abi-manifest.txt" ||
+    fail "the ABI manifest could not be measured"
 
 cat >"$stage/lib/pkgconfig/karyos.pc" <<EOF
 prefix=\${pcfiledir}/../..
@@ -202,7 +215,15 @@ target=$triple
 rustc=$(rustc -V)
 profile=release
 pkg_config=karyos.pc karyos-static.pc
+abi_manifest=share/karyos/abi-manifest.txt
+contents=library
+excludes=karyosd
 EOF
+
+# The library alone (owner item 44): no executable and no karyosd.
+if [ -e "$stage/bin" ] || [ -n "$(find "$stage" -name 'karyosd*' -print -quit)" ]; then
+    fail "the package holds a binary or karyosd; it ships the library only"
+fi
 
 # The functions the header declares: one declaration per line, starting
 # with its return type (the hand-written header's style, ffi-gap-analysis.md

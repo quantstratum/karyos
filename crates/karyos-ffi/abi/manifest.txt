@@ -1,0 +1,257 @@
+abi_version=0.1.2
+struct karyos_detail size=24 align=8
+  size offset=0 size=4
+  reserved offset=4 size=4
+  code offset=8 size=8
+  value offset=16 size=8
+struct karyos_client_options size=40 align=8
+  size offset=0 size=4
+  idle_strategy offset=4 size=4
+  dir offset=8 size=8
+  idle_sleep_ns offset=16 size=8
+  timeout_ns offset=24 size=8
+  max_pending offset=32 size=4
+  max_images offset=36 size=4
+struct karyos_accepted size=16 align=8
+  size offset=0 size=4
+  lane offset=4 size=4
+  position offset=8 size=8
+struct karyos_driver_options size=56 align=8
+  size offset=0 size=4
+  max_clients offset=4 size=4
+  max_streams offset=8 size=4
+  max_pending_per_client offset=12 size=4
+  ring_capacity offset=16 size=4
+  broadcast_capacity offset=20 size=4
+  counters_capacity offset=24 size=4
+  reserved offset=28 size=4
+  heartbeat_interval_ns offset=32 size=8
+  client_liveness_timeout_ns offset=40 size=8
+  cutover_deadline_ns offset=48 size=8
+struct karyos_stream_options size=88 align=8
+  size offset=0 size=4
+  stream_id offset=4 size=4
+  term_length offset=8 size=4
+  mtu offset=12 size=4
+  max_reserved offset=16 size=4
+  spare_slots offset=20 size=4
+  max_subscribers offset=24 size=4
+  session_id offset=28 size=4
+  initial_term_id offset=32 size=4
+  lane offset=36 size=4
+  publication_mode offset=40 size=4
+  allow_unconnected offset=44 size=4
+  schedule_capacity offset=48 size=4
+  on_required_loss offset=52 size=4
+  claim_deadline_ns offset=56 size=8
+  conflation_keys offset=64 size=4
+  conflation_value_capacity offset=68 size=4
+  conflation_journal_capacity offset=72 size=8
+  publishers offset=80 size=4
+  reserved offset=84 size=4
+struct karyos_offer_options size=16 align=8
+  size offset=0 size=4
+  reserved offset=4 size=4
+  reserved_value offset=8 size=8
+struct karyos_outcome size=72 align=8
+  size offset=0 size=4
+  kind offset=4 size=4
+  lane offset=8 size=4
+  receiver offset=12 size=4
+  sequence offset=16 size=8
+  incarnation offset=24 size=8
+  start offset=32 size=8
+  end offset=40 size=8
+  epoch offset=48 size=8
+  reason offset=56 size=8
+  lost offset=64 size=8
+struct karyos_message_info size=40 align=8
+  size offset=0 size=4
+  lane offset=4 size=4
+  position offset=8 size=8
+  reserved_value offset=16 size=8
+  extent offset=24 size=4
+  session_id offset=28 size=4
+  flags offset=32 size=4
+  reserved offset=36 size=4
+struct karyos_image_change size=48 align=8
+  size offset=0 size=4
+  session_id offset=4 size=4
+  image_id offset=8 size=8
+  lane offset=16 size=4
+  available offset=20 size=4
+  end_reason offset=24 size=4
+  reserved offset=28 size=4
+  end_position offset=32 size=8
+  seal_code offset=40 size=8
+struct karyos_subscription_options size=40 align=8
+  size offset=0 size=4
+  role offset=4 size=4
+  rejoin offset=8 size=4
+  reserved offset=12 size=4
+  archive offset=16 size=8
+  archive_client_id offset=24 size=8
+  replay_stream_id offset=32 size=4
+  secondary offset=36 size=4
+struct karyos_subscription_rejoin size=16 align=4
+  size offset=0 size=4
+  recovering offset=4 size=4
+  merge_failure offset=8 size=4
+  reserved offset=12 size=4
+struct karyos_archive_options size=32 align=8
+  size offset=0 size=4
+  reserved offset=4 size=4
+  requests offset=8 size=4
+  responses offset=12 size=4
+  client_id offset=16 size=8
+  deadline_ns offset=24 size=8
+struct karyos_recording size=72 align=8
+  size offset=0 size=4
+  state offset=4 size=4
+  stop_reason offset=8 size=4
+  incomplete offset=12 size=4
+  stream_id offset=16 size=4
+  session_id offset=20 size=4
+  id offset=24 size=8
+  start offset=32 size=8
+  start_time_ns offset=40 size=8
+  position offset=48 size=8
+  channel offset=56 size=8
+  channel_length offset=64 size=8
+struct karyos_replay_options size=48 align=8
+  size offset=0 size=4
+  rate offset=4 size=4
+  scale_ppm offset=8 size=4
+  target_stream_id offset=12 size=4
+  recording_id offset=16 size=8
+  position offset=24 size=8
+  length offset=32 size=8
+  target_channel offset=40 size=8
+struct karyos_replay_subscription_options size=8 align=4
+  size offset=0 size=4
+  reserved offset=4 size=4
+struct karyos_subscription_end size=24 align=8
+  size offset=0 size=4
+  reason offset=4 size=4
+  position offset=8 size=8
+  seal_code offset=16 size=8
+const KARYOS_ABI_VERSION_MAJOR=0
+const KARYOS_ABI_VERSION_MINOR=1
+const KARYOS_ABI_VERSION_PATCH=2
+const KARYOS_NULL_HANDLE=0
+const KARYOS_MAX_CLIENTS=64
+const KARYOS_MAX_PUBLICATIONS=4096
+const KARYOS_MAX_CLAIMS=4096
+const KARYOS_MAX_SUBSCRIPTIONS=4096
+const KARYOS_MAX_CONFLATED_SUBSCRIPTIONS=4096
+const KARYOS_MAX_ARCHIVES=64
+const KARYOS_RECORDING_RECORDING=0
+const KARYOS_RECORDING_STOPPED=1
+const KARYOS_STOP_NORMAL=1
+const KARYOS_STOP_RECOVERED=2
+const KARYOS_STOP_EMPTY=3
+const KARYOS_STOP_LAPPED=4
+const KARYOS_STOP_STOPPED=5
+const KARYOS_STOP_SHUTDOWN=6
+const KARYOS_STOP_SOURCE_FAILED=7
+const KARYOS_STOP_REQUIRED_LAPPED=8
+const KARYOS_STOP_INVALID_SOURCE=9
+const KARYOS_MESSAGE_END_OF_STREAM=1
+const KARYOS_MESSAGE_TRACED=2
+const KARYOS_OUTCOME_SUBMITTED=1
+const KARYOS_OUTCOME_CONFIRMED_CANCELLED=2
+const KARYOS_OUTCOME_UNKNOWN=3
+const KARYOS_OUTCOME_REJECTED=4
+const KARYOS_OUTCOME_ABORTED=5
+const KARYOS_OUTCOME_RANGE=16
+const KARYOS_OUTCOME_INTERRUPTED=17
+const KARYOS_OUTCOME_ENDED=18
+const KARYOS_OUTCOME_OUTCOMES_LOST=19
+const KARYOS_ROLE_REQUIRED=0
+const KARYOS_ROLE_OPTIONAL=1
+const KARYOS_ROLE_OBSERVER=2
+const KARYOS_STRATEGY_MIN=0
+const KARYOS_STRATEGY_MAX=1
+const KARYOS_STRATEGY_TAGGED=2
+const KARYOS_ADMISSION_UNKNOWN=0
+const KARYOS_ADMISSION_OPEN=1
+const KARYOS_ADMISSION_NOT_JOINED=2
+const KARYOS_ADMISSION_LOST_REQUIRED=3
+const KARYOS_REJOIN_AT_HEAD=0
+const KARYOS_REJOIN_CLOSE=1
+const KARYOS_REJOIN_ARCHIVE=2
+const KARYOS_MERGE_NONE=0
+const KARYOS_MERGE_EPOCH_CHANGED=1
+const KARYOS_MERGE_REPLAY_SHORT=2
+const KARYOS_MERGE_MISMATCH=3
+const KARYOS_MERGE_LANE=4
+const KARYOS_MERGE_REPLAY_OVERRUN=5
+const KARYOS_MERGE_REPLAY_REVOKED=6
+const KARYOS_MERGE_REPLAY=7
+const KARYOS_MERGE_LIVE_OVERRUN=8
+const KARYOS_MERGE_LIVE=9
+const KARYOS_MERGE_OTHER=255
+const KARYOS_MAX_DRIVERS=8
+const KARYOS_PROTOCOL_VERSION=3
+const KARYOS_PUBLICATION_EXCLUSIVE=0
+const KARYOS_PUBLICATION_CONCURRENT=1
+const KARYOS_CLOCK_MONOTONIC=0
+const KARYOS_CLOCK_TAI=1
+const KARYOS_LOSS_HOLD=0
+const KARYOS_LOSS_CONTINUE=1
+const KARYOS_LOSS_ABORT=2
+const KARYOS_IDLE_BUSY_SPIN=0
+const KARYOS_IDLE_YIELD=1
+const KARYOS_IDLE_SLEEP=2
+const KARYOS_IDLE_YIELD_THEN_SLEEP=3
+const KARYOS_OK=0
+const KARYOS_E_BACK_PRESSURED=1
+const KARYOS_E_NOT_CONNECTED=2
+const KARYOS_E_ADMIN_ACTION=3
+const KARYOS_E_CLOSED_PUBLICATION=4
+const KARYOS_E_GATED=5
+const KARYOS_E_RATE_LIMITED=6
+const KARYOS_E_ABORTED=7
+const KARYOS_E_INVALID_ARGUMENT=100
+const KARYOS_E_INVALID_HANDLE=101
+const KARYOS_E_MESSAGE_TOO_LARGE=102
+const KARYOS_E_EMPTY_MESSAGE=103
+const KARYOS_E_INVALID_LANE=104
+const KARYOS_E_INVALID_SCHEDULE=105
+const KARYOS_E_INVALID_CHANNEL=106
+const KARYOS_E_INVALID_CONTEXT=107
+const KARYOS_E_REENTRANT=108
+const KARYOS_E_BUSY=109
+const KARYOS_E_CONFLATION=110
+const KARYOS_E_UNSUPPORTED=111
+const KARYOS_E_CLAIM_OUTSTANDING=112
+const KARYOS_E_CLOSED=200
+const KARYOS_E_CLOSED_BY_OVERRUN=201
+const KARYOS_E_POSITIONS_EXHAUSTED=202
+const KARYOS_E_OUTCOMES_LOST=203
+const KARYOS_E_EVENTS_LOST=204
+const KARYOS_E_OUTCOMES=205
+const KARYOS_E_HANDLES_EXHAUSTED=300
+const KARYOS_E_COMMAND_RING_FULL=301
+const KARYOS_E_TOO_MANY_PENDING=302
+const KARYOS_E_TIMEOUT=303
+const KARYOS_E_REFUSED=304
+const KARYOS_E_UNSUPPORTED_CHANNEL=305
+const KARYOS_E_UNKNOWN=306
+const KARYOS_E_SYSTEM=307
+const KARYOS_E_RESOURCES_UNAVAILABLE=308
+const KARYOS_E_INCOMPATIBLE_DRIVER=400
+const KARYOS_E_ADMISSION_REFUSED=401
+const KARYOS_E_PROTOCOL=402
+const KARYOS_E_INTERNAL=500
+const KARYOS_IMAGE_CHANGE_SIZE_ENDS=48
+const KARYOS_REPLAY_FULL=1
+const KARYOS_REPLAY_AS_RECORDED=2
+const KARYOS_REPLAY_SCALED=3
+const KARYOS_END_NONE=0
+const KARYOS_END_END_OF_STREAM=1
+const KARYOS_END_IMAGE_RETIRED=2
+const KARYOS_END_STREAM_REMOVED=3
+const KARYOS_END_REVOKED=4
+const KARYOS_END_CLOSED_BY_OVERRUN=5
+const KARYOS_END_OTHER=255
