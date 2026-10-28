@@ -656,10 +656,34 @@ fn a_reopen_refused_for_a_required_capability_counts_as_missing() {
     assert_eq!(endpoints.capabilities().count(), 0);
 }
 
-/// #838 (R2): a standing request deferred within the endpoint's interval
-/// is kept, accepted, and served by the table itself when the interval
-/// ends, with no new request; an ordinary one is dropped as before, so a
-/// need that went meanwhile resets nothing.
+/// The current epoch of endpoint `id` in `endpoints`.
+fn epoch_of(endpoints: &Endpoints<S>, id: EndpointId) -> karyos_io::backend::BackendEpoch {
+    endpoints
+        .capabilities()
+        .find(|(endpoint, _)| *endpoint == id)
+        .map(|(_, capabilities)| capabilities.epoch)
+        .unwrap()
+}
+
+/// Polls `endpoints` at `now` until the agents settle: the events.
+fn poll_at(
+    endpoints: &mut Endpoints<S>,
+    agents: &mut NetworkAgents<S>,
+    links: &AgentLinks<S>,
+    now: u64,
+) -> Vec<EndpointEvent> {
+    let mut events = Vec::new();
+    for _ in 0..1000 {
+        agents.do_work(now).unwrap();
+        endpoints.poll(links, now, |event| events.push(event), |_| {});
+    }
+    events
+}
+
+/// #838: a standing request within the endpoint's interval is kept and
+/// served by the table itself when the interval ends, with no new request;
+/// an ordinary one is dropped as before, so a need that went meanwhile
+/// resets nothing.
 #[test]
 fn a_standing_request_is_served_when_its_interval_ends() {
     const SEC: u64 = 1_000_000_000;
@@ -671,33 +695,22 @@ fn a_standing_request_is_served_when_its_interval_ends() {
             .open(&links, config(), ScriptedSocket::new())
             .unwrap();
         settle(&mut agents, &links, &mut endpoints, 1);
-        let poll_at = |endpoints: &mut Endpoints<S>, agents: &mut NetworkAgents<S>, now| {
-            let mut events = Vec::new();
-            for _ in 0..1000 {
-                agents.do_work(now).unwrap();
-                endpoints.poll(&links, now, |event| events.push(event), |_| {});
-            }
-            events
-        };
         endpoints.requested(&links, id, None, 10 * SEC);
         assert_eq!(endpoints.counters().resets, 1);
-        let events = poll_at(&mut endpoints, &mut agents, 10 * SEC);
+        let events = poll_at(&mut endpoints, &mut agents, &links, 10 * SEC);
         assert!(
             matches!(events.as_slice(), [EndpointEvent::Reopened { .. }]),
             "{events:?}"
         );
         // The fault recurs half an interval later: deferred.
-        let mut slot = crate::agents::StandingReset::new();
-        slot.rearm();
-        let request = standing.then(|| slot.clone());
-        endpoints.requested(&links, id, request, 10 * SEC + SEC / 2);
+        let epoch = epoch_of(&endpoints, id);
+        endpoints.requested(&links, id, standing.then_some(epoch), 10 * SEC + SEC / 2);
         let counters = endpoints.counters();
         assert_eq!((counters.resets, counters.resets_deferred), (1, 1));
-        assert_eq!(slot.accepted(), standing, "a standing one is accepted");
-        assert!(poll_at(&mut endpoints, &mut agents, 10 * SEC + SEC - 1).is_empty());
+        assert!(poll_at(&mut endpoints, &mut agents, &links, 10 * SEC + SEC - 1).is_empty());
         // The interval ends: only the standing one is served, unasked.
         let requests = endpoints.counters().reset_requests;
-        let events = poll_at(&mut endpoints, &mut agents, 11 * SEC);
+        let events = poll_at(&mut endpoints, &mut agents, &links, 11 * SEC);
         assert_eq!(
             endpoints.counters().reset_requests,
             requests,
@@ -713,16 +726,46 @@ fn a_standing_request_is_served_when_its_interval_ends() {
             assert!(events.is_empty(), "the need went: {events:?}");
             assert_eq!(endpoints.counters().resets, 1);
         }
-        // Served once at most: nothing later.
-        assert!(poll_at(&mut endpoints, &mut agents, 20 * SEC).is_empty());
+        // Once at most: nothing later.
+        assert!(poll_at(&mut endpoints, &mut agents, &links, 20 * SEC).is_empty());
     }
 }
 
-/// #838 (R1): a standing request for an endpoint that is not active (its
-/// reset in flight) is answered as not accepted, so the sender asks again;
-/// one the table serves is accepted.
+/// #838: a standing request while the endpoint is not active (attaching)
+/// is kept and served once it is active, in that epoch; an ordinary one is
+/// ignored.
 #[test]
-fn a_standing_request_learns_whether_it_was_accepted() {
+fn a_standing_request_while_attaching_is_served_when_active() {
+    for standing in [true, false] {
+        let agent_config = AgentConfig::default();
+        let (mut agents, links, mut endpoints) = table(&agent_config);
+        let id = endpoints
+            .open(&links, config(), ScriptedSocket::new())
+            .unwrap();
+        // Still attaching: the agents have not answered.
+        let epoch = epoch_of(&endpoints, id);
+        endpoints.requested(&links, id, standing.then_some(epoch), 0);
+        assert_eq!(endpoints.counters().resets, 0);
+        let events = poll_at(&mut endpoints, &mut agents, &links, 0);
+        assert!(matches!(events.first(), Some(EndpointEvent::Opened(opened)) if *opened == id));
+        if standing {
+            assert_eq!(endpoints.counters().resets, 1, "served once active");
+            assert!(
+                matches!(events.as_slice(), [_, EndpointEvent::Reopened { endpoint, .. }] if *endpoint == id),
+                "{events:?}"
+            );
+        } else {
+            assert_eq!(endpoints.counters().resets, 0, "ignored");
+            assert_eq!(endpoints.counters().requests_ignored, 1);
+        }
+    }
+}
+
+/// #838: a standing request kept for its epoch is dropped when the epoch
+/// changes (another reset served the need), and one of an older epoch is
+/// ignored: the endpoint is reset once.
+#[test]
+fn a_standing_request_is_dropped_when_its_epoch_changes() {
     const SEC: u64 = 1_000_000_000;
 
     let agent_config = AgentConfig::default();
@@ -731,21 +774,20 @@ fn a_standing_request_learns_whether_it_was_accepted() {
         .open(&links, config(), ScriptedSocket::new())
         .unwrap();
     settle(&mut agents, &links, &mut endpoints, 1);
-    let mut slot = crate::agents::StandingReset::new();
-    slot.rearm();
-    endpoints.requested(&links, id, Some(slot.clone()), 10 * SEC);
-    assert!(slot.accepted(), "served");
-    // A second one while that reset is in flight: ignored, not accepted.
-    slot.rearm();
-    endpoints.requested(&links, id, Some(slot.clone()), 10 * SEC);
-    assert!(slot.refused(), "ignored while not active");
-    let _ = settle(&mut agents, &links, &mut endpoints, 1);
-    // An answer to an older generation changes nothing.
-    let old = slot.clone();
-    slot.rearm();
-    old.accept();
-    assert!(
-        !slot.accepted() && !slot.refused(),
-        "a newer request unanswered"
-    );
+    endpoints.requested(&links, id, None, 10 * SEC);
+    poll_at(&mut endpoints, &mut agents, &links, 10 * SEC);
+    // Kept within the interval for epoch E.
+    let old = epoch_of(&endpoints, id);
+    endpoints.requested(&links, id, Some(old), 10 * SEC + SEC / 2);
+    // Another reset moves the endpoint to the next epoch.
+    endpoints.reset(&links, id).unwrap();
+    poll_at(&mut endpoints, &mut agents, &links, 10 * SEC + SEC / 2);
+    assert_ne!(epoch_of(&endpoints, id), old);
+    let resets = endpoints.counters().resets;
+    // The interval ends: E's request is gone.
+    assert!(poll_at(&mut endpoints, &mut agents, &links, 20 * SEC).is_empty());
+    // A late request of E is ignored.
+    endpoints.requested(&links, id, Some(old), 30 * SEC);
+    assert!(poll_at(&mut endpoints, &mut agents, &links, 30 * SEC).is_empty());
+    assert_eq!(endpoints.counters().resets, resets);
 }

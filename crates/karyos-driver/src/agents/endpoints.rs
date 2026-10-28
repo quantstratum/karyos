@@ -208,10 +208,11 @@ struct Entry<O: SocketOps> {
     /// A request was deferred since the last requested reset: the fault
     /// came back within the interval.
     deferred: bool,
-    /// A standing request deferred to the interval's end, when the table
-    /// serves it itself: the sender asks once (#838). Other requests are
-    /// dropped within the interval and asked again by their owner.
-    waiting: Option<super::StandingReset>,
+    /// The epoch of a standing request kept for later: the endpoint not
+    /// active, within its interval, or the command ring full. Served once
+    /// in that epoch, dropped when the epoch changes; the sender asks once
+    /// (#838). Other requests are dropped and asked again by their owner.
+    waiting: Option<karyos_io::backend::BackendEpoch>,
 }
 
 /// The first interval between two requested resets of an endpoint (ns).
@@ -562,11 +563,18 @@ impl<O: SocketOps> Endpoints<O> {
                 }
             }
         }
-        // A deferred request whose interval ended is served now.
+        // A kept standing request: dropped once its epoch has passed,
+        // served once the endpoint is active and its interval ended.
         for index in 0..self.entries.len() {
-            let Some(entry) = self.entries.get(index) else {
+            let Some(entry) = self.entries.get_mut(index) else {
                 break;
             };
+            if entry
+                .waiting
+                .is_some_and(|epoch| epoch != entry.capabilities.epoch)
+            {
+                entry.waiting = None;
+            }
             let due = entry.waiting.is_some()
                 && matches!(entry.state, State::Active)
                 && entry
@@ -612,15 +620,17 @@ impl<O: SocketOps> Endpoints<O> {
     /// at least its interval old. A request within the interval is
     /// deferred, and the next reset doubles the interval (up to
     /// [`RESET_BACKOFF_MAX`]); a reset after a clean interval starts over
-    /// at [`RESET_BACKOFF_MIN`]. A deferred request is kept and served by
-    /// [`Endpoints::poll`] when the interval ends, so the sender need not
-    /// ask again (#838); a refused one the sender asks again while the
-    /// need holds.
+    /// at [`RESET_BACKOFF_MIN`]. A standing request (tagged with its epoch,
+    /// #838) that cannot be served now (the endpoint not active, within its
+    /// interval, or the command ring full) is kept and served by
+    /// [`Endpoints::poll`] once in that epoch; another epoch drops it.
+    /// Other requests are dropped then, and their owner asks again while
+    /// the need holds.
     fn requested<T: StreamTerms>(
         &mut self,
         links: &AgentLinks<O, T>,
         endpoint: EndpointId,
-        standing: Option<super::StandingReset>,
+        standing: Option<karyos_io::backend::BackendEpoch>,
         now: u64,
     ) {
         self.counters.bump(|c| &mut c.reset_requests);
@@ -628,26 +638,33 @@ impl<O: SocketOps> Endpoints<O> {
     }
 
     /// Serves a reset request for `endpoint` at `now`, or defers it; a
-    /// standing one learns whether it was accepted (deferred or served).
+    /// standing one of the entry's epoch is kept when it cannot be served.
     fn serve_request<T: StreamTerms>(
         &mut self,
         links: &AgentLinks<O, T>,
         endpoint: EndpointId,
-        standing: Option<super::StandingReset>,
+        standing: Option<karyos_io::backend::BackendEpoch>,
         now: u64,
     ) {
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == endpoint)
-            .filter(|entry| matches!(entry.state, State::Active))
-        else {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) else {
             self.counters.bump(|c| &mut c.requests_ignored);
-            if let Some(standing) = standing {
-                standing.refuse();
-            }
             return;
         };
+        // A standing request of an older epoch: that epoch's reset is done.
+        let standing = match standing {
+            Some(epoch) if epoch != entry.capabilities.epoch => {
+                self.counters.bump(|c| &mut c.requests_ignored);
+                return;
+            }
+            standing => standing,
+        };
+        if !matches!(entry.state, State::Active) {
+            match standing {
+                Some(epoch) => entry.waiting = Some(epoch),
+                None => self.counters.bump(|c| &mut c.requests_ignored),
+            }
+            return;
+        }
         // A clock behind the last reset (stepped back) counts as an
         // elapsed interval: deferring until it catches up would break the
         // interval's bound.
@@ -656,11 +673,10 @@ impl<O: SocketOps> Endpoints<O> {
             && age_ns(now, at) < entry.backoff
         {
             entry.deferred = true;
-            if let Some(standing) = standing {
-                standing.accept();
-                if entry.waiting.replace(standing).is_some() {
-                    return;
-                }
+            if let Some(epoch) = standing
+                && entry.waiting.replace(epoch).is_some()
+            {
+                return;
             }
             self.counters.bump(|c| &mut c.resets_deferred);
             return;
@@ -680,14 +696,15 @@ impl<O: SocketOps> Endpoints<O> {
                     entry.last_reset = Some(now);
                     entry.deferred = false;
                 }
-                if let Some(standing) = standing {
-                    standing.accept();
-                }
                 self.counters.bump(|c| &mut c.resets);
             }
             Err(_) => {
-                if let Some(standing) = standing {
-                    standing.refuse();
+                // A standing request waits for the next poll.
+                if let Some(epoch) = standing
+                    && let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint)
+                    && entry.waiting.replace(epoch).is_some()
+                {
+                    return;
                 }
                 self.counters.bump(|c| &mut c.resets_refused);
             }

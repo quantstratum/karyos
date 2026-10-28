@@ -288,35 +288,6 @@ pub struct ControlRoutes {
     /// A logical clock for least-recently-used eviction.
     tick: u64,
     report: TxReport,
-    /// Evicted entries whose queue still had frames in flight: closed again
-    /// at the sender's next duty, once, before they count as failed (#838).
-    lingering: Vec<Destination>,
-    /// What this epoch refused or failed to close, until the sender takes
-    /// it ([`ControlRoutes::take_refusal`]).
-    refusal: ControlRefusal,
-    /// Test only: the next closes to report in flight.
-    #[cfg(test)]
-    pub(crate) close_in_flight: u32,
-}
-
-/// What an endpoint's control routes hit in its current epoch (#838): a
-/// route or queue refused for the endpoint's limit, and a close that did
-/// not complete.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ControlRefusal {
-    /// A route or queue was refused for the endpoint's limit.
-    pub limited: bool,
-    /// A live route or queue did not close.
-    pub close_failed: bool,
-}
-
-/// How a control entry's close went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Closed {
-    Done,
-    /// Its queue still has frames in flight.
-    InFlight,
-    Failed,
 }
 
 /// Datagrams one control queue holds: controls are sent at once.
@@ -333,10 +304,6 @@ impl ControlRoutes {
             epoch: None,
             tick: 0,
             report: TxReport::new(),
-            lingering: Vec::with_capacity(max),
-            refusal: ControlRefusal::default(),
-            #[cfg(test)]
-            close_in_flight: 0,
         }
     }
 
@@ -344,32 +311,7 @@ impl ControlRoutes {
     /// endpoint handed back, or a half of a new epoch.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.lingering.clear();
         self.epoch = None;
-        self.refusal = ControlRefusal::default();
-    }
-
-    /// Test only: the entries evicted in flight, not closed yet.
-    #[cfg(test)]
-    pub(crate) fn lingering(&self) -> usize {
-        self.lingering.len()
-    }
-
-    /// Test only: records `refusal` as this cache's, in `epoch`.
-    #[cfg(test)]
-    pub(crate) fn refuse(&mut self, epoch: BackendEpoch, refusal: ControlRefusal) {
-        self.epoch = Some(epoch);
-        self.refusal.limited |= refusal.limited;
-        self.refusal.close_failed |= refusal.close_failed;
-    }
-
-    /// What this epoch's control routes refused or failed to close since
-    /// the last call, which clears it, with that epoch.
-    pub fn take_refusal(&mut self) -> Option<(BackendEpoch, ControlRefusal)> {
-        let refusal = std::mem::take(&mut self.refusal);
-        self.epoch
-            .filter(|_| refusal != ControlRefusal::default())
-            .map(|epoch| (epoch, refusal))
     }
 
     /// The cached destinations, oldest use first (tests).
@@ -384,75 +326,9 @@ impl ControlRoutes {
     fn evict<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, queue: TxQueueId) {
         if let Some(index) = self.entries.iter().position(|entry| entry.queue == queue) {
             let old = self.entries.swap_remove(index);
-            match self.close(tx, old) {
-                Closed::Done => {}
-                // Closed again at the next duty before it counts as
-                // failed; the caller made room ([`ControlRoutes::queue`]).
-                Closed::InFlight => self.lingering.push(old),
-                Closed::Failed => self.refusal.close_failed = true,
-            }
-        }
-    }
-
-    /// Closes the entries evicted with frames in flight once more, at the
-    /// sender's duty (each cycle, however many controls it sends): what
-    /// still does not close has failed. A half of another epoch dropped
-    /// them in its reset.
-    pub fn close_lingering<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
-        if self.epoch != Some(tx.capabilities().epoch) {
-            self.lingering.clear();
-            return;
-        }
-        while let Some(old) = self.lingering.pop() {
-            if self.close(tx, old) != Closed::Done {
-                self.refusal.close_failed = true;
-            }
-        }
-    }
-
-    /// Closes again the entries evicted in flight that have closed since,
-    /// keeping the others for the duty: none counts as failed here, so a
-    /// burst of sends cannot use up their grace.
-    fn reclose_closed<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
-        let mut index = 0;
-        while let Some(old) = self.lingering.get(index).copied() {
-            if self.close(tx, old) == Closed::Done {
-                self.lingering.swap_remove(index);
-            } else {
-                index += 1;
-            }
-        }
-    }
-
-    /// Closes `old`'s queue, then its route. A handle already gone counts
-    /// as closed.
-    fn close<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, old: Destination) -> Closed {
-        use karyos_io::backend::{QueueError, RouteError};
-
-        #[cfg(test)]
-        if self.close_in_flight > 0 {
-            self.close_in_flight -= 1;
-            return Closed::InFlight;
-        }
-        loop {
-            match tx.close_queue(old.queue, &mut self.report) {
-                Ok(outcome) => {
-                    let returned = outcome.returned;
-                    while self.report.pop_front().is_some() {}
-                    if !outcome.more {
-                        break;
-                    }
-                    if returned == 0 {
-                        return Closed::InFlight;
-                    }
-                }
-                Err(QueueError::UnknownQueue) => break,
-                Err(_) => return Closed::Failed,
-            }
-        }
-        match tx.remove_route(old.route) {
-            Ok(()) | Err(RouteError::Unknown) => Closed::Done,
-            Err(_) => Closed::Failed,
+            let _ = tx.close_queue(old.queue, &mut self.report);
+            while self.report.pop_front().is_some() {}
+            let _ = tx.remove_route(old.route);
         }
     }
 
@@ -468,9 +344,7 @@ impl ControlRoutes {
         let epoch = tx.capabilities().epoch;
         if self.epoch != Some(epoch) {
             self.entries.clear();
-            self.lingering.clear();
             self.epoch = Some(epoch);
-            self.refusal = ControlRefusal::default();
         }
         // A u64 use clock does not wrap in practice; if it ever would, the
         // ages start over.
@@ -492,15 +366,6 @@ impl ControlRoutes {
             entry.used = tick;
             return Ok(entry.queue);
         }
-        if self.entries.len() >= self.max && self.lingering.len() >= self.lingering.capacity() {
-            // Every evicted entry is still in flight: those that closed
-            // since make room; with none, this send waits (refused, not a
-            // failed close nor a limit).
-            self.reclose_closed(tx);
-            if self.lingering.len() >= self.lingering.capacity() {
-                return Err(ControlSendError::Route);
-            }
-        }
         if self.entries.len() >= self.max
             && let Some(oldest) = self
                 .entries
@@ -510,26 +375,14 @@ impl ControlRoutes {
         {
             self.evict(tx, oldest);
         }
-        let route = tx.add_route(address).map_err(|error| {
-            if error == karyos_io::backend::RouteError::RouteLimit {
-                self.refusal.limited = true;
-            }
-            ControlSendError::Route
-        })?;
+        let route = tx.add_route(address).map_err(|_| ControlSendError::Route)?;
         let queue = tx
             .open_queue(TxQueueConfig {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::new(CONTROL_QUEUE_DEPTH).unwrap_or(NonZeroU16::MIN),
             })
-            .map_err(|error| {
-                if matches!(
-                    error,
-                    karyos_io::backend::QueueError::QueueLimit
-                        | karyos_io::backend::QueueError::OverCommitted { .. }
-                ) {
-                    self.refusal.limited = true;
-                }
+            .map_err(|_| {
                 let _ = tx.remove_route(route);
                 ControlSendError::Route
             })?;
