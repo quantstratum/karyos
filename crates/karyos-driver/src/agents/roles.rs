@@ -364,17 +364,27 @@ pub struct SenderCounters {
     /// single-path lanes that sent nothing for `sender_heartbeat_interval`
     /// (SPEC §6).
     pub heartbeats_sent: u64,
-    /// Queues and routes of removed publications the sender closed at its
-    /// next duty (driver-network-agents.md §7: the sender drops its
-    /// queues); a repair queue counts as one, a route as one.
+    /// Queues and routes of removed publications, and of retired
+    /// destinations of a multi-destination publication, the sender closed
+    /// at its next duty (driver-network-agents.md §7: the sender drops its
+    /// queues; multi-destination-unicast.md 3.7); a repair queue counts as
+    /// one, a route as one.
     pub removed_closed: u64,
-    /// Items still pending in a removed publication's queues when they
-    /// closed, returned with `QueueClosed`.
+    /// Items still pending in those queues when they closed, returned
+    /// with `QueueClosed`.
     pub removed_returned: u64,
     /// Removed publications' routes or queues not recorded for closing:
     /// the preallocated close list was full (never, by construction; their
-    /// endpoint's next reset drops them).
+    /// endpoint's next reset drops them). A retired destination's are
+    /// carried over instead (`OutboundCounters::close_deferred`).
     pub removed_unrecorded: u64,
+    /// Entries of the close list whose endpoint's TX half was not held at
+    /// their duty: it comes back only in a new epoch, whose reset drops
+    /// them, or never. Dropped, each counted once.
+    pub removed_dropped: u64,
+    /// Queues or routes of the close list the endpoint refused to close,
+    /// or that returned nothing while not done: left to its next reset.
+    pub removed_close_failed: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -1616,12 +1626,14 @@ pub(super) fn roles<T: StreamTerms>(
             path_heartbeat_interval: config.path_heartbeat_interval,
             sender_heartbeat_interval: config.sender_heartbeat_interval,
             setup_interval: config.setup_interval,
+            // Per publication: its routes, or its destinations and those
+            // retired since the last drain, which a removal closes too.
             closing: Vec::with_capacity(
                 config
                     .publications
                     .checked_mul(
                         karyos_io::lanes::routes::MAX_ROUTES
-                            .saturating_add(super::data::MAX_DESTINATIONS),
+                            .saturating_add(super::data::MAX_DESTINATIONS.saturating_mul(2)),
                     )
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
             ),
@@ -4783,7 +4795,8 @@ impl<T: StreamTerms> SenderRole<T> {
     /// multi-destination publication removed and did not report yet, after
     /// expiring its member, so it stops counting for the strategy edge
     /// (design 4.5; MD-7, MD-12). One the ring refused is posted again next
-    /// cycle.
+    /// cycle. A posted report retires the destination and hands its route
+    /// and queues to the close list (design 3.7).
     pub(super) fn report_removals<O: SocketOps>(
         &mut self,
         mut post: impl FnMut(AgentEvent<O, T>) -> bool,
@@ -4791,6 +4804,11 @@ impl<T: StreamTerms> SenderRole<T> {
         let now = (self.clock)();
         for outbound in &mut self.publications {
             while let Some(removal) = outbound.removal_unreported() {
+                // Its member stops counting for the strategy edge before
+                // the report is posted: with the conductor's ring full, a
+                // slow member must not keep holding the publisher (#630).
+                // Releasing it again on a retry is harmless: its SMs are
+                // dropped once it is removed.
                 if let Some(membership) = outbound.membership_mut() {
                     let _ = membership.release_source(removal.destination, now);
                 }
@@ -4807,7 +4825,11 @@ impl<T: StreamTerms> SenderRole<T> {
                 if !post(event) {
                     return;
                 }
-                outbound.removal_reported(removal.destination);
+                outbound.removal_reported(removal.destination, now);
+                // Its route and queues go to the close list now, so the
+                // next cycle's commands, served before its duty, find the
+                // slot free; that duty closes them before it opens anything.
+                outbound.drain_retired(&mut self.closing);
             }
         }
     }
@@ -4928,10 +4950,14 @@ impl<T: StreamTerms> SenderRole<T> {
     /// another epoch, dropped them already (a reset or a retirement).
     fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
         while let Some(opened) = self.closing.pop() {
+            // A half not held now comes back only in a new epoch, whose
+            // reset drops these handles, or never (retired): dropped and
+            // counted, so the list never fills with what cannot close.
             let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
                 Half::Tx(tx) if *held == opened.endpoint => Some(tx),
                 _ => None,
             }) else {
+                self.count(|c| &mut c.removed_dropped);
                 continue;
             };
             if tx.capabilities().epoch != opened.epoch {
@@ -4940,22 +4966,35 @@ impl<T: StreamTerms> SenderRole<T> {
             for queue in opened.queues.into_iter().flatten() {
                 // A full report leaves items pending: emptied and called
                 // again until none remains, each call returning at least
-                // one, so the queue's depth bounds the loop.
-                while let Ok(outcome) = tx.close_queue(queue, &mut self.close_report) {
-                    while self.close_report.pop_front().is_some() {
-                        self.count(|c| &mut c.removed_returned);
-                    }
-                    if !outcome.more {
-                        self.count(|c| &mut c.removed_closed);
-                        break;
-                    }
-                    if outcome.returned == 0 {
-                        break;
+                // one, so the queue's depth bounds the loop. A refusal or a
+                // call that returns nothing is counted: the endpoint's next
+                // reset drops the queue.
+                loop {
+                    match tx.close_queue(queue, &mut self.close_report) {
+                        Ok(outcome) => {
+                            while self.close_report.pop_front().is_some() {
+                                self.count(|c| &mut c.removed_returned);
+                            }
+                            if !outcome.more {
+                                self.count(|c| &mut c.removed_closed);
+                                break;
+                            }
+                            if outcome.returned == 0 {
+                                self.count(|c| &mut c.removed_close_failed);
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            self.count(|c| &mut c.removed_close_failed);
+                            break;
+                        }
                     }
                 }
             }
             if tx.remove_route(opened.route).is_ok() {
                 self.count(|c| &mut c.removed_closed);
+            } else {
+                self.count(|c| &mut c.removed_close_failed);
             }
         }
     }

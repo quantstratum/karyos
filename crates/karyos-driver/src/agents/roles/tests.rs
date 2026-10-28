@@ -4331,3 +4331,336 @@ fn a_removed_publication_with_no_half_closes_nothing() {
     let _ = sender.duty(&mut halves, 5).unwrap();
     assert_eq!(sender.counters().removed_closed, 0, "nothing waited");
 }
+
+/// Plan 157, QS-COORDINATOR's option A on #829: a removed destination is
+/// retired as a removed publication is, through the close list. An item
+/// still pending in its queue (committed, never flushed) comes back as
+/// `QueueClosed` and is counted in `removed_returned`, and the queue and
+/// route close.
+#[test]
+fn a_retired_destinations_pending_items_return_queue_closed() {
+    use karyos_io::backend::{
+        Authority, Commit, SenderToken, TxBackend, TxFrame, TxOptions, TxQueueConfig,
+    };
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let queue = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::new(4).unwrap(),
+        })
+        .unwrap();
+    let frame = tx.claim_tx(queue, 32).unwrap();
+    let _ticket = frame
+        .commit(Commit {
+            len: 32,
+            token: SenderToken::new(1),
+            options: TxOptions::none(),
+        })
+        .unwrap();
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(queue);
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    });
+    sender.close_removed(&mut halves);
+    let counters = sender.counters();
+    assert_eq!(counters.removed_returned, 1, "{counters:?}");
+    assert_eq!(counters.removed_closed, 2, "the queue and the route");
+}
+
+/// Review H1 of #829: in the sender's cycle order (commands, then the
+/// duty, then the reports), a removal reported at the end of a cycle
+/// frees its slot for the next cycle's commands, which run before that
+/// cycle's duty: a move at capacity right after the report is `Added`.
+#[test]
+fn a_move_right_after_the_report_is_added_in_the_cycle_order() {
+    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
+    let address = |port: u16| SocketAddr::from(([10, 0, 0, 9], port));
+    let destinations: Vec<SocketAddr> = (0..u16::try_from(MAX_DESTINATIONS).unwrap())
+        .map(|index| address(5000 + index))
+        .collect();
+    let term = publication(EndpointId(1)).term;
+    let (mut outbound, _log) = super::super::data::testing::outbound(
+        EndpointId(1),
+        alias(),
+        destinations[0],
+        term,
+        1,
+        false,
+    );
+    outbound
+        .set_destinations(&destinations, &[], Some(true))
+        .unwrap();
+    // Every destination opened: its removal leaves a route and queues to
+    // close.
+    let mut tx = {
+        use karyos_io::backend::InstanceId;
+        use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+        use karyos_io::sockets::scripted::ScriptedSocket;
+
+        let mut config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+        config.max_routes = std::num::NonZeroU16::new(64).unwrap();
+        config.max_queues = std::num::NonZeroU16::new(256).unwrap();
+        config.tx_slots = std::num::NonZeroU16::new(4096).unwrap();
+        SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new())
+            .unwrap()
+            .split()
+            .unwrap()
+            .0
+    };
+    outbound.open_destinations(&mut tx, 0);
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound,
+        guard: None,
+        roles: None,
+    });
+    let change = |sender: &mut super::SenderRole, destination, add| {
+        let answered = sender.command(AgentCommand::<OsSocket>::ChangeDestination {
+            reply: replies.reserve().unwrap(),
+            endpoint: EndpointId(1),
+            alias: alias(),
+            registration: 1,
+            destination,
+            add,
+        });
+        match answered {
+            Some((_, AgentEvent::DestinationChanged { outcome, .. })) => outcome,
+            other => panic!("{other:?}"),
+        }
+    };
+    // Cycle 1: the removal (a command), then its report.
+    assert_eq!(
+        change(&mut sender, address(5003), false),
+        DestinationChange::Removed
+    );
+    let mut reported = 0;
+    sender.report_removals(|_: AgentEvent<OsSocket>| {
+        reported += 1;
+        true
+    });
+    assert_eq!(reported, 1);
+    assert_eq!(
+        sender.closing.len(),
+        1,
+        "its route and queues wait to close"
+    );
+    // Cycle 2: the move's command comes before any duty.
+    assert_eq!(
+        change(&mut sender, address(6000), true),
+        DestinationChange::Added
+    );
+}
+
+/// Review J1 of #829: an entry of the close list whose endpoint's TX half
+/// is not held at its duty is dropped and counted once: that half comes
+/// back only in a new epoch, whose reset drops the handles, or never.
+#[test]
+fn a_close_without_its_tx_half_is_dropped_once() {
+    use karyos_io::backend::{Authority, TxQueueConfig};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let queue = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(queue);
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    });
+    // A duty that does not hold endpoint 1's half.
+    let mut none: Halves = Vec::new();
+    sender.close_removed(&mut none);
+    assert!(sender.closing.is_empty(), "dropped");
+    assert_eq!(sender.counters().removed_dropped, 1);
+    sender.close_removed(&mut halves);
+    assert_eq!(sender.counters().removed_dropped, 1, "once");
+    assert_eq!(sender.counters().removed_closed, 0);
+}
+
+/// Review H2 of #829 (karyos#630): with the conductor's event ring full,
+/// a removed destination's report cannot be posted, yet its member stops
+/// counting for the strategy edge at once, so a slow member never keeps
+/// holding the publisher while the ring stays full.
+#[test]
+fn a_removed_destinations_member_is_released_with_the_ring_full() {
+    use crate::agents::data::DestinationChange;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let other: SocketAddr = "10.0.0.9:5001".parse().unwrap();
+    let term = publication(EndpointId(1)).term;
+    let (mut outbound, _log) =
+        super::super::data::testing::outbound(EndpointId(1), alias(), receiver, term, 1, false);
+    outbound
+        .set_destinations(&[receiver, other], &[], Some(true))
+        .unwrap();
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound,
+        guard: None,
+        roles: None,
+    });
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    let live = |sender: &mut super::SenderRole| {
+        sender.publications[0]
+            .membership_mut()
+            .is_some_and(|membership| membership.live_at(receiver, 2))
+    };
+    assert!(live(&mut sender), "a member bound to the destination");
+    let removed = sender.command(AgentCommand::<OsSocket>::ChangeDestination {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias: alias(),
+        registration: 1,
+        destination: receiver,
+        add: false,
+    });
+    assert!(matches!(
+        removed,
+        Some((
+            _,
+            AgentEvent::DestinationChanged {
+                outcome: DestinationChange::Removed,
+                ..
+            }
+        ))
+    ));
+    // The ring is full: nothing is posted.
+    sender.report_removals(|_: AgentEvent<OsSocket>| false);
+    assert!(!live(&mut sender), "released though not reported");
+    assert!(sender.publications[0].removal_unreported().is_some());
+}
+
+/// Review H1 of #829, in real cycles (commands, duty, reports) on an
+/// endpoint whose route table holds exactly `MAX_DESTINATIONS` routes: a
+/// destination removed and reported frees its slot for the next cycle's
+/// move, and that cycle's duty closes the old route before it opens the
+/// new one, which could not open otherwise.
+#[test]
+fn a_move_closes_the_old_route_before_opening_the_new_one() {
+    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
+    let address = |port: u16| SocketAddr::from(([10, 0, 0, 9], port));
+    let destinations: Vec<SocketAddr> = (0..u16::try_from(MAX_DESTINATIONS).unwrap())
+        .map(|index| address(5000 + index))
+        .collect();
+    let term = publication(EndpointId(1)).term;
+    let (mut outbound, _log) = super::super::data::testing::outbound(
+        EndpointId(1),
+        alias(),
+        destinations[0],
+        term,
+        1,
+        false,
+    );
+    outbound
+        .set_destinations(&destinations, &[], Some(true))
+        .unwrap();
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound,
+        guard: None,
+        roles: None,
+    });
+    let mut config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    config.max_routes =
+        std::num::NonZeroU16::new(u16::try_from(MAX_DESTINATIONS).unwrap()).unwrap();
+    config.max_queues = std::num::NonZeroU16::new(256).unwrap();
+    config.tx_slots = std::num::NonZeroU16::new(4096).unwrap();
+    let (tx, _rx) = SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new())
+        .unwrap()
+        .split()
+        .unwrap();
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    sender.bind(EndpointId(1), destinations[0], &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), destinations[0], &sm_status([7, 8], 0), 1);
+    for now in 2..4 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    let opened = sender.publications[0].counters();
+    assert_eq!(opened.route_failures, 0, "every route opened: {opened:?}");
+    let change =
+        |sender: &mut super::SenderRole, destination, add| match sender.command(AgentCommand::<
+            OsSocket,
+        >::ChangeDestination {
+            reply: replies.reserve().unwrap(),
+            endpoint: EndpointId(1),
+            alias: alias(),
+            registration: 1,
+            destination,
+            add,
+        }) {
+            Some((_, AgentEvent::DestinationChanged { outcome, .. })) => outcome,
+            other => panic!("{other:?}"),
+        };
+    // A cycle: the removal, the duty, the report.
+    assert_eq!(
+        change(&mut sender, address(5003), false),
+        DestinationChange::Removed
+    );
+    let _ = sender.duty(&mut halves, 4).unwrap();
+    sender.report_removals(|_: AgentEvent<OsSocket>| true);
+    // The next cycle: the move, then the duty that closes and opens.
+    assert_eq!(
+        change(&mut sender, address(6000), true),
+        DestinationChange::Added
+    );
+    let _ = sender.duty(&mut halves, 5).unwrap();
+    let counters = sender.publications[0].counters();
+    assert_eq!(
+        counters.route_failures, 0,
+        "the new route opened: {counters:?}"
+    );
+    assert_eq!(counters.endpoint_limits, 0);
+    assert_eq!(
+        sender.counters().removed_closed,
+        2,
+        "the old queue and route"
+    );
+}
