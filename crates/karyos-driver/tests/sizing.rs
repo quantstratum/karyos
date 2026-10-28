@@ -65,8 +65,9 @@ fn stream(stream_id: i32, term_length: u32, spare_slots: u8) -> StreamConfig {
     }
 }
 
-/// The page size every mapping is rounded up to, as the kernel reports it.
-fn page() -> u64 {
+/// The page size every mapping is rounded up to, as the kernel reports it
+/// in smaps; the report takes it from `karyos_sys::ipc::page_size`.
+fn kernel_page() -> u64 {
     let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
     let kib: u64 = smaps
         .lines()
@@ -98,40 +99,57 @@ fn mapped_regions() -> BTreeMap<u64, u64> {
 }
 
 /// The report's mapped bytes of the regions a driver with `clients` command
-/// rings maps: every line but the budgets and the retained or bounded
-/// groups, each region rounded up to the page.
+/// rings maps: every configured line but the journal budget. The report
+/// already rounds each region up to the page.
 fn expected(lines: &[SizingLine], clients: u64) -> u64 {
     lines
         .iter()
-        .filter(|line| !line.region.contains("(budget)"))
+        .filter(|line| !line.region.contains("(budget"))
         .map(|line| {
             let count = if line.region == "command rings" {
                 clients
             } else {
                 line.count
             };
-            count * line.bytes_each.next_multiple_of(page())
+            count * line.bytes_each
         })
         .sum()
 }
 
 #[test]
 fn the_report_states_exactly_the_regions_a_driver_maps() {
-    let config = DriverConfig::default();
-    let streams = [stream(2, 64 * 1024, 3), stream(3, 1 << 20, 6)];
-    let sizing = report(&config, &streams).unwrap();
-    assert!(sizing.peak_bytes >= sizing.bounded_bytes);
-    assert!(sizing.bounded_bytes >= sizing.configured_bytes);
+    let page = kernel_page();
+    assert_eq!(page, u64::try_from(karyos_sys::ipc::page_size()).unwrap());
+    let config = DriverConfig {
+        network: Some(karyos_driver::net::NetworkConfig::default()),
+        ..DriverConfig::default()
+    };
+    let mut conflated = stream(4, 64 * 1024, 3);
+    conflated.conflation = Some(karyos_sys::conflation::ConflationConfig::new(64, 32, 4096));
+    let streams = [stream(2, 64 * 1024, 3), stream(3, 1 << 20, 6), conflated];
+    let sizing = report(&config, &streams, karyos_sys::ipc::page_size()).unwrap();
     assert!(
         sizing.peak_bytes > sizing.configured_bytes,
         "a stream retains generations"
     );
+    assert_eq!(sizing.heap.len(), 1, "the network journal budget: {sizing}");
+    assert!(
+        sizing
+            .configured
+            .iter()
+            .any(|line| line.region.contains("conflation table"))
+    );
     for line in sizing
         .configured
         .iter()
-        .chain(&sizing.bounded)
+        .chain(&sizing.heap)
         .chain(&sizing.retained)
     {
+        assert!(
+            line.region.contains("(budget") || line.bytes_each % page == 0,
+            "{} is not in pages",
+            line.region
+        );
         assert!(!line.inputs.is_empty(), "{} names no input", line.region);
     }
     let before = mapped_regions();

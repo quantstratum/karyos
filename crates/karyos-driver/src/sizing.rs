@@ -6,28 +6,35 @@
 //!
 //! Every figure comes from the same function that sizes the region when it
 //! is created (`karyos_sys::sizing::region_length` over each kind's
-//! structure length), so the report states the size each region is mapped
-//! with, and every line names the configuration inputs it read.
+//! structure length), rounded up to the page, since every region is its own
+//! `memfd` and is mapped and charged in whole pages. Every line names the
+//! configuration inputs it read.
 //!
-//! The report gives three figures:
+//! The report gives two figures:
 //!
-//! - **configured**: the fixed regions, `max_clients` command rings, the
-//!   trace journal budgets and the streams the host declares;
-//! - **bounded**: configured plus the streams clients may still add, up to
-//!   `max_streams`, each at the largest declared stream's size;
-//! - **restart peak**: bounded plus, for every stream, its
+//! - **configured steady state**: the fixed regions, `max_clients` command
+//!   rings, the client trace journal budget, the declared streams with
+//!   their conflation tables, and the network trace journal budget, which
+//!   lives on the heap and is listed apart;
+//! - **restart peak**: configured plus, for every declared stream, its
 //!   `max_retained_generations` predecessor mappings, which a cutover or a
-//!   restart keeps mapped for readers that have not finished. The peak is
-//!   never below bounded, and bounded never below configured.
+//!   restart keeps mapped for readers that have not finished. It assumes
+//!   no `reconfigure_stream` or `reconfigure_aggregate` since start, so
+//!   that a predecessor has the current geometry; the report states that
+//!   assumption.
 //!
-//! **What the cgroup counts.** Every region is a `memfd`, shared by the
-//! driver and the clients that map it. A shared page is charged once, to
-//! the memory cgroup of the process that first touches it, however many
-//! processes map it. In a pod whose processes share one cgroup, each region
-//! counts once. The figures are mapped bytes, a ceiling: a page never
-//! touched is never charged.
+//! Streams added after start, by the host or as replay targets a client
+//! asks for, are excluded: no configuration bounds their geometry, so no
+//! figure could bound them.
+//!
+//! **What the cgroup counts.** A shared page is charged once, to the memory
+//! cgroup of the process that first touches it, however many processes map
+//! it. In a pod whose processes share one cgroup, each region counts once.
+//! The figures are mapped pages, a ceiling: a page never touched is never
+//! charged.
 
 use core::fmt;
+use std::collections::BTreeSet;
 
 use karyos_sys::log_buffer::LogBuffer;
 use karyos_sys::sizing::region_length;
@@ -36,14 +43,20 @@ use karyos_sys::term_bytes::SharedTerms;
 use crate::embedded::{DriverConfig, StreamConfig};
 
 /// What the report does not cover.
-pub const EXCLUDED: [&str; 6] = [
-    "the application's and karyosd's own heap, code and thread stacks",
+pub const EXCLUDED: [&str; 7] = [
+    "streams added after start and Archive replay targets: no configuration sets their maximum geometry, so nothing bounds them",
+    "the application's and karyosd's own heap, code and thread stacks, except the network trace journal budget",
     "kernel socket buffers and network receive buffers",
     "the Archive's page cache and recording files",
     "page tables and other kernel memory",
     "the network image lanes and network publications, sized by remote senders and URIs, not by this configuration",
     "the outcome rings and consumed cells of guarded handles, one pair per handle a client takes",
 ];
+
+/// The assumption the restart peak rests on.
+pub const PEAK_ASSUMPTION: &str = "no reconfigure_stream or reconfigure_aggregate since start: \
+     a retained predecessor has its stream's current geometry; after a \
+     reconfiguration, size with the largest geometry the stream has had";
 
 /// One line of the report: a kind of region, how many, and the
 /// configuration inputs it read.
@@ -54,29 +67,29 @@ pub struct SizingLine {
     pub region: String,
     /// How many.
     pub count: u64,
-    /// Bytes of each, header included.
+    /// Bytes of each, header included, rounded up to the page; a budget's
+    /// bytes as configured.
     pub bytes_each: u64,
-    /// `count * bytes_each`, or the budget for a line given as one.
+    /// `count * bytes_each`.
     pub total: u64,
     /// The configuration fields it read.
     pub inputs: &'static [&'static str],
 }
 
-/// The report: its lines, in the three groups that make the three figures.
+/// The report: its lines, in groups, and its two figures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SizingReport {
-    /// The configured regions.
+    /// The configured shared regions.
     pub configured: Vec<SizingLine>,
-    /// The streams clients may still add, up to `max_streams`.
-    pub bounded: Vec<SizingLine>,
+    /// The configured budgets that live on the heap, not in a region.
+    pub heap: Vec<SizingLine>,
     /// The predecessor mappings retained across a cutover or a restart.
     pub retained: Vec<SizingLine>,
-    /// Bytes of the configured regions.
+    /// Bytes of the configured regions and heap budgets.
     pub configured_bytes: u64,
-    /// Configured plus the streams clients may add.
-    pub bounded_bytes: u64,
-    /// Bounded plus the retained predecessor mappings: the peak.
+    /// Configured plus the retained predecessor mappings, under
+    /// [`PEAK_ASSUMPTION`].
     pub peak_bytes: u64,
 }
 
@@ -92,12 +105,25 @@ pub enum SizingError {
     Overflow,
 }
 
-/// The bytes of a region of `structure` bytes, header included.
-fn region(structure: Option<usize>, what: &'static str) -> Result<u64, SizingError> {
-    structure
-        .and_then(region_length)
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(SizingError::Invalid(what))
+/// Sizes regions in whole pages of `page` bytes.
+struct Pages(u64);
+
+impl Pages {
+    /// The mapped bytes of a region of `structure` bytes: header included,
+    /// rounded up to the page.
+    fn region(&self, structure: Option<usize>, what: &'static str) -> Result<u64, SizingError> {
+        let bytes = structure
+            .and_then(region_length)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(SizingError::Invalid(what))?;
+        self.round(bytes)
+    }
+
+    fn round(&self, bytes: u64) -> Result<u64, SizingError> {
+        bytes
+            .checked_next_multiple_of(self.0)
+            .ok_or(SizingError::Overflow)
+    }
 }
 
 fn line(
@@ -122,15 +148,15 @@ fn sum(lines: &[SizingLine]) -> Result<u64, SizingError> {
         .ok_or(SizingError::Overflow)
 }
 
-/// The bytes of one generation of `stream`'s log buffer, and of its
+/// The mapped bytes of one generation of `stream`'s log buffer, and of its
 /// conflation table when it has one.
-fn stream_bytes(stream: &StreamConfig) -> Result<(u64, u64), SizingError> {
-    let buffer = region(
+fn stream_bytes(pages: &Pages, stream: &StreamConfig) -> Result<(u64, u64), SizingError> {
+    let buffer = pages.region(
         LogBuffer::<SharedTerms>::structure_length(&stream.buffer),
         "a stream's log buffer configuration",
     )?;
     let table = match &stream.conflation {
-        Some(conflation) => region(
+        Some(conflation) => pages.region(
             conflation.structure_length(),
             "a stream's conflation configuration",
         )?,
@@ -140,22 +166,48 @@ fn stream_bytes(stream: &StreamConfig) -> Result<(u64, u64), SizingError> {
 }
 
 /// The sizing report of a driver of `config` in IPC mode serving `streams`
-/// (R-CORE-34): from the configuration alone, with no driver running.
+/// (R-CORE-34), with regions mapped in pages of `page_size` bytes (`karyos_sys::ipc::page_size`): from the
+/// configuration alone, with no driver running.
 ///
 /// # Errors
 ///
-/// [`SizingError::Invalid`] for a value the driver would refuse, naming it;
-/// [`SizingError::Overflow`] when a sum does not fit 64 bits.
+/// [`SizingError::Invalid`] for a value the driver would refuse, naming it:
+/// a configuration `DriverConfig::validate` refuses, more streams than
+/// `max_streams`, two streams with one stream and session id, or a stream
+/// or table a buffer refuses; [`SizingError::Overflow`] when a sum does not
+/// fit 64 bits.
 pub fn report(
     config: &DriverConfig,
     streams: &[StreamConfig],
+    page_size: usize,
 ) -> Result<SizingReport, SizingError> {
+    config
+        .validate()
+        .map_err(|_| SizingError::Invalid("the driver configuration"))?;
+    if streams.len() > config.max_streams {
+        return Err(SizingError::Invalid("more streams than max_streams"));
+    }
+    let mut keys = BTreeSet::new();
+    if !streams
+        .iter()
+        .all(|stream| keys.insert((stream.buffer.stream_id, stream.buffer.session_id)))
+    {
+        return Err(SizingError::Invalid(
+            "two streams with one stream and session id",
+        ));
+    }
+    let pages = Pages(
+        u64::try_from(page_size)
+            .ok()
+            .filter(|page| page.is_power_of_two())
+            .ok_or(SizingError::Invalid("the page size"))?,
+    );
     let count = |value: usize| u64::try_from(value).map_err(|_| SizingError::Overflow);
     let mut configured = vec![
         line(
             "broadcast buffer",
             1,
-            region(
+            pages.region(
                 karyos_sys::broadcast::structure_length(config.broadcast_capacity),
                 "broadcast_capacity",
             )?,
@@ -164,7 +216,7 @@ pub fn report(
         line(
             "driver counters",
             1,
-            region(
+            pages.region(
                 karyos_sys::counters::structure_length(config.counters_capacity),
                 "counters_capacity",
             )?,
@@ -173,7 +225,7 @@ pub fn report(
         line(
             "client counters",
             1,
-            region(
+            pages.region(
                 karyos_sys::counters::structure_length(config.client_counters_capacity),
                 "client_counters_capacity",
             )?,
@@ -182,7 +234,7 @@ pub fn report(
         line(
             "error log",
             1,
-            region(
+            pages.region(
                 karyos_sys::diag::error_log_structure_length(config.error_log_records),
                 "error_log_records",
             )?,
@@ -191,7 +243,7 @@ pub fn report(
         line(
             "loss report",
             1,
-            region(
+            pages.region(
                 karyos_sys::diag::loss_report_structure_length(config.loss_report_records),
                 "loss_report_records",
             )?,
@@ -200,7 +252,7 @@ pub fn report(
         line(
             "trace mirror",
             1,
-            region(
+            pages.region(
                 karyos_sys::trace_mirror::structure_length(
                     config.max_trace_journals,
                     config.trace_recycle_log_entries,
@@ -217,7 +269,7 @@ pub fn report(
         line(
             "guard audit",
             1,
-            region(
+            pages.region(
                 karyos_sys::diag::guard_audit_structure_length(config.guard_audit_records.max(1)),
                 "guard_audit_records",
             )?,
@@ -226,45 +278,45 @@ pub fn report(
         line(
             "guard region",
             1,
-            crate::shared_words::region_bytes(config.max_guards)
-                .ok_or(SizingError::Invalid("max_guards"))?,
+            pages.round(
+                crate::shared_words::region_bytes(config.max_guards)
+                    .ok_or(SizingError::Invalid("max_guards"))?,
+            )?,
             &["max_guards"],
         )?,
         line(
             "command rings",
             count(config.max_clients)?,
-            region(
+            pages.region(
                 karyos_sys::command_ring::structure_length(config.ring_capacity),
                 "ring_capacity",
             )?,
             &["max_clients", "ring_capacity"],
         )?,
-        SizingLine {
-            region: "client trace journals (budget)".to_owned(),
-            count: 1,
-            bytes_each: config.max_trace_journal_bytes,
-            total: config.max_trace_journal_bytes,
-            inputs: &["max_trace_journal_bytes"],
-        },
+        // A budget over all journals, each its own region: at most one
+        // partial page per journal beyond it.
+        line(
+            "client trace journals (budget, plus a page per journal)",
+            1,
+            config
+                .max_trace_journal_bytes
+                .checked_add(
+                    count(config.max_trace_journals)?
+                        .checked_mul(pages.0)
+                        .ok_or(SizingError::Overflow)?,
+                )
+                .ok_or(SizingError::Overflow)?,
+            &["max_trace_journal_bytes", "max_trace_journals"],
+        )?,
     ];
-    if config.network.is_some() {
-        configured.push(SizingLine {
-            region: "network trace journals (budget)".to_owned(),
-            count: 1,
-            bytes_each: config.max_network_journal_bytes,
-            total: config.max_network_journal_bytes,
-            inputs: &["max_network_journal_bytes"],
-        });
-    }
-    if streams.len() > config.max_streams {
-        return Err(SizingError::Invalid("more streams than max_streams"));
-    }
-    let mut largest = 0u64;
     let mut retained = Vec::new();
     let generations = count(config.max_retained_generations)?;
     for (index, stream) in streams.iter().enumerate() {
-        let (buffer, table) = stream_bytes(stream)?;
-        let name = format!("stream {} (declared {index})", stream.buffer.stream_id);
+        let (buffer, table) = stream_bytes(&pages, stream)?;
+        let name = format!(
+            "stream {}:{} (declared {index})",
+            stream.buffer.stream_id, stream.buffer.session_id
+        );
         configured.push(line(
             format!("{name}: log buffer"),
             1,
@@ -288,54 +340,46 @@ pub fn report(
                 ],
             )?);
         }
+        // A cutover replaces the log buffer only; the table stays.
         retained.push(line(
             format!("{name}: retained generations"),
             generations,
             buffer,
             &["max_retained_generations", "stream term_length"],
         )?);
-        largest = largest.max(buffer.checked_add(table).ok_or(SizingError::Overflow)?);
     }
-    let mut bounded = Vec::new();
-    let more = count(config.max_streams - streams.len())?;
-    if more > 0 && largest > 0 {
-        bounded.push(line(
-            "streams clients may add, each at the largest declared stream",
-            more,
-            largest,
-            &["max_streams", "the declared streams"],
-        )?);
-        retained.push(line(
-            "retained generations of the streams clients may add",
-            more.checked_mul(generations).ok_or(SizingError::Overflow)?,
-            largest,
-            &["max_streams", "max_retained_generations"],
+    let mut heap = Vec::new();
+    if config.network.is_some() {
+        heap.push(line(
+            "network trace journals (budget)",
+            1,
+            config.max_network_journal_bytes,
+            &["max_network_journal_bytes"],
         )?);
     }
-    let configured_bytes = sum(&configured)?;
-    let bounded_bytes = configured_bytes
-        .checked_add(sum(&bounded)?)
+    let configured_bytes = sum(&configured)?
+        .checked_add(sum(&heap)?)
         .ok_or(SizingError::Overflow)?;
-    let peak_bytes = bounded_bytes
+    let peak_bytes = configured_bytes
         .checked_add(sum(&retained)?)
         .ok_or(SizingError::Overflow)?;
     Ok(SizingReport {
         configured,
-        bounded,
+        heap,
         retained,
         configured_bytes,
-        bounded_bytes,
         peak_bytes,
     })
 }
 
 impl fmt::Display for SizingReport {
-    /// The report as text: each group's lines with their inputs, the three
-    /// figures, what the cgroup counts and what is excluded.
+    /// The report as text: each group's lines with their inputs, the two
+    /// figures, the peak's assumption, what the cgroup counts and what is
+    /// excluded.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (title, lines) in [
-            ("configured", &self.configured),
-            ("streams clients may add", &self.bounded),
+            ("configured shared regions", &self.configured),
+            ("configured heap budgets", &self.heap),
             ("retained across a cutover or restart", &self.retained),
         ] {
             writeln!(f, "{title}:")?;
@@ -359,13 +403,13 @@ impl fmt::Display for SizingReport {
             "configured steady state: {} bytes",
             self.configured_bytes
         )?;
-        writeln!(f, "bounded steady state:    {} bytes", self.bounded_bytes)?;
         writeln!(f, "restart peak:            {} bytes", self.peak_bytes)?;
+        writeln!(f, "the restart peak assumes {PEAK_ASSUMPTION}.")?;
         writeln!(
             f,
-            "cgroup: every region is a shared memfd, charged once to the cgroup of \
-             the process that first touches each page; the figures are mapped bytes, \
-             a ceiling."
+            "cgroup: every region is a shared memfd, mapped in whole pages and \
+             charged once to the cgroup of the process that first touches each \
+             page; the figures are mapped pages, a ceiling."
         )?;
         writeln!(f, "excluded:")?;
         for excluded in EXCLUDED {

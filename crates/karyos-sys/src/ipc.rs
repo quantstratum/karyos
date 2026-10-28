@@ -945,6 +945,13 @@ pub fn peer_credentials(socket: BorrowedFd<'_>) -> Result<rustix::net::UCred, Sy
 /// The file name of the driver's admission socket in its directory.
 pub const SOCKET_NAME: &str = "driver.sock";
 
+/// The page size the kernel maps and charges a region in: every region is
+/// its own `memfd`, so each takes whole pages (R-CORE-34).
+#[must_use]
+pub fn page_size() -> usize {
+    rustix::param::page_size()
+}
+
 /// The effective uid of this process.
 #[must_use]
 pub fn own_uid() -> u32 {

@@ -330,6 +330,66 @@ pub struct DriverConfig {
     pub initial_term_id: Option<u32>,
 }
 
+impl DriverConfig {
+    /// Checks the configuration as a driver does when it is created: every
+    /// limit nonzero, the rings and the broadcast buffer large enough, the
+    /// network configuration valid. The sizing report checks it the same
+    /// way, so it never sizes a configuration a driver refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidConfig`].
+    pub fn validate(&self) -> Result<(), DriverError> {
+        let needed = RESPONSE_EXTENT
+            .checked_mul(2)
+            .and_then(|n| n.checked_mul(self.command_budget))
+            .and_then(|n| n.checked_mul(self.cycles_between_drains))
+            .ok_or(DriverError::InvalidConfig)?;
+        let valid = self.max_clients > 0
+            && self.max_streams > 0
+            && self.max_retained_generations > 0
+            && self.counters_capacity >= crate::counters::FIXED_COUNTERS
+            && self.position_sample_interval > 0
+            && self.error_log_records > 0
+            && self.loss_report_records > 0
+            && self.client_counters_capacity > 0
+            && self.max_counters_per_client > 0
+            && self.max_trace_journals > 0
+            && self.trace_recycle_log_entries > 0
+            && self.max_trace_journal_bytes > 0
+            && self.max_network_journal_bytes > 0
+            && self.network_journal_records.is_power_of_two()
+            && self.trace_drain_budget > 0
+            && self.trace_mirror_records > 0
+            && self.cutover_deadline > 0
+            && self.startup_timeout > 0
+            && self.heartbeat_interval > 0
+            && self
+                .heartbeat_interval
+                .checked_mul(10)
+                .is_some_and(|minimum| self.client_liveness_timeout >= minimum)
+            && self.max_pending_per_client > 0
+            && self.max_hand_over > 0
+            && self.command_budget > 0
+            && self.cycles_between_drains > 0
+            && self.ring_capacity >= karyos_sys::command_ring::MIN_CAPACITY
+            && self.ring_capacity.is_power_of_two()
+            && karyos_protocol::cnc::MAX_COMMAND_LENGTH
+                .checked_add(HEADER_LENGTH as usize)
+                .is_some_and(|record| self.ring_capacity / 8 >= record)
+            && self.broadcast_capacity >= needed
+            && self.guard_ack_timeout > 0
+            && self.network.is_none_or(|network| {
+                crate::net::client::valid_network(&network, self.max_clients)
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err(DriverError::InvalidConfig)
+        }
+    }
+}
+
 impl Default for DriverConfig {
     fn default() -> Self {
         Self {
@@ -1306,51 +1366,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     where
         T: 'static,
     {
-        let needed = RESPONSE_EXTENT
-            .checked_mul(2)
-            .and_then(|n| n.checked_mul(config.command_budget))
-            .and_then(|n| n.checked_mul(config.cycles_between_drains))
-            .ok_or(DriverError::InvalidConfig)?;
-        let valid = config.max_clients > 0
-            && config.max_streams > 0
-            && config.max_retained_generations > 0
-            && config.counters_capacity >= crate::counters::FIXED_COUNTERS
-            && config.position_sample_interval > 0
-            && config.error_log_records > 0
-            && config.loss_report_records > 0
-            && config.client_counters_capacity > 0
-            && config.max_counters_per_client > 0
-            && config.max_trace_journals > 0
-            && config.trace_recycle_log_entries > 0
-            && config.max_trace_journal_bytes > 0
-            && config.max_network_journal_bytes > 0
-            && config.network_journal_records.is_power_of_two()
-            && config.trace_drain_budget > 0
-            && config.trace_mirror_records > 0
-            && config.cutover_deadline > 0
-            && config.startup_timeout > 0
-            && config.heartbeat_interval > 0
-            && config
-                .heartbeat_interval
-                .checked_mul(10)
-                .is_some_and(|minimum| config.client_liveness_timeout >= minimum)
-            && config.max_pending_per_client > 0
-            && config.max_hand_over > 0
-            && config.command_budget > 0
-            && config.cycles_between_drains > 0
-            && config.ring_capacity >= karyos_sys::command_ring::MIN_CAPACITY
-            && config.ring_capacity.is_power_of_two()
-            && karyos_protocol::cnc::MAX_COMMAND_LENGTH
-                .checked_add(HEADER_LENGTH as usize)
-                .is_some_and(|record| config.ring_capacity / 8 >= record)
-            && config.broadcast_capacity >= needed
-            && config.guard_ack_timeout > 0
-            && config.network.is_none_or(|network| {
-                crate::net::client::valid_network(&network, config.max_clients)
-            });
-        if !valid {
-            return Err(DriverError::InvalidConfig);
-        }
+        config.validate()?;
         // The one per-instance id: trace and loss identities carry it, and
         // in IPC mode it is the admission instance id too (ACS 13555).
         let mut driver_id = [0u64; 2];
