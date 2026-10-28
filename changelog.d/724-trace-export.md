@@ -17,12 +17,15 @@
   (`MAX_RECORD_REPLY`, 695 bytes; `MAX_JOURNAL_REPLY`, 2560 bytes), the
   read itself bounded by those bytes and the count clamped to 16 384; it
   names only the journals of the records it holds. A cursor beyond the
-  ring is refused (`cursor ahead`, with the ring's head), as is a read
+  ring is refused (`cursor ahead`, with the ring's `next`), as is a read
   that finds the ring's bounds busy (`mirror busy`); the head is always
   the ring's. A record whose journal entry stays busy ends the page
-  before it, and a malformed record (a length past the payload bound,
-  `MirrorRecord::truncated`) is never delivered: it is lost when it
-  starts a page and ends the page otherwise.
+  before it (the reader retries); a journal recycled for good goes out as
+  `unknown`, its records counted in `unknown_records`. A malformed record
+  (a length past the payload bound, `MirrorRecord::truncated`) is never
+  delivered: it is lost with its sequence and reason `malformed`, and the
+  page goes on. Each lost range carries its `reason` (`overwritten` or
+  `malformed`).
   `capabilities` lists `trace-export`.
 - `karyos_sys::diag_ring::scan_at_most` and
   `TraceMirrorReader::scan_at_most`: a ring scan that delivers at most a

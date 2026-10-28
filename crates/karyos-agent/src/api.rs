@@ -891,8 +891,8 @@ pub struct ExportRecord {
     pub payload: Vec<u64>,
 }
 
-/// Mirror sequences `first..=last` an export never delivers: overwritten
-/// before they were read (R-CORE-13).
+/// Mirror sequences `first..=last` an export never delivers, and why
+/// (R-CORE-13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExportLoss {
@@ -900,6 +900,19 @@ pub struct ExportLoss {
     pub first: u64,
     /// The last lost sequence.
     pub last: u64,
+    /// Why they were lost.
+    pub reason: LossReason,
+}
+
+/// Why an export lost records (R-CORE-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LossReason {
+    /// Overwritten in the ring before they were read.
+    Overwritten,
+    /// A record whose length passed the payload bound: never delivered
+    /// cut.
+    Malformed,
 }
 
 /// A journal a page's records name, as the table showed it when the page
@@ -940,6 +953,9 @@ pub struct ExportPage {
     pub head: u64,
     /// The journals the records name, by number.
     pub journals: Vec<ExportJournal>,
+    /// The records whose journal is `unknown` (recycled and gone from the
+    /// log too): they are delivered, without their calibration.
+    pub unknown_records: u64,
 }
 
 /// Why an export read is refused (R-CORE-13).
@@ -956,7 +972,7 @@ pub enum ExportRefusal {
     /// sequences, or a reader's error. It is never served as caught up.
     Ahead {
         /// The ring's next sequence.
-        head: u64,
+        next: u64,
     },
     /// The ring's bounds were being written on every attempt: retry.
     Busy,

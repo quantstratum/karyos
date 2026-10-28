@@ -559,7 +559,11 @@ fn export_page(records: u64) -> crate::api::ExportPage {
     ExportPage {
         epoch: 0xab,
         from: 2,
-        lost: vec![ExportLoss { first: 2, last: 4 }],
+        lost: vec![ExportLoss {
+            first: 2,
+            last: 4,
+            reason: crate::api::LossReason::Overwritten,
+        }],
         records: (5..5 + records)
             .map(|seq| ExportRecord {
                 seq,
@@ -571,6 +575,7 @@ fn export_page(records: u64) -> crate::api::ExportPage {
         next: 5 + records,
         head: 5 + records,
         journals: vec![ExportJournal::Unknown { journal: 10 }],
+        unknown_records: 3,
     }
 }
 
@@ -583,12 +588,12 @@ fn an_export_page_stops_at_a_whole_record_within_its_bound() {
     let whole = trace_export(&page, usize::MAX);
     assert!(
         whole.starts_with(
-            r#"{"epoch":"000000000000000000000000000000ab","from":2,"lost":[{"first":2,"last":4}],"records":[{"seq":5,"journal":10,"sequence":5,"payload":[5,"#
+            r#"{"epoch":"000000000000000000000000000000ab","from":2,"lost":[{"first":2,"last":4,"reason":"overwritten"}],"records":[{"seq":5,"journal":10,"sequence":5,"payload":[5,"#
         ),
         "{whole}"
     );
     assert!(
-        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}]}"#),
+        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"unknown_records":3}"#),
         "{whole}"
     );
     let one = whole.matches(r#"{"seq":"#).count();
@@ -699,6 +704,7 @@ fn the_largest_record_and_journal_encode_within_their_bounds() {
         next: 4000,
         head: 4000,
         journals: vec![ExportJournal::Live(Box::new(entry))],
+        unknown_records: 0,
     };
     let reply = trace_export(&page, MAX_EXPORT_REPLY);
     assert!(reply.len() <= MAX_EXPORT_REPLY + MAX_RECORD_REPLY + MAX_JOURNAL_REPLY);
@@ -728,11 +734,12 @@ fn an_export_page_names_only_the_journals_of_its_records() {
             ExportJournal::Unknown { journal: 10 },
             ExportJournal::Unknown { journal: 11 },
         ],
+        unknown_records: 2,
     };
     let one = trace_export(&page, 10);
     assert!(one.contains(r#""next":1,"#), "{one}");
     assert!(
-        one.ends_with(r#""journals":[{"journal":10,"table":"unknown"}]}"#),
+        one.ends_with(r#""journals":[{"journal":10,"table":"unknown"}],"unknown_records":2}"#),
         "{one}"
     );
     let both = trace_export(&page, usize::MAX);

@@ -13,6 +13,7 @@ use karyos_sys::trace_mirror::{
 };
 
 use super::*;
+use crate::api::LossReason;
 
 /// [`export`] with no byte bound.
 fn read_page(
@@ -87,7 +88,14 @@ fn a_cursor_behind_retention_reports_the_lost_range() {
     let mut mirror = mirror(4);
     append(&mut mirror, 0..10);
     let page = read_page(&mirror.reader(), EPOCH, 1, 16, Some(EPOCH)).unwrap();
-    assert_eq!(page.lost, vec![ExportLoss { first: 1, last: 5 }]);
+    assert_eq!(
+        page.lost,
+        vec![ExportLoss {
+            first: 1,
+            last: 5,
+            reason: LossReason::Overwritten
+        }]
+    );
     assert_eq!(seqs(&page), vec![6, 7, 8, 9]);
     assert_eq!((page.from, page.next, page.head), (1, 10, 10));
     // Up to date: nothing lost, nothing new.
@@ -148,6 +156,9 @@ fn a_page_names_its_journals() {
         ExportJournal::Recycled(Box::new(recycled))
     );
     assert_eq!(page.journals[2], ExportJournal::Unknown { journal: 12 });
+    // Journal 12 is gone for good (every entry read): its record is
+    // delivered, counted as one without calibration.
+    assert_eq!(page.unknown_records, 1);
 }
 
 /// Against a writer that keeps appending: every record delivered is
@@ -262,7 +273,7 @@ fn a_cursor_ahead_of_the_ring_is_refused() {
     append(&mut mirror, 0..10);
     assert_eq!(
         read_page(&mirror.reader(), EPOCH, 5000, 16, None),
-        Err(ExportRefusal::Ahead { head: 10 })
+        Err(ExportRefusal::Ahead { next: 10 })
     );
     let page = read_page(&mirror.reader(), EPOCH, 10, 16, None).unwrap();
     assert_eq!((page.next, page.head), (10, 10));
@@ -294,11 +305,12 @@ fn a_busy_journal_entry_ends_the_page_before_its_records() {
     assert_eq!(page.journals.len(), 2);
 }
 
-/// Review B4 of #826: a record whose length word passes the payload bound
-/// is malformed: never delivered, stated as lost when it starts the page,
-/// and ending the page before it otherwise.
+/// Review B4 of #826 (QS-COORDINATOR, ACS 33476): a record whose length
+/// word passes the payload bound is malformed. It is never delivered, cut
+/// or whole: it is lost, with its exact sequence and reason `malformed`,
+/// and the page goes on past it.
 #[test]
-fn a_malformed_record_is_lost_not_delivered() {
+fn a_malformed_record_is_lost_and_the_page_goes_on() {
     use karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD;
 
     let mut mirror = mirror(16);
@@ -308,12 +320,14 @@ fn a_malformed_record_is_lost_not_delivered() {
     let _ = mirror.append_with_length(10, 3, &[3, 3], long).unwrap();
     append(&mut mirror, 4..5);
     let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
-    assert_eq!(page.lost, vec![ExportLoss { first: 0, last: 0 }]);
-    assert_eq!(seqs(&page), [1, 2]);
-    assert_eq!(page.next, 3);
-    let page = read_page(&mirror.reader(), EPOCH, 3, 16, None).unwrap();
-    assert_eq!(page.lost, vec![ExportLoss { first: 3, last: 3 }]);
-    assert_eq!(seqs(&page), [4]);
+    let malformed = |seq| ExportLoss {
+        first: seq,
+        last: seq,
+        reason: LossReason::Malformed,
+    };
+    assert_eq!(page.lost, vec![malformed(0), malformed(3)]);
+    assert_eq!(seqs(&page), [1, 2, 4]);
+    assert_eq!(page.next, 5);
 }
 
 /// Review of #826: the read is bounded by bytes, so a page of a small

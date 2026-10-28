@@ -837,6 +837,13 @@ pub fn trace_export(page: &ExportPage, max_bytes: usize) -> String {
             out.object(|fields| {
                 fields.number("first", loss.first);
                 fields.number("last", loss.last);
+                fields.string(
+                    "reason",
+                    match loss.reason {
+                        crate::api::LossReason::Overwritten => "overwritten",
+                        crate::api::LossReason::Malformed => "malformed",
+                    },
+                );
             });
         });
         fields
@@ -847,6 +854,7 @@ pub fn trace_export(page: &ExportPage, max_bytes: usize) -> String {
         fields
             .key("journals")
             .array(&journals, |out, journal| out.raw(journal));
+        fields.number("unknown_records", page.unknown_records);
     });
     text
 }
@@ -884,9 +892,9 @@ pub fn export_refusal(refusal: &ExportRefusal) -> String {
             fields.string("error", "epoch changed");
             fields.string("epoch", &format!("{epoch:032x}"));
         }
-        ExportRefusal::Ahead { head } => {
+        ExportRefusal::Ahead { next } => {
             fields.string("error", "cursor ahead");
-            fields.number("head", head);
+            fields.number("next", next);
         }
         ExportRefusal::Busy => fields.string("error", "mirror busy"),
     });

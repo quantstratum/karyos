@@ -36,13 +36,16 @@ use std::collections::BTreeSet;
 
 use karyos_sys::trace_mirror::{EntryRead, LogRead, TraceMirrorReader};
 
-use crate::api::{ExportJournal, ExportLoss, ExportPage, ExportRecord, ExportRefusal};
+use crate::api::{ExportJournal, ExportLoss, ExportPage, ExportRecord, ExportRefusal, LossReason};
 
 /// Overwrites within one page retried at most before the page ends.
 pub(crate) const OVERWRITE_RETRIES: usize = 4;
-/// Lost ranges one page states at most: the cursor's own and one per
-/// overwrite retry, and a malformed record at the start of the page.
-pub(crate) const MAX_LOST_RANGES: usize = OVERWRITE_RETRIES + 2;
+/// Overwritten ranges one page states at most: the cursor's own and one
+/// per overwrite retry. Malformed records are counted in the byte bound,
+/// one range each.
+pub(crate) const MAX_LOST_RANGES: usize = OVERWRITE_RETRIES + 1;
+/// The bytes one lost range takes in a reply at most.
+const LOSS_BYTES: usize = 96;
 /// Reads of the ring's bounds, or of a table or log entry, retried while
 /// a publication is in progress.
 const BUSY_RETRIES: usize = 16;
@@ -53,9 +56,10 @@ const BUSY_RETRIES: usize = 16;
 /// the epoch of the reader's cursor, if it has one.
 ///
 /// The read stops where the page must end: at the byte bound, before a
-/// record overwritten under it, before a malformed record (one is stated
-/// as lost instead when it is the first), and before the first record
-/// whose journal's table entry could not be read; `next` names where.
+/// record overwritten under it, and before the first record whose
+/// journal's table entry could not be read (busy: the reader retries);
+/// `next` names where. A malformed record is lost, with its sequence and
+/// reason, and the page goes on.
 ///
 /// # Errors
 ///
@@ -79,7 +83,7 @@ pub fn export(
     // A cursor past what the ring has given: another instance's, or a
     // reader's error. Never served as caught up.
     if from > bounds.next {
-        return Err(ExportRefusal::Ahead { head: bounds.next });
+        return Err(ExportRefusal::Ahead { next: bounds.next });
     }
     let count = count.min(crate::api::EXPORT_MAX);
     let mut cursor = from;
@@ -88,9 +92,17 @@ pub fn export(
     let mut named = BTreeSet::new();
     let mut used = crate::json::EXPORT_REPLY_OVERHEAD;
     let mut stop = None;
-    let note = |lost: &mut Vec<ExportLoss>, first: u64, last: u64| match lost.last_mut() {
-        Some(previous) if previous.last.saturating_add(1) == first => previous.last = last,
-        _ => lost.push(ExportLoss { first, last }),
+    let note = |lost: &mut Vec<ExportLoss>, first: u64, last: u64, reason: LossReason| match lost
+        .last_mut()
+    {
+        Some(previous) if previous.reason == reason && previous.last.saturating_add(1) == first => {
+            previous.last = last;
+        }
+        _ => lost.push(ExportLoss {
+            first,
+            last,
+            reason,
+        }),
     };
     for _ in 0..=OVERWRITE_RETRIES {
         let before = cursor;
@@ -99,13 +111,14 @@ pub fn export(
             if stop.is_some() {
                 return;
             }
-            // A malformed record is never delivered: lost when it is the
-            // first, else the page ends before it.
+            // A malformed record is never delivered: it is lost, with its
+            // sequence, counted in the bound, and the page goes on.
             if record.truncated {
-                if records.is_empty() {
-                    note(&mut lost, record.seq, record.seq);
-                } else {
+                if used.saturating_add(LOSS_BYTES) > max_bytes && !records.is_empty() {
                     stop = Some(record.seq);
+                } else {
+                    used = used.saturating_add(LOSS_BYTES);
+                    note(&mut lost, record.seq, record.seq, LossReason::Malformed);
                 }
                 return;
             }
@@ -130,7 +143,12 @@ pub fn export(
             records.push(exported);
         });
         if scan.overwritten > 0 {
-            note(&mut lost, before, before + scan.overwritten - 1);
+            note(
+                &mut lost,
+                before,
+                before + scan.overwritten - 1,
+                LossReason::Overwritten,
+            );
         }
         // Overwritten under the reader: the next scan's boundary proves
         // it and states it as lost, in this page while it has no record
@@ -154,10 +172,21 @@ pub fn export(
         records.truncate(at);
     }
     let kept: BTreeSet<u64> = records.iter().map(|record| record.journal).collect();
-    let journals = journals
+    let journals: Vec<ExportJournal> = journals
         .into_iter()
         .filter(|journal| kept.contains(&journal_number(journal)))
         .collect();
+    let unknown: BTreeSet<u64> = journals
+        .iter()
+        .filter_map(|journal| match journal {
+            ExportJournal::Unknown { journal } => Some(*journal),
+            _ => None,
+        })
+        .collect();
+    let unknown_records = records
+        .iter()
+        .filter(|record| unknown.contains(&record.journal))
+        .count();
     // The head is the ring's, read again after the page, never the cursor.
     let head = (0..BUSY_RETRIES)
         .find_map(|_| mirror.bounds())
@@ -170,6 +199,7 @@ pub fn export(
         next,
         head,
         journals,
+        unknown_records: u64::try_from(unknown_records).unwrap_or(u64::MAX),
     })
 }
 
