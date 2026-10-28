@@ -302,3 +302,33 @@ fn a_policy_keeps_its_reserve_only_at_or_above_it() {
     assert!(!policy(9, 5, None).keeps(&reserve));
     assert!(!policy(50, 1, None).keeps(&reserve));
 }
+
+/// R-CORE-21: a new policy earns the old rates up to the change, then
+/// clamps each level to its new burst and never raises it; a byte limit
+/// added starts empty and earns at its own rate.
+#[test]
+fn a_policy_change_clamps_and_never_grants_tokens() {
+    use crate::rate_limit::RateLimiter;
+
+    let mut limiter = RateLimiter::new(policy(10, 8, None), 0);
+    for _ in 0..6 {
+        assert!(limiter.try_admit(100, true));
+    }
+    assert_eq!(limiter.message_tokens(), 2);
+    // 0.1 s at the old 10/s earns one token, then the tighter burst of 2
+    // clamps the 3 held.
+    limiter.set_policy(policy(5, 2, Some((1_000, 500))), 100_000_000);
+    assert_eq!(limiter.message_tokens(), 2);
+    assert_eq!(limiter.byte_tokens(), Some(0));
+    assert!(
+        !limiter.try_admit(100, true),
+        "the new byte limit starts empty"
+    );
+    // A looser policy does not refill either: the level stays.
+    limiter.set_policy(policy(100, 50, None), 100_000_000);
+    assert_eq!(limiter.message_tokens(), 2);
+    assert_eq!(limiter.byte_tokens(), None);
+    // Then it earns at the new rate: 0.1 s at 100/s.
+    limiter.refill_at(200_000_000);
+    assert_eq!(limiter.message_tokens(), 12);
+}

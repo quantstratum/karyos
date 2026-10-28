@@ -172,6 +172,14 @@ impl Bucket {
         }
     }
 
+    /// A bucket of `rate` holding `level` nano-tokens, at most its burst.
+    fn clamped(rate: Rate, level: u128) -> Self {
+        Self {
+            rate,
+            level: level.min(Self::cap(rate)),
+        }
+    }
+
     /// `tokens` in nano-tokens; `None` on overflow, which a `u64` times
     /// 10^9 never reaches in a `u128`.
     fn nanos(tokens: u64) -> Option<u128> {
@@ -335,6 +343,20 @@ impl RateLimiter {
         if let Some(bytes) = &mut self.bytes {
             bytes.give(length);
         }
+    }
+
+    /// Applies `policy`, a newer version of the publication's policy, at
+    /// `now` (R-CORE-21): the buckets first earn what the old rates gave up
+    /// to `now`, then take the new rates, each level clamped to its new
+    /// burst and never raised. A byte limit the old policy did not have
+    /// starts empty, so a change never grants tokens. The caller validated
+    /// the policy and its transition.
+    pub fn set_policy(&mut self, policy: RatePolicy, now: u64) {
+        self.refill_at(now);
+        self.messages = Bucket::clamped(policy.messages, self.messages.level);
+        self.bytes = policy
+            .bytes
+            .map(|rate| Bucket::clamped(rate, self.bytes.as_ref().map_or(0, |bytes| bytes.level)));
     }
 
     /// Whole message tokens held at the last refill.
