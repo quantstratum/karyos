@@ -720,14 +720,29 @@ fn move_at_capacity(threading: ThreadingMode) {
             answers.len() == 2
         });
     }
-    assert_eq!(
-        answers
-            .iter()
-            .map(|(_, change)| *change)
-            .collect::<Vec<_>>(),
-        [DestinationChange::Removed, DestinationChange::Full],
-        "the slot is held until the removal retires"
-    );
+    let changes: Vec<DestinationChange> = answers.iter().map(|(_, change)| *change).collect();
+    match threading {
+        // One thread serves the two commands back to back: the removal
+        // has not drained yet.
+        ThreadingMode::Shared => assert_eq!(
+            changes,
+            [DestinationChange::Removed, DestinationChange::Full],
+            "the slot is held until the removal retires"
+        ),
+        // The sender's thread may drain, report and retire the removal
+        // between the two posts: either answer, then the end state below.
+        _ => assert!(
+            matches!(
+                changes.as_slice(),
+                [
+                    DestinationChange::Removed,
+                    DestinationChange::Full | DestinationChange::Added
+                ]
+            ),
+            "{changes:?}"
+        ),
+    }
+    let added_early = changes.last() == Some(&DestinationChange::Added);
     // The public signal: once the removal shows, a retried move is added.
     let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
         .chain(receivers.iter_mut())
@@ -738,10 +753,15 @@ fn move_at_capacity(threading: ThreadingMode) {
             .iter()
             .any(|removal| removal.destination == at(1))
     });
+    let expected = if added_early {
+        DestinationChange::Present
+    } else {
+        DestinationChange::Added
+    };
     a.add_network_destination(&publication, at(100)).unwrap();
     assert_eq!(
         answer(&mut a, &mut receivers, &publication),
-        (at(100), DestinationChange::Added)
+        (at(100), expected)
     );
 }
 

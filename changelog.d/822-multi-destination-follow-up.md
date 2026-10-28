@@ -6,17 +6,20 @@
     routes and queues of the destinations retired since that duty's
     drain; they used to stay open until an endpoint epoch change.
   - A removed destination holds its slot until its removal is reported,
-    which now happens only once its queues are drained. While the
-    conductor's event ring was full, remove and add churn grew the
-    per-destination state past `MAX_DESTINATIONS` and allocated on the
-    duty path. An addition now answers `Full` instead. A move at capacity
-    retried after the removal shows in `network_removed_destinations`
-    finds the slot free: the addition retires the reported destination
-    first. A removal is retired in the cycle it is reported. A removal, a
-    refused addition and the drain of retired destinations allocate
-    nothing; only an accepted addition does. The sender's close list has
-    a fixed capacity, and what does not fit waits for the next duty
-    (`close_deferred`).
+    which now happens only once it is drained: its cancel succeeded with
+    nothing left pending, or it was never opened (so a publication not
+    yet established reports at once). It is retired in the cycle its
+    removal is reported. While the conductor's event ring was full,
+    remove and add churn grew the per-destination state past
+    `MAX_DESTINATIONS` and allocated on the duty path. An addition now
+    answers `Full` instead, and a move at capacity retried after the
+    removal shows in `network_removed_destinations` finds the slot free.
+    A removal, a refused addition, a report with its retirement and the
+    drain allocate nothing; only an accepted addition does. When the
+    sender's fixed close list has no room, retired routes and queues are
+    carried over to the next duty (`close_deferred`), and a retirement
+    that finds the retired list full waits with its slot
+    (`retire_deferred`): nothing is dropped.
   - A route table, queue entries or TX slots that other publications
     filled (`RouteLimit`, `QueueLimit`, `OverCommitted`) no longer count
     as the destination's own fault, so an optional destination is not
