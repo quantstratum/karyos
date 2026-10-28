@@ -17,7 +17,7 @@ older minor ABI client against a newer library: pending the ABI manifest test of
 # Not a §13 row of its own: the size rule of SPEC.md §10.2 that both halves
 # of minor compatibility rest on. karyos_accepted's sizes need an
 # accepted offer: a subscriber, on a stream without allow_unconnected.
-struct sizes of another minor version: struct.size.driver.options struct.size.stream.options struct.size.client.options struct.size.detail struct.reserved.driver.options struct.size.subscription.options struct.size.offer.options
+struct sizes of another minor version: struct.size.driver.options struct.size.stream.options struct.size.client.options struct.size.detail struct.reserved.driver.options struct.size.subscription.options struct.size.offer.options struct.size.readiness
 # Not §13 rows of their own: the claim semantics every binding shares
 # (BIND-S3 in quantstratum-docs: reviews/2026-10-20-product-open-questions.md)
 # and the clocks of scheduled offers (F7a-3).
@@ -29,3 +29,6 @@ archive replays: op.replay.complete op.replay.stopped op.replay.refused op.repla
 # Not a §13 row: a driver in another process, the runner's karyosd, with a
 # conflated and a guarded stream (karyos#585), Linux only.
 remote driver: op.remote.conflated op.remote.outcomes
+# Not a §13 row: a driver's readiness over the C ABI (R-CORE-35,
+# karyos#794), on its caller's thread and on its own.
+driver readiness: driver.readiness.invoker driver.readiness.threaded

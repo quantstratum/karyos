@@ -29,9 +29,10 @@ use support::{abi, semantic, sha256};
 /// The format versions this runner reads.
 const FORMATS: [&str; 2] = ["1", "2"];
 
-/// The lowest ABI version this suite needs (FORMAT.md, Versions): 0.1.2,
-/// whose roles calls two scenarios make (karyos#637).
-const MINIMUM_ABI: [u32; 3] = [0, 1, 2];
+/// The lowest ABI version this suite needs (FORMAT.md, Versions): 0.1.3,
+/// whose readiness calls two scenarios make (karyos#794), after 0.1.2's
+/// roles calls (karyos#637).
+const MINIMUM_ABI: [u32; 3] = [0, 1, 3];
 
 /// Whether a library of ABI `library` can run this suite (FORMAT.md,
 /// Versions): before 1.0 exactly the suite's 0.y, at least its 0.y.z;
@@ -972,6 +973,26 @@ fn call(step: &Step, at: &str) -> Returned {
                     arguments.narrow("idle_sleep_ns", 0),
                 )),
                 results: BTreeMap::new(),
+            }
+        }
+        "karyos_driver_startup_complete" => {
+            let (status, complete) =
+                abi::driver_startup_complete(handle_argument(step, "driver", at));
+            with_count(status, "complete", complete)
+        }
+        "karyos_driver_readiness" => {
+            let arguments = Arguments::new(step, &["driver", "size"], at);
+            let size = size_argument::<abi::Readiness>(&arguments, "size");
+            let (status, out) = abi::driver_readiness_sized(arguments.handle("driver"), size);
+            let mut results = BTreeMap::from([("tail".to_owned(), tail(out.tail_intact()))]);
+            if let Some((state, reason, reserved)) = abi::readiness_fields(&out) {
+                results.insert("state".to_owned(), Value::Integer(i128::from(state)));
+                results.insert("reason".to_owned(), Value::Integer(i128::from(reason)));
+                results.insert("reserved".to_owned(), Value::Integer(i128::from(reserved)));
+            }
+            Returned {
+                status: Some(status),
+                results,
             }
         }
         "karyos_driver_stop" => Returned {
@@ -2449,11 +2470,11 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert!(runs((1, 3), (1, 3)));
     assert!(!runs((1, 4), (1, 3)));
     assert!(!runs((2, 0), (1, 3)));
-    // The suite as a whole needs 0.1.2 or a later 0.1.z (the roles
-    // calls, karyos#637).
+    // The suite as a whole needs 0.1.3 or a later 0.1.z (the readiness
+    // calls, karyos#794).
     assert!(!suite_runs_on([0, 1, 0]));
-    assert!(!suite_runs_on([0, 1, 1]));
-    assert!(suite_runs_on([0, 1, 2]));
+    assert!(!suite_runs_on([0, 1, 2]));
+    assert!(suite_runs_on([0, 1, 3]));
     assert!(suite_runs_on([0, 1, 7]));
     assert!(!suite_runs_on([0, 2, 0]));
     assert!(!suite_runs_on([0, 0, 9]));

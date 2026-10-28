@@ -31,8 +31,10 @@ const IDLE_SLEEP: u32 = 2;
 fn the_options_carry_their_size_and_the_drivers_defaults() {
     let (status, options) = abi::driver_options();
     assert_eq!(status, OK);
-    assert_eq!(options.size, 56);
+    // ABI 0.1.3 appends startup_timeout_ns to the 56 bytes of 0.1.0.
+    assert_eq!(options.size, 64);
     assert_eq!(options.max_clients, 16);
+    assert_eq!(options.startup_timeout_ns, 30_000_000_000);
     assert_eq!(options.reserved, 0);
     assert!(options.heartbeat_interval_ns > 0);
 }

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 /*
- * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.2.
+ * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.3.
  *
  * Written by hand until cbindgen is admitted; a test in karyos-ffi checks
  * it against the Rust source (quantstratum-docs:
@@ -101,7 +101,7 @@ extern "C" {
 
 #define KARYOS_ABI_VERSION_MAJOR 0
 #define KARYOS_ABI_VERSION_MINOR 1
-#define KARYOS_ABI_VERSION_PATCH 2
+#define KARYOS_ABI_VERSION_PATCH 3
 
 /** No handle names an object with this value. */
 #define KARYOS_NULL_HANDLE 0
@@ -266,6 +266,32 @@ extern "C" {
 #define KARYOS_IDLE_YIELD 1
 #define KARYOS_IDLE_SLEEP 2
 #define KARYOS_IDLE_YIELD_THEN_SLEEP 3
+
+/**
+ * A driver's readiness (R-CORE-35, karyos_driver_readiness), with the
+ * values of the admission protocol's readiness probe. STARTING: the host
+ * has not called karyos_driver_startup_complete, within its deadline.
+ * READY: a client would be admitted now, into no cutover. RECOVERING:
+ * admitting, but a stream still retains a predecessor mapping after a
+ * cutover. NOT_READY: not admitting a client now, for the reason given.
+ * FAILED: startup missed its deadline; it does not end.
+ */
+#define KARYOS_READINESS_STARTING 1
+#define KARYOS_READINESS_READY 2
+#define KARYOS_READINESS_RECOVERING 3
+#define KARYOS_READINESS_NOT_READY 4
+#define KARYOS_READINESS_FAILED 5
+
+/**
+ * Why a driver is not ready, or why its startup failed: NONE for
+ * STARTING, READY and RECOVERING; NOT_ADMITTING, FULL or TERMINAL for
+ * NOT_READY; STARTUP_DEADLINE for FAILED.
+ */
+#define KARYOS_READINESS_REASON_NONE 0
+#define KARYOS_READINESS_REASON_NOT_ADMITTING 1
+#define KARYOS_READINESS_REASON_FULL 2
+#define KARYOS_READINESS_REASON_TERMINAL 3
+#define KARYOS_READINESS_REASON_STARTUP_DEADLINE 4
 
 /*
  * Status codes. 0 is success; 1-99 data-path outcomes, 100-199 usage,
@@ -436,7 +462,31 @@ typedef struct karyos_driver_options {
     uint64_t client_liveness_timeout_ns;
     /* How long a handle has to move to a successor mapping, in ns. */
     uint64_t cutover_deadline_ns;
+    /*
+     * How long the host has to call karyos_driver_startup_complete, in
+     * ns (ABI 0.1.3). Nonzero; the default, and an older struct's, is
+     * 30 s.
+     */
+    uint64_t startup_timeout_ns;
 } karyos_driver_options;
+
+/**
+ * A driver's readiness, written by karyos_driver_readiness. The caller
+ * sets size to sizeof(karyos_readiness); a size below that of ABI 0.1.3
+ * is KARYOS_E_INVALID_ARGUMENT, and a larger one gets the fields this
+ * version knows.
+ */
+typedef struct karyos_readiness {
+    uint32_t size;
+    /* KARYOS_READINESS_*. */
+    uint32_t state;
+    /* KARYOS_READINESS_REASON_*. */
+    uint32_t reason;
+    /* Written as zero. */
+    uint32_t reserved;
+    /* Nanoseconds since the driver was created, on its clock. */
+    uint64_t uptime_ns;
+} karyos_readiness;
 
 /**
  * A stream's options, copied by karyos_driver_add_stream: the driver's
@@ -1088,6 +1138,24 @@ int32_t karyos_driver_start(uint64_t driver, uint32_t idle_strategy, uint64_t id
  * poisoned the driver.
  */
 int32_t karyos_driver_stop(uint64_t driver);
+
+/**
+ * Declares the host's startup complete (R-CORE-35): its streams and
+ * whatever else it needs before serving exist. Writes 1 through complete,
+ * or 0 when startup_timeout_ns had already passed: the readiness is then
+ * FAILED for good. It works with or without karyos_driver_start.
+ */
+int32_t karyos_driver_startup_complete(uint64_t driver, uint32_t *complete);
+
+/**
+ * Writes the driver's readiness, its reason and its uptime (R-CORE-35).
+ * It reads the driver's state and clock, and touches no data path. A host
+ * that never calls karyos_driver_startup_complete reads
+ * KARYOS_READINESS_FAILED once startup_timeout_ns (30 s by default) has
+ * passed. KARYOS_E_INVALID_ARGUMENT for a null or misaligned out, or a
+ * size below that of ABI 0.1.3.
+ */
+int32_t karyos_driver_readiness(uint64_t driver, karyos_readiness *out);
 
 /**
  * Fills options with a stream's defaults (stream id 0, the smallest term)

@@ -26,7 +26,9 @@ use std::collections::BTreeMap;
 
 use karyos_client::ClientConductor;
 use karyos_driver::agents::{IdleStrategy as _, YieldThenSleep};
-use karyos_driver::{DriverConfig, DriverError, EmbeddedDriver, StreamConfig, StreamHandle};
+use karyos_driver::{
+    DriverConfig, DriverError, EmbeddedDriver, Readiness, StreamConfig, StreamHandle,
+};
 use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::error::SysError;
 use karyos_sys::frame::Lane;
@@ -76,6 +78,9 @@ pub(crate) struct Options {
     /// How long a handle has to move to a successor mapping, in
     /// nanoseconds.
     pub(crate) cutover_deadline_ns: u64,
+    /// How long the host has to declare its startup complete, in
+    /// nanoseconds (R-CORE-35).
+    pub(crate) startup_timeout_ns: u64,
 }
 
 impl Options {
@@ -93,6 +98,7 @@ impl Options {
             heartbeat_interval_ns: config.heartbeat_interval,
             client_liveness_timeout_ns: config.client_liveness_timeout,
             cutover_deadline_ns: config.cutover_deadline,
+            startup_timeout_ns: config.startup_timeout,
         }
     }
 
@@ -109,6 +115,7 @@ impl Options {
             heartbeat_interval: self.heartbeat_interval_ns,
             client_liveness_timeout: self.client_liveness_timeout_ns,
             cutover_deadline: self.cutover_deadline_ns,
+            startup_timeout: self.startup_timeout_ns,
             ..DriverConfig::default()
         })
     }
@@ -819,6 +826,31 @@ pub(crate) fn conductor(driver: Handle) -> Result<(ClientConductor, DriverState)
         let conductor =
             slot.with_driver(|driver| driver.connect().map_err(|error| Failure::from(&error)))??;
         Ok((conductor, slot.state.clone()))
+    })?
+}
+
+/// Declares `driver`'s startup complete (R-CORE-35), on its caller's
+/// thread or its own: whether startup is complete, `false` when its
+/// deadline had already passed.
+///
+/// # Errors
+///
+/// [`Status::Internal`] for a lost driver, and the table's errors.
+pub(crate) fn startup_complete(driver: Handle) -> Result<bool, Status> {
+    with_slot(driver, |slot| {
+        slot.with_driver(EmbeddedDriver::startup_complete)
+    })?
+}
+
+/// `driver`'s readiness (R-CORE-35) and its uptime in nanoseconds, on
+/// its caller's thread or its own.
+///
+/// # Errors
+///
+/// [`Status::Internal`] for a lost driver, and the table's errors.
+pub(crate) fn readiness(driver: Handle) -> Result<(Readiness, u64), Status> {
+    with_slot(driver, |slot| {
+        slot.with_driver(|driver| (driver.readiness(), driver.uptime()))
     })?
 }
 

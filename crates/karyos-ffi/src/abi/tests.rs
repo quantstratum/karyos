@@ -2749,3 +2749,162 @@ fn test_port() -> u16 {
         }
     }
 }
+
+// R-CORE-35 over the C ABI (karyos#794).
+
+/// A driver of `options` (the defaults with `startup_timeout_ns` when
+/// given).
+fn readiness_driver(startup_timeout_ns: Option<u64>) -> u64 {
+    let mut options = default_driver_options();
+    if let Some(timeout) = startup_timeout_ns {
+        options.startup_timeout_ns = timeout;
+    }
+    let mut driver = 0;
+    // SAFETY: live, aligned pointers; no detail.
+    let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    driver
+}
+
+/// `karyos_driver_readiness` into a full struct: the status and the
+/// struct.
+fn readiness_of(driver: u64) -> (i32, ReadinessOut) {
+    let mut out = ReadinessOut {
+        size: READINESS_SIZE_0_1_3,
+        state: u32::MAX,
+        reason: u32::MAX,
+        reserved: u32::MAX,
+        uptime_ns: u64::MAX,
+    };
+    // SAFETY: a live, aligned `karyos_readiness` whose size is set.
+    let status = unsafe { karyos_driver_readiness(driver, &mut out) };
+    (status, out)
+}
+
+/// `karyos_driver_startup_complete`: the status and what it wrote.
+fn complete(driver: u64) -> (i32, u32) {
+    let mut done = u32::MAX;
+    // SAFETY: a live, aligned `uint32_t`.
+    let status = unsafe { karyos_driver_startup_complete(driver, &mut done) };
+    (status, done)
+}
+
+#[test]
+fn an_older_driver_options_struct_takes_the_default_startup_timeout() {
+    let mut given = default_driver_options();
+    given.startup_timeout_ns = 5;
+    // SAFETY: a live, aligned `DriverOptions` whose size is set.
+    let read = unsafe { read_sized(&given, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) };
+    assert_eq!(read.unwrap().startup_timeout_ns, 5);
+    // ABI 0.1.2's struct ends before the field: the 30 s default.
+    given.size = DRIVER_OPTIONS_SIZE_0_1;
+    // SAFETY: as above.
+    let read = unsafe { read_sized(&given, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) };
+    assert_eq!(
+        read.unwrap().startup_timeout_ns,
+        karyos_driver::DriverConfig::default().startup_timeout
+    );
+    assert_eq!(
+        karyos_driver::DriverConfig::default().startup_timeout,
+        30_000_000_000
+    );
+}
+
+#[test]
+fn a_zero_startup_timeout_is_refused() {
+    let mut options = default_driver_options();
+    options.startup_timeout_ns = 0;
+    let mut driver = 0;
+    // SAFETY: live, aligned pointers; no detail.
+    let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
+    assert_eq!(status, Status::InvalidArgument.code());
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn readiness_goes_from_starting_to_ready_on_the_callers_thread_and_its_own() {
+    use karyos_protocol::admission::probe;
+    for threaded in [false, true] {
+        let driver = readiness_driver(None);
+        if threaded {
+            assert_eq!(
+                karyos_driver_start(driver, crate::api::client::IDLE_YIELD, 0),
+                Status::Ok.code()
+            );
+        }
+        let (status, out) = readiness_of(driver);
+        assert_eq!(status, Status::Ok.code());
+        let starting = (
+            u32::try_from(probe::STARTING).unwrap(),
+            u32::try_from(probe::NONE).unwrap(),
+        );
+        assert_eq!((out.state, out.reason), starting, "threaded {threaded}");
+        assert_eq!((out.size, out.reserved), (READINESS_SIZE_0_1_3, 0));
+        assert_eq!(complete(driver), (Status::Ok.code(), 1));
+        let (status, later) = readiness_of(driver);
+        assert_eq!(status, Status::Ok.code());
+        assert_eq!(
+            (later.state, later.reason),
+            (u32::try_from(probe::READY).unwrap(), 0),
+            "threaded {threaded}"
+        );
+        assert!(later.uptime_ns >= out.uptime_ns);
+        assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "timing; covered natively")]
+fn a_startup_past_its_deadline_reads_failed_and_completes_with_zero() {
+    use karyos_protocol::admission::probe;
+    let driver = readiness_driver(Some(1));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let (status, out) = readiness_of(driver);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(
+        (out.state, out.reason),
+        (
+            u32::try_from(probe::FAILED).unwrap(),
+            u32::try_from(probe::STARTUP_DEADLINE).unwrap()
+        )
+    );
+    assert_eq!(complete(driver), (Status::Ok.code(), 0));
+    assert_eq!(complete(driver), (Status::Ok.code(), 0));
+    assert_eq!(readiness_of(driver).1.state, out.state);
+    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+}
+
+#[test]
+fn a_readiness_struct_below_its_first_size_is_refused_and_a_larger_one_gets_the_known_fields() {
+    let driver = readiness_driver(None);
+    // Below ABI 0.1.3's size: refused, nothing written.
+    let mut small = [u64::MAX; 4];
+    let out = small.as_mut_ptr().cast::<ReadinessOut>();
+    // SAFETY: an aligned buffer of 32 bytes; the size is its first field.
+    unsafe { out.cast::<u32>().write(READINESS_SIZE_0_1_3 - 1) };
+    // SAFETY: as above.
+    let status = unsafe { karyos_driver_readiness(driver, out) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    assert_eq!(&small[1..], &[u64::MAX; 3]);
+    // A null pointer is refused too.
+    // SAFETY: null is checked first.
+    let status = unsafe { karyos_driver_readiness(driver, core::ptr::null_mut()) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    // SAFETY: null is checked first.
+    let status = unsafe { karyos_driver_startup_complete(driver, core::ptr::null_mut()) };
+    assert_eq!(status, Status::InvalidArgument.code());
+    // A newer caller's larger struct: the known 24 bytes, nothing past.
+    let mut large = [u64::MAX; 4];
+    let out = large.as_mut_ptr().cast::<ReadinessOut>();
+    // SAFETY: as above.
+    unsafe { out.cast::<u32>().write(32) };
+    // SAFETY: an aligned buffer of the 32 bytes its size says.
+    let status = unsafe { karyos_driver_readiness(driver, out) };
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: the library wrote the first 24 bytes.
+    let written = unsafe { out.read() };
+    // The caller's size stays, as karyos_detail's does.
+    assert_eq!((written.size, written.reserved), (32, 0));
+    assert_eq!(large[3], u64::MAX, "nothing past the known fields");
+    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+}

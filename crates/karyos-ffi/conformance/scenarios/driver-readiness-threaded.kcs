@@ -1,0 +1,21 @@
+# A driver's readiness over the C ABI (R-CORE-35, karyos#794) while it
+# runs on its own thread (karyos_driver_start): the same answers as on
+# its caller's thread, starting, then ready after the host declares its
+# startup complete.
+format 1
+id driver.readiness.threaded
+abi 0.1
+covers "driver readiness"
+
+call karyos_driver_create
+expect KARYOS_OK driver=$driver
+call karyos_driver_start driver=$driver
+expect KARYOS_OK
+call karyos_driver_readiness driver=$driver
+expect KARYOS_OK state=1 reason=0 reserved=0
+call karyos_driver_startup_complete driver=$driver
+expect KARYOS_OK complete=1
+call karyos_driver_readiness driver=$driver
+expect KARYOS_OK state=2 reason=0 reserved=0
+call karyos_driver_close driver=$driver
+expect KARYOS_OK

@@ -22,7 +22,7 @@ pub(crate) const ABI_VERSION_MAJOR: u32 = 0;
 /// The ABI version's minor number (`KARYOS_ABI_VERSION_MINOR`).
 pub(crate) const ABI_VERSION_MINOR: u32 = 1;
 /// The ABI version's patch number (`KARYOS_ABI_VERSION_PATCH`).
-pub(crate) const ABI_VERSION_PATCH: u32 = 2;
+pub(crate) const ABI_VERSION_PATCH: u32 = 3;
 
 /// Whether `out` can take a `T`: not null and aligned. It cannot tell a
 /// dangling pointer; the caller's contract excludes one.
@@ -2035,6 +2035,9 @@ pub struct DriverOptions {
     /// How long a handle has to move to a successor mapping, in
     /// nanoseconds.
     pub cutover_deadline_ns: u64,
+    /// How long the host has to call `karyos_driver_startup_complete`, in
+    /// nanoseconds (ABI 0.1.3; 30 s for an older caller's struct).
+    pub startup_timeout_ns: u64,
 }
 
 /// The size of `karyos_driver_options` in the first ABI version that has
@@ -2057,6 +2060,7 @@ fn default_driver_options() -> DriverOptions {
         heartbeat_interval_ns: defaults.heartbeat_interval_ns,
         client_liveness_timeout_ns: defaults.client_liveness_timeout_ns,
         cutover_deadline_ns: defaults.cutover_deadline_ns,
+        startup_timeout_ns: defaults.startup_timeout_ns,
     }
 }
 
@@ -2150,6 +2154,7 @@ pub unsafe extern "C" fn karyos_driver_create(
             heartbeat_interval_ns: raw.heartbeat_interval_ns,
             client_liveness_timeout_ns: raw.client_liveness_timeout_ns,
             cutover_deadline_ns: raw.cutover_deadline_ns,
+            startup_timeout_ns: raw.startup_timeout_ns,
         };
         match driver::create(&options) {
             Ok(handle) => {
@@ -2219,6 +2224,99 @@ pub extern "C" fn karyos_driver_stop(driver: u64) -> i32 {
     guard(|| match driver::stop(Handle::from_raw(driver)) {
         Ok(()) => Status::Ok,
         Err(status) => status,
+    })
+}
+
+/// Declares `driver`'s startup complete (R-CORE-35): its readiness may
+/// then be ready. Writes 1 through `complete` when startup is complete,
+/// and 0 when `startup_timeout_ns` had already passed: the readiness is
+/// then failed, for good. Calling it again writes the same answer. It
+/// works whether the driver runs on its caller's thread or its own.
+///
+/// # Safety
+///
+/// `complete` points to a writable `uint32_t`; null or misaligned returns
+/// `KARYOS_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_startup_complete(driver: u64, complete: *mut u32) -> i32 {
+    guard(|| {
+        if !writable(complete) {
+            return Status::InvalidArgument;
+        }
+        match driver::startup_complete(Handle::from_raw(driver)) {
+            Ok(done) => {
+                // SAFETY: `complete` is non-null and aligned, and the
+                // caller's contract makes it a writable `uint32_t`.
+                unsafe { complete.write(u32::from(done)) };
+                Status::Ok
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+/// `karyos_readiness`: a driver's readiness (R-CORE-35), written by
+/// `karyos_driver_readiness`. `size` comes first and is set by the caller.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ReadinessOut {
+    /// The struct's size in bytes, set by the caller.
+    pub size: u32,
+    /// `KARYOS_READINESS_*`.
+    pub state: u32,
+    /// `KARYOS_READINESS_REASON_*`.
+    pub reason: u32,
+    /// Written as zero.
+    pub reserved: u32,
+    /// Nanoseconds since the driver was created, on its clock.
+    pub uptime_ns: u64,
+}
+
+/// The size of `karyos_readiness` in ABI 0.1.3, its first version.
+const READINESS_SIZE_0_1_3: u32 = 24;
+
+/// Writes `driver`'s readiness through `out` (R-CORE-35): the state, the
+/// reason, and the uptime. The codes are those of the admission protocol's
+/// readiness probe. It reads the driver's state and its clock, and touches
+/// no data path. A host that never calls `karyos_driver_startup_complete`
+/// reads `KARYOS_READINESS_FAILED` once `startup_timeout_ns` has passed.
+///
+/// # Safety
+///
+/// `out` points to a writable `karyos_readiness` whose `size` is set. A
+/// null or misaligned `out`, or a `size` below ABI 0.1.3's, returns
+/// `KARYOS_E_INVALID_ARGUMENT` with nothing written; a larger `size` gets
+/// the fields this version knows.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn karyos_driver_readiness(driver: u64, out: *mut ReadinessOut) -> i32 {
+    guard(|| {
+        if !sized_struct(out) {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `out` is non-null and aligned for its `uint32_t` size,
+        // and points to the caller's struct (its contract), whose first
+        // field is the `uint32_t` size.
+        if unsafe { out.cast::<u32>().read() } < READINESS_SIZE_0_1_3 {
+            return Status::InvalidArgument;
+        }
+        match driver::readiness(Handle::from_raw(driver)) {
+            Ok((readiness, uptime_ns)) => {
+                let (state, reason) = readiness.wire();
+                let narrow = |code: u64| u32::try_from(code).unwrap_or(u32::MAX);
+                // SAFETY: the caller's contract on `out`.
+                unsafe {
+                    write_sized(out, READINESS_SIZE_0_1_3, |size| ReadinessOut {
+                        size,
+                        state: narrow(state),
+                        reason: narrow(reason),
+                        reserved: 0,
+                        uptime_ns,
+                    });
+                };
+                Status::Ok
+            }
+            Err(status) => status,
+        }
     })
 }
 

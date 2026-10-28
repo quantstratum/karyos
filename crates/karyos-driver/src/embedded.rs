@@ -488,6 +488,29 @@ pub enum NotReadyReason {
     Terminal,
 }
 
+impl Readiness {
+    /// The state and reason codes of `karyos_protocol::admission::probe`,
+    /// the one mapping a probe's answer and the C ABI share.
+    #[must_use]
+    pub fn wire(self) -> (u64, u64) {
+        use karyos_protocol::admission::probe;
+        match self {
+            Self::Starting => (probe::STARTING, probe::NONE),
+            Self::Ready => (probe::READY, probe::NONE),
+            Self::Recovering => (probe::RECOVERING, probe::NONE),
+            Self::NotReady(why) => (
+                probe::NOT_READY,
+                match why {
+                    NotReadyReason::NotAdmitting => probe::NOT_ADMITTING,
+                    NotReadyReason::Full => probe::FULL,
+                    NotReadyReason::Terminal => probe::TERMINAL,
+                },
+            ),
+            Self::Failed(FailedReason::StartupDeadline) => (probe::FAILED, probe::STARTUP_DEADLINE),
+        }
+    }
+}
+
 /// Why a driver's startup failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2041,9 +2064,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Readiness::Ready
     }
 
-    /// Nanoseconds since the driver was created, on its clock.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn uptime(&mut self) -> u64 {
+    /// Nanoseconds since the driver was created, on its clock: the uptime a
+    /// readiness probe answers with (R-CORE-35).
+    pub fn uptime(&mut self) -> u64 {
         let now = self.clock.now();
         karyos_sys::host_clock::age_ns(now, self.started_at)
     }
