@@ -36,9 +36,13 @@
     for its limit (`RouteLimit`, `QueueLimit`, `OverCommitted`), on any
     open path or control route, in the same epoch, its reset is asked
     for, once per epoch; the served reset starts a new epoch, which drops
-    what did not close. The endpoint table now keeps a reset request it
-    defers within the endpoint's interval and serves it itself when the
-    interval ends, so no request is lost to the backoff. A control route
+    what did not close. This request is a standing one: the endpoint table
+    keeps it when it defers it within the endpoint's interval and serves
+    it itself when the interval ends, and tells the sender whether it
+    accepted it; one refused (the command ring full) or ignored (the
+    endpoint not active) is asked again next cycle until accepted. Other
+    reset requests are dropped within the interval as before, and asked
+    again by their owner while the need holds. A control route
     evicted with frames in flight is closed again at the sender's next
     duty, however many controls it sends meanwhile. Without a
     failed close in the epoch the limit is an ordinary refusal and

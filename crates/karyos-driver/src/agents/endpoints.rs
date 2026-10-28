@@ -208,9 +208,10 @@ struct Entry<O: SocketOps> {
     /// A request was deferred since the last requested reset: the fault
     /// came back within the interval.
     deferred: bool,
-    /// A deferred request waits for the interval's end, when the table
-    /// serves it itself: the sender asks once (#838).
-    waiting: bool,
+    /// A standing request deferred to the interval's end, when the table
+    /// serves it itself: the sender asks once (#838). Other requests are
+    /// dropped within the interval and asked again by their owner.
+    waiting: Option<super::StandingReset>,
 }
 
 /// The first interval between two requested resets of an endpoint (ns).
@@ -432,7 +433,7 @@ impl<O: SocketOps> Endpoints<O> {
                     backoff: RESET_BACKOFF_MIN,
                     last_reset: None,
                     deferred: false,
-                    waiting: false,
+                    waiting: None,
                     state: State::Failing {
                         error: EndpointError::Agent(error.clone()),
                         sender: Fate::Posted,
@@ -451,7 +452,7 @@ impl<O: SocketOps> Endpoints<O> {
             backoff: RESET_BACKOFF_MIN,
             last_reset: None,
             deferred: false,
-            waiting: false,
+            waiting: None,
         });
         Ok(id)
     }
@@ -480,7 +481,7 @@ impl<O: SocketOps> Endpoints<O> {
         // Any reset serves a deferred request: its new epoch is what the
         // request asked for.
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) {
-            entry.waiting = false;
+            entry.waiting = None;
         }
         Ok(())
     }
@@ -552,8 +553,8 @@ impl<O: SocketOps> Endpoints<O> {
     ) {
         for link in [&links.sender, &links.receiver] {
             while let Some(event) = link.take_event() {
-                if let AgentEvent::ResetRequested { endpoint } = event {
-                    self.requested(links, endpoint, now);
+                if let AgentEvent::ResetRequested { endpoint, standing } = event {
+                    self.requested(links, endpoint, standing, now);
                     continue;
                 }
                 if let Some(event) = self.answer(event) {
@@ -566,14 +567,18 @@ impl<O: SocketOps> Endpoints<O> {
             let Some(entry) = self.entries.get(index) else {
                 break;
             };
-            let due = entry.waiting
+            let due = entry.waiting.is_some()
                 && matches!(entry.state, State::Active)
                 && entry
                     .last_reset
                     .is_none_or(|at| now < at || age_ns(now, at) >= entry.backoff);
             if due {
                 let endpoint = entry.id;
-                self.serve_request(links, endpoint, now);
+                let standing = self
+                    .entries
+                    .get_mut(index)
+                    .and_then(|entry| entry.waiting.take());
+                self.serve_request(links, endpoint, standing, now);
             }
         }
         // Backwards, so a removed entry never makes the loop skip another.
@@ -615,17 +620,20 @@ impl<O: SocketOps> Endpoints<O> {
         &mut self,
         links: &AgentLinks<O, T>,
         endpoint: EndpointId,
+        standing: Option<super::StandingReset>,
         now: u64,
     ) {
         self.counters.bump(|c| &mut c.reset_requests);
-        self.serve_request(links, endpoint, now);
+        self.serve_request(links, endpoint, standing, now);
     }
 
-    /// Serves a reset request for `endpoint` at `now`, or defers it.
+    /// Serves a reset request for `endpoint` at `now`, or defers it; a
+    /// standing one learns whether it was accepted (deferred or served).
     fn serve_request<T: StreamTerms>(
         &mut self,
         links: &AgentLinks<O, T>,
         endpoint: EndpointId,
+        standing: Option<super::StandingReset>,
         now: u64,
     ) {
         let Some(entry) = self
@@ -635,6 +643,9 @@ impl<O: SocketOps> Endpoints<O> {
             .filter(|entry| matches!(entry.state, State::Active))
         else {
             self.counters.bump(|c| &mut c.requests_ignored);
+            if let Some(standing) = standing {
+                standing.refuse();
+            }
             return;
         };
         // A clock behind the last reset (stepped back) counts as an
@@ -645,10 +656,13 @@ impl<O: SocketOps> Endpoints<O> {
             && age_ns(now, at) < entry.backoff
         {
             entry.deferred = true;
-            if !entry.waiting {
-                entry.waiting = true;
-                self.counters.bump(|c| &mut c.resets_deferred);
+            if let Some(standing) = standing {
+                standing.accept();
+                if entry.waiting.replace(standing).is_some() {
+                    return;
+                }
             }
+            self.counters.bump(|c| &mut c.resets_deferred);
             return;
         }
         let backoff = if entry.deferred {
@@ -665,11 +679,18 @@ impl<O: SocketOps> Endpoints<O> {
                     entry.backoff = backoff;
                     entry.last_reset = Some(now);
                     entry.deferred = false;
-                    entry.waiting = false;
+                }
+                if let Some(standing) = standing {
+                    standing.accept();
                 }
                 self.counters.bump(|c| &mut c.resets);
             }
-            Err(_) => self.counters.bump(|c| &mut c.resets_refused),
+            Err(_) => {
+                if let Some(standing) = standing {
+                    standing.refuse();
+                }
+                self.counters.bump(|c| &mut c.resets_refused);
+            }
         }
     }
 

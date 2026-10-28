@@ -1430,28 +1430,28 @@ fn a_reset_request_is_repeated_at_its_cadence() {
     let mut sender = sm_sender();
     let mut asked = Vec::new();
     sender.cycle = 10;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert!(asked.is_empty(), "nothing needs a reset");
     sender.publications[0].force_needs_reset();
     // The ring is full: counted, not recorded.
-    sender.request_resets(|_| false);
+    sender.request_resets(|_, _| false);
     sender.cycle = 11;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert_eq!(asked, [EndpointId(1)]);
     sender.cycle = 11 + RESET_REQUEST_CYCLES - 1;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert_eq!(asked.len(), 1);
     sender.cycle = 11 + RESET_REQUEST_CYCLES;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
@@ -2807,7 +2807,7 @@ fn a_route_fault_asks_for_a_reset_at_its_cadence() {
     let mut asked = Vec::new();
     let mut ask = |receiver: &mut super::ReceiverRole, cycle| {
         receiver.cycle = cycle;
-        receiver.request_resets(|endpoint| {
+        receiver.request_resets(|endpoint, _| {
             asked.push((cycle, endpoint));
             true
         });
@@ -2833,7 +2833,7 @@ fn a_route_fault_asks_for_a_reset_at_its_cadence() {
     receiver.fault_naks(slot, &nak);
     let mut later = Vec::new();
     receiver.cycle = 11 + RESET_REQUEST_CYCLES;
-    receiver.request_resets(|endpoint| {
+    receiver.request_resets(|endpoint, _| {
         later.push(endpoint);
         true
     });
@@ -4557,7 +4557,7 @@ fn a_route_in_use_counts_once_and_resets_nothing() {
         "once per entry: {counters:?}"
     );
     let mut asked = 0;
-    sender.request_resets(|_| {
+    sender.request_resets(|_, _| {
         asked += 1;
         true
     });
@@ -4604,7 +4604,7 @@ fn a_close_of_handles_already_gone_asks_no_reset() {
         "a queue and a route already gone"
     );
     let mut asked = 0;
-    sender.request_resets(|_| {
+    sender.request_resets(|_, _| {
         asked += 1;
         true
     });
@@ -4827,6 +4827,9 @@ struct LimitCase {
     queue_limit: bool,
     /// Cycles run before the reset is served.
     cycles: u64,
+    /// The table answers the first this many standing requests as not
+    /// accepted (refused or ignored), the later ones as accepted.
+    refusals: usize,
 }
 
 fn route_limit_after(failed_close: bool, routed: bool) -> (usize, bool) {
@@ -4848,6 +4851,7 @@ fn limit_after(case: LimitCase) -> (usize, bool) {
         fanout,
         queue_limit,
         cycles,
+        refusals,
     } = case;
     use karyos_io::backend::{Authority, InstanceId, TxQueueConfig, TxReport};
     use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
@@ -4924,9 +4928,16 @@ fn limit_after(case: LimitCase) -> (usize, bool) {
     let end = 2 + cycles;
     for now in 2..end {
         let _ = sender.duty(&mut halves, now).unwrap();
-        sender.request_resets(|endpoint| {
+        sender.request_resets(|endpoint, standing| {
             if endpoint == EndpointId(1) {
                 asked += 1;
+            }
+            if let Some(standing) = standing {
+                if asked <= refusals {
+                    standing.refuse();
+                } else {
+                    standing.accept();
+                }
             }
             true
         });
@@ -5221,7 +5232,7 @@ fn a_control_close_failure_counts_for_the_limit() {
         let mut asked = 0usize;
         for now in 1..4 {
             let _ = sender.duty(&mut halves, now).unwrap();
-            sender.request_resets(|endpoint| {
+            sender.request_resets(|endpoint, _| {
                 asked += usize::from(endpoint == EndpointId(1));
                 true
             });
@@ -5277,5 +5288,22 @@ fn the_duty_closes_an_evicted_control_route_in_flight() {
             failed,
             "in flight {in_flight}"
         );
+    }
+}
+
+/// R1 (#838): a standing request the table refuses (its command ring full)
+/// or ignores (the endpoint not active) is asked again next cycle, until
+/// the table accepts it; accepted, it is not asked again in the epoch.
+#[test]
+fn a_refused_standing_request_is_asked_again_until_accepted() {
+    for refusals in [1, 3] {
+        let (asked, opened) = limit_after(LimitCase {
+            failed_close: true,
+            cycles: 20,
+            refusals,
+            ..LimitCase::default()
+        });
+        assert_eq!(asked, refusals + 1, "{refusals} refused, then accepted");
+        assert!(opened, "the route opens after the reset");
     }
 }

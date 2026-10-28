@@ -528,12 +528,12 @@ fn requested_resets_back_off_while_the_fault_recurs() {
     );
     let reset_at = |endpoints: &mut Endpoints<S>, agents: &mut NetworkAgents<S>, now| {
         let resets = endpoints.counters().resets;
-        endpoints.requested(&links, id, now);
+        endpoints.requested(&links, id, None, now);
         let started = endpoints.counters().resets > resets;
         if started {
             // A duplicate while the reset is in flight is ignored.
             let ignored = endpoints.counters().requests_ignored;
-            endpoints.requested(&links, id, now);
+            endpoints.requested(&links, id, None, now);
             assert_eq!(endpoints.counters().requests_ignored, ignored + 1);
             let events = settle(agents, &links, endpoints, 1);
             assert!(
@@ -564,7 +564,7 @@ fn requested_resets_back_off_while_the_fault_recurs() {
     assert!(reset_at(&mut endpoints, &mut agents, clean + SEC));
     // An unknown endpoint is ignored.
     let ignored = endpoints.counters().requests_ignored;
-    endpoints.requested(&links, EndpointId(u32::MAX - 1), clean);
+    endpoints.requested(&links, EndpointId(u32::MAX - 1), None, clean);
     assert_eq!(endpoints.counters().requests_ignored, ignored + 1);
 }
 
@@ -580,11 +580,11 @@ fn a_clock_stepped_back_does_not_defer_resets() {
         .open(&links, config(), ScriptedSocket::new())
         .unwrap();
     settle(&mut agents, &links, &mut endpoints, 1);
-    endpoints.requested(&links, id, 100 * SEC);
+    endpoints.requested(&links, id, None, 100 * SEC);
     assert_eq!(endpoints.counters().resets, 1);
     settle(&mut agents, &links, &mut endpoints, 1);
     // The clock steps back 50 s: the next request resets at once.
-    endpoints.requested(&links, id, 50 * SEC);
+    endpoints.requested(&links, id, None, 50 * SEC);
     assert_eq!(endpoints.counters().resets, 2);
     assert_eq!(endpoints.counters().resets_deferred, 0);
 }
@@ -656,11 +656,73 @@ fn a_reopen_refused_for_a_required_capability_counts_as_missing() {
     assert_eq!(endpoints.capabilities().count(), 0);
 }
 
-/// #838: a request deferred within the endpoint's interval is kept and
-/// served by the table itself when the interval ends, with no new request
-/// from the sender.
+/// #838 (R2): a standing request deferred within the endpoint's interval
+/// is kept, accepted, and served by the table itself when the interval
+/// ends, with no new request; an ordinary one is dropped as before, so a
+/// need that went meanwhile resets nothing.
 #[test]
-fn a_deferred_request_is_served_when_its_interval_ends() {
+fn a_standing_request_is_served_when_its_interval_ends() {
+    const SEC: u64 = 1_000_000_000;
+
+    for standing in [true, false] {
+        let agent_config = AgentConfig::default();
+        let (mut agents, links, mut endpoints) = table(&agent_config);
+        let id = endpoints
+            .open(&links, config(), ScriptedSocket::new())
+            .unwrap();
+        settle(&mut agents, &links, &mut endpoints, 1);
+        let poll_at = |endpoints: &mut Endpoints<S>, agents: &mut NetworkAgents<S>, now| {
+            let mut events = Vec::new();
+            for _ in 0..1000 {
+                agents.do_work(now).unwrap();
+                endpoints.poll(&links, now, |event| events.push(event), |_| {});
+            }
+            events
+        };
+        endpoints.requested(&links, id, None, 10 * SEC);
+        assert_eq!(endpoints.counters().resets, 1);
+        let events = poll_at(&mut endpoints, &mut agents, 10 * SEC);
+        assert!(
+            matches!(events.as_slice(), [EndpointEvent::Reopened { .. }]),
+            "{events:?}"
+        );
+        // The fault recurs half an interval later: deferred.
+        let mut slot = crate::agents::StandingReset::new();
+        slot.rearm();
+        let request = standing.then(|| slot.clone());
+        endpoints.requested(&links, id, request, 10 * SEC + SEC / 2);
+        let counters = endpoints.counters();
+        assert_eq!((counters.resets, counters.resets_deferred), (1, 1));
+        assert_eq!(slot.accepted(), standing, "a standing one is accepted");
+        assert!(poll_at(&mut endpoints, &mut agents, 10 * SEC + SEC - 1).is_empty());
+        // The interval ends: only the standing one is served, unasked.
+        let requests = endpoints.counters().reset_requests;
+        let events = poll_at(&mut endpoints, &mut agents, 11 * SEC);
+        assert_eq!(
+            endpoints.counters().reset_requests,
+            requests,
+            "no new request"
+        );
+        if standing {
+            assert!(
+                matches!(events.as_slice(), [EndpointEvent::Reopened { endpoint, .. }] if *endpoint == id),
+                "{events:?}"
+            );
+            assert_eq!(endpoints.counters().resets, 2);
+        } else {
+            assert!(events.is_empty(), "the need went: {events:?}");
+            assert_eq!(endpoints.counters().resets, 1);
+        }
+        // Served once at most: nothing later.
+        assert!(poll_at(&mut endpoints, &mut agents, 20 * SEC).is_empty());
+    }
+}
+
+/// #838 (R1): a standing request for an endpoint that is not active (its
+/// reset in flight) is answered as not accepted, so the sender asks again;
+/// one the table serves is accepted.
+#[test]
+fn a_standing_request_learns_whether_it_was_accepted() {
     const SEC: u64 = 1_000_000_000;
 
     let agent_config = AgentConfig::default();
@@ -669,39 +731,21 @@ fn a_deferred_request_is_served_when_its_interval_ends() {
         .open(&links, config(), ScriptedSocket::new())
         .unwrap();
     settle(&mut agents, &links, &mut endpoints, 1);
-    let poll_at = |endpoints: &mut Endpoints<S>, agents: &mut NetworkAgents<S>, now| {
-        let mut events = Vec::new();
-        for _ in 0..1000 {
-            agents.do_work(now).unwrap();
-            endpoints.poll(&links, now, |event| events.push(event), |_| {});
-        }
-        events
-    };
-    endpoints.requested(&links, id, 10 * SEC);
-    assert_eq!(endpoints.counters().resets, 1);
-    let events = poll_at(&mut endpoints, &mut agents, 10 * SEC);
+    let mut slot = crate::agents::StandingReset::new();
+    slot.rearm();
+    endpoints.requested(&links, id, Some(slot.clone()), 10 * SEC);
+    assert!(slot.accepted(), "served");
+    // A second one while that reset is in flight: ignored, not accepted.
+    slot.rearm();
+    endpoints.requested(&links, id, Some(slot.clone()), 10 * SEC);
+    assert!(slot.refused(), "ignored while not active");
+    let _ = settle(&mut agents, &links, &mut endpoints, 1);
+    // An answer to an older generation changes nothing.
+    let old = slot.clone();
+    slot.rearm();
+    old.accept();
     assert!(
-        matches!(events.as_slice(), [EndpointEvent::Reopened { .. }]),
-        "{events:?}"
+        !slot.accepted() && !slot.refused(),
+        "a newer request unanswered"
     );
-    // The fault recurs half an interval later: deferred, asked once.
-    endpoints.requested(&links, id, 10 * SEC + SEC / 2);
-    let counters = endpoints.counters();
-    assert_eq!((counters.resets, counters.resets_deferred), (1, 1));
-    // Still within the interval: nothing.
-    assert!(poll_at(&mut endpoints, &mut agents, 10 * SEC + SEC - 1).is_empty());
-    assert_eq!(endpoints.counters().resets, 1);
-    // The interval ends: the table serves it, no new request.
-    let requests = endpoints.counters().reset_requests;
-    let events = poll_at(&mut endpoints, &mut agents, 11 * SEC);
-    assert!(
-        matches!(events.as_slice(), [EndpointEvent::Reopened { endpoint, .. }] if *endpoint == id),
-        "{events:?}"
-    );
-    let counters = endpoints.counters();
-    assert_eq!(counters.resets, 2);
-    assert_eq!(counters.reset_requests, requests, "no new request");
-    // Served once: no further reset.
-    assert!(poll_at(&mut endpoints, &mut agents, 20 * SEC).is_empty());
-    assert_eq!(endpoints.counters().resets, 2);
 }

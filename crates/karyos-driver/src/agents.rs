@@ -972,13 +972,112 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// `endpoint` needs one before it can send again
     /// (`Outbound::needs_reset`), or a route or queue it refused for its
     /// limit after a close failed in that epoch (#838); on the receiver, a
-    /// route fault holds an image's NAKs (RC-6). Posted unsolicited into a free slot, and again
-    /// every `RESET_REQUEST_CYCLES` cycles while the need holds; the
-    /// endpoint table ignores it unless the endpoint is active.
+    /// route fault holds an image's NAKs (RC-6). Posted unsolicited into a
+    /// free slot, and again every `RESET_REQUEST_CYCLES` cycles while the
+    /// need holds; the endpoint table ignores it unless the endpoint is
+    /// active, and drops it within the endpoint's interval. A standing
+    /// request (the close failure's) is instead kept through the interval
+    /// and served then, and asked again only until the table accepts it.
     ResetRequested {
         /// The endpoint.
         endpoint: EndpointId,
+        /// A standing request (a close that failed in the epoch, #838):
+        /// the table keeps it through its interval and serves it then, and
+        /// tells the sender here whether it accepted it. `None` for the
+        /// others, which the table drops within its interval and their
+        /// owner asks again while the need holds.
+        standing: Option<StandingReset>,
     },
+}
+
+/// The answer slot of a standing reset request (#838): the endpoint table
+/// records whether it accepted the request (deferred to its interval's end,
+/// or served) or not (refused, or the endpoint not active), and the sender
+/// asks again until it is accepted. The sender reuses a slot for another
+/// request under a new generation, so an answer to an older one changes
+/// nothing. Cloning shares the slot; nothing allocates.
+#[derive(Debug, Clone)]
+pub struct StandingReset {
+    slot: Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+}
+
+/// A standing request posted, not answered yet.
+const STANDING_POSTED: u64 = 0;
+/// A standing request the table accepted.
+const STANDING_ACCEPTED: u64 = 1;
+/// A standing request the table did not accept.
+const STANDING_REFUSED: u64 = 2;
+
+impl StandingReset {
+    /// A slot for the sender's standing requests (allocated here).
+    pub(crate) fn new() -> Self {
+        Self {
+            slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            generation: 0,
+        }
+    }
+
+    /// A new request on this slot: answers to older ones are ignored.
+    pub(crate) fn rearm(&mut self) {
+        self.generation = self.generation.wrapping_add(1) & (u64::MAX >> 2);
+        self.set(STANDING_POSTED);
+    }
+
+    /// The request is posted again, unanswered.
+    pub(crate) fn posted(&self) {
+        self.set(STANDING_POSTED);
+    }
+
+    /// The table accepted the request.
+    pub(crate) fn accept(&self) {
+        self.answer(STANDING_ACCEPTED);
+    }
+
+    /// The table did not accept the request.
+    pub(crate) fn refuse(&self) {
+        self.answer(STANDING_REFUSED);
+    }
+
+    /// Whether the table accepted this generation's request.
+    #[cfg(test)]
+    pub(crate) fn accepted(&self) -> bool {
+        self.state() == Some(STANDING_ACCEPTED)
+    }
+
+    /// Whether the table answered this generation's request without
+    /// accepting it.
+    pub(crate) fn refused(&self) -> bool {
+        self.state() == Some(STANDING_REFUSED)
+    }
+
+    fn state(&self) -> Option<u64> {
+        let raw = self.slot.load(Ordering::Acquire);
+        (raw >> 2 == self.generation).then_some(raw & 3)
+    }
+
+    /// The sender's own store: this generation, `state`.
+    fn set(&self, state: u64) {
+        self.slot
+            .store((self.generation << 2) | state, Ordering::Release);
+    }
+
+    /// The table's answer: kept only while the slot is still at this
+    /// generation.
+    fn answer(&self, state: u64) {
+        let mut raw = self.slot.load(Ordering::Acquire);
+        while raw >> 2 == self.generation {
+            match self.slot.compare_exchange(
+                raw,
+                (self.generation << 2) | state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => raw = now,
+            }
+        }
+    }
 }
 
 /// A role's answer to a command: the reply's slot and its event, if any.
@@ -1459,9 +1558,9 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         let work = role.duty(&mut core.halves, now)?;
         // A full ring drops the request; the next cycle asks again.
         let events = &core.events;
-        role.request_resets(|endpoint| {
+        role.request_resets(|endpoint, standing| {
             events
-                .try_post(AgentEvent::ResetRequested { endpoint })
+                .try_post(AgentEvent::ResetRequested { endpoint, standing })
                 .is_ok()
         });
         // A drained publication's report; a full ring asks again next
@@ -1546,9 +1645,9 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
         // A route fault asks for the endpoint's reset (RC-6); a full ring
         // drops the request and a later cycle asks again.
         let events = &core.events;
-        role.request_resets(|endpoint| {
+        role.request_resets(|endpoint, standing| {
             events
-                .try_post(AgentEvent::ResetRequested { endpoint })
+                .try_post(AgentEvent::ResetRequested { endpoint, standing })
                 .is_ok()
         });
         // Journals a retirement closed reach the conductor with their facts
