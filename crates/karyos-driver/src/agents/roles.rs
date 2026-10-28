@@ -382,10 +382,11 @@ pub struct SenderCounters {
     /// their endpoint's TX half was not held (in a reset, which drops them,
     /// or retired) or was in another epoch (whose reset dropped them).
     pub removed_dropped: u64,
-    /// Entries of the close list (a route and its queues) the endpoint
-    /// would not close whole, each counted once. When what did not close
-    /// still holds the endpoint's resources, the sender asks for its
-    /// reset, which drops them; a handle already gone holds nothing.
+    /// Entries of the close list (a route and its queues) with a live
+    /// handle the endpoint would not close, each counted once; a handle
+    /// already gone counts as closed. Only an endpoint that is failing
+    /// (`NeedsReset`) has its reset asked for, which drops them; a single
+    /// route's or queue's failure never resets a shared endpoint.
     pub removed_close_failed: u64,
     /// Endpoints whose reset a close would have asked for, with no room to
     /// record the request (never, by its capacity).
@@ -5012,10 +5013,10 @@ impl<T: StreamTerms> SenderRole<T> {
                 self.count(|c| &mut c.removed_dropped);
                 continue;
             }
-            // Failed: something did not close. Held: what did not close
-            // still holds the endpoint's queue entries or route table,
-            // which only a reset frees; a handle already gone holds
-            // nothing.
+            // A handle already gone counts as closed. Failed: a live handle
+            // did not close. Held: the endpoint itself is failing
+            // (`NeedsReset`), which only its reset resolves; a single
+            // route's or queue's failure never resets a shared endpoint.
             let (mut failed, mut held) = (false, false);
             for queue in opened.queues.into_iter().flatten() {
                 // A full report leaves items pending: emptied and called
@@ -5032,12 +5033,12 @@ impl<T: StreamTerms> SenderRole<T> {
                                 break;
                             }
                             if outcome.returned == 0 {
-                                (failed, held) = (true, true);
+                                failed = true;
                                 break;
                             }
                         }
                         Err(QueueError::UnknownQueue) => {
-                            failed = true;
+                            self.count(|c| &mut c.removed_closed);
                             break;
                         }
                         Err(error) => {
@@ -5049,11 +5050,8 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
             }
             match tx.remove_route(opened.route) {
-                Ok(()) => self.count(|c| &mut c.removed_closed),
-                Err(error) => {
-                    failed = true;
-                    held |= matches!(error, RouteError::InUse);
-                }
+                Ok(()) | Err(RouteError::Unknown) => self.count(|c| &mut c.removed_closed),
+                Err(_) => failed = true,
             }
             // Once per entry; a reset asked for only for what is held.
             if failed {

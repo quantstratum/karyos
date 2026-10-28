@@ -4511,12 +4511,12 @@ fn a_close_without_its_tx_half_is_dropped_once() {
     assert_eq!(sender.counters().removed_closed, 0);
 }
 
-/// The follow-up of #829's review, points 1 and 2: an entry the endpoint
-/// will not close whole (its queue already gone, so the route stays in
-/// use) is counted once, and the sender asks for the endpoint's reset,
-/// which drops what would not close; one request per endpoint.
+/// The follow-up of #829's review, point 2, and QS-COORDINATOR's T1 rule
+/// on #838: an entry whose live route stays in use (a queue on it would not
+/// close) is counted failed once per entry, and a single route's failure
+/// never resets the shared endpoint.
 #[test]
-fn a_failed_close_asks_for_one_reset_and_counts_once() {
+fn a_route_in_use_counts_once_and_resets_nothing() {
     use karyos_io::backend::{Authority, TxQueueConfig};
 
     let (mut sender, _receiver) =
@@ -4556,19 +4556,12 @@ fn a_failed_close_asks_for_one_reset_and_counts_once() {
         counters.removed_close_failed, 2,
         "once per entry: {counters:?}"
     );
-    let mut asked = Vec::new();
-    sender.request_resets(|endpoint| {
-        asked.push(endpoint);
-        true
-    });
-    assert_eq!(asked, [EndpointId(1)], "one request for the endpoint");
-    assert_eq!(sender.counters().reset_requests, 1);
-    let mut again = 0;
+    let mut asked = 0;
     sender.request_resets(|_| {
-        again += 1;
+        asked += 1;
         true
     });
-    assert_eq!(again, 0, "not again within RESET_REQUEST_CYCLES");
+    assert_eq!(asked, 0, "a route's failure resets nothing");
 }
 
 /// Review T2 of #838: a close reset request is kept while what it is for
@@ -4577,7 +4570,7 @@ fn a_failed_close_asks_for_one_reset_and_counts_once() {
 /// and it is cleared once the half is in another epoch or gone.
 #[test]
 fn a_close_reset_request_stands_until_its_epoch_ends() {
-    use karyos_io::backend::{Authority, InstanceId, TxQueueConfig, TxReport};
+    use karyos_io::backend::{InstanceId, TxReport};
     use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
     use karyos_io::sockets::scripted::ScriptedSocket;
 
@@ -4586,27 +4579,13 @@ fn a_close_reset_request_stands_until_its_epoch_ends() {
     let config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
     let endpoint =
         SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new()).unwrap();
-    let (mut tx, rx) = endpoint.split().unwrap();
-    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
-    let open = |tx: &mut karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>| {
-        tx.open_queue(TxQueueConfig {
-            authority: Authority::FIRST,
-            route,
-            max_pending: std::num::NonZeroU16::MIN,
-        })
-        .unwrap()
-    };
-    let _held = open(&mut tx);
-    let stale = open(&mut tx);
-    let _ = tx.close_queue(stale, &mut TxReport::new());
-    let mut queues = [None; super::super::data::OPENED_QUEUES];
-    queues[0] = Some(stale);
+    let (tx, rx) = endpoint.split().unwrap();
     let epoch = tx.capabilities().epoch;
-    sender.closing.push(super::super::data::Opened {
+    // A close found the endpoint failing (NeedsReset): its request.
+    sender.close_resets.push(super::CloseReset {
         endpoint: EndpointId(1),
         epoch,
-        route,
-        queues,
+        requested: None,
     });
     let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
     sender.close_removed(&mut halves);
@@ -4651,9 +4630,9 @@ fn a_close_reset_request_stands_until_its_epoch_ends() {
     assert_eq!(asked, 2, "cleared by the new epoch");
 }
 
-/// Review T1 of #838: an entry whose handles are already gone (its queue
-/// and route unknown to the endpoint) holds nothing: it is counted as
-/// failed, and no reset of the shared endpoint is asked for.
+/// Review T1 of #838 (QS-COORDINATOR's rule): an entry whose handles are
+/// already gone (its queue and route unknown to a healthy shared
+/// endpoint) counts as closed, and no reset is asked for.
 #[test]
 fn a_close_of_handles_already_gone_asks_no_reset() {
     use karyos_io::backend::{Authority, TxQueueConfig, TxReport};
@@ -4684,7 +4663,12 @@ fn a_close_of_handles_already_gone_asks_no_reset() {
         queues,
     });
     sender.close_removed(&mut halves);
-    assert_eq!(sender.counters().removed_close_failed, 1);
+    let counters = sender.counters();
+    assert_eq!(counters.removed_close_failed, 0, "{counters:?}");
+    assert_eq!(
+        counters.removed_closed, 2,
+        "a queue and a route already gone"
+    );
     let mut asked = 0;
     sender.request_resets(|_| {
         asked += 1;
