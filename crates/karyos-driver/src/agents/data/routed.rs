@@ -312,9 +312,9 @@ fn held(routed: &Routed, lane: usize, route: usize) -> usize {
 /// a route that cannot send waits afresh once it can. Any route holding a
 /// copy of the lane bounds every route's heartbeat at that copy's
 /// position: sending or not, live, or returning (it stages before its
-/// first submit, RP-9). A route that left with its half away does not:
-/// its half comes back only in a new epoch, which drops the copies, or
-/// never, and either way they are not sent. A heartbeat so never
+/// first submit, RP-9). A route whose TX half is not held at the epoch it
+/// opened in does not: its copies go only with that half, which a reset
+/// replaces with a new epoch's (dropping them), or never gives back. A heartbeat so never
 /// announces a position a held copy would still bring, and still reveals
 /// what lies below it. The bound reads each copy's own position, never a
 /// route's frontier, so nothing stale reaches it. While a route holds a
@@ -331,15 +331,12 @@ fn idle_routes(
     interval: u64,
 ) -> ([bool; MAX_ROUTES], Option<u64>) {
     let mut due = [false; MAX_ROUTES];
-    // A route that left with its half away bounds nothing: its reset
-    // reopens in a new epoch, which drops its copies, and if the reset
-    // fails it never sends them (QS-COORDINATOR on #842).
-    let counts: [bool; MAX_ROUTES] = std::array::from_fn(|route| {
-        routed
-            .routes
-            .get(route)
-            .is_some_and(|slot| !slot.left || present.get(route) == Some(&true))
-    });
+    // Only a route whose TX half is held at the epoch it opened in can
+    // still send its copies: a half away (a reset of its endpoint, for
+    // this publication or another on it), or back in a new epoch (its
+    // copies dropped, or a reopen that failed), bounds nothing, whether it
+    // left or not (QS-COORDINATOR and QS-REVIEWER on #842).
+    let counts = *present;
     let Some(track) = routed.tracks.get_mut(lane) else {
         return (due, None);
     };
@@ -1026,15 +1023,19 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             return Some(0);
         }
         let sending = self.sending_routes(halves);
-        // The routes whose TX half the agent holds now.
+        // The routes whose TX half the agent holds now, at the epoch the
+        // route opened in: only their copies can still be sent.
         let present: [bool; MAX_ROUTES] = std::array::from_fn(|index| {
             self.routed
                 .as_deref()
                 .and_then(|routed| routed.routes.get(index))
                 .is_some_and(|route| {
-                    halves
-                        .iter()
-                        .any(|(held, half)| *held == route.endpoint && matches!(half, Half::Tx(_)))
+                    halves.iter().any(|(held, half)| match half {
+                        Half::Tx(tx) => {
+                            *held == route.endpoint && route.opened == Some(tx.capabilities().epoch)
+                        }
+                        _ => false,
+                    })
                 })
         });
         let mut sent = 0u32;
