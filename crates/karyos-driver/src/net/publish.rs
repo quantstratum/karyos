@@ -598,8 +598,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// The destinations the multi-destination publication `aggregate` has
-    /// removed, in order, each with its reason: an optional destination
-    /// whose queue was full (MD-7) or whose sends kept faulting (MD-12)
+    /// removed, the newest `MAX_DESTINATIONS` in order, each with its
+    /// reason: an optional destination whose queue was full (MD-7), whose
+    /// sends kept faulting (MD-12), or removed by command (MD-3)
     /// (karyos#630). Empty for another publication.
     #[must_use]
     pub fn network_removed_destinations(
@@ -610,6 +611,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .as_ref()
             .map(|net| net.removed_destinations(aggregate.registration()))
             .unwrap_or_default()
+    }
+
+    /// How many removals of `aggregate`'s destinations were overwritten in
+    /// [`Self::network_removed_destinations`], which keeps the newest
+    /// `MAX_DESTINATIONS` (karyos#630).
+    #[must_use]
+    pub fn network_removals_overwritten(&self, aggregate: &AggregateHandle) -> u64 {
+        self.net
+            .as_ref()
+            .map_or(0, |net| net.removals_overwritten(aggregate.registration()))
     }
 
     /// Guards every lane stream of `handle` with `guard`, unless a

@@ -302,6 +302,13 @@ pub struct OutboundCounters {
     /// Faulted destination queues that refused their retry: the control
     /// path resets the endpoint for a required one (MD-12).
     pub retries_refused: u64,
+    /// Removed destinations retired: their queues and route closed and
+    /// their slot freed (karyos#630, design 3.7).
+    pub destinations_retired: u64,
+    /// Retired destinations whose quarantine record was overwritten by a
+    /// newer one before it expired (more than `MAX_DESTINATIONS` within one
+    /// quarantine).
+    pub quarantine_forgotten: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -858,7 +865,8 @@ impl<T: StreamTerms> Outbound<T> {
     /// Admits `nak` from a receiver bound to this publication, whose state
     /// on the lane is `requester`, at `now`. A publication with no repair
     /// path drops it.
-    pub fn nak(&mut self, nak: &Nak, requester: Requester, now: u64) -> NakOutcome {
+    #[cfg(test)]
+    pub(crate) fn nak(&mut self, nak: &Nak, requester: Requester, now: u64) -> NakOutcome {
         self.nak_on(nak, requester, (0, true), now)
     }
 
@@ -881,11 +889,12 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// [`Outbound::nak`] for a NAK that arrived on route `route` (0 on one
-    /// path). A multi-destination publication has no single repair path
-    /// and drops it: its NAKs go through `Outbound::nak_at`. One from a `validated` receiver id is recorded to absorb its
+    /// path). One from a `validated` receiver id is recorded to absorb its
     /// copies on other routes (RP-11); one whose receiver id is not
-    /// validated yet takes no part in absorption.
-    pub fn nak_on(
+    /// validated yet takes no part in absorption. A multi-destination
+    /// publication has no single repair path and drops it: its NAKs go
+    /// through [`Outbound::nak_at`], the one entry point.
+    pub(crate) fn nak_on(
         &mut self,
         nak: &Nak,
         requester: Requester,

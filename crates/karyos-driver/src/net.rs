@@ -327,8 +327,12 @@ struct NetPublication {
     /// Removed for its next incarnation: no linger, and its removal ends
     /// in a [`Reincarnation`].
     reincarnating: bool,
-    /// The destinations its sender removed, with why (karyos#630).
-    removed_destinations: Vec<crate::agents::data::DestinationRemoval>,
+    /// The destinations its sender removed, with why, the newest
+    /// `MAX_DESTINATIONS`, oldest first (karyos#630), and how many older
+    /// ones were overwritten: a destination can be removed again after it
+    /// is added back.
+    removed_destinations: std::collections::VecDeque<crate::agents::data::DestinationRemoval>,
+    removals_overwritten: u64,
     /// The answers to its run-time destination changes, oldest first, at
     /// most `MAX_DESTINATIONS` (karyos#630).
     destination_changes:
@@ -1757,7 +1761,10 @@ impl<T: StreamTerms> Network<T> {
             trace_closes: Vec::new(),
             channel: Some(channel),
             reincarnating: false,
-            removed_destinations: Vec::new(),
+            removed_destinations: std::collections::VecDeque::with_capacity(
+                crate::agents::data::MAX_DESTINATIONS,
+            ),
+            removals_overwritten: 0,
             destination_changes: std::collections::VecDeque::new(),
             admission,
         });
@@ -2080,8 +2087,18 @@ impl<T: StreamTerms> Network<T> {
             .unwrap_or_default()
     }
 
+    /// How many removals of the network publication `registration` were
+    /// overwritten by newer ones in its history (karyos#630).
+    pub(crate) fn removals_overwritten(&self, registration: u64) -> u64 {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map_or(0, |entry| entry.removals_overwritten)
+    }
+
     /// The destinations the sender of the network publication
-    /// `registration` removed, in order, with why (karyos#630).
+    /// `registration` removed, the newest `MAX_DESTINATIONS` in order, with
+    /// why (karyos#630).
     pub(crate) fn removed_destinations(
         &self,
         registration: u64,
@@ -2089,7 +2106,7 @@ impl<T: StreamTerms> Network<T> {
         self.publications
             .iter()
             .find(|entry| entry.registration == registration)
-            .map(|entry| entry.removed_destinations.clone())
+            .map(|entry| entry.removed_destinations.iter().copied().collect())
             .unwrap_or_default()
     }
 
@@ -2901,8 +2918,8 @@ fn publication_answer<T: StreamTerms>(
                 entry.destination_changes.push_back((destination, outcome));
             }
         }
-        // A destination its sender removed: kept with the publication, at
-        // most one entry per destination.
+        // A destination its sender removed: kept with the publication, the
+        // newest `MAX_DESTINATIONS`, an older one overwritten and counted.
         AgentEvent::DestinationRemoved {
             endpoint,
             alias,
@@ -2911,9 +2928,12 @@ fn publication_answer<T: StreamTerms>(
         } => {
             if let Some(entry) = find(publications, endpoint, alias, registration)
                 .and_then(|index| publications.get_mut(index))
-                && entry.removed_destinations.len() < crate::agents::data::MAX_DESTINATIONS
             {
-                entry.removed_destinations.push(removal);
+                if entry.removed_destinations.len() >= crate::agents::data::MAX_DESTINATIONS {
+                    let _ = entry.removed_destinations.pop_front();
+                    entry.removals_overwritten = entry.removals_overwritten.saturating_add(1);
+                }
+                entry.removed_destinations.push_back(removal);
             }
         }
         AgentEvent::PublicationRemoved {

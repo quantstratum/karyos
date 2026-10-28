@@ -1394,6 +1394,15 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
             .unwrap_or_default()
     }
 
+    /// The repair jobs of its `index`-th publication's destinations,
+    /// summed (tests).
+    #[cfg(test)]
+    pub(crate) fn fanout_job_capacity(&self, index: usize) -> usize {
+        self.role
+            .outbound(index)
+            .map_or(0, data::Outbound::fanout_job_capacity)
+    }
+
     /// What the timed gate of its `index`-th publication counted (tests).
     #[cfg(test)]
     pub(crate) fn outbound_timed_counts(

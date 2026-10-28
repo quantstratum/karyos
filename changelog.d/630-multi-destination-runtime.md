@@ -16,3 +16,17 @@
   - A NAK has one entry point in the sender's publication, which repairs
     toward the requester's destination on a multi-destination
     publication and on the single path otherwise.
+  - A removed destination retires once its queues are drained and its
+    removal reported (design 3.7): its queues and route close and its slot
+    is freed (`destinations_retired`), so moving an optional destination
+    any number of times never fills the table. Its address is kept for its
+    quarantine (MD-14); a destination added back is a fresh one, with a
+    fresh repair path.
+  - Each destination's repair cap is the job table's share for
+    `MAX_DESTINATIONS` (MD-8), so additions never overcommit it: a reliable
+    multi-destination publication needs `repair_jobs` of at least 16.
+  - An optional destination whose route or queues cannot open is removed
+    after three tries (`RemovalReason::Fault`), and a change on a
+    publication being removed answers `DestinationChange::Removing`.
+  - `network_removed_destinations` keeps the newest 16 removals;
+    `network_removals_overwritten` counts the older ones.

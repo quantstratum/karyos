@@ -93,6 +93,8 @@ pub enum DestinationChange {
     Quarantined,
     /// Refused: the publication has [`MAX_DESTINATIONS`] destinations.
     Full,
+    /// Refused: the publication is being removed.
+    Removing,
     /// Refused: no multi-destination publication by that name, or an
     /// address of another family.
     Unknown,
@@ -156,6 +158,53 @@ pub(super) struct Target {
     repair: Option<Box<crate::agents::repair::RepairPath>>,
 }
 
+impl Target {
+    /// A destination toward `address`, required or not, with `lanes.len()`
+    /// lanes served under `drr`, each joining at its position in `joins`,
+    /// and its repair path if the publication repairs.
+    fn new(
+        address: SocketAddr,
+        required: bool,
+        drr: DrrConfig,
+        joins: &[u64],
+        repair: Option<Box<crate::agents::repair::RepairPath>>,
+    ) -> Option<Self> {
+        let placeholder = TxQueueId::new(BackendEpoch::FIRST, u16::MAX, NonZeroU32::MAX);
+        let bound = usize::from(STAGED_PER_LANE);
+        let queues = vec![placeholder; joins.len()];
+        let sender = LaneSender::new(drr, &queues, bound).ok()?;
+        Some(Self {
+            address,
+            required,
+            sender,
+            queues,
+            lanes: joins
+                .iter()
+                .map(|join| TargetLane {
+                    staged: VecDeque::with_capacity(bound),
+                    high: *join,
+                    unsent: false,
+                    mismatched: false,
+                    submitted: false,
+                })
+                .collect(),
+            route: None,
+            opened: None,
+            live: false,
+            edges: [0; 4],
+            bounds: false,
+            stalled: false,
+            idle_since: [None; 4],
+            counters: TargetCounters::default(),
+            removed: None,
+            reported: false,
+            cancelled: false,
+            faults: 0,
+            repair,
+        })
+    }
+}
+
 /// What one destination sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TargetCounters {
@@ -205,6 +254,9 @@ pub(super) struct Fanout {
     /// What a target's lane sender is built with.
     drr: DrrConfig,
     mtu: usize,
+    /// Retired destinations and when they were removed, kept for their
+    /// quarantine (MD-14), at most [`MAX_DESTINATIONS`], oldest first.
+    quarantined: VecDeque<(SocketAddr, u64)>,
 }
 
 /// The gate of one target's first sends: every candidate is permitted,
@@ -275,43 +327,28 @@ impl Fanout {
         mtu: usize,
         joins: &[u64],
     ) -> Option<Self> {
-        let placeholder = TxQueueId::new(BackendEpoch::FIRST, u16::MAX, NonZeroU32::MAX);
-        let bound = usize::from(STAGED_PER_LANE);
-        let mut targets = Vec::with_capacity(destinations.len());
+        let joins: Vec<u64> = (0..lanes)
+            .map(|lane| joins.get(lane).copied().unwrap_or(0))
+            .collect();
+        let mut targets = Vec::with_capacity(MAX_DESTINATIONS);
         for address in destinations {
-            let queues = vec![placeholder; lanes];
-            let sender = LaneSender::new(drr, &queues, bound).ok()?;
-            targets.push(Target {
-                address: *address,
-                required: required.contains(address),
-                sender,
-                queues,
-                lanes: (0..lanes)
-                    .map(|lane| TargetLane {
-                        staged: VecDeque::with_capacity(bound),
-                        high: joins.get(lane).copied().unwrap_or(0),
-                        unsent: false,
-                        mismatched: false,
-                        submitted: false,
-                    })
-                    .collect(),
-                route: None,
-                opened: None,
-                live: false,
-                edges: [0; 4],
-                bounds: false,
-                stalled: false,
-                idle_since: [None; 4],
-                counters: TargetCounters::default(),
-                removed: None,
-                reported: false,
-                cancelled: false,
-                faults: 0,
-                repair: None,
-            });
+            targets.push(Target::new(
+                *address,
+                required.contains(address),
+                drr,
+                &joins,
+                None,
+            )?);
         }
         Some(Self {
-            staged_for: vec![vec![false; targets.len()]; lanes],
+            staged_for: (0..lanes)
+                .map(|_| {
+                    let mut flags = Vec::with_capacity(MAX_DESTINATIONS);
+                    flags.resize(targets.len(), false);
+                    flags
+                })
+                .collect(),
+            quarantined: VecDeque::with_capacity(MAX_DESTINATIONS),
             targets,
             pending: vec![None; lanes],
             scratch: (0..lanes).map(|_| vec![0; mtu]).collect(),
@@ -541,7 +578,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// target is never opened again, and one that fails to open is retried
     /// at the next call without holding the others (it gets nothing until
     /// it opens; a required one bounds the publisher meanwhile).
-    fn open_targets<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) -> bool {
+    fn open_targets<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, now: u64) -> bool {
         let epoch = tx.capabilities().epoch;
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return false;
@@ -554,6 +591,7 @@ impl<T: StreamTerms> Outbound<T> {
             }
             let Ok(route) = tx.add_route(target.address) else {
                 self.counters.bump(|c| &mut c.route_failures, 1);
+                open_failed(target, now);
                 continue;
             };
             let mut failed = false;
@@ -578,6 +616,7 @@ impl<T: StreamTerms> Outbound<T> {
                 }
             }
             if std::mem::take(&mut failed) {
+                open_failed(target, now);
                 continue;
             }
             for (lane, queue) in target.queues.iter().enumerate() {
@@ -629,8 +668,17 @@ impl<T: StreamTerms> Outbound<T> {
             return;
         };
         for target in &mut fanout.targets {
+            let was_live = target.live;
             target.live = target.removed.is_none()
                 && membership.is_some_and(|membership| membership.live_at(target.address, now));
+            if target.live && !was_live {
+                // It joins at the cursor: what came before is not its own
+                // (MD-15), so its sent frontier starts there and never holds
+                // the publication's below it.
+                for (track, reader) in target.lanes.iter_mut().zip(&self.readers) {
+                    track.high = track.high.max(reader.position());
+                }
+            }
             target.bounds =
                 membership.is_some_and(|membership| membership.bounds_at(target.address, now));
             for (lane, edge) in target.edges.iter_mut().enumerate() {
@@ -661,7 +709,7 @@ impl<T: StreamTerms> Outbound<T> {
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
-        if !self.open_targets(tx) {
+        if !self.open_targets(tx, now) {
             return Ok(0);
         }
         self.refresh_targets(now);
@@ -782,6 +830,50 @@ impl<T: StreamTerms> Outbound<T> {
             }
         }
         fanout.backpressure = backpressure;
+        // Removed targets drained and reported retire (design 3.7): their
+        // queues and route close, their slot is freed, and their address
+        // is kept for its quarantine (MD-14).
+        let mut retired = 0u64;
+        let mut forgotten = 0u64;
+        let mut at = fanout.targets.len();
+        while let Some(index) = at.checked_sub(1) {
+            at = index;
+            let retire = fanout.targets.get(index).is_some_and(|target| {
+                target.removed.is_some() && target.cancelled && target.reported
+            });
+            if !retire {
+                continue;
+            }
+            let target = fanout.targets.remove(index);
+            for flags in &mut fanout.staged_for {
+                if index < flags.len() {
+                    let _ = flags.remove(index);
+                }
+            }
+            if target.opened == Some(epoch) {
+                let repair = target
+                    .repair
+                    .as_deref()
+                    .and_then(|repair| repair.queue_on(0));
+                for queue in target.queues.iter().copied().chain(repair) {
+                    let _ = tx.close_queue(queue, &mut self.report);
+                    while self.report.pop_front().is_some() {}
+                }
+                if let Some(route) = target.route {
+                    let _ = tx.remove_route(route);
+                }
+            }
+            if fanout.quarantined.len() >= MAX_DESTINATIONS {
+                let _ = fanout.quarantined.pop_front();
+                forgotten = forgotten.saturating_add(1);
+            }
+            let removed_at = target.removed.map_or(now, |(_, time)| time);
+            fanout.quarantined.push_back((target.address, removed_at));
+            retired = retired.saturating_add(1);
+        }
+        self.counters.bump(|c| &mut c.destinations_retired, retired);
+        self.counters
+            .bump(|c| &mut c.quarantine_forgotten, forgotten);
         if let Some(
             SenderFailure::Backend { .. }
             | SenderFailure::Invariant { .. }
@@ -1138,9 +1230,22 @@ fn slow(target: &Target, held: bool, backpressure: bool, advancing: bool) -> boo
     !target.required && !target.bounds && target.stalled && !held && !backpressure && advancing
 }
 
+/// A failed open of `target`'s route or queues at `now` counts as a send
+/// fault (MD-12): an optional destination that cannot open is removed after
+/// [`DESTINATION_FAULT_LIMIT`] tries, rather than answering `Added` and
+/// failing for good; a required one keeps trying and bounds the publisher.
+fn open_failed(target: &mut Target, now: u64) {
+    target.faults = target.faults.saturating_add(1);
+    if target.faults >= DESTINATION_FAULT_LIMIT && !target.required {
+        remove_target(target, RemovalReason::Fault, now);
+    }
+}
+
 /// Removes `target` for `reason` at `now`: it gets nothing more; what its
-/// queues held is dropped at its next serve (its receiver closes the gap
-/// by its gap policy, and its image expires).
+/// queues and its sender hold is dropped at its next serve, and once its
+/// removal is reported it is retired (design 3.7): its queues and route
+/// close and its slot is freed. Its receiver closes the gap by its gap
+/// policy, and its image expires.
 fn remove_target(target: &mut Target, reason: RemovalReason, now: u64) {
     if target.removed.is_some() {
         return;
@@ -1149,9 +1254,6 @@ fn remove_target(target: &mut Target, reason: RemovalReason, now: u64) {
     target.live = false;
     target.cancelled = false;
     target.reported = false;
-    for track in &mut target.lanes {
-        track.staged.clear();
-    }
 }
 
 /// A destination's removal, for the conductor (design 4.5; MD-7, MD-12).
@@ -1188,6 +1290,19 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// The repair jobs every destination's table holds, summed (tests).
+    #[cfg(test)]
+    pub(crate) fn fanout_job_capacity(&self) -> usize {
+        self.fanout.as_deref().map_or(0, |fanout| {
+            fanout
+                .targets
+                .iter()
+                .filter_map(|target| target.repair.as_deref())
+                .map(|repair| repair.parts().1.capacity())
+                .sum()
+        })
+    }
+
     /// Each destination's counters (tests).
     #[cfg(test)]
     pub(crate) fn destination_counters(&self) -> Vec<(SocketAddr, TargetCounters)> {
@@ -1203,8 +1318,8 @@ impl<T: StreamTerms> Outbound<T> {
             .unwrap_or_default()
     }
 
-    /// Enables a repair path per destination, each with a fair share of
-    /// the job table (MD-8; control path, allocates).
+    /// Enables a repair path per destination, each with its share of the
+    /// job table for [`MAX_DESTINATIONS`] (MD-8; control path, allocates).
     pub(super) fn enable_fanout_repair(
         &mut self,
         config: &crate::agents::repair::RepairConfig,
@@ -1215,12 +1330,11 @@ impl<T: StreamTerms> Outbound<T> {
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return Ok(());
         };
-        let share = config
-            .jobs
-            .repair_jobs
-            .checked_div(fanout.targets.len())
-            .unwrap_or(1)
-            .max(1);
+        // MD-8: each destination's cap is the share of the job table for
+        // `max_destinations`, whatever the current count, so additions never
+        // overcommit it. A table below one job per destination is refused
+        // (`JobsError::Capacity`, from a zero share).
+        let share = config.jobs.repair_jobs / MAX_DESTINATIONS;
         let mut config = *config;
         config.jobs.repair_jobs = share;
         fanout.repair = Some((config, term_length, alias, identity));
@@ -1271,7 +1385,7 @@ impl<T: StreamTerms> Outbound<T> {
         budget: &mut crate::repair::scheduler::RepairBudget,
         now: u64,
     ) -> u32 {
-        if !self.open_targets(tx) {
+        if !self.open_targets(tx, now) {
             return 0;
         }
         let Some(fanout) = self.fanout.as_deref_mut() else {
@@ -1333,12 +1447,10 @@ impl<T: StreamTerms> Outbound<T> {
 
 impl Fanout {
     /// A new optional target toward `address`, its lanes joining at
-    /// `joins` (allocates: a run-time addition, MD-3).
+    /// `joins` (allocates: a run-time addition, MD-3), with its own repair
+    /// path if the publication repairs: nothing of an earlier target
+    /// toward the same address is reused (design 3.7).
     fn target(&self, address: SocketAddr, joins: &[u64]) -> Option<Target> {
-        let placeholder = TxQueueId::new(BackendEpoch::FIRST, u16::MAX, NonZeroU32::MAX);
-        let bound = usize::from(STAGED_PER_LANE);
-        let queues = vec![placeholder; joins.len()];
-        let sender = LaneSender::new(self.drr, &queues, bound).ok()?;
         let repair = match self.repair {
             Some((config, term_length, alias, identity)) => Some(Box::new(
                 crate::agents::repair::RepairPath::new(
@@ -1351,35 +1463,33 @@ impl Fanout {
             )),
             None => None,
         };
-        Some(Target {
-            address,
-            required: false,
-            sender,
-            queues,
-            lanes: joins
-                .iter()
-                .map(|join| TargetLane {
-                    staged: VecDeque::with_capacity(bound),
-                    high: *join,
-                    unsent: false,
-                    mismatched: false,
-                    submitted: false,
-                })
-                .collect(),
-            route: None,
-            opened: None,
-            live: false,
-            edges: [0; 4],
-            bounds: false,
-            stalled: false,
-            idle_since: [None; 4],
-            counters: TargetCounters::default(),
-            removed: None,
-            reported: false,
-            cancelled: false,
-            faults: 0,
-            repair,
-        })
+        Target::new(address, false, self.drr, joins, repair)
+    }
+
+    /// The targets not retired: live, or removed and still draining.
+    fn active(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Whether `address` was retired less than `quarantine` before `now`
+    /// (MD-14); an expired record is dropped.
+    fn quarantined(&mut self, address: SocketAddr, now: u64, quarantine: u64) -> bool {
+        let Some(at) = self
+            .quarantined
+            .iter()
+            .position(|(retired, _)| *retired == address)
+        else {
+            return false;
+        };
+        let removed_at = self.quarantined.get(at).map_or(0, |(_, time)| *time);
+        if now
+            .checked_sub(removed_at)
+            .is_none_or(|age| age < quarantine)
+        {
+            return true;
+        }
+        let _ = self.quarantined.remove(at);
+        false
     }
 }
 
@@ -1396,6 +1506,9 @@ impl<T: StreamTerms> Outbound<T> {
         now: u64,
         quarantine: u64,
     ) -> DestinationChange {
+        if self.removing() {
+            return DestinationChange::Removing;
+        }
         let joins: Vec<u64> = self
             .readers
             .iter()
@@ -1410,70 +1523,37 @@ impl<T: StreamTerms> Outbound<T> {
             .map(|target| target.address.is_ipv4());
         let found = fanout
             .targets
-            .iter()
-            .position(|target| target.address == destination);
-        let Some(at) = found else {
-            if !add {
-                return DestinationChange::Absent;
-            }
-            if family != Some(destination.is_ipv4()) {
-                return DestinationChange::Unknown;
-            }
-            if fanout.targets.len() >= MAX_DESTINATIONS {
-                return DestinationChange::Full;
-            }
-            let Some(target) = fanout.target(destination, &joins) else {
-                return DestinationChange::Unknown;
-            };
-            fanout.targets.push(target);
-            for flags in &mut fanout.staged_for {
-                // The pending datagram, if any, is not the new target's.
-                flags.push(true);
-            }
-            return DestinationChange::Added;
-        };
-        let Some(target) = fanout.targets.get_mut(at) else {
-            return DestinationChange::Unknown;
-        };
-        if target.required {
-            return DestinationChange::Required;
-        }
-        match (add, target.removed) {
-            (false, Some(_)) => DestinationChange::Absent,
-            (false, None) => {
+            .iter_mut()
+            .find(|target| target.address == destination);
+        match (found, add) {
+            (Some(target), _) if target.required => DestinationChange::Required,
+            (Some(target), false) if target.removed.is_none() => {
                 remove_target(target, RemovalReason::Command, now);
                 DestinationChange::Removed
             }
-            (true, None) => DestinationChange::Present,
-            (true, Some((_, removed_at))) => {
-                if now
-                    .checked_sub(removed_at)
-                    .is_none_or(|age| age < quarantine)
-                {
+            // Removed and still draining: absent, and in its quarantine.
+            (Some(_), false) => DestinationChange::Absent,
+            (Some(target), true) if target.removed.is_none() => DestinationChange::Present,
+            (Some(_), true) => DestinationChange::Quarantined,
+            (None, false) => DestinationChange::Absent,
+            (None, true) => {
+                if family != Some(destination.is_ipv4()) {
+                    return DestinationChange::Unknown;
+                }
+                if fanout.quarantined(destination, now, quarantine) {
                     return DestinationChange::Quarantined;
                 }
-                // Back after its quarantine: a fresh optional destination,
-                // joining at the cursor, on queues emptied at its removal.
-                if !target.cancelled {
-                    return DestinationChange::Quarantined;
+                if fanout.active() >= MAX_DESTINATIONS {
+                    return DestinationChange::Full;
                 }
-                target.removed = None;
-                target.reported = false;
-                target.cancelled = false;
-                target.faults = 0;
-                target.live = false;
-                target.stalled = false;
-                for (track, join) in target.lanes.iter_mut().zip(&joins) {
-                    track.staged.clear();
-                    track.high = *join;
-                }
-                for (lane, queue) in target.queues.iter().enumerate() {
-                    target.sender.reopen(lane, *queue);
-                }
+                // A fresh optional destination, joining at the cursor.
+                let Some(target) = fanout.target(destination, &joins) else {
+                    return DestinationChange::Unknown;
+                };
+                fanout.targets.push(target);
                 for flags in &mut fanout.staged_for {
-                    if let Some(flag) = flags.get_mut(at) {
-                        *flag = true;
-                    }
+                    // The pending datagram, if any, is not the new target's.
+                    flags.push(true);
                 }
                 DestinationChange::Added
             }
