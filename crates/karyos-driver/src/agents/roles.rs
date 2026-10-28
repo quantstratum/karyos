@@ -513,11 +513,12 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
     }
 }
 
-/// Test only: the frame length and term offset of the DATA frame `bytes`
-/// starts with, from its header (word 0, then the term offset at bytes 8
-/// to 12); `None` for another frame type or a short datagram.
+/// Test only: the frame length, term offset and term id of the DATA frame
+/// `bytes` starts with, from its header (word 0, the term offset at bytes 8
+/// to 12, the term id at 20 to 24); `None` for another frame type or a
+/// short datagram.
 #[cfg(test)]
-fn drop_tail_frame(bytes: &[u8]) -> Option<(i32, u32)> {
+fn drop_tail_frame(bytes: &[u8]) -> Option<(i32, u32, u32)> {
     use karyos_sys::frame::{FrameType, Word0};
 
     let word0 = Word0::unpack(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)).ok()?;
@@ -525,7 +526,8 @@ fn drop_tail_frame(bytes: &[u8]) -> Option<(i32, u32)> {
         return None;
     }
     let offset = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
-    Some((word0.frame_length(), offset))
+    let term = u32::from_le_bytes(bytes.get(20..24)?.try_into().ok()?);
+    Some((word0.frame_length(), offset, term))
 }
 
 /// Test only: a tail's first transmission lost (`ReceiverRole::drop_tail`):
@@ -541,6 +543,8 @@ struct DropTail {
     chosen: Option<SocketAddr>,
     /// The end of the frames lost so far.
     end: u32,
+    /// The term they are in: the first lost frame's.
+    term: Option<u32>,
     /// The sources whose idle heartbeat at or past `end` arrived.
     done: [Option<SocketAddr>; 4],
 }
@@ -2305,6 +2309,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             one_source,
             chosen: None,
             end: term_offset,
+            term: None,
             done: [None; 4],
         });
     }
@@ -3939,13 +3944,15 @@ impl<T: StreamTerms> Intake<'_, T> {
             // with a payload is lost (from its source alone when
             // `one_source`); a header-only one at or past the end of what
             // was lost is the source's heartbeat showing the whole tail.
+            // A negative length (padding) or another term is not the tail.
             if let Some(mut tail) = self.role.drop_tail
-                && let Some((length, at)) = drop_tail_frame(bytes)
+                && let Some((length, at, term)) = drop_tail_frame(bytes)
+                && let Ok(length) = u32::try_from(length)
                 && at >= tail.offset
+                && tail.term.is_none_or(|lost| lost == term)
                 && !tail.done.contains(&Some(source))
             {
-                let header = karyos_sys::frame::HEADER_LENGTH;
-                if u32::try_from(length).is_ok_and(|length| length <= header) {
+                if length <= karyos_sys::frame::HEADER_LENGTH {
                     if tail.end > tail.offset
                         && at >= tail.end
                         && let Some(slot) = tail.done.iter_mut().find(|slot| slot.is_none())
@@ -3954,13 +3961,13 @@ impl<T: StreamTerms> Intake<'_, T> {
                         self.role.drop_tail = Some(tail);
                     }
                 } else if !tail.one_source || tail.chosen.is_none_or(|chosen| chosen == source) {
-                    let aligned = u32::try_from(length).ok().and_then(|length| {
-                        length.checked_next_multiple_of(karyos_sys::frame::FRAME_ALIGNMENT)
-                    });
+                    // The whole datagram is lost, every frame it carries.
+                    let end = u32::try_from(bytes.len())
+                        .ok()
+                        .and_then(|len| at.checked_add(len));
                     tail.chosen = Some(source);
-                    tail.end = aligned
-                        .and_then(|length| at.checked_add(length))
-                        .map_or(tail.end, |end| tail.end.max(end));
+                    tail.term = Some(term);
+                    tail.end = end.map_or(tail.end, |end| tail.end.max(end));
                     self.role.drop_tail = Some(tail);
                     return;
                 }

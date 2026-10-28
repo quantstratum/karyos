@@ -309,16 +309,17 @@ fn held(routed: &Routed, lane: usize, route: usize) -> usize {
 /// #842), and the position none may announce past. A sending route is
 /// idle when the lane sent it no DATA and no heartbeat for `interval` and
 /// it holds no copy of the lane; its wait restarts while it is busy, and
-/// a route that cannot send waits afresh once it can. A route in the live
-/// set holding copies, sending or not (a full socket, a refused retry, a
-/// half away in a reset), bounds every route's heartbeat at the position
-/// of its first held copy: a heartbeat never announces a position a held
-/// copy would still bring, and still reveals what lies below it. A route
-/// that left or is returning (RP-9) bounds nothing: a left route forgets
-/// its copies, and a returning one is not live until its first submit,
-/// so the receiver does not wait on it. The exclusion is defensive: the
-/// bound reads each copy's own position, not the route's frontier, so a
-/// frontier stale from before a leave cannot reach it either.
+/// a route that cannot send waits afresh once it can. Any route holding a
+/// copy of the lane bounds every route's heartbeat at that copy's
+/// position: sending or not, live, returning (it stages before its first
+/// submit, RP-9), or left with its half away (the copies it could not
+/// cancel go on its return in the same epoch). A heartbeat so never
+/// announces a position a held copy would still bring, and still reveals
+/// what lies below it. The bound reads each copy's own position, never a
+/// route's frontier, so nothing stale reaches it. While a route holds a
+/// copy for long (its socket full, its endpoint in a reset), a tail lost
+/// above that copy is revealed only once the copy goes: the copy may
+/// still fill it.
 fn idle_routes(
     routed: &mut Routed,
     lane: usize,
@@ -327,21 +328,13 @@ fn idle_routes(
     interval: u64,
 ) -> ([bool; MAX_ROUTES], Option<u64>) {
     let mut due = [false; MAX_ROUTES];
-    let live: [bool; MAX_ROUTES] = std::array::from_fn(|route| {
-        routed
-            .routes
-            .get(route)
-            .is_some_and(|slot| !slot.left && !slot.returning)
-    });
     let Some(track) = routed.tracks.get_mut(lane) else {
         return (due, None);
     };
     let bound = track
         .staged
         .iter()
-        .zip(&live)
-        .filter(|(_, live)| **live)
-        .filter_map(|(copies, _)| copies.front().map(|(_, start, _)| *start))
+        .filter_map(|copies| copies.front().map(|(_, start, _)| *start))
         .min();
     for (route, (idle, slot)) in track.idle_since.iter_mut().zip(&mut due).enumerate() {
         if sending.get(route) != Some(&true) {
@@ -838,6 +831,24 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         }
     }
 
+    /// A left path waits `backoff` before it returns (tests).
+    #[cfg(test)]
+    pub(crate) fn set_path_backoff(&mut self, backoff: u64) {
+        if let Some(routed) = self.routed.as_deref_mut() {
+            routed.policy.backoff_initial = backoff;
+            routed.policy.backoff_max = backoff;
+        }
+    }
+
+    /// Whether `route` left, and whether it is returning (tests).
+    #[cfg(test)]
+    pub(crate) fn route_state(&self, route: usize) -> Option<(bool, bool)> {
+        self.routed
+            .as_deref()
+            .and_then(|routed| routed.routes.get(route))
+            .map(|slot| (slot.left, slot.returning))
+    }
+
     /// The position of `route`'s first copy held for `lane`, staged and not
     /// submitted (tests).
     #[cfg(test)]
@@ -986,9 +997,9 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// The idle heartbeats of a routed publication due at `now` (SPEC §6,
     /// karyos#834): a lane sends a header-only DATA frame on each route
     /// that can send and was idle for `interval` ([`idle_routes`]), at its
-    /// next position, or at the frontier of a route that holds copies of
-    /// it when that is lower, as a single-path lane does on its one. PATH_HB still keeps each path's binding live
-    /// (RP-3); this frame is what tells an image where the lane stands, so
+    /// next position, or at the first copy of it any route still holds
+    /// when that is lower, as a single-path lane does on its one. PATH_HB
+    /// still keeps each path's binding live (RP-3); this frame is what tells an image where the lane stands, so
     /// a tail lost on every path shows. None while the publication is
     /// removed (its EOS replaces them). Returns the frames submitted.
     pub(crate) fn serve_routed_heartbeats<O: SocketOps>(

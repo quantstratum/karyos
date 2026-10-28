@@ -4946,3 +4946,121 @@ fn a_route_holding_copies_bounds_the_others_heartbeats() {
     }
     assert_eq!(sender.publications[0].routed_pending(0, 1), 0, "sent");
 }
+
+/// K3 (#842 review): route 2 leaves, comes back (returning, RP-9), stages
+/// the next copy and is refused (its socket full) before its first submit:
+/// route 1's heartbeat stops at that copy, which route 2 still brings.
+#[test]
+fn a_returning_route_holding_a_copy_bounds_the_heartbeat() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN); 8]);
+    sender.publications[0].leave_before_serve(1);
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    assert_eq!(
+        sender.publications[0].route_state(1),
+        Some((true, false)),
+        "left"
+    );
+    // Past any backoff, a message's serve brings route 2 back, returning;
+    // the next one it stages and its socket refuses.
+    let back = 6 + 50_000_000;
+    let _ = log.publications[0]
+        .append(&[2; 1000], AppendOptions::default())
+        .unwrap();
+    let _ = sender.duty(&mut halves, back).unwrap();
+    assert_eq!(
+        sender.publications[0].route_state(1),
+        Some((false, true)),
+        "returning"
+    );
+    let _ = log.publications[0]
+        .append(&[3; 1000], AppendOptions::default())
+        .unwrap();
+    let _ = sender.duty(&mut halves, back + 1).unwrap();
+    let held = sender.publications[0]
+        .first_held(0, 1)
+        .expect("route 2 holds its copy");
+    assert_eq!(
+        sender.publications[0].route_state(1),
+        Some((false, true)),
+        "still returning"
+    );
+    frames[0].lock().unwrap().clear();
+    for step in 1..=3 {
+        let _ = sender
+            .duty(&mut halves, back + 1 + step * interval)
+            .unwrap();
+    }
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(!beats.is_empty(), "route 1 heartbeats");
+    assert!(
+        beats
+            .iter()
+            .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == held),
+        "at route 2's held copy {held}: {beats:?}"
+    );
+    // Its socket takes again: the copy goes, and the halves drop clean.
+    let mut now = back + 4 * interval;
+    while sender.publications[0].first_held(0, 1).is_some() && now < back + 64 * interval {
+        now += interval;
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert_eq!(sender.publications[0].first_held(0, 1), None, "sent");
+}
+
+/// K3 (#842 review): route 2 holds a copy, its half goes away in a reset,
+/// and it leaves the live set meanwhile: with no half to cancel on, the
+/// copy stays, to go on its return in the same epoch, and still bounds
+/// route 1's heartbeat.
+#[test]
+fn a_left_route_with_its_half_away_still_bounds_the_heartbeat() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN)]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    let held = sender.publications[0]
+        .first_held(0, 1)
+        .expect("route 2 holds");
+    let away = halves.pop().unwrap();
+    // It stays out for the whole test.
+    sender.publications[0].set_path_backoff(1_000_000_000_000);
+    sender.publications[0].leave_before_serve(1);
+    let _ = sender.duty(&mut halves, 7).unwrap();
+    assert_eq!(
+        sender.publications[0].route_state(1).map(|(left, _)| left),
+        Some(true),
+        "left"
+    );
+    for step in 1..=3 {
+        let _ = sender.duty(&mut halves, 7 + step * interval).unwrap();
+    }
+    assert_eq!(sender.publications[0].first_held(0, 1), Some(held), "kept");
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(!beats.is_empty(), "route 1 heartbeats");
+    assert!(
+        beats
+            .iter()
+            .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == held),
+        "at route 2's kept copy {held}: {beats:?}"
+    );
+    assert_eq!(
+        sender.publications[0].route_state(1).map(|(left, _)| left),
+        Some(true),
+        "still left"
+    );
+    // The half is still in its reset; this test ends before it comes back,
+    // so it is not dropped with the copy it holds.
+    std::mem::forget(away);
+}
