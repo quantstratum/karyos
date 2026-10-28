@@ -511,6 +511,7 @@ impl<T: StreamTerms> Outbound<T> {
         &mut self,
         destinations: &[SocketAddr],
         required: &[SocketAddr],
+        ipv4: bool,
     ) -> Result<(), super::OutboundError> {
         let distinct = destinations.iter().enumerate().all(|(at, address)| {
             !destinations
@@ -532,7 +533,7 @@ impl<T: StreamTerms> Outbound<T> {
             .iter()
             .map(|reader| reader.position())
             .collect();
-        let fanout = Fanout::new(
+        let mut fanout = Fanout::new(
             destinations,
             required,
             self.drr,
@@ -541,6 +542,10 @@ impl<T: StreamTerms> Outbound<T> {
             &joins,
         )
         .ok_or(super::OutboundError::Lanes)?;
+        // Every destination shares the endpoint's address family, fixed
+        // here: an addition of another family is `Unknown`, whatever is
+        // left of the others.
+        fanout.ipv4 = ipv4;
         self.fanout = Some(Box::new(fanout));
         Ok(())
     }
@@ -698,9 +703,13 @@ impl<T: StreamTerms> Outbound<T> {
                 }
             }
         }
+        // A reset asked for is done only once the endpoint is in a new
+        // epoch: one asked in this epoch stays for the sender to act on.
+        if self.opened != Some(epoch) {
+            self.needs_reset = false;
+            self.reset_requested = None;
+        }
         self.opened = Some(epoch);
-        self.needs_reset = false;
-        self.reset_requested = None;
         true
     }
 
@@ -783,6 +792,12 @@ impl<T: StreamTerms> Outbound<T> {
             // its open.
             if target.removed.is_some() {
                 if !target.cancelled {
+                    // Its member stops counting for the strategy edge now,
+                    // not at its liveness expiry (design 3.7): under `min` a
+                    // removed destination never holds the others.
+                    if let Some(membership) = self.membership.as_deref_mut() {
+                        let _ = membership.release_source(target.address, now);
+                    }
                     for lane in 0..target.queues.len() {
                         let mut gate = TargetGate {
                             lanes: &mut target.lanes,

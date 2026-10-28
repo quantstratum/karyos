@@ -921,3 +921,65 @@ fn an_addition_after_every_destination_removed_is_still_taken() {
         (v6, DestinationChange::Unknown)
     );
 }
+
+/// MD-12, review N3: an endpoint reset is not a send fault of any
+/// destination. Three resets, each reopening the endpoint between rounds
+/// of traffic, remove no optional destination, the idle one included.
+#[test]
+fn endpoint_resets_remove_no_optional_destination() {
+    let mut a = driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers(1);
+    let idle = SocketAddr::from((LOOPBACK, 44_000));
+    let (publication, images) = connect(
+        &mut a,
+        &mut receivers,
+        &destinations(&[addresses[0], idle], false),
+        &[],
+        None,
+    );
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    let mut reader = receivers[0]
+        .subscribe_aggregate(&images[0], Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    for (reset, until) in (0..=3u64).zip([16u32, 32, 48, 64]) {
+        if reset > 0 {
+            a.net
+                .as_ref()
+                .unwrap()
+                .links()
+                .sender
+                .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+                .unwrap();
+        }
+        let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+            .chain(receivers.iter_mut())
+            .collect();
+        pump(&mut all, |drivers| {
+            while sent < until {
+                match lane.offer(&sent.to_le_bytes()).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent += 1,
+                    _ => break,
+                }
+            }
+            let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+            drivers[0].net.as_ref().unwrap().reopened() >= reset && seen >= until
+        });
+    }
+    assert!(a.network_removed_destinations(&publication).is_empty());
+    let destinations: Vec<SocketAddr> = super::shared(&mut a)
+        .sender
+        .destination_counters(0)
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect();
+    assert_eq!(destinations, [addresses[0], idle]);
+}

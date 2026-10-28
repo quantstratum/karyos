@@ -35,3 +35,7 @@
     `DestinationChange::Removing`.
   - `network_removed_destinations` keeps the newest 16 removals;
     `network_removals_overwritten` counts the older ones.
+  - A removed destination's member stops counting for the strategy edge at
+    its removal (design 3.7), not at its liveness expiry, and a sender
+    reset asked for in an epoch is no longer cleared before the sender
+    acts on it.

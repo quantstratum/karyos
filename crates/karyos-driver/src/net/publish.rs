@@ -837,6 +837,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
         }
         let &(endpoint, _) = held.first().ok_or(DriverError::InvalidConfig)?;
+        // The family of every destination: the shared endpoint's own.
+        let ipv4 = net
+            .endpoint_address(endpoint)
+            .is_none_or(|address| address.is_ipv4());
         let outbound = if held.len() > 1 {
             Outbound::new_routed(&held, alias, readers, &quanta, config.mtu, reliable)
         } else {
@@ -851,7 +855,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             )
             .and_then(|mut outbound| {
                 if !destinations.is_empty() {
-                    outbound.set_destinations(&destinations, &required_destinations)?;
+                    outbound.set_destinations(&destinations, &required_destinations, ipv4)?;
                 }
                 Ok(outbound)
             })
