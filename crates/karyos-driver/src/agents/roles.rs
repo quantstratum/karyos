@@ -1225,15 +1225,9 @@ fn tail_hole<T: StreamTerms>(
 ) -> Option<Hole> {
     use crate::repair::loss::RttSource;
 
-    let rebuild = image.owner.rebuild_position(lane)?;
-    // Never NAK past a recorded terminal bound.
-    let mark = image
-        .heartbeat_marks
-        .get(at)
-        .copied()
-        .flatten()
-        .map(|mark| terminal_bound(image, lane).map_or(mark, |bound| mark.min(bound)));
-    let Some(mark) = mark.filter(|mark| *mark > rebuild) else {
+    let tail = heartbeat_mark(image, lane, at)
+        .and_then(|mark| image.owner.heartbeat_tail(lane, mark).ok().flatten());
+    let Some((start, length)) = tail else {
         if let Some(since) = image.tail_since.get_mut(at) {
             *since = None;
         }
@@ -1244,16 +1238,19 @@ fn tail_hole<T: StreamTerms>(
     if age_ns(now, first) < image.rtt.rtt_snapshot(0) {
         return None;
     }
-    let term = u64::from(image.term_length);
-    let term_end = rebuild
-        .checked_div(term)?
-        .checked_add(1)?
-        .checked_mul(term)?;
-    let length = u32::try_from(mark.min(term_end).checked_sub(rebuild)?).ok()?;
-    Some(Hole {
-        start: rebuild,
-        length,
-    })
+    Some(Hole { start, length })
+}
+
+/// `lane`'s heartbeat mark (at index `at`), the sender's next position,
+/// never past a recorded terminal bound: the end of a tail no frame
+/// revealed, which a reliable image NAKs and an unreliable one seals.
+fn heartbeat_mark<T: StreamTerms>(image: &Installed<T>, lane: Lane, at: usize) -> Option<u64> {
+    image
+        .heartbeat_marks
+        .get(at)
+        .copied()
+        .flatten()
+        .map(|mark| terminal_bound(image, lane).map_or(mark, |bound| mark.min(bound)))
 }
 
 /// `hole` of `image`'s `lane` proven unrecoverable, with the sender's
@@ -3184,6 +3181,17 @@ impl<T: StreamTerms> ReceiverRole<T> {
         // an unreliable image; on a reliable one under `skip`, the holes
         // left below an unrecoverable range (at most a few per call).
         if image.closing.is_none() {
+            // An unreliable tail no frame revealed is sealed at its
+            // deadline (SPEC §6, G1), up to the clamped mark.
+            if !image.reliable {
+                for (at, lane) in (0..image.heartbeat_marks.len())
+                    .filter_map(|at| Some((at, Lane::try_new(u8::try_from(at).ok()?).ok()?)))
+                {
+                    if let Some(mark) = heartbeat_mark(image, lane, at) {
+                        image.skip.revealed(lane, mark);
+                    }
+                }
+            }
             // Each committed seal reaches the lane's trace journal, if any
             // (§5).
             let slot = image.slot;
