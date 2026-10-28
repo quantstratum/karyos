@@ -4,7 +4,7 @@
 //! platform tests them: a sampling pass's cells grouped into API v1, and a
 //! bounded follower of a diagnostic ring.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use karyos_sys::counters::{CounterMetadata, KIND_SUBSCRIBER, TYPE_POSITION};
 use karyos_sys::host_clock::age_ns;
@@ -19,22 +19,6 @@ fn difference(a: u64, b: u64) -> Option<i64> {
     i64::try_from(i128::from(a) - i128::from(b)).ok()
 }
 
-/// A datum's identity within one driver instance (R-CORE-17), as the
-/// contract states it: its label, type and keys. Two passes of one
-/// instance join on it; a new instance is a new series.
-#[cfg(test)]
-pub(crate) fn identity(metadata: &CounterMetadata) -> (Vec<u8>, u64, u64, u8, u8, u64) {
-    let keys = metadata.keys;
-    (
-        metadata.label().to_vec(),
-        metadata.type_id,
-        keys.stream,
-        keys.lane,
-        keys.kind,
-        keys.participant,
-    )
-}
-
 /// The last value of each datum and when the agent last saw it change,
 /// over one driver instance, by the cell's registration: a region never
 /// reuses one, so a registration is one allocation of one identity, and
@@ -46,7 +30,10 @@ pub(crate) fn identity(metadata: &CounterMetadata) -> (Vec<u8>, u64, u64, u8, u8
 /// A pass reads the cells in region order, so the last pass's entries
 /// are matched in that order with a cursor: a pass costs one comparison
 /// per cell when nothing was allocated or freed, and allocates nothing
-/// once both buffers have grown to the region's cells.
+/// once both buffers have grown to the region's cells. A cell the cursor
+/// does not find (cells were allocated or freed) is looked up in an index
+/// of the last pass, built once in that pass, so a pass of any churn
+/// costs O(cells).
 #[derive(Debug, Default)]
 pub(crate) struct Changes {
     /// The last pass's registration, value and `changed_ns`, in order.
@@ -55,6 +42,10 @@ pub(crate) struct Changes {
     next: Vec<(u64, u64, Option<u64>)>,
     /// The next entry of `last` to match.
     cursor: usize,
+    /// `last`'s positions by registration, built at the first miss of a
+    /// pass.
+    index: HashMap<u64, usize>,
+    indexed: bool,
 }
 
 impl Changes {
@@ -74,6 +65,29 @@ impl Changes {
     fn begin(&mut self) {
         self.next.clear();
         self.cursor = 0;
+        self.indexed = false;
+    }
+
+    /// The position in `last` of `registration`, if the last pass had it.
+    fn find(&mut self, registration: u64) -> Option<usize> {
+        if self
+            .last
+            .get(self.cursor)
+            .is_some_and(|entry| entry.0 == registration)
+        {
+            return Some(self.cursor);
+        }
+        if !self.indexed {
+            self.index.clear();
+            self.index.extend(
+                self.last
+                    .iter()
+                    .enumerate()
+                    .map(|(at, entry)| (entry.0, at)),
+            );
+            self.indexed = true;
+        }
+        self.index.get(&registration).copied()
     }
 
     /// `value` of `metadata`'s datum in this pass, read at `now`: its
@@ -81,12 +95,8 @@ impl Changes {
     /// value differs from its last pass changed by `now`.
     fn observe(&mut self, metadata: &CounterMetadata, value: u64, now: u64) -> Option<u64> {
         let registration = metadata.registration_id;
-        let found = self
-            .last
-            .get(self.cursor..)
-            .and_then(|rest| rest.iter().position(|entry| entry.0 == registration));
-        let changed = match found.and_then(|offset| {
-            let index = self.cursor + offset;
+        let found = self.find(registration);
+        let changed = match found.and_then(|index| {
             self.cursor = index + 1;
             self.last.get(index)
         }) {
@@ -118,6 +128,7 @@ pub(crate) fn counter(
         lane: metadata.keys.lane,
         kind: metadata.keys.kind,
         participant: metadata.keys.participant,
+        cell_registration: metadata.registration_id,
         value,
         read_ns,
         changed_ns,
@@ -153,8 +164,13 @@ pub(crate) fn sample(cells: &[Cell], consistent: bool, now: u64, changes: &mut C
     let sampled_at = fixed("positions sampled at");
     let age_ns = sampled_at.map(|at| age_ns(now, at));
     // A position's time is the driver's sampling time; a counter's, the
-    // agent's read.
-    let position_ns = sampled_at.unwrap_or(now);
+    // agent's read. An inconsistent pass may mix samples, so its position
+    // changes are stamped with this pass's read instead.
+    let position_ns = if consistent {
+        sampled_at.unwrap_or(now)
+    } else {
+        now
+    };
     changes.begin();
     let mut counters = Vec::new();
     let mut lanes: BTreeMap<(u64, u8), Lane> = BTreeMap::new();
@@ -165,7 +181,6 @@ pub(crate) fn sample(cells: &[Cell], consistent: bool, now: u64, changes: &mut C
             counters.push(counter(metadata, *value, now, changed));
             continue;
         }
-        let changed = changes.observe(metadata, *value, position_ns);
         let lane = lanes
             .entry((keys.stream, keys.lane))
             .or_insert_with(|| Lane {
@@ -182,13 +197,17 @@ pub(crate) fn sample(cells: &[Cell], consistent: bool, now: u64, changes: &mut C
             b"stream limit" => lane.limit = Some(*value),
             b"stream head" => lane.head = Some(*value),
             b"stream floor" => lane.floor = Some(*value),
-            _ if keys.kind == KIND_SUBSCRIBER => lane.subscribers.push(Subscriber {
-                registration: keys.participant,
-                label: String::from_utf8_lossy(metadata.label()).into_owned(),
-                position: *value,
-                lag: None,
-                changed_ns: changed,
-            }),
+            _ if keys.kind == KIND_SUBSCRIBER => {
+                let changed = changes.observe(metadata, *value, position_ns);
+                lane.subscribers.push(Subscriber {
+                    registration: keys.participant,
+                    cell_registration: metadata.registration_id,
+                    label: String::from_utf8_lossy(metadata.label()).into_owned(),
+                    position: *value,
+                    lag: None,
+                    changed_ns: changed,
+                });
+            }
             _ => {}
         }
     }
@@ -199,6 +218,7 @@ pub(crate) fn sample(cells: &[Cell], consistent: bool, now: u64, changes: &mut C
             counter.kind,
             counter.participant,
             counter.label.clone(),
+            counter.cell_registration,
         )
     });
     let lanes = lanes
@@ -213,7 +233,7 @@ pub(crate) fn sample(cells: &[Cell], consistent: bool, now: u64, changes: &mut C
                 subscriber.lag = head.and_then(|head| difference(head, subscriber.position));
             }
             lane.subscribers
-                .sort_by_key(|subscriber| subscriber.registration);
+                .sort_by_key(|subscriber| (subscriber.registration, subscriber.cell_registration));
             lane
         })
         .collect();

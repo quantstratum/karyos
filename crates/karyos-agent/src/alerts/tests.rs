@@ -27,6 +27,7 @@ fn sample(consistent: bool, lags: &[(u64, Option<i64>)]) -> Sample {
             subscribers: lags
                 .iter()
                 .map(|&(registration, lag)| Subscriber {
+                    cell_registration: 0,
                     changed_ns: None,
                     registration,
                     label: String::new(),

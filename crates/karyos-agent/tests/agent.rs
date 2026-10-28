@@ -663,3 +663,48 @@ fn a_driver_that_closes_ends_its_catalog_session_at_once() {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+/// R-CORE-17 (karyos#737): a new driver instance restarts every datum's
+/// series, the driver counters' and the client counters', so nothing the
+/// old instance changed carries a `changed_ns` into the new one.
+#[test]
+fn test_agent_a_new_instance_restarts_every_series() {
+    let _serial = serial();
+    let dir = dir("series");
+    let mut driver = driver(&dir, DriverConfig::default(), 1);
+    let mut agent = agent(&[&dir]);
+    for _ in 0..4 {
+        refresh_serving(&mut driver, &mut agent);
+    }
+    let view = agent.view();
+    let counters = &view.drivers[0].sample.as_ref().unwrap().counters;
+    assert!(
+        counters.iter().all(|counter| counter.read_ns > 0),
+        "every counter carries its read time"
+    );
+    drop(driver);
+    agent.refresh();
+    let mut driver = self::driver(&dir, DriverConfig::default(), 1);
+    refresh_serving(&mut driver, &mut agent);
+    let view = agent.view();
+    assert_eq!(view.drivers[0].instance, driver.instance());
+    let sample = view.drivers[0].sample.as_ref().unwrap();
+    assert!(
+        sample
+            .counters
+            .iter()
+            .all(|counter| counter.changed_ns.is_none()),
+        "a counter of the new instance joined an old series: {:?}",
+        sample
+            .counters
+            .iter()
+            .filter(|c| c.changed_ns.is_some())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        view.drivers[0]
+            .client_counters
+            .iter()
+            .all(|counter| counter.changed_ns.is_none())
+    );
+}

@@ -267,34 +267,128 @@ fn test_agent_datum_a_freed_counter_leaves_no_entry_and_returns_as_new() {
     assert_eq!(changes.len(), 4);
 }
 
-/// Two application counters may share a label in two classes (karyos#786):
-/// type is part of the identity, so they are two data.
+/// Two application counters may share a label in two classes (karyos#786),
+/// and two clients may allocate the same label, type and keys: each is its
+/// own cell, so its own identity and series.
 #[test]
-fn test_agent_datum_identity_tells_apart_a_label_in_two_classes() {
-    let cells = |event, gauge| {
+fn test_agent_datum_identity_is_the_cell_registration() {
+    let cells = |event, gauge, twin| {
         vec![
-            cell("orders", TYPE_APPLICATION_EVENT, CounterKeys::DRIVER, event),
-            cell("orders", TYPE_APPLICATION_GAUGE, CounterKeys::DRIVER, gauge),
+            allocated(
+                10,
+                "orders",
+                TYPE_APPLICATION_EVENT,
+                CounterKeys::DRIVER,
+                event,
+            ),
+            allocated(
+                11,
+                "orders",
+                TYPE_APPLICATION_GAUGE,
+                CounterKeys::DRIVER,
+                gauge,
+            ),
+            // A second client's counter with the first one's keys.
+            allocated(
+                12,
+                "orders",
+                TYPE_APPLICATION_EVENT,
+                CounterKeys::DRIVER,
+                twin,
+            ),
         ]
     };
     let mut changes = Changes::default();
-    let _ = sample(&cells(1, 5), true, 1000, &mut changes);
-    assert_eq!(changes.len(), 2, "two identities");
-    let second = sample(&cells(2, 5), true, 2000, &mut changes);
-    assert_eq!(
-        find(&second, "orders", TYPE_APPLICATION_EVENT).changed_ns,
-        Some(2000)
-    );
-    assert_eq!(
-        find(&second, "orders", TYPE_APPLICATION_GAUGE).changed_ns,
-        None
-    );
-    // Within one pass every identity is unique.
-    let identities: std::collections::BTreeSet<_> = cells(1, 1)
+    let first = counters(&cells(1, 5, 1), 1000, &mut changes);
+    let registrations: std::collections::BTreeSet<_> = first
         .iter()
-        .map(|(metadata, _)| identity(metadata))
+        .map(|counter| counter.cell_registration)
         .collect();
-    assert_eq!(identities.len(), 2);
+    assert_eq!(registrations.len(), 3, "each cell is one identity");
+    let second = counters(&cells(2, 5, 1), 2000, &mut changes);
+    let by = |registration| {
+        second
+            .iter()
+            .find(|counter| counter.cell_registration == registration)
+            .unwrap()
+            .changed_ns
+    };
+    assert_eq!((by(10), by(11), by(12)), (Some(2000), None, None));
+}
+
+/// A counter freed and allocated again under the same keys is a new
+/// series: a new `cell_registration`, and no change carried over.
+#[test]
+fn test_agent_datum_a_reallocation_under_the_same_keys_is_a_new_series() {
+    let mut changes = Changes::default();
+    let cell = |registration, value| {
+        vec![allocated(
+            registration,
+            "orders",
+            TYPE_APPLICATION_EVENT,
+            CounterKeys::DRIVER,
+            value,
+        )]
+    };
+    let _ = counters(&cell(20, 42), 1000, &mut changes);
+    let changed = counters(&cell(20, 43), 2000, &mut changes);
+    assert_eq!(changed[0].changed_ns, Some(2000));
+    // Freed, then allocated again at 0: the consumer sees a new cell.
+    let _ = counters(&[], 3000, &mut changes);
+    let again = counters(&cell(21, 0), 4000, &mut changes);
+    assert_eq!(
+        (again[0].cell_registration, again[0].changed_ns),
+        (21, None)
+    );
+}
+
+/// A pass that is not consistent stamps a position's change with its own
+/// read, not with the sampling time of a pass it may mix.
+#[test]
+fn test_agent_datum_an_inconsistent_pass_stamps_with_its_read() {
+    let mut changes = Changes::default();
+    let _ = sample(&pass(1, 100, 90), true, 1000, &mut changes);
+    let mixed = sample(&pass(1, 150, 90), false, 2000, &mut changes);
+    assert_eq!(mixed.lanes[0].subscribers[0].changed_ns, Some(2000));
+}
+
+/// Cells allocated and freed between passes are matched through the
+/// index: every surviving datum keeps its series.
+#[test]
+fn test_agent_datum_survives_churn() {
+    let mut changes = Changes::default();
+    let cells = |keep: &[u64], value| -> Vec<Cell> {
+        keep.iter()
+            .map(|&registration| {
+                allocated(
+                    registration,
+                    "c",
+                    TYPE_EVENT,
+                    lane(registration, 0, KIND_PUBLICATION, 0),
+                    value + registration,
+                )
+            })
+            .collect()
+    };
+    let _ = counters(&cells(&[1, 2, 3, 4, 5, 6], 0), 1000, &mut changes);
+    // 2 and 4 freed, 7 and 8 allocated in the middle, the order changed.
+    let after = counters(&cells(&[1, 7, 3, 8, 6, 5], 100), 2000, &mut changes);
+    let changed: Vec<_> = after
+        .iter()
+        .map(|c| (c.cell_registration, c.changed_ns))
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            (1, Some(2000)),
+            (7, None),
+            (3, Some(2000)),
+            (8, None),
+            (6, Some(2000)),
+            (5, Some(2000))
+        ]
+    );
+    assert_eq!(changes.len(), 6);
 }
 
 /// The cost of a pass with per-datum times (karyos#737, recorded in the
@@ -337,5 +431,18 @@ fn pass_cost() {
         "pass_cost: {:?} per pass of {} cells",
         start.elapsed() / passes,
         cells.len()
+    );
+    // Churn: every pass a tenth of the counters are new cells.
+    let start = std::time::Instant::now();
+    for now in 0..passes {
+        let mut churned = cells.clone();
+        for (at, entry) in churned.iter_mut().enumerate().skip(1).step_by(10) {
+            entry.0.registration_id = 1_000_000 + u64::from(now) * 10_000 + at as u64;
+        }
+        let _ = sample(&churned, true, u64::from(now), &mut changes);
+    }
+    println!(
+        "pass_cost under churn: {:?} per pass, a tenth of the cells new",
+        start.elapsed() / passes
     );
 }

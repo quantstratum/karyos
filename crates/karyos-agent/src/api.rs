@@ -349,19 +349,22 @@ pub enum DriverState {
 /// One sampling pass of the driver counters.
 ///
 /// **Identity** (R-CORE-17). A counter's identity is its driver's
-/// `instance` with its `label`, `type_id`, `stream`, `lane`, `kind` and
-/// `participant`; a lane's is the instance with its `stream` and `lane`,
-/// and a subscriber's adds its `registration`. Within one pass each
-/// identity appears once, and two passes of one instance join on it. A
-/// new instance is a new series: nothing joins across it, and every
+/// `instance` with its `cell_registration`, which a region never reuses;
+/// a subscriber position's is the instance with its `cell_registration`;
+/// a lane's is the instance with its `stream` and `lane`. Within one pass
+/// each identity appears once, and two passes of one instance join on
+/// it. The label, type and keys describe a datum but are not its
+/// identity: a counter freed and allocated again under the same keys is
+/// a new series, and two clients may allocate the same keys. A new
+/// instance is a new series: nothing joins across it, and every
 /// `changed_ns` starts again at `None`.
 ///
 /// **Times.** Each counter carries `read_ns`, when the agent read it, and
-/// `changed_ns`, the first pass in which the agent saw its value change.
-/// Each lane carries `sampled_ns`, the driver's own sampling time of its
-/// positions. A datum untouched for several passes reports this pass's
-/// `read_ns` and the older `changed_ns`, never the pass time as its change.
-/// The pass-level `consistent`, `sampled` and `age_ns` keep their meaning.
+/// `changed_ns`, an upper bound on when its value last changed. Each lane
+/// carries `sampled_ns`, the driver's own sampling time of its positions.
+/// A datum untouched for several passes reports this pass's `read_ns` and
+/// the older `changed_ns`, never the pass time as its change. The
+/// pass-level `consistent`, `sampled` and `age_ns` keep their meaning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Sample {
@@ -396,17 +399,21 @@ pub struct Counter {
     pub kind: u8,
     /// The participant or client registration, 0 when none.
     pub participant: u64,
+    /// The cell's registration: one allocation, never reused within the
+    /// driver instance's region. With the instance, the datum's identity
+    /// (R-CORE-17).
+    pub cell_registration: u64,
     /// Its value.
     pub value: u64,
     /// Host `CLOCK_MONOTONIC` nanoseconds at which the agent read this
     /// cell: the end of the read of its pass (R-CORE-17).
     pub read_ns: u64,
     /// The `read_ns` of the first pass in which the agent saw this
-    /// datum's value differ from its previous pass: a lower bound the
-    /// agent observed, not the instant of the change, which happened
-    /// after the previous pass's `read_ns` and by this one. `None` until
-    /// the agent has seen the datum change since it appeared, or since
-    /// the driver instance changed.
+    /// datum's value differ from its previous pass. It is an upper bound
+    /// on the instant of the change: the change happened after the
+    /// previous pass's `read_ns`, the earliest, and by this one, the
+    /// latest. `None` until the agent has seen the datum change since it
+    /// was allocated, or since the driver instance changed.
     pub changed_ns: Option<u64>,
 }
 
@@ -441,6 +448,10 @@ pub struct Lane {
 pub struct Subscriber {
     /// Its registration.
     pub registration: u64,
+    /// Its position cell's registration: with the instance, the
+    /// position's identity, which tells apart a subscriber's predecessor
+    /// and current cells during a cutover (R-CORE-17).
+    pub cell_registration: u64,
     /// Its position cell's label.
     pub label: String,
     /// Its position.
@@ -449,7 +460,8 @@ pub struct Subscriber {
     /// difference does not fit.
     pub lag: Option<i64>,
     /// As [`Counter::changed_ns`], for the position, at the lane's
-    /// `sampled_ns` passes.
+    /// `sampled_ns` passes; in a pass that is not `consistent`, at the
+    /// agent's read instead, as that pass may mix samples.
     pub changed_ns: Option<u64>,
 }
 
