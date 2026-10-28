@@ -521,6 +521,31 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
     }
 }
 
+/// The tries a close entry gets before it counts as stuck: one per duty.
+const CLOSE_TRIES: u8 = 8;
+
+/// A close entry a live endpoint would not close, retried at each duty
+/// until `CLOSE_TRIES`, then kept as stuck: what it holds is freed by the
+/// endpoint's next reset, asked for only when stuck entries are what holds
+/// the endpoint at its route limit.
+#[derive(Debug, Clone, Copy)]
+struct Stuck {
+    opened: super::data::Opened,
+    tries: u8,
+}
+
+/// What one close attempt did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// Closed, or already gone (a handle the endpoint does not know).
+    Done,
+    /// Its half is not held, or in another epoch: dropped.
+    Dropped,
+    /// A live handle did not close; `failing` when the endpoint itself is
+    /// (`NeedsReset`).
+    Failed { failing: bool },
+}
+
 /// An endpoint whose close list held something it would not close, in that
 /// epoch, and when its reset was last asked for: asked again every
 /// `RESET_REQUEST_CYCLES` (the endpoint table may defer a request inside
@@ -1504,6 +1529,8 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     /// Endpoints a close failed on, whose reset the sender asks for: the
     /// reset drops what would not close, which nothing else frees.
     close_resets: Vec<CloseReset>,
+    /// Close entries retried, or stuck past `CLOSE_TRIES`.
+    stuck: Vec<Stuck>,
     /// Report storage for those closes (allocated at creation).
     close_report: karyos_io::backend::TxReport,
     /// When a routed publication's path leaves the live set (RP-8).
@@ -1664,6 +1691,12 @@ pub(super) fn roles<T: StreamTerms>(
                 config
                     .publications
                     .saturating_mul(karyos_io::lanes::routes::MAX_ROUTES),
+            ),
+            stuck: Vec::with_capacity(
+                config.publications.saturating_mul(
+                    karyos_io::lanes::routes::MAX_ROUTES
+                        .saturating_add(super::data::MAX_DESTINATIONS.saturating_mul(2)),
+                ),
             ),
             path_policy: config.path_policy,
             bindings: Vec::with_capacity(config.receiver_bindings),
@@ -4981,8 +5014,6 @@ impl<T: StreamTerms> SenderRole<T> {
     /// the same epoch. An endpoint whose half it does not hold, or now in
     /// another epoch, dropped them already (a reset or a retirement).
     fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
-        use karyos_io::backend::{QueueError, RouteError};
-
         // A request whose half is gone (in a reset, or retired) or back in
         // another epoch is resolved.
         self.close_resets.retain(|request| {
@@ -4993,86 +5024,171 @@ impl<T: StreamTerms> SenderRole<T> {
                 _ => false,
             })
         });
+        // The entries still being retried, then the new ones; those past
+        // their tries stay stuck, untouched, until their epoch ends.
+        let mut stuck = std::mem::take(&mut self.stuck);
+        stuck.retain_mut(|entry| {
+            let live = halves.iter().any(|(held, half)| match half {
+                Half::Tx(tx) => {
+                    *held == entry.opened.endpoint && tx.capabilities().epoch == entry.opened.epoch
+                }
+                _ => false,
+            });
+            if !live {
+                self.count(|c| &mut c.removed_dropped);
+                return false;
+            }
+            if entry.tries >= CLOSE_TRIES {
+                return true;
+            }
+            match self.close_entry(halves, entry.opened) {
+                Closed::Failed { failing } => {
+                    entry.tries = entry.tries.saturating_add(1);
+                    if failing {
+                        self.ask_reset(entry.opened.endpoint, entry.opened.epoch);
+                    }
+                    true
+                }
+                Closed::Done | Closed::Dropped => false,
+            }
+        });
         while let Some(opened) = self.closing.pop() {
-            // A half not held now is in a reset or retired: the reset, done
-            // or to come, drops these handles, and a retired half never
-            // comes back. Dropped and counted, so the list never fills
-            // with what cannot close.
-            let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
-                Half::Tx(tx) if *held == opened.endpoint => Some(tx),
-                _ => None,
-            }) else {
-                self.count(|c| &mut c.removed_dropped);
-                continue;
+            if let Closed::Failed { failing } = self.close_entry(halves, opened) {
+                // Once per entry.
+                self.count(|c| &mut c.removed_close_failed);
+                if failing {
+                    self.ask_reset(opened.endpoint, opened.epoch);
+                }
+                if stuck.len() < stuck.capacity() {
+                    stuck.push(Stuck { opened, tries: 1 });
+                } else {
+                    self.count(|c| &mut c.removed_unrecorded);
+                }
+            }
+        }
+        self.stuck = stuck;
+    }
+
+    /// Records that `endpoint`'s reset is wanted, in `epoch`, once.
+    fn ask_reset(&mut self, endpoint: EndpointId, epoch: karyos_io::backend::BackendEpoch) {
+        if self
+            .close_resets
+            .iter()
+            .any(|request| request.endpoint == endpoint)
+        {
+            return;
+        }
+        if self.close_resets.len() < self.close_resets.capacity() {
+            self.close_resets.push(CloseReset {
+                endpoint,
+                epoch,
+                requested: None,
+            });
+        } else {
+            self.count(|c| &mut c.close_resets_full);
+        }
+    }
+
+    /// The endpoints that refused a destination's route for their route
+    /// limit this cycle, while entries stuck past their tries hold routes
+    /// there: only then is a reset asked for, even of a shared endpoint
+    /// (QS-COORDINATOR on #838). With room, a stuck entry resets nothing.
+    fn reset_route_limited<O: SocketOps>(&mut self, halves: &[(EndpointId, Half<O>)]) {
+        for index in 0..self.publications.len() {
+            let Some(outbound) = self.publications.get_mut(index) else {
+                break;
             };
-            // An older epoch's handles died with its reset (an entry is
-            // never of a later epoch than its half).
-            let epoch = tx.capabilities().epoch;
-            if epoch != opened.epoch {
-                debug_assert!(opened.epoch < epoch, "an entry of a later epoch");
-                self.count(|c| &mut c.removed_dropped);
+            if !outbound.take_route_limited() {
                 continue;
             }
-            // A handle already gone counts as closed. Failed: a live handle
-            // did not close. Held: the endpoint itself is failing
-            // (`NeedsReset`), which only its reset resolves; a single
-            // route's or queue's failure never resets a shared endpoint.
-            let (mut failed, mut held) = (false, false);
-            for queue in opened.queues.into_iter().flatten() {
-                // A full report leaves items pending: emptied and called
-                // again until none remains, each call returning at least
-                // one, so the queue's depth bounds the loop.
-                loop {
-                    match tx.close_queue(queue, &mut self.close_report) {
-                        Ok(outcome) => {
-                            while self.close_report.pop_front().is_some() {
-                                self.count(|c| &mut c.removed_returned);
-                            }
-                            if !outcome.more {
-                                self.count(|c| &mut c.removed_closed);
-                                break;
-                            }
-                            if outcome.returned == 0 {
-                                failed = true;
-                                break;
-                            }
+            let endpoint = outbound.endpoint();
+            let epoch = halves.iter().find_map(|(held, half)| match half {
+                Half::Tx(tx) if *held == endpoint => Some(tx.capabilities().epoch),
+                _ => None,
+            });
+            let Some(epoch) = epoch else {
+                continue;
+            };
+            let held = self.stuck.iter().any(|entry| {
+                entry.opened.endpoint == endpoint
+                    && entry.opened.epoch == epoch
+                    && entry.tries >= CLOSE_TRIES
+            });
+            if held {
+                self.ask_reset(endpoint, epoch);
+            }
+        }
+    }
+
+    /// One try at closing `opened` whole.
+    fn close_entry<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        opened: super::data::Opened,
+    ) -> Closed {
+        use karyos_io::backend::{QueueError, RouteError};
+
+        // A half not held now is in a reset or retired: the reset, done or
+        // to come, drops these handles, and a retired half never comes
+        // back. Dropped and counted, so nothing waits on what cannot close.
+        let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
+            Half::Tx(tx) if *held == opened.endpoint => Some(tx),
+            _ => None,
+        }) else {
+            self.count(|c| &mut c.removed_dropped);
+            return Closed::Dropped;
+        };
+        // An older epoch's handles died with its reset (an entry is never
+        // of a later epoch than its half).
+        let epoch = tx.capabilities().epoch;
+        if epoch != opened.epoch {
+            debug_assert!(opened.epoch < epoch, "an entry of a later epoch");
+            self.count(|c| &mut c.removed_dropped);
+            return Closed::Dropped;
+        }
+        // A handle already gone counts as closed. Failed: a live handle did
+        // not close. Failing: the endpoint itself is (`NeedsReset`), which
+        // only its reset resolves.
+        let (mut failed, mut failing) = (false, false);
+        for queue in opened.queues.into_iter().flatten() {
+            // A full report leaves items pending: emptied and called again
+            // until none remains, each call returning at least one, so the
+            // queue's depth bounds the loop.
+            loop {
+                match tx.close_queue(queue, &mut self.close_report) {
+                    Ok(outcome) => {
+                        while self.close_report.pop_front().is_some() {
+                            self.count(|c| &mut c.removed_returned);
                         }
-                        Err(QueueError::UnknownQueue) => {
+                        if !outcome.more {
                             self.count(|c| &mut c.removed_closed);
                             break;
                         }
-                        Err(error) => {
+                        if outcome.returned == 0 {
                             failed = true;
-                            held |= matches!(error, QueueError::NeedsReset);
                             break;
                         }
                     }
+                    Err(QueueError::UnknownQueue) => {
+                        self.count(|c| &mut c.removed_closed);
+                        break;
+                    }
+                    Err(error) => {
+                        failed = true;
+                        failing |= matches!(error, QueueError::NeedsReset);
+                        break;
+                    }
                 }
             }
-            match tx.remove_route(opened.route) {
-                Ok(()) | Err(RouteError::Unknown) => self.count(|c| &mut c.removed_closed),
-                Err(_) => failed = true,
-            }
-            // Once per entry; a reset asked for only for what is held.
-            if failed {
-                self.count(|c| &mut c.removed_close_failed);
-            }
-            if held
-                && !self
-                    .close_resets
-                    .iter()
-                    .any(|request| request.endpoint == opened.endpoint)
-            {
-                if self.close_resets.len() < self.close_resets.capacity() {
-                    self.close_resets.push(CloseReset {
-                        endpoint: opened.endpoint,
-                        epoch,
-                        requested: None,
-                    });
-                } else {
-                    self.count(|c| &mut c.close_resets_full);
-                }
-            }
+        }
+        match tx.remove_route(opened.route) {
+            Ok(()) | Err(RouteError::Unknown) => self.count(|c| &mut c.removed_closed),
+            Err(_) => failed = true,
+        }
+        if failed {
+            Closed::Failed { failing }
+        } else {
+            Closed::Done
         }
     }
 
@@ -5489,6 +5605,9 @@ impl<T: StreamTerms> SenderRole<T> {
             }
         }
         self.counters.needs_reset = needing_reset;
+        // Stuck closes holding an endpoint at its route limit ask for its
+        // reset.
+        self.reset_route_limited(halves);
         // Removing publications: each lane drained to its seal sends its
         // EOS, then the linger runs (driver-network-agents.md §7).
         work = work

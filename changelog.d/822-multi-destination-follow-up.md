@@ -27,9 +27,15 @@
     nothing; only an accepted addition does. A close entry whose
     endpoint's TX half is not held at its duty (the half is in a reset,
     which drops the handles, or retired), or is of another epoch, is
-    dropped and counted once (`removed_dropped`). An entry the endpoint
-    will not close whole is counted once (`removed_close_failed`), and
-    the sender asks for the endpoint's reset, which drops it. With the
+    dropped and counted once (`removed_dropped`); a handle already gone
+    counts as closed. An entry with a live handle the endpoint will not
+    close is counted once (`removed_close_failed`) and retried at each
+    duty, up to eight tries. The sender asks for the endpoint's reset,
+    which drops it, when the endpoint itself is failing (`NeedsReset`),
+    or when entries stuck past their tries hold it at its route limit and
+    a new route is refused; otherwise a stuck entry resets nothing. The
+    request stands, asked again at the reset request interval, until the
+    endpoint's epoch ends. With the
     quarantine full, the record removed earliest makes room, the
     incoming one included; an incoming record already past its
     quarantine is not kept.

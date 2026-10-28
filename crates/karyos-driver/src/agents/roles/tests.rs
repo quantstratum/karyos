@@ -4872,3 +4872,157 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
         "the old queue and route"
     );
 }
+
+/// QS-COORDINATOR on #838: on an endpoint of `max_routes` routes, a
+/// 16-destination publication whose removed destination's close is stuck
+/// (its route kept in use) past its tries, then a new destination: returns
+/// the resets asked for, and whether the new destination's route opened
+/// after the reset was served (or without one).
+fn stuck_route_then_add(max_routes: u16) -> (usize, bool) {
+    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+    use karyos_io::backend::{Authority, InstanceId, TxQueueConfig, TxReport};
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
+    let address = |port: u16| SocketAddr::from(([10, 0, 0, 9], port));
+    let destinations: Vec<SocketAddr> = (0..u16::try_from(MAX_DESTINATIONS).unwrap())
+        .map(|index| address(5000 + index))
+        .collect();
+    let term = publication(EndpointId(1)).term;
+    let (mut outbound, _log) = super::super::data::testing::outbound(
+        EndpointId(1),
+        alias(),
+        destinations[0],
+        term,
+        1,
+        false,
+    );
+    outbound
+        .set_destinations(&destinations, &[], Some(true))
+        .unwrap();
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound,
+        guard: None,
+        roles: None,
+    });
+    let mut config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    config.max_routes = std::num::NonZeroU16::new(max_routes).unwrap();
+    config.max_queues = std::num::NonZeroU16::new(256).unwrap();
+    config.tx_slots = std::num::NonZeroU16::new(4096).unwrap();
+    let (tx, rx) = SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new())
+        .unwrap()
+        .split()
+        .unwrap();
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    sender.bind(EndpointId(1), destinations[0], &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), destinations[0], &sm_status([7, 8], 0), 1);
+    let mut now = 2;
+    for _ in 0..2 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+        now += 1;
+    }
+    let change =
+        |sender: &mut super::SenderRole, destination, add| match sender.command(AgentCommand::<
+            OsSocket,
+        >::ChangeDestination {
+            reply: replies.reserve().unwrap(),
+            endpoint: EndpointId(1),
+            alias: alias(),
+            registration: 1,
+            destination,
+            add,
+        }) {
+            Some((_, AgentEvent::DestinationChanged { outcome, .. })) => outcome,
+            other => panic!("{other:?}"),
+        };
+    assert_eq!(
+        change(&mut sender, address(5003), false),
+        DestinationChange::Removed
+    );
+    let _ = sender.duty(&mut halves, now).unwrap();
+    now += 1;
+    sender.report_removals(|_: AgentEvent<OsSocket>| true);
+    // Its route is kept in use: a queue on it the entry does not name.
+    let route = sender.closing.last().unwrap().route;
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let _keeper = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let mut asked = 0usize;
+    let cycle = |sender: &mut super::SenderRole, halves: &mut Halves, now: &mut u64| {
+        let _ = sender.duty(halves, *now).unwrap();
+        *now += 1;
+        let mut posted = 0usize;
+        sender.request_resets(|_| {
+            posted += 1;
+            true
+        });
+        posted
+    };
+    for _ in 0..=super::CLOSE_TRIES {
+        asked += cycle(&mut sender, &mut halves, &mut now);
+    }
+    assert!(sender.counters().removed_close_failed >= 1);
+    assert_eq!(asked, 0, "a stuck route alone resets nothing");
+    // The new destination.
+    assert_eq!(
+        change(&mut sender, address(6000), true),
+        DestinationChange::Added
+    );
+    let before = sender.publications[0].counters().route_failures;
+    asked += cycle(&mut sender, &mut halves, &mut now);
+    let refused = sender.publications[0].counters().route_failures > before;
+    if asked == 0 {
+        return (asked, !refused);
+    }
+    // The reset, served: the endpoint comes back in a new epoch.
+    let super::super::Half::Tx(tx) = halves.pop().unwrap().1 else {
+        panic!("a TX half");
+    };
+    let mut endpoint = SocketsEndpoint::join(*tx, rx).unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    let _ = endpoint.reopen(&config).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    let before = sender.publications[0].counters().route_failures;
+    for _ in 0..2 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+        now += 1;
+    }
+    let opened = sender.publications[0].counters().route_failures == before;
+    (asked, opened)
+}
+
+/// QS-COORDINATOR on #838: a close stuck past its tries holds a route; at
+/// `MAX_DESTINATIONS` routes, the new destination's route is refused, so
+/// the endpoint's reset is asked for, and once served the route opens.
+#[test]
+fn a_stuck_close_at_the_route_limit_asks_for_the_reset() {
+    let (asked, opened) = stuck_route_then_add(16);
+    assert_eq!(asked, 1, "one reset asked for");
+    assert!(opened, "the new route opens after the reset");
+}
+
+/// The same stuck close on an endpoint with room resets nothing, and the
+/// new destination's route opens.
+#[test]
+fn a_stuck_close_with_room_resets_nothing() {
+    let (asked, opened) = stuck_route_then_add(32);
+    assert_eq!(asked, 0);
+    assert!(opened);
+}

@@ -363,6 +363,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     route: Option<RouteId>,
     /// See [`Outbound::needs_reset`].
     needs_reset: bool,
+    /// A route of a destination was refused for the endpoint's route limit
+    /// since the sender last asked ([`Outbound::take_route_limited`]).
+    route_limited: bool,
     /// The sender cycle its last reset request was posted in, while it
     /// needs a reset.
     reset_requested: Option<u64>,
@@ -578,6 +581,7 @@ impl<T: StreamTerms> Outbound<T> {
             tracks,
             opened: None,
             needs_reset: false,
+            route_limited: false,
             reset_requested: None,
             report: TxReport::new(),
             next_token: 1,
@@ -1723,6 +1727,12 @@ impl<T: StreamTerms> Outbound<T> {
                 }
             }
         }
+    }
+
+    /// Whether a destination's route was refused for the endpoint's route
+    /// limit since the last call, which clears it.
+    pub(crate) fn take_route_limited(&mut self) -> bool {
+        std::mem::take(&mut self.route_limited)
     }
 
     /// Whether the endpoint needs a reset before this publication can send

@@ -745,6 +745,7 @@ impl<T: StreamTerms> Outbound<T> {
         let spacing = fanout.open_spacing;
         let (mut route_failures, mut queue_failures, mut removed) = (0u64, 0u64, 0u64);
         let mut limits = 0u64;
+        let mut route_limited = false;
         for target in &mut fanout.targets {
             if target.opened == Some(epoch) || target.removed.is_some() {
                 continue;
@@ -763,6 +764,7 @@ impl<T: StreamTerms> Outbound<T> {
                     route_failures = route_failures.saturating_add(1);
                     if error == karyos_io::backend::RouteError::RouteLimit {
                         limits = limits.saturating_add(1);
+                        route_limited = true;
                     }
                     if open_failed(target, route_own(error), (now, spacing)) {
                         removed = removed.saturating_add(1);
@@ -837,6 +839,7 @@ impl<T: StreamTerms> Outbound<T> {
             .bump(|c| &mut c.queue_failures, queue_failures);
         self.counters.bump(|c| &mut c.removed_fault, removed);
         self.counters.bump(|c| &mut c.endpoint_limits, limits);
+        self.route_limited |= route_limited;
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return false;
         };
