@@ -4850,16 +4850,20 @@ fn held_copies_on_a_route_hold_back_every_heartbeat() {
         let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
         let held = sender.publications[0].routed_pending(0, 1);
         assert!(held > 0, "route 2 holds its copies at step {step}");
-        let frontier = sender.publications[0].route_frontier(0, 1).unwrap();
+        let held_from = sender.publications[0].first_held(0, 1).unwrap();
         assert!(
             frames[0]
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|(_, offset, _)| u64::try_from(*offset).unwrap() <= frontier),
-            "route 1 stops at route 2's frontier {frontier} at step {step}"
+                .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == held_from),
+            "route 1 stops at route 2's first held copy {held_from} at step {step}"
         );
     }
+    assert!(
+        !frames[0].lock().unwrap().is_empty(),
+        "route 1 heartbeats while route 2 holds"
+    );
     assert_eq!(
         data[0].load(std::sync::atomic::Ordering::Relaxed),
         3,
@@ -4899,17 +4903,31 @@ fn a_route_holding_copies_bounds_the_others_heartbeats() {
     }
     let _ = sender.duty(&mut halves, 6).unwrap();
     assert!(sender.publications[0].routed_pending(0, 1) > 0, "blocked");
-    // Endpoint 2 goes into a reset: its half is away.
+    let held_from = sender.publications[0].first_held(0, 1).unwrap();
+    // Endpoint 2 goes into a reset: its half is away. More messages come
+    // meanwhile: route 2 skips them (RP-8), its frontier passes its held
+    // copies, but its first held copy still bounds route 1's heartbeat.
     let away = halves.pop().unwrap();
+    for byte in [4, 5] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 7).unwrap();
     for step in 1..=4 {
-        let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
+        let _ = sender.duty(&mut halves, 7 + step * interval).unwrap();
         assert!(
             sender.publications[0].routed_pending(0, 1) > 0,
             "route 2 holds its copies at step {step}"
         );
     }
     let frontier = sender.publications[0].route_frontier(0, 1).unwrap();
-    assert!(frontier < 3 * 1056, "route 2 is behind: {frontier}");
+    assert!(frontier > held_from, "route 2 skipped past its held copies");
+    assert_eq!(
+        sender.publications[0].first_held(0, 1),
+        Some(held_from),
+        "still held"
+    );
     let beats = frames[0].lock().unwrap().clone();
     assert!(
         beats.len() >= 2,
@@ -4918,8 +4936,8 @@ fn a_route_holding_copies_bounds_the_others_heartbeats() {
     assert!(
         beats
             .iter()
-            .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == frontier),
-        "at route 2's frontier {frontier}, not past it: {beats:?}"
+            .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == held_from),
+        "at route 2's first held copy {held_from}, not past it: {beats:?}"
     );
     // Back: route 2 sends what it held, and the halves drop clean.
     halves.push(away);

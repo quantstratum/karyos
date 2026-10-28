@@ -529,10 +529,21 @@ fn drop_tail_frame(bytes: &[u8]) -> Option<(i32, u32)> {
 }
 
 /// Test only: a tail's first transmission lost (`ReceiverRole::drop_tail`):
-/// the term offset, whether on one source only, the source chosen, and the
-/// sources whose idle heartbeat ended it.
+/// what it lost and from which sources its heartbeat showed all of it.
 #[cfg(test)]
-type DropTail = (u32, bool, Option<SocketAddr>, [Option<SocketAddr>; 4]);
+#[derive(Debug, Clone, Copy)]
+struct DropTail {
+    /// The term offset the tail starts at.
+    offset: u32,
+    /// Whether it is lost from one source only.
+    one_source: bool,
+    /// That source, once chosen.
+    chosen: Option<SocketAddr>,
+    /// The end of the frames lost so far.
+    end: u32,
+    /// The sources whose idle heartbeat at or past `end` arrived.
+    done: [Option<SocketAddr>; 4],
+}
 
 /// The receiver agent's network state.
 #[derive(Debug)]
@@ -2289,7 +2300,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
         allow(dead_code, reason = "its tests need two real paths, on Linux")
     )]
     pub(super) fn drop_tail(&mut self, term_offset: u32, one_source: bool) {
-        self.drop_tail = Some((term_offset, one_source, None, [None; 4]));
+        self.drop_tail = Some(DropTail {
+            offset: term_offset,
+            one_source,
+            chosen: None,
+            end: term_offset,
+            done: [None; 4],
+        });
     }
 
     /// The sources whose idle heartbeat past the lost tail arrived (tests).
@@ -2300,7 +2317,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
     )]
     pub(super) fn tail_heartbeat_sources(&self) -> usize {
         self.drop_tail
-            .map_or(0, |(_, _, _, done)| done.iter().flatten().count())
+            .map_or(0, |tail| tail.done.iter().flatten().count())
     }
 
     /// Whether the path queues are allocated (tests).
@@ -3918,25 +3935,33 @@ impl<T: StreamTerms> Intake<'_, T> {
                 return;
             }
             // A DATA frame at or past the offset, decoded from its header:
-            // word 0 (length, flags, type), then the term offset.
-            if let Some((offset, one_source, chosen, mut done)) = self.role.drop_tail
+            // word 0 (length, flags, type), then the term offset. A frame
+            // with a payload is lost (from its source alone when
+            // `one_source`); a header-only one at or past the end of what
+            // was lost is the source's heartbeat showing the whole tail.
+            if let Some(mut tail) = self.role.drop_tail
                 && let Some((length, at)) = drop_tail_frame(bytes)
-                && at >= offset
-                && !done.contains(&Some(source))
+                && at >= tail.offset
+                && !tail.done.contains(&Some(source))
             {
-                if length <= karyos_sys::frame::HEADER_LENGTH as i32 {
-                    // The source's idle heartbeat past the offset: its
-                    // tail was sent. One at the offset shows nothing of it.
-                    if at == offset {
-                        self.data_once(source, alias, bytes);
-                        return;
-                    }
-                    if let Some(slot) = done.iter_mut().find(|slot| slot.is_none()) {
+                let header = karyos_sys::frame::HEADER_LENGTH;
+                if u32::try_from(length).is_ok_and(|length| length <= header) {
+                    if tail.end > tail.offset
+                        && at >= tail.end
+                        && let Some(slot) = tail.done.iter_mut().find(|slot| slot.is_none())
+                    {
                         *slot = Some(source);
+                        self.role.drop_tail = Some(tail);
                     }
-                    self.role.drop_tail = Some((offset, one_source, chosen, done));
-                } else if !one_source || chosen.is_none_or(|chosen| chosen == source) {
-                    self.role.drop_tail = Some((offset, one_source, Some(source), done));
+                } else if !tail.one_source || tail.chosen.is_none_or(|chosen| chosen == source) {
+                    let aligned = u32::try_from(length).ok().and_then(|length| {
+                        length.checked_next_multiple_of(karyos_sys::frame::FRAME_ALIGNMENT)
+                    });
+                    tail.chosen = Some(source);
+                    tail.end = aligned
+                        .and_then(|length| at.checked_add(length))
+                        .map_or(tail.end, |end| tail.end.max(end));
+                    self.role.drop_tail = Some(tail);
                     return;
                 }
             }
