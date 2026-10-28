@@ -546,10 +546,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// required destination (fixed at creation), one already present, one
     /// removed less than `image_liveness_timeout` ago (MD-14), or a full
     /// set. A removed destination holds its slot until its removal is
-    /// reported and it retires, normally the sender's next cycle: a move
-    /// at [`MAX_DESTINATIONS`]
-    /// answers `Full` until then, and is retried after the removal shows
-    /// in [`EmbeddedDriver::network_removed_destinations`].
+    /// reported, once its queues are drained, normally the sender's next
+    /// cycle: a move at [`MAX_DESTINATIONS`] answers `Full` until then,
+    /// and a move retried after the removal shows in
+    /// [`EmbeddedDriver::network_removed_destinations`] finds the slot
+    /// free.
     ///
     /// # Errors
     ///

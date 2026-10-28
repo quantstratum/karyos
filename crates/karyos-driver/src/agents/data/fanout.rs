@@ -92,7 +92,8 @@ pub enum DestinationChange {
     /// Refused: it was removed less than its quarantine ago (MD-14).
     Quarantined,
     /// Refused: the publication has [`MAX_DESTINATIONS`] destinations,
-    /// counting those removed whose removal is not reported yet.
+    /// counting those removed whose removal is not reported yet (it is
+    /// reported once drained, and an addition then retires it).
     Full,
     /// Refused: the publication is being removed.
     Removing,
@@ -347,6 +348,7 @@ impl Fanout {
         lanes: usize,
         mtu: usize,
         joins: &[u64],
+        ipv4: bool,
     ) -> Option<Self> {
         let joins: Vec<u64> = (0..lanes)
             .map(|lane| joins.get(lane).copied().unwrap_or(0))
@@ -372,7 +374,7 @@ impl Fanout {
             quarantined: VecDeque::with_capacity(MAX_DESTINATIONS),
             quarantine: 0,
             open_spacing: 0,
-            ipv4: destinations.first().is_none_or(SocketAddr::is_ipv4),
+            ipv4,
             retired: Vec::with_capacity(MAX_DESTINATIONS),
             targets,
             pending: vec![None; lanes],
@@ -432,6 +434,81 @@ impl Fanout {
             .all(|target| target.live || target.removed.is_some())
     }
 
+    /// Retires the removed targets drained and reported (design 3.7): their
+    /// route and queues, opened in `epoch` (another epoch dropped them),
+    /// go to `retired` for the sender to close, their slot is freed, and
+    /// their address is kept for its quarantine (MD-14). Returns the
+    /// targets retired, the quarantine records forgotten to make room, and
+    /// the resources `retired` had no room for (never, by its capacity).
+    fn retire(
+        &mut self,
+        endpoint: crate::agents::EndpointId,
+        epoch: Option<BackendEpoch>,
+        now: u64,
+    ) -> (u64, u64, u64) {
+        let mut retired = 0u64;
+        let mut forgotten = 0u64;
+        let mut unrecorded = 0u64;
+        let fanout = self;
+        let mut at = fanout.targets.len();
+        while let Some(index) = at.checked_sub(1) {
+            at = index;
+            let retire = fanout.targets.get(index).is_some_and(|target| {
+                target.removed.is_some() && target.cancelled && target.reported
+            });
+            if !retire {
+                continue;
+            }
+            let target = fanout.targets.remove(index);
+            for flags in &mut fanout.staged_for {
+                if index < flags.len() {
+                    let _ = flags.remove(index);
+                }
+            }
+            // Its route and queues go to the sender's closing list, which
+            // closes them whole (`close_removed`); another epoch dropped them.
+            if let (Some(opened), Some(route)) =
+                (target.opened.filter(|at| Some(*at) == epoch), target.route)
+            {
+                let mut queues = [None; OPENED_QUEUES];
+                for (slot, queue) in queues.iter_mut().zip(&target.queues) {
+                    *slot = Some(*queue);
+                }
+                if let Some(slot) = queues.last_mut() {
+                    *slot = target
+                        .repair
+                        .as_deref()
+                        .and_then(|repair| repair.queue_on(0));
+                }
+                if fanout.retired.len() < fanout.retired.capacity() {
+                    fanout.retired.push(Opened {
+                        endpoint,
+                        epoch: opened,
+                        route,
+                        queues,
+                    });
+                } else {
+                    unrecorded = unrecorded.saturating_add(1);
+                }
+            }
+            // Expired records go first; only one still in its quarantine
+            // is counted when it must make room.
+            let quarantine = fanout.quarantine;
+            fanout.quarantined.retain(|(_, removed_at)| {
+                now.checked_sub(*removed_at)
+                    .is_none_or(|age| age < quarantine)
+            });
+            if fanout.quarantined.len() >= MAX_DESTINATIONS {
+                let _ = fanout.quarantined.pop_front();
+                forgotten = forgotten.saturating_add(1);
+            }
+            let removed_at = target.removed.map_or(now, |(_, time)| time);
+            fanout.quarantined.push_back((target.address, removed_at));
+            retired = retired.saturating_add(1);
+        }
+        (retired, forgotten, unrecorded)
+    }
+
     /// The destinations not live and not removed, which announce again.
     pub(super) fn not_live(&self) -> impl Iterator<Item = SocketAddr> + '_ {
         self.targets
@@ -440,9 +517,9 @@ impl Fanout {
             .map(|target| target.address)
     }
 
-    /// Each target's route and queues in its epoch, then those of the
-    /// targets retired since the sender's last duty, which no drain took
-    /// yet: a publication removed before that drain closes them too.
+    /// The route and queues of the targets retired since the sender's last
+    /// drain, which a publication removed before that drain closes too,
+    /// then each target's in its epoch.
     pub(super) fn opened_resources(
         &self,
         endpoint: crate::agents::EndpointId,
@@ -549,19 +626,19 @@ impl<T: StreamTerms> Outbound<T> {
             .iter()
             .map(|reader| reader.position())
             .collect();
-        let mut fanout = Fanout::new(
+        let fanout = Fanout::new(
             destinations,
             required,
             self.drr,
             self.readers.len(),
             self.mtu,
             &joins,
+            // Every destination shares the endpoint's address family, fixed
+            // here: an addition of another family is `Unknown`, whatever is
+            // left of the others.
+            ipv4,
         )
         .ok_or(super::OutboundError::Lanes)?;
-        // Every destination shares the endpoint's address family, fixed
-        // here: an addition of another family is `Unknown`, whatever is
-        // left of the others.
-        fanout.ipv4 = ipv4;
         self.fanout = Some(Box::new(fanout));
         Ok(())
     }
@@ -690,12 +767,11 @@ impl<T: StreamTerms> Outbound<T> {
             }
             if let Some(error) = failure {
                 target.open_tried = Some((epoch, now));
+                // No queue failure is the destination's own: the limits
+                // are counted, the rest is a reset or a stale handle.
                 queue_failures = queue_failures.saturating_add(1);
-                if !queue_own(error) {
+                if queue_limit(error) {
                     limits = limits.saturating_add(1);
-                }
-                if open_failed(target, queue_own(error), (now, spacing)) {
-                    removed = removed.saturating_add(1);
                 }
                 continue;
             }
@@ -918,64 +994,10 @@ impl<T: StreamTerms> Outbound<T> {
             }
         }
         fanout.backpressure = backpressure;
-        // Removed targets drained and reported retire (design 3.7): their
-        // queues and route close, their slot is freed, and their address
-        // is kept for its quarantine (MD-14).
-        let mut retired = 0u64;
-        let mut forgotten = 0u64;
-        let endpoint = self.endpoint;
-        let mut at = fanout.targets.len();
-        while let Some(index) = at.checked_sub(1) {
-            at = index;
-            let retire = fanout.targets.get(index).is_some_and(|target| {
-                target.removed.is_some() && target.cancelled && target.reported
-            });
-            if !retire {
-                continue;
-            }
-            let target = fanout.targets.remove(index);
-            for flags in &mut fanout.staged_for {
-                if index < flags.len() {
-                    let _ = flags.remove(index);
-                }
-            }
-            // Its route and queues go to the sender's closing list, which
-            // closes them whole (`close_removed`); another epoch dropped them.
-            if let (Some(opened), Some(route)) =
-                (target.opened.filter(|at| *at == epoch), target.route)
-            {
-                let mut queues = [None; OPENED_QUEUES];
-                for (slot, queue) in queues.iter_mut().zip(&target.queues) {
-                    *slot = Some(*queue);
-                }
-                if let Some(slot) = queues.last_mut() {
-                    *slot = target
-                        .repair
-                        .as_deref()
-                        .and_then(|repair| repair.queue_on(0));
-                }
-                fanout.retired.push(Opened {
-                    endpoint,
-                    epoch: opened,
-                    route,
-                    queues,
-                });
-            }
-            // Expired records go first; only one still in its quarantine
-            // is counted when it must make room.
-            let quarantine = fanout.quarantine;
-            fanout.quarantined.retain(|(_, removed_at)| {
-                now.checked_sub(*removed_at)
-                    .is_none_or(|age| age < quarantine)
-            });
-            if fanout.quarantined.len() >= MAX_DESTINATIONS {
-                let _ = fanout.quarantined.pop_front();
-                forgotten = forgotten.saturating_add(1);
-            }
-            let removed_at = target.removed.map_or(now, |(_, time)| time);
-            fanout.quarantined.push_back((target.address, removed_at));
-            retired = retired.saturating_add(1);
-        }
+        // Removed targets drained and reported retire (design 3.7).
+        let (retired, forgotten, unrecorded) = fanout.retire(self.endpoint, Some(epoch), now);
+        self.counters
+            .bump(|c| &mut c.retired_unrecorded, unrecorded);
         self.counters.bump(|c| &mut c.destinations_retired, retired);
         self.counters
             .bump(|c| &mut c.quarantine_forgotten, forgotten);
@@ -1403,13 +1425,16 @@ const fn route_own(error: karyos_io::backend::RouteError) -> bool {
     )
 }
 
-/// Whether a queue that would not open is the destination's own failure.
-/// None is: the queue entries and TX slots (`QueueLimit`, `OverCommitted`)
-/// are the endpoint's, shared with its other publications, and the rest
-/// are a reset or a stale handle.
-const fn queue_own(error: karyos_io::backend::QueueError) -> bool {
-    let _ = error;
-    false
+/// Whether a queue that would not open hit an endpoint-wide limit: its
+/// queue entries or TX slots, shared with its other publications. No queue
+/// failure is the destination's own: the rest are a reset or a stale
+/// handle.
+const fn queue_limit(error: karyos_io::backend::QueueError) -> bool {
+    use karyos_io::backend::QueueError;
+    matches!(
+        error,
+        QueueError::QueueLimit | QueueError::OverCommitted { .. }
+    )
 }
 
 /// Removes `target` for `reason` at `now`: it gets nothing more; what its
@@ -1441,7 +1466,11 @@ impl<T: StreamTerms> Outbound<T> {
     pub(crate) fn removal_unreported(&self) -> Option<DestinationRemoval> {
         self.fanout.as_deref().and_then(|fanout| {
             fanout.targets.iter().find_map(|target| {
-                let (reason, _) = target.removed.filter(|_| !target.reported)?;
+                // Reported once drained, so a reported target retires at
+                // the next addition or serve.
+                let (reason, _) = target
+                    .removed
+                    .filter(|_| !target.reported && target.cancelled)?;
                 Some(DestinationRemoval {
                     destination: target.address,
                     reason,
@@ -1474,9 +1503,20 @@ impl<T: StreamTerms> Outbound<T> {
     /// the sender's list of what removed publications left, which closes
     /// each whole (design 3.7).
     pub(crate) fn drain_retired(&mut self, closing: &mut Vec<Opened>) {
-        if let Some(fanout) = self.fanout.as_deref_mut() {
-            closing.append(&mut fanout.retired);
+        let Some(fanout) = self.fanout.as_deref_mut() else {
+            return;
+        };
+        let mut unrecorded = 0u64;
+        for opened in fanout.retired.drain(..) {
+            if closing.len() < closing.capacity() {
+                closing.push(opened);
+            } else {
+                unrecorded = unrecorded.saturating_add(1);
+            }
         }
+        debug_assert_eq!(unrecorded, 0, "the close list holds every route");
+        self.counters
+            .bump(|c| &mut c.retired_unrecorded, unrecorded);
     }
 
     /// The repair jobs every destination's table holds, summed (tests).
@@ -1702,11 +1742,7 @@ impl<T: StreamTerms> Outbound<T> {
         if self.removing() {
             return DestinationChange::Removing;
         }
-        let joins: Vec<u64> = self
-            .readers
-            .iter()
-            .map(|reader| reader.position())
-            .collect();
+        let (endpoint, epoch) = (self.endpoint, self.opened);
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return DestinationChange::Unknown;
         };
@@ -1733,15 +1769,39 @@ impl<T: StreamTerms> Outbound<T> {
                 if fanout.quarantined(destination, now, quarantine) {
                     return DestinationChange::Quarantined;
                 }
-                // A removed target holds its slot until it retires, after
-                // its removal is reported: while the conductor's ring is
-                // full nothing retires, so churn never grows the targets,
-                // their flags or the retired list past their capacity.
+                // A removed target holds its slot until it retires: the
+                // removals already reported (which come only once drained)
+                // retire now, so a move retried after its removal shows in
+                // `network_removed_destinations` finds the slot free. While
+                // the conductor's ring is full nothing is reported and
+                // nothing retires, so churn never grows the targets, their
+                // flags or the retired list past their capacity.
+                let (retired, forgotten, unrecorded) = fanout.retire(endpoint, epoch, now);
                 if fanout.targets.len() >= MAX_DESTINATIONS {
+                    self.counters.bump(|c| &mut c.destinations_retired, retired);
+                    self.counters
+                        .bump(|c| &mut c.quarantine_forgotten, forgotten);
+                    self.counters
+                        .bump(|c| &mut c.retired_unrecorded, unrecorded);
                     return DestinationChange::Full;
                 }
-                // A fresh optional destination, joining at the cursor.
-                let Some(target) = fanout.target(destination, &joins) else {
+                // A fresh optional destination, joining at the cursor (an
+                // addition allocates: a run-time command).
+                let joins: Vec<u64> = self
+                    .readers
+                    .iter()
+                    .map(|reader| reader.position())
+                    .collect();
+                let target = fanout.target(destination, &joins);
+                self.counters.bump(|c| &mut c.destinations_retired, retired);
+                self.counters
+                    .bump(|c| &mut c.quarantine_forgotten, forgotten);
+                self.counters
+                    .bump(|c| &mut c.retired_unrecorded, unrecorded);
+                let Some(fanout) = self.fanout.as_deref_mut() else {
+                    return DestinationChange::Unknown;
+                };
+                let Some(target) = target else {
                     return DestinationChange::Unknown;
                 };
                 fanout.targets.push(target);
@@ -1765,7 +1825,7 @@ mod tests {
         let address: SocketAddr = "127.0.0.1:4000".parse().unwrap();
         let drr = DrrConfig::new(&[1536], 1536).unwrap();
         let required = if required { vec![address] } else { Vec::new() };
-        let mut fanout = Fanout::new(&[address], &required, drr, 1, 1500, &[0]).unwrap();
+        let mut fanout = Fanout::new(&[address], &required, drr, 1, 1500, &[0], true).unwrap();
         let mut target = fanout.targets.pop().unwrap();
         target.stalled = true;
         target
@@ -1893,6 +1953,7 @@ mod tests {
         };
         let before = capacities(&outbound);
         let mut full = 0;
+        // Every removal emptied and never reported (the ring full).
         for port in 1..=40u16 {
             match outbound.change_destination(address(4000 + port), true, 0, 0) {
                 DestinationChange::Added => {}
@@ -1920,7 +1981,66 @@ mod tests {
             assert!(fanout.staged_for[0].len() <= MAX_DESTINATIONS);
         }
         assert!(full > 0, "the table filled");
+        // The ring drains: each removal is reported, and the next addition
+        // retires the reported ones, within the retired list's capacity.
+        while let Some(removal) = outbound.removal_unreported() {
+            outbound.removal_reported(removal.destination);
+        }
+        for port in 41..=80u16 {
+            let change = outbound.change_destination(address(4000 + port), true, 0, 0);
+            assert_eq!(change, DestinationChange::Added, "port {port}");
+            let _ = outbound.change_destination(address(4000 + port), false, 0, 0);
+            let fanout = outbound.fanout.as_deref_mut().unwrap();
+            for target in &mut fanout.targets {
+                if target.removed.is_some() {
+                    target.cancelled = true;
+                    target.reported = true;
+                }
+            }
+            assert!(fanout.retired.len() <= MAX_DESTINATIONS);
+        }
         assert_eq!(capacities(&outbound), before, "nothing reallocated");
+    }
+
+    /// Review B1 of #829: once a removal is reported (which it is only once
+    /// drained), the next addition finds its slot free: a move at
+    /// capacity retried after the removal shows in
+    /// `network_removed_destinations` is `Added`, not `Full` again.
+    #[test]
+    fn an_addition_after_the_removal_is_reported_finds_the_slot_free() {
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut outbound = fanned(address(4000));
+        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+            let change = outbound.change_destination(address(4000 + port), true, 0, 0);
+            assert_eq!(change, DestinationChange::Added);
+        }
+        assert_eq!(
+            outbound.change_destination(address(4100), true, 0, 0),
+            DestinationChange::Full
+        );
+        let _ = outbound.change_destination(address(4001), false, 0, 0);
+        assert_eq!(outbound.removal_unreported(), None, "not drained yet");
+        assert_eq!(
+            outbound.change_destination(address(4100), true, 0, 0),
+            DestinationChange::Full,
+            "the removed target holds its slot"
+        );
+        // Drained: its removal is reported, then the move is retried.
+        let fanout = outbound.fanout.as_deref_mut().unwrap();
+        fanout
+            .targets
+            .iter_mut()
+            .find(|t| t.address == address(4001))
+            .unwrap()
+            .cancelled = true;
+        let removal = outbound.removal_unreported().unwrap();
+        assert_eq!(removal.destination, address(4001));
+        outbound.removal_reported(removal.destination);
+        assert_eq!(
+            outbound.change_destination(address(4100), true, 0, 0),
+            DestinationChange::Added
+        );
+        assert_eq!(outbound.counters().destinations_retired, 1);
     }
 
     /// MD-15, review N2: a destination moves to the cursor when it first
@@ -1952,9 +2072,11 @@ mod tests {
         assert!(!route_own(RouteError::IdentityExhausted));
         assert!(!route_own(RouteError::RouteLimit), "endpoint-wide");
         assert!(route_own(RouteError::FamilyMismatch));
-        assert!(!queue_own(QueueError::NotActive));
-        assert!(!queue_own(QueueError::NeedsReset));
-        assert!(!queue_own(QueueError::QueueLimit), "endpoint-wide");
+        assert!(!queue_limit(QueueError::NotActive), "a reset");
+        assert!(!queue_limit(QueueError::NeedsReset), "a reset");
+        assert!(!queue_limit(QueueError::IdentityExhausted));
+        assert!(!queue_limit(QueueError::UnknownQueue));
+        assert!(queue_limit(QueueError::QueueLimit), "endpoint-wide");
         let mut optional = target(false);
         // An endpoint reset, twice per duty for a long while: nothing.
         for now in 0..100 {
@@ -2050,7 +2172,6 @@ mod tests {
                 "{destinations:?} on {family:?}"
             );
         }
-        let _ = fanned(v4);
     }
 
     /// MD-7: an optional destination stalled at its own edge while the

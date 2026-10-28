@@ -276,6 +276,10 @@ pub struct OutboundCounters {
     /// the destination (they are in `route_failures` or `queue_failures`
     /// too).
     pub endpoint_limits: u64,
+    /// A retired destination's route and queues, or a drained list's, that
+    /// found no room in the list closing them (never, by its capacity):
+    /// left to the endpoint's next epoch.
+    pub retired_unrecorded: u64,
     /// Send faults reported for a lane's head.
     pub send_faults: u64,
     /// Invariant, sender or DRR failures.

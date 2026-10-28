@@ -674,13 +674,24 @@ fn twenty_moves_neither_fill_the_table_nor_leak() {
 }
 
 /// Plan 157, point 2: a move at `MAX_DESTINATIONS` answers `Full` while
-/// the removed destination holds its slot, and the cycle that reports and
-/// retires it frees the slot for the addition.
+/// the removed destination holds its slot, and once its removal shows in
+/// `network_removed_destinations` (reported only once drained), the move
+/// retried is added. It checks the public contract end to end in both
+/// threading modes; the timing it relies on (an addition retires what was
+/// reported) is guarded by the unit test
+/// `an_addition_after_the_removal_is_reported_finds_the_slot_free`, and
+/// the bound by the unit churn test.
 #[test]
 fn a_move_at_capacity_waits_for_the_removal_to_retire() {
+    move_at_capacity(ThreadingMode::Shared);
+    move_at_capacity(ThreadingMode::Dedicated);
+}
+
+/// [`a_move_at_capacity_waits_for_the_removal_to_retire`] in `threading`.
+fn move_at_capacity(threading: ThreadingMode) {
     use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
 
-    let mut a = driver(ThreadingMode::Shared);
+    let mut a = driver(threading);
     let (mut receivers, addresses) = receivers(1);
     let at = |index: u16| SocketAddr::from((LOOPBACK, 43_000 + index));
     let (publication, _) = connect(
@@ -717,16 +728,15 @@ fn a_move_at_capacity_waits_for_the_removal_to_retire() {
         [DestinationChange::Removed, DestinationChange::Full],
         "the slot is held until the removal retires"
     );
+    // The public signal: once the removal shows, a retried move is added.
     let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
         .chain(receivers.iter_mut())
         .collect();
     pump(&mut all, |drivers| {
-        super::shared(drivers[0])
-            .sender
-            .outbound_counters(0)
-            .unwrap()
-            .destinations_retired
-            == 1
+        drivers[0]
+            .network_removed_destinations(&publication)
+            .iter()
+            .any(|removal| removal.destination == at(1))
     });
     a.add_network_destination(&publication, at(100)).unwrap();
     assert_eq!(
