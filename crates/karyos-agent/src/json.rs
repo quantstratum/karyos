@@ -24,6 +24,7 @@ use crate::api::{
     GuardEntry, JournalView, Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
 };
 use crate::api::{BucketLane, BucketRead, BucketRefusal, TraceBucket};
+use crate::api::{ExportJournal, ExportPage, ExportRefusal};
 
 /// A JSON value being written into a string.
 struct Out<'a>(&'a mut String);
@@ -720,19 +721,21 @@ fn bucket_header(out: &mut Out<'_>, bucket: &TraceBucket, lanes: &[BucketLane]) 
         fields.number("start_ns", bucket.start_ns);
         fields.number("end_ns", bucket.end_ns);
         fields.key("incomplete").bool(bucket.incomplete);
-        fields.key("loss").object(|loss| {
-            for (key, value) in [
-                ("pending_dropped", bucket.loss.pending_dropped),
-                ("polls_dropped", bucket.loss.polls_dropped),
-                ("lanes_dropped", bucket.loss.lanes_dropped),
-                ("aged_out", bucket.loss.aged_out),
-                ("mirror_overwritten", bucket.loss.mirror_overwritten),
-                ("journals_dropped", bucket.loss.journals_dropped),
-                ("malformed", bucket.loss.malformed),
-                ("unknown_journal", bucket.loss.unknown_journal),
-            ] {
-                loss.number(key, value);
-            }
+        fields.key("loss").option(bucket.loss, |out, bucket_loss| {
+            out.object(|loss| {
+                for (key, value) in [
+                    ("pending_dropped", bucket_loss.pending_dropped),
+                    ("polls_dropped", bucket_loss.polls_dropped),
+                    ("lanes_dropped", bucket_loss.lanes_dropped),
+                    ("aged_out", bucket_loss.aged_out),
+                    ("mirror_overwritten", bucket_loss.mirror_overwritten),
+                    ("journals_dropped", bucket_loss.journals_dropped),
+                    ("malformed", bucket_loss.malformed),
+                    ("unknown_journal", bucket_loss.unknown_journal),
+                ] {
+                    loss.number(key, value);
+                }
+            });
         });
         fields.number("lanes_total", bucket.lanes_total);
         fields.number("first_lane", bucket.first_lane);
@@ -773,6 +776,188 @@ fn bucket_lane(out: &mut Out<'_>, lane: &BucketLane) {
                 fields.number("above", side.above);
                 fields.number("below", side.below);
             });
+        }
+    });
+}
+
+/// A `trace-export` page (R-CORE-13): the driver instance as `epoch` (32
+/// lowercase hex digits, as `instance`), the sequence asked for, the lost
+/// ranges first, then whole records in order, the next sequence to ask
+/// for, the ring's head, the journals the records name, and how many
+/// records name an unknown one. The read
+/// ([`crate::trace_export::export`]) bounded the page; this encodes it
+/// whole, cutting nothing.
+#[must_use]
+pub fn trace_export(page: &ExportPage) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("epoch", &format!("{:032x}", page.epoch));
+        fields.number("from", page.from);
+        fields.key("lost").array(&page.lost, |out, loss| {
+            out.object(|fields| {
+                fields.number("first", loss.first);
+                fields.number("last", loss.last);
+                fields.string(
+                    "reason",
+                    match loss.reason {
+                        crate::api::LossReason::Overwritten => "overwritten",
+                        crate::api::LossReason::Malformed => "malformed",
+                    },
+                );
+            });
+        });
+        fields
+            .key("records")
+            .array(&page.records, |out, record| export_record(out, record));
+        fields.number("next", page.next);
+        fields.number("head", page.head);
+        fields
+            .key("journals")
+            .array(&page.journals, |out, journal| export_journal(out, journal));
+        fields.number("unknown_records", page.unknown_records);
+        fields.number("unreadable_records", page.unreadable_records);
+    });
+    text
+}
+
+/// The bytes of a `trace-export` reply besides its records and journals:
+/// its fields, 256 bytes at most, and its overwritten ranges, at most
+/// `MAX_LOST_RANGES` of at most `LOSS_BYTES` each (malformed records are
+/// counted as the read meets them).
+pub(crate) const EXPORT_REPLY_OVERHEAD: usize =
+    256 + crate::trace_export::MAX_LOST_RANGES * crate::trace_export::LOSS_BYTES;
+
+/// The bytes `record`'s encoding takes in a page, with its separator,
+/// computed without encoding it:
+/// `{"seq":S,"journal":J,"sequence":Q,"payload":[W,...]},`.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn export_record_len(record: &crate::api::ExportRecord) -> usize {
+    export_record_len_of(record.seq, record.journal, record.sequence, &record.payload)
+}
+
+/// [`export_record_len`] of a record's parts, before it is built.
+#[must_use]
+pub(crate) fn export_record_len_of(
+    seq: u64,
+    journal: u64,
+    sequence: u64,
+    payload: &[u64],
+) -> usize {
+    let digits = |value: u64| value.checked_ilog10().map_or(1, |log| log as usize + 1);
+    let words: usize = payload.iter().map(|word| digits(*word) + 1).sum();
+    // The keys and punctuation, the payload's last word having no comma.
+    r#"{"seq":,"journal":,"sequence":,"payload":[]},"#.len()
+        + digits(seq)
+        + digits(journal)
+        + digits(sequence)
+        + words.saturating_sub(usize::from(!payload.is_empty()))
+}
+
+fn export_record(out: &mut Out<'_>, record: &crate::api::ExportRecord) {
+    out.object(|fields| {
+        fields.number("seq", record.seq);
+        fields.number("journal", record.journal);
+        fields.number("sequence", record.sequence);
+        fields
+            .key("payload")
+            .array(&record.payload, |out, word| out.number(*word));
+    });
+}
+
+/// A refused `trace-export` read, typed (R-CORE-13).
+#[must_use]
+pub fn export_refusal(refusal: &ExportRefusal) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match *refusal {
+        ExportRefusal::EpochChanged { epoch } => {
+            fields.string("error", "epoch changed");
+            fields.string("epoch", &format!("{epoch:032x}"));
+        }
+        ExportRefusal::Ahead { next } => {
+            fields.string("error", "cursor ahead");
+            fields.number("next", next);
+        }
+        ExportRefusal::Busy => fields.string("error", "mirror busy"),
+    });
+    text
+}
+
+fn export_journal(out: &mut Out<'_>, journal: &ExportJournal) {
+    use karyos_sys::trace_mirror::{JournalKind, JournalState, TimeNamespace};
+
+    let state = |state: JournalState| match state {
+        JournalState::Open => "open",
+        JournalState::Closed => "closed",
+        JournalState::WriterLost => "writer_lost",
+    };
+    out.object(|fields| match journal {
+        ExportJournal::Live(entry) => {
+            fields.number("journal", entry.journal);
+            fields.string("table", "live");
+            fields.number("client", entry.client);
+            fields.string("state", state(entry.state));
+            fields.string(
+                "kind",
+                match entry.kind {
+                    JournalKind::Subscriber => "subscriber",
+                    JournalKind::Publisher => "publisher",
+                    JournalKind::NetworkSender => "network_sender",
+                    JournalKind::NetworkReceiver => "network_receiver",
+                },
+            );
+            fields.number("registration", entry.registration);
+            fields.number("stream", entry.stream);
+            fields.number("lane", u64::from(entry.lane.get()));
+            fields.number("incarnation", entry.incarnation);
+            fields.string(
+                "time_namespace",
+                match entry.time_namespace {
+                    TimeNamespace::Unknown => "unknown",
+                    TimeNamespace::Same => "same",
+                    TimeNamespace::Different => "different",
+                },
+            );
+            fields.number("provenance", entry.provenance);
+            fields.number("payload_words", entry.payload_words);
+            fields.number("sequence", entry.sequence);
+            fields.number("attempted", entry.attempted);
+            fields.number("stored", entry.stored);
+            fields.number("mirrored", entry.mirrored);
+            fields
+                .key("lost_before")
+                .option(entry.lost_before, |out, value| out.number(value));
+            fields.number("unstable", entry.unstable);
+            fields.key("drops").array(entry.ranges(), |out, range| {
+                out.object(|fields| {
+                    fields.number("first", range.first);
+                    fields.number("last", range.last);
+                    fields.number("first_time", range.first_time);
+                    fields.number("last_time", range.last_time);
+                    fields.number("clock", range.clock);
+                    fields.number("epoch", range.epoch);
+                });
+            });
+        }
+        ExportJournal::Recycled(entry) => {
+            fields.number("journal", entry.journal);
+            fields.string("table", "recycled");
+            fields.string("state", state(entry.state));
+            fields.number("stream", entry.stream);
+            fields.number("lane", u64::from(entry.lane.get()));
+            fields.number("incarnation", entry.incarnation);
+            fields
+                .key("boundary")
+                .option(entry.boundary, |out, value| out.number(value));
+            fields.number("sequence", entry.sequence);
+        }
+        ExportJournal::Unknown { journal } => {
+            fields.number("journal", *journal);
+            fields.string("table", "unknown");
+        }
+        ExportJournal::Unreadable { journal } => {
+            fields.number("journal", *journal);
+            fields.string("table", "unreadable");
         }
     });
 }

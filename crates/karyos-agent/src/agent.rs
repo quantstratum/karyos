@@ -255,6 +255,37 @@ impl Agent {
         Ok(window.buckets(from, count, epoch, crate::api::MAX_BUCKET_REPLY))
     }
 
+    /// Up to `count` raw trace records of the driver in `dir`, from mirror
+    /// sequence `from` on, for a cursor of driver instance `epoch` when
+    /// given (R-CORE-13). Read from the attached driver's mirror at the
+    /// call: the agent keeps no cursor. `Ok(Err(_))` is the export's own
+    /// refusal; `Err(answer)` a driver unknown or not attached, answered as
+    /// a guard operation's.
+    pub fn trace_export(
+        &self,
+        dir: &Path,
+        from: u64,
+        count: usize,
+        epoch: Option<u128>,
+    ) -> Result<Result<crate::api::ExportPage, crate::api::ExportRefusal>, GuardAnswer> {
+        let driver = self
+            .drivers
+            .iter()
+            .find(|driver| driver.dir == dir)
+            .ok_or(GuardAnswer::UnknownDriver)?;
+        let (Some(tool), Some(instance)) = (driver.tool.as_ref(), driver.instance) else {
+            return Err(GuardAnswer::Unattached);
+        };
+        Ok(crate::trace_export::export(
+            tool.trace_mirror(),
+            instance,
+            from,
+            count,
+            epoch,
+            crate::api::MAX_EXPORT_REPLY,
+        ))
+    }
+
     /// Closes guard `guard` of the driver in `dir` for operator `uid`
     /// with `reason`, journalled (M10b; see `operations`).
     pub fn guard_close(&mut self, dir: &Path, guard: u64, uid: u32, reason: &[u8]) -> GuardAnswer {
@@ -463,7 +494,9 @@ impl Agent {
                     "gap-ack" => (acknowledge_off, acknowledge),
                     "catalog" => ((!catalog).then_some("not_configured"), true),
                     // Served to every role, always.
-                    "view" | "trace-window" | "limits" | "trace-buckets" => (None, true),
+                    "view" | "trace-window" | "limits" | "trace-buckets" | "trace-export" => {
+                        (None, true)
+                    }
                     // A name added to CAPABILITIES must be classified here.
                     _ => (Some("not_configured"), true),
                 };
