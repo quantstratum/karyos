@@ -270,6 +270,18 @@ impl RateLimiter {
         }
     }
 
+    /// Empty buckets for `policy`, the clock read at `now`: a limiter that
+    /// takes a policy at run time, which never grants tokens (R-CORE-21).
+    /// The caller validated the policy.
+    #[must_use]
+    pub fn empty(policy: RatePolicy, now: u64) -> Self {
+        Self {
+            messages: Bucket::clamped(policy.messages, 0),
+            bytes: policy.bytes.map(|rate| Bucket::clamped(rate, 0)),
+            last: now,
+        }
+    }
+
     /// Adds the tokens `elapsed` nanoseconds earn to every bucket, capped
     /// at its burst. The deterministic core: the caller measures `elapsed`.
     pub fn refill(&mut self, elapsed: u64) {

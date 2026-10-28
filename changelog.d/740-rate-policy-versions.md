@@ -14,7 +14,7 @@
     the publication's; each lane is weighed only against its own reserve,
     and a lane whose reserve the policy would cross is
     `DriverError::RateChangeOnLane` with `ReserveCrossed`, naming the lane
-    (`LaneRefusal`), with the refusal's own CnC code. A publication has one
+    (`LaneRefusal::Change`), with the refusal's own CnC code. A publication has one
     policy and one version, kept by the driver for its aggregate: a lane
     guarded with no rate takes it, one guarded with the same policy joins
     at its version, and one guarded with another policy is refused and
@@ -24,7 +24,7 @@
     audited from no rate (version 0).
     A handle with no copy (a rateless lane's, a remote one's before a
     policy) watches its ring's slot and takes a policy published later
-    at its next call; the gate's slot is published with it. A lane guarded
+    at its next call, its copy starting empty; the gate's slot is published with it. A lane guarded
     without a rate on a publication with a policy is audited from no rate
     to its version. A publication's stored policy goes with its last lane.
     A retiring lane, guarded or not, refuses a change as retiring.

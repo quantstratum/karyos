@@ -1678,6 +1678,27 @@ mod tests {
             assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
         }
 
+        /// The #841 review, decided 2026-10-28 by QS-COORDINATOR: a handle
+        /// that found no policy at bind and takes one later starts its copy
+        /// empty, as the sender gate's bucket does
+        /// (`a_rateless_gate_adopts_a_published_policy`): no burst at once.
+        #[test]
+        fn a_policy_taken_at_run_time_starts_empty() {
+            use karyos_sys::rate_policy_slot::{OUTCOME_SLOT, publish};
+
+            let (driver, mut publication) =
+                guarded_by(|binding, _| binding.with_published_rate(now));
+            assert_eq!(publication.guard().unwrap().rate_tokens(), None);
+            publish(
+                driver.ring.words(),
+                OUTCOME_SLOT,
+                1,
+                &messages_per_second(1, 10),
+            );
+            assert_eq!(publication.offer(b"a").unwrap(), OfferOutcome::RateLimited);
+            assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
+        }
+
         /// G-e3 (ACS 15347): a claim that will never be sent gives its
         /// token back: dropped, aborted, or aborted by its deadline before
         /// the commit; an accepted commit keeps it.

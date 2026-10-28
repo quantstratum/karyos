@@ -580,6 +580,66 @@ fn a_publications_rate_policy_stays_while_a_lane_is_retiring() {
     assert!(driver.rate_policies.is_empty());
 }
 
+/// The #841 review: one `free_retired_streams` over several removed
+/// publications drops the policy of each whose last lane went, and keeps
+/// the one with a lane still retiring.
+#[test]
+fn freeing_several_publications_drops_only_the_policies_with_no_lane_left() {
+    use karyos_client::link::{Lease, LeaseEnd};
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    let aggregates: Vec<_> = (0..3)
+        .map(|index| {
+            let aggregate = driver
+                .add_aggregate(AggregateConfig {
+                    stream: stream(2 + index),
+                    quanta: vec![u64::from(DEFAULT_MTU) * 4; 2],
+                })
+                .unwrap();
+            for lane in aggregate.streams() {
+                driver
+                    .guard_stream(
+                        lane,
+                        guard,
+                        4,
+                        Some(crate::guards::GuardRate::publication(policy)),
+                    )
+                    .unwrap();
+            }
+            aggregate
+        })
+        .collect();
+    assert_eq!(driver.rate_policies.len(), 3);
+    // The middle one keeps a lane retiring.
+    let kept = aggregates[1].streams().nth(1).unwrap();
+    let registration = driver.stream(kept).unwrap().aggregate.registration;
+    let lease = Lease::acquire(
+        &driver.stream(kept).unwrap().leases,
+        &Arc::new(LeaseEnd::default()),
+    );
+    for aggregate in &aggregates {
+        driver.remove_aggregate(aggregate).unwrap();
+    }
+    driver.free_retired_streams();
+    assert_eq!(driver.streams.len(), 1);
+    assert_eq!(
+        driver.rate_policies.keys().copied().collect::<Vec<_>>(),
+        vec![registration]
+    );
+    drop(lease);
+    driver.free_retired_streams();
+    assert!(driver.rate_policies.is_empty());
+}
+
 /// QS-COORDINATOR, ACS 33899: with every lane the driver can hold guarded
 /// with a rate, the stored policies never pass `max_streams`, and the next
 /// stream is refused before any policy could be stored for it.

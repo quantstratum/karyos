@@ -1047,8 +1047,9 @@ fn the_gate_applies_a_newer_published_policy_at_its_next_serve() {
 
 /// R-CORE-21, follow-up 1 of the #814 review: a gate built with no rate
 /// (a rateless lane's) creates its bucket from the first policy published
-/// to its slot, full at the new burst as a gate built with it would be,
-/// and takes later changes as any other gate.
+/// to its slot, empty (a policy taken at run time never grants tokens,
+/// decided 2026-10-28 by QS-COORDINATOR), and takes later changes as any
+/// other gate.
 #[test]
 fn a_rateless_gate_adopts_a_published_policy() {
     use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
@@ -1066,14 +1067,83 @@ fn a_rateless_gate_adopts_a_published_policy() {
     f.gate.set_now(1);
     assert_eq!(
         (f.gate.policy_version(), f.gate.message_tokens()),
-        (1, Some(3))
+        (1, Some(0))
     );
+    // It earns from the adoption on.
+    f.gate.set_now(1 + 1_000_000_000);
+    assert_eq!(f.gate.message_tokens(), Some(3));
     publish(slot.words(), 0, 2, &rate(1, 1));
-    f.gate.set_now(2);
+    f.gate.set_now(2 + 1_000_000_000);
     assert_eq!(
         (f.gate.policy_version(), f.gate.message_tokens()),
         (2, Some(1))
     );
+}
+
+/// Z1 of the #841 review: positions a gate with no rate let through took
+/// no tokens, so they are not taken as paid once it adopts a policy: with
+/// a burst of 2, at most 2 positions go until the bucket refills.
+#[test]
+fn a_rateless_gates_positions_are_not_taken_as_paid_after_adoption() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, None);
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    let mut tokens: Vec<_> = (0..2).map(|_| f.stage(0).0).collect();
+    assert_eq!(check(&mut f.gate, 0, &tokens), permit(2));
+    publish(slot.words(), 0, 1, &rate(1, 2));
+    f.gate.set_now(0);
+    assert_eq!(f.gate.message_tokens(), Some(0), "adopted empty");
+    // Two seconds fill the burst of 2.
+    f.gate.set_now(2_000_000_000);
+    assert_eq!(f.gate.message_tokens(), Some(2));
+    // The backend kept the two pending; two more are staged. Exposed
+    // together, a gate that took the first two as paid would let all
+    // four go on a burst of 2.
+    tokens.extend((0..2).map(|_| f.stage(0).0));
+    let GateDecision::Permit { count } = check(&mut f.gate, 0, &tokens) else {
+        panic!("permitted");
+    };
+    assert!(count.get() <= 2, "{count} positions on a burst of 2");
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    assert_eq!(f.gate.counts().faults, 0);
+}
+
+/// Z2 of the #841 review: a published policy whose byte burst is below the
+/// gate's largest datagram is not adopted (it would hold the lane for
+/// good), and is counted.
+#[test]
+fn a_policy_the_largest_datagram_refuses_is_not_adopted() {
+    use karyos_sys::rate_limit::Rate;
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, None);
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    let small = RatePolicy {
+        messages: Rate {
+            per_second: 10,
+            burst: 10,
+        },
+        bytes: Some(Rate {
+            per_second: 1000,
+            burst: u64::from(MAX_FRAME) - 1,
+        }),
+    };
+    publish(slot.words(), 0, 1, &small);
+    f.gate.set_now(1);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (0, None)
+    );
+    assert_eq!(f.gate.counts().policies_refused, 1);
+    // Read once: the next serve does not count it again.
+    f.gate.set_now(2);
+    assert_eq!(f.gate.counts().policies_refused, 1);
 }
 
 /// Words that complete a publication of version 3 right after the first

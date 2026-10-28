@@ -192,6 +192,9 @@ pub struct GateCounts {
     pub corrupt: u64,
     /// Counts that would have overflowed and kept their last value.
     pub overflows: u64,
+    /// Published rate policies not applied: a byte burst below the gate's
+    /// largest datagram (R-CORE-21).
+    pub policies_refused: u64,
 }
 
 /// Adds one to `count`; at its end it keeps its value and `overflows`
@@ -417,10 +420,19 @@ impl core::fmt::Debug for PolicySlot {
 
 impl PolicySlot {
     /// Applies a newer published policy to `limiter` at `now`, creating it
-    /// for a gate built with no rate (a rateless lane's publication getting
-    /// one). An unchanged sequence word is one Acquire load; a torn read
+    /// empty for a gate built with no rate (a rateless lane's publication
+    /// getting one): a policy taken at run time never grants tokens. An unchanged sequence word is one Acquire load; a torn read
     /// waits for the next call.
-    fn refresh(&mut self, limiter: &mut Option<RateLimiter>, now: u64) {
+    /// A policy the gate's largest datagram refuses (a byte burst below
+    /// it) is not applied, as a gate is never built with one, and counted
+    /// in `counts.policies_refused`.
+    fn refresh(
+        &mut self,
+        limiter: &mut Option<RateLimiter>,
+        max_datagram: u64,
+        counts: &mut GateCounts,
+        now: u64,
+    ) {
         use karyos_sys::rate_policy_slot::{SEQUENCE, SlotRead, try_read_sequenced};
 
         if self.words.load_acquire(SEQUENCE) == Some(self.sequence) {
@@ -432,9 +444,16 @@ impl PolicySlot {
         if let SlotRead::Policy { version, policy } = read
             && version > self.version
         {
+            if policy.validate(max_datagram).is_err() {
+                bump(&mut counts.policies_refused, &mut counts.overflows);
+                if let Some(sequence) = sequence {
+                    self.sequence = sequence;
+                }
+                return;
+            }
             match limiter {
                 Some(limiter) => limiter.set_policy(policy, now),
-                None => *limiter = Some(RateLimiter::new(policy, now)),
+                None => *limiter = Some(RateLimiter::empty(policy, now)),
             }
             self.version = version;
         }
@@ -452,6 +471,9 @@ pub struct GuardGate {
     lanes: Vec<State>,
     /// The publication's bucket, shared by its lanes.
     limiter: Option<RateLimiter>,
+    /// The largest datagram the routes build: a policy's byte burst is
+    /// validated against it.
+    max_datagram: u64,
     /// Where the driver publishes a changed policy (R-CORE-21), the
     /// sequence word last read whole there, and the version applied.
     policy: Option<PolicySlot>,
@@ -573,6 +595,7 @@ impl GuardGate {
             cell,
             lanes,
             limiter: rate.map(|policy| RateLimiter::new(policy, now)),
+            max_datagram,
             policy: None,
             flushing: None,
             applied: 0,
@@ -704,11 +727,14 @@ impl GuardGate {
     /// A backward step earns nothing. A newer policy the driver published
     /// is applied first (R-CORE-21): the bucket earns the old rates up to
     /// `now`, then takes the new ones, its level clamped and never raised.
-    /// One load decides that nothing changed; a publication in progress is
+    /// A gate built with no rate creates its bucket, empty, from the first
+    /// policy published. A policy whose byte burst is below the largest datagram
+    /// is not applied, and counted (`GateCounts::policies_refused`). One
+    /// load decides that nothing changed; a publication in progress is
     /// read at the next call.
     pub fn set_now(&mut self, now: u64) {
         if let Some(slot) = &mut self.policy {
-            slot.refresh(&mut self.limiter, now);
+            slot.refresh(&mut self.limiter, self.max_datagram, &mut self.counts, now);
         }
         if let Some(limiter) = &mut self.limiter {
             limiter.refill_at(now);
@@ -725,8 +751,9 @@ impl GuardGate {
         });
     }
 
-    /// The version of the published rate policy the gate applies; 0 for
-    /// the policy it was built with.
+    /// The version of the published rate policy the gate applies: 0 for
+    /// the policy it was built with, or for none; a version it refused is
+    /// never this.
     #[must_use]
     pub fn policy_version(&self) -> u64 {
         self.policy.as_ref().map_or(0, |slot| slot.version)
@@ -1094,11 +1121,13 @@ impl SenderGate for GuardGate {
                 mismatch = true;
                 break;
             };
-            if !charge.charged {
-                let paid = limiter.as_mut().is_none_or(|limiter| {
-                    limiter.try_admit_datagram(charge.head.length, charge.head.messages)
-                });
-                if !paid {
+            if !charge.charged
+                && let Some(limiter) = limiter.as_mut()
+            {
+                // Charged only when a bucket took its tokens: a position a
+                // gate with no rate let through is never refunded into a
+                // bucket it adopts later (R-CORE-21).
+                if !limiter.try_admit_datagram(charge.head.length, charge.head.messages) {
                     held = true;
                     break;
                 }
