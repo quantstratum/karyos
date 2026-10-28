@@ -271,6 +271,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// Stops serving remote client `client`, whose socket closed before
+    /// its exit proof (karyos#827): as a faulty one, but counted apart,
+    /// since a dying process closes its socket first. Its slot stays until
+    /// the exit proof.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn retire_closed_client(&mut self, client: u64) {
+        if let Some(index) = self.clients.iter().position(|slot| slot.id == client) {
+            self.stop_serving(index, Event::ClientsClosedBeforeExit);
+        }
+    }
+
     /// Records the grant of `command` to `client` on the stream `stream`
     /// (an internal id) as `registration`, if that stream is audited.
     fn audit_grant(&mut self, client: u64, stream: u64, command: &Command, registration: u64) {
@@ -606,6 +620,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // its Leave): every grant it holds ends, sent or not.
                 if let Some(ledger) = slot.ledger.take() {
                     for grant in ledger.into_grants() {
+                        // Counted when its descriptor left: a grant the
+                        // client could have detached, and did not.
+                        if grant.sent {
+                            self.counters.add(Event::GrantsReleasedAtExit, 1);
+                        }
                         self.end_grant(&grant);
                     }
                 }
