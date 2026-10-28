@@ -665,9 +665,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let slot = Arc::new(crate::shared_words::Words::heap(
                     karyos_sys::rate_policy_slot::SLOT_WORDS,
                 ));
+                // Published once, by the first guarded lane; the others
+                // keep the same slot.
+                let mut published = false;
                 for stream in handle.streams() {
                     if let Some(guarded) = self.stream(stream)?.guarded.as_mut() {
-                        guarded.set_gate_slot(Arc::clone(&slot));
+                        if published {
+                            guarded.keep_gate_slot(Arc::clone(&slot));
+                        } else {
+                            guarded.set_gate_slot(Arc::clone(&slot));
+                            published = true;
+                        }
                     }
                 }
                 slot

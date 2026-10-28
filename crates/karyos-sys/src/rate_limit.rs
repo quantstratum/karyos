@@ -151,7 +151,11 @@ impl RatePolicy {
     /// burst a member needs for its cancellations and resolutions
     /// (R-CORE-21's control reserve), in both buckets: a byte limit keeps
     /// `reserve` messages of `frame` bytes each, its rate and its burst, so
-    /// a tight byte bucket never holds back the reserved messages.
+    /// a tight byte bucket never holds back the reserved messages. Each
+    /// reserved message counts as a full frame, since a cancel or a
+    /// resolution may travel in one: on a stream of a 64 KiB MTU, a reserve
+    /// of 10 messages a second needs a byte rate of at least 655 360 bytes
+    /// a second.
     #[must_use]
     pub const fn keeps(&self, reserve: &Rate, frame: u64) -> bool {
         let messages =

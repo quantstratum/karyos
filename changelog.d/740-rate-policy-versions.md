@@ -7,8 +7,11 @@
     provable tightening (`RatePolicy::transition`); `Administrator` takes
     any valid policy. No policy goes below the stream's control reserve,
     in messages and, for a byte limit, in reserve messages of the largest
-    frame. A change on one lane of an aggregate of several lanes changes
-    every lane. Refusals are `DriverError::RateChange` (`VersionMismatch`,
+    frame (each reserved message counted as a full frame). A change on one
+    lane of an aggregate of several lanes is a change of the aggregate:
+    its guarded lanes, each weighed with its own policy, version and
+    reserve, take it together or not at all, and each guard audits it;
+    unguarded lanes are left as they are. Refusals are `DriverError::RateChange` (`VersionMismatch`,
     `NotATightening`, `ReserveCrossed`, `NoRate`) and
     `DriverError::InvalidRatePolicy`, with CnC error codes 19 to 23 (23
     `RateInvalidPolicy`). A byte burst is validated against the largest

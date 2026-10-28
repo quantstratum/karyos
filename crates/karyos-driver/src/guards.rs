@@ -770,6 +770,10 @@ pub(crate) fn error_code(error: &DriverError) -> ErrorCode {
         DriverError::RateChange(RateChangeError::ReserveCrossed) => ErrorCode::RateReserveCrossed,
         DriverError::RateChange(RateChangeError::NoRate) => ErrorCode::RateNotSet,
         DriverError::InvalidRatePolicy(_) => ErrorCode::RateInvalidPolicy,
+        // A lane of the call that is gone or retiring names no guard.
+        DriverError::UnknownStream { .. } | DriverError::StreamRetiring { .. } => {
+            ErrorCode::UnknownStream
+        }
         // A corrupt word is a broken invariant, reported as unknown to
         // the requester; the guard stays closed.
         _ => ErrorCode::UnknownGuard,
