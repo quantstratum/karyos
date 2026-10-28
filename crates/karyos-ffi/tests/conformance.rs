@@ -3125,3 +3125,50 @@ fn the_runner_keeps_its_karyosd_client_served_between_scenarios() {
         abi::client_add_publication(client, c"karyos:ipc", archive_host::linux::UNTIMED, 24);
     assert_eq!(status, closed, "unserved for {gap:?}, yet kept");
 }
+
+/// karyos#830: `subscription.await_image` answers the status of a failing
+/// `karyos_subscription_next_image_change`, as FORMAT.md says, and does not
+/// panic. The subscription's handle is closed behind the adapter, so the
+/// call answers that the handle is invalid.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn await_image_answers_a_failing_image_change_status() {
+    let statuses = statuses();
+    let mut adapter = semantic::Adapter::new(&statuses);
+    let driver = adapter.provided_driver();
+    let ok = |answer: semantic::Answer, name: &str| match answer {
+        semantic::Answer::Ok(results) => results[name].clone(),
+        other => panic!("{name}: {other:?}"),
+    };
+    let client = ok(
+        adapter.op(
+            "client.connect",
+            &BTreeMap::from([("driver".to_owned(), driver)]),
+            "test",
+        ),
+        "client",
+    );
+    let subscription = ok(
+        adapter.op(
+            "subscription.add",
+            &BTreeMap::from([
+                ("client".to_owned(), client),
+                ("stream_id".to_owned(), Value::Integer(2)),
+            ]),
+            "test",
+        ),
+        "subscription",
+    );
+    let handle = adapter.handle_of(&subscription).unwrap();
+    assert_eq!(abi::subscription_close(handle), 0);
+    let answer = adapter.op(
+        "subscription.await_image",
+        &BTreeMap::from([("subscription".to_owned(), subscription)]),
+        "test",
+    );
+    assert!(
+        matches!(&answer, semantic::Answer::Status(status) if status != "timeout"),
+        "{answer:?}"
+    );
+    adapter.close_all();
+}

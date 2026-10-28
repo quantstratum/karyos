@@ -146,6 +146,15 @@ impl Adapter {
         driver
     }
 
+    /// The C handle of an object a step answered, for a runner test that
+    /// acts on it behind the adapter's back.
+    pub fn handle_of(&self, value: &Value) -> Option<u64> {
+        match value {
+            Value::Object(index) => self.objects.get(*index).map(|object| object.handle),
+            _ => None,
+        }
+    }
+
     /// Closes the objects a scenario left open, children first, so the
     /// next scenario starts from nothing.
     pub fn close_all(&mut self) {
