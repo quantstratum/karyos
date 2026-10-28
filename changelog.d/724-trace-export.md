@@ -20,3 +20,11 @@
 - `karyos_sys::diag_ring::scan_at_most` and
   `TraceMirrorReader::scan_at_most`: a ring scan that delivers at most a
   given number of records, so its work is bounded by that number.
+- `trace-buckets` paging (R-CORE-23, review of karyos#817): a bucket's
+  `loss` is on its first page only (`first_lane` 0) and `null` on a later
+  page of it, so a reader never counts it twice; no page holds a bucket's
+  header without a lane.
+- The API socket writes each reply within `WRITE_DEADLINE` (250 ms) in
+  all, in 64 KiB writes: a reply a client reads too slowly is cut short,
+  without its final newline, never holding the polling thread longer.
+  `limits` answers it as `write.deadline_ms`.

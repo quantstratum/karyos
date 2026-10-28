@@ -721,19 +721,21 @@ fn bucket_header(out: &mut Out<'_>, bucket: &TraceBucket, lanes: &[BucketLane]) 
         fields.number("start_ns", bucket.start_ns);
         fields.number("end_ns", bucket.end_ns);
         fields.key("incomplete").bool(bucket.incomplete);
-        fields.key("loss").object(|loss| {
-            for (key, value) in [
-                ("pending_dropped", bucket.loss.pending_dropped),
-                ("polls_dropped", bucket.loss.polls_dropped),
-                ("lanes_dropped", bucket.loss.lanes_dropped),
-                ("aged_out", bucket.loss.aged_out),
-                ("mirror_overwritten", bucket.loss.mirror_overwritten),
-                ("journals_dropped", bucket.loss.journals_dropped),
-                ("malformed", bucket.loss.malformed),
-                ("unknown_journal", bucket.loss.unknown_journal),
-            ] {
-                loss.number(key, value);
-            }
+        fields.key("loss").option(bucket.loss, |out, bucket_loss| {
+            out.object(|loss| {
+                for (key, value) in [
+                    ("pending_dropped", bucket_loss.pending_dropped),
+                    ("polls_dropped", bucket_loss.polls_dropped),
+                    ("lanes_dropped", bucket_loss.lanes_dropped),
+                    ("aged_out", bucket_loss.aged_out),
+                    ("mirror_overwritten", bucket_loss.mirror_overwritten),
+                    ("journals_dropped", bucket_loss.journals_dropped),
+                    ("malformed", bucket_loss.malformed),
+                    ("unknown_journal", bucket_loss.unknown_journal),
+                ] {
+                    loss.number(key, value);
+                }
+            });
         });
         fields.number("lanes_total", bucket.lanes_total);
         fields.number("first_lane", bucket.first_lane);

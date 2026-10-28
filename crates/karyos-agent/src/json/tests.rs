@@ -439,7 +439,7 @@ fn spread_bucket(number: u64, lanes: u8, spread: i64) -> crate::api::TraceBucket
                 counts: histogram.counts(),
             })
             .collect(),
-        loss: crate::api::Loss::default(),
+        loss: Some(crate::api::Loss::default()),
         incomplete: false,
     }
 }

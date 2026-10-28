@@ -717,9 +717,12 @@ pub struct TraceBucket {
     pub end_ns: u64,
     /// Each lane with pairs in it.
     pub lanes: Vec<BucketLane>,
-    /// What was lost while it was current.
-    pub loss: Loss,
+    /// What was lost while it was current, on the bucket's first page
+    /// (`first_lane` 0) only; `None` on a later page of it, so a reader
+    /// never counts it twice.
+    pub loss: Option<Loss>,
     /// It lost something, or a lane's count overflowed: no clean quantile.
+    /// Stated on every page of the bucket.
     pub incomplete: bool,
 }
 

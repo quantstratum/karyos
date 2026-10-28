@@ -163,7 +163,8 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"gap-ack","state":"unavailable","reason":"not_configured"},"#,
             r#"{"name":"catalog","state":"unavailable","reason":"not_configured"},"#,
             r#"{"name":"trace-window","state":"served","reason":null},"#,
-            r#"{"name":"limits","state":"served","reason":null},{"name":"trace-buckets","state":"served","reason":null}]}"#,
+            r#"{"name":"limits","state":"served","reason":null},{"name":"trace-buckets","state":"served","reason":null},"#,
+            r#"{"name":"trace-export","state":"served","reason":null}]}"#,
             "\n"
         )
     );
@@ -274,6 +275,7 @@ fn a_client_negotiates_the_limits() {
         r#"{"limits":{"read.request_bytes":{"value":256,"negotiable":true},"#,
         r#""read.timeout_ms":{"value":100,"negotiable":false},"#,
         r#""write.timeout_ms":{"value":100,"negotiable":false},"#,
+        r#""write.deadline_ms":{"value":250,"negotiable":false},"#,
         r#""write.response_bytes":{"value":null},"#,
         r#""connection.accepts_per_poll":{"value":16,"negotiable":false},"#,
         r#""connection.requests":{"value":1,"negotiable":false}}}"#,

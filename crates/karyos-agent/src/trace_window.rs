@@ -432,7 +432,11 @@ impl TraceWindow {
                             number,
                             lane: index,
                         });
-                        buckets.push(bucket);
+                        // A page never holds a bucket's header alone: one
+                        // with no lane here starts the next page instead.
+                        if !bucket.lanes.is_empty() {
+                            buckets.push(bucket);
+                        }
                         break 'read;
                     }
                     used = used.saturating_add(size);
@@ -685,6 +689,9 @@ fn bucket_of(number: u64, slice_ns: u64, kept: Option<&Bucket>, first_lane: usiz
         let incomplete = kept.loss.any() || kept.lanes.iter().any(|(_, counts)| counts.incomplete);
         (kept.lanes.len(), kept.loss, incomplete)
     });
+    // The loss is the bucket's, stated once, on its first page; a later
+    // page of it says only whether the bucket is incomplete.
+    let loss = (first_lane == 0).then_some(loss);
     TraceBucket {
         number,
         lanes_total,

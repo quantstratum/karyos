@@ -31,8 +31,11 @@
 //!   role (R-CORE-24). A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
 //! - **Bounds.** Each connection is served on the calling thread with
-//!   [`IO_TIMEOUT`] on its reads and writes, so a slow client delays the
-//!   others by that much at most.
+//!   [`IO_TIMEOUT`] on its reads and each write, and [`WRITE_DEADLINE`] on
+//!   writing its whole reply: a client that reads a large reply too slowly
+//!   gets it cut short, never the polling thread held for longer. A reply
+//!   cut short has no final newline, so the client knows it is incomplete,
+//!   and reads again from the same cursor: reading consumes nothing.
 //! - **Limits (R-CORE-38).** `limits` answers every dimension of [`LIMITS`]
 //!   with one of three answers, never "unknown": `{"value":N,
 //!   "negotiable":true}`, a bound a client may propose within;
@@ -72,6 +75,12 @@ pub const PROTOCOL: &str = "KARYOS-AGENT";
 pub const MAX_REQUEST: usize = 256;
 /// The read and write timeout of each connection.
 pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
+/// The time a whole reply may take to write: past it, the reply is cut
+/// short and the connection closed (`Served::Dropped`).
+pub const WRITE_DEADLINE: Duration = Duration::from_millis(250);
+/// The bytes of one write of a reply, so the deadline is checked between
+/// them.
+const WRITE_CHUNK: usize = 64 << 10;
 /// Connections one [`Server::poll`] serves at most; the rest wait for the
 /// next poll, so a burst of clients cannot hold the polling thread.
 pub const MAX_ACCEPTS: usize = 16;
@@ -79,7 +88,7 @@ pub const MAX_ACCEPTS: usize = 16;
 /// The dimensions `limits` answers, their bounds being the constants
 /// above. Only `read.request_bytes` is negotiable in v1, and only
 /// downwards: no bound is raised.
-pub const LIMITS: [Limit; 6] = [
+pub const LIMITS: [Limit; 7] = [
     Limit {
         name: "read.request_bytes",
         bound: Some(MAX_REQUEST as u64),
@@ -93,6 +102,11 @@ pub const LIMITS: [Limit; 6] = [
     Limit {
         name: "write.timeout_ms",
         bound: Some(IO_TIMEOUT.as_millis() as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "write.deadline_ms",
+        bound: Some(WRITE_DEADLINE.as_millis() as u64),
         negotiable: false,
     },
     Limit {
@@ -490,15 +504,34 @@ impl Server {
             (Some(_), Request::Bad) => (json::error("bad request", None), Served::Refused),
         };
         let mut stream = stream;
-        let written = stream
-            .write_all(answer.as_bytes())
-            .and_then(|()| stream.write_all(b"\n"))
-            .and_then(|()| stream.flush());
-        if written.is_err() {
+        let mut reply = answer.into_bytes();
+        reply.push(b'\n');
+        if !write_within(&mut stream, &reply, WRITE_DEADLINE) {
             return Served::Dropped;
         }
         served
     }
+}
+
+/// Writes `reply` to `stream` within `deadline` in all, in chunks of
+/// [`WRITE_CHUNK`], each under the time left (at most [`IO_TIMEOUT`]);
+/// `false` when it failed or the deadline passed.
+fn write_within(stream: &mut UnixStream, reply: &[u8], deadline: Duration) -> bool {
+    let start = std::time::Instant::now();
+    for chunk in reply.chunks(WRITE_CHUNK) {
+        let left = deadline.saturating_sub(start.elapsed());
+        if left.is_zero()
+            || stream
+                .set_write_timeout(Some(left.min(IO_TIMEOUT)))
+                .is_err()
+        {
+            return false;
+        }
+        if stream.write_all(chunk).is_err() {
+            return false;
+        }
+    }
+    stream.flush().is_ok()
 }
 
 impl Drop for Server {
@@ -794,6 +827,33 @@ mod tests {
         }
     }
 
+    /// A reply that a client reads too slowly is cut short at the write
+    /// deadline, never holding the polling thread for longer; one it reads
+    /// is written whole (review of #817, QS-COORDINATOR, ACS 33400).
+    #[test]
+    fn a_reply_is_written_within_its_deadline() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let reply = vec![b'x'; 16 << 20];
+        let start = std::time::Instant::now();
+        assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
+        assert!(
+            start.elapsed() < WRITE_DEADLINE + IO_TIMEOUT * 2,
+            "{:?}",
+            start.elapsed()
+        );
+        drop(reader);
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let reply = vec![b'y'; 1 << 20];
+        let read = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            reader.read_to_end(&mut all).unwrap();
+            all.len()
+        });
+        assert!(write_within(&mut writer, &reply, WRITE_DEADLINE));
+        drop(writer);
+        assert_eq!(read.join().unwrap(), 1 << 20);
+    }
+
     /// R-CORE-38: a dimension this agent does not know is refused by
     /// name, so a client tells it from an agent without `limits`.
     #[test]
@@ -909,9 +969,10 @@ mod tests {
         assert_eq!(bounds[0], Some(256));
         assert_eq!(bounds[1], Some(100));
         assert_eq!(bounds[2], Some(100));
-        assert_eq!(bounds[3], None);
-        assert_eq!(bounds[4], Some(16));
-        assert_eq!(bounds[5], Some(1));
+        assert_eq!(bounds[3], Some(250));
+        assert_eq!(bounds[4], None);
+        assert_eq!(bounds[5], Some(16));
+        assert_eq!(bounds[6], Some(1));
     }
 
     /// R-CORE-38: a proposal above a bound is refused with that limit;
@@ -924,7 +985,7 @@ mod tests {
         );
         assert_eq!(
             negotiate(&LIMITS, "read.request_bytes=256 connection.requests=2"),
-            Err(Refusal::Above(LIMITS[5]))
+            Err(Refusal::Above(LIMITS[6]))
         );
         for bad in [
             "read.timeout_ms",
